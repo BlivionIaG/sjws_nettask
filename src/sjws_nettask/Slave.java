@@ -22,13 +22,14 @@ public class Slave implements Runnable {
     private Socket client;
     private PrintWriter output;
     private BufferedReader input;
-    private String id, key, received_message;
+    private String id, html_path, received_message;
 
-    public Slave(ServerSocket server, Socket client) {
+    public Slave(ServerSocket server, Socket client, String path) {
         System.out.println("Un client s'est connecté");
         this.server = server;
         this.client = client;
         this.received_message = null;
+        this.html_path = path;
     }
 
     public void run() {
@@ -63,7 +64,7 @@ public class Slave implements Runnable {
             case 1:
                 String[] not_nts = message.split(" ");
                 if (not_nts[0].equals("GET") && not_nts[2].split("/")[0].equals("HTTP")) {
-                    new HTML().send(this.client, not_nts[1]);
+                    new HTML(html_path).send(this.client, not_nts[1]);
                     return false;
                 } else {
                     System.out.println(this.id + " : " + message);

@@ -16,16 +16,23 @@ public class New_client implements Runnable {
     private Socket client;
     private PrintWriter output;
     private ArrayList<Thread> threads;
+    private String path = null;
 
     public New_client(ServerSocket server) {
         this.server = server;
         threads = new ArrayList<>();
     }
 
+    public New_client(ServerSocket server, String path) {
+        this.server = server;
+        threads = new ArrayList<>();
+        this.path = path;
+    }
+
     public void run() {
         try {
             while (true) {
-                new Thread(new Slave(server, (client = server.accept()))).start();
+                new Thread(new Slave(server, (client = server.accept()), path)).start();
             }
         } catch (IOException e) {
             e.printStackTrace();

@@ -13,7 +13,6 @@ import java.io.File;
  *
  * @author BlivionIaG
  */
-
 public class HTML {
 
     public static final String[] DAYS = {
@@ -41,7 +40,14 @@ public class HTML {
         "Dec"
     };
 
-    public HTML() {
+    private String html_path;
+
+    public HTML(String html_path) {
+        if (html_path != null) {
+            this.html_path = html_path;
+        } else {
+            this.html_path = Defines.HTML_PATH;
+        }
     }
 
     public void send(Socket client, String path) throws IOException {
@@ -49,9 +55,9 @@ public class HTML {
         String final_path = path.equals("/") ? "index.html" : path;
         BufferedOutputStream output_stream = new BufferedOutputStream(client.getOutputStream());
 
-        if (!new File(Defines.HTML_PATH + final_path).isDirectory()) {
+        if (!new File(html_path + final_path).isDirectory()) {
             ByteBuffer buffer = ByteBuffer.allocateDirect(Defines.HTML_BUFFER_SIZE);
-            RandomAccessFile ra_file = new RandomAccessFile(Defines.HTML_PATH + final_path, "r");
+            RandomAccessFile ra_file = new RandomAccessFile(html_path + final_path, "r");
             FileChannel input_channel = ra_file.getChannel();
 
             System.out.println("Sending " + final_path + "(" + ra_file.length() + " bytes)");
@@ -68,7 +74,7 @@ public class HTML {
             input_channel.close();
             ra_file.close();
         } else {
-            File folder = new File(Defines.HTML_PATH + final_path);
+            File folder = new File(html_path + final_path);
             File[] list = folder.listFiles();
             String page = initHtmlHeader("index.html"),
                     temp = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"/><title>"
@@ -165,20 +171,5 @@ public class HTML {
         header += "Content-Length: ";
 
         return header;
-    }
-
-    public static String[] splitStringEvery(String s, int interval) {
-        int arrayLength = (int) Math.ceil(((s.length() / (double) interval)));
-        String[] result = new String[arrayLength];
-
-        int j = 0;
-        int lastIndex = result.length - 1;
-        for (int i = 0; i < lastIndex; i++) {
-            result[i] = s.substring(j, j + interval);
-            j += interval;
-        }
-        result[lastIndex] = s.substring(j);
-
-        return result;
     }
 }
