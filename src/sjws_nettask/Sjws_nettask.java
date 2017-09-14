@@ -35,12 +35,13 @@ public class Sjws_nettask {
         String path = Defines.HTML_PATH;
         int port = Defines.PORT;
 
-        if (args.length > 3) {
-            path = args[2];
-        } else if (args.length > 2 && is_numeric(args[1])
-                && Integer.parseInt(args[1]) > 0
-                && Integer.parseInt(args[1]) < 65536) {
-            port = Integer.parseInt(args[1]);
+        if (args.length > 1) {
+            path = args[1];
+        }
+        if (args.length > 0 && is_numeric(args[0])
+                && Integer.parseInt(args[0]) > 0
+                && Integer.parseInt(args[0]) < 65536) {
+            port = Integer.parseInt(args[0]);
         }
         new Sjws_nettask(port, path);
     }

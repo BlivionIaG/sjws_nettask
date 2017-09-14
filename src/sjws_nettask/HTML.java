@@ -92,7 +92,7 @@ public class HTML {
             }
             temp += "</body></html>";
 
-            page += (page.length() + 4 + temp.length()) + "\r\n\r\n" + temp;
+            page += (page.length() + 4 + temp.length() + String.valueOf(page.length() + 4 + temp.length()).length()) + "\r\n\r\n" + temp;
             System.out.println("Sending " + final_path + " (" + page.length() + " bytes)");
             output_stream.write(page.getBytes());
             output_stream.flush();
