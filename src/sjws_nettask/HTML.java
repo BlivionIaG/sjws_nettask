@@ -58,7 +58,7 @@ public class HTML {
 
     private String html_path;
 
-    public HTML(String html_path) {
+    public HTML(String html_path) {        
         if (html_path != null) {
             this.html_path = html_path;
         } else {
@@ -67,9 +67,10 @@ public class HTML {
     }
 
     public void send(Socket client, String path) throws IOException {
-
         String final_path = path.equals("/") ? "index.html" : path;
-        BufferedOutputStream output_stream = new BufferedOutputStream(client.getOutputStream());
+        System.out.println("[HTML] Sending "+final_path);
+        
+        var output_stream = new BufferedOutputStream(client.getOutputStream());
 
         if (!new File(html_path + final_path).isDirectory()) {
             ByteBuffer buffer = ByteBuffer.allocateDirect(CONSTANTS.HTML_BUFFER_SIZE);

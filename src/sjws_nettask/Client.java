@@ -29,6 +29,7 @@ import java.util.ArrayList;
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public class Client extends Thread {
+
     private final Socket client;
     private String id, received_message;
     private final ArrayList<Client> threads;
@@ -45,13 +46,13 @@ public class Client extends Thread {
     @Override
     public void run() {
         try {
+            var input = new BufferedReader(new InputStreamReader(this.client.getInputStream()));
+            
             do {
                 this.received_message = "";
                 do {
-                    var input = new BufferedReader(new InputStreamReader(this.client.getInputStream())); // Can be improved
-                    received_message = input.readLine();
-                    input.close();
-                    
+                    this.received_message = input.readLine();
+
                     if (this.received_message == null) { // "null" when client not connected to the server
                         this.close(); // closing the thread
                         return;
@@ -64,28 +65,30 @@ public class Client extends Thread {
                     }
                 } while (this.received_message.equals("")); // Trying to get a message (can be improved ?)
             } while (this.interpreter(this.received_message));
+            
+            input.close();
         } catch (IOException e) {
             System.err.println(e);
         }
-        
+
         this.close();
     }
 
     private boolean interpreter(String message) throws IOException {
+        System.out.println(message);
+
         var parsed_message = message.split("§");
 
         switch (parsed_message.length) {
             case 1:
-                if (parsed_message[0].toUpperCase().equals("STOP") || parsed_message[0].toUpperCase().equals("EXIT")) {                    
+                if (parsed_message[0].toUpperCase().equals("STOP") || parsed_message[0].toUpperCase().equals("EXIT")) {
                     return false;
-                }else{
+                } else {
                     var spacedMessage = message.split(" ");
                     if (spacedMessage[0].equals("GET") && spacedMessage[2].split("/")[0].equals("HTTP")) {
                         new HTML(null).send(this.client, spacedMessage[1]);
-                        return false;
                     }
-                    System.out.println(parsed_message[0]);
-                } 
+                }
                 break;
             default:
                 System.out.println("This message is not interpretable.");
@@ -138,7 +141,7 @@ public class Client extends Thread {
         } catch (IOException e) {
             System.err.println("Error while trying to client socket ! \n " + e);
         } finally {
-            System.out.println("Client socket closed ! ("+this.client+")");
+            System.out.println("Client socket closed ! (" + this.client + ")");
         }
 
         synchronized (this) {                           //Synchronised access
