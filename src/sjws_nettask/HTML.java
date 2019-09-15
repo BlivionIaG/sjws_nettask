@@ -1,41 +1,33 @@
 /*
- * The MIT License
+ * Copyright (C) 2019 BlivionIaG <BlivionIaG at chenco.tk>
  *
- * Copyright 2017 BlivionIaG.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
 package sjws_nettask;
 
-import java.io.IOException;
 import java.io.BufferedOutputStream;
-import java.net.Socket;
-import java.util.Calendar;
+import java.io.File;
+import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.io.File;
+import java.util.Calendar;
 
 /**
  *
- * @author BlivionIaG
+ * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public class HTML {
 
@@ -70,7 +62,7 @@ public class HTML {
         if (html_path != null) {
             this.html_path = html_path;
         } else {
-            this.html_path = Defines.HTML_PATH;
+            this.html_path = CONSTANTS.DEFAULT_HTML_PATH;
         }
     }
 
@@ -80,7 +72,7 @@ public class HTML {
         BufferedOutputStream output_stream = new BufferedOutputStream(client.getOutputStream());
 
         if (!new File(html_path + final_path).isDirectory()) {
-            ByteBuffer buffer = ByteBuffer.allocateDirect(Defines.HTML_BUFFER_SIZE);
+            ByteBuffer buffer = ByteBuffer.allocateDirect(CONSTANTS.HTML_BUFFER_SIZE);
             RandomAccessFile ra_file = new RandomAccessFile(html_path + final_path, "r");
             FileChannel input_channel = ra_file.getChannel();
 
@@ -197,3 +189,4 @@ public class HTML {
         return header;
     }
 }
+

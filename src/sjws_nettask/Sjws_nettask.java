@@ -1,72 +1,65 @@
 /*
- * The MIT License
+ * Copyright (C) 2019 BlivionIaG <BlivionIaG at chenco.tk>
  *
- * Copyright 2017 BlivionIaG.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 package sjws_nettask;
 
-import java.net.ServerSocket;
 import java.io.IOException;
+import java.net.ServerSocket;
 
 /**
  *
- * @author BlivionIaG
+ * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public class Sjws_nettask {
 
-    private ServerSocket server;
-
-    public Sjws_nettask(int port, String path) {
+    public Sjws_nettask(int port) {
         try {
-            this.server = new ServerSocket(port);
-            System.out.println("Server started at port : " + port);
-            Thread scred = new Thread(new New_client(server, path));
+            var socket = new ServerSocket(port);
+            System.out.println("Server started on port : " + port);
 
-            scred.start();
-            while (scred.getState() != Thread.State.TERMINATED);
+            var listener = new Thread(new ClientManager(socket));
+            listener.start();
+
+            while (listener.getState() != Thread.State.TERMINATED) {
+                try {
+                    Thread.sleep(500); // Wait 500ms, reducing CPU load
+                } catch (InterruptedException e) {
+                    System.err.println(e);
+                }
+            }
         } catch (IOException e) {
-            e.printStackTrace();
+            System.err.println("Failed to open the server on port " + port + " !");
+        } finally {
+            System.out.println("Server Terminated properly !");
         }
-    }
-
-    public static boolean is_numeric(String value) {
-        return value != null && value.matches("[-+]?\\d*\\.?\\d+");
     }
 
     /**
-     * @param args arg1 = Port Number arg2 = files path
+     * @param args the command line arguments
      */
     public static void main(String[] args) {
-        String path = Defines.HTML_PATH;
-        int port = Defines.PORT;
+        var port = CONSTANTS.DEFAULT_PORT; // Declared default port value
 
-        if (args.length > 1) {
-            path = args[1];
-        }
-        if (args.length > 0 && is_numeric(args[0])
+        if (args.length > 0 && Tools.is_numeric(args[0])
                 && Integer.parseInt(args[0]) > 0
                 && Integer.parseInt(args[0]) < 65536) {
             port = Integer.parseInt(args[0]);
         }
-        new Sjws_nettask(port, path);
+
+        var sjws_nettask = new Sjws_nettask(port);
     }
 
 }
