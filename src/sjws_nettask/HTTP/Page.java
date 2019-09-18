@@ -81,7 +81,6 @@ public final class Page {
         map.put("mp4", "video/mp4");
         map.put("webm", "video/webm");
         map.put("pdf", "application/pdf");
-        map.put("", "text/html");
 
         MIME_TYPE = Collections.unmodifiableMap(map);
     }
