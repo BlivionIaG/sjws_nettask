@@ -29,6 +29,6 @@ public class CONSTANTS {
                                                   ).toCharArray();
     public final static int ID_SIZE = 16; // Default ID Size
     
-    public final static String DEFAULT_HTML_PATH = "./HTML/";
+    public final static String DEFAULT_HTML_PATH = "./HTML";
     public final static int HTML_BUFFER_SIZE = 65536;
 }

@@ -20,9 +20,10 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
+
+import sjws_nettask.HTTP.HTML;
 
 /**
  *
@@ -86,7 +87,7 @@ public class Client extends Thread {
                 } else {
                     var spacedMessage = message.split(" ");
                     if (spacedMessage[0].equals("GET") && spacedMessage[2].split("/")[0].equals("HTTP")) {
-                        new HTML(null).send(this.client, spacedMessage[1]);
+                        new HTML().send(this.client, spacedMessage[1]);
                     }
                 }
                 break;
