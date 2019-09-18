@@ -90,7 +90,6 @@ public final class Page {
     private final String path;
 
     public Page(String path) {
-        System.out.println(path);
         this.path = path;
 
         this.buildDate();
@@ -102,11 +101,11 @@ public final class Page {
                 + this.date + "\n"
                 + "Last-Modified: Wed, 13 Sep 2017 16:32:54 GMT\n"
                 + "Accept-Ranges: bytes\n"
-                + "Content-Type: " + getMime(this.path) + "\n"
+                + "Content-Type: " + this.getMime(this.path) + "\n"
                 + "Connection: keep-alive\n"
                 + "Content-Length: " + fileSize + "\r\n\r\n";
     }
-    
+
     public void buildHeader(String mime, long fileSize) {
         this.header = "HTTP/" + PROTOCOL + " 200 OK\n"
                 + "Server: " + DEFAULT_SERVER_NAME + "/" + DEFAULT_SERVER_VERSION + "\n"
@@ -120,17 +119,15 @@ public final class Page {
 
     public void buildDate() {
         Calendar now = Calendar.getInstance();
-        date = "Date: "
+        this.date = "Date: "
                 + DAYS[now.get(Calendar.DAY_OF_WEEK) - 1]
                 + ", " + now.get(Calendar.DAY_OF_MONTH)
                 + " " + MONTHS[now.get(Calendar.MONTH)]
                 + " " + now.get(Calendar.YEAR);
-        if (now.get(Calendar.AM_PM) != 0) {
-            date += now.get(Calendar.HOUR) + 12;
-        } else {
-            date += now.get(Calendar.HOUR);
-        }
-        date += ":"
+
+        this.date += (now.get(Calendar.AM_PM) != 0) ? now.get(Calendar.HOUR) : now.get(Calendar.HOUR) + 12;
+
+        this.date += ":"
                 + now.get(Calendar.MINUTE)
                 + ":"
                 + now.get(Calendar.SECOND)
@@ -141,8 +138,6 @@ public final class Page {
         int i;
         for (i = path.length() - 1; path.charAt(i) != '.' && i >= 0; i--);
 
-        System.out.println(MIME_TYPE.getOrDefault(path.substring(i + 1), "application/octet-stream"));
-        
         return MIME_TYPE.getOrDefault(path.substring(i + 1), "application/octet-stream");
     }
 
@@ -150,15 +145,15 @@ public final class Page {
         var outputStream = new BufferedOutputStream(client.getOutputStream());
         var buffer = ByteBuffer.allocateDirect(CONSTANTS.HTML_BUFFER_SIZE);
 
-        try (var raFile = new RandomAccessFile(path, "r"); var inputChannel = raFile.getChannel()) {
+        try (var raFile = new RandomAccessFile(this.path, "r"); var inputChannel = raFile.getChannel()) {
 
             this.buildHeader(raFile.length());
 
-            System.out.println("Sending " + path + "(" + raFile.length() + " bytes)");
+            System.out.println("Sending " + this.path + "(" + raFile.length() + " bytes)");
             outputStream.write(this.header.getBytes());
             while (inputChannel.read(buffer) > 0) {
                 buffer.flip();
-                for (int i = 0; i < buffer.limit(); i++) {
+                for (var i = 0; i < buffer.limit(); i++) {
                     outputStream.write(buffer.get());
                 }
                 buffer.compact();
@@ -170,16 +165,16 @@ public final class Page {
 
     public void sendFolder(Socket client) throws IOException {
         var outputStream = new BufferedOutputStream(client.getOutputStream());
-        File folder = new File(path);
-        File[] list = folder.listFiles();
+        var folder = new File(path);
+        var list = folder.listFiles();
 
         String temp = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"/><title>"
-                + path
+                + this.path
                 + "</title></head><body><h1>"
-                + path
+                + this.path
                 + "</h1>";
 
-        for (File list1 : list) {
+        for (var list1 : list) {
             temp += "<a href=\"./" + list1.getName() + "\"> " + list1.getName() + " </a><br>";
         }
         temp += "</body></html>";
@@ -187,7 +182,7 @@ public final class Page {
         this.buildHeader("text/html", temp.length());
 
         String page = this.header + "\r\n\r\n" + temp;
-        System.out.println("Sending " + path + " (" + page.length() + " bytes)");
+        System.out.println("Sending " + this.path + " (" + page.length() + " bytes)");
         outputStream.write(page.getBytes());
         outputStream.flush();
     }
