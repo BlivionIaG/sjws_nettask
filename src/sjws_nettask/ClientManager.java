@@ -20,6 +20,8 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  *
@@ -29,20 +31,22 @@ public class ClientManager implements Runnable {
 
     private final ServerSocket server;
     private Socket client;
-    private final ArrayList<Client> threads;
+    private final HashMap<Thread, Client> clients;
 
     public ClientManager(ServerSocket server) {
         this.server = server;
 
-        this.threads = new ArrayList<>();
+        this.clients = new HashMap<>();
     }
 
     @Override
     public void run() {
         try {
             do {
-                threads.add(new Client(threads, (client = server.accept()))); //Création et ajout d'un nouveau client quand il se connecte
-                threads.get(threads.size() - 1).start(); //On démarre le thread du client
+                var tmpClient = new Client(clients, (client = server.accept())); //Création et ajout d'un nouveau client quand il se connecte
+                var tmpThread = new Thread(tmpClient);
+                clients.put(tmpThread, tmpClient);
+                tmpThread.start(); //On démarre le thread du client
             } while (true);
         } catch (IOException e) { // Erreur de connexion 
             e.printStackTrace();

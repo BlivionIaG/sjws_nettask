@@ -21,7 +21,7 @@ package sjws_nettask;
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public class CONSTANTS {
-    public final static int DEFAULT_PORT = 8080; // Default Port
+    public final static int DEFAULT_PORT = 1234; // Default Port
     public final static char[] ALPHANUMERIC_SET = (
                                                   "1234567890" + 
                                                   "AZERTYUIOPQSDFGHJKLMWXCVBN" +

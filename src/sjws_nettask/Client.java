@@ -22,6 +22,9 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import sjws_nettask.HTTP.HTML;
 
@@ -29,89 +32,127 @@ import sjws_nettask.HTTP.HTML;
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
-public class Client extends Thread {
+public class Client implements Runnable {
 
     private final Socket client;
-    private String id, received_message;
-    private final ArrayList<Client> threads;
+    private String id;
+    private final HashMap<Thread, Client> clients;
+    private PrintWriter output;
+    private BufferedReader input;
 
-    public Client(ArrayList<Client> threads, Socket client) {
-        this.threads = threads;
+    public Client(HashMap<Thread, Client> clients, Socket client) {
+        this.clients = clients;
         this.client = client;
 
-        this.received_message = "";
+        try {
+            output = new PrintWriter(client.getOutputStream());
+            input = new BufferedReader(new InputStreamReader(client.getInputStream()));
+        } catch (IOException ex) {
+            Logger.getLogger(Client.class.getName()).log(Level.SEVERE, null, ex);
+        }
 
         System.out.println("A Client is connected ! (" + this.client + ")");
     }
 
     @Override
     public void run() {
-        try {
-            var input = new BufferedReader(new InputStreamReader(this.client.getInputStream()));
-            
-            do {
-                this.received_message = "";
-                do {
-                    this.received_message = input.readLine();
+        String val1, val2;
+        String op, message = "";
+        int c = 0;
 
-                    if (this.received_message == null) { // "null" when client not connected to the server
-                        this.close(); // closing the thread
-                        return;
-                    }
-
-                    try {
-                        Thread.sleep(100); // Decrease CPU load by sleeping every 100ms (very effective)
-                    } catch (InterruptedException e) {
-                        System.err.println(e);
-                    }
-                } while (this.received_message.equals("")); // Trying to get a message (can be improved ?)
-            } while (this.interpreter(this.received_message));
-            
-            input.close();
-        } catch (IOException e) {
-            System.err.println(e);
+        while (!isNumeric(message = receive())) {
+            if (c++ > 10) {
+                return;
+            }
         }
+        val1 = message;
+
+        c = 0;
+        while (!isNumeric(message = receive())) {
+            if (c++ > 10) {
+                return;
+            }
+        }
+        val2 = message;
+
+        c = 0;
+        while ((message = receive()).equals("")) {
+            if (c++ > 10) {
+                return;
+            }
+        }
+        op = message;
+
+        send(calc(val1, val2, op));
 
         this.close();
     }
 
-    private boolean interpreter(String message) throws IOException {
-        System.out.println(message);
+    public String calc(String val1, String val2, String op) {
+        String result = "ERROR";
+        Double a = Double.parseDouble(val1),
+                b = Double.parseDouble(val2);
 
-        var parsed_message = message.split("§");
-
-        switch (parsed_message.length) {
-            case 1:
-                if (parsed_message[0].toUpperCase().equals("STOP") || parsed_message[0].toUpperCase().equals("EXIT")) {
-                    return false;
-                } else {
-                    var spacedMessage = message.split(" ");
-                    if (spacedMessage[0].equals("GET") && spacedMessage[2].split("/")[0].equals("HTTP")) {
-                        new HTML().send(this.client, spacedMessage[1]);
-                    }
-                }
-                break;
-            default:
-                System.out.println("This message is not interpretable.");
-                break;
+        if (op.equals("+")) {
+            result = Double.toString(a + b);
+        } else if (op.equals("-")) {
+            result = Double.toString(a - b);
+        } else if (op.equals("*") || op.toLowerCase().equals("x")) {
+            result = Double.toString(a * b);
+        } else if (op.equals("/")) {
+            result = Double.toString(a / b);
+        } else if (op.equals("%")) {
+            result = Double.toString(a % b);
+        } else if (op.equals("=")) {
+            result = Boolean.toString(a == b);
+        } else if (op.equals("!=")) {
+            result = Boolean.toString(a != b);
+        } else if (op.equals(">=")) {
+            result = Boolean.toString(a >= b);
+        } else if (op.equals("<=")) {
+            result = Boolean.toString(a <= b);
+        } else if (op.equals("<")) {
+            result = Boolean.toString(a < b);
+        } else if (op.equals(">")) {
+            result = Boolean.toString(a > b);
+        } else if (op.equals("^")) {
+            result = Double.toString(Math.pow(a, b));
         }
 
-        return true;
+        System.out.println("Result : " + result);
+
+        return result;
+    }
+
+    public String receive() {
+        String receivedMessage = "";
+        try {
+            do {
+                if ((receivedMessage = input.readLine()) == null) { // "null" when client not connected to the server
+                    close();
+                    return "";
+                }
+
+                try {
+                    Thread.sleep(100); // Decrease CPU load by sleeping every 100ms (very effective)
+                } catch (InterruptedException e) {
+                    System.err.println(e);
+                }
+            } while (receivedMessage.equals("")); // Trying to get a message (can be improved ?)
+            System.out.println("The server has received : " + receivedMessage);
+        } catch (IOException e) {
+            System.err.println(e);
+        }
+
+        return receivedMessage;
     }
 
     public void send(String message) {
-        try {
-            var output = new PrintWriter(client.getOutputStream());
+        output.println(message);
 
-            output.println(message);
-            if (!output.checkError()) {
-                output.close();
-            }
-
-        } catch (IOException e) {
-            System.err.println("An error has occured while sending ! \n" + e);
-            this.close();
-        } finally {
+        if (output.checkError()) {
+            System.err.println("The server has failed to send the client : " + message);
+        } else {
             System.out.println("The server has sent to the client : " + message);
         }
     }
@@ -122,8 +163,8 @@ public class Client extends Thread {
 
     public int find(String id) {
         synchronized (this) { // Synchronised access
-            for (var i = 0; i < this.threads.size(); i++) {
-                if (this.threads.get(i) != null && this.threads.get(i).getClientId().equals(id)) { // ID matching
+            for (var i = 0; i < this.clients.size(); i++) {
+                if (this.clients.get(i) != null && this.clients.get(i).getClientId().equals(id)) { // ID matching
                     return i;
                 }
             }
@@ -138,6 +179,8 @@ public class Client extends Thread {
         try {
             if (this.client != null) {
                 this.client.close();
+                input.close();
+                output.close();
             }
         } catch (IOException e) {
             System.err.println("Error while trying to client socket ! \n " + e);
@@ -146,13 +189,25 @@ public class Client extends Thread {
         }
 
         synchronized (this) {                           //Synchronised access
-            for (var i = 0; i < this.threads.size(); i++) {
-                if (this.threads.get(i) == this) {           // Client found
-                    this.threads.set(i, null);               // Set to "null"
+            for (var i = 0; i < this.clients.size(); i++) {
+                if (this.clients.get(i) == this) {           // Client found
+                    this.clients.remove(Thread.currentThread());
                 }
             }
         }
 
-        this.interrupt(); // Thread Interruption
+        Thread.currentThread().interrupt(); // Thread Interruption
+    }
+
+    public static boolean isNumeric(String strNum) {
+        if (strNum == null) {
+            return false;
+        }
+        try {
+            double d = Double.parseDouble(strNum);
+        } catch (NumberFormatException nfe) {
+            return false;
+        }
+        return true;
     }
 }
