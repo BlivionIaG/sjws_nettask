@@ -19,9 +19,7 @@ package sjws_nettask;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Map;
 
 /**
  *
@@ -44,6 +42,13 @@ public class ClientManager implements Runnable {
         try {
             do {
                 var tmpClient = new Client(clients, (client = server.accept())); //Création et ajout d'un nouveau client quand il se connecte
+                tmpClient.send(tmpClient.getClientId()); // ID
+                
+                var type = tmpClient.receive();
+                if(type.toUpperCase().equals("SELLER")){
+                    tmpClient = new Seller(tmpClient);
+                }
+                
                 var tmpThread = new Thread(tmpClient);
                 clients.put(tmpThread, tmpClient);
                 tmpThread.start(); //On démarre le thread du client

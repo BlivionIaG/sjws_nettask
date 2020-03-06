@@ -16,6 +16,8 @@
  */
 package sjws_nettask;
 
+import java.util.UUID;
+
 /**
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
@@ -31,4 +33,5 @@ public class CONSTANTS {
     
     public final static String DEFAULT_HTML_PATH = "./HTML";
     public final static int HTML_BUFFER_SIZE = 65536;
+    public final static String SERVER_ID = UUID.randomUUID().toString().replaceAll("-", "");
 }

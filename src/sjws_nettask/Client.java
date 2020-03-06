@@ -21,12 +21,10 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.Socket;
-import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-
-import sjws_nettask.HTTP.HTML;
 
 /**
  *
@@ -34,15 +32,24 @@ import sjws_nettask.HTTP.HTML;
  */
 public class Client implements Runnable {
 
-    private final Socket client;
-    private String id;
-    private final HashMap<Thread, Client> clients;
-    private PrintWriter output;
-    private BufferedReader input;
+    protected final Socket client;
+    protected String id;
+    protected final HashMap<Thread, Client> clients;
+    protected PrintWriter output;
+    protected BufferedReader input;
+
+    public Client(Client _copy) {
+        client = _copy.getClient();
+        id = _copy.getClientId();
+        clients = _copy.getClients();
+        output = _copy.getOutput();
+        input = _copy.getInput();
+    }
 
     public Client(HashMap<Thread, Client> clients, Socket client) {
         this.clients = clients;
         this.client = client;
+        this.id = UUID.randomUUID().toString().replaceAll("-", "");
 
         try {
             output = new PrintWriter(client.getOutputStream());
@@ -56,72 +63,7 @@ public class Client implements Runnable {
 
     @Override
     public void run() {
-        String val1, val2;
-        String op, message = "";
-        int c = 0;
-
-        while (!isNumeric(message = receive())) {
-            if (c++ > 10) {
-                return;
-            }
-        }
-        val1 = message;
-
-        c = 0;
-        while (!isNumeric(message = receive())) {
-            if (c++ > 10) {
-                return;
-            }
-        }
-        val2 = message;
-
-        c = 0;
-        while ((message = receive()).equals("")) {
-            if (c++ > 10) {
-                return;
-            }
-        }
-        op = message;
-
-        send(calc(val1, val2, op));
-
         this.close();
-    }
-
-    public String calc(String val1, String val2, String op) {
-        String result = "ERROR";
-        Double a = Double.parseDouble(val1),
-                b = Double.parseDouble(val2);
-
-        if (op.equals("+")) {
-            result = Double.toString(a + b);
-        } else if (op.equals("-")) {
-            result = Double.toString(a - b);
-        } else if (op.equals("*") || op.toLowerCase().equals("x")) {
-            result = Double.toString(a * b);
-        } else if (op.equals("/")) {
-            result = Double.toString(a / b);
-        } else if (op.equals("%")) {
-            result = Double.toString(a % b);
-        } else if (op.equals("=")) {
-            result = Boolean.toString(a == b);
-        } else if (op.equals("!=")) {
-            result = Boolean.toString(a != b);
-        } else if (op.equals(">=")) {
-            result = Boolean.toString(a >= b);
-        } else if (op.equals("<=")) {
-            result = Boolean.toString(a <= b);
-        } else if (op.equals("<")) {
-            result = Boolean.toString(a < b);
-        } else if (op.equals(">")) {
-            result = Boolean.toString(a > b);
-        } else if (op.equals("^")) {
-            result = Double.toString(Math.pow(a, b));
-        }
-
-        System.out.println("Result : " + result);
-
-        return result;
     }
 
     public String receive() {
@@ -156,9 +98,25 @@ public class Client implements Runnable {
             System.out.println("The server has sent to the client : " + message);
         }
     }
+    
+    public Socket getClient(){
+        return this.client;
+    }
 
     public String getClientId() {
         return this.id;
+    }
+    
+    public HashMap<Thread, Client> getClients(){
+        return this.clients;
+    }
+    
+    public PrintWriter getOutput(){
+        return this.output;
+    }
+    
+    public BufferedReader getInput(){
+        return this.input;
     }
 
     public int find(String id) {
