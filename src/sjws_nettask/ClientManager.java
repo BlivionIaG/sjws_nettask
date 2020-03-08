@@ -42,13 +42,21 @@ public class ClientManager implements Runnable {
         try {
             do {
                 var tmpClient = new Client(clients, (client = server.accept())); //Création et ajout d'un nouveau client quand il se connecte
-                tmpClient.send(tmpClient.getClientId()); // ID
                 
+                /* ID Exchange */
+                tmpClient.send(CONSTANTS.SERVER_ID);
+                var clientID = tmpClient.receive();
+                if (!clientID.equals("0")) {
+                    tmpClient.setClientId(clientID);
+
+                }
+                tmpClient.send(tmpClient.getClientId()); // Generated ID
+
                 var type = tmpClient.receive();
-                if(type.toUpperCase().equals("SELLER")){
+                if (type.toUpperCase().equals("SELLER")) {
                     tmpClient = new Seller(tmpClient);
                 }
-                
+
                 var tmpThread = new Thread(tmpClient);
                 clients.put(tmpThread, tmpClient);
                 tmpThread.start(); //On démarre le thread du client

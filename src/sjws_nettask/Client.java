@@ -103,6 +103,10 @@ public class Client implements Runnable {
         return this.client;
     }
 
+    public void setClientId(String _id){
+        id = _id;
+    }
+    
     public String getClientId() {
         return this.id;
     }
