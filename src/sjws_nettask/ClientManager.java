@@ -19,6 +19,7 @@ package sjws_nettask;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.ArrayList;
 import java.util.HashMap;
 
 /**
@@ -42,29 +43,52 @@ public class ClientManager implements Runnable {
         try {
             do {
                 var tmpClient = new Client(clients, (client = server.accept())); //Création et ajout d'un nouveau client quand il se connecte
-                
+
                 /* ID Exchange */
                 tmpClient.send(CONSTANTS.SERVER_ID);
                 var clientID = tmpClient.receive();
-                if (!clientID.equals("0")) {
-                    tmpClient.setClientId(clientID);
+                var recovClient = findClient(clientID);
 
-                }
                 tmpClient.send(tmpClient.getClientId()); // Generated ID
+                if (clientID.equals("0") || recovClient == null) {
+                    var type = tmpClient.receive();
+                    if (type.toUpperCase().equals("SELLER")) {
+                        tmpClient = new Seller(tmpClient);
+                    }
 
-                var type = tmpClient.receive();
-                if (type.toUpperCase().equals("SELLER")) {
-                    tmpClient = new Seller(tmpClient);
+                    var tmpThread = new Thread(tmpClient);
+                    clients.put(tmpThread, tmpClient);
+                    tmpThread.start(); //On démarre le thread du client
+                } else {
+                    System.out.println("Session recovery !");
+                    recovClient.setClient(tmpClient.getClient());
+                    recovClient.receive();
+                    clients.forEach((k,v)->{
+                        if(v==recovClient){
+                            synchronized(k){
+                                k.notify();
+                            }
+                        }
+                    });
                 }
-
-                var tmpThread = new Thread(tmpClient);
-                clients.put(tmpThread, tmpClient);
-                tmpThread.start(); //On démarre le thread du client
             } while (true);
         } catch (IOException e) { // Erreur de connexion 
             e.printStackTrace();
             close();
         }
+    }
+
+    public Client findClient(String id) {
+        synchronized (this) { // Synchronised access
+            var tmp = new ArrayList<>(clients.values());
+            for (var it : tmp) {
+                if (it.getClientId().equals(id)) {
+                    return it;
+                }
+            }
+        }
+
+        return null; // Nothing found
     }
 
     public void close() {

@@ -32,7 +32,7 @@ import java.util.logging.Logger;
  */
 public class Client implements Runnable {
 
-    protected final Socket client;
+    protected Socket client;
     protected String id;
     protected final HashMap<Thread, Client> clients;
     protected PrintWriter output;
@@ -46,11 +46,14 @@ public class Client implements Runnable {
         input = _copy.getInput();
     }
 
-    public Client(HashMap<Thread, Client> clients, Socket client) {
+    public Client(HashMap<Thread, Client> clients, Socket _client) {
         this.clients = clients;
-        this.client = client;
         this.id = UUID.randomUUID().toString().replaceAll("-", "");
+        setClient(_client);
+    }
 
+    public void setClient(Socket _client) {
+        this.client = _client;
         try {
             output = new PrintWriter(client.getOutputStream());
             input = new BufferedReader(new InputStreamReader(client.getInputStream()));
@@ -59,6 +62,7 @@ public class Client implements Runnable {
         }
 
         System.out.println("A Client is connected ! (" + this.client + ")");
+
     }
 
     @Override
@@ -70,8 +74,15 @@ public class Client implements Runnable {
         String receivedMessage = "";
         try {
             do {
-                if ((receivedMessage = input.readLine()) == null) { // "null" when client not connected to the server
-                    close();
+                if ((receivedMessage = input.readLine()) == null) { try {
+                    // "null" when client not connected to the server
+                    //close();
+                    synchronized(this){
+                        Thread.currentThread().wait();
+                    }
+                    } catch (InterruptedException ex) {
+                        Logger.getLogger(Client.class.getName()).log(Level.SEVERE, null, ex);
+                    }
                     return "";
                 }
 
@@ -98,28 +109,28 @@ public class Client implements Runnable {
             System.out.println("The server has sent to the client : " + message);
         }
     }
-    
-    public Socket getClient(){
+
+    public Socket getClient() {
         return this.client;
     }
 
-    public void setClientId(String _id){
+    public void setClientId(String _id) {
         id = _id;
     }
-    
+
     public String getClientId() {
         return this.id;
     }
-    
-    public HashMap<Thread, Client> getClients(){
+
+    public HashMap<Thread, Client> getClients() {
         return this.clients;
     }
-    
-    public PrintWriter getOutput(){
+
+    public PrintWriter getOutput() {
         return this.output;
     }
-    
-    public BufferedReader getInput(){
+
+    public BufferedReader getInput() {
         return this.input;
     }
 

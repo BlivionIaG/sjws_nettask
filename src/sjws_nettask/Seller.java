@@ -26,14 +26,14 @@ import java.util.HashMap;
  */
 public class Seller extends Client {
 
-    private final HashMap<String, Article> articles;
+    private final Stock stock;
     private final Gson gson;
 
     public Seller(Client _client) {
         super(_client);
 
         gson = new Gson();
-        articles = new HashMap<>();
+        stock = new Stock();
     }
 
     @Override
@@ -47,16 +47,20 @@ public class Seller extends Client {
 
     private boolean interpreter(String message) {
         boolean result = true;
-        var request = gson.fromJson(message, JsonCMD.class);
+        if (!message.equals("")) {
+            var request = gson.fromJson(message, JsonCMD.class);
 
-        if (request.command.equals("article_add")) {
-            addArticle(request);
-        } else if (request.command.equals("article_update")) {
-            updateArticle(request);
-        } else if (request.command.equals("article_del")) {
-            deleteArticle(request);
-        } else if (request.command.equals("article_list")) {
-            listArticle(request);
+            if (request.command.equals("article_add")) {
+                addArticle(request);
+            } else if (request.command.equals("article_update")) {
+                updateArticle(request);
+            } else if (request.command.equals("article_del")) {
+                deleteArticle(request);
+            } else if (request.command.equals("article_list")) {
+                listArticle(request);
+            } else if (request.command.toLowerCase().equals("quit")) {
+                close();
+            }
         }
 
         return result;
@@ -105,7 +109,7 @@ public class Seller extends Client {
                 }
             }
 
-            if (addArticle(name, price, quantity)) {
+            if (stock.addArticle(name, price, quantity)) {
                 sendConfirm(request.command, "Article successfully added !");
             } else {
                 sendError(request.command, "Article already exists ...");
@@ -147,7 +151,7 @@ public class Seller extends Client {
                 return;
             }
 
-            if (updateArticle(name, price, quantity)) {
+            if (stock.updateArticle(name, price, quantity)) {
                 sendConfirm(request.command, "Article successfully updated !");
             } else {
                 sendError(request.command, "Article doesn't exists ...");
@@ -161,7 +165,7 @@ public class Seller extends Client {
         if (request.data.containsKey("name")) {
             String name = request.data.get("name");
 
-            if (deleteArticle(name)) {
+            if (stock.deleteArticle(name)) {
                 sendConfirm(request.command, "Article successfully deleted !");
             } else {
                 sendError(request.command, "Article doesn't exists ...");
@@ -173,7 +177,7 @@ public class Seller extends Client {
 
     public void listArticle(JsonCMD request) {
         var jsonArticles = new HashMap<String, String>();
-        articles.forEach((key, value) -> {
+        stock.getArticles().forEach((key, value) -> {
             jsonArticles.put(key, gson.toJson(value));
         });
 
@@ -185,67 +189,5 @@ public class Seller extends Client {
         );
 
         send(gson.toJson(result));
-    }
-
-    public boolean addArticle(String name, double price, long quantity) {
-        if (articles.containsKey(name)) { // Article already exists
-            return false;
-        }
-
-        String tmp = new String(name);
-
-        articles.put(tmp, new Article(tmp, price, quantity));
-
-        return true;
-    }
-
-    public boolean updateArticle(String name, double price, long quantity) {
-        if (!articles.containsKey(name)) { // Article doesn't exists
-            return false;
-        }
-
-        var article = articles.get(name);
-        article.setPrice(price);
-        article.setQuantity(quantity);
-
-        return true;
-    }
-
-    public boolean updateArticlePrice(String name, double price) {
-        if (!articles.containsKey(name)) { // Article doesn't exists
-            return false;
-        }
-
-        articles.get(name).setPrice(price);
-
-        return true;
-    }
-
-    public boolean updateArticleQuantity(String name, long quantity) {
-        if (!articles.containsKey(name)) { // Article doesn't exists
-            return false;
-        }
-
-        articles.get(name).setQuantity(quantity);
-
-        return true;
-    }
-
-    public boolean deleteArticle(String name) {
-        if (!articles.containsKey(name)) {
-            return false;
-        }
-
-        articles.remove(name);
-
-        return true;
-    }
-
-    public HashMap<String, Article> getArticles() {
-        return articles;
-    }
-
-    public ArrayList<Article> getArticlesList() {
-        return new ArrayList<>(articles.values());
     }
 }
