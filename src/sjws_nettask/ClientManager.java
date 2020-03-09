@@ -63,11 +63,9 @@ public class ClientManager implements Runnable {
                     System.out.println("Session recovery !");
                     recovClient.setClient(tmpClient.getClient());
                     recovClient.receive();
-                    clients.forEach((k,v)->{
-                        if(v==recovClient){
-                            synchronized(k){
-                                k.notify();
-                            }
+                    clients.forEach((k, v) -> {
+                        if (v == recovClient) {
+                            v.resume();
                         }
                     });
                 }

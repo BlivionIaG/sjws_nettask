@@ -37,12 +37,10 @@ public class Seller extends Client {
     }
 
     @Override
-    public void run() {
-        while (interpreter(receive())) {
-
+    public void loop() {
+        if(!interpreter(receive())) {
+            this.close();
         }
-
-        this.close();
     }
 
     private boolean interpreter(String message) {
