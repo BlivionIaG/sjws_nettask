@@ -17,6 +17,7 @@
 package sjws_nettask;
 
 import com.google.gson.Gson;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.HashMap;
 
@@ -36,9 +37,17 @@ public class Seller extends Client {
         stock = new Stock();
     }
 
+    public Seller(HashMap<Thread, Client> _clients, SellerExport _se) {
+        super(_clients, new Socket());
+
+        gson = new Gson();
+        stock = _se.stock;
+        id = _se.id;
+    }
+
     @Override
     public void loop() {
-        if(!interpreter(receive())) {
+        if (!interpreter(receive())) {
             this.close();
         }
     }
@@ -187,5 +196,9 @@ public class Seller extends Client {
         );
 
         send(gson.toJson(result));
+    }
+
+    public Stock getStock() {
+        return stock;
     }
 }

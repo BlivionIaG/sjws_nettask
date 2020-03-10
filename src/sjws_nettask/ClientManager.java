@@ -104,10 +104,18 @@ public class ClientManager implements Runnable {
 
     public void saveClients() {
         var clientsSave = new ClientSave();
-        clientsSave.clients = (List<Client>) clients.values();
+
+        for (var client : clients.values()) {
+            if (client.getClass() == Seller.class) {
+                clientsSave.addSeller((Seller) client);
+            }
+        }
+
         try {
             PrintWriter pw = new PrintWriter(new FileWriter("clients.json"));
             pw.println(gson.toJson(clientsSave));
+            pw.flush();
+            pw.close();
         } catch (IOException ex) {
             Logger.getLogger(ClientManager.class.getName()).log(Level.SEVERE, null, ex);
         }
@@ -123,11 +131,15 @@ public class ClientManager implements Runnable {
                     savedClients += line + "\n";
                 }
 
-                var tmpClients = gson.fromJson(savedClients, ClientSave.class).clients;
-                for (var client : tmpClients) {
-                    var tmpThread = new Thread(client);
-                    clients.put(tmpThread, client);
+                var clientsSave = gson.fromJson(savedClients, ClientSave.class);
+
+                for (var seller : clientsSave.sellers) {
+                    var tmpSeller = new Seller(clients, seller);
+                    var tmpThread = new Thread(tmpSeller);
+
+                    clients.put(tmpThread, tmpSeller);
                     tmpThread.start();
+                    tmpSeller.pause();
                 }
             }
         } catch (IOException e) {
@@ -136,6 +148,9 @@ public class ClientManager implements Runnable {
     }
 
     public void close() {
+
+        saveClients();
+        
         try {
             if (server != null) {
                 server.close();
@@ -146,8 +161,6 @@ public class ClientManager implements Runnable {
         } catch (IOException e) {
             e.printStackTrace();
         }
-
-        saveClients();
 
         Thread.currentThread().interrupt(); //Interruption du thread
     }

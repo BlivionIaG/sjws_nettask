@@ -16,20 +16,16 @@
  */
 package sjws_nettask;
 
-import java.util.ArrayList;
-
 /**
  *
  * @author bevin
  */
-public class ClientSave {
-    ArrayList<SellerExport> sellers;
+public class SellerExport {
+    public String id;
+    public Stock stock;
     
-    public ClientSave(){
-        sellers = new ArrayList<>();
-    }
-    
-    public void addSeller(Seller _seller){
-        sellers.add(new SellerExport(_seller));        
+    public SellerExport(Seller _seller){
+        id = _seller.getClientId();
+        stock = _seller.getStock();
     }
 }
