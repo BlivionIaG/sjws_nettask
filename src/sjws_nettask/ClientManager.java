@@ -16,6 +16,8 @@
  */
 package sjws_nettask;
 
+import sjws_nettask.Economy.Seller;
+import sjws_nettask.Economy.ClientSave;
 import com.google.gson.Gson;
 import java.io.File;
 import java.io.FileWriter;

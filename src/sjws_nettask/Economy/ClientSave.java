@@ -14,18 +14,22 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package sjws_nettask;
+package sjws_nettask.Economy;
+
+import java.util.ArrayList;
 
 /**
  *
  * @author bevin
  */
-public class SellerExport {
-    public String id;
-    public Stock stock;
+public class ClientSave {
+    public ArrayList<SellerExport> sellers;
     
-    public SellerExport(Seller _seller){
-        id = _seller.getClientId();
-        stock = _seller.getStock();
+    public ClientSave(){
+        sellers = new ArrayList<>();
+    }
+    
+    public void addSeller(Seller _seller){
+        sellers.add(new SellerExport(_seller));        
     }
 }

@@ -14,35 +14,29 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package sjws_nettask;
+package sjws_nettask.Economy;
 
+import sjws_nettask.Economy.Compte;
 import com.google.gson.Gson;
-import java.net.Socket;
-import java.util.ArrayList;
 import java.util.HashMap;
+import sjws_nettask.CONSTANTS;
+import sjws_nettask.Client;
+import sjws_nettask.JsonCMD;
 
 /**
  *
  * @author bevin
  */
-public class Seller extends Client {
+public class Bank extends Client {
 
-    private final Stock stock;
     private final Gson gson;
+    private Comptes comptes;
 
-    public Seller(Client _client) {
+    public Bank(Client _client) {
         super(_client);
 
         gson = new Gson();
-        stock = new Stock();
-    }
-
-    public Seller(HashMap<Thread, Client> _clients, SellerExport _se) {
-        super(_clients, new Socket());
-
-        gson = new Gson();
-        stock = _se.stock;
-        id = _se.id;
+        comptes = new Comptes();
     }
 
     @Override
@@ -57,14 +51,14 @@ public class Seller extends Client {
         if (!message.equals("")) {
             var request = gson.fromJson(message, JsonCMD.class);
 
-            if (request.command.equals("article_add")) {
-                addArticle(request);
-            } else if (request.command.equals("article_update")) {
-                updateArticle(request);
-            } else if (request.command.equals("article_del")) {
-                deleteArticle(request);
-            } else if (request.command.equals("article_list")) {
-                listArticle(request);
+            if (request.command.equals("compte_add")) {
+                addCompte(request);
+            } else if (request.command.equals("compte_update")) {
+                updateCompte(request);
+            } else if (request.command.equals("compte_del")) {
+                deleteCompte(request);
+            } else if (request.command.equals("compte_list")) {
+                listCompte(request);
             } else if (request.command.toLowerCase().equals("quit")) {
                 close();
             }
@@ -96,37 +90,32 @@ public class Seller extends Client {
         send(gson.toJson(result));
     }
 
-    public void addArticle(JsonCMD request) {
-        if (request.data.containsKey("name")) {
-            String name = request.data.get("name");
-            long quantity = 0;
-            double price = 0;
+    public void addCompte(JsonCMD request) {
+        if (request.data.containsKey("id")) {
+            String id = request.data.get("id");
 
-            if (request.data.containsKey("quantity")) {
-                String tmp = request.data.get("quantity");
-                if (isNumeric(tmp)) {
-                    quantity = Long.parseLong(tmp);
+            if (request.data.containsKey("name")) {
+                String name = request.data.get("name");
+                double solde = 0;
+
+                if (request.data.containsKey("solde")) {
+                    String tmp = request.data.get("solde");
+                    if (isNumeric(tmp)) {
+                        solde = Double.parseDouble(tmp);
+                    }
                 }
-            }
-
-            if (request.data.containsKey("price")) {
-                String tmp = request.data.get("price");
-                if (isNumeric(tmp)) {
-                    price = Double.parseDouble(tmp);
+                if (comptes.addCompte(request.fromID, name, solde)) {
+                    sendConfirm(request.command, "Compte successfully added !");
+                } else {
+                    sendError(request.command, "Compte already exists ...");
                 }
-            }
-
-            if (stock.addArticle(name, price, quantity)) {
-                sendConfirm(request.command, "Article successfully added !");
-            } else {
-                sendError(request.command, "Article already exists ...");
             }
         } else {
             sendError(request.command, "Wrong arguments ...");
         }
     }
 
-    public void updateArticle(JsonCMD request) {
+    public void updateCompte(JsonCMD request) {
         if (request.data.containsKey("name")) {
             String name = request.data.get("name");
             long quantity = 0;
@@ -198,7 +187,7 @@ public class Seller extends Client {
         send(gson.toJson(result));
     }
 
-    public Stock getStock() {
-        return stock;
+    public HashMap<String, Compte> getComptes() {
+        return comptes;
     }
 }
