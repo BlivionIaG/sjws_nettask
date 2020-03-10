@@ -16,11 +16,20 @@
  */
 package sjws_nettask;
 
+import com.google.gson.Gson;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 /**
  *
@@ -32,10 +41,13 @@ public class ClientManager implements Runnable {
     private Socket client;
     private final HashMap<Thread, Client> clients;
 
+    private Gson gson = new Gson();
+
     public ClientManager(ServerSocket server) {
         this.server = server;
 
         this.clients = new HashMap<>();
+        loadClients();
     }
 
     @Override
@@ -89,6 +101,35 @@ public class ClientManager implements Runnable {
         return null; // Nothing found
     }
 
+    public void saveClients() {
+        var clientsSave = new ClientSave();
+        clientsSave.clients = (List<Client>) clients.values();
+        try {
+            PrintWriter pw = new PrintWriter(new FileWriter("clients.json"));
+            pw.println(gson.toJson(clientsSave));
+        } catch (IOException ex) {
+            Logger.getLogger(ClientManager.class.getName()).log(Level.SEVERE, null, ex);
+        }
+    }
+
+    public void loadClients() {
+        var savedClients = "";
+        try (var stream = Files.lines(Paths.get("clients.json"))) {
+            var lines = stream.collect(Collectors.toList());
+            for (var line : lines) {
+                savedClients += line + "\n";
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        var tmpClients = gson.fromJson(savedClients, ClientSave.class).clients;
+        for(var client : tmpClients){
+            var tmpThread = new Thread(client);
+            clients.put(tmpThread, client);
+            tmpThread.start();
+        }
+    }
+
     public void close() {
         try {
             if (server != null) {
@@ -101,6 +142,8 @@ public class ClientManager implements Runnable {
             e.printStackTrace();
         }
 
+        saveClients();
+        
         Thread.currentThread().interrupt(); //Interruption du thread
     }
 }

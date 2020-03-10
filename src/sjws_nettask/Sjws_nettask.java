@@ -30,8 +30,18 @@ public class Sjws_nettask {
             var socket = new ServerSocket(port);
             System.out.println("Server started on port : " + port);
 
-            var listener = new Thread(new ClientManager(socket));
+            final var clientManager = new ClientManager(socket);
+            var listener = new Thread(clientManager);
             listener.start();
+
+            Runtime.getRuntime().addShutdownHook(new Thread() {
+                @Override
+                public void run(){
+                    synchronized(clientManager){
+                        clientManager.close();
+                    }
+                }
+            });
 
             while (listener.getState() != Thread.State.TERMINATED) {
                 try {
