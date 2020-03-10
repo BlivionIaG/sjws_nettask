@@ -17,6 +17,7 @@
 package sjws_nettask;
 
 import com.google.gson.Gson;
+import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -114,19 +115,23 @@ public class ClientManager implements Runnable {
 
     public void loadClients() {
         var savedClients = "";
-        try (var stream = Files.lines(Paths.get("clients.json"))) {
-            var lines = stream.collect(Collectors.toList());
-            for (var line : lines) {
-                savedClients += line + "\n";
+        try {
+            if (new File("clients.json").exists()) {
+                var stream = Files.lines(Paths.get("clients.json"));
+                var lines = stream.collect(Collectors.toList());
+                for (var line : lines) {
+                    savedClients += line + "\n";
+                }
+
+                var tmpClients = gson.fromJson(savedClients, ClientSave.class).clients;
+                for (var client : tmpClients) {
+                    var tmpThread = new Thread(client);
+                    clients.put(tmpThread, client);
+                    tmpThread.start();
+                }
             }
         } catch (IOException e) {
             e.printStackTrace();
-        }
-        var tmpClients = gson.fromJson(savedClients, ClientSave.class).clients;
-        for(var client : tmpClients){
-            var tmpThread = new Thread(client);
-            clients.put(tmpThread, client);
-            tmpThread.start();
         }
     }
 
@@ -143,7 +148,7 @@ public class ClientManager implements Runnable {
         }
 
         saveClients();
-        
+
         Thread.currentThread().interrupt(); //Interruption du thread
     }
 }
