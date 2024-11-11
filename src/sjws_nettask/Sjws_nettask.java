@@ -18,6 +18,7 @@ package sjws_nettask;
 
 import java.io.IOException;
 import java.net.ServerSocket;
+import java.util.Map;
 
 /**
  *
@@ -47,16 +48,28 @@ public class Sjws_nettask {
         }
     }
 
+    public static boolean checkValidPort(String port) {
+        return Tools.isNumeric(port) && Integer.parseInt(port) > 0 && Integer.parseInt(port) < 65536;
+    }
+
     /**
      * @param args the command line arguments
      */
     public static void main(String[] args) {
+        Map<String, String> env = System.getenv();
         var port = CONSTANTS.DEFAULT_PORT; // Declared default port value
+        var contentPath = CONSTANTS.DEFAULT_HTML_PATH;
 
-        if (args.length > 0 && Tools.is_numeric(args[0])
-                && Integer.parseInt(args[0]) > 0
-                && Integer.parseInt(args[0]) < 65536) {
+        if (args.length > 0 && checkValidPort(args[0])) {
             port = Integer.parseInt(args[0]);
+        }
+
+        if (env.containsKey("WEB_SERVER_PORT") && checkValidPort(env.get("WEB_SERVER_PORT"))) {
+            port = Integer.parseInt(env.get("WEB_SERVER_PORT"));
+        }
+        
+        if(env.containsKey("WEB_SERVER_DIR")){
+            contentPath = env.get("WEB_SERVER_DIR");
         }
 
         var sjws_nettask = new Sjws_nettask(port);
