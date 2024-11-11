@@ -17,6 +17,7 @@
 package sjws_nettask;
 
 import java.security.SecureRandom;
+import java.util.Calendar;
 import java.util.Random;
 
 /**
@@ -30,7 +31,7 @@ public class Tools {
      * @param value String to check
      * @return result of the verification
      */
-    public static boolean is_numeric(String value) {
+    public static boolean isNumeric(String value) {
         return value != null && value.matches("[-+]?\\d*\\.?\\d+");
     }
 
@@ -41,7 +42,7 @@ public class Tools {
      * @param length Size
      * @return Random String
      */
-    public static String random_alpha_numeric(char[] charset, int length) {
+    public static String randomAlphaNumeric(char[] charset, int length) {
         var random = new SecureRandom(); // Random values generator
         String result = "";
 
@@ -50,5 +51,29 @@ public class Tools {
         }
 
         return result;
+    }
+
+    /**
+     * Generate readable current date
+     * 
+     * @return HTTP header compatible format date
+     */
+    public static String formatedCurrentDate() {
+        Calendar now = Calendar.getInstance();
+        String date = "Date: "
+                + CONSTANTS.DAYS[now.get(Calendar.DAY_OF_WEEK) - 1]
+                + ", " + now.get(Calendar.DAY_OF_MONTH)
+                + " " + CONSTANTS.MONTHS[now.get(Calendar.MONTH)]
+                + " " + now.get(Calendar.YEAR);
+
+        date += (now.get(Calendar.AM_PM) != 0) ? now.get(Calendar.HOUR) : now.get(Calendar.HOUR) + 12;
+
+        date += ":"
+                + now.get(Calendar.MINUTE)
+                + ":"
+                + now.get(Calendar.SECOND)
+                + " GMT";
+
+        return date;
     }
 }

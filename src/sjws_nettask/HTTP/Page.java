@@ -21,124 +21,22 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.net.Socket;
-import java.util.Calendar;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
 import java.nio.ByteBuffer;
 import sjws_nettask.CONSTANTS;
+import sjws_nettask.Tools;
 
 /**
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public final class Page {
-
-    public static final String PROTOCOL = "1.1";
-    public static final String DEFAULT_SERVER_NAME = "IaGgy_Veb_Server";
-    public static final String DEFAULT_SERVER_VERSION = "0.1";
-
-    public static final String[] DAYS = {
-        "Sun",
-        "Mon",
-        "Tue",
-        "Wed",
-        "Thu",
-        "Fri",
-        "Sat"
-    };
-
-    public static final String[] MONTHS = {
-        "Jan",
-        "Feb",
-        "Mar",
-        "Apr",
-        "May",
-        "Jun",
-        "Jul",
-        "Aug",
-        "Sep",
-        "Oct",
-        "Nov",
-        "Dec"
-    };
-
-    public static final Map<String, String> MIME_TYPE;
-
-    static {
-        Map<String, String> map = new HashMap<>();
-        map.put("html", "text/html");
-        map.put("css", "text/css");
-        map.put("js", "application/javascript");
-        map.put("txt", "text/plain");
-        map.put("zip", "application/zip");
-        map.put("png", "image/png");
-        map.put("jpeg", "image/jpeg");
-        map.put("jpg", "image/jpeg");
-        map.put("gif", "image/gif");
-        map.put("mp3", "audio/mpeg");
-        map.put("ogg", "application/ogg");
-        map.put("mp4", "video/mp4");
-        map.put("webm", "video/webm");
-        map.put("pdf", "application/pdf");
-
-        MIME_TYPE = Collections.unmodifiableMap(map);
-    }
-
-    private String header;
+    private Header header;
     private String date;
     private final String path;
 
     public Page(String path) {
         this.path = path;
-
-        this.buildDate();
-    }
-
-    public void buildHeader(long fileSize) {
-        this.header = "HTTP/" + PROTOCOL + " 200 OK\n"
-                + "Server: " + DEFAULT_SERVER_NAME + "/" + DEFAULT_SERVER_VERSION + "\n"
-                + this.date + "\n"
-                + "Last-Modified: Wed, 13 Sep 2017 16:32:54 GMT\n"
-                + "Accept-Ranges: bytes\n"
-                + "Content-Type: " + this.getMime(this.path) + "\n"
-                + "Connection: keep-alive\n"
-                + "Content-Length: " + fileSize + "\r\n\r\n";
-    }
-
-    public void buildHeader(String mime, long fileSize) {
-        this.header = "HTTP/" + PROTOCOL + " 200 OK\n"
-                + "Server: " + DEFAULT_SERVER_NAME + "/" + DEFAULT_SERVER_VERSION + "\n"
-                + this.date + "\n"
-                + "Last-Modified: Wed, 13 Sep 2017 16:32:54 GMT\n"
-                + "Accept-Ranges: bytes\n"
-                + "Content-Type: " + mime + "\n"
-                + "Connection: keep-alive\n"
-                + "Content-Length: " + fileSize + "\r\n\r\n";
-    }
-
-    public void buildDate() {
-        Calendar now = Calendar.getInstance();
-        this.date = "Date: "
-                + DAYS[now.get(Calendar.DAY_OF_WEEK) - 1]
-                + ", " + now.get(Calendar.DAY_OF_MONTH)
-                + " " + MONTHS[now.get(Calendar.MONTH)]
-                + " " + now.get(Calendar.YEAR);
-
-        this.date += (now.get(Calendar.AM_PM) != 0) ? now.get(Calendar.HOUR) : now.get(Calendar.HOUR) + 12;
-
-        this.date += ":"
-                + now.get(Calendar.MINUTE)
-                + ":"
-                + now.get(Calendar.SECOND)
-                + " GMT";
-    }
-
-    public String getMime(String path) {
-        int i;
-        for (i = path.length() - 1; path.charAt(i) != '.' && i >= 0; i--);
-
-        return MIME_TYPE.getOrDefault(path.substring(i + 1), "application/octet-stream");
+        this.date = Tools.formatedCurrentDate();
     }
 
     public void send(Socket client) throws IOException {
@@ -147,10 +45,10 @@ public final class Page {
 
         try (var raFile = new RandomAccessFile(this.path, "r"); var inputChannel = raFile.getChannel()) {
 
-            this.buildHeader(raFile.length());
+            this.header = new Header(200, this.path, raFile.length());
 
             System.out.println("Sending " + this.path + "(" + raFile.length() + " bytes)");
-            outputStream.write(this.header.getBytes());
+            outputStream.write(this.header.toString().getBytes());
             while (inputChannel.read(buffer) > 0) {
                 buffer.flip();
                 for (var i = 0; i < buffer.limit(); i++) {
@@ -179,9 +77,9 @@ public final class Page {
         }
         temp += "</body></html>";
 
-        this.buildHeader("text/html", temp.length());
+        this.header = new Header(200, this.path, "text/html", temp.length());
 
-        String page = this.header + "\r\n\r\n" + temp;
+        String page = this.header.toString() + "\r\n\r\n" + temp;
         System.out.println("Sending " + this.path + " (" + page.length() + " bytes)");
         outputStream.write(page.getBytes());
         outputStream.flush();
