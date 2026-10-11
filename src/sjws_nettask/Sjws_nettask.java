@@ -26,53 +26,59 @@ import java.util.Map;
  */
 public class Sjws_nettask {
 
-    public Sjws_nettask(int port) {
-        try {
-            var socket = new ServerSocket(port);
-            System.out.println("Server started on port : " + port);
+    public Sjws_nettask(int port, String htmlPath) {
+        try (var socket = new ServerSocket(port)) {
+            System.out.println("Server started on port : " + port + " (serving " + htmlPath + ")");
 
-            var listener = new Thread(new ClientManager(socket));
+            var listener = new Thread(new ClientManager(socket, htmlPath), "accept-loop");
             listener.start();
-
-            while (listener.getState() != Thread.State.TERMINATED) {
-                try {
-                    Thread.sleep(500); // Wait 500ms, reducing CPU load
-                } catch (InterruptedException e) {
-                    System.err.println(e);
-                }
-            }
+            listener.join();
         } catch (IOException e) {
-            System.err.println("Failed to open the server on port " + port + " !");
+            System.err.println("Failed to open the server on port " + port + " ! " + e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } finally {
             System.out.println("Server Terminated properly !");
         }
     }
 
     public static boolean checkValidPort(String port) {
-        return Tools.isNumeric(port) && Integer.parseInt(port) > 0 && Integer.parseInt(port) < 65536;
+        if (port == null || !port.matches("\\d{1,5}")) {
+            return false;
+        }
+        var value = Integer.parseInt(port);
+        return value > 0 && value < 65536;
     }
 
     /**
+     * Usage: [port] [html folder path]. The WEB_SERVER_PORT and WEB_SERVER_DIR
+     * environment variables override the arguments.
+     *
      * @param args the command line arguments
      */
     public static void main(String[] args) {
         Map<String, String> env = System.getenv();
-        var port = CONSTANTS.DEFAULT_PORT; // Declared default port value
+        var port = CONSTANTS.DEFAULT_PORT;
         var contentPath = CONSTANTS.DEFAULT_HTML_PATH;
 
-        if (args.length > 0 && checkValidPort(args[0])) {
-            port = Integer.parseInt(args[0]);
+        if (args.length > 0) {
+            if (checkValidPort(args[0])) {
+                port = Integer.parseInt(args[0]);
+            } else {
+                System.err.println("Invalid port '" + args[0] + "', using " + port);
+            }
+        }
+        if (args.length > 1) {
+            contentPath = args[1];
         }
 
-        if (env.containsKey("WEB_SERVER_PORT") && checkValidPort(env.get("WEB_SERVER_PORT"))) {
+        if (checkValidPort(env.get("WEB_SERVER_PORT"))) {
             port = Integer.parseInt(env.get("WEB_SERVER_PORT"));
         }
-        
-        if(env.containsKey("WEB_SERVER_DIR")){
+        if (env.containsKey("WEB_SERVER_DIR")) {
             contentPath = env.get("WEB_SERVER_DIR");
         }
 
-        var sjws_nettask = new Sjws_nettask(port);
+        new Sjws_nettask(port, contentPath);
     }
-
 }
