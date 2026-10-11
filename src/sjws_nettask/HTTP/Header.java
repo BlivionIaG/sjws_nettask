@@ -16,76 +16,117 @@
  */
 package sjws_nettask.HTTP;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
 import sjws_nettask.CONSTANTS;
 import sjws_nettask.Tools;
 
 /**
+ * HTTP/1.1 response head (status line + header fields).
  *
  * @author BlivionIaG <kev29lt@gmail.com>
  */
 public class Header {
 
-    public static final String DEFAULT_ACCEPT_RANGE = "bytes";
+    public static final String DEFAULT_ACCEPT_RANGE = "none"; // Range requests are not supported
     public static final String DEFAULT_PROTOCOL = "1.1";
     public static final String DEFAULT_SERVER_NAME = "sjws_nettask web server";
     public static final String DEFAULT_SERVER_VERSION = "0.2";
     public static final String DEFAULT_CONNECTION = "keep-alive";
+    public static final String DEFAULT_MIME = "application/octet-stream";
 
-    private String acceptRanges;
-    private String contentType;
-    private long contentLength;
-    private String server;
-    private String serverVersion;
-    private String connection;
-    private String currentDate;
-    private String lastModified;
-    private String httpProtocol;
-    private int httpCode;
-    private String path;
+    private static final String CRLF = "\r\n";
+
+    private final int httpCode;
+    private final String contentType;
+    private final long contentLength;
+    private final String currentDate;
+    private String lastModified; // null -> header omitted
+    private String connection = DEFAULT_CONNECTION;
+    private final Map<String, String> extra = new LinkedHashMap<>();
 
     public Header(int httpCode, String path, long fileSize) {
-        this.path = path;
-        this.httpCode = httpCode;
-        this.currentDate = Tools.formatedCurrentDate();
-        this.lastModified = this.currentDate;
-        this.contentType = getMime(path);
-        this.contentLength = fileSize;
-        this.server = DEFAULT_SERVER_NAME;
-        this.serverVersion = DEFAULT_SERVER_VERSION;
-        this.connection = DEFAULT_CONNECTION;
+        this(httpCode, path, getMime(path), fileSize);
     }
 
     public Header(int httpCode, String path, String mime, long fileSize) {
-        this.path = path;
         this.httpCode = httpCode;
-        this.currentDate = Tools.formatedCurrentDate();
-        this.lastModified = this.currentDate;
         this.contentType = mime;
         this.contentLength = fileSize;
-        this.server = DEFAULT_SERVER_NAME;
-        this.serverVersion = DEFAULT_SERVER_VERSION;
-        this.connection = DEFAULT_CONNECTION;
+        this.currentDate = Tools.httpDate(Instant.now());
     }
 
     public static String getMime(String path) {
         int extensionIndex = path.lastIndexOf('.');
 
         if (extensionIndex == -1 || extensionIndex == path.length() - 1) {
-            return "application/octet-stream";
+            return DEFAULT_MIME;
         }
 
-        return CONSTANTS.MIME_TYPE.getOrDefault(path.substring(extensionIndex + 1), "application/octet-stream");
+        var extension = path.substring(extensionIndex + 1).toLowerCase(Locale.ROOT);
+        return CONSTANTS.MIME_TYPE.getOrDefault(extension, DEFAULT_MIME);
+    }
+
+    public static String reasonPhrase(int code) {
+        return switch (code) {
+            case 200 -> "OK";
+            case 301 -> "Moved Permanently";
+            case 304 -> "Not Modified";
+            case 400 -> "Bad Request";
+            case 403 -> "Forbidden";
+            case 404 -> "Not Found";
+            case 405 -> "Method Not Allowed";
+            case 414 -> "URI Too Long";
+            case 431 -> "Request Header Fields Too Large";
+            case 500 -> "Internal Server Error";
+            case 501 -> "Not Implemented";
+            case 505 -> "HTTP Version Not Supported";
+            default -> "Unknown";
+        };
+    }
+
+    public Header lastModified(Instant instant) {
+        this.lastModified = Tools.httpDate(instant);
+        return this;
+    }
+
+    public Header keepAlive(boolean keepAlive) {
+        this.connection = keepAlive ? "keep-alive" : "close";
+        return this;
+    }
+
+    public Header with(String name, String value) {
+        this.extra.put(name, value);
+        return this;
+    }
+
+    public int getHttpCode() {
+        return this.httpCode;
+    }
+
+    public byte[] toBytes() {
+        return toString().getBytes(StandardCharsets.ISO_8859_1);
     }
 
     @Override
     public String toString() {
-        return "HTTP/" + this.httpProtocol + " " + this.httpCode + " OK\n"
-                + "Server: " + this.server + "/" + this.serverVersion + "\n"
-                + this.currentDate + "\n"
-                + "Last-Modified: " + this.lastModified + "\n"
-                + "Accept-Ranges: " + this.acceptRanges + "\n"
-                + "Content-Type: " + this.contentType + "\n"
-                + "Connection: " + this.connection + "\n"
-                + "Content-Length: " + this.contentLength + "\r\n\r\n";
+        var type = "text/html".equals(this.contentType) ? "text/html; charset=utf-8" : this.contentType;
+        var sb = new StringBuilder(256)
+                .append("HTTP/").append(DEFAULT_PROTOCOL).append(' ')
+                .append(this.httpCode).append(' ').append(reasonPhrase(this.httpCode)).append(CRLF)
+                .append("Server: ").append(DEFAULT_SERVER_NAME).append('/').append(DEFAULT_SERVER_VERSION).append(CRLF)
+                .append("Date: ").append(this.currentDate).append(CRLF);
+        if (this.lastModified != null) {
+            sb.append("Last-Modified: ").append(this.lastModified).append(CRLF);
+        }
+        sb.append("Accept-Ranges: ").append(DEFAULT_ACCEPT_RANGE).append(CRLF)
+                .append("Content-Type: ").append(type).append(CRLF)
+                .append("Connection: ").append(this.connection).append(CRLF)
+                .append("Content-Length: ").append(this.contentLength).append(CRLF);
+        this.extra.forEach((k, v) -> sb.append(k).append(": ").append(v).append(CRLF));
+        return sb.append(CRLF).toString();
     }
 }

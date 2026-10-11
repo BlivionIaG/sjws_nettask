@@ -2,7 +2,6 @@ package sjws_nettask.HTTP;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -26,7 +25,6 @@ class HeaderTest {
         assertEquals(expected, Header.getMime(path));
     }
 
-    @Tag("bug")
     @Test
     void BUG_mimeLookupIsCaseSensitive() {
         assertEquals("text/html", Header.getMime("/INDEX.HTML"));
@@ -44,7 +42,6 @@ class HeaderTest {
         assertTrue(new Header(200, "/x.txt", 1).toString().endsWith("\r\n\r\n"));
     }
 
-    @Tag("bug")
     @Test
     void BUG_statusLineHasProtocolVersion() {
         // httpProtocol is never assigned -> "HTTP/null 200 OK"
@@ -52,14 +49,12 @@ class HeaderTest {
         assertEquals("HTTP/1.1 200 OK", statusLine);
     }
 
-    @Tag("bug")
     @Test
     void BUG_reasonPhraseMatchesStatusCode() {
         String statusLine = new Header(404, "/missing", 0).toString().split("\r?\n")[0];
         assertTrue(statusLine.endsWith(" 404 Not Found"), statusLine);
     }
 
-    @Tag("bug")
     @Test
     void BUG_headerLinesUseCrlf() {
         // RFC 9112: header fields are terminated by CRLF; Header uses bare "\n".
@@ -68,14 +63,12 @@ class HeaderTest {
         assertFalse(withoutCrlf.contains("\n"), "bare LF found in: " + h.replace("\r", "\\r").replace("\n", "\\n"));
     }
 
-    @Tag("bug")
     @Test
     void BUG_noNullHeaderValues() {
         // acceptRanges is never assigned -> "Accept-Ranges: null"
         assertFalse(new Header(200, "/index.html", 1).toString().contains("null"));
     }
 
-    @Tag("bug")
     @Test
     void BUG_lastModifiedIsAPlainDate() {
         // lastModified = currentDate which already contains "Date: " -> "Last-Modified: Date: ..."
