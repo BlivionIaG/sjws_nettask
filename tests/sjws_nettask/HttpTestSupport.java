@@ -85,7 +85,14 @@ public final class HttpTestSupport {
             }
         }
         byte[] body = new byte[0];
-        if (!headRequest && headers.containsKey("content-length")) {
+        int status = -1;
+        try {
+            status = Integer.parseInt(lines[0].split(" ")[1]);
+        } catch (RuntimeException ignored) {
+            // leave -1
+        }
+        boolean bodiless = headRequest || status == 304 || status == 204 || (status >= 100 && status < 200);
+        if (!bodiless && headers.containsKey("content-length")) {
             int len = Integer.parseInt(headers.get("content-length"));
             body = in.readNBytes(len);
         }
