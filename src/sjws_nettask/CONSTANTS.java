@@ -30,29 +30,7 @@ public class CONSTANTS {
     public final static int MAX_HEADERS = 100;
     public final static long MAX_DRAINED_BODY = 64 * 1024; // larger bodies on GET/HEAD: answer then close
 
-    public static final Map<String, String> MIME_TYPE = Map.ofEntries(
-        Map.entry("html", "text/html"),
-        Map.entry("css", "text/css"),
-        Map.entry("js", "application/javascript"),
-        Map.entry("txt", "text/plain"),
-        Map.entry("zip", "application/zip"),
-        Map.entry("png", "image/png"),
-        Map.entry("jpeg", "image/jpeg"),
-        Map.entry("jpg", "image/jpeg"),
-        Map.entry("gif", "image/gif"),
-        Map.entry("mp3", "audio/mpeg"),
-        Map.entry("ogg", "application/ogg"),
-        Map.entry("mp4", "video/mp4"),
-        Map.entry("webm", "video/webm"),
-        Map.entry("pdf", "application/pdf"),
-        Map.entry("htm", "text/html"),
-        Map.entry("mjs", "application/javascript"),
-        Map.entry("json", "application/json"),
-        Map.entry("svg", "image/svg+xml"),
-        Map.entry("ico", "image/x-icon"),
-        Map.entry("webp", "image/webp"),
-        Map.entry("woff", "font/woff"),
-        Map.entry("woff2", "font/woff2"),
-        Map.entry("wasm", "application/wasm")
-    );
+    /** @deprecated use {@link sjws_nettask.core.Mime} */
+    @Deprecated
+    public static final Map<String, String> MIME_TYPE = sjws_nettask.core.Mime.types();
 }

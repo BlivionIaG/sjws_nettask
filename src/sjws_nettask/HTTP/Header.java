@@ -18,35 +18,33 @@ package sjws_nettask.HTTP;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.LinkedHashMap;
-import java.util.Locale;
-import java.util.Map;
-import sjws_nettask.CONSTANTS;
-import sjws_nettask.Tools;
+import sjws_nettask.core.HttpDate;
+import sjws_nettask.core.Mime;
+import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.core.StaticFileHandler;
 
 /**
- * HTTP/1.1 response head (status line + header fields).
+ * HTTP/1.1 response head. Legacy API kept for existing callers: it builds core
+ * {@link ResponseHeaders} and delegates serialization to {@link Http1Writer}.
  *
  * @author BlivionIaG <kev29lt@gmail.com>
  */
 public class Header {
 
-    public static final String DEFAULT_ACCEPT_RANGE = "none"; // Range requests are not supported
+    public static final String DEFAULT_ACCEPT_RANGE = StaticFileHandler.ACCEPT_RANGES;
     public static final String DEFAULT_PROTOCOL = "1.1";
     public static final String DEFAULT_SERVER_NAME = "sjws_nettask web server";
     public static final String DEFAULT_SERVER_VERSION = "0.2";
     public static final String DEFAULT_CONNECTION = "keep-alive";
-    public static final String DEFAULT_MIME = "application/octet-stream";
-
-    private static final String CRLF = "\r\n";
+    public static final String DEFAULT_MIME = Mime.DEFAULT;
 
     private final int httpCode;
     private final String contentType;
     private final long contentLength;
-    private final String currentDate;
-    private String lastModified; // null -> header omitted
-    private String connection = DEFAULT_CONNECTION;
-    private final Map<String, String> extra = new LinkedHashMap<>();
+    private final Instant date = Instant.now();
+    private Instant lastModified;
+    private boolean keepAlive = true;
+    private final ResponseHeaders extra = ResponseHeaders.of();
 
     public Header(int httpCode, String path, long fileSize) {
         this(httpCode, path, getMime(path), fileSize);
@@ -56,54 +54,32 @@ public class Header {
         this.httpCode = httpCode;
         this.contentType = mime;
         this.contentLength = fileSize;
-        this.currentDate = Tools.httpDate(Instant.now());
     }
 
     public static String getMime(String path) {
-        int extensionIndex = path.lastIndexOf('.');
-
-        if (extensionIndex == -1 || extensionIndex == path.length() - 1) {
-            return DEFAULT_MIME;
-        }
-
-        var extension = path.substring(extensionIndex + 1).toLowerCase(Locale.ROOT);
-        return CONSTANTS.MIME_TYPE.getOrDefault(extension, DEFAULT_MIME);
+        return Mime.of(path);
     }
 
     public static String reasonPhrase(int code) {
-        return switch (code) {
-            case 100 -> "Continue";
-            case 200 -> "OK";
-            case 301 -> "Moved Permanently";
-            case 304 -> "Not Modified";
-            case 400 -> "Bad Request";
-            case 403 -> "Forbidden";
-            case 404 -> "Not Found";
-            case 405 -> "Method Not Allowed";
-            case 408 -> "Request Timeout";
-            case 413 -> "Content Too Large";
-            case 414 -> "URI Too Long";
-            case 417 -> "Expectation Failed";
-            case 431 -> "Request Header Fields Too Large";
-            case 500 -> "Internal Server Error";
-            case 501 -> "Not Implemented";
-            case 505 -> "HTTP Version Not Supported";
-            default -> "Unknown";
-        };
+        return StaticFileHandler.reasonPhrase(code);
+    }
+
+    static String withCharset(String mime) {
+        return Mime.contentType(mime);
     }
 
     public Header lastModified(Instant instant) {
-        this.lastModified = Tools.httpDate(instant);
+        this.lastModified = instant;
         return this;
     }
 
     public Header keepAlive(boolean keepAlive) {
-        this.connection = keepAlive ? "keep-alive" : "close";
+        this.keepAlive = keepAlive;
         return this;
     }
 
     public Header with(String name, String value) {
-        this.extra.put(name, value);
+        this.extra.add(name, value);
         return this;
     }
 
@@ -115,33 +91,18 @@ public class Header {
         return toString().getBytes(StandardCharsets.ISO_8859_1);
     }
 
-    /** Textual types are served as UTF-8. */
-    static String withCharset(String mime) {
-        if (mime.startsWith("text/") || mime.equals("application/javascript") || mime.equals("application/json")
-                || mime.equals("image/svg+xml")) {
-            return mime + "; charset=utf-8";
-        }
-        return mime;
-    }
-
     @Override
     public String toString() {
-        var type = withCharset(this.contentType);
-        var sb = new StringBuilder(256)
-                .append("HTTP/").append(DEFAULT_PROTOCOL).append(' ')
-                .append(this.httpCode).append(' ').append(reasonPhrase(this.httpCode)).append(CRLF)
-                .append("Server: ").append(DEFAULT_SERVER_NAME).append('/').append(DEFAULT_SERVER_VERSION).append(CRLF)
-                .append("Date: ").append(this.currentDate).append(CRLF);
+        var headers = ResponseHeaders.of();
         if (this.lastModified != null) {
-            sb.append("Last-Modified: ").append(this.lastModified).append(CRLF);
+            headers.add("last-modified", HttpDate.format(this.lastModified));
         }
-        sb.append("Accept-Ranges: ").append(DEFAULT_ACCEPT_RANGE).append(CRLF)
-                .append("Content-Type: ").append(type).append(CRLF)
-                .append("Connection: ").append(this.connection).append(CRLF);
-        if (this.httpCode != 304) { // a 304 has no body; omit the length to keep naive clients happy
-            sb.append("Content-Length: ").append(this.contentLength).append(CRLF);
+        headers.add("accept-ranges", DEFAULT_ACCEPT_RANGE).add("content-type", withCharset(this.contentType));
+        for (var e : this.extra.entries()) {
+            headers.add(e.getKey(), e.getValue());
         }
-        this.extra.forEach((k, v) -> sb.append(k).append(": ").append(v).append(CRLF));
-        return sb.append(CRLF).toString();
+        boolean withLength = this.httpCode >= 200 && this.httpCode != 204 && this.httpCode != 304;
+        return Http1Writer.head(this.httpCode, headers, withLength, this.contentLength, this.keepAlive,
+                ResponseHeaders.of(), this.date);
     }
 }

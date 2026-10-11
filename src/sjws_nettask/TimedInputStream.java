@@ -25,6 +25,10 @@ import java.net.SocketTimeoutException;
 /**
  * Socket input stream with an idle timeout per read plus an optional overall
  * deadline (protects against slowloris-style trickling).
+ * <p>
+ * KNOWN COST (design review, section 3.2): calling {@code Socket.setSoTimeout} per refill on a
+ * virtual thread roughly halves HTTP/1 throughput. Accepted until S4, where the channel-based
+ * transport replaces this class with a reaper enforcing read and write deadlines. Don't build on it.
  */
 final class TimedInputStream extends FilterInputStream {
 

@@ -17,20 +17,12 @@
 package sjws_nettask;
 
 import java.time.Instant;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
-import java.util.Locale;
 
 /**
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public final class Tools {
-
-    /** IMF-fixdate (RFC 9110 section 5.6.7), e.g. "Sun, 06 Nov 1994 08:49:37 GMT". */
-    private static final DateTimeFormatter HTTP_DATE = DateTimeFormatter
-            .ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.ENGLISH)
-            .withZone(ZoneOffset.UTC);
 
     private Tools() {
     }
@@ -49,7 +41,7 @@ public final class Tools {
      * @return the instant formatted as an HTTP date (always GMT)
      */
     public static String httpDate(Instant instant) {
-        return HTTP_DATE.format(instant);
+        return sjws_nettask.core.HttpDate.format(instant);
     }
 
     /**

@@ -24,7 +24,10 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import sjws_nettask.HTTP.HTML;
+import java.util.function.Supplier;
+
+import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Accept loop: hands every connection to a virtual thread, with a cap on
@@ -39,7 +42,8 @@ public class ClientManager implements Runnable {
 
     private final ServerSocket server;
     private final ServerConfig config;
-    private final HTML html;
+    private final StaticFileHandler handler;
+    private final Supplier<ResponseHeaders> extraHeaders;
     private final Semaphore permits;
     private final AtomicInteger active = new AtomicInteger();
 
@@ -52,9 +56,17 @@ public class ClientManager implements Runnable {
     }
 
     public ClientManager(ServerSocket server, ServerConfig config) {
+        this(server, config, ResponseHeaders::of);
+    }
+
+    /**
+     * @param extraHeaders fields added to every HTTP/1 response (Alt-Svc hook); called per response
+     */
+    public ClientManager(ServerSocket server, ServerConfig config, Supplier<ResponseHeaders> extraHeaders) {
         this.server = server;
         this.config = config;
-        this.html = new HTML(config.root().toString());
+        this.handler = new StaticFileHandler(config.root());
+        this.extraHeaders = extraHeaders;
         this.permits = new Semaphore(config.maxConnections());
     }
 
@@ -93,7 +105,7 @@ public class ClientManager implements Runnable {
                     this.active.incrementAndGet();
                     executor.execute(() -> {
                         try {
-                            new Client(socket, this.html, this.config).run();
+                            new Client(socket, this.handler, this.config, this.extraHeaders).run();
                         } finally {
                             this.active.decrementAndGet();
                             this.permits.release();

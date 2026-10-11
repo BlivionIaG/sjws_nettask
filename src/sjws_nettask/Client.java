@@ -26,32 +26,49 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 
+import java.util.function.Supplier;
+
 import sjws_nettask.HTTP.HTML;
 import sjws_nettask.HTTP.Http1Parser;
-import sjws_nettask.HTTP.Page;
+import sjws_nettask.HTTP.Http1Writer;
 import sjws_nettask.HTTP.ParseError;
+import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestHeaders;
+import sjws_nettask.core.Response;
+import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.core.StaticFileHandler;
 
 /**
- * Serves the HTTP/1.x requests of one connection (keep-alive aware).
+ * HTTP/1.x adapter for one connection: parses with {@link Http1Parser}, maps to a core
+ * {@link Request}, asks the {@link StaticFileHandler}, serializes with {@link Http1Writer}.
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public class Client implements Runnable {
 
+    /** Output buffer per connection: a typical response leaves in a single write. */
+    static final int OUTPUT_BUFFER = 64 * 1024;
+
     private static final byte[] CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final Socket client;
-    private final HTML html;
+    private final StaticFileHandler handler;
     private final ServerConfig config;
+    private final Supplier<ResponseHeaders> extraHeaders;
 
     public Client(Socket client, HTML html) {
-        this(client, html, ServerConfig.defaults(html.getFolderPath()));
+        this(client, html.handler(), ServerConfig.defaults(html.getFolderPath()), ResponseHeaders::of);
     }
 
-    public Client(Socket client, HTML html, ServerConfig config) {
+    /**
+     * @param extraHeaders transport-level fields added to every response (e.g. Alt-Svc); called per response
+     */
+    public Client(Socket client, StaticFileHandler handler, ServerConfig config,
+            Supplier<ResponseHeaders> extraHeaders) {
         this.client = client;
-        this.html = html;
+        this.handler = handler;
         this.config = config;
+        this.extraHeaders = extraHeaders;
     }
 
     @Override
@@ -59,7 +76,7 @@ public class Client implements Runnable {
         try (var socket = this.client;
              var timed = new TimedInputStream(socket.getInputStream(), socket, (int) this.config.idleTimeout().toMillis());
              var in = new BufferedInputStream(timed);
-             var out = new BufferedOutputStream(socket.getOutputStream())) {
+             var out = new BufferedOutputStream(socket.getOutputStream(), OUTPUT_BUFFER)) {
             while (serveOne(timed, in, out)) {
                 // keep-alive: next request on this connection
             }
@@ -99,11 +116,11 @@ public class Client implements Runnable {
         try {
             request = Http1Parser.read(in, CONSTANTS.MAX_LINE_LENGTH, CONSTANTS.MAX_HEADERS);
         } catch (ParseError e) {
-            Page.sendError(out, e.status(), false, false);
+            send(out, StaticFileHandler.error(e.status(), false), false);
             return false;
         } catch (SocketTimeoutException e) {
             if (timed.deadlineExpired()) {
-                Page.sendError(out, 408, false, false);
+                send(out, StaticFileHandler.error(408, false), false);
             }
             return false;
         }
@@ -111,14 +128,14 @@ public class Client implements Runnable {
             return false;
         }
 
-        var method = request.method();
-        boolean head = request.headOnly();
-        if (!head && !method.equals("GET")) {
-            // Known but unsupported method. Never read (possibly huge) bodies just to reject them.
+        var core = new Request(request.method(), request.target(), new RequestHeaders(
+                request.header("if-none-match"), request.ifModifiedSince(), request.header("if-range"),
+                request.header("range"), request.header("accept-encoding"), request.header("host")));
+        if (!core.headOnly() && !"GET".equals(core.method())) {
+            // Known but unsupported method (the handler answers 405). Never read (possibly huge)
+            // bodies just to reject them: keep the connection only if there is no body.
             boolean keepAlive = request.keepAlive() && request.contentLength() == 0;
-            Page.sendBody(out, 405, "text/html",
-                    "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>",
-                    false, keepAlive, "Allow", "GET, HEAD");
+            send(out, this.handler.handle(core), keepAlive);
             return keepAlive;
         }
 
@@ -139,7 +156,11 @@ public class Client implements Runnable {
         }
         timed.clearDeadline();
 
-        this.html.send(out, request.target(), head, keepAlive, request.ifModifiedSince());
+        send(out, this.handler.handle(core), keepAlive);
         return keepAlive;
+    }
+
+    private void send(OutputStream out, Response response, boolean keepAlive) throws IOException {
+        Http1Writer.write(out, response, keepAlive, this.extraHeaders.get());
     }
 }
