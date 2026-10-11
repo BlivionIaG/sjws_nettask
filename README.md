@@ -15,7 +15,7 @@ Run:
 |---|---|---|---|
 | `[port]` | `WEB_SERVER_PORT` | 8080 | TCP port |
 | `[html folder]` | `WEB_SERVER_DIR` | `./HTML` | document root (must exist) |
-| `--max-connections=N` | `WEB_SERVER_MAX_CONNECTIONS` | 10000 | concurrent connections; extra ones wait in the backlog |
+| `--max-connections=N` | `WEB_SERVER_MAX_CONNECTIONS` | 2048 | concurrent connections; extra ones wait in the backlog |
 | `--idle-timeout=S` | `WEB_SERVER_IDLE_TIMEOUT` | 30 | keep-alive idle timeout (seconds) |
 | `--header-timeout=S` | `WEB_SERVER_HEADER_TIMEOUT` | 10 | time to receive a complete request head (seconds) |
 
