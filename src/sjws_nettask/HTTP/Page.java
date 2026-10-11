@@ -20,9 +20,16 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
+import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 
 /**
@@ -32,30 +39,76 @@ import java.util.List;
  */
 public final class Page {
 
+    private static final int TRANSFER_BUFFER = 64 * 1024;
+
     private Page() {
     }
 
+    /**
+     * Sends exactly the number of bytes the file had when it was opened. If the
+     * file shrinks during the transfer an IOException is thrown (the caller must
+     * close the connection); growth is ignored.
+     */
     public static int sendFile(OutputStream out, Path file, boolean headOnly, boolean keepAlive) throws IOException {
-        var header = new Header(200, file.getFileName().toString(), Files.size(file))
-                .lastModified(Files.getLastModifiedTime(file).toInstant())
-                .keepAlive(keepAlive);
-        out.write(header.toBytes());
-        if (!headOnly) {
-            Files.copy(file, out); // streams in chunks, never loads the whole file
-        }
-        out.flush();
-        return 200;
+        return sendFile(out, file, headOnly, keepAlive, null);
     }
 
-    public static int sendFolder(OutputStream out, Path folder, String urlPath, boolean headOnly, boolean keepAlive)
-            throws IOException {
-        var base = urlPath.endsWith("/") ? urlPath : urlPath + "/";
-        List<String> names = new ArrayList<>();
-        try (var entries = Files.list(folder)) {
-            entries.forEach(p -> names.add(p.getFileName().toString() + (Files.isDirectory(p) ? "/" : "")));
-        }
-        names.sort(String::compareTo);
+    public static int sendFile(OutputStream out, Path file, boolean headOnly, boolean keepAlive,
+            String ifModifiedSince) throws IOException {
+        try (var channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            long size = channel.size();
+            var modified = Files.getLastModifiedTime(file).toInstant().truncatedTo(ChronoUnit.SECONDS);
+            var since = parseHttpDate(ifModifiedSince);
+            if (since != null && !modified.isAfter(since)) {
+                out.write(new Header(304, file.getFileName().toString(), size)
+                        .lastModified(modified).keepAlive(keepAlive).toBytes());
+                out.flush();
+                return 304;
+            }
 
+            var header = new Header(200, file.getFileName().toString(), size)
+                    .lastModified(modified)
+                    .keepAlive(keepAlive);
+            out.write(header.toBytes());
+            if (!headOnly) {
+                var buffer = ByteBuffer.allocate((int) Math.min(TRANSFER_BUFFER, Math.max(size, 1)));
+                long position = 0;
+                while (position < size) {
+                    buffer.clear().limit((int) Math.min(buffer.capacity(), size - position));
+                    int n = channel.read(buffer, position);
+                    if (n < 0) {
+                        throw new IOException("file shrank during transfer: " + file);
+                    }
+                    out.write(buffer.array(), 0, n);
+                    position += n;
+                }
+            }
+            out.flush();
+            return 200;
+        }
+    }
+
+    static Instant parseHttpDate(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return ZonedDateTime.parse(value.trim(), DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
+        } catch (DateTimeParseException e) {
+            return null; // invalid dates are ignored (RFC 9110 13.1.3)
+        }
+    }
+
+    public static int sendRedirect(OutputStream out, String location, boolean headOnly, boolean keepAlive)
+            throws IOException {
+        var body = "<!DOCTYPE html><html><body><a href=\"" + escape(location) + "\">Moved</a></body></html>";
+        return sendBody(out, 301, "text/html", body, headOnly, keepAlive, "Location", location);
+    }
+
+    /** @param names entries to list; directories end with "/" */
+    public static int sendFolder(OutputStream out, List<String> names, String urlPath, boolean headOnly,
+            boolean keepAlive) throws IOException {
+        var base = urlPath.endsWith("/") ? urlPath : urlPath + "/";
         var title = escape(base);
         var html = new StringBuilder(256 + names.size() * 64)
                 .append("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"/><title>").append(title)
