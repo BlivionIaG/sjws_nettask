@@ -1,0 +1,281 @@
+/*
+ * Copyright (C) 2026 BlivionIaG <BlivionIaG at chenco.tk>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package sjws_nettask.HTTP;
+
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+/**
+ * Strict HTTP/1.x request-head parser (RFC 9112). Anything ambiguous enough to
+ * enable request smuggling is rejected with a {@link ParseError}.
+ * <p>
+ * The result is the wire-level {@link Head}; the protocol-neutral core Request
+ * planned in the architecture docs can be built from it (method, target,
+ * conditionals such as {@link Head#ifModifiedSince()}).
+ */
+public final class Http1Parser {
+
+    /** Methods we recognise; of these only GET and HEAD are implemented (others: 405). */
+    public static final Set<String> KNOWN_METHODS = Set.of(
+            "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH");
+
+    public static final int MAX_LEADING_EMPTY_LINES = 4;
+
+    private static final Pattern TOKEN = Pattern.compile("[!#$%&'*+.^_`|~0-9A-Za-z-]+");
+    private static final Pattern VERSION = Pattern.compile("HTTP/[0-9]\\.[0-9]");
+    private static final Pattern DIGITS = Pattern.compile("[0-9]{1,18}");
+
+    private Http1Parser() {
+    }
+
+    /**
+     * A parsed HTTP/1.x request head.
+     *
+     * @param method request method (case-sensitive token)
+     * @param target origin-form target ("/path?query"), also for absolute-form requests
+     * @param version "HTTP/1.0" or "HTTP/1.1"
+     * @param headers lower-cased field name to values, in arrival order (unmodifiable)
+     * @param contentLength declared body length (0 if none)
+     * @param keepAlive whether the connection may be reused after the response
+     * @param expectContinue the client waits for "100 Continue" before sending the body
+     */
+    public record Head(String method, String target, String version, Map<String, List<String>> headers,
+            long contentLength, boolean keepAlive, boolean expectContinue) {
+
+        public boolean headOnly() {
+            return "HEAD".equals(this.method);
+        }
+
+        /** @return first value of the (case-insensitive) header, or null */
+        public String header(String name) {
+            var values = this.headers.get(name.toLowerCase(Locale.ROOT));
+            return values == null || values.isEmpty() ? null : values.get(0);
+        }
+
+        public List<String> headers(String name) {
+            return this.headers.getOrDefault(name.toLowerCase(Locale.ROOT), List.of());
+        }
+
+        public String ifModifiedSince() {
+            return header("if-modified-since");
+        }
+    }
+
+    /**
+     * Reads one request head.
+     *
+     * @return the request, or null if the stream ended cleanly before a request started
+     * @throws ParseError for malformed or unsupported requests (answer with its status and close)
+     * @throws EOFException if the stream ended in the middle of a request head
+     */
+    public static Head read(InputStream in, int maxLineLength, int maxHeaders) throws IOException, ParseError {
+        String requestLine;
+        int empty = 0;
+        while (true) {
+            requestLine = readLine(in, maxLineLength, 414);
+            if (requestLine == null) {
+                return null;
+            }
+            if (!requestLine.isEmpty()) {
+                break;
+            }
+            if (++empty > MAX_LEADING_EMPTY_LINES) {
+                throw new ParseError(400, "too many empty lines before request");
+            }
+        }
+
+        var parts = requestLine.split(" ", -1);
+        if (parts.length != 3 || !TOKEN.matcher(parts[0]).matches() || parts[1].isEmpty()) {
+            throw new ParseError(400, "malformed request line");
+        }
+        var method = parts[0];
+        var version = parts[2];
+        if (!VERSION.matcher(version).matches()) {
+            throw new ParseError(400, "malformed HTTP version");
+        }
+        if (!version.equals("HTTP/1.1") && !version.equals("HTTP/1.0")) {
+            throw new ParseError(505, "unsupported HTTP version");
+        }
+        if (!KNOWN_METHODS.contains(method)) {
+            throw new ParseError(501, "unknown method");
+        }
+        for (int i = 0; i < parts[1].length(); i++) {
+            char c = parts[1].charAt(i);
+            if (c <= 0x20 || c >= 0x7f) {
+                throw new ParseError(400, "invalid character in request-target");
+            }
+        }
+        var target = originForm(parts[1]);
+
+        var headers = new LinkedHashMap<String, List<String>>();
+        for (int count = 0;; count++) {
+            var line = readLine(in, maxLineLength, 431);
+            if (line == null) {
+                throw new EOFException("connection closed inside request head");
+            }
+            if (line.isEmpty()) {
+                break;
+            }
+            if (count >= maxHeaders) {
+                throw new ParseError(431, "too many header fields");
+            }
+            char first = line.charAt(0);
+            if (first == ' ' || first == '\t') {
+                throw new ParseError(400, "obsolete line folding");
+            }
+            int colon = line.indexOf(':');
+            if (colon <= 0 || !TOKEN.matcher(line.substring(0, colon)).matches()) {
+                throw new ParseError(400, "invalid header field name");
+            }
+            var value = trimOws(line.substring(colon + 1));
+            for (int i = 0; i < value.length(); i++) {
+                char c = value.charAt(i);
+                if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                    throw new ParseError(400, "control character in header value");
+                }
+            }
+            headers.computeIfAbsent(line.substring(0, colon).toLowerCase(Locale.ROOT), k -> new ArrayList<>()).add(value);
+        }
+
+        var hosts = headers.getOrDefault("host", List.of());
+        if (hosts.size() > 1 || (version.equals("HTTP/1.1") && hosts.isEmpty())) {
+            throw new ParseError(400, "missing or duplicate Host");
+        }
+        if (headers.containsKey("transfer-encoding")) {
+            throw new ParseError(501, "Transfer-Encoding not supported"); // also covers TE + CL smuggling
+        }
+        long contentLength = parseContentLength(headers.getOrDefault("content-length", List.of()));
+
+        boolean close = false;
+        boolean keepAliveToken = false;
+        for (var value : headers.getOrDefault("connection", List.of())) {
+            for (var token : value.split(",")) {
+                var t = trimOws(token).toLowerCase(Locale.ROOT);
+                close |= t.equals("close");
+                keepAliveToken |= t.equals("keep-alive");
+            }
+        }
+        boolean keepAlive = !close && (version.equals("HTTP/1.1") || keepAliveToken);
+
+        boolean expectContinue = false;
+        for (var value : headers.getOrDefault("expect", List.of())) {
+            if (!value.equalsIgnoreCase("100-continue")) {
+                throw new ParseError(417, "unsupported expectation");
+            }
+            expectContinue = version.equals("HTTP/1.1");
+        }
+
+        headers.replaceAll((k, v) -> Collections.unmodifiableList(v));
+        return new Head(method, target, version, Collections.unmodifiableMap(headers),
+                contentLength, keepAlive, expectContinue);
+    }
+
+    /** Converts origin-form or absolute-form (http/https) targets to origin-form. */
+    static String originForm(String target) throws ParseError {
+        if (target.startsWith("/")) {
+            return target;
+        }
+        var lower = target.toLowerCase(Locale.ROOT);
+        int schemeEnd = lower.startsWith("http://") ? 7 : lower.startsWith("https://") ? 8 : -1;
+        if (schemeEnd < 0) {
+            throw new ParseError(400, "unsupported request-target form");
+        }
+        int pathStart = schemeEnd;
+        while (pathStart < target.length() && target.charAt(pathStart) != '/' && target.charAt(pathStart) != '?') {
+            pathStart++;
+        }
+        if (pathStart == schemeEnd) {
+            throw new ParseError(400, "absolute-form target without authority");
+        }
+        var rest = target.substring(pathStart);
+        return rest.isEmpty() ? "/" : rest.startsWith("?") ? "/" + rest : rest;
+    }
+
+    private static long parseContentLength(List<String> values) throws ParseError {
+        long result = -1;
+        for (var value : values) {
+            for (var item : value.split(",", -1)) {
+                var v = trimOws(item);
+                if (!DIGITS.matcher(v).matches()) {
+                    throw new ParseError(400, "invalid Content-Length");
+                }
+                long n = Long.parseLong(v);
+                if (result >= 0 && n != result) {
+                    throw new ParseError(400, "conflicting Content-Length");
+                }
+                result = n;
+            }
+        }
+        return Math.max(result, 0);
+    }
+
+    private static String trimOws(String s) {
+        int start = 0;
+        int end = s.length();
+        while (start < end && (s.charAt(start) == ' ' || s.charAt(start) == '\t')) {
+            start++;
+        }
+        while (end > start && (s.charAt(end - 1) == ' ' || s.charAt(end - 1) == '\t')) {
+            end--;
+        }
+        return s.substring(start, end);
+    }
+
+    /**
+     * Reads a line terminated by CRLF (bare LF tolerated, RFC 9112 2.2). A CR not
+     * followed by LF is rejected.
+     *
+     * @return the line, or null on end of stream before any byte
+     */
+    static String readLine(InputStream in, int maxLength, int tooLongStatus) throws IOException, ParseError {
+        var buf = new ByteArrayOutputStream(128);
+        while (true) {
+            int b = in.read();
+            if (b == -1) {
+                if (buf.size() == 0) {
+                    return null;
+                }
+                throw new EOFException("connection closed inside a line");
+            }
+            if (b == '\r') {
+                int next = in.read();
+                if (next != '\n') {
+                    throw new ParseError(400, "bare CR");
+                }
+                return buf.toString(StandardCharsets.ISO_8859_1);
+            }
+            if (b == '\n') {
+                return buf.toString(StandardCharsets.ISO_8859_1);
+            }
+            if (buf.size() >= maxLength) {
+                throw new ParseError(tooLongStatus, "line too long");
+            }
+            buf.write(b);
+        }
+    }
+}
