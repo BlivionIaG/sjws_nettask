@@ -24,7 +24,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -67,7 +66,7 @@ class ServerIntegrationTest {
         Response r = HttpTestSupport.get(port, "/", TIMEOUT_MS);
         assertEquals(200, r.statusCode());
         assertTrue(r.bodyText().contains("It works"), r.bodyText());
-        assertEquals("text/html", r.headers().get("content-type"));
+        assertEquals("text/html; charset=utf-8", r.headers().get("content-type"));
         assertEquals(String.valueOf(Files.size(Path.of("HTML", "index.html"))), r.headers().get("content-length"));
     }
 
@@ -109,7 +108,6 @@ class ServerIntegrationTest {
         }
     }
 
-    @Tag("bug")
     @Test
     void BUG_requestLatencyIsNotDominatedBySleep() throws IOException {
         // Client.run() sleeps 100 ms after EVERY line it reads. The request line is
@@ -130,7 +128,6 @@ class ServerIntegrationTest {
         }
     }
 
-    @Tag("bug")
     @Test
     void BUG_standardHttpClientCanFetchRoot() throws Exception {
         // java.net.http rejects the "HTTP/null 200 OK" status line.
@@ -143,7 +140,6 @@ class ServerIntegrationTest {
         assertTrue(resp.body().contains("It works"));
     }
 
-    @Tag("bug")
     @Test
     void BUG_missingFileReturns404() throws IOException {
         Response r = getOrNull("/definitely-missing.html");
@@ -151,7 +147,6 @@ class ServerIntegrationTest {
         assertEquals(404, r.statusCode());
     }
 
-    @Tag("bug")
     @Test
     void BUG_pathTraversalOutsideDocRootIsRejected() throws IOException {
         // ./HTML/../README.md resolves to the repo README, outside the doc root.
@@ -165,7 +160,6 @@ class ServerIntegrationTest {
         }
     }
 
-    @Tag("bug")
     @Test
     void BUG_malformedRequestLineGets400AndConnectionSurvivesOrCloses() throws IOException {
         // "GET" alone -> message.split(" ")[2] throws ArrayIndexOutOfBoundsException
@@ -185,7 +179,6 @@ class ServerIntegrationTest {
         }
     }
 
-    @Tag("bug")
     @ParameterizedTest(name = "BUG: {0} request gets some response")
     @ValueSource(strings = {"HEAD", "POST", "PUT", "DELETE"})
     void BUG_nonGetMethodsGetAResponse(String method) throws IOException {
@@ -198,20 +191,68 @@ class ServerIntegrationTest {
         }
         assertNotNull(r == null ? null : r.statusLine(),
                 method + " got no response (expected 200 for HEAD, 405/501 otherwise)");
+        if (method.equals("HEAD")) {
+            assertEquals(200, r.statusCode());
+            assertEquals(0, r.body().length);
+            assertEquals(String.valueOf(Files.size(Path.of("HTML", "index.html"))), r.headers().get("content-length"));
+        } else {
+            assertEquals(405, r.statusCode());
+            assertEquals("GET, HEAD", r.headers().get("allow"));
+        }
     }
 
-    @Tag("bug")
     @Test
     void BUG_finishedClientsAreRemovedFromRegistry() throws Exception {
         for (int i = 0; i < 10; i++) {
             HttpTestSupport.get(port, "/index.html", TIMEOUT_MS); // client closes after reading
         }
         Thread.sleep(500); // let Client threads observe EOF and run close()
-        var field = ClientManager.class.getDeclaredField("threads");
-        field.setAccessible(true);
-        List<?> threads = (List<?>) field.get(manager);
-        // close() only sets the slot to null, so the list grows by one per connection forever.
-        assertTrue(threads.size() < 10, "registry holds " + threads.size() + " slots after 10 finished connections");
+        // The server must not keep per-connection state after a connection ends:
+        // any collection held by ClientManager must not grow with finished connections.
+        for (var field : ClientManager.class.getDeclaredFields()) {
+            if (java.util.Collection.class.isAssignableFrom(field.getType())) {
+                field.setAccessible(true);
+                var c = (java.util.Collection<?>) field.get(manager);
+                assertTrue(c.size() < 10, field.getName() + " holds " + c.size() + " entries after 10 finished connections");
+            }
+        }
+    }
+
+    @Test
+    void http10ClosesAfterResponse() throws IOException {
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "GET /index.html HTTP/1.0\r\n\r\n");
+            Response r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(200, r.statusCode());
+            assertEquals("close", r.headers().get("connection"));
+            assertEquals(-1, s.getInputStream().read(), "connection should be closed");
+        }
+    }
+
+    @Test
+    void requestBodyIsNotInterpretedAsARequest() throws IOException {
+        String body = "GET /index.html HTTP/1.1\r\n\r\n";
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: "
+                    + body.length() + "\r\n\r\n" + body + "GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n");
+            assertEquals(405, HttpTestSupport.readResponse(s.getInputStream()).statusCode());
+            // exactly one more response: for the real second request, not for the body
+            assertEquals(200, HttpTestSupport.readResponse(s.getInputStream()).statusCode());
+            s.setSoTimeout(500);
+            assertThrows(SocketTimeoutException.class, () -> s.getInputStream().read());
+        }
+    }
+
+    @Test
+    void connectionCloseHeaderIsHonoured() throws IOException {
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            assertEquals(200, HttpTestSupport.readResponse(s.getInputStream()).statusCode());
+            assertEquals(-1, s.getInputStream().read());
+        }
     }
 
     private Response getOrNull(String path) throws IOException {
@@ -227,7 +268,6 @@ class ServerIntegrationTest {
     @TempDir
     Path tmp;
 
-    @Tag("bug")
     @Test
     void BUG_mainHonoursWebServerDirEnvVar() throws Exception {
         Files.writeString(tmp.resolve("only-here.txt"), "from WEB_SERVER_DIR");

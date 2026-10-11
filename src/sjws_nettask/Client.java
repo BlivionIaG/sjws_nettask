@@ -16,143 +16,170 @@
  */
 package sjws_nettask;
 
-import java.io.BufferedReader;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.Socket;
-import java.util.ArrayList;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 
 import sjws_nettask.HTTP.HTML;
+import sjws_nettask.HTTP.Page;
 
 /**
+ * Serves the HTTP/1.x requests of one connection (keep-alive aware).
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
-public class Client extends Thread {
+public class Client implements Runnable {
+
+    /** Thrown when a request is malformed; carries the status code to answer with. */
+    private static final class BadRequest extends Exception {
+
+        final int status;
+
+        BadRequest(int status) {
+            super(null, null, false, false);
+            this.status = status;
+        }
+    }
 
     private final Socket client;
-    private String id, received_message;
-    private final ArrayList<Client> threads;
+    private final HTML html;
 
-    public Client(ArrayList<Client> threads, Socket client) {
-        this.threads = threads;
+    public Client(Socket client, HTML html) {
         this.client = client;
-
-        this.received_message = "";
-
-        System.out.println("A Client is connected ! (" + this.client + ")");
+        this.html = html;
     }
 
     @Override
     public void run() {
+        try (var socket = this.client;
+             var in = new BufferedInputStream(socket.getInputStream());
+             var out = new BufferedOutputStream(socket.getOutputStream())) {
+            while (handleRequest(in, out)) {
+                // keep-alive: serve the next request on this connection
+            }
+        } catch (SocketTimeoutException e) {
+            // idle keep-alive connection: just close it
+        } catch (IOException | RuntimeException e) {
+            if (!Thread.currentThread().isInterrupted()) { // interrupted = server shutting down
+                System.err.println("Connection " + this.client.getRemoteSocketAddress() + " failed: " + e);
+            }
+        }
+    }
+
+    /**
+     * Reads and answers one request.
+     *
+     * @return true if the connection should stay open for another request
+     */
+    private boolean handleRequest(InputStream in, OutputStream out) throws IOException {
+        String requestLine;
         try {
-            var input = new BufferedReader(new InputStreamReader(this.client.getInputStream()));
-            
             do {
-                this.received_message = "";
-                do {
-                    this.received_message = input.readLine();
+                requestLine = readLine(in);
+                if (requestLine == null) {
+                    return false; // client closed the connection
+                }
+            } while (requestLine.isEmpty()); // RFC 9112 2.2: ignore leading empty lines
 
-                    if (this.received_message == null) { // "null" when client not connected to the server
-                        this.close(); // closing the thread
-                        return;
-                    }
+            if (requestLine.equalsIgnoreCase("STOP") || requestLine.equalsIgnoreCase("EXIT")) {
+                return false; // legacy plain-text "close" command
+            }
 
-                    try {
-                        Thread.sleep(100); // Decrease CPU load by sleeping every 100ms (very effective)
-                    } catch (InterruptedException e) {
-                        System.err.println(e);
-                    }
-                } while (this.received_message.equals("")); // Trying to get a message (can be improved ?)
-            } while (this.interpreter(this.received_message));
-            
-            input.close();
-        } catch (IOException e) {
-            System.err.println(e);
-        }
+            var parts = requestLine.split(" ");
+            if (parts.length != 3 || !parts[1].startsWith("/") || !parts[2].startsWith("HTTP/1.")) {
+                throw new BadRequest(400);
+            }
+            var method = parts[0];
+            var target = parts[1];
 
-        this.close();
-    }
-
-    private boolean interpreter(String message) throws IOException {
-        System.out.println(message);
-
-        var parsed_message = message.split("§");
-
-        switch (parsed_message.length) {
-            case 1:
-                if (parsed_message[0].toUpperCase().equals("STOP") || parsed_message[0].toUpperCase().equals("EXIT")) {
+            boolean close = false;
+            boolean keepAliveRequested = false;
+            long contentLength = 0;
+            boolean chunked = false;
+            for (int count = 0;; count++) {
+                var line = readLine(in);
+                if (line == null) {
                     return false;
-                } else {
-                    var spacedMessage = message.split(" ");
-                    if (spacedMessage[0].equals("GET") && spacedMessage[2].split("/")[0].equals("HTTP")) {
-                        new HTML().send(this.client, spacedMessage[1]);
+                }
+                if (line.isEmpty()) {
+                    break;
+                }
+                if (count >= CONSTANTS.MAX_HEADERS) {
+                    throw new BadRequest(431);
+                }
+                int colon = line.indexOf(':');
+                if (colon <= 0) {
+                    throw new BadRequest(400);
+                }
+                var name = line.substring(0, colon).trim().toLowerCase(Locale.ROOT);
+                var value = line.substring(colon + 1).trim();
+                switch (name) {
+                    case "connection" -> {
+                        var v = value.toLowerCase(Locale.ROOT);
+                        close |= v.contains("close");
+                        keepAliveRequested |= v.contains("keep-alive");
+                    }
+                    case "content-length" -> {
+                        try {
+                            contentLength = Long.parseLong(value);
+                        } catch (NumberFormatException e) {
+                            throw new BadRequest(400);
+                        }
+                        if (contentLength < 0) {
+                            throw new BadRequest(400);
+                        }
+                    }
+                    case "transfer-encoding" -> chunked = true;
+                    default -> {
                     }
                 }
-                break;
-            default:
-                System.out.println("This message is not interpretable.");
-                break;
-        }
-
-        return true;
-    }
-
-    public void send(String message) {
-        try {
-            var output = new PrintWriter(client.getOutputStream());
-
-            output.println(message);
-            if (!output.checkError()) {
-                output.close();
             }
+            if (chunked) {
+                throw new BadRequest(501); // request bodies with chunked encoding are not supported
+            }
+            in.skipNBytes(contentLength); // never interpret a body as the next request
 
-        } catch (IOException e) {
-            System.err.println("An error has occured while sending ! \n" + e);
-            this.close();
-        } finally {
-            System.out.println("The server has sent to the client : " + message);
+            boolean keepAlive = parts[2].equals("HTTP/1.0") ? keepAliveRequested && !close : !close;
+
+            switch (method) {
+                case "GET" -> this.html.send(out, target, false, keepAlive);
+                case "HEAD" -> this.html.send(out, target, true, keepAlive);
+                default -> Page.sendBody(out, 405, "text/html",
+                        "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>",
+                        false, keepAlive, "Allow", "GET, HEAD");
+            }
+            return keepAlive;
+        } catch (BadRequest e) {
+            Page.sendError(out, e.status, false, false);
+            return false;
         }
     }
 
-    public String getClientId() {
-        return this.id;
-    }
-
-    public int find(String id) {
-        synchronized (this) { // Synchronised access
-            for (var i = 0; i < this.threads.size(); i++) {
-                if (this.threads.get(i) != null && this.threads.get(i).getClientId().equals(id)) { // ID matching
-                    return i;
-                }
+    /**
+     * Reads one CRLF (or bare LF) terminated line as ISO-8859-1.
+     *
+     * @return the line without terminator, or null at end of stream
+     */
+    private static String readLine(InputStream in) throws IOException, BadRequest {
+        var buf = new ByteArrayOutputStream(128);
+        int b;
+        while ((b = in.read()) != -1) {
+            if (b == '\n') {
+                var line = buf.toString(StandardCharsets.ISO_8859_1);
+                return line.endsWith("\r") ? line.substring(0, line.length() - 1) : line;
             }
-        }
-
-        return -1; // Nothing found
-    }
-
-    public void close() {
-        System.out.println("Closing client : " + this);
-
-        try {
-            if (this.client != null) {
-                this.client.close();
+            if (buf.size() >= CONSTANTS.MAX_LINE_LENGTH) {
+                throw new BadRequest(414);
             }
-        } catch (IOException e) {
-            System.err.println("Error while trying to client socket ! \n " + e);
-        } finally {
-            System.out.println("Client socket closed ! (" + this.client + ")");
+            buf.write(b);
         }
-
-        synchronized (this) {                           //Synchronised access
-            for (var i = 0; i < this.threads.size(); i++) {
-                if (this.threads.get(i) == this) {           // Client found
-                    this.threads.set(i, null);               // Set to "null"
-                }
-            }
-        }
-
-        this.interrupt(); // Thread Interruption
+        return buf.size() == 0 ? null : buf.toString(StandardCharsets.ISO_8859_1);
     }
 }

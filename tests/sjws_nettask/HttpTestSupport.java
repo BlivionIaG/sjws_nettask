@@ -39,7 +39,7 @@ public final class HttpTestSupport {
         try (var socket = new Socket(InetAddress.getLoopbackAddress(), port)) {
             socket.setSoTimeout(timeoutMs);
             write(socket.getOutputStream(), request);
-            return readResponse(socket.getInputStream());
+            return readResponse(socket.getInputStream(), request.startsWith("HEAD "));
         }
     }
 
@@ -58,6 +58,11 @@ public final class HttpTestSupport {
      * without sending anything.
      */
     public static Response readResponse(InputStream in) throws IOException {
+        return readResponse(in, false);
+    }
+
+    /** @param headRequest true if answering HEAD: Content-Length is advertised but no body follows. */
+    public static Response readResponse(InputStream in, boolean headRequest) throws IOException {
         var head = new ByteArrayOutputStream();
         int b;
         while ((b = in.read()) != -1) {
@@ -80,7 +85,7 @@ public final class HttpTestSupport {
             }
         }
         byte[] body = new byte[0];
-        if (headers.containsKey("content-length")) {
+        if (!headRequest && headers.containsKey("content-length")) {
             int len = Integer.parseInt(headers.get("content-length"));
             body = in.readNBytes(len);
         }
