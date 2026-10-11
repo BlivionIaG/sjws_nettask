@@ -19,7 +19,6 @@ package sjws_nettask;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.BindException;
-import java.net.ServerSocket;
 import java.nio.file.Files;
 
 /**
@@ -31,36 +30,51 @@ public class Sjws_nettask {
     private Sjws_nettask() {
     }
 
+    /** Process exit codes. */
+    public static final int EXIT_OK = 0;
+    public static final int EXIT_CANNOT_LISTEN = 1;
+    public static final int EXIT_BAD_ROOT = 2;
+    public static final int EXIT_USAGE = 64;
+
     /**
      * Runs the server until it is stopped.
      *
      * @return process exit code: 0 normal, 1 cannot listen, 2 bad document root
      */
     public static int serve(ServerConfig config) {
+        return serve(config, H3Transports.defaultFactory());
+    }
+
+    static int serve(ServerConfig config, Transport.Factory h3Factory) {
         var root = config.root();
         if (!Files.isDirectory(root)) {
             System.err.println("Document root " + root.toAbsolutePath() + " does not exist or is not a directory.");
-            return 2;
+            return EXIT_BAD_ROOT;
         }
-        int port = config.port();
-        try (var socket = new ServerSocket(port)) {
-            System.out.println("Server started on port : " + socket.getLocalPort() + " (serving " + root + ")");
-
-            var listener = new Thread(new ClientManager(socket, config), "accept-loop");
-            listener.start();
-            listener.join();
-            System.out.println("Server Terminated properly !");
-            return 0;
+        SjwsServer server;
+        try {
+            server = SjwsServer.start(config, h3Factory);
         } catch (BindException e) {
-            System.err.println("Cannot listen on port " + port + ": " + e.getMessage()
+            System.err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
                     + " (already in use or not permitted).");
-            return 1;
+            return EXIT_CANNOT_LISTEN;
         } catch (IOException | UncheckedIOException e) {
-            System.err.println("Failed to start the server on port " + port + ": " + e);
-            return 1;
+            System.err.println("Failed to start the server on port " + config.port() + ": " + e);
+            return EXIT_CANNOT_LISTEN;
+        }
+        var hook = new Thread(server::close, "shutdown");
+        Runtime.getRuntime().addShutdownHook(hook);
+        System.out.println("Server started on port : " + server.tcpPort() + " (serving " + root + ")");
+        System.out.println(server.describe());
+        try {
+            server.awaitTermination();
+            System.out.println("Server Terminated properly !");
+            return EXIT_OK;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return 0;
+            return EXIT_OK;
+        } finally {
+            server.close();
         }
     }
 
@@ -74,14 +88,22 @@ public class Sjws_nettask {
     }
 
     /**
-     * Usage: [port] [html folder path] [--max-connections=N] [--idle-timeout=S] [--header-timeout=S].
-     * WEB_SERVER_* environment variables override the arguments (see {@link ServerConfig}).
+     * See {@link ServerConfig#usage()}.
      *
      * @param args the command line arguments
      */
     public static void main(String[] args) {
         var parsed = ServerConfig.parse(args, System.getenv());
-        parsed.warnings().forEach(System.err::println);
+        if (parsed.helpRequested()) {
+            System.out.print(ServerConfig.usage());
+            return;
+        }
+        parsed.warnings().forEach(w -> System.err.println("WARN: " + w));
+        if (!parsed.ok()) {
+            parsed.errors().forEach(e -> System.err.println("ERROR: " + e));
+            System.err.println("See --help.");
+            System.exit(EXIT_USAGE);
+        }
         int code = serve(parsed.config());
         if (code != 0) {
             System.exit(code);
