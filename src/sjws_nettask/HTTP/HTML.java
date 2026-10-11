@@ -16,50 +16,118 @@
  */
 package sjws_nettask.HTTP;
 
-import java.io.File;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.Socket;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import sjws_nettask.CONSTANTS;
 
 /**
+ * Maps a request target onto the document root and sends the matching
+ * file, directory listing or error page.
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public class HTML {
 
-    private String folderPath;
+    private Path root;
 
     public HTML() {
-        this.folderPath = CONSTANTS.DEFAULT_HTML_PATH;
+        this(CONSTANTS.DEFAULT_HTML_PATH);
     }
 
     public HTML(String htmlPath) {
-        this.folderPath = htmlPath;
+        setFolderPath(htmlPath);
     }
 
     public String getFolderPath() {
-        return this.folderPath;
+        return this.root.toString();
     }
 
     public void setFolderPath(String path) {
-        this.folderPath = path;
+        this.root = Path.of(path).toAbsolutePath().normalize();
     }
 
-    public void send(Socket client, String path) throws IOException {
-        var file = new File(this.folderPath + path);
+    /** Convenience entry point: GET with keep-alive on a raw socket. */
+    public void send(Socket client, String target) throws IOException {
+        var out = new BufferedOutputStream(client.getOutputStream());
+        send(out, target, false, true);
+        out.flush();
+    }
 
-        if (file.isDirectory()) {
-            if (path.equals("/") && new File(this.folderPath + "/index.html").exists()) {
-                new Page(this.folderPath + "/index.html").send(client);
-            } else {
-                new Page(this.folderPath + path).sendFolder(client);
-            }
-        } else {
-            if (!file.exists()) {
-
-            } else {
-                new Page(this.folderPath + path).send(client);
-            }
+    /**
+     * @param out response stream (caller flushes/closes)
+     * @param target request-target from the request line, e.g. "/a%20b.txt?x=1"
+     * @param headOnly HEAD request: send the head only
+     * @param keepAlive value advertised in the Connection header
+     * @return the HTTP status code sent
+     */
+    public int send(OutputStream out, String target, boolean headOnly, boolean keepAlive) throws IOException {
+        var urlPath = stripQuery(target);
+        String decoded;
+        try {
+            // URLDecoder is form-decoding: protect literal '+' (it means '+' in a path).
+            decoded = URLDecoder.decode(urlPath.replace("+", "%2B"), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return Page.sendError(out, 400, headOnly, keepAlive);
         }
+        if (!decoded.startsWith("/") || decoded.indexOf('\0') >= 0) {
+            return Page.sendError(out, 400, headOnly, keepAlive);
+        }
+
+        var file = resolve(decoded);
+        if (file == null || !Files.exists(file)) {
+            return Page.sendError(out, 404, headOnly, keepAlive);
+        }
+
+        if (Files.isDirectory(file)) {
+            var index = file.resolve("index.html");
+            if (Files.isRegularFile(index)) {
+                return Page.sendFile(out, index, headOnly, keepAlive);
+            }
+            return Page.sendFolder(out, file, decoded, headOnly, keepAlive);
+        }
+        if (!Files.isRegularFile(file) || !Files.isReadable(file)) {
+            return Page.sendError(out, 404, headOnly, keepAlive);
+        }
+        return Page.sendFile(out, file, headOnly, keepAlive);
+    }
+
+    private static String stripQuery(String target) {
+        int cut = target.length();
+        int q = target.indexOf('?');
+        int h = target.indexOf('#');
+        if (q >= 0) {
+            cut = q;
+        }
+        if (h >= 0 && h < cut) {
+            cut = h;
+        }
+        return target.substring(0, cut);
+    }
+
+    /**
+     * @return the file inside the document root, or null if the path escapes it
+     * (including through symbolic links).
+     */
+    private Path resolve(String decodedPath) throws IOException {
+        Path candidate;
+        try {
+            candidate = this.root.resolve(decodedPath.substring(1)).normalize();
+        } catch (InvalidPathException e) {
+            return null;
+        }
+        if (!candidate.startsWith(this.root)) {
+            return null;
+        }
+        if (Files.exists(candidate) && !candidate.toRealPath().startsWith(this.root.toRealPath())) {
+            return null;
+        }
+        return candidate;
     }
 }

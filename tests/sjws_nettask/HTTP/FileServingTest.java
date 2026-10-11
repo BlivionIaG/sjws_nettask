@@ -11,7 +11,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.HttpTestSupport;
@@ -113,7 +112,6 @@ class FileServingTest {
         assertTrue(r.bodyText().contains("a.css"), r.bodyText());
     }
 
-    @Tag("bug")
     @Test
     void BUG_directoryListingContentLengthMatchesBody() throws IOException {
         // sendFolder appends an extra "\r\n\r\n" after a head that already ends in one,
@@ -126,7 +124,6 @@ class FileServingTest {
                 + r.bodyText().substring(Math.max(0, r.bodyText().length() - 30)) + "'");
     }
 
-    @Tag("bug")
     @Test
     void BUG_directoryListingEscapesFileNames() throws IOException {
         Files.writeString(root.resolve("sub").resolve("<script>x.txt"), "x");
@@ -134,7 +131,6 @@ class FileServingTest {
         assertFalse(r.bodyText().contains("<script>"), "file name injected unescaped into HTML");
     }
 
-    @Tag("bug")
     @Test
     void BUG_subdirectoryWithIndexServesIndex() throws IOException {
         Files.writeString(root.resolve("sub").resolve("index.html"), "<p>sub index</p>");
@@ -142,7 +138,6 @@ class FileServingTest {
         assertEquals("<p>sub index</p>", r.bodyText(), "index.html is only honoured for \"/\"");
     }
 
-    @Tag("bug")
     @Test
     void BUG_missingFileReturns404() throws IOException {
         Response r = serve("/does-not-exist.html");
@@ -150,7 +145,6 @@ class FileServingTest {
         assertEquals(404, r.statusCode());
     }
 
-    @Tag("bug")
     @Test
     void BUG_pathTraversalIsRejected() throws IOException {
         Response r = serve("/../secret.txt");
@@ -159,7 +153,6 @@ class FileServingTest {
         assertTrue(r.statusCode() == 400 || r.statusCode() == 403 || r.statusCode() == 404, r.statusLine());
     }
 
-    @Tag("bug")
     @Test
     void BUG_queryStringIsIgnoredForFileLookup() throws IOException {
         Response r = serve("/hello.txt?v=2");
@@ -167,12 +160,46 @@ class FileServingTest {
         assertEquals("hello world", r.bodyText());
     }
 
-    @Tag("bug")
     @Test
     void BUG_percentEncodedPathIsDecoded() throws IOException {
         Files.writeString(root.resolve("my file.txt"), "spaced");
         Response r = serve("/my%20file.txt");
         assertNotNull(r.statusLine(), "no response: %20 is not decoded");
         assertEquals("spaced", r.bodyText());
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {
+        "/%2e%2e/secret.txt", "/..%2fsecret.txt", "/sub/../../secret.txt", "/%2E%2E%2Fsecret.txt"})
+    void encodedPathTraversalIsRejected(String path) throws IOException {
+        Response r = serve(path);
+        assertNotNull(r.statusLine(), "expected an error response");
+        assertFalse(r.bodyText().contains("TOP-SECRET"));
+        assertEquals(404, r.statusCode());
+    }
+
+    @Test
+    void dotDotInsideRootIsAllowed() throws IOException {
+        Response r = serve("/sub/../hello.txt");
+        assertEquals(200, r.statusCode());
+        assertEquals("hello world", r.bodyText());
+    }
+
+    @Test
+    void malformedPercentEncodingIs400() throws IOException {
+        assertEquals(400, serve("/%zz").statusCode());
+    }
+
+    @Test
+    void lastModifiedIsTheFileMtime() throws IOException {
+        var mtime = java.time.Instant.parse("2001-02-03T04:05:06Z");
+        Files.setLastModifiedTime(root.resolve("hello.txt"), java.nio.file.attribute.FileTime.from(mtime));
+        Response r = serve("/hello.txt");
+        assertEquals("Sat, 03 Feb 2001 04:05:06 GMT", r.headers().get("last-modified"));
+    }
+
+    @Test
+    void htmlGetsUtf8Charset() throws IOException {
+        assertEquals("text/html; charset=utf-8", serve("/index.html").headers().get("content-type"));
     }
 }

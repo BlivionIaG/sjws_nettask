@@ -16,7 +16,6 @@
  */
 package sjws_nettask;
 
-import java.util.Collections;
 import java.util.Map;
 
 /**
@@ -26,38 +25,10 @@ import java.util.Map;
 public class CONSTANTS {
 
     public final static int DEFAULT_PORT = 8080; // Default Port
-    public final static char[] ALPHANUMERIC_SET = ("1234567890"
-            + "AZERTYUIOPQSDFGHJKLMWXCVBN"
-            + "azertyuiopqsdfghjklmwxcvbn").toCharArray();
-    public final static int ID_SIZE = 16; // Default ID Size
-
     public final static String DEFAULT_HTML_PATH = "./HTML";
-    public final static int HTML_BUFFER_SIZE = 65536;
-
-    public static final String[] DAYS = {
-        "Sun",
-        "Mon",
-        "Tue",
-        "Wed",
-        "Thu",
-        "Fri",
-        "Sat"
-    };
-
-    public static final String[] MONTHS = {
-        "Jan",
-        "Feb",
-        "Mar",
-        "Apr",
-        "May",
-        "Jun",
-        "Jul",
-        "Aug",
-        "Sep",
-        "Oct",
-        "Nov",
-        "Dec"
-    };
+    public final static int SOCKET_TIMEOUT_MS = 30_000; // idle keep-alive timeout
+    public final static int MAX_LINE_LENGTH = 8192; // request line / header line limit
+    public final static int MAX_HEADERS = 100;
 
     public static final Map<String, String> MIME_TYPE = Map.ofEntries(
         Map.entry("html", "text/html"),
