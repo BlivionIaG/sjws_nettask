@@ -63,9 +63,15 @@ public class ClientManager implements Runnable {
      * @param extraHeaders fields added to every HTTP/1 response (Alt-Svc hook); called per response
      */
     public ClientManager(ServerSocket server, ServerConfig config, Supplier<ResponseHeaders> extraHeaders) {
+        this(server, config, new StaticFileHandler(config.root()), extraHeaders);
+    }
+
+    /** Shares {@code handler} with other transports (HTTP/3). */
+    public ClientManager(ServerSocket server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders) {
         this.server = server;
         this.config = config;
-        this.handler = new StaticFileHandler(config.root());
+        this.handler = handler;
         this.extraHeaders = extraHeaders;
         this.permits = new Semaphore(config.maxConnections());
     }
