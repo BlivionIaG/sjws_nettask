@@ -72,6 +72,7 @@ public class Header {
 
     public static String reasonPhrase(int code) {
         return switch (code) {
+            case 100 -> "Continue";
             case 200 -> "OK";
             case 301 -> "Moved Permanently";
             case 304 -> "Not Modified";
@@ -79,7 +80,10 @@ public class Header {
             case 403 -> "Forbidden";
             case 404 -> "Not Found";
             case 405 -> "Method Not Allowed";
+            case 408 -> "Request Timeout";
+            case 413 -> "Content Too Large";
             case 414 -> "URI Too Long";
+            case 417 -> "Expectation Failed";
             case 431 -> "Request Header Fields Too Large";
             case 500 -> "Internal Server Error";
             case 501 -> "Not Implemented";
@@ -111,9 +115,18 @@ public class Header {
         return toString().getBytes(StandardCharsets.ISO_8859_1);
     }
 
+    /** Textual types are served as UTF-8. */
+    static String withCharset(String mime) {
+        if (mime.startsWith("text/") || mime.equals("application/javascript") || mime.equals("application/json")
+                || mime.equals("image/svg+xml")) {
+            return mime + "; charset=utf-8";
+        }
+        return mime;
+    }
+
     @Override
     public String toString() {
-        var type = "text/html".equals(this.contentType) ? "text/html; charset=utf-8" : this.contentType;
+        var type = withCharset(this.contentType);
         var sb = new StringBuilder(256)
                 .append("HTTP/").append(DEFAULT_PROTOCOL).append(' ')
                 .append(this.httpCode).append(' ').append(reasonPhrase(this.httpCode)).append(CRLF)
@@ -124,8 +137,10 @@ public class Header {
         }
         sb.append("Accept-Ranges: ").append(DEFAULT_ACCEPT_RANGE).append(CRLF)
                 .append("Content-Type: ").append(type).append(CRLF)
-                .append("Connection: ").append(this.connection).append(CRLF)
-                .append("Content-Length: ").append(this.contentLength).append(CRLF);
+                .append("Connection: ").append(this.connection).append(CRLF);
+        if (this.httpCode != 304) { // a 304 has no body; omit the length to keep naive clients happy
+            sb.append("Content-Length: ").append(this.contentLength).append(CRLF);
+        }
         this.extra.forEach((k, v) -> sb.append(k).append(": ").append(v).append(CRLF));
         return sb.append(CRLF).toString();
     }
