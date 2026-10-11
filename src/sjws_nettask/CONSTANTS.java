@@ -26,9 +26,9 @@ public class CONSTANTS {
 
     public final static int DEFAULT_PORT = 8080; // Default Port
     public final static String DEFAULT_HTML_PATH = "./HTML";
-    public final static int SOCKET_TIMEOUT_MS = 30_000; // idle keep-alive timeout
     public final static int MAX_LINE_LENGTH = 8192; // request line / header line limit
     public final static int MAX_HEADERS = 100;
+    public final static long MAX_DRAINED_BODY = 64 * 1024; // larger bodies on GET/HEAD: answer then close
 
     public static final Map<String, String> MIME_TYPE = Map.ofEntries(
         Map.entry("html", "text/html"),
@@ -44,6 +44,15 @@ public class CONSTANTS {
         Map.entry("ogg", "application/ogg"),
         Map.entry("mp4", "video/mp4"),
         Map.entry("webm", "video/webm"),
-        Map.entry("pdf", "application/pdf")
+        Map.entry("pdf", "application/pdf"),
+        Map.entry("htm", "text/html"),
+        Map.entry("mjs", "application/javascript"),
+        Map.entry("json", "application/json"),
+        Map.entry("svg", "image/svg+xml"),
+        Map.entry("ico", "image/x-icon"),
+        Map.entry("webp", "image/webp"),
+        Map.entry("woff", "font/woff"),
+        Map.entry("woff2", "font/woff2"),
+        Map.entry("wasm", "application/wasm")
     );
 }
