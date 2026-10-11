@@ -1,0 +1,317 @@
+package sjws_nettask;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import sjws_nettask.HttpTestSupport.Response;
+
+/**
+ * Network-level tests for the review fixes: strict parsing ends in "status + close",
+ * deadlines, connection cap, pipelining, Expect, absolute-form, process exit codes.
+ */
+class HardeningIntegrationTest {
+
+    private static final int TIMEOUT_MS = 4000;
+
+    @TempDir
+    Path root;
+
+    private ServerSocket serverSocket;
+    private ClientManager manager;
+    private Thread acceptThread;
+    private int port;
+
+    private void start(ServerConfig config) throws IOException {
+        serverSocket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+        port = serverSocket.getLocalPort();
+        manager = new ClientManager(serverSocket, config);
+        acceptThread = new Thread(manager, "accept-loop");
+        acceptThread.setDaemon(true);
+        acceptThread.start();
+    }
+
+    private void start() throws IOException {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        start(ServerConfig.defaults(root.toString()));
+    }
+
+    @AfterEach
+    void stop() throws Exception {
+        if (serverSocket != null) {
+            serverSocket.close();
+            acceptThread.join(2000);
+        }
+    }
+
+    private Socket connect() throws IOException {
+        var s = new Socket(InetAddress.getLoopbackAddress(), port);
+        s.setSoTimeout(TIMEOUT_MS);
+        return s;
+    }
+
+    /** Sends raw bytes, expects exactly one response with the given status, then EOF. */
+    private Response expectStatusThenClose(String raw, int status) throws IOException {
+        try (var s = connect()) {
+            s.getOutputStream().write(raw.getBytes(StandardCharsets.ISO_8859_1));
+            s.getOutputStream().flush();
+            Response r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(status, r.statusCode(), r.rawHead());
+            assertEquals("close", r.headers().get("connection"));
+            assertEquals(-1, s.getInputStream().read(), "connection must be closed after the error");
+            return r;
+        }
+    }
+
+    @ParameterizedTest(name = "[{index}] smuggling vector -> 400 + close")
+    @ValueSource(strings = {
+        "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nContent-Length: 41\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: h\r\nContent-Length : 41\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: h\r\nContent-Length: +5\r\n\r\nxxxxx",
+        "GET / HTTP/1.1\r\nHost: h\r\nX: a\rContent-Length: 5\r\n\r\nxxxxx",
+        "GET / HTTP/1.1\r\nHost: h\r\nX: a\r\n Content-Length: 5\r\n\r\nxxxxx",
+        "GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 5, 6\r\n\r\nxxxxxx"
+    })
+    void smugglingVectorsAre400AndClose(String raw) throws IOException {
+        start();
+        expectStatusThenClose(raw, 400);
+    }
+
+    @Test
+    void transferEncodingWithContentLengthIs501AndClose() throws IOException {
+        start();
+        expectStatusThenClose("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n"
+                + "0\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n", 501);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "'GET / HTTP/2.0\r\nHost: h\r\n\r\n', 505",
+        "'BREW / HTTP/1.1\r\nHost: h\r\n\r\n', 501",
+        "'GET / HTTP/1.1\r\n\r\n', 400",
+        "'GET / HTTP/1.1\r\nHost: h\r\nExpect: teapot\r\n\r\n', 417"
+    })
+    void protocolErrors(String raw, int status) throws IOException {
+        start();
+        expectStatusThenClose(raw.replace("\\r\\n", "\r\n"), status);
+    }
+
+    @Test
+    void limits414And431() throws IOException {
+        start();
+        expectStatusThenClose("GET /" + "a".repeat(10_000) + " HTTP/1.1\r\nHost: h\r\n\r\n", 414);
+        expectStatusThenClose("GET / HTTP/1.1\r\nHost: h\r\nX: " + "a".repeat(10_000) + "\r\n\r\n", 431);
+        var many = new StringBuilder("GET / HTTP/1.1\r\nHost: h\r\n");
+        for (int i = 0; i < 150; i++) {
+            many.append("X-").append(i).append(": 1\r\n");
+        }
+        expectStatusThenClose(many.append("\r\n").toString(), 431);
+    }
+
+    @Test
+    void pipelinedRequestsAreAnsweredInOrder() throws IOException {
+        start();
+        Files.writeString(root.resolve("b.txt"), "bee");
+        try (var s = connect()) {
+            HttpTestSupport.write(s.getOutputStream(),
+                    "GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n"
+                    + "HEAD /b.txt HTTP/1.1\r\nHost: h\r\n\r\n"
+                    + "GET /b.txt HTTP/1.1\r\nHost: h\r\n\r\n");
+            InputStream in = s.getInputStream();
+            assertEquals("hello", HttpTestSupport.readResponse(in).bodyText());
+            Response head = HttpTestSupport.readResponse(in, true);
+            assertEquals(200, head.statusCode());
+            assertEquals("3", head.headers().get("content-length"));
+            assertEquals("bee", HttpTestSupport.readResponse(in).bodyText());
+        }
+    }
+
+    @Test
+    void trickledRequestIsCutOffAtDeadline() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        start(ServerConfig.defaults(root.toString()).withTimeouts(java.time.Duration.ofSeconds(5), java.time.Duration.ofMillis(800)));
+        try (var s = connect()) {
+            var out = s.getOutputStream();
+            long t0 = System.nanoTime();
+            var req = "GET /hello.txt HTTP/1.1\r\nHost: h\r\nX-Slow: " + "a".repeat(100);
+            Response r = null;
+            try {
+                for (char c : req.toCharArray()) { // one byte every 50 ms: never idle long enough for SO_TIMEOUT
+                    out.write(c);
+                    out.flush();
+                    Thread.sleep(50);
+                }
+            } catch (IOException e) {
+                // server closed while we were still trickling: expected
+            }
+            r = HttpTestSupport.readResponse(s.getInputStream());
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            if (r.statusLine() != null) {
+                assertEquals(408, r.statusCode());
+            }
+            assertEquals(-1, s.getInputStream().read());
+            assertTrue(ms < 4000, "took " + ms + " ms");
+        }
+    }
+
+    @Test
+    void idleKeepAliveIsNotCutByHeadDeadline() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        start(ServerConfig.defaults(root.toString()).withTimeouts(java.time.Duration.ofSeconds(5), java.time.Duration.ofMillis(300)));
+        try (var s = connect()) {
+            Thread.sleep(800); // idle longer than the head deadline before sending anything
+            HttpTestSupport.write(s.getOutputStream(), "GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n");
+            assertEquals("hello", HttpTestSupport.readResponse(s.getInputStream()).bodyText());
+        }
+    }
+
+    @Test
+    void absoluteFormTarget() throws IOException {
+        start();
+        Response r = HttpTestSupport.rawRequest(port, "GET http://x/hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", TIMEOUT_MS);
+        assertEquals(200, r.statusCode());
+        assertEquals("hello", r.bodyText());
+    }
+
+    @Test
+    void headOn404() throws IOException {
+        start();
+        Response r = HttpTestSupport.rawRequest(port, "HEAD /missing HTTP/1.1\r\nHost: h\r\n\r\n", TIMEOUT_MS);
+        assertEquals(404, r.statusCode());
+        assertEquals(0, r.body().length);
+    }
+
+    @Test
+    void ifModifiedSinceGives304() throws IOException {
+        start();
+        Response first = HttpTestSupport.get(port, "/hello.txt", TIMEOUT_MS);
+        String lm = first.headers().get("last-modified");
+        assertNotNull(lm);
+        Response r = HttpTestSupport.rawRequest(port,
+                "GET /hello.txt HTTP/1.1\r\nHost: h\r\nIf-Modified-Since: " + lm + "\r\n\r\n", TIMEOUT_MS);
+        assertEquals(304, r.statusCode());
+    }
+
+    @Test
+    void directoryWithoutSlashRedirectsOverTheWire() throws IOException {
+        start();
+        Files.createDirectory(root.resolve("sub"));
+        Response r = HttpTestSupport.get(port, "/sub?a=b", TIMEOUT_MS);
+        assertEquals(301, r.statusCode());
+        assertEquals("/sub/?a=b", r.headers().get("location"));
+    }
+
+    @Test
+    void unreadableDirectoryIs403OverTheWire() throws IOException {
+        org.junit.jupiter.api.Assumptions.assumeFalse("root".equals(System.getProperty("user.name")));
+        start();
+        var locked = Files.createDirectory(root.resolve("locked"));
+        Files.setPosixFilePermissions(locked, java.util.Set.of());
+        try {
+            assertEquals(403, HttpTestSupport.get(port, "/locked/", TIMEOUT_MS).statusCode());
+        } finally {
+            Files.setPosixFilePermissions(locked, java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+        }
+    }
+
+    @Test
+    void errorWithHugeBodyIsAnsweredWithoutDraining() throws IOException {
+        start();
+        long t0 = System.nanoTime();
+        // Claims 1 GB but sends nothing: the 405 must come immediately, then close.
+        expectStatusThenClose("PUT /x HTTP/1.1\r\nHost: h\r\nContent-Length: 1000000000\r\n\r\n", 405);
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 2000);
+    }
+
+    @Test
+    void expect100ContinueOnUnsupportedMethodGetsFinalStatus() throws IOException {
+        start();
+        expectStatusThenClose("POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n", 405);
+    }
+
+    @Test
+    void expect100ContinueOnGetWithBody() throws IOException {
+        start();
+        try (var s = connect()) {
+            HttpTestSupport.write(s.getOutputStream(),
+                    "GET /hello.txt HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n");
+            Response interim = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(100, interim.statusCode());
+            HttpTestSupport.write(s.getOutputStream(), "body");
+            Response r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(200, r.statusCode());
+            assertEquals("hello", r.bodyText());
+            // body was consumed, connection is still usable
+            HttpTestSupport.write(s.getOutputStream(), "GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n");
+            assertEquals(200, HttpTestSupport.readResponse(s.getInputStream()).statusCode());
+        }
+    }
+
+    @Test
+    void connectionCapQueuesExtraClients() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        start(ServerConfig.defaults(root.toString()).withMaxConnections(2));
+        try (var a = connect(); var b = connect(); var c = connect()) {
+            HttpTestSupport.write(a.getOutputStream(), "GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n");
+            HttpTestSupport.write(b.getOutputStream(), "GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n");
+            assertEquals(200, HttpTestSupport.readResponse(a.getInputStream()).statusCode());
+            assertEquals(200, HttpTestSupport.readResponse(b.getInputStream()).statusCode());
+            assertEquals(2, manager.activeConnections());
+
+            HttpTestSupport.write(c.getOutputStream(), "GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n");
+            c.setSoTimeout(700);
+            assertThrows(SocketTimeoutException.class, () -> c.getInputStream().read(),
+                    "third client must wait while two connections are open");
+            a.close(); // frees a slot
+            c.setSoTimeout(TIMEOUT_MS);
+            assertEquals("hello", HttpTestSupport.readResponse(c.getInputStream()).bodyText());
+        }
+    }
+
+    // --- process level ----------------------------------------------------------
+
+    private Process launch(String... args) throws IOException {
+        String javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        var cmd = new java.util.ArrayList<>(java.util.List.of(javaBin, "-cp", System.getProperty("java.class.path"),
+                "sjws_nettask.Sjws_nettask"));
+        cmd.addAll(java.util.List.of(args));
+        var pb = new ProcessBuilder(cmd).redirectErrorStream(true);
+        pb.environment().remove("WEB_SERVER_DIR");
+        pb.environment().remove("WEB_SERVER_PORT");
+        return pb.start();
+    }
+
+    @Test
+    void portInUseExitsNonZeroWithClearMessage() throws Exception {
+        try (var taken = new ServerSocket(0)) {
+            Process p = launch(String.valueOf(taken.getLocalPort()), root.toString());
+            assertTrue(p.waitFor(10, TimeUnit.SECONDS), "should exit");
+            String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            assertEquals(1, p.exitValue(), out);
+            assertTrue(out.contains("Cannot listen on port " + taken.getLocalPort()), out);
+        }
+    }
+
+    @Test
+    void missingDocRootExitsNonZeroWithClearMessage() throws Exception {
+        Process p = launch("18099", root.resolve("nope").toString());
+        assertTrue(p.waitFor(10, TimeUnit.SECONDS), "should exit");
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(2, p.exitValue(), out);
+        assertTrue(out.contains("does not exist"), out);
+    }
+}

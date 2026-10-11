@@ -17,8 +17,10 @@
 package sjws_nettask;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.BindException;
 import java.net.ServerSocket;
-import java.util.Map;
+import java.nio.file.Files;
 
 /**
  *
@@ -26,22 +28,43 @@ import java.util.Map;
  */
 public class Sjws_nettask {
 
-    public Sjws_nettask(int port, String htmlPath) {
-        try (var socket = new ServerSocket(port)) {
-            System.out.println("Server started on port : " + port + " (serving " + htmlPath + ")");
+    private Sjws_nettask() {
+    }
 
-            var listener = new Thread(new ClientManager(socket, htmlPath), "accept-loop");
+    /**
+     * Runs the server until it is stopped.
+     *
+     * @return process exit code: 0 normal, 1 cannot listen, 2 bad document root
+     */
+    public static int serve(ServerConfig config) {
+        var root = config.root();
+        if (!Files.isDirectory(root)) {
+            System.err.println("Document root " + root.toAbsolutePath() + " does not exist or is not a directory.");
+            return 2;
+        }
+        int port = config.port();
+        try (var socket = new ServerSocket(port)) {
+            System.out.println("Server started on port : " + socket.getLocalPort() + " (serving " + root + ")");
+
+            var listener = new Thread(new ClientManager(socket, config), "accept-loop");
             listener.start();
             listener.join();
-        } catch (IOException e) {
-            System.err.println("Failed to open the server on port " + port + " ! " + e);
+            System.out.println("Server Terminated properly !");
+            return 0;
+        } catch (BindException e) {
+            System.err.println("Cannot listen on port " + port + ": " + e.getMessage()
+                    + " (already in use or not permitted).");
+            return 1;
+        } catch (IOException | UncheckedIOException e) {
+            System.err.println("Failed to start the server on port " + port + ": " + e);
+            return 1;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-        } finally {
-            System.out.println("Server Terminated properly !");
+            return 0;
         }
     }
 
+    /** Kept for existing callers and tests. */
     public static boolean checkValidPort(String port) {
         if (port == null || !port.matches("\\d{1,5}")) {
             return false;
@@ -51,34 +74,17 @@ public class Sjws_nettask {
     }
 
     /**
-     * Usage: [port] [html folder path]. The WEB_SERVER_PORT and WEB_SERVER_DIR
-     * environment variables override the arguments.
+     * Usage: [port] [html folder path] [--max-connections=N] [--idle-timeout=S] [--header-timeout=S].
+     * WEB_SERVER_* environment variables override the arguments (see {@link ServerConfig}).
      *
      * @param args the command line arguments
      */
     public static void main(String[] args) {
-        Map<String, String> env = System.getenv();
-        var port = CONSTANTS.DEFAULT_PORT;
-        var contentPath = CONSTANTS.DEFAULT_HTML_PATH;
-
-        if (args.length > 0) {
-            if (checkValidPort(args[0])) {
-                port = Integer.parseInt(args[0]);
-            } else {
-                System.err.println("Invalid port '" + args[0] + "', using " + port);
-            }
+        var parsed = ServerConfig.parse(args, System.getenv());
+        parsed.warnings().forEach(System.err::println);
+        int code = serve(parsed.config());
+        if (code != 0) {
+            System.exit(code);
         }
-        if (args.length > 1) {
-            contentPath = args[1];
-        }
-
-        if (checkValidPort(env.get("WEB_SERVER_PORT"))) {
-            port = Integer.parseInt(env.get("WEB_SERVER_PORT"));
-        }
-        if (env.containsKey("WEB_SERVER_DIR")) {
-            contentPath = env.get("WEB_SERVER_DIR");
-        }
-
-        new Sjws_nettask(port, contentPath);
     }
 }

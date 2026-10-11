@@ -18,17 +18,18 @@ package sjws_nettask;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
-import java.util.Locale;
 
 import sjws_nettask.HTTP.HTML;
+import sjws_nettask.HTTP.Http1Parser;
 import sjws_nettask.HTTP.Page;
+import sjws_nettask.HTTP.ParseError;
 
 /**
  * Serves the HTTP/1.x requests of one connection (keep-alive aware).
@@ -37,149 +38,108 @@ import sjws_nettask.HTTP.Page;
  */
 public class Client implements Runnable {
 
-    /** Thrown when a request is malformed; carries the status code to answer with. */
-    private static final class BadRequest extends Exception {
-
-        final int status;
-
-        BadRequest(int status) {
-            super(null, null, false, false);
-            this.status = status;
-        }
-    }
+    private static final byte[] CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final Socket client;
     private final HTML html;
+    private final ServerConfig config;
 
     public Client(Socket client, HTML html) {
+        this(client, html, ServerConfig.defaults(html.getFolderPath()));
+    }
+
+    public Client(Socket client, HTML html, ServerConfig config) {
         this.client = client;
         this.html = html;
+        this.config = config;
     }
 
     @Override
     public void run() {
         try (var socket = this.client;
-             var in = new BufferedInputStream(socket.getInputStream());
+             var timed = new TimedInputStream(socket.getInputStream(), socket, (int) this.config.idleTimeout().toMillis());
+             var in = new BufferedInputStream(timed);
              var out = new BufferedOutputStream(socket.getOutputStream())) {
-            while (handleRequest(in, out)) {
-                // keep-alive: serve the next request on this connection
+            while (serveOne(timed, in, out)) {
+                // keep-alive: next request on this connection
             }
-        } catch (SocketTimeoutException e) {
-            // idle keep-alive connection: just close it
         } catch (IOException | RuntimeException e) {
-            if (!Thread.currentThread().isInterrupted()) { // interrupted = server shutting down
+            if (!isRoutine(e) && !Thread.currentThread().isInterrupted()) {
                 System.err.println("Connection " + this.client.getRemoteSocketAddress() + " failed: " + e);
             }
         }
     }
 
-    /**
-     * Reads and answers one request.
-     *
-     * @return true if the connection should stay open for another request
-     */
-    private boolean handleRequest(InputStream in, OutputStream out) throws IOException {
-        String requestLine;
-        try {
-            do {
-                requestLine = readLine(in);
-                if (requestLine == null) {
-                    return false; // client closed the connection
-                }
-            } while (requestLine.isEmpty()); // RFC 9112 2.2: ignore leading empty lines
-
-            if (requestLine.equalsIgnoreCase("STOP") || requestLine.equalsIgnoreCase("EXIT")) {
-                return false; // legacy plain-text "close" command
-            }
-
-            var parts = requestLine.split(" ");
-            if (parts.length != 3 || !parts[1].startsWith("/") || !parts[2].startsWith("HTTP/1.")) {
-                throw new BadRequest(400);
-            }
-            var method = parts[0];
-            var target = parts[1];
-
-            boolean close = false;
-            boolean keepAliveRequested = false;
-            long contentLength = 0;
-            boolean chunked = false;
-            for (int count = 0;; count++) {
-                var line = readLine(in);
-                if (line == null) {
-                    return false;
-                }
-                if (line.isEmpty()) {
-                    break;
-                }
-                if (count >= CONSTANTS.MAX_HEADERS) {
-                    throw new BadRequest(431);
-                }
-                int colon = line.indexOf(':');
-                if (colon <= 0) {
-                    throw new BadRequest(400);
-                }
-                var name = line.substring(0, colon).trim().toLowerCase(Locale.ROOT);
-                var value = line.substring(colon + 1).trim();
-                switch (name) {
-                    case "connection" -> {
-                        var v = value.toLowerCase(Locale.ROOT);
-                        close |= v.contains("close");
-                        keepAliveRequested |= v.contains("keep-alive");
-                    }
-                    case "content-length" -> {
-                        try {
-                            contentLength = Long.parseLong(value);
-                        } catch (NumberFormatException e) {
-                            throw new BadRequest(400);
-                        }
-                        if (contentLength < 0) {
-                            throw new BadRequest(400);
-                        }
-                    }
-                    case "transfer-encoding" -> chunked = true;
-                    default -> {
-                    }
-                }
-            }
-            if (chunked) {
-                throw new BadRequest(501); // request bodies with chunked encoding are not supported
-            }
-            in.skipNBytes(contentLength); // never interpret a body as the next request
-
-            boolean keepAlive = parts[2].equals("HTTP/1.0") ? keepAliveRequested && !close : !close;
-
-            switch (method) {
-                case "GET" -> this.html.send(out, target, false, keepAlive);
-                case "HEAD" -> this.html.send(out, target, true, keepAlive);
-                default -> Page.sendBody(out, 405, "text/html",
-                        "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>",
-                        false, keepAlive, "Allow", "GET, HEAD");
-            }
-            return keepAlive;
-        } catch (BadRequest e) {
-            Page.sendError(out, e.status, false, false);
-            return false;
+    /** Client went away, timed out or the server is shutting down: not worth logging. */
+    static boolean isRoutine(Exception e) {
+        if (e instanceof EOFException || e instanceof SocketTimeoutException) {
+            return true;
         }
+        if (e instanceof SocketException) {
+            var msg = String.valueOf(e.getMessage());
+            return msg.contains("reset") || msg.contains("Broken pipe") || msg.contains("closed")
+                    || msg.contains("Closed") || msg.contains("abort");
+        }
+        return false;
     }
 
-    /**
-     * Reads one CRLF (or bare LF) terminated line as ISO-8859-1.
-     *
-     * @return the line without terminator, or null at end of stream
-     */
-    private static String readLine(InputStream in) throws IOException, BadRequest {
-        var buf = new ByteArrayOutputStream(128);
-        int b;
-        while ((b = in.read()) != -1) {
-            if (b == '\n') {
-                var line = buf.toString(StandardCharsets.ISO_8859_1);
-                return line.endsWith("\r") ? line.substring(0, line.length() - 1) : line;
-            }
-            if (buf.size() >= CONSTANTS.MAX_LINE_LENGTH) {
-                throw new BadRequest(414);
-            }
-            buf.write(b);
+    /** @return true if the connection should stay open for another request */
+    private boolean serveOne(TimedInputStream timed, BufferedInputStream in, OutputStream out) throws IOException {
+        // Wait for the first byte of the next request with only the idle timeout ...
+        timed.clearDeadline();
+        in.mark(1);
+        if (in.read() == -1) {
+            return false;
         }
-        return buf.size() == 0 ? null : buf.toString(StandardCharsets.ISO_8859_1);
+        in.reset();
+        // ... then the whole head must arrive before the deadline.
+        timed.setDeadline(this.config.headerTimeout().toMillis());
+
+        Http1Parser.Head request;
+        try {
+            request = Http1Parser.read(in, CONSTANTS.MAX_LINE_LENGTH, CONSTANTS.MAX_HEADERS);
+        } catch (ParseError e) {
+            Page.sendError(out, e.status(), false, false);
+            return false;
+        } catch (SocketTimeoutException e) {
+            if (timed.deadlineExpired()) {
+                Page.sendError(out, 408, false, false);
+            }
+            return false;
+        }
+        if (request == null) {
+            return false;
+        }
+
+        var method = request.method();
+        boolean head = request.headOnly();
+        if (!head && !method.equals("GET")) {
+            // Known but unsupported method. Never read (possibly huge) bodies just to reject them.
+            boolean keepAlive = request.keepAlive() && request.contentLength() == 0;
+            Page.sendBody(out, 405, "text/html",
+                    "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>",
+                    false, keepAlive, "Allow", "GET, HEAD");
+            return keepAlive;
+        }
+
+        boolean keepAlive = request.keepAlive();
+        long length = request.contentLength();
+        if (length > CONSTANTS.MAX_DRAINED_BODY) {
+            keepAlive = false; // answer, then close instead of reading the body
+        } else if (length > 0) {
+            if (request.expectContinue()) {
+                out.write(CONTINUE);
+                out.flush();
+            }
+            try {
+                in.skipNBytes(length); // GET/HEAD bodies have no meaning; discard them (deadline still applies)
+            } catch (SocketTimeoutException e) {
+                return false;
+            }
+        }
+        timed.clearDeadline();
+
+        this.html.send(out, request.target(), head, keepAlive, request.ifModifiedSince());
+        return keepAlive;
     }
 }

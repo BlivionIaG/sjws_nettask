@@ -203,19 +203,37 @@ class ServerIntegrationTest {
 
     @Test
     void BUG_finishedClientsAreRemovedFromRegistry() throws Exception {
-        for (int i = 0; i < 10; i++) {
-            HttpTestSupport.get(port, "/index.html", TIMEOUT_MS); // client closes after reading
+        // Real leak check: after many connections (complete, keep-alive then closed,
+        // and abandoned mid-request) both the server's live-connection count and the
+        // process's open file descriptors return to their baseline.
+        var fdDir = Path.of("/proc/self/fd");
+        org.junit.jupiter.api.Assumptions.assumeTrue(Files.isDirectory(fdDir), "needs /proc");
+        HttpTestSupport.get(port, "/index.html", TIMEOUT_MS); // warm up lazily created resources
+        awaitActive(0);
+        long fdBefore;
+        try (var l = Files.list(fdDir)) {
+            fdBefore = l.count();
         }
-        Thread.sleep(500); // let Client threads observe EOF and run close()
-        // The server must not keep per-connection state after a connection ends:
-        // any collection held by ClientManager must not grow with finished connections.
-        for (var field : ClientManager.class.getDeclaredFields()) {
-            if (java.util.Collection.class.isAssignableFrom(field.getType())) {
-                field.setAccessible(true);
-                var c = (java.util.Collection<?>) field.get(manager);
-                assertTrue(c.size() < 10, field.getName() + " holds " + c.size() + " entries after 10 finished connections");
+        for (int i = 0; i < 30; i++) {
+            HttpTestSupport.get(port, "/index.html", TIMEOUT_MS);
+            try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+                HttpTestSupport.write(s.getOutputStream(), "GET /index.html HTTP/1.1\r\nHo"); // abandoned
             }
         }
+        awaitActive(0);
+        long fdAfter;
+        try (var l = Files.list(fdDir)) {
+            fdAfter = l.count();
+        }
+        assertTrue(fdAfter <= fdBefore + 3, "fd count grew from " + fdBefore + " to " + fdAfter);
+    }
+
+    private void awaitActive(int expected) throws InterruptedException {
+        long end = System.currentTimeMillis() + 5000;
+        while (manager.activeConnections() != expected && System.currentTimeMillis() < end) {
+            Thread.sleep(20);
+        }
+        assertEquals(expected, manager.activeConnections(), "live connections");
     }
 
     @Test
@@ -232,16 +250,17 @@ class ServerIntegrationTest {
 
     @Test
     void requestBodyIsNotInterpretedAsARequest() throws IOException {
-        String body = "GET /index.html HTTP/1.1\r\n\r\n";
+        // A rejected request with a body is answered with Connection: close and the
+        // body is never read, so it can't be parsed as a second (smuggled) request.
+        String body = "GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n";
         try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
             s.setSoTimeout(TIMEOUT_MS);
             HttpTestSupport.write(s.getOutputStream(), "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: "
-                    + body.length() + "\r\n\r\n" + body + "GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n");
-            assertEquals(405, HttpTestSupport.readResponse(s.getInputStream()).statusCode());
-            // exactly one more response: for the real second request, not for the body
-            assertEquals(200, HttpTestSupport.readResponse(s.getInputStream()).statusCode());
-            s.setSoTimeout(500);
-            assertThrows(SocketTimeoutException.class, () -> s.getInputStream().read());
+                    + body.length() + "\r\n\r\n" + body);
+            Response r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(405, r.statusCode());
+            assertEquals("close", r.headers().get("connection"));
+            assertEquals(-1, s.getInputStream().read(), "no second response may follow");
         }
     }
 
