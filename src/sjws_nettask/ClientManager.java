@@ -19,49 +19,67 @@ package sjws_nettask;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.ArrayList;
+import java.util.concurrent.Executors;
+
+import sjws_nettask.HTTP.HTML;
 
 /**
+ * Accept loop: hands every connection to a virtual thread.
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
 public class ClientManager implements Runnable {
 
     private final ServerSocket server;
-    private Socket client;
-    private final ArrayList<Client> threads;
+    private final HTML html;
 
     public ClientManager(ServerSocket server) {
-        this.server = server;
+        this(server, CONSTANTS.DEFAULT_HTML_PATH);
+    }
 
-        this.threads = new ArrayList<>();
+    public ClientManager(ServerSocket server, String htmlPath) {
+        this.server = server;
+        this.html = new HTML(htmlPath);
     }
 
     @Override
     public void run() {
+        var executor = Executors.newVirtualThreadPerTaskExecutor();
         try {
-            do {
-                threads.add(new Client(threads, (client = server.accept()))); //Création et ajout d'un nouveau client quand il se connecte
-                threads.get(threads.size() - 1).start(); //On démarre le thread du client
-            } while (true);
-        } catch (IOException e) { // Erreur de connexion 
-            e.printStackTrace();
+            while (!this.server.isClosed()) {
+                Socket socket;
+                try {
+                    socket = this.server.accept();
+                } catch (IOException e) {
+                    if (this.server.isClosed()) {
+                        break; // normal shutdown
+                    }
+                    System.err.println("accept() failed, still listening: " + e);
+                    continue;
+                }
+                try {
+                    socket.setSoTimeout(CONSTANTS.SOCKET_TIMEOUT_MS);
+                    executor.execute(new Client(socket, this.html));
+                } catch (IOException | RuntimeException e) {
+                    System.err.println("Could not start client: " + e);
+                    closeQuietly(socket);
+                }
+            }
+        } finally {
             close();
+            executor.shutdownNow(); // don't wait for idle keep-alive connections
         }
     }
 
     public void close() {
-        try {
-            if (server != null) {
-                server.close();
-            }
-            if (client != null) {
-                client.close();
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+        closeQuietly(this.server);
+    }
 
-        Thread.currentThread().interrupt(); //Interruption du thread
+    private static void closeQuietly(AutoCloseable c) {
+        try {
+            c.close();
+        } catch (Exception e) {
+            System.err.println(e);
+        }
     }
 }
