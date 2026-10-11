@@ -14,9 +14,28 @@
     <junit.version>5.11.4</junit.version>
     <!-- Run only the green suite with: mvn test -DexcludedGroups=bug -->
     <excludedGroups></excludedGroups>
+    <netty.version>4.2.19.Final</netty.version>
   </properties>
 
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.netty</groupId>
+        <artifactId>netty-bom</artifactId>
+        <version>${netty.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
   <dependencies>
+    <!-- HTTP/3 (QUIC). Its POM already pulls the native quiche jars for linux-x86_64, linux-aarch_64,
+         osx-x86_64, osx-aarch_64 and windows-x86_64 as runtime dependencies (see the HTTP/3 design §1). -->
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-codec-http3</artifactId>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
