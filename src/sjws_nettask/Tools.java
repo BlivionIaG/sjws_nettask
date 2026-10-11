@@ -16,15 +16,24 @@
  */
 package sjws_nettask;
 
-import java.security.SecureRandom;
-import java.util.Calendar;
-import java.util.Random;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 /**
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
-public class Tools {
+public final class Tools {
+
+    /** IMF-fixdate (RFC 9110 section 5.6.7), e.g. "Sun, 06 Nov 1994 08:49:37 GMT". */
+    private static final DateTimeFormatter HTTP_DATE = DateTimeFormatter
+            .ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.ENGLISH)
+            .withZone(ZoneOffset.UTC);
+
+    private Tools() {
+    }
 
     /**
      *
@@ -36,44 +45,19 @@ public class Tools {
     }
 
     /**
-     * Generate a random alphanumeric string at a given size
-     *
-     * @param charset Alphanumeric charset
-     * @param length Size
-     * @return Random String
+     * @param instant point in time
+     * @return the instant formatted as an HTTP date (always GMT)
      */
-    public static String randomAlphaNumeric(char[] charset, int length) {
-        var random = new SecureRandom(); // Random values generator
-        String result = "";
-
-        for(var i = 0; i < length; ++i){
-            result += charset[random.nextInt(charset.length)];
-        }
-
-        return result;
+    public static String httpDate(Instant instant) {
+        return HTTP_DATE.format(instant);
     }
 
     /**
      * Generate readable current date
-     * 
-     * @return HTTP header compatible format date
+     *
+     * @return HTTP "Date" header line (without line terminator)
      */
     public static String formatedCurrentDate() {
-        Calendar now = Calendar.getInstance();
-        String date = "Date: "
-                + CONSTANTS.DAYS[now.get(Calendar.DAY_OF_WEEK) - 1]
-                + ", " + now.get(Calendar.DAY_OF_MONTH)
-                + " " + CONSTANTS.MONTHS[now.get(Calendar.MONTH)]
-                + " " + now.get(Calendar.YEAR);
-
-        date += (now.get(Calendar.AM_PM) != 0) ? now.get(Calendar.HOUR) : now.get(Calendar.HOUR) + 12;
-
-        date += ":"
-                + now.get(Calendar.MINUTE)
-                + ":"
-                + now.get(Calendar.SECOND)
-                + " GMT";
-
-        return date;
+        return "Date: " + httpDate(Instant.now());
     }
 }
