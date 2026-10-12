@@ -314,4 +314,51 @@ class HardeningIntegrationTest {
         assertEquals(2, p.exitValue(), out);
         assertTrue(out.contains("does not exist"), out);
     }
+
+    @Test
+    void helpPrintsUsageAndExitsZero() throws Exception {
+        Process p = launch("--help");
+        assertTrue(p.waitFor(10, TimeUnit.SECONDS));
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(0, p.exitValue(), out);
+        assertTrue(out.contains("Usage:") && out.contains("--h3-port"), out);
+    }
+
+    @Test
+    void configErrorsExitWithUsageCode() throws Exception {
+        Process p = launch("18097", root.toString(), "--h3", "--cert=/only/cert.pem");
+        assertTrue(p.waitFor(10, TimeUnit.SECONDS));
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(Sjws_nettask.EXIT_USAGE, p.exitValue(), out);
+        assertTrue(out.contains("ERROR: --cert and --key must be given together"), out);
+    }
+
+    @Test
+    void h3UnavailableFallsBackToHttp1() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        int port;
+        try (var probe = new ServerSocket(0)) {
+            port = probe.getLocalPort();
+        }
+        Process p = launch(String.valueOf(port), root.toString(), "--h3");
+        try {
+            var reader = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
+            var log = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                log.append(line).append('\n');
+                if (line.startsWith("HTTP/1.1 on tcp/")) {
+                    break;
+                }
+            }
+            assertTrue(log.toString().contains("WARN: HTTP/3 not started"), log.toString());
+            assertTrue(log.toString().contains("HTTP/3 unavailable"), log.toString());
+            Response r = HttpTestSupport.get(port, "/hello.txt", TIMEOUT_MS);
+            assertEquals("hello", r.bodyText());
+            assertNull(r.headers().get("alt-svc"));
+        } finally {
+            p.destroyForcibly();
+            p.waitFor(5, TimeUnit.SECONDS);
+        }
+    }
 }

@@ -64,6 +64,60 @@
           <workingDirectory>${project.basedir}</workingDirectory>
         </configuration>
       </plugin>
+      <!-- Coverage (W1/W5): agent for unit + in-process integration tests, report at
+           target/site/jacoco, gate enforced by `mvn verify`. Subprocess tests are not instrumented. -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>0.8.12</version>
+        <executions>
+          <execution>
+            <id>prepare-agent</id>
+            <goals><goal>prepare-agent</goal></goals>
+          </execution>
+          <execution>
+            <id>report</id>
+            <phase>verify</phase>
+            <goals><goal>report</goal></goals>
+          </execution>
+          <!-- Gate: per-package rules (measured 2026-10-12, set ~3 pts below). Only the packages
+               listed are gated, so sjws_nettask.h3 is not, until the h3-transport merge adds its rule. -->
+          <execution>
+            <id>check</id>
+            <phase>verify</phase>
+            <goals><goal>check</goal></goals>
+            <configuration>
+              <haltOnFailure>true</haltOnFailure>
+              <rules>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.core</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.87</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.78</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.HTTP</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.88</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.80</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.78</minimum></limit>
+                </limits>
+              </rule>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
