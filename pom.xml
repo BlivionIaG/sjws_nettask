@@ -97,7 +97,7 @@
           <excludedGroups>jar,${excludedGroups}</excludedGroups>
           <workingDirectory>${project.basedir}</workingDirectory>
           <!-- @{argLine} keeps the JaCoCo agent; native access for Netty's QUIC natives (JEP 472). -->
-          <argLine>@{argLine} --enable-native-access=ALL-UNNAMED</argLine>
+          <argLine>@{argLine} --enable-native-access=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED</argLine>
         </configuration>
         <executions>
           <!-- Tests tagged "jar" run the packaged jar (java -jar target/sjws_nettask-*.jar), so they run
@@ -168,6 +168,14 @@
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.95</minimum></limit>
                   <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.86</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.cluster</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.78</minimum></limit>
                 </limits>
               </rule>
               <rule>
