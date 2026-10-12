@@ -549,7 +549,7 @@ class Http3ServerTest {
                 stream.config().setAutoRead(false);
                 stalled.set(stream);
             });
-            Thread.sleep(1500); // window fills, server waits > writeTimeout, then resets
+            waitFor(() -> s.responses(Http3Writer.Outcome.STALLED) == 1); // window filled, then reset
             stalled.get().config().setAutoRead(true);
             stalled.get().read();
             var r = future.get(20, TimeUnit.SECONDS);
@@ -604,7 +604,10 @@ class Http3ServerTest {
                 st.config().setAutoRead(false); // the transfer cannot finish before the cancel
                 stream.set(st);
             });
-            waitFor(() -> stream.get() != null);
+            waitFor(() -> stream.get() != null && s.inflight() == 1);
+            // Let the writer get going: the request side is already finished, so the cancel is in effect
+            // STOP_SENDING only, which Netty surfaces as a failed write; a writer that hasn't written yet
+            // only notices at the write timeout (documented limitation, bounded by writeTimeout).
             Thread.sleep(300);
             // STOP_SENDING + RESET_STREAM from the client
             stream.get().shutdown(io.netty.handler.codec.http3.Http3ErrorCode.H3_REQUEST_CANCELLED.code());
@@ -622,11 +625,12 @@ class Http3ServerTest {
             var q = c.connect(s.localAddress());
             var future = H3TestClient.request(q, "GET", "/large.bin", Map.of(), null,
                     stream -> stream.config().setAutoRead(false));
-            Thread.sleep(500); // writer is now parked waiting for flow-control credit
+            waitFor(() -> s.inflight() == 1); // writer parked waiting for flow-control credit
             s.close();
             waitFor(() -> s.responses(Http3Writer.Outcome.CLOSED) == 1);
             assertTrue(q.closeFuture().await(5, TimeUnit.SECONDS));
-            assertTrue(future.isDone() || q.closeFuture().isDone());
+            assertTrue(future.handle((r, e) -> e != null || r.reset()).get(5, TimeUnit.SECONDS),
+                    "the client sees the download cut, not completed");
         } finally {
             s.close();
         }
@@ -696,10 +700,10 @@ class Http3ServerTest {
 
     @Test
     void alpnMismatchIsRejected() throws Exception {
-        try (var c = new H3TestClient(this.tls.certificate(), 5_000, "h2")) {
+        try (var c = new H3TestClient(this.tls.certificate(), 1_000, "h2")) {
             assertThrows(Exception.class, () -> c.connect(this.server.localAddress()));
         }
-        try (var c = new H3TestClient(null, 5_000, "h3")) { // insecure trust, right ALPN: works
+        try (var c = new H3TestClient(null, 1_000, "h3")) { // insecure trust, right ALPN: works
             assertEquals(200, H3TestClient.get(c.connect(this.server.localAddress()), "/hello.txt").status());
         }
     }
@@ -712,7 +716,7 @@ class Http3ServerTest {
             var b = c.connect(s.localAddress());
             assertEquals(200, H3TestClient.get(a, "/hello.txt").status());
             assertEquals(200, H3TestClient.get(b, "/hello.txt").status());
-            assertTrue(refused(c, s), "third connection must be refused");
+            assertRefused(c, s);
             a.close().sync();
             waitFor(() -> s.connections() < 2);
             var d = c.connect(s.localAddress()); // a slot is free again
@@ -720,14 +724,18 @@ class Http3ServerTest {
         }
     }
 
-    static boolean refused(H3TestClient c, Http3Server s) {
-        try {
-            var extra = c.connect(s.localAddress());
-            var r = H3TestClient.request(extra, "GET", "/hello.txt", Map.of()).get(10, TimeUnit.SECONDS);
-            return r.status() != 200;
-        } catch (Exception e) {
-            return true;
-        }
+    /** The connection over the limit is closed promptly with H3_EXCESSIVE_LOAD (a hang fails). */
+    static void assertRefused(H3TestClient c, Http3Server s) throws Exception {
+        var close = new java.util.concurrent.atomic.AtomicReference<io.netty.handler.codec.quic.QuicConnectionCloseEvent>();
+        var extra = c.connect(s.localAddress(), evt -> {
+            if (evt instanceof io.netty.handler.codec.quic.QuicConnectionCloseEvent e) {
+                close.set(e);
+            }
+        });
+        assertTrue(extra.closeFuture().await(2, TimeUnit.SECONDS), "refused connection must be closed, not left hanging");
+        assertNotNull(close.get(), "the peer closed it");
+        assertTrue(close.get().isApplicationClose());
+        assertEquals(io.netty.handler.codec.http3.Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), close.get().error());
     }
 
     static void waitFor(java.util.function.BooleanSupplier condition) throws InterruptedException {

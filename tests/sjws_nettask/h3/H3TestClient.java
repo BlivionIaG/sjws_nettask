@@ -87,6 +87,24 @@ final class H3TestClient implements AutoCloseable {
                 .bind(new InetSocketAddress("127.0.0.1", 0)).sync().channel();
     }
 
+    /** Like {@link #connect(InetSocketAddress)}, passing every connection-level user event to {@code events}. */
+    QuicChannel connect(InetSocketAddress server, java.util.function.Consumer<Object> events) throws Exception {
+        var quic = QuicChannel.newBootstrap(this.datagram).handler(new io.netty.channel.ChannelInitializer<QuicChannel>() {
+            @Override
+            protected void initChannel(QuicChannel ch) {
+                ch.pipeline().addLast(new Http3ClientConnectionHandler(), new io.netty.channel.ChannelInboundHandlerAdapter() {
+                    @Override
+                    public void userEventTriggered(io.netty.channel.ChannelHandlerContext ctx, Object evt) {
+                        events.accept(evt);
+                        ctx.fireUserEventTriggered(evt);
+                    }
+                });
+            }
+        }).remoteAddress(server).localAddress(this.datagram.localAddress()).connect().get(10, TimeUnit.SECONDS);
+        this.connections.add(quic);
+        return quic;
+    }
+
     QuicChannel connect(InetSocketAddress server) throws Exception {
         var quic = QuicChannel.newBootstrap(this.datagram).handler(new Http3ClientConnectionHandler())
                 .remoteAddress(server).localAddress(this.datagram.localAddress()).connect().get(10, TimeUnit.SECONDS);
