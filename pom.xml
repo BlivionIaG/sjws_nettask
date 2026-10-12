@@ -47,6 +47,11 @@
       <groupId>io.netty</groupId>
       <artifactId>netty-codec-http3</artifactId>
     </dependency>
+    <!-- HTTP/2 (TLS with ALPN, h2c): same Netty version as HTTP/3, via the BOM. -->
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-codec-http2</artifactId>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
@@ -159,6 +164,14 @@
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.96</minimum></limit>
                   <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.96</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.h2</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.92</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.83</minimum></limit>
                 </limits>
               </rule>
               <rule>

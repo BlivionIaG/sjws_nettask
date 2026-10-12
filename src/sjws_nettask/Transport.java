@@ -51,6 +51,10 @@ public interface Transport extends AutoCloseable {
     default void stopAccepting() {
     }
 
+    /** How long {@link #close()} may wait for responses in progress. Default: ignored. */
+    default void shutdownTimeout(java.time.Duration timeout) {
+    }
+
     /** Stops serving and releases the port. Idempotent; safe after a failed start. */
     @Override
     void close();

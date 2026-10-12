@@ -59,6 +59,8 @@ public final class SjwsServer implements AutoCloseable {
     private volatile Duration shutdownTimeout = Daemon.DEFAULT_SHUTDOWN_TIMEOUT;
     private Transport h3;
     private Throwable h3Failure;
+    private Transport h2;
+    private Throwable h2Failure;
     private ServerSocketChannel tcp;
     private ClientManager manager;
     private Thread acceptThread;
@@ -155,9 +157,41 @@ public final class SjwsServer implements AutoCloseable {
      */
     public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, RequestFilters filters,
             Function<StaticFileHandler, Handler> terminal) throws IOException {
+        return start(config, h3Factory, H2_FACTORY, filters, terminal);
+    }
+
+    /** Creates the HTTP/2 transport (TLS + optional h2c, see {@link sjws_nettask.h2.Http2Server}). */
+    public static final Transport.Factory H2_FACTORY = new Transport.Factory() {
+        @Override
+        public Transport create(ServerConfig config, StaticFileHandler handler) {
+            return new sjws_nettask.h2.Http2Server(config, handler);
+        }
+
+        /** HTTP/2 serves what HTTP/1.1 serves: the filter chain / router when there is one. */
+        @Override
+        public Transport create(ServerConfig config, StaticFileHandler handler, FilterChain chain, Handler terminal) {
+            return new sjws_nettask.h2.Http2Server(config, terminal != null ? terminal : handler);
+        }
+    };
+
+    /**
+     * @param h2Factory used only when {@code config.h2Enabled()}; HTTP/2 has its own port, so the
+     *        HTTP/1.1 listener and its connections are unchanged by it
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory)
+            throws IOException {
+        return start(config, h3Factory, h2Factory, null, null);
+    }
+
+    /** As {@link #start(ServerConfig, Transport.Factory, RequestFilters, Function)}, with an HTTP/2 factory. */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory,
+            RequestFilters filters, Function<StaticFileHandler, Handler> terminal) throws IOException {
         var server = new SjwsServer(config, filters, terminal);
         if (config.h3Enabled()) {
             server.startH3(h3Factory);
+        }
+        if (config.h2Enabled()) {
+            server.startH2(h2Factory);
         }
         try {
             server.tcp = bind(config.port(), config.backlog());
@@ -206,6 +240,40 @@ public final class SjwsServer implements AutoCloseable {
             }
             System.err.println("WARN: HTTP/3 not started, serving HTTP/1.1 only (no Alt-Svc): " + e);
         }
+    }
+
+    private void startH2(Transport.Factory factory) {
+        Transport transport = null;
+        try {
+            transport = factory.create(this.config, this.handler, this.chain, this.override, this.slot);
+            transport.start();
+            this.h2 = transport;
+        } catch (Exception | LinkageError e) {
+            this.h2Failure = e;
+            if (transport != null) {
+                try {
+                    transport.close();
+                } catch (RuntimeException suppressed) {
+                    e.addSuppressed(suppressed);
+                }
+            }
+            System.err.println("WARN: HTTP/2 not started: " + e);
+        }
+    }
+
+    /** @return the bound HTTP/2 (TLS) port, or -1 if HTTP/2 is not running */
+    public int h2Port() {
+        return this.h2 == null ? -1 : this.h2.port();
+    }
+
+    /** @return the running HTTP/2 transport, or null */
+    public Transport h2() {
+        return this.h2;
+    }
+
+    /** @return why HTTP/2 could not start, or null */
+    public Throwable h2Failure() {
+        return this.h2Failure;
     }
 
     public ServerConfig config() {
@@ -305,6 +373,9 @@ public final class SjwsServer implements AutoCloseable {
         }
         this.shutdownTimeout = timeout;
         this.manager.shutdownTimeout(timeout);
+        if (this.h2 != null) {
+            this.h2.shutdownTimeout(timeout);
+        }
     }
 
     /** One-line summary for the startup log (never contains secrets). */
@@ -316,6 +387,14 @@ public final class SjwsServer implements AutoCloseable {
                     .append(')');
         } else if (this.config.h3Enabled()) {
             sb.append(", HTTP/3 unavailable");
+        }
+        if (this.h2 != null) {
+            sb.append(", HTTP/2 on tcp/").append(h2Port());
+            if (this.h2 instanceof sjws_nettask.h2.Http2Server s && s.h2cPort() >= 0) {
+                sb.append(" (h2c tcp/").append(s.h2cPort()).append(')');
+            }
+        } else if (this.config.h2Enabled()) {
+            sb.append(", HTTP/2 unavailable");
         }
         sb.append(", serving ").append(this.config.root());
         if (this.config.accessLog() != null) {
@@ -356,8 +435,23 @@ public final class SjwsServer implements AutoCloseable {
             if (this.h3 != null) {
                 this.h3.stopAccepting(); // together with TCP, before the listen socket closes
             }
+            if (this.h2 != null) {
+                this.h2.stopAccepting();
+            }
             if (this.manager != null) {
                 this.manager.close();
+            }
+            Thread h2Shutdown = null;
+            if (this.h2 != null) { // GOAWAY was sent by stopAccepting; drains in parallel with HTTP/1
+                var transport = this.h2;
+                h2Shutdown = new Thread(() -> {
+                    try {
+                        transport.close();
+                    } catch (RuntimeException e) {
+                        System.err.println("WARN: error closing " + transport.name() + ": " + e);
+                    }
+                }, "h2-shutdown");
+                h2Shutdown.start();
             }
             Thread h3Shutdown = null;
             if (this.h3 != null) {
@@ -379,6 +473,9 @@ public final class SjwsServer implements AutoCloseable {
                 }
                 if (h3Shutdown != null) {
                     h3Shutdown.join(waitMs);
+                }
+                if (h2Shutdown != null) {
+                    h2Shutdown.join(waitMs);
                 }
             } catch (InterruptedException e) {
                 interrupted = true;
