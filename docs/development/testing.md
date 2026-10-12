@@ -21,6 +21,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
 | `observe/NodeReporterTest` | control heartbeat: 5 s cadence reuses the report, sequence advances only on a fresh take, cumulative 4xx/5xx, health and config generation suppliers, log2 histogram merge and p99 bucket bound |
+| `observe/ClusterBoardTest` | cluster aggregate: per-node rate from cumulative snapshots, restart zeroes the interval, merged p99, errors by node and route, config drift, label-name cap |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |
@@ -90,6 +91,7 @@ Every user-visible behaviour and the test that asserts it.
 | `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
 | access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed; the observe filter is order 0 and is absent while off | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test`; HTTP/2 recording in `h2/H2ConfigAndWiringTest` |
 | control heartbeat report (cumulative snapshot, 5 s cache, histogram merge by index) | `observe/NodeReporterTest` |
+| cluster requests/s, merged p99, errors by node and route, config drift, shown on the admin status view when a board is attached | `observe/ClusterBoardTest`, `admin/AdminTuiTest` |
 | gateway mode off matches standalone file serving (ephemeral ports, no `cp-` thread, applied version 0) | `clusterharness/ClusterScenariosTest` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
