@@ -27,6 +27,6 @@ public final class H3Transports {
     }
 
     public static Transport.Factory defaultFactory() {
-        return (config, handler) -> new sjws_nettask.h3.Http3Transport(config, handler);
+        return (config, handler) -> new sjws_nettask.h3.Http3Server(config, handler);
     }
 }
