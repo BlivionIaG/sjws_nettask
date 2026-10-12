@@ -108,7 +108,7 @@
             <goals><goal>report</goal></goals>
           </execution>
           <!-- Gate: per-package rules (measured 2026-10-12, set ~2-3 pts below). Every production
-               package is gated; h3 (92.5/91.5) and tls (93.1/94.1) were measured on the merged http3 branch. -->
+               package is gated; gates sit ~1-2 points under the coverage measured on 2026-10-12 (root 97.8/98.7, http1 99.7/99.1, h3 95.9/91.4, tls 96.0/94.5, core 95.2/90.9). -->
           <execution>
             <id>check</id>
             <phase>verify</phase>
@@ -120,24 +120,24 @@
                 <element>PACKAGE</element>
                 <includes><include>sjws_nettask.core</include></includes>
                 <limits>
-                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.87</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.78</minimum></limit>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.94</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.89</minimum></limit>
                 </limits>
               </rule>
               <rule>
                 <element>PACKAGE</element>
                 <includes><include>sjws_nettask.http1</include></includes>
                 <limits>
-                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.88</minimum></limit>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.98</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.97</minimum></limit>
                 </limits>
               </rule>
               <rule>
                 <element>PACKAGE</element>
                 <includes><include>sjws_nettask</include></includes>
                 <limits>
-                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.80</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.78</minimum></limit>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.96</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.96</minimum></limit>
                 </limits>
               </rule>
               <rule>
@@ -240,40 +240,40 @@
       <id>h3-gate-linux-x86_64</id>
       <activation><os><name>linux</name><arch>amd64</arch></os></activation>
       <properties>
-        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
-        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+        <h3.gate.line>0.94</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.95</tls.gate.line><tls.gate.branch>0.93</tls.gate.branch>
       </properties>
     </profile>
     <profile>
       <id>h3-gate-linux-aarch64</id>
       <activation><os><name>linux</name><arch>aarch64</arch></os></activation>
       <properties>
-        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
-        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+        <h3.gate.line>0.94</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.95</tls.gate.line><tls.gate.branch>0.93</tls.gate.branch>
       </properties>
     </profile>
     <profile>
       <id>h3-gate-mac-x86_64</id>
       <activation><os><family>mac</family><arch>x86_64</arch></os></activation>
       <properties>
-        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
-        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+        <h3.gate.line>0.94</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.95</tls.gate.line><tls.gate.branch>0.93</tls.gate.branch>
       </properties>
     </profile>
     <profile>
       <id>h3-gate-mac-aarch64</id>
       <activation><os><family>mac</family><arch>aarch64</arch></os></activation>
       <properties>
-        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
-        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+        <h3.gate.line>0.94</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.95</tls.gate.line><tls.gate.branch>0.93</tls.gate.branch>
       </properties>
     </profile>
     <profile>
       <id>h3-gate-windows-x86_64</id>
       <activation><os><family>windows</family><arch>amd64</arch></os></activation>
       <properties>
-        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
-        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+        <h3.gate.line>0.94</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.95</tls.gate.line><tls.gate.branch>0.93</tls.gate.branch>
       </properties>
     </profile>
   </profiles>
