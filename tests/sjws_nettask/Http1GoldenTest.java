@@ -25,7 +25,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Byte-for-byte regression check of the HTTP/1.1 wire output (Date normalised).
+ * Byte-for-byte regression check of the HTTP/1.1 wire output (Date and the file-key part of ETag
+ * normalised). S3 changes vs review-fixes: ETag on file responses; 304 carries only ETag and
+ * Last-Modified (no Content-Type/Accept-Ranges, RFC 9110 §15.4.5).
  * <p>
  * Golden file: tests/regression/http1-golden.txt, captured from the review-fixes jar with
  * {@code mvn test -Dtest=Http1GoldenTest -Dgolden.jar=/path/to/before.jar}
@@ -36,6 +38,8 @@ class Http1GoldenTest {
     static final Path GOLDEN = Path.of("tests", "regression", "http1-golden.txt");
     static final Instant MTIME = Instant.parse("2001-02-03T04:05:06Z");
     static final Pattern DATE = Pattern.compile("\r\nDate: [^\r]*\r\n");
+    /** The file-key (inode) hash differs per run; the W/ marker, mtime and size parts stay checked. */
+    static final Pattern ETAG_KEY = Pattern.compile("\r\nETag: (W/)?\"[0-9a-f]+-");
 
     @TempDir
     Path tmp;
@@ -122,7 +126,8 @@ class Http1GoldenTest {
 
     static String normalise(byte[] raw) {
         var text = new String(raw, StandardCharsets.ISO_8859_1);
-        return DATE.matcher(text).replaceAll("\r\nDate: <normalised>\r\n");
+        text = DATE.matcher(text).replaceAll("\r\nDate: <normalised>\r\n");
+        return ETAG_KEY.matcher(text).replaceAll("\r\nETag: $1\"<key>-");
     }
 
     static String capture(int port) throws IOException {
