@@ -313,7 +313,8 @@ public final class SjwsServer implements AutoCloseable {
             // A test or embedder supplied the file handler. Keep that instance as the snapshot
             // instead of compiling a second one beside it.
             Handler visible = snapshot.handler() == snapshot.files() ? injected : snapshot.handler();
-            snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation());
+            snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation(),
+                    snapshot.resources());
         }
         var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha);
         if (snapshot.document().server().h3Enabled()) {
@@ -501,9 +502,14 @@ public final class SjwsServer implements AutoCloseable {
             if (opened != null) {
                 opened.close();
             }
+            result.snapshot().close(); // never published: release its upstream pools
             return ReloadResult.rejected(this.live.get(), java.util.List.of("HTTP-01 listener: " + e.getMessage()));
         }
+        var replaced = this.live.get();
         this.live.set(result.snapshot());
+        if (replaced != result.snapshot()) {
+            replaced.close(); // old upstream pools: idle connections now, in-flight ones when they finish
+        }
         var server = result.snapshot().document().server();
         if (this.manager != null && this.manager.reaper() != null) {
             this.manager.reaper().update(server.idleTimeout(), server.headerTimeout(), server.writeTimeout());
@@ -853,6 +859,7 @@ public final class SjwsServer implements AutoCloseable {
                     Thread.currentThread().interrupt();
                 }
             }
+            this.live.get().close(); // upstream pools, after the listeners drained
         } finally {
             this.shutdownDone.countDown();
         }

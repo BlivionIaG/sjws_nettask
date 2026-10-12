@@ -96,6 +96,40 @@ class ResponseWriterTest {
     }
 
     @Test
+    void streamIsSentChunkByChunkAndEndsWithAnEmptyLastFrame() {
+        var r = new Recorder();
+        var src = new sjws_nettask.core.TestSource(false, new byte[3], new byte[4]);
+        assertEquals(ResponseWriter.Outcome.COMPLETE, write(r, new Response(200, ResponseHeaders.of(), new Body.Stream(7, src))));
+        assertEquals(7, r.bytes);
+        assertEquals(List.of(false, false, false, true), r.ends);
+        assertEquals(1, src.closes);
+        var unknown = new Recorder();
+        assertEquals(ResponseWriter.Outcome.COMPLETE, write(unknown,
+                new Response(200, ResponseHeaders.of(), new Body.Stream(-1, new sjws_nettask.core.TestSource(true, new byte[2])))));
+        assertEquals(2, unknown.bytes);
+    }
+
+    @Test
+    void streamLengthMismatchHeadAndClosedSink() {
+        var shortR = new Recorder();
+        assertEquals(ResponseWriter.Outcome.SHRANK, write(shortR,
+                new Response(200, ResponseHeaders.of(), new Body.Stream(9, new sjws_nettask.core.TestSource(false, new byte[2])))));
+        var longR = new Recorder();
+        assertEquals(ResponseWriter.Outcome.SHRANK, write(longR,
+                new Response(200, ResponseHeaders.of(), new Body.Stream(1, new sjws_nettask.core.TestSource(false, new byte[2])))));
+        var head = new Recorder();
+        var src = new sjws_nettask.core.TestSource(false, new byte[2]);
+        assertEquals(ResponseWriter.Outcome.COMPLETE, write(head,
+                new Response(200, ResponseHeaders.of(), new Body.Stream(2, src), true)));
+        assertEquals(List.of(true), head.ends);
+        assertEquals(1, src.closes);
+        var closed = new Recorder();
+        closed.failWrites = true;
+        assertEquals(ResponseWriter.Outcome.CLOSED, write(closed,
+                new Response(200, ResponseHeaders.of(), new Body.Stream(4, new sjws_nettask.core.TestSource(false, new byte[2], new byte[2])))));
+    }
+
+    @Test
     void noBodyEndsWithTheHead() {
         var r = new Recorder();
         assertEquals(ResponseWriter.Outcome.COMPLETE, write(r, StaticFileHandler.options()));

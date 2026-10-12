@@ -32,7 +32,7 @@ import sjws_nettask.core.StaticFileHandler;
  * A target with a {@code ..} path segment (also percent-encoded) is answered 400 before any route
  * is tried, so a prefix can never be escaped. Immutable and thread-safe.
  */
-public final class Router implements Handler {
+public final class Router implements Handler, AutoCloseable {
 
     /**
      * One rule.
@@ -110,6 +110,21 @@ public final class Router implements Handler {
 
     public List<Route> routes() {
         return List.of(this.routes);
+    }
+
+    /** Closes every route handler that holds resources (proxy connection pools), once each. */
+    @Override
+    public void close() {
+        var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
+        for (var r : this.routes) {
+            if (r.handler() instanceof AutoCloseable c && seen.add(c)) {
+                try {
+                    c.close();
+                } catch (Exception e) {
+                    System.err.println("WARN: closing route " + r.prefix() + ": " + e);
+                }
+            }
+        }
     }
 
     @Override

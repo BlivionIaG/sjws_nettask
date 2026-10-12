@@ -101,7 +101,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                 h.add(e.getKey(), e.getValue());
             }
         }
-        if (response.mayHaveBody()) {
+        if (response.mayHaveBody() && response.contentLength() >= 0) {
             h.add("content-length", Long.toString(response.contentLength()));
         }
         return h;

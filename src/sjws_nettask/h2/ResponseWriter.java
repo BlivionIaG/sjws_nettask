@@ -123,6 +123,11 @@ final class ResponseWriter {
     }
 
     private Outcome send(Response response) throws IOException, InterruptedException {
+        if (response.body() instanceof Body.Stream stream) {
+            try (var source = stream.source()) {
+                return sendStream(response, stream, source);
+            }
+        }
         boolean sendBody = response.sendsBody() && response.contentLength() > 0;
         if (sendBody && response.body() instanceof Body.FileBody file) {
             long deadline = System.nanoTime() + this.fileWait.toNanos();
@@ -208,6 +213,36 @@ final class ResponseWriter {
             this.previous = this.sink.data(Unpooled.wrappedBuffer(chunk), !data.hasRemaining());
         }
         return awaitLast();
+    }
+
+    /** Pulls the next chunk only after the previous write completed (backpressure). */
+    private Outcome sendStream(Response response, Body.Stream stream, Body.Stream.Source source)
+            throws IOException, InterruptedException {
+        if (!response.sendsBody() || stream.length() == 0) {
+            this.previous = this.sink.head(response, true);
+            return awaitLast();
+        }
+        this.sink.head(response, false);
+        long sent = 0;
+        while (true) {
+            var outcome = ready();
+            if (outcome != Outcome.COMPLETE) {
+                return outcome;
+            }
+            var data = source.next();
+            if (data == null) {
+                if (stream.length() >= 0 && sent != stream.length()) {
+                    return Outcome.SHRANK;
+                }
+                this.previous = this.sink.data(Unpooled.EMPTY_BUFFER, true);
+                return awaitLast();
+            }
+            sent += data.remaining();
+            if (stream.length() >= 0 && sent > stream.length()) {
+                return Outcome.SHRANK;
+            }
+            this.previous = this.sink.data(Unpooled.copiedBuffer(data), false);
+        }
     }
 
     /** The last write must also complete: a response is only done once the peer's window took it. */
