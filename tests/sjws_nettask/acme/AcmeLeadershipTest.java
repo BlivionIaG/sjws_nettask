@@ -23,6 +23,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.BiConsumer;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -78,6 +80,34 @@ class AcmeLeadershipTest {
         Thread.sleep(150);
         assertEquals(0, attempts.get());
         service.close();
+    }
+
+    @Test
+    void readyCallbacksThatAreNotLeaderReadyDoNotIssue() throws Exception {
+        var gate = new Gate();
+        var attempts = new AtomicInteger();
+        var service = new AcmeService(settings(dir.resolve("gate")), new ChallengeBoard(), material -> {
+        }, gate);
+        service.beforeAttempt = attempts::incrementAndGet;
+        service.start();
+        gate.leader = false;
+        gate.ready.accept(2L, 4L);
+        gate.leader = true;
+        gate.ready.accept(0L, 4L);
+        gate.ready.accept(2L, -1L);
+        gate.changed.accept(1L, Optional.of("self"));
+        Thread.sleep(100);
+        assertEquals(0, attempts.get());
+        gate.ready.accept(2L, 4L);
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (attempts.get() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertEquals(1, attempts.get());
+        gate.changed.accept(2L, Optional.of("self"));
+        service.update(settings(dir.resolve("gate")));
+        service.close();
+        gate.changed.accept(9L, Optional.empty());
     }
 
     @Test
@@ -155,6 +185,26 @@ class AcmeLeadershipTest {
     private static AcmeSettings settings(Path storage) {
         return new AcmeSettings(true, "http://127.0.0.1:1/directory", "ops@example.com",
                 java.util.List.of("example.com"), storage, 0, true, Duration.ofDays(30));
+    }
+
+    private static final class Gate implements ControlLeadership {
+        private boolean leader;
+        private BiConsumer<Long, Optional<String>> changed = (term, id) -> {
+        };
+        private BiConsumer<Long, Long> ready = (term, index) -> {
+        };
+
+        public boolean isLeader() {
+            return this.leader;
+        }
+
+        public void onLeaderChange(BiConsumer<Long, Optional<String>> listener) {
+            this.changed = listener;
+        }
+
+        public void leaderReady(BiConsumer<Long, Long> listener) {
+            this.ready = listener;
+        }
     }
 
     private static HashSet<String> names() {
