@@ -25,6 +25,9 @@ import sjws_nettask.core.StaticFileHandler;
 /**
  * Answers every request with a redirect to {@code location}; with {@code keepPath} the request
  * target is appended (so a Router route with rewrite "/" maps "/old/x?q" to location + "x?q").
+ * A run of leading slashes or backslashes in the target becomes one separator, so
+ * {@code /old//evil.example} cannot turn a relative location into the protocol-relative
+ * {@code //evil.example} (or {@code /\evil.example}, which browsers read the same way).
  */
 public record RedirectHandler(int status, String location, boolean keepPath) implements Handler {
 
@@ -44,10 +47,21 @@ public record RedirectHandler(int status, String location, boolean keepPath) imp
         var target = request.target();
         String loc = this.location;
         if (this.keepPath) {
-            loc = loc.endsWith("/") && target.startsWith("/") ? loc + target.substring(1) : loc + target;
+            loc = appendPath(loc, target);
         }
         var r = StaticFileHandler.error(this.status, request.headOnly());
         r.headers().set("location", loc);
         return r;
+    }
+
+    static String appendPath(String location, String target) {
+        int i = 0;
+        while (i < target.length() && (target.charAt(i) == '/' || target.charAt(i) == '\\')) {
+            i++;
+        }
+        if (i == 0) {
+            return location + target; // "?q", "*": nothing to join
+        }
+        return (location.endsWith("/") ? location : location + "/") + target.substring(i);
     }
 }

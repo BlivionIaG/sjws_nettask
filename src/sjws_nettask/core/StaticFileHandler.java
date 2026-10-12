@@ -49,6 +49,8 @@ public final class StaticFileHandler implements Handler {
     private final boolean allowUnlistableDirs;
     private final EntityTag.Policy etags;
     private final FileCache cache;
+    /** Directories without index.html: listing (true) or 404 (false). */
+    private final boolean listings;
 
     /** @throws UncheckedIOException if the root does not exist or is not a directory */
     public StaticFileHandler(Path root) {
@@ -90,6 +92,28 @@ public final class StaticFileHandler implements Handler {
         this.allowUnlistableDirs = allowUnlistableDirs;
         this.etags = new EntityTag.Policy(clock);
         this.cache = java.util.Objects.requireNonNull(cache, "cache");
+        this.listings = true;
+    }
+
+    private StaticFileHandler(StaticFileHandler base, boolean listings) {
+        this.resolver = base.resolver;
+        this.allowUnlistableDirs = base.allowUnlistableDirs;
+        this.etags = base.etags;
+        this.cache = base.cache;
+        this.listings = listings;
+    }
+
+    /**
+     * The same handler (root, policy, cache and ETag memory shared) with directory listings on or
+     * off. Off answers a directory without index.html with 404, as if it did not exist.
+     */
+    public StaticFileHandler withListings(boolean on) {
+        return on == this.listings ? this : new StaticFileHandler(this, on);
+    }
+
+    /** @return whether directories without index.html are listed */
+    public boolean listings() {
+        return this.listings;
     }
 
     /** The entity-tag policy (tests). */
@@ -189,6 +213,9 @@ public final class StaticFileHandler implements Handler {
                 var index = this.resolver.resolve(base + "index.html");
                 if (index != null && Files.isRegularFile(index.real())) {
                     return file(index, head, request.headers(), key);
+                }
+                if (!this.listings) {
+                    return error(404, head);
                 }
                 return listing(listVisible(resolved.real(), logical), decoded, head);
             }
@@ -330,6 +357,15 @@ public final class StaticFileHandler implements Handler {
                 .add("x-content-type-options", NOSNIFF)
                 .add("content-security-policy", HTML_CSP);
         return new Response(status, headers, Body.Bytes.of(html.getBytes(StandardCharsets.UTF_8)), head);
+    }
+
+    /**
+     * True for a page built by {@link #error}/{@link #html} here (identity check on the shared
+     * {@link #HTML_CSP} constant, so a proxied upstream response never qualifies). Lets a route
+     * re-render server-generated errors (e.g. as problem+json) without touching upstream bodies.
+     */
+    public static boolean isGenerated(Response response) {
+        return response.headers().get("content-security-policy") == HTML_CSP;
     }
 
     public static Response error(int status, boolean head) {

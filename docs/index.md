@@ -22,15 +22,20 @@ Back to the [README](../README.md) (quick start).
 - [Architecture](design/architecture.md)
 - [Implementation overview and measured performance](design/implementation-and-performance.md)
 - [Request routing and reverse proxy (proposal)](design/proxy-routing.md)
+- [Control plane: distributable access policy, operator RBAC and audit](design/control-plane-security.md)
 - [Messaging core (draft)](messaging/design.md)
 - [High availability (draft)](ha/design.md)
 - [Control plane / API gateway mode (draft)](design/control-plane.md)
+
+## Security
+- [Security audit (2026-10-13)](security/audit.md)
 
 ## Development
 - [Contributing](../CONTRIBUTING.md)
 - [Test suite catalog](development/testing.md)
 - [Integration and end-to-end tests](development/integration-tests.md)
 - [Request filters](development/filters.md)
+- [Perf-regression gate (CI)](development/perf-gate.md)
 
 ## Benchmarks
 - [Footprint report](benchmarks/footprint-report.md); harnesses: [bench/](../bench/README.md), [bench/footprint/](../bench/footprint/README.md)
