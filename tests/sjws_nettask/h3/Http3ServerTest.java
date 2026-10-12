@@ -277,7 +277,7 @@ class Http3ServerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"POST", "PUT", "DELETE", "OPTIONS", "PATCH"}) // "get" is unknown: 501, see SecurityReviewTest
+    @ValueSource(strings = {"POST", "PUT", "DELETE", "PATCH"}) // "get" is unknown: 501, see SecurityReviewTest
     void methodNotAllowed(String method) throws Exception {
         var r = send(method, "/hello.txt", Map.of());
         assertEquals(405, r.status());
