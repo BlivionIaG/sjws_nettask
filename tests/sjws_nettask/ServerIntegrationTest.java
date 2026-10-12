@@ -199,7 +199,7 @@ class ServerIntegrationTest {
             assertEquals(String.valueOf(Files.size(Path.of("HTML", "index.html"))), r.headers().get("content-length"));
         } else {
             assertEquals(405, r.statusCode());
-            assertEquals("GET, HEAD", r.headers().get("allow"));
+            assertEquals("GET, HEAD, OPTIONS", r.headers().get("allow"));
         }
     }
 
@@ -263,6 +263,91 @@ class ServerIntegrationTest {
             assertEquals(405, r.statusCode());
             assertEquals("close", r.headers().get("connection"));
             assertEquals(-1, s.getInputStream().read(), "no second response may follow");
+        }
+    }
+
+    @Test
+    void chunkedGetBodyIsDrainedAndConnectionKeptAlive() throws IOException {
+        // RFC 9112 §7.1: the body is consumed exactly, so the pipelined request after it is served.
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "GET /index.html HTTP/1.1\r\nHost: x\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n5;e=1\r\nhello\r\n0\r\nT: 1\r\n\r\n"
+                    + "HEAD /index.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            Response first = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(200, first.statusCode());
+            assertEquals("keep-alive", first.headers().get("connection"));
+            Response second = HttpTestSupport.readResponse(s.getInputStream(), true);
+            assertEquals(200, second.statusCode());
+            assertEquals(-1, s.getInputStream().read());
+        }
+    }
+
+    @Test
+    void chunkedExpectContinueGets100ThenFinal() throws IOException {
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "GET /index.html HTTP/1.1\r\nHost: x\r\n"
+                    + "Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n");
+            assertEquals(100, HttpTestSupport.readResponse(s.getInputStream(), true).statusCode());
+            HttpTestSupport.write(s.getOutputStream(), "3\r\nabc\r\n0\r\n\r\n");
+            assertEquals(200, HttpTestSupport.readResponse(s.getInputStream()).statusCode());
+        }
+    }
+
+    @Test
+    void malformedChunkedBodyIs400AndClose() throws IOException {
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "GET /index.html HTTP/1.1\r\nHost: x\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\nzz\r\n");
+            Response r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(400, r.statusCode());
+            assertEquals("close", r.headers().get("connection"));
+            assertEquals(-1, s.getInputStream().read());
+        }
+    }
+
+    @Test
+    void oversizedChunkedBodyIsAnsweredThenClosed() throws IOException {
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "GET /index.html HTTP/1.1\r\nHost: x\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n"
+                    + Long.toHexString(CONSTANTS.MAX_DRAINED_BODY + 1) + "\r\n");
+            Response r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(200, r.statusCode());
+            assertEquals("close", r.headers().get("connection"));
+        }
+    }
+
+    @Test
+    void chunkedPostIs405AndCloseWithoutReadingTheBody() throws IOException {
+        String body = "0\r\n\r\nGET /index.html HTTP/1.1\r\nHost: x\r\n\r\n";
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "POST / HTTP/1.1\r\nHost: x\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n" + body);
+            Response r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(405, r.statusCode());
+            assertEquals("close", r.headers().get("connection"));
+            assertEquals(-1, s.getInputStream().read(), "no second response may follow");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"*", "/index.html"})
+    void optionsAnswersAllowWithEmptyBodyAndKeepsAlive(String target) throws IOException {
+        try (var s = new Socket(InetAddress.getLoopbackAddress(), port)) {
+            s.setSoTimeout(TIMEOUT_MS);
+            HttpTestSupport.write(s.getOutputStream(), "OPTIONS " + target + " HTTP/1.1\r\nHost: x\r\n\r\n"
+                    + "GET /index.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            Response r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(200, r.statusCode());
+            assertEquals("GET, HEAD, OPTIONS", r.headers().get("allow"));
+            assertEquals("0", r.headers().get("content-length"));
+            assertEquals(0, r.body().length);
+            assertEquals(200, HttpTestSupport.readResponse(s.getInputStream()).statusCode());
         }
     }
 

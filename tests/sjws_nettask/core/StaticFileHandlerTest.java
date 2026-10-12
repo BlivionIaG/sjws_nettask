@@ -177,12 +177,27 @@ class StaticFileHandlerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"POST", "PUT", "DELETE", "OPTIONS", "PATCH", "TRACE", "CONNECT"})
+    @ValueSource(strings = {"POST", "PUT", "DELETE", "PATCH", "TRACE", "CONNECT"})
     void methodNotAllowed405(String method) throws IOException {
         var r = handler.handle(new Request(method, "/hello.txt"));
         assertEquals(405, r.status());
-        assertEquals("GET, HEAD", r.headers().get("allow"));
+        assertEquals("GET, HEAD, OPTIONS", r.headers().get("allow"));
         assertTrue(text(r).contains("405 Method Not Allowed"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"*", "/", "/hello.txt", "/missing.txt"})
+    void optionsAnswers200WithAllowAndNoContent(String target) {
+        var r = handler.handle(new Request("OPTIONS", target));
+        assertEquals(200, r.status());
+        assertEquals("GET, HEAD, OPTIONS", r.headers().get("allow"));
+        assertEquals(0, r.contentLength());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "HEAD"})
+    void asteriskTargetIs400ForOtherMethods(String method) {
+        assertEquals(400, handler.handle(new Request(method, "*")).status());
     }
 
     @ParameterizedTest
