@@ -15,6 +15,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `http1/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
+| `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/PlatformEdgeCaseTest` | case/Unicode/`%2F` behaviour per file system |
