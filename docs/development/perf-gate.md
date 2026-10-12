@@ -19,3 +19,9 @@ Run locally:
     mvn -B -q -DskipTests package   # in two checkouts
     tools/perf-gate/bench.sh base.jar head.jar /tmp/perf
     tools/perf-gate/compare.py /tmp/perf/base.jsonl /tmp/perf/head.jsonl --threshold 10
+
+The gateway-off mode is only reachable through the bench harness (`bench/GatewayBench.java`), not
+the server CLI, so the A/B gate compares standalone builds. Standalone vs gateway-off within one
+build is `tools/gateway-bench.sh`, run briefly in CI and at full length by
+`.github/workflows/cluster-tests.yml` (nightly, `workflow_dispatch`, or the `cluster-tests` PR label),
+together with the cluster harness (`mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test`).

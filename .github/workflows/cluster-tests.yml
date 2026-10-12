@@ -1,0 +1,45 @@
+name: Cluster tests
+
+# Multi-node cluster harness (tests/sjws_nettask/clusterharness, tag `cluster`) plus the
+# standalone vs gateway-off wrk comparison, at full length. Nightly, on demand, and on PRs
+# carrying the `cluster-tests` label. The short versions already run in CI on every PR.
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cluster-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cluster:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'cluster-tests')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Build
+        run: mvn -B -q -DskipTests package
+      - name: Cluster harness scenarios
+        run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Install wrk
+        run: sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q wrk
+      - name: wrk standalone vs gateway-off (full length)
+        run: tools/gateway-bench.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cluster-surefire-reports
+          path: target/surefire-reports/
+          if-no-files-found: ignore
