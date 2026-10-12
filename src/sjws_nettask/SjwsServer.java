@@ -309,6 +309,12 @@ public final class SjwsServer implements AutoCloseable {
             HaSettings ha) throws IOException {
         var board = new ChallengeBoard();
         var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
+        if (ha != null && ha.handler() instanceof StaticFileHandler injected) {
+            // A test or embedder supplied the file handler. Keep that instance as the snapshot
+            // instead of compiling a second one beside it.
+            Handler visible = snapshot.handler() == snapshot.files() ? injected : snapshot.handler();
+            snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation());
+        }
         var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha);
         if (snapshot.document().server().h3Enabled()) {
             server.startH3(h3Factory, storedCertificate(snapshot));
