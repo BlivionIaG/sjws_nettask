@@ -88,11 +88,16 @@ final class Http3Writer {
     }
 
     static Http3HeadersFrame headersFrame(Response response, Instant now) {
+        return headersFrame(response, HttpDate.format(now));
+    }
+
+    /** @param date the Date value, already formatted (see {@link sjws_nettask.core.DateClock}) */
+    static Http3HeadersFrame headersFrame(Response response, String date) {
         var frame = new DefaultHttp3HeadersFrame();
         var h = frame.headers();
         h.status(Integer.toString(response.status()));
         h.add("server", ServerInfo.NAME);
-        h.add("date", HttpDate.format(now));
+        h.add("date", date);
         for (var e : response.headers().entries()) {
             if (!NOT_COPIED.contains(e.getKey())) {
                 h.add(e.getKey(), e.getValue());
@@ -131,7 +136,7 @@ final class Http3Writer {
 
     private Outcome send(Response response) throws IOException, InterruptedException {
         boolean sendBody = response.sendsBody() && response.contentLength() > 0;
-        var head = headersFrame(response, Instant.now());
+        var head = headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now());
         if (sendBody && response.body() instanceof Body.FileBody file) {
             long deadline = System.nanoTime() + this.limits.slotWait().toNanos();
             if (!this.connectionFiles.tryAcquire(this.limits.slotWait().toNanos(), TimeUnit.NANOSECONDS)) {
