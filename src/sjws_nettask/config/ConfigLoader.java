@@ -963,6 +963,30 @@ public final class ConfigLoader {
     private record HostPattern(String host, boolean wildcard, String suffix) {
     }
 
+    /**
+     * {@code [v6]} route host: a real IPv6 literal (parsed without DNS, no zone id, no port),
+     * returned lower-case without brackets; {@link RouteSpec#routerHost()} brackets it again
+     * as {@code [::1]}, the form a Host header carries.
+     */
+    private static String ipv6Literal(String text, String path) {
+        var bad = new ConfigException(path + ": expected a bracketed IPv6 literal such as [::1] (no port)");
+        if (text.length() < 3 || text.indexOf(']') != text.length() - 1) {
+            throw bad;
+        }
+        var inner = text.substring(1, text.length() - 1);
+        if (inner.indexOf(':') < 0 || inner.indexOf('%') >= 0 || inner.indexOf('[') >= 0) {
+            throw bad;
+        }
+        try {
+            if (!(InetAddress.ofLiteral(inner) instanceof java.net.Inet6Address)) {
+                throw bad;
+            }
+        } catch (IllegalArgumentException e) {
+            throw bad;
+        }
+        return inner;
+    }
+
     private static HostPattern host(String value, String path) {
         var text = value.trim().toLowerCase(Locale.ROOT);
         if (text.startsWith("*.")) {
@@ -972,8 +996,11 @@ public final class ConfigLoader {
             }
             return new HostPattern(text, true, "." + rest);
         }
+        if (text.startsWith("[")) {
+            return new HostPattern(ipv6Literal(text, path), false, null);
+        }
         if (text.indexOf('*') >= 0 || text.indexOf(':') >= 0) {
-            throw new ConfigException(path + ": expected a name or *.suffix");
+            throw new ConfigException(path + ": expected a name, *.suffix or [ipv6]");
         }
         try {
             InetAddress.ofLiteral(text);
