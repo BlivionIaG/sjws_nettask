@@ -261,7 +261,9 @@ public final class Http3Server implements Transport {
         boolean refused = this.closed.get(); // read once: close() may flip it concurrently
         // accept() and the closeFuture listeners run on the one event loop, so size() is exact here
         if (refused || this.state.size() >= this.config.h3MaxConnections()) {
-            quic.close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
+            // Close once the handshake is done: a close from initChannel never reaches the client,
+            // which then hangs until its own timeout.
+            quic.pipeline().addLast(Refuse.INSTANCE);
             return;
         }
         var connection = new Connection(this.limits.newConnectionFiles());
@@ -275,6 +277,18 @@ public final class Http3Server implements Transport {
         }, null, null, new DefaultHttp3SettingsFrame(Http3Settings.defaultSettings()
                 .maxFieldSectionSize(CODEC_MAX_FIELD_SECTION)), true));
         quic.pipeline().addLast(QuietErrors.INSTANCE);
+    }
+
+    /** Closes a connection over the limit with H3_EXCESSIVE_LOAD as soon as it is established. */
+    @io.netty.channel.ChannelHandler.Sharable
+    static final class Refuse extends io.netty.channel.ChannelInboundHandlerAdapter {
+
+        static final Refuse INSTANCE = new Refuse();
+
+        @Override
+        public void channelActive(io.netty.channel.ChannelHandlerContext ctx) {
+            ((QuicChannel) ctx.channel()).close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
+        }
     }
 
     /** @return requests currently being handled or sent */
