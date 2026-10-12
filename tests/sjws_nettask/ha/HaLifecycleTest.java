@@ -17,6 +17,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.nio.channels.ServerSocketChannel;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import sjws_nettask.ClientManager;
 import sjws_nettask.HttpTestSupport;
 import sjws_nettask.ServerConfig;
@@ -31,6 +33,8 @@ import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.observe.ObserverSlot;
+import sjws_nettask.observe.RequestObserver;
 
 class HaLifecycleTest {
 
@@ -317,6 +321,126 @@ class HaLifecycleTest {
             var manager = new ClientManager(channel, ServerConfig.defaults(root));
             manager.expireIdleConnections();
             assertThrows(IllegalArgumentException.class, () -> manager.prepareGracefulDrain(0));
+        }
+    }
+
+    /** Health probes at startup plus an injected handler: the observe chain keeps that handler. */
+    @Test
+    void observingStartupKeepsAnInjectedHandler() throws Exception {
+        var settings = HaSettings.builder().drainDelay(Duration.ZERO).drainTimeout(Duration.ofMillis(500))
+                .handler(request -> text("injected")).build();
+        var config = ServerConfig.builder(root).port(0).healthz(true).build();
+        try (var server = SjwsServer.start(config, settings)) {
+            assertEquals(200, HttpTestSupport.get(server.tcpPort(), "/healthz", 2000).statusCode());
+            assertEquals("injected", HttpTestSupport.get(server.tcpPort(), "/x", 2000).bodyText());
+            assertTrue(server.requestHandler() instanceof HaHandler);
+        }
+    }
+
+    /** HTTP/2 with HA attached must see the HA handler and not a filter chain beside it. */
+    @Test
+    void http2DrainStopsAcceptingWithoutASideChain() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        var fake = new FakeH3();
+        var seen = new AtomicReference<FilterChain>();
+        Transport.Factory h2 = new Transport.Factory() {
+            @Override
+            public Transport create(ServerConfig config, StaticFileHandler handler, FilterChain chain, Handler terminal) {
+                seen.set(chain);
+                assertTrue(terminal instanceof HaHandler);
+                return fake;
+            }
+
+            @Override
+            public Transport create(ServerConfig config, StaticFileHandler handler) {
+                throw new AssertionError("HTTP/2 must receive the HA handler");
+            }
+        };
+        var settings = HaSettings.builder().drainDelay(Duration.ZERO).drainTimeout(Duration.ofMillis(500)).build();
+        var config = ServerConfig.builder(root).port(0).h2Enabled(true).h2Port(0).build();
+        try (var server = SjwsServer.start(config, (c, h) -> {
+            throw new AssertionError("HTTP/3 is off");
+        }, h2, null, null, settings)) {
+            assertNull(seen.get(), "HTTP/2 must not run a chain beside the HA handler");
+            assertTrue(server.describe().contains("HTTP/2"));
+            assertEquals("hello", HttpTestSupport.get(server.tcpPort(), "/hello.txt", 2000).bodyText());
+            server.drain();
+            assertTrue(fake.stops >= 1, "HTTP/2 stopped accepting during drain");
+        }
+    }
+
+    /** Clustering off: the filter chain is the request handler, and arming metrics keeps it. */
+    @Test
+    void filterChainIsTheRequestHandlerUntilMetricsArm() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        var hits = new AtomicInteger();
+        var filters = RequestFilters.create().add((request, next) -> {
+            hits.incrementAndGet();
+            return next.proceed(request);
+        });
+        try (var server = SjwsServer.start(ServerConfig.defaults(root).withPort(0), filters)) {
+            assertNull(server.ha());
+            assertSame(server.filterChain(), server.requestHandler());
+            server.armMetrics();
+            assertEquals("hello", HttpTestSupport.get(server.tcpPort(), "/hello.txt", 2000).bodyText());
+            assertEquals(1, hits.get());
+        }
+    }
+
+    /** A recording slot in front of the live supplier still serves the handler the supplier returns. */
+    @Test
+    void recordingSlotReadsTheLiveSupplier() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        var files = new StaticFileHandler(root, false, new FileCache(0));
+        var config = ServerConfig.builder(root).healthz(true).build();
+        try (var observer = RequestObserver.open(config); var listener = ServerSocketChannel.open()) {
+            listener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+            Supplier<Handler> handlers = () -> files;
+            var manager = new ClientManager(listener, config, handlers, ResponseHeaders::of, new ObserverSlot(observer));
+            var thread = new Thread(manager, "accept-live-supplier");
+            thread.start();
+            try {
+                int port = ((InetSocketAddress) listener.getLocalAddress()).getPort();
+                assertEquals("hello", HttpTestSupport.get(port, "/hello.txt", 2000).bodyText());
+                assertTrue(observer.metrics().snapshot().requests() >= 1);
+            } finally {
+                manager.close();
+                thread.join(2000);
+            }
+        }
+    }
+
+    /** Drain's shutdown wait reports a handler that is still running when the budget ends. */
+    @Test
+    void drainReportsAHandlerThatOutlastsTheBudget() throws Exception {
+        var entered = new CountDownLatch(1);
+        var settings = HaSettings.builder().drainDelay(Duration.ZERO).drainTimeout(Duration.ofMillis(40))
+                .handler(request -> {
+                    entered.countDown();
+                    long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(350);
+                    while (System.nanoTime() < end) {
+                        try {
+                            Thread.sleep(20);
+                        } catch (InterruptedException e) {
+                            // Stay past the drain budget so shutdown still sees the connection.
+                        }
+                    }
+                    return text("late");
+                }).build();
+        var server = SjwsServer.start(ServerConfig.defaults(root).withPort(0), settings);
+        try {
+            var worker = Thread.ofVirtual().start(() -> {
+                try {
+                    HttpTestSupport.get(server.tcpPort(), "/block", 3000);
+                } catch (IOException ignored) {
+                    // the socket may close while the handler is still running
+                }
+            });
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            server.drain();
+            worker.join(2000);
+        } finally {
+            server.close();
         }
     }
 
