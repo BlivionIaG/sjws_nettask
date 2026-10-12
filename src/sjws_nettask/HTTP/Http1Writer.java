@@ -26,6 +26,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import sjws_nettask.core.Body;
+import sjws_nettask.core.DateClock;
 import sjws_nettask.core.HttpDate;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.SafeOpen;
@@ -47,14 +48,28 @@ public final class Http1Writer {
     static final Set<String> REPRESENTATION = Set.of(
             "last-modified", "etag", "accept-ranges", "content-type", "content-encoding", "vary");
 
-    /** Names whose canonical case is not simple title case. */
-    private static final Map<String, String> CANONICAL = Map.of(
-            "etag", "ETag",
-            "www-authenticate", "WWW-Authenticate",
-            "content-md5", "Content-MD5",
-            "x-xss-protection", "X-XSS-Protection",
-            "dnt", "DNT",
-            "te", "TE");
+    /** Names whose canonical case is not simple title case, plus the common ones (saves building them). */
+    private static final Map<String, String> CANONICAL = Map.ofEntries(
+            Map.entry("etag", "ETag"),
+            Map.entry("www-authenticate", "WWW-Authenticate"),
+            Map.entry("content-md5", "Content-MD5"),
+            Map.entry("x-xss-protection", "X-XSS-Protection"),
+            Map.entry("dnt", "DNT"),
+            Map.entry("te", "TE"),
+            Map.entry("last-modified", "Last-Modified"),
+            Map.entry("accept-ranges", "Accept-Ranges"),
+            Map.entry("content-type", "Content-Type"),
+            Map.entry("location", "Location"),
+            Map.entry("allow", "Allow"),
+            Map.entry("alt-svc", "Alt-Svc"),
+            Map.entry("cache-control", "Cache-Control"),
+            Map.entry("vary", "Vary"));
+
+    /**
+     * Largest in-memory body sent together with the head in one {@code write}: covers every body the
+     * file cache holds ({@link sjws_nettask.core.FileCache#MAX_FILE_SIZE}) plus listings and error pages.
+     */
+    static final int SINGLE_WRITE_MAX = 256 * 1024;
 
     private static final int TRANSFER_BUFFER = 64 * 1024;
     private static final String CRLF = "\r\n";
@@ -81,10 +96,16 @@ public final class Http1Writer {
     /** Status line and header fields, terminated by the empty line. */
     public static String head(int status, ResponseHeaders headers, boolean withLength, long length,
             boolean keepAlive, ResponseHeaders extra, Instant now) {
+        return head(status, headers, withLength, length, keepAlive, extra, HttpDate.format(now));
+    }
+
+    /** Same, with the Date value already formatted (see {@link DateClock}). */
+    public static String head(int status, ResponseHeaders headers, boolean withLength, long length,
+            boolean keepAlive, ResponseHeaders extra, String date) {
         var sb = new StringBuilder(256)
                 .append("HTTP/1.1 ").append(status).append(' ').append(StaticFileHandler.reasonPhrase(status)).append(CRLF)
                 .append("Server: ").append(sjws_nettask.core.ServerInfo.NAME).append(CRLF)
-                .append("Date: ").append(HttpDate.format(now)).append(CRLF);
+                .append("Date: ").append(date).append(CRLF);
         var entries = headers.entries();
         for (var e : entries) {
             if (REPRESENTATION.contains(e.getKey())) {
@@ -112,7 +133,7 @@ public final class Http1Writer {
 
     public static byte[] serializeHead(Response response, boolean keepAlive, ResponseHeaders extra) {
         return head(response.status(), response.headers(), response.mayHaveBody(), response.contentLength(),
-                keepAlive, extra, Instant.now()).getBytes(StandardCharsets.ISO_8859_1);
+                keepAlive, extra, DateClock.SYSTEM.now()).getBytes(StandardCharsets.ISO_8859_1);
     }
 
     public static void write(OutputStream out, Response response, boolean keepAlive) throws IOException {
@@ -145,6 +166,14 @@ public final class Http1Writer {
                 out.write(serializeHead(response, keepAlive, extra));
                 copy(channel, file, out);
             }
+        } else if (sendBody && response.body() instanceof Body.Bytes bytes
+                && bytes.length() <= SINGLE_WRITE_MAX) {
+            // head + body in one write (one syscall even when it exceeds the stream's buffer)
+            var head = serializeHead(response, keepAlive, extra);
+            var all = new byte[head.length + (int) bytes.length()];
+            System.arraycopy(head, 0, all, 0, head.length);
+            bytes.data().duplicate().get(all, head.length, (int) bytes.length());
+            out.write(all);
         } else {
             out.write(serializeHead(response, keepAlive, extra));
             if (sendBody && response.body() instanceof Body.Bytes bytes) {
