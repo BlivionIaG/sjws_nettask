@@ -38,6 +38,7 @@ import sjws_nettask.core.RequestRules;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.RequestObserver;
 
 /**
  * One instance per request stream. Maps the HEADERS frame to a core {@link Request} as soon as it
@@ -157,7 +158,14 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                 }
             }
             var request = toRequest(headers, peer(stream), this.shared.captureFields());
-            start(stream, request, refusal(headers, request));
+            String referer = "-";
+            String userAgent = "-";
+            var obs = this.shared.observer();
+            if (obs != RequestObserver.NONE && obs.logHeaders()) {
+                referer = dash(first(headers, "referer"));
+                userAgent = dash(first(headers, "user-agent"));
+            }
+            start(stream, request, refusal(headers, request), referer, userAgent);
         } finally {
             ReferenceCountUtil.release(frame);
         }
@@ -183,7 +191,11 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         return status == 0 ? null : StaticFileHandler.error(status, request.headOnly());
     }
 
-    private void start(QuicStreamChannel stream, Request request, Response refusal) {
+    private static String dash(String value) {
+        return value == null || value.isEmpty() ? "-" : value;
+    }
+
+    private void start(QuicStreamChannel stream, Request request, Response refusal, String referer, String userAgent) {
         var limits = this.shared.limits();
         // Under pressure each connection gets only its share, so a few connections (one address) can't
         // hold the whole in-flight cap (verification V1); without pressure a client may use every stream.
@@ -194,7 +206,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
             return;
         }
         this.connection.inflight.incrementAndGet();
-        var task = new Task(stream, request, refusal);
+        var task = new Task(stream, request, refusal, referer, userAgent);
         try {
             this.shared.executor().execute(task);
         } catch (RejectedExecutionException e) { // shutting down
@@ -213,7 +225,13 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         stream.shutdown(Http3ErrorCode.H3_REQUEST_REJECTED.code());
     }
 
-    private Response respond(Request request) {
+    private Response respond(Request request, RequestObserver obs) {
+        if (obs != RequestObserver.NONE && obs.intercepts()) {
+            var special = obs.intercept(request.method(), request.target(), this.connection.loopback);
+            if (special != null) {
+                return special;
+            }
+        }
         try {
             return this.shared.handler().apply(request);
         } catch (RuntimeException e) { // StaticFileHandler never throws; a test seam might
@@ -227,14 +245,18 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         private final QuicStreamChannel stream;
         private final Request request;
         private final Response refusal;
+        private final String referer;
+        private final String userAgent;
         private final AtomicBoolean finished = new AtomicBoolean();
         private volatile Thread thread;
         private volatile boolean cancelled;
 
-        Task(QuicStreamChannel stream, Request request, Response refusal) {
+        Task(QuicStreamChannel stream, Request request, Response refusal, String referer, String userAgent) {
             this.stream = stream;
             this.request = request;
             this.refusal = refusal;
+            this.referer = referer;
+            this.userAgent = userAgent;
         }
 
         /** Interrupts the request's thread, or makes it return at once if it hasn't started yet. */
@@ -250,17 +272,41 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         public void run() {
             this.thread = Thread.currentThread();
             Http3Writer.Outcome outcome = Http3Writer.Outcome.FAILED;
+            Response response = null;
+            var obs = Http3RequestHandler.this.shared.observer();
+            boolean record = obs != RequestObserver.NONE;
+            long started = 0;
+            if (record) {
+                started = System.nanoTime();
+            }
             try {
                 if (this.cancelled || !this.stream.isActive()) {
                     outcome = Http3Writer.Outcome.CLOSED;
                     return;
                 }
-                var response = this.refusal != null ? this.refusal : respond(this.request);
+                response = this.refusal != null ? this.refusal : respond(this.request, obs);
                 outcome = new Http3Writer(this.stream, Http3RequestHandler.this.shared.limits(),
                         Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connection)
                         .write(response);
             } finally {
                 finish(outcome);
+                if (record && response != null) {
+                    observe(obs, response, outcome, started);
+                }
+            }
+        }
+
+        /** After the write, so the duration includes it. A reset before a response is not a request. */
+        private void observe(RequestObserver obs, Response response, Http3Writer.Outcome outcome, long started) {
+            long nanos = System.nanoTime() - started;
+            long bytes = outcome == Http3Writer.Outcome.COMPLETE && response.sendsBody()
+                    ? Math.max(0L, response.contentLength()) : 0L;
+            if (obs.logging()) {
+                var conn = Http3RequestHandler.this.connection;
+                obs.complete(response.status(), RequestObserver.HTTP_3, bytes, nanos, conn.remote, this.request.method(),
+                        this.request.target(), "HTTP/3", this.referer, this.userAgent);
+            } else {
+                obs.complete(response.status(), RequestObserver.HTTP_3, bytes, nanos);
             }
         }
 

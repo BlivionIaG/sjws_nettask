@@ -16,6 +16,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
+| `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |
@@ -67,6 +68,7 @@ Every user-visible behaviour and the test that asserts it.
 |---|---|
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
 | `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
+| access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
 | `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |

@@ -55,6 +55,72 @@ Run:
 | `--status` | | | print whether that server is running |
 | `--restart` | | | `--stop`, then start in the background |
 
+### Observability
+
+Off by default, and off means the request path does not touch it. The transports are given
+`RequestObserver.NONE`. A request then does one volatile read of that slot and a reference compare,
+and stops: no `System.nanoTime`, no `LongAdder` update, no latency compare-and-set, and no inspection
+of the path for `/healthz` or `/metrics`. A file at either path is served from the document root, the
+same as a build without this feature.
+
+Counters, the access log and the probes turn on only when something asks for them:
+
+| Option | Environment | Default | |
+|---|---|---|---|
+| `--access-log=PATH` | `WEB_SERVER_ACCESS_LOG` | off | `-` writes to stdout; any other value appends to that file. Unset leaves logging off. Setting it also turns counters on |
+| `--access-log-format=FMT` | `WEB_SERVER_ACCESS_LOG_FORMAT` | combined | `common`, `combined` or `json` |
+| `--metrics=MODE` | `WEB_SERVER_METRICS` | off | `/metrics` in Prometheus text. `MODE` is `off`, `localhost` or `on`. A bare `--metrics` means `localhost`. Any mode other than `off` also turns counters on |
+| `--no-metrics` | | | leave `/metrics` disabled |
+| `--healthz` | `WEB_SERVER_HEALTHZ` | off | GET and HEAD `/healthz` answer `ok` (and counters turn on). Off: a document-root file at `/healthz` is served |
+| `--no-healthz` | | | leave `/healthz` to the document root |
+
+The admin TUI is the other switch. `EmbeddedServerControl.status()` calls `server.metricsSnapshot()`,
+which is `armMetrics().snapshot()`. The first call replaces `NONE` with a recording observer; the next
+request on each transport starts sampling the clock and updating counters. That snapshot does not
+enable `/healthz` or `/metrics` — those stay at the flags above — so a document-root `/healthz` file
+is still served after the TUI has armed the counters. Reading `server.metrics()` without
+`metricsSnapshot()` does not arm anything; it returns the empty `NONE` registry.
+
+```java
+Snapshot snap = server.metricsSnapshot(); // arms on the first call, then reads
+snap.requests();
+```
+
+Request threads never write the log and never take a lock for it. Each response updates striped `LongAdder`s (status, protocol, a latency bucket, bytes). When logging is on, the thread formats one `byte[]` and enqueues it on a bounded lock-free queue; a single `access-log` thread writes and flushes. A full queue drops the line and counts it (`accessLogDropped` / `sjws_access_log_dropped_total`) instead of blocking the request.
+
+**Access line.** Common and combined are the NCSA formats, with the duration in microseconds appended. A zero body is `-`. Combined adds the quoted Referer and User-Agent. JSON is one object per line: `time` (UTC), `remote`, `method`, `path` (the request-target), `protocol`, `status`, `bytes`, `duration_us`, `referer`, `user_agent`. Quotes and controls in a CLF field are replaced with `?`. The client address is the numeric IP captured at accept (no reverse DNS).
+
+**Metrics API** (what an admin TUI reads; also rendered at `/metrics` when that endpoint is enabled):
+
+```java
+ServerMetrics metrics = server.metrics();
+Snapshot snap = metrics.snapshot();
+snap.requests();                  // responses so far
+snap.status(200);                 // by status code
+snap.protocol("HTTP/1.1");        // HTTP/1.0, HTTP/1.1, HTTP/2, HTTP/3, or other
+snap.bytesSent();                 // response body bytes (not headers)
+snap.activeConnections();         // HTTP/1.1 being served + established HTTP/3
+snap.http1Connections();
+snap.http3Connections();
+snap.accessLogDropped();
+snap.latency().count();
+snap.latency().sumNanos();
+snap.latency().maxNanos();
+snap.latency().meanNanos();
+snap.latency().upperBoundNanos(); // inclusive; the last bound is Long.MAX_VALUE
+snap.latency().counts();          // one bucket, not cumulative
+snap.latency().cumulative(i);     // Prometheus-style, through bucket i
+metrics.prometheus();             // text exposition 0.0.4
+```
+
+Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. `bytes` is the body size the handler committed to; a write that throws counts the request and 0 bytes. `/healthz` and `/metrics` are counted like any other response once those probes are enabled. With observability off, nothing is counted.
+
+**Latency histogram contract.** `sjws_http_request_duration_seconds` is a fixed log2 scale so a cluster can merge nodes by adding bucket `i` to bucket `i` (do not re-bin). Bounds are inclusive and stable: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 and 16384 ms, then everything above. `Snapshot.latency().counts()` is not cumulative; index `i` is `(previous bound, upperBoundNanos()[i]]`. `upperBoundNanos()` is `ServerMetrics.LATENCY_BOUNDS_NANOS` (the last entry is `Long.MAX_VALUE`). `ServerMetrics.LATENCY_LE_LABELS` is the Prometheus `le` for that same index: `0.001`, `0.002`, `0.004`, `0.008`, `0.016`, `0.032`, `0.064`, `0.128`, `0.256`, `0.512`, `1.024`, `2.048`, `4.096`, `8.192`, `16.384`, `+Inf`. The `/metrics` histogram is cumulative at those labels; adding two nodes' series with the same `le` is the merged cumulative. Changing a bound or a label is a breaking change for that merge.
+
+`/metrics` on `localhost` answers only a loopback peer (403 otherwise), so it stays safe on a public bind. `on` answers every client. Behind a proxy that connects from 127.0.0.1, `localhost` is the proxy, not the browser. The endpoint is not a document-root file: when it is off, a file named `metrics` is served normally.
+
+The hook is `RequestObserver`, held in a shared `ObserverSlot`. While the slot is `NONE` the transports do not call `intercept` or `complete`. When it is a recording observer they call `intercept` only if `/healthz` or `/metrics` is enabled, and `complete` after the response is written. `core.Handler` is the seam a middleware chain will decorate; that chain is not composed in the server yet, so the calls stay at the two transports and can move into one decorator later without changing the counters or the log.
+
 **HTTP/1.1 connections** run on blocking `SocketChannel`s, one virtual thread each. One timer thread
 enforces every deadline (no per-socket timeouts): `--idle-timeout` between requests,
 `--header-timeout` from the first byte of a request until its head (and any small body to discard,

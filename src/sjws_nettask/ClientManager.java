@@ -32,6 +32,8 @@ import java.util.function.Supplier;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserverSlot;
+import sjws_nettask.observe.RequestObserver;
 
 /**
  * Accept loop: hands every connection to a virtual thread ({@link Http1Connection} on a
@@ -55,6 +57,7 @@ public class ClientManager implements Runnable {
      */
     private final Handler override;
     private final Supplier<ResponseHeaders> extraHeaders;
+    private final ObserverSlot slot;
     private final Semaphore permits;
     private final AtomicInteger active = new AtomicInteger();
     private final sjws_nettask.core.PerIpLimit perIp;
@@ -83,7 +86,7 @@ public class ClientManager implements Runnable {
     /** Shares {@code handler} with other transports (HTTP/3). */
     public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
             Supplier<ResponseHeaders> extraHeaders) {
-        this(server, config, handler, extraHeaders, null);
+        this(server, config, handler, extraHeaders, null, RequestObserver.NONE);
     }
 
     /**
@@ -92,11 +95,42 @@ public class ClientManager implements Runnable {
      */
     public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
             Supplier<ResponseHeaders> extraHeaders, Handler override) {
+        this(server, config, handler, extraHeaders, override, RequestObserver.NONE);
+    }
+
+    /** Shares {@code handler} and one {@link RequestObserver} with other transports. */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, RequestObserver observer) {
+        this(server, config, handler, extraHeaders, null, observer);
+    }
+
+    /** Shares {@code handler} and the server's {@link ObserverSlot} with other transports. */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, ObserverSlot slot) {
+        this(server, config, handler, extraHeaders, null, slot);
+    }
+
+    /**
+     * @param override compiled filters or another terminal, or null to call {@code handler} directly
+     * @param observer {@link RequestObserver#NONE} leaves the hook off the request path
+     */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, Handler override, RequestObserver observer) {
+        this(server, config, handler, extraHeaders, override, new ObserverSlot(observer));
+    }
+
+    /**
+     * @param override compiled filters or another terminal, or null to call {@code handler} directly
+     * @param slot shared observer slot
+     */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, Handler override, ObserverSlot slot) {
         this.server = server;
         this.config = config;
         this.handler = handler;
         this.override = override;
         this.extraHeaders = extraHeaders;
+        this.slot = java.util.Objects.requireNonNull(slot, "slot");
         this.permits = new Semaphore(config.maxConnections());
         this.perIp = new sjws_nettask.core.PerIpLimit(config.maxConnectionsPerIp());
     }
@@ -182,11 +216,14 @@ public class ClientManager implements Runnable {
                     continue;
                 }
                 this.active.incrementAndGet();
+                String host = address.getHostAddress();
+                boolean loopback = address.isLoopbackAddress();
                 // never rejected: the executor is shut down only after this loop
                 executor.execute(() -> {
                     try {
                         var terminal = this.override != null ? this.override : this.handler;
-                        new Http1Connection(socket, terminal, this.extraHeaders, deadlines).run();
+                        new Http1Connection(socket, terminal, this.extraHeaders, deadlines, this.slot, host, loopback)
+                                .run();
                     } finally {
                         this.active.decrementAndGet();
                         this.perIp.release(address);
