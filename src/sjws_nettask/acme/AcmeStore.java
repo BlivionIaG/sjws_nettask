@@ -146,20 +146,17 @@ public final class AcmeStore {
     }
 
     /**
-     * Writes a secret by creating a 0600 temp file and moving it into place. Bytes are never
-     * written to the destination and then chmod'd. Without POSIX permissions the destination is
+     * Writes a secret by creating a 0600 temp file in the same directory and moving it into place.
+     * The destination is replaced in one move, so a reader never sees a partial PEM. When the
+     * filesystem cannot create a 0600 file or cannot move atomically, the temp file is created
+     * without a mode and then moved; if temp files themselves are unsupported the destination is
      * written directly and the process umask applies.
      */
     private void writeSecret(Path path, String contents) throws IOException {
         ensureDirectory();
-        if (!posix(path)) {
-            Files.writeString(path, contents);
-            return;
-        }
         Path tmp = null;
         try {
-            tmp = Files.createTempFile(path.getParent(), ".acme-", ".tmp",
-                    PosixFilePermissions.asFileAttribute(OWNER_RW));
+            tmp = secretTemp(path.getParent());
             Files.writeString(tmp, contents);
             try {
                 Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
@@ -174,6 +171,18 @@ public final class AcmeStore {
                 Files.deleteIfExists(tmp);
             }
         }
+    }
+
+    private static Path secretTemp(Path directory) throws IOException {
+        if (posix(directory)) {
+            try {
+                return Files.createTempFile(directory, ".acme-", ".tmp",
+                        PosixFilePermissions.asFileAttribute(OWNER_RW));
+            } catch (UnsupportedOperationException e) {
+                // the view was advertised, but this store cannot set a file mode
+            }
+        }
+        return Files.createTempFile(directory, ".acme-", ".tmp");
     }
 
     private static boolean posix(Path path) {
