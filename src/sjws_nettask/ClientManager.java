@@ -46,6 +46,8 @@ public class ClientManager implements Runnable {
     private final Supplier<ResponseHeaders> extraHeaders;
     private final Semaphore permits;
     private final AtomicInteger active = new AtomicInteger();
+    private final sjws_nettask.core.PerIpLimit perIp;
+    private final java.util.concurrent.atomic.LongAdder refusedPerIp = new java.util.concurrent.atomic.LongAdder();
 
     public ClientManager(ServerSocket server) {
         this(server, ServerConfig.defaults(CONSTANTS.DEFAULT_HTML_PATH));
@@ -74,6 +76,12 @@ public class ClientManager implements Runnable {
         this.handler = handler;
         this.extraHeaders = extraHeaders;
         this.permits = new Semaphore(config.maxConnections());
+        this.perIp = new sjws_nettask.core.PerIpLimit(config.maxConnectionsPerIp());
+    }
+
+    /** @return connections closed at accept because their address already had the per-IP maximum */
+    public long refusedPerIp() {
+        return this.refusedPerIp.sum();
     }
 
     /** @return number of connections currently being served */
@@ -106,6 +114,13 @@ public class ClientManager implements Runnable {
                     Thread.sleep(backoff.next()); // e.g. EMFILE: don't spin at 100% CPU
                     continue;
                 }
+                var address = socket.getInetAddress();
+                if (!this.perIp.tryAcquire(address)) { // one address can't take every connection slot
+                    this.refusedPerIp.increment();
+                    this.permits.release();
+                    closeQuietly(socket);
+                    continue;
+                }
                 try {
                     socket.setTcpNoDelay(true); // responses are flushed whole; don't wait for Nagle/delayed ACK
                     this.active.incrementAndGet();
@@ -114,11 +129,13 @@ public class ClientManager implements Runnable {
                             new Client(socket, this.handler, this.config, this.extraHeaders).run();
                         } finally {
                             this.active.decrementAndGet();
+                            this.perIp.release(address);
                             this.permits.release();
                         }
                     });
                 } catch (IOException | RuntimeException e) {
                     this.active.decrementAndGet();
+                    this.perIp.release(address);
                     this.permits.release();
                     System.err.println("Could not start client: " + e);
                     closeQuietly(socket);

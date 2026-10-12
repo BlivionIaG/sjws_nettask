@@ -145,6 +145,40 @@ class ServerConfigTest {
         assertEquals(Duration.ZERO, c.altSvcMaxAge());
     }
 
+    /** Verification V1/V5: per-address caps and the HTTP/3 minimum rate. */
+    @Test
+    void perAddressAndRateFlags() {
+        var d = parse(Map.of()).config();
+        assertEquals(ServerConfig.DEFAULT_MAX_CONNECTIONS_PER_IP, d.maxConnectionsPerIp());
+        assertEquals(16, d.h3MaxConnectionsPerIp());
+        assertEquals(2048, d.h3MinRate());
+        var p = parse(Map.of(), "--h3", "--max-connections-per-ip=3", "--h3-max-connections-per-ip=4",
+                "--h3-min-rate=0");
+        assertTrue(p.ok(), p.errors().toString());
+        assertEquals(3, p.config().maxConnectionsPerIp());
+        assertEquals(4, p.config().h3MaxConnectionsPerIp());
+        assertEquals(0, p.config().h3MinRate(), "0 disables the check");
+        var env = Map.of("WEB_SERVER_MAX_CONNECTIONS_PER_IP", "5", "WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP", "6",
+                "WEB_SERVER_H3_MIN_RATE", "4096", "WEB_SERVER_H3", "true");
+        var e = parse(env, "--max-connections-per-ip=3").config();
+        assertEquals(5, e.maxConnectionsPerIp());
+        assertEquals(6, e.h3MaxConnectionsPerIp());
+        assertEquals(4096, e.h3MinRate());
+        var bad = parse(Map.of(), "--h3", "--max-connections-per-ip=0", "--h3-max-connections-per-ip=x",
+                "--h3-min-rate=-1");
+        assertEquals(ServerConfig.DEFAULT_MAX_CONNECTIONS_PER_IP, bad.config().maxConnectionsPerIp());
+        assertEquals(ServerConfig.DEFAULT_H3_MAX_CONNECTIONS_PER_IP, bad.config().h3MaxConnectionsPerIp());
+        assertEquals(ServerConfig.DEFAULT_H3_MIN_RATE, bad.config().h3MinRate());
+        assertEquals(3, bad.warnings().size(), bad.warnings().toString());
+        assertThrows(IllegalArgumentException.class,
+                () -> ServerConfig.builder(Path.of("/r")).maxConnectionsPerIp(0).build());
+        assertThrows(IllegalArgumentException.class,
+                () -> ServerConfig.builder(Path.of("/r")).h3MaxConnectionsPerIp(0).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).h3MinRate(-1).build());
+        var shown = ServerConfig.builder(Path.of("/r")).maxConnectionsPerIp(9).build().toString();
+        assertTrue(shown.contains("maxConnectionsPerIp=9"), shown);
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"true,true", "1,true", "YES,true", "on,true",
         "false,false", "0,false", "No,false", "off,false"})
@@ -269,7 +303,9 @@ class ServerConfigTest {
         for (var flag : java.util.List.of("--max-connections", "--idle-timeout", "--header-timeout", "--h3 ",
                 "--no-h3", "--h3-port", "--h3-host", "--h3-max-connections", "--cert", "--key=",
                 "--key-password-file", "--alt-svc-max-age", "WEB_SERVER_TLS_KEY_PASSWORD", "--help", "--alt-svc ",
-                "--no-alt-svc", "WEB_SERVER_ALT_SVC=", "--write-timeout", "WEB_SERVER_WRITE_TIMEOUT")) {
+                "--no-alt-svc", "WEB_SERVER_ALT_SVC=", "--write-timeout", "WEB_SERVER_WRITE_TIMEOUT",
+                "--max-connections-per-ip", "WEB_SERVER_MAX_CONNECTIONS_PER_IP", "--h3-max-connections-per-ip",
+                "WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP", "--h3-min-rate", "WEB_SERVER_H3_MIN_RATE")) {
             assertTrue(usage.contains(flag), "usage lacks " + flag);
         }
         for (var dropped : java.util.List.of("--max-pipelined", "--small-file-max", "--revalidate-ms")) {

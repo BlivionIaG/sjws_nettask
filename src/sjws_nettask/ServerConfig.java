@@ -48,10 +48,17 @@ import java.util.Objects;
  * @param accessLog not used yet: "-" for stdout, a file path, or null for off
  * @param altSvc send {@code Alt-Svc} on HTTP/1.1 responses once HTTP/3 is bound (opt-in: browsers
  *        ignore it on plain http:// origins, see the README)
+ * @param maxConnectionsPerIp concurrent HTTP/1.1 connections from one client IP address (generous:
+ *        browsers open ~6 per host, and many users may share one NAT address)
+ * @param h3MaxConnectionsPerIp established QUIC connections from one client IP address (a browser
+ *        needs one)
+ * @param h3MinRate HTTP/3: minimum average send rate per connection, bytes/s, enforced only while file
+ *        slots are contended (0 = off)
  */
 public record ServerConfig(int port, Path root, int maxConnections, Duration idleTimeout, Duration headerTimeout,
         Duration writeTimeout, boolean h3Enabled, int h3Port, String h3Host, int h3MaxConnections, Path tlsCert,
-        Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc) {
+        Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc,
+        int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate) {
 
     public static final int DEFAULT_PORT = CONSTANTS.DEFAULT_PORT;
     /** Design review M11: 64 KB output buffer per connection, so 2048 x 64 KB = 128 MB worst case. */
@@ -64,6 +71,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
     public static final int DEFAULT_H3_MAX_CONNECTIONS = 1024;
     public static final Duration DEFAULT_ALT_SVC_MAX_AGE = Duration.ofSeconds(86_400);
     public static final long DEFAULT_CACHE_BYTES = 64L * 1024 * 1024;
+    public static final int DEFAULT_MAX_CONNECTIONS_PER_IP = 256;
+    public static final int DEFAULT_H3_MAX_CONNECTIONS_PER_IP = 16;
+    public static final long DEFAULT_H3_MIN_RATE = 2048;
 
     public ServerConfig {
         if (port < 0 || port > 65535) {
@@ -74,7 +84,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(h3Host, "h3Host");
-        if (maxConnections < 1 || h3MaxConnections < 1) {
+        if (maxConnections < 1 || h3MaxConnections < 1 || maxConnectionsPerIp < 1
+                || h3MaxConnectionsPerIp < 1) {
             throw new IllegalArgumentException("connection limits must be positive");
         }
         for (var d : new Duration[] {idleTimeout, headerTimeout, writeTimeout}) {
@@ -84,6 +95,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if (altSvcMaxAge.isNegative()) {
             throw new IllegalArgumentException("altSvcMaxAge must not be negative");
+        }
+        if (h3MinRate < 0) {
+            throw new IllegalArgumentException("h3MinRate must not be negative");
         }
         if (cacheBytes < 0) {
             throw new IllegalArgumentException("cacheBytes must not be negative");
@@ -133,7 +147,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 + ", h3Enabled=" + h3Enabled + ", h3Port=" + h3Port + ", h3Host=" + h3Host
                 + ", h3MaxConnections=" + h3MaxConnections + ", tlsCert=" + tlsCert + ", tlsKey=" + tlsKey
                 + ", tlsKeyPassword=" + (tlsKeyPassword == null ? "null" : "****") + ", altSvcMaxAge=" + altSvcMaxAge
-                + ", cacheBytes=" + cacheBytes + ", accessLog=" + accessLog + ", altSvc=" + altSvc + "]";
+                + ", cacheBytes=" + cacheBytes + ", accessLog=" + accessLog + ", altSvc=" + altSvc
+                + ", maxConnectionsPerIp=" + maxConnectionsPerIp + ", h3MaxConnectionsPerIp="
+                + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + "]";
     }
 
     /** Mutable builder; new fields get a default here so existing callers keep compiling. */
@@ -142,6 +158,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         private int port = DEFAULT_PORT;
         private Path root;
         private int maxConnections = DEFAULT_MAX_CONNECTIONS;
+        private int maxConnectionsPerIp = DEFAULT_MAX_CONNECTIONS_PER_IP;
+        private int h3MaxConnectionsPerIp = DEFAULT_H3_MAX_CONNECTIONS_PER_IP;
+        private long h3MinRate = DEFAULT_H3_MIN_RATE;
         private Duration idleTimeout = DEFAULT_IDLE_TIMEOUT;
         private Duration headerTimeout = DEFAULT_HEADER_TIMEOUT;
         private Duration writeTimeout = DEFAULT_WRITE_TIMEOUT;
@@ -165,6 +184,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             this.port = c.port;
             this.root = c.root;
             this.maxConnections = c.maxConnections;
+            this.maxConnectionsPerIp = c.maxConnectionsPerIp;
+            this.h3MaxConnectionsPerIp = c.h3MaxConnectionsPerIp;
+            this.h3MinRate = c.h3MinRate;
             this.idleTimeout = c.idleTimeout;
             this.headerTimeout = c.headerTimeout;
             this.writeTimeout = c.writeTimeout;
@@ -184,6 +206,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public Builder port(int v) { this.port = v; return this; }
         public Builder root(Path v) { this.root = v; return this; }
         public Builder maxConnections(int v) { this.maxConnections = v; return this; }
+        public Builder maxConnectionsPerIp(int v) { this.maxConnectionsPerIp = v; return this; }
+        public Builder h3MaxConnectionsPerIp(int v) { this.h3MaxConnectionsPerIp = v; return this; }
+        public Builder h3MinRate(long v) { this.h3MinRate = v; return this; }
         public Builder idleTimeout(Duration v) { this.idleTimeout = v; return this; }
         public Builder headerTimeout(Duration v) { this.headerTimeout = v; return this; }
         public Builder writeTimeout(Duration v) { this.writeTimeout = v; return this; }
@@ -202,7 +227,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public ServerConfig build() {
             return new ServerConfig(port, root, maxConnections, idleTimeout, headerTimeout, writeTimeout, h3Enabled,
                     h3Port, h3Host, h3MaxConnections, tlsCert, tlsKey, tlsKeyPassword, altSvcMaxAge, cacheBytes,
-                    accessLog, altSvc);
+                    accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate);
         }
     }
 
@@ -229,6 +254,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   port                      TCP port (default 8080)                       WEB_SERVER_PORT
                   document root             folder to serve (default ./HTML)             WEB_SERVER_DIR
                   --max-connections=N       concurrent HTTP/1 connections (2048)          WEB_SERVER_MAX_CONNECTIONS
+                  --max-connections-per-ip=N  HTTP/1 connections per client IP (256)      WEB_SERVER_MAX_CONNECTIONS_PER_IP
                   --idle-timeout=S          keep-alive idle timeout, seconds (30)         WEB_SERVER_IDLE_TIMEOUT
                   --header-timeout=S        time to send a request head, seconds (10)     WEB_SERVER_HEADER_TIMEOUT
                   --write-timeout=S         HTTP/3: reset a stalled response, seconds (30) WEB_SERVER_WRITE_TIMEOUT
@@ -236,6 +262,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --h3-port=N               UDP port (default: the TCP port; 0 = ephemeral) WEB_SERVER_H3_PORT
                   --h3-host=ADDR            UDP bind address (0.0.0.0)                    WEB_SERVER_H3_HOST
                   --h3-max-connections=N    concurrent QUIC connections (1024)            WEB_SERVER_H3_MAX_CONNECTIONS
+                  --h3-max-connections-per-ip=N  QUIC connections per client IP (16)   WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP
+                  --h3-min-rate=B           bytes/s per connection while file slots are   WEB_SERVER_H3_MIN_RATE
+                                            contended (2048; 0 = off)
                   --cert=PATH               TLS certificate chain, PEM (self-signed)      WEB_SERVER_TLS_CERT
                   --key=PATH                TLS private key, PKCS#8 PEM                   WEB_SERVER_TLS_KEY
                   --key-password-file=PATH  file holding the key password                 WEB_SERVER_TLS_KEY_PASSWORD_FILE
@@ -289,6 +318,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         int h3Port = H3_PORT_SAME_AS_TCP;
         String h3Host = DEFAULT_H3_HOST;
         int h3Max = DEFAULT_H3_MAX_CONNECTIONS;
+        int perIp = DEFAULT_MAX_CONNECTIONS_PER_IP;
+        int h3PerIp = DEFAULT_H3_MAX_CONNECTIONS_PER_IP;
+        int minRate = (int) DEFAULT_H3_MIN_RATE;
         String cert = null;
         String key = null;
         String passwordFile = null;
@@ -308,6 +340,15 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 var value = eq < 0 ? null : arg.substring(eq + 1);
                 switch (name) {
                     case "--max-connections" -> max = number(value, max, 1, 10_000_000, name, warnings);
+                    case "--max-connections-per-ip" -> perIp = number(value, perIp, 1, 10_000_000, name, warnings);
+                    case "--h3-max-connections-per-ip" -> {
+                        h3PerIp = number(value, h3PerIp, 1, 10_000_000, name, warnings);
+                        explicitH3Options.add(name);
+                    }
+                    case "--h3-min-rate" -> {
+                        minRate = number(value, minRate, 0, 1_000_000_000, name, warnings);
+                        explicitH3Options.add(name);
+                    }
                     case "--idle-timeout" -> idle = number(value, idle, 1, 86_400, name, warnings);
                     case "--header-timeout" -> header = number(value, header, 1, 86_400, name, warnings);
                     case "--write-timeout" -> write = number(value, write, 1, 86_400, name, warnings);
@@ -371,6 +412,17 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if ((v = env.get("WEB_SERVER_MAX_CONNECTIONS")) != null) {
             max = number(v, max, 1, 10_000_000, "WEB_SERVER_MAX_CONNECTIONS", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_MAX_CONNECTIONS_PER_IP")) != null) {
+            perIp = number(v, perIp, 1, 10_000_000, "WEB_SERVER_MAX_CONNECTIONS_PER_IP", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP")) != null) {
+            h3PerIp = number(v, h3PerIp, 1, 10_000_000, "WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP", warnings);
+            explicitH3Options.add("WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP");
+        }
+        if ((v = env.get("WEB_SERVER_H3_MIN_RATE")) != null) {
+            minRate = number(v, minRate, 0, 1_000_000_000, "WEB_SERVER_H3_MIN_RATE", warnings);
+            explicitH3Options.add("WEB_SERVER_H3_MIN_RATE");
         }
         if ((v = env.get("WEB_SERVER_IDLE_TIMEOUT")) != null) {
             idle = number(v, idle, 1, 86_400, "WEB_SERVER_IDLE_TIMEOUT", warnings);
@@ -457,7 +509,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     + " ha" + (explicitH3Options.size() == 1 ? "s" : "ve") + " no effect (add --h3)");
         }
 
-        var config = b.port(port).root(Path.of(dir)).maxConnections(max)
+        var config = b.port(port).root(Path.of(dir)).maxConnections(max).maxConnectionsPerIp(perIp)
+                .h3MaxConnectionsPerIp(h3PerIp).h3MinRate(minRate)
                 .idleTimeout(Duration.ofSeconds(idle)).headerTimeout(Duration.ofSeconds(header))
                 .writeTimeout(Duration.ofSeconds(write)).altSvc(altSvcOn)
                 .h3Enabled(h3).h3Port(h3Port).h3Host(h3Host).h3MaxConnections(h3Max)
