@@ -336,4 +336,23 @@ class TlsMaterialTest {
             }
         }
     }
+
+    @Test
+    void selfSignedNamesTheHostLocalhostAndLoopbackAddresses() throws Exception {
+        var sans = TlsMaterial.selfSigned("example.test").certificate().getSubjectAlternativeNames().stream()
+                .map(l -> l.get(0) + "=" + l.get(1)).toList();
+        assertEquals(java.util.List.of("2=example.test", "2=localhost", "7=127.0.0.1", "7=0:0:0:0:0:0:0:1"), sans);
+        var local = TlsMaterial.selfSigned("localhost").certificate().getSubjectAlternativeNames().stream()
+                .map(l -> l.get(0) + "=" + l.get(1)).toList();
+        assertEquals(java.util.List.of("2=localhost", "7=127.0.0.1", "7=0:0:0:0:0:0:0:1"), local);
+    }
+
+    @Test
+    void keyOfAnotherAlgorithmIsRefused() throws Exception {
+        var files = writePem(this.tmp, TlsMaterial.selfSigned("localhost"));
+        var ed = java.security.KeyPairGenerator.getInstance("Ed25519").generateKeyPair().getPrivate();
+        java.nio.file.Files.writeString(files[1], "-----BEGIN PRIVATE KEY-----\n"
+                + java.util.Base64.getMimeEncoder().encodeToString(ed.getEncoded()) + "\n-----END PRIVATE KEY-----\n");
+        assertThrows(java.io.IOException.class, () -> TlsMaterial.fromPem(files[0], files[1], null));
+    }
 }

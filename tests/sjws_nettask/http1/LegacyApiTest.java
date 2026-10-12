@@ -81,4 +81,27 @@ class LegacyApiTest {
         assertEquals("text/html", sjws_nettask.CONSTANTS.MIME_TYPE.get("html"));
         assertSame(sjws_nettask.core.Mime.types(), sjws_nettask.CONSTANTS.MIME_TYPE);
     }
+
+    @Test
+    void pageSendFileReturnsTheStatus() throws IOException {
+        var f = Files.writeString(root.resolve("f.txt"), "hello");
+        assertEquals(200, Page.sendFile(out, f, false, true));
+        assertTrue(text().endsWith("hello"));
+        out.reset();
+        assertEquals(304, Page.sendFile(out, f, false, true, "Sun, 01 Jan 2090 00:00:00 GMT"));
+        assertTrue(text().startsWith("HTTP/1.1 304 "), text());
+    }
+
+    @Test
+    void htmlSendOnASocketFlushesTheResponse() throws Exception {
+        Files.writeString(root.resolve("s.txt"), "sock");
+        try (var server = new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress());
+                var client = new java.net.Socket(server.getInetAddress(), server.getLocalPort());
+                var accepted = server.accept()) {
+            new HTML(root.toString()).send(accepted, "/s.txt");
+            accepted.shutdownOutput();
+            var got = new String(client.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
+            assertTrue(got.startsWith("HTTP/1.1 200 OK\r\n") && got.endsWith("sock"), got);
+        }
+    }
 }
