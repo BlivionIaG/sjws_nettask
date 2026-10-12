@@ -242,6 +242,14 @@
                   <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>${tls.gate.branch}</minimum></limit>
                 </limits>
               </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.routing</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.95</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
+                </limits>
+              </rule>
               </rules>
             </configuration>
           </execution>

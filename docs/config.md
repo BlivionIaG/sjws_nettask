@@ -151,13 +151,18 @@ and connections that already shook hands keep the old one.
 
 ## Routing
 
-Parsed and stored. Not dispatched: with `enabled: true` the server warns and
-still serves the document root. With `enabled: false` (the default) the request
-path does not build a router. The records map onto `Route(host, prefix, rewrite,
+With `enabled: true` each snapshot (startup and every reload) compiles the section
+into a `routing.Router` in front of the static handler (`config.RoutingCompiler`):
+`proxy` routes share one `ProxyHandler` (one connection pool) per upstream,
+`redirect` routes answer directly, `static` and unmatched requests go to the
+document root, and a path with a `..` segment is 400. ACME challenges are
+answered before any route. With `enabled: false` (the default) no router is built
+and the request path is unchanged. The records map onto `Route(host, prefix, rewrite,
 handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
-maxBody, proto)`. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+maxBody, proto, trustedProxies)`. Phase 1 proxies requests without a body
+(501 otherwise); see `docs/design/proxy-routing.md`. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
 TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) and `preserve_host`
-(default false) are kept beside that prototype `Settings` record.
+(default false) are parsed but not applied yet (phase 2).
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml
