@@ -301,4 +301,23 @@ class Http1ParserTest {
         var line = "GET /0123456789ab".getBytes(StandardCharsets.ISO_8859_1); // 17 bytes, no line end yet
         assertEquals(414, assertThrows(ParseError.class, () -> p.feed(line, 0, line.length)).status());
     }
+
+    @Test
+    void emptyTargetAndControlCharactersAreRejected() {
+        assertEquals(400, status("GET  HTTP/1.1\r\nHost: h\r\n\r\n"));
+        assertEquals(400, status("GET / HTTP/1.1\r\nHost: h\r\nX: a\u007fb\r\n\r\n"));
+        assertEquals(400, status("GET / HTTP/1.1\r\nHost: h\r\nX: a\u0001b\r\n\r\n"));
+    }
+
+    @Test
+    void valuesAreTrimmedOfSpacesAndTabsButKeepInnerTabs() throws Exception {
+        var r = parse("HEAD / HTTP/1.1\r\nHost: h\r\nX-A: \t a\tb \t\r\nX-B:\r\nx-a: second\r\n\r\n");
+        assertTrue(r.headOnly());
+        assertEquals("a\tb", r.header("X-A"));
+        assertEquals(java.util.List.of("a\tb", "second"), r.headers("x-A"));
+        assertEquals("", r.header("x-b"));
+        assertNull(r.header("x-missing"));
+        assertEquals(java.util.List.of(), r.headers("x-missing"));
+        assertFalse(parse("GET / HTTP/1.1\r\nHost: h\r\n\r\n").headOnly());
+    }
 }
