@@ -131,10 +131,10 @@ class HardeningIntegrationTest {
     }
 
     @Test
-    void transferEncodingWithContentLengthIs501AndClose() throws IOException {
+    void transferEncodingWithContentLengthIs400AndClose() throws IOException {
         start();
         expectStatusThenClose("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n"
-                + "0\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n", 501);
+                + "0\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n", 400);
     }
 
     @ParameterizedTest
