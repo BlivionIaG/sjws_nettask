@@ -113,7 +113,8 @@ class Http3ServerTest {
     }
 
     ServerConfig.Builder config() {
-        return ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0);
+        // every test client is 127.0.0.1: the per-address cap has its own test
+        return ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0).h3MaxConnectionsPerIp(1000);
     }
 
     @AfterAll
@@ -417,7 +418,7 @@ class Http3ServerTest {
     }
 
     @Test
-    void swappedFileIsRefusedWithStreamReset() throws Exception {
+    void swappedFileIsAnswered404() throws Exception {
         var file = this.root.resolve("swap.txt");
         var replacement = this.root.resolve("replacement.txt");
         Function<Request, Response> seam = req -> {
@@ -434,9 +435,9 @@ class Http3ServerTest {
         try (var s = seamServer(seam, config().build()); var c = new H3TestClient(this.tls.certificate())) {
             var q = c.connect(s.localAddress());
             var r = H3TestClient.get(q, "/swap.txt");
-            assertTrue(r.reset(), "expected a reset, got " + r.status());
-            assertEquals(-1, r.status(), "no head may be sent for a swapped file");
-            assertEquals(0, r.body().length);
+            assertFalse(r.reset(), "the 200 wasn't committed: an error response, not a reset");
+            assertEquals(404, r.status());
+            assertFalse(H3Fixture.text(r).contains("OTHER FILE"), "nothing of the other inode");
             assertTrue(H3TestClient.get(q, "/hello.txt").status() == 200, "connection survives");
             waitFor(() -> s.responses(Http3Writer.Outcome.SWAPPED) == 1);
         } finally {
@@ -461,8 +462,8 @@ class Http3ServerTest {
         };
         try (var s = seamServer(seam, config().build()); var c = new H3TestClient(this.tls.certificate())) {
             var r = H3TestClient.get(c.connect(s.localAddress()), "/victim.txt");
-            assertTrue(r.reset(), "expected a reset");
-            assertEquals(-1, r.status());
+            assertFalse(r.reset());
+            assertEquals(404, r.status());
             assertFalse(H3Fixture.text(r).contains(H3Fixture.SECRET));
             waitFor(() -> s.responses(Http3Writer.Outcome.SWAPPED) == 1);
         } finally {

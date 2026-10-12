@@ -38,6 +38,7 @@ import sjws_nettask.core.HttpDate;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.SafeOpen;
 import sjws_nettask.core.ServerInfo;
+import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Serializes a core {@link Response} on one HTTP/3 request stream: a HEADERS frame
@@ -72,14 +73,18 @@ final class Http3Writer {
     private final Limits limits;
     private final Semaphore serverFiles;
     private final Semaphore connectionFiles;
+    private final RateGuard rate; // the connection's
     private ChannelFuture previous; // last DATA write
-    private RateGuard rate;
+    private boolean sending; // registered with the rate guard
+    private long reported; // bytes reported to the rate guard
+    private boolean answered; // the file couldn't be opened and an error response was sent instead
 
-    Http3Writer(QuicStreamChannel channel, Limits limits, Semaphore serverFiles, Semaphore connectionFiles) {
+    Http3Writer(QuicStreamChannel channel, Limits limits, Semaphore serverFiles, Http3Server.Connection connection) {
         this.channel = channel;
         this.limits = limits;
         this.serverFiles = serverFiles;
-        this.connectionFiles = connectionFiles;
+        this.connectionFiles = connection.files;
+        this.rate = connection.rate;
     }
 
     static Http3HeadersFrame headersFrame(Response response, Instant now) {
@@ -103,7 +108,7 @@ final class Http3Writer {
     Outcome write(Response response) {
         try {
             var outcome = send(response);
-            if (outcome != Outcome.COMPLETE) {
+            if (outcome != Outcome.COMPLETE && !this.answered) {
                 reset(outcome);
             }
             return outcome;
@@ -117,6 +122,10 @@ final class Http3Writer {
         } catch (Error e) { // don't leave the stream open until the idle timeout
             reset(Outcome.FAILED);
             throw e;
+        } finally {
+            if (this.sending) {
+                this.rate.end();
+            }
         }
     }
 
@@ -157,7 +166,11 @@ final class Http3Writer {
         try {
             fc = SafeOpen.open(file);
         } catch (IOException e) {
-            return Outcome.SWAPPED; // deleted, swapped (symlink in any component, other inode), unreadable
+            // Deleted, swapped (symlink in any component, other inode, not a regular file), unreadable.
+            // Nothing was sent yet: answer with the matching error instead of a bare reset.
+            var outcome = send(StaticFileHandler.error(SafeOpen.status(e), false));
+            this.answered = outcome == Outcome.COMPLETE;
+            return Outcome.SWAPPED;
         }
         try (fc) {
             this.channel.write(head);
@@ -227,8 +240,10 @@ final class Http3Writer {
             return Outcome.CLOSED;
         }
         if (this.previous == null) {
-            this.rate = new RateGuard(this.limits.writeTimeout().toNanos(), this.limits.minBytesPerSecond(),
-                    System.nanoTime());
+            if (!this.sending) {
+                this.sending = true;
+                this.rate.begin(System.nanoTime());
+            }
             return Outcome.COMPLETE;
         }
         // CompletableFuture parks virtual threads cleanly (Netty's await() would pin the carrier).
@@ -242,7 +257,11 @@ final class Http3Writer {
         if (!this.previous.isSuccess()) {
             return Outcome.CLOSED;
         }
-        return this.rate.ok(sent, System.nanoTime()) ? Outcome.COMPLETE : Outcome.SLOW;
+        this.rate.sent(sent - this.reported);
+        this.reported = sent;
+        // Too slow only matters while others wait for file slots (a slow link alone is no attack).
+        boolean slow = !this.rate.ok(System.nanoTime()) && this.limits.filesContended(this.serverFiles);
+        return slow ? Outcome.SLOW : Outcome.COMPLETE;
     }
 
     private void reset(Outcome why) {

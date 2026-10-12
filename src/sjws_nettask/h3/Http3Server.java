@@ -101,6 +101,9 @@ public final class Http3Server implements Transport {
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
     private volatile boolean accepting = true;
+    private final java.util.concurrent.atomic.AtomicInteger halfOpen = new java.util.concurrent.atomic.AtomicInteger();
+    private final LongAdder droppedHandshakes = new LongAdder();
+    private sjws_nettask.core.PerIpLimit perIp;
     private final Map<Http3Writer.Outcome, LongAdder> outcomes = new EnumMap<>(Http3Writer.Outcome.class);
     private Limits limits;
     private Shared shared;
@@ -159,11 +162,18 @@ public final class Http3Server implements Transport {
     static final class Connection {
 
         final Semaphore files;
+        final java.util.concurrent.atomic.AtomicInteger inflight = new java.util.concurrent.atomic.AtomicInteger();
+        final RateGuard rate;
         long nextStreamId; // lowest client request stream id not seen yet
         long goAwayId = -1; // -1 = no GOAWAY sent; else streams with id >= this are refused
 
         Connection(Semaphore files) {
+            this(files, new RateGuard(1, 0));
+        }
+
+        Connection(Semaphore files, RateGuard rate) {
             this.files = files;
+            this.rate = rate;
         }
 
         /** @return false if the stream arrived after a GOAWAY that excluded it */
@@ -230,6 +240,7 @@ public final class Http3Server implements Transport {
             var ssl = QuicSslContextBuilder.forServer(this.tls.key(), null, this.tls.chain())
                     .applicationProtocols(Http3.supportedApplicationProtocols()).build();
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h3-request-", 0).factory());
+            this.perIp = new sjws_nettask.core.PerIpLimit(this.limits.connectionsPerIp());
             this.shared = new Shared(this.handler, this.executor, this.limits, new Semaphore(this.limits.maxInflight()),
                     new Semaphore(this.limits.maxOpenFiles()), this.outcomes);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
@@ -258,18 +269,38 @@ public final class Http3Server implements Transport {
         }
     }
 
+    /**
+     * A new QUIC connection, before its handshake (verification V2). Its source address may be spoofed,
+     * so it is only counted as half-open (capped by {@link Limits#maxHalfOpen()}, dropped after
+     * {@link Limits#handshakeTimeout()}); the connection limits apply once it is established
+     * ({@link Gate}). Runs on the event loop, like every listener below.
+     */
     private void accept(QuicChannel quic) {
-        boolean refused = !this.accepting; // read once: close() may flip it concurrently
-        // accept() and the closeFuture listeners run on the one event loop, so size() is exact here
-        if (refused || this.state.size() >= this.config.h3MaxConnections()) {
-            // Close once the handshake is done: a close from initChannel never reaches the client,
-            // which then hangs until its own timeout.
-            quic.pipeline().addLast(Refuse.INSTANCE);
+        if (this.halfOpen.incrementAndGet() > this.limits.maxHalfOpen()) {
+            this.halfOpen.decrementAndGet();
+            this.droppedHandshakes.increment();
+            quic.close(); // nothing useful can be sent to an unvalidated address
             return;
         }
-        var connection = new Connection(this.limits.newConnectionFiles());
-        this.state.put(quic, connection);
-        quic.closeFuture().addListener(f -> this.state.remove(quic));
+        var pending = new AtomicBoolean(true);
+        Runnable established = () -> {
+            if (pending.compareAndSet(true, false)) {
+                this.halfOpen.decrementAndGet();
+            }
+        };
+        var deadline = quic.eventLoop().schedule(() -> {
+            if (!quic.isActive()) {
+                this.droppedHandshakes.increment();
+                quic.close();
+            }
+        }, this.limits.handshakeTimeout().toNanos(), TimeUnit.NANOSECONDS);
+        quic.closeFuture().addListener(f -> {
+            established.run();
+            deadline.cancel(false);
+        });
+        var connection = new Connection(this.limits.newConnectionFiles(),
+                new RateGuard(this.limits.writeTimeout().toNanos(), this.limits.minBytesPerSecond()));
+        quic.pipeline().addLast(new Gate(connection, established, deadline));
         quic.pipeline().addLast(new Http3ServerConnectionHandler(new ChannelInitializer<QuicStreamChannel>() {
             @Override
             protected void initChannel(QuicStreamChannel stream) {
@@ -280,16 +311,57 @@ public final class Http3Server implements Transport {
         quic.pipeline().addLast(QuietErrors.INSTANCE);
     }
 
-    /** Closes a connection over the limit with H3_EXCESSIVE_LOAD as soon as it is established. */
-    @io.netty.channel.ChannelHandler.Sharable
-    static final class Refuse extends io.netty.channel.ChannelInboundHandlerAdapter {
+    /**
+     * Admits a connection once its handshake completes (the peer address is then validated): it counts
+     * against {@code h3MaxConnections} and the per-address limit from here on. Refused ones are closed
+     * with H3_EXCESSIVE_LOAD (a close before the handshake would never reach the client) and the HTTP/3
+     * handler behind this one never sees them become active.
+     */
+    private final class Gate extends io.netty.channel.ChannelInboundHandlerAdapter {
 
-        static final Refuse INSTANCE = new Refuse();
+        private final Connection connection;
+        private final Runnable established;
+        private final io.netty.util.concurrent.Future<?> deadline;
+
+        Gate(Connection connection, Runnable established, io.netty.util.concurrent.Future<?> deadline) {
+            this.connection = connection;
+            this.established = established;
+            this.deadline = deadline;
+        }
 
         @Override
         public void channelActive(io.netty.channel.ChannelHandlerContext ctx) {
-            ((QuicChannel) ctx.channel()).close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
+            this.established.run();
+            this.deadline.cancel(false);
+            var quic = (QuicChannel) ctx.channel();
+            var address = quic.remoteSocketAddress() instanceof InetSocketAddress isa ? isa.getAddress() : null;
+            boolean admitted = Http3Server.this.accepting
+                    && Http3Server.this.state.size() < Http3Server.this.config.h3MaxConnections()
+                    && (address == null || Http3Server.this.perIp.tryAcquire(address));
+            if (!admitted) {
+                quic.close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
+                return;
+            }
+            Http3Server.this.state.put(quic, this.connection);
+            quic.closeFuture().addListener(f -> {
+                Http3Server.this.state.remove(quic);
+                if (address != null) {
+                    Http3Server.this.perIp.release(address);
+                }
+            });
+            ctx.pipeline().remove(this);
+            ctx.fireChannelActive();
         }
+    }
+
+    /** @return connections still in their handshake */
+    int halfOpen() {
+        return this.halfOpen.get();
+    }
+
+    /** @return connections dropped before completing their handshake (over the cap or too slow) */
+    long droppedHandshakes() {
+        return this.droppedHandshakes.sum();
     }
 
     /** @return requests currently being handled or sent */
