@@ -25,6 +25,12 @@ import io.netty.handler.codec.http3.Http3HeadersFrame;
 import io.netty.handler.codec.http3.Http3RequestStreamInboundHandler;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.util.ReferenceCountUtil;
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.Request;
@@ -56,20 +62,83 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         this.connection = connection;
     }
 
-    /** Pseudo-headers and the fields the core understands; :authority wins over a host field. */
+    /** Six typed fields only. No header-map allocation. */
     static Request toRequest(Http3Headers h) {
+        return toRequest(h, null, false);
+    }
+
+    /** @param peer client UDP address, or null */
+    static Request toRequest(Http3Headers h, InetSocketAddress peer) {
+        return toRequest(h, peer, false);
+    }
+
+    /**
+     * @param captureFields when true, copy every regular header before the HEADERS frame is
+     *        released (the handler runs later, on another thread, so the frame cannot be retained).
+     *        Pseudo-headers stay out of the map; {@code :authority} still wins for
+     *        {@link RequestHeaders#host()}. When false, only the six typed fields are read, which
+     *        is the static-handler path
+     */
+    static Request toRequest(Http3Headers h, InetSocketAddress peer, boolean captureFields) {
         var method = h.method();
         var path = h.path();
         var authority = h.authority();
-        return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(),
-                new RequestHeaders(first(h, "if-none-match"), first(h, "if-modified-since"), first(h, "if-range"),
-                        first(h, "range"), first(h, "accept-encoding"),
-                        authority != null ? authority.toString() : first(h, "host")));
+        var auth = authority == null ? null : authority.toString();
+        var headers = captureFields
+                ? RequestHeaders.of(fieldMap(h), auth)
+                : new RequestHeaders(first(h, "if-none-match"), first(h, "if-modified-since"), first(h, "if-range"),
+                        first(h, "range"), first(h, "accept-encoding"), auth != null ? auth : first(h, "host"));
+        return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(), headers,
+                peer, true);
     }
 
     private static String first(Http3Headers h, String name) {
-        var v = h.get(name);
-        return v == null ? null : v.toString();
+        var value = h.get(name);
+        return value == null ? null : value.toString();
+    }
+
+    /**
+     * Client UDP address. {@link QuicStreamChannel#remoteAddress()} is a stream id, not the peer;
+     * the connection's {@code remoteSocketAddress} is the socket address.
+     */
+    static InetSocketAddress peer(QuicStreamChannel stream) {
+        var connection = stream.parent();
+        if (connection == null) {
+            return null;
+        }
+        var remote = connection.remoteSocketAddress();
+        if (remote instanceof InetSocketAddress inet) {
+            return inet;
+        }
+        return null;
+    }
+
+    /** Lower-case name to values, first-seen order, pseudo-headers excluded. Empty when there are none. */
+    private static Map<String, List<String>> fieldMap(Http3Headers headers) {
+        LinkedHashMap<String, List<String>> fields = null;
+        for (var entry : headers) {
+            var raw = entry.getKey();
+            if (raw.charAt(0) == ':') {
+                continue;
+            }
+            if (fields == null) {
+                fields = new LinkedHashMap<>();
+            }
+            var name = raw.toString();
+            var values = fields.get(name);
+            if (values == null) {
+                values = new ArrayList<>(1);
+                fields.put(name, values);
+            }
+            values.add(entry.getValue().toString());
+        }
+        if (fields == null) {
+            return Map.of();
+        }
+        for (var entry : fields.entrySet()) {
+            entry.setValue(List.copyOf(entry.getValue()));
+        }
+        return Collections.unmodifiableMap(fields);
     }
 
     @Override
@@ -88,7 +157,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                     return;
                 }
             }
-            var request = toRequest(headers);
+            var request = toRequest(headers, peer(stream), this.shared.captureFields());
             String referer = "-";
             String userAgent = "-";
             var obs = this.shared.observer();

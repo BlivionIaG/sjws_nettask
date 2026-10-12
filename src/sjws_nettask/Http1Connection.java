@@ -18,6 +18,8 @@ package sjws_nettask;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -27,8 +29,6 @@ import java.util.function.Supplier;
 
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
-import sjws_nettask.observe.ObserverSlot;
-import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
@@ -37,12 +37,15 @@ import sjws_nettask.http1.Http1Parser;
 import sjws_nettask.http1.Http1Requests;
 import sjws_nettask.http1.Http1Writer;
 import sjws_nettask.http1.ParseError;
+import sjws_nettask.observe.ObserverSlot;
+import sjws_nettask.observe.RequestObserver;
 
 /**
  * HTTP/1.x adapter for one connection on a blocking {@link SocketChannel} (run on a virtual
  * thread): parses with {@link Http1Parser.HeadParser}, maps to a core
  * {@link sjws_nettask.core.Request} ({@link Http1Requests}), asks the {@link Handler} (in production
- * the {@link StaticFileHandler}), serializes with {@link Http1Writer}. Deadlines (idle keep-alive,
+ * the {@link StaticFileHandler}, or a filter chain / router when one is installed), serializes with
+ * {@link Http1Writer}. Deadlines (idle keep-alive,
  * request head, writes) are enforced by the shared {@link ConnectionReaper}, not by socket
  * timeouts.
  * <p>
@@ -73,6 +76,14 @@ final class Http1Connection implements Runnable {
 
     private final SocketChannel channel;
     private final Handler handler;
+    /**
+     * Non-null only when {@link #handler} is the static file handler. {@link #apply} then calls
+     * {@link StaticFileHandler#handle} directly and does not go through {@link Handler}.
+     */
+    private final StaticFileHandler files;
+    private final InetSocketAddress peer;
+    /** Captured with {@link #peer} for the failure log; the channel may already be closed by then. */
+    private final String remote;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ConnectionReaper reaper;
     private final ObserverSlot slot;
@@ -98,6 +109,8 @@ final class Http1Connection implements Runnable {
 
     /**
      * @param extraHeaders transport-level fields added to every response (e.g. Alt-Svc); called per response
+     * @param handler static file handler, a filter chain, or another terminal. A
+     *        {@link StaticFileHandler} is called directly ({@link #apply})
      */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
@@ -117,6 +130,20 @@ final class Http1Connection implements Runnable {
             ConnectionReaper reaper, ObserverSlot slot, String clientHost, boolean loopback) {
         this.channel = channel;
         this.handler = handler;
+        this.files = handler instanceof StaticFileHandler direct ? direct : null;
+        var peer = (InetSocketAddress) null;
+        var remote = "(closed)";
+        try {
+            SocketAddress address = channel.getRemoteAddress();
+            remote = String.valueOf(address);
+            if (address instanceof InetSocketAddress inet) {
+                peer = inet;
+            }
+        } catch (IOException e) {
+            // already closed
+        }
+        this.peer = peer;
+        this.remote = remote;
         this.extraHeaders = extraHeaders;
         this.reaper = reaper;
         this.slot = java.util.Objects.requireNonNull(slot, "slot");
@@ -124,10 +151,23 @@ final class Http1Connection implements Runnable {
         this.loopback = loopback;
     }
 
+    /**
+     * Static files: one null test, then {@link StaticFileHandler#handle}. Anything else (a filter
+     * chain, a router, a test double) goes through {@link Handler}. The choice is fixed for the
+     * life of the connection.
+     */
+    private Response apply(Request request) {
+        var files = this.files;
+        if (files != null) {
+            return files.handle(request);
+        }
+        return this.handler.handle(request);
+    }
+
     @Override
     public void run() {
         var timer = this.reaper.register(this.channel);
-        var remote = remote(); // read now: the channel is closed by the time a failure is logged
+        var remote = this.remote; // captured at construction: the channel is closed by the time a failure is logged
         try (var ch = this.channel) {
             var out = new ChannelOutput(ch, timer);
             // Idle wait lives here, not in serveOne: a parked virtual thread keeps its frames, so
@@ -144,14 +184,6 @@ final class Http1Connection implements Runnable {
             }
         } finally {
             this.reaper.deregister(timer);
-        }
-    }
-
-    private String remote() {
-        try {
-            return String.valueOf(this.channel.getRemoteAddress());
-        } catch (IOException e) {
-            return "(closed)";
         }
     }
 
@@ -259,7 +291,7 @@ final class Http1Connection implements Runnable {
             return false;
         }
 
-        var core = Http1Requests.toCore(request);
+        var core = Http1Requests.toCore(request, this.peer);
         note(request);
         if (!core.headOnly() && !"GET".equals(core.method())) {
             // OPTIONS (200) or a known but unsupported method (405). Never read (possibly huge)
@@ -340,7 +372,7 @@ final class Http1Connection implements Runnable {
                 return special;
             }
         }
-        return this.handler.handle(core);
+        return apply(core);
     }
 
     /**

@@ -21,6 +21,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static sjws_nettask.h3.H3Fixture.assertParity;
@@ -415,6 +417,28 @@ class Http3ServerTest {
         assertEquals("bytes=1-2", rh.range());
         assertEquals("br", rh.acceptEncoding());
         assertEquals("example.org:443", rh.host());
+        assertTrue(rh.fields().isEmpty()); // static path: no header map
+        assertTrue(request.secure());
+        assertNull(request.peer());
+        var peer = new java.net.InetSocketAddress("127.0.0.1", 443);
+        var captured = Http3RequestHandler.toRequest(h, peer, true);
+        assertSame(peer, captured.peer());
+        var full = captured.headers();
+        assertEquals("\"a\"", full.ifNoneMatch());
+        assertEquals("example.org:443", full.host());
+        assertEquals(java.util.List.of("\"a\"", "\"b\""), full.values("if-none-match"));
+        assertEquals(java.util.List.of("ignored"), full.values("host"));
+        assertFalse(full.fields().containsKey(":method"));
+        assertFalse(full.fields().containsKey(":authority"));
+        assertEquals(java.util.List.of("if-none-match", "if-modified-since", "if-range", "range", "accept-encoding",
+                "host"), java.util.List.copyOf(full.fields().keySet()));
+
+        var onlyPseudo = new io.netty.handler.codec.http3.DefaultHttp3Headers();
+        onlyPseudo.method("GET").path("/").scheme("https");
+        var bare = Http3RequestHandler.toRequest(onlyPseudo);
+        assertTrue(bare.headers().fields().isEmpty());
+        assertNull(bare.headers().host());
+        assertTrue(bare.secure());
 
         var noAuthority = new io.netty.handler.codec.http3.DefaultHttp3Headers();
         noAuthority.add("host", "h.example");
@@ -423,6 +447,33 @@ class Http3ServerTest {
         assertEquals("", r2.target());
         assertEquals("h.example", r2.headers().host());
         assertEquals(null, r2.headers().range());
+        assertTrue(r2.headers().fields().isEmpty());
+        assertEquals(java.util.List.of("h.example"), Http3RequestHandler.toRequest(noAuthority, null, true).headers().values("host"));
+        assertTrue(r2.secure());
+
+        h.add("x-trace", "one");
+        var copied = Http3RequestHandler.toRequest(h, null, true);
+        h.set("x-trace", "mutated");
+        h.add("x-new", "after");
+        h.clear();
+        assertEquals(java.util.List.of("one"), copied.headers().values("x-trace"));
+        assertTrue(copied.headers().values("x-new").isEmpty());
+        assertEquals("example.org:443", copied.headers().host());
+        assertThrows(UnsupportedOperationException.class, () -> copied.headers().fields().clear());
+        assertThrows(UnsupportedOperationException.class, () -> copied.headers().values("x-trace").add("z"));
+    }
+
+    @Test
+    void rawHeadersAreCapturedOnlyForFiltersOrAnotherTerminal() {
+        var files = new StaticFileHandler(base);
+        assertFalse(Http3Server.captureFields(null, files, null));
+        assertFalse(Http3Server.captureFields(null, files, files));
+        var chain = sjws_nettask.core.RequestFilters.create().add((q, n) -> n.proceed(q)).build(files);
+        assertTrue(Http3Server.captureFields(chain, files, null));
+        sjws_nettask.core.Handler router = request -> {
+            throw new AssertionError("not called");
+        };
+        assertTrue(Http3Server.captureFields(null, files, router));
     }
 
     @Test

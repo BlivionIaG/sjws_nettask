@@ -2,8 +2,13 @@ package sjws_nettask.core;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /** Invariants of the frozen core contract. */
@@ -13,9 +18,49 @@ class ContractTest {
     void requestDefaults() {
         var r = new Request("HEAD", "/x");
         assertSame(RequestHeaders.NONE, r.headers());
+        assertTrue(r.headers().fields().isEmpty());
+        assertTrue(r.headers().all().isEmpty());
+        assertNull(r.peer());
+        assertFalse(r.secure());
         assertTrue(r.headOnly());
         assertFalse(new Request("GET", "/x").headOnly());
         assertThrows(NullPointerException.class, () -> new Request(null, "/"));
+        var cleared = new RequestHeaders(null, null, null, null, null, null, null);
+        assertTrue(cleared.fields().isEmpty());
+        assertSame(Map.of(), new RequestHeaders(null, null, null, null, null, null, Map.of()).fields());
+    }
+
+    @Test
+    void rawFieldsAreStoredInOrderAndRewritesKeepThePeer() {
+        var raw = new LinkedHashMap<String, List<String>>();
+        raw.put("host", List.of("example"));
+        raw.put("x-trace", List.of("a", "b"));
+        raw.put("range", List.of());
+        var frozen = Collections.unmodifiableMap(raw);
+        var headers = RequestHeaders.of(frozen);
+        assertSame(frozen, headers.fields());
+        assertEquals("example", headers.host());
+        assertNull(headers.range());
+        assertEquals(List.of("a", "b"), headers.values("x-trace"));
+        assertEquals(List.of(), headers.values("missing"));
+        assertEquals(List.of("host", "x-trace", "range"), List.copyOf(headers.fields().keySet()));
+        assertEquals(3, headers.all().size());
+        assertEquals("a", headers.all().get(1).getValue());
+        var overridden = RequestHeaders.of(frozen, "auth.example");
+        assertEquals("auth.example", overridden.host());
+        assertEquals(List.of("example"), overridden.values("host"));
+        assertSame(frozen, overridden.fields());
+        assertNull(RequestHeaders.of(null).host());
+        assertTrue(RequestHeaders.of(null, "only-authority").fields().isEmpty());
+        assertEquals("only-authority", RequestHeaders.of(null, "only-authority").host());
+        var peer = new InetSocketAddress("127.0.0.1", 9);
+        var request = new Request("GET", "/x", headers, peer, true);
+        var rewritten = request.withTarget("/y").withMethod("HEAD");
+        assertSame(peer, rewritten.peer());
+        assertTrue(rewritten.secure());
+        assertSame(headers, rewritten.headers());
+        assertEquals("/y", rewritten.target());
+        assertTrue(rewritten.headOnly());
     }
 
     @Test

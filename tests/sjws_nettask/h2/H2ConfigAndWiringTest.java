@@ -83,6 +83,45 @@ class H2ConfigAndWiringTest {
         return ServerConfig.builder(this.root).port(0).h2Enabled(true).h2Port(0).h2cPort(0).build();
     }
 
+    /** Filters (access rules, routes, middleware) apply to HTTP/2 exactly as to HTTP/1.1. */
+    @Test
+    void requestFiltersApplyOverHttp2() throws Exception {
+        var filters = sjws_nettask.core.RequestFilters.create().add((request, next) ->
+                request.target().startsWith("/blocked")
+                        ? sjws_nettask.core.StaticFileHandler.error(403, request.headOnly())
+                        : next.proceed(request));
+        try (var server = SjwsServer.start(config(), filters);
+                var h2 = new RawH2(((sjws_nettask.h2.Http2Server) server.h2()).h2cPort(), 65535)) {
+            h2.get(1, "/blocked/a.txt");
+            h2.get(3, "/a.txt");
+            String s1 = null, s3 = null;
+            for (RawH2.Frame f; (s1 == null || s3 == null) && (f = h2.read()) != null;) {
+                if (f.type() == RawH2.HEADERS) {
+                    var status = statusOf(f.payload());
+                    if (f.stream() == 1) {
+                        s1 = status;
+                    } else if (f.stream() == 3) {
+                        s3 = status;
+                    }
+                }
+            }
+            assertEquals("403", s1, "the filter ran on HTTP/2");
+            assertEquals("200", s3);
+        }
+    }
+
+    /** :status from a server HEADERS block: Netty encodes it as an indexed field (static table 8-14). */
+    private static String statusOf(byte[] block) {
+        return switch (block[0] & 0xff) {
+            case 0x88 -> "200";
+            case 0x8b -> "206";
+            case 0x8c -> "304";
+            case 0x8d -> "400";
+            case 0x8e -> "404";
+            default -> new String(block, java.nio.charset.StandardCharsets.ISO_8859_1).contains("403") ? "403" : "?";
+        };
+    }
+
     @Test
     void serverStartsAndDescribesHttp2() throws Exception {
         try (var server = SjwsServer.start(config())) {
