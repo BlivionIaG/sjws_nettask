@@ -16,6 +16,8 @@
  */
 package sjws_nettask.ha;
 
+import java.util.function.Supplier;
+
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
@@ -28,10 +30,21 @@ import sjws_nettask.core.Response;
 public final class HaHandler implements Handler {
 
     private final SnapshotHolder<Handler> snapshots;
+    /** Config snapshot. Null in tests that only publish generations. */
+    private final Supplier<Handler> configHandler;
     private final HealthBoard health;
 
     public HaHandler(SnapshotHolder<Handler> snapshots, HealthBoard health) {
+        this(snapshots, null, health);
+    }
+
+    /**
+     * @param configHandler read once per request until {@link SnapshotHolder#publish} replaces it.
+     *        The holder does not keep a second copy of this handler.
+     */
+    public HaHandler(SnapshotHolder<Handler> snapshots, Supplier<Handler> configHandler, HealthBoard health) {
         this.snapshots = snapshots;
+        this.configHandler = configHandler;
         this.health = health;
     }
 
@@ -45,10 +58,14 @@ public final class HaHandler implements Handler {
             return this.health.ready(request.headOnly());
         }
         var snap = this.snapshots.current();
-        if (snap == null) {
-            return this.health.ready(request.headOnly());
+        if (snap != null) {
+            return snap.value().handle(request);
         }
-        return snap.value().handle(request);
+        var config = this.configHandler;
+        if (config != null) {
+            return config.get().handle(request);
+        }
+        return this.health.ready(request.headOnly());
     }
 
     /** Path equals {@code probe}, or that path plus a query. No allocation. */

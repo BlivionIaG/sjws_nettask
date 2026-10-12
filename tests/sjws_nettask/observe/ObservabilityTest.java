@@ -570,6 +570,27 @@ class ObservabilityTest {
         assertFalse(text.contains(" 200 "), text);
     }
 
+    /**
+     * Observability with a custom terminal (not the static handler) still compiles the order-0
+     * filter, and HTTP/3 keeps that chain instead of replacing it with the live file handler.
+     */
+    @Test
+    void observeKeepsACustomTerminalAndTheHttp3Chain() throws Exception {
+        Files.writeString(dir.resolve("index.html"), "hello");
+        Handler leaf = request -> new Response(202, ResponseHeaders.of().add("content-type", "text/plain"),
+                Body.Bytes.of("leaf".getBytes(StandardCharsets.US_ASCII)), request.headOnly());
+        var config = ServerConfig.builder(dir).port(0).healthz(true).h3Enabled(true).h3Port(0).build();
+        try (var server = SjwsServer.start(config, null, files -> leaf)) {
+            assertNotNull(server.filterChain());
+            var response = HttpTestSupport.get(server.tcpPort(), "/index.html", 2000);
+            assertEquals(202, response.statusCode());
+            assertEquals("leaf", response.bodyText());
+            var health = HttpTestSupport.get(server.tcpPort(), "/healthz", 2000);
+            assertEquals(200, health.statusCode());
+            assertEquals("ok\n", health.bodyText());
+        }
+    }
+
     @Test
     void clientManagerWrapsARecordingObserver() throws Exception {
         Files.writeString(dir.resolve("index.html"), "hello");

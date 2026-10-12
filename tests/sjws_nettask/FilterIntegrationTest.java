@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.InetAddress;
@@ -188,6 +189,13 @@ class FilterIntegrationTest {
         this.server = SjwsServer.start(config(), null, files -> leaf);
         assertNull(this.server.filterChain());
         assertEquals("routed", HttpTestSupport.get(this.server.tcpPort(), "/hello.txt", 4000).bodyText());
+    }
+
+    @Test
+    void unknownFilterNameFailsBeforeTheListenerBinds() {
+        var filters = RequestFilters.create().add(MiddlewareSpec.of("missing"));
+        assertThrows(IllegalArgumentException.class, () -> SjwsServer.start(config(), filters));
+        assertNull(this.server);
     }
 
     private static Response text(Request request, String body) {
