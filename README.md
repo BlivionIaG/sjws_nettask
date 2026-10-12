@@ -18,6 +18,7 @@ Run:
 | `--max-connections=N` | `WEB_SERVER_MAX_CONNECTIONS` | 2048 | concurrent connections; extra ones wait in the backlog |
 | `--idle-timeout=S` | `WEB_SERVER_IDLE_TIMEOUT` | 30 | keep-alive idle timeout (seconds) |
 | `--header-timeout=S` | `WEB_SERVER_HEADER_TIMEOUT` | 10 | time to receive a complete request head (seconds) |
+| `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | HTTP/3: reset a response that makes no progress for this long; also the window of its minimum send rate (8 KiB/s). Not used by HTTP/1.1 yet |
 | `-h`, `--help` | | | print usage and exit |
 
 Environment variables override arguments. Invalid values are replaced by the default
@@ -39,23 +40,40 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 | `--key=PATH` | `WEB_SERVER_TLS_KEY` | self-signed | private key, PKCS#8 PEM |
 | `--key-password-file=PATH` | `WEB_SERVER_TLS_KEY_PASSWORD_FILE` | | file containing the key password (one trailing newline is ignored) |
 | | `WEB_SERVER_TLS_KEY_PASSWORD` | | key password itself (wins over the file) |
+| `--alt-svc` / `--no-alt-svc` | `WEB_SERVER_ALT_SVC` | off | send `Alt-Svc` on HTTP/1.1 responses (see below) |
 | `--alt-svc-max-age=S` | `WEB_SERVER_ALT_SVC_MA` | 86400 | `ma` of the `Alt-Svc` header |
 
 * `--cert` and `--key` go together; without both, a self-signed `localhost` certificate is generated.
 * The key password is deliberately **not** accepted as a command-line argument (it would show in
   `ps`); it never appears in logs (`ServerConfig.toString()` masks it).
 * HTTP/3 options given without `--h3` produce a warning and have no effect.
-* Once the UDP listener has actually bound, every HTTP/1.1 response (including errors and `HEAD`)
-  carries `Alt-Svc: h3=":<udp port>"; ma=<max-age>`. If HTTP/3 cannot start (port busy, QUIC
-  natives missing for this platform, bad certificate) the server logs
-  `WARN: HTTP/3 not started, serving HTTP/1.1 only (no Alt-Svc)` and keeps serving HTTP/1.1.
-* Caveat: browsers only honour `Alt-Svc` received over HTTPS. The TCP listener is plain HTTP, so
-  browsers will not switch to HTTP/3 from it; use `curl --http3` / `--http3-only` against the UDP port.
+* **Reaching HTTP/3.** This server's TCP listener speaks plain HTTP/1.1 (`http://`). HTTP/3 is always
+  `https`, so clients reach it directly when they know the UDP port:
+  `curl --http3-only -k https://host:<udp port>/` (`-k` for the self-signed certificate).
+  Browsers find HTTP/3 only through `Alt-Svc` received **over HTTPS** from a certificate they trust;
+  they ignore `Alt-Svc` on `http://` origins. Browser upgrade therefore needs a real HTTPS (TLS over
+  TCP) listener plus a trusted certificate, which this server does not have yet.
+* **`Alt-Svc` is opt-in** (`--alt-svc`), and starting with it prints a warning saying the above. When
+  enabled, and only once the UDP listener has actually bound, every HTTP/1.1 response (including
+  errors and `HEAD`) carries `Alt-Svc: h3=":<real udp port>"; ma=<max-age>`; it is withdrawn on
+  shutdown. If HTTP/3 cannot start (port busy, QUIC natives missing for this platform, bad
+  certificate) the server logs `WARN: HTTP/3 not started, serving HTTP/1.1 only (no Alt-Svc)` and
+  keeps serving HTTP/1.1. Mind that clients cache `Alt-Svc` for `ma` seconds, and that it names only a
+  port: behind NAT/Docker, publish the UDP port too.
+* **Limits** (per server unless noted): in-flight HTTP/3 requests = `--max-connections` (more are
+  refused with `H3_REQUEST_REJECTED`, which clients may retry); files being sent = min(`--max-connections`,
+  1024), at most 16 per QUIC connection, waiting at most `--header-timeout` for a slot; 64 concurrent
+  request streams and 16 KiB / 1 MiB receive windows per stream / connection (request bodies are
+  discarded); request field sections up to 16 KiB (larger: 431). No QUIC Retry is used, so the
+  RFC 9000 anti-amplification limit applies until a client's address is validated by the handshake.
+* **Shutdown** sends `GOAWAY`, lets in-flight HTTP/3 responses finish for up to 2 s, then closes.
+* The self-signed certificate is new on every start (its fingerprint is printed): a pinned fingerprint
+  is valid until restart.
 * The QUIC transport is Netty's `netty-codec-http3` with its bundled native quiche library
   (linux x86_64/aarch64, macOS, Windows x86_64). On other platforms, or if the native library cannot be
   extracted (e.g. `/tmp` mounted `noexec`; set `-Dio.netty.native.workdir=<dir>`), `--h3` takes the
   fallback path above and the warning names the cause.
-* Quick check: `curl -I http://127.0.0.1:<port>/` shows the `Alt-Svc` header, and
+* Quick check: with `--h3 --alt-svc`, `curl -I http://127.0.0.1:<port>/` shows the `Alt-Svc` header, and
   `curl --http3-only -k https://127.0.0.1:<udp port>/` fetches over HTTP/3 (`-k` for the self-signed cert).
 
 ### Platform notes

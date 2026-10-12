@@ -23,8 +23,9 @@ import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Embeddable server: HTTP/1.1 on TCP plus, when enabled, an HTTP/3 {@link Transport}.
- * Alt-Svc is advertised on HTTP/1.1 only after the HTTP/3 listener bound successfully;
- * if it fails, the failure is logged and HTTP/1.1 keeps serving without Alt-Svc.
+ * Alt-Svc (opt-in, {@link ServerConfig#altSvc()}) is advertised on HTTP/1.1 only after the HTTP/3
+ * listener bound successfully, with its real port; if HTTP/3 fails, the failure is logged and
+ * HTTP/1.1 keeps serving without Alt-Svc.
  */
 public final class SjwsServer implements AutoCloseable {
 
@@ -75,7 +76,9 @@ public final class SjwsServer implements AutoCloseable {
             transport = factory.create(this.config, this.handler);
             transport.start();
             this.h3 = transport;
-            this.altSvc.advertise(transport.port(), this.config.altSvcMaxAge());
+            if (this.config.altSvc()) {
+                this.altSvc.advertise(transport.port(), this.config.altSvcMaxAge());
+            }
         } catch (Exception | LinkageError e) { // LinkageError: QUIC natives missing for this platform
             this.h3Failure = e;
             if (transport != null) {

@@ -25,7 +25,7 @@ import java.util.Objects;
 
 /**
  * Server settings: the complete field set of the merged plan (S1 superset contract).
- * Fields marked "inert" are accepted and carried but not used yet; their defaults keep the
+ * Fields marked "not used yet" are carried for later milestones; their defaults keep the
  * current behaviour. See {@link #usage()} for flags and environment variables.
  * Precedence: defaults &lt; command line &lt; environment.
  *
@@ -34,21 +34,24 @@ import java.util.Objects;
  * @param maxConnections HTTP/1 connections served concurrently; extra ones wait in the backlog
  * @param idleTimeout keep-alive idle timeout (also the QUIC max idle timeout)
  * @param headerTimeout time allowed to receive a complete request head (slowloris)
- * @param writeTimeout inert until S4: close a connection whose writes make no progress for this long
- * @param h3Enabled inert until S2: start the HTTP/3 (QUIC) listener
+ * @param writeTimeout HTTP/3: reset a response whose writes make no progress for this long (also the
+ *        window of the minimum send rate); HTTP/1.1 does not use it yet (S4)
+ * @param h3Enabled start the HTTP/3 (QUIC) listener
  * @param h3Port UDP port for HTTP/3; {@link #H3_PORT_SAME_AS_TCP} (-1) = same as {@code port}, 0 = ephemeral
  * @param h3Host UDP bind address for HTTP/3
- * @param h3MaxConnections inert until S2: concurrent QUIC connections
+ * @param h3MaxConnections concurrent QUIC connections
  * @param tlsCert PEM certificate chain (null = self-signed for development)
  * @param tlsKey PKCS#8 PEM private key (must be set together with tlsCert)
  * @param tlsKeyPassword key password, or null (masked in {@link #toString()})
- * @param altSvcMaxAge inert until S2: {@code ma} of the Alt-Svc header advertising HTTP/3
- * @param cacheBytes inert until S3: small-file cache budget in bytes (0 = disabled)
- * @param accessLog inert: "-" for stdout, a file path, or null for off
+ * @param altSvcMaxAge {@code ma} of the Alt-Svc header advertising HTTP/3
+ * @param cacheBytes not used yet (S3): small-file cache budget in bytes (0 = disabled)
+ * @param accessLog not used yet: "-" for stdout, a file path, or null for off
+ * @param altSvc send {@code Alt-Svc} on HTTP/1.1 responses once HTTP/3 is bound (opt-in: browsers
+ *        ignore it on plain http:// origins, see the README)
  */
 public record ServerConfig(int port, Path root, int maxConnections, Duration idleTimeout, Duration headerTimeout,
         Duration writeTimeout, boolean h3Enabled, int h3Port, String h3Host, int h3MaxConnections, Path tlsCert,
-        Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog) {
+        Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc) {
 
     public static final int DEFAULT_PORT = CONSTANTS.DEFAULT_PORT;
     /** Design review M11: 64 KB output buffer per connection, so 2048 x 64 KB = 128 MB worst case. */
@@ -130,7 +133,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 + ", h3Enabled=" + h3Enabled + ", h3Port=" + h3Port + ", h3Host=" + h3Host
                 + ", h3MaxConnections=" + h3MaxConnections + ", tlsCert=" + tlsCert + ", tlsKey=" + tlsKey
                 + ", tlsKeyPassword=" + (tlsKeyPassword == null ? "null" : "****") + ", altSvcMaxAge=" + altSvcMaxAge
-                + ", cacheBytes=" + cacheBytes + ", accessLog=" + accessLog + "]";
+                + ", cacheBytes=" + cacheBytes + ", accessLog=" + accessLog + ", altSvc=" + altSvc + "]";
     }
 
     /** Mutable builder; new fields get a default here so existing callers keep compiling. */
@@ -152,6 +155,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         private Duration altSvcMaxAge = DEFAULT_ALT_SVC_MAX_AGE;
         private long cacheBytes = DEFAULT_CACHE_BYTES;
         private String accessLog;
+        private boolean altSvc;
 
         private Builder(Path root) {
             this.root = root;
@@ -174,6 +178,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             this.altSvcMaxAge = c.altSvcMaxAge;
             this.cacheBytes = c.cacheBytes;
             this.accessLog = c.accessLog;
+            this.altSvc = c.altSvc;
         }
 
         public Builder port(int v) { this.port = v; return this; }
@@ -192,11 +197,12 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public Builder altSvcMaxAge(Duration v) { this.altSvcMaxAge = v; return this; }
         public Builder cacheBytes(long v) { this.cacheBytes = v; return this; }
         public Builder accessLog(String v) { this.accessLog = v; return this; }
+        public Builder altSvc(boolean v) { this.altSvc = v; return this; }
 
         public ServerConfig build() {
             return new ServerConfig(port, root, maxConnections, idleTimeout, headerTimeout, writeTimeout, h3Enabled,
                     h3Port, h3Host, h3MaxConnections, tlsCert, tlsKey, tlsKeyPassword, altSvcMaxAge, cacheBytes,
-                    accessLog);
+                    accessLog, altSvc);
         }
     }
 
@@ -225,14 +231,17 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --max-connections=N       concurrent HTTP/1 connections (2048)          WEB_SERVER_MAX_CONNECTIONS
                   --idle-timeout=S          keep-alive idle timeout, seconds (30)         WEB_SERVER_IDLE_TIMEOUT
                   --header-timeout=S        time to send a request head, seconds (10)     WEB_SERVER_HEADER_TIMEOUT
+                  --write-timeout=S         HTTP/3: reset a stalled response, seconds (30) WEB_SERVER_WRITE_TIMEOUT
                   --h3 | --no-h3            enable HTTP/3 over QUIC (off)                 WEB_SERVER_H3=true|false
-                  --h3-port=N               UDP port, 0 = ephemeral (same as TCP port)    WEB_SERVER_H3_PORT
+                  --h3-port=N               UDP port (default: the TCP port; 0 = ephemeral) WEB_SERVER_H3_PORT
                   --h3-host=ADDR            UDP bind address (0.0.0.0)                    WEB_SERVER_H3_HOST
                   --h3-max-connections=N    concurrent QUIC connections (1024)            WEB_SERVER_H3_MAX_CONNECTIONS
                   --cert=PATH               TLS certificate chain, PEM (self-signed)      WEB_SERVER_TLS_CERT
                   --key=PATH                TLS private key, PKCS#8 PEM                   WEB_SERVER_TLS_KEY
                   --key-password-file=PATH  file holding the key password                 WEB_SERVER_TLS_KEY_PASSWORD_FILE
                                             (or the password itself in                    WEB_SERVER_TLS_KEY_PASSWORD)
+                  --alt-svc | --no-alt-svc  advertise HTTP/3 with Alt-Svc on HTTP/1.1 (off) WEB_SERVER_ALT_SVC=true|false
+                                            (browsers ignore it on http:// origins)
                   --alt-svc-max-age=S       Alt-Svc max-age, seconds (86400)              WEB_SERVER_ALT_SVC_MA
                   -h, --help                show this help
 
@@ -273,6 +282,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         int max = DEFAULT_MAX_CONNECTIONS;
         long idle = DEFAULT_IDLE_TIMEOUT.toSeconds();
         long header = DEFAULT_HEADER_TIMEOUT.toSeconds();
+        long write = DEFAULT_WRITE_TIMEOUT.toSeconds();
+        boolean altSvcOn = false;
         String dir = CONSTANTS.DEFAULT_HTML_PATH;
         boolean h3 = false;
         int h3Port = H3_PORT_SAME_AS_TCP;
@@ -299,7 +310,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     case "--max-connections" -> max = number(value, max, 1, 10_000_000, name, warnings);
                     case "--idle-timeout" -> idle = number(value, idle, 1, 86_400, name, warnings);
                     case "--header-timeout" -> header = number(value, header, 1, 86_400, name, warnings);
-                    case "--h3" -> h3 = value == null || bool(value, true, name, warnings);
+                    case "--write-timeout" -> write = number(value, write, 1, 86_400, name, warnings);
+                    case "--h3" -> h3 = value == null || bool(value, h3, name, warnings);
                     case "--no-h3" -> h3 = false;
                     case "--h3-port" -> {
                         h3Port = number(value, h3Port, 0, 65535, name, warnings);
@@ -324,7 +336,15 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     case "--key-password-file" -> passwordFile = text(value, passwordFile, name, warnings);
                     case "--key-password" -> warnings.add("--key-password is not accepted on the command line "
                             + "(visible to other users); use WEB_SERVER_TLS_KEY_PASSWORD or --key-password-file");
-                    case "--alt-svc-max-age" -> altSvc = number(value, altSvc, 0, 31_536_000, name, warnings);
+                    case "--alt-svc" -> {
+                        altSvcOn = value == null || bool(value, altSvcOn, name, warnings);
+                        explicitH3Options.add(name);
+                    }
+                    case "--no-alt-svc" -> altSvcOn = false;
+                    case "--alt-svc-max-age" -> {
+                        altSvc = number(value, altSvc, 0, 31_536_000, name, warnings);
+                        explicitH3Options.add(name);
+                    }
                     default -> warnings.add("Unknown option '" + name + "' (see --help)");
                 }
             } else if (positional == 0) {
@@ -355,6 +375,15 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         if ((v = env.get("WEB_SERVER_HEADER_TIMEOUT")) != null) {
             header = number(v, header, 1, 86_400, "WEB_SERVER_HEADER_TIMEOUT", warnings);
         }
+        if ((v = env.get("WEB_SERVER_WRITE_TIMEOUT")) != null) {
+            write = number(v, write, 1, 86_400, "WEB_SERVER_WRITE_TIMEOUT", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_ALT_SVC")) != null) {
+            altSvcOn = bool(v, altSvcOn, "WEB_SERVER_ALT_SVC", warnings);
+            if (altSvcOn) {
+                explicitH3Options.add("WEB_SERVER_ALT_SVC");
+            }
+        }
         if ((v = env.get("WEB_SERVER_H3")) != null) {
             h3 = bool(v, h3, "WEB_SERVER_H3", warnings);
         }
@@ -383,6 +412,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if ((v = env.get("WEB_SERVER_ALT_SVC_MA")) != null) {
             altSvc = number(v, altSvc, 0, 31_536_000, "WEB_SERVER_ALT_SVC_MA", warnings);
+            explicitH3Options.add("WEB_SERVER_ALT_SVC_MA");
         }
 
         // key password: environment value wins over a file
@@ -407,6 +437,17 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             key = null;
             password = null;
         }
+        if (h3 && altSvcOn) {
+            warnings.add("Alt-Svc is enabled but this server only speaks plain HTTP/1.1 (http://): browsers "
+                    + "ignore Alt-Svc from http:// origins and will not switch to HTTP/3. Clients that know the "
+                    + "UDP port reach HTTP/3 directly (curl --http3-only https://host:port/); browser upgrade "
+                    + "needs an HTTPS listener with a trusted certificate");
+        }
+        if (!altSvcOn && explicitH3Options.contains("--alt-svc-max-age")) {
+            warnings.add("--alt-svc-max-age has no effect without --alt-svc");
+        }
+        explicitH3Options.remove("--alt-svc-max-age");
+        explicitH3Options.remove("WEB_SERVER_ALT_SVC_MA");
         if (!h3 && !explicitH3Options.isEmpty()) {
             warnings.add("HTTP/3 is disabled, so " + String.join(", ", explicitH3Options)
                     + " ha" + (explicitH3Options.size() == 1 ? "s" : "ve") + " no effect (add --h3)");
@@ -414,6 +455,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
 
         var config = b.port(port).root(Path.of(dir)).maxConnections(max)
                 .idleTimeout(Duration.ofSeconds(idle)).headerTimeout(Duration.ofSeconds(header))
+                .writeTimeout(Duration.ofSeconds(write)).altSvc(altSvcOn)
                 .h3Enabled(h3).h3Port(h3Port).h3Host(h3Host).h3MaxConnections(h3Max)
                 .tlsCert(cert == null ? null : Path.of(cert)).tlsKey(key == null ? null : Path.of(key))
                 .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc)).build();
