@@ -146,10 +146,10 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   regular 404/403/500 response instead of a dropped connection.
 
 Serves GET and HEAD (other known methods: 405, unknown: 501), HTTP/1.0 and 1.1
-with keep-alive and pipelining, `ETag` / `If-None-Match` / `If-Modified-Since`, directory listings, and
-`index.html`. Dotfiles and symlinks leading outside the root are never served.
+with keep-alive and pipelining, `ETag` / `If-None-Match` / `If-Modified-Since`, single byte ranges
+(`Range` / `If-Range`), directory listings, and `index.html`. Dotfiles and symlinks leading outside the root are never served.
 
-### Caching and validators
+### Caching, validators and ranges
 
 * **Small-file cache.** Files up to 256 KiB are kept in memory (both protocols), up to
   `--cache-bytes` in total (body + key + ~256 bytes per entry) and 4096 entries, least recently used
@@ -168,3 +168,55 @@ with keep-alive and pipelining, `ETag` / `If-None-Match` / `If-Modified-Since`, 
   second write within that second could otherwise keep the tag. `If-None-Match` (lists, `*`, weak
   comparison) takes precedence over `If-Modified-Since`; a 304 carries `ETag`, `Last-Modified` and
   `Date` only.
+* **Ranges** (both protocols, decided in core after the 304 conditionals). One `bytes=` range
+  (`a-b`, `a-`, `-n`) gets `206` with `Content-Range` (from the cache: a slice; otherwise the file region,
+  with `sendfile` above 64 KiB). Several ranges (no multipart), other units, malformed or > 18-digit
+  positions are ignored (`200`, whole file); a range starting at or past the end, or `-0`, gets `416` with
+  `Content-Range: bytes */<size>`. `If-Range` needs a strong match: the exact current ETag, or a date
+  equal to `Last-Modified` while the ETag is strong (a version under 1 s old has a weak ETag, so a resume
+  of it restarts with `200`); anything else serves the whole file. Only GET has range semantics
+  (RFC 9110 §14.2): HEAD with `Range` answers the plain `200` head; listings, redirects and errors ignore
+  `Range` and say `Accept-Ranges: none`. Dates are parsed in IMF-fixdate form only (an RFC 850/asctime
+  `If-Range` or `If-Modified-Since` is treated as not matching). Empty files ignore `Range`.
+
+## Architecture
+
+* **core** (`sjws_nettask.core`): protocol-neutral `Request`/`Response`/`Body` records, the
+  `StaticFileHandler` (every status decision: path decoding and containment, index/listings, MIME,
+  validators, conditionals, ranges), `SafeOpen` (no-follow, `openat`-based opens checked against the
+  resolved file identity), the small-file `FileCache` and the per-address connection counter. Both
+  transports call the same handler, so behaviour is identical by construction; a parity test compares
+  every HTTP/3 response with the HTTP/1.1 bytes for the same request.
+* **HTTP/1.1** (`sjws_nettask` + `sjws_nettask.http1`): one virtual thread per connection on a blocking
+  `SocketChannel`; an incremental, strict byte-level head parser (CL/TE smuggling, limits, obs-fold,
+  Host, Expect); responses written whole (head and small bodies in one `write`, `Date` formatted once
+  per second); files over 64 KiB that are not cached go out with `FileChannel.transferTo` (`sendfile`).
+  A single timer thread enforces the idle, request-head (408) and write-progress deadlines and ends
+  expired connections with `shutdown(2)` (it never blocks in `close()`).
+* **HTTP/3** (`sjws_nettask.h3`, `sjws_nettask.tls`): Netty QUIC (quiche); a virtual thread per request
+  stream runs the shared handler; file slots, a per-connection in-flight share, a minimum send rate
+  under contention, handshake and half-open caps, GOAWAY drain.
+
+**Measured** (loopback, 8 cores: server pinned to 4, `wrk -t4` to the other 4; 8 s per point, fresh JVM
+with G1 and a 1 GB heap, 3 repetitions, medians; requests/s, or GB/s for 50 MB with a 30 s wrk timeout).
+Each column is the server as of that step, all measured in the same session:
+
+| File | Connections | before S3 | S3 (Date, cache, ETag) | S4 (channels, timer thread, sendfile) |
+|---|---|---|---|---|
+| 1 KB | 100 | 68k | 85k | 207k |
+| 1 KB | 1000 | 54k | 67k | 218k |
+| 100 KB | 100 | 43k | 60k | 69k |
+| 100 KB | 1000 | 35k | 45k | 68k |
+| 50 MB | 100 | 11.2 GB/s | 10.9 GB/s | 17.3 GB/s |
+| 50 MB | 1000 | 11.3 GB/s | 11.3 GB/s | 16.6 GB/s |
+
+Memory per idle keep-alive connection: ~6.3 KB of heap (~6.6 KB RSS) since S4, against ~78 KB before
+(a 2 KiB input buffer and the parser's 256 B line buffer; no output buffer). Caveats: these are
+loopback numbers with the client on the same machine, small working sets that sit in the page cache
+and wrk's closed-loop load (no think time); at fixed rates every variant could sustain (wrk2, 50k
+req/s for 1 KB, 30k req/s for 100 KB) p50/p99 were within noise of each other (0.8-3 ms / 2-10 ms), and
+the 1 KB / 100-connection p99.9 of S4 varied between 7 and 35 ms across runs (not GC; not explained
+yet); at 1000 connections a few runs saw connect timeouts (accept backlog 50). Every cache hit stats the file (correctness first); skipping that stat for a 1 s window
+measured +12-20% on 1 KB files and was deliberately not adopted. HTTP/3 throughput was not
+benchmarked. A larger `sendfile` chunk (256 KiB, 1 MiB) was measured in S5 and moved 50 MB by
+under 5%, so it stays at 64 KiB.

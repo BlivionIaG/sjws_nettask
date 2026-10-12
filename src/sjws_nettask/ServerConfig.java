@@ -263,7 +263,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --max-connections-per-ip=N  HTTP/1 connections per client IP (256)      WEB_SERVER_MAX_CONNECTIONS_PER_IP
                   --idle-timeout=S          keep-alive idle timeout, seconds (30)         WEB_SERVER_IDLE_TIMEOUT
                   --header-timeout=S        time to send a request head, seconds (10)     WEB_SERVER_HEADER_TIMEOUT
-                  --write-timeout=S         HTTP/3: reset a stalled response, seconds (30) WEB_SERVER_WRITE_TIMEOUT
+                  --write-timeout=S         end a response stalled this long, seconds (30) WEB_SERVER_WRITE_TIMEOUT
                   --cache-bytes=N[k|m|g]    small-file cache size (64m; 0 = off)          WEB_SERVER_CACHE_BYTES
                   --h3 | --no-h3            enable HTTP/3 over QUIC (off)                 WEB_SERVER_H3=true|false
                   --h3-port=N               UDP port (default: the TCP port; 0 = ephemeral) WEB_SERVER_H3_PORT
