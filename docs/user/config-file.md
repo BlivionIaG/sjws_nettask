@@ -26,7 +26,30 @@ line and in the environment stay relative to the working directory.
 `--help` wins before a missing file is an error. A missing document root is exit
 code 2, including when the root comes from the file.
 
-`routing`, `middleware` and `access` are file-only. They do not add command-line flags.
+`routing`, `middleware`, `access` and `node` are file-only. They do not add command-line flags.
+
+## Node
+
+Omitted, the process is `standalone`. The request path does not read the mode.
+
+```yaml
+schema: 1
+version: 0          # control-plane bundle version; 0 means unset
+node:
+  mode: standalone  # standalone (default), control, or data
+  labels: {}        # up to 64 keys; each key and value is 1..63 of [A-Za-z0-9_.:-]
+```
+
+`schema` must be 1 when it is present. A reload or a remote apply rejects a non-zero
+`version` that is lower than the one already running. `node.mode` is kept until
+restart; `labels` apply on the next successful apply.
+
+A data-plane process whose config file is missing boots from the sibling
+`<file>.last-good` when that file exists and its `node.mode` is `data`. Standalone
+and control do not: a missing file is still an error. After a successful start or
+apply the process writes that sibling atomically, mode `0600`. The bytes are the
+canonical document, so they do not contain a key password. A failed apply leaves
+both the running config and this file as they were.
 
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
 `h`, `d`). In a size, a bare integer is bytes and `1m` is one mebibyte (`k`, `m`,
@@ -78,6 +101,9 @@ start of `close`. The hook re-reads the file, reapplies the original arguments
 and the environment captured at startup, and on success compiles a new immutable
 snapshot and publishes it with one `AtomicReference` write. A validation error,
 a missing root, or an unreadable certificate keeps the previous snapshot.
+`SjwsServer.applyRemote` validates and publishes a pushed document through that
+same swap. It does not re-read the file and it does not replace the file: the
+user's YAML stays put, and the last-good sibling is updated only after the swap.
 
 The request path is that one volatile read and then the handler that was built
 with the snapshot. It does not parse YAML, match routes, or take the reload lock.
@@ -258,12 +284,18 @@ the access settings. Building that snapshot is the only time the file is parsed.
 
 ## ConfigStore rollout
 
-The bundle is this YAML file. Its version is the lowercase SHA-256 of the file
-bytes (`ConfigDocument.contentHash()`). A process that was started without a file
-has no hash. Each successful reload also bumps a generation counter on the
+The bundle is this YAML file. `ConfigDocument.contentHash()` is the lowercase
+SHA-256 of the file bytes. A process that was started without a file has no file
+hash. `canonicalHash()` is a second lowercase SHA-256, of the canonical YAML of
+the effective document (fixed key order, sorted maps, no key password). Reordering
+keys in the file changes `contentHash()` and leaves `canonicalHash()` the same.
+`version` (`bundleVersion()`) is the control-plane bundle version, separate from
+both hashes. Each successful reload also bumps a generation counter on the
 snapshot; that counter is how many times this process has swapped, not the bundle
-version. The hash is of the file, not of the file after arguments and environment
-variables have been applied.
+version. The file hash is of the file, not of the file after arguments and
+environment variables have been applied. Bind-time fields that are clamped back
+to the running value are reflected in the canonical hash of the snapshot that was
+published, so that hash can differ from the hash of the bundle that was pushed.
 
 Applied live, on the next request, with no drain: document root, cache budget,
 unlistable directories, HTTP/1 timeouts when HTTP/3 is not running, the stored
