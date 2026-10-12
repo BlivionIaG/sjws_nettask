@@ -30,6 +30,8 @@ Run:
 | `--stop` | | | stop the server recorded in the pid file (SIGTERM, then wait) |
 | `--status` | | | print whether that server is running |
 | `--restart` | | | `--stop`, then start in the background |
+| `--role=ROLE` | `WEB_SERVER_ROLE` | standalone | `standalone` (default), `control`, or `data`. `control` and `data` require `--bootstrap` and `--pid-file`. The environment wins |
+| `--bootstrap=PATH` | `WEB_SERVER_BOOTSTRAP` | | absolute or relative path of the control/data bootstrap file. Names the pin and the join-token file; the token secret is not a flag or a variable. See [Control-plane service](../operations/control-plane-service.md) |
 
 
 Defaults, then the config file, then arguments, then environment variables.

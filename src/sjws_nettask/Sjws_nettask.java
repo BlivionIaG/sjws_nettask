@@ -92,12 +92,13 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile);
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null);
     }
 
     /** Same lifecycle as {@link #serve}, starting from a loaded config file so reload can re-read it. */
     private static int serveLoaded(sjws_nettask.config.ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
-            PrintStream out, PrintStream err, Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile) {
+            PrintStream out, PrintStream err, Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile,
+            ServiceHooks hooks) {
         var config = loaded.document().server();
         if (!Files.isDirectory(config.root())) {
             err.println("Document root " + config.root().toAbsolutePath() + " does not exist or is not a directory.");
@@ -121,11 +122,11 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile);
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks);
     }
 
     private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,
-            Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile) {
+            Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile, ServiceHooks hooks) {
         server.shutdownTimeout(shutdownTimeout);
         var pid = new AtomicReference<PidFile>();
         var task = new Shutdown(server, pid, out, err);
@@ -148,6 +149,25 @@ public class Sjws_nettask {
                     return EXIT_CANNOT_LISTEN;
                 }
                 pid.set(claim.file());
+            }
+            if (hooks != null) {
+                if (pidFile == null) {
+                    err.println("ERROR: --bootstrap requires --pid-file");
+                    return EXIT_USAGE;
+                }
+                task.hooks(hooks);
+                try {
+                    hooks.onListening(server, pidFile, shutdownTimeout);
+                } catch (IOException | RuntimeException e) {
+                    err.println("ERROR: " + safeMessage(e.getMessage()));
+                    return EXIT_CANNOT_LISTEN;
+                }
+                var line = hooks.startupLine();
+                if (line != null && !line.isBlank()) {
+                    out.println(line);
+                }
+            } else {
+                publishHaDrainBudget(server, pidFile, shutdownTimeout);
             }
             out.println("Server started: " + server.describe());
             sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
@@ -185,6 +205,7 @@ public class Sjws_nettask {
         private final AtomicBoolean logged = new AtomicBoolean();
         private final CountDownLatch reported = new CountDownLatch(1);
         private volatile Thread hookThread;
+        private volatile ServiceHooks hooks;
         /** How long a signal hook waits for the main thread to log termination before logging it. */
         private Duration reportWait = Duration.ofSeconds(5);
 
@@ -197,6 +218,10 @@ public class Sjws_nettask {
 
         void bind(Thread hook) {
             this.hookThread = hook;
+        }
+
+        void hooks(ServiceHooks hooks) {
+            this.hooks = hooks;
         }
 
         /** Tests shrink the signal-hook wait so the fallback log path does not block. */
@@ -220,7 +245,12 @@ public class Sjws_nettask {
         @Override
         public void run() {
             try {
-                this.server.close();
+                try {
+                    this.server.drain();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    this.server.close();
+                }
                 if (Thread.currentThread() == this.hookThread && this.serving.get()) {
                     boolean mainLogged = false;
                     try {
@@ -233,9 +263,64 @@ public class Sjws_nettask {
                     }
                 }
             } finally {
-                releasePid(this.pid.get(), this.err);
+                var hooks = this.hooks;
+                try {
+                    if (hooks != null) {
+                        hooks.onShutdown();
+                    }
+                } catch (RuntimeException e) {
+                    this.err.println("WARN: status cleanup failed");
+                } finally {
+                    releasePid(this.pid.get(), this.err);
+                }
             }
         }
+    }
+
+    /**
+     * How long {@link sjws_nettask.ha.Lifecycle#drain()} can take before {@link SjwsServer#close()},
+     * or {@code -1} when high availability is not attached. {@code --stop} uses this as a wait
+     * budget. Standalone without HA stays {@code -1}, which keeps today's shutdown timeout.
+     */
+    public static long drainBudgetMillis(SjwsServer server, Duration shutdownTimeout) {
+        if (server == null || shutdownTimeout == null || server.ha() == null) {
+            return -1L;
+        }
+        long delay = Math.max(0L, server.ha().settings().drainDelay().toMillis());
+        long drain = Math.max(0L, server.ha().settings().drainTimeout().toMillis());
+        long shut = Math.max(0L, shutdownTimeout.toMillis());
+        long budget = delay + drain + 1_000L + shut + 3_000L;
+        return budget < 0 ? 600_000L : budget;
+    }
+
+    /**
+     * Writes a drain budget for an HA process that is still role standalone. The {@code --status}
+     * line stays {@code running pid=…}. Not called for control or data (their status file already
+     * carries the budget) and not called when HA is off, so that path does not load
+     * {@code sjws_nettask.service}.
+     */
+    static void publishHaDrainBudget(SjwsServer server, Path pidFile, Duration shutdownTimeout) {
+        if (server.ha() == null || pidFile == null) {
+            return;
+        }
+        try {
+            long pid = ProcessHandle.current().pid();
+            long started = ProcessHandle.current().info().startInstant().map(java.time.Instant::toEpochMilli)
+                    .orElse(-1L);
+            Class.forName("sjws_nettask.service.ServiceStatus")
+                    .getMethod("writeStandaloneDrain", Path.class, long.class, long.class, long.class)
+                    .invoke(null, pidFile, pid, started, drainBudgetMillis(server, shutdownTimeout));
+        } catch (ReflectiveOperationException e) {
+            System.err.println("WARN: could not record the drain budget");
+        }
+    }
+
+    static String safeMessage(String message) {
+        if (message == null || message.isBlank()) {
+            return "bootstrap failed";
+        }
+        var one = message.replace('\n', ' ').replace('\r', ' ');
+        return one.length() > 240 ? one.substring(0, 240) : one;
     }
 
     private static void releasePid(PidFile file, PrintStream err) {
@@ -306,6 +391,19 @@ public class Sjws_nettask {
             }
             return Daemon.daemonize(opt, env, out, err);
         }
+        ServiceHooks hooks = null;
+        if (opt.bootstrap() != null) {
+            if (!opt.trackPid()) {
+                err.println("ERROR: --bootstrap requires --pid-file");
+                return EXIT_USAGE;
+            }
+            try {
+                hooks = loadServiceHooks(opt);
+            } catch (IOException e) {
+                err.println("ERROR: " + safeMessage(e.getMessage()));
+                return EXIT_USAGE;
+            }
+        }
         if (child) {
             Daemon.ignoreSignal("HUP");
         }
@@ -328,12 +426,20 @@ public class Sjws_nettask {
         }
         try {
             return serveLoaded(loaded, h3Factory, logOut, logErr, started, opt.shutdownTimeout(),
-                    opt.trackPid() ? opt.pidFile() : null);
+                    opt.trackPid() ? opt.pidFile() : null, hooks);
         } finally {
             if (ownLog) {
                 logOut.close();
             }
         }
+    }
+
+    /**
+     * Loads the control/data bootstrap. Only called when {@code --bootstrap} is set, so a standalone
+     * process does not resolve {@code sjws_nettask.service}.
+     */
+    private static ServiceHooks loadServiceHooks(Daemon.Options opt) throws IOException {
+        return sjws_nettask.service.ServiceLaunch.prepare(opt.bootstrap(), opt.role());
     }
 
     /** {@code --stop} / {@code --status}: no server configuration is required. */

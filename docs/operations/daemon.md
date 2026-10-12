@@ -16,16 +16,23 @@ java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --restart --pid-file=/run/sjws_ne
 ```
 
 `--stop` sends SIGTERM and waits for `--shutdown-timeout` plus 5 seconds, then SIGKILL.
-`--status` prints `running pid=<n>`, `stopped`, or `stopped stale pid=<n>`. A pid file whose
+`--status` prints `running pid=<n>`, `stopped`, or `stopped stale pid=<n>`. A control or data
+process adds `role`, `connection`, and `config-version` when the status file beside the pid file
+names that same process (see [Control-plane service](control-plane-service.md)). Standalone does
+not write that file, so its line does not change. A pid file whose
 process is gone, or whose pid was reused (the start time no longer matches), is stale: `--stop`
 removes it and does not signal the new process. A file a live server has locked is left in place,
 so a restart cannot delete the pid file the new process just claimed. `--restart` is `--stop`
 followed by `--daemon`.
 
-SIGTERM and SIGINT (the shutdown hook) stop accepting on every listener, drop idle and
-half-read HTTP/1 connections immediately, and let responses already in progress finish until
-`--shutdown-timeout` (default 10 seconds). Whatever is still open is then closed. HTTP/3 sends
-GOAWAY and drains for up to 2 seconds in parallel with that wait. A foreground process with
+SIGTERM and SIGINT (the shutdown hook) call `SjwsServer.drain()`. With high availability
+attached, that is `Lifecycle.drain()`: not-ready, the deregistration delay, `Connection: close`,
+then the same close as below. Without it, `drain()` is that close and the wait does not change.
+Close stops accepting on every listener, drops idle and half-read HTTP/1 connections immediately,
+and lets responses already in progress finish until `--shutdown-timeout` (default 10 seconds).
+Whatever is still open is then closed. HTTP/3 sends GOAWAY and drains for up to 2 seconds in
+parallel with that wait. `--stop` waits for the HA budget recorded in the status file when one
+is present, then the same 5 second margin as before. A foreground process with
 `--pid-file` writes the same file, so `--stop` works for it too; without `--log-file` it keeps
 logging to the console.
 

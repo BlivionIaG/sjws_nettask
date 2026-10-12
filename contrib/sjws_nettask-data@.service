@@ -1,0 +1,46 @@
+# systemd template for a sjws_nettask data-plane node.
+#   systemctl enable --now sjws_nettask-data@edge1
+#
+# Same account and file rules as sjws_nettask-control@.service.
+# Do not Requires= a control unit. The control plane may be down or on another host;
+# a data node still starts and serves the last good local snapshot. Optional same-host
+# ordering (does not stop this node when control fails):
+#
+#   mkdir -p /etc/systemd/system/sjws_nettask-data@.service.d
+#   install -m 0644 contrib/sjws_nettask-data-same-host.conf \
+#       /etc/systemd/system/sjws_nettask-data@.service.d/same-host.conf
+#
+# No ExecReload. Config rollout is the control-plane watch, not a process restart.
+# -XX:-HeapDumpOnOutOfMemoryError and LimitCORE=0 keep a join token out of crash dumps.
+#
+#   install -D -m 0644 contrib/sjws_nettask-data@.service /etc/systemd/system/sjws_nettask-data@.service
+#   systemctl daemon-reload
+
+[Unit]
+Description=sjws_nettask data node %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=sjws
+Group=sjws
+UMask=0077
+PIDFile=/run/sjws_nettask/data-%i.pid
+RuntimeDirectory=sjws_nettask
+StateDirectory=sjws_nettask
+LogsDirectory=sjws_nettask
+WorkingDirectory=/var/www/html
+ExecStart=/usr/bin/java -XX:-HeapDumpOnOutOfMemoryError -jar /usr/share/sjws_nettask/sjws_nettask.jar --daemon --role=data --bootstrap=/etc/sjws_nettask/data-%i/bootstrap --pid-file=/run/sjws_nettask/data-%i.pid --log-file=/var/log/sjws_nettask/data-%i.log --shutdown-timeout=10 8080 /var/www/html
+ExecStop=/usr/bin/java -jar /usr/share/sjws_nettask/sjws_nettask.jar --stop --pid-file=/run/sjws_nettask/data-%i.pid --shutdown-timeout=10
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,7 @@ Back to the [README](../README.md) (quick start).
 ## Operations
 - [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API
 - [Running in the background (daemon)](operations/daemon.md)
+- [Control-plane and data-node service](operations/control-plane-service.md): systemd units, join bootstrap, status, drain
 - [Admin console (TUI)](operations/admin-console.md)
 - [Releasing](operations/releasing.md)
 
