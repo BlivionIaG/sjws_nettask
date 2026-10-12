@@ -45,6 +45,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
 | `ha/SnapshotHolderTest`, `ha/HealthBoardTest`, `ha/HaLifecycleTest` | atomic snapshot publish, precomputed `/healthz` and `/readyz`, drain (delay, in-flight, `Connection: close`), accept pause |
 | `SingleNodeHotPathTest` | clustering off: file handler, no role supplier, no drain supplier, no heartbeat or raft thread |
+| `clusterharness/ClusterScenariosTest` (`@Tag("cluster")`) | N control + M data nodes on the file-serving harness (ephemeral port, temp root, HTTP/1.1 client). Live: gateway-off and standalone serve the same file with no `cp-` thread. Partition, leader kill, slow node, and rollback are `@Disabled` until `sjws_nettask.cp` (design PR #38); `PendingControlPlane` refuses those calls |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
 | `tls/TlsMaterialTest` | PEM/encrypted keys, self-signed certificates, key-file/validity warnings |
 | `h2/Http2ServerTest` | HTTP/2: ALPN h2 + http/1.1 fallback, parity with HTTP/1.1, concurrent streams, h2c Upgrade and prior knowledge, stream cap, rapid reset (GOAWAY ENHANCE_YOUR_CALM), CONTINUATION flood, header list size, flow control on a large file, stalled stream, in-flight cap |
@@ -69,6 +70,8 @@ Tags: `h3` = needs QUIC; those classes also skip themselves (JUnit assumption) w
 `Http3Server.isAvailable()` is false, and `QuicNativesReportTest` prints a `WARNING` line saying so.
 `jar` = needs the packaged jar; excluded from the default Surefire run and run by the `jar-tests`
 execution in the `integration-test` phase (without the JaCoCo agent: subprocesses aren't measured).
+`cluster` = the multi-node harness. Live cases run in CI. Fault scenarios in that class are
+`@Disabled` until the control plane exists (see below).
 
 Tests named `BUG_*` were written against the original code and failed there.
 New regressions can be added as `@Tag("bug")` tests first (`mvn test -DexcludedGroups=bug`
@@ -84,6 +87,7 @@ Every user-visible behaviour and the test that asserts it.
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and the docs option tables in sync |
 | `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
 | access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed; the observe filter is order 0 and is absent while off | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test`; HTTP/2 recording in `h2/H2ConfigAndWiringTest` |
+| gateway mode off matches standalone file serving (ephemeral ports, no `cp-` thread, applied version 0) | `clusterharness/ClusterScenariosTest` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
 | `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |
