@@ -48,6 +48,26 @@ class PerIpLimitTest {
         assertThrows(IllegalArgumentException.class, () -> new PerIpLimit(0));
     }
 
+    /** Verification V1 nit: an IPv6 host can pick any address of its /64, so the /64 is what counts. */
+    @Test
+    void ipv6CountsPerSlash64() throws Exception {
+        var limit = new PerIpLimit(2);
+        assertTrue(limit.tryAcquire(InetAddress.getByName("2001:db8:1:2::1")));
+        assertTrue(limit.tryAcquire(InetAddress.getByName("2001:db8:1:2:ffff:ffff:ffff:ffff")));
+        assertFalse(limit.tryAcquire(InetAddress.getByName("2001:db8:1:2:dead:beef::7")), "same /64");
+        assertEquals(2, limit.count(InetAddress.getByName("2001:db8:1:2::abc")));
+        assertTrue(limit.tryAcquire(InetAddress.getByName("2001:db8:1:3::1")), "next /64 is separate");
+        assertEquals(2, limit.addresses());
+        limit.release(InetAddress.getByName("2001:db8:1:2::99")); // any address of the /64 releases its slot
+        assertTrue(limit.tryAcquire(InetAddress.getByName("2001:db8:1:2::5")));
+        // IPv4 (and IPv4-mapped IPv6, which Java reports as IPv4) count per full address
+        assertTrue(limit.tryAcquire(InetAddress.getByName("192.0.2.1")));
+        assertTrue(limit.tryAcquire(InetAddress.getByName("::ffff:192.0.2.1")));
+        assertFalse(limit.tryAcquire(InetAddress.getByName("192.0.2.1")));
+        assertTrue(limit.tryAcquire(InetAddress.getByName("192.0.2.2")), "neighbouring IPv4 address is separate");
+        assertEquals(InetAddress.getByName("192.0.2.9"), PerIpLimit.key(InetAddress.getByName("192.0.2.9")));
+    }
+
     @Test
     void neverGrantsMoreThanTheLimitConcurrently() throws Exception {
         var limit = new PerIpLimit(5);
