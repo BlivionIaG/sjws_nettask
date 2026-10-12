@@ -711,9 +711,6 @@ public final class ConfigLoader {
         boolean world = map.containsKey("require_world_readable")
                 && bool(map.get("require_world_readable"), "access.require_world_readable");
         var settings = new AccessSettings(deny, rules, dotfiles, owner, world);
-        if (!settings.isDefault()) {
-            warnings.add("access is stored but not enforced");
-        }
         return settings;
     }
 

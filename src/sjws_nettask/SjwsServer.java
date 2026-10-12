@@ -416,6 +416,10 @@ public final class SjwsServer implements AutoCloseable {
         try {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
+            if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
+                // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies
+                http2.armHandler(request -> this.live.handler().handle(request));
+            }
             transport.start();
             this.h2 = transport;
         } catch (Exception | LinkageError e) {
