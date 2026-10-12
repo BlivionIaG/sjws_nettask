@@ -1,4 +1,5 @@
 dist/
 build/
 test/
-nbproject/private
+nbproject/private/
+target/

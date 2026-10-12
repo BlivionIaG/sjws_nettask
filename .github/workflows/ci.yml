@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1' # weekly mutation run
+
+jobs:
+  verify:
+    # macOS (QUIC natives load there) runs on manual dispatch only: three Linux-specific
+    # expectations still fail on it (see tests/README.md, "Known platform gaps").
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - run: mvn -B verify
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jacoco-${{ matrix.os }}
+          path: target/site/jacoco/
+          if-no-files-found: ignore
+
+  mutation:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - run: mvn -B -P pitest test-compile org.pitest:pitest-maven:mutationCoverage
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pit-reports
+          path: target/pit-reports/
