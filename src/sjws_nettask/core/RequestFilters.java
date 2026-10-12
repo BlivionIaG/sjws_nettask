@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Registration entry point for request filters. Fill it before
@@ -37,6 +38,8 @@ import java.util.Objects;
  * The configuration workstream owns the file format. It should bind each implementation with
  * {@link #factory} and pass the parsed {@code middleware} list to {@link #addAll}. See
  * {@link MiddlewareSpec} for the fields that list must produce (name, order, route, options).
+ * A control plane distributes the same factories as a {@link FilterDocument}; {@link #compile}
+ * turns that document into a chain and {@link ChainControl} publishes it.
  */
 public final class RequestFilters {
 
@@ -157,6 +160,59 @@ public final class RequestFilters {
     }
 
     /**
+     * Compiles a control-plane {@link FilterDocument} with the factories bound on this registry.
+     * Label selectors are applied here: an entry whose selector does not match {@code nodeLabels}
+     * is still constructed (so a bad param fails the document) and then left out of the chain.
+     * Route patterns stay on the chain and are tested per request.
+     * <p>
+     * {@code outer}, when non-null, is inserted at order 0 ahead of other order-0 entries (a
+     * negative order still runs further out). The request path does not call this method.
+     *
+     * @return a chain ending at {@code terminal}, or null when nothing applies and {@code outer}
+     *         is null
+     * @throws IllegalArgumentException unknown type, a factory returned null, or a factory rejected
+     *         the entry
+     */
+    public FilterChain compile(FilterDocument document, Set<String> nodeLabels, Handler terminal, RequestFilter outer) {
+        Objects.requireNonNull(document, "document");
+        Objects.requireNonNull(terminal, "terminal");
+        var labels = nodeLabels == null ? Set.<String>of() : nodeLabels;
+        var built = new ArrayList<Built>(document.filters().size() + 1);
+        if (outer != null) {
+            built.add(new Built(0, -1, "observe", outer));
+        }
+        var entries = document.filters();
+        for (int i = 0; i < entries.size(); i++) {
+            var entry = entries.get(i);
+            var selector = LabelSelector.parse(entry.scope().labels());
+            var pattern = RoutePattern.parse(entry.scope().route());
+            RequestFilter filter;
+            try {
+                filter = create(new MiddlewareSpec(entry.type(), entry.order(), entry.scope().route(), entry.params()));
+            } catch (RuntimeException e) {
+                throw new IllegalArgumentException("filters[" + i + "]: " + e.getMessage(), e);
+            }
+            if (!selector.matches(labels)) {
+                continue;
+            }
+            if (!pattern.isAll()) {
+                filter = new FilterChain.Routed(pattern, filter);
+            }
+            built.add(new Built(entry.order(), i, entry.type(), filter));
+        }
+        if (built.isEmpty()) {
+            return null;
+        }
+        built.sort(Comparator.comparingInt(Built::order).thenComparingInt(Built::sequence));
+        RequestFilter.Chain next = new FilterChain.TerminalNode(terminal);
+        for (int i = built.size() - 1; i >= 0; i--) {
+            var entry = built.get(i);
+            next = new FilterChain.FilterNode(entry.name, entry.filter, next);
+        }
+        return new FilterChain(next);
+    }
+
+    /**
      * Handler to install for one route, or for the whole server. An empty registry returns
      * {@code terminal} itself, so a route with no filters pays nothing. Otherwise the returned
      * chain ends at {@code terminal}.
@@ -180,5 +236,8 @@ public final class RequestFilters {
 
     private record Entry(int order, int sequence, String name, RoutePattern route, RequestFilter filter,
             MiddlewareSpec spec) {
+    }
+
+    private record Built(int order, int sequence, String name, RequestFilter filter) {
     }
 }

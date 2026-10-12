@@ -274,7 +274,7 @@ class ConfigLoaderTest {
         assertEquals(sjws_nettask.config.ConfigCodec.sha256(loaded.document().canonicalText()),
                 loaded.document().canonicalHash());
         assertNotEquals(sha256(bytes), loaded.document().canonicalHash());
-        assertTrue(loaded.warnings().stream().anyMatch(w -> w.contains("not enforced")));
+        assertTrue(loaded.warnings().stream().noneMatch(w -> w.contains("not enforced")));
         var injected = ConfigLoader.load(new String[] {"--config=" + write("""
                 acme:
                   enabled: true

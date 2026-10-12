@@ -297,9 +297,11 @@ with `/`). Any other `*` is an error.
 
 ## Access
 
-Stored for the rights-management flags and not enforced here. Dotfiles are already
-hidden by the file handler. A non-default section warns. The fields map onto
-`AccessRules` once that class is present, without this server depending on it:
+Enforced by the file handler over HTTP/1.1, HTTP/2 and HTTP/3, and re-applied
+on every reload (add a rule and reload: it is enforced on the next request; remove
+it and reload: it is lifted). A malformed rule or an unknown `require_owner` is an
+error, and a reload that fails keeps the previous rules. Each field has a flag and
+an environment variable:
 
 | YAML | Flag | Environment |
 |---|---|---|
@@ -320,6 +322,22 @@ access:
   require_world_readable: false
 ```
 
+### Precedence with the command line
+
+The YAML section and the flags / environment are **merged**, never one replacing
+the other, so nothing configured in either place is silently dropped:
+
+| Field | Effective value |
+|---|---|
+| `deny` | union: flag/environment patterns, then YAML patterns (all answer 403, before any rule) |
+| `rules` | flag/environment rules first, then YAML rules; first match wins, so a flag rule overrides a YAML rule for the same path |
+| `allow_dotfiles` | on if either source turns it on (each is an explicit opt-in) |
+| `require_world_readable` | on if either source turns it on |
+| `require_owner` | the flag/environment value when set, otherwise the YAML value |
+
+With no `access:` section (or a default one) the flag policy is used as is, with
+no extra cost per request.
+
 `/.well-known/acme-challenge/` is answered by the ACME handler before the file
 handler, including its dotfile check, whenever ACME is on the main listener. An
 unknown token is 404 and is not a file. When ACME is enabled the stored rules
@@ -330,7 +348,7 @@ access-rule list needs. A dedicated HTTP-01 port never consults the file handler
 ## Request path
 
 `LiveConfig` holds an `AtomicReference` of `ConfigSnapshot`. The snapshot carries
-the static-file handler (and, only when ACME challenges are on the main listener,
+the static-file handler with the merged access rules (and, only when ACME challenges are on the main listener,
 the challenge handler in front of it), the route table, the middleware list and
 the access settings. Building that snapshot is the only time the file is parsed.
 
