@@ -117,7 +117,7 @@ final class H3Fixture {
         }
         assertArrayEquals(h1.body(), h3.body(), what + ": body");
         assertNotNull(h3.header("date"), what);
-        assertEquals(Http1Writer.SERVER, h3.header("server"), what);
+        assertEquals(sjws_nettask.core.ServerInfo.NAME, h3.header("server"), what);
         for (var forbidden : new String[] {"connection", "keep-alive", "transfer-encoding", "upgrade",
                 "proxy-connection"}) {
             assertNull(h3.header(forbidden), what + ": " + forbidden);

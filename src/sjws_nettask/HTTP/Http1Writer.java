@@ -42,7 +42,6 @@ import sjws_nettask.core.StaticFileHandler;
  */
 public final class Http1Writer {
 
-    public static final String SERVER = "sjws_nettask web server/0.2";
 
     /** Fields written before Connection/Content-Length. */
     static final Set<String> REPRESENTATION = Set.of(
@@ -84,7 +83,7 @@ public final class Http1Writer {
             boolean keepAlive, ResponseHeaders extra, Instant now) {
         var sb = new StringBuilder(256)
                 .append("HTTP/1.1 ").append(status).append(' ').append(StaticFileHandler.reasonPhrase(status)).append(CRLF)
-                .append("Server: ").append(SERVER).append(CRLF)
+                .append("Server: ").append(sjws_nettask.core.ServerInfo.NAME).append(CRLF)
                 .append("Date: ").append(HttpDate.format(now)).append(CRLF);
         var entries = headers.entries();
         for (var e : entries) {
@@ -130,7 +129,7 @@ public final class Http1Writer {
      */
     public static void write(OutputStream out, Response response, boolean keepAlive, ResponseHeaders extra)
             throws IOException {
-        boolean sendBody = !response.headOnly() && response.mayHaveBody();
+        boolean sendBody = response.sendsBody();
         if (sendBody && response.body() instanceof Body.FileBody file) {
             try (var channel = SafeOpen.open(file)) {
                 out.write(serializeHead(response, keepAlive, extra));

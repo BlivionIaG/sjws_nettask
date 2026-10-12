@@ -33,11 +33,11 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import sjws_nettask.HTTP.Http1Writer;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.HttpDate;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.SafeOpen;
+import sjws_nettask.core.ServerInfo;
 
 /**
  * Serializes a core {@link Response} on one HTTP/3 request stream: a HEADERS frame
@@ -86,7 +86,7 @@ final class Http3Writer {
         var frame = new DefaultHttp3HeadersFrame();
         var h = frame.headers();
         h.status(Integer.toString(response.status()));
-        h.add("server", Http1Writer.SERVER);
+        h.add("server", ServerInfo.NAME);
         h.add("date", HttpDate.format(now));
         for (var e : response.headers().entries()) {
             if (!NOT_COPIED.contains(e.getKey())) {
@@ -121,7 +121,7 @@ final class Http3Writer {
     }
 
     private Outcome send(Response response) throws IOException, InterruptedException {
-        boolean sendBody = !response.headOnly() && response.mayHaveBody() && response.contentLength() > 0;
+        boolean sendBody = response.sendsBody() && response.contentLength() > 0;
         var head = headersFrame(response, Instant.now());
         if (sendBody && response.body() instanceof Body.FileBody file) {
             long deadline = System.nanoTime() + this.limits.slotWait().toNanos();
