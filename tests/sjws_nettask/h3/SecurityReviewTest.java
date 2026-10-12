@@ -127,4 +127,23 @@ class SecurityReviewTest {
             assertEquals(200, H3TestClient.get(client.connect(server.localAddress()), "/hello.txt").status());
         }
     }
+
+    /** S2: small receive windows (bodies are discarded), so out-of-order data can't pin megabytes per connection. */
+    @Test
+    void s2ReceiveWindowsAreSmall() throws Exception {
+        try (var server = new Http3Server(config().build(), this.handler, this.tls).start();
+                var client = new H3TestClient(this.tls.certificate())) {
+            var q = client.connect(server.localAddress());
+            var params = q.peerTransportParameters();
+            assertEquals(1024 * 1024, params.initialMaxData());
+            assertEquals(16 * 1024, params.initialMaxStreamDataBidiRemote());
+            assertEquals(0, params.initialMaxStreamDataBidiLocal(), "the server never opens bidi streams");
+            assertEquals(Http3Server.MAX_STREAMS, params.initialMaxStreamsBidi());
+            // a request body far above the stream window is still drained and the response unaffected
+            var body = new byte[200_000];
+            var r = H3TestClient.request(q, "GET", "/hello.txt", Map.of(), body, null).get(10, TimeUnit.SECONDS);
+            H3Fixture.assertParity(this.handler, "GET", "/hello.txt", Map.of(), r);
+            assertEquals(200, H3TestClient.get(q, "/bin.dat").status());
+        }
+    }
 }

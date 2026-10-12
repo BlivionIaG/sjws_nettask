@@ -316,7 +316,7 @@ class Http3ServerTest {
         var paths = new String[] {"/hello.txt", "/bin.dat", "/sub/", "/missing", "/", "/large.bin", "/style.css",
             "/sub", "/%zz", "/a%20b+c.txt"};
         var futures = new ArrayList<CompletableFuture<H3TestClient.H3Response>>();
-        for (int i = 0; i < 60; i++) {
+        for (int i = 0; i < 40; i++) { // below MAX_STREAMS (64), minus streams other tests may still hold
             futures.add(H3TestClient.request(shared(), i % 7 == 0 ? "HEAD" : "GET", paths[i % paths.length], Map.of()));
         }
         for (int i = 0; i < futures.size(); i++) {
