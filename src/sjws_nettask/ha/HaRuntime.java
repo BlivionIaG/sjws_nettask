@@ -16,6 +16,8 @@
  */
 package sjws_nettask.ha;
 
+import java.util.function.Supplier;
+
 import sjws_nettask.core.Handler;
 
 /** HA state attached to one server. Absent entirely when the server is started without it. */
@@ -37,13 +39,21 @@ public final class HaRuntime {
     }
 
     public static HaRuntime create(HaSettings settings, Handler files) {
+        return create(settings, () -> files);
+    }
+
+    /**
+     * {@code configHandler} is the config snapshot (one volatile read). A later
+     * {@link SnapshotHolder#publish} replaces it for cluster generations. The holder starts empty
+     * so reload does not maintain a second copy of the same handler.
+     */
+    public static HaRuntime create(HaSettings settings, Supplier<Handler> configHandler) {
         var health = new HealthBoard(settings.requireQuorum());
         health.onChange(() -> settings.metrics().gauge("ha_ready", health.readyNow() ? 1 : 0));
         var holder = new SnapshotHolder<Handler>();
-        holder.publish(new Snapshot<>(1, 1L, files));
         health.setSnapshotLoaded(true);
         var lifecycle = new Lifecycle(health, settings);
-        return new HaRuntime(settings, holder, health, lifecycle, new HaHandler(holder, health));
+        return new HaRuntime(settings, holder, health, lifecycle, new HaHandler(holder, configHandler, health));
     }
 
     public HaSettings settings() {

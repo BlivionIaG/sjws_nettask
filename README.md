@@ -51,6 +51,7 @@ Run:
 | `--require-world-readable` | `WEB_SERVER_REQUIRE_WORLD_READABLE` | off | serve only files with mode `o+r`; others answer 403 |
 | `--cache-bytes=N[k\|m\|g]` | `WEB_SERVER_CACHE_BYTES` | 64m | small-file cache size (see below); `0` disables it |
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
+| `--config=PATH` | `WEB_SERVER_CONFIG` | | YAML configuration file (see [docs/config.md](docs/config.md)); the environment wins |
 | `-h`, `--help` | | | print usage and exit |
 | `--daemon` | | | detach and run in the background; the parent exits once the child is listening |
 | `--pid-file=PATH` | `WEB_SERVER_PID_FILE` | sjws_nettask.pid | process-id file; written by `--daemon`, and whenever this option is set |
@@ -144,11 +145,20 @@ server is then limited to the per-address cap (256 HTTP/1.1 connections, 16 QUIC
 `--max-connections-per-ip` / `--h3-max-connections-per-ip` there (e.g. to `--max-connections` /
 `--h3-max-connections`).
 
-Environment variables override arguments. Invalid values are replaced by the default
-with a `WARN:` line; unknown options warn too. Exit codes: 0 = normal / `--help`,
-1 = cannot listen on the port (also: already running, pid file or log file not writable,
-background start failed), 2 = document root missing, 64 = configuration error
-(e.g. `--cert` without `--key`, unreadable key password file, `--stop` combined with `--daemon`).
+Defaults, then the config file, then arguments, then environment variables.
+A bad value in the file is an error (exit 64). Invalid values of the server flags
+above are still replaced by the default with a `WARN:` line; unknown options warn too.
+Exit codes: 0 = normal / `--help`, 1 = cannot listen on the port (also: already running,
+pid file or log file not writable, background start failed), 2 = document root missing,
+64 = configuration error (e.g. `--cert` without `--key`, a bad config file, unreadable
+key password file, `--stop` combined with `--daemon`). Routing, middleware and
+access rules are file-only and are validated into the snapshot. The file's middleware
+list is `core.MiddlewareSpec` and is not passed to `RequestFilters`, so it does not
+build a chain; a caller that has bound factories can still pass `RequestFilters` to
+`SjwsServer.start`. This server does not proxy or enforce the access list. ACME HTTP-01
+on the main listener is answered before the file handler hides dotfiles. Reload re-reads
+the file through `ReloadHook` (see docs/config.md, including the ConfigStore notes).
+ACME HTTP-01 issuance uses the staging CA unless you select production.
 `--status` uses 0 = running, 1 = pid file is stale, 3 = not running.
 
 ### Running in the background
@@ -187,6 +197,7 @@ logging to the console.
 (`PIDFile` plus `--daemon`). Copy `target/lib/` next to the jar: `java -jar` loads Netty from the
 manifest `Class-Path`. On Windows, `--stop` ends the process without a POSIX SIGTERM, so the
 drain hook does not run; use a service manager that can signal the JVM there.
+The daemon child ignores `SIGHUP`. `ReloadHook.run()` is the reload entry a handler can call.
 
 ### HTTP/2
 
@@ -231,6 +242,14 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 | | `WEB_SERVER_TLS_KEY_PASSWORD` | | key password itself (wins over the file) |
 | `--alt-svc` / `--no-alt-svc` | `WEB_SERVER_ALT_SVC` | off | send `Alt-Svc` on HTTP/1.1 responses (see below) |
 | `--alt-svc-max-age=S` | `WEB_SERVER_ALT_SVC_MA` | 86400 | `ma` of the `Alt-Svc` header |
+| `--acme` / `--no-acme` | `WEB_SERVER_ACME` | off | ACME (RFC 8555) certificate issuance; default CA is Let's Encrypt staging |
+| `--acme-directory=URL` | `WEB_SERVER_ACME_DIRECTORY` | staging | `staging`, `production`, or an ACME directory URL |
+| `--acme-email=ADDR` | `WEB_SERVER_ACME_EMAIL` | | account contact email (required when ACME is on) |
+| `--acme-domain=NAME` | `WEB_SERVER_ACME_DOMAINS` | | domain (repeat the flag; the variable is comma-separated) |
+| `--acme-storage=PATH` | `WEB_SERVER_ACME_STORAGE` | `./acme` | account key, domain key and certificate chain |
+| `--acme-http-port=N` | `WEB_SERVER_ACME_HTTP_PORT` | 0 | HTTP-01 port; 0 serves challenges on the main listener |
+| `--acme-accept-terms` | `WEB_SERVER_ACME_ACCEPT_TERMS` | off | agree to the CA terms of service (required when ACME is on) |
+| `--acme-renew-before=DUR` | `WEB_SERVER_ACME_RENEW_BEFORE` | 30d | renew this long before the certificate expires |
 
 * `--cert` and `--key` go together; without both, a self-signed `localhost` certificate is generated.
 * The key password is deliberately **not** accepted as a command-line argument (it would show in

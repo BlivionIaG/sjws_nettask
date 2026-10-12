@@ -101,9 +101,9 @@ final class ConnectionReaper implements AutoCloseable {
         }
     }
 
-    private final long idleNanos;
-    private final long headNanos;
-    private final long writeNanos;
+    private volatile long idleNanos;
+    private volatile long headNanos;
+    private volatile long writeNanos;
     private final Set<Timer> timers = ConcurrentHashMap.newKeySet();
     private final LongAdder idleExpired = new LongAdder();
     private final LongAdder headExpired = new LongAdder();
@@ -119,6 +119,17 @@ final class ConnectionReaper implements AutoCloseable {
         this.writeNanos = write.toNanos();
         this.thread = Thread.ofPlatform().daemon().name("http1-reaper").unstarted(this::loop);
         this.thread.start();
+    }
+
+    /** Applies timeouts from a reload. Deadlines already published keep their old instant. */
+    void update(Duration idle, Duration head, Duration write) {
+        this.idleNanos = idle.toNanos();
+        this.headNanos = head.toNanos();
+        this.writeNanos = write.toNanos();
+    }
+
+    long idleNanos() {
+        return this.idleNanos;
     }
 
     Timer register(SocketChannel channel) {
