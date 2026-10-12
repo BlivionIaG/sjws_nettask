@@ -585,6 +585,78 @@ class Http1TransportTest {
         assertFalse(Http1Connection.isRoutine(new IllegalStateException("bug")));
     }
 
+    @Test
+    void routineFailureMessagesAreRecognised() {
+        for (var msg : new String[] {"Connection reset by peer", "Broken pipe", "Socket closed", "Closed by interrupt",
+                "Software caused connection abort"}) {
+            assertTrue(Http1Connection.isRoutine(new IOException(msg)), msg);
+        }
+        assertFalse(Http1Connection.isRoutine(new IOException((String) null)));
+        assertFalse(Http1Connection.isRoutine(new java.io.FileNotFoundException("closed")), "only plain IOException");
+    }
+
+    @Test
+    void fileEndingDuringTheCatchUpReadIsAShrink() throws Exception {
+        var shrinking = new FakeFileChannel(1 << 20) {
+            @Override
+            public long transferTo(long position, long count, WritableByteChannel target) {
+                return 0; // socket full
+            }
+
+            @Override
+            public int read(ByteBuffer dst, long position) {
+                return -1; // the file ended between size() and this read
+            }
+        };
+        try (var reaper = new ConnectionReaper(Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1))) {
+            var out = new ChannelOutput(null, reaper.register(null));
+            var e = assertThrows(IOException.class, () -> out.transferFrom(shrinking, 0, 1000));
+            assertEquals("file shrank during transfer (0 of 1000 bytes sent)", e.getMessage());
+        }
+    }
+
+    @Test
+    void singleByteWritesGoStraightToTheSocket() throws Exception {
+        try (var reaper = new ConnectionReaper(Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1));
+                var p = new Pair()) {
+            var out = new ChannelOutput(p.server, reaper.register(p.server));
+            out.write('A');
+            var b = ByteBuffer.allocate(1);
+            assertEquals(1, p.client.read(b));
+            assertEquals('A', b.get(0));
+        }
+    }
+
+    @Test
+    void headExpiryOfAnAlreadyClosedChannelEndsIt() throws Exception {
+        try (var reaper = new ConnectionReaper(Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1));
+                var p = new Pair()) {
+            var timer = reaper.register(p.server);
+            timer.head();
+            p.server.close(); // shutdownInput() now fails: the reaper ends it at once
+            reaper.sweep(System.nanoTime() + Duration.ofMinutes(1).toNanos());
+            assertTrue(timer.headExpired());
+            assertEquals(0, reaper.tracked());
+        }
+    }
+
+    @Test
+    void headExpiredConnectionGetsTheWriteDeadlineAsGraceBeforeItIsClosed() throws Exception {
+        try (var reaper = new ConnectionReaper(Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(5));
+                var p = new Pair()) {
+            var timer = reaper.register(p.server);
+            timer.head();
+            long now = System.nanoTime();
+            reaper.sweep(now + Duration.ofSeconds(2).toNanos());
+            assertTrue(timer.headExpired());
+            reaper.sweep(now + Duration.ofSeconds(4).toNanos());
+            assertEquals(1, reaper.tracked(), "within the grace period (write deadline): a 408 may still go out");
+            assertTrue(p.server.isOpen());
+            reaper.sweep(now + Duration.ofSeconds(8).toNanos());
+            assertEquals(0, reaper.tracked());
+        }
+    }
+
     /** Minimal FileChannel of a given size; only what ChannelOutput uses is meaningful. */
     private abstract static class FakeFileChannel extends FileChannel {
         private final long size;

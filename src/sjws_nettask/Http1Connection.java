@@ -80,6 +80,7 @@ final class Http1Connection implements Runnable {
     @Override
     public void run() {
         var timer = this.reaper.register(this.channel);
+        var remote = remote(); // read now: the channel is closed by the time a failure is logged
         try (var ch = this.channel) {
             var out = new ChannelOutput(ch, timer);
             while (serveOne(timer, out)) {
@@ -87,7 +88,7 @@ final class Http1Connection implements Runnable {
             }
         } catch (IOException | RuntimeException e) {
             if (!isRoutine(e) && !Thread.currentThread().isInterrupted()) {
-                System.err.println("Connection " + remote() + " failed: " + e);
+                System.err.println("Connection " + remote + " failed: " + e);
             }
         } finally {
             this.reaper.deregister(timer);
