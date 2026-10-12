@@ -1,10 +1,10 @@
 # Control Plane / API Gateway Mode — sjws_nettask
 
 Status: Draft · Scope: control plane and config distribution
-Base: master `459d98e` (Java 25), which includes the config model from [PR #42](https://github.com/BlivionIaG/sjws_nettask/pull/42)
+Base: master `a38fdb5` (Java 25), which includes the config model from [PR #42](https://github.com/BlivionIaG/sjws_nettask/pull/42) and the Rights package from [PR #47](https://github.com/BlivionIaG/sjws_nettask/pull/47) (`sjws_nettask.controlplane`)
 Consistent with: [high availability](../ha/design.md) (the document PR #14 added as `docs/design/high-availability.md`; PR #34 moved it), the per-group Raft API shipped in [PR #29](https://github.com/BlivionIaG/sjws_nettask/pull/29), and the cluster harness in `tests/sjws_nettask/clusterharness`.
 
-PR #29 is merged into the HA stack (`cursor/ha-vip-restart-5d15` and its parents). It is not on master `459d98e`. This design calls that API. Implementation PRs merge the stack forward. They do not reimplement Raft.
+PR #29 is merged into the HA stack (`cursor/ha-vip-restart-5d15` and its parents). It is not on master `a38fdb5`. This design calls that API. Implementation PRs merge the stack forward. They do not reimplement Raft.
 
 Binding decisions, which override a review where the two disagree:
 
@@ -20,8 +20,9 @@ Binding decisions, which override a review where the two disagree:
 10. A join token is idempotent for one node identity for its TTL. Presenting it again from that same identity is the same join.
 11. The control role does not bind the content port unless the operator sets an explicit content listener.
 12. Role precedence is the command line, then the environment, then YAML.
+13. Admin roles are `viewer`, `operator`, and `admin`. Admin authentication is mTLS only. The client certificate maps to a role through `sjws_nettask.controlplane.Rbac` (the Rights package). There is no admin bearer token. The only token is the one-shot join token.
 
-These twelve override [PR #65](https://github.com/BlivionIaG/sjws_nettask/pull/65) where that daemon slice assumed a different lifecycle (a SIGHUP that cannot run, max-staleness calling `drain()`, a content port on the control role, and an open question on role precedence).
+Decisions 5–12 override [PR #65](https://github.com/BlivionIaG/sjws_nettask/pull/65) where that daemon slice assumed a different lifecycle (a SIGHUP that cannot run, max-staleness calling `drain()`, a content port on the control role, and an open question on role precedence). Decision 13 overrides the bearer-token half of [PR #47](https://github.com/BlivionIaG/sjws_nettask/pull/47): the Rights types stay, and `Rbac.Token` is not an admin credential.
 
 ## 1. Context
 
@@ -33,7 +34,7 @@ The content request path reads the snapshot that is already installed. It does n
 
 ## 2. Principles
 
-1. **One binary, three startup roles.** `standalone` (the default), `control`, or `data`. The choice is made once at process start. `standalone` constructs no control-plane object, opens no `cp-config` group, and starts no watch. The HTTP path stays the path on master `459d98e`.
+1. **One binary, three startup roles.** `standalone` (the default), `control`, or `data`. The choice is made once at process start. `standalone` constructs no control-plane object, opens no `cp-config` group, and starts no watch. The HTTP path stays the path on master `a38fdb5`.
 2. **Zero cost when the control plane is off.** With `standalone`, the accept loop and `Http1Connection` do not read a role, a lease, a generation from Raft, or a control-plane flag. Evidence for every PR, including this one, is a `wrk` / `wrk2` before/after on the same host. The gate is the same shape as HA: report req/s and p50/p90/p99/p99.9.
 3. **Lock-free hot path.** A request performs one volatile read of an immutable snapshot (`LiveConfig.get` / `handler()`), then runs that snapshot's `Handler`. Publish is an atomic swap (`AtomicReference.set`) of the whole snapshot. The handler chain, the HA generation leaf, and the HTTP/3 handler supplier all read that snapshot. They do not keep a leaf captured at startup (§5.6). Readers take no lock. An in-flight request keeps the handler it already loaded.
 4. **Raft I/O on dedicated threads.** Append, fsync, election, and `GroupListener.onCommitted` run on the cluster group's threads (PR #29: one apply thread per group, index order). Those threads are distinct from the accept loop and from request virtual threads.
@@ -70,7 +71,7 @@ The content request path reads the snapshot that is already installed. It does n
 
 | Package | Role |
 |---|---|
-| `sjws_nettask.cp` | Raft state machine, signing, rollout, admin API, watch, registration. Depends on `sjws_nettask.cluster` and on the config model. Owns `SignedSnapshot`. Does not apply patches. |
+| `sjws_nettask.cp` | Raft state machine, signing, rollout, admin API, watch, registration. Depends on `sjws_nettask.cluster`, the config model, and `sjws_nettask.controlplane` for admin RBAC. Owns `SignedSnapshot`. Does not apply patches. |
 | `sjws_nettask.config` | Owns `ConfigDocument`, `ConfigCodec`, `canonicalHash`, `contentHash`, `ConfigValidator`, `ConfigDiff.between`, `ConfigSnapshot.compile`, `ConfigReloader.apply`, `LiveConfig`. It does not mention a `cp` type. Signature checks are not here; they are inside `SjwsServer.applyRemote` (§5.5). |
 | `sjws_nettask.cluster` | Per-group Raft from PR #29. Unchanged by this workstream. It imports neither `sjws_nettask.cp` nor `sjws_nettask.messaging`. |
 | Data plane (`http1`, `h2`, `h3`, `routing`, `core`, `messaging`, `acme` on a data node) | Sees a `Handler` or, for the broker and the composition root only, `AppliedConfig` (§3.2). Does not depend on `sjws_nettask.cp`. |
@@ -156,7 +157,7 @@ The state machine, applied in index order on the group thread:
 | `Rollback` | A new version whose content hash equals an older activated version. |
 | `Register` / `Heartbeat` / `Revoke` | Data-node liveness and denylist. `Register` commits in the same entry as `ConsumeToken` (§12.4). |
 | `TrustBundle` | Root-signed delegation of per-voter online signing keys, CA intermediates, and the version floor (§12.3). `admin` only. |
-| `Rbac` | SAN-to-role map and the secrets-directory allowlist (§12.7). `admin` only. A `Propose` that carries either is rejected. |
+| `Rbac` | Certificate-to-role policy for `viewer`, `operator`, and `admin` (§12.7). `admin` only. A `Propose` that carries it is rejected. |
 | `Audit` | One control-plane audit record (§12.10). Replicated so one voter cannot drop it. |
 | `CertReference` | ACME result: chain reference and envelope-encrypted key material (§5.7, §12.6). |
 
@@ -409,7 +410,7 @@ The leader pushes the staged version only to nodes in the open stage. Other node
 
 `Advance` opens the next stage after the open stage has enough `Ack`s. The default requirement is every targeted node that is `ALIVE`. The operator can set a minimum count. A node that is `DEAD` is reported and, under the default policy, blocks advance; the operator may skip it explicitly. That skip is itself a log entry.
 
-`Activate` commits when the last stage has met its ack rule, or when an admin with role `operate` forces it. Activation publishes the version as desired. Nodes that have not acked still receive it (subject to their window) and still serve last-good until they apply.
+`Activate` commits when the last stage has met its ack rule, or when an identity with role `operator` forces it. Activation publishes the version as desired. Nodes that have not acked still receive it (subject to their window) and still serve last-good until they apply.
 
 `Rollback { toVersion }` appends a new version whose `canonicalHash` and canonical YAML equal the retained activated snapshot `toVersion`. The new version is higher than any current version, so anti-replay still moves forward. The rollout of a rollback uses the same stage list unless the operator selects a single stage of all nodes. Nodes that never installed the bad version treat the rollback as a no-op if their installed hash already matches, and ack it.
 
@@ -501,7 +502,7 @@ Key compromise: the operator signs a new `TrustBundle` with the root. The bundle
 
 ### 12.4 Join tokens and bootstrap
 
-A join token is `{tokenId, secret}` issued for one node identity. The control plane stores the hash of `secret`, a TTL (default 1 hour, maximum 24 hours), the role, the labels, the capabilities, and the node id. Within that TTL the token is idempotent for that identity: presenting it again, including after a restart that still has the token file and including after a leadership change, is the same join. The committed consume entry is returned again. A second enrollment is not created. A different node identity is rejected. A presentation after the TTL is rejected.
+A join token is `{tokenId, secret}` issued for one node identity. It is the only token the control plane accepts. It is not an admin credential and it is not an `Authorization` bearer. The control plane stores the hash of `secret`, a TTL (default 1 hour, maximum 24 hours), the role, the labels, the capabilities, and the node id. Within that TTL the token is one-shot for that identity: presenting it again, including after a restart that still has the token file and including after a leadership change, is the same join, not a second enrollment and not a reusable session. The committed consume entry is returned again. A second enrollment is not created. A different node identity is rejected. A presentation after the TTL is rejected.
 
 The data node checks the pinned CA fingerprint **before** it sends the token. Role `data` has no trust-on-first-use path. A lab process may pass `--insecure-tofu`, and that flag is refused when the role is `data` or when the group has more than one voter. The bootstrap API returns the fingerprint and the token to its caller. A test does not scrape stdout for either value.
 
@@ -542,19 +543,27 @@ A `Secret` value's `toString` is `***`. Logs, metrics, admin JSON, and validatio
 
 Heap dumps and core dumps are in scope. The service unit sets `-XX:-HeapDumpOnOutOfMemoryError` and `ulimit -c 0`.
 
-Admin tokens and join tokens are stored as hashes. Heartbeats and audit records carry node ids and versions, not secret bytes. The YAML loader does not interpolate `${env:}` or `${file:}`.
+There is no admin bearer token. Join tokens are stored as hashes and are not admin credentials. Heartbeats and audit records carry node ids and versions, not secret bytes. The YAML loader does not interpolate `${env:}` or `${file:}`.
 
 ### 12.7 Admin RBAC
 
-The admin API authenticates the client certificate. The SAN maps to a role stored in the `Rbac` log entry, which only `admin` can append. `Propose` is rejected when the YAML contains `rbac` or `trust`. An `operate` identity cannot grant itself `admin`, and it cannot rotate keys or issue join tokens.
+Admin authentication is mTLS only. The TLS layer verifies the client certificate against the operator CA before the handler runs. The verified identity is a URI SAN (`urn:sjws:admin:<id>`) or a subject DN. `sjws_nettask.cp` does not invent a second role enum. It calls the Rights package from [PR #47](https://github.com/BlivionIaG/sjws_nettask/pull/47):
 
-| Role | Allowed |
-|---|---|
-| `view` | Read desired config, diffs, nodes, leadership, per-node applied version. Responses omit sealed blobs. |
-| `operate` | `view`, plus propose, stage, advance, activate, rollback. |
-| `admin` | `operate`, plus voter membership, revoke, `TrustBundle`, `Rbac`, join-token issue. |
+```java
+var decision = rbac.authorize(new Rbac.ClientCert(san), permission, target, version);
+```
 
-An unknown SAN is rejected. The bootstrap token maps to `admin` until the first admin identity is enrolled, and only from a connection that also presents that token's holder. The TUI uses this API. It does not get a side channel into the content server.
+`Rbac` (`sjws_nettask.controlplane.Rbac`) is the CP policy. An `Operator` is enrolled with a certificate subject and a `Role`. `tokenHash` is null. `Rbac.Token`, `Authorization: Bearer`, and `Rbac.newToken` are not accepted on the admin API and are not issued for it. An unknown, disabled, or malformed certificate is denied. If the audit write fails, the action is denied.
+
+The names are `viewer`, `operator`, and `admin`, which are `Role.VIEWER`, `Role.OPERATOR`, and `Role.ADMIN`.
+
+| Role | Rights | Allowed |
+|---|---|---|
+| `viewer` | `Permission.READ` | Read desired config, diffs, nodes, leadership, per-node applied version. Responses omit sealed blobs. |
+| `operator` | `READ`, `EDIT_ROUTES`, `ROLLOUT`, `ROLLBACK`, `NODE_DRAIN` | `viewer`, plus propose, stage, advance, activate, rollback, and drain of a data node. |
+| `admin` | every `Permission`, including `MANAGE_OPERATORS` | `operator`, plus voter membership, revoke, `TrustBundle`, operator policy, and join-token issue. |
+
+Only `admin` appends an `Rbac` entry (`Rbac.putOperator` / `removeOperator`, which require `MANAGE_OPERATORS` and refuse to leave no enabled admin). `Propose` is rejected when the YAML contains `rbac` or `trust`. An `operator` cannot grant itself `admin`, rotate keys, or issue join tokens. The TUI uses this API. It does not get a side channel into the content server, and it does not keep a bearer token.
 
 ### 12.8 Limits
 
@@ -611,17 +620,19 @@ Desired topic state and the message log are different Raft groups. Losing the co
 
 The control role binds a dedicated admin address and does not bind the content port by default (§3.3). The content port, when a control process has one, does not serve these routes.
 
-| Method | Path | Role | Body |
-|---|---|---|---|
-| `GET` | `/cp/v1/health` | `view` | leader, term, `leaderReady`, voter count |
-| `GET` | `/cp/v1/config` | `view` | activated metadata and canonical YAML. Sealed blobs appear as ids and hashes. |
-| `GET` | `/cp/v1/config/diff?from=&to=` | `view` | `ConfigDiff.between` for the two retained versions: section, `LIVE` or `RESTART`, field names. Not a patch. Sealed blobs are omitted. |
-| `POST` | `/cp/v1/config` | `operate` | canonical YAML to `Propose` |
-| `POST` | `/cp/v1/rollout` | `operate` | ordered selectors |
-| `POST` | `/cp/v1/rollout/advance` | `operate` | open the next stage, or force |
-| `POST` | `/cp/v1/rollback` | `operate` | `{ "toVersion": <long> }` |
-| `GET` | `/cp/v1/nodes` | `view` | id, role, labels, version, freshness |
-| `POST` | `/cp/v1/nodes/{id}/revoke` | `admin` | denylist |
+| Method | Path | Role | Rights | Body |
+|---|---|---|---|---|
+| `GET` | `/cp/v1/health` | `viewer` | `READ` | leader, term, `leaderReady`, voter count |
+| `GET` | `/cp/v1/config` | `viewer` | `READ` | activated metadata and canonical YAML. Sealed blobs appear as ids and hashes. |
+| `GET` | `/cp/v1/config/diff?from=&to=` | `viewer` | `READ` | `ConfigDiff.between` for the two retained versions: section, `LIVE` or `RESTART`, field names. Not a patch. Sealed blobs are omitted. |
+| `POST` | `/cp/v1/config` | `operator` | `EDIT_ROUTES` | canonical YAML to `Propose` |
+| `POST` | `/cp/v1/rollout` | `operator` | `ROLLOUT` | ordered selectors |
+| `POST` | `/cp/v1/rollout/advance` | `operator` | `ROLLOUT` | open the next stage, or force |
+| `POST` | `/cp/v1/rollback` | `operator` | `ROLLBACK` | `{ "toVersion": <long> }` |
+| `GET` | `/cp/v1/nodes` | `viewer` | `READ` | id, role, labels, version, freshness |
+| `POST` | `/cp/v1/nodes/{id}/revoke` | `admin` | `MANAGE_OPERATORS` | denylist |
+
+Every route authenticates with the client certificate. There is no `Authorization` bearer. A missing or unmapped certificate is 401. A mapped certificate whose role lacks the permission is 403.
 
 Responses are JSON. Mutations return the committed `version` and `raftIndex`, or a validation error and no committed entry. A follower responds with the leader address and does not append.
 
@@ -635,7 +646,7 @@ In-JVM unless a row says otherwise. The cluster transport is the PR #29 sim tran
 
 The suite that will run the four outage scenarios is already in the tree: `tests/sjws_nettask/clusterharness`. `ClusterHarness.open(controlNodes, dataNodes, root, role, clock)` starts data nodes the way `FileServingEndToEndTest` does (`SjwsServer` on port 0). Control nodes go through `ControlPlane`. `PendingControlPlane` refuses every call until `sjws_nettask.cp` implements that interface. The implementation reads `ClusterClock` for election, heartbeat, suspect, dead, watch retry, max-staleness, and `delay`. `GroupOptions` durations are arguments of the test cluster, not only the production defaults. The four scenarios stay `@Disabled` until `ControlPlane.available()` is true. Enabling one is removing `@Disabled` and pointing `ClusterHarness.newControlPlane()` at the real factory.
 
-The in-JVM observation does not mint a `view` certificate. `ControlPlane` is the direct read: `leader()`, `ControlNode.leaderReady()`, `ControlNode.adminPort()`, `ControlNode.term()`, `push`, `rollback`, `contentHash(version)` (that value is `canonicalHash`), `partitionDataFromControl`, `heal`, `killLeader`, `delay`, and `awaitConverged`. A follower's leader address is data on that interface, not a log line. Admin and watch listeners bind `127.0.0.1:0` and return the bound port from `start`. A subprocess prints one line, `content=<port> admin=<port> watch=<port>`. Bootstrap returns the CA fingerprint and the join token to the caller. A test does not scrape stdout for either value.
+The in-JVM observation does not mint a `viewer` certificate. `ControlPlane` is the direct read: `leader()`, `ControlNode.leaderReady()`, `ControlNode.adminPort()`, `ControlNode.term()`, `push`, `rollback`, `contentHash(version)` (that value is `canonicalHash`), `partitionDataFromControl`, `heal`, `killLeader`, `delay`, and `awaitConverged`. A follower's leader address is data on that interface, not a log line. Admin and watch listeners bind `127.0.0.1:0` and return the bound port from `start`. A subprocess prints one line, `content=<port> admin=<port> watch=<port>`. Bootstrap returns the CA fingerprint and the join token to the caller. A test does not scrape stdout for either value.
 
 While the watch is down, the oracle is the data node, not the admin API. `DataNode.version()` and `DataNode.contentHash()` read `AppliedConfig` (`bundleVersion` and `canonicalHash`). Role `data` also exposes a loopback status with version, epoch, `canonicalHash`, and whether the watch is connected. Role `standalone` does not register that route. A standalone snapshot reports version `0`.
 
@@ -658,7 +669,7 @@ While the watch is down, the oracle is the data node, not the admin API. `DataNo
 | Expiry | An envelope past `expiresAtMillis`, or a node with no freshness frame past that expiry, is stale. Serving stays on last-good. |
 | Anti-replay | An envelope at or below the floor is rejected. `epoch` below the highest applied epoch is rejected. No nonce set is required. |
 | Wiped `stateDir` | With the pin floor set, a pre-floor envelope is rejected and the listener answers 503. Last-good is not compiled. |
-| `operate` RBAC | A `Propose` that contains `rbac` or `trust` is rejected. The `Rbac` entry is unchanged. |
+| `operator` RBAC | A `Propose` that contains `rbac` or `trust` is rejected. The `Rbac` entry is unchanged. A bearer token is rejected. A `viewer` certificate cannot propose. |
 | Secret path | A reference outside the secrets directory, including `..` and a symlink escape, is rejected. The error has no file bytes. |
 | Learner revoke | A learner watch server drops a revoked node on the next handshake and on apply of `Revoke`. |
 | Token replay | After a leader change, the same join token from the same node identity is the same join. A different identity is rejected. The certificate was returned only after `ConsumeToken` committed. |
@@ -714,7 +725,7 @@ This design PR changes no `.java` file. Its before/after pair is noise on identi
 Each PR is based on current master (this document's base or newer), merges the HA stack when it needs `ClusterNode`, keeps `mvn verify` green, does not lower the 0.96 root branch floor, and does not merge itself.
 
 1. **Design.** This document.
-2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, and `ConfigDiff.between` as a report. `SjwsServer.applyRemote` verifies the signature and the rollback inside the lock and fails closed, then uses `ConfigReloader.apply`. The handler chain reads the live snapshot. Last-good is `<stateDir>/config/last-good.json`. Admin routes in §14 with RBAC kept out of `Propose`. Expose `sjws_nettask.service.ControlPlaneBinding` and `NodeEnrollment` with the signatures in §6.1. SIGHUP stays a local reload. Drain stays inside the 30 s `drain-ms` budget. Readiness is `/readyz` plus `leaderReady()` on a control node. Join tokens are idempotent per node identity. The control role does not bind the content port by default. Role precedence is CLI, then environment, then YAML. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
+2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, and `ConfigDiff.between` as a report. `SjwsServer.applyRemote` verifies the signature and the rollback inside the lock and fails closed, then uses `ConfigReloader.apply`. The handler chain reads the live snapshot. Last-good is `<stateDir>/config/last-good.json`. Admin routes in §14 authorize through `sjws_nettask.controlplane.Rbac` with `Role.VIEWER`, `Role.OPERATOR`, and `Role.ADMIN`. The client certificate is the only admin credential. RBAC stays out of `Propose`. Expose `sjws_nettask.service.ControlPlaneBinding` and `NodeEnrollment` with the signatures in §6.1. SIGHUP stays a local reload. Drain stays inside the 30 s `drain-ms` budget. Readiness is `/readyz` plus `leaderReady()` on a control node. Join tokens are one-shot and idempotent per node identity. The control role does not bind the content port by default. Role precedence is CLI, then environment, then YAML. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
 3. **Registration and distribution.** Watch client and server, projection, ack window, full snapshots only, `<stateDir>/config/last-good.json`, staged rollout and rollback, label selection. Data role calls `applyRemote`. Implement `ControlPlane` so the four harness scenarios can drop `@Disabled`. Tests for resume, backpressure, canary, partition, and revoke. Benchmark as §16.
 
 The request path in both implementation PRs stays a volatile read of the immutable snapshot.
