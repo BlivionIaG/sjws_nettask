@@ -100,10 +100,15 @@ class RouterTest {
     @Test
     void dotDotSegmentsAre400() {
         var router = new Router(List.of(new Route("/api", echo("api"))), echo("fb"));
-        for (var t : new String[] {"/api/../secret", "/..", "/a/%2e%2e/b", "/a/.%2E", "/a/%2E.?x", "/api/.."}) {
+        for (var t : new String[] {"/api/../secret", "/..", "/a/%2e%2e/b", "/a/.%2E", "/a/%2E.?x", "/api/..",
+                // path confusion: forms an upstream may read as ".." (servlet ";" parameters, backslash, encoded separators)
+                "/api/..;/admin", "/api/..;x/admin", "/api/%2e%2e;/admin", "/api/..\\admin", "/api\\..\\admin",
+                "/api/..%2fadmin", "/api/..%2Fadmin", "/api/%2e%2e%2fadmin", "/api%2f..%2fadmin", "/api/..%5cadmin",
+                "/api/..%5Cadmin", "/api/x/..;"}) {
             assertEquals(400, router.handle(req(null, t)).status(), t);
         }
-        for (var t : new String[] {"/api/.x", "/a/...", "/a/..b", "/a/.", "/a?x=/../", "/%2e", "/a/%2", "/a/%2f%2e"}) {
+        for (var t : new String[] {"/api/.x", "/a/...", "/a/..b", "/a/.", "/a?x=/../", "/%2e", "/a/%2", "/a/%2f%2e",
+                "/api/.;/x", "/api/x;..", "/api/a..;/b", "/api/...;/b", "/api/%2e;/b", "/a\\b", "/a%2fb", "/a/..x%2f"}) {
             assertNotEquals(400, router.handle(req(null, t)).status(), t);
         }
     }
@@ -130,6 +135,18 @@ class RouterTest {
         assertEquals("https://e.org/a", noSlash.handle(req(null, "/a")).headers().get("location"));
         var routed = new Router(List.of(new Route(null, "/old", "/", new RedirectHandler(307, "/new/", true))), null);
         assertEquals("/new/x", routed.handle(req(null, "/old/x")).headers().get("location"));
+        // open redirect: a relative location must never become protocol-relative ("//host", "/\\host")
+        var toRoot = new Router(List.of(new Route(null, "/old", "/", new RedirectHandler(301, "/", true))), null);
+        for (var t : new String[] {"/old//evil.example", "/old///evil.example/x", "/old/\\evil.example",
+                "/old/\\/evil.example", "/old//\\evil.example"}) {
+            var loc = toRoot.handle(req(null, t)).headers().get("location");
+            assertFalse(loc.startsWith("//") || loc.startsWith("/\\"), t + " -> " + loc);
+        }
+        assertEquals("/evil.example", toRoot.handle(req(null, "/old//evil.example")).headers().get("location"));
+        assertEquals("/x?q", toRoot.handle(req(null, "/old/x?q")).headers().get("location"));
+        assertEquals("/", toRoot.handle(req(null, "/old")).headers().get("location"));
+        assertEquals("https://e.org/a", noSlash.handle(req(null, "//a")).headers().get("location"));
+        assertEquals("https://example.com/a", keep.handle(req(null, "//a")).headers().get("location"));
         assertThrows(IllegalArgumentException.class, () -> new RedirectHandler(200, "/", false));
         assertThrows(IllegalArgumentException.class, () -> new RedirectHandler(301, "", false));
         assertThrows(IllegalArgumentException.class, () -> new RedirectHandler(301, null, false));

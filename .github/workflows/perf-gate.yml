@@ -1,0 +1,79 @@
+name: Perf gate
+
+# A/B wrk benchmark of the PR head against its base branch on the same runner.
+# Opt out per PR with the `skip-perf` label. Tune with repository variables
+# PERF_THRESHOLD (throughput %, default 10) and PERF_P99_THRESHOLD (default 2x).
+# See docs/development/perf-gate.md.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - 'tools/perf-gate/**'
+      - '.github/workflows/perf-gate.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  perf:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-perf') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: head
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: |
+            head/pom.xml
+            base/pom.xml
+      - name: Install wrk
+        run: sudo apt-get update -q && sudo apt-get install -y -q wrk
+      - name: Build base and head jars
+        run: |
+          for side in base head; do
+            (cd "$side" && mvn -B -q -DskipTests package)
+            jar="$(ls "$side"/target/sjws_nettask-*.jar | grep -v -e sources -e tests | head -n1)"
+            echo "${side^^}_JAR=$GITHUB_WORKSPACE/$jar" >> "$GITHUB_ENV"
+          done
+      - name: Benchmark (interleaved, warmup, median of runs)
+        env:
+          RUNS: '5'
+          DURATION: 10s
+          WARMUP: 5s
+        # Scripts come from the PR head; the base build is only executed as a server.
+        run: head/tools/perf-gate/bench.sh "$BASE_JAR" "$HEAD_JAR" perf-out
+      - name: Compare
+        env:
+          THRESHOLD: ${{ vars.PERF_THRESHOLD || '10' }}
+          P99_THRESHOLD: ${{ vars.PERF_P99_THRESHOLD || '' }}
+        run: |
+          args=(--threshold "$THRESHOLD")
+          [[ -n "$P99_THRESHOLD" ]] && args+=(--p99-threshold "$P99_THRESHOLD")
+          set +e
+          python3 head/tools/perf-gate/compare.py perf-out/base.jsonl perf-out/head.jsonl "${args[@]}" > perf-out/summary.md
+          rc=$?
+          set -e
+          cat perf-out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat perf-out/summary.md
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-gate
+          path: perf-out/
+          if-no-files-found: ignore
