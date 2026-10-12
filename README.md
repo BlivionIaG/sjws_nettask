@@ -7,6 +7,13 @@ Build and test:
 
     mvn verify      # tests + JaCoCo coverage gate (report: target/site/jacoco/index.html)
 
+This builds `target/sjws_nettask-0.2-SNAPSHOT.jar` plus `target/lib/` (Netty and the QUIC natives,
+named in the jar's `Class-Path`): copy both together. `mvn verify` also runs the jar itself with
+`--h3` (tests tagged `jar`). The h3/tls coverage thresholds apply only on platforms that ship QUIC
+natives (Maven profiles `h3-gate-*`, activated by OS/arch); elsewhere the HTTP/3 tests skip and the
+build log says so. If the natives exist but can't load (e.g. a `noexec` `/tmp`), add
+`-Dh3.gate.line=0 -Dh3.gate.branch=0 -Dtls.gate.line=0 -Dtls.gate.branch=0` (or `-DexcludedGroups=h3`).
+
 Run:
 
     java -jar target/sjws_nettask-0.2-SNAPSHOT.jar [port] [html folder] [options]
@@ -68,7 +75,9 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   RFC 9000 anti-amplification limit applies until a client's address is validated by the handshake.
 * **Shutdown** sends `GOAWAY`, lets in-flight HTTP/3 responses finish for up to 2 s, then closes.
 * The self-signed certificate is new on every start (its fingerprint is printed): a pinned fingerprint
-  is valid until restart.
+  is valid until restart, although Alt-Svc tells clients to remember the endpoint for `ma` seconds.
+* With `--cert`/`--key`, startup warns (`WARN:`) if the key file is readable by group or others, or if the
+  certificate is expired or not yet valid. The key password is only read when `--h3` is on.
 * The QUIC transport is Netty's `netty-codec-http3` with its bundled native quiche library
   (linux x86_64/aarch64, macOS, Windows x86_64). On other platforms, or if the native library cannot be
   extracted (e.g. `/tmp` mounted `noexec`; set `-Dio.netty.native.workdir=<dir>`), `--h3` takes the
@@ -84,6 +93,11 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 * `%2F` is decoded before path resolution, so it acts as `/` (it cannot escape the root).
 * Where the file system has no file keys (Windows), the "file was swapped between resolve and send"
   check falls back to the size check during transfer.
+* Files are opened relative to the document root one directory at a time without following symlinks
+  (`SecureDirectoryStream`, i.e. `openat`, on Linux and macOS), so a directory swapped for a symlink
+  between resolve and send is never followed. Where that API is missing (Windows), the server opens the
+  path without following a final symlink and re-checks its real path and file key afterwards; that
+  narrows but does not close the race.
 
 Serves GET and HEAD (other known methods: 405, unknown: 501), HTTP/1.0 and 1.1
 with keep-alive and pipelining, `If-Modified-Since`, directory listings, and
