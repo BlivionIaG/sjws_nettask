@@ -432,7 +432,7 @@ class SecurityReviewTest {
             assertEquals(List.of(8L), goaways, "GOAWAY names the first unprocessed request stream");
             assertTrue(took > TimeUnit.MILLISECONDS.toNanos(500), "close() waited for the request");
             assertTrue(took < TimeUnit.SECONDS.toNanos(9), "returned once drained, not after the full window");
-            assertEquals(1, server.responses(Http3Writer.Outcome.COMPLETE) - 1);
+            waitFor(() -> server.responses(Http3Writer.Outcome.COMPLETE) == 2, 5, "both counted: " + outcomes(server));
             q.closeFuture().await(5, TimeUnit.SECONDS);
             assertFalse(q.isActive(), "connection closed after the drain");
         } finally {
@@ -456,6 +456,108 @@ class SecurityReviewTest {
             assertTrue(took >= TimeUnit.MILLISECONDS.toNanos(450) && took < TimeUnit.SECONDS.toNanos(4),
                     "close took " + took / 1_000_000 + " ms");
             waitFor(() -> !q.isActive(), 5, "connection closed");
+        }
+    }
+
+    /** Writer error path: a read error mid-file resets the stream (H3_INTERNAL_ERROR) and counts FAILED. */
+    @Test
+    void readErrorResetsTheStreamAndCountsFailed() throws Exception {
+        // /proc/<pid>/mem is a regular file whose read at offset 0 (unmapped) fails with EIO
+        var proc = Path.of("/proc/" + ProcessHandle.current().pid());
+        var mem = proc.resolve("mem");
+        org.junit.jupiter.api.Assumptions.assumeTrue(Files.isRegularFile(mem), "Linux /proc only");
+        var attrs = Files.readAttributes(mem, java.nio.file.attribute.BasicFileAttributes.class);
+        java.util.function.Function<sjws_nettask.core.Request, sjws_nettask.core.Response> broken = r ->
+                !r.target().equals("/x") ? this.handler.handle(r)
+                        : new sjws_nettask.core.Response(200, sjws_nettask.core.ResponseHeaders.of(),
+                                new sjws_nettask.core.Body.FileBody(mem, 0, 4096, sjws_nettask.core.Validator.of(attrs), proc));
+        try (var server = new Http3Server(config().build(), broken, this.tls).start();
+                var client = new H3TestClient(this.tls.certificate())) {
+            var q = client.connect(server.localAddress());
+            var r = H3TestClient.request(q, "GET", "/x", Map.of()).get(10, TimeUnit.SECONDS);
+            assertTrue(r.reset() || r.body().length < 4096, "not served as complete");
+            waitFor(() -> server.responses(Http3Writer.Outcome.FAILED) == 1, 5, "FAILED counted: " + outcomes(server));
+            waitFor(() -> server.inflight() == 0, 5, "slot returned");
+            assertTrue(q.isActive(), "a stream error, not a connection error");
+            H3Fixture.assertParity(this.handler, "GET", "/hello.txt", Map.of(), H3TestClient.get(q, "/hello.txt"));
+        }
+    }
+
+    /**
+     * Writer interrupt path: a request waiting for a file slot whose client goes away is cancelled at once
+     * (CLOSED), not refused after the full slot wait, and the slot holder's permit is returned afterwards.
+     */
+    @Test
+    void waiterWhoseClientLeavesIsCancelledAndSlotsAreReturned() throws Exception {
+        try (var server = new Http3Server(config().writeTimeout(Duration.ofSeconds(30)).build(), this.handler, this.tls)
+                .limits(limits(100, 1, 16, Duration.ofSeconds(20), Duration.ofSeconds(30), 0)).start();
+                var holder = new H3TestClient(this.tls.certificate());
+                var waiter = new H3TestClient(this.tls.certificate())) {
+            var hq = holder.connect(server.localAddress());
+            pausedDownloads(hq, 1);
+            waitFor(() -> server.inflight() == 1, 5, "slot held");
+            var wq = waiter.connect(server.localAddress());
+            H3TestClient.request(wq, "GET", "/hello.txt", Map.of());
+            waitFor(() -> server.inflight() == 2, 5, "second request waiting for the slot");
+            long t0 = System.nanoTime();
+            wq.close().sync();
+            waitFor(() -> server.responses(Http3Writer.Outcome.CLOSED) == 1, 5, "waiter cancelled: " + outcomes(server));
+            assertTrue(System.nanoTime() - t0 < TimeUnit.SECONDS.toNanos(5), "well before the 20 s slot wait");
+            assertEquals(0, server.responses(Http3Writer.Outcome.REJECTED));
+            hq.close().sync();
+            waitFor(() -> server.inflight() == 0, 5, "holder's slot returned");
+            try (var again = new H3TestClient(this.tls.certificate())) { // the single file slot is free again
+                var r = H3TestClient.request(again.connect(server.localAddress()), "GET", "/hello.txt", Map.of())
+                        .get(5, TimeUnit.SECONDS);
+                H3Fixture.assertParity(this.handler, "GET", "/hello.txt", Map.of(), r);
+            }
+        }
+    }
+
+    /** S3: after GOAWAY(id) the client may not open stream id or above; the server refuses any that arrive. */
+    @Test
+    void requestsAfterGoAwayAreRefused() throws Exception {
+        var c = new Http3Server.Connection(new java.util.concurrent.Semaphore(1));
+        assertTrue(c.admit(0));
+        assertTrue(c.admit(8)); // out of order is fine
+        assertEquals(12, c.nextStreamId);
+        c.goAwayId = c.nextStreamId;
+        assertTrue(c.admit(4), "below the GOAWAY id: still processed");
+        assertFalse(c.admit(12));
+        assertFalse(c.admit(16));
+
+        var goaways = new java.util.concurrent.CopyOnWriteArrayList<Long>();
+        var group = new io.netty.channel.MultiThreadIoEventLoopGroup(1, io.netty.channel.nio.NioIoHandler.newFactory());
+        try {
+            var server = new Http3Server(config().writeTimeout(Duration.ofSeconds(30)).build(), this.handler, this.tls)
+                    .limits(limits(100, 100, 16, Duration.ofSeconds(5), Duration.ofSeconds(30), 0, Duration.ofSeconds(3)))
+                    .start();
+            var q = goAwayRecordingConnection(group, this.tls, server.localAddress(), goaways);
+            var held = pausedDownloads(q, 1); // stream 0 keeps close() draining
+            waitFor(() -> server.inflight() == 1, 5, "download in flight");
+            var closer = Thread.ofPlatform().start(server::close);
+            waitFor(() -> !goaways.isEmpty(), 5, "GOAWAY");
+            assertEquals(List.of(4L), goaways);
+            var late = H3TestClient.request(q, "GET", "/hello.txt", Map.of()).get(5, TimeUnit.SECONDS);
+            assertTrue(late.reset(), "the client may not send it (Netty's client enforces GOAWAY)");
+            assertEquals(-1, late.status());
+            held.forEach(s -> s.config().setAutoRead(true));
+            closer.join(10_000);
+            assertFalse(closer.isAlive());
+            assertEquals(1, server.responses(Http3Writer.Outcome.COMPLETE), "the held download still completed");
+        } finally {
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).await(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void limitsAreFixedAtStart() throws Exception {
+        var server = new Http3Server(config().build(), this.handler, this.tls);
+        var custom = limits(7, 3, 2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0);
+        assertEquals(custom, server.limits(custom).limits());
+        try (var started = server.start()) {
+            assertThrows(IllegalStateException.class, () -> started.limits(custom));
+            assertEquals(0, started.inflight());
         }
     }
 

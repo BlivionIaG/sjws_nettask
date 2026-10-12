@@ -236,10 +236,8 @@ final class Http3Writer {
         this.previous.addListener(f -> done.complete(null));
         try {
             done.get(this.limits.writeTimeout().toNanos(), TimeUnit.NANOSECONDS);
-        } catch (TimeoutException e) {
+        } catch (TimeoutException | ExecutionException e) { // (the latter can't happen: completed with null)
             return Outcome.STALLED; // no progress: the peer stopped reading
-        } catch (ExecutionException e) {
-            throw new IllegalStateException(e); // never completed exceptionally
         }
         if (!this.previous.isSuccess()) {
             return Outcome.CLOSED;
