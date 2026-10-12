@@ -44,6 +44,11 @@ Run:
 | `--header-timeout=S` | `WEB_SERVER_HEADER_TIMEOUT` | 10 | time to receive a complete request head (seconds) |
 | `--max-connections-per-ip=N` | `WEB_SERVER_MAX_CONNECTIONS_PER_IP` | 256 | HTTP/1.1 connections from one client address (IPv6: one /64); extra ones are closed at once without a response |
 | `--allow-unlistable-dirs` | `WEB_SERVER_ALLOW_UNLISTABLE_DIRS` | off | serve files below directories the server can't read (mode `--x`) through a weaker path-based open; see Platform notes |
+| `--deny=PAT[,PAT...]` | `WEB_SERVER_DENY` | none | answer 403 for paths matching these patterns; checked before every other rule (see Access rules) |
+| `--access-rule=ACTION:PAT` | `WEB_SERVER_ACCESS_RULES` (comma-separated) | none | `allow:`, `deny:` (403) or `hide:` (404) a path pattern; repeatable, first match wins |
+| `--allow-dotfiles` | `WEB_SERVER_ALLOW_DOTFILES` | off | serve names starting with `.`; off: they answer 404 and are never listed |
+| `--require-owner=USER` | `WEB_SERVER_REQUIRE_OWNER` | off | serve only files owned by this user (name or numeric uid); others answer 403 |
+| `--require-world-readable` | `WEB_SERVER_REQUIRE_WORLD_READABLE` | off | serve only files with mode `o+r`; others answer 403 |
 | `--cache-bytes=N[k\|m\|g]` | `WEB_SERVER_CACHE_BYTES` | 64m | small-file cache size (see below); `0` disables it |
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
 | `-h`, `--help` | | | print usage and exit |
@@ -57,10 +62,11 @@ Run:
 
 ### Observability
 
-Off by default, and off means the request path does not touch it. The transports are given
-`RequestObserver.NONE`. A request then does one volatile read of that slot and a reference compare,
-and stops: no `System.nanoTime`, no `LongAdder` update, no latency compare-and-set, and no inspection
-of the path for `/healthz` or `/metrics`. A file at either path is served from the document root, the
+Off by default, and off means the request path does not install an observe filter. A request then
+does not call `System.nanoTime`, does not update a `LongAdder`, does not compare-and-set a latency
+sample, and does not inspect the path for `/healthz` or `/metrics`. HTTP/1.1 calls the static file
+handler directly. HTTP/2 and HTTP/3 do the same after one volatile read of a handler slot that stays
+null until `metricsSnapshot()` arms it. A file at either path is served from the document root, the
 same as a build without this feature.
 
 Counters, the access log and the probes turn on only when something asks for them:
@@ -75,8 +81,9 @@ Counters, the access log and the probes turn on only when something asks for the
 | `--no-healthz` | | | leave `/healthz` to the document root |
 
 The admin TUI is the other switch. `EmbeddedServerControl.status()` calls `server.metricsSnapshot()`,
-which is `armMetrics().snapshot()`. The first call replaces `NONE` with a recording observer; the next
-request on each transport starts sampling the clock and updating counters. That snapshot does not
+which is `armMetrics().snapshot()`. The first call replaces `NONE` with a recording observer and, when
+the observe filter was not installed at startup, publishes that filter. The next request on each
+transport enters it and starts sampling the clock and updating counters. That snapshot does not
 enable `/healthz` or `/metrics` — those stay at the flags above — so a document-root `/healthz` file
 is still served after the TUI has armed the counters. Reading `server.metrics()` without
 `metricsSnapshot()` does not arm anything; it returns the empty `NONE` registry.
@@ -113,13 +120,13 @@ snap.latency().cumulative(i);     // Prometheus-style, through bucket i
 metrics.prometheus();             // text exposition 0.0.4
 ```
 
-Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. `bytes` is the body size the handler committed to; a write that throws counts the request and 0 bytes. `/healthz` and `/metrics` are counted like any other response once those probes are enabled. With observability off, nothing is counted.
+Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. `bytes` is the body size the handler committed to, recorded when the filter returns, before the socket write. `/healthz` and `/metrics` are counted like any other response once those probes are enabled. A request that never enters the chain (an HTTP/1 parse error or 408, an HTTP/2 refusal, an HTTP/3 refusal) is not counted. With observability off, nothing is counted.
 
-**Latency histogram contract.** `sjws_http_request_duration_seconds` is a fixed log2 scale so a cluster can merge nodes by adding bucket `i` to bucket `i` (do not re-bin). Bounds are inclusive and stable: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 and 16384 ms, then everything above. `Snapshot.latency().counts()` is not cumulative; index `i` is `(previous bound, upperBoundNanos()[i]]`. `upperBoundNanos()` is `ServerMetrics.LATENCY_BOUNDS_NANOS` (the last entry is `Long.MAX_VALUE`). `ServerMetrics.LATENCY_LE_LABELS` is the Prometheus `le` for that same index: `0.001`, `0.002`, `0.004`, `0.008`, `0.016`, `0.032`, `0.064`, `0.128`, `0.256`, `0.512`, `1.024`, `2.048`, `4.096`, `8.192`, `16.384`, `+Inf`. The `/metrics` histogram is cumulative at those labels; adding two nodes' series with the same `le` is the merged cumulative. Changing a bound or a label is a breaking change for that merge.
+**Latency histogram contract.** `sjws_http_request_duration_seconds` is a fixed log2 scale so a cluster can merge nodes by adding bucket `i` to bucket `i` (do not re-bin). The value is the time until the handler returns the response, which is before the transport writes the body. Bounds are inclusive and stable: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 and 16384 ms, then everything above. `Snapshot.latency().counts()` is not cumulative; index `i` is `(previous bound, upperBoundNanos()[i]]`. `upperBoundNanos()` is `ServerMetrics.LATENCY_BOUNDS_NANOS` (the last entry is `Long.MAX_VALUE`). `ServerMetrics.LATENCY_LE_LABELS` is the Prometheus `le` for that same index: `0.001`, `0.002`, `0.004`, `0.008`, `0.016`, `0.032`, `0.064`, `0.128`, `0.256`, `0.512`, `1.024`, `2.048`, `4.096`, `8.192`, `16.384`, `+Inf`. The `/metrics` histogram is cumulative at those labels; adding two nodes' series with the same `le` is the merged cumulative. Changing a bound or a label is a breaking change for that merge.
 
 `/metrics` on `localhost` answers only a loopback peer (403 otherwise), so it stays safe on a public bind. `on` answers every client. Behind a proxy that connects from 127.0.0.1, `localhost` is the proxy, not the browser. The endpoint is not a document-root file: when it is off, a file named `metrics` is served normally.
 
-The hook is `RequestObserver`, held in a shared `ObserverSlot`. While the slot is `NONE` the transports do not call `intercept` or `complete`. When it is a recording observer they call `intercept` only if `/healthz` or `/metrics` is enabled, and `complete` after the response is written. `core.Handler` is the seam a middleware chain will decorate; that chain is not composed in the server yet, so the calls stay at the two transports and can move into one decorator later without changing the counters or the log.
+The hook is `ObserveRequestFilter`, registered at order 0 through `RequestFilters.create().add(0, filter)` when `--access-log`, `--metrics` or `--healthz` is on. It is added before any caller filter, so among order 0 it is the outermost stage (a negative order still runs further out). The filter calls `intercept` only when `/healthz` or `/metrics` is enabled, then `complete` when `proceed` returns. While observability is off, that filter is not installed and the transports do not read the clock, update a counter, or check the path. `metricsSnapshot()` publishes the same filter on a server that started off. HTTP/1.1 sees it on the next request of an already-accepted connection; HTTP/2 and HTTP/3 install it through `Transport.armHandler`.
 
 **HTTP/1.1 connections** run on blocking `SocketChannel`s, one virtual thread each. One timer thread
 enforces every deadline (no per-socket timeouts): `--idle-timeout` between requests,
@@ -270,6 +277,34 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   fallback path above and the warning names the cause.
 * Quick check: with `--h3 --alt-svc`, `curl -I http://127.0.0.1:<port>/` shows the `Alt-Svc` header, and
   `curl --http3-only -k https://127.0.0.1:<udp port>/` fetches over HTTP/3 (`-k` for the self-signed cert).
+
+### Access rules
+
+Which paths may be served is decided by `core.AccessRules` (behind the `core.AccessPolicy` seam)
+before any file is opened, on the normalized URL path and again on the real path once symlinks are
+resolved (so a link can't reach a refused path under another name, and on case-insensitive file
+systems the on-disk case is checked):
+
+1. `--deny` patterns: 403. They always win.
+2. `--access-rule` rules in order, first match wins: `allow:` serves, `deny:` answers 403, `hide:` 404.
+3. A path with a component starting with `.` answers 404 unless `--allow-dotfiles`.
+4. Everything else is served.
+
+Patterns are `/`-separated globs: `*` matches within one component, `?` one character, `**` any number of
+components. A pattern starting with `/` is anchored at the document root; one without matches at any
+depth (`*.bak` = `/**/*.bak`). A pattern also covers everything below what it matches (`/private` covers
+`/private/a/b`). As in a shell, wildcards in an `allow:` rule never match a name starting with `.`, so
+`allow:/**` can't expose `/.git`, while a literal name can: `--access-rule=allow:/.well-known/acme-challenge`
+serves ACME HTTP-01 tokens and keeps every other dotfile hidden. Denied and hidden entries are left out of
+directory listings, and a symlink whose target is a dotfile or a denied path is refused.
+
+    --deny='*.bak,*~,/private' --access-rule=hide:/drafts --access-rule=allow:/.well-known/acme-challenge
+
+`--require-owner` and `--require-world-readable` check the file being served (POSIX file systems only;
+elsewhere such files answer 403). A change of owner or mode changes the file's ctime, so the
+small-file cache drops the entry and the check runs again (with a revalidation window, only after it).
+An invalid pattern or unknown user stops startup (exit code 64). Matching costs tens of nanoseconds per
+request (see Performance).
 
 ### Platform notes
 

@@ -538,4 +538,19 @@ class FilterChainTest {
         assertTrue(elapsed.get() >= 0);
         assertEquals(String.valueOf(elapsed.get()), response.headers().get("x-nanos"));
     }
+
+    @Test
+    void includeCopiesFactoriesAndKeepsEarlierFiltersOutside() {
+        assertThrows(NullPointerException.class, () -> RequestFilters.create().include(null));
+        var trace = new ArrayList<String>();
+        var inner = RequestFilters.create().factory("mark", spec -> (request, next) -> {
+            trace.add("inner");
+            return next.proceed(request);
+        }).add(MiddlewareSpec.of("mark"));
+        var outer = RequestFilters.create().add(0, mark(trace, "outer"));
+        assertSame(outer, outer.include(inner).include(RequestFilters.create()));
+        var chain = outer.build(echo());
+        assertEquals(200, chain.handle(req("GET", "/z")).status());
+        assertEquals(List.of("outer", "inner"), trace);
+    }
 }
