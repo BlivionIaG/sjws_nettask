@@ -145,6 +145,61 @@ class ServerConfigTest {
         assertEquals(Duration.ZERO, c.altSvcMaxAge());
     }
 
+    @Test
+    void recordRejectsOutOfRangeValues() {
+        var ok = ServerConfig.builder(Path.of("/r"));
+        assertThrows(IllegalArgumentException.class, () -> ok.port(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).port(65536).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).h3Port(-2).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).h3Port(65536).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).maxConnections(0).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).h3MaxConnections(0).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).maxConnectionsPerIp(0).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).h3MaxConnectionsPerIp(0).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).idleTimeout(Duration.ZERO).build());
+        assertThrows(IllegalArgumentException.class,
+                () -> ServerConfig.builder(Path.of("/r")).writeTimeout(Duration.ofDays(30)).build());
+        assertThrows(IllegalArgumentException.class,
+                () -> ServerConfig.builder(Path.of("/r")).altSvcMaxAge(Duration.ofSeconds(-1)).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).h3MinRate(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).cacheBytes(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).tlsCert(Path.of("/c")).build());
+        assertThrows(NullPointerException.class, () -> ServerConfig.builder(null).build());
+        assertThrows(NullPointerException.class, () -> ServerConfig.builder(Path.of("/r")).h3Host(null).build());
+        assertEquals(65535, ServerConfig.builder(Path.of("/r")).port(65535).h3Port(65535).build().effectiveH3Port());
+    }
+
+    @Test
+    void passwordFileWithoutTrailingNewlineIsUsedAsIs(@org.junit.jupiter.api.io.TempDir Path tmp) throws Exception {
+        for (var content : new String[] {"secret", "secret\n", "secret\r\n"}) {
+            var f = java.nio.file.Files.writeString(tmp.resolve("pw"), content);
+            var p = ServerConfig.parse(new String[] {"--h3", "--cert=/c", "--key=/k", "--key-password-file=" + f}, Map.of());
+            assertEquals("secret", p.config().tlsKeyPassword(), content);
+        }
+    }
+
+    @Test
+    void booleanAndValuelessOptions() {
+        assertFalse(parse(Map.of(), "--h3", "--alt-svc=no").config().altSvc());
+        assertTrue(parse(Map.of(), "--h3", "--alt-svc=yes").config().altSvc());
+        assertTrue(parse(Map.of(), "--allow-unlistable-dirs=true").config().allowUnlistableDirs());
+        var missing = parse(Map.of(), "--max-connections", "--cache-bytes");
+        assertEquals(ServerConfig.DEFAULT_MAX_CONNECTIONS, missing.config().maxConnections());
+        assertEquals(ServerConfig.DEFAULT_CACHE_BYTES, missing.config().cacheBytes());
+        assertTrue(missing.warnings().stream().anyMatch(w -> w.contains("Invalid --max-connections (value 'null')")),
+                missing.warnings().toString());
+        assertTrue(missing.warnings().stream().anyMatch(w -> w.contains("Invalid --cache-bytes (value 'null')")),
+                missing.warnings().toString());
+    }
+
+    @Test
+    void altSvcHeaderValueChecksThePort() {
+        assertEquals("h3=\":443\"; ma=60", AltSvc.headerValue(443, Duration.ofMinutes(1)));
+        assertThrows(IllegalArgumentException.class, () -> AltSvc.headerValue(0, Duration.ZERO));
+        assertThrows(IllegalArgumentException.class, () -> AltSvc.headerValue(65536, Duration.ZERO));
+        assertEquals("h3=\":65535\"; ma=0", AltSvc.headerValue(65535, Duration.ZERO));
+    }
+
     /** N6: the accept backlog is configurable (1024 by default instead of the JDK's 50). */
     @Test
     void backlogOption() {

@@ -74,10 +74,6 @@ public final class Page {
         return write(out, response, keepAlive);
     }
 
-    static String escape(String s) {
-        return StaticFileHandler.escape(s);
-    }
-
     private static int write(OutputStream out, Response response, boolean keepAlive) throws IOException {
         Http1Writer.write(out, response, keepAlive);
         return response.status();

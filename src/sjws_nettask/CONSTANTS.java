@@ -22,7 +22,10 @@ import java.util.Map;
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
-public class CONSTANTS {
+public final class CONSTANTS {
+
+    private CONSTANTS() {
+    }
 
     public final static int DEFAULT_PORT = 8080; // Default Port
     public final static String DEFAULT_HTML_PATH = "./HTML";
