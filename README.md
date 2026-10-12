@@ -28,8 +28,17 @@ Run:
 | `--max-connections-per-ip=N` | `WEB_SERVER_MAX_CONNECTIONS_PER_IP` | 256 | HTTP/1.1 connections from one client address (IPv6: one /64); extra ones are closed at once without a response |
 | `--allow-unlistable-dirs` | `WEB_SERVER_ALLOW_UNLISTABLE_DIRS` | off | serve files below directories the server can't read (mode `--x`) through a weaker path-based open; see Platform notes |
 | `--cache-bytes=N[k\|m\|g]` | `WEB_SERVER_CACHE_BYTES` | 64m | small-file cache size (see below); `0` disables it |
-| `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | HTTP/3: reset a response that makes no progress for this long; also the window of the minimum send rate. Not used by HTTP/1.1 yet |
+| `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
 | `-h`, `--help` | | | print usage and exit |
+
+**HTTP/1.1 connections** run on blocking `SocketChannel`s, one virtual thread each. One timer thread
+enforces every deadline (no per-socket timeouts): `--idle-timeout` between requests,
+`--header-timeout` from the first byte of a request until its head (and any small body to discard)
+has arrived (then `408` and close: slowloris), and `--write-timeout` without progress while a response
+is being written (a client that stops reading is closed; a slow download that keeps moving is not).
+Files larger than 64 KiB that are not in the cache go out with `sendfile` (`FileChannel.transferTo`);
+a file that shrinks during the transfer ends the connection (the response can't be completed).
+An idle keep-alive connection holds a 2 KiB input buffer and no output buffer.
 
 **Per-address caps behind a reverse proxy or NAT.** The caps count connections per client address
 (IPv4: the full address; IPv6: its /64 prefix, since one host can use any address of its /64). Behind a

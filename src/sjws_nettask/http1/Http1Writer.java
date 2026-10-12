@@ -72,6 +72,21 @@ public final class Http1Writer {
     static final int SINGLE_WRITE_MAX = 256 * 1024;
 
     private static final int TRANSFER_BUFFER = 64 * 1024;
+
+    /** Files up to this size are read whole and leave with their head in one write. */
+    static final int SMALL_FILE_MAX = TRANSFER_BUFFER;
+
+    /**
+     * An output that can send file ranges itself (sendfile). {@link #write} hands it file bodies
+     * larger than {@link #SMALL_FILE_MAX} after writing the head.
+     */
+    public interface FileSink {
+        /**
+         * @throws IOException if the file ends before {@code position + count} (it shrank) or the
+         *         transfer fails; the response is then incomplete and the connection must close
+         */
+        void transferFrom(FileChannel source, long position, long count) throws IOException;
+    }
     private static final String CRLF = "\r\n";
 
     private Http1Writer() {
@@ -163,8 +178,21 @@ public final class Http1Writer {
                 return;
             }
             try (var channel = opened) {
-                out.write(serializeHead(response, keepAlive, extra));
-                copy(channel, file, out);
+                var head = serializeHead(response, keepAlive, extra);
+                if (file.length() <= SMALL_FILE_MAX) {
+                    // head + body in one write; a file that shrank is detected before anything is sent
+                    var all = new byte[head.length + (int) file.length()];
+                    System.arraycopy(head, 0, all, 0, head.length);
+                    readFully(channel, file, ByteBuffer.wrap(all, head.length, (int) file.length()));
+                    out.write(all);
+                } else if (out instanceof FileSink sink) {
+                    out.write(head);
+                    out.flush();
+                    sink.transferFrom(channel, file.offset(), file.length());
+                } else {
+                    out.write(head);
+                    copy(channel, file, out);
+                }
             }
         } else if (sendBody && response.body() instanceof Body.Bytes bytes
                 && bytes.length() <= SINGLE_WRITE_MAX) {
@@ -187,6 +215,17 @@ public final class Http1Writer {
             }
         }
         out.flush();
+    }
+
+    private static void readFully(FileChannel channel, Body.FileBody file, ByteBuffer into) throws IOException {
+        long position = file.offset();
+        while (into.hasRemaining()) {
+            int n = channel.read(into, position);
+            if (n < 0) {
+                throw new IOException("file shrank during transfer: " + file.realPath());
+            }
+            position += n;
+        }
     }
 
     private static void copy(FileChannel channel, Body.FileBody file, OutputStream out) throws IOException {

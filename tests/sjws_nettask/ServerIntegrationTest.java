@@ -6,7 +6,9 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.nio.channels.ServerSocketChannel;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URI;
@@ -39,7 +41,7 @@ class ServerIntegrationTest {
 
     private static final int TIMEOUT_MS = 4000;
 
-    private ServerSocket serverSocket;
+    private ServerSocketChannel serverSocket;
     private ClientManager manager;
     private Thread acceptThread;
     private int port;
@@ -47,8 +49,8 @@ class ServerIntegrationTest {
     @BeforeEach
     void start() throws IOException {
         assertTrue(Files.exists(Path.of("HTML", "index.html")), "tests must run from the repo root");
-        serverSocket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
-        port = serverSocket.getLocalPort();
+        serverSocket = ServerSocketChannel.open().bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50);
+        port = serverSocket.socket().getLocalPort();
         manager = new ClientManager(serverSocket);
         acceptThread = new Thread(manager, "accept-loop");
         acceptThread.setDaemon(true);

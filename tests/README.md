@@ -9,7 +9,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 
 | Class | Covers |
 |---|---|
-| `http1/Http1ParserTest` | request-head parsing: smuggling vectors, limits, versions, absolute-form, Connection/Expect |
+| `http1/Http1ParserTest` | request-head parsing: smuggling vectors, limits, versions, absolute-form, Connection/Expect; every case runs through the stream API and the byte-level `HeadParser` (whole, chunked, every split, reused) with identical results |
 | `http1/HeaderTest`, `ToolsTest` | response head, dates, MIME, port parsing |
 | `http1/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
@@ -22,6 +22,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/FileCacheTest` | S3 small-file cache: hit/miss, HEAD/304 don't load, index under the directory key, spellings share one entry, query-string/404 flooding can't evict, LRU by entries and bytes, every hit validated (edit, same-size + restored mtime, rename swap, symlink/parent-dir swap to outside, chmod, delete), revalidation window with a fake clock, change during load not cached, load through `SafeOpen`, no I/O under the lock, concurrent accounting |
 | `core/ETagTest` | strong/weak ETag rule (fake clock, sticky per version, bounded memo), If-None-Match matrix (lists, `*`, `W/`, malformed), INM over IMS precedence, 304 heads |
 | `core/DateClockTest`, `http1/Http1WriterSingleWriteTest` | Date formatted once per second (fake clock); head + body in one `write` |
+| `Http1TransportTest` | S4 channel transport: slowloris 408 at the head deadline (silent and trickling), idle keep-alive close, stalled reader closed by the write deadline, slow-but-progressing 50 MB download survives, sendfile exact bytes (50 MB, uncached 200 KB), file shrink during sendfile closes without spinning (process CPU check), fragmented pipelining with a body, timer deregistration, reaper sweep per state, bounded transfer stalls |
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
