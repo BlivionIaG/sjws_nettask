@@ -13,8 +13,89 @@ import org.junit.jupiter.params.provider.ValueSource;
 /** Unit tests of the strict request-head parser. */
 class Http1ParserTest {
 
+    /**
+     * Parses with the stream API and checks that the byte-level {@link Http1Parser.HeadParser}
+     * (used by the channel transport) agrees exactly: same head or same error status, same bytes
+     * consumed, whatever the fragmentation (whole, every 2-way split, fixed chunks, reused parser).
+     * Every case of this class therefore runs against both APIs.
+     */
     private static Http1Parser.Head parse(String head) throws Exception {
-        return Http1Parser.read(new ByteArrayInputStream(head.getBytes(StandardCharsets.ISO_8859_1)), 8192, 100);
+        var bytes = head.getBytes(StandardCharsets.ISO_8859_1);
+        var in = new ByteArrayInputStream(bytes);
+        var stream = outcome(() -> Http1Parser.read(in, 8192, 100), () -> bytes.length - in.available());
+        var reused = new Http1Parser.HeadParser(8192, 100);
+        reused.feed(PRIMER, 0, PRIMER.length);
+        assertTrue(reused.isComplete());
+        for (int chunk : new int[] {1, 3, 7, 64, 4096, Integer.MAX_VALUE}) {
+            assertEquals(stream, fed(bytes, new int[] {chunk}, null), "chunk " + chunk);
+        }
+        reused.reset();
+        assertEquals(stream, fed(bytes, new int[] {5}, reused), "reused parser");
+        if (bytes.length <= 512) {
+            for (int split = 1; split < bytes.length; split++) {
+                assertEquals(stream, fed(bytes, new int[] {split, Integer.MAX_VALUE}, null), "split at " + split);
+            }
+        }
+        if (stream.error() != null) {
+            throw stream.error();
+        }
+        return stream.head();
+    }
+
+    private static final byte[] PRIMER = "GET /prime HTTP/1.1\r\nHost: p\r\nX-Long: ".concat("y".repeat(3000))
+            .concat("\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1);
+
+    /** Head or failure (error class + status), plus the bytes consumed. */
+    private record Outcome(Http1Parser.Head head, Exception error, int consumed) {
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Outcome other && java.util.Objects.equals(head, other.head)
+                    && consumed == other.consumed && describe(error).equals(describe(other.error));
+        }
+
+        @Override
+        public int hashCode() {
+            return 0;
+        }
+
+        private static String describe(Exception e) {
+            return e == null ? "-" : e instanceof ParseError p ? "ParseError " + p.status() : e.getClass().getName();
+        }
+    }
+
+    private interface Call {
+        Http1Parser.Head run() throws Exception;
+    }
+
+    private static Outcome outcome(Call call, java.util.function.IntSupplier consumed) {
+        try {
+            var h = call.run();
+            return new Outcome(h, null, h == null ? -1 : consumed.getAsInt());
+        } catch (ParseError | EOFException e) {
+            return new Outcome(null, e, -1);
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** Feeds {@code bytes} in chunks of the given sizes (the last size repeats), then end of input. */
+    private static Outcome fed(byte[] bytes, int[] chunks, Http1Parser.HeadParser parser) {
+        var p = parser != null ? parser : new Http1Parser.HeadParser(8192, 100);
+        int[] pos = {0};
+        return outcome(() -> {
+            int k = 0;
+            while (pos[0] < bytes.length) {
+                int n = (int) Math.min((long) chunks[Math.min(k++, chunks.length - 1)], bytes.length - pos[0]);
+                int used = p.feed(bytes, pos[0], n);
+                assertTrue(used >= 0 && used <= n);
+                pos[0] += used;
+                if (p.isComplete()) {
+                    return p.head();
+                }
+                assertEquals(n, used, "an incomplete head consumes everything it is fed");
+            }
+            return p.endOfInput();
+        }, () -> pos[0]);
     }
 
     private static int status(String head) {
@@ -181,5 +262,43 @@ class Http1ParserTest {
         assertTrue(parse("GET / HTTP/1.1\r\nHost: h\r\nExpect: 100-Continue\r\nContent-Length: 3\r\n\r\n").expectContinue());
         assertFalse(parse("GET / HTTP/1.0\r\nExpect: 100-continue\r\n\r\n").expectContinue());
         assertEquals(417, status("GET / HTTP/1.1\r\nHost: h\r\nExpect: teapot\r\n\r\n"));
+    }
+
+    @Test
+    void byteParserStopsAtTheEndOfTheHeadAndLeavesPipelinedBytes() throws Exception {
+        var first = "GET /a HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\n";
+        var wire = (first + "abcGET /b HTTP/1.1\r\nHost: h\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1);
+        var p = new Http1Parser.HeadParser(8192, 100);
+        int used = p.feed(wire, 0, wire.length);
+        assertEquals(first.length(), used);
+        assertEquals("/a", p.head().target());
+        assertEquals(3, p.head().contentLength());
+        assertThrows(IllegalStateException.class, () -> p.feed(wire, used, 1));
+        p.reset();
+        assertThrows(IllegalStateException.class, p::head);
+        int second = used + 3;
+        assertEquals(wire.length - second, p.feed(wire, second, wire.length - second));
+        assertEquals("/b", p.head().target());
+        assertSame(p.head(), p.endOfInput());
+    }
+
+    @Test
+    void byteParserEndOfInput() throws Exception {
+        var p = new Http1Parser.HeadParser(8192, 100);
+        assertNull(p.endOfInput(), "nothing received");
+        p.feed("\r\n\n".getBytes(StandardCharsets.ISO_8859_1), 0, 3);
+        assertNull(p.endOfInput(), "only empty lines");
+        p.feed("G".getBytes(StandardCharsets.ISO_8859_1), 0, 1);
+        assertThrows(EOFException.class, p::endOfInput);
+        p.reset();
+        p.feed("GET / HTTP/1.1\r".getBytes(StandardCharsets.ISO_8859_1), 0, 15);
+        assertEquals(400, assertThrows(ParseError.class, p::endOfInput).status());
+    }
+
+    @Test
+    void byteParserRejectsAnOverlongLineBeforeItEnds() {
+        var p = new Http1Parser.HeadParser(16, 100);
+        var line = "GET /0123456789ab".getBytes(StandardCharsets.ISO_8859_1); // 17 bytes, no line end yet
+        assertEquals(414, assertThrows(ParseError.class, () -> p.feed(line, 0, line.length)).status());
     }
 }
