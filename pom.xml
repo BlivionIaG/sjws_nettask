@@ -111,8 +111,9 @@
             <phase>verify</phase>
             <goals><goal>report</goal></goals>
           </execution>
-          <!-- Gate: per-package rules (measured 2026-10-12, set ~2-3 pts below). Every production
-               package is gated; gates sit ~1-2 points under the coverage measured on 2026-10-12 (root 97.8/98.7, http1 99.7/99.1, h3 95.9/91.4, tls 96.0/94.5, core 95.2/90.9). -->
+          <!-- Gate: per-package rules. Every production package is gated; gates sit ~1-2 points
+               under the coverage measured on 2026-10-12 (root 97.4/96.5, http1 99.4/98.8,
+               h3 96.2/89.5, tls 96.0/94.5, core 95.3/91.0, observe 97.0/88.3). -->
           <execution>
             <id>check</id>
             <phase>verify</phase>
@@ -120,6 +121,14 @@
             <configuration>
               <haltOnFailure>true</haltOnFailure>
               <rules>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.observe</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.95</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.86</minimum></limit>
+                </limits>
+              </rule>
               <rule>
                 <element>PACKAGE</element>
                 <includes><include>sjws_nettask.core</include></includes>
