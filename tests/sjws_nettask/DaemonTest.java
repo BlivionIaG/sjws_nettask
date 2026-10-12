@@ -806,8 +806,7 @@ class DaemonTest {
     @Test
     void inFlightResponseCompletesAndNewConnectionsAreRefused() throws Exception {
         var root = Files.createDirectory(tmp.resolve("html"));
-        var body = new byte[2 * 1024 * 1024];
-        java.util.Arrays.fill(body, (byte) 'x');
+        var body = bodyThatStalls((byte) 'x');
         Files.write(root.resolve("big.bin"), body);
         var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3);
         server.shutdownTimeout(Duration.ofSeconds(5));
@@ -850,8 +849,7 @@ class DaemonTest {
     @Test
     void shutdownTimeoutForceClosesAStalledResponse() throws Throwable {
         var root = Files.createDirectory(tmp.resolve("html"));
-        var body = new byte[2 * 1024 * 1024];
-        java.util.Arrays.fill(body, (byte) 'y');
+        var body = bodyThatStalls((byte) 'y');
         Files.write(root.resolve("big.bin"), body);
         var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3);
         server.shutdownTimeout(Duration.ofMillis(500));
@@ -1165,8 +1163,7 @@ class DaemonTest {
     @Test
     void closeInterruptsTheDrainAndRejectsABadManagerTimeout() throws Exception {
         var root = Files.createDirectory(tmp.resolve("html"));
-        var body = new byte[2 * 1024 * 1024];
-        java.util.Arrays.fill(body, (byte) 'z');
+        var body = bodyThatStalls((byte) 'z');
         Files.write(root.resolve("big.bin"), body);
         var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3);
         server.shutdownTimeout(Duration.ofSeconds(3));
@@ -1288,6 +1285,35 @@ class DaemonTest {
 
     private static long startMillis(Process process) {
         return process.info().startInstant().map(Instant::toEpochMilli).orElse(-1L);
+    }
+
+    /**
+     * Bytes that cannot fit in the autotuned loopback windows ({@code tcp_wmem} + {@code tcp_rmem}).
+     * A 2 MiB file is fully written, and the connection leaves {@link ConnectionReaper.State#WRITING},
+     * before the next poll when the kernel absorbs it. {@code timer.writing()} still runs
+     * ({@link ChannelOutput}); the state just does not last. A client that does not read then
+     * stays in WRITING, which is what the drain tests have to observe.
+     */
+    private static byte[] bodyThatStalls(byte fill) throws IOException {
+        long limit = 0;
+        for (var name : List.of("/proc/sys/net/ipv4/tcp_wmem", "/proc/sys/net/ipv4/tcp_rmem")) {
+            var path = Path.of(name);
+            if (!Files.isRegularFile(path)) {
+                continue;
+            }
+            long highest = 0;
+            for (var part : Files.readString(path).trim().split("\\s+")) {
+                highest = Math.max(highest, Long.parseLong(part));
+            }
+            limit += highest;
+        }
+        long size = Math.max(16L * 1024 * 1024, limit + 4L * 1024 * 1024);
+        if (size > 32L * 1024 * 1024) {
+            size = 32L * 1024 * 1024;
+        }
+        var body = new byte[(int) size];
+        java.util.Arrays.fill(body, fill);
+        return body;
     }
 
     private static void waitFor(java.util.function.BooleanSupplier cond, long timeoutMs, String what) throws Exception {
