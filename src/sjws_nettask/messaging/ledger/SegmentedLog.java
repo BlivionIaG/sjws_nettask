@@ -22,6 +22,8 @@ public final class SegmentedLog implements AutoCloseable {
     private final long segmentBytes;
     private final List<Segment> segments = new ArrayList<>();
     private final long recoveredTruncatedBytes;
+    /** Active segment, readable by a background syncer thread while the writer appends. */
+    private volatile Segment active;
 
     private SegmentedLog(Path dir, long segmentBytes, long truncated) {
         this.dir = dir;
@@ -62,7 +64,7 @@ public final class SegmentedLog implements AutoCloseable {
         return new SegmentedLog(dir, segmentBytes, truncated[0]).adopt(segs);
     }
 
-    private SegmentedLog adopt(List<Segment> segs) { segments.addAll(segs); return this; }
+    private SegmentedLog adopt(List<Segment> segs) { segments.addAll(segs); active = segs.getLast(); return this; }
 
     public long nextOffset() { return segments.getLast().nextOffset(); }
     public long startOffset() { return segments.getFirst().baseOffset; }
@@ -80,6 +82,7 @@ public final class SegmentedLog implements AutoCloseable {
             active.seal();
             active = Segment.create(dir, active.nextOffset());
             segments.add(active);
+            this.active = active;
         }
         active.append(frames, frameOffsets[0], frameOffsets, frameLens, n, newNext);
     }
@@ -94,7 +97,12 @@ public final class SegmentedLog implements AutoCloseable {
         return base;
     }
 
-    public void force() throws IOException { segments.getLast().force(); }
+    /**
+     * Fsyncs the active segment. Safe to call from one other thread concurrently with appends: a
+     * segment is fsynced when sealed, before its successor becomes active, so every byte written
+     * before this call started is durable when it returns.
+     */
+    public void force() throws IOException { active.force(); }
 
     /** Returns the batch containing {@code offset}, or null when out of range. */
     public RecordBatch read(long offset) throws IOException {

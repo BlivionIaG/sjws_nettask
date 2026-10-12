@@ -1,11 +1,22 @@
 package sjws_nettask.messaging.ledger;
 
-/** When an append is acknowledged relative to fsync (names as in ARCHITECTURE.md T3 / docs/design/messaging.md §2.2). */
+/**
+ * When an append is acknowledged relative to fsync (docs/design/messaging.md §2.2, ARCHITECTURE.md T3).
+ * Usable as a writer default and as a per-append override.
+ */
 public enum Durability {
-    /** Ack after write(2) into the page cache; never fsyncs on the append path. Loses data on power failure. */
+    /** Ack after write(2); no fsync unless a later append asks for one or the writer closes. Loses data on power failure. */
     NONE,
-    /** Group commit: one write + one fsync for everything queued, then ack the whole group. Default. */
+    /**
+     * Default. Ack after write(2) into the page cache; a background syncer fsyncs continuously (at most
+     * every {@code fsyncInterval}) and publishes {@link LedgerSnapshot#durableOffset}. Process crashes lose
+     * nothing; a power or kernel failure loses at most the records written since the last completed fsync.
+     */
+    ASYNC,
+    /** Group commit: ack after the fsync covering the record (one fsync per drained group). */
     GROUP,
-    /** One fsync per batch. Compliance-style streams only. */
-    EACH
+    /** One fsync per batch (writer default only; as a per-append override it behaves like GROUP). */
+    EACH;
+
+    boolean waitsForFsync() { return this == GROUP || this == EACH; }
 }

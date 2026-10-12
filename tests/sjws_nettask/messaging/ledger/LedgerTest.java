@@ -210,7 +210,8 @@ class LedgerTest {
             assertEquals(producers * per, s.nextOffset());
             assertEquals(producers * per, s.committedRecords());
             assertEquals(producers * per, s.committedBatches());
-            if (mode == Durability.NONE) assertEquals(0, s.fsyncs());
+            if (mode == Durability.NONE) { assertEquals(0, s.fsyncs()); }
+            if (mode.waitsForFsync()) assertEquals(s.nextOffset(), s.durableOffset());
             if (mode == Durability.EACH) assertEquals(producers * per, s.fsyncs());
             if (mode == Durability.GROUP) assertTrue(s.fsyncs() < producers * per, "group commit batched: " + s.fsyncs());
             w.close();
@@ -270,5 +271,84 @@ class LedgerTest {
             assertArrayEquals(b("m42"), log.read(42).records().get(0));
         }
         assertThrows(IllegalArgumentException.class, () -> SegmentedLog.open(dir, 1));
+    }
+
+    @Test
+    void defaultIsAsyncAckedBeforeFsyncThenDurableInBackground() throws Exception {
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log)) {
+            assertEquals(Durability.ASYNC, w.durability());
+            assertEquals(Durability.ASYNC, LedgerWriter.DEFAULT_DURABILITY);
+            long last = -1;
+            for (int i = 0; i < 500; i++) last = w.append(List.of(b("a" + i))).get();
+            assertEquals(499, last);
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            while (w.snapshot().durableOffset() < 500 && System.nanoTime() < deadline) Thread.sleep(1);
+            var s = w.snapshot();
+            assertEquals(500, s.durableOffset());
+            assertEquals(0, s.unsyncedRecords());
+            assertTrue(s.fsyncs() >= 1);
+        }
+    }
+
+    @Test
+    void perAppendGroupOverrideOnAsyncWriterWaitsForFsync() throws Exception {
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.ASYNC, 0, 1024, 1 << 20, 50_000_000L)) {
+            w.append(List.of(b("fast"))).get();
+            long base = w.append(List.of(b("x"), b("y")), Durability.GROUP).get();
+            assertTrue(w.snapshot().durableOffset() >= base + 2, "durable when acked: " + w.snapshot());
+            // EACH as an override behaves like GROUP
+            long b2 = w.append(List.of(b("z")), Durability.EACH).get();
+            assertTrue(w.snapshot().durableOffset() >= b2 + 1);
+        }
+    }
+
+    @Test
+    void perAppendAsyncOverrideOnGroupWriterSkipsFsync() throws Exception {
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.GROUP)) {
+            for (int i = 0; i < 20; i++) w.append(List.of(b("q")), Durability.ASYNC).get();
+            assertEquals(0, w.snapshot().fsyncs(), "no fsync on the ack path");
+            assertEquals(20, w.snapshot().nextOffset());
+            w.append(List.of(b("sync")), Durability.GROUP).get();
+            assertEquals(1, w.snapshot().fsyncs());
+            assertEquals(21, w.snapshot().durableOffset());
+        }
+    }
+
+    @Test
+    void noneWriterServesGroupOverridesAndCloseSyncsTail() throws Exception {
+        try (var log = SegmentedLog.open(dir)) {
+            var w = new LedgerWriter(log, Durability.NONE);
+            for (int i = 0; i < 10; i++) w.append(List.of(b("n"))).get();
+            Thread.sleep(20);
+            assertEquals(0, w.snapshot().fsyncs());
+            assertEquals(10, w.snapshot().unsyncedRecords());
+            w.append(List.of(b("g")), Durability.GROUP).get();
+            assertTrue(w.snapshot().durableOffset() >= 11);
+            w.append(List.of(b("n2"))).get();
+            w.close();
+            assertEquals(12, w.snapshot().durableOffset());
+            assertEquals(0, w.snapshot().unsyncedRecords());
+        }
+    }
+
+    @Test
+    void eachWriterWithAsyncOverride() throws Exception {
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.EACH)) {
+            w.append(List.of(b("a")), Durability.ASYNC).get();
+            assertEquals(0, w.snapshot().fsyncs());
+            w.append(List.of(b("b"))).get();
+            assertEquals(1, w.snapshot().fsyncs());
+        }
+    }
+
+    @Test
+    void asyncWriterFailsPendingOverridesOnIoError() throws Exception {
+        var log = SegmentedLog.open(dir);
+        var w = new LedgerWriter(log, Durability.ASYNC, 0, 1024, 1 << 20, 10_000_000_000L);
+        w.append(List.of(b("ok"))).get();
+        log.close();
+        var f = w.append(List.of(b("x")), Durability.GROUP);
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> f.get(10, java.util.concurrent.TimeUnit.SECONDS));
+        w.close();
     }
 }

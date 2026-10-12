@@ -13,8 +13,9 @@ import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Crash test: a child JVM appends with GROUP durability and prints each acked offset; we SIGKILL it
- * mid-stream, reopen, and require every acked record to be present and intact (no acked-message loss).
+ * Crash test: a child JVM appends with the ASYNC default (odd values) and per-append GROUP (even values) and prints each acked offset; we SIGKILL it
+ * mid-stream, reopen, and require every acked record to be present and intact. SIGKILL is a process
+ * crash (page cache survives), so ASYNC acks must survive too; only power/kernel loss may drop ASYNC tails.
  */
 class LedgerCrashTest {
 
@@ -22,10 +23,10 @@ class LedgerCrashTest {
 
     /** Child entry point: writes until killed. */
     public static void main(String[] args) throws Exception {
-        try (var log = SegmentedLog.open(Path.of(args[0]), 64 * 1024); var w = new LedgerWriter(log, Durability.GROUP)) {
+        try (var log = SegmentedLog.open(Path.of(args[0]), 64 * 1024); var w = new LedgerWriter(log, Durability.ASYNC)) {
             for (long i = 0; ; i++) {
                 long v = i;
-                w.append(List.of(ByteBuffer.allocate(8).putLong(v).array(), new byte[(int) (v % 300)]))
+                w.append(List.of(ByteBuffer.allocate(8).putLong(v).array(), new byte[(int) (v % 300)]), v % 2 == 0 ? Durability.GROUP : null)
                         .thenAccept(off -> { synchronized (System.out) { System.out.println(off + " " + v); System.out.flush(); } });
             }
         }

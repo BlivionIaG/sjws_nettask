@@ -7,67 +7,110 @@ import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Single writer for one {@link SegmentedLog}: a dedicated platform thread drains a bounded queue,
- * encodes every pending append as one batch, writes the whole group with one positional write and,
- * depending on {@link Durability}, one fsync (GROUP), one per batch (EACH) or none (NONE). Futures
- * complete with each batch's base offset only after that; then an immutable {@link LedgerSnapshot}
- * is published. A full queue blocks {@link #append} (backpressure).
+ * Single writer for one {@link SegmentedLog}. A dedicated platform thread drains a bounded queue
+ * (backpressure) and writes each drained group with one positional write; every append is its own
+ * batch. When a future completes depends on the append's effective {@link Durability} (per-append
+ * override, else the writer default):
+ * <ul>
+ *   <li>NONE / ASYNC: right after the write (page cache). ASYNC is the default; a background syncer
+ *       thread fsyncs off the ack path and advances {@link LedgerSnapshot#durableOffset}.</li>
+ *   <li>GROUP: after the fsync covering it. Inline (one fsync per group) when GROUP is the writer
+ *       default, otherwise by the syncer.</li>
+ *   <li>EACH (writer default): one fsync per batch.</li>
+ * </ul>
+ * After every commit, and after every background fsync, an immutable {@link LedgerSnapshot} is
+ * published through an atomic reference.
  */
 public final class LedgerWriter implements AutoCloseable {
 
     public static final int DEFAULT_QUEUE = 65_536;
+    public static final Durability DEFAULT_DURABILITY = Durability.ASYNC;
 
-    private record Pending(List<byte[]> records, long timestampMs, CompletableFuture<Long> done) { }
+    private record Pending(List<byte[]> records, long timestampMs, Durability mode, CompletableFuture<Long> done) { }
 
-    private static final Pending POISON = new Pending(List.of(), 0, null);
+    private record Waiter(long endOffset, long base, CompletableFuture<Long> done) { }
+
+    private static final Pending POISON = new Pending(List.of(), 0, null, null);
 
     private final SegmentedLog log;
     private final Durability durability;
     private final long lingerNanos;
+    private final long fsyncIntervalNanos;
     private final int maxGroupBytes;
     private final BlockingQueue<Pending> queue;
     private final AtomicReference<LedgerSnapshot> snapshot = new AtomicReference<>();
+    private final ConcurrentLinkedQueue<Waiter> fsyncWaiters = new ConcurrentLinkedQueue<>();
     private final Thread thread;
+    private final Thread syncer;
     private volatile boolean closed;
+    private volatile boolean stopSyncer;
     private volatile Throwable failure;
+    /** Offset after the last write; read by the syncer. */
+    private volatile long written;
     private ByteBuffer buf = ByteBuffer.allocateDirect(1 << 20);
-    private long batches, records, bytes, fsyncs, seq;
+    private final ReentrantLock lock = new ReentrantLock();
+    // Guarded by lock: counters shared by writer and syncer for snapshot publication.
+    private long batches, records, bytes, fsyncs, seq, durable;
 
-    public LedgerWriter(SegmentedLog log, Durability durability) { this(log, durability, 0, DEFAULT_QUEUE, 4 << 20); }
+    /** ASYNC writer with defaults. */
+    public LedgerWriter(SegmentedLog log) { this(log, DEFAULT_DURABILITY); }
+
+    public LedgerWriter(SegmentedLog log, Durability durability) { this(log, durability, 0, DEFAULT_QUEUE, 4 << 20, 0); }
+
+    public LedgerWriter(SegmentedLog log, Durability durability, long lingerNanos, int queueCapacity, int maxGroupBytes) {
+        this(log, durability, lingerNanos, queueCapacity, maxGroupBytes, 0);
+    }
 
     /**
-     * @param lingerNanos   extra wait to grow a group after the first pending append (0 = none)
-     * @param queueCapacity bounded hand-off queue (backpressure)
-     * @param maxGroupBytes soft cap on bytes written per group
+     * @param lingerNanos        extra wait to grow a group after the first pending append (0 = none)
+     * @param queueCapacity      bounded hand-off queue (backpressure)
+     * @param maxGroupBytes      soft cap on bytes written per group
+     * @param fsyncIntervalNanos minimum spacing of background fsyncs in ASYNC mode (0 = back to back);
+     *                           bounds the power-loss window together with one fsync duration
      */
-    public LedgerWriter(SegmentedLog log, Durability durability, long lingerNanos, int queueCapacity, int maxGroupBytes) {
+    public LedgerWriter(SegmentedLog log, Durability durability, long lingerNanos, int queueCapacity, int maxGroupBytes,
+            long fsyncIntervalNanos) {
         this.log = log;
         this.durability = durability;
         this.lingerNanos = lingerNanos;
+        this.fsyncIntervalNanos = fsyncIntervalNanos;
         this.maxGroupBytes = maxGroupBytes;
         this.queue = new ArrayBlockingQueue<>(queueCapacity);
+        this.written = log.nextOffset();
+        this.durable = log.nextOffset(); // recovered data is treated as durable (it survived a restart)
         publish();
-        this.thread = Thread.ofPlatform().name("ledger-writer-" + log.dir().getFileName()).daemon().unstarted(this::run);
+        var name = log.dir().getFileName();
+        this.syncer = Thread.ofPlatform().name("ledger-syncer-" + name).daemon().unstarted(this::syncLoop);
+        this.thread = Thread.ofPlatform().name("ledger-writer-" + name).daemon().unstarted(this::run);
+        syncer.start();
         thread.start();
     }
 
-    /** The latest committed state; one volatile read. */
+    /** The latest published state; one volatile read. */
     public LedgerSnapshot snapshot() { return snapshot.get(); }
 
     public Durability durability() { return durability; }
 
-    /** Enqueues one batch; completes with its base offset once durable per the mode. Blocks when the queue is full. */
-    public CompletableFuture<Long> append(List<byte[]> recs) throws InterruptedException {
-        RecordBatch.encodedSize(recs); // validate size eagerly
+    /** Appends with the writer's default durability. */
+    public CompletableFuture<Long> append(List<byte[]> recs) throws InterruptedException { return append(recs, null); }
+
+    /**
+     * Enqueues one batch; completes with its base offset once durable per {@code mode} (null = writer
+     * default). Blocks while the queue is full.
+     */
+    public CompletableFuture<Long> append(List<byte[]> recs, Durability mode) throws InterruptedException {
         if (recs.isEmpty()) throw new IllegalArgumentException("empty batch");
-        var f = new CompletableFuture<Long>();
+        RecordBatch.encodedSize(recs); // validate size eagerly
         if (closed || failure != null) return CompletableFuture.failedFuture(failure != null ? failure : new IllegalStateException("closed"));
-        queue.put(new Pending(List.copyOf(recs), System.currentTimeMillis(), f));
+        var f = new CompletableFuture<Long>();
+        queue.put(new Pending(List.copyOf(recs), System.currentTimeMillis(), mode == null ? durability : mode, f));
         return f;
     }
 
@@ -90,7 +133,6 @@ public final class LedgerWriter implements AutoCloseable {
             if (!group.isEmpty()) commit(group);
             group.clear();
         }
-        // Fail anything still queued.
         Pending p;
         while ((p = queue.poll()) != null) if (p.done != null) p.done.completeExceptionally(new IllegalStateException("closed"));
     }
@@ -120,25 +162,39 @@ public final class LedgerWriter implements AutoCloseable {
         try {
             if (durability == Durability.EACH) {
                 for (var p : g) {
-                    var one = List.of(p);
-                    long base = write(one, RecordBatch.encodedSize(p.records));
-                    log.force();
-                    fsyncs++;
-                    publish();
+                    long base = write(List.of(p), RecordBatch.encodedSize(p.records));
+                    if (p.mode.waitsForFsync()) forceInline(); else publish();
                     p.done.complete(base);
                 }
                 return;
             }
             long base = write(g, total);
-            if (durability == Durability.GROUP) { log.force(); fsyncs++; }
-            publish();
+            boolean anyWaits = false;
+            for (var p : g) anyWaits |= p.mode.waitsForFsync();
+            if (durability == Durability.GROUP && anyWaits) forceInline(); else publish();
             long o = base;
-            for (var p : g) { p.done.complete(o); o += p.records.size(); }
+            for (var p : g) {
+                long end = o + p.records.size();
+                if (!p.mode.waitsForFsync() || durableNow() >= end) p.done.complete(o);
+                else fsyncWaiters.add(new Waiter(end, o, p.done));
+                o = end;
+            }
+            LockSupport.unpark(syncer);
         } catch (IOException | RuntimeException e) {
-            // The log's in-memory tail may now disagree with disk: stop accepting writes; reopen recovers.
+            // The in-memory tail may disagree with disk: fence the writer; reopening recovers.
             failure = e;
             g.forEach(p -> p.done.completeExceptionally(e));
+            failWaiters(e);
         }
+    }
+
+    private long durableNow() { lock.lock(); try { return durable; } finally { lock.unlock(); } }
+
+    private void forceInline() throws IOException {
+        log.force();
+        lock.lock();
+        try { fsyncs++; durable = written; } finally { lock.unlock(); }
+        publish();
     }
 
     private long write(List<Pending> g, int total) throws IOException {
@@ -147,6 +203,7 @@ public final class LedgerWriter implements AutoCloseable {
         long base = log.nextOffset(), o = base;
         var offs = new long[g.size()];
         var lens = new int[g.size()];
+        int recs = 0;
         for (int k = 0; k < g.size(); k++) {
             var p = g.get(k);
             int start = buf.position();
@@ -154,25 +211,77 @@ public final class LedgerWriter implements AutoCloseable {
             offs[k] = o;
             lens[k] = buf.position() - start;
             o += p.records.size();
-            records += p.records.size();
+            recs += p.records.size();
         }
         buf.flip();
-        bytes += buf.remaining();
+        int n = buf.remaining();
         log.appendFrames(buf, offs, lens, g.size(), o);
-        batches += g.size();
+        lock.lock();
+        try { records += recs; bytes += n; batches += g.size(); } finally { lock.unlock(); }
+        written = o;
         return base;
     }
 
-    private void publish() {
-        snapshot.set(new LedgerSnapshot(log.nextOffset(), log.startOffset(), batches, records, bytes, fsyncs,
-                log.segmentCount(), durability, seq++, System.nanoTime()));
+    /** Background fsync: ASYNC writers keep durableOffset close to nextOffset; any writer serves GROUP overrides. */
+    private void syncLoop() {
+        long lastFsync = 0;
+        while (true) {
+            long target = written;
+            boolean dirty = target > durableNow();
+            boolean wanted = dirty && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
+            if (!wanted) {
+                if (stopSyncer) return;
+                LockSupport.parkNanos(1_000_000);
+                continue;
+            }
+            long wait = lastFsync + fsyncIntervalNanos - System.nanoTime();
+            if (wait > 0 && fsyncWaiters.isEmpty() && !stopSyncer) { LockSupport.parkNanos(wait); continue; }
+            try {
+                log.force();
+            } catch (IOException | RuntimeException e) {
+                failure = e;
+                failWaiters(e);
+                return;
+            }
+            lastFsync = System.nanoTime();
+            lock.lock();
+            try { fsyncs++; if (target > durable) durable = target; } finally { lock.unlock(); }
+            publish();
+            Waiter w;
+            while ((w = fsyncWaiters.peek()) != null && w.endOffset <= target) { fsyncWaiters.poll(); w.done.complete(w.base); }
+        }
     }
 
-    /** Stops after committing everything already queued. Does not close the log. */
+    private void failWaiters(Throwable e) {
+        Waiter w;
+        while ((w = fsyncWaiters.poll()) != null) w.done.completeExceptionally(e);
+    }
+
+    private void publish() {
+        lock.lock();
+        try {
+        snapshot.set(new LedgerSnapshot(log.nextOffset(), Math.min(durable, written), log.startOffset(), batches, records,
+                bytes, fsyncs, log.segmentCount(), durability, seq++, System.nanoTime()));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Stops after committing everything already queued, then fsyncs whatever ASYNC/NONE left unsynced
+     * (a clean shutdown loses nothing). Does not close the log.
+     */
     @Override public void close() throws InterruptedException {
         if (closed) return;
         closed = true;
         queue.put(POISON);
         thread.join(TimeUnit.SECONDS.toMillis(30));
+        stopSyncer = true;
+        LockSupport.unpark(syncer);
+        syncer.join(TimeUnit.SECONDS.toMillis(30));
+        if (failure == null && written > durableNow()) {
+            try { forceInline(); } catch (IOException e) { failure = e; }
+        }
+        failWaiters(new IllegalStateException("closed"));
     }
 }
