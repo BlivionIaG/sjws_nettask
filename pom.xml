@@ -15,6 +15,15 @@
     <!-- Run only the green suite with: mvn test -DexcludedGroups=bug -->
     <excludedGroups></excludedGroups>
     <netty.version>4.2.19.Final</netty.version>
+    <!-- Coverage gate for the h3 and tls packages. Their tests need the QUIC natives, which Netty ships
+         only for linux-x86_64/aarch64, osx-x86_64/aarch64 and windows-x86_64; the h3-gate-* profiles
+         below raise these on exactly those platforms. Elsewhere the h3 tests skip themselves and the gate
+         is 0. On a supported platform where the natives still can't load (e.g. a noexec /tmp), run with
+         -Dh3.gate.line=0 -Dh3.gate.branch=0 -Dtls.gate.line=0 -Dtls.gate.branch=0. -->
+    <h3.gate.line>0</h3.gate.line>
+    <h3.gate.branch>0</h3.gate.branch>
+    <tls.gate.line>0</tls.gate.line>
+    <tls.gate.branch>0</tls.gate.branch>
   </properties>
 
   <dependencyManagement>
@@ -60,9 +69,25 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.2</version>
         <configuration>
-          <excludedGroups>${excludedGroups}</excludedGroups>
+          <excludedGroups>jar,${excludedGroups}</excludedGroups>
           <workingDirectory>${project.basedir}</workingDirectory>
         </configuration>
+        <executions>
+          <!-- Tests tagged "jar" run the packaged jar (java -jar target/sjws_nettask-*.jar), so they run
+               after `package`. No JaCoCo agent here: it would overwrite the unit-test execution data. -->
+          <execution>
+            <id>jar-tests</id>
+            <phase>integration-test</phase>
+            <goals><goal>test</goal></goals>
+            <configuration>
+              <groups>jar</groups>
+              <!-- Non-empty values: an empty element would inherit the plugin-level config. -->
+              <excludedGroups>bug-only-placeholder,${excludedGroups}</excludedGroups>
+              <argLine>-Dsjws.jarTests=true</argLine>
+              <failIfNoSpecifiedTests>false</failIfNoSpecifiedTests>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
       <!-- Coverage (W1/W5): agent for unit + in-process integration tests, report at
            target/site/jacoco, gate enforced by `mvn verify`. Subprocess tests are not instrumented. -->
@@ -74,6 +99,8 @@
           <execution>
             <id>prepare-agent</id>
             <goals><goal>prepare-agent</goal></goals>
+            <!-- Fresh data every build: stale runs must not inflate coverage. -->
+            <configuration><append>false</append></configuration>
           </execution>
           <execution>
             <id>report</id>
@@ -117,16 +144,16 @@
                 <element>PACKAGE</element>
                 <includes><include>sjws_nettask.h3</include></includes>
                 <limits>
-                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.89</minimum></limit>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>${h3.gate.line}</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>${h3.gate.branch}</minimum></limit>
                 </limits>
               </rule>
               <rule>
                 <element>PACKAGE</element>
                 <includes><include>sjws_nettask.tls</include></includes>
                 <limits>
-                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.91</minimum></limit>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>${tls.gate.line}</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>${tls.gate.branch}</minimum></limit>
                 </limits>
               </rule>
               </rules>
@@ -139,9 +166,77 @@
         <artifactId>maven-jar-plugin</artifactId>
         <version>3.4.2</version>
         <configuration>
-          <archive><manifest><mainClass>sjws_nettask.Sjws_nettask</mainClass></manifest></archive>
+          <!-- Runnable with `java -jar target/sjws_nettask-<version>.jar`: dependencies (Netty + the
+               QUIC natives) are copied to target/lib and listed in the manifest Class-Path. -->
+          <archive>
+            <manifest>
+              <mainClass>sjws_nettask.Sjws_nettask</mainClass>
+              <addClasspath>true</addClasspath>
+              <classpathPrefix>lib/</classpathPrefix>
+            </manifest>
+          </archive>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.7.0</version>
+        <executions>
+          <execution>
+            <id>copy-runtime-deps</id>
+            <phase>package</phase>
+            <goals><goal>copy-dependencies</goal></goals>
+            <configuration>
+              <includeScope>runtime</includeScope>
+              <outputDirectory>${project.build.directory}/lib</outputDirectory>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!-- One per platform with Netty QUIC natives (activation conditions are ANDed, so one each). -->
+    <profile>
+      <id>h3-gate-linux-x86_64</id>
+      <activation><os><name>linux</name><arch>amd64</arch></os></activation>
+      <properties>
+        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+      </properties>
+    </profile>
+    <profile>
+      <id>h3-gate-linux-aarch64</id>
+      <activation><os><name>linux</name><arch>aarch64</arch></os></activation>
+      <properties>
+        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+      </properties>
+    </profile>
+    <profile>
+      <id>h3-gate-mac-x86_64</id>
+      <activation><os><family>mac</family><arch>x86_64</arch></os></activation>
+      <properties>
+        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+      </properties>
+    </profile>
+    <profile>
+      <id>h3-gate-mac-aarch64</id>
+      <activation><os><family>mac</family><arch>aarch64</arch></os></activation>
+      <properties>
+        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+      </properties>
+    </profile>
+    <profile>
+      <id>h3-gate-windows-x86_64</id>
+      <activation><os><family>windows</family><arch>amd64</arch></os></activation>
+      <properties>
+        <h3.gate.line>0.90</h3.gate.line><h3.gate.branch>0.89</h3.gate.branch>
+        <tls.gate.line>0.90</tls.gate.line><tls.gate.branch>0.91</tls.gate.branch>
+      </properties>
+    </profile>
+  </profiles>
 </project>

@@ -247,14 +247,23 @@ class SjwsServerHttp3Test {
 
     @Test
     void mainWithH3ServesBothProtocols() throws Exception {
+        runWithH3(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp", System.getProperty("java.class.path"), "sjws_nettask.Sjws_nettask"),
+                this.root, this.cert, this.key, this.tls);
+    }
+
+    /**
+     * Starts {@code launcher + <port> <root> --h3 ...} as a process and checks HTTP/1.1 + HTTP/3 parity,
+     * Alt-Svc, and a clean SIGTERM shutdown that releases the UDP port.
+     */
+    static void runWithH3(List<String> launcher, Path root, Path cert, Path key, TlsMaterial tls) throws Exception {
         int port;
         try (var probe = new ServerSocket(0)) {
             port = probe.getLocalPort();
         }
-        var cmd = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                "-cp", System.getProperty("java.class.path"), "sjws_nettask.Sjws_nettask", String.valueOf(port),
-                this.root.toString(), "--h3", "--h3-host=127.0.0.1", "--cert=" + this.cert, "--key=" + this.key,
-                "--alt-svc", "--alt-svc-max-age=120"));
+        var cmd = new ArrayList<>(launcher);
+        cmd.addAll(List.of(String.valueOf(port), root.toString(), "--h3", "--h3-host=127.0.0.1", "--cert=" + cert,
+                "--key=" + key, "--alt-svc", "--alt-svc-max-age=120"));
         var pb = new ProcessBuilder(cmd).redirectErrorStream(true);
         pb.environment().keySet().removeIf(k -> k.startsWith("WEB_SERVER_"));
         var p = pb.start();
@@ -279,7 +288,7 @@ class SjwsServerHttp3Test {
             assertTrue(log.toString().contains("browsers ignore Alt-Svc from http:// origins"), log.toString());
             var h1 = HttpTestSupport.get(port, "/hello.txt", 4000);
             assertEquals("h3=\":" + udp + "\"; ma=120", h1.headers().get("alt-svc"));
-            try (var client = new H3TestClient(this.tls.certificate())) {
+            try (var client = new H3TestClient(tls.certificate())) {
                 var quic = client.connect(new java.net.InetSocketAddress("127.0.0.1", udp));
                 var h3 = H3TestClient.get(quic, "/hello.txt");
                 assertEquals(200, h3.status());
@@ -287,7 +296,7 @@ class SjwsServerHttp3Test {
                 assertEquals(h1.headers().get("last-modified"), h3.header("last-modified"));
                 assertEquals(h1.headers().get("content-type"), h3.header("content-type"));
                 var large = H3TestClient.get(quic, "/large.bin");
-                assertArrayEquals(Files.readAllBytes(this.root.resolve("large.bin")), large.body());
+                assertArrayEquals(Files.readAllBytes(root.resolve("large.bin")), large.body());
             }
         } finally {
             p.destroy(); // SIGTERM: shutdown hook closes both listeners
