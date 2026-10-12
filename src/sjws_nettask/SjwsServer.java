@@ -28,7 +28,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
@@ -41,13 +40,15 @@ import sjws_nettask.acme.LocalLeadership;
 import sjws_nettask.acme.ChallengeBoard;
 import sjws_nettask.acme.ChallengeHttpServer;
 import sjws_nettask.config.ConfigDocument;
-import sjws_nettask.config.NodeSettings;
+import sjws_nettask.config.ConfigException;
 import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.config.ConfigReloader;
 import sjws_nettask.config.ConfigSnapshot;
 import sjws_nettask.config.LastGoodStore;
 import sjws_nettask.config.LiveConfig;
+import sjws_nettask.config.NodeSettings;
 import sjws_nettask.config.ReloadResult;
+import sjws_nettask.config.SnapshotVerifier;
 import sjws_nettask.core.ChainControl;
 import sjws_nettask.core.FilterChain;
 import sjws_nettask.core.Handler;
@@ -125,10 +126,14 @@ public final class SjwsServer implements AutoCloseable {
     /** Null on a data node. Not read by the request path. */
     private ControlLeadership leadership;
     private ChallengeHttpServer challengeHttp;
+    /** Always invoked by {@link #applyRemote}. No-op only for standalone and an explicit test injection. */
+    private final SnapshotVerifier verifier;
 
     private SjwsServer(ConfigSnapshot snapshot, ConfigReloader reloader, ChallengeBoard board,
-            RequestFilters filters, Function<StaticFileHandler, Handler> terminal, HaSettings haSettings)
+            RequestFilters filters, Function<StaticFileHandler, Handler> terminal, HaSettings haSettings,
+            SnapshotVerifier verifier)
             throws IOException {
+        this.verifier = verifier != null ? verifier : SnapshotVerifier.forMode(snapshot.document().node().mode());
         this.live = new LiveConfig(snapshot);
         this.reloader = reloader;
         this.board = board;
@@ -326,6 +331,14 @@ public final class SjwsServer implements AutoCloseable {
         return start(loaded, H3Transports.defaultFactory());
     }
 
+    /**
+     * @param verifier required for a data or control node. {@link SnapshotVerifier#noop()} is only
+     *        for standalone and tests. A null verifier uses {@link SnapshotVerifier#forMode}.
+     */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, SnapshotVerifier verifier) throws IOException {
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier, true);
+    }
+
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory) throws IOException {
         return start(loaded, h3Factory, true);
     }
@@ -333,7 +346,7 @@ public final class SjwsServer implements AutoCloseable {
     /** {@code bindContent} false leaves the content port unbound. The process still stays up until {@link #close()}. */
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent)
             throws IOException {
-        return start(loaded, h3Factory, H2_FACTORY, null, null, null, bindContent);
+        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent);
     }
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
@@ -345,12 +358,12 @@ public final class SjwsServer implements AutoCloseable {
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
             HaSettings ha) throws IOException {
-        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, true);
+        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null, true);
     }
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
-            HaSettings ha, boolean bindContent) throws IOException {
+            HaSettings ha, SnapshotVerifier verifier, boolean bindContent) throws IOException {
         var board = new ChallengeBoard();
         var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
         if (ha != null && ha.handler() instanceof StaticFileHandler injected) {
@@ -359,7 +372,7 @@ public final class SjwsServer implements AutoCloseable {
             Handler visible = snapshot.handler() == snapshot.files() ? injected : snapshot.handler();
             snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation());
         }
-        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha);
+        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha, verifier);
         if (bindContent) {
             if (snapshot.document().server().h3Enabled()) {
                 server.startH3(h3Factory, storedCertificate(snapshot));
@@ -408,7 +421,9 @@ public final class SjwsServer implements AutoCloseable {
         if (snapshot.document().acme().enabled()) {
             server.startAcme(snapshot);
         }
-        server.persistLastGood(snapshot.document());
+        if (snapshot.document().node().mode() == NodeSettings.Mode.DATA) {
+            server.persistLastGood(snapshot.document());
+        }
         return server;
     }
 
@@ -552,44 +567,62 @@ public final class SjwsServer implements AutoCloseable {
      * keeps the previous snapshot.
      */
     public ReloadResult reload() {
-        this.reloadLock.lock();
-        try {
-            return reloadLocked();
-        } finally {
-            this.reloadLock.unlock();
-        }
+        return finish(null);
     }
 
     /**
-     * Applies a document pushed by a control plane. Validation, clamping and compilation are
-     * {@link ConfigReloader#apply}; the swap is the same one {@link #reload()} publishes, so a
-     * failure keeps the current snapshot. This does not call {@link ReloadHook#run()}: that
-     * re-reads the local file.
+     * Applies a document pushed by a control plane. The injected {@link SnapshotVerifier} runs
+     * before the swap, and a lower non-zero bundle version is rejected before it too. There is no
+     * other apply entry. Validation, clamping and compilation are {@link ConfigReloader#apply}; the
+     * swap is the same one {@link #reload()} publishes, so a failure keeps the current snapshot.
+     * An equal {@link ConfigDocument#canonicalHash()} does not rebuild the snapshot. This does not
+     * call {@link ReloadHook#run()}: that re-reads the local file. The last-good file is written
+     * after the lock is released, and only for a data node.
      */
     public ReloadResult applyRemote(ConfigDocument incoming) {
         Objects.requireNonNull(incoming, "incoming");
+        return finish(incoming);
+    }
+
+    private ReloadResult finish(ConfigDocument incoming) {
+        ReloadResult result;
+        boolean write = false;
         this.reloadLock.lock();
         try {
-            var result = publish(this.reloader.apply(this.live.get(), incoming, this.h3 != null, this.board, true));
-            if (result.applied() && this.live.get().document().node().mode() == NodeSettings.Mode.DATA) {
-                this.remoteApplied.set(true);
+            var previous = this.live.get();
+            try {
+                if (incoming == null && this.remoteApplied.get()) {
+                    result = reloadLocalOnly();
+                } else {
+                    if (incoming != null) {
+                        this.verifier.verify(incoming);
+                    }
+                    var prepared = incoming == null
+                            ? this.reloader.reload(previous, this.h3 != null, this.board)
+                            : this.reloader.apply(previous, incoming, this.h3 != null, this.board, true);
+                    result = prepared.applied() && prepared.snapshot() == previous ? prepared : publish(prepared);
+                    if (incoming != null && result.applied()
+                            && this.live.get().document().node().mode() == NodeSettings.Mode.DATA) {
+                        this.remoteApplied.set(true);
+                    }
+                }
+            } catch (ConfigException e) {
+                var message = e.getMessage() == null ? "configuration rejected" : e.getMessage();
+                result = ReloadResult.rejected(previous, java.util.List.of(message));
             }
-            return result;
+            write = result.applied() && result.snapshot() != previous;
         } finally {
             this.reloadLock.unlock();
         }
+        if (write) {
+            persistLastGood(result.snapshot().document());
+        }
+        return result;
     }
 
     /** Re-read bootstrap local settings on SIGHUP after a pushed config. The request path does not call this. */
     public void setLocalReload(Runnable action) {
         this.localReload = action;
-    }
-
-    private ReloadResult reloadLocked() {
-        if (this.remoteApplied.get()) {
-            return reloadLocalOnly();
-        }
-        return publish(this.reloader.reload(this.live.get(), this.h3 != null, this.board));
     }
 
     /**
@@ -667,11 +700,13 @@ public final class SjwsServer implements AutoCloseable {
         } else if (this.acme != null) {
             this.acme.update(result.snapshot().document().acme());
         }
-        persistLastGood(result.snapshot().document());
         return result;
     }
 
     private void persistLastGood(ConfigDocument document) {
+        if (document.node().mode() != NodeSettings.Mode.DATA) {
+            return;
+        }
         try {
             LastGoodStore.write(document);
         } catch (IOException e) {

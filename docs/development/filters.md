@@ -88,8 +88,12 @@ when `proceed` returns, before the socket write. Parse errors, 408, HTTP/2 refus
 refusals do not enter the chain, so they are not logged or counted.
 
 `RoutePattern` is `*` (or omitted) for every request, `/exact`, or `/prefix/*` (the path equals
-`/prefix` or starts with `/prefix/`). The query and fragment are ignored. The path is not
-percent-decoded.
+`/prefix` or starts with `/prefix/`). The query and fragment are ignored. The path is matched
+after percent-decoding and dot-segment normalisation, so `/%61dmin`, `//admin` and `/x/../admin`
+all match `/admin/*`. Spellings that different readers resolve differently (`%2f`, `%5c`, `\`,
+`;` path parameters, a `%` left after decoding, malformed escapes, `..` above the root) match
+every route, so a scoped filter fails closed instead of being skipped. Plain paths are matched in
+place without allocating.
 
 ## Configuration hook
 

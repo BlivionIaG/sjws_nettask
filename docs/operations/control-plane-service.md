@@ -164,8 +164,9 @@ in this daemon slice.
    and retry with backoff. Past max-staleness, readiness is false and the process keeps
    serving. There is no automatic drain. This daemon does not start a watch thread and
    does not move `connection` off `pending` by itself. A missing config file on a data
-   node already boots from the sibling `<file>.last-good` when that file exists
-   (`LastGoodStore`). `Requires=` stays off the data unit.
+   node already boots from `<stateDir>/config/last-good.json` when the envelope hash
+   matches and `node.mode` is `data`. A leftover sibling `<file>.last-good` is read
+   once when that JSON file is absent (`LastGoodStore`). `Requires=` stays off the data unit.
 
 5. **SIGHUP is reload.** The daemon child installs `ReloadHook`. `ExecReload` is
    `kill -HUP`. A data node reloads local bootstrap settings only after

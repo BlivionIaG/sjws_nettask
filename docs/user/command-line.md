@@ -22,6 +22,7 @@ Run:
 | `--cache-bytes=N[k\|m\|g]` | `WEB_SERVER_CACHE_BYTES` | 64m | small-file cache size (see [Caching](caching-and-ranges.md)); `0` disables it |
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
 | `--config=PATH` | `WEB_SERVER_CONFIG` | | YAML configuration file (see [docs/user/config-file.md](config-file.md)); the environment wins |
+| `--state-dir=PATH` | `WEB_SERVER_STATE_DIR` | the working directory | data directory for a data node's last-good config (`config/last-good.json`); the environment wins over `--state-dir`, which wins over `node.state_dir` |
 | `-h`, `--help` | | | print usage and exit |
 | `--daemon` | | | detach and run in the background; the parent exits once the child is up |
 | `--pid-file=PATH` | `WEB_SERVER_PID_FILE` | sjws_nettask.pid | process-id file; written by `--daemon`, and whenever this option is set |

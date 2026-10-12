@@ -21,11 +21,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
+import sjws_nettask.config.SnapshotVerifier;
 import sjws_nettask.ha.HaEvents;
 import sjws_nettask.ha.HaSettings;
 import sjws_nettask.service.Bootstrap;
 import sjws_nettask.service.ControlPlaneBinding;
 import sjws_nettask.service.NodeEnrollment;
+import sjws_nettask.service.ServiceLaunch;
 import sjws_nettask.service.ServiceStatus;
 
 /**
@@ -680,15 +682,21 @@ class ServiceDaemonTest {
         Files.writeString(two.resolve("hello.txt"), "two");
         Files.writeString(three.resolve("hello.txt"), "three");
         var yaml = tmp.resolve("live.yaml");
-        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
-                + one.toAbsolutePath() + "\n");
+        var cfgState = tmp.resolve("cfg-state");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\n  state_dir: " + cfgState.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + one.toAbsolutePath() + "\n");
         var boot = bootstrap(tmp, "data");
         var pid = tmp.resolve("live.pid");
-        int code = Sjws_nettask.run(new String[] {"--config=" + yaml, "--role=data", "--bootstrap=" + boot,
-                "--pid-file=" + pid, "--shutdown-timeout=1"}, Map.of(), out, err, NO_H3, server -> {
+        var loaded = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var hooks = ServiceLaunch.prepare(boot, "data");
+        // The daemon does not inject a verifier; the control-plane workstream does. noop stands in for that.
+        try (var server = SjwsServer.start(loaded, SnapshotVerifier.noop())) {
+            hooks.onListening(server, pid, Duration.ofSeconds(1));
                     try {
-                        Files.writeString(yaml, "schema: 1\nversion: 2\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
-                                + two.toAbsolutePath() + "\n");
+                        Files.writeString(yaml, "schema: 1\nversion: 2\nnode:\n  mode: data\n  state_dir: "
+                                + cfgState.toAbsolutePath() + "\nserver:\n  port: 0\n  root: " + two.toAbsolutePath()
+                                + "\n");
                         var local = server.reload();
                         assertTrue(local.applied(), local.errors().toString());
                         assertEquals(two.toAbsolutePath(), server.config().root());
@@ -696,12 +704,13 @@ class ServiceDaemonTest {
                                 .document();
                         var pushed = sjws_nettask.config.ConfigDocument.of(
                                 base.server().toBuilder().root(three).build(), base.acme(), base.routing(),
-                                base.middleware(), base.access(), base.node(), 1, 3, null, null);
+                                base.middleware(), base.access(), base.node(), 1, 3, null);
                         var applied = server.applyRemote(pushed);
                         assertTrue(applied.applied(), applied.errors().toString());
                         assertEquals(three.toAbsolutePath(), server.config().root());
-                        Files.writeString(yaml, "schema: 1\nversion: 4\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
-                                + one.toAbsolutePath() + "\n");
+                        Files.writeString(yaml, "schema: 1\nversion: 4\nnode:\n  mode: data\n  state_dir: "
+                                + cfgState.toAbsolutePath() + "\nserver:\n  port: 0\n  root: " + one.toAbsolutePath()
+                                + "\n");
                         Files.writeString(boot, Files.readString(boot) + "listen=127.0.0.1:9\n");
                         Files.setPosixFilePermissions(boot, PosixFilePermissions.fromString("rw-------"));
                         var kept = server.reload();
@@ -724,19 +733,16 @@ class ServiceDaemonTest {
                         var fresh = Bootstrap.load(again, "data");
                         assertThrows(IllegalStateException.class, () -> enrollment.adoptLocal(fresh));
                         assertThrows(IllegalArgumentException.class, () -> enrollment.adoptLocal(null));
-                    } catch (Exception e) {
-                        throw new IllegalStateException(e);
                     } finally {
-                        server.close();
+                        hooks.onShutdown();
                     }
-                });
-        assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
+        }
 
         var direct = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
-        try (var server = SjwsServer.start(direct, NO_H3)) {
+        try (var server = SjwsServer.start(direct, SnapshotVerifier.noop())) {
             var doc = direct.document();
             var pushed = sjws_nettask.config.ConfigDocument.of(doc.server().toBuilder().root(three).build(), doc.acme(),
-                    doc.routing(), doc.middleware(), doc.access(), doc.node(), 1, 5, null, null);
+                    doc.routing(), doc.middleware(), doc.access(), doc.node(), 1, 5, null);
             assertTrue(server.applyRemote(pushed).applied());
             var kept = server.reload();
             assertTrue(kept.warnings().toString().contains("no local bootstrap"), kept.warnings().toString());
