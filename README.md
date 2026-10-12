@@ -51,8 +51,12 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   `WARN: HTTP/3 not started, serving HTTP/1.1 only (no Alt-Svc)` and keeps serving HTTP/1.1.
 * Caveat: browsers only honour `Alt-Svc` received over HTTPS. The TCP listener is plain HTTP, so
   browsers will not switch to HTTP/3 from it; use `curl --http3` / `--http3-only` against the UDP port.
-* This build does not include the QUIC transport yet (`H3Transports` placeholder), so `--h3` currently
-  always takes the fallback path above.
+* The QUIC transport is Netty's `netty-codec-http3` with its bundled native quiche library
+  (linux x86_64/aarch64, macOS, Windows x86_64). On other platforms, or if the native library cannot be
+  extracted (e.g. `/tmp` mounted `noexec`; set `-Dio.netty.native.workdir=<dir>`), `--h3` takes the
+  fallback path above and the warning names the cause.
+* Quick check: `curl -I http://127.0.0.1:<port>/` shows the `Alt-Svc` header, and
+  `curl --http3-only -k https://127.0.0.1:<udp port>/` fetches over HTTP/3 (`-k` for the self-signed cert).
 
 ### Platform notes
 
