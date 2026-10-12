@@ -164,6 +164,60 @@ class JwtFilterTest {
                         "alg", "HS256", "hmac-keys", Encoding.base64Url(bytes(32, 1)), "require-exp", "maybe"))));
     }
 
+    @Test
+    void publicKeyBytesAreNotAnHmacSecret() throws Exception {
+        var rsa = KeyPairGenerator.getInstance("RSA");
+        rsa.initialize(2048);
+        var keys = rsa.generateKeyPair();
+        var spki = keys.getPublic().getEncoded();
+        var secret = bytes(32, 7);
+        var p256 = ec("secp256r1");
+        var ecSpki = p256.getPublic().getEncoded();
+        assertThrows(IllegalArgumentException.class, () -> JwtFilter.create(GatewayTestSupport.spec("jwt", Map.of(
+                "alg", "HS256,RS256",
+                "hmac-keys", Encoding.base64Url(spki),
+                "rsa-keys", Encoding.base64Url(spki)))));
+        assertThrows(IllegalArgumentException.class, () -> JwtFilter.create(GatewayTestSupport.spec("jwt", Map.of(
+                "alg", "HS256,ES256",
+                "hmac-keys", Encoding.base64Url(ecSpki),
+                "ec-keys", Encoding.base64Url(ecSpki)))));
+        var rsOnly = JwtFilter.create(GatewayTestSupport.spec("jwt", Map.of(
+                "alg", "RS256",
+                "rsa-keys", "k:" + Encoding.base64Url(spki),
+                "require-exp", "false")));
+        var forged = token("HS256", "k", "{}", spki, "HmacSHA256");
+        assertEquals(401, call(rsOnly, forged).status());
+        var dual = JwtFilter.create(GatewayTestSupport.spec("jwt", Map.of(
+                "alg", "HS256,RS256",
+                "hmac-keys", "k:" + Encoding.base64Url(secret),
+                "rsa-keys", "k:" + Encoding.base64Url(spki),
+                "ec-keys", Encoding.base64Url(ecSpki),
+                "require-exp", "false")));
+        assertEquals(200, call(dual, token("HS256", "k", "{}", secret, "HmacSHA256")).status());
+        assertEquals(200, call(dual, signed(keys, "RS256", "SHA256withRSA", "k", "{}")).status());
+        assertEquals(401, call(dual, forged).status());
+        assertEquals(401, call(dual, token("HS256", "k", "{}", keys.getPrivate().getEncoded(), "HmacSHA256")).status());
+    }
+
+    @Test
+    void negativeExpIsRejectedAndLeewayIsInclusive() throws Exception {
+        var secret = bytes(32, 8);
+        var params = Map.of(
+                "alg", "HS256",
+                "hmac-keys", Encoding.base64Url(secret),
+                "require-exp", "false",
+                "leeway", "10");
+        var filter = JwtFilter.create(GatewayTestSupport.spec("jwt", params), () -> NOW);
+        assertEquals(401, call(filter, token("HS256", null, "{\"exp\":-1}", secret, "HmacSHA256")).status());
+        assertEquals(401, call(filter, token("HS256", null, "{\"nbf\":-1}", secret, "HmacSHA256")).status());
+        assertEquals(401, call(filter, token("HS256", null, "{\"exp\":true}", secret, "HmacSHA256")).status());
+        var edge = token("HS256", null, "{\"exp\":" + NOW + "}", secret, "HmacSHA256");
+        var atLeeway = JwtFilter.create(GatewayTestSupport.spec("jwt", params), () -> NOW + 10);
+        assertEquals(200, call(atLeeway, edge).status());
+        var past = JwtFilter.create(GatewayTestSupport.spec("jwt", params), () -> NOW + 11);
+        assertEquals(401, call(past, edge).status());
+    }
+
     private static java.util.function.LongSupplier clock() {
         return () -> NOW;
     }

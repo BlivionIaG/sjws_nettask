@@ -48,8 +48,10 @@ import sjws_nettask.core.StaticFileHandler;
  * become a 500.
  * <p>
  * RSA and EC material is an X.509 SubjectPublicKeyInfo, base64 or base64url. HMAC material is
- * the raw secret, base64, at least as long as the hash. Rotation is a new compiled filter: the
- * key set is fixed for the life of this instance.
+ * the raw secret, base64, at least as long as the hash. An HMAC secret that equals a configured
+ * public-key encoding is rejected. A present {@code exp} or {@code nbf} that is not a
+ * non-negative integer is rejected. Rotation is a new compiled filter: the key set is fixed for
+ * the life of this instance.
  */
 public final class JwtFilter implements RequestFilter {
 
@@ -57,7 +59,8 @@ public final class JwtFilter implements RequestFilter {
 
     private final String header;
     private final String prefix;
-    private final Map<String, byte[]> hmac;
+    private final Map<String, Map<String, SecretKeySpec>> hmacSpecs;
+    private final Map<String, SecretKeySpec> soleHmac;
     private final Map<String, PublicKey> rsa;
     private final Map<String, ECPublicKey> ec;
     private final String[] algs;
@@ -72,7 +75,8 @@ public final class JwtFilter implements RequestFilter {
             boolean requireExp, LongSupplier clock) {
         this.header = header;
         this.prefix = prefix;
-        this.hmac = hmac;
+        this.hmacSpecs = hmacSpecs(hmac, algs);
+        this.soleHmac = this.hmacSpecs.size() == 1 ? this.hmacSpecs.values().iterator().next() : null;
         this.rsa = rsa;
         this.ec = ec;
         this.algs = algs;
@@ -97,6 +101,7 @@ public final class JwtFilter implements RequestFilter {
         var hmac = hmacKeys(spec.option("hmac-keys"));
         var rsa = publicKeys(spec.option("rsa-keys"), "RSA");
         var ec = ecKeys(spec.option("ec-keys"));
+        rejectSharedMaterial(hmac, rsa, ec);
         for (var alg : algs) {
             if (!hasKey(alg, hmac, rsa, ec)) {
                 throw new IllegalArgumentException("jwt alg " + alg + " has no key");
@@ -179,17 +184,19 @@ public final class JwtFilter implements RequestFilter {
 
     private boolean claims(Map<String, Object> payload) {
         long now = this.clock.getAsLong();
-        var exp = number(payload.get("exp"));
-        if (exp == null) {
-            if (this.requireExp) {
+        if (payload.containsKey("exp")) {
+            var exp = number(payload.get("exp"));
+            if (exp == null || expired(now, exp, this.leeway)) {
                 return false;
             }
-        } else if (expired(now, exp, this.leeway)) {
+        } else if (this.requireExp) {
             return false;
         }
-        var nbf = number(payload.get("nbf"));
-        if (nbf != null && notYet(now, nbf, this.leeway)) {
-            return false;
+        if (payload.containsKey("nbf")) {
+            var nbf = number(payload.get("nbf"));
+            if (nbf == null || notYet(now, nbf, this.leeway)) {
+                return false;
+            }
         }
         if (this.issuer != null && !this.issuer.equals(payload.get("iss"))) {
             return false;
@@ -235,12 +242,12 @@ public final class JwtFilter implements RequestFilter {
     private boolean verify(String alg, String kid, byte[] input, byte[] sig) throws GeneralSecurityException {
         int kind = family(alg);
         if (kind == 1) {
-            var key = select(this.hmac, kid);
-            if (key == null || key.length < hashLen(alg) || sig.length != hashLen(alg)) {
+            var key = hmacSpec(kid, alg);
+            if (key == null || sig.length != hashLen(alg)) {
                 return false;
             }
             var mac = mac(alg);
-            mac.init(new SecretKeySpec(key, mac.getAlgorithm()));
+            mac.init(key);
             return MessageDigest.isEqual(mac.doFinal(input), sig);
         }
         if (kind == 2) {
@@ -264,6 +271,39 @@ public final class JwtFilter implements RequestFilter {
             return verifier.verify(joseToDer(sig, partLen(alg)));
         }
         return false;
+    }
+
+    private SecretKeySpec hmacSpec(String kid, String alg) {
+        Map<String, SecretKeySpec> byAlg;
+        if (kid.isEmpty()) {
+            byAlg = this.soleHmac;
+        } else {
+            byAlg = this.hmacSpecs.get(kid);
+        }
+        return byAlg == null ? null : byAlg.get(alg);
+    }
+
+    private static Map<String, Map<String, SecretKeySpec>> hmacSpecs(Map<String, byte[]> hmac, String[] algs) {
+        var byKid = new LinkedHashMap<String, Map<String, SecretKeySpec>>();
+        for (var entry : hmac.entrySet()) {
+            var byAlg = new LinkedHashMap<String, SecretKeySpec>();
+            for (var alg : algs) {
+                if (family(alg) == 1 && entry.getValue().length >= hashLen(alg)) {
+                    byAlg.put(alg, new SecretKeySpec(entry.getValue(), jcaMac(alg)));
+                }
+            }
+            byKid.put(entry.getKey(), Map.copyOf(byAlg));
+        }
+        return Map.copyOf(byKid);
+    }
+
+    private static String jcaMac(String alg) {
+        return switch (alg) {
+            case "HS256" -> "HmacSHA256";
+            case "HS384" -> "HmacSHA384";
+            case "HS512" -> "HmacSHA512";
+            default -> throw new IllegalArgumentException(alg);
+        };
     }
 
     private static <T> T select(Map<String, T> keys, String kid) {
@@ -306,7 +346,7 @@ public final class JwtFilter implements RequestFilter {
         try {
             return now > Math.addExact(exp, leeway);
         } catch (ArithmeticException e) {
-            return false;
+            return true;
         }
     }
 
@@ -362,6 +402,23 @@ public final class JwtFilter implements RequestFilter {
             case "ES512" -> 521;
             default -> 0;
         };
+    }
+
+    /** The public-key bytes must not also be an HMAC secret (algorithm confusion). */
+    private static void rejectSharedMaterial(Map<String, byte[]> hmac, Map<String, PublicKey> rsa,
+            Map<String, ECPublicKey> ec) {
+        for (var secret : hmac.values()) {
+            for (var key : rsa.values()) {
+                if (MessageDigest.isEqual(secret, key.getEncoded())) {
+                    throw new IllegalArgumentException("hmac key must not be a public key encoding");
+                }
+            }
+            for (var key : ec.values()) {
+                if (MessageDigest.isEqual(secret, key.getEncoded())) {
+                    throw new IllegalArgumentException("hmac key must not be a public key encoding");
+                }
+            }
+        }
     }
 
     private static boolean hasKey(String alg, Map<String, byte[]> hmac, Map<String, PublicKey> rsa,

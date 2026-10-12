@@ -16,6 +16,7 @@
  */
 package sjws_nettask.gateway;
 
+import java.net.InetAddress;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -35,8 +36,8 @@ import sjws_nettask.core.StaticFileHandler;
  * Params: {@code by} ({@code ip}, {@code header}, {@code route}; default {@code ip}),
  * {@code header} (required when {@code by} is {@code header}), {@code capacity} (tokens, required),
  * {@code refill-per-second} (decimal, required), {@code max-keys} (default 10000),
- * {@code status} (default 429). A known key does not allocate. A new key past {@code max-keys}
- * is refused and the map does not grow.
+ * {@code status} (default 429). A known key does not allocate. A known address does not allocate
+ * a string. New keys are inserted under one lock, so the map cannot grow past {@code max-keys}.
  */
 public final class RateLimitFilter implements RequestFilter {
 
@@ -93,27 +94,37 @@ public final class RateLimitFilter implements RequestFilter {
 
     @Override
     public Response filter(Request request, Chain next) {
+        if (this.kind == Kind.IP) {
+            var address = peerAddress(request);
+            if (this.quota.tryAcquireAddress(address)) {
+                return next.proceed(request);
+            }
+            return refused(request, this.quota.retryAfterAddress(address));
+        }
         var key = key(request);
         if (this.quota.tryAcquire(key)) {
             return next.proceed(request);
         }
+        return refused(request, this.quota.retryAfterSeconds(key));
+    }
+
+    private Response refused(Request request, int retryAfter) {
         var response = StaticFileHandler.error(this.status, request.headOnly());
-        response.headers().set("retry-after", Integer.toString(Math.max(1, this.quota.retryAfterSeconds(key))));
+        response.headers().set("retry-after", Integer.toString(Math.max(1, retryAfter)));
         return response;
     }
 
+    private static InetAddress peerAddress(Request request) {
+        var peer = request.peer();
+        return peer == null ? null : peer.getAddress();
+    }
+
     private String key(Request request) {
-        return switch (this.kind) {
-            case IP -> {
-                var peer = request.peer();
-                yield peer == null || peer.getAddress() == null ? null : peer.getAddress().getHostAddress();
-            }
-            case HEADER -> {
-                var values = request.headers().values(this.header);
-                yield values.isEmpty() || values.get(0).isEmpty() ? null : values.get(0);
-            }
-            case ROUTE -> request.target();
-        };
+        if (this.kind == Kind.ROUTE) {
+            return request.target();
+        }
+        var values = request.headers().values(this.header);
+        return values.isEmpty() || values.get(0).isEmpty() ? null : values.get(0);
     }
 
     private enum Kind {
@@ -122,8 +133,9 @@ public final class RateLimitFilter implements RequestFilter {
 
     /**
      * Local token bucket. Credit is stored in millionths of a token so a fractional refill does
-     * not use floating point. Each key has its own lock; the lock is taken only while this filter
-     * is installed.
+     * not use floating point. Each key has its own lock. A new key is inserted under {@link #admit}
+     * so {@code max-keys} cannot be passed by concurrent first sightings. A known key takes only
+     * its own lock.
      */
     static final class TokenBucket implements Quota {
 
@@ -133,7 +145,9 @@ public final class RateLimitFilter implements RequestFilter {
         private final long refillPerSecond;
         private final int maxKeys;
         private final LongSupplier clock;
+        private final ReentrantLock admit = new ReentrantLock();
         private final ConcurrentHashMap<String, Bucket> buckets = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<InetAddress, Bucket> addresses = new ConcurrentHashMap<>();
         private final Bucket anonymous;
 
         private TokenBucket(long capacity, long refillPerSecond, int maxKeys, LongSupplier clock) {
@@ -174,18 +188,25 @@ public final class RateLimitFilter implements RequestFilter {
             }
             var bucket = this.buckets.get(key);
             if (bucket == null) {
-                if (this.buckets.size() >= this.maxKeys) {
+                bucket = admit(this.buckets, key);
+                if (bucket == null) {
                     return false;
                 }
-                var fresh = new Bucket();
-                var prev = this.buckets.putIfAbsent(key, fresh);
-                if (prev != null) {
-                    bucket = prev;
-                } else if (this.buckets.size() > this.maxKeys) {
-                    this.buckets.remove(key, fresh);
+            }
+            return bucket.tryTake(now, this.capacity, this.refillPerSecond);
+        }
+
+        @Override
+        public boolean tryAcquireAddress(InetAddress address) {
+            long now = this.clock.getAsLong();
+            if (address == null) {
+                return this.anonymous.tryTake(now, this.capacity, this.refillPerSecond);
+            }
+            var bucket = this.addresses.get(address);
+            if (bucket == null) {
+                bucket = admit(this.addresses, address);
+                if (bucket == null) {
                     return false;
-                } else {
-                    bucket = fresh;
                 }
             }
             return bucket.tryTake(now, this.capacity, this.refillPerSecond);
@@ -193,16 +214,35 @@ public final class RateLimitFilter implements RequestFilter {
 
         @Override
         public int retryAfterSeconds(String key) {
-            Bucket bucket;
-            if (key == null || key.isEmpty()) {
-                bucket = this.anonymous;
-            } else {
-                bucket = this.buckets.get(key);
+            return retryAfter(key == null || key.isEmpty() ? this.anonymous : this.buckets.get(key));
+        }
+
+        @Override
+        public int retryAfterAddress(InetAddress address) {
+            return retryAfter(address == null ? this.anonymous : this.addresses.get(address));
+        }
+
+        private static int retryAfter(Bucket bucket) {
+            return bucket == null ? 1 : bucket.retryAfter();
+        }
+
+        /** Inserts a key only while the map is under the cap. Known keys do not call this. */
+        private <K> Bucket admit(ConcurrentHashMap<K, Bucket> map, K key) {
+            this.admit.lock();
+            try {
+                var existing = map.get(key);
+                if (existing != null) {
+                    return existing;
+                }
+                if (map.size() >= this.maxKeys) {
+                    return null;
+                }
+                var created = new Bucket();
+                map.put(key, created);
+                return created;
+            } finally {
+                this.admit.unlock();
             }
-            if (bucket == null) {
-                return 1;
-            }
-            return bucket.retryAfter();
         }
 
         private static String required(MiddlewareSpec spec, String name) {
@@ -269,7 +309,7 @@ public final class RateLimitFilter implements RequestFilter {
         private boolean open;
         private long tokens;
         private long lastNanos;
-        private int retryAfter = 1;
+        private volatile int retryAfter = 1;
 
         boolean tryTake(long now, long capacity, long refillPerSecond) {
             this.lock.lock();

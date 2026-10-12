@@ -32,13 +32,17 @@ Bearer JWT. `alg` is a comma-separated allow-list: `HS256`, `HS384`, `HS512`, `R
 the list. `hmac-keys`, `rsa-keys` and `ec-keys` are comma-separated `kid:base64` entries
 (base64url is accepted). A single key may omit the kid. HMAC material is the raw secret and
 must be at least as long as the hash. RSA and EC material is an X.509 SubjectPublicKeyInfo.
-RSA keys shorter than 2048 bits are rejected. Every allowed algorithm needs a usable key.
+RSA keys shorter than 2048 bits are rejected. An HMAC secret that is the encoding of one of the
+configured public keys is rejected when the filter is built. Every allowed algorithm needs a
+usable key.
 
 `header` defaults to `authorization`. `prefix` defaults to `Bearer `; an empty prefix takes the
 whole field. `issuer` and `audience` are exact matches when set (`aud` may be a string or an
 array). `exp` is required unless `require-exp` is `false`. `nbf` is checked when present.
 `leeway` is whole seconds added to `exp` and subtracted from `nbf` (default 0). A token is
-still valid at the exact `exp` instant.
+still valid at the exact `exp` instant, and rejected one second later. A present `exp` or `nbf`
+that is not a non-negative integer is rejected, including when `require-exp` is false. HMAC
+signatures are compared over the whole digest.
 
 The header must not carry `crit`, `jku`, `jwk`, `x5u` or `x5c`. `typ`, when present, must be
 `JWT`. A missing `kid` selects the only key of that family; with more than one key the token
@@ -56,12 +60,14 @@ Local token bucket. `capacity` is the number of tokens (required, at least 1).
 `refill-per-second` is a positive decimal with up to six fractional digits. `by` is `ip`
 (default), `header` or `route`. `header` names the field when `by` is `header`. The route key
 is the raw request target. A missing address or header shares one bucket, which does not count
-against `max-keys` (default 10000). A new key past that cap is refused and the map does not
-grow. A known key does not allocate. `status` defaults to 429 and must be 400..599. A refusal
-sets `Retry-After`.
+against `max-keys` (default 10000). New keys are inserted under one lock, so concurrent
+first sightings cannot grow the map past that cap. A known key does not allocate, and a known
+client address does not allocate a string. `status` defaults to 429 and must be 400..599. A
+refusal sets `Retry-After`.
 
-`Quota` is the extension point. `tryAcquire` is the only method the request path calls, and it
-must not block or do I/O. `GatewayFilters.install(registry, factory)` uses that factory for
+`Quota` is the extension point. The request path calls `tryAcquire` for a header or route key
+and `tryAcquireAddress` for an address, and neither may block or do I/O.
+`GatewayFilters.install(registry, factory)` uses that factory for
 each `rate-limit` entry, so a cluster remainder can refill a local balance on another thread
 and answer from it here. The default factory is the local bucket.
 

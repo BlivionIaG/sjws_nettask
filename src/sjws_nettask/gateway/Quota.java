@@ -16,6 +16,7 @@
  */
 package sjws_nettask.gateway;
 
+import java.net.InetAddress;
 import sjws_nettask.core.MiddlewareSpec;
 
 /**
@@ -38,6 +39,19 @@ public interface Quota {
      */
     default int retryAfterSeconds(String key) {
         return 1;
+    }
+
+    /**
+     * Admission for a client address. The default encodes the address and calls {@link #tryAcquire}.
+     * A local token bucket overrides this so a known address does not allocate a string.
+     */
+    default boolean tryAcquireAddress(InetAddress address) {
+        return tryAcquire(address == null ? null : address.getHostAddress());
+    }
+
+    /** Same hint as {@link #retryAfterSeconds} for an address key. */
+    default int retryAfterAddress(InetAddress address) {
+        return retryAfterSeconds(address == null ? null : address.getHostAddress());
     }
 
     /** Builds the quota for one filter entry. The local token bucket is the default. */
