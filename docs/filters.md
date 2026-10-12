@@ -171,10 +171,14 @@ lands. The fields above (`peer`, `secure`, `headers().fields()`) are already on 
 ## Custom transports
 
 A custom `Transport.Factory` that serves requests must override
-`create(config, handler, chain, terminal)`. `SjwsServer` calls that form. The three-argument
-default exists so a factory that already overrides it still receives the chain; the four-argument
-default forwards to it and drops `terminal`. Dispatch with
+`create(config, handler, chain, terminal)`. `SjwsServer` calls
+`create(config, handler, chain, terminal, slot)`. That default forwards to the four-argument form
+and then `Transport.useSlot(slot)`, so an override of the four-argument form still receives the
+chain and an HTTP/3 server still shares the observer slot. The three-argument filter default
+exists so a factory that already overrides it still receives the chain; the four-argument default
+forwards to it and drops `terminal`. Dispatch with
 `FilterChain.dispatch(handler, terminal, chain)`: a non-null chain is `chain::handle` (the chain
 already closes over its terminal); a null chain and a null or static-handler terminal is
 `handler::handle`; any other terminal is `terminal::handle`. HTTP/3's factory does this. A future
 HTTP/2 listener should do the same, so the empty path stays a direct call on the concrete handler.
+Override `useSlot` to keep the shared `ObserverSlot` rather than a frozen observer.
