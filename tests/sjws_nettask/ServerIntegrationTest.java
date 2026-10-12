@@ -232,10 +232,14 @@ class ServerIntegrationTest {
 
     private void awaitActive(int expected) throws InterruptedException {
         long end = System.currentTimeMillis() + 5000;
-        while (manager.activeConnections() != expected && System.currentTimeMillis() < end) {
+        int seen = manager.activeConnections();
+        while (seen != expected && System.currentTimeMillis() < end) {
             Thread.sleep(20);
+            seen = manager.activeConnections();
         }
-        assertEquals(expected, manager.activeConnections(), "live connections");
+        // Assert the sample that ended the wait. A second read races a connection
+        // that is accepted in the gap and fails a suite that is otherwise idle.
+        assertEquals(expected, seen, "live connections");
     }
 
     @Test

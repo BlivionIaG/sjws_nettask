@@ -190,3 +190,13 @@ Still to align: as of this update #17 §6 describes quorum + fsync as the defaul
 2. Should Raft be used for metadata only, with ISR-style replication for data (Kafka/KRaft shape), or Raft for data too (NATS JetStream shape)?
 3. What are the RPO/RTO targets (e.g. RPO = 0 for acked messages under minority failures in `replicated` mode, RTO < N s)? These drive heartbeat and election timeouts.
 4. Should HTTP static serving be active-active on all nodes (proposed), independent of messaging leadership?
+
+## Routing and reverse proxy (`sjws_nettask.routing`)
+
+Plain `core.Handler` implementations, so they slot into the handler/filter chain like any other handler:
+
+* `Router(List<Route>, fallback)`: first match wins; a `Route` is host (exact, `*.suffix`, or any) + path prefix (segment boundary) + optional prefix rewrite + target `Handler`. No match: fallback (e.g. `StaticFileHandler`) or 404.
+* `RedirectHandler(status, location, keepPath)`: 301/302/303/307/308.
+* `ProxyHandler(Settings)`: forwards to one upstream with `java.net.http.HttpClient` (HTTP/1.1, no redirects), adds `X-Forwarded-Host`, `X-Forwarded-Proto`, `Forwarded`; drops hop-by-hop and writer-owned fields; buffers up to `maxBody`; connect/IO error or oversize → 502, timeout → 504, non-origin-form target or invalid method → 400.
+
+Design and phases: `docs/design/proxy-routing.md`.
