@@ -90,3 +90,8 @@ The suite is green on Linux. On macOS (CI run 38212694685, manual job only) thre
 - `core/SafeOpenTest.parentSymlinkRaceNeverLeaksOverHttp1`: a file was served while a parent directory was swapped for a symlink (the race guard relies on Linux `SecureDirectoryStream`/`O_NOFOLLOW` behaviour).
 - `core/FileCacheTest.searchOnlyDirectoryStays403`: a cached file below an execute-only directory is answered 200 instead of 403.
 - `HardeningIntegrationTest.trickledRequestIsCutOffAtDeadline`: the client sees a reset instead of the 408 (macOS sends RST when a socket with unread data is closed).
+
+## Mutation testing
+
+`mvn -P pitest test-compile org.pitest:pitest-maven:mutationCoverage` (about 70 min on 4 threads; CI runs it weekly and on manual dispatch).
+On 2026-10-12: 1524 mutants, 87% killed (test strength 89%). Most survivors are log calls, `flush()` on paths that also flush later, password scrubbing (`clearPassword`, `Arrays.fill`), and boundary flips on limits that tests check with margins.
