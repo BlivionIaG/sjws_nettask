@@ -110,6 +110,8 @@ final class ConnectionReaper implements AutoCloseable {
     private final LongAdder writeExpired = new LongAdder();
     private final Thread thread;
     private volatile boolean closed;
+    /** Shutdown has begun: idle and half-read connections are closed; responses in progress are not. */
+    private volatile boolean draining;
 
     ConnectionReaper(Duration idle, Duration head, Duration write) {
         this.idleNanos = idle.toNanos();
@@ -164,9 +166,45 @@ final class ConnectionReaper implements AutoCloseable {
         }
     }
 
+    /**
+     * Ends idle and half-read connections immediately. A response already being handled
+     * ({@link State#PROCESSING} or {@link State#WRITING}) is left alone until {@link #forceAll()}.
+     * Later transitions back to idle are closed by {@link #sweep(long)}.
+     */
+    void beginDrain() {
+        this.draining = true;
+        for (var t : this.timers) {
+            var state = t.state;
+            if (state == State.IDLE || state == State.HEAD) {
+                expire(t);
+            }
+        }
+    }
+
+    /** Closes every tracked connection. Called when the drain timeout has elapsed. */
+    void forceAll() {
+        for (var t : this.timers) {
+            expire(t);
+        }
+    }
+
+    /** @return true when any tracked connection is in {@code state} */
+    boolean any(State state) {
+        for (var t : this.timers) {
+            if (t.state == state) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void sweep(long now) {
         for (var t : this.timers) {
             var state = t.state; // read before the deadline (see class comment)
+            if (this.draining && (state == State.IDLE || state == State.HEAD)) {
+                expire(t);
+                continue;
+            }
             long deadline = t.deadline;
             switch (state) {
                 case IDLE, WRITING -> {
