@@ -54,16 +54,16 @@ API and the admin TUI make before every action.
 | operator |  ✓   |      ✓      |    ✓    |    ✓     |     ✓      |                  |
 | admin    |  ✓   |      ✓      |    ✓    |    ✓     |     ✓      |        ✓         |
 
-* The package can authenticate a bearer token `sjws_<operator>.<256-bit secret>` (only the
-  SHA-256 is stored, compared in constant time) or the subject of an mTLS client certificate.
-  **The control-plane design does not use the bearer.** Admin authentication is mTLS only
-  (`Rbac.ClientCert`). The TLS layer must have verified that certificate against the operator CA
-  before it hands over the subject. The only token outside that rule is the one-shot join token,
-  and it is not an admin credential (`docs/design/control-plane.md`, decision 13).
+* Identities: mTLS only (v1). The operator is the URI SAN (e.g. `urn:sjws:admin:alice`) or the
+  RFC 2253 canonical subject DN of its client certificate, mapped to a role in the CP-distributed
+  operator table (#38 §12.7). **The TLS layer must have verified the certificate against the
+  admin CA** before it hands over the identity. There are no admin bearer tokens; the only tokens
+  in the control plane are the one-shot node join tokens (#38 §12.4). This matches decision 13
+  in `docs/design/control-plane.md`.
 * Deny by default: unknown, disabled or malformed credentials are refused, and so is any
   permission outside the role. If the audit write fails, the action is denied.
 * `putOperator` and `removeOperator` need `MANAGE_OPERATORS`. Each change is atomic and takes
-  effect immediately, so a revoked token fails on its next use. A change that would leave no
+  effect immediately, so a removed or disabled operator is refused on its next request. A change that would leave no
   enabled admin is refused.
 
 ## Audit trail

@@ -1,3 +1,5 @@
+# Version updates: weekly, one grouped PR per ecosystem.
+# Security updates stay enabled (repo setting) and are raised immediately, also grouped per ecosystem.
 version: 2
 updates:
   - package-ecosystem: maven
@@ -6,13 +8,21 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      netty:
-        patterns: ["io.netty:*"]
-      bouncycastle:
-        patterns: ["org.bouncycastle:*"]
-      maven-plugins:
-        patterns: ["org.apache.maven.plugins:*", "org.jacoco:*", "org.pitest:*", "org.codehaus.mojo:*"]
+      maven:
+        applies-to: version-updates
+        patterns: ["*"]
+      maven-security:
+        applies-to: security-updates
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ["*"]
+      github-actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
