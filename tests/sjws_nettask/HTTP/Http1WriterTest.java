@@ -85,9 +85,10 @@ class Http1WriterTest {
         Files.writeString(other, "REPLACED");
         Files.move(other, f, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         var out = new ByteArrayOutputStream();
-        var e = assertThrows(IOException.class, () -> Http1Writer.write(out, r, true));
-        assertTrue(e.getMessage().contains("replaced"), e.getMessage());
-        assertEquals(0, out.size(), "nothing may be written for a swapped file");
+        Http1Writer.write(out, r, true);
+        var wire = out.toString(StandardCharsets.ISO_8859_1);
+        assertTrue(wire.startsWith("HTTP/1.1 404 "), "an error instead of the swapped file: " + wire);
+        assertFalse(wire.contains("REPLACED"), "nothing of the other file");
     }
 
     @Test
@@ -99,7 +100,8 @@ class Http1WriterTest {
         Files.delete(f);
         Files.createSymbolicLink(f, tmp.resolve("secret.txt"));
         var out = new ByteArrayOutputStream();
-        assertThrows(IOException.class, () -> Http1Writer.write(out, r, true));
+        Http1Writer.write(out, r, true);
+        assertTrue(out.toString(StandardCharsets.ISO_8859_1).startsWith("HTTP/1.1 404 "));
         assertFalse(out.toString(StandardCharsets.ISO_8859_1).contains("TOP-SECRET"));
     }
 }

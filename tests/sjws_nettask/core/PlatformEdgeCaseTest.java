@@ -89,8 +89,9 @@ class PlatformEdgeCaseTest {
         var body = new Body.FileBody(file, 0, a.size(), new Validator(other, 0, a.size()));
         var response = new Response(200, ResponseHeaders.of(), body);
         var out = new ByteArrayOutputStream();
-        assertThrows(IOException.class, () -> Http1Writer.write(out, response, false, ResponseHeaders.of()));
-        assertEquals(0, out.size(), "nothing written before the identity check");
+        Http1Writer.write(out, response, false, ResponseHeaders.of());
+        var wire = out.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
+        assertTrue(wire.startsWith("HTTP/1.1 404 "), "the identity check fails before the status is committed: " + wire);
     }
 
     @Test
