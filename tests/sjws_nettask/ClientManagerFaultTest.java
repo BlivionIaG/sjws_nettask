@@ -248,4 +248,23 @@ class ClientManagerFaultTest {
             assertEquals(0, new ClientManager(real, config(), sjws_nettask.core.ResponseHeaders::of).refusedPerIp());
         }
     }
+
+    /** The filter-chain overloads and the live-handler overloads all build an idle manager. */
+    @Test
+    void filterAndSnapshotConstructorsStayIdle() throws Exception {
+        var config = config();
+        var files = new sjws_nettask.core.StaticFileHandler(root, false, new sjws_nettask.core.FileCache(0));
+        sjws_nettask.core.Handler terminal = request -> null;
+        java.util.function.Supplier<sjws_nettask.core.ResponseHeaders> headers = sjws_nettask.core.ResponseHeaders::of;
+        var observer = sjws_nettask.observe.RequestObserver.NONE;
+        try (var real = loopback()) {
+            assertEquals(0, new ClientManager(real, config, files, headers, terminal).activeConnections());
+            assertEquals(0, new ClientManager(real, config, () -> files, headers).activeConnections());
+            assertEquals(0, new ClientManager(real, config, files, headers, observer).activeConnections());
+            assertEquals(0, new ClientManager(real, config, () -> files, headers, observer).activeConnections());
+            assertEquals(0, new ClientManager(real, config, files, headers,
+                    new sjws_nettask.observe.ObserverSlot(observer)).activeConnections());
+            assertEquals(0, new ClientManager(real, config, files, headers, terminal, observer).activeConnections());
+        }
+    }
 }

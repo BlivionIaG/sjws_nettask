@@ -37,8 +37,6 @@ import sjws_nettask.http1.Http1Parser;
 import sjws_nettask.http1.Http1Requests;
 import sjws_nettask.http1.Http1Writer;
 import sjws_nettask.http1.ParseError;
-import sjws_nettask.observe.ObserverSlot;
-import sjws_nettask.observe.RequestObserver;
 
 /**
  * HTTP/1.x adapter for one connection on a blocking {@link SocketChannel} (run on a virtual
@@ -75,30 +73,18 @@ final class Http1Connection implements Runnable {
     private static final byte[] CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final SocketChannel channel;
-    private final Handler handler;
-    /**
-     * Non-null only when {@link #handler} is the static file handler. {@link #apply} then calls
-     * {@link StaticFileHandler#handle} directly and does not go through {@link Handler}.
-     */
-    private final StaticFileHandler files;
+    /** One read per request: the live snapshot, or a filter chain captured at accept. */
+    private final Supplier<Handler> handlers;
     private final InetSocketAddress peer;
     /** Captured with {@link #peer} for the failure log; the channel may already be closed by then. */
     private final String remote;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ConnectionReaper reaper;
-    private final ObserverSlot slot;
-    /** Numeric client address (no reverse lookup), cached for the life of the connection. */
-    private final String clientHost;
-    private final boolean loopback;
-    /** Observer captured for the request in progress. {@link RequestObserver#NONE} skips the hook. */
-    private RequestObserver active = RequestObserver.NONE;
-    private long startedAt;
-    private String method = "-";
-    private String target = "-";
-    private String protocol = "HTTP/1.1";
-    private int protocolId = RequestObserver.HTTP_1_1;
-    private String referer = "-";
-    private String userAgent = "-";
+    /**
+     * Non-null on a server connection. {@link HandlerRef#get()} is the chain published when counters
+     * are armed after start; null means this connection's {@link #handler}.
+     */
+    private final HandlerRef armed;
     private final Http1Parser.HeadParser parser = new Http1Parser.HeadParser(CONSTANTS.MAX_LINE_LENGTH,
             CONSTANTS.MAX_HEADERS);
     /** Discards chunked request bodies (GET/HEAD) up to {@link CONSTANTS#MAX_DRAINED_BODY}. */
@@ -114,23 +100,28 @@ final class Http1Connection implements Runnable {
      */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
-        this(channel, handler, extraHeaders, reaper, RequestObserver.NONE, "0.0.0.0", false);
+        this(channel, () -> handler, extraHeaders, reaper, (HandlerRef) null);
+    }
+
+    /** {@code handlers.get()} is one volatile read of the current snapshot handler, per request. */
+    Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper) {
+        this(channel, handlers, extraHeaders, reaper, (HandlerRef) null);
     }
 
     /**
-     * @param clientHost numeric peer address, captured once at accept (never a DNS name)
-     * @param loopback peer is a loopback address; gates {@code /metrics} when it is localhost-only
+     * @param armed handler published when counters are armed after start, or null when this
+     *        connection's handler will not be replaced
      */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
-            ConnectionReaper reaper, RequestObserver observer, String clientHost, boolean loopback) {
-        this(channel, handler, extraHeaders, reaper, new ObserverSlot(observer), clientHost, loopback);
+            ConnectionReaper reaper, HandlerRef armed) {
+        this(channel, () -> handler, extraHeaders, reaper, armed);
     }
 
-    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
-            ConnectionReaper reaper, ObserverSlot slot, String clientHost, boolean loopback) {
+    Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, HandlerRef armed) {
         this.channel = channel;
-        this.handler = handler;
-        this.files = handler instanceof StaticFileHandler direct ? direct : null;
+        this.handlers = handlers;
         var peer = (InetSocketAddress) null;
         var remote = "(closed)";
         try {
@@ -146,22 +137,26 @@ final class Http1Connection implements Runnable {
         this.remote = remote;
         this.extraHeaders = extraHeaders;
         this.reaper = reaper;
-        this.slot = java.util.Objects.requireNonNull(slot, "slot");
-        this.clientHost = java.util.Objects.requireNonNull(clientHost, "clientHost");
-        this.loopback = loopback;
+        this.armed = armed;
     }
 
     /**
-     * Static files: one null test, then {@link StaticFileHandler#handle}. Anything else (a filter
-     * chain, a router, a test double) goes through {@link Handler}. The choice is fixed for the
-     * life of the connection.
+     * One snapshot read. A {@link StaticFileHandler} is called directly; a filter chain, a router
+     * or a test double goes through {@link Handler}.
      */
     private Response apply(Request request) {
-        var files = this.files;
-        if (files != null) {
+        var armed = this.armed;
+        if (armed != null) {
+            var live = armed.get();
+            if (live != null) {
+                return live.handle(request);
+            }
+        }
+        var handler = this.handlers.get();
+        if (handler instanceof StaticFileHandler files) {
             return files.handle(request);
         }
-        return this.handler.handle(request);
+        return handler.handle(request);
     }
 
     @Override
@@ -249,20 +244,6 @@ final class Http1Connection implements Runnable {
     private boolean serveRequest(ConnectionReaper.Timer timer, ChannelOutput out) throws IOException {
         // run() waited for the first byte under the idle timeout; now the whole head (and any body to discard) must arrive before the head deadline.
         timer.head();
-        // One volatile read. NONE skips the clock, the counters and every probe path check.
-        this.active = this.slot.get();
-        if (this.active != RequestObserver.NONE) {
-            this.startedAt = System.nanoTime();
-            this.protocolId = RequestObserver.HTTP_1_1;
-        }
-        if (this.active != RequestObserver.NONE && this.active.logging()) {
-            this.method = "-";
-            this.target = "-";
-            this.protocol = "HTTP/1.1";
-            this.referer = "-";
-            this.userAgent = "-";
-        }
-
         Http1Parser.Head request;
         try {
             this.parser.reset();
@@ -292,13 +273,12 @@ final class Http1Connection implements Runnable {
         }
 
         var core = Http1Requests.toCore(request, this.peer);
-        note(request);
         if (!core.headOnly() && !"GET".equals(core.method())) {
             // OPTIONS (200) or a known but unsupported method (405). Never read (possibly huge)
             // bodies just to reject them: keep the connection only if there is no body.
             boolean keepAlive = request.keepAlive() && !request.hasBody();
             timer.processing();
-            send(out, respond(core), keepAlive);
+            send(out, apply(core), keepAlive);
             return keepAlive;
         }
 
@@ -337,42 +317,8 @@ final class Http1Connection implements Runnable {
         }
         timer.processing();
 
-        send(out, respond(core), keepAlive);
+        send(out, apply(core), keepAlive);
         return keepAlive;
-    }
-
-    /** Copies the request into connection fields. Referer and User-Agent are read only when logged. */
-    private void note(Http1Parser.Head request) {
-        if (this.active == RequestObserver.NONE) {
-            return;
-        }
-        this.protocolId = RequestObserver.protocolId(request.version());
-        if (!this.active.logging()) {
-            return;
-        }
-        this.method = request.method();
-        this.target = request.target();
-        this.protocol = request.version();
-        if (this.active.logHeaders()) {
-            var ref = request.headers().get("referer");
-            var ua = request.headers().get("user-agent");
-            if (ref != null && !ref.isEmpty()) {
-                this.referer = ref.get(0);
-            }
-            if (ua != null && !ua.isEmpty()) {
-                this.userAgent = ua.get(0);
-            }
-        }
-    }
-
-    private Response respond(Request core) {
-        if (this.active != RequestObserver.NONE && this.active.intercepts()) {
-            var special = this.active.intercept(core.method(), core.target(), this.loopback);
-            if (special != null) {
-                return special;
-            }
-        }
-        return apply(core);
     }
 
     /**
@@ -436,25 +382,6 @@ final class Http1Connection implements Runnable {
     static final int LINGER_BYTES = 64 * 1024;
 
     private void send(ChannelOutput out, Response response, boolean keepAlive) throws IOException {
-        long bytes = 0;
-        IOException error = null;
-        try {
-            Http1Writer.write(out, response, keepAlive, this.extraHeaders.get());
-            bytes = response.sendsBody() ? Math.max(0L, response.contentLength()) : 0L;
-        } catch (IOException e) {
-            error = e;
-        }
-        if (this.active != RequestObserver.NONE) {
-            long nanos = System.nanoTime() - this.startedAt;
-            if (this.active.logging()) {
-                this.active.complete(response.status(), this.protocolId, bytes, nanos, this.clientHost, this.method,
-                        this.target, this.protocol, this.referer, this.userAgent);
-            } else {
-                this.active.complete(response.status(), this.protocolId, bytes, nanos);
-            }
-        }
-        if (error != null) {
-            throw error;
-        }
+        Http1Writer.write(out, response, keepAlive, this.extraHeaders.get());
     }
 }

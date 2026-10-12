@@ -19,7 +19,9 @@ package sjws_nettask.observe;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -30,7 +32,9 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.channels.ServerSocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,12 +45,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.ClientManager;
 import sjws_nettask.H3Transports;
 import sjws_nettask.HttpTestSupport;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.ServerConfig.AccessLogFormat;
 import sjws_nettask.ServerConfig.MetricsExposure;
 import sjws_nettask.SjwsServer;
+import sjws_nettask.core.Body;
+import sjws_nettask.core.Handler;
+import sjws_nettask.core.RequestFilters;
+import sjws_nettask.core.Response;
+import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.h3.Http3Server;
 
@@ -382,6 +392,8 @@ class ObservabilityTest {
         var config = ServerConfig.builder(dir).port(0).accessLog(log.toString()).accessLogFormat(AccessLogFormat.COMBINED)
                 .metricsExposure(MetricsExposure.LOCALHOST).healthz(true).build();
         try (var server = SjwsServer.start(config)) {
+            assertNotNull(server.filterChain(), "observability installs the order-0 filter");
+            server.metricsSnapshot(); // already recording: does not publish a second filter
             assertTrue(server.describe().contains("access log " + log), server.describe());
             assertTrue(server.describe().contains("metrics localhost"), server.describe());
             assertTrue(server.describe().contains("healthz"), server.describe());
@@ -391,9 +403,8 @@ class ObservabilityTest {
                         "GET /index.html HTTP/1.1\r\nHost: h\r\nReferer: http://ref\r\nUser-Agent: ua \"x\"\r\n\r\n");
                 var ok = HttpTestSupport.readResponse(socket.getInputStream());
                 assertEquals(200, ok.statusCode());
-                var snap = server.metrics().snapshot();
+                var snap = awaitRecorded(server, 1, 1);
                 assertTrue(snap.http1Connections() >= 1, "gauge while the connection is open: " + snap.http1Connections());
-                assertTrue(snap.requests() >= 1);
                 assertEquals(1, snap.protocol("HTTP/1.1"));
             }
             var health = HttpTestSupport.get(server.tcpPort(), "/healthz", 2000);
@@ -412,12 +423,12 @@ class ObservabilityTest {
             var bad = HttpTestSupport.rawRequest(server.tcpPort(), "GET / HTTP/1.1\r\n\r\n", 2000);
             assertEquals(400, bad.statusCode());
         }
-        var text = Files.readString(log);
+        var text = awaitLog(log, "\"GET /index.html HTTP/1.1\" 200 5 \"http://ref\" \"ua ?x?\"");
         assertTrue(text.contains("\"GET /index.html HTTP/1.1\" 200 5 \"http://ref\" \"ua ?x?\""), text);
         assertTrue(text.contains("\"GET /healthz HTTP/1.1\" 200 3"), text);
         assertTrue(text.contains("\"GET /metrics HTTP/1.1\" 200"), text);
         assertTrue(text.contains(" 404 "), text);
-        assertTrue(text.contains(" 400 "), text);
+        assertFalse(text.contains(" 400 "), "a parse error never enters the filter: " + text);
 
         try (var plain = SjwsServer.start(ServerConfig.builder(dir).port(0).build())) {
             var file = HttpTestSupport.get(plain.tcpPort(), "/metrics", 2000);
@@ -430,8 +441,12 @@ class ObservabilityTest {
             assertFalse(plain.describe().contains("access log"), plain.describe());
             assertFalse(plain.describe().contains("healthz"), plain.describe());
             assertEquals(0, plain.metricsSnapshot().requests(), "arming counts only later requests");
+            var armed = plain.filterChain();
+            assertNotNull(armed, "arming publishes the observe filter");
+            plain.metricsSnapshot(); // second call leaves the published filter in place
+            assertSame(armed, plain.filterChain());
             HttpTestSupport.get(plain.tcpPort(), "/index.html", 2000);
-            assertTrue(plain.metrics().snapshot().requests() >= 1);
+            assertTrue(awaitRecorded(plain, 1, -1).requests() >= 1);
             var stillFile = HttpTestSupport.get(plain.tcpPort(), "/healthz", 2000);
             assertEquals("from-disk\n", stillFile.bodyText(), "arming counters does not take /healthz");
         }
@@ -446,11 +461,11 @@ class ObservabilityTest {
             var health = HttpTestSupport.get(probe.tcpPort(), "/healthz", 2000);
             assertEquals(200, health.statusCode());
             assertEquals("ok\n", health.bodyText());
-            assertTrue(probe.metrics().snapshot().requests() >= 1);
+            assertTrue(awaitRecorded(probe, 1, -1).requests() >= 1);
             assertTrue(probe.describe().contains("healthz"), probe.describe());
         }
 
-        var commonText = Files.readString(commonLog);
+        var commonText = awaitLog(commonLog, "\"GET /index.html HTTP/1.1\" 200 5 ");
         assertTrue(commonText.contains("\"GET /index.html HTTP/1.1\" 200 5 "), commonText);
         assertFalse(commonText.contains("secret"), commonText);
     }
@@ -470,7 +485,16 @@ class ObservabilityTest {
         var transport = H3Transports.defaultFactory().create(ServerConfig.builder(dir).build(), handler, observer);
         assertInstanceOf(Http3Server.class, transport);
         var http3 = (Http3Server) transport;
+        assertSame(http3, http3.withObserver(observer));
         assertSame(http3, http3.withObserver(null));
+        var logged = RequestObserver.open(ServerConfig.builder(dir).accessLog(dir.resolve("h3-wrap.log").toString())
+                .accessLogFormat(AccessLogFormat.COMBINED).build());
+        try {
+            var fresh = new Http3Server(ServerConfig.builder(dir).build(), handler);
+            assertSame(fresh, fresh.withObserver(logged));
+        } finally {
+            logged.close();
+        }
         try {
             try {
                 http3.start();
@@ -503,6 +527,138 @@ class ObservabilityTest {
         assertThrows(NullPointerException.class,
                 () -> new sjws_nettask.h3.Http3Server(ServerConfig.builder(dir).build(), new StaticFileHandler(dir))
                         .withSlot(null));
+    }
+
+    @Test
+    void armCountsTheNextRequestOnTheSameConnection() throws Exception {
+        Files.writeString(dir.resolve("index.html"), "hello");
+        try (var server = SjwsServer.start(ServerConfig.builder(dir).port(0).build())) {
+            assertNull(server.filterChain());
+            try (var socket = new Socket(InetAddress.getLoopbackAddress(), server.tcpPort())) {
+                socket.setSoTimeout(2000);
+                var out = socket.getOutputStream();
+                HttpTestSupport.write(out, "GET /index.html HTTP/1.1\r\nHost: h\r\n\r\n");
+                assertEquals(200, HttpTestSupport.readResponse(socket.getInputStream()).statusCode());
+                assertEquals(0, server.metrics().snapshot().requests());
+                assertEquals(0, server.metricsSnapshot().requests());
+                HttpTestSupport.write(out, "GET /index.html HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+                assertEquals(200, HttpTestSupport.readResponse(socket.getInputStream()).statusCode());
+            }
+            assertTrue(awaitRecorded(server, 1, 1).requests() >= 1);
+        }
+    }
+
+    @Test
+    void observeFilterIsOutermostAtOrderZero() throws Exception {
+        Files.writeString(dir.resolve("index.html"), "hello");
+        var log = dir.resolve("outer.log");
+        var filters = RequestFilters.create().add(0, (request, next) -> {
+            next.proceed(request);
+            return new Response(201, ResponseHeaders.of().add("content-type", "text/plain"),
+                    Body.Bytes.of("x".getBytes(StandardCharsets.US_ASCII)));
+        });
+        var config = ServerConfig.builder(dir).port(0).accessLog(log.toString()).accessLogFormat(AccessLogFormat.COMMON)
+                .build();
+        try (var server = SjwsServer.start(config, filters)) {
+            assertNotNull(server.filterChain());
+            var response = HttpTestSupport.get(server.tcpPort(), "/index.html", 2000);
+            assertEquals(201, response.statusCode());
+            assertEquals("x", response.bodyText());
+        }
+        var text = awaitLog(log, " 201 ");
+        assertTrue(text.contains("\"GET /index.html HTTP/1.1\" 201 1 "), text);
+        assertFalse(text.contains(" 200 "), text);
+    }
+
+    /**
+     * Observability with a custom terminal (not the static handler) still compiles the order-0
+     * filter, and HTTP/3 keeps that chain instead of replacing it with the live file handler.
+     */
+    @Test
+    void observeKeepsACustomTerminalAndTheHttp3Chain() throws Exception {
+        Files.writeString(dir.resolve("index.html"), "hello");
+        Handler leaf = request -> new Response(202, ResponseHeaders.of().add("content-type", "text/plain"),
+                Body.Bytes.of("leaf".getBytes(StandardCharsets.US_ASCII)), request.headOnly());
+        var config = ServerConfig.builder(dir).port(0).healthz(true).h3Enabled(true).h3Port(0).build();
+        try (var server = SjwsServer.start(config, null, files -> leaf)) {
+            assertNotNull(server.filterChain());
+            var response = HttpTestSupport.get(server.tcpPort(), "/index.html", 2000);
+            assertEquals(202, response.statusCode());
+            assertEquals("leaf", response.bodyText());
+            var health = HttpTestSupport.get(server.tcpPort(), "/healthz", 2000);
+            assertEquals(200, health.statusCode());
+            assertEquals("ok\n", health.bodyText());
+        }
+    }
+
+    @Test
+    void clientManagerWrapsARecordingObserver() throws Exception {
+        Files.writeString(dir.resolve("index.html"), "hello");
+        var files = new StaticFileHandler(dir);
+        var config = ServerConfig.builder(dir).build();
+        try (var observer = RequestObserver.open(config); var listener = ServerSocketChannel.open()) {
+            listener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+            Handler leaf = request -> new Response(202, ResponseHeaders.of().add("content-type", "text/plain"),
+                    Body.Bytes.of("leaf".getBytes(StandardCharsets.US_ASCII)), request.headOnly());
+            var manager = new ClientManager(listener, config, files, ResponseHeaders::of, leaf, observer);
+            var thread = new Thread(manager, "accept-observe");
+            thread.start();
+            try {
+                int port = ((InetSocketAddress) listener.getLocalAddress()).getPort();
+                var response = HttpTestSupport.get(port, "/index.html", 2000);
+                assertEquals(202, response.statusCode());
+                assertEquals("leaf", response.bodyText());
+                assertTrue(observer.metrics().snapshot().requests() >= 1);
+            } finally {
+                manager.close();
+                thread.join(2000);
+            }
+        }
+        try (var observer = RequestObserver.open(config); var listener = ServerSocketChannel.open()) {
+            listener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+            var manager = new ClientManager(listener, config, files, ResponseHeaders::of, (Handler) null, observer);
+            var thread = new Thread(manager, "accept-observe-files");
+            thread.start();
+            try {
+                int port = ((InetSocketAddress) listener.getLocalAddress()).getPort();
+                assertEquals(200, HttpTestSupport.get(port, "/index.html", 2000).statusCode());
+                assertTrue(observer.metrics().snapshot().requests() >= 1);
+            } finally {
+                manager.close();
+                thread.join(2000);
+            }
+        }
+    }
+
+    /**
+     * The filter updates counters before the write, but {@link ServerMetrics#snapshot()} can still
+     * be read from this thread before that update is visible. Spin until it catches up.
+     */
+    private static Snapshot awaitRecorded(SjwsServer server, long atLeast, long http11) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        Snapshot last = server.metrics().snapshot();
+        while (last.requests() < atLeast || (http11 >= 0 && last.protocol("HTTP/1.1") < http11)) {
+            if (System.nanoTime() >= deadline) {
+                fail("counters stayed at requests=" + last.requests() + " http/1.1=" + last.protocol("HTTP/1.1"));
+            }
+            Thread.yield();
+            last = server.metrics().snapshot();
+        }
+        return last;
+    }
+
+    /** Poll the access log until the writer has flushed {@code needle}, or fail at the deadline. */
+    private static String awaitLog(Path log, String needle) throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        String text = Files.exists(log) ? Files.readString(log) : "";
+        while (!text.contains(needle)) {
+            if (System.nanoTime() >= deadline) {
+                fail("access log did not contain " + needle + " within 2s: " + text);
+            }
+            Thread.yield();
+            text = Files.exists(log) ? Files.readString(log) : "";
+        }
+        return text;
     }
 
     private static String bodyText(sjws_nettask.core.Response response, java.nio.charset.Charset charset) {

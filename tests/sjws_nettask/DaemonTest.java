@@ -1135,7 +1135,7 @@ class DaemonTest {
                 + "time.sleep(60)\n");
         var process = new ProcessBuilder(python.toString(), script.toString(), childPid.toString()).start();
         try {
-            waitFor(() -> Files.exists(childPid), 5_000, "restart child");
+            waitFor(() -> readablePid(childPid), 5_000, "restart child");
             long recorded = readPid(childPid);
             var pidFile = tmp.resolve("restart.pid");
             Files.writeString(pidFile, recorded + "\n");
@@ -1266,6 +1266,16 @@ class DaemonTest {
 
     private static long readPid(Path file) throws IOException {
         return Long.parseLong(Files.readString(file).trim());
+    }
+
+    /** The writer creates the file before the pid bytes are visible. */
+    private static boolean readablePid(Path file) {
+        try {
+            var text = Files.readString(file).trim();
+            return !text.isEmpty() && Long.parseLong(text) > 0;
+        } catch (IOException | NumberFormatException e) {
+            return false;
+        }
     }
 
     private static boolean alive(long pid) {

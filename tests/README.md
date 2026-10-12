@@ -15,6 +15,9 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `http1/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
+| `config/ConfigLoaderTest`, `config/RouteTableTest`, `ReloadServerTest`, `ReloadCoverageTest` | YAML file, routing table validation (not dispatched), immutable snapshot reload, challenge-port rebind, HTTP/3 cert swap on reload |
+| `ReloadHookTest` | reload hook registry |
+| `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance (linux/amd64), hot cert swap |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
@@ -34,6 +37,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `Http1TransportTest` | S4 channel transport: slowloris 408 at the head deadline (silent and trickling), idle keep-alive close, stalled reader closed by the write deadline, slow-but-progressing 50 MB download survives, sendfile exact bytes (50 MB, uncached 200 KB), file shrink during sendfile closes without spinning (process CPU check), fragmented pipelining with a body, timer deregistration, reaper sweep per state (FIN sent at once on expiry), bounded transfer stalls; S5: 50 MB download resumed from an offset with Range + If-Range byte-exact (sendfile), shrink during a ranged sendfile, uncached ranges on both write paths; perf review N1/N2: an unfinished body is cut at the head deadline with a 408, with or without `100 Continue` |
 | `core/SecurityHeadersTest` | `X-Content-Type-Options: nosniff` on every file and generated page; script-free, frame-free `Content-Security-Policy` on listings, errors and redirects |
 | `core/RenderingTest` | reason phrases for every registered status (empty for unregistered codes), error page titles, HEAD error heads, MIME/charset of the added static-file types |
+| `core/AccessRulesTest` | access rules: glob table (anchored/unanchored, `*`/`?`/`**`, "everything below"), deny list > rules > dotfile default, allow wildcards never expose dotfiles but literals can (`.well-known/acme-challenge`), linear matching with many `**` on deep paths, malformed rules, handler wiring with and without the cache (403/404, normalized and decoded paths, listings filtered, denied index falls back to listing), symlinks to denied/dot paths refused, owner/world-readable policy (re-checked on cache hits, fails closed without POSIX attributes), custom `AccessPolicy` seam. `AccessRulesBench` (not a test) prints the per-request cost |
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
@@ -42,7 +46,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `h2/Http2JuryTest` | security jury regressions: PINGs / unfinished header block don't keep an idle h2 connection, open streams do, never-ending request reset with NO_ERROR, slowloris on the HTTP/1.x fallback, header timeout vs keep-alive and upgrade, PING flood without reading |
 | `h2/Http2BudgetTest` | review fixes: zero-window clients don't delay another client (<1 s), per-connection file/in-flight budgets (REFUSED_STREAM), zero-window CANCEL, per-IP cap, HTTP/1 fallback in-flight slot (503), GOAWAY on stopAccepting, drain on close |
 | `h2/Http2EdgeTest` | HTTP/2 listener edges: HTTP/1.x fallback keep-alive/pipelining/close, refusals, 500s, connection caps, idle close, stopAccepting/close, busy port, header mapping |
-| `h2/H2ConfigAndWiringTest` | `--h2`, `--h2-port`, `--h2c-port` parsing/warnings and `SjwsServer` wiring (fallback when HTTP/2 fails) |
+| `h2/H2ConfigAndWiringTest` | `--h2`, `--h2-port`, `--h2c-port` parsing/warnings and `SjwsServer` wiring (fallback when HTTP/2 fails, observe filter at startup and after `metricsSnapshot()`) |
 | `h2/ResponseWriterTest` | HTTP/2 response writer outcomes: swapped/shrunk files, stall, rejected, closed, sink failures |
 | `h3/Http3ServerTest` | HTTP/3 server: parity with HTTP/1.1, ranges, back-pressure, write timeout, cancel, limits, idle/ALPN, Netty leak detector (`PARANOID`, checked in `@AfterAll`) |
 | `h3/SecurityReviewTest` | the security review's repros, inverted: slot exhaustion, drip readers, reset floods, Retry tokens, receive windows, in-flight cap, GOAWAY drain, request validation, writer error/cancel paths |
@@ -74,7 +78,7 @@ Every user-visible behaviour and the test that asserts it.
 |---|---|
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
 | `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
-| access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test` |
+| access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed; the observe filter is order 0 and is absent while off | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test`; HTTP/2 recording in `h2/H2ConfigAndWiringTest` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
 | `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |

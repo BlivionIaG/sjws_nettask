@@ -22,12 +22,15 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import sjws_nettask.core.AccessRules;
 
 /**
  * Server settings: the complete field set of the merged plan (S1 superset contract).
  * Fields marked "not used yet" are carried for later milestones; their defaults keep the
  * current behaviour. See {@link #usage()} for flags and environment variables.
- * Precedence: defaults &lt; command line &lt; environment.
+ * Precedence: defaults, then the config file, then the command line, then the environment.
+ * {@code --config} and the {@code --acme*} flags are recognized here and applied by
+ * {@code config.ConfigLoader}; routing and middleware are file-only.
  *
  * @param port TCP port (0 = ephemeral)
  * @param root document root
@@ -57,6 +60,8 @@ import java.util.Objects;
  * @param allowUnlistableDirs serve files below directories the server can search but not read (mode
  *        {@code --x}) through the weaker path-based open; off: such requests get 403 (security
  *        verification V7: anyone who can write in the root could create such a directory to force it)
+ * @param access which paths and files may be served: deny list, allow/deny/hide rules, dotfiles,
+ *        owner/permission policy (see {@code core.AccessRules}; default: dotfiles hidden, nothing else)
  * @param backlog TCP accept backlog: connections the kernel completes and queues before the server
  *        accepts them (capped by the OS, e.g. {@code net.core.somaxconn} on Linux)
  * @param accessLogFormat common, combined (default) or json; ignored when {@code accessLog} is null
@@ -72,7 +77,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc,
         int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate, boolean allowUnlistableDirs,
         int backlog, AccessLogFormat accessLogFormat, MetricsExposure metricsExposure, boolean healthz,
-        boolean h2Enabled, int h2Port, int h2cPort) {
+        boolean h2Enabled, int h2Port, int h2cPort, AccessRules access) {
 
     public static final int DEFAULT_H2_PORT = 8443;
     public static final int H2C_DISABLED = -1;
@@ -126,6 +131,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         if (cacheBytes < 0) {
             throw new IllegalArgumentException("cacheBytes must not be negative");
         }
+        Objects.requireNonNull(access, "access");
         if ((tlsCert == null) != (tlsKey == null)) {
             throw new IllegalArgumentException("tlsCert and tlsKey must be given together");
         }
@@ -194,7 +200,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + ", allowUnlistableDirs=" + allowUnlistableDirs
                 + ", backlog=" + backlog + ", accessLogFormat=" + accessLogFormat + ", metricsExposure="
                 + metricsExposure + ", healthz=" + healthz
-                + ", h2Enabled=" + h2Enabled + ", h2Port=" + h2Port + ", h2cPort=" + h2cPort + "]";
+                + ", h2Enabled=" + h2Enabled + ", h2Port=" + h2Port + ", h2cPort=" + h2cPort + ", access=" + access + "]";
     }
 
     /** Mutable builder; new fields get a default here so existing callers keep compiling. */
@@ -228,6 +234,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         private boolean h2Enabled;
         private int h2Port = DEFAULT_H2_PORT;
         private int h2cPort = H2C_DISABLED;
+        private AccessRules access = AccessRules.DEFAULT;
 
         private Builder(Path root) {
             this.root = root;
@@ -262,6 +269,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             this.h2Enabled = c.h2Enabled;
             this.h2Port = c.h2Port;
             this.h2cPort = c.h2cPort;
+            this.access = c.access;
         }
 
         public Builder port(int v) { this.port = v; return this; }
@@ -292,13 +300,14 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public Builder h2Enabled(boolean v) { this.h2Enabled = v; return this; }
         public Builder h2Port(int v) { this.h2Port = v; return this; }
         public Builder h2cPort(int v) { this.h2cPort = v; return this; }
+        public Builder access(AccessRules v) { this.access = v; return this; }
 
         public ServerConfig build() {
             return new ServerConfig(port, root, maxConnections, idleTimeout, headerTimeout, writeTimeout, h3Enabled,
                     h3Port, h3Host, h3MaxConnections, tlsCert, tlsKey, tlsKeyPassword, altSvcMaxAge, cacheBytes,
                     accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate, allowUnlistableDirs,
                     backlog, accessLogFormat, metricsExposure, healthz,
-                    h2Enabled, h2Port, h2cPort);
+                    h2Enabled, h2Port, h2cPort, access);
         }
     }
 
@@ -361,18 +370,36 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --healthz | --no-healthz  GET/HEAD /healthz answers "ok" (off).        WEB_SERVER_HEALTHZ=true|false
                                             Off: a document-root file at /healthz is
                                             served. On also turns request counters on
+                  --deny=PAT[,PAT...]       refuse (403) matching paths; always wins      WEB_SERVER_DENY
+                  --access-rule=ACT:PAT     allow:, deny: (403) or hide: (404) a path      WEB_SERVER_ACCESS_RULES
+                                            pattern; repeatable, first match wins
+                  --allow-dotfiles          serve names starting with '.' (off: 404)      WEB_SERVER_ALLOW_DOTFILES
+                  --require-owner=USER      serve only files owned by USER (name or uid)  WEB_SERVER_REQUIRE_OWNER
+                  --require-world-readable  serve only files with mode o+r (off)          WEB_SERVER_REQUIRE_WORLD_READABLE
+                  --config=PATH             YAML configuration file (see docs/config.md)  WEB_SERVER_CONFIG
+                  --acme | --no-acme        ACME certificate issuance (off; staging CA)   WEB_SERVER_ACME=true|false
+                  --acme-directory=URL      staging, production, or a directory URL       WEB_SERVER_ACME_DIRECTORY
+                  --acme-email=ADDR         account contact email                         WEB_SERVER_ACME_EMAIL
+                  --acme-domain=NAME        domain name (repeatable; the variable is a    WEB_SERVER_ACME_DOMAINS
+                                            comma-separated list)
+                  --acme-storage=PATH       account key and certificates (./acme)        WEB_SERVER_ACME_STORAGE
+                  --acme-http-port=N        HTTP-01 port (0 = the main listener)         WEB_SERVER_ACME_HTTP_PORT
+                  --acme-accept-terms       agree to the CA terms of service (required)  WEB_SERVER_ACME_ACCEPT_TERMS
+                  --acme-renew-before=DUR   renew this long before expiry (30d)          WEB_SERVER_ACME_RENEW_BEFORE
                   -h, --help                show this help
 
-                Environment variables override arguments. The key password is never accepted
-                on the command line (it would be visible in the process list).
+                Environment variables override arguments, which override the config file.
+                The file is strict (a bad value is an error). Invalid values of the server
+                flags above still warn and fall back. The key password is never accepted
+                on the command line (it would be visible in the process list) or in the file.
                 """;
     }
 
     public static Parsed parse(String[] args, Map<String, String> env) {
-        return parse(args, env, ServerConfig::readPasswordFile);
+        return parse(args, env, null, ServerConfig::readPasswordFile);
     }
 
-    private static String readPasswordFile(Path file) throws java.io.IOException {
+    public static String readPasswordFile(Path file) throws java.io.IOException {
         var text = java.nio.file.Files.readString(file, java.nio.charset.StandardCharsets.UTF_8);
         // a single trailing newline (as written by echo / editors) is not part of the password
         if (text.endsWith("\r\n")) {
@@ -387,46 +414,63 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String read(Path file) throws java.io.IOException;
     }
 
+    public static Parsed parse(String[] args, Map<String, String> env, PasswordFileReader passwordReader) {
+        return parse(args, env, null, passwordReader);
+    }
+
+    /** @param baseline file settings under the command line; null starts from the defaults */
+    public static Parsed parse(String[] args, Map<String, String> env, ServerConfig baseline) {
+        return parse(args, env, baseline, ServerConfig::readPasswordFile);
+    }
+
     /**
      * Parses arguments and environment. Pure apart from reading the key password file through
-     * {@code passwordReader}.
+     * {@code passwordReader}. A non-null {@code baseline} is the config file: arguments and then
+     * the environment override it.
      */
-    public static Parsed parse(String[] args, Map<String, String> env, PasswordFileReader passwordReader) {
+    public static Parsed parse(String[] args, Map<String, String> env, ServerConfig baseline,
+            PasswordFileReader passwordReader) {
         var warnings = new ArrayList<String>();
         var errors = new ArrayList<String>();
         boolean help = false;
-        var b = builder(Path.of(CONSTANTS.DEFAULT_HTML_PATH));
-        int port = DEFAULT_PORT;
-        int max = DEFAULT_MAX_CONNECTIONS;
-        long idle = DEFAULT_IDLE_TIMEOUT.toSeconds();
-        long header = DEFAULT_HEADER_TIMEOUT.toSeconds();
-        long write = DEFAULT_WRITE_TIMEOUT.toSeconds();
-        long cache = DEFAULT_CACHE_BYTES;
-        boolean altSvcOn = false;
-        boolean unlistable = false;
-        String dir = CONSTANTS.DEFAULT_HTML_PATH;
-        boolean h3 = false;
-        int h3Port = H3_PORT_SAME_AS_TCP;
-        String h3Host = DEFAULT_H3_HOST;
-        int h3Max = DEFAULT_H3_MAX_CONNECTIONS;
-        int perIp = DEFAULT_MAX_CONNECTIONS_PER_IP;
-        int backlog = DEFAULT_BACKLOG;
-        int h3PerIp = DEFAULT_H3_MAX_CONNECTIONS_PER_IP;
-        int minRate = (int) DEFAULT_H3_MIN_RATE;
-        String cert = null;
-        String key = null;
+        var base = baseline;
+        var b = builder(base == null ? Path.of(CONSTANTS.DEFAULT_HTML_PATH) : base.root());
+        int port = base == null ? DEFAULT_PORT : base.port();
+        int max = base == null ? DEFAULT_MAX_CONNECTIONS : base.maxConnections();
+        long idle = (base == null ? DEFAULT_IDLE_TIMEOUT : base.idleTimeout()).toSeconds();
+        long header = (base == null ? DEFAULT_HEADER_TIMEOUT : base.headerTimeout()).toSeconds();
+        long write = (base == null ? DEFAULT_WRITE_TIMEOUT : base.writeTimeout()).toSeconds();
+        long cache = base == null ? DEFAULT_CACHE_BYTES : base.cacheBytes();
+        boolean altSvcOn = base != null && base.altSvc();
+        boolean unlistable = base != null && base.allowUnlistableDirs();
+        String dir = base == null ? CONSTANTS.DEFAULT_HTML_PATH : base.root().toString();
+        boolean h3 = base != null && base.h3Enabled();
+        int h3Port = base == null ? H3_PORT_SAME_AS_TCP : base.h3Port();
+        String h3Host = base == null ? DEFAULT_H3_HOST : base.h3Host();
+        int h3Max = base == null ? DEFAULT_H3_MAX_CONNECTIONS : base.h3MaxConnections();
+        int perIp = base == null ? DEFAULT_MAX_CONNECTIONS_PER_IP : base.maxConnectionsPerIp();
+        int backlog = base == null ? DEFAULT_BACKLOG : base.backlog();
+        int h3PerIp = base == null ? DEFAULT_H3_MAX_CONNECTIONS_PER_IP : base.h3MaxConnectionsPerIp();
+        int minRate = (int) (base == null ? DEFAULT_H3_MIN_RATE : base.h3MinRate());
+        String cert = base == null || base.tlsCert() == null ? null : base.tlsCert().toString();
+        String key = base == null || base.tlsKey() == null ? null : base.tlsKey().toString();
         String passwordFile = null;
-        long altSvc = DEFAULT_ALT_SVC_MAX_AGE.toSeconds();
-        String accessLog = null;
-        var accessLogFormat = AccessLogFormat.COMBINED;
-        var metricsExposure = MetricsExposure.OFF;
-        boolean healthz = false;
+        String accessLog = base == null ? null : base.accessLog();
+        long altSvc = (base == null ? DEFAULT_ALT_SVC_MAX_AGE : base.altSvcMaxAge()).toSeconds();
+        var accessLogFormat = base == null ? AccessLogFormat.COMBINED : base.accessLogFormat();
+        var metricsExposure = base == null ? MetricsExposure.OFF : base.metricsExposure();
+        boolean healthz = base != null && base.healthz();
         boolean accessLogFormatSet = false;
         var explicitH3Options = new ArrayList<String>();
         boolean h2 = false;
         int h2Port = DEFAULT_H2_PORT;
         int h2cPort = H2C_DISABLED;
         var explicitH2Options = new ArrayList<String>();
+        var denyList = new ArrayList<String>();
+        var accessRules = new ArrayList<String>();
+        boolean dotfiles = false;
+        String owner = null;
+        boolean worldReadable = false;
 
         // command line: positional [port] [dir], --flags anywhere
         int positional = 0;
@@ -508,9 +552,25 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     case "--no-metrics" -> metricsExposure = MetricsExposure.OFF;
                     case "--healthz" -> healthz = value == null || bool(value, healthz, name, warnings);
                     case "--no-healthz" -> healthz = false;
+                    case "--deny" -> list(value, denyList, name, warnings);
+                    case "--access-rule" -> {
+                        if (value == null || value.isBlank()) {
+                            warnings.add("Missing value for " + name + " (use " + name + "=VALUE)");
+                        } else {
+                            accessRules.add(value);
+                        }
+                    }
+                    case "--allow-dotfiles" -> dotfiles = value == null || bool(value, dotfiles, name, warnings);
+                    case "--require-owner" -> owner = text(value, owner, name, warnings);
+                    case "--require-world-readable" ->
+                        worldReadable = value == null || bool(value, worldReadable, name, warnings);
                     case "--alt-svc-max-age" -> {
                         altSvc = number(value, altSvc, 0, 31_536_000, name, warnings);
                         explicitH3Options.add(name);
+                    }
+                    case "--config", "--acme", "--no-acme", "--acme-directory", "--acme-email", "--acme-domain",
+                            "--acme-storage", "--acme-http-port", "--acme-accept-terms", "--acme-renew-before" -> {
+                        // applied by config.ConfigLoader; recognized so they are not unknown options
                     }
                     default -> warnings.add("Unknown option '" + name + "' (see --help)");
                 }
@@ -584,6 +644,27 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         if ((v = env.get("WEB_SERVER_HEALTHZ")) != null) {
             healthz = bool(v, healthz, "WEB_SERVER_HEALTHZ", warnings);
         }
+        if ((v = env.get("WEB_SERVER_DENY")) != null) {
+            denyList.clear();
+            if (!v.isBlank()) { // empty: none
+                list(v, denyList, "WEB_SERVER_DENY", warnings);
+            }
+        }
+        if ((v = env.get("WEB_SERVER_ACCESS_RULES")) != null) {
+            accessRules.clear();
+            if (!v.isBlank()) { // empty: none
+                list(v, accessRules, "WEB_SERVER_ACCESS_RULES", warnings);
+            }
+        }
+        if ((v = env.get("WEB_SERVER_ALLOW_DOTFILES")) != null) {
+            dotfiles = bool(v, dotfiles, "WEB_SERVER_ALLOW_DOTFILES", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_REQUIRE_OWNER")) != null) {
+            owner = v.isBlank() ? null : v.trim();
+        }
+        if ((v = env.get("WEB_SERVER_REQUIRE_WORLD_READABLE")) != null) {
+            worldReadable = bool(v, worldReadable, "WEB_SERVER_REQUIRE_WORLD_READABLE", warnings);
+        }
         if ((v = env.get("WEB_SERVER_H3")) != null) {
             h3 = bool(v, h3, "WEB_SERVER_H3", warnings);
         }
@@ -638,6 +719,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 errors.add("Cannot read the key password file " + passwordFile + ": " + e.getMessage());
             }
         }
+        if (password == null && baseline != null && baseline.tlsKeyPassword() != null) {
+            password = baseline.tlsKeyPassword();
+        }
         if (password != null && key == null) {
             warnings.add("A key password was given without --key/WEB_SERVER_TLS_KEY; ignoring it");
             password = null;
@@ -675,7 +759,23 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             warnings.add("--access-log-format has no effect without --access-log");
         }
 
-        var config = b.port(port).root(Path.of(dir)).maxConnections(max).maxConnectionsPerIp(perIp).backlog(backlog)
+        // access rules: a typo in a security setting must stop startup, not be ignored
+        var access = AccessRules.DEFAULT;
+        try {
+            var rules = new ArrayList<AccessRules.Rule>();
+            for (var spec : accessRules) {
+                rules.add(AccessRules.Rule.parse(spec));
+            }
+            access = new AccessRules(denyList, rules, dotfiles, owner, worldReadable);
+            if (dotfiles) {
+                warnings.add("--allow-dotfiles serves names starting with '.' (e.g. .git, .env, .htpasswd); "
+                        + "consider --deny for those");
+            }
+        } catch (IllegalArgumentException e) {
+            errors.add("Invalid access configuration: " + e.getMessage());
+        }
+
+        var config = b.access(access).port(port).root(Path.of(dir)).maxConnections(max).maxConnectionsPerIp(perIp).backlog(backlog)
                 .h3MaxConnectionsPerIp(h3PerIp).h3MinRate(minRate)
                 .idleTimeout(Duration.ofSeconds(idle)).headerTimeout(Duration.ofSeconds(header))
                 .writeTimeout(Duration.ofSeconds(write)).cacheBytes(cache).altSvc(altSvcOn).allowUnlistableDirs(unlistable)
@@ -724,6 +824,19 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 yield whenBare;
             }
         };
+    }
+
+    /** Appends the comma-separated, non-blank items of {@code value}. */
+    private static void list(String value, List<String> into, String what, List<String> warnings) {
+        if (value == null || value.isBlank()) {
+            warnings.add("Missing value for " + what + " (use " + what + "=VALUE)");
+            return;
+        }
+        for (var item : value.split(",")) {
+            if (!item.isBlank()) {
+                into.add(item.trim());
+            }
+        }
     }
 
     private static boolean bool(String value, boolean fallback, String what, List<String> warnings) {

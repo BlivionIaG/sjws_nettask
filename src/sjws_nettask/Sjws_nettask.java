@@ -92,6 +92,40 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile);
+    }
+
+    /** Same lifecycle as {@link #serve}, starting from a loaded config file so reload can re-read it. */
+    private static int serveLoaded(sjws_nettask.config.ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
+            PrintStream out, PrintStream err, Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile) {
+        var config = loaded.document().server();
+        if (!Files.isDirectory(config.root())) {
+            err.println("Document root " + config.root().toAbsolutePath() + " does not exist or is not a directory.");
+            return EXIT_BAD_ROOT;
+        }
+        if (pidFile != null) {
+            var existing = PidFile.read(pidFile);
+            if (PidFile.blocksStart(existing)) {
+                err.println("Already running with pid " + existing.pid() + " (" + pidFile + ").");
+                return EXIT_CANNOT_LISTEN;
+            }
+        }
+        SjwsServer server;
+        try {
+            server = SjwsServer.start(loaded, h3Factory);
+        } catch (BindException e) {
+            err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
+                    + " (already in use or not permitted).");
+            return EXIT_CANNOT_LISTEN;
+        } catch (IOException | UncheckedIOException e) {
+            err.println("Failed to start the server on port " + config.port() + ": " + e);
+            return EXIT_CANNOT_LISTEN;
+        }
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile);
+    }
+
+    private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,
+            Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile) {
         server.shutdownTimeout(shutdownTimeout);
         var pid = new AtomicReference<PidFile>();
         var task = new Shutdown(server, pid, out, err);
@@ -254,12 +288,12 @@ public class Sjws_nettask {
         if (opt.action() == Daemon.Action.STOP || opt.action() == Daemon.Action.STATUS) {
             return control(opt, out, err);
         }
-        var parsed = ServerConfig.parse(opt.remaining(), env);
+        var loaded = sjws_nettask.config.ConfigLoader.load(opt.remaining(), env);
         opt.warnings().forEach(w -> err.println("WARN: " + w));
-        parsed.warnings().forEach(w -> err.println("WARN: " + w));
-        if (!opt.ok() || !parsed.ok()) {
+        loaded.warnings().forEach(w -> err.println("WARN: " + w));
+        if (!opt.ok() || !loaded.ok()) {
             opt.errors().forEach(e -> err.println("ERROR: " + e));
-            parsed.errors().forEach(e -> err.println("ERROR: " + e));
+            loaded.errors().forEach(e -> err.println("ERROR: " + e));
             err.println("See --help.");
             return EXIT_USAGE;
         }
@@ -293,7 +327,7 @@ public class Sjws_nettask {
             }
         }
         try {
-            return serve(parsed.config(), h3Factory, logOut, logErr, started, opt.shutdownTimeout(),
+            return serveLoaded(loaded, h3Factory, logOut, logErr, started, opt.shutdownTimeout(),
                     opt.trackPid() ? opt.pidFile() : null);
         } finally {
             if (ownLog) {

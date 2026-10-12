@@ -47,19 +47,24 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.Transport;
+import sjws_nettask.HandlerRef;
 import sjws_nettask.core.FilterChain;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserveRequestFilter;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
+import sjws_nettask.tls.SwappableKeyManager;
 import sjws_nettask.tls.TlsMaterial;
 
 /**
@@ -98,9 +103,16 @@ public final class Http3Server implements Transport {
     static final QuicTokenHandler TOKENS = NoRetryTokenHandler.INSTANCE;
 
     private final ServerConfig config;
-    private final Function<Request, Response> handler;
-    /** Copied into every request only when a chain or a non-static terminal is installed. */
-    private final boolean captureFields;
+    /** Swapped by {@link #replaceHandler}. Read once per request. */
+    private final AtomicReference<Function<Request, Response>> handlers;
+    /**
+     * Copied into every request only when a chain, a non-static terminal, or header logging is installed.
+     * {@link #withObserver} may set this before {@link #start()}.
+     */
+    private boolean captureFields;
+    /** Published by {@link #armHandler} after start. A null value keeps {@link #handlers}. */
+    private final HandlerRef armed = new HandlerRef();
+    private boolean observerWrapped;
     private final Map<QuicChannel, Connection> state = new ConcurrentHashMap<>();
     private final BooleanSupplier available;
     private final Supplier<Throwable> unavailabilityCause;
@@ -113,7 +125,8 @@ public final class Http3Server implements Transport {
     private final Map<Http3Writer.Outcome, LongAdder> outcomes = new EnumMap<>(Http3Writer.Outcome.class);
     private Limits limits;
     private Shared shared;
-    private TlsMaterial tls;
+    private volatile TlsMaterial tls;
+    private volatile SwappableKeyManager keys;
     private EventLoopGroup group;
     private ExecutorService executor;
     private Channel channel;
@@ -179,7 +192,7 @@ public final class Http3Server implements Transport {
         this.available = Objects.requireNonNull(available, "available");
         this.unavailabilityCause = Objects.requireNonNull(unavailabilityCause, "unavailabilityCause");
         this.config = Objects.requireNonNull(config, "config");
-        this.handler = Objects.requireNonNull(handler, "handler");
+        this.handlers = new AtomicReference<>(Objects.requireNonNull(handler, "handler"));
         this.tls = tls;
         this.captureFields = captureFields;
         this.limits = Limits.of(config);
@@ -196,7 +209,18 @@ public final class Http3Server implements Transport {
         if (this.started.get()) {
             throw new IllegalStateException("already started");
         }
-        this.slot.set(observer);
+        var installed = observer == null ? RequestObserver.NONE : observer;
+        this.slot.set(installed);
+        if (installed.recording() && !this.observerWrapped) {
+            this.observerWrapped = true;
+            Function<Request, Response> current = this.handlers.get();
+            Handler terminal = current::apply;
+            this.handlers.set(
+                    RequestFilters.create().add(0, new ObserveRequestFilter(this.slot)).build(terminal)::handle);
+            if (installed.logHeaders()) {
+                this.captureFields = true;
+            }
+        }
         return this;
     }
 
@@ -220,15 +244,10 @@ public final class Http3Server implements Transport {
      */
     record Shared(Function<Request, Response> handler, ExecutorService executor, Limits limits, Semaphore inflight,
             Semaphore serverFiles, Map<Http3Writer.Outcome, LongAdder> outcomes, boolean captureFields,
-            ObserverSlot slot) {
+            HandlerRef armed) {
 
         void count(Http3Writer.Outcome outcome) {
             this.outcomes.get(outcome).increment();
-        }
-
-        /** Live observer. {@link RequestObserver#NONE} until logging, a probe, or an admin snapshot. */
-        RequestObserver observer() {
-            return this.slot.get();
         }
     }
 
@@ -241,9 +260,6 @@ public final class Http3Server implements Transport {
         final Semaphore files;
         final java.util.concurrent.atomic.AtomicInteger inflight = new java.util.concurrent.atomic.AtomicInteger();
         final RateGuard rate;
-        /** Numeric peer address, set once the handshake completes. No reverse lookup. */
-        String remote = "-";
-        boolean loopback;
         long nextStreamId; // lowest client request stream id not seen yet
         long goAwayId = -1; // -1 = no GOAWAY sent; else streams with id >= this are refused
 
@@ -317,12 +333,14 @@ public final class Http3Server implements Transport {
             }
         }
         try {
-            var ssl = QuicSslContextBuilder.forServer(this.tls.key(), null, this.tls.chain())
+            this.keys = new SwappableKeyManager(this.tls);
+            var ssl = QuicSslContextBuilder.forServer(this.keys, null)
                     .applicationProtocols(Http3.supportedApplicationProtocols()).build();
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h3-request-", 0).factory());
             this.perIp = new sjws_nettask.core.PerIpLimit(this.limits.connectionsPerIp());
-            this.shared = new Shared(this.handler, this.executor, this.limits, new Semaphore(this.limits.maxInflight()),
-                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.captureFields, this.slot);
+            this.shared = new Shared(request -> this.handlers.get().apply(request), this.executor, this.limits,
+                    new Semaphore(this.limits.maxInflight()),
+                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.captureFields, this.armed);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             var codec = Http3.newQuicServerCodecBuilder()
                     .sslContext(ssl)
@@ -422,8 +440,6 @@ public final class Http3Server implements Transport {
                 quic.close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
                 return;
             }
-            this.connection.remote = address == null ? "-" : address.getHostAddress();
-            this.connection.loopback = address != null && address.isLoopbackAddress();
             Http3Server.this.state.put(quic, this.connection);
             quic.closeFuture().addListener(f -> {
                 Http3Server.this.state.remove(quic);
@@ -473,9 +489,26 @@ public final class Http3Server implements Transport {
         return (InetSocketAddress) this.channel.localAddress();
     }
 
-    /** @return the TLS material in use (after {@link #start()}) */
+    /** @return the TLS material in use (after {@link #start()}, or the material set by {@link #replaceTls}) */
     public TlsMaterial tls() {
         return this.tls;
+    }
+
+    /**
+     * Certificate for new handshakes. Before {@link #start()} this replaces what start would load
+     * from the configuration. After start, BoringSSL reads it on the next handshake.
+     */
+    public void replaceTls(TlsMaterial material) {
+        this.tls = Objects.requireNonNull(material, "material");
+        var manager = this.keys;
+        if (manager != null) {
+            manager.set(material);
+        }
+    }
+
+    /** The next request uses this handler. A request already in the handler keeps the previous one. */
+    public void replaceHandler(Function<Request, Response> handler) {
+        this.handlers.set(Objects.requireNonNull(handler, "handler"));
     }
 
     /** @return QUIC connections currently open */
@@ -484,10 +517,16 @@ public final class Http3Server implements Transport {
         return this.state.size();
     }
 
-    /** Keeps the server's slot, so arming metrics after start is visible on this listener. */
+    /** Keeps the server's slot, so a filter built against that slot stays on this listener. */
     @Override
     public Http3Server useSlot(ObserverSlot slot) {
         return slot == null ? this : withSlot(slot);
+    }
+
+    /** The next request uses {@code handler} instead of the function captured at {@link #start()}. */
+    @Override
+    public void armHandler(Handler handler) {
+        this.armed.set(handler);
     }
 
     /** @return how many responses ended with this outcome (completed, or why the stream was reset) */
