@@ -143,11 +143,21 @@ class SjwsServerTest {
     }
 
     @Test
-    void defaultFactoryIsThePlaceholderUntilTheMerge() throws IOException {
-        server = SjwsServer.start(config(true));
-        assertNotNull(server.h3Failure());
-        assertTrue(server.h3Failure().getMessage().contains("not included in this build"));
-        assertNull(get("/hello.txt").headers().get("alt-svc"));
+    void defaultFactoryStartsRealHttp3() throws IOException {
+        org.junit.jupiter.api.Assumptions.assumeTrue(sjws_nettask.h3.Http3Server.isAvailable(), "no QUIC natives");
+        var err = System.err;
+        System.setErr(new java.io.PrintStream(java.io.OutputStream.nullOutputStream())); // self-signed warning
+        try {
+            server = SjwsServer.start(ServerConfig.builder(root).port(0).h3Enabled(true).h3Port(0)
+                    .h3Host("127.0.0.1").build());
+        } finally {
+            System.setErr(err);
+        }
+        assertNull(server.h3Failure());
+        assertTrue(server.udpPort() > 0);
+        assertEquals("h3=\":" + server.udpPort() + "\"; ma=86400", get("/hello.txt").headers().get("alt-svc"));
+        assertTrue(server.describe().contains("HTTP/3 on udp/" + server.udpPort() + " (self-signed)"),
+                server.describe());
     }
 
     @Test
