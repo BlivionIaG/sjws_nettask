@@ -12,6 +12,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Set;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -25,6 +26,12 @@ class AcmeTest {
 
     @TempDir
     Path dir;
+
+    /** {@code renewalDelayAndARefusedDirectoryBacksOff} leaves the renew thread writing this directory. */
+    @AfterEach
+    void awaitAcmeWritersBeforeTempDirCleanup() throws InterruptedException {
+        AcmeCleanup.awaitWriters();
+    }
 
     @Test
     void challengeHandlerAnswersOnlyKnownTokens() {
