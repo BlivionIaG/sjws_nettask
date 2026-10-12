@@ -41,7 +41,12 @@ public final class SjwsServer implements AutoCloseable {
 
     private SjwsServer(ServerConfig config) {
         this.config = config;
-        this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs());
+        this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
+                new sjws_nettask.core.FileCache(config.cacheBytes()));
+        if (config.cacheBytes() > Runtime.getRuntime().maxMemory() / 2) {
+            System.err.println("WARN: --cache-bytes=" + config.cacheBytes() + " is more than half of the maximum heap ("
+                    + Runtime.getRuntime().maxMemory() + " bytes); raise -Xmx or lower it");
+        }
     }
 
     public static SjwsServer start(ServerConfig config) throws IOException {

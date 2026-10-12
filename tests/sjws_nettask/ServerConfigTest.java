@@ -372,4 +372,31 @@ class ServerConfigTest {
         assertTrue(p.warnings().get(0).contains("--h3"), p.warnings().toString());
         assertTrue(parse(Map.of(), "--h3", "--h3=maybe").config().h3Enabled(), "keeps the previous value");
     }
+
+    // --- S3: --cache-bytes ---------------------------------------------------------------------
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"0,0", "65536,65536", "64k,65536", "64K,65536", "64m,67108864",
+        "1g,1073741824", "16g,17179869184"})
+    void cacheBytesFlag(String value, long expected) {
+        var p = parse(Map.of(), "--cache-bytes=" + value);
+        assertTrue(p.warnings().isEmpty(), p.warnings().toString());
+        assertEquals(expected, p.config().cacheBytes());
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"-1", "17g", "1t", "64 m", "1.5m", "", "m",
+        "999999999999"})
+    void invalidCacheBytesWarnAndKeepTheDefault(String value) {
+        var p = parse(Map.of(), "--cache-bytes=" + value);
+        assertEquals(ServerConfig.DEFAULT_CACHE_BYTES, p.config().cacheBytes());
+        assertEquals(1, p.warnings().size(), p.warnings().toString());
+        assertTrue(p.warnings().get(0).contains("--cache-bytes"), p.warnings().get(0));
+    }
+
+    @Test
+    void cacheBytesEnvironmentOverridesArgument() {
+        assertEquals(0, parse(Map.of("WEB_SERVER_CACHE_BYTES", "0"), "--cache-bytes=1m").config().cacheBytes());
+        assertTrue(ServerConfig.usage().contains("--cache-bytes"));
+    }
 }

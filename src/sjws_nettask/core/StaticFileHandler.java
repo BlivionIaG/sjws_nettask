@@ -45,6 +45,7 @@ public final class StaticFileHandler {
     private final PathResolver resolver;
     private final boolean allowUnlistableDirs;
     private final EntityTag.Policy etags;
+    private final FileCache cache;
 
     /** @throws UncheckedIOException if the root does not exist or is not a directory */
     public StaticFileHandler(Path root) {
@@ -62,9 +63,24 @@ public final class StaticFileHandler {
 
     /** @param clock decides which file versions are "young" (weak ETag); tests inject a fake one */
     public StaticFileHandler(Path root, boolean allowUnlistableDirs, java.time.InstantSource clock) {
+        this(root, allowUnlistableDirs, clock, FileCache.disabled());
+    }
+
+    /** With a small-file cache (see {@link FileCache}). */
+    public StaticFileHandler(Path root, boolean allowUnlistableDirs, FileCache cache) {
+        this(root, allowUnlistableDirs, java.time.InstantSource.system(), cache);
+    }
+
+    public StaticFileHandler(Path root, boolean allowUnlistableDirs, java.time.InstantSource clock,
+            FileCache cache) {
         this.resolver = new PathResolver(root);
         this.allowUnlistableDirs = allowUnlistableDirs;
         this.etags = new EntityTag.Policy(clock);
+        this.cache = java.util.Objects.requireNonNull(cache, "cache");
+    }
+
+    public FileCache cache() {
+        return this.cache;
     }
 
     /** @return whether files below search-only directories are served (see the constructor) */
@@ -97,6 +113,18 @@ public final class StaticFileHandler {
         if (decoded == null) {
             return error(400, head);
         }
+        String key = null;
+        if (this.cache.enabled()) {
+            var logical = this.resolver.logical(decoded); // lexical checks run on hits too
+            if (logical == null) {
+                return error(404, head);
+            }
+            key = decoded.endsWith("/") ? logical + "/" : logical.toString();
+            var hit = this.cache.lookup(key);
+            if (hit != null) {
+                return hit.response(head, request.headers());
+            }
+        }
         var resolved = this.resolver.resolve(decoded);
         if (resolved == null) {
             return error(404, head);
@@ -110,14 +138,14 @@ public final class StaticFileHandler {
                 var base = decoded.endsWith("/") ? decoded : decoded + "/";
                 var index = this.resolver.resolve(base + "index.html");
                 if (index != null && Files.isRegularFile(index.real())) {
-                    return file(index, head, request.headers());
+                    return file(index, head, request.headers(), key);
                 }
                 return listing(listVisible(resolved.real()), decoded, head);
             }
             if (!attributes.isRegularFile()) {
                 return error(404, head);
             }
-            return file(resolved, head, request.headers());
+            return file(resolved, head, request.headers(), key);
         } catch (AccessDeniedException e) {
             return error(403, head);
         } catch (IOException | UncheckedIOException e) {
@@ -125,12 +153,34 @@ public final class StaticFileHandler {
         }
     }
 
-    private Response file(PathResolver.Resolved file, boolean head, RequestHeaders conditionals) throws IOException {
+    /** @param key cache key of the request, or null when the cache is off */
+    private Response file(PathResolver.Resolved file, boolean head, RequestHeaders conditionals, String key)
+            throws IOException {
         if (!Files.isReadable(file.real())) {
             return error(403, head);
         }
+        var name = file.logical().getFileName().toString();
         var attributes = Files.readAttributes(file.real(), BasicFileAttributes.class);
-        var meta = FileMeta.of(Validator.of(attributes), file.logical().getFileName().toString(), this.etags);
+        var meta = FileMeta.of(Validator.of(attributes), name, this.etags);
+        // Load into the cache only for a GET that sends the body: HEAD and 304 never open the file
+        // (as without a cache), so they keep their exact semantics.
+        if (key != null && !head && attributes.isRegularFile() && this.cache.admits(attributes.size())
+                && !meta.notModified(conditionals)) {
+            var body = new Body.FileBody(file.real(), 0, attributes.size(), meta.validator(), this.resolver.realRoot(),
+                    this.allowUnlistableDirs);
+            FileCache.Entry entry;
+            try {
+                entry = this.cache.load(key, file.logical(), body, meta);
+            } catch (IOException e) { // what the writer would have answered when opening it
+                return error(SafeOpen.status(e), false);
+            }
+            if (entry != null) {
+                return entry.response(false, conditionals);
+            }
+            // changed while it was read: serve the version that is there now, uncached
+            attributes = Files.readAttributes(file.real(), BasicFileAttributes.class);
+            meta = FileMeta.of(Validator.of(attributes), name, this.etags);
+        }
         return fileResponse(meta, this.resolver.realRoot(), file.real(), head, conditionals, this.allowUnlistableDirs);
     }
 
