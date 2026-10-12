@@ -18,6 +18,7 @@ package sjws_nettask.h3;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -115,7 +116,13 @@ class SjwsServerHttp3Test {
         var tcp = this.server.tcpPort();
         var h1 = HttpTestSupport.get(tcp, "/hello.txt", 4000);
         assertEquals(expected, h1.headers().get("alt-svc"));
-        assertTrue(this.server.metrics().snapshot().requests() >= 1);
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+        while (this.server.metrics().snapshot().requests() < 1) {
+            if (System.nanoTime() >= deadline) {
+                fail("request was not counted after the response was written");
+            }
+            Thread.yield();
+        }
         assertEquals(expected, HttpTestSupport.get(tcp, "/missing", 4000).headers().get("alt-svc"));
         assertEquals(expected, HttpTestSupport.rawRequest(tcp,
                 "HEAD /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n", 4000).headers().get("alt-svc"));

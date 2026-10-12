@@ -34,13 +34,24 @@ import java.util.Objects;
  * @param peer client address, or null when the transport could not read one. One address per
  *        HTTP/1 connection (reused for every request on it) and one per HTTP/3 stream
  * @param secure true when the request arrived over TLS (HTTP/3 today; plain HTTP/1 is false)
+ * @param protocol the version token ({@code HTTP/1.0}, {@code HTTP/1.1}, {@code HTTP/3}, ...).
+ *        Null becomes {@code HTTP/3} when {@code secure} is true and {@code HTTP/1.1} otherwise,
+ *        so existing constructors keep a protocol without an extra allocation
  */
-public record Request(String method, String target, RequestHeaders headers, InetSocketAddress peer, boolean secure) {
+public record Request(String method, String target, RequestHeaders headers, InetSocketAddress peer, boolean secure,
+        String protocol) {
 
     public Request {
         Objects.requireNonNull(method, "method");
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(headers, "headers");
+        if (protocol == null) {
+            protocol = secure ? "HTTP/3" : "HTTP/1.1";
+        }
+    }
+
+    public Request(String method, String target, RequestHeaders headers, InetSocketAddress peer, boolean secure) {
+        this(method, target, headers, peer, secure, null);
     }
 
     public Request(String method, String target, RequestHeaders headers) {
@@ -55,13 +66,13 @@ public record Request(String method, String target, RequestHeaders headers, Inet
         return "HEAD".equals(this.method);
     }
 
-    /** Same request, different target. Keeps headers, peer and secure. */
+    /** Same request, different target. Keeps headers, peer, secure and protocol. */
     public Request withTarget(String target) {
-        return new Request(this.method, target, this.headers, this.peer, this.secure);
+        return new Request(this.method, target, this.headers, this.peer, this.secure, this.protocol);
     }
 
-    /** Same request, different method. Keeps headers, peer and secure. */
+    /** Same request, different method. Keeps headers, peer, secure and protocol. */
     public Request withMethod(String method) {
-        return new Request(method, this.target, this.headers, this.peer, this.secure);
+        return new Request(method, this.target, this.headers, this.peer, this.secure, this.protocol);
     }
 }

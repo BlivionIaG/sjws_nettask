@@ -34,6 +34,7 @@ import java.util.function.Supplier;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserveRequestFilter;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 
@@ -59,7 +60,8 @@ public class ClientManager implements Runnable {
      */
     private final Handler override;
     private final Supplier<ResponseHeaders> extraHeaders;
-    private final ObserverSlot slot;
+    /** Non-null. A published handler replaces {@link #override} for the next request on every connection. */
+    private final HandlerRef armed;
     private volatile BooleanSupplier drainSignal;
     private volatile IntSupplier acceptPause;
     private volatile long gracefulDrainMs;
@@ -86,7 +88,7 @@ public class ClientManager implements Runnable {
      */
     public ClientManager(ServerSocketChannel server, ServerConfig config, Supplier<ResponseHeaders> extraHeaders) {
         this(server, config, new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
-                new sjws_nettask.core.FileCache(config.cacheBytes())), extraHeaders);
+                new sjws_nettask.core.FileCache(config.cacheBytes()), config.access()), extraHeaders);
     }
 
     /** Shares {@code handler} with other transports (HTTP/3). */
@@ -118,7 +120,8 @@ public class ClientManager implements Runnable {
 
     /**
      * @param override compiled filters or another terminal, or null to call {@code handler} directly
-     * @param observer {@link RequestObserver#NONE} leaves the hook off the request path
+     * @param observer a recording observer is installed as an order-0 filter; {@link RequestObserver#NONE}
+     *        leaves the handler unchanged
      */
     public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
             Supplier<ResponseHeaders> extraHeaders, Handler override, RequestObserver observer) {
@@ -127,18 +130,40 @@ public class ClientManager implements Runnable {
 
     /**
      * @param override compiled filters or another terminal, or null to call {@code handler} directly
-     * @param slot shared observer slot
+     * @param slot when it already holds a recording observer, that observer is wrapped at order 0
      */
     public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
             Supplier<ResponseHeaders> extraHeaders, Handler override, ObserverSlot slot) {
+        this(server, config, handler, extraHeaders, wrap(override, handler, slot), new HandlerRef());
+    }
+
+    /**
+     * @param override compiled filters or another terminal, or null to call {@code handler} directly
+     * @param armed shared with the server so a later arm is visible on connections already accepted
+     */
+    ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, Handler override, HandlerRef armed) {
         this.server = server;
         this.config = config;
         this.handler = handler;
         this.override = override;
         this.extraHeaders = extraHeaders;
-        this.slot = java.util.Objects.requireNonNull(slot, "slot");
+        this.armed = java.util.Objects.requireNonNull(armed, "armed");
         this.permits = new Semaphore(config.maxConnections());
         this.perIp = new sjws_nettask.core.PerIpLimit(config.maxConnectionsPerIp());
+    }
+
+    /**
+     * A recording observer becomes the outermost order-0 filter. {@link RequestObserver#NONE} returns
+     * {@code override} unchanged, so the static handler stays a direct call.
+     */
+    private static Handler wrap(Handler override, StaticFileHandler handler, ObserverSlot slot) {
+        var installed = java.util.Objects.requireNonNull(slot, "slot");
+        if (!installed.get().recording()) {
+            return override;
+        }
+        Handler leaf = override != null ? override : handler;
+        return ObserveRequestFilter.chain(installed, leaf);
     }
 
     /** @return connections closed at accept because their address already had the per-IP maximum */
@@ -279,8 +304,6 @@ public class ClientManager implements Runnable {
                     continue;
                 }
                 this.active.incrementAndGet();
-                String host = address.getHostAddress();
-                boolean loopback = address.isLoopbackAddress();
                 // never rejected: the executor is shut down only after this loop
                 executor.execute(() -> {
                     try {
@@ -288,11 +311,10 @@ public class ClientManager implements Runnable {
                         // (clustering off) uses the constructor that never reads a supplier.
                         var terminal = this.override != null ? this.override : this.handler;
                         if (signal == null) {
-                            new Http1Connection(socket, terminal, this.extraHeaders, deadlines, this.slot, host,
-                                    loopback).run();
+                            new Http1Connection(socket, terminal, this.extraHeaders, deadlines, this.armed).run();
                         } else {
-                            new Http1Connection(socket, terminal, this.extraHeaders, deadlines, this.slot, host,
-                                    loopback, signal).run();
+                            new Http1Connection(socket, terminal, this.extraHeaders, deadlines, this.armed, signal)
+                                    .run();
                         }
                     } finally {
                         this.active.decrementAndGet();

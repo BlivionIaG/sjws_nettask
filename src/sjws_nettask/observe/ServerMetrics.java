@@ -188,7 +188,7 @@ public final class ServerMetrics {
         sb.append("# HELP sjws_http_response_bytes_total Response body bytes handed to the transport.\n");
         sb.append("# TYPE sjws_http_response_bytes_total counter\n");
         sb.append("sjws_http_response_bytes_total ").append(snap.bytesSent()).append('\n');
-        sb.append("# HELP sjws_http_request_duration_seconds Time to finish the response, including the write.\n");
+        sb.append("# HELP sjws_http_request_duration_seconds Time until the handler returns the response, before the socket write.\n");
         sb.append("# TYPE sjws_http_request_duration_seconds histogram\n");
         long cumulative = 0;
         var latency = snap.latency();

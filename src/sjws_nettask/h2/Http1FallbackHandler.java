@@ -33,6 +33,7 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
+import java.net.InetSocketAddress;
 import java.util.concurrent.RejectedExecutionException;
 import sjws_nettask.core.DateClock;
 import sjws_nettask.core.Request;
@@ -63,14 +64,22 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
     }
 
     static Request toRequest(FullHttpRequest r) {
+        return toRequest(r, null, false);
+    }
+
+    static Request toRequest(FullHttpRequest r, InetSocketAddress peer, boolean secure) {
         var h = r.headers();
         return new Request(r.method().name(), r.uri(), new RequestHeaders(h.get("if-none-match"),
-                h.get("if-modified-since"), h.get("if-range"), h.get("range"), h.get("accept-encoding"), h.get("host")));
+                h.get("if-modified-since"), h.get("if-range"), h.get("range"), h.get("accept-encoding"), h.get("host")),
+                peer, secure, r.protocolVersion().text());
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest msg) {
-        var request = toRequest(msg);
+        var channel = ctx.channel();
+        var remote = channel.remoteAddress();
+        var request = toRequest(msg, remote instanceof InetSocketAddress inet ? inet : null,
+                channel.pipeline().get(io.netty.handler.ssl.SslHandler.class) != null);
         boolean keepAlive = HttpUtil.isKeepAlive(msg);
         Response refusal;
         if (msg.decoderResult().isFailure()) {
@@ -83,7 +92,6 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
         } else {
             refusal = Http2StreamHandler.refusal(request);
         }
-        var channel = ctx.channel();
         channel.config().setAutoRead(false); // one request at a time; reading resumes when idle again
         var task = new Task(channel, request, refusal, keepAlive);
         if (this.busy) {
@@ -177,7 +185,7 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
                 Response response;
                 try {
                     response = this.refusal != null ? this.refusal
-                            : Http1FallbackHandler.this.shared.handler().handle(this.request);
+                            : Http1FallbackHandler.this.shared.live().handle(this.request);
                 } catch (RuntimeException e) {
                     response = StaticFileHandler.error(500, this.request.headOnly());
                 }

@@ -1136,7 +1136,13 @@ class DaemonTest {
                 + "time.sleep(60)\n");
         var process = new ProcessBuilder(python.toString(), script.toString(), childPid.toString()).start();
         try {
-            waitFor(() -> Files.exists(childPid), 5_000, "restart child");
+            waitFor(() -> {
+                try {
+                    return Files.size(childPid) > 0;
+                } catch (IOException e) {
+                    return false;
+                }
+            }, 5_000, "restart child");
             long recorded = readPid(childPid);
             var pidFile = tmp.resolve("restart.pid");
             Files.writeString(pidFile, recorded + "\n");

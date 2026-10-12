@@ -543,4 +543,57 @@ class ServerConfigTest {
                 badHealth.warnings().toString());
         assertTrue(ServerConfig.builder(Path.of("/r")).healthz(true).build().healthz());
     }
+
+    @Test
+    void accessRulesFromArgumentsAndEnvironment() {
+        var p = parse(Map.of(), "--deny=*.bak, /private", "--access-rule=hide:/drafts",
+                "--access-rule=allow:/.well-known/acme-challenge", "--require-world-readable");
+        assertTrue(p.ok(), p.errors().toString());
+        var a = p.config().access();
+        assertEquals(403, a.check("/x/y.bak"));
+        assertEquals(403, a.check("/private/a"));
+        assertEquals(404, a.check("/drafts/a"));
+        assertEquals(0, a.check("/.well-known/acme-challenge/t"));
+        assertEquals(404, a.check("/.env"));
+        assertTrue(a.requireWorldReadable());
+        assertTrue(p.config().toString().contains("access=AccessRules[deny=[deny:*.bak, deny:/private]"));
+        assertTrue(ServerConfig.defaults(".").access().isDefault());
+
+        var env = parse(Map.of("WEB_SERVER_DENY", "/a,/b", "WEB_SERVER_ACCESS_RULES", "deny:/c",
+                "WEB_SERVER_ALLOW_DOTFILES", "true", "WEB_SERVER_REQUIRE_OWNER", "0",
+                "WEB_SERVER_REQUIRE_WORLD_READABLE", "yes"), "--deny=/z", "--access-rule=deny:/y");
+        var e = env.config().access();
+        assertEquals(0, e.check("/z"), "environment replaces the argument list");
+        assertEquals(0, e.check("/y"));
+        assertEquals(403, e.check("/b"));
+        assertEquals(403, e.check("/c"));
+        assertEquals(0, e.check("/.env"));
+        assertEquals("0", e.requireOwner());
+        assertTrue(e.requireWorldReadable());
+        assertTrue(env.warnings().stream().anyMatch(w -> w.contains("--allow-dotfiles")));
+
+        var cleared = parse(Map.of("WEB_SERVER_DENY", "", "WEB_SERVER_ACCESS_RULES", " ", "WEB_SERVER_REQUIRE_OWNER", ""),
+                "--deny=/z", "--access-rule=deny:/y", "--require-owner=0", "--allow-dotfiles", "--allow-dotfiles=no");
+        assertTrue(cleared.config().access().isDefault(), cleared.config().access().toString());
+        assertTrue(cleared.warnings().isEmpty(), cleared.warnings().toString());
+    }
+
+    @Test
+    void invalidAccessRulesStopStartup() {
+        for (var arg : new String[] {"--access-rule=permit:/x", "--deny=/a/../b", "--require-owner=no-such-user-sjws-x"}) {
+            var p = parse(Map.of(), arg);
+            assertFalse(p.ok(), arg);
+            assertTrue(p.errors().get(0).startsWith("Invalid access configuration"), p.errors().toString());
+            assertTrue(p.config().access().isDefault());
+        }
+        var w = parse(Map.of(), "--deny", "--access-rule=", "--require-owner", "--require-world-readable=maybe");
+        assertTrue(w.ok());
+        assertEquals(4, w.warnings().size(), w.warnings().toString());
+        var w2 = parse(Map.of(), "--deny=", "--access-rule", "--deny=/a,,/b,");
+        assertEquals(2, w2.warnings().size(), w2.warnings().toString());
+        assertEquals(2, w2.config().access().denyList().size());
+        var flags = parse(Map.of(), "--allow-dotfiles=yes", "--require-world-readable").config().access();
+        assertTrue(flags.allowDotfiles());
+        assertTrue(flags.requireWorldReadable());
+    }
 }
