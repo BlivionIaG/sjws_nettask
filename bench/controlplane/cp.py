@@ -61,7 +61,8 @@ def main():
     ap.add_argument("--port", type=int, default=18090)
     ap.add_argument("--rate", type=int, default=50000)
     ap.add_argument("--duration", type=int, default=30)
-    ap.add_argument("--push-ms", default="100")
+    ap.add_argument("--push-ms", default="100", help="comma list; empty for no push runs")
+    ap.add_argument("--wrk-duration", type=int, default=10, help="unthrottled wrk run (push 0 only)")
     ap.add_argument("--modes", default="", help="comma list of node.mode values for (d), e.g. standalone,data")
     ap.add_argument("--skip", default="", help="comma list of a,b,c,d to skip")
     ap.add_argument("--out", default=os.path.join(HERE, "results"))
@@ -82,14 +83,20 @@ def main():
         print("== (b) route lookup"); res["route"] = run(a, "route", "--config", cfg, "--seconds", "5")
     if "c" not in skip:
         res["wrk2"] = {}
-        for push in [0] + [int(x) for x in a.push_ms.split(",")]:
+        for push in [0] + [int(x) for x in a.push_ms.split(",") if x]:
             p, log = serve(a, cfg, push)
             try:
                 wait_port(a.port, p)
                 fp.sh(["wrk", "-t4", "-c100", "-d5s", f"http://127.0.0.1:{a.port}/1k.bin"])  # warmup
+                if push == 0:
+                    w = fp.sh(["wrk", "-t4", "-c100", f"-d{a.wrk_duration}s", f"http://127.0.0.1:{a.port}/1k.bin"])
+                    m = re.search(r"Requests/sec:\s+([\d.]+)", w)
+                    wrk_rps = float(m.group(1)) if m else None
                 out = fp.sh(["wrk2", "-t4", "-c100", f"-d{a.duration}s", f"-R{a.rate}", "--latency",
                              f"http://127.0.0.1:{a.port}/1k.bin"])
                 r = wrk2_lat(out)
+                if push == 0:
+                    r["wrk_max_rps"] = wrk_rps
                 p.terminate(); p.wait(10)
                 r["server"] = open(log).read().strip().splitlines()
                 print(f"== (c) push_ms={push} rate={a.rate}", json.dumps(r))

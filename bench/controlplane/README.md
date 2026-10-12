@@ -9,7 +9,7 @@
 | (c) | p99/p99.9 under pushes | `CpBench serve` with an N-route config. `wrk2 -R<rate> -c100 -t4` on `/1k.bin` (unmatched, so it scans every route and then falls back to static), first without pushes, then with a push every `--push-ms`. A push is `SjwsServer.applyRemote(doc)` when it exists (#42), otherwise `reload()` (re-reads the file) |
 | (d) | idle data-node footprint | for each `--modes` value (`omit` = no `node:` key; `standalone`/`data` need #42), measures startup, RSS, threads, heap after GC and NMT total, and whether a `.last-good` file was written |
 
-Options: `--routes 1000 --rate 50000 --duration 30 --push-ms 100 --modes omit[,standalone,data] --skip a,b,c,d`.
+Options: `--routes 1000 --rate 50000 --duration 30 --push-ms 100 --wrk-duration 10 --modes omit[,standalone,data] --skip a,b,c,d`. `--routes 0` turns routing off. (b) also measures an unmatched target, which the static fallback answers with 404. (a) also reports the heap a compiled snapshot holds.
 On master, run with `--modes omit`. To measure #42, copy this directory into a checkout of its branch.
 
 ## Results, 2026-10-13 (8-vCPU shared box, JDK 25, G1, 256m heap; single runs, wrk2 shares the box)

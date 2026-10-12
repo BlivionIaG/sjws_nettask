@@ -18,6 +18,7 @@ package sjws_nettask.config;
 
 import java.util.ArrayList;
 import java.util.List;
+import sjws_nettask.routing.Router;
 
 /**
  * Routes in declaration order. The first match wins. {@link #match} does not allocate and is not
@@ -88,13 +89,8 @@ public final class RouteTable {
         return later.host().length() > suffix.length() && later.host().endsWith(suffix);
     }
 
+    /** {@link Router#prefixCovers}: the request-path rule, so warnings match what is served. */
     static boolean prefixCovers(String earlier, String later) {
-        if (earlier.equals("/")) {
-            return true;
-        }
-        if (later.length() < earlier.length() || !later.startsWith(earlier)) {
-            return false;
-        }
-        return later.length() == earlier.length() || later.charAt(earlier.length()) == '/';
+        return Router.prefixCovers(earlier, later);
     }
 }

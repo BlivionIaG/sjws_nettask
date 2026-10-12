@@ -62,9 +62,9 @@ final class RoutingCompiler {
             var errors = spec.errors();
             if (errors.problem()) { // opt-in wrapper; it applies the rewrite so "instance" is the client's path
                 handler = new ProblemErrorHandler(handler, spec.prefix(), spec.rewrite(), errors.typeBase());
-                routes.add(new Router.Route(spec.host(), spec.prefix(), null, handler));
+                routes.add(new Router.Route(spec.routerHost(), spec.prefix(), null, handler));
             } else {
-                routes.add(new Router.Route(spec.host(), spec.prefix(), spec.rewrite(), handler));
+                routes.add(new Router.Route(spec.routerHost(), spec.prefix(), spec.rewrite(), handler));
             }
         }
         return new Router(routes, files);
