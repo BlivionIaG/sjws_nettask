@@ -21,39 +21,75 @@ import java.util.concurrent.Semaphore;
 import sjws_nettask.ServerConfig;
 
 /**
- * Resource limits of one HTTP/3 server (security review M1/S1). Derived from the configuration;
- * tests shrink them through the package-private {@link Http3Server} seam.
+ * Resource limits of one HTTP/3 server (security review M1/S1/V1/V2/V5). Derived from the
+ * configuration; tests shrink them through the package-private {@link Http3Server} seam.
  *
  * @param maxInflight requests being handled or sent at once, across all connections; more are
  *        refused with H3_REQUEST_REJECTED (covers listings and error pages too)
  * @param maxOpenFiles files open for sending at once, across all connections
  * @param filesPerConnection files open for sending at once on one QUIC connection
+ * @param inflightPerConnection a connection's fair share of {@code maxInflight}: while more than half
+ *        of {@code maxInflight} is in use, a connection already holding this many is refused more
  * @param slotWait how long a response waits for a file slot before it is refused with H3_REQUEST_REJECTED
  * @param writeTimeout a response whose previous chunk was not taken for this long is reset; also the
  *        window over which {@code minBytesPerSecond} is averaged
- * @param minBytesPerSecond slower responses are reset (0 = no minimum)
+ * @param minBytesPerSecond while file slots are contended (more than 3/4 in use), responses on a
+ *        connection whose total send rate in the last window was below this are reset (0 = off)
  * @param drain how long {@link Http3Server#close()} lets in-flight responses finish after GOAWAY
+ * @param handshakeTimeout a connection whose handshake hasn't completed by then is dropped
+ * @param maxHalfOpen connections still in their handshake; more are dropped (they are not counted
+ *        against the connection limit, which a spoofed source could otherwise fill)
+ * @param connectionsPerIp established connections per client address
  */
-record Limits(int maxInflight, int maxOpenFiles, int filesPerConnection, Duration slotWait, Duration writeTimeout,
-        long minBytesPerSecond, Duration drain) {
+record Limits(int maxInflight, int maxOpenFiles, int filesPerConnection, int inflightPerConnection,
+        Duration slotWait, Duration writeTimeout, long minBytesPerSecond, Duration drain, Duration handshakeTimeout,
+        int maxHalfOpen, int connectionsPerIp) {
 
     static final int MAX_OPEN_FILES = 1024;
     static final int FILES_PER_CONNECTION = 16;
-    static final long MIN_BYTES_PER_SECOND = 8 * 1024;
+    static final int INFLIGHT_PER_CONNECTION = 16;
     static final Duration DRAIN = Duration.ofSeconds(2);
+    static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(5);
+    static final int MAX_HALF_OPEN = 256;
 
     static Limits of(ServerConfig config) {
         return new Limits(config.maxConnections(), Math.min(config.maxConnections(), MAX_OPEN_FILES),
-                FILES_PER_CONNECTION, config.headerTimeout(), config.writeTimeout(), MIN_BYTES_PER_SECOND, DRAIN);
+                FILES_PER_CONNECTION, INFLIGHT_PER_CONNECTION, config.headerTimeout(), config.writeTimeout(),
+                config.h3MinRate(), DRAIN, HANDSHAKE_TIMEOUT, MAX_HALF_OPEN, config.h3MaxConnectionsPerIp());
     }
 
     Limits {
-        if (maxInflight < 1 || maxOpenFiles < 1 || filesPerConnection < 1 || minBytesPerSecond < 0) {
+        if (maxInflight < 1 || maxOpenFiles < 1 || filesPerConnection < 1 || inflightPerConnection < 1
+                || minBytesPerSecond < 0 || maxHalfOpen < 1 || connectionsPerIp < 1) {
             throw new IllegalArgumentException("limits must be positive");
         }
     }
 
+    Limits withHandshake(Duration timeout, int halfOpen) {
+        return new Limits(this.maxInflight, this.maxOpenFiles, this.filesPerConnection, this.inflightPerConnection,
+                this.slotWait, this.writeTimeout, this.minBytesPerSecond, this.drain, timeout, halfOpen,
+                this.connectionsPerIp);
+    }
+
+    Limits withConnectionsPerIp(int perIp) {
+        return new Limits(this.maxInflight, this.maxOpenFiles, this.filesPerConnection, this.inflightPerConnection,
+                this.slotWait, this.writeTimeout, this.minBytesPerSecond, this.drain, this.handshakeTimeout,
+                this.maxHalfOpen, perIp);
+    }
+
     Semaphore newConnectionFiles() {
         return new Semaphore(this.filesPerConnection);
+    }
+
+    /** @return true if file slots are contended: more than 3/4 of {@code maxOpenFiles} in use */
+    boolean filesContended(Semaphore serverFiles) {
+        long used = this.maxOpenFiles - serverFiles.availablePermits();
+        return used * 4 > this.maxOpenFiles * 3L;
+    }
+
+    /** @return true if more than half of {@code maxInflight} is in use: connections get only their share */
+    boolean inflightContended(Semaphore inflight) {
+        long used = this.maxInflight - inflight.availablePermits();
+        return used * 2 > this.maxInflight;
     }
 }

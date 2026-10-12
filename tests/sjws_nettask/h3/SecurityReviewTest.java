@@ -198,7 +198,9 @@ class SecurityReviewTest {
 
     static Limits limits(int maxInflight, int maxOpenFiles, int perConnection, Duration slotWait,
             Duration writeTimeout, long minRate, Duration drain) {
-        return new Limits(maxInflight, maxOpenFiles, perConnection, slotWait, writeTimeout, minRate, drain);
+        return new Limits(maxInflight, maxOpenFiles, perConnection, Limits.INFLIGHT_PER_CONNECTION, slotWait,
+                writeTimeout, minRate, drain, Limits.HANDSHAKE_TIMEOUT, Limits.MAX_HALF_OPEN,
+                sjws_nettask.ServerConfig.DEFAULT_H3_MAX_CONNECTIONS_PER_IP);
     }
 
     /**
@@ -258,7 +260,7 @@ class SecurityReviewTest {
     @Test
     void m1DripReaderBelowTheMinimumRateIsReset() throws Exception {
         try (var server = new Http3Server(config().build(), this.handler, this.tls)
-                .limits(limits(100, 100, 16, Duration.ofSeconds(5), Duration.ofSeconds(1), Long.MAX_VALUE / 4))
+                .limits(limits(100, 1, 16, Duration.ofSeconds(5), Duration.ofSeconds(1), Long.MAX_VALUE / 4)) // contended
                 .start();
                 var client = new H3TestClient(this.tls.certificate())) {
             var q = client.connect(server.localAddress());

@@ -115,10 +115,16 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
     }
 
     private void start(QuicStreamChannel stream, Request request, Response refusal) {
-        if (!this.connection.admit(stream.streamId()) || !this.shared.inflight().tryAcquire()) {
+        var limits = this.shared.limits();
+        // Under pressure each connection gets only its share, so a few connections (one address) can't
+        // hold the whole in-flight cap (verification V1); without pressure a client may use every stream.
+        boolean overShare = this.connection.inflight.get() >= limits.inflightPerConnection()
+                && limits.inflightContended(this.shared.inflight());
+        if (!this.connection.admit(stream.streamId()) || overShare || !this.shared.inflight().tryAcquire()) {
             reject(stream);
             return;
         }
+        this.connection.inflight.incrementAndGet();
         var task = new Task(stream, request, refusal);
         try {
             this.shared.executor().execute(task);
@@ -182,7 +188,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                 }
                 var response = this.refusal != null ? this.refusal : respond(this.request);
                 outcome = new Http3Writer(this.stream, Http3RequestHandler.this.shared.limits(),
-                        Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connection.files)
+                        Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connection)
                         .write(response);
             } finally {
                 finish(outcome);
@@ -191,6 +197,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
 
         void finish(Http3Writer.Outcome outcome) {
             if (this.finished.compareAndSet(false, true)) {
+                Http3RequestHandler.this.connection.inflight.decrementAndGet();
                 Http3RequestHandler.this.shared.inflight().release();
                 if (outcome != null) {
                     Http3RequestHandler.this.shared.count(outcome);
