@@ -220,6 +220,36 @@ case-insensitive; a port in the request's Host header is ignored; `*.example.com
 matches a subdomain and not the apex. A route that an earlier route completely
 covers is a warning. The sample above does not shadow itself.
 
+### Per-route error format and listings
+
+These settings are part of the route records (`RouteSpec`), so they travel with the
+rest of the routing section to every node that loads it. Defaults keep today's behaviour.
+
+```yaml
+  routes:
+    - prefix: "/api"
+      proxy: api
+      errors: problem                               # html (default) | problem
+      problem_type: "https://errors.example.com/"   # optional, absolute URI; needs errors: problem
+    - prefix: "/files"
+      static: true
+      listing: false                                # static routes only; default true
+```
+
+`errors: problem` renders the error pages this server generates for the route as
+RFC 9457 `application/problem+json` with `type`, `title`, `status`, `detail` and
+`instance`, for 400, 401, 403, 404, 405, 408, 413, 429, 500, 501, 502, 503 and
+504. Other statuses keep the HTML page. A response relayed from an upstream (for
+example the upstream's own 503) is never rewritten. `type` is `about:blank`, or
+`problem_type` followed by the status code (`https://errors.example.com/503`).
+`instance` is the request path as the client sent it (before `rewrite`, without
+the query). The body carries `Cache-Control: no-store`, and semantic fields of the
+page such as `Allow`, `Content-Range` or `Retry-After` are kept. Routes without
+`errors: problem` get no wrapper and run exactly as before.
+
+`listing: false` answers a directory without `index.html` with 404, as if it did
+not exist. The route still shares the document root, access policy and file cache.
+
 ## Middleware
 
 A list, stored and not applied. An empty list (or a missing key) is no chain and
