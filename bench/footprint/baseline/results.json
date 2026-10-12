@@ -1,0 +1,176 @@
+{
+  "env": {
+    "cpu": "Intel(R) Xeon(R) Processor",
+    "nproc": 8,
+    "mem": "16013 MB",
+    "kernel": "6.12.94+",
+    "java": [
+      "openjdk version \"25.0.4.1\" 2026-08-18 LTS",
+      "OpenJDK Runtime Environment Temurin-25.0.4.1+1 (build 25.0.4.1+1-LTS)",
+      "OpenJDK 64-Bit Server VM Temurin-25.0.4.1+1 (build 25.0.4.1+1-LTS, mixed mode, sharing)"
+    ],
+    "wrk": "wrk debian/4.1.0-4+b1 [epoll] Copyright (C) 2012 Will Glozer",
+    "git": "b8055fe",
+    "time": "2026-10-12T14:50:25+0200"
+  },
+  "jvm_flags": [
+    "-Xms256m",
+    "-Xmx256m",
+    "-XX:+UseG1GC",
+    "-XX:NativeMemoryTracking=summary",
+    "-XX:+UnlockDiagnosticVMOptions",
+    "-XX:-PrintNMTStatistics"
+  ],
+  "startup_ms": {
+    "runs": [
+      177.7,
+      168.1,
+      154.8,
+      204.6,
+      147.3
+    ],
+    "median": 168.1,
+    "min": 147.3
+  },
+  "command": [
+    "/home/box/jdk25/bin/java",
+    "-Xms256m",
+    "-Xmx256m",
+    "-XX:+UseG1GC",
+    "-XX:NativeMemoryTracking=summary",
+    "-XX:+UnlockDiagnosticVMOptions",
+    "-XX:-PrintNMTStatistics",
+    "-jar",
+    "/workspace/src/sjws_nettask/target/sjws_nettask-0.2-SNAPSHOT.jar",
+    "18080",
+    "/workspace/src/sjws_nettask/bench/footprint/results/docroot",
+    "--max-connections=20000",
+    "--max-connections-per-ip=20000",
+    "--idle-timeout=3600",
+    "--header-timeout=3600",
+    "--backlog=4096"
+  ],
+  "idle": [
+    {
+      "conns": 0,
+      "rss_kb": 66268,
+      "heap_used_after_gc_kb": 2778,
+      "threads": 28,
+      "nmt_committed_kb": {
+        "Total": 352773,
+        "Java Heap": 262144,
+        "Class": 456,
+        "Thread": 1487,
+        "Code": 7886,
+        "GC": 54722,
+        "Compiler": 218,
+        "Internal": 1272,
+        "Other": 14,
+        "Symbol": 1227,
+        "Native Memory Tracking": 266,
+        "Arena Chunk": 7118,
+        "Tracing": 7,
+        "Module": 41,
+        "Safepoint": 8,
+        "Synchronization": 93,
+        "Serviceability": 17,
+        "Metaspace": 1883,
+        "String Deduplication": 1,
+        "Object Monitors": 1
+      }
+    },
+    {
+      "conns": 1000,
+      "rss_kb": 92272,
+      "heap_used_after_gc_kb": 9990,
+      "threads": 36,
+      "nmt_committed_kb": {
+        "Total": 348546,
+        "Java Heap": 262144,
+        "Class": 474,
+        "Thread": 2426,
+        "Code": 8189,
+        "GC": 54745,
+        "GCCardSet": 1,
+        "Compiler": 237,
+        "Internal": 1303,
+        "Other": 55,
+        "Symbol": 1228,
+        "Native Memory Tracking": 341,
+        "Arena Chunk": 914,
+        "Tracing": 9,
+        "Module": 40,
+        "Safepoint": 8,
+        "Synchronization": 169,
+        "Serviceability": 17,
+        "Metaspace": 2333,
+        "String Deduplication": 1,
+        "Object Monitors": 1
+      },
+      "per_conn_bytes": {
+        "rss": 26628,
+        "heap_after_gc": 7385,
+        "nmt_total": -4328,
+        "nmt_non_heap": -4328
+      },
+      "sockstat": "TCP: inuse 1140 orphan 0 tw 2045 alloc 2274 mem 522"
+    },
+    {
+      "conns": 10000,
+      "rss_kb": 278568,
+      "heap_used_after_gc_kb": 67819,
+      "threads": 38,
+      "nmt_committed_kb": {
+        "Total": 348805,
+        "Java Heap": 262144,
+        "Class": 484,
+        "Thread": 2531,
+        "Code": 8869,
+        "GC": 54812,
+        "GCCardSet": 2,
+        "Compiler": 316,
+        "Internal": 1322,
+        "Other": 55,
+        "Symbol": 1230,
+        "Native Memory Tracking": 402,
+        "Arena Chunk": 2,
+        "Tracing": 10,
+        "Module": 40,
+        "Safepoint": 8,
+        "Synchronization": 187,
+        "Serviceability": 17,
+        "Metaspace": 2461,
+        "String Deduplication": 1,
+        "Object Monitors": 1
+      },
+      "per_conn_bytes": {
+        "rss": 21740,
+        "heap_after_gc": 6660,
+        "nmt_total": -406,
+        "nmt_non_heap": -406
+      },
+      "sockstat": "TCP: inuse 10140 orphan 0 tw 1446 alloc 20273 mem 10"
+    }
+  ],
+  "throughput_1k": [
+    {
+      "conns": 100,
+      "reps": [
+        {
+          "rps": 189605.81,
+          "p99": "5.61ms"
+        },
+        {
+          "rps": 174475.99,
+          "p99": "5.60ms"
+        },
+        {
+          "rps": 258369.04,
+          "p99": "4.61ms"
+        }
+      ],
+      "median_rps": 189605.81,
+      "rss_after_kb": 269956
+    }
+  ]
+}
