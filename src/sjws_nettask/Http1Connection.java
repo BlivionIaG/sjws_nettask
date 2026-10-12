@@ -29,24 +29,29 @@ import java.util.function.Supplier;
 
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
-import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.http1.ChunkedDecoder;
 import sjws_nettask.http1.Http1Parser;
+import sjws_nettask.http1.Http1Requests;
 import sjws_nettask.http1.Http1Writer;
 import sjws_nettask.http1.ParseError;
 
 /**
  * HTTP/1.x adapter for one connection on a blocking {@link SocketChannel} (run on a virtual
- * thread): parses with {@link Http1Parser.HeadParser}, maps to a core {@link Request}, asks the
- * {@link StaticFileHandler} (or {@link #override}, the filter chain or another terminal handler,
- * when one was installed), serializes with {@link Http1Writer}. Deadlines (idle keep-alive,
+ * thread): parses with {@link Http1Parser.HeadParser}, maps to a core
+ * {@link sjws_nettask.core.Request} ({@link Http1Requests}), asks the {@link Handler} (in production
+ * the {@link StaticFileHandler}, or a filter chain / router when one is installed), serializes with
+ * {@link Http1Writer}. Deadlines (idle keep-alive,
  * request head, writes) are enforced by the shared {@link ConnectionReaper}, not by socket
  * timeouts.
  * <p>
- * Memory per idle keep-alive connection: the {@link #INPUT_BUFFER} input array (allocated at
- * the first read) and a small parser line buffer; output is unbuffered.
+ * Memory per idle keep-alive connection is kept small: the connection waits for the next request
+ * directly in {@link #run()} (a shallow virtual-thread stack while parked) reading into a
+ * {@link #IDLE_BUFFER}-byte array; the {@link #INPUT_BUFFER} array is only used while a read fills
+ * the small one, and dropped again once idle. The previous request's head is forgotten after the
+ * response. Output is unbuffered.
  *
  * @author BlivionIaG <BlivionIaG at chenco.tk>
  */
@@ -59,15 +64,21 @@ final class Http1Connection implements Runnable {
      */
     static final int INPUT_BUFFER = 2048;
 
+    /**
+     * Input buffer while idle and for requests that fit in one small read (most heads). A read
+     * that fills it switches to {@link #INPUT_BUFFER} for the rest of the request.
+     */
+    static final int IDLE_BUFFER = 256;
+
     private static final byte[] CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final SocketChannel channel;
-    private final StaticFileHandler handler;
+    private final Handler handler;
     /**
-     * Null when the terminal is {@link #handler} and no filters are registered. {@link #apply} then
-     * calls {@link StaticFileHandler#handle} and does not go through {@link Handler}.
+     * Non-null only when {@link #handler} is the static file handler. {@link #apply} then calls
+     * {@link StaticFileHandler#handle} directly and does not go through {@link Handler}.
      */
-    private final Handler override;
+    private final StaticFileHandler files;
     private final InetSocketAddress peer;
     /** Captured with {@link #peer} for the failure log; the channel may already be closed by then. */
     private final String remote;
@@ -75,57 +86,50 @@ final class Http1Connection implements Runnable {
     private final ConnectionReaper reaper;
     private final Http1Parser.HeadParser parser = new Http1Parser.HeadParser(CONSTANTS.MAX_LINE_LENGTH,
             CONSTANTS.MAX_HEADERS);
+    /** Discards chunked request bodies (GET/HEAD) up to {@link CONSTANTS#MAX_DRAINED_BODY}. */
+    private final ChunkedDecoder chunks = new ChunkedDecoder(CONSTANTS.MAX_LINE_LENGTH, CONSTANTS.MAX_HEADERS,
+            CONSTANTS.MAX_DRAINED_BODY);
     /** Unread input between position and limit; null until the first read. */
     private ByteBuffer in;
 
     /**
      * @param extraHeaders transport-level fields added to every response (e.g. Alt-Svc); called per response
+     * @param handler static file handler, a filter chain, or another terminal. A
+     *        {@link StaticFileHandler} is called directly ({@link #apply})
      */
-    Http1Connection(SocketChannel channel, StaticFileHandler handler, Supplier<ResponseHeaders> extraHeaders,
+    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
-        this(channel, handler, null, extraHeaders, reaper);
-    }
-
-    /**
-     * @param override compiled filters, or another terminal handler, or null to call {@code handler}
-     *        directly (no extra indirection on the hot path)
-     */
-    Http1Connection(SocketChannel channel, StaticFileHandler handler, Handler override,
-            Supplier<ResponseHeaders> extraHeaders, ConnectionReaper reaper) {
         this.channel = channel;
         this.handler = handler;
-        this.override = override;
-        var remote = peerOf(channel);
-        this.peer = remote.peer;
-        this.remote = remote.label;
+        this.files = handler instanceof StaticFileHandler direct ? direct : null;
+        var peer = (InetSocketAddress) null;
+        var remote = "(closed)";
+        try {
+            SocketAddress address = channel.getRemoteAddress();
+            remote = String.valueOf(address);
+            if (address instanceof InetSocketAddress inet) {
+                peer = inet;
+            }
+        } catch (IOException e) {
+            // already closed
+        }
+        this.peer = peer;
+        this.remote = remote;
         this.extraHeaders = extraHeaders;
         this.reaper = reaper;
     }
 
-    private record Peer(InetSocketAddress peer, String label) {
-    }
-
-    /** One {@code getRemoteAddress} for every request on this connection and for the failure log. */
-    private static Peer peerOf(SocketChannel channel) {
-        try {
-            SocketAddress address = channel.getRemoteAddress();
-            var peer = address instanceof InetSocketAddress inet ? inet : null;
-            return new Peer(peer, String.valueOf(address));
-        } catch (IOException e) {
-            return new Peer(null, "(closed)");
-        }
-    }
-
     /**
-     * No override: one null test, then the same {@link StaticFileHandler#handle} call as without a
-     * chain. The test is constant for the life of the connection.
+     * Static files: one null test, then {@link StaticFileHandler#handle}. Anything else (a filter
+     * chain, a router, a test double) goes through {@link Handler}. The choice is fixed for the
+     * life of the connection.
      */
     private Response apply(Request request) {
-        var terminal = this.override;
-        if (terminal == null) {
-            return this.handler.handle(request);
+        var files = this.files;
+        if (files != null) {
+            return files.handle(request);
         }
-        return terminal.handle(request);
+        return this.handler.handle(request);
     }
 
     @Override
@@ -134,9 +138,14 @@ final class Http1Connection implements Runnable {
         var remote = this.remote; // captured at construction: the channel is closed by the time a failure is logged
         try (var ch = this.channel) {
             var out = new ChannelOutput(ch, timer);
-            while (serveOne(timer, out)) {
-                // keep-alive: next request on this connection
-            }
+            // Idle wait lives here, not in serveOne: a parked virtual thread keeps its frames, so
+            // waiting in this shallow frame keeps the idle stack chunk small.
+            do {
+                timer.idle();
+                if (!hasInput() && idleFill() < 0) {
+                    break;
+                }
+            } while (serveOne(timer, out));
         } catch (IOException | RuntimeException e) {
             if (!isRoutine(e) && !Thread.currentThread().isInterrupted()) {
                 System.err.println("Connection " + remote + " failed: " + e);
@@ -159,13 +168,34 @@ final class Http1Connection implements Runnable {
         return false;
     }
 
-    /** Reads more input; only called when every buffered byte has been consumed. */
-    private int fill() throws IOException {
-        if (this.in == null) {
-            this.in = ByteBuffer.allocate(INPUT_BUFFER);
-        } else {
-            this.in.clear();
+    /** The small buffer, kept for the connection's lifetime once allocated. */
+    private ByteBuffer small;
+
+    /**
+     * Waits for the next request (keep-alive idle). Every buffered byte has been consumed, so a
+     * large buffer is released and the read goes into the small one.
+     */
+    private int idleFill() throws IOException {
+        if (this.small == null) {
+            this.small = ByteBuffer.allocate(IDLE_BUFFER);
         }
+        this.in = this.small;
+        return read();
+    }
+
+    /**
+     * Reads more input; only called (after {@link #idleFill()}) when every buffered byte has been consumed. When the last
+     * read filled the small buffer, more is likely pending: switch to {@link #INPUT_BUFFER}.
+     */
+    private int fill() throws IOException {
+        if (this.in == this.small && this.in.limit() == this.in.capacity()) {
+            this.in = ByteBuffer.allocate(INPUT_BUFFER);
+        }
+        return read();
+    }
+
+    private int read() throws IOException {
+        this.in.clear();
         int n = this.channel.read(this.in);
         this.in.flip();
         return n;
@@ -177,12 +207,15 @@ final class Http1Connection implements Runnable {
 
     /** @return true if the connection should stay open for another request */
     private boolean serveOne(ConnectionReaper.Timer timer, ChannelOutput out) throws IOException {
-        // Wait for the first byte of the next request with only the idle timeout ...
-        timer.idle();
-        if (!hasInput() && fill() < 0) {
-            return false;
+        try {
+            return serveRequest(timer, out);
+        } finally {
+            this.parser.reset(); // do not keep the last head (strings, header map) while idle
         }
-        // ... then the whole head (and any body to discard) must arrive before the head deadline.
+    }
+
+    private boolean serveRequest(ConnectionReaper.Timer timer, ChannelOutput out) throws IOException {
+        // run() waited for the first byte under the idle timeout; now the whole head (and any body to discard) must arrive before the head deadline.
         timer.head();
 
         Http1Parser.Head request;
@@ -209,15 +242,15 @@ final class Http1Connection implements Runnable {
             }
         } catch (ParseError e) {
             send(out, StaticFileHandler.error(e.status(), false), false);
+            lingerBeforeClose();
             return false;
         }
 
-        var core = new Request(request.method(), request.target(), RequestHeaders.of(request.headers()), this.peer,
-                false);
+        var core = Http1Requests.toCore(request, this.peer);
         if (!core.headOnly() && !"GET".equals(core.method())) {
-            // Known but unsupported method (the handler answers 405). Never read (possibly huge)
+            // OPTIONS (200) or a known but unsupported method (405). Never read (possibly huge)
             // bodies just to reject them: keep the connection only if there is no body.
-            boolean keepAlive = request.keepAlive() && request.contentLength() == 0;
+            boolean keepAlive = request.keepAlive() && !request.hasBody();
             timer.processing();
             send(out, apply(core), keepAlive);
             return keepAlive;
@@ -225,7 +258,17 @@ final class Http1Connection implements Runnable {
 
         boolean keepAlive = request.keepAlive();
         long length = request.contentLength();
-        if (length > CONSTANTS.MAX_DRAINED_BODY) {
+        if (request.chunked()) {
+            if (request.expectContinue()) {
+                out.write(CONTINUE);
+                timer.resumeHead();
+            }
+            int drained = drainChunked(out, timer);
+            if (drained < 0) {
+                return false; // malformed (answered 400), or the peer went away
+            }
+            keepAlive &= drained == 1;
+        } else if (length > CONSTANTS.MAX_DRAINED_BODY) {
             keepAlive = false; // answer, then close instead of reading the body
         } else if (length > 0) {
             if (request.expectContinue()) {
@@ -251,6 +294,66 @@ final class Http1Connection implements Runnable {
         send(out, apply(core), keepAlive);
         return keepAlive;
     }
+
+    /**
+     * Discards a chunked body under the head deadline.
+     *
+     * @return 1 when it was consumed whole, 0 when it exceeded {@link CONSTANTS#MAX_DRAINED_BODY}
+     *         (answer, then close), -1 when the connection must close now (400/408 already sent, or EOF)
+     */
+    private int drainChunked(ChannelOutput out, ConnectionReaper.Timer timer) throws IOException {
+        this.chunks.reset();
+        try {
+            while (true) {
+                if (hasInput()) {
+                    int used = this.chunks.feed(this.in.array(), this.in.arrayOffset() + this.in.position(),
+                            this.in.remaining());
+                    this.in.position(this.in.position() + used);
+                    if (this.chunks.isComplete()) {
+                        return 1;
+                    }
+                    if (this.chunks.overLimit()) {
+                        return 0;
+                    }
+                }
+                if (!hasInput() && fill() < 0) {
+                    if (timer.headExpired()) {
+                        send(out, StaticFileHandler.error(408, false), false);
+                    }
+                    return -1;
+                }
+            }
+        } catch (ParseError e) {
+            send(out, StaticFileHandler.error(e.status(), false), false);
+            lingerBeforeClose();
+            return -1;
+        }
+    }
+
+    /**
+     * After an error response to a request whose input was not read whole: closing with unread
+     * input makes the kernel send a reset, which can destroy the response before the client reads
+     * it. Half-close, then discard up to {@link #LINGER_BYTES} until the client closes; the head
+     * deadline (still armed) bounds the time.
+     */
+    private void lingerBeforeClose() {
+        try {
+            this.channel.shutdownOutput();
+            long left = LINGER_BYTES;
+            while (left > 0) {
+                int n = read();
+                if (n < 0) {
+                    return;
+                }
+                left -= n;
+            }
+        } catch (IOException e) {
+            // closing anyway
+        }
+    }
+
+    /** Input discarded at most after an error response (see {@link #lingerBeforeClose()}). */
+    static final int LINGER_BYTES = 64 * 1024;
 
     private void send(ChannelOutput out, Response response, boolean keepAlive) throws IOException {
         Http1Writer.write(out, response, keepAlive, this.extraHeaders.get());

@@ -183,10 +183,49 @@ class Http1ParserTest {
         assertEquals(10, parse("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 010\r\n\r\n").contentLength());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"chunked", "Chunked", "CHUNKED", " chunked "})
+    void chunkedTransferEncodingIsAccepted(String value) throws Exception {
+        var r = parse("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: " + value + "\r\n\r\n");
+        assertTrue(r.chunked());
+        assertTrue(r.hasBody());
+        assertEquals(0, r.contentLength());
+    }
+
     @Test
-    void transferEncodingIs501() {
-        assertEquals(501, status("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"));
-        assertEquals(501, status("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n"));
+    void noBodyWithoutLengthOrChunked() throws Exception {
+        var r = parse("GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+        assertFalse(r.chunked());
+        assertFalse(r.hasBody());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+        // RFC 9112 §6.1/§6.3: TE + CL is a smuggling vector; TE in 1.0 is faulty framing
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n'|400",
+        "'POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n'|400",
+        "'POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n'|400",
+        // final coding must be a single chunked
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n'|400",
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked, gzip\r\n\r\n'|400",
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked, chunked\r\n\r\n'|400",
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n'|400",
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked,\r\n\r\n'|400",
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: \r\n\r\n'|400",
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: xchunked\r\n\r\n'|400",
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked;q=1\r\n\r\n'|400",
+        // another coding before chunked: understood framing, unimplemented coding
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n'|501",
+        "'POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n'|501",
+    })
+    void transferEncodingRules(String raw, int expected) {
+        assertEquals(expected, status(raw));
+    }
+
+    @Test
+    void asteriskFormOnlyForOptions() throws Exception {
+        assertEquals("*", parse("OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n").target());
+        assertEquals(400, status("HEAD * HTTP/1.1\r\nHost: h\r\n\r\n"));
     }
 
     @ParameterizedTest

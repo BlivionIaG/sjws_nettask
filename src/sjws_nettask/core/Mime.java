@@ -32,6 +32,18 @@ public final class Mime {
             Map.entry("mjs", "application/javascript"),
             Map.entry("json", "application/json"),
             Map.entry("txt", "text/plain"),
+            Map.entry("md", "text/markdown"),
+            Map.entry("csv", "text/csv"),
+            Map.entry("xml", "application/xml"),
+            Map.entry("map", "application/json"),
+            Map.entry("webmanifest", "application/manifest+json"),
+            Map.entry("avif", "image/avif"),
+            Map.entry("bmp", "image/bmp"),
+            Map.entry("ttf", "font/ttf"),
+            Map.entry("otf", "font/otf"),
+            Map.entry("wav", "audio/wav"),
+            Map.entry("gz", "application/gzip"),
+            Map.entry("tar", "application/x-tar"),
             Map.entry("svg", "image/svg+xml"),
             Map.entry("png", "image/png"),
             Map.entry("jpeg", "image/jpeg"),
@@ -64,7 +76,8 @@ public final class Mime {
     /** @return the Content-Type value: textual types are served as UTF-8 */
     public static String contentType(String mime) {
         if (mime.startsWith("text/") || mime.equals("application/javascript") || mime.equals("application/json")
-                || mime.equals("image/svg+xml")) {
+                || mime.equals("image/svg+xml") || mime.equals("application/xml")
+                || mime.equals("application/manifest+json")) {
             return mime + "; charset=utf-8";
         }
         return mime;

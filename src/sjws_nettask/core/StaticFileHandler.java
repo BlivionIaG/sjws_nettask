@@ -36,7 +36,7 @@ import java.util.List;
  */
 public final class StaticFileHandler implements Handler {
 
-    public static final String ALLOW = "GET, HEAD";
+    public static final String ALLOW = "GET, HEAD, OPTIONS";
     /** Accept-Ranges of file responses (single byte ranges, see {@link ByteRanges}). */
     public static final String ACCEPT_RANGES = "bytes";
     /** Accept-Ranges of generated pages (errors, listings, redirects): Range is ignored there. */
@@ -105,8 +105,15 @@ public final class StaticFileHandler implements Handler {
     }
 
     /** Never throws: unexpected filesystem errors become 500. */
+    @Override
     public Response handle(Request request) {
         boolean head = request.headOnly();
+        if ("OPTIONS".equals(request.method())) {
+            return options();
+        }
+        if ("*".equals(request.target())) { // asterisk-form is only meaningful for OPTIONS (RFC 9112 §3.2.4)
+            return error(400, head);
+        }
         if (!head && !"GET".equals(request.method())) {
             return methodNotAllowed();
         }
@@ -273,15 +280,27 @@ public final class StaticFileHandler implements Handler {
 
     // --- response builders (shared with the legacy http1/Page API) -------------------------
 
+    /** Stops browsers from MIME-sniffing served content into an executable type (e.g. text/plain as HTML). */
+    public static final String NOSNIFF = "nosniff";
+
+    /**
+     * Generated pages (listings, errors) need no script, frame or external resource: a CSP that
+     * forbids them neutralises any markup injected through a file name, and stops framing.
+     */
+    public static final String HTML_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+
     public static Response html(int status, String html, boolean head) {
         var headers = ResponseHeaders.of()
                 .add("accept-ranges", NO_RANGES)
-                .add("content-type", Mime.contentType("text/html"));
+                .add("content-type", Mime.contentType("text/html"))
+                .add("x-content-type-options", NOSNIFF)
+                .add("content-security-policy", HTML_CSP);
         return new Response(status, headers, Body.Bytes.of(html.getBytes(StandardCharsets.UTF_8)), head);
     }
 
     public static Response error(int status, boolean head) {
-        var title = status + " " + reasonPhrase(status);
+        var reason = reasonPhrase(status);
+        var title = reason.isEmpty() ? Integer.toString(status) : status + " " + reason;
         return html(status, "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"/><title>" + title
                 + "</title></head><body><h1>" + title + "</h1></body></html>", head);
     }
@@ -290,6 +309,16 @@ public final class StaticFileHandler implements Handler {
     public static Response rangeNotSatisfiable(ByteRanges.Unsatisfiable u) {
         var r = error(416, false);
         r.headers().add("content-range", u.contentRange());
+        return r;
+    }
+
+    /**
+     * OPTIONS (RFC 9110 §9.3.7), for "*" and any path: 200 with {@link #ALLOW} and an empty body
+     * (Content-Length: 0). Resource existence is not checked: the method set is server-wide.
+     */
+    public static Response options() {
+        var r = new Response(200, ResponseHeaders.of(), Body.Empty.INSTANCE);
+        r.headers().add("allow", ALLOW);
         return r;
     }
 
@@ -321,28 +350,61 @@ public final class StaticFileHandler implements Handler {
         return html(200, html.toString(), head);
     }
 
-    /** Standard reason phrases (used by error pages and by the HTTP/1 status line). */
+    /**
+     * Reason phrases of the RFC 9110 (section 15) status codes, plus 429/431 (RFC 6585), used by
+     * error pages and by the HTTP/1 status line. Unregistered codes get an empty phrase, which
+     * RFC 9112 section 4 allows ({@code "HTTP/1.1 599 "}); callers must not rely on it being non-empty.
+     */
     public static String reasonPhrase(int code) {
         return switch (code) {
             case 100 -> "Continue";
+            case 101 -> "Switching Protocols";
             case 200 -> "OK";
+            case 201 -> "Created";
+            case 202 -> "Accepted";
+            case 203 -> "Non-Authoritative Information";
+            case 204 -> "No Content";
+            case 205 -> "Reset Content";
             case 206 -> "Partial Content";
+            case 300 -> "Multiple Choices";
             case 301 -> "Moved Permanently";
+            case 302 -> "Found";
+            case 303 -> "See Other";
             case 304 -> "Not Modified";
+            case 305 -> "Use Proxy";
+            case 307 -> "Temporary Redirect";
+            case 308 -> "Permanent Redirect";
             case 400 -> "Bad Request";
+            case 401 -> "Unauthorized";
+            case 402 -> "Payment Required";
             case 403 -> "Forbidden";
             case 404 -> "Not Found";
             case 405 -> "Method Not Allowed";
+            case 406 -> "Not Acceptable";
+            case 407 -> "Proxy Authentication Required";
             case 408 -> "Request Timeout";
+            case 409 -> "Conflict";
+            case 410 -> "Gone";
+            case 411 -> "Length Required";
+            case 412 -> "Precondition Failed";
             case 413 -> "Content Too Large";
             case 414 -> "URI Too Long";
+            case 415 -> "Unsupported Media Type";
             case 416 -> "Range Not Satisfiable";
             case 417 -> "Expectation Failed";
+            case 421 -> "Misdirected Request";
+            case 422 -> "Unprocessable Content";
+            case 426 -> "Upgrade Required";
+            case 428 -> "Precondition Required";
+            case 429 -> "Too Many Requests";
             case 431 -> "Request Header Fields Too Large";
             case 500 -> "Internal Server Error";
             case 501 -> "Not Implemented";
+            case 502 -> "Bad Gateway";
+            case 503 -> "Service Unavailable";
+            case 504 -> "Gateway Timeout";
             case 505 -> "HTTP Version Not Supported";
-            default -> "Unknown";
+            default -> "";
         };
     }
 
