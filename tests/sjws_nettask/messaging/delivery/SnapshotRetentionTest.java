@@ -230,11 +230,27 @@ class SnapshotRetentionTest {
             assertThrows(IllegalArgumentException.class, () -> p.payloadCacheBytes(-1));
             p.snapshotEveryEntries(10);
             p.subscribe("g", true);
-            for (int i = 0; i < 35; i++) p.produce(0, 0, b("x"));
+            for (int i = 0; i < 35; i++) p.produce(0, 0, b("x")); // 35 live: interval stretches to 2 × live
+            for (int i = 0; i < 35; i++) for (var d : p.poll("g", "c", 1, 1000)) p.ack("g", d.offset());
+            for (int i = 0; i < 40; i++) { p.produce(0, 0, b("y")); for (var d : p.poll("g", "c", 1, 1000)) p.ack("g", d.offset()); }
             assertEquals(p.snapshotNow().get(), p.snapshotNow().get(), "same offset: no second write");
         }
         try (var s = Files.list(dir.resolve("t"))) { assertEquals(2, s.filter(x -> x.toString().endsWith(".snap")).count(), "keeps two"); }
         try (var q = open()) { assertTrue(q.recoveredFromSnapshot() > 0); assertEquals(0, q.replayedEntries()); }
+    }
+
+    @Test
+    void automaticSnapshotIntervalScalesWithLiveState() throws Exception {
+        try (var p = open()) {
+            p.snapshotEveryEntries(10);
+            p.subscribe("g", true);
+            for (int i = 0; i < 100; i++) p.produce(0, 0, b("x")); // all live: 2 × live always exceeds the entries since
+        }
+        try (var s = Files.list(dir.resolve("t"))) {
+            var offs = s.map(x -> x.getFileName().toString()).filter(n -> n.endsWith(".snap")).sorted().toList();
+            // a fixed 10-entry interval would have written ~10 (2 kept); scaled by live state, none is due yet
+            assertTrue(offs.isEmpty(), offs.toString());
+        }
     }
 
     /** Torn tail after a snapshot: every cut recovers a recorded operation-boundary state. */

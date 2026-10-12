@@ -177,6 +177,15 @@ final class Segment implements AutoCloseable {
     void force() throws IOException { ch.force(false); }
 
     /** Reads the batch containing {@code offset}, or null if it is not in this segment (or compacted away). */
+    /** Last readahead window: immutable bytes [start, start + buf.limit()) of this file. */
+    private record Chunk(long start, ByteBuffer buf) { }
+    static final int READAHEAD_BYTES = 256 << 10;
+    private volatile Chunk chunk;
+
+    /**
+     * Batch containing {@code offset}, or null (out of range, or a gap in a compacted segment). Reads go through a
+     * {@link #READAHEAD_BYTES} window, so sequential consumers do one pread per window instead of two per frame.
+     */
     RecordBatch read(long offset) throws IOException {
         long end = size;
         if (offset < baseOffset || offset >= nextOffset) return null;
@@ -184,22 +193,46 @@ final class Segment implements AutoCloseable {
         long[] o = idxOff, p = idxPos;
         int i = Arrays.binarySearch(o, 0, n, offset);
         long pos = i >= 0 ? p[i] : (i == -1 ? 0 : p[-i - 2]);
-        var lenBuf = ByteBuffer.allocate(4);
+        long floorOff = i >= 0 ? o[i] : (i == -1 ? baseOffset : o[-i - 2]);
+        var h = hint; // sequential readers: start at the frame after the previous hit
+        if (h != null && h.offset <= offset && h.offset > floorOff && h.pos < end) pos = h.pos;
+        var c = chunk;
         while (pos < end) {
-            lenBuf.clear();
-            ch.read(lenBuf, pos);
-            int len = lenBuf.getInt(0);
-            var frame = ByteBuffer.allocate(4 + len);
-            while (frame.hasRemaining() && ch.read(frame, pos + frame.position()) > 0) { }
+            if (c == null || pos < c.start || pos + 4 > c.start + c.buf.limit()) c = load(pos, end, 4);
+            int rel = (int) (pos - c.start);
+            int len = c.buf.getInt(rel);
+            if (len < RecordBatch.HEADER_BYTES - 4 || len > RecordBatch.MAX_FRAME_BYTES)
+                throw new IOException("corrupt committed batch at " + logPath + ":" + pos);
+            if (rel + 4 + len > c.buf.limit()) { c = load(pos, end, 4 + len); rel = 0; }
+            long fb = c.buf.getLong(rel + 8);
+            int fc = c.buf.getInt(rel + 16);
+            if (fc > 0 && offset >= fb + fc) { pos += 4 + len; continue; } // skip without CRC/decode
             try {
-                var rb = RecordBatch.decode(frame.flip());
-                if (offset < rb.nextOffset()) return rb.baseOffset() <= offset ? rb : null;
+                var rb = RecordBatch.decode(c.buf.duplicate().position(rel).limit(rel + 4 + len).slice());
+                if (offset < rb.nextOffset()) {
+                    hint = new Hint(rb.nextOffset(), pos + 4 + len);
+                    return rb.baseOffset() <= offset ? rb : null;
+                }
             } catch (RecordBatch.CorruptBatchException e) {
                 throw new IOException("corrupt committed batch at " + logPath + ":" + pos, e);
             }
             pos += 4 + len;
         }
         return null;
+    }
+
+    private record Hint(long offset, long pos) { }
+    private volatile Hint hint;
+
+    private Chunk load(long pos, long end, int need) throws IOException {
+        int n = (int) Math.min(Math.max(READAHEAD_BYTES, need), end - pos);
+        if (n < need) throw new IOException("short committed frame at " + logPath + ":" + pos);
+        var buf = ByteBuffer.allocate(n);
+        while (buf.hasRemaining()) if (ch.read(buf, pos + buf.position()) <= 0) throw new IOException("short read " + logPath);
+        buf.flip();
+        var c = new Chunk(pos, buf);
+        chunk = c;
+        return c;
     }
 
     /** Calls {@code sink} for every batch in file order (replay, compaction). */

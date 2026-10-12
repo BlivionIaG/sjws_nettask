@@ -69,14 +69,15 @@ public final class Partition implements AutoCloseable {
     private volatile long minRebuildNanos = 50_000_000L;
     private volatile long maxStaleNanos = 1_000_000_000L;
     private volatile int maxItemsPerList = 10_000;
-    /** Payloads appended but not yet written to the segment (removed when the write completes). */
     /**
      * Payloads of the most recent messages (bounded by {@link #payloadCacheBytes}); always holds every message the
      * writer has not yet written, so a read never races the log. Older payloads are read back from segments.
      */
-    private final ConcurrentHashMap<Long, byte[]> recent = new ConcurrentHashMap<>();
-    private final java.util.ArrayDeque<long[]> recentOrder = new java.util.ArrayDeque<>(); // {offset, bytes}; lock held
-    private long recentBytes;
+    // Ring of (offset, payload) in offset order; guarded by `lock`. No per-message allocation, O(log n) lookup.
+    private long[] ringOff = new long[1024];
+    private byte[][] ringVal = new byte[1024][];
+    private int ringHead, ringCount;
+    private long recentBytes, writtenHint;
     private volatile long payloadCacheBytes = 64L << 20;
     private final Path logDir;
     private final ConcurrentSkipListSet<Long> snapshots = new ConcurrentSkipListSet<>();
@@ -353,7 +354,9 @@ public final class Partition implements AutoCloseable {
         if (e instanceof LedgerEntry.Enqueue x) cachePayload(offset, x.payloadRef());
         state.apply(offset, e);
         publish();
-        if (state.nextOffset - lastSnapshotTrigger >= snapshotEveryEntries) snapshotLocked();
+        // Amortized O(1) per entry: a snapshot costs O(live state), so wait at least twice that many entries.
+        long since = state.nextOffset - lastSnapshotTrigger;
+        if (since >= snapshotEveryEntries && since >= 2L * state.messages.size()) snapshotLocked();
         return f.thenApply(base -> {
             if (base != offset) throw new IllegalStateException("ledger offset drift " + base + " != " + offset);
             return base;
@@ -362,17 +365,54 @@ public final class Partition implements AutoCloseable {
 
     /** Lock held. Evicts the oldest cached payloads over budget, but never one the writer has not written yet. */
     private void cachePayload(long offset, byte[] payload) {
-        recent.put(offset, payload);
-        recentOrder.addLast(new long[] {offset, payload.length});
+        if (ringCount == ringOff.length) growRing();
+        int mask = ringOff.length - 1, i = (ringHead + ringCount) & mask;
+        ringOff[i] = offset;
+        ringVal[i] = payload;
+        ringCount++;
         recentBytes += payload.length;
+        if (recentBytes > payloadCacheBytes) evictPayloads();
+    }
+
+    private void evictPayloads() {
         long budget = payloadCacheBytes;
-        if (recentBytes <= budget) return;
-        long written = writer.snapshot().nextOffset();
-        while (recentBytes > budget && !recentOrder.isEmpty() && recentOrder.peekFirst()[0] < written) {
-            var h = recentOrder.pollFirst();
-            recent.remove(h[0]);
-            recentBytes -= h[1];
+        int mask = ringOff.length - 1;
+        while (recentBytes > budget && ringCount > 0) {
+            long ho = ringOff[ringHead];
+            if (ho >= writtenHint) {
+                writtenHint = writer.snapshot().nextOffset();
+                if (ho >= writtenHint) return; // not written yet: keep (temporarily over budget)
+            }
+            recentBytes -= ringVal[ringHead].length;
+            ringVal[ringHead] = null;
+            ringHead = (ringHead + 1) & mask;
+            ringCount--;
         }
+    }
+
+    private void growRing() {
+        int n = ringOff.length, mask = n - 1;
+        var o = new long[n * 2];
+        var v = new byte[n * 2][];
+        for (int k = 0; k < ringCount; k++) { o[k] = ringOff[(ringHead + k) & mask]; v[k] = ringVal[(ringHead + k) & mask]; }
+        ringOff = o;
+        ringVal = v;
+        ringHead = 0;
+    }
+
+    /** Lock held. Cached payload of {@code offset}, or null. */
+    private byte[] cachedPayload(long offset) {
+        int n = ringCount;
+        if (n == 0) return null;
+        int mask = ringOff.length - 1;
+        if (offset < ringOff[ringHead] || offset > ringOff[(ringHead + n - 1) & mask]) return null;
+        int lo = 0, hi = n - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            long v = ringOff[(ringHead + mid) & mask];
+            if (v < offset) lo = mid + 1; else if (v > offset) hi = mid - 1; else return ringVal[(ringHead + mid) & mask];
+        }
+        return null;
     }
 
     /** Bytes of recent payloads kept in memory (default 64 MiB; 0 = only unwritten ones). */
@@ -384,7 +424,7 @@ public final class Partition implements AutoCloseable {
 
     /** Payload of the message at {@code offset}: from the recent cache, else from its log segment. */
     private byte[] payloadOf(long offset) {
-        var b = recent.get(offset);
+        var b = cachedPayload(offset);
         if (b != null) return b;
         try {
             var rb = log.read(offset);
@@ -399,7 +439,10 @@ public final class Partition implements AutoCloseable {
 
     // ---- state snapshots (step 3) ----
 
-    /** Take a state snapshot every {@code n} applied entries (default 100 000). */
+    /**
+     * Take a state snapshot every {@code n} applied entries (default 100 000), or every {@code 2 × live messages}
+     * entries when that is larger, so snapshot work stays proportional to append work.
+     */
     public void snapshotEveryEntries(long n) {
         if (n < 1) throw new IllegalArgumentException("snapshot interval");
         snapshotEveryEntries = n;
@@ -418,16 +461,21 @@ public final class Partition implements AutoCloseable {
         long off = state.nextOffset;
         lastSnapshotTrigger = off;
         if (snapshots.contains(off)) return CompletableFuture.completedFuture(off);
-        byte[] data = state.serialize();
+        // Nothing is serialized under the lock: the snapshotter rebuilds the state at `off` from the newest
+        // snapshot file plus the log tail (deterministic replay) and serializes that private copy.
         var prev = lastSnapshot;
         lastSnapshot = prev.handleAsync((v, t) -> {
-            writeSnapshot(off, data);
+            writeSnapshot(off, rebuildAt(off));
             return off;
         }, snapshotter);
         return lastSnapshot;
     }
 
-    private void writeSnapshot(long off, byte[] data) {
+    /**
+     * Snapshotter thread. State at {@code off}, rebuilt off-lock: newest snapshot file (or empty) + replay of
+     * {@code [base, off)}. Only reads log at or above the newest snapshot, which retention/compaction never touch.
+     */
+    private byte[] rebuildAt(long off) {
         try {
             // The snapshot is only valid if the log is durable through `off`: wait for the writer, then fsync.
             long deadline = System.nanoTime() + 30_000_000_000L;
@@ -436,6 +484,35 @@ public final class Partition implements AutoCloseable {
                 LockSupport.parkNanos(100_000);
             }
             log.force();
+            var policy = state.policy();
+            DeliveryState st = null;
+            Long base = snapshots.floor(off);
+            if (base != null) {
+                try { st = DeliveryState.deserialize(Files.readAllBytes(logDir.resolve(snapName(base))), policy); }
+                catch (IllegalArgumentException bad) { st = null; }
+            }
+            if (st == null) {
+                if (log.startOffset() > 0) throw new IOException("snapshot base unreadable and log starts at " + log.startOffset());
+                st = new DeliveryState(policy);
+            }
+            var target = st;
+            long from = target.nextOffset;
+            log.scanFrom(from, b -> {
+                long o = b.baseOffset();
+                for (byte[] r : b.records()) {
+                    if (o >= target.nextOffset && o < off) target.apply(o, LedgerEntry.decode(r));
+                    o++;
+                }
+            });
+            if (target.nextOffset != off) throw new IOException("rebuilt state at " + target.nextOffset + " != " + off);
+            return target.serialize();
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
+    private void writeSnapshot(long off, byte[] data) {
+        try {
             var tmp = logDir.resolve(snapName(off) + ".tmp");
             try (var ch = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
                 var b = java.nio.ByteBuffer.wrap(data);
