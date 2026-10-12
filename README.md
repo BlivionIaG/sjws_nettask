@@ -25,7 +25,8 @@ Run:
 | `--max-connections=N` | `WEB_SERVER_MAX_CONNECTIONS` | 2048 | concurrent connections; extra ones wait in the backlog |
 | `--idle-timeout=S` | `WEB_SERVER_IDLE_TIMEOUT` | 30 | keep-alive idle timeout (seconds) |
 | `--header-timeout=S` | `WEB_SERVER_HEADER_TIMEOUT` | 10 | time to receive a complete request head (seconds) |
-| `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | HTTP/3: reset a response that makes no progress for this long; also the window of its minimum send rate (8 KiB/s). Not used by HTTP/1.1 yet |
+| `--max-connections-per-ip=N` | `WEB_SERVER_MAX_CONNECTIONS_PER_IP` | 256 | HTTP/1.1 connections from one client address; extra ones are closed at once (generous because of NAT) |
+| `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | HTTP/3: reset a response that makes no progress for this long; also the window of the minimum send rate. Not used by HTTP/1.1 yet |
 | `-h`, `--help` | | | print usage and exit |
 
 Environment variables override arguments. Invalid values are replaced by the default
@@ -42,7 +43,9 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 | `--h3` / `--no-h3` | `WEB_SERVER_H3` (`true/false/1/0/yes/no/on/off`) | off | enable HTTP/3 |
 | `--h3-port=N` | `WEB_SERVER_H3_PORT` | same as TCP port | UDP port; `0` = ephemeral |
 | `--h3-host=ADDR` | `WEB_SERVER_H3_HOST` | `0.0.0.0` | UDP bind address |
-| `--h3-max-connections=N` | `WEB_SERVER_H3_MAX_CONNECTIONS` | 1024 | concurrent QUIC connections |
+| `--h3-max-connections=N` | `WEB_SERVER_H3_MAX_CONNECTIONS` | 1024 | concurrent QUIC connections (counted once the handshake completes) |
+| `--h3-max-connections-per-ip=N` | `WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP` | 16 | QUIC connections from one client address; extra ones are closed with `H3_EXCESSIVE_LOAD` |
+| `--h3-min-rate=B` | `WEB_SERVER_H3_MIN_RATE` | 2048 | minimum send rate per connection, bytes/s, enforced only while file slots are contended; `0` = off |
 | `--cert=PATH` | `WEB_SERVER_TLS_CERT` | self-signed | certificate chain, PEM |
 | `--key=PATH` | `WEB_SERVER_TLS_KEY` | self-signed | private key, PKCS#8 PEM |
 | `--key-password-file=PATH` | `WEB_SERVER_TLS_KEY_PASSWORD_FILE` | | file containing the key password (one trailing newline is ignored) |
@@ -68,11 +71,22 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   keeps serving HTTP/1.1. Mind that clients cache `Alt-Svc` for `ma` seconds, and that it names only a
   port: behind NAT/Docker, publish the UDP port too.
 * **Limits** (per server unless noted): in-flight HTTP/3 requests = `--max-connections` (more are
-  refused with `H3_REQUEST_REJECTED`, which clients may retry); files being sent = min(`--max-connections`,
-  1024), at most 16 per QUIC connection, waiting at most `--header-timeout` for a slot; 64 concurrent
-  request streams and 16 KiB / 1 MiB receive windows per stream / connection (request bodies are
-  discarded); request field sections up to 16 KiB (larger: 431). No QUIC Retry is used, so the
-  RFC 9000 anti-amplification limit applies until a client's address is validated by the handshake.
+  refused with `H3_REQUEST_REJECTED`, which clients may retry); once more than half of them are in use,
+  a connection with 16 or more in flight gets no more (fair share: a few connections can't take the
+  whole cap). Files being sent = min(`--max-connections`, 1024), at most 16 per QUIC connection, waiting
+  at most `--header-timeout` for a slot; 64 concurrent request streams and 16 KiB / 1 MiB receive
+  windows per stream / connection (request bodies are discarded); request field sections up to 16 KiB
+  (larger: 431).
+* **Handshakes.** A QUIC connection counts against `--h3-max-connections` and the per-address cap only
+  once its handshake completes (its address is then validated). Until then it is *half-open*: at most
+  256 at a time (more are dropped silently), and one not established within 5 s is dropped. No QUIC
+  Retry is used, so the RFC 9000 anti-amplification limit applies until the handshake validates the
+  address; a flood of spoofed Initial packets (~50/s) can keep the half-open table full, which delays
+  *new* clients (established connections are unaffected).
+* **Slow readers.** A response that makes no progress for `--write-timeout` is reset. While more than
+  75% of the file slots are in use, a connection whose responses together send less than
+  `--h3-min-rate` bytes/s (averaged over `--write-timeout`) also has its file responses reset, so
+  slow-reading clients can't keep the slots; with free slots slow clients are left alone.
 * **Shutdown** sends `GOAWAY`, lets in-flight HTTP/3 responses finish for up to 2 s, then closes.
 * The self-signed certificate is new on every start (its fingerprint is printed): a pinned fingerprint
   is valid until restart, although Alt-Svc tells clients to remember the endpoint for `ma` seconds.
@@ -95,9 +109,15 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   check falls back to the size check during transfer.
 * Files are opened relative to the document root one directory at a time without following symlinks
   (`SecureDirectoryStream`, i.e. `openat`, on Linux and macOS), so a directory swapped for a symlink
-  between resolve and send is never followed. Where that API is missing (Windows), the server opens the
-  path without following a final symlink and re-checks its real path and file key afterwards; that
-  narrows but does not close the race.
+  between resolve and send is never followed. That needs read permission on each directory: below an
+  execute-only (e.g. `711`) directory, and where the API is missing (Windows; startup then prints a
+  `WARN:` line), the server opens the path without following a final symlink and re-checks its real
+  path (containment) and file key afterwards; that narrows but does not close the race, so don't serve
+  a tree that untrusted users can write to in that mode.
+* Only regular files are served: a FIFO, device or socket (also one swapped in after the request was
+  resolved) is refused before it is opened (404), so nothing blocks on it. If the file can't be opened
+  after the response was decided (removed, swapped, permissions changed), the client gets a regular
+  404/403/500 response instead of a dropped connection.
 
 Serves GET and HEAD (other known methods: 405, unknown: 501), HTTP/1.0 and 1.1
 with keep-alive and pipelining, `If-Modified-Since`, directory listings, and
