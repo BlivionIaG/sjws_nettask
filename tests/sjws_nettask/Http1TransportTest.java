@@ -427,6 +427,65 @@ class Http1TransportTest {
         }
     }
 
+    /**
+     * Heads and bodies larger than the idle buffer (switch to the large one mid-request), heads
+     * exactly filling it, and pipelined requests spanning the switch, all on one keep-alive
+     * connection that goes idle between batches.
+     */
+    @Test
+    void requestsAroundTheIdleBufferSizeAreServedOnOneConnection() throws Exception {
+        start(Duration.ofSeconds(10), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        var pad = "a".repeat(3000);
+        String simple = "GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n";
+        String exact = "GET /hello.txt HTTP/1.1\r\nHost: h\r\nX: ";
+        exact += "b".repeat(Http1Connection.IDLE_BUFFER - exact.length() - 4) + "\r\n\r\n";
+        assertEquals(Http1Connection.IDLE_BUFFER, exact.length());
+        String big = "GET /hello.txt HTTP/1.1\r\nHost: h\r\nX-Pad: " + pad + "\r\n\r\n";
+        String body = "GET /hello.txt HTTP/1.1\r\nHost: h\r\nContent-Length: 5000\r\n\r\n" + "z".repeat(5000);
+        String[] batches = {simple, exact, big, body, exact + big + simple + body + exact, simple};
+        int[] counts = {1, 1, 1, 1, 5, 1};
+        try (var s = connect()) {
+            s.setTcpNoDelay(true);
+            var out = s.getOutputStream();
+            var in = s.getInputStream();
+            for (int b = 0; b < batches.length; b++) {
+                out.write(batches[b].getBytes(StandardCharsets.ISO_8859_1));
+                out.flush();
+                for (int i = 0; i < counts[b]; i++) {
+                    assertEquals("hello", HttpTestSupport.readResponse(in).bodyText(), "batch " + b + " #" + i);
+                }
+                Thread.sleep(20); // idle between batches
+            }
+        }
+        waitFor(() -> manager.reaper().tracked() == 0, 2000, "deregistration");
+    }
+
+    /**
+     * An error response with more unread input behind it: the server half-closes and discards a
+     * bounded amount, so the client reads the whole response instead of a reset.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1000, 200_000})
+    void errorResponseSurvivesUnreadInput(int trailing) throws Exception {
+        start(Duration.ofSeconds(10), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        var raw = "GET / HTTP/1.1\r\nHost: h\r\nX: " + "a".repeat(10_000) + "\r\n\r\n" + "q".repeat(trailing);
+        try (var s = connect()) {
+            var writer = Thread.ofVirtual().start(() -> {
+                try {
+                    s.getOutputStream().write(raw.getBytes(StandardCharsets.ISO_8859_1));
+                    s.getOutputStream().flush();
+                } catch (IOException e) {
+                    // the server may stop reading (over the linger bound) and close
+                }
+            });
+            var r = HttpTestSupport.readResponse(s.getInputStream());
+            assertEquals(431, r.statusCode());
+            assertEquals("close", r.headers().get("connection"));
+            writer.join(5000);
+        }
+        waitFor(() -> manager.reaper().tracked() == 0, 5000, "deregistration");
+    }
+
     @Test
     void pipelinedRequestsWithAFragmentedBodyAreAnsweredInOrder() throws Exception {
         start(Duration.ofSeconds(10), Duration.ofSeconds(5), Duration.ofSeconds(5));

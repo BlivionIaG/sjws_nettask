@@ -55,3 +55,31 @@ Heap histogram at 10,000 idle connections (`GC.class_histogram`, ad-hoc, same fl
 
 RSS after the throughput run: 269,956 KB. Variance between reps is large on this shared VM; the
 median is in line with the earlier ~200–220k req/s.
+
+## After idle-footprint changes (`perf/idle-footprint`)
+
+A/B on the same box, 2026-10-12 ~15:10 CEST, base `eb87f48` ("before") vs the branch ("after"),
+runs interleaved (before, after, before, after) with `footprint.py` defaults. The box was shared
+with other workloads (load average up to 12), so throughput is noisy.
+
+| metric | before run 1 | before run 2 | after run 1 | after run 2 |
+|---|---|---|---|---|
+| startup median | 144.0 ms | 132.5 ms | 128.3 ms | 123.3 ms |
+| heap after GC / idle conn @1k | 7,319 B | 7,311 B | 4,580 B | 4,566 B |
+| heap after GC / idle conn @10k | 6,582 B | 6,754 B | 3,750 B | 4,197 B |
+| RSS / idle conn @1k | 24,277 B | 24,670 B | 19,710 B | 19,513 B |
+| RSS / idle conn @10k | 19,255 B | 19,286 B | 14,537 B | 16,456 B |
+| RSS @10k idle | 254,248 KB | 254,860 KB | 208,900 KB | 227,180 KB |
+| 1 KB wrk c100 median (3×10 s) | 306,772 | 330,659 | 280,415 | 333,111 req/s |
+
+Dedicated throughput A/B (both servers up at once, `-Xms256m -Xmx256m -XX:+UseG1GC`, wrk -t4 -c100,
+5 s warm-up, then 6 alternating 8 s runs each): before 188.6k, 234.8k, 263.2k, 204.0k, 193.5k, 207.2k
+(median 205.6k); after 211.9k, 195.2k, 202.8k, 254.3k, 253.6k, 196.3k (median 207.4k) req/s. No
+throughput difference is detectable above the noise.
+
+Heap histogram at 10k idle connections (ad-hoc, before → after, ÷10,000): `byte[]` 2,570 → 658 B,
+`StackChunk` 2,411 → 2,168 B, `String` 171 → 52 B, retained `LinkedHashMap` heads gone. (The
+after-histogram was taken before the parser line buffer was also made lazy, so `byte[]` is lower
+still in the final branch.) The parked stack is now dominated by JDK frames (`SocketChannelImpl.read`
+→ `Poller.poll` → `VirtualThread.park`); shrinking it further needs idle connections that do not
+hold a parked virtual thread at all.
