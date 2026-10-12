@@ -100,10 +100,15 @@ class RouterTest {
     @Test
     void dotDotSegmentsAre400() {
         var router = new Router(List.of(new Route("/api", echo("api"))), echo("fb"));
-        for (var t : new String[] {"/api/../secret", "/..", "/a/%2e%2e/b", "/a/.%2E", "/a/%2E.?x", "/api/.."}) {
+        for (var t : new String[] {"/api/../secret", "/..", "/a/%2e%2e/b", "/a/.%2E", "/a/%2E.?x", "/api/..",
+                // path confusion: forms an upstream may read as ".." (servlet ";" parameters, backslash, encoded separators)
+                "/api/..;/admin", "/api/..;x/admin", "/api/%2e%2e;/admin", "/api/..\\admin", "/api\\..\\admin",
+                "/api/..%2fadmin", "/api/..%2Fadmin", "/api/%2e%2e%2fadmin", "/api%2f..%2fadmin", "/api/..%5cadmin",
+                "/api/..%5Cadmin", "/api/x/..;"}) {
             assertEquals(400, router.handle(req(null, t)).status(), t);
         }
-        for (var t : new String[] {"/api/.x", "/a/...", "/a/..b", "/a/.", "/a?x=/../", "/%2e", "/a/%2", "/a/%2f%2e"}) {
+        for (var t : new String[] {"/api/.x", "/a/...", "/a/..b", "/a/.", "/a?x=/../", "/%2e", "/a/%2", "/a/%2f%2e",
+                "/api/.;/x", "/api/x;..", "/api/a..;/b", "/api/...;/b", "/api/%2e;/b", "/a\\b", "/a%2fb", "/a/..x%2f"}) {
             assertNotEquals(400, router.handle(req(null, t)).status(), t);
         }
     }
