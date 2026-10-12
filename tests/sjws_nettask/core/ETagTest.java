@@ -155,7 +155,7 @@ class ETagTest {
     void the200HeadCarriesEtagInOrder() {
         var r = get("/a.txt", RequestHeaders.NONE);
         assertEquals(200, r.status());
-        assertEquals(List.of("last-modified", "etag", "accept-ranges", "content-type"),
+        assertEquals(List.of("last-modified", "etag", "accept-ranges", "content-type", "x-content-type-options"),
                 r.headers().entries().stream().map(Map.Entry::getKey).toList());
     }
 
