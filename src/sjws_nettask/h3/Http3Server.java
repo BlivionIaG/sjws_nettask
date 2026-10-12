@@ -47,6 +47,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
@@ -63,6 +64,7 @@ import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.observe.ObserveRequestFilter;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
+import sjws_nettask.tls.SwappableKeyManager;
 import sjws_nettask.tls.TlsMaterial;
 
 /**
@@ -101,11 +103,14 @@ public final class Http3Server implements Transport {
     static final QuicTokenHandler TOKENS = NoRetryTokenHandler.INSTANCE;
 
     private final ServerConfig config;
-    /** Replaced by {@link #withObserver} before {@link #start()} when a recording observer is installed. */
-    private Function<Request, Response> handler;
-    /** Copied into every request only when a chain, a non-static terminal, or header logging is installed. */
+    /** Swapped by {@link #replaceHandler}. Read once per request. */
+    private final AtomicReference<Function<Request, Response>> handlers;
+    /**
+     * Copied into every request only when a chain, a non-static terminal, or header logging is installed.
+     * {@link #withObserver} may set this before {@link #start()}.
+     */
     private boolean captureFields;
-    /** Published by {@link #armHandler} after start. Null value keeps {@link #handler}. */
+    /** Published by {@link #armHandler} after start. A null value keeps {@link #handlers}. */
     private final HandlerRef armed = new HandlerRef();
     private boolean observerWrapped;
     private final Map<QuicChannel, Connection> state = new ConcurrentHashMap<>();
@@ -120,7 +125,8 @@ public final class Http3Server implements Transport {
     private final Map<Http3Writer.Outcome, LongAdder> outcomes = new EnumMap<>(Http3Writer.Outcome.class);
     private Limits limits;
     private Shared shared;
-    private TlsMaterial tls;
+    private volatile TlsMaterial tls;
+    private volatile SwappableKeyManager keys;
     private EventLoopGroup group;
     private ExecutorService executor;
     private Channel channel;
@@ -186,7 +192,7 @@ public final class Http3Server implements Transport {
         this.available = Objects.requireNonNull(available, "available");
         this.unavailabilityCause = Objects.requireNonNull(unavailabilityCause, "unavailabilityCause");
         this.config = Objects.requireNonNull(config, "config");
-        this.handler = Objects.requireNonNull(handler, "handler");
+        this.handlers = new AtomicReference<>(Objects.requireNonNull(handler, "handler"));
         this.tls = tls;
         this.captureFields = captureFields;
         this.limits = Limits.of(config);
@@ -207,8 +213,10 @@ public final class Http3Server implements Transport {
         this.slot.set(installed);
         if (installed.recording() && !this.observerWrapped) {
             this.observerWrapped = true;
-            Handler terminal = this.handler::apply;
-            this.handler = RequestFilters.create().add(0, new ObserveRequestFilter(this.slot)).build(terminal)::handle;
+            Function<Request, Response> current = this.handlers.get();
+            Handler terminal = current::apply;
+            this.handlers.set(
+                    RequestFilters.create().add(0, new ObserveRequestFilter(this.slot)).build(terminal)::handle);
             if (installed.logHeaders()) {
                 this.captureFields = true;
             }
@@ -325,11 +333,13 @@ public final class Http3Server implements Transport {
             }
         }
         try {
-            var ssl = QuicSslContextBuilder.forServer(this.tls.key(), null, this.tls.chain())
+            this.keys = new SwappableKeyManager(this.tls);
+            var ssl = QuicSslContextBuilder.forServer(this.keys, null)
                     .applicationProtocols(Http3.supportedApplicationProtocols()).build();
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h3-request-", 0).factory());
             this.perIp = new sjws_nettask.core.PerIpLimit(this.limits.connectionsPerIp());
-            this.shared = new Shared(this.handler, this.executor, this.limits, new Semaphore(this.limits.maxInflight()),
+            this.shared = new Shared(request -> this.handlers.get().apply(request), this.executor, this.limits,
+                    new Semaphore(this.limits.maxInflight()),
                     new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.captureFields, this.armed);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             var codec = Http3.newQuicServerCodecBuilder()
@@ -479,9 +489,26 @@ public final class Http3Server implements Transport {
         return (InetSocketAddress) this.channel.localAddress();
     }
 
-    /** @return the TLS material in use (after {@link #start()}) */
+    /** @return the TLS material in use (after {@link #start()}, or the material set by {@link #replaceTls}) */
     public TlsMaterial tls() {
         return this.tls;
+    }
+
+    /**
+     * Certificate for new handshakes. Before {@link #start()} this replaces what start would load
+     * from the configuration. After start, BoringSSL reads it on the next handshake.
+     */
+    public void replaceTls(TlsMaterial material) {
+        this.tls = Objects.requireNonNull(material, "material");
+        var manager = this.keys;
+        if (manager != null) {
+            manager.set(material);
+        }
+    }
+
+    /** The next request uses this handler. A request already in the handler keeps the previous one. */
+    public void replaceHandler(Function<Request, Response> handler) {
+        this.handlers.set(Objects.requireNonNull(handler, "handler"));
     }
 
     /** @return QUIC connections currently open */

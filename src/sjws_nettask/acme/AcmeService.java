@@ -1,0 +1,138 @@
+/*
+ * Copyright (C) 2026 BlivionIaG <BlivionIaG at chenco.tk>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package sjws_nettask.acme;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import javax.net.ssl.SSLContext;
+import sjws_nettask.config.AcmeSettings;
+import sjws_nettask.tls.TlsMaterial;
+
+/**
+ * Issues and renews on a daemon thread, then publishes the certificate. The request path never
+ * waits on this. A delay under a minute after a successful issue is stretched to an hour so a
+ * short {@code renew_before} cannot spin. Failures back off from 30 seconds to 15 minutes.
+ */
+public final class AcmeService implements AutoCloseable {
+
+    private static final Duration MIN_DELAY = Duration.ofMinutes(1);
+    private static final Duration SHORT_DELAY = Duration.ofHours(1);
+    private static final int BACKOFF_START = 30;
+    private static final int BACKOFF_MAX = 15 * 60;
+
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
+            Thread.ofPlatform().daemon().name("acme-renew").factory());
+    private final ChallengeBoard board;
+    private final Consumer<TlsMaterial> publish;
+    private final AtomicInteger epoch = new AtomicInteger();
+    private volatile AcmeSettings settings;
+    private volatile SSLContext trust;
+    private volatile int backoffSeconds = BACKOFF_START;
+
+    public AcmeService(AcmeSettings settings, ChallengeBoard board, Consumer<TlsMaterial> publish) {
+        this.settings = settings;
+        this.board = board;
+        this.publish = publish;
+    }
+
+    public void start() {
+        arm(Duration.ZERO);
+    }
+
+    public void update(AcmeSettings settings) {
+        this.settings = settings;
+        this.backoffSeconds = BACKOFF_START;
+        if (settings.enabled()) {
+            arm(Duration.ZERO);
+        } else {
+            this.epoch.incrementAndGet();
+        }
+    }
+
+    /** Test hook: trust this context for the ACME directory (Pebble). */
+    void useTrust(SSLContext ssl) {
+        this.trust = ssl;
+    }
+
+    /**
+     * How long until the certificate should be renewed. Negative when it is already inside the
+     * renewal window.
+     */
+    public static Duration renewalDelay(Instant notAfter, Duration renewBefore, Instant now) {
+        return Duration.between(now, notAfter.minus(renewBefore));
+    }
+
+    private void arm(Duration delay) {
+        int ticket = this.epoch.incrementAndGet();
+        long millis = Math.max(0, delay.toMillis());
+        this.scheduler.schedule(() -> attempt(ticket), millis, TimeUnit.MILLISECONDS);
+    }
+
+    private void attempt(int ticket) {
+        if (ticket != this.epoch.get() || !this.settings.enabled()) {
+            return;
+        }
+        try {
+            var store = new AcmeStore(this.settings.storage());
+            var existing = store.loadCertificate();
+            if (existing != null) {
+                var notAfter = existing.chain()[0].getNotAfter().toInstant();
+                if (notAfter.isAfter(Instant.now())) {
+                    this.publish.accept(existing);
+                    var delay = renewalDelay(notAfter, this.settings.renewBefore(), Instant.now());
+                    if (delay.compareTo(MIN_DELAY) >= 0) {
+                        this.backoffSeconds = BACKOFF_START;
+                        if (ticket == this.epoch.get()) {
+                            arm(delay);
+                        }
+                        return;
+                    }
+                }
+            }
+            var issued = AcmeIssuer.issue(this.settings, this.board, this.trust);
+            this.publish.accept(issued);
+            this.backoffSeconds = BACKOFF_START;
+            var delay = renewalDelay(issued.chain()[0].getNotAfter().toInstant(), this.settings.renewBefore(),
+                    Instant.now());
+            if (delay.compareTo(MIN_DELAY) < 0) {
+                delay = SHORT_DELAY;
+            }
+            if (ticket == this.epoch.get()) {
+                arm(delay);
+            }
+        } catch (Exception e) {
+            System.err.println("ERROR: ACME: " + AcmeIssuer.safe(e));
+            int wait = this.backoffSeconds;
+            this.backoffSeconds = Math.min(wait * 2, BACKOFF_MAX);
+            if (ticket == this.epoch.get()) {
+                arm(Duration.ofSeconds(wait));
+            }
+        }
+    }
+
+    @Override
+    public void close() {
+        this.epoch.incrementAndGet();
+        this.scheduler.shutdownNow();
+        this.board.clear();
+    }
+}
