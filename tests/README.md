@@ -10,6 +10,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | Class | Covers |
 |---|---|
 | `http1/Http1ParserTest` | request-head parsing: smuggling vectors, limits, versions, absolute-form, Connection/Expect; every case runs through the stream API and the byte-level `HeadParser` (whole, chunked, every split, reused) with identical results |
+| `http1/ChunkedDecoderTest` | chunked request bodies (RFC 9112 §7.1): sizes, extensions, trailers, bare CR/LF, overflow, line/trailer/body limits, every input split stops exactly at the body's end |
 | `http1/HeaderTest`, `ToolsTest` | response head, dates, MIME, port parsing |
 | `http1/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |

@@ -29,6 +29,7 @@ import sjws_nettask.core.Handler;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.http1.ChunkedDecoder;
 import sjws_nettask.http1.Http1Parser;
 import sjws_nettask.http1.Http1Requests;
 import sjws_nettask.http1.Http1Writer;
@@ -64,6 +65,9 @@ final class Http1Connection implements Runnable {
     private final ConnectionReaper reaper;
     private final Http1Parser.HeadParser parser = new Http1Parser.HeadParser(CONSTANTS.MAX_LINE_LENGTH,
             CONSTANTS.MAX_HEADERS);
+    /** Discards chunked request bodies (GET/HEAD) up to {@link CONSTANTS#MAX_DRAINED_BODY}. */
+    private final ChunkedDecoder chunks = new ChunkedDecoder(CONSTANTS.MAX_LINE_LENGTH, CONSTANTS.MAX_HEADERS,
+            CONSTANTS.MAX_DRAINED_BODY);
     /** Unread input between position and limit; null until the first read. */
     private ByteBuffer in;
 
@@ -172,9 +176,9 @@ final class Http1Connection implements Runnable {
 
         var core = Http1Requests.toCore(request);
         if (!core.headOnly() && !"GET".equals(core.method())) {
-            // Known but unsupported method (the handler answers 405). Never read (possibly huge)
+            // OPTIONS (200) or a known but unsupported method (405). Never read (possibly huge)
             // bodies just to reject them: keep the connection only if there is no body.
-            boolean keepAlive = request.keepAlive() && request.contentLength() == 0;
+            boolean keepAlive = request.keepAlive() && !request.hasBody();
             timer.processing();
             send(out, this.handler.handle(core), keepAlive);
             return keepAlive;
@@ -182,7 +186,17 @@ final class Http1Connection implements Runnable {
 
         boolean keepAlive = request.keepAlive();
         long length = request.contentLength();
-        if (length > CONSTANTS.MAX_DRAINED_BODY) {
+        if (request.chunked()) {
+            if (request.expectContinue()) {
+                out.write(CONTINUE);
+                timer.resumeHead();
+            }
+            int drained = drainChunked(out, timer);
+            if (drained < 0) {
+                return false; // malformed (answered 400), or the peer went away
+            }
+            keepAlive &= drained == 1;
+        } else if (length > CONSTANTS.MAX_DRAINED_BODY) {
             keepAlive = false; // answer, then close instead of reading the body
         } else if (length > 0) {
             if (request.expectContinue()) {
@@ -207,6 +221,40 @@ final class Http1Connection implements Runnable {
 
         send(out, this.handler.handle(core), keepAlive);
         return keepAlive;
+    }
+
+    /**
+     * Discards a chunked body under the head deadline.
+     *
+     * @return 1 when it was consumed whole, 0 when it exceeded {@link CONSTANTS#MAX_DRAINED_BODY}
+     *         (answer, then close), -1 when the connection must close now (400/408 already sent, or EOF)
+     */
+    private int drainChunked(ChannelOutput out, ConnectionReaper.Timer timer) throws IOException {
+        this.chunks.reset();
+        try {
+            while (true) {
+                if (hasInput()) {
+                    int used = this.chunks.feed(this.in.array(), this.in.arrayOffset() + this.in.position(),
+                            this.in.remaining());
+                    this.in.position(this.in.position() + used);
+                    if (this.chunks.isComplete()) {
+                        return 1;
+                    }
+                    if (this.chunks.overLimit()) {
+                        return 0;
+                    }
+                }
+                if (!hasInput() && fill() < 0) {
+                    if (timer.headExpired()) {
+                        send(out, StaticFileHandler.error(408, false), false);
+                    }
+                    return -1;
+                }
+            }
+        } catch (ParseError e) {
+            send(out, StaticFileHandler.error(e.status(), false), false);
+            return -1;
+        }
     }
 
     private void send(ChannelOutput out, Response response, boolean keepAlive) throws IOException {
