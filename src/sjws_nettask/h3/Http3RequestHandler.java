@@ -29,6 +29,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestRules;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
@@ -79,18 +80,47 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
             }
             this.started = true;
             var stream = (QuicStreamChannel) ctx.channel();
-            start(stream, toRequest(frame.headers()));
+            var headers = frame.headers();
+            for (var name : RequestRules.CONNECTION_SPECIFIC) {
+                if (headers.contains(name)) { // malformed (RFC 9114 §4.2): stream error, no response
+                    this.shared.count(Http3Writer.Outcome.REJECTED);
+                    stream.shutdown(Http3ErrorCode.H3_MESSAGE_ERROR.code());
+                    return;
+                }
+            }
+            var request = toRequest(headers);
+            start(stream, request, refusal(headers, request));
         } finally {
             ReferenceCountUtil.release(frame);
         }
     }
 
-    private void start(QuicStreamChannel stream, Request request) {
+    /**
+     * The same request-line rules as HTTP/1.1 (unknown method 501, raw space/CTL/non-ASCII in the
+     * target 400, too long 414), plus 431 for an oversized field section. The codec's own limit is
+     * set higher ({@link Http3Server#CODEC_MAX_FIELD_SECTION}), so these are answered on the stream
+     * instead of closing the whole connection.
+     *
+     * @return the error response to send, or null to run the handler
+     */
+    static Response refusal(Http3Headers headers, Request request) {
+        long size = 0;
+        for (var e : headers) {
+            size += e.getKey().length() + e.getValue().length() + 32; // RFC 9114 §4.2.2
+        }
+        if (size > Http3Server.MAX_FIELD_SECTION) {
+            return StaticFileHandler.error(431, request.headOnly());
+        }
+        int status = RequestRules.check(request.method(), request.target());
+        return status == 0 ? null : StaticFileHandler.error(status, request.headOnly());
+    }
+
+    private void start(QuicStreamChannel stream, Request request, Response refusal) {
         if (!this.connection.admit(stream.streamId()) || !this.shared.inflight().tryAcquire()) {
             reject(stream);
             return;
         }
-        var task = new Task(stream, request);
+        var task = new Task(stream, request, refusal);
         try {
             task.future = this.shared.executor().submit(task);
         } catch (RejectedExecutionException e) { // shutting down
@@ -124,12 +154,14 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
 
         private final QuicStreamChannel stream;
         private final Request request;
+        private final Response refusal;
         private final AtomicBoolean finished = new AtomicBoolean();
         volatile Future<?> future;
 
-        Task(QuicStreamChannel stream, Request request) {
+        Task(QuicStreamChannel stream, Request request, Response refusal) {
             this.stream = stream;
             this.request = request;
+            this.refusal = refusal;
         }
 
         @Override
@@ -140,7 +172,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                     outcome = Http3Writer.Outcome.CLOSED;
                     return;
                 }
-                var response = respond(this.request);
+                var response = this.refusal != null ? this.refusal : respond(this.request);
                 outcome = new Http3Writer(this.stream, Http3RequestHandler.this.shared.limits(),
                         Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connection.files)
                         .write(response);

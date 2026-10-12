@@ -130,6 +130,13 @@ final class H3Fixture {
         }
     }
 
+    /** The body HTTP/1.1 sends for {@code response}. */
+    static byte[] http1Body(sjws_nettask.core.Response response) throws IOException {
+        var out = new ByteArrayOutputStream();
+        Http1Writer.write(out, response, true);
+        return HttpTestSupport.readResponse(new ByteArrayInputStream(out.toByteArray()), false).body();
+    }
+
     static String text(H3TestClient.H3Response r) {
         return new String(r.body(), StandardCharsets.UTF_8);
     }
