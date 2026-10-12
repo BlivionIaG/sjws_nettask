@@ -24,18 +24,17 @@ import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 
 /**
- * Transport hook for access logging, in-process metrics and the optional {@code /healthz} and
- * {@code /metrics} responses.
+ * Access logging, in-process metrics and the optional {@code /healthz} and {@code /metrics} responses.
  * <p>
- * There is no handler chain to decorate yet ({@link sjws_nettask.core.Handler} is only the seam).
- * Each transport reads an {@link ObserverSlot}. When that read is {@link #NONE} the transport does
- * not call {@link System#nanoTime()}, does not update a counter, and does not inspect the path.
- * Otherwise it calls {@link #intercept} before the application handler (only when {@link #intercepts()}
- * is true) and {@link #complete} after the response bytes have been written. A future chain can make
- * those two calls from one decorator; nothing else in this package has to move.
+ * {@link ObserveRequestFilter} is the only caller on the request path. The server registers that
+ * filter at order 0 when observability is on, and again if {@link sjws_nettask.SjwsServer#metricsSnapshot()}
+ * arms a server that started with {@link #NONE}. Transports do not call {@link #intercept} or
+ * {@link #complete}. While the filter is not installed there is no {@link System#nanoTime()}, no
+ * counter update and no path check.
  * <p>
  * With access logging off, {@link #complete(int, int, long, long)} only touches striped counters.
  * Logging adds one line-{@code byte[]} and a lock-free enqueue. Neither path waits on I/O.
+ * Duration is the time until the handler returns, which is before the transport writes the body.
  */
 public final class RequestObserver implements AutoCloseable {
 
@@ -48,9 +47,9 @@ public final class RequestObserver implements AutoCloseable {
     public static final String[] PROTOCOL_NAMES = {"HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3", "other"};
 
     /**
-     * Observability off. Transports compare with {@code ==} and skip the hook: no clock read, no
-     * counter update, no {@code /healthz} or {@code /metrics} path check. A document-root file at
-     * those paths is served as on a build without this package.
+     * Observability off. The filter is not installed, so a request does not read the clock, does not
+     * update a counter, and does not check {@code /healthz} or {@code /metrics}. A document-root file
+     * at those paths is served as on a build without this package.
      */
     public static final RequestObserver NONE = new RequestObserver(new ServerMetrics(), null, MetricsExposure.OFF, false,
             false);
@@ -111,7 +110,7 @@ public final class RequestObserver implements AutoCloseable {
     /**
      * @return true when {@link #intercept} might replace the handler. False for {@link #NONE} and for
      *         a recording observer whose {@code /healthz} and {@code /metrics} are both off, so the
-     *         transport can skip the path check.
+     *         filter can skip the path check.
      */
     public boolean intercepts() {
         return this.healthz || this.exposure != MetricsExposure.OFF;

@@ -73,6 +73,14 @@ public interface Transport extends AutoCloseable {
     }
 
     /**
+     * Replaces the request handler after {@link #start()} so a late metrics arm is counted.
+     * The default ignores it. HTTP/2 and HTTP/3 install the chain. No effect when the observe filter
+     * was already compiled into the startup chain.
+     */
+    default void armHandler(Handler handler) {
+    }
+
+    /**
      * Creates (but does not start) a transport.
      * <p>
      * {@link #create(ServerConfig, StaticFileHandler)} is the single abstract method so existing

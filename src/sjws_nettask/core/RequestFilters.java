@@ -105,6 +105,23 @@ public final class RequestFilters {
         return this;
     }
 
+    /**
+     * Copies {@code other}'s factories and entries after whatever is already registered here.
+     * Order values are kept. New sequence numbers follow this registry, so a filter added here
+     * first stays further out when the order is equal.
+     */
+    public RequestFilters include(RequestFilters other) {
+        Objects.requireNonNull(other, "filters");
+        for (var factory : other.factories.entrySet()) {
+            this.factories.putIfAbsent(factory.getKey(), factory.getValue());
+        }
+        for (var entry : other.entries) {
+            int seq = this.sequence++;
+            this.entries.add(new Entry(entry.order, seq, entry.name, entry.route, entry.filter, entry.spec));
+        }
+        return this;
+    }
+
     /** The whole {@code middleware} list. Null or empty adds nothing. */
     public RequestFilters addAll(List<MiddlewareSpec> specs) {
         if (specs != null) {
