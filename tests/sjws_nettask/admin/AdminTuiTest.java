@@ -38,6 +38,8 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.observe.ClusterBoard;
+import sjws_nettask.observe.ClusterStatus;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.SjwsServer;
 
@@ -196,8 +198,10 @@ class AdminTuiTest {
         final List<String> calls = new ArrayList<>();
         boolean controllable = true;
         ControlException failure;
+        ClusterStatus cluster;
 
         @Override public ServerStatus status() { return this.status; }
+        @Override public ClusterStatus clusterStatus() { return this.cluster; }
         @Override public void start() throws ControlException { call("start"); }
         @Override public void stop() throws ControlException { call("stop"); }
         @Override public void reload() throws ControlException { call("reload"); }
@@ -282,6 +286,38 @@ class AdminTuiTest {
         assertTrue(screen.contains("started"));
         assertTrue(screen.contains("V STATUS"));
         assertTrue(screen.endsWith("> "));
+        assertFalse(screen.contains("Cluster desired"));
+    }
+
+    @Test
+    void renderClusterSection() {
+        var control = new FakeControl();
+        control.cluster = new ClusterStatus(7, 1500.0, 2_000_000L, 200, 4, 1, new ClusterStatus.Node[] {
+                new ClusterStatus.Node("a", true, true, false, 7, false, 100, 1, 1000.0, 0),
+                new ClusterStatus.Node("b", false, false, true, 6, true, 5, 3, 0, Long.MAX_VALUE) },
+                new ClusterStatus.Series[] { new ClusterStatus.Series("/api", 10, 2, 1_000_000L) },
+                new ClusterStatus.Series[] { new ClusterStatus.Series("key-id", 10, 2, 1_000_000L) });
+        var screen = new AdminTui(control, new LogBuffer(5), null, false).render();
+        assertTrue(screen.contains("Cluster desired 7: 1500.0 req/s  p99 0.002 s  errors 4  drifted 1"), screen);
+        assertTrue(screen.contains("node a applied 7  1000.0 req/s  errors 1  p99 -"), screen);
+        assertTrue(screen.contains("node b applied 6 DRIFT down draining not-ready  0.0 req/s  errors 3  p99 +Inf"),
+                screen);
+        assertTrue(screen.contains("route /api  requests 10  errors 2  p99 0.001 s"), screen);
+        assertTrue(screen.contains("api-key key-id  requests 10  errors 2  p99 0.001 s"), screen);
+    }
+
+    @Test
+    void embeddedControlExposesAnAttachedBoard() {
+        try (var control = new EmbeddedServerControl(() -> config(0), SjwsServer::start, new LogBuffer(5),
+                Clock.systemUTC())) {
+            assertNull(control.clusterStatus());
+            var board = new ClusterBoard();
+            board.desiredVersion(3);
+            control.attachCluster(board);
+            assertEquals(3, control.clusterStatus().desiredVersion());
+            control.attachCluster(null);
+            assertNull(control.clusterStatus());
+        }
     }
 
     @Test

@@ -17,8 +17,10 @@
 package sjws_nettask.config;
 
 import java.io.IOException;
-import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.acme.ChallengeBoard;
 import sjws_nettask.tls.TlsMaterial;
@@ -52,29 +54,76 @@ public final class ConfigReloader {
                     : loaded.errors();
             return ReloadResult.rejected(current, errors);
         }
-        var fresh = loaded.document().server();
-        if (!Files.isDirectory(fresh.root())) {
-            return ReloadResult.rejected(current, java.util.List.of("Document root " + fresh.root().toAbsolutePath()
-                    + " does not exist or is not a directory"));
+        return apply(current, loaded.document(), http3Running, board, loaded.warnings(), false);
+    }
+
+    /**
+     * Validates {@code incoming}, clamps bind-time fields, and compiles the next snapshot. Does
+     * not swap it in. A lower non-zero {@link ConfigDocument#bundleVersion()} is rejected. On
+     * failure the returned snapshot is {@code current}.
+     *
+     * @param keepLocalFile when true, the compiled document keeps {@code current}'s config path
+     *        so a pushed bundle does not replace the user's YAML path
+     */
+    public ReloadResult apply(ConfigSnapshot current, ConfigDocument incoming, boolean http3Running,
+            ChallengeBoard board, boolean keepLocalFile) {
+        return apply(current, incoming, http3Running, board, List.of(), keepLocalFile);
+    }
+
+    private ReloadResult apply(ConfigSnapshot current, ConfigDocument incoming, boolean http3Running,
+            ChallengeBoard board, List<String> warnings, boolean keepLocalFile) {
+        var errors = ConfigValidator.validate(incoming);
+        if (!errors.isEmpty()) {
+            return ReloadResult.rejected(current, errors);
+        }
+        long currentVersion = current.document().bundleVersion();
+        if (incoming.bundleVersion() > 0 && currentVersion > incoming.bundleVersion()) {
+            return ReloadResult.rejected(current, List.of("bundle version " + incoming.bundleVersion()
+                    + " is older than " + currentVersion));
+        }
+        if (!incoming.canonicalHash().isEmpty()
+                && incoming.canonicalHash().equals(current.document().canonicalHash())
+                && Objects.equals(incoming.server().tlsKeyPassword(), current.document().server().tlsKeyPassword())) {
+            return new ReloadResult(true, current.generation(), warnings, List.of(), List.of(), current, null);
         }
         var restart = new ArrayList<String>();
-        var clamped = clamp(current.document().server(), fresh, http3Running, restart);
+        var clamped = clamp(current.document().server(), incoming.server(), http3Running, restart);
+        var node = incoming.node();
+        if (current.document().node().mode() != node.mode()) {
+            node = new NodeSettings(current.document().node().mode(), node.labels());
+            restart.add("node.mode changed to " + incoming.node().mode().wire() + "; still "
+                    + current.document().node().mode().wire() + " until restart");
+        }
         TlsMaterial tls = null;
         if (clamped.tlsCert() != null) {
             try {
                 tls = TlsMaterial.fromPem(clamped.tlsCert(), clamped.tlsKey(), clamped.tlsKeyPassword());
             } catch (IOException e) {
-                return ReloadResult.rejected(current, java.util.List.of("tls: " + e.getMessage()));
+                return ReloadResult.rejected(current, List.of("tls: " + e.getMessage()));
             }
         } else if (current.document().server().tlsCert() != null) {
             restart.add("removing tls.cert leaves the current certificate in place until restart");
         }
+        Path configFile = keepLocalFile || incoming.configFile() == null
+                ? current.document().configFile()
+                : incoming.configFile();
+        Path stateDir = incoming.stateDir() != null ? incoming.stateDir() : current.document().stateDir();
         try {
-            var next = ConfigSnapshot.compile(loaded.document().withServer(clamped), board, current.generation() + 1);
-            return new ReloadResult(true, next.generation(), loaded.warnings(), java.util.List.of(), restart, next,
-                    tls);
+            boolean unchanged = clamped.equals(incoming.server()) && node.equals(incoming.node())
+                    && incoming.canonicalText() != null;
+            var document = unchanged
+                    ? incoming.withConfigFile(configFile).withStateDir(stateDir)
+                    : ConfigDocument.of(clamped, incoming.acme(), incoming.routing(), incoming.middleware(),
+                            incoming.access(), node, incoming.schemaVersion(), incoming.bundleVersion(), configFile)
+                            .withStateDir(stateDir);
+            if (incoming.signature() != null && document.signature() == null
+                    && document.canonicalHash().equals(incoming.canonicalHash())) {
+                document = document.withSignature(incoming.signature());
+            }
+            var next = ConfigSnapshot.compile(document, board, current.generation() + 1);
+            return new ReloadResult(true, next.generation(), warnings, List.of(), restart, next, tls);
         } catch (RuntimeException e) {
-            return ReloadResult.rejected(current, java.util.List.of(e.getMessage()));
+            return ReloadResult.rejected(current, List.of(e.getMessage()));
         }
     }
 

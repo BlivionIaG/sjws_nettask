@@ -20,9 +20,14 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance (linux/amd64), hot cert swap |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
+| `observe/NodeReporterTest` | control heartbeat: 5 s cadence reuses the report, sequence advances only on a fresh take, cumulative 4xx/5xx, health and config generation suppliers, log2 histogram merge and p99 bucket bound |
+| `observe/ClusterBoardTest` | cluster aggregate: per-node rate from cumulative snapshots, restart zeroes the interval, merged p99, errors by node and route, config drift, label-name cap |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |
+| `core/FilterDocumentTest` | declarative document: JSON round trip, scope, label selectors, rejected wire forms |
+| `core/ChainControlTest` | atomic snapshot swap, stale and invalid documents keep the live chain, in-flight requests finish on the old chain |
+| `ChainControlServerTest` | publishing a document onto a live server leaves the direct file path in place until the first apply |
 | `FilterIntegrationTest` | real HTTP/1.1 server: no chain by default, header/short-circuit filters, client address and raw headers, a replacement terminal handler, 500 then the next request on the same connection |
 | `h3/FilterHttp3Test` | default HTTP/3 factory runs the same chain; a filter failure is a 500 on that stream |
 | `core/PlatformEdgeCaseTest` | case/Unicode/`%2F` behaviour per file system |
@@ -38,6 +43,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/SecurityHeadersTest` | `X-Content-Type-Options: nosniff` on every file and generated page; script-free, frame-free `Content-Security-Policy` on listings, errors and redirects |
 | `core/RenderingTest` | reason phrases for every registered status (empty for unregistered codes), error page titles, HEAD error heads, MIME/charset of the added static-file types |
 | `core/AccessRulesTest` | access rules: glob table (anchored/unanchored, `*`/`?`/`**`, "everything below"), deny list > rules > dotfile default, allow wildcards never expose dotfiles but literals can (`.well-known/acme-challenge`), linear matching with many `**` on deep paths, malformed rules, handler wiring with and without the cache (403/404, normalized and decoded paths, listings filtered, denied index falls back to listing), symlinks to denied/dot paths refused, owner/world-readable policy (re-checked on cache hits, fails closed without POSIX attributes), custom `AccessPolicy` seam. `AccessRulesBench` (not a test) prints the per-request cost |
+| `config/RouteErrorsTest` | per-route `errors: problem` (RFC 9457) and `listing:`: YAML parsing and rejections, no wrapper when off, static 404/403/405 and HEAD as problem+json with the client's path and kept fields, proxy 502/504 converted while an upstream's own 503 body is relayed, 401/403/429/502/503/504 from any inner handler, JSON escaping, `listing: false` 404 sharing the cache |
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
 | `ha/SnapshotHolderTest`, `ha/HealthBoardTest`, `ha/HaLifecycleTest` | atomic snapshot publish, precomputed `/healthz` and `/readyz`, drain (delay, in-flight, `Connection: close`), accept pause |
@@ -84,6 +90,8 @@ Every user-visible behaviour and the test that asserts it.
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and the docs option tables in sync |
 | `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
 | access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed; the observe filter is order 0 and is absent while off | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test`; HTTP/2 recording in `h2/H2ConfigAndWiringTest` |
+| control heartbeat report (cumulative snapshot, 5 s cache, histogram merge by index) | `observe/NodeReporterTest` |
+| cluster requests/s, merged p99, errors by node and route, config drift, shown on the admin status view when a board is attached | `observe/ClusterBoardTest`, `admin/AdminTuiTest` |
 | gateway mode off matches standalone file serving (ephemeral ports, no `cp-` thread, applied version 0) | `clusterharness/ClusterScenariosTest` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |

@@ -123,6 +123,9 @@ public final class AcmeIssuer {
         if (newline >= 0) {
             message = message.substring(0, newline);
         }
+        if (message.contains("PRIVATE KEY") || message.contains("BEGIN CERTIFICATE")) {
+            return error.getClass().getSimpleName();
+        }
         if (message.length() > 300) {
             message = message.substring(0, 300);
         }
