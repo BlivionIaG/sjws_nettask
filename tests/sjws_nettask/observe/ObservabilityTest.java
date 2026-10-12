@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -74,7 +75,7 @@ class ObservabilityTest {
         assertFalse(common.contains("http://ref"), common);
 
         var combined = line(AccessLogFormat.COMBINED, 204, 0, 0, "http://ref", "ua \"x\"\n");
-        assertTrue(combined.contains("\"GET /a?b HTTP/1.1\" 204 - \"http://ref\" \"ua ?x?\" 0\n"), combined);
+        assertTrue(combined.contains("\"GET /a?b HTTP/1.1\" 204 - \"http://ref\" \"ua ?x??\" 0\n"), combined);
 
         var json = line(AccessLogFormat.JSON, 200, 0, 1_500L, "say \"hi\"", "caf\u00e9 \uD83D\uDE00");
         assertTrue(json.contains("\"time\":\"2026-10-12T13:55:36.000Z\""), json);
@@ -374,7 +375,7 @@ class ObservabilityTest {
             assertEquals(400, bad.statusCode());
         }
         var text = Files.readString(log);
-        assertTrue(text.contains("\"GET /index.html HTTP/1.1\" 200 5 \"http://ref\" \"ua ?x\""), text);
+        assertTrue(text.contains("\"GET /index.html HTTP/1.1\" 200 5 \"http://ref\" \"ua ?x?\""), text);
         assertTrue(text.contains("\"GET /healthz HTTP/1.1\" 200 3"), text);
         assertTrue(text.contains("\"GET /metrics HTTP/1.1\" 200"), text);
         assertTrue(text.contains(" 404 "), text);
@@ -414,6 +415,7 @@ class ObservabilityTest {
         var transport = H3Transports.defaultFactory().create(ServerConfig.builder(dir).build(), handler, observer);
         assertInstanceOf(Http3Server.class, transport);
         var http3 = (Http3Server) transport;
+        assertSame(http3, http3.withObserver(null));
         try {
             try {
                 http3.start();
