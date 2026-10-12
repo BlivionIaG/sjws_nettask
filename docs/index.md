@@ -25,6 +25,9 @@ Back to the [README](../README.md) (quick start).
 - [Messaging core (draft)](messaging/design.md)
 - [High availability (draft)](ha/design.md)
 
+## Security
+- [Security audit (2026-10-13)](security/audit.md)
+
 ## Development
 - [Contributing](../CONTRIBUTING.md)
 - [Test suite catalog](development/testing.md)
