@@ -21,6 +21,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static sjws_nettask.h3.H3Fixture.assertParity;
@@ -415,6 +417,23 @@ class Http3ServerTest {
         assertEquals("bytes=1-2", rh.range());
         assertEquals("br", rh.acceptEncoding());
         assertEquals("example.org:443", rh.host());
+        assertEquals(java.util.List.of("\"a\"", "\"b\""), rh.values("if-none-match"));
+        assertEquals(java.util.List.of("ignored"), rh.values("host"));
+        assertFalse(rh.fields().containsKey(":method"));
+        assertFalse(rh.fields().containsKey(":authority"));
+        assertEquals(java.util.List.of("if-none-match", "if-modified-since", "if-range", "range", "accept-encoding",
+                "host"), java.util.List.copyOf(rh.fields().keySet()));
+        assertTrue(request.secure());
+        assertNull(request.peer());
+        var peer = new java.net.InetSocketAddress("127.0.0.1", 443);
+        assertSame(peer, Http3RequestHandler.toRequest(h, peer).peer());
+
+        var onlyPseudo = new io.netty.handler.codec.http3.DefaultHttp3Headers();
+        onlyPseudo.method("GET").path("/").scheme("https");
+        var bare = Http3RequestHandler.toRequest(onlyPseudo);
+        assertTrue(bare.headers().fields().isEmpty());
+        assertNull(bare.headers().host());
+        assertTrue(bare.secure());
 
         var noAuthority = new io.netty.handler.codec.http3.DefaultHttp3Headers();
         noAuthority.add("host", "h.example");
@@ -423,6 +442,8 @@ class Http3ServerTest {
         assertEquals("", r2.target());
         assertEquals("h.example", r2.headers().host());
         assertEquals(null, r2.headers().range());
+        assertEquals(java.util.List.of("h.example"), r2.headers().values("host"));
+        assertTrue(r2.secure());
     }
 
     @Test
