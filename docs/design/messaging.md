@@ -46,15 +46,24 @@ the CRC32C covers the batch. Batches are the unit of write, fsync, replication a
 ### 2.2 Group commit / fsync
 - One dedicated **platform thread** per partition writer (PR #16 T1: blocking file I/O must not pin
   virtual-thread carriers), fed by a bounded queue (65 536 entries, also the backpressure signal), drains pending
-  appends, writes them as one batch and issues one `force(false)` (fdatasync); completion
-  futures are released after the fsync.
+  appends and writes them with one positional write. A **background syncer** thread issues
+  `force(false)` (fdatasync) continuously, off the ack path, and advances `durableOffset`. The ledger
+  therefore records **every** enqueued and undelivered message durably (lagging at most one fsync behind
+  the ack), without fsync latency on the default ack (decision by Blivion, 2026-10-12).
 - The batch closes on `maxBatchBytes` (256 KiB), `maxBatchDelay` (200 µs) or an idle queue, whichever comes first.
   Under load this amortizes fsync across thousands of records; when idle, latency is about one fsync.
   Measured in PR #16 §B2: one fsync ≈ 0.5 ms, so per-record fsync (`each`) caps at ~1.7k rec/s,
   while `group` reaches 48.6k rec/s at p50 1.12 ms / p99 4.95 ms with 64 producers. The linger
   (`maxBatchDelay`) is PR #16's proposed "later option", which addresses the 1-producer case (1.7k rec/s).
-- Durability modes use PR #16's names: `group` (default single node), `each`, `none`
-  (≈489k rec/s, loses data on power failure), and `replicated` (§6).
+- Local durability modes (implemented in PR #21 `messaging.ledger.Durability`), selectable **per topic
+  and per append (producer)**:
+  - `async` (**default**): ack after write(2); background group fsync. PR #21 bench: 288k rec/s, p50 171 µs at 64 producers.
+  - `group` (opt-in): ack after the fsync covering the record. 48.6k rec/s (PR #16) / 57.6k (PR #21) at 64 producers.
+  - `each` (opt-in, compliance): one fsync per batch, ~1.2–1.7k rec/s.
+  - `none`: no fsync on the path at all (tests and caches only).
+- Cluster default: `replicated` = **ack on majority in-memory receipt** (as in PR #16 T3), with each
+  replica fsyncing in the background. **Quorum + fsync (`strict`) is opt-in per topic or per producer**
+  (§6, req. 2). See §2.6 for what each mode can lose.
 
 ### 2.3 In-memory state machine
 Per partition and group: `nextOffset`, `committedOffset`, an in-flight map backed by a deadline
@@ -67,7 +76,8 @@ read back from segments (page cache) via the index.
 3. Truncate the tail at the first bad length or CRC (torn write). In replicated mode,
    reconcile with the group's committed index (§6).
 4. Expired `IN_FLIGHT` messages go back to `ENQUEUED` (at-least-once).
-Invariant: `state(replay(log)) == pre-crash state` for every fsynced prefix. This is
+Invariant: `state(replay(log)) == pre-crash state` for every fsynced prefix (process crashes keep the
+page cache, so after SIGKILL that means every write; PR #21's crash test checks it). This is
 property-tested with a fault-injecting `FileChannel` that kills the process at arbitrary byte offsets.
 
 ### 2.5 Retention, truncation, compaction
@@ -75,6 +85,30 @@ property-tested with a fault-injecting `FileChannel` that kills the process at a
   A segment entirely below it *and* covered by a snapshot is deleted.
 - Background compaction rewrites mostly-acked segments, keeping live records only, and swaps them in via `MANIFEST`.
 - The DLQ is a topic (`<topic>.dlq`) with the original offset, reason and attempts in its headers.
+
+### 2.6 Crash-loss window
+What an **acked** message can lose, by mode. "Unsynced window" W = records written but not yet fsynced
+on a node. With the background syncer, W ≤ the records written during one fsync plus `fsyncInterval`
+(default 0): ≈0.5–1 ms of traffic on the PR #16 VM, plus linger (≤200 µs) when enabled. It is exposed live as
+`LedgerSnapshot.unsyncedRecords()` and in the inspection API (§4).
+
+| Mode | Process crash (SIGKILL/OOM), any number of nodes | Power/kernel loss of a minority | Power/kernel loss of a majority at once |
+|---|---|---|---|
+| single-node `async` (default) | nothing (page cache survives) | n/a | last W on that node |
+| single-node `group` / `each` | nothing | n/a | nothing |
+| cluster `replicated` (default, majority in-memory) | nothing as long as a majority comes back with its page cache, otherwise as the next column | nothing (the survivors have it; laggards re-fetch) | acked entries that were not yet fsynced on any surviving member of the new majority: at most W per node, i.e. ≈ one fsync interval + linger + replication batch delay |
+| cluster `strict` (opt-in, quorum + fsync) | nothing | nothing | nothing (unless a majority of disks is destroyed) |
+
+Notes:
+- Loss needs a correlated failure: a majority losing power (not just the process) inside the same ~1 ms window.
+  Single-rack or single-PDU deployments should use `strict` for critical topics.
+- Loss is always a **suffix**: recovery truncates to the longest durable prefix, so no holes and no
+  reordering. Raft then elects among the survivors and the new leader's log wins. Consumers may have
+  seen a lost message (at-least-once does not protect against that), and the producer's idempotent sequence
+  allows a retry to re-append it.
+- Ledger state records (DELIVER/ACK/DLQ) follow the same mode as the topic. A lost ACK leads to a
+  redelivery (safe under at-least-once). A lost ENQUEUE is the only real loss.
+- Unacked messages are never "lost": the producer never got the ack and retries.
 
 ## 3. Delivery, redelivery, DLQ
 - `poll(group, consumer, max, visibilityTimeout)` writes `DELIVER` records;
@@ -109,10 +143,13 @@ log and the ledger may share segments (log index == ledger position), so each en
 
 ### Requirements for the cluster layer
 1. **Per-partition total order**: one replicated log per group; entries are applied in index order everywhere.
-2. **Ack after quorum commit + fsync**: `append` completes once a majority has fsynced the entry.
-   A configurable **relaxed mode** completes on majority receipt in memory, without a follower fsync (the Kafka/NATS
-   default cited in PR #16 T3 `replicated`). Note: PR #16 leans to relaxed as the default; Blivion's requirement
-   makes quorum+fsync the default, which PR #16's HA open question 4 is to settle.
+2. **Durability modes, per group and per append**: the default (`RELAXED` in PR #29) completes `append` on majority
+   **in-memory** receipt, with followers and the leader fsyncing in the background (as PR #16 T3). `STRICT` completes after a
+   majority has fsynced. It is opt-in per topic (group option) **and per producer, which needs a per-append override**
+   (`append(g, batch, durability)`). The cluster must also expose a per-group **durable index** (highest index fsynced on a
+   majority) so the inspection API can report the crash-loss window (§2.6).
+   *Resolved conflict:* an earlier draft made quorum+fsync the default, which contradicted PR #16. Blivion decided
+   (2026-10-12) on majority in-memory as the default, matching PR #16, with strict as opt-in. This also answers HA open question 4.
 3. **Latency**: single-digit-ms p99 replication on a LAN, with batching and pipelined appends.
 4. **Multiplexing**: per-partition groups share one transport per node pair (shared heartbeats,
    batched cross-group frames), scaling to thousands of groups per node.
@@ -120,7 +157,8 @@ log and the ledger may share segments (log index == ledger position), so each en
    lagging or new replicas; compaction-aware snapshots.
 6. **Assumed API**:
    ```java
-   CompletableFuture<Long> append(GroupId g, List<ByteBuffer> batch); // -> committed index
+   CompletableFuture<Long> append(GroupId g, List<ByteBuffer> batch);             // -> committed index (group default durability)
+   CompletableFuture<Long> append(GroupId g, List<ByteBuffer> batch, Durability d); // per-append override (per producer)
    void onCommitted(GroupId g, CommittedEntryCallback cb);            // in-order apply
    void onLeadership(GroupId g, Consumer<LeadershipEvent> l);         // gained/lost + term
    void snapshotHooks(GroupId g, SnapshotTaker take, SnapshotInstaller install);
@@ -175,10 +213,12 @@ for 256 B payloads with p99 ≤ ~5.5 ms on that VM. NVMe targets are set after m
    The committed offset is then the low watermark of fully acked messages. A separate store would need its own
    durability and replication path. Per-message TTL and priority are deferred; priority would
    use multiple partitions or topics.
-4. **Group fsync as default.** *Recommendation: yes,* `group` is the single-node default, with a
+4. **Group fsync as default.** *Original recommendation: yes,* `group` is the single-node default, with a
    linger of 0 by default and configurable up to ~200 µs. PR #16 §B2 data: 48.6k rec/s at p50 1.1 ms
-   with 64 producers vs 1.7k rec/s for `each`; `none` is unsafe as a default for a "reliable" MOM. In a
-   cluster the default is `replicated` with quorum+fsync (§6, req. 2), with relaxed as opt-in.
+   with 64 producers vs 1.7k rec/s for `each`; `none` is unsafe as a default for a "reliable" MOM.
+   **Superseded by Blivion's decision (2026-10-12):** group fsync still runs on every node, but **in the background**.
+   The default ack is `async` locally and majority in-memory (`replicated`) in a cluster; `group`/`strict` are opt-in per topic or
+   producer. The crash-loss window is documented in §2.6.
 5. **On-disk format = wire format.** *Recommendation: yes,* at batch granularity. Batches are
    stored exactly as produced on the wire (after the leader assigns the base offset and
    validates the CRC32C), which enables sendfile fetch for consumers and followers (PR #16 T1) and one
