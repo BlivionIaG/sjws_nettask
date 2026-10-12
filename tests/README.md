@@ -37,6 +37,9 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `h3/SjwsServerHttp3Test` | full server with real HTTP/3: Alt-Svc, encrypted keys, fallbacks (busy port, missing natives), `main` as a process |
 | `h3/JarLaunchTest` (`@Tag("jar")`) | `java -jar target/sjws_nettask-*.jar --h3` gets HTTP/3 200; runs after `package` |
 | `h3/QuicNativesReportTest` | prints whether the QUIC natives loaded (untagged, always runs) |
+| `MainTest` | entry point: `--help`/`-h` (exit 0), usage errors (64), bad root (2), busy port (1), warnings, startup/shutdown messages |
+| `ClientManagerFaultTest`, `Http1EdgeTest` | accept-loop faults (back-off, reset before registration, setOption failure), EOF/CR/body-drain edge cases, failure log |
+| `http1/LegacyApiTest`, `core/CoreApiTest` | legacy wrappers (HTML/Page/Header/CONSTANTS) and small core APIs (ResponseHeaders, Mime, Response, FileCache bounds) |
 
 Tags: `h3` = needs QUIC; those classes also skip themselves (JUnit assumption) when
 `Http3Server.isAvailable()` is false, and `QuicNativesReportTest` prints a `WARNING` line saying so.
@@ -47,3 +50,35 @@ Tests named `BUG_*` were written against the original code and failed there.
 New regressions can be added as `@Tag("bug")` tests first (`mvn test -DexcludedGroups=bug`
 runs the rest), then untagged once fixed. The permission-based 403 tests are
 skipped when run as root.
+
+## Behaviour audit
+
+Every user-visible behaviour and the test that asserts it.
+
+| Behaviour | Asserted by |
+|---|---|
+| every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
+| `--help` / `-h` text, exit 0 | `MainTest` |
+| exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
+| `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |
+| `Server started: ...`, `HTTP/3 unavailable` fallback, `Server Terminated properly !` | `MainTest`, `SjwsServerTest`, `h3/SjwsServerHttp3Test` |
+| statuses 200 206 304 301 400 403 404 405 408 413 414 416 431 500 501 505 | `Http1GoldenTest`, `http1/Http1ParserTest`, `http1/FileServingTest`, `core/StaticFileHandlerRangeTest`, `Http1TransportTest`, `h3/Http3ServerTest` |
+| headers Date, Server, Content-Type/charset, Content-Length, Last-Modified, ETag, Accept-Ranges, Content-Range, Location, Connection, Alt-Svc, Allow | `Http1GoldenTest`, `core/ETagTest`, `AltSvcTest`, `h3/Http3ServerTest` |
+| HTTP/1.1 keep-alive, pipelining, timeouts, limits | `ServerIntegrationTest`, `HardeningIntegrationTest`, `Http1TransportTest` |
+| HTTP/3 parity, limits, Alt-Svc, launch from the jar | `h3/*` |
+
+## Not covered on purpose
+
+Lines JaCoCo reports as missed that no behaviour test can reach (or only by faking the JDK):
+
+- `Sjws_nettask.main`: runs only in the child JVM of `JarLaunchTest` (all its logic is in the tested `run`).
+- `Sjws_nettask`: the hook-removal `IllegalStateException` (JVM already shutting down) and the start `IOException` when the root vanishes between check and bind.
+- `ConnectionReaper`: the sweep's `RuntimeException` guard, a spurious interrupt, `close()` failing on a socket.
+- `Http1Connection`: non-routine failure while interrupted; `getRemoteAddress` failing on a closed socket.
+- `ClientManager` / `Transport`: the default no-op `stopAccepting`.
+- `PerIpLimit`, `SelfSignedDer`: `UnknownHostException` on a byte-array address (impossible for 4/16 bytes).
+- `TlsMaterial`: `GeneralSecurityException`/`IOException` wrappers around JDK providers that always exist (EC, PKCS#12 in memory).
+- `Http3Writer`: `catch (Error)`; `Http3Server`/`Http3RequestHandler`: interrupts and `RejectedExecutionException` during shutdown, connection-closed races.
+- `FileCache`: the non-UNIX stat path (Linux CI), `ExecutionException` (the leader never completes exceptionally), the CLOCK `e == null` branch, concurrent-load races (`old != null`).
+- `SafeOpen`: non-`SecureDirectoryStream` and non-`FileChannel` providers, I/O errors after a successful open.
+- `StaticFileHandler`: the `UncheckedIOException` unwrap from a directory stream failing mid-iteration.
