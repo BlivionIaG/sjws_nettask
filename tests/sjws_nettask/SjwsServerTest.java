@@ -71,7 +71,7 @@ class SjwsServerTest {
     }
 
     private ServerConfig config(boolean h3) {
-        return ServerConfig.builder(root).port(0).h3Enabled(h3).h3Port(0).altSvcMaxAge(Duration.ofSeconds(86400)).build();
+        return ServerConfig.builder(root).port(0).h3Enabled(h3).h3Port(0).altSvc(true).altSvcMaxAge(Duration.ofSeconds(86400)).build();
     }
 
     private Response get(String path) throws IOException {
@@ -155,9 +155,18 @@ class SjwsServerTest {
         }
         assertNull(server.h3Failure());
         assertTrue(server.udpPort() > 0);
-        assertEquals("h3=\":" + server.udpPort() + "\"; ma=86400", get("/hello.txt").headers().get("alt-svc"));
+        assertNull(get("/hello.txt").headers().get("alt-svc"), "Alt-Svc is opt-in (--alt-svc)");
         assertTrue(server.describe().contains("HTTP/3 on udp/" + server.udpPort() + " (self-signed)"),
                 server.describe());
+    }
+
+    @Test
+    void altSvcIsOptIn() throws IOException {
+        var fake = new FakeTransport(4433, null);
+        server = SjwsServer.start(config(true).toBuilder().altSvc(false).build(), (c, h) -> fake);
+        assertEquals(4433, server.udpPort(), "HTTP/3 runs");
+        assertNull(server.altSvc().current());
+        assertNull(get("/hello.txt").headers().get("alt-svc"));
     }
 
     @Test

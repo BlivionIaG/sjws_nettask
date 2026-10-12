@@ -101,7 +101,7 @@ class SjwsServerHttp3Test {
 
     ServerConfig.Builder config() {
         return ServerConfig.builder(this.root).port(0).h3Enabled(true).h3Port(0).h3Host("127.0.0.1")
-                .tlsCert(this.cert).tlsKey(this.key).altSvcMaxAge(Duration.ofSeconds(3600));
+                .tlsCert(this.cert).tlsKey(this.key).altSvc(true).altSvcMaxAge(Duration.ofSeconds(3600));
     }
 
     @Test
@@ -254,7 +254,7 @@ class SjwsServerHttp3Test {
         var cmd = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-cp", System.getProperty("java.class.path"), "sjws_nettask.Sjws_nettask", String.valueOf(port),
                 this.root.toString(), "--h3", "--h3-host=127.0.0.1", "--cert=" + this.cert, "--key=" + this.key,
-                "--alt-svc-max-age=120"));
+                "--alt-svc", "--alt-svc-max-age=120"));
         var pb = new ProcessBuilder(cmd).redirectErrorStream(true);
         pb.environment().keySet().removeIf(k -> k.startsWith("WEB_SERVER_"));
         var p = pb.start();
@@ -276,6 +276,7 @@ class SjwsServerHttp3Test {
                 }
             }
             assertEquals(port, udp, "HTTP/3 defaults to the TCP port number:\n" + log);
+            assertTrue(log.toString().contains("browsers ignore Alt-Svc from http:// origins"), log.toString());
             var h1 = HttpTestSupport.get(port, "/hello.txt", 4000);
             assertEquals("h3=\":" + udp + "\"; ma=120", h1.headers().get("alt-svc"));
             try (var client = new H3TestClient(this.tls.certificate())) {

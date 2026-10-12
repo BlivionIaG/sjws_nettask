@@ -117,10 +117,11 @@ class ServerConfigTest {
     @Test
     void h3FlagsFromCommandLine() {
         var p = parse(Map.of(), "--h3", "--h3-port=0", "--h3-host=127.0.0.1", "--h3-max-connections=5",
-                "--cert=/c.pem", "--key=/k.pem", "--alt-svc-max-age=60");
+                "--cert=/c.pem", "--key=/k.pem", "--alt-svc", "--alt-svc-max-age=60");
         var c = p.config();
         assertTrue(p.ok(), p.errors().toString());
-        assertTrue(p.warnings().isEmpty(), p.warnings().toString());
+        assertEquals(1, p.warnings().size(), "only the plaintext Alt-Svc warning: " + p.warnings());
+        assertTrue(c.altSvc());
         assertTrue(c.h3Enabled());
         assertEquals(0, c.h3Port());
         assertEquals("127.0.0.1", c.h3Host());
@@ -174,7 +175,7 @@ class ServerConfigTest {
         assertEquals(ServerConfig.DEFAULT_H3_HOST, c.h3Host());
         assertEquals(ServerConfig.DEFAULT_ALT_SVC_MAX_AGE, c.altSvcMaxAge());
         assertNull(c.tlsCert());
-        assertEquals(5, p.warnings().size(), p.warnings().toString());
+        assertEquals(6, p.warnings().size(), p.warnings().toString()); // + "--alt-svc-max-age has no effect"
         assertTrue(p.warnings().stream().anyMatch(w -> w.contains("Missing value for --cert")));
     }
 
@@ -255,11 +256,54 @@ class ServerConfigTest {
         var usage = ServerConfig.usage();
         for (var flag : java.util.List.of("--max-connections", "--idle-timeout", "--header-timeout", "--h3 ",
                 "--no-h3", "--h3-port", "--h3-host", "--h3-max-connections", "--cert", "--key=",
-                "--key-password-file", "--alt-svc-max-age", "WEB_SERVER_TLS_KEY_PASSWORD", "--help")) {
+                "--key-password-file", "--alt-svc-max-age", "WEB_SERVER_TLS_KEY_PASSWORD", "--help", "--alt-svc ",
+                "--no-alt-svc", "WEB_SERVER_ALT_SVC=", "--write-timeout", "WEB_SERVER_WRITE_TIMEOUT")) {
             assertTrue(usage.contains(flag), "usage lacks " + flag);
         }
         for (var dropped : java.util.List.of("--max-pipelined", "--small-file-max", "--revalidate-ms")) {
             assertFalse(usage.contains(dropped), dropped + " was trimmed by the design review");
         }
+    }
+
+    @Test
+    void altSvcIsOptInWithAPlaintextWarning() {
+        var off = parse(Map.of(), "--h3");
+        assertFalse(off.config().altSvc(), "off by default");
+        assertTrue(off.warnings().isEmpty(), off.warnings().toString());
+        var on = parse(Map.of(), "--h3", "--alt-svc");
+        assertTrue(on.config().altSvc());
+        assertEquals(1, on.warnings().size());
+        assertTrue(on.warnings().get(0).contains("browsers ignore Alt-Svc from http:// origins"));
+        assertTrue(on.warnings().get(0).contains("curl --http3-only"));
+        assertTrue(parse(Map.of("WEB_SERVER_ALT_SVC", "true"), "--h3").config().altSvc());
+        assertFalse(parse(Map.of("WEB_SERVER_ALT_SVC", "false"), "--h3", "--alt-svc").config().altSvc(), "env wins");
+        assertFalse(parse(Map.of(), "--h3", "--alt-svc", "--no-alt-svc").config().altSvc());
+        var noH3 = parse(Map.of(), "--alt-svc");
+        assertTrue(noH3.warnings().stream().anyMatch(w -> w.contains("--alt-svc") && w.contains("add --h3")),
+                noH3.warnings().toString());
+        var maOnly = parse(Map.of(), "--h3", "--alt-svc-max-age=5");
+        assertTrue(maOnly.warnings().contains("--alt-svc-max-age has no effect without --alt-svc"),
+                maOnly.warnings().toString());
+        var bad = parse(Map.of(), "--h3", "--alt-svc=maybe");
+        assertFalse(bad.config().altSvc(), "an invalid value keeps the default");
+    }
+
+    @Test
+    void writeTimeoutFlagAndEnvironment() {
+        assertEquals(ServerConfig.DEFAULT_WRITE_TIMEOUT, parse(Map.of()).config().writeTimeout());
+        assertEquals(Duration.ofSeconds(5), parse(Map.of(), "--write-timeout=5").config().writeTimeout());
+        assertEquals(Duration.ofSeconds(7),
+                parse(Map.of("WEB_SERVER_WRITE_TIMEOUT", "7"), "--write-timeout=5").config().writeTimeout());
+        var bad = parse(Map.of(), "--write-timeout=0");
+        assertEquals(ServerConfig.DEFAULT_WRITE_TIMEOUT, bad.config().writeTimeout());
+        assertEquals(1, bad.warnings().size());
+    }
+
+    @Test
+    void invalidBooleanKeepsTheDefault() { // code review N-1: --h3=maybe used to enable HTTP/3
+        var p = parse(Map.of(), "--h3=maybe");
+        assertFalse(p.config().h3Enabled());
+        assertTrue(p.warnings().get(0).contains("--h3"), p.warnings().toString());
+        assertTrue(parse(Map.of(), "--h3", "--h3=maybe").config().h3Enabled(), "keeps the previous value");
     }
 }
