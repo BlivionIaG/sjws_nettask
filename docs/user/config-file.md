@@ -15,6 +15,16 @@ java -jar sjws_nettask.jar --config=sjws.yaml
 
 Defaults, then the file, then arguments, then environment variables.
 
+```mermaid
+flowchart TB
+    d["Built-in defaults"] -->|"overridden by"| f["YAML file<br/>--config, or WEB_SERVER_CONFIG"]
+    f -->|"overridden by"| a["Command-line arguments"]
+    a -->|"overridden by"| e["Environment variables<br/>WEB_SERVER_*"]
+    e --> doc["ConfigDocument, validated"]
+    doc --> snap["ConfigSnapshot<br/>immutable, one<br/>prebuilt handler"]
+    snap --> live["LiveConfig<br/>one AtomicReference,<br/>read once per request"]
+```
+
 The file is strict: an unknown key or a bad value is an error and the process exits
 64. The existing server flags stay lenient (a bad number warns and falls back).
 There is no `--key-password` and no `key_password` key; a password lives in
@@ -148,6 +158,28 @@ stream limits are fixed at start.
 
 No config file means reload reports `no config file` and changes nothing.
 
+`reload()` re-reads the file with the original arguments and environment; `applyRemote` takes a
+document that a control plane pushed instead. *Valid* means it parses, `ConfigValidator` accepts it
+(schema version, document root is a directory, certificate and key files, no `tls.cert` together with
+ACME, node labels), the certificate loads, and a new HTTP-01 port can be opened. A pushed document is
+also refused when its non-zero `version` is lower than the running one:
+
+```mermaid
+flowchart TD
+    a["ReloadHook.run() or<br/>SjwsServer.reload()<br/>re-read the config file"] --> has{"Started with a<br/>config file?"}
+    has -->|no| rej0["Rejected: no config<br/>file, nothing changes"]
+    has -->|yes| val
+    b["SjwsServer.applyRemote<br/>a document pushed by<br/>a control plane"] --> val{"Valid, and not an<br/>older bundle version?"}
+    val -->|no| keep["Rejected: the<br/>previous snapshot<br/>stays"]
+    val -->|yes| cp["Bind-time settings and node.mode keep<br/>their old value, reported as needsRestart<br/>Compile the next ConfigSnapshot:<br/>generation + 1, fresh router<br/>and upstream pools"]
+    cp --> sw["Publish it with one<br/>AtomicReference write<br/>the next request reads it"]
+    sw --> se["Apply the side effects:<br/>HTTP/1 timeouts, when HTTP/3<br/>is not running<br/>the HTTP/3 handler and certificate<br/>the HTTP-01 listener<br/>the ACME schedule"]
+    se --> lg["Write the last-good copy<br/>next to the config file"]
+```
+
+HTTP/2 takes its handler when it starts and is not swapped here; see
+[Handler composition](../design/architecture.md#handler-composition).
+
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
 the JDK does not expose `sun.misc.Signal`, and when this process already ignores
 `SIGHUP`. An ignored `SIGHUP` stays ignored: the VM does not install a Java
@@ -204,6 +236,35 @@ already on disk is published immediately when it is still valid. Renewal is
 scheduled for `notAfter - renew_before`. A delay under one minute after a
 successful issue is stretched to one hour. Failures back off from 30 seconds,
 doubling up to 15 minutes.
+
+```mermaid
+sequenceDiagram
+    participant R as acme-renew thread
+    participant CA as ACME CA
+    participant B as ChallengeBoard
+    participant H3 as Http3Server
+
+    Note over R: starts once this node is leader-ready:<br/>a standalone node at once, a control node<br/>after leaderReady, a data node never
+    Note over R: load the stored certificate
+    alt valid, outside the renewal window
+        R->>H3: replaceTls(stored)
+        Note over R: sleep until notAfter minus renew_before
+    else missing, expired or inside the window
+        R->>CA: place an order
+        CA-->>R: HTTP-01 challenge
+        R->>B: put(token, authorization)
+        R->>CA: trigger the challenge
+        CA->>B: GET the token
+        Note over CA,B: answered by the main listener,<br/>or by the dedicated http_port listener
+        B-->>CA: key authorization
+        CA-->>R: authorization valid
+        R->>CA: finalize with the domain key
+        CA-->>R: certificate chain
+        Note over R: write it to the store,<br/>remove the token from the board
+        R->>H3: replaceTls(new)
+    end
+    Note over R: A failure is logged and retried after 30 s,<br/>doubling up to 15 min.<br/>Losing leadership stops issuing
+```
 
 The published chain is installed with `Http3Server.replaceTls`. BoringSSL asks
 the key manager on every handshake, so new connections use the new certificate

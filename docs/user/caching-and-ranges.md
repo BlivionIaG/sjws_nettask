@@ -1,5 +1,43 @@
 # Caching, validators and ranges
 
+How a request for a file is answered. First the small-file cache, which decides where the bytes come
+from. The path is already decoded, normalized and checked against the access rules:
+
+```mermaid
+flowchart TD
+    k{"Entry in the cache?"} -->|yes| v{"Entry still valid?"}
+    k -->|no| r
+    v -->|yes| hit["Answer from memory<br/>conditionals and ranges<br/>apply to the cached bytes"]
+    v -->|no| r["Resolve from scratch,<br/>dropping a stale entry<br/>containment, no-follow<br/>open, access rules on<br/>the real path"]
+    r --> f{"Cacheable?"}
+    f -->|yes| l["Read the file once<br/>into the cache<br/>concurrent misses of one<br/>file share that read"]
+    f -->|no| s["Serve from disk, not cached<br/>sendfile above 64 KiB"]
+```
+
+*Still valid* means a `stat` shows the same inode, mtime in ns, size and ctime, and (unless
+`--allow-unlistable-dirs` is set) every directory down to the file is still readable. *Cacheable* means a GET that will send the body (not HEAD, not a
+304), for a file of 256 KiB or less, with room in the cache budget.
+
+Then the validators and the byte range decide the status, for a cached and an uncached file alike.
+`If-None-Match` takes lists and `*` and uses weak comparison; an `If-Range` validator must match strongly:
+
+```mermaid
+flowchart TD
+    inm{"If-None-Match<br/>present?"} -->|yes| m{"Matches the ETag?"}
+    inm -->|no| ims{"If-Modified-Since,<br/>not modified since?"}
+    m -->|yes| n304["304 Not Modified"]
+    m -->|no| g
+    ims -->|yes| n304
+    ims -->|no| g{"GET with a Range?"}
+    g -->|no| ok["200, whole file"]
+    g -->|yes| ir{"If-Range present and<br/>not a strong match?"}
+    ir -->|yes| ok
+    ir -->|no| p{"The Range value"}
+    p -->|"one range<br/>in the file"| r206["206"]
+    p -->|"starts past the end,<br/>or -0"| r416["416"]
+    p -->|"several, other units,<br/>malformed"| ok
+```
+
 * **Small-file cache.** Files up to 256 KiB are kept in memory (both protocols), up to
   `--cache-bytes` in total (body + key + ~256 bytes per entry) and 4096 entries; eviction is CLOCK
   (second chance: an approximation of least recently used, O(1) amortized, hits take no lock). The key is the decoded, normalized path without the query, so `?v=1`, `%68ello`, `./`

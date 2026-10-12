@@ -23,6 +23,22 @@ transports behind `core.Handler`; it gets its own doc), the admin TUI itself, an
   `IN_FLIGHT → ENQUEUED` on nack/visibility timeout (attempts+1) and
   `→ DEAD_LETTERED` once `attempts > maxDeliveries` or on an explicit reject.
 
+```mermaid
+stateDiagram-v2
+    [*] --> ENQUEUED: produce
+    ENQUEUED --> IN_FLIGHT: poll leases it to a consumer
+    IN_FLIGHT --> ACKED: ack
+    IN_FLIGHT --> ENQUEUED: nack, or the lease expires
+    IN_FLIGHT --> DEAD_LETTERED: reject, or nack or expiry after maxAttempts deliveries
+    ACKED --> [*]
+    DEAD_LETTERED --> [*]
+
+    note right of ENQUEUED: redelivered after its backoff, attempt + 1
+    note right of DEAD_LETTERED: copied to the topic.dlq partition first
+```
+
+This is what `messaging.delivery.Partition` implements today.
+
 ## 2. Durable ledger
 Every non-acked message and each of its state transitions is durable before it is
 acknowledged to the caller.
@@ -64,6 +80,27 @@ the CRC32C covers the batch. Batches are the unit of write, fsync, replication a
 - Cluster default: `replicated` = **ack on majority in-memory receipt** (as in PR #16 T3), with each
   replica fsyncing in the background. **Quorum + fsync (`strict`) is opt-in per topic or per producer**
   (§6, req. 2). See §2.6 for what each mode can lose.
+
+The local write path, as `messaging.ledger.LedgerWriter` implements it:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant W as ledger-writer<br/>thread
+    participant L as SegmentedLog
+    participant S as ledger-syncer<br/>thread
+
+    P->>W: append(batch)
+    Note over P,W: queued on a bounded queue of 65,536 entries,<br/>the producer blocks while it is full
+    W->>L: write the drained group
+    alt NONE or ASYNC, the default
+        W-->>P: ack after the write
+    else GROUP or EACH
+        W-->>P: ack once an fsync covers it
+    end
+    S->>L: force(false)
+    Note left of S: ASYNC and per-append GROUP only,<br/>off the ack path. Then durableOffset<br/>advances and a LedgerSnapshot<br/>is published
+```
 
 ### 2.3 In-memory state machine
 Per partition and group: `nextOffset`, `committedOffset`, an in-flight map backed by a deadline
@@ -132,6 +169,37 @@ rights decorator; metrics go to the observability `MetricsSink`.
 `sjws_nettask.messaging`: `Broker`, `Partition`, `Ledger`, `Segment`, `SegmentIndex`,
 `GroupCommitWriter`, `LedgerStateMachine`, `Snapshotter`, `RedeliveryTimer`, `Inspector`,
 `ReplicatedLedger` (cluster adapter; a `LocalOnly` implementation until the cluster layer lands).
+
+The list above is the original plan. Some names changed when the code was written. This is what exists
+(solid) and what the rest of the design still needs (dashed); nothing outside `sjws_nettask.messaging`
+uses the package yet:
+
+```mermaid
+flowchart TB
+    bind["HTTP bindings and<br/>native binary protocol"]
+    adm["Admin endpoint<br/>for the inspector"]
+    br["Broker<br/>topics, partitions,<br/>consumer groups"]
+    insp["delivery.LedgerInspector<br/>counts and paged listings"]
+    part["delivery.Partition<br/>produce, subscribe, poll,<br/>ack, nack, reject"]
+    ds["delivery.DeliveryState<br/>cursor, leases, retries,<br/>dead letters, de-duplication"]
+    dlq["Partition for topic.dlq<br/>dead-lettered copies"]
+    lw["ledger.LedgerWriter<br/>writer thread, bounded queue,<br/>group commit, syncer"]
+    sl["ledger.SegmentedLog<br/>segments, CRC batches,<br/>torn-tail recovery"]
+    rep["Replication through<br/>the cluster layer"]
+
+    bind -.-> br
+    br -.-> part
+    adm -.-> insp
+    insp --> part
+    part --> ds
+    part --> lw
+    part --> dlq
+    lw --> sl
+    rep -.-> lw
+
+    classDef design stroke-dasharray: 5 5
+    class bind,adm,br,rep design
+```
 
 ## 6. Replication via the cluster layer
 One replication group per partition. PR #16 T4 proposes Raft for metadata plus Kafka-style

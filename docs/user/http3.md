@@ -35,6 +35,24 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   Browsers find HTTP/3 only through `Alt-Svc` received **over HTTPS** from a certificate they trust;
   they ignore `Alt-Svc` on `http://` origins. Browser upgrade therefore needs a real HTTPS (TLS over
   TCP) listener plus a trusted certificate, which this server does not have yet.
+* **How a client finds HTTP/3.** Directly, when it knows the UDP port. Through `Alt-Svc`, only if it
+  received the header over HTTPS, which this server's plain HTTP/1.1 TCP listener does not offer:
+
+  ```mermaid
+  sequenceDiagram
+      participant C as Client
+      participant T as TCP listener<br/>plain HTTP/1.1
+      participant Q as UDP listener<br/>HTTP/3
+
+      Note over T,Q: With --h3 --alt-svc the UDP socket binds first,<br/>then Alt-Svc is advertised
+      C->>T: GET / over http://
+      T-->>C: 200 with Alt-Svc
+      Note over C,T: h3 on the UDP port, ma=86400.<br/>Browsers ignore Alt-Svc received over http://
+      C->>Q: QUIC handshake, HTTP/3
+      Q-->>C: the same files as HTTP/1.1
+      Note over C,Q: Direct access, for example:<br/>curl --http3-only -k https://host:udp-port/
+  ```
+
 * **`Alt-Svc` is opt-in** (`--alt-svc`), and starting with it prints a warning saying the above. When
   enabled, and only once the UDP listener has actually bound, every HTTP/1.1 response (including
   errors and `HEAD`) carries `Alt-Svc: h3=":<real udp port>"; ma=<max-age>`; it is withdrawn on
@@ -55,6 +73,20 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   Retry is used, so the RFC 9000 anti-amplification limit applies until the handshake validates the
   address; a flood of spoofed Initial packets (~50/s) can keep the half-open table full, which delays
   *new* clients (established connections are unaffected).
+
+  The *connection caps* are `--h3-max-connections` and `--h3-max-connections-per-ip`. A request stream is
+  *admitted* when it is under the server-wide in-flight cap, within its connection's fair share, and not
+  past a GOAWAY.
+
+  ```mermaid
+  flowchart TD
+      a["New QUIC connection<br/>source address not<br/>yet validated"] --> b["Fewer than 256<br/>half-open handshakes<br/>otherwise: dropped silently"]
+      b --> c["Handshake completes within 5 s<br/>otherwise: dropped"]
+      c --> d["Under the connection caps<br/>otherwise: closed with<br/>H3_EXCESSIVE_LOAD"]
+      d --> e["A request stream is admitted<br/>otherwise: refused with<br/>H3_REQUEST_REJECTED"]
+      e --> f["The handler runs on<br/>a virtual thread<br/>a file response waits<br/>for a file slot<br/>and is refused if<br/>none frees up"]
+  ```
+
 * **Slow readers.** A response that makes no progress for `--write-timeout` is reset. While more than
   75% of the file slots are in use, a connection whose responses together send less than
   `--h3-min-rate` bytes/s (averaged over `--write-timeout`) also has its file responses reset, so

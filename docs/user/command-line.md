@@ -53,3 +53,18 @@ on the main listener is answered before the file handler hides dotfiles. Reload 
 the file through `ReloadHook` (see docs/user/config-file.md, including the ConfigStore notes).
 ACME HTTP-01 issuance uses the staging CA unless you select production.
 `--status` uses 0 = running, 1 = pid file is stale, 3 = not running.
+
+What happens at startup, and where each exit code comes from:
+
+```mermaid
+flowchart TD
+    s(["java -jar<br/>sjws_nettask.jar<br/>[options]"]) --> a["-h or --help<br/>print usage, exit 0"]
+    a --> b["--stop or --status<br/>act on the pid file and exit<br/>exit codes as listed above"]
+    b --> c["Load the configuration<br/>invalid: exit 64"]
+    c --> d{"--daemon or --restart?"}
+    d -->|yes| e["Start a detached<br/>child JVM that<br/>repeats the steps<br/>below, and wait<br/>until it is listening"]
+    d -->|no| f["Document root must<br/>be a directory<br/>otherwise: exit 2"]
+    f --> g["Pid file must not<br/>name a live server<br/>otherwise: exit 1,<br/>already running"]
+    g --> h["Bind the TCP port<br/>otherwise: exit 1,<br/>cannot listen"]
+    h --> i["Serve until SIGTERM or SIGINT<br/>then exit 0"]
+```

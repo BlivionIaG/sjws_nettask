@@ -22,6 +22,44 @@ See [docs/design/architecture.md](architecture.md) for the layers, the `core.Han
   stream runs the shared handler; file slots, a per-connection in-flight share, a minimum send rate
   under contention, handshake and half-open caps, GOAWAY drain.
 
+Threads at runtime. Every request runs the shared handler on a virtual thread; platform threads exist
+only for accepting, timing, event loops and background work:
+
+```mermaid
+flowchart TB
+    subgraph tcp["HTTP/1.1: blocking NIO"]
+        direction TB
+        acc["accept-loop<br/>platform thread"]
+        rp["http1-reaper<br/>platform daemon thread<br/>sweeps every 50 ms"]
+        vt1["virtual thread<br/>per connection"]
+        acc ~~~ rp
+        acc -->|"each connection"| vt1
+        rp -.->|"expires deadlines"| vt1
+    end
+
+    subgraph h2["HTTP/2: Netty"]
+        direction TB
+        el2["boss and worker<br/>event loops"]
+        vt2["virtual thread<br/>per stream"]
+        el2 --> vt2
+    end
+
+    subgraph h3["HTTP/3: Netty QUIC"]
+        direction TB
+        el3["one event loop thread:<br/>the UDP socket and<br/>every QUIC connection"]
+        vt3["virtual thread<br/>per request"]
+        el3 --> vt3
+    end
+
+    hh["Handler.handle(Request)<br/>file reads and<br/>writes happen here,<br/>never on an event loop"]
+    vt1 --> hh
+    vt2 --> hh
+    vt3 --> hh
+```
+
+Two more daemon threads exist only when their feature is on: `access-log` drains the bounded log
+queue, and `acme-renew` issues and renews certificates.
+
 **Measured** (loopback, 8 cores: server pinned to 4, `wrk -t4` to the other 4; 8 s per point, fresh JVM
 with G1 and a 1 GB heap, 3 repetitions, medians; requests/s, or GB/s for 50 MB with a 30 s wrk timeout).
 Each column is the server as of that step, all measured in the same session:

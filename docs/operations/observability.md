@@ -33,6 +33,22 @@ snap.requests();
 
 Request threads never write the log and never take a lock for it. Each response updates striped `LongAdder`s (status, protocol, a latency bucket, bytes). When logging is on, the thread formats one `byte[]` and enqueues it on a bounded lock-free queue; a single `access-log` thread writes and flushes. A full queue drops the line and counts it (`accessLogDropped` / `sjws_access_log_dropped_total`) instead of blocking the request.
 
+The observe filter is installed by `--access-log`, `--metrics` or `--healthz` at startup, or when the
+admin console arms the counters. Until then the handler is called directly: no clock, no counters, no
+path check. With the filter installed, each request goes through this:
+
+```mermaid
+flowchart TD
+    pr{"Probe requested<br/>and enabled?"} -->|yes| probe["The filter answers<br/>/healthz or /metrics<br/>/metrics on localhost: 403<br/>for a non-loopback peer"]
+    pr -->|no| h["The handler builds<br/>the response"]
+    probe --> rec
+    h --> rec["Record when the<br/>response is built,<br/>before the socket<br/>write<br/>striped LongAdders:<br/>status, protocol,<br/>latency bucket, bytes"]
+    rec --> lg{"Access log on?"}
+    lg -->|yes| q{"Room in the bounded<br/>lock-free queue?"}
+    q -->|yes| th["The access-log thread<br/>writes and flushes<br/>to stdout or the file"]
+    q -->|no| dr["The line is<br/>dropped and<br/>counted<br/>accessLogDropped"]
+```
+
 **Access line.** Common and combined are the NCSA formats, with the duration in microseconds appended. A zero body is `-`. Combined adds the quoted Referer and User-Agent. JSON is one object per line: `time` (UTC), `remote`, `method`, `path` (the request-target), `protocol`, `status`, `bytes`, `duration_us`, `referer`, `user_agent`. Quotes and controls in a CLF field are replaced with `?`. The client address is the numeric IP captured at accept (no reverse DNS).
 
 **Metrics API** (what an admin TUI reads; also rendered at `/metrics` when that endpoint is enabled):

@@ -175,6 +175,25 @@ The rest of the suite:
   120 minutes, PIT via `mvn -B -P pitest test-compile org.pitest:pitest-maven:mutationCoverage`.
   Not part of a pull request.
 
+```mermaid
+flowchart TB
+    push["push to master"] --> verify
+    pr["pull request"] --> verify
+    wd["workflow_dispatch"] --> verify
+    wd --> mut
+    cron["weekly cron<br/>Monday 03:00 UTC"] --> mut
+
+    subgraph verify["Job verify: Temurin 25"]
+        direction TB
+        v1["mvn -B verify<br/>tests, jar tests, JaCoCo gate<br/>on ubuntu-latest, and<br/>on macos-latest<br/>too for workflow_dispatch"] --> v2["mvn -B -Dgroups=e2e test<br/>fails if no e2e test matched"] --> v3["mvn -B -Dgroups=cluster test<br/>live multi-node scenarios"] --> v4["Linux only: install wrk, then<br/>tools/gateway-bench.sh<br/>standalone vs gateway-off"] --> v5["Upload target/site/jacoco/"]
+    end
+
+    subgraph mut["Job mutation: ubuntu-latest"]
+        direction TB
+        m1["PIT mutation coverage<br/>never on a pull request"] --> m2["Upload target/pit-reports/"]
+    end
+```
+
 `.github/workflows/release.yml` is a tag workflow. It is not the test matrix.
 
 Local equivalents, with Java 25:

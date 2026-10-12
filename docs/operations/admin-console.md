@@ -14,3 +14,16 @@ the server only through `sjws_nettask.admin.ServerControl`, so another implement
 controlling a daemon) can be plugged in. `clusterStatus()` is null until a control plane attaches
 a `ClusterBoard`; the status view then shows cluster requests per second, p99, errors, drifted
 nodes, and per-route totals.
+
+`r` restarts the server with the re-evaluated configuration and rolls back if that cannot start. The
+new server fails to start when, for example, its port cannot be bound:
+
+```mermaid
+flowchart TD
+    r["r: reload"] --> ok{"New configuration valid?"}
+    ok -->|no| keep["Error shown, the running<br/>server is left alone"]
+    ok -->|yes| st["Stop the running<br/>server, gracefully,<br/>then start one with the<br/>new configuration"]
+    st --> f{"Did it start?"}
+    f -->|yes| done["Running with the<br/>new configuration<br/>log: reloaded"]
+    f -->|no| rb["Start the previous<br/>configuration again<br/>and show the error<br/>log: reload failed,<br/>restoring previous<br/>configuration"]
+```

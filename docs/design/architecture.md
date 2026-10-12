@@ -22,24 +22,116 @@ tests that pin each behaviour are listed in [docs/development/testing.md](../dev
 
 ## Request flow
 
-```
-HTTP/1.1: ClientManager → Http1Connection → Http1Parser → Http1Requests.toCore ─┐
-                                                                                ├→ Handler.handle(Request) → Response
-HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ───────┘        │
-                                                                     Http1Writer / Http3Writer
+Each transport turns its wire format into a `core.Request`, hands it to the shared handler and writes
+the returned `Response` through its own writer. The handler is the narrow waist; nothing above it
+knows which protocol carried the request.
+
+```mermaid
+flowchart TB
+    p1["HTTP/1.1<br/>ClientManager, Http1Connection<br/>Http1Parser, Http1Requests"]
+    p2["HTTP/2<br/>Http2Server<br/>Http2StreamHandler"]
+    p3["HTTP/3<br/>Http3Server<br/>Http3RequestHandler"]
+
+    h{{"Handler.handle(Request)<br/>returns Response"}}
+
+    w1["Http1Writer"]
+    w2["h2.ResponseWriter"]
+    w3["Http3Writer"]
+
+    p1 -->|"core.Request"| h
+    p2 -->|"core.Request"| h
+    p3 -->|"core.Request"| h
+    h -->|"HTTP/1.1 only"| w1
+    h -->|"HTTP/2 only"| w2
+    h -->|"HTTP/3 only"| w3
 ```
 
 * `core.Handler` (`Response handle(Request)`) is the seam between transports and application logic.
   `StaticFileHandler` implements it; `Http1Connection` depends on `Handler`. Optional request
   filters (`RequestFilters`, [docs/development/filters.md](../development/filters.md)) wrap that handler. With none
   registered, HTTP/1.1 still calls `StaticFileHandler.handle` directly.
-* Both transports call the same handler, so behaviour is identical by construction; a parity test
+* Every transport calls the same handler, so behaviour is identical by construction; a parity test
   compares every HTTP/3 response with the HTTP/1.1 bytes for the same request. `Request` carries
   the client address, whether the connection is TLS, and the raw header map.
 * Errors raised before a request reaches the handler (parse errors, 408 deadlines, 431 on HTTP/3) use
   `StaticFileHandler.error(...)`, so their pages match the handler's. Status lines and
   error-page titles use `StaticFileHandler.reasonPhrase` (all RFC 9110 codes plus 429, empty for
   unregistered ones); `Mime` maps extensions to `Content-Type`.
+
+## Startup
+
+`SjwsServer` is the composition root. `SjwsServer.start` builds the pieces in this order. HTTP/3 and
+HTTP/2 are optional: if one cannot start (port busy, QUIC natives missing, bad certificate) the server
+logs a `WARN:` line and keeps serving the others. Only a failure to bind the TCP port, or to open the
+dedicated HTTP-01 listener, stops it, and it then closes everything it had already started.
+
+```mermaid
+sequenceDiagram
+    participant S as SjwsServer
+    participant H3 as Http3Server
+    participant H2 as Http2Server
+    participant CM as ClientManager
+
+    Note over S: compile the config snapshot<br/>StaticFileHandler and FileCache<br/>Router if routing.enabled<br/>ACME wrapper on the main listener
+    Note over S: build the observer slot,<br/>FilterChain and HaRuntime
+    opt HTTP/3 enabled
+        S->>H3: start on UDP
+        Note over S,H3: with the stored ACME certificate if still valid,<br/>then advertise Alt-Svc if enabled.<br/>Failure: WARN, continue without HTTP/3
+    end
+    opt HTTP/2 enabled
+        S->>H2: start the TLS port,<br/>and the h2c port if set
+        Note over S,H2: Failure: WARN, continue without HTTP/2
+    end
+    S->>CM: bind the TCP port
+    Note over S,CM: runs the accept loop on its own thread.<br/>Bind failure: close everything started, exit code 1
+    opt ACME with its own HTTP-01 port
+        Note over S: open the dedicated HTTP-01 listener
+    end
+    Note over S: create the control-plane leadership<br/>(none on a data node)
+    Note over S: register the reload hook
+    opt ACME enabled, and not a data node
+        Note over S: start the AcmeService,<br/>it issues once it is leader-ready
+    end
+    Note over S: write the last-good config
+```
+
+## Handler composition
+
+What a transport calls is decided once, in `SjwsServer`. Each box below is a `Handler` that wraps the
+one inside it, and each exists only when its feature is on. With none of them, the transports call
+`StaticFileHandler` directly, and HTTP/1.1 and HTTP/3 read the live config snapshot, so a reload is
+visible on the next request.
+
+```mermaid
+flowchart TB
+    t["Transport<br/>HTTP/1.1 · HTTP/2 · HTTP/3"] --> ha
+
+    subgraph ha["HaHandler: only when HaSettings is attached"]
+        subgraph fc["FilterChain: only when observability is on or filters are registered"]
+            subgraph ac["AcmeChallengeHandler: only when ACME answers on the main listener"]
+                subgraph rt["Router: only when routing.enabled"]
+                    px["ProxyHandler"]
+                    rd["RedirectHandler"]
+                end
+                sf["StaticFileHandler:<br/>always present"]
+                rt -->|"static route, or no route matches"| sf
+            end
+        end
+    end
+```
+
+| Layer | What it does |
+|---|---|
+| `HaHandler` | answers `/healthz` and `/readyz` from `HealthBoard`; everything else goes to the published generation, or to the config handler until one is published |
+| `FilterChain` | `ObserveRequestFilter` at order 0, then the other filters by order ([filters](../development/filters.md)) |
+| `AcmeChallengeHandler` | answers `/.well-known/acme-challenge/` before anything else, including the file handler's dotfile check |
+| `Router` | first matching route wins: `ProxyHandler`, `RedirectHandler`, or the static handler; a route with `errors: problem` wraps its handler in `ProblemErrorHandler` ([routing](proxy-routing.md)) |
+| `StaticFileHandler` | every status decision for a file ([access rules](../user/access-rules.md), [caching](../user/caching-and-ranges.md)) |
+
+HTTP/2 is the exception today. `Http2Server` is handed one handler when it starts: the chain, terminal or
+`HaHandler` if there is one, otherwise the startup snapshot's `StaticFileHandler`. Nothing swaps it on
+reload, so config-driven routing and reloaded settings reach HTTP/2 only through a chain (the
+observe filter reads the live snapshot, whether it was installed at startup or armed later).
 
 ## Current gaps
 
@@ -61,6 +153,26 @@ plug in. The target design and migration plan follow below.
 ## Observability
 
 `observe.ObserveRequestFilter` sits at order 0, outermost among equal orders, and only when observability is on. `SjwsServer` builds it with `RequestFilters.create().add(0, filter)` and copies any caller filters inside it. While the filter is absent a request does not read the clock, does not update a counter, and does not look at the path for `/healthz` or `/metrics`, so a document-root file at `/healthz` is served. `--access-log`, `--metrics` (other than `off`) and `--healthz` install it at startup. The admin TUI's status view calls `SjwsServer.metricsSnapshot()`, which arms counters on the first call (publishing the filter if startup did not) without enabling `/healthz`. HTTP/1.1 reads that published handler on the next request; HTTP/2 and HTTP/3 learn about it through `Transport.armHandler`. Duration is the time until the handler returns, before the socket write. Protocol failures that never enter the chain are not recorded. `ServerMetrics`, `Snapshot` and `AccessLog` stay in `observe`.
+
+Arming from the admin console, step by step:
+
+```mermaid
+sequenceDiagram
+    participant Admin as Admin console
+    participant S as SjwsServer
+    participant Slot as ObserverSlot
+    participant T as Transports
+
+    Admin->>S: metricsSnapshot()
+    S->>Slot: arm()
+    Note over S,Slot: replaces NONE with a recording observer
+    alt the filter was not compiled at startup
+        S->>T: publish the observe chain
+        Note over S,T: HTTP/1.1 reads it from the shared HandlerRef,<br/>HTTP/2 and HTTP/3 get armHandler(chain)
+    end
+    S-->>Admin: Snapshot
+    Note over T: The next request on each transport enters the filter,<br/>reads the clock and updates the LongAdder counters
+```
 
 Counters are `LongAdder`s, and only after the observer is recording. The access log is a bounded lock-free queue drained by one thread. Neither path blocks a request on I/O.
 
@@ -119,14 +231,31 @@ Prototype: `bench/LogBench.java` (bench code only, not server code).
 * **HTTP in a cluster.** Static content is served by every node. Messaging HTTP endpoints redirect or proxy to the partition leader.
 
 ## T5. How the existing code fits
-```
-                    ┌──────── shared core: listeners, virtual threads, ConnectionReaper, buffer pool ────────┐
-TCP :80/:443 ──▶ Http1Connection ─┐                                                                       │
-UDP (QUIC)   ──▶ h3 (Netty)      ─┼─▶ core.Request ─▶ Handler chain ─▶ StaticFileHandler                  │
-                                  │                       └─▶ MessagingHttpHandler ─┐                       │
-TCP :msg     ──▶ MsgConnection ───┴──────────────── produce/fetch ─────────────────▶ Broker ─▶ PartitionLog │
-                                                                                     │        (segments)   │
-                                                                         Replicator ◀┴▶ Raft metadata ─────┘
+Dashed boxes are not built yet. The ledger and delivery code in `sjws_nettask.messaging` covers part of
+`PartitionLog` and of the partition logic, and is not wired into the server.
+
+```mermaid
+flowchart TB
+    subgraph shared["Shared core: listeners, virtual threads, ConnectionReaper, buffer pool"]
+        tcp["TCP :80 / :443<br/>Http1Connection"]
+        quic["UDP, QUIC<br/>h3 on Netty"]
+        msg["TCP :msg<br/>MsgConnection"]
+    end
+
+    tcp --> req["core.Request"]
+    quic --> req
+    req --> chain["Handler chain"]
+    chain --> static["StaticFileHandler"]
+    chain --> mh["MessagingHttpHandler"]
+
+    mh -->|"produce / fetch"| broker["Broker"]
+    msg -->|"produce / fetch"| broker
+    broker --> plog[("PartitionLog<br/>segments")]
+    broker <--> repl["Replicator"]
+    repl <--> raft["Raft metadata"]
+
+    classDef design stroke-dasharray: 5 5
+    class msg,mh,broker,plog,repl,raft design
 ```
 * `core.Handler` (PR #4) stays the HTTP seam. Messaging over HTTP is just another `Handler` in the chain, so it needs no transport change.
 * `Transport` (today the HTTP/3 lifecycle) becomes the generic listener interface. A messaging TCP listener is a new `Transport`.

@@ -21,10 +21,14 @@ Non-goals (for now)
 
 ## 2. Placement: `core.Handler` and the middleware chain
 
-```
-transport ─▶ core.Request ─▶ [filters: logging, rights, security headers…] ─▶ Router ─┬▶ ProxyHandler(upstream A)
-                                                                                     ├▶ RedirectHandler
-                                                                                     └▶ StaticFileHandler (fallback)
+```mermaid
+flowchart TB
+    t["transport"] --> rq["core.Request"]
+    rq --> fl["filters<br/>logging, rights,<br/>security headers, ..."]
+    fl --> r{{"Router"}}
+    r --> p["ProxyHandler<br/>upstream A"]
+    r --> rd["RedirectHandler"]
+    r --> sf["StaticFileHandler<br/>fallback"]
 ```
 
 - `Router`, `RedirectHandler` and `ProxyHandler` are leaf `core.Handler`s. They are not filters.
@@ -38,6 +42,24 @@ transport ─▶ core.Request ─▶ [filters: logging, rights, security headers
 ## 3. Route matching
 
 A route is `{host?, prefix, rewrite?, action}`, where the action is exactly one of `proxy`, `redirect` or `static`.
+
+A route matches when its prefix matches on a segment boundary and its host matches; the first match in
+config order wins. A target with a `..` segment is refused in any spelling: either dot may be `%2e`,
+segments are also split at `\`, `%2f` and `%5c`, and a segment ends at `;`. A route that sets
+`errors: problem` has its handler wrapped in `ProblemErrorHandler`, which renders the error pages this
+server generates for the route as RFC 9457 `application/problem+json`; an upstream's own error
+responses are relayed unchanged:
+
+```mermaid
+flowchart TD
+    dd{"A path segment is ..?<br/>in any encoded spelling"} -->|yes| e400["400, before any route is tried"]
+    dd -->|no| m{"A route matches?"}
+    m -->|no| fb["Fallback: the<br/>static file handler"]
+    m -->|yes| rw{"Route has a rewrite?"}
+    rw -->|yes| rq["Replace the matched<br/>prefix, keep the query"]
+    rw -->|no| act
+    rq --> act["Call the route's handler<br/>ProxyHandler,<br/>RedirectHandler or the<br/>static handler"]
+```
 
 - **Host.** The value is an exact name (`example.com`), a wildcard suffix (`*.example.com`, which
   matches sub-domains only), or absent (any host). Matching ignores case and strips the port
@@ -105,6 +127,23 @@ The client's own deadlines also stay in force, such as the write timeout via `Co
 | target not origin-form, invalid method | 400 (normally caught earlier by the parser) |
 
 Errors are logged once per upstream per interval, rate-limited so log volume stays flat when an upstream is down.
+
+The order in which the phase-1 `ProxyHandler` decides. A request has a body when it carries
+`Transfer-Encoding`, or a `Content-Length` other than 0:
+
+```mermaid
+flowchart TD
+    b{"Request has a body?"} -->|yes| e501["501, until phase 2"]
+    b -->|no| c{"Origin-form target<br/>and a usable method?"}
+    c -->|no| e400["400"]
+    c -->|yes| s["Send with the<br/>shared HttpClient<br/>HTTP/1.1, no redirects,<br/>X-Forwarded-* and<br/>Forwarded added"]
+    s --> r{"Outcome"}
+    r -->|"timeout"| e504["504"]
+    r -->|"refused, reset,<br/>DNS or I/O error"| e502a["502"]
+    r -->|"response head<br/>received"| bd{"Body over<br/>max_body?"}
+    bd -->|yes| e502b["502"]
+    bd -->|no| ok["Relay the status, headers<br/>and the buffered body"]
+```
 
 ## 6. Config schema (sent to Config & ACME)
 

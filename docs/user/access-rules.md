@@ -10,6 +10,21 @@ systems the on-disk case is checked):
 3. A path with a component starting with `.` answers 404 unless `--allow-dotfiles`.
 4. Everything else is served.
 
+The rules are applied to the decoded, normalized path, and again to the real path once symlinks are
+resolved, so a link cannot reach a refused path under another name:
+
+```mermaid
+flowchart TD
+    d{"--deny pattern matches?"} -->|yes| r403["403"]
+    d -->|no| rl{"First matching<br/>--access-rule"}
+    rl -->|"allow:"| ok["Allowed"]
+    rl -->|"deny:"| r403
+    rl -->|"hide:"| r404["404"]
+    rl -->|"none matches"| dot{"Dot component and<br/>--allow-dotfiles off?"}
+    dot -->|yes| r404
+    dot -->|no| ok
+```
+
 Patterns are `/`-separated globs: `*` matches within one component, `?` one character, `**` any number of
 components. A pattern starting with `/` is anchored at the document root; one without matches at any
 depth (`*.bak` = `/**/*.bak`). A pattern also covers everything below what it matches (`/private` covers

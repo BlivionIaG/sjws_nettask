@@ -11,6 +11,27 @@ Register before start. `SjwsServer.start(config, filters)` compiles the registry
 it. `filterChain()` is null when the registry was null or empty. `handler()` stays the
 `StaticFileHandler` either way (the file cache lives there).
 
+One request through a chain with two filters:
+
+```mermaid
+sequenceDiagram
+    participant T as Transport
+    participant O as ObserveRequestFilter<br/>order 0
+    participant F as Your filter<br/>order 100
+    participant H as Terminal handler
+
+    T->>O: handle(request)
+    O->>F: proceed(request)
+    F->>H: proceed(request)
+    H-->>F: Response
+    F-->>O: Response
+    O-->>T: Response
+    Note over F,H: The response is built, not yet written.<br/>A filter may return it or a new one
+    Note over T: writes it, adding Date, Server,<br/>Content-Length, Connection, Alt-Svc
+    Note over F,H: A filter that skips proceed short-circuits:<br/>later filters and the handler do not run
+    Note over O,H: A RuntimeException or a null return<br/>becomes the normal HTML 500. Outer filters<br/>see it as the result of proceed,<br/>and the connection stays open
+```
+
 ## Write a filter
 
 ```java
@@ -197,6 +218,15 @@ default forwards to it and drops `terminal`. Dispatch with
 already closes over its terminal); a null chain and a null or static-handler terminal is
 `handler::handle`; any other terminal is `terminal::handle`. HTTP/2 and HTTP/3 do this, so the empty
 path stays a direct call on the concrete handler.
+
+```mermaid
+flowchart TD
+    s["At startup:<br/>FilterChain.dispatch(files,<br/>terminal, chain)"] --> c{"chain is not null?"}
+    c -->|yes| ch["Call chain.handle<br/>the chain already<br/>closes over its<br/>terminal"]
+    c -->|no| t{"terminal is null, or is<br/>the static file handler?"}
+    t -->|yes| fl["Call files.handle directly<br/>no chain object on<br/>the request path"]
+    t -->|no| tm["Call terminal.handle<br/>for example a router"]
+```
 `Transport.armHandler` is how a listener learns about a filter published by a later
 `metricsSnapshot()`. The default ignores it. HTTP/2 and HTTP/3 install that handler for the next
 request.

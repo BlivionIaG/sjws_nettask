@@ -27,6 +27,33 @@ is attached in code (`SjwsServer.start(config, ha)`). This workstream does not a
 workstream. The process shutdown hook in `Sjws_nettask.serve` still calls `close()`; signal
 wiring that should drain instead belongs to daemon mode, which can call `Lifecycle.drain()`.
 
+What exists in the code today (solid) and what this document only designs (dashed):
+
+```mermaid
+flowchart TB
+    hh["ha.HaHandler<br/>probes, then the<br/>published generation"]
+    hb["ha.HealthBoard<br/>precomputed probes"]
+    sh["ha.SnapshotHolder<br/>atomic publish"]
+    lc["ha.Lifecycle.drain()<br/>and ClientManager hooks"]
+
+    mem["cluster: Membership<br/>and QuorumPolicy"]
+    raft["cluster: Raft groups<br/>ha-control, one per partition"]
+    sync["cluster: config, certificate<br/>and content sync"]
+    vip["cluster: VipHook and<br/>failover policy"]
+
+    hh --> hb
+    hh --> sh
+    lc --> hb
+    mem -.-> raft
+    vip -.-> raft
+    raft -.->|"quorum ok"| hb
+    raft -.-> sync
+    sync -.->|"publishes a generation"| sh
+
+    classDef design stroke-dasharray: 5 5
+    class mem,raft,sync,vip design
+```
+
 ## 2. Design principles
 
 1. **Near-zero hot-path overhead.** No per-request coordination, locks, RPCs or quorum reads.
@@ -97,6 +124,34 @@ the partition leader; that redirect is not part of the static path.
   The accept loop's one volatile role read (passive mode only) feeds that hook and the
   `ha_role` gauge; it does not run per request.
 
+Two data nodes and a witness (design only, the cluster layer is not built):
+
+```mermaid
+flowchart TB
+    lb["Load balancer or DNS<br/>probes /healthz and /readyz"]
+
+    subgraph a["Node A"]
+        sa["Static files<br/>served locally"]
+        ra["ha-control voter"]
+    end
+
+    subgraph b["Node B"]
+        sb["Static files<br/>served locally"]
+        rb["ha-control voter"]
+    end
+
+    w["Witness<br/>votes, stores no log"]
+
+    lb --> sa
+    lb --> sb
+    ra <--> rb
+    ra <--> w
+    rb <--> w
+
+    classDef design stroke-dasharray: 5 5
+    class ra,rb,w design
+```
+
 ### 4.2 Three nodes
 
 - Majority quorum (2/3) for the leader lease and for generation publish. A minority partition
@@ -111,8 +166,31 @@ the partition leader; that redirect is not part of the static path.
   `HealthBoard` precomputes the `Response` objects (plain text, 200 or 503) and `HaHandler`
   returns one of them. No allocation and no file I/O on the probe path.
 - The accept loop clears liveness in its `finally`, off the request path.
+
+  ```mermaid
+  flowchart TD
+      r["Request, with HA attached"] --> p1{"Path is /healthz?"}
+      p1 -->|yes| h["200 ok while the accept<br/>loop is alive, else 503<br/>precomputed, no allocation"]
+      p1 -->|no| p2{"Path is /readyz?"}
+      p2 -->|yes| rd["200 only when a<br/>snapshot is loaded, the<br/>node is not draining,<br/>and quorum is ok if the<br/>policy requires it, else 503"]
+      p2 -->|no| g{"A generation has<br/>been published?"}
+      g -->|yes| gh["Its handler, loaded once at<br/>the start of the call"]
+      g -->|no| ch["The config snapshot handler"]
+  ```
+
 - Peer failure detection: UDP heartbeat plus an indirect probe (k=2 via other members when
   N≥3). Defaults: interval 500 ms, suspect after 3 misses, dead after 5 s.
+
+  Member states (design only):
+
+  ```mermaid
+  stateDiagram-v2
+      [*] --> ALIVE
+      ALIVE --> SUSPECT: 3 missed heartbeats
+      SUSPECT --> ALIVE: a heartbeat, or a higher incarnation refutes the suspicion
+      SUSPECT --> DEAD: dead after 5 s, by default
+      note right of ALIVE: also probed indirectly through 2 other members when N is 3 or more
+  ```
 
 ## 6. Failover
 
@@ -133,6 +211,26 @@ the partition leader; that redirect is not part of the static path.
   return. `ClientManager` only takes this path when `prepareGracefulDrain` was called;
   `close()` stays the current interrupt-immediately behaviour.
 - Signal wiring belongs to the daemon-mode workstream. HA exposes `Lifecycle.drain()`.
+
+The drain as implemented by `Lifecycle.drain()` and `SjwsServer.drain()`:
+
+```mermaid
+sequenceDiagram
+    participant LB as Load balancer
+    participant L as Lifecycle.drain()
+    participant H as HealthBoard
+    participant S as SjwsServer
+
+    L->>H: setDraining(true)
+    LB->>H: GET /readyz
+    H-->>LB: 503, not ready
+    Note over L: wait drainDelay, default 5 s,<br/>so the balancer deregisters the node
+    Note over L: later keep-alive responses<br/>carry Connection close
+    L->>S: stop accepting
+    Note over S: expire idle connections,<br/>stop the TCP, HTTP/2 and HTTP/3 listeners
+    L->>S: wait for in-flight work
+    Note over L,S: bounded by drainTimeout, then close()
+```
 
 ## 8. Zero-downtime reload
 
@@ -165,6 +263,28 @@ the partition leader; that redirect is not part of the static path.
   a peer has the bytes, the peer keeps the last activated snapshot (fail static) and the new
   leader publishes again from `ConfigSource`. The log coordinates activation; it is not the
   only copy of the bytes.
+
+The rollout (design only, the cluster layer is not built):
+
+```mermaid
+sequenceDiagram
+    participant CS as ConfigSource and<br/>CertProvider
+    participant Ld as ha-control leader
+    participant Q as Quorum and<br/>the witness
+    participant P as Peer node
+
+    Ld->>CS: pull the bundle
+    Note over Ld: compute the generation<br/>and the content hash
+    Ld->>Q: STAGE
+    Q-->>Ld: committed on a majority
+    Ld-->>P: (generation, hash)
+    Note over Ld,P: announced in heartbeats
+    P->>Ld: pull the bundle
+    Note over Ld,P: over TCP, authenticated with HMAC-SHA256
+    Ld->>Q: ACTIVATE
+    Q-->>P: committed
+    Note over P: applying ACTIVATE publishes the snapshot.<br/>If the leader dies before a peer has the bytes,<br/>the peer keeps its last activated snapshot<br/>and the new leader publishes again
+```
 
 ## 10. Shared state
 

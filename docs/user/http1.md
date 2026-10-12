@@ -18,6 +18,41 @@ Files larger than 64 KiB that are not in the cache go out with `sendfile` (`File
 a file that shrinks during the transfer ends the connection (the response can't be completed).
 An idle keep-alive connection holds a 256 B input buffer (2 KiB only while a request needs it) and no output buffer.
 
+Each connection moves through four states, and the timer thread applies the deadline of the state it is in:
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> HEAD: first byte
+    HEAD --> PROCESSING: head received
+    PROCESSING --> WRITING: handler returned
+    WRITING --> IDLE: keep-alive
+    IDLE --> CLOSED: idle timeout
+    HEAD --> CLOSED: header timeout, 408
+    WRITING --> CLOSED: no progress, or Connection close
+    CLOSED --> [*]
+    IDLE : IDLE
+    IDLE : --idle-timeout
+    HEAD : HEAD
+    HEAD : --header-timeout
+    PROCESSING : PROCESSING
+    PROCESSING : no deadline
+    WRITING : WRITING
+    WRITING : --write-timeout
+```
+
+**Admission.** The connection cap is applied before `accept`, so clients over it wait in the kernel's
+accept queue (`--backlog`); the per-address cap is applied after it.
+
+```mermaid
+flowchart TD
+    q["Client connects<br/>kernel accept queue,<br/>--backlog default 1024"] --> cap{"Under --max-connections?"}
+    cap -->|no| wait["Stays in the accept queue<br/>until a connection finishes"]
+    cap -->|yes| ip{"Under --max-connections-per-ip<br/>for this address?"}
+    ip -->|no| drop["Closed at once, no response"]
+    ip -->|yes| run["A virtual thread<br/>runs the connection<br/>under the IDLE, HEAD<br/>and WRITING deadlines"]
+```
+
 **Per-address caps behind a reverse proxy or NAT.** The caps count connections per client address
 (IPv4: the full address; IPv6: its /64 prefix, since one host can use any address of its /64). Behind a
 reverse proxy, load balancer or a shared NAT every client arrives from the same address, so the whole

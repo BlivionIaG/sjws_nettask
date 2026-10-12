@@ -16,6 +16,26 @@ java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --restart --pid-file=/run/sjws_ne
     --log-file=/var/log/sjws_nettask.log 8080 /var/www/html
 ```
 
+```mermaid
+sequenceDiagram
+    participant U as Shell
+    participant P as Parent JVM
+    participant C as Child JVM
+    participant F as Pid file<br/>and log file
+
+    U->>P: java -jar ... --daemon
+    P->>F: check the pid file and log file
+    Note over P,F: refuse if the pid file names a live server,<br/>or the log file is not writable
+    P->>C: start a second JVM
+    Note over P,C: in a new session when setsid exists,<br/>SJWS_DAEMON_CHILD=1,<br/>output appended to the log file
+    Note over C: ignore SIGHUP, load the configuration,<br/>bind the listeners
+    C->>F: write the pid file
+    Note over C,F: only once listening
+    P->>F: poll for the child's pid
+    P-->>U: Started sjws_nettask (pid N), exit 0
+    Note over P,C: If the child exits first, or 20 s pass<br/>without a pid file, the parent prints the<br/>last log lines and exits non-zero
+```
+
 `--stop` sends SIGTERM and waits for the drain budget (default 30 seconds, or `drain-ms` from the
 status file) plus 5 seconds, then SIGKILL. `--shutdown-timeout` is not added to that wait.
 `--status` prints `running pid=<n>`, `stopped`, or `stopped stale pid=<n>`. A control or data
@@ -37,6 +57,18 @@ parallel with that wait. `--stop` waits for the HA budget recorded in the status
 is present, then the same 5 second margin as before. A foreground process with
 `--pid-file` writes the same file, so `--stop` works for it too; without `--log-file` it keeps
 logging to the console.
+
+```mermaid
+flowchart TD
+    sig["SIGTERM or SIGINT<br/>--stop sends SIGTERM"] --> a["The shutdown hook runs<br/>SjwsServer.close()<br/>stop the ACME renew<br/>thread and the HTTP-01<br/>listener, withdraw<br/>Alt-Svc"]
+    a --> b["Stop accepting on<br/>every listener<br/>HTTP/2 and HTTP/3 send<br/>GOAWAY, the TCP listen<br/>socket closes<br/>idle and half-read<br/>HTTP/1.1 connections<br/>are dropped at once"]
+    b --> d{"Responses in progress<br/>finished in time?"}
+    d -->|"yes, within --shutdown-timeout, default 10 s"| e["Listeners and<br/>threads are<br/>released"]
+    d -->|no| f["Whatever is still<br/>open is closed"]
+    e --> g["Pid file removed,<br/>process exits"]
+    f --> g
+    b -.-> par["HTTP/2 and HTTP/3<br/>drain in parallel<br/>HTTP/2 up to<br/>--shutdown-timeout, HTTP/3<br/>up to 2 s"]
+```
 
 `contrib/sjws` is a small start/stop/status/restart wrapper (`SJWS_JAR`, `SJWS_PID_FILE`,
 `SJWS_LOG_FILE`, `JAVA`). `contrib/sjws_nettask.service` is a systemd `Type=forking` example
