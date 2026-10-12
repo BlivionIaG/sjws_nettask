@@ -2,18 +2,21 @@ package sjws_nettask;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 
+/** Signal tests are ordered: delivery first, then a case that ignores {@code SIGHUP} for good. */
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ReloadHookTest {
 
     @Test
+    @Order(1)
     void aThrowingHookDoesNotStopTheNextAndUnregisterRemovesIt() throws Exception {
         var seen = new AtomicInteger();
         var first = ReloadHook.register(() -> {
@@ -30,18 +33,20 @@ class ReloadHookTest {
     }
 
     @Test
+    @Order(2)
     void registerRejectsNull() {
         assertThrows(IllegalArgumentException.class, () -> ReloadHook.register(null));
     }
 
     @Test
+    @Order(3)
     @EnabledOnOs(OS.LINUX)
     void sighupRunsTheHookWhenTheJdkExposesIt() throws Exception {
         var seen = new AtomicInteger();
         var hook = ReloadHook.register(seen::incrementAndGet);
         try {
             org.junit.jupiter.api.Assumptions.assumeTrue(ReloadHook.installSighup(),
-                    "sun.misc.Signal is hidden from this JDK");
+                    "SIGHUP is already ignored, or sun.misc.Signal is hidden");
             var pid = ProcessHandle.current().pid();
             var kill = new ProcessBuilder("kill", "-HUP", Long.toString(pid)).start();
             assertEquals(0, kill.waitFor());
@@ -53,5 +58,13 @@ class ReloadHookTest {
         } finally {
             hook.close();
         }
+    }
+
+    @Test
+    @Order(4)
+    @EnabledOnOs(OS.LINUX)
+    void installSighupLeavesAnIgnoredHangupIgnored() {
+        assertTrue(Daemon.ignoreSignal("HUP"));
+        assertFalse(ReloadHook.installSighup());
     }
 }

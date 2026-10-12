@@ -96,10 +96,11 @@ stream limits are fixed at start.
 No config file means reload reports `no config file` and changes nothing.
 
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
-the JDK does not expose `sun.misc.Signal`. `main` does not call it: a foreground
-process must still die on `SIGHUP`. Daemon mode (PR #5) ignores `SIGHUP` and has
-no reload hook; its handler should call `ReloadHook.run()` instead of ignoring
-the signal. Whichever handler is installed last owns `SIGHUP`.
+the JDK does not expose `sun.misc.Signal`, and when this process already ignores
+`SIGHUP`. An ignored `SIGHUP` stays ignored: the VM does not install a Java
+handler over it. `main` does not call it: a foreground process must still die on
+`SIGHUP`. The daemon child ignores `SIGHUP` and has no reload hook; its handler
+should call `ReloadHook.run()` instead of ignoring the signal.
 
 ## ACME
 

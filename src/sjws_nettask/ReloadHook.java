@@ -21,12 +21,12 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Process-wide reload hooks. {@link #run()} rebuilds each registered server's immutable
- * configuration snapshot and swaps it in. Daemon mode (PR #5) ignores {@code SIGHUP} and does not
- * expose a hook of its own; its handler should call {@link #run()} instead of ignoring the signal.
- * Whichever handler is installed last owns {@code SIGHUP}.
+ * configuration snapshot and swaps it in. Daemon mode ignores {@code SIGHUP} and does not expose a
+ * hook of its own; its handler should call {@link #run()} instead of ignoring the signal.
  * <p>
  * {@link #installSighup()} is optional and is not called from {@code main}: a foreground process
- * must still die on {@code SIGHUP}. The registry itself is the interface.
+ * must still die on {@code SIGHUP}. The registry itself is the interface. A {@code SIGHUP} the
+ * process already ignores stays ignored, and {@link #installSighup()} then returns false.
  */
 public final class ReloadHook {
 
@@ -59,7 +59,9 @@ public final class ReloadHook {
 
     /**
      * Points {@code SIGHUP} at {@link #run()}. Returns false when the JDK does not expose
-     * {@code sun.misc.Signal} (nothing is changed). Not used by {@code main}.
+     * {@code sun.misc.Signal}, or when this process already ignores {@code SIGHUP} (inherited from
+     * the parent, or set earlier in this VM). In that case the call changes nothing: the VM will
+     * not replace an ignored {@code SIGHUP}. Not used by {@code main}.
      */
     public static boolean installSighup() {
         try {
@@ -73,8 +75,10 @@ public final class ReloadHook {
                         }
                         return null;
                     });
-            signalClass.getMethod("handle", signalClass, handlerClass).invoke(null, signal, handler);
-            return true;
+            var previous = signalClass.getMethod("handle", signalClass, handlerClass).invoke(null, signal, handler);
+            // Ignored at startup (no controlling terminal, GitHub Actions) or via SIG_IGN. handle()
+            // returns SIG_IGN and leaves the disposition unchanged.
+            return previous != handlerClass.getField("SIG_IGN").get(null);
         } catch (ReflectiveOperationException | LinkageError e) {
             return false;
         }
