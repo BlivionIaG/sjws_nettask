@@ -54,11 +54,14 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.Transport;
+import sjws_nettask.HandlerRef;
 import sjws_nettask.core.FilterChain;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserveRequestFilter;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.tls.SwappableKeyManager;
@@ -100,9 +103,16 @@ public final class Http3Server implements Transport {
     static final QuicTokenHandler TOKENS = NoRetryTokenHandler.INSTANCE;
 
     private final ServerConfig config;
+    /** Swapped by {@link #replaceHandler}. Read once per request. */
     private final AtomicReference<Function<Request, Response>> handlers;
-    /** Copied into every request only when a chain or a non-static terminal is installed. */
-    private final boolean captureFields;
+    /**
+     * Copied into every request only when a chain, a non-static terminal, or header logging is installed.
+     * {@link #withObserver} may set this before {@link #start()}.
+     */
+    private boolean captureFields;
+    /** Published by {@link #armHandler} after start. A null value keeps {@link #handlers}. */
+    private final HandlerRef armed = new HandlerRef();
+    private boolean observerWrapped;
     private final Map<QuicChannel, Connection> state = new ConcurrentHashMap<>();
     private final BooleanSupplier available;
     private final Supplier<Throwable> unavailabilityCause;
@@ -199,7 +209,18 @@ public final class Http3Server implements Transport {
         if (this.started.get()) {
             throw new IllegalStateException("already started");
         }
-        this.slot.set(observer);
+        var installed = observer == null ? RequestObserver.NONE : observer;
+        this.slot.set(installed);
+        if (installed.recording() && !this.observerWrapped) {
+            this.observerWrapped = true;
+            Function<Request, Response> current = this.handlers.get();
+            Handler terminal = current::apply;
+            this.handlers.set(
+                    RequestFilters.create().add(0, new ObserveRequestFilter(this.slot)).build(terminal)::handle);
+            if (installed.logHeaders()) {
+                this.captureFields = true;
+            }
+        }
         return this;
     }
 
@@ -223,15 +244,10 @@ public final class Http3Server implements Transport {
      */
     record Shared(Function<Request, Response> handler, ExecutorService executor, Limits limits, Semaphore inflight,
             Semaphore serverFiles, Map<Http3Writer.Outcome, LongAdder> outcomes, boolean captureFields,
-            ObserverSlot slot) {
+            HandlerRef armed) {
 
         void count(Http3Writer.Outcome outcome) {
             this.outcomes.get(outcome).increment();
-        }
-
-        /** Live observer. {@link RequestObserver#NONE} until logging, a probe, or an admin snapshot. */
-        RequestObserver observer() {
-            return this.slot.get();
         }
     }
 
@@ -244,9 +260,6 @@ public final class Http3Server implements Transport {
         final Semaphore files;
         final java.util.concurrent.atomic.AtomicInteger inflight = new java.util.concurrent.atomic.AtomicInteger();
         final RateGuard rate;
-        /** Numeric peer address, set once the handshake completes. No reverse lookup. */
-        String remote = "-";
-        boolean loopback;
         long nextStreamId; // lowest client request stream id not seen yet
         long goAwayId = -1; // -1 = no GOAWAY sent; else streams with id >= this are refused
 
@@ -327,7 +340,7 @@ public final class Http3Server implements Transport {
             this.perIp = new sjws_nettask.core.PerIpLimit(this.limits.connectionsPerIp());
             this.shared = new Shared(request -> this.handlers.get().apply(request), this.executor, this.limits,
                     new Semaphore(this.limits.maxInflight()),
-                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.captureFields, this.slot);
+                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.captureFields, this.armed);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             var codec = Http3.newQuicServerCodecBuilder()
                     .sslContext(ssl)
@@ -427,8 +440,6 @@ public final class Http3Server implements Transport {
                 quic.close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
                 return;
             }
-            this.connection.remote = address == null ? "-" : address.getHostAddress();
-            this.connection.loopback = address != null && address.isLoopbackAddress();
             Http3Server.this.state.put(quic, this.connection);
             quic.closeFuture().addListener(f -> {
                 Http3Server.this.state.remove(quic);
@@ -506,10 +517,16 @@ public final class Http3Server implements Transport {
         return this.state.size();
     }
 
-    /** Keeps the server's slot, so arming metrics after start is visible on this listener. */
+    /** Keeps the server's slot, so a filter built against that slot stays on this listener. */
     @Override
     public Http3Server useSlot(ObserverSlot slot) {
         return slot == null ? this : withSlot(slot);
+    }
+
+    /** The next request uses {@code handler} instead of the function captured at {@link #start()}. */
+    @Override
+    public void armHandler(Handler handler) {
+        this.armed.set(handler);
     }
 
     /** @return how many responses ended with this outcome (completed, or why the stream was reset) */

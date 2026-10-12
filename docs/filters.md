@@ -1,11 +1,11 @@
 # Request filters
 
 Filters sit between protocol decoding and the terminal `Handler`. That terminal is
-`StaticFileHandler` unless a caller installs another one (a router). HTTP/1.1 and HTTP/3 use one
-chain (a future HTTP/2 listener should too). With nothing registered, and the terminal still the
+`StaticFileHandler` unless a caller installs another one (a router). HTTP/1.1, HTTP/2 and HTTP/3 use
+one chain. With nothing registered, and the terminal still the
 static file handler, that chain is not built and not called: HTTP/1.1 calls
-`StaticFileHandler.handle` directly, and HTTP/3 keeps the `files::handle` method reference it
-already used.
+`StaticFileHandler.handle` directly, and HTTP/2 and HTTP/3 call the handler they were given
+at start.
 
 Register before start. `SjwsServer.start(config, filters)` compiles the registry once and shares
 it. `filterChain()` is null when the registry was null or empty. `handler()` stays the
@@ -39,7 +39,8 @@ handler do not run.
 
 `request.peer()` is the client `InetSocketAddress` (one per HTTP/1 connection, one per HTTP/3
 stream), or null if the transport could not read it. `request.secure()` is false on plain HTTP/1
-and true on HTTP/3. `request.headers().fields()` is the raw field map (lower-case name to values,
+and true on HTTP/3. `request.protocol()` is the version token. HTTP/1 copies the parsed version;
+a request built without one is `HTTP/1.1`, or `HTTP/3` when `secure` is true. `request.headers().fields()` is the raw field map (lower-case name to values,
 first-seen order, pseudo-headers excluded). HTTP/1 stores the parser's map by reference: that map
 is built while parsing either way, and `RequestHeaders.of` does not copy it. `reset()` drops the
 parser's reference and does not clear the map, so a filter may retain the request. HTTP/3 copies
@@ -60,8 +61,8 @@ downstream handler has *built* the response. The transport writes the body after
 returns, so this is not time-to-last-byte. `Date`, `Server`, `Connection`, `Content-Length` and
 `Alt-Svc` are added by the writers after the chain. `X-Content-Type-Options` and
 `Content-Security-Policy` are put on the handler's response, so a filter sees them and can change
-them. Protocol failures that never reach the file handler (HTTP/1 parse errors and 408, HTTP/3
-431 / bad target / unknown method) do not enter the chain either. A runtime exception or a null
+them. Protocol failures that never reach the file handler (HTTP/1 parse errors and 408, HTTP/2
+refusals, HTTP/3 431 / bad target / unknown method) do not enter the chain either. A runtime exception or a null
 return, from a filter or from the terminal handler, becomes the normal HTML 500
 (`StaticFileHandler.error`); outer filters see that 500 as the return value of `proceed`, and the
 connection stays open. `Error` (including `AssertionError`) is not caught.
@@ -76,6 +77,15 @@ var filters = RequestFilters.create()
     .add(100, "/api/*", (request, next) -> proxy(request));
 SjwsServer.start(config, filters);
 ```
+
+When `--access-log`, `--metrics` (other than `off`) or `--healthz` is set, the server registers
+`ObserveRequestFilter` first, at order 0, via `RequestFilters.create().add(0, filter)`, then copies
+the caller's filters in. Among order 0 it is the outermost stage. A filter with a negative order
+still runs further out. The filter is not installed when observability is off, and the transports
+do not call it. `metricsSnapshot()` publishes that same order-0 filter later if startup left it
+out, so the next request on an already-accepted connection is counted. The filter's clock stops
+when `proceed` returns, before the socket write. Parse errors, 408, HTTP/2 refusals and HTTP/3
+refusals do not enter the chain, so they are not logged or counted.
 
 `RoutePattern` is `*` (or omitted) for every request, `/exact`, or `/prefix/*` (the path equals
 `/prefix` or starts with `/prefix/`). The query and fragment are ignored. The path is not
@@ -174,12 +184,14 @@ lands. The fields above (`peer`, `secure`, `headers().fields()`) are already on 
 A custom `Transport.Factory` that serves requests must override
 `create(config, handler, chain, terminal)`. `SjwsServer` calls
 `create(config, handler, chain, terminal, slot)`. That default forwards to the four-argument form
-and then `Transport.useSlot(slot)`, so an override of the four-argument form still receives the
-chain and an HTTP/3 server still shares the observer slot. The three-argument filter default
-exists so a factory that already overrides it still receives the chain; the four-argument default
-forwards to it and drops `terminal`. Dispatch with
+and then `Transport.useSlot(slot)`. The chain already contains the observe filter when observability
+was on at startup; the transports do not call the observer themselves. The three-argument filter
+default exists so a factory that already overrides it still receives the chain; the four-argument
+default forwards to it and drops `terminal`. Dispatch with
 `FilterChain.dispatch(handler, terminal, chain)`: a non-null chain is `chain::handle` (the chain
 already closes over its terminal); a null chain and a null or static-handler terminal is
-`handler::handle`; any other terminal is `terminal::handle`. HTTP/3's factory does this. A future
-HTTP/2 listener should do the same, so the empty path stays a direct call on the concrete handler.
-Override `useSlot` to keep the shared `ObserverSlot` rather than a frozen observer.
+`handler::handle`; any other terminal is `terminal::handle`. HTTP/2 and HTTP/3 do this, so the empty
+path stays a direct call on the concrete handler.
+`Transport.armHandler` is how a listener learns about a filter published by a later
+`metricsSnapshot()`. The default ignores it. HTTP/2 and HTTP/3 install that handler for the next
+request.

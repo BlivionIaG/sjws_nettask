@@ -42,6 +42,7 @@ import sjws_nettask.core.Handler;
 import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.h3.Http3Server;
+import sjws_nettask.observe.ObserveRequestFilter;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.observe.ServerMetrics;
@@ -63,6 +64,10 @@ public final class SjwsServer implements AutoCloseable {
     private final ConfigReloader reloader;
     private final ChallengeBoard board;
     private final ObserverSlot slot;
+    /** True when the order-0 observe filter was compiled into {@link #chain} at startup. */
+    private final boolean observingAtStart;
+    /** Published when counters are armed and the filter was not installed at startup. */
+    private final HandlerRef armed = new HandlerRef();
     /** Null when no filters were registered. */
     private final FilterChain chain;
     /**
@@ -99,12 +104,27 @@ public final class SjwsServer implements AutoCloseable {
             initial = RequestObserver.open(config);
         }
         this.slot = new ObserverSlot(initial);
+        this.observingAtStart = initial.recording();
         FilterChain built;
         Handler selected;
         try {
             var files = snapshot.files();
             var leaf = select(files, terminal);
-            built = filters == null ? null : filters.build(leaf);
+            RequestFilters registry = filters;
+            if (this.observingAtStart) {
+                // Order 0, added first, so it stays outermost among equal orders.
+                registry = RequestFilters.create().add(0, new ObserveRequestFilter(this.slot));
+                if (filters != null) {
+                    registry.include(filters);
+                }
+            }
+            // No caller filters: the observe chain reads the live snapshot, so a reload still
+            // swaps the file handler. Caller filters keep the leaf they were compiled around.
+            Handler chainLeaf = leaf;
+            if (this.observingAtStart && filters == null && leaf == files) {
+                chainLeaf = request -> this.live.handler().handle(request);
+            }
+            built = registry == null ? null : registry.build(chainLeaf);
             selected = built != null ? built : (leaf == files ? null : leaf);
         } catch (RuntimeException e) {
             this.slot.close();
@@ -247,7 +267,7 @@ public final class SjwsServer implements AutoCloseable {
         }
         Supplier<Handler> handlers = server.override != null ? () -> server.override : server.live::handler;
         server.manager = new ClientManager(server.tcp, snapshot.document().server(), handlers, server.altSvc,
-                server.slot);
+                null, server.armed);
         server.attachGauges(server.slot.get().metrics());
         server.acceptThread = new Thread(server.manager, "accept-loop");
         server.acceptThread.start();
@@ -453,6 +473,10 @@ public final class SjwsServer implements AutoCloseable {
      *         not call into {@link FilterChain})
      */
     public FilterChain filterChain() {
+        var live = this.armed.get();
+        if (live instanceof FilterChain liveChain) {
+            return liveChain;
+        }
         return this.chain;
     }
 
@@ -469,22 +493,42 @@ public final class SjwsServer implements AutoCloseable {
      * Turns request counters on if they were off, then returns them. The admin TUI calls this
      * (through {@link #metricsSnapshot()}) when it draws a status view.
      * <p>
-     * The first call replaces {@link RequestObserver#NONE} in the shared {@link ObserverSlot}.
-     * The next request on each transport sees the recording observer and starts sampling the clock
-     * and updating {@link java.util.concurrent.atomic.LongAdder}s. Until that call, and unless
-     * {@code --healthz}, {@code --access-log} or {@code --metrics} was set at startup, the transports
-     * hold {@link RequestObserver#NONE}: no {@link System#nanoTime()}, no counter updates, no latency
-     * compare-and-set, and no {@code /healthz} or {@code /metrics} path checks.
+     * The first call replaces {@link RequestObserver#NONE} in the shared {@link ObserverSlot} and, when
+     * the order-0 observe filter was not compiled at startup, publishes that filter as the live handler.
+     * The next request on each transport enters it and starts sampling the clock and updating
+     * {@link java.util.concurrent.atomic.LongAdder}s. Until that call, and unless {@code --healthz},
+     * {@code --access-log} or {@code --metrics} was set at startup, no filter is installed: no
+     * {@link System#nanoTime()}, no counter updates, no latency compare-and-set, and no {@code /healthz}
+     * or {@code /metrics} path checks.
      * <p>
      * Arming does not by itself answer {@code /healthz}. That probe stays opt-in ({@code --healthz}).
      * A document-root file at {@code /healthz} keeps being served after the counters come on.
      */
     public ServerMetrics armMetrics() throws IOException {
         var metrics = this.slot.arm(config()).metrics();
+        if (!this.observingAtStart) {
+            publishArmed();
+        }
         if (this.manager != null) {
             attachGauges(metrics);
         }
         return metrics;
+    }
+
+    /** Installs the observe filter once, outside whatever handler startup compiled. */
+    private void publishArmed() {
+        if (this.armed.get() != null) {
+            return;
+        }
+        Handler leaf = this.override != null ? this.override : request -> this.live.handler().handle(request);
+        var chain = ObserveRequestFilter.chain(this.slot, leaf);
+        this.armed.set(chain);
+        if (this.h3 != null) {
+            this.h3.armHandler(chain);
+        }
+        if (this.h2 != null) {
+            this.h2.armHandler(chain);
+        }
     }
 
     /**

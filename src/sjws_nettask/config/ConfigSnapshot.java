@@ -37,7 +37,7 @@ public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, H
     public static ConfigSnapshot compile(ConfigDocument document, ChallengeBoard board, int generation) {
         var server = document.server();
         var files = new StaticFileHandler(server.root(), server.allowUnlistableDirs(),
-                new FileCache(server.cacheBytes()));
+                new FileCache(server.cacheBytes()), server.access());
         Handler handler = files;
         var acme = document.acme();
         if (acme.enabled() && acme.onMainListener(server.port())) {
