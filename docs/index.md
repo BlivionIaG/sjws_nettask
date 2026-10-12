@@ -24,6 +24,7 @@ Back to the [README](../README.md) (quick start).
 - [Request routing and reverse proxy (proposal)](design/proxy-routing.md)
 - [Messaging core (draft)](messaging/design.md)
 - [High availability (draft)](ha/design.md)
+- [Control plane / API gateway mode (draft)](design/control-plane.md)
 
 ## Development
 - [Contributing](../CONTRIBUTING.md)
