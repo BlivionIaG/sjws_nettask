@@ -45,7 +45,7 @@ import java.util.Objects;
  * @param tlsKeyPassword key password, or null (masked in {@link #toString()})
  * @param altSvcMaxAge {@code ma} of the Alt-Svc header advertising HTTP/3
  * @param cacheBytes small-file cache budget in bytes (0 = disabled), see {@code core.FileCache}
- * @param accessLog not used yet: "-" for stdout, a file path, or null for off
+ * @param accessLog "-" for stdout, a file path to append, or null for off
  * @param altSvc send {@code Alt-Svc} on HTTP/1.1 responses once HTTP/3 is bound (opt-in: browsers
  *        ignore it on plain http:// origins, see the README)
  * @param maxConnectionsPerIp concurrent HTTP/1.1 connections from one client IP address (generous:
@@ -59,12 +59,15 @@ import java.util.Objects;
  *        verification V7: anyone who can write in the root could create such a directory to force it)
  * @param backlog TCP accept backlog: connections the kernel completes and queues before the server
  *        accepts them (capped by the OS, e.g. {@code net.core.somaxconn} on Linux)
+ * @param accessLogFormat common, combined (default) or json; ignored when {@code accessLog} is null
+ * @param metricsExposure who may read {@code /metrics} ({@link MetricsExposure#OFF} by default)
+ * @param healthz answer GET/HEAD {@code /healthz} with {@code ok} instead of a document-root file
  */
 public record ServerConfig(int port, Path root, int maxConnections, Duration idleTimeout, Duration headerTimeout,
         Duration writeTimeout, boolean h3Enabled, int h3Port, String h3Host, int h3MaxConnections, Path tlsCert,
         Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc,
         int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate, boolean allowUnlistableDirs,
-        int backlog) {
+        int backlog, AccessLogFormat accessLogFormat, MetricsExposure metricsExposure, boolean healthz) {
 
     public static final int DEFAULT_PORT = CONSTANTS.DEFAULT_PORT;
     /** Design review M11: 64 KB output buffer per connection, so 2048 x 64 KB = 128 MB worst case. */
@@ -116,6 +119,24 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         if ((tlsCert == null) != (tlsKey == null)) {
             throw new IllegalArgumentException("tlsCert and tlsKey must be given together");
         }
+        Objects.requireNonNull(accessLogFormat, "accessLogFormat");
+        Objects.requireNonNull(metricsExposure, "metricsExposure");
+    }
+
+    /** Line shape of {@link #accessLog()}. Combined and JSON also carry Referer and User-Agent. */
+    public enum AccessLogFormat { COMMON, COMBINED, JSON }
+
+    /** Who is answered at {@code /metrics}. {@link #OFF} leaves that path to the document root. */
+    public enum MetricsExposure { OFF, LOCALHOST, ON }
+
+    /**
+     * @return true when startup should install a recording observer. False leaves the transports on
+     *         {@link sjws_nettask.observe.RequestObserver#NONE} (no clock read, no counters, no probe
+     *         path checks). The admin TUI can still arm counters later via
+     *         {@link SjwsServer#metricsSnapshot()}.
+     */
+    public boolean observe() {
+        return this.healthz || this.accessLog != null || this.metricsExposure != MetricsExposure.OFF;
     }
 
     /** @return the UDP port HTTP/3 binds to (resolving {@link #H3_PORT_SAME_AS_TCP}) */
@@ -161,7 +182,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 + ", cacheBytes=" + cacheBytes + ", accessLog=" + accessLog + ", altSvc=" + altSvc
                 + ", maxConnectionsPerIp=" + maxConnectionsPerIp + ", h3MaxConnectionsPerIp="
                 + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + ", allowUnlistableDirs=" + allowUnlistableDirs
-                + ", backlog=" + backlog + "]";
+                + ", backlog=" + backlog + ", accessLogFormat=" + accessLogFormat + ", metricsExposure="
+                + metricsExposure + ", healthz=" + healthz + "]";
     }
 
     /** Mutable builder; new fields get a default here so existing callers keep compiling. */
@@ -189,6 +211,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         private boolean altSvc;
         private boolean allowUnlistableDirs;
         private int backlog = DEFAULT_BACKLOG;
+        private AccessLogFormat accessLogFormat = AccessLogFormat.COMBINED;
+        private MetricsExposure metricsExposure = MetricsExposure.OFF;
+        private boolean healthz;
 
         private Builder(Path root) {
             this.root = root;
@@ -217,6 +242,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             this.altSvc = c.altSvc;
             this.allowUnlistableDirs = c.allowUnlistableDirs;
             this.backlog = c.backlog;
+            this.accessLogFormat = c.accessLogFormat;
+            this.metricsExposure = c.metricsExposure;
+            this.healthz = c.healthz;
         }
 
         public Builder port(int v) { this.port = v; return this; }
@@ -241,12 +269,15 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public Builder altSvc(boolean v) { this.altSvc = v; return this; }
         public Builder allowUnlistableDirs(boolean v) { this.allowUnlistableDirs = v; return this; }
         public Builder backlog(int v) { this.backlog = v; return this; }
+        public Builder accessLogFormat(AccessLogFormat v) { this.accessLogFormat = v; return this; }
+        public Builder metricsExposure(MetricsExposure v) { this.metricsExposure = v; return this; }
+        public Builder healthz(boolean v) { this.healthz = v; return this; }
 
         public ServerConfig build() {
             return new ServerConfig(port, root, maxConnections, idleTimeout, headerTimeout, writeTimeout, h3Enabled,
                     h3Port, h3Host, h3MaxConnections, tlsCert, tlsKey, tlsKeyPassword, altSvcMaxAge, cacheBytes,
                     accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate, allowUnlistableDirs,
-                    backlog);
+                    backlog, accessLogFormat, metricsExposure, healthz);
         }
     }
 
@@ -295,6 +326,16 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --alt-svc-max-age=S       Alt-Svc max-age, seconds (86400)              WEB_SERVER_ALT_SVC_MA
                   --allow-unlistable-dirs   serve below unreadable (--x) directories by   WEB_SERVER_ALLOW_UNLISTABLE_DIRS
                                             path (weaker against local writers; off: 403)
+                  --access-log=PATH         access log: - is stdout, or a file to append  WEB_SERVER_ACCESS_LOG
+                                            (unset: off). One line per response, written
+                                            off the request thread
+                  --access-log-format=FMT   common, combined (default) or json           WEB_SERVER_ACCESS_LOG_FORMAT
+                  --metrics[=MODE]          /metrics: off (default), localhost or on     WEB_SERVER_METRICS
+                                            (a bare --metrics means localhost)
+                  --no-metrics              leave /metrics disabled
+                  --healthz | --no-healthz  GET/HEAD /healthz answers "ok" (off).        WEB_SERVER_HEALTHZ=true|false
+                                            Off: a document-root file at /healthz is
+                                            served. On also turns request counters on
                   -h, --help                show this help
 
                 Environment variables override arguments. The key password is never accepted
@@ -351,6 +392,11 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String key = null;
         String passwordFile = null;
         long altSvc = DEFAULT_ALT_SVC_MAX_AGE.toSeconds();
+        String accessLog = null;
+        var accessLogFormat = AccessLogFormat.COMBINED;
+        var metricsExposure = MetricsExposure.OFF;
+        boolean healthz = false;
+        boolean accessLogFormatSet = false;
         var explicitH3Options = new ArrayList<String>();
 
         // command line: positional [port] [dir], --flags anywhere
@@ -414,6 +460,15 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     }
                     case "--no-alt-svc" -> altSvcOn = false;
                     case "--allow-unlistable-dirs" -> unlistable = value == null || bool(value, unlistable, name, warnings);
+                    case "--access-log" -> accessLog = text(value, accessLog, name, warnings);
+                    case "--access-log-format" -> {
+                        accessLogFormat = logFormat(value, accessLogFormat, name, warnings);
+                        accessLogFormatSet = true;
+                    }
+                    case "--metrics" -> metricsExposure = metricsMode(value, MetricsExposure.LOCALHOST, name, warnings);
+                    case "--no-metrics" -> metricsExposure = MetricsExposure.OFF;
+                    case "--healthz" -> healthz = value == null || bool(value, healthz, name, warnings);
+                    case "--no-healthz" -> healthz = false;
                     case "--alt-svc-max-age" -> {
                         altSvc = number(value, altSvc, 0, 31_536_000, name, warnings);
                         explicitH3Options.add(name);
@@ -476,6 +531,19 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if ((v = env.get("WEB_SERVER_ALLOW_UNLISTABLE_DIRS")) != null) {
             unlistable = bool(v, unlistable, "WEB_SERVER_ALLOW_UNLISTABLE_DIRS", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_ACCESS_LOG")) != null) {
+            accessLog = text(v, accessLog, "WEB_SERVER_ACCESS_LOG", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_ACCESS_LOG_FORMAT")) != null) {
+            accessLogFormat = logFormat(v, accessLogFormat, "WEB_SERVER_ACCESS_LOG_FORMAT", warnings);
+            accessLogFormatSet = true;
+        }
+        if ((v = env.get("WEB_SERVER_METRICS")) != null) {
+            metricsExposure = metricsMode(v, metricsExposure, "WEB_SERVER_METRICS", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_HEALTHZ")) != null) {
+            healthz = bool(v, healthz, "WEB_SERVER_HEALTHZ", warnings);
         }
         if ((v = env.get("WEB_SERVER_H3")) != null) {
             h3 = bool(v, h3, "WEB_SERVER_H3", warnings);
@@ -546,6 +614,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             warnings.add("HTTP/3 is disabled, so " + String.join(", ", explicitH3Options)
                     + " ha" + (explicitH3Options.size() == 1 ? "s" : "ve") + " no effect (add --h3)");
         }
+        if (accessLog == null && accessLogFormatSet) {
+            warnings.add("--access-log-format has no effect without --access-log");
+        }
 
         var config = b.port(port).root(Path.of(dir)).maxConnections(max).maxConnectionsPerIp(perIp).backlog(backlog)
                 .h3MaxConnectionsPerIp(h3PerIp).h3MinRate(minRate)
@@ -553,8 +624,48 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 .writeTimeout(Duration.ofSeconds(write)).cacheBytes(cache).altSvc(altSvcOn).allowUnlistableDirs(unlistable)
                 .h3Enabled(h3).h3Port(h3Port).h3Host(h3Host).h3MaxConnections(h3Max)
                 .tlsCert(cert == null ? null : Path.of(cert)).tlsKey(key == null ? null : Path.of(key))
-                .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc)).build();
+                .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc))
+                .accessLog(accessLog).accessLogFormat(accessLogFormat).metricsExposure(metricsExposure)
+                .healthz(healthz).build();
         return new Parsed(config, List.copyOf(warnings), List.copyOf(errors), help);
+    }
+
+    private static AccessLogFormat logFormat(String value, AccessLogFormat fallback, String what, List<String> warnings) {
+        if (value == null || value.isBlank()) {
+            warnings.add("Missing value for " + what + " (use " + what + "=common|combined|json)");
+            return fallback;
+        }
+        return switch (value.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "common" -> AccessLogFormat.COMMON;
+            case "combined" -> AccessLogFormat.COMBINED;
+            case "json" -> AccessLogFormat.JSON;
+            default -> {
+                warnings.add("Invalid " + what + " (value '" + value + "'), expected common, combined or json; using "
+                        + fallback.name().toLowerCase(java.util.Locale.ROOT));
+                yield fallback;
+            }
+        };
+    }
+
+    /** {@code value == null} means the flag was given without {@code =} (bare {@code --metrics}). */
+    private static MetricsExposure metricsMode(String value, MetricsExposure whenBare, String what, List<String> warnings) {
+        if (value == null) {
+            return whenBare;
+        }
+        if (value.isBlank()) {
+            warnings.add("Missing value for " + what + " (use off, localhost or on)");
+            return whenBare;
+        }
+        return switch (value.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "on", "all", "true", "1", "yes" -> MetricsExposure.ON;
+            case "off", "false", "0", "no" -> MetricsExposure.OFF;
+            case "localhost", "local", "loopback" -> MetricsExposure.LOCALHOST;
+            default -> {
+                warnings.add("Invalid " + what + " (value '" + value + "'), expected off, localhost or on; using "
+                        + whenBare.name().toLowerCase(java.util.Locale.ROOT));
+                yield whenBare;
+            }
+        };
     }
 
     private static boolean bool(String value, boolean fallback, String what, List<String> warnings) {

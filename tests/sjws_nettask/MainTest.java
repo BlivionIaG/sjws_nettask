@@ -9,9 +9,11 @@ import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -126,6 +128,72 @@ class MainTest {
         assertEquals(Sjws_nettask.EXIT_OK, code[0]);
         assertEquals(-1, server.tcpPort(), "closed on the way out");
         assertFalse(out().contains("Terminated properly"));
+    }
+
+    @Test
+    void signalHookWaitsForTheTerminationLine() throws Exception {
+        var root = Files.createDirectory(this.root.resolve("hook"));
+        try (var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3)) {
+            var task = new Sjws_nettask.Shutdown(server, new AtomicReference<>(), out, err);
+            task.markServing();
+            var hook = new Thread(task, "shutdown");
+            task.bind(hook);
+            hook.start();
+            task.reportTerminated();
+            hook.join(5_000);
+            assertFalse(hook.isAlive());
+            assertEquals(1, out().split("Server Terminated properly !", -1).length - 1, out());
+        }
+
+        outBytes.reset();
+        try (var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3)) {
+            var task = new Sjws_nettask.Shutdown(server, new AtomicReference<>(), out, err);
+            task.markServing();
+            task.reportWait(Duration.ZERO);
+            var hook = new Thread(task, "shutdown");
+            task.bind(hook);
+            hook.start();
+            hook.join(5_000);
+            assertFalse(hook.isAlive());
+            assertTrue(out().contains("Server Terminated properly !"), out());
+        }
+
+        outBytes.reset();
+        try (var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3)) {
+            var task = new Sjws_nettask.Shutdown(server, new AtomicReference<>(), out, err);
+            var hook = new Thread(task, "shutdown");
+            task.bind(hook);
+            hook.start();
+            hook.join(5_000);
+            assertFalse(hook.isAlive());
+            assertFalse(out().contains("Terminated properly"), out());
+            task.run();
+            assertFalse(out().contains("Terminated properly"), out());
+            task.reportTerminated();
+            assertFalse(out().contains("Terminated properly"), out());
+            task.markServing();
+            task.reportTerminated();
+            task.reportTerminated();
+            assertEquals(1, out().split("Server Terminated properly !", -1).length - 1, out());
+        }
+
+        outBytes.reset();
+        try (var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3)) {
+            var task = new Sjws_nettask.Shutdown(server, new AtomicReference<>(), out, err);
+            task.markServing();
+            task.reportWait(Duration.ofSeconds(30));
+            var hook = new Thread(task, "shutdown");
+            task.bind(hook);
+            hook.start();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (hook.isAlive() && hook.getState() != Thread.State.TIMED_WAITING && System.nanoTime() < deadline) {
+                Thread.sleep(1);
+            }
+            hook.interrupt();
+            hook.join(5_000);
+            assertFalse(hook.isAlive());
+            assertTrue(out().contains("Server Terminated properly !"), out());
+        }
     }
 
     @Test
