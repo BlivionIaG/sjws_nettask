@@ -77,6 +77,43 @@ class HardeningIntegrationTest {
         }
     }
 
+    /** Verification V1 for HTTP/1.1: one address gets at most maxConnectionsPerIp connections. */
+    @Test
+    void connectionsPerAddressAreCapped() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        start(ServerConfig.builder(root).maxConnectionsPerIp(2).build());
+        try (var a = connect(); var b = connect()) {
+            waitUntil(() -> manager.activeConnections() == 2);
+            try (var c = connect()) {
+                assertEquals(-1, readOrReset(c), "the third connection is closed at once");
+            }
+            waitUntil(() -> manager.refusedPerIp() == 1);
+            a.close();
+            waitUntil(() -> manager.activeConnections() == 1);
+            try (var d = connect()) {
+                d.getOutputStream().write("GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                assertEquals(200, HttpTestSupport.readResponse(d.getInputStream()).statusCode(), "slot freed");
+            }
+        }
+        assertEquals(ServerConfig.DEFAULT_MAX_CONNECTIONS_PER_IP, ServerConfig.defaults(root.toString()).maxConnectionsPerIp());
+    }
+
+    private static int readOrReset(Socket s) {
+        try {
+            return s.getInputStream().read();
+        } catch (IOException e) {
+            return -1; // reset by peer
+        }
+    }
+
+    private static void waitUntil(java.util.function.BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        while (!condition.getAsBoolean()) {
+            assertTrue(System.nanoTime() < deadline, "condition not reached");
+            Thread.sleep(10);
+        }
+    }
+
     @ParameterizedTest(name = "[{index}] smuggling vector -> 400 + close")
     @ValueSource(strings = {
         "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nContent-Length: 41\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n",
