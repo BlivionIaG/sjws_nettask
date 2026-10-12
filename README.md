@@ -34,8 +34,8 @@ Run:
 
 **HTTP/1.1 connections** run on blocking `SocketChannel`s, one virtual thread each. One timer thread
 enforces every deadline (no per-socket timeouts): `--idle-timeout` between requests,
-`--header-timeout` from the first byte of a request until its head (and any small body to discard)
-has arrived (then `408` and close: slowloris), and `--write-timeout` without progress while a response
+`--header-timeout` from the first byte of a request until its head (and any small body to discard,
+also after a `100 Continue`) has arrived (then `408` and close: slowloris), and `--write-timeout` without progress while a response
 is being written (a client that stops reading is closed; a slow download that keeps moving is not).
 Files larger than 64 KiB that are not in the cache go out with `sendfile` (`FileChannel.transferTo`);
 a file that shrinks during the transfer ends the connection (the response can't be completed).
@@ -153,12 +153,19 @@ with keep-alive and pipelining, `ETag` / `If-None-Match` / `If-Modified-Since`, 
 ### Caching, validators and ranges
 
 * **Small-file cache.** Files up to 256 KiB are kept in memory (both protocols), up to
-  `--cache-bytes` in total (body + key + ~256 bytes per entry) and 4096 entries, least recently used
-  first out. The key is the decoded, normalized path without the query, so `?v=1`, `%68ello`, `./`
+  `--cache-bytes` in total (body + key + ~256 bytes per entry) and 4096 entries; eviction is CLOCK
+  (second chance: an approximation of least recently used, O(1) amortized, hits take no lock). The key is the decoded, normalized path without the query, so `?v=1`, `%68ello`, `./`
   spellings share one entry and can't push others out; 404s are never cached. **Every hit stats the
   file** and compares file key (inode), mtime in ns, size and ctime; any change drops the entry and
-  the request is resolved again from scratch (containment, no-follow open). A file is read through the
+  the request is resolved again from scratch (containment, no-follow open). Unless
+  `--allow-unlistable-dirs` is set, a hit also checks (`access(2)`) that the document root and every
+  directory down to the file are still readable, so a directory made search-only after the file was
+  cached answers `403` at once, as it would uncached; that is one more syscall per directory level on
+  every hit (measured below). A file is read through the
   same no-follow open as when it is sent, and is cached only if it did not change while being read.
+  At most `min(--cache-bytes, 4 MiB)` of files are being read into memory at once; a miss that finds no
+  room is served from disk without caching (streamed), and concurrent misses of one file share a
+  single read.
   Limits: on a platform without file keys and ctime (Windows) an edit that keeps both size and mtime
   is not noticed; on Linux, file timestamps tick every few ms, so a same-size rewrite that also
   restores the mtime within one tick of the previous change is not noticed either. Directory listings
@@ -166,7 +173,9 @@ with keep-alive and pipelining, `ETag` / `If-None-Match` / `If-Modified-Since`, 
   entry (they don't open the file), so they behave as without a cache.
 * **ETag** is `"<inode hash>-<mtime ns>-<size>"` (hex). A file version first seen less than 1 s after its
   mtime gets a weak tag (`W/"..."`) and keeps it while unchanged: on file systems with a coarse mtime a
-  second write within that second could otherwise keep the tag. `If-None-Match` (lists, `*`, weak
+  second write within that second could otherwise keep the tag. Up to 4096 such young versions are
+  remembered; when that memory is reset, versions that are old by then get their strong tag, on the
+  cached and the uncached path alike. `If-None-Match` (lists, `*`, weak
   comparison) takes precedence over `If-Modified-Since`; a 304 carries `ETag`, `Last-Modified` and
   `Date` only.
 * **Ranges** (both protocols, decided in core after the 304 conditionals). One `bytes=` range
@@ -211,13 +220,35 @@ Each column is the server as of that step, all measured in the same session:
 | 50 MB | 100 | 11.2 GB/s | 10.9 GB/s | 17.3 GB/s |
 | 50 MB | 1000 | 11.3 GB/s | 11.3 GB/s | 16.6 GB/s |
 
+Tails at 1000 connections: p99 as the median over runs (worst run in brackets), and the runs where wrk
+reported socket timeouts (all were read timeouts: wrk's default 2 s; never connect errors). The last
+two columns are the final code with the old and the new accept backlog, 7 runs each (50 MB: 3):
+
+| File | before S3 | S3 | S4 | backlog 50 | backlog 1024 (default) |
+|---|---|---|---|---|---|
+| 1 KB p99 | 69 ms (687) | 46 ms (334) | 13 ms (612) | 14 ms (549) | 8.8 ms (25) |
+| 1 KB timeouts | 1 of 3 runs (121) | 1 of 3 (3) | 1 of 3 (88) | 3 of 7 (65-127), one run at 5k req/s | 0 of 7 |
+| 100 KB p99 | 55 ms (126) | 112 ms (623) | 64 ms (615) | 78 ms (1030) | 23 ms (40) |
+| 100 KB timeouts | 0 of 3 | 0 of 3 | 1 of 3 (126) | 1 of 7 (39) | 0 of 7 |
+| 50 MB p99 (30 s timeout) | 7.0 s | 6.8 s | 5.3 s | 5.0 s (17.5 GB/s) | 5.0 s (18.3 GB/s) |
+
+Throughput at 1000 connections did not change with the backlog (1 KB 217k vs 219k req/s, 100 KB 68.8k vs
+68.5k); the tails did. That is consistent with bursts of new connections overflowing an accept queue of 50,
+whose SYN retransmits (after 1 s, then 3 s) show up as timeouts and p99 spikes. A 50 MB response at 1000 connections
+takes longer than wrk's default 2 s timeout by itself (17 GB/s shared 1000 ways), so those runs use 30 s.
+
 Memory per idle keep-alive connection: ~6.3 KB of heap (~6.6 KB RSS) since S4, against ~78 KB before
 (a 2 KiB input buffer and the parser's 256 B line buffer; no output buffer). Caveats: these are
 loopback numbers with the client on the same machine, small working sets that sit in the page cache
 and wrk's closed-loop load (no think time); at fixed rates every variant could sustain (wrk2, 50k
 req/s for 1 KB, 30k req/s for 100 KB) p50/p99 were within noise of each other (0.8-3 ms / 2-10 ms), and
 the 1 KB / 100-connection p99.9 of S4 varied between 7 and 35 ms across runs (not GC; not explained
-yet); at 1000 connections a few runs saw connect timeouts (accept backlog 50). Every cache hit stats the file (correctness first); skipping that stat for a 1 s window
+yet); two 1 KB runs with backlog 1024 were lower (137k, 185k req/s, no errors), also unexplained.
+The search-only directory check on every cache hit (one `access(2)` per directory level, see the cache above)
+costs, for 1 KB files at 100 connections, 224k → 200k req/s (-11%) for a file in the root and 213k
+→ 157k (-26%) three directories down; with `--allow-unlistable-dirs` (no check) the difference is
+within noise (-2 to -3%). System calls are slow on the measurement VM (~0.7 µs for one `access`,
+~2.4 µs with 4 threads in parallel), so the share may be smaller on bare metal (not measured). Every cache hit stats the file (correctness first); skipping that stat for a 1 s window
 measured +12-20% on 1 KB files and was deliberately not adopted. HTTP/3 throughput was not
 benchmarked. A larger `sendfile` chunk (256 KiB, 1 MiB) was measured in S5 and moved 50 MB by
 under 5%, so it stays at 64 KiB.
