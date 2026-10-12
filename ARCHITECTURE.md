@@ -16,6 +16,7 @@ tests that pin each behaviour are listed in [tests/README.md](tests/README.md).
 | TLS | `sjws_nettask.tls`: `TlsMaterial`, `SelfSignedDer` | PEM certificate/key loading (encrypted keys), self-signed certificate |
 | Core contract | `sjws_nettask.core`: `Handler`, `Request`, `RequestHeaders`, `Response`, `ResponseHeaders`, `Body` | protocol-neutral request/response |
 | Application | `core.StaticFileHandler` + `PathResolver`, `RequestRules`, `SafeOpen`, `FileCache`, `FileMeta`, `ByteRanges`, `EntityTag`, `Validator`, `Mime`, `HttpDate`, `DateClock`, `PerIpLimit` | every status decision for static files |
+| Observability | `sjws_nettask.observe`: `RequestObserver`, `ServerMetrics`, `Snapshot`, `AccessLog` | access log, in-process metrics, `/healthz`, optional `/metrics` |
 
 `SourceGuardTest` enforces the boundaries: no Netty in core or HTTP/1, and `h3` does not import HTTP/1.
 
@@ -39,7 +40,7 @@ HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ──
 
 ## Current gaps
 
-These are true of `master` today and are the next refactoring steps (each small, without file
+These are true of this branch today and are the next refactoring steps (each small, without file
 moves, so parallel workstreams don't conflict):
 
 1. `ClientManager`, `SjwsServer`, `Transport.Factory` and `h3.Http3RequestHandler` still take the
@@ -57,6 +58,14 @@ server. Messaging is still being designed and nothing of it exists in the code y
 seam and the protocol-neutral `Request`/`Response` contract are where such features are expected to
 plug in. The target design and migration plan follow below.
 
+## Observability
+
+`observe.RequestObserver` is the isolated hook. It is not a `Handler` decorator: the chain above is not composed in `SjwsServer` yet. Both transports share an `ObserverSlot`. While that slot is `RequestObserver.NONE` (the default) a request does not read the clock, does not update a counter, and does not look at the path for `/healthz` or `/metrics`, so a document-root file at `/healthz` is served. `--access-log`, `--metrics` (other than `off`) and `--healthz` install a recording observer at startup. The admin TUI's status view calls `SjwsServer.metricsSnapshot()`, which arms counters on the first call without enabling `/healthz`. When the chain exists, one decorator can make the `intercept` and `complete` calls and the transport calls go away; `ServerMetrics`, `Snapshot` and `AccessLog` stay where they are.
+
+Counters are `LongAdder`s, and only after the observer is recording. The access log is a bounded lock-free queue drained by one thread. Neither path blocks a request on I/O.
+
+The latency histogram is a fixed log2 scale (ratio 2, from 1 ms through 16.384 s, then `+Inf`). `ServerMetrics.LATENCY_BOUNDS_NANOS` and `LATENCY_LE_LABELS` are the stable contract: a cluster merges by summing `Snapshot.latency().counts()[i]` across nodes, or by summing Prometheus `sjws_http_request_duration_seconds_bucket` series that share an `le` label. The in-process counts are not cumulative; the exposition is.
+
 ---
 
 # Target: message-oriented middleware that is also a web server
@@ -67,7 +76,7 @@ Goal (from Blivion): a **reliable, fast, low-latency message-oriented middleware
 1. **One I/O + threading core, many protocols.** HTTP/1.1, HTTP/3 and the messaging protocol(s) are adapters on the same listeners, buffer pool and deadline machinery (today `ClientManager` + `ConnectionReaper`).
 2. **The log is the source of truth.** Messages are durable only once they are in an append-only segmented log. Queues, topics, consumer offsets and replication are all views over or copies of that log.
 3. **Single writer per partition.** One thread owns each partition's append path, so there are no locks on the hot path. Producers hand records over through a bounded queue, which is also the backpressure signal.
-4. **Durability is explicit and configurable** per stream: `none` / `group` (fsync batching) / `replicated` (quorum ack), never implicit.
+4. **Durability is explicit and configurable** per stream: `none` / `group` (fsync batching) / `replicated` (majority in-memory ack, the **decided cluster default**) / `replicated+fsync` (opt-in quorum + fsync), never implicit.
 5. **Behavior-preserving, incremental migration.** The web server keeps working at every phase, and every phase ships with benchmarks.
 
 ## T1. Shared I/O and threading core
@@ -81,21 +90,22 @@ Goal (from Blivion): a **reliable, fast, low-latency message-oriented middleware
 | Deadlines | Generalize `ConnectionReaper` timers to messaging sessions (heartbeat/idle, ack timeout) | Reuse, not a second timer wheel. |
 
 ## T2. Messaging engine
-* **Protocols.** These are open questions for Messaging Core (§A). Proposal: (1) a native binary TCP protocol, length-prefixed frames, with **batched produce and fetch** whose frames match the log record format; (2) **HTTP bindings** through the existing `core.Handler` seam: `POST /topics/{t}` publishes, `GET /topics/{t}?offset=` fetches, SSE or WebSocket streams, so the web server *is* a messaging gateway; (3) MQTT/AMQP/STOMP are explicitly later and optional.
-* **Model.** *Topic* = named stream split into *partitions* (one log each, ordered within a partition). *Queue* = a topic with one shared consumer group, competing consumers and per-message ack/redelivery. *Subscription / consumer group* = a durable cursor (committed offset) stored in an internal compacted log. This is how Kafka models it ([Kafka design](https://kafka.apache.org/37/design/design/)). NATS JetStream offers the same split (streams + consumers, [docs](https://docs.nats.io/reference/config/jetstream/)).
-* **Delivery semantics.** At-most-once (ack before processing), **at-least-once by default** (ack after durable append; redelivery after ack timeout), and effectively-once via **idempotent producers** (producer id + sequence number deduplicated at the partition leader). Exactly-once *transactions* are out of scope.
+* **Protocols** (resolved by Messaging Core, PR #17). (1) Our own native binary TCP protocol, length-prefixed frames, with **batched produce and fetch** whose frames match the log record format; (2) **HTTP bindings** through the existing `core.Handler` seam: `POST /topics/{t}` publishes, `GET /topics/{t}?offset=` fetches, SSE or WebSocket streams, so the web server *is* a messaging gateway; (3) AMQP/MQTT come later, as gateways. The Kafka wire protocol will not be implemented.
+* **Model.** *Topic* = named stream split into *partitions* (one log each, ordered within a partition). *Queue* = a topic with one shared consumer group, competing consumers and per-message ack/redelivery. Per-message state (deliver/ack/nack/DLQ records) is stored as records in the partition's own log, not in a separate store (PR #17 §2.1). *Subscription / consumer group* = a durable cursor (committed offset) stored in an internal compacted log. This is how Kafka models it ([Kafka design](https://kafka.apache.org/37/design/design/)). NATS JetStream offers the same split (streams + consumers, [docs](https://docs.nats.io/reference/config/jetstream/)).
+* **Delivery semantics.** At-most-once (ack before processing), **at-least-once by default** (ack after durable append; redelivery after ack timeout), and effectively-once via **idempotent producers** (producer id + sequence number deduplicated at the partition leader). There is no exactly-once in v1 (PR #17); producer deduplication covers retries.
 * **Backpressure.** End to end and credit-based: (a) each partition writer has a bounded queue (`LogBench` uses 65 536 entries), and a full queue makes the producer's send block or get a `retry-after`; (b) consumers grant **credits** (max in-flight messages/bytes), the server never pushes beyond them, and on HTTP the equivalent is long-poll / chunked fetch with `max_bytes`; (c) per-connection write deadlines (`ConnectionReaper`) drop slow consumers instead of buffering without bound.
 * **Ordering.** Per partition. Key-hashing picks the partition.
 
 ## T3. Storage log
 Prototype: `bench/LogBench.java` (bench code only, not server code).
 * **Segmented append-only log** per partition: files `<baseOffset:020d>.log` (1 GiB default) plus a sparse `.index` (relative offset → file position, one entry every 4 KiB). Kafka uses the same layout ([Kafka design: log](https://kafka.apache.org/37/design/design/)).
-* **Record frame** (prototype): `[len:int][crc32c:int][offset:long][payload]`. Production adds a batch header (base offset, count, timestamp, producer id/seq) so that **disk format = wire format** and fetch can use sendfile.
+* **Record frame** (prototype): `[len:int][crc32c:int][offset:long][payload]`. Production adds a **format version byte** (PR #17) and a batch header (base offset, count, timestamp, producer id/seq) so that **disk format = wire format** and fetch can use sendfile.
 * **Fsync policy** per stream:
   * `none`: write to the page cache; fast but loses data on power failure. Measured **489k rec/s** (8 producers, 256 B), p50 11 µs.
   * `group` (**default for single node**): the writer drains everything queued, does one `write` + one `fsync`, then acks the batch. Measured: 1 producer 1.7k rec/s (≈ the fsync rate), 8 producers 6.9k rec/s, **64 producers 48.6k rec/s at p50 1.1 ms**. Throughput scales with concurrency because each fsync covers more records.
   * `each`: fsync per record. 1.6–1.7k rec/s regardless of producer count, p50 4.2 ms at 8 producers. Only for compliance-style streams.
-  * `replicated` (cluster): ack after a quorum has the record, with fsync left to the OS or a timer. This is Kafka's recommended default ([flush.messages](https://kafka.apache.org/43/configuration/topic-configs/), [Hardware and OS](https://kafka.apache.org/43/operations/hardware-and-os/)). NATS JetStream also acks on quorum and syncs on a 2-minute timer by default ([replication and R=3](https://docs.nats.io/learn/clustering/replication-and-r3), [sync_interval](https://docs.nats.io/reference/config/jetstream/sync_interval)). We would document this trade-off loudly rather than hide it.
+  * `replicated` (**cluster default, decided by Blivion on 2026-10-12**): `append` is acked once a **majority of the replica set holds the entry in memory**. No follower fsync is required; the leader's and followers' fsync follows the stream's local policy (`group` or the background timer). This matches Kafka's recommended default ([flush.messages](https://kafka.apache.org/43/configuration/topic-configs/), [Hardware and OS](https://kafka.apache.org/43/operations/hardware-and-os/)) and NATS JetStream, which acks on quorum and syncs on a 2-minute timer by default ([replication and R=3](https://docs.nats.io/learn/clustering/replication-and-r3), [sync_interval](https://docs.nats.io/reference/config/jetstream/sync_interval)). Trade-off, documented on purpose: an acked message survives the loss of any minority of nodes, but it can be lost if a majority loses power before its next fsync.
+  * `replicated+fsync` (**explicit opt-in, per stream/topic**): the ack waits until a majority has **fsynced** the entry (one `group` commit on each replica in the quorum). This closes the simultaneous-power-loss window, at the cost of about one fsync (≈ 0.5 ms here, §B2) plus a round-trip on every ack. Set in the stream/topic config (e.g. `durability: replicated+fsync`). It is never the implicit default.
   * A later option for `group`: linger N µs to grow batches at low concurrency. The 1-producer result shows a closed loop gets no batching benefit.
 * **Recovery.** Scan the last (unsynced) segment, validate CRCs, truncate at the first bad record, rebuild its index. Kafka does the same for segments not known to be fsynced ([Hardware and OS](https://kafka.apache.org/43/operations/hardware-and-os/)).
 * **Retention.** Delete whole segments by age or size (cheap: unlink), plus **compaction** (latest value per key) for internal topics (consumer offsets, cluster metadata).
@@ -131,7 +141,7 @@ TCP :msg     ──▶ MsgConnection ───┴──────────�
 | 2 | `storage` package: production `PartitionLog` (segments, index, recovery, retention, fsync policies) with crash tests (kill -9 / truncated tail) | Recovery tests; `LogBench` numbers within 10 % of the prototype |
 | 3 | Single-node broker: topics, partitions, consumer groups, offsets log, at-least-once, credits; HTTP bindings via `Handler` | End-to-end produce→consume latency bench; backpressure tests |
 | 4 | Native binary protocol + idempotent producers | Batch-produce throughput vs HTTP baseline |
-| 5 | Raft metadata + replication + failover; witness-based dual-node HA | Jepsen-style partition/kill tests; no acked-message loss in `replicated` mode |
+| 5 | Raft metadata + replication + failover; witness-based dual-node HA | Jepsen-style partition/kill tests; no acked-message loss under minority failures in `replicated`, nor under majority power loss in `replicated+fsync` |
 | 6 | Optional: Netty or io_uring front-end behind `Transport` if benchmarks justify it | Measured win > 20 % |
 
 ## B. Benchmarks (measured)
@@ -158,21 +168,25 @@ Run on **b8055fe** (master at the time + this PR's `bench/`; later master merges
 | group | 8 | 6,896 | 1.9 | 99,201 | 970 µs | 3.88 ms | 20.0 ms |
 | group | 64 | 48,579 | 13.2 | 12,265 | 1.12 ms | 4.95 ms | 8.31 ms |
 
-**Takeaways.** (1) One fsync on this disk costs about 0.5 ms, which caps per-record-durable writes at about 1.7k/s no matter how many producers there are. (2) Group commit scales almost linearly with concurrency: 64 producers gave 28× the per-record throughput at roughly 2× the p50. Group commit is therefore the default single-node policy. (3) Without fsync the single writer thread sustains about 0.5–0.65 M rec/s, so the write path is not CPU-bound. (4) A durable round-trip (~0.5–1 ms) is larger than the whole HTTP request latency (45 µs). For low-latency acks, **replicated-in-memory quorum** (T3 `replicated`) beats local fsync, provided the network RTT is below fsync latency. That needs to be measured in phase 5.
+**Takeaways.** (1) One fsync on this disk costs about 0.5 ms, which caps per-record-durable writes at about 1.7k/s no matter how many producers there are. (2) Group commit scales almost linearly with concurrency: 64 producers gave 28× the per-record throughput at roughly 2× the p50. Group commit is therefore the default single-node policy. (3) Without fsync the single writer thread sustains about 0.5–0.65 M rec/s, so the write path is not CPU-bound. (4) A durable round-trip (~0.5–1 ms) is larger than the whole HTTP request latency (45 µs). This is why the decided cluster default is the **majority in-memory ack** (T3 `replicated`): it beats local fsync whenever the network RTT is below fsync latency, which phase 5 must measure.
 
 ## A. Alignment with sibling workstreams
-At the time of writing (2026-10-12 PM) the repo had **no open PR, branch or doc** from *sjws Messaging Core* or *sjws High Availability*. Open PRs: #5 daemon, #7 rights, #11 docs overhaul. Branches and `/workspace/src/sjws_nettask-*.md` contain no messaging or replication design. So nothing to agree or disagree with yet; these questions are proposed for them.
+Updated 2026-10-12, 16:36 Paris time.
 
-**Messaging Core: open questions**
-1. Native protocol: custom binary (proposed) vs adopting an existing wire protocol (Kafka, AMQP 1.0, MQTT 5) for client ecosystem reasons?
-2. Is the default **at-least-once + idempotent producer** acceptable, or is exactly-once required?
-3. Should queues be topics with shared consumer groups (proposed), or a separate per-message-state store (needed for per-message TTL, priority and DLQ)?
-4. Should the default single-node fsync policy be `group` (proposed)? With a linger setting?
-5. Should the on-disk batch format equal the wire format (needed for sendfile fetch)?
+### Decided
+* **Cluster ack default** (Blivion, 2026-10-12): majority **in-memory** ack (`replicated`), with no follower fsync. Quorum + fsync (`replicated+fsync`) is an explicit per-stream/topic opt-in (T3). This settles the former HA open question "does a replicated ack require a follower fsync?".
 
-**High Availability: open questions**
+### Messaging Core: resolved by PR #17 (`docs/design/messaging.md`)
+1. Protocol: **our own binary protocol plus HTTP**. AMQP/MQTT come later as gateways. No Kafka wire protocol.
+2. **No exactly-once in v1**; producer deduplication instead.
+3. Queues are **a shared consumer group, with per-message state records in the partition log** (no separate store).
+4. **`group` fsync is the single-node default.**
+5. The on-disk/wire format carries a **format version byte**.
+
+Still to align: as of this update #17 §6 describes quorum + fsync as the default with in-memory as a "relaxed mode". That is the reverse of the decision above, so #17 needs a wording update.
+
+**High Availability: open questions** (the HA design has since appeared in PR #14 and its follow-ups #22, #27, #29, #30. They were not re-reviewed for this update.)
 1. Does "dual-node HA" allow a third **witness** process (proposed)? Without one, automatic failover is not split-brain safe.
 2. Should Raft be used for metadata only, with ISR-style replication for data (Kafka/KRaft shape), or Raft for data too (NATS JetStream shape)?
-3. What are the RPO/RTO targets (e.g. RPO = 0 for acked messages in `replicated` mode, RTO < N s)? These drive heartbeat and election timeouts.
-4. Should an ack in `replicated` mode require a follower fsync, or only quorum in-memory receipt (Kafka/NATS default, see T3)?
-5. Should HTTP static serving be active-active on all nodes (proposed), independent of messaging leadership?
+3. What are the RPO/RTO targets (e.g. RPO = 0 for acked messages under minority failures in `replicated` mode, RTO < N s)? These drive heartbeat and election timeouts.
+4. Should HTTP static serving be active-active on all nodes (proposed), independent of messaging leadership?
