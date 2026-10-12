@@ -134,9 +134,11 @@
             <phase>verify</phase>
             <goals><goal>report</goal></goals>
           </execution>
-          <!-- Gate: per-package rules, set ~1-2 points under measured coverage (2026-10-12).
-               Root after the daemon merge is about 96.7/95.6. config 83.6/69.5, acme 86.8/68.6.
-               observe 97.0/88.3. -->
+          <!-- Gate: per-package rules, set ~1-2 points under measured coverage (2026-10-12),
+               except the restored root branch floor of 0.96 (measured 97.0/96.1) and the
+               acme branch floor of 0.85 (measured 91.1/85.8). config is 86.2/75.0; its branch
+               floor stays 0.73 because 159 of the 181 missed branches are ConfigLoader's
+               strict YAML error matrix, which is not on the request path. -->
           <execution>
             <id>check</id>
             <phase>verify</phase>
@@ -181,7 +183,7 @@
                 <includes><include>sjws_nettask</include></includes>
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.96</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.94</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.96</minimum></limit>
                 </limits>
               </rule>
               <rule>
@@ -213,7 +215,7 @@
                 <includes><include>sjws_nettask.config</include></includes>
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.81</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.67</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.73</minimum></limit>
                 </limits>
               </rule>
               <rule>
@@ -221,7 +223,7 @@
                 <includes><include>sjws_nettask.acme</include></includes>
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.66</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
                 </limits>
               </rule>
               <rule>

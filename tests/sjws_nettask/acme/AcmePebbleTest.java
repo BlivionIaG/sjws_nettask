@@ -13,14 +13,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
-import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLContext;
@@ -33,13 +31,11 @@ import sjws_nettask.config.AcmeSettings;
 import sjws_nettask.tls.TlsMaterial;
 
 /**
- * Issues a real HTTP-01 certificate against Pebble. The linux/amd64 release binaries are
- * downloaded into {@code target/pebble-v2.10.1} unless {@code PEBBLE_BIN} and
- * {@code PEBBLE_CHALLTESTSRV_BIN} point at them. Other platforms skip.
+ * Issues a real HTTP-01 certificate against Pebble when {@code PEBBLE_BIN} and
+ * {@code PEBBLE_CHALLTESTSRV_BIN} point at the binaries. Otherwise the test skips. It does not
+ * download a release from GitHub.
  */
 class AcmePebbleTest {
-
-    private static final String VERSION = "v2.10.1";
 
     @TempDir
     Path dir;
@@ -47,9 +43,8 @@ class AcmePebbleTest {
     @Test
     @Timeout(180)
     void issuesACertificateAgainstPebble() throws Exception {
-        assumeTrue(linuxAmd64(), "Pebble release binaries are published for linux/amd64");
-        var pebbleBin = binary("pebble", "pebble-linux-amd64");
-        var challBin = binary("pebble-challtestsrv", "pebble-challtestsrv-linux-amd64");
+        var pebbleBin = binary("PEBBLE_BIN");
+        var challBin = binary("PEBBLE_CHALLTESTSRV_BIN");
         var ports = freePorts(4);
         int dnsPort = ports[0];
         int dnsMgmt = ports[1];
@@ -205,39 +200,13 @@ class AcmePebbleTest {
         }
     }
 
-    private static boolean linuxAmd64() {
-        var os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-        var arch = System.getProperty("os.arch", "");
-        return os.contains("linux") && (arch.equals("amd64") || arch.equals("x86_64"));
-    }
-
-    private static Path binary(String name, String artifact) throws Exception {
-        var override = System.getenv(name.equals("pebble") ? "PEBBLE_BIN" : "PEBBLE_CHALLTESTSRV_BIN");
-        if (override != null && !override.isBlank()) {
-            var path = Path.of(override);
-            assertTrue(Files.isExecutable(path), path + " is not executable");
-            return path;
-        }
-        var root = Path.of("target", "pebble-" + VERSION);
-        var binary = root.resolve(name);
-        if (Files.isRegularFile(binary)) {
-            binary.toFile().setExecutable(true);
-            return binary;
-        }
-        Files.createDirectories(root);
-        var archive = root.resolve(artifact + ".tar.gz");
-        var url = "https://github.com/letsencrypt/pebble/releases/download/" + VERSION + "/" + artifact + ".tar.gz";
-        var client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL)
-                .connectTimeout(Duration.ofSeconds(20)).build();
-        var response = client.send(HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(60)).build(),
-                HttpResponse.BodyHandlers.ofFile(archive));
-        assertEquals(200, response.statusCode(), "download " + url);
-        var extract = new ProcessBuilder("tar", "-xzf", archive.toString(), "-C", root.toString()).start();
-        assertEquals(0, extract.waitFor());
-        var nested = root.resolve(artifact).resolve("linux").resolve("amd64").resolve(name);
-        Files.move(nested, binary, StandardCopyOption.REPLACE_EXISTING);
-        binary.toFile().setExecutable(true);
-        return binary;
+    private static Path binary(String env) {
+        var override = System.getenv(env);
+        assumeTrue(override != null && !override.isBlank(),
+                env + " is unset; this test does not download Pebble");
+        var path = Path.of(override);
+        assertTrue(Files.isExecutable(path), path + " is not executable");
+        return path;
     }
 
     private static String pem(String type, byte[] der) {

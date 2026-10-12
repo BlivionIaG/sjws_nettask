@@ -17,6 +17,7 @@
 package sjws_nettask.acme;
 
 import java.nio.charset.StandardCharsets;
+import java.util.regex.Pattern;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
@@ -32,6 +33,9 @@ import sjws_nettask.core.StaticFileHandler;
 public final class AcmeChallengeHandler implements Handler {
 
     public static final String PREFIX = "/.well-known/acme-challenge/";
+
+    /** RFC 8555 token: unpadded base64url, bounded so a request cannot smuggle a path. */
+    private static final Pattern TOKEN = Pattern.compile("^[A-Za-z0-9_-]{1,128}$");
 
     private final ChallengeBoard board;
     private final Handler next;
@@ -50,7 +54,7 @@ public final class AcmeChallengeHandler implements Handler {
             return this.next.handle(request);
         }
         var token = path.substring(PREFIX.length());
-        if (token.isEmpty() || token.indexOf('/') >= 0) {
+        if (!TOKEN.matcher(token).matches()) {
             return StaticFileHandler.error(404, request.headOnly());
         }
         var authorization = this.board.get(token);

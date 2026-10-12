@@ -21,9 +21,12 @@ import java.io.StringReader;
 import java.io.StringWriter;
 import java.net.URI;
 import java.net.URL;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.KeyPair;
@@ -38,15 +41,18 @@ import sjws_nettask.tls.TlsMaterial;
 
 /**
  * Account key, domain key and certificate chain on disk. New keys are PKCS#8 PEM ({@code PRIVATE
- * KEY}) so {@link TlsMaterial#fromPem} can load the domain key, and owner-read/write when the
- * filesystem allows it. A legacy PKCS#1 {@code RSA PRIVATE KEY} file is still read. If
- * {@code directory} does not match the CA the account URL was issued by, the URL is ignored and
- * the key is kept.
+ * KEY}) so {@link TlsMaterial#fromPem} can load the domain key. Secret files are created
+ * owner-read/write (0600) and the directory owner-only (0700) when the filesystem has POSIX
+ * permissions; a filesystem without that view is written as-is. A legacy PKCS#1 {@code RSA PRIVATE
+ * KEY} file is still read. If {@code directory} does not match the CA the account URL was issued
+ * by, the URL is ignored and the key is kept.
  */
 public final class AcmeStore {
 
-    private static final Set<PosixFilePermission> OWNER_ONLY = EnumSet.of(PosixFilePermission.OWNER_READ,
+    private static final Set<PosixFilePermission> OWNER_RW = EnumSet.of(PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE);
+    private static final Set<PosixFilePermission> OWNER_RWX = EnumSet.of(PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE);
 
     private final Path directory;
 
@@ -80,16 +86,14 @@ public final class AcmeStore {
     }
 
     public void saveAccount(URL url, String acmeDirectory) throws IOException {
-        Files.createDirectories(this.directory);
-        Files.writeString(this.directory.resolve("directory"), acmeDirectory + "\n");
-        Files.writeString(this.directory.resolve("account.url"), url + "\n");
+        writeSecret(this.directory.resolve("directory"), acmeDirectory + "\n");
+        writeSecret(this.directory.resolve("account.url"), url + "\n");
     }
 
     public void writeCertificate(org.shredzone.acme4j.Certificate certificate) throws IOException {
         var writer = new StringWriter();
         certificate.writeCertificate(writer);
-        Files.createDirectories(this.directory);
-        Files.writeString(this.directory.resolve("cert.pem"), writer.toString());
+        writeSecret(this.directory.resolve("cert.pem"), writer.toString());
     }
 
     /** @return the stored chain, or null when there is no certificate yet */
@@ -103,20 +107,77 @@ public final class AcmeStore {
     }
 
     private KeyPair key(String name) throws IOException {
-        Files.createDirectories(this.directory);
+        ensureDirectory();
         var path = this.directory.resolve(name);
         if (Files.isRegularFile(path)) {
             return readKey(path);
         }
         var pair = KeyPairUtils.createKeyPair(2048);
         var body = Base64.getMimeEncoder(64, new byte[] {'\n'}).encodeToString(pair.getPrivate().getEncoded());
-        Files.writeString(path, "-----BEGIN PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----\n");
-        try {
-            Files.setPosixFilePermissions(path, OWNER_ONLY);
-        } catch (UnsupportedOperationException e) {
-            // filesystems without POSIX permissions keep the process umask
-        }
+        writeSecret(path, "-----BEGIN PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----\n");
         return pair;
+    }
+
+    /**
+     * Creates the store directory as 0700 when POSIX permissions exist. An existing directory
+     * (a temp dir, or one left from a previous run) is tightened the same way: the directory
+     * itself holds no secret bytes, unlike the key files.
+     */
+    private void ensureDirectory() throws IOException {
+        if (!Files.isDirectory(this.directory)) {
+            try {
+                if (posix(this.directory)) {
+                    Files.createDirectories(this.directory, PosixFilePermissions.asFileAttribute(OWNER_RWX));
+                } else {
+                    Files.createDirectories(this.directory);
+                }
+            } catch (UnsupportedOperationException e) {
+                Files.createDirectories(this.directory);
+            }
+        }
+        if (!posix(this.directory)) {
+            return;
+        }
+        try {
+            Files.setPosixFilePermissions(this.directory, OWNER_RWX);
+        } catch (UnsupportedOperationException e) {
+            // the view was advertised, but this store cannot change directory mode
+        }
+    }
+
+    /**
+     * Writes a secret by creating a 0600 temp file and moving it into place. Bytes are never
+     * written to the destination and then chmod'd. Without POSIX permissions the destination is
+     * written directly and the process umask applies.
+     */
+    private void writeSecret(Path path, String contents) throws IOException {
+        ensureDirectory();
+        if (!posix(path)) {
+            Files.writeString(path, contents);
+            return;
+        }
+        Path tmp = null;
+        try {
+            tmp = Files.createTempFile(path.getParent(), ".acme-", ".tmp",
+                    PosixFilePermissions.asFileAttribute(OWNER_RW));
+            Files.writeString(tmp, contents);
+            try {
+                Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+            }
+            tmp = null;
+        } catch (UnsupportedOperationException e) {
+            Files.writeString(path, contents);
+        } finally {
+            if (tmp != null) {
+                Files.deleteIfExists(tmp);
+            }
+        }
+    }
+
+    private static boolean posix(Path path) {
+        return path.getFileSystem().supportedFileAttributeViews().contains("posix");
     }
 
     private static KeyPair readKey(Path path) throws IOException {

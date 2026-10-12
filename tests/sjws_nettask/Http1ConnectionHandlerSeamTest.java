@@ -17,6 +17,7 @@
 package sjws_nettask;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -64,6 +65,28 @@ class Http1ConnectionHandlerSeamTest {
             assertEquals("/x?y", seen.get().target());
             assertEquals("h", seen.get().headers().host());
             assertEquals("bytes=0-0", seen.get().headers().range());
+        } finally {
+            reaper.close();
+        }
+    }
+
+    @Test
+    void closedAndUnixPeersDoNotResolveAnInetAddress() throws Exception {
+        var reaper = new ConnectionReaper(Duration.ofSeconds(5), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        Handler handler = request -> new Response(200, ResponseHeaders.of(), Body.Bytes.of("ok".getBytes()));
+        try (var closed = SocketChannel.open()) {
+            closed.close();
+            assertNotNull(new Http1Connection(closed, handler, ResponseHeaders::of, reaper));
+        }
+        var path = java.nio.file.Files.createTempDirectory("h1-unix").resolve("sock");
+        try (var server = ServerSocketChannel.open(java.net.StandardProtocolFamily.UNIX);
+                var client = SocketChannel.open(java.net.StandardProtocolFamily.UNIX)) {
+            var address = java.net.UnixDomainSocketAddress.of(path);
+            server.bind(address);
+            client.connect(address);
+            try (var accepted = server.accept()) {
+                assertNotNull(new Http1Connection(accepted, handler, ResponseHeaders::of, reaper));
+            }
         } finally {
             reaper.close();
         }

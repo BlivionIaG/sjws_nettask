@@ -394,8 +394,50 @@ class ConfigLoaderTest {
         assertEquals(Duration.ofMillis(500), Durations.parse("500ms", "t"));
         assertEquals(Duration.ofMinutes(1), Durations.parse("1m", "t"));
         assertEquals(16L << 20, Sizes.parse("16m", Integer.MAX_VALUE, "s"));
+        assertEquals(64L << 10, Sizes.parse("64K", Integer.MAX_VALUE, "s"));
+        assertEquals(1L << 30, Sizes.parse("1g", Long.MAX_VALUE, "s"));
+        assertEquals(0L, Sizes.parse("0", 10, "s"));
+        assertEquals(Duration.ofHours(2), Durations.parse("2h", "t"));
+        assertEquals(Duration.ofDays(1), Durations.parse("1d", "t"));
+        assertEquals(Duration.ofSeconds(3), Durations.parse(" 3s ", "t"));
         assertThrows(ConfigException.class, () -> Durations.parse("0", "t"));
+        assertThrows(ConfigException.class, () -> Durations.parse(null, "t"));
+        assertThrows(ConfigException.class, () -> Durations.parse("  ", "t"));
+        assertThrows(ConfigException.class, () -> Durations.parse("1w", "t"));
+        assertThrows(ConfigException.class, () -> Durations.parse("0ms", "t"));
         assertThrows(ConfigException.class, () -> Sizes.parse("nope", 10, "s"));
+        assertThrows(ConfigException.class, () -> Sizes.parse(null, 10, "s"));
+        assertThrows(ConfigException.class, () -> Sizes.parse("   ", 10, "s"));
+        assertThrows(ConfigException.class, () -> Sizes.parse("9", 4, "s"));
+        assertThrows(ConfigException.class, () -> Sizes.parse("9000000000g", Long.MAX_VALUE, "s"));
+    }
+
+    @Test
+    void accessSettingsDefaultIsEachFlag() {
+        assertTrue(AccessSettings.DEFAULT.isDefault());
+        assertFalse(new AccessSettings(List.of("/secret"), List.of(), false, null, false).isDefault());
+        assertFalse(new AccessSettings(List.of(), List.of("deny:/x"), false, null, false).isDefault());
+        assertFalse(new AccessSettings(List.of(), List.of(), true, null, false).isDefault());
+        assertFalse(new AccessSettings(List.of(), List.of(), false, "0", false).isDefault());
+        assertFalse(new AccessSettings(List.of(), List.of(), false, null, true).isDefault());
+        var injected = AccessSettings.DEFAULT.withAcmeChallenge();
+        assertSame(injected, injected.withAcmeChallenge());
+        assertFalse(injected.isDefault());
+    }
+
+    @Test
+    void acmePortMustFitInATcpPortAndADedicatedListenerMatchesThatPort() {
+        assertThrows(IllegalArgumentException.class, () -> settings(-1));
+        assertThrows(IllegalArgumentException.class, () -> settings(65536));
+        var dedicated = settings(80);
+        assertTrue(dedicated.onMainListener(80));
+        assertFalse(dedicated.onMainListener(8080));
+        assertTrue(AcmeSettings.disabled().onMainListener(9));
+    }
+
+    private static AcmeSettings settings(int port) {
+        return new AcmeSettings(true, "http://127.0.0.1/dir", "ops@example.com", List.of("example.com"),
+                Path.of("acme"), port, true, Duration.ofDays(30));
     }
 
     @Test

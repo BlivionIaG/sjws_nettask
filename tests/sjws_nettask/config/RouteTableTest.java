@@ -64,6 +64,24 @@ class RouteTableTest {
         assertFalse(wild.shadows().stream().anyMatch(w -> w.contains("routes[2]")));
         assertTrue(RouteTable.prefixCovers("/api", "/api/v1"));
         assertFalse(RouteTable.prefixCovers("/api", "/apiv1"));
+        assertTrue(RouteTable.prefixCovers("/", "/anything"));
+        assertTrue(RouteTable.prefixCovers("/api", "/api"));
+        assertFalse(RouteTable.prefixCovers("/api/v1", "/api"));
+        assertFalse(RouteTable.covers(route("example.com", false, null, "/"), route(null, false, null, "/")));
+        assertFalse(RouteTable.covers(route("example.com", false, null, "/"),
+                route("*.example.com", true, ".example.com", "/")));
+        assertFalse(RouteTable.covers(route("a.example.com", false, null, "/"),
+                route("b.example.com", false, null, "/")));
+        assertTrue(RouteTable.covers(route("example.com", false, null, "/api"),
+                route("example.com", false, null, "/api")));
+        assertTrue(RouteTable.covers(route("*.example.com", true, ".example.com", "/"),
+                route("*.example.com", true, ".example.com", "/x")));
+        assertFalse(RouteTable.covers(route("*.example.com", true, ".example.com", "/"),
+                route("*.other.test", true, ".other.test", "/")));
+        assertFalse(RouteTable.covers(route("*.example.com", true, ".example.com", "/"),
+                route("notexample.com", false, null, "/")));
+        assertFalse(RouteTable.covers(route("*.example.com", true, ".example.com", "/"),
+                route("x", false, null, "/")));
     }
 
     @Test
