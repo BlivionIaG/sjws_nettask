@@ -41,7 +41,8 @@ public record FileMeta(Validator validator, Instant lastModified, String lastMod
                 .add("last-modified", this.lastModifiedText)
                 .add("etag", this.etag)
                 .add("accept-ranges", StaticFileHandler.ACCEPT_RANGES)
-                .add("content-type", this.contentType);
+                .add("content-type", this.contentType)
+                .add("x-content-type-options", StaticFileHandler.NOSNIFF);
     }
 
     /**
