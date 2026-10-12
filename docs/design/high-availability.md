@@ -301,6 +301,27 @@ enum Durability {
 `ha-control` is `openGroup(new GroupId("ha-control"), strictOptions, listener)`.
 Messaging Core calls `openGroup` once per partition and `append(groupId, batch)` on the
 broker's single writer for that partition. The HTTP request path never calls `append`.
+Callers pass `Durability.STRICT` unless they opt into relaxed mode.
+
+## Default ack mode
+
+Blivion's decision is pending. These are the two default-ack options named by
+[PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) (HA open question 4, T3 `replicated`)
+and [PR #17](https://github.com/BlivionIaG/sjws_nettask/pull/17) (§6 requirement 2 and §10 answer 4).
+
+1. **Quorum commit plus fsync — proposed default.** `Durability.STRICT`. Followers fsync
+   the batch, then ack. `append` completes only after a majority has done that. This is
+   the default this design follows throughout: `ha-control` is opened in this mode,
+   Messaging Core passes it unless a partition opts out, and RPO 0 in the decisions
+   below applies to a completed append. One fsync per batch (group commit), not per record.
+2. **Majority in-memory.** `Durability.RELAXED`. `append` completes once a majority holds
+   the batch in memory. Fsync runs afterwards and does not gate the ack. PR #16 leans
+   toward this as the cluster default, matching the Kafka and NATS behaviour it cites.
+   It stays available on `GroupOptions` for a caller that opts in. It is not the default
+   used by this design or by the implementation.
+
+Either choice is one line on `GroupOptions`. Switching the default later does not change
+the API. Until Blivion picks, the code keeps quorum commit plus fsync.
 
 Pluggable SPIs: `ClusterRpc` (in-JVM for tests; one TCP connection per peer, length-prefixed
 frames demuxed by `groupId`, append batches pipelined), `LogStorage` (segmented append-only
@@ -371,13 +392,15 @@ PR #16's T4 asks for a choice; this section is that choice.
      the request path. These timeouts are what the heartbeat and election defaults are
      sized to; changing them moves the RTO on purpose.
 
-4. **Follower fsync before ack in strict mode; relaxed is a per-group option.** Strict
-   (`Durability.STRICT`): each follower `fsync`s the appended batch, then sends the ack;
-   the leader commits and completes the future only after a quorum of those acks. That is
-   one fsync per batch (group commit), not per record. Relaxed (`Durability.RELAXED`):
-   the quorum ack is in-memory receipt; fsync runs on the storage timer and does not gate
-   the future. This matches the trade-off PR #16 documents for Kafka and NATS, and it is
-   visible on `GroupOptions`, not hidden. The strict path is the one that delivers RPO 0.
+4. **Ack mode: both options, decision pending.** See **Default ack mode** above.
+   The proposed default, and the one the implementation follows, is quorum commit plus
+   fsync (`Durability.STRICT`). The other option is majority in-memory
+   (`Durability.RELAXED`): the quorum ack is receipt in memory, and fsync does not gate
+   the future. That is the Kafka/NATS trade-off PR #16 documents, and the relaxed mode
+   PR #17 keeps configurable. Blivion has not chosen the default yet
+   ([PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) question 4,
+   [PR #17](https://github.com/BlivionIaG/sjws_nettask/pull/17) §6.2 and §10.4).
+   Until that decision, `ha-control` and every group this workstream opens use strict.
 
 5. **Static HTTP is active on all nodes.** Every node with a published snapshot serves
    `GET`/`HEAD` whether or not it leads any Raft group. `/healthz` and `/readyz` are how
