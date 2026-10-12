@@ -5,7 +5,9 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.nio.channels.ServerSocketChannel;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
@@ -31,14 +33,14 @@ class HardeningIntegrationTest {
     @TempDir
     Path root;
 
-    private ServerSocket serverSocket;
+    private ServerSocketChannel serverSocket;
     private ClientManager manager;
     private Thread acceptThread;
     private int port;
 
     private void start(ServerConfig config) throws IOException {
-        serverSocket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
-        port = serverSocket.getLocalPort();
+        serverSocket = ServerSocketChannel.open().bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50);
+        port = serverSocket.socket().getLocalPort();
         manager = new ClientManager(serverSocket, config);
         acceptThread = new Thread(manager, "accept-loop");
         acceptThread.setDaemon(true);

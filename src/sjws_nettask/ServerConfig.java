@@ -34,8 +34,8 @@ import java.util.Objects;
  * @param maxConnections HTTP/1 connections served concurrently; extra ones wait in the backlog
  * @param idleTimeout keep-alive idle timeout (also the QUIC max idle timeout)
  * @param headerTimeout time allowed to receive a complete request head (slowloris)
- * @param writeTimeout HTTP/3: reset a response whose writes make no progress for this long (also the
- *        window of the minimum send rate); HTTP/1.1 does not use it yet (S4)
+ * @param writeTimeout reset (HTTP/3) or close (HTTP/1.1) a response whose writes make no progress for
+ *        this long (also the window of the minimum send rate)
  * @param h3Enabled start the HTTP/3 (QUIC) listener
  * @param h3Port UDP port for HTTP/3; {@link #H3_PORT_SAME_AS_TCP} (-1) = same as {@code port}, 0 = ephemeral
  * @param h3Host UDP bind address for HTTP/3

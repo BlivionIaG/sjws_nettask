@@ -17,7 +17,9 @@
 package sjws_nettask;
 
 import java.io.IOException;
-import java.net.ServerSocket;
+import java.net.InetSocketAddress;
+import java.net.StandardSocketOptions;
+import java.nio.channels.ServerSocketChannel;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.StaticFileHandler;
 
@@ -35,7 +37,7 @@ public final class SjwsServer implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     private Transport h3;
     private Throwable h3Failure;
-    private ServerSocket tcp;
+    private ServerSocketChannel tcp;
     private ClientManager manager;
     private Thread acceptThread;
 
@@ -64,7 +66,7 @@ public final class SjwsServer implements AutoCloseable {
             server.startH3(h3Factory);
         }
         try {
-            server.tcp = new ServerSocket(config.port());
+            server.tcp = bind(config.port());
         } catch (IOException e) {
             server.close();
             throw e;
@@ -73,6 +75,19 @@ public final class SjwsServer implements AutoCloseable {
         server.acceptThread = new Thread(server.manager, "accept-loop");
         server.acceptThread.start();
         return server;
+    }
+
+    /** Wildcard address, default backlog (50), SO_REUSEADDR: as {@code new ServerSocket(port)}. */
+    static ServerSocketChannel bind(int port) throws IOException {
+        var channel = ServerSocketChannel.open();
+        try {
+            channel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+            channel.bind(new InetSocketAddress(port), 50);
+            return channel;
+        } catch (IOException | RuntimeException e) {
+            channel.close();
+            throw e;
+        }
     }
 
     private void startH3(Transport.Factory factory) {
@@ -110,7 +125,11 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     public int tcpPort() {
-        return this.tcp.getLocalPort();
+        try {
+            return ((InetSocketAddress) this.tcp.getLocalAddress()).getPort();
+        } catch (IOException e) { // closed
+            return -1;
+        }
     }
 
     /** @return the bound HTTP/3 (UDP) port, or -1 if HTTP/3 is not running */

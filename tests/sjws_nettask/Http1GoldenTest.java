@@ -149,13 +149,14 @@ class Http1GoldenTest {
                 Files.writeString(GOLDEN, captureFromJar(Path.of(jar), root), StandardCharsets.ISO_8859_1);
                 return;
             }
-            var server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            var server = java.nio.channels.ServerSocketChannel.open()
+                    .bind(new java.net.InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50);
             var manager = new ClientManager(server, ServerConfig.defaults(root));
             var t = new Thread(manager);
             t.setDaemon(true);
             t.start();
             try {
-                String actual = capture(server.getLocalPort());
+                String actual = capture(server.socket().getLocalPort());
                 String expected = Files.readString(GOLDEN, StandardCharsets.ISO_8859_1);
                 if (!expected.equals(actual)) {
                     Files.writeString(Path.of("target", "http1-actual.txt"), actual, StandardCharsets.ISO_8859_1);
