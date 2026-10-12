@@ -21,14 +21,15 @@ package sjws_nettask.observe;
  * does not race the counters, and changing them does not change the server.
  *
  * @param requests responses recorded so far
- * @param bytesSent response body bytes (HEAD, 1xx, 204 and 304 contribute 0; a write that threw contributes 0)
+ * @param bytesSent response body bytes the handler committed to (HEAD, 1xx, 204 and 304 contribute 0).
+ *        Recorded when the observe filter returns, before the socket write
  * @param activeConnections HTTP/1.1 connections being served plus established HTTP/3 connections
  * @param http1Connections {@link sjws_nettask.ClientManager#activeConnections()}
  * @param http3Connections established QUIC connections, or 0 when HTTP/3 is not running
  * @param accessLogDropped lines not written because the buffer was full or the stream failed
  * @param requestsByStatus index is the status code (0 outside 100..999)
  * @param protocols counts for HTTP/1.0, HTTP/1.1, HTTP/2, HTTP/3 and anything else, in that order
- * @param latency non-cumulative histogram of request time, including the response write
+ * @param latency non-cumulative histogram of time until the handler returns, before the socket write
  */
 public record Snapshot(long requests, long bytesSent, int activeConnections, int http1Connections, int http3Connections,
         long accessLogDropped, long[] requestsByStatus, long[] protocols, Latency latency) {

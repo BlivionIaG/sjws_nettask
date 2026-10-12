@@ -39,6 +39,7 @@ public final class Http1Requests {
      * @param peer client address captured once for the connection, or null
      */
     public static Request toCore(Http1Parser.Head head, InetSocketAddress peer) {
-        return new Request(head.method(), head.target(), RequestHeaders.of(head.headers()), peer, false);
+        return new Request(head.method(), head.target(), RequestHeaders.of(head.headers()), peer, false,
+                head.version());
     }
 }

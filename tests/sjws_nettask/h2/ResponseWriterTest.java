@@ -210,6 +210,7 @@ class ResponseWriterTest {
         h.add("host", "h.example");
         h.add("range", "bytes=0-1");
         var req = Http2StreamHandler.toRequest(h);
+        assertEquals("HTTP/2", req.protocol());
         assertEquals("a.example", req.headers().host());
         assertEquals("bytes=0-1", req.headers().range());
         var hostOnly = new DefaultHttp2Headers().method("GET").path("/x");

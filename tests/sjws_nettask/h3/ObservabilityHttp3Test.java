@@ -52,7 +52,8 @@ class ObservabilityHttp3Test {
                 .metricsExposure(MetricsExposure.LOCALHOST).healthz(true).build();
         var observer = RequestObserver.open(config);
         var tls = TlsMaterial.selfSigned("localhost");
-        var server = new Http3Server(config, new StaticFileHandler(dir), tls).withObserver(observer).start();
+        var server = new Http3Server(config, new StaticFileHandler(dir), tls).withObserver(observer)
+                .withObserver(observer).start();
         observer.metrics().setConnectionGauges(() -> 0, server::connections);
         try (var client = new H3TestClient(tls.certificate())) {
             var quic = client.connect(server.localAddress());
