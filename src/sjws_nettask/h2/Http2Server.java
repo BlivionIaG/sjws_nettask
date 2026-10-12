@@ -95,6 +95,9 @@ public final class Http2Server implements Transport {
      * @param maxInflight requests handled at once, server-wide (extra streams: REFUSED_STREAM)
      * @param maxOpenFiles file responses streaming at once, server-wide
      */
+    /** Unflushed PING/SETTINGS ACKs (and RSTs) allowed before the connection is closed. */
+    static final int MAX_QUEUED_CONTROL_FRAMES = 1000;
+
     public record Limits(int maxConcurrentStreams, int maxHeaderListSize, int maxRstFrames, int rstWindowSeconds,
             int maxSmallContinuationFrames, int maxInflight, int maxOpenFiles) {
 
@@ -235,6 +238,7 @@ public final class Http2Server implements Transport {
                 .decoderEnforceMaxRstFramesPerWindow(this.limits.maxRstFrames(), this.limits.rstWindowSeconds())
                 .decoderEnforceMaxSmallContinuationFrames(this.limits.maxSmallContinuationFrames())
                 .decoderEnforceMaxConsecutiveEmptyDataFrames(2)
+                .encoderEnforceMaxQueuedControlFrames(MAX_QUEUED_CONTROL_FRAMES) // PING/SETTINGS floods
                 .build();
     }
 
@@ -247,14 +251,20 @@ public final class Http2Server implements Transport {
         });
     }
 
+    Deadlines.StreamIdle streamIdle(Http2FrameCodec codec) {
+        return new Deadlines.StreamIdle(codec, this.config.idleTimeout());
+    }
+
     void http2(ChannelPipeline p) {
-        p.addLast(frameCodec(), multiplexer(), Quiet.INSTANCE);
+        var codec = frameCodec();
+        p.addLast(codec, streamIdle(codec), multiplexer(), Quiet.INSTANCE);
     }
 
     void http1(ChannelPipeline p) {
-        p.addLast(new HttpServerCodec(8192, this.limits.maxHeaderListSize(), 8192),
+        var deadline = new Deadlines.HeadDeadline(this.config.headerTimeout());
+        p.addLast(deadline.front(), new HttpServerCodec(8192, this.limits.maxHeaderListSize(), 8192),
                 new HttpServerExpectContinueHandler(),
-                new HttpObjectAggregator(64 * 1024),
+                new HttpObjectAggregator(64 * 1024), deadline.back(),
                 new Http1FallbackHandler(this.shared), Quiet.INSTANCE);
     }
 
@@ -263,21 +273,31 @@ public final class Http2Server implements Transport {
         var source = new HttpServerCodec(8192, this.limits.maxHeaderListSize(), 8192);
         var upgrade = new HttpServerUpgradeHandler(source, protocol ->
                 AsciiString.contentEquals(Http2CodecUtil.HTTP_UPGRADE_PROTOCOL_NAME, protocol)
-                        ? new Http2ServerUpgradeCodec(frameCodec(), multiplexer())
+                        ? upgradeCodec()
                         : null, 64 * 1024);
         var prior = new ChannelInitializer<Channel>() {
             @Override
             protected void initChannel(Channel ch) {
                 // before the trailing handlers (Quiet must stay last)
-                ch.pipeline().addBefore("expect-continue", "h2-codec", frameCodec());
-                ch.pipeline().addAfter("h2-codec", "h2-multiplexer", multiplexer());
+                var codec = frameCodec();
+                ch.pipeline().addBefore("expect-continue", "h2-codec", codec);
+                ch.pipeline().addAfter("h2-codec", "h2-idle", streamIdle(codec));
+                ch.pipeline().addAfter("h2-idle", "h2-multiplexer", multiplexer());
             }
         };
+        var deadline = new Deadlines.HeadDeadline(this.config.headerTimeout());
+        p.addLast(deadline.front());
         p.addLast(new CleartextHttp2ServerUpgradeHandler(source, upgrade, prior));
         p.addLast("expect-continue", new HttpServerExpectContinueHandler());
         p.addLast("h1-aggregator", new HttpObjectAggregator(64 * 1024));
+        p.addLast(deadline.back());
         p.addLast("h1-fallback", new Http1FallbackHandler(this.shared));
         p.addLast(Quiet.INSTANCE);
+    }
+
+    private Http2ServerUpgradeCodec upgradeCodec() {
+        var codec = frameCodec();
+        return new Http2ServerUpgradeCodec(codec, streamIdle(codec), multiplexer());
     }
 
     private final class Alpn extends ApplicationProtocolNegotiationHandler {
