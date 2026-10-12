@@ -4,7 +4,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-c"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
@@ -17,7 +17,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-6"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/css; charset=utf-8
 Connection: close
 Content-Length: 6
@@ -29,7 +29,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-22272"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: application/octet-stream
 Connection: close
 Content-Length: 139890
@@ -3041,7 +3041,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-e"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 14
@@ -3054,7 +3054,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-c"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
@@ -3067,7 +3067,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-c"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
@@ -3080,7 +3080,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-c"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
@@ -3113,7 +3113,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-c"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
@@ -3205,7 +3205,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-c"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
@@ -3294,13 +3294,126 @@ Connection: close
 Content-Length: 139
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>501 Not Implemented</title></head><body><h1>501 Not Implemented</h1></body></html>
+=== 206-range ===
+HTTP/1.1 206 Partial Content
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-22272"
+Accept-Ranges: bytes
+Content-Type: application/octet-stream
+Content-Range: bytes 10-29/139890
+Connection: close
+Content-Length: 20
+
+defghijklmnopqrstuvw
+=== 206-suffix ===
+HTTP/1.1 206 Partial Content
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
+Accept-Ranges: bytes
+Content-Type: text/plain; charset=utf-8
+Content-Range: bytes 6-11/12
+Connection: close
+Content-Length: 6
+
+world
+
+=== 206-open-end ===
+HTTP/1.1 206 Partial Content
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
+Accept-Ranges: bytes
+Content-Type: text/plain; charset=utf-8
+Content-Range: bytes 6-11/12
+Connection: close
+Content-Length: 6
+
+world
+
+=== 416 ===
+HTTP/1.1 416 Range Not Satisfiable
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Accept-Ranges: none
+Content-Type: text/html; charset=utf-8
+Content-Range: bytes */12
+Connection: close
+Content-Length: 151
+
+<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>416 Range Not Satisfiable</title></head><body><h1>416 Range Not Satisfiable</h1></body></html>
+=== 200-multi-range ===
+HTTP/1.1 200 OK
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
+Accept-Ranges: bytes
+Content-Type: text/plain; charset=utf-8
+Connection: close
+Content-Length: 12
+
+hello world
+
+=== 206-if-range-date ===
+HTTP/1.1 206 Partial Content
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
+Accept-Ranges: bytes
+Content-Type: text/plain; charset=utf-8
+Content-Range: bytes 0-4/12
+Connection: close
+Content-Length: 5
+
+hello
+=== 200-if-range-etag-mismatch ===
+HTTP/1.1 200 OK
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
+Accept-Ranges: bytes
+Content-Type: text/plain; charset=utf-8
+Connection: close
+Content-Length: 12
+
+hello world
+
+=== head-range ===
+HTTP/1.1 200 OK
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
+Accept-Ranges: bytes
+Content-Type: text/plain; charset=utf-8
+Connection: close
+Content-Length: 12
+
+
+=== 200-range-listing ===
+HTTP/1.1 200 OK
+Server: sjws_nettask web server/0.2
+Date: <normalised>
+Accept-Ranges: none
+Content-Type: text/html; charset=utf-8
+Connection: close
+Content-Length: 223
+
+<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>/sub/</title></head><body><h1>/sub/</h1><a href="/sub/a.css"> a.css </a><br><a href="/sub/b.txt"> b.txt </a><br><a href="/sub/nested/"> nested/ </a><br></body></html>
 === keepalive-pipelined ===
 HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-c"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: keep-alive
 Content-Length: 12
@@ -3311,7 +3424,7 @@ Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
 ETag: "<key>-d9dd3bdce4bf400-6"
-Accept-Ranges: none
+Accept-Ranges: bytes
 Content-Type: text/css; charset=utf-8
 Connection: keep-alive
 Content-Length: 6

@@ -76,7 +76,7 @@ class StaticFileHandlerTest {
         assertEquals(11, r.contentLength());
         assertEquals("text/plain; charset=utf-8", r.headers().get("Content-Type"));
         assertEquals("Sat, 03 Feb 2001 04:05:06 GMT", r.headers().get("last-modified"));
-        assertEquals("none", r.headers().get("accept-ranges"));
+        assertEquals("bytes", r.headers().get("accept-ranges"));
         assertFalse(r.headOnly());
         if (r.body() instanceof Body.FileBody f) {
             assertEquals(root.resolve("hello.txt").toRealPath(), f.realPath());

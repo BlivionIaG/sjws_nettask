@@ -65,7 +65,7 @@ public final class Page {
     public static int sendBody(OutputStream out, int code, String mime, String body, boolean headOnly,
             boolean keepAlive, String... extraHeaders) throws IOException {
         var headers = ResponseHeaders.of()
-                .add("accept-ranges", StaticFileHandler.ACCEPT_RANGES)
+                .add("accept-ranges", StaticFileHandler.NO_RANGES)
                 .add("content-type", Header.withCharset(mime));
         for (int i = 0; i + 1 < extraHeaders.length; i += 2) {
             headers.add(extraHeaders[i], extraHeaders[i + 1]);

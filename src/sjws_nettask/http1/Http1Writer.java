@@ -46,7 +46,7 @@ public final class Http1Writer {
 
     /** Fields written before Connection/Content-Length. */
     static final Set<String> REPRESENTATION = Set.of(
-            "last-modified", "etag", "accept-ranges", "content-type", "content-encoding", "vary");
+            "last-modified", "etag", "accept-ranges", "content-type", "content-range", "content-encoding", "vary");
 
     /** Names whose canonical case is not simple title case, plus the common ones (saves building them). */
     private static final Map<String, String> CANONICAL = Map.ofEntries(
@@ -59,6 +59,7 @@ public final class Http1Writer {
             Map.entry("last-modified", "Last-Modified"),
             Map.entry("accept-ranges", "Accept-Ranges"),
             Map.entry("content-type", "Content-Type"),
+            Map.entry("content-range", "Content-Range"),
             Map.entry("location", "Location"),
             Map.entry("allow", "Allow"),
             Map.entry("alt-svc", "Alt-Svc"),

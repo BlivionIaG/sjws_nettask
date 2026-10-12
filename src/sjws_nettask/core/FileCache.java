@@ -134,6 +134,22 @@ public final class FileCache {
             if (this.meta.notModified(conditionals)) {
                 return new Response(304, this.headers304.copy(), Body.Empty.INSTANCE, head);
             }
+            if (!head && conditionals.range() != null) { // only GET has range semantics
+                switch (ByteRanges.decide(conditionals, this.meta)) {
+                    case ByteRanges.Partial p -> {
+                        var slice = this.body.data().duplicate().position((int) p.offset())
+                                .limit((int) (p.offset() + p.length()));
+                        return new Response(206, this.headers200.copy().add("content-range", p.contentRange()),
+                                new Body.Bytes(slice), false);
+                    }
+                    case ByteRanges.Unsatisfiable u -> {
+                        return StaticFileHandler.rangeNotSatisfiable(u);
+                    }
+                    case ByteRanges.Full f -> {
+                        // whole file below
+                    }
+                }
+            }
             return new Response(200, this.headers200.copy(), this.body, head);
         }
     }
