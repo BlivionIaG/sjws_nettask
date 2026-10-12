@@ -135,6 +135,18 @@ class RouterTest {
         assertEquals("https://e.org/a", noSlash.handle(req(null, "/a")).headers().get("location"));
         var routed = new Router(List.of(new Route(null, "/old", "/", new RedirectHandler(307, "/new/", true))), null);
         assertEquals("/new/x", routed.handle(req(null, "/old/x")).headers().get("location"));
+        // open redirect: a relative location must never become protocol-relative ("//host", "/\\host")
+        var toRoot = new Router(List.of(new Route(null, "/old", "/", new RedirectHandler(301, "/", true))), null);
+        for (var t : new String[] {"/old//evil.example", "/old///evil.example/x", "/old/\\evil.example",
+                "/old/\\/evil.example", "/old//\\evil.example"}) {
+            var loc = toRoot.handle(req(null, t)).headers().get("location");
+            assertFalse(loc.startsWith("//") || loc.startsWith("/\\"), t + " -> " + loc);
+        }
+        assertEquals("/evil.example", toRoot.handle(req(null, "/old//evil.example")).headers().get("location"));
+        assertEquals("/x?q", toRoot.handle(req(null, "/old/x?q")).headers().get("location"));
+        assertEquals("/", toRoot.handle(req(null, "/old")).headers().get("location"));
+        assertEquals("https://e.org/a", noSlash.handle(req(null, "//a")).headers().get("location"));
+        assertEquals("https://example.com/a", keep.handle(req(null, "//a")).headers().get("location"));
         assertThrows(IllegalArgumentException.class, () -> new RedirectHandler(200, "/", false));
         assertThrows(IllegalArgumentException.class, () -> new RedirectHandler(301, "", false));
         assertThrows(IllegalArgumentException.class, () -> new RedirectHandler(301, null, false));
