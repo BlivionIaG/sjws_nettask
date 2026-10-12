@@ -106,11 +106,16 @@ public final class Http2Server implements Transport {
 
         public static final Limits DEFAULT = new Limits(100, 16 * 1024, 100, 10, 16, 4096, 512);
 
-        /** The global limits with the default per-connection and per-client budgets. */
+        /**
+         * The global limits with the default per-connection and per-client budgets: in flight per
+         * connection = the stream cap (a smaller budget breaks compliant clients, e.g. the JDK client
+         * fails on REFUSED_STREAM or a lower SETTINGS_MAX_CONCURRENT_STREAMS), 8 file responses per
+         * connection with a 100 ms wait, CANCEL after 5 s of zero window, 16 connections per address.
+         */
         public Limits(int maxConcurrentStreams, int maxHeaderListSize, int maxRstFrames, int rstWindowSeconds,
                 int maxSmallContinuationFrames, int maxInflight, int maxOpenFiles) {
             this(maxConcurrentStreams, maxHeaderListSize, maxRstFrames, rstWindowSeconds, maxSmallContinuationFrames,
-                    maxInflight, maxOpenFiles, 32, 8, Duration.ofMillis(100), Duration.ofSeconds(5), 16);
+                    maxInflight, maxOpenFiles, maxConcurrentStreams, 8, Duration.ofMillis(100), Duration.ofSeconds(5), 16);
         }
     }
 
