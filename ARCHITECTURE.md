@@ -41,3 +41,9 @@ transport (http1 / h3)  ──parse──▶ core.Request ──▶ core.Handler
 4. Move the method check (405) into a small router decorator; keep file logic in `StaticFileHandler`.
 
 Each step is small and avoids file moves/renames so parallel workstreams don't conflict.
+
+## Observability
+
+`observe.RequestObserver` is the isolated hook. It is not a `Handler` decorator: the chain above is owned by another change and is not composed in `SjwsServer` yet. HTTP/1.1 (`Http1Connection`) and HTTP/3 (`Http3RequestHandler`) each call `intercept` (for `/healthz` and `/metrics`) and `complete` (after the response write). When the chain exists, one decorator can make those two calls and the transport calls go away; `ServerMetrics`, `Snapshot` and `AccessLog` stay where they are.
+
+Counters are `LongAdder`s. The access log is a bounded lock-free queue drained by one thread. Neither path blocks a request on I/O.

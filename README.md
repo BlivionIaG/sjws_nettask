@@ -32,6 +32,51 @@ Run:
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
 | `-h`, `--help` | | | print usage and exit |
 
+### Observability
+
+In-process counters are always on. Access logging and the Prometheus scrape endpoint are off until configured.
+`/healthz` is always served (GET and HEAD, body `ok`).
+
+| Option | Environment | Default | |
+|---|---|---|---|
+| `--access-log=PATH` | `WEB_SERVER_ACCESS_LOG` | off | `-` writes to stdout; any other value appends to that file. Unset leaves logging off |
+| `--access-log-format=FMT` | `WEB_SERVER_ACCESS_LOG_FORMAT` | combined | `common`, `combined` or `json` |
+| `--metrics=MODE` | `WEB_SERVER_METRICS` | off | `/metrics` in Prometheus text. `MODE` is `off`, `localhost` or `on`. A bare `--metrics` means `localhost` |
+| `--no-metrics` | | | leave `/metrics` disabled |
+
+Request threads never write the log and never take a lock for it. Each response updates striped `LongAdder`s (status, protocol, a latency bucket, bytes). When logging is on, the thread formats one `byte[]` and enqueues it on a bounded lock-free queue; a single `access-log` thread writes and flushes. A full queue drops the line and counts it (`accessLogDropped` / `sjws_access_log_dropped_total`) instead of blocking the request.
+
+**Access line.** Common and combined are the NCSA formats, with the duration in microseconds appended. A zero body is `-`. Combined adds the quoted Referer and User-Agent. JSON is one object per line: `time` (UTC), `remote`, `method`, `path` (the request-target), `protocol`, `status`, `bytes`, `duration_us`, `referer`, `user_agent`. Quotes and controls in a CLF field are replaced with `?`. The client address is the numeric IP captured at accept (no reverse DNS).
+
+**Metrics API** (what an admin TUI reads; also rendered at `/metrics` when that endpoint is enabled):
+
+```java
+ServerMetrics metrics = server.metrics();
+Snapshot snap = metrics.snapshot();
+snap.requests();                  // responses so far
+snap.status(200);                 // by status code
+snap.protocol("HTTP/1.1");        // HTTP/1.0, HTTP/1.1, HTTP/2, HTTP/3, or other
+snap.bytesSent();                 // response body bytes (not headers)
+snap.activeConnections();         // HTTP/1.1 being served + established HTTP/3
+snap.http1Connections();
+snap.http3Connections();
+snap.accessLogDropped();
+snap.latency().count();
+snap.latency().sumNanos();
+snap.latency().maxNanos();
+snap.latency().meanNanos();
+snap.latency().upperBoundNanos(); // inclusive; the last bound is Long.MAX_VALUE
+snap.latency().counts();          // one bucket, not cumulative
+snap.latency().cumulative(i);     // Prometheus-style, through bucket i
+metrics.prometheus();             // text exposition 0.0.4
+```
+
+Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. Latency buckets are 1, 5, 10, 25, 50, 100, 250 and 500 ms, then 1, 2.5, 5 and 10 s, then everything above. `bytes` is the body size the handler committed to; a write that throws counts the request and 0 bytes. `/healthz` and `/metrics` are counted like any other response.
+
+`/metrics` on `localhost` answers only a loopback peer (403 otherwise), so it stays safe on a public bind. `on` answers every client. Behind a proxy that connects from 127.0.0.1, `localhost` is the proxy, not the browser. The endpoint is not a document-root file: when it is off, a file named `metrics` is served normally.
+
+The hook is `RequestObserver`: transports call `intercept` before the application handler and `complete` after the response is written. `core.Handler` is the seam a middleware chain will decorate; that chain is not composed in the server yet, so the calls stay at the two transports and can move into one decorator later without changing the counters or the log.
+
 **HTTP/1.1 connections** run on blocking `SocketChannel`s, one virtual thread each. One timer thread
 enforces every deadline (no per-socket timeouts): `--idle-timeout` between requests,
 `--header-timeout` from the first byte of a request until its head (and any small body to discard,

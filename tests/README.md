@@ -15,6 +15,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `http1/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
+| `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/PlatformEdgeCaseTest` | case/Unicode/`%2F` behaviour per file system |
@@ -60,6 +61,7 @@ Every user-visible behaviour and the test that asserts it.
 | Behaviour | Asserted by |
 |---|---|
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
+| access log (common, combined, JSON), `/healthz`, `/metrics` off / localhost / on, in-process snapshot | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
 | `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |
