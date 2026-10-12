@@ -36,7 +36,7 @@ import java.util.List;
  */
 public final class StaticFileHandler implements Handler {
 
-    public static final String ALLOW = "GET, HEAD";
+    public static final String ALLOW = "GET, HEAD, OPTIONS";
     /** Accept-Ranges of file responses (single byte ranges, see {@link ByteRanges}). */
     public static final String ACCEPT_RANGES = "bytes";
     /** Accept-Ranges of generated pages (errors, listings, redirects): Range is ignored there. */
@@ -108,6 +108,12 @@ public final class StaticFileHandler implements Handler {
     @Override
     public Response handle(Request request) {
         boolean head = request.headOnly();
+        if ("OPTIONS".equals(request.method())) {
+            return options();
+        }
+        if ("*".equals(request.target())) { // asterisk-form is only meaningful for OPTIONS (RFC 9112 §3.2.4)
+            return error(400, head);
+        }
         if (!head && !"GET".equals(request.method())) {
             return methodNotAllowed();
         }
@@ -302,6 +308,16 @@ public final class StaticFileHandler implements Handler {
     public static Response rangeNotSatisfiable(ByteRanges.Unsatisfiable u) {
         var r = error(416, false);
         r.headers().add("content-range", u.contentRange());
+        return r;
+    }
+
+    /**
+     * OPTIONS (RFC 9110 §9.3.7), for "*" and any path: 200 with {@link #ALLOW} and an empty body
+     * (Content-Length: 0). Resource existence is not checked: the method set is server-wide.
+     */
+    public static Response options() {
+        var r = new Response(200, ResponseHeaders.of(), Body.Empty.INSTANCE);
+        r.headers().add("allow", ALLOW);
         return r;
     }
 
