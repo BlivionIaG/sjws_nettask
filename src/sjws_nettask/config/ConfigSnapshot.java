@@ -24,7 +24,9 @@ import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Immutable configuration for the request path: one prebuilt handler, swapped as a whole.
- * The route table is stored on {@link #document()} and is not consulted here.
+ * The route table, middleware list and access settings are stored on {@link #document()} and are
+ * not consulted here. When ACME is on the main listener the challenge handler runs first, so
+ * {@code /.well-known/acme-challenge/} is answered before the file handler's dotfile check.
  *
  * @param files the static-file handler (also what {@code SjwsServer.handler()} returns)
  * @param handler what a request runs: {@code files}, or an ACME challenge wrapper in front of it

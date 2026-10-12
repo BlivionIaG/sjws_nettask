@@ -141,12 +141,54 @@ server is then limited to the per-address cap (256 HTTP/1.1 connections, 16 QUIC
 Defaults, then the config file, then arguments, then environment variables.
 A bad value in the file is an error (exit 64). Invalid values of the server flags
 above are still replaced by the default with a `WARN:` line; unknown options warn too.
-Exit codes: 0 = normal / `--help`, 1 = cannot listen on the port, 2 = document root
-missing, 64 = configuration error (e.g. `--cert` without `--key`, a bad config file,
-unreadable key password file). Routing and middleware are file-only and are validated
-into the snapshot; this server does not proxy or apply a middleware chain.
-Reload re-reads the file through `ReloadHook` (see docs/config.md). ACME HTTP-01
-issuance uses the staging CA unless you select production.
+Exit codes: 0 = normal / `--help`, 1 = cannot listen on the port (also: already running,
+pid file or log file not writable, background start failed), 2 = document root missing,
+64 = configuration error (e.g. `--cert` without `--key`, a bad config file, unreadable
+key password file, `--stop` combined with `--daemon`). Routing, middleware and
+access rules are file-only and are validated into the snapshot; this server does not
+proxy, apply a middleware chain, or enforce the access list. ACME HTTP-01 on the main
+listener is answered before the file handler hides dotfiles. Reload re-reads the file
+through `ReloadHook` (see docs/config.md, including the ConfigStore notes).
+ACME HTTP-01 issuance uses the staging CA unless you select production.
+`--status` uses 0 = running, 1 = pid file is stale, 3 = not running.
+
+### Running in the background
+
+`--daemon` starts a second JVM and exits once that process is listening. The child runs in a new
+session when `setsid` is available (`/usr/bin/setsid`), ignores `SIGHUP`, writes the pid file and
+appends stdout and stderr to the log file (default `sjws_nettask.log` in the working directory).
+JVM flags placed before `-jar` or the main class, such as `-Xmx`, are kept. Paths in `--pid-file`
+and `--log-file` are relative to the working directory; a service should use absolute paths.
+
+```
+java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --daemon --pid-file=/run/sjws_nettask.pid \
+    --log-file=/var/log/sjws_nettask.log 8080 /var/www/html
+java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --status --pid-file=/run/sjws_nettask.pid
+java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --stop --pid-file=/run/sjws_nettask.pid
+java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --restart --pid-file=/run/sjws_nettask.pid \
+    --log-file=/var/log/sjws_nettask.log 8080 /var/www/html
+```
+
+`--stop` sends SIGTERM and waits for `--shutdown-timeout` plus 5 seconds, then SIGKILL.
+`--status` prints `running pid=<n>`, `stopped`, or `stopped stale pid=<n>`. A pid file whose
+process is gone, or whose pid was reused (the start time no longer matches), is stale: `--stop`
+removes it and does not signal the new process. A file a live server has locked is left in place,
+so a restart cannot delete the pid file the new process just claimed. `--restart` is `--stop`
+followed by `--daemon`.
+
+SIGTERM and SIGINT (the shutdown hook) stop accepting on every listener, drop idle and
+half-read HTTP/1 connections immediately, and let responses already in progress finish until
+`--shutdown-timeout` (default 10 seconds). Whatever is still open is then closed. HTTP/3 sends
+GOAWAY and drains for up to 2 seconds in parallel with that wait. A foreground process with
+`--pid-file` writes the same file, so `--stop` works for it too; without `--log-file` it keeps
+logging to the console.
+
+`contrib/sjws` is a small start/stop/status/restart wrapper (`SJWS_JAR`, `SJWS_PID_FILE`,
+`SJWS_LOG_FILE`, `JAVA`). `contrib/sjws_nettask.service` is a systemd `Type=forking` example
+(`PIDFile` plus `--daemon`). Copy `target/lib/` next to the jar: `java -jar` loads Netty from the
+manifest `Class-Path`. On Windows, `--stop` ends the process without a POSIX SIGTERM, so the
+drain hook does not run; use a service manager that can signal the JVM there.
+The daemon child ignores `SIGHUP`. `ReloadHook.run()` is the reload entry a handler can call.
 
 ### HTTP/3
 

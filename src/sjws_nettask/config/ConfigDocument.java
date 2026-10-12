@@ -17,21 +17,30 @@
 package sjws_nettask.config;
 
 import java.nio.file.Path;
+import java.util.List;
 import sjws_nettask.ServerConfig;
 
 /**
  * One validated configuration: server settings plus the sections other workstreams fill in.
  *
+ * @param middleware file order; empty means no chain
  * @param configFile file this document was read from, or null when there is no file
+ * @param contentHash lowercase SHA-256 of that file's bytes, or null when there is no file
  */
-public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing routing, MiddlewareChain middleware,
-        Path configFile) {
+public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing routing, List<MiddlewareSpec> middleware,
+        AccessSettings access, Path configFile, String contentHash) {
+
+    public ConfigDocument {
+        middleware = List.copyOf(middleware);
+    }
 
     public static ConfigDocument defaults(ServerConfig server) {
-        return new ConfigDocument(server, AcmeSettings.disabled(), Routing.disabled(), MiddlewareChain.EMPTY, null);
+        return new ConfigDocument(server, AcmeSettings.disabled(), Routing.disabled(), List.of(),
+                AccessSettings.DEFAULT, null, null);
     }
 
     public ConfigDocument withServer(ServerConfig server) {
-        return new ConfigDocument(server, this.acme, this.routing, this.middleware, this.configFile);
+        return new ConfigDocument(server, this.acme, this.routing, this.middleware, this.access, this.configFile,
+                this.contentHash);
     }
 }

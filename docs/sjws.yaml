@@ -39,5 +39,10 @@ routing:
       static: true
   forwarded_proto: auto   # http|https|auto
 
-middleware:
-  chain: []
+middleware: []   # list of {name, order, route, options}; empty = no chain
+
+access:
+  deny: []
+  rules: []
+  allow_dotfiles: false
+  require_world_readable: false

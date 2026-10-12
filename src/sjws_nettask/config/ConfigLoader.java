@@ -19,8 +19,11 @@ package sjws_nettask.config;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -38,7 +41,7 @@ import sjws_nettask.ServerConfig;
  */
 public final class ConfigLoader {
 
-    private static final List<String> TOP = List.of("server", "http3", "tls", "acme", "routing", "middleware");
+    private static final List<String> TOP = List.of("server", "http3", "tls", "acme", "routing", "middleware", "access");
     private static final Pattern HOST = Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
@@ -93,32 +96,28 @@ public final class ConfigLoader {
         ServerConfig baseline = null;
         AcmeSettings acme = AcmeSettings.disabled();
         Routing routing = Routing.disabled();
-        MiddlewareChain middleware = MiddlewareChain.EMPTY;
+        List<MiddlewareSpec> middleware = List.of();
+        AccessSettings access = AccessSettings.DEFAULT;
         Path configFile = null;
+        String contentHash = null;
         Path yamlPassword = null;
         if (configured != null) {
             configFile = Path.of(configured);
             if (!Files.isRegularFile(configFile)) {
                 throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath());
             }
-            long size;
+            byte[] bytes;
             try {
-                size = Files.size(configFile);
+                bytes = Files.readAllBytes(configFile);
             } catch (IOException e) {
                 throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath() + ": "
                         + e.getMessage());
             }
-            if (size > 1_000_000) {
+            if (bytes.length > 1_000_000) {
                 throw new ConfigException("Config file " + configFile.toAbsolutePath() + " is larger than 1MB");
             }
-            String text;
-            try {
-                text = Files.readString(configFile);
-            } catch (IOException e) {
-                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath() + ": "
-                        + e.getMessage());
-            }
-            var root = YamlValues.parse(text, configFile.toString());
+            contentHash = sha256(bytes);
+            var root = YamlValues.parse(new String(bytes, StandardCharsets.UTF_8), configFile.toString());
             YamlValues.knownKeys(root, TOP, "config");
             var base = configFile.toAbsolutePath().getParent();
             baseline = serverSection(root, base);
@@ -126,6 +125,7 @@ public final class ConfigLoader {
             acme = acmeSection(root, base);
             routing = routingSection(root, warnings);
             middleware = middlewareSection(root, warnings);
+            access = accessSection(root, warnings);
         }
         var parsed = baseline == null
                 ? ServerConfig.parse(args, env, passwords)
@@ -139,7 +139,10 @@ public final class ConfigLoader {
         if (server.tlsCert() != null && acme.enabled()) {
             throw new ConfigException("tls.cert and acme.enabled cannot both be set");
         }
-        var document = new ConfigDocument(server, acme, routing, middleware, configFile);
+        if (acme.enabled()) {
+            access = access.withAcmeChallenge();
+        }
+        var document = new ConfigDocument(server, acme, routing, middleware, access, configFile, contentHash);
         return new Loaded(document, warnings, List.of(), false, args, env, passwords);
     }
 
@@ -526,38 +529,154 @@ public final class ConfigLoader {
         return new RouteSpec.Action.Redirect(status, location, keep);
     }
 
-    private static MiddlewareChain middlewareSection(Map<String, Object> root, List<String> warnings) {
+    private static List<MiddlewareSpec> middlewareSection(Map<String, Object> root, List<String> warnings) {
         if (!(root.get("middleware") instanceof Object middleware)) {
-            return MiddlewareChain.EMPTY;
+            return List.of();
         }
-        var map = YamlValues.mapping(middleware, "middleware");
-        YamlValues.knownKeys(map, List.of("chain"), "middleware");
-        if (!map.containsKey("chain")) {
-            return MiddlewareChain.EMPTY;
-        }
-        var list = YamlValues.sequence(map.get("chain"), "middleware.chain");
-        var steps = new ArrayList<MiddlewareChain.Step>(list.size());
+        var list = YamlValues.sequence(middleware, "middleware");
+        var specs = new ArrayList<MiddlewareSpec>(list.size());
         for (int i = 0; i < list.size(); i++) {
-            var path = "middleware.chain[" + i + "]";
+            var path = "middleware[" + i + "]";
             var step = YamlValues.mapping(list.get(i), path);
-            YamlValues.knownKeys(step, List.of("name", "params"), path);
+            YamlValues.knownKeys(step, List.of("name", "order", "route", "options"), path);
             if (!step.containsKey("name")) {
                 throw new ConfigException(path + ".name is required");
             }
-            var name = text(step.get("name"), path + ".name");
-            var params = new LinkedHashMap<String, String>();
-            if (step.containsKey("params")) {
-                var body = YamlValues.mapping(step.get("params"), path + ".params");
+            int order = step.containsKey("order")
+                    ? integer(step.get("order"), path + ".order", Integer.MIN_VALUE, Integer.MAX_VALUE)
+                    : 0;
+            String route = step.containsKey("route") ? route(step.get("route"), path + ".route") : null;
+            var options = new LinkedHashMap<String, String>();
+            if (step.containsKey("options") && step.get("options") != null) {
+                var body = YamlValues.mapping(step.get("options"), path + ".options");
                 for (var entry : body.entrySet()) {
-                    params.put(entry.getKey(), scalar(entry.getValue(), path + ".params." + entry.getKey()));
+                    options.put(entry.getKey(), scalar(entry.getValue(), path + ".options." + entry.getKey()));
                 }
             }
-            steps.add(new MiddlewareChain.Step(name, params));
+            try {
+                specs.add(MiddlewareSpec.of(text(step.get("name"), path + ".name"), order, route, options));
+            } catch (IllegalArgumentException e) {
+                throw new ConfigException(path + ": " + e.getMessage());
+            }
         }
-        if (!steps.isEmpty()) {
-            warnings.add("middleware.chain is stored but not applied");
+        if (!specs.isEmpty()) {
+            warnings.add("middleware is stored but not applied");
         }
-        return new MiddlewareChain(steps);
+        return List.copyOf(specs);
+    }
+
+    /**
+     * {@code *} and blank match every request and are stored as null. Otherwise {@code /exact},
+     * {@code /prefix/*}, or {@code /*}.
+     */
+    private static String route(Object value, String path) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof String raw)) {
+            throw new ConfigException(path + ": expected a string");
+        }
+        var r = raw.trim();
+        if (r.isEmpty() || "*".equals(r)) {
+            return null;
+        }
+        int star = r.indexOf('*');
+        if (star >= 0) {
+            if (star != r.length() - 1 || !r.endsWith("/*")) {
+                throw new ConfigException(path + ": expected *, /exact, or /prefix/*");
+            }
+            var prefix = r.substring(0, r.length() - 2);
+            if (!prefix.isEmpty() && !prefix.startsWith("/")) {
+                throw new ConfigException(path + ": expected *, /exact, or /prefix/*");
+            }
+            return r;
+        }
+        if (!r.startsWith("/")) {
+            throw new ConfigException(path + ": expected *, /exact, or /prefix/*");
+        }
+        return r;
+    }
+
+    private static AccessSettings accessSection(Map<String, Object> root, List<String> warnings) {
+        if (!(root.get("access") instanceof Object access)) {
+            return AccessSettings.DEFAULT;
+        }
+        var map = YamlValues.mapping(access, "access");
+        YamlValues.knownKeys(map, List.of("deny", "rules", "allow_dotfiles", "require_owner",
+                "require_world_readable"), "access");
+        var deny = map.containsKey("deny") ? patterns(map.get("deny"), "access.deny") : List.<String>of();
+        var rules = map.containsKey("rules") ? rules(map.get("rules"), "access.rules") : List.<String>of();
+        boolean dotfiles = map.containsKey("allow_dotfiles") && bool(map.get("allow_dotfiles"), "access.allow_dotfiles");
+        String owner = null;
+        if (map.containsKey("require_owner") && map.get("require_owner") != null) {
+            owner = text(map.get("require_owner"), "access.require_owner");
+        }
+        boolean world = map.containsKey("require_world_readable")
+                && bool(map.get("require_world_readable"), "access.require_world_readable");
+        var settings = new AccessSettings(deny, rules, dotfiles, owner, world);
+        if (!settings.isDefault()) {
+            warnings.add("access is stored but not enforced");
+        }
+        return settings;
+    }
+
+    private static List<String> patterns(Object value, String path) {
+        var out = new ArrayList<String>();
+        if (value instanceof String text) {
+            if (text.isBlank()) {
+                return List.of();
+            }
+            for (var item : text.split(",")) {
+                if (!item.isBlank()) {
+                    out.add(item.trim());
+                }
+            }
+            return List.copyOf(out);
+        }
+        for (var item : YamlValues.sequence(value, path)) {
+            out.add(text(item, path));
+        }
+        return List.copyOf(out);
+    }
+
+    private static List<String> rules(Object value, String path) {
+        var list = YamlValues.sequence(value, path);
+        var out = new ArrayList<String>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            out.add(rule(text(list.get(i), path + "[" + i + "]"), path + "[" + i + "]"));
+        }
+        return List.copyOf(out);
+    }
+
+    /** {@code allow:PATTERN}, {@code deny:PATTERN} or {@code hide:PATTERN}. */
+    private static String rule(String raw, String path) {
+        int colon = raw.indexOf(':');
+        if (colon <= 0) {
+            throw new ConfigException(path + ": expected allow:, deny: or hide:PATTERN");
+        }
+        var action = raw.substring(0, colon).trim().toLowerCase(Locale.ROOT);
+        if (!action.equals("allow") && !action.equals("deny") && !action.equals("hide")) {
+            throw new ConfigException(path + ": expected allow:, deny: or hide:");
+        }
+        var pattern = raw.substring(colon + 1).trim();
+        if (pattern.isEmpty()) {
+            throw new ConfigException(path + ": pattern is required");
+        }
+        return action + ":" + pattern;
+    }
+
+    private static String sha256(byte[] bytes) {
+        try {
+            var digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+            var hex = new StringBuilder(digest.length * 2);
+            for (byte b : digest) {
+                hex.append(Character.forDigit((b >> 4) & 0xf, 16));
+                hex.append(Character.forDigit(b & 0xf, 16));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     private static String directory(String value, String path) {

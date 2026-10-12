@@ -4,7 +4,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -180,18 +182,107 @@ class ConfigLoaderTest {
     }
 
     @Test
-    void middlewareIsStoredAndWarned() throws Exception {
+    void middlewareListKeepsFileOrderAndRepeatsNames() throws Exception {
         var loaded = ConfigLoader.load(new String[] {"--config=" + write("""
                 middleware:
-                  chain:
-                    - name: security-headers
-                      params: { enabled: true, count: 2 }
+                  - name: reverse-proxy
+                    order: 100
+                    route: /api/*
+                    options:
+                      upstream: http://127.0.0.1:9000
+                      preserve-host: true
+                      limit: 5
+                  - name: access-log
+                    options: { format: combined }
+                  - name: access-log
+                    route: "*"
+                    order: 0
                 """)}, Map.of());
         assertTrue(loaded.ok(), loaded.errors().toString());
-        assertEquals("security-headers", loaded.document().middleware().steps().get(0).name());
-        assertEquals("true", loaded.document().middleware().steps().get(0).params().get("enabled"));
-        assertEquals("2", loaded.document().middleware().steps().get(0).params().get("count"));
+        var specs = loaded.document().middleware();
+        assertEquals(3, specs.size());
+        assertEquals("reverse-proxy", specs.get(0).name());
+        assertEquals(100, specs.get(0).order());
+        assertEquals("/api/*", specs.get(0).route());
+        assertEquals("http://127.0.0.1:9000", specs.get(0).options().get("upstream"));
+        assertEquals("true", specs.get(0).options().get("preserve-host"));
+        assertEquals("5", specs.get(0).options().get("limit"));
+        assertEquals("access-log", specs.get(1).name());
+        assertEquals(0, specs.get(1).order());
+        assertNull(specs.get(1).route());
+        assertEquals("combined", specs.get(1).options().get("format"));
+        assertEquals("access-log", specs.get(2).name());
+        assertNull(specs.get(2).route());
         assertTrue(loaded.warnings().stream().anyMatch(w -> w.contains("not applied")));
+        var empty = ConfigLoader.load(new String[] {"--config=" + write("middleware: []\n")}, Map.of());
+        assertTrue(empty.ok(), empty.errors().toString());
+        assertTrue(empty.document().middleware().isEmpty());
+        assertTrue(empty.warnings().stream().noneMatch(w -> w.contains("middleware")));
+        assertTrue(error("middleware:\n  chain: []\n").contains("list"));
+        assertTrue(error("middleware:\n  - name: x\n    route: api/*\n").contains("route"));
+        assertTrue(error("middleware:\n  - name: x\n    route: 1\n").contains("string"));
+        assertTrue(error("middleware:\n  - name: x\n    route: \"/a*b\"\n").contains("route"));
+        assertTrue(error("middleware:\n  - order: 1\n").contains("name"));
+        assertTrue(error("middleware:\n  - name: \" \"\n").contains("name"));
+        var listed = ConfigLoader.load(new String[] {"--config=" + write("""
+                middleware:
+                  - name: gate
+                    route: /*
+                  - name: exact
+                    route: /only
+                access:
+                  deny:
+                    - "*.bak"
+                  rules: ["deny:/private"]
+                """)}, Map.of());
+        assertTrue(listed.ok(), listed.errors().toString());
+        assertEquals("/*", listed.document().middleware().get(0).route());
+        assertEquals("/only", listed.document().middleware().get(1).route());
+        assertEquals(List.of("*.bak"), listed.document().access().deny());
+        assertEquals(List.of("deny:/private"), listed.document().access().rules());
+        assertTrue(error("access:\n  rules: [\"allow:\"]\n").contains("pattern"));
+        assertTrue(error("access:\n  rules: [\"nope\"]\n").contains("allow:"));
+    }
+
+    @Test
+    void accessSectionMatchesTheRuleFlagsAndAcmeOpensTheChallenge() throws Exception {
+        var file = write("""
+                access:
+                  deny: "*.bak,*~"
+                  rules:
+                    - hide:/drafts
+                    - "ALLOW: /.well-known/acme-challenge"
+                  allow_dotfiles: false
+                  require_owner: www-data
+                  require_world_readable: true
+                acme:
+                  enabled: true
+                  email: ops@example.com
+                  domains: [example.com]
+                  accept_terms: true
+                """);
+        var bytes = Files.readAllBytes(file);
+        var loaded = ConfigLoader.load(new String[] {"--config=" + file}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var access = loaded.document().access();
+        assertEquals(List.of("*.bak", "*~"), access.deny());
+        assertEquals(List.of("hide:/drafts", AccessSettings.ACME_CHALLENGE_RULE), access.rules());
+        assertFalse(access.allowDotfiles());
+        assertEquals("www-data", access.requireOwner());
+        assertTrue(access.requireWorldReadable());
+        assertEquals(sha256(bytes), loaded.document().contentHash());
+        assertTrue(loaded.warnings().stream().anyMatch(w -> w.contains("not enforced")));
+        var injected = ConfigLoader.load(new String[] {"--config=" + write("""
+                acme:
+                  enabled: true
+                  email: ops@example.com
+                  domains: [example.com]
+                  accept_terms: true
+                """)}, Map.of());
+        assertEquals(List.of(AccessSettings.ACME_CHALLENGE_RULE), injected.document().access().rules());
+        assertTrue(injected.warnings().stream().noneMatch(w -> w.contains("not enforced")));
+        assertTrue(error("access:\n  rules: [permit:/x]\n").contains("allow:"));
+        assertNull(ConfigLoader.standalone(ServerConfig.defaults(dir)).document().contentHash());
     }
 
     @Test
@@ -321,6 +412,16 @@ class ConfigLoaderTest {
         assertEquals(ForwardedProto.HTTPS, loaded.document().routing().forwardedProto());
         assertEquals(2, loaded.document().routing().trustedProxies().size());
         assertTrue(error("routing:\n  trusted_proxies: [example.com]\n").contains("not a name"));
+    }
+
+    private static String sha256(byte[] bytes) throws Exception {
+        var digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+        var hex = new StringBuilder(digest.length * 2);
+        for (byte b : digest) {
+            hex.append(Character.forDigit((b >> 4) & 0xf, 16));
+            hex.append(Character.forDigit(b & 0xf, 16));
+        }
+        return hex.toString();
     }
 
     private String error(String yaml) throws Exception {

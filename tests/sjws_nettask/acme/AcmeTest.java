@@ -33,6 +33,8 @@ class AcmeTest {
         var handler = new AcmeChallengeHandler(board, request -> new Response(200,
                 sjws_nettask.core.ResponseHeaders.of().add("content-type", "text/plain"),
                 sjws_nettask.core.Body.Bytes.of("file".getBytes()), request.headOnly()));
+        assertNull(new sjws_nettask.core.PathResolver(dir).logical("/.well-known/acme-challenge/token"),
+                "a dot component is hidden before any access-rule list runs");
         var hit = handler.handle(new Request("GET", "/.well-known/acme-challenge/token?unused=1"));
         assertEquals(200, hit.status());
         assertEquals("token.thumb", new String(bytes(hit)));

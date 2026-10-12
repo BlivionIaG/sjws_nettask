@@ -26,7 +26,7 @@ line and in the environment stay relative to the working directory.
 `--help` wins before a missing file is an error. A missing document root is exit
 code 2, including when the root comes from the file.
 
-`routing` and `middleware` are file-only. They do not add command-line flags.
+`routing`, `middleware` and `access` are file-only. They do not add command-line flags.
 
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
 `h`, `d`). In a size, a bare integer is bytes and `1m` is one mebibyte (`k`, `m`,
@@ -46,7 +46,7 @@ server:
   write_timeout: 30
   cache_bytes: 64m          # up to 16g; 0 disables the cache
   allow_unlistable_dirs: false
-  access_log: off           # reserved; not written yet
+  access_log: off           # opened at startup; a reload does not reopen the writer
 
 http3:
   enabled: false
@@ -83,10 +83,11 @@ The request path is that one volatile read and then the handler that was built
 with the snapshot. It does not parse YAML, match routes, or take the reload lock.
 
 Applied on the next request: document root, cache budget, unlistable-directory
-policy, the routing table and the middleware list (both stored, neither
-dispatched), ACME settings (the renewal task is rescheduled), and a file
+policy, the routing table, the middleware list and the access settings (stored,
+not dispatched), ACME settings (the renewal task is rescheduled), and a file
 certificate (`TlsMaterial.fromPem` into `Http3Server.replaceTls`). HTTP/1
-timeouts are applied when HTTP/3 is not running.
+timeouts are applied when HTTP/3 is not running. The access-log writer, metrics
+exposure and `/healthz` probe stay as they were opened at startup.
 
 Left as they were, and reported as `needsRestart`: `port`, `backlog`, connection
 caps, HTTP/3 bind settings, `alt_svc`, `alt_svc_max_age`, and (while HTTP/3 is
@@ -184,20 +185,102 @@ covers is a warning. The sample above does not shadow itself.
 
 ## Middleware
 
-Reserved and not applied. A non-empty chain warns.
+A list, stored and not applied. An empty list (or a missing key) is no chain and
+does not warn. A non-empty list warns. The same `name` may appear more than once.
+File order is kept; a lower `order` is further out, and ties stay in that order
+when a filter chain sorts them. This record is
+`MiddlewareSpec.of(name, order, route, options)`, the same call
+`RequestFilters.addAll` expects. This server does not reference that workstream's
+classes.
 
 ```yaml
 middleware:
-  chain:
-    - name: security-headers
-      params: { }
+  - name: access-log          # required
+    order: 0                  # optional, default 0; lower is further out
+    options:                  # optional; numbers and booleans become strings
+      format: combined
+  - name: reverse-proxy
+    order: 100
+    route: /api/*             # optional; omitted, blank or "*" = every request
+    options:
+      upstream: http://127.0.0.1:9000
+      preserve-host: "true"
 ```
 
-`params` values are scalars. Unknown keys are errors.
+`route` is `*`, `/exact`, or `/prefix/*` (and `/*` for every path that starts
+with `/`). Any other `*` is an error.
+
+## Access
+
+Stored for the rights-management flags and not enforced here. Dotfiles are already
+hidden by the file handler. A non-default section warns. The fields map onto
+`AccessRules` once that class is present, without this server depending on it:
+
+| YAML | Flag | Environment |
+|---|---|---|
+| `deny` | `--deny=PAT[,PAT...]` | `WEB_SERVER_DENY` |
+| `rules` | `--access-rule=ACT:PAT` | `WEB_SERVER_ACCESS_RULES` |
+| `allow_dotfiles` | `--allow-dotfiles` | `WEB_SERVER_ALLOW_DOTFILES` |
+| `require_owner` | `--require-owner=USER` | `WEB_SERVER_REQUIRE_OWNER` |
+| `require_world_readable` | `--require-world-readable` | `WEB_SERVER_REQUIRE_WORLD_READABLE` |
+
+```yaml
+access:
+  deny: ["*.bak", "*~", "/private"]   # or one comma-separated string
+  rules:                               # allow:, deny: or hide:; first match wins there
+    - hide:/drafts
+    - allow:/.well-known/acme-challenge
+  allow_dotfiles: false
+  require_owner: www-data              # name or numeric uid; omit to leave it off
+  require_world_readable: false
+```
+
+`/.well-known/acme-challenge/` is answered by the ACME handler before the file
+handler, including its dotfile check, whenever ACME is on the main listener. An
+unknown token is 404 and is not a file. When ACME is enabled the stored rules
+also gain `allow:/.well-known/acme-challenge` if it is not already there: a
+wildcard allow does not match a dot component, and that literal is the form the
+access-rule list needs. A dedicated HTTP-01 port never consults the file handler.
 
 ## Request path
 
 `LiveConfig` holds an `AtomicReference` of `ConfigSnapshot`. The snapshot carries
 the static-file handler (and, only when ACME challenges are on the main listener,
-the challenge handler in front of it), the route table and the middleware chain.
-Building that snapshot is the only time the file is parsed.
+the challenge handler in front of it), the route table, the middleware list and
+the access settings. Building that snapshot is the only time the file is parsed.
+
+## ConfigStore rollout
+
+The bundle is this YAML file. Its version is the lowercase SHA-256 of the file
+bytes (`ConfigDocument.contentHash()`). A process that was started without a file
+has no hash. Each successful reload also bumps a generation counter on the
+snapshot; that counter is how many times this process has swapped, not the bundle
+version. The hash is of the file, not of the file after arguments and environment
+variables have been applied.
+
+Applied live, on the next request, with no drain: document root, cache budget,
+unlistable directories, HTTP/1 timeouts when HTTP/3 is not running, the stored
+routing table, middleware list and access settings, and ACME's renewal schedule.
+A file certificate is loaded and passed to `Http3Server.replaceTls`.
+
+Needs a restart (the previous value is kept and named in the reload result):
+`server.port`, `server.backlog`, both connection caps, whether HTTP/3 is enabled,
+its port, host, connection caps, minimum rate, Alt-Svc and its max-age, and the
+idle, header and write timeouts while HTTP/3 is running. QUIC's idle timeout and
+stream limits are fixed when the UDP socket is opened. Removing `tls.cert` leaves
+the certificate that is already installed until restart. The access-log writer,
+the metrics exposure and the `/healthz` probe are opened at startup and are not
+replaced on reload.
+
+TLS. HTTP/1.1 on this server is plain TCP; there is no certificate on that
+listener, so ACME renewal does not drain HTTP/1 connections. HTTP/3 uses a key
+manager that BoringSSL asks on every handshake. `replaceTls` publishes the new
+chain for the next handshake. Connections that already finished a handshake keep
+the previous certificate until they close. Renewal does not restart the process
+and does not drain the UDP listener.
+
+Secrets. The file is not scanned for `${env:NAME}` or `${file:path}` placeholders.
+The one secret is the TLS key password. It is never a YAML value and never a
+command-line argument. `tls.key_password_file` is read when HTTP/3 stays enabled
+and neither `WEB_SERVER_TLS_KEY_PASSWORD` nor `WEB_SERVER_TLS_KEY_PASSWORD_FILE`
+nor `--key-password-file` was set. The environment variable wins over the file.
