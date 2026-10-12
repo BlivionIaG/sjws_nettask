@@ -323,4 +323,17 @@ class TlsMaterialTest {
                 .get(0).contains("not valid before"));
         assertTrue(TlsMaterial.warnings(this.tmp.resolve("missing.pem"), material.certificate(), now).isEmpty());
     }
+
+    @org.junit.jupiter.api.Test
+    void derLengthsUseTheShortestForm() {
+        for (int len : new int[] {0x7f, 0x80, 0xff, 0x100, 0xffff, 0x10000, 0x123456}) {
+            byte[] der = SelfSignedDer.tlv(0x04, new byte[len]);
+            int hdr = len < 0x80 ? 2 : len < 0x100 ? 3 : len < 0x10000 ? 4 : 5;
+            org.junit.jupiter.api.Assertions.assertEquals(hdr + len, der.length, "length " + len);
+            if (hdr == 5) {
+                org.junit.jupiter.api.Assertions.assertEquals((byte) 0x83, der[1]);
+                org.junit.jupiter.api.Assertions.assertEquals(len, (der[2] & 0xff) << 16 | (der[3] & 0xff) << 8 | der[4] & 0xff);
+            }
+        }
+    }
 }
