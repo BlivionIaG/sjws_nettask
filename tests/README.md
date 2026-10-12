@@ -82,3 +82,11 @@ Lines JaCoCo reports as missed that no behaviour test can reach (or only by faki
 - `FileCache`: the non-UNIX stat path (Linux CI), `ExecutionException` (the leader never completes exceptionally), the CLOCK `e == null` branch, concurrent-load races (`old != null`).
 - `SafeOpen`: non-`SecureDirectoryStream` and non-`FileChannel` providers, I/O errors after a successful open.
 - `StaticFileHandler`: the `UncheckedIOException` unwrap from a directory stream failing mid-iteration.
+
+## Known platform gaps (macOS)
+
+The suite is green on Linux. On macOS (CI run 38212694685, manual job only) three tests fail and need a fix in the code, not the test:
+
+- `core/SafeOpenTest.parentSymlinkRaceNeverLeaksOverHttp1`: a file was served while a parent directory was swapped for a symlink (the race guard relies on Linux `SecureDirectoryStream`/`O_NOFOLLOW` behaviour).
+- `core/FileCacheTest.searchOnlyDirectoryStays403`: a cached file below an execute-only directory is answered 200 instead of 403.
+- `HardeningIntegrationTest.trickledRequestIsCutOffAtDeadline`: the client sees a reset instead of the 408 (macOS sends RST when a socket with unread data is closed).
