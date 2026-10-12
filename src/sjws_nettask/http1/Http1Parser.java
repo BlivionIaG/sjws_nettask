@@ -16,12 +16,12 @@
  */
 package sjws_nettask.http1;
 
-import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -87,78 +87,232 @@ public final class Http1Parser {
     }
 
     /**
-     * Reads one request head.
+     * Reads one request head from a stream, one byte at a time (never past the head's final
+     * line feed, so the body stays in {@code in}). Same rules as {@link HeadParser}.
      *
      * @return the request, or null if the stream ended cleanly before a request started
      * @throws ParseError for malformed or unsupported requests (answer with its status and close)
      * @throws EOFException if the stream ended in the middle of a request head
      */
     public static Head read(InputStream in, int maxLineLength, int maxHeaders) throws IOException, ParseError {
-        String requestLine;
-        int empty = 0;
+        var parser = new HeadParser(maxLineLength, maxHeaders);
+        var one = new byte[1];
         while (true) {
-            requestLine = readLine(in, maxLineLength, 414);
-            if (requestLine == null) {
-                return null;
+            int b = in.read();
+            if (b == -1) {
+                return parser.endOfInput();
             }
-            if (!requestLine.isEmpty()) {
-                break;
+            one[0] = (byte) b;
+            parser.feed(one, 0, 1);
+            if (parser.isComplete()) {
+                return parser.head();
             }
-            if (++empty > MAX_LEADING_EMPTY_LINES) {
-                throw new ParseError(400, "too many empty lines before request");
-            }
+        }
+    }
+
+    /**
+     * Incremental, byte-level request-head parser for channel transports: feed it whatever the
+     * socket returned; each complete line is validated once, as soon as it ends. The rules are
+     * those of {@link #read(InputStream, int, int)} (which is built on it):
+     * <ul>
+     * <li>lines end with CRLF or a bare LF; a CR not followed by LF is a 400 (also at end of input);</li>
+     * <li>a line holding more than {@code maxLineLength} bytes (CR/LF not counted) is a 414 for the
+     * request line, 431 for a header line; more than {@code maxHeaders} fields is a 431;</li>
+     * <li>at most {@link #MAX_LEADING_EMPTY_LINES} empty lines before the request line;</li>
+     * <li>request line, field syntax, Host, Transfer-Encoding, Content-Length, Connection and Expect
+     * checks are unchanged (smuggling vectors are rejected, never guessed).</li>
+     * </ul>
+     * Not thread-safe; reuse one per connection with {@link #reset()}.
+     */
+    public static final class HeadParser {
+
+        private static final int INITIAL_LINE = 256;
+
+        private final int maxLineLength;
+        private final int maxHeaders;
+        private byte[] line = new byte[INITIAL_LINE];
+        private int lineLength;
+        private boolean pendingCr;
+        private int emptyLines;
+        private boolean inHeaders;
+        private int headerCount;
+        private String method;
+        private String target;
+        private String version;
+        private LinkedHashMap<String, List<String>> headers;
+        private Head head;
+
+        public HeadParser(int maxLineLength, int maxHeaders) {
+            this.maxLineLength = maxLineLength;
+            this.maxHeaders = maxHeaders;
         }
 
-        var parts = requestLine.split(" ", -1);
-        if (parts.length != 3 || !TOKEN.matcher(parts[0]).matches() || parts[1].isEmpty()) {
-            throw new ParseError(400, "malformed request line");
+        /** Forgets the previous head (keep-alive); drops a line buffer grown by a long line. */
+        public void reset() {
+            if (this.line.length > 4 * INITIAL_LINE) {
+                this.line = new byte[INITIAL_LINE];
+            }
+            this.lineLength = 0;
+            this.pendingCr = false;
+            this.emptyLines = 0;
+            this.inHeaders = false;
+            this.headerCount = 0;
+            this.method = null;
+            this.target = null;
+            this.version = null;
+            this.headers = null;
+            this.head = null;
         }
-        var method = parts[0];
-        var version = parts[2];
-        if (!VERSION.matcher(version).matches()) {
-            throw new ParseError(400, "malformed HTTP version");
-        }
-        if (!version.equals("HTTP/1.1") && !version.equals("HTTP/1.0")) {
-            throw new ParseError(505, "unsupported HTTP version");
-        }
-        if (RequestRules.checkMethod(method) != 0) {
-            throw new ParseError(501, "unknown method");
-        }
-        if (RequestRules.checkTarget(parts[1]) == 400) { // (longer than the line limit: 414 above)
-            throw new ParseError(400, "invalid character in request-target");
-        }
-        var target = originForm(parts[1]);
 
-        var headers = new LinkedHashMap<String, List<String>>();
-        for (int count = 0;; count++) {
-            var line = readLine(in, maxLineLength, 431);
-            if (line == null) {
-                throw new EOFException("connection closed inside request head");
+        /** @return true once the empty line ending the head has been consumed */
+        public boolean isComplete() {
+            return this.head != null;
+        }
+
+        /** @return the parsed head (only when {@link #isComplete()}) */
+        public Head head() {
+            if (this.head == null) {
+                throw new IllegalStateException("head not complete");
             }
-            if (line.isEmpty()) {
-                break;
+            return this.head;
+        }
+
+        /**
+         * Consumes bytes up to and including the head's final line feed.
+         *
+         * @return bytes consumed: {@code len}, or fewer when the head completed inside the range
+         *         (the rest belongs to the body or the next pipelined request)
+         * @throws ParseError as soon as a complete line (or an overlong one) breaks a rule
+         */
+        public int feed(byte[] buf, int off, int len) throws ParseError {
+            if (this.head != null) {
+                throw new IllegalStateException("head already complete; reset() first");
             }
-            if (count >= maxHeaders) {
-                throw new ParseError(431, "too many header fields");
-            }
-            char first = line.charAt(0);
-            if (first == ' ' || first == '\t') {
-                throw new ParseError(400, "obsolete line folding");
-            }
-            int colon = line.indexOf(':');
-            if (colon <= 0 || !TOKEN.matcher(line.substring(0, colon)).matches()) {
-                throw new ParseError(400, "invalid header field name");
-            }
-            var value = trimOws(line.substring(colon + 1));
-            for (int i = 0; i < value.length(); i++) {
-                char c = value.charAt(i);
-                if ((c < 0x20 && c != '\t') || c == 0x7f) {
-                    throw new ParseError(400, "control character in header value");
+            int end = off + len;
+            int i = off;
+            while (i < end) {
+                byte b = buf[i++];
+                if (this.pendingCr) {
+                    if (b != '\n') {
+                        throw new ParseError(400, "bare CR");
+                    }
+                    this.pendingCr = false;
+                    if (completeLine()) {
+                        return i - off;
+                    }
+                } else if (b == '\r') {
+                    this.pendingCr = true;
+                } else if (b == '\n') {
+                    if (completeLine()) {
+                        return i - off;
+                    }
+                } else {
+                    if (this.lineLength >= this.maxLineLength) {
+                        throw new ParseError(this.inHeaders ? 431 : 414, "line too long");
+                    }
+                    if (this.lineLength == this.line.length) {
+                        this.line = Arrays.copyOf(this.line, Math.min(this.maxLineLength, 2 * this.line.length));
+                    }
+                    this.line[this.lineLength++] = b;
                 }
             }
-            headers.computeIfAbsent(line.substring(0, colon).toLowerCase(Locale.ROOT), k -> new ArrayList<>()).add(value);
+            return len;
         }
 
+        /**
+         * The peer closed its side.
+         *
+         * @return null if no request had started (only empty lines, or nothing, were received)
+         * @throws EOFException if the input ended inside a request head
+         * @throws ParseError if it ended right after a CR (bare CR)
+         */
+        public Head endOfInput() throws EOFException, ParseError {
+            if (this.head != null) {
+                return this.head;
+            }
+            if (this.pendingCr) {
+                throw new ParseError(400, "bare CR");
+            }
+            if (!this.inHeaders && this.lineLength == 0) {
+                return null;
+            }
+            throw new EOFException(this.lineLength == 0 ? "connection closed inside request head"
+                    : "connection closed inside a line");
+        }
+
+        /** @return true if the line completed the head */
+        private boolean completeLine() throws ParseError {
+            var text = new String(this.line, 0, this.lineLength, StandardCharsets.ISO_8859_1);
+            this.lineLength = 0;
+            if (!this.inHeaders) {
+                if (text.isEmpty()) {
+                    if (++this.emptyLines > MAX_LEADING_EMPTY_LINES) {
+                        throw new ParseError(400, "too many empty lines before request");
+                    }
+                    return false;
+                }
+                requestLine(text);
+                this.inHeaders = true;
+                this.headers = new LinkedHashMap<>();
+                return false;
+            }
+            if (text.isEmpty()) {
+                this.head = finish(this.method, this.target, this.version, this.headers);
+                return true;
+            }
+            if (this.headerCount++ >= this.maxHeaders) {
+                throw new ParseError(431, "too many header fields");
+            }
+            headerLine(text, this.headers);
+            return false;
+        }
+
+        private void requestLine(String requestLine) throws ParseError {
+            var parts = requestLine.split(" ", -1);
+            if (parts.length != 3 || !TOKEN.matcher(parts[0]).matches() || parts[1].isEmpty()) {
+                throw new ParseError(400, "malformed request line");
+            }
+            var m = parts[0];
+            var v = parts[2];
+            if (!VERSION.matcher(v).matches()) {
+                throw new ParseError(400, "malformed HTTP version");
+            }
+            if (!v.equals("HTTP/1.1") && !v.equals("HTTP/1.0")) {
+                throw new ParseError(505, "unsupported HTTP version");
+            }
+            if (RequestRules.checkMethod(m) != 0) {
+                throw new ParseError(501, "unknown method");
+            }
+            if (RequestRules.checkTarget(parts[1]) == 400) { // (longer than the line limit: 414 above)
+                throw new ParseError(400, "invalid character in request-target");
+            }
+            this.target = originForm(parts[1]);
+            this.method = m;
+            this.version = v;
+        }
+    }
+
+    private static void headerLine(String line, Map<String, List<String>> headers) throws ParseError {
+        char first = line.charAt(0);
+        if (first == ' ' || first == '\t') {
+            throw new ParseError(400, "obsolete line folding");
+        }
+        int colon = line.indexOf(':');
+        if (colon <= 0 || !TOKEN.matcher(line.substring(0, colon)).matches()) {
+            throw new ParseError(400, "invalid header field name");
+        }
+        var value = trimOws(line.substring(colon + 1));
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                throw new ParseError(400, "control character in header value");
+            }
+        }
+        headers.computeIfAbsent(line.substring(0, colon).toLowerCase(Locale.ROOT), k -> new ArrayList<>()).add(value);
+    }
+
+    private static Head finish(String method, String target, String version,
+            LinkedHashMap<String, List<String>> headers) throws ParseError {
         var hosts = headers.getOrDefault("host", List.of());
         if (hosts.size() > 1 || (version.equals("HTTP/1.1") && hosts.isEmpty())) {
             throw new ParseError(400, "missing or duplicate Host");
@@ -241,38 +395,5 @@ public final class Http1Parser {
             end--;
         }
         return s.substring(start, end);
-    }
-
-    /**
-     * Reads a line terminated by CRLF (bare LF tolerated, RFC 9112 2.2). A CR not
-     * followed by LF is rejected.
-     *
-     * @return the line, or null on end of stream before any byte
-     */
-    static String readLine(InputStream in, int maxLength, int tooLongStatus) throws IOException, ParseError {
-        var buf = new ByteArrayOutputStream(128);
-        while (true) {
-            int b = in.read();
-            if (b == -1) {
-                if (buf.size() == 0) {
-                    return null;
-                }
-                throw new EOFException("connection closed inside a line");
-            }
-            if (b == '\r') {
-                int next = in.read();
-                if (next != '\n') {
-                    throw new ParseError(400, "bare CR");
-                }
-                return buf.toString(StandardCharsets.ISO_8859_1);
-            }
-            if (b == '\n') {
-                return buf.toString(StandardCharsets.ISO_8859_1);
-            }
-            if (buf.size() >= maxLength) {
-                throw new ParseError(tooLongStatus, "line too long");
-            }
-            buf.write(b);
-        }
     }
 }
