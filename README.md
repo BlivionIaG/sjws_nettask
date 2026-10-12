@@ -4,6 +4,10 @@ Simple Java Web Server
 Basic multi-threaded (virtual threads) static file server: HTTP/1.0 and 1.1 over TCP, plus opt-in
 HTTP/3 over QUIC, both served by the same protocol-neutral core. Requires Java 25+ (and Maven to build).
 
+**Vision (roadmap, not shipped):** the end goal is a reliable, fast, low-latency message-oriented
+middleware that is also a web server. Messaging is being designed now; today the server serves
+static files only.
+
 Documentation: [configuration reference](docs/configuration.md) ·
 [architecture](ARCHITECTURE.md) · [tests](tests/README.md) · [contributing](CONTRIBUTING.md) ·
 [releasing](RELEASING.md). The option tables below are the canonical list of options
@@ -161,7 +165,11 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 Serves GET and HEAD, and OPTIONS (`200` with `Allow: GET, HEAD, OPTIONS`, also for `OPTIONS *`); other
 known methods get 405, unknown ones 501. HTTP/1.0 and 1.1 with keep-alive and pipelining; request bodies
 (`Content-Length` or `chunked`) are read and discarded, `ETag` / `If-None-Match` / `If-Modified-Since`, single byte ranges
-(`Range` / `If-Range`), directory listings, and `index.html`. Dotfiles and symlinks leading outside the root are never served.
+(`Range` / `If-Range`), directory listings, and `index.html`.
+Responses carry the RFC 9110 reason phrase for every registered status code (plus 429); an unregistered
+code gets an empty phrase (`HTTP/1.1 599 `) and an error page titled with the bare code. File types come
+from the extension (`core.Mime`; unknown: `application/octet-stream`), with `charset=utf-8` on `text/*`,
+JavaScript, JSON, SVG, XML and web manifests. Dotfiles and symlinks leading outside the root are never served.
 
 ### Caching, validators and ranges
 

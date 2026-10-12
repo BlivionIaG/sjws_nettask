@@ -33,7 +33,9 @@ HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ──
 * Both transports call the same handler, so behaviour is identical by construction; a parity test
   compares every HTTP/3 response with the HTTP/1.1 bytes for the same request.
 * Errors raised before a request reaches the handler (parse errors, 408 deadlines, 431 on HTTP/3) use
-  `StaticFileHandler.error(...)`, so their pages match the handler's.
+  `StaticFileHandler.error(...)`, so their pages match the handler's. Status lines and
+  error-page titles use `StaticFileHandler.reasonPhrase` (all RFC 9110 codes plus 429, empty for
+  unregistered ones); `Mime` maps extensions to `Content-Type`.
 
 ## Current gaps
 
@@ -47,3 +49,10 @@ moves, so parallel workstreams don't conflict):
    (`Handler → Handler`) instead of edits inside transports.
 3. Move the method check (405/OPTIONS) from `StaticFileHandler` into a small router decorator.
 4. HTTP/3 has no pure mapping step equivalent to `Http1Requests.toCore` yet.
+
+## Future direction
+
+The project's goal is a reliable, fast, low-latency message-oriented middleware that is also a web
+server. Messaging is still being designed and nothing of it exists in the code yet; the `core.Handler`
+seam and the protocol-neutral `Request`/`Response` contract are where such features are expected to
+plug in.
