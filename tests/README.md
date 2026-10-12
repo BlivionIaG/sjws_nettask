@@ -18,12 +18,15 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/PlatformEdgeCaseTest` | case/Unicode/`%2F` behaviour per file system |
 | `core/SafeOpenTest` | security review M4: symlink/rename swaps of any path component between resolve and send, both open strategies (secure + fallback), and an HTTP/1.1 race test |
+| `core/VerificationRegressionTest` | security verification V3/V4/V6: execute-only (711/0100) directories served, FIFO swapped in or present refused without blocking (thread + timeout guard), open failures after the decision answered 403/404, fallback-mode warning |
+| `core/PerIpLimitTest` | per-address connection counter |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
 | `tls/TlsMaterialTest` | PEM/encrypted keys, self-signed certificates, key-file/validity warnings |
 | `h3/Http3ServerTest` | HTTP/3 server: parity with HTTP/1.1, ranges, back-pressure, write timeout, cancel, limits, idle/ALPN, Netty leak detector (`PARANOID`, checked in `@AfterAll`) |
 | `h3/SecurityReviewTest` | the security review's repros, inverted: slot exhaustion, drip readers, reset floods, Retry tokens, receive windows, in-flight cap, GOAWAY drain, request validation, writer error/cancel paths |
-| `h3/RateGuardTest` | minimum send-rate window |
+| `h3/VerificationTest` | security verification V1/V2/V3/V4/V5 over HTTP/3: one-way (spoofed) handshakes hold no connection slot, handshake timeout and half-open cap, per-address cap, fair in-flight share, slow streams cut only under contention, 711 directories and FIFOs |
+| `h3/RateGuardTest` | per-connection minimum send-rate window |
 | `h3/SjwsServerHttp3Test` | full server with real HTTP/3: Alt-Svc, encrypted keys, fallbacks (busy port, missing natives), `main` as a process |
 | `h3/JarLaunchTest` (`@Tag("jar")`) | `java -jar target/sjws_nettask-*.jar --h3` gets HTTP/3 200; runs after `package` |
 | `h3/QuicNativesReportTest` | prints whether the QUIC natives loaded (untagged, always runs) |
