@@ -87,6 +87,8 @@ public final class SjwsServer implements AutoCloseable {
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final ReentrantLock reloadLock = new ReentrantLock();
+    /** Set only by a data-role bootstrap. The field type is {@code Object} so standalone does not name {@code cp}. */
+    private Object controlPlane;
     /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
     private final CountDownLatch shutdownDone = new CountDownLatch(1);
     private volatile Duration shutdownTimeout = Daemon.DEFAULT_SHUTDOWN_TIMEOUT;
@@ -128,12 +130,10 @@ public final class SjwsServer implements AutoCloseable {
                     registry.include(filters);
                 }
             }
-            // No caller filters: the observe chain reads the live snapshot, so a reload still
-            // swaps the file handler. Caller filters keep the leaf they were compiled around.
-            Handler chainLeaf = leaf;
-            if (this.observingAtStart && filters == null && injected == null && leaf == files) {
-                chainLeaf = request -> this.live.handler().handle(request);
-            }
+            // A chain whose leaf is the file handler reads the live snapshot, so a reload swaps
+            // routing under caller filters and the observe filter. A caller-supplied replacement
+            // leaf stays the leaf it was compiled around.
+            Handler chainLeaf = leaf == files ? request -> this.live.handler().handle(request) : leaf;
             built = registry == null ? null : registry.build(chainLeaf);
             selected = built != null ? built : (leaf == files ? null : leaf);
         } catch (RuntimeException e) {
@@ -316,7 +316,8 @@ public final class SjwsServer implements AutoCloseable {
             // A test or embedder supplied the file handler. Keep that instance as the snapshot
             // instead of compiling a second one beside it.
             Handler visible = snapshot.handler() == snapshot.files() ? injected : snapshot.handler();
-            snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation());
+            snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation(),
+                    snapshot.epoch());
         }
         var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha);
         if (snapshot.document().server().h3Enabled()) {
@@ -380,9 +381,7 @@ public final class SjwsServer implements AutoCloseable {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
             if (transport instanceof Http3Server http3) {
-                if (this.override == null) {
-                    http3.replaceHandler(this.live.handler()::handle);
-                }
+                http3.replaceHandler(request -> this.requestHandler().handle(request));
                 if (stored != null) {
                     http3.replaceTls(stored);
                 }
@@ -498,8 +497,109 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
+    /**
+     * Attaches the data-plane verifier. Standalone never calls this. The argument is a
+     * {@code sjws_nettask.cp.DataApply}; the field stays untyped so this class's constant pool
+     * does not force that load until {@link #applyRemote(sjws_nettask.cp.SignedSnapshot)} runs.
+     */
+    public void attachControlPlane(Object apply) {
+        this.controlPlane = Objects.requireNonNull(apply, "apply");
+    }
+
+    /**
+     * Verifies the signature and the rollback inside this lock, then applies the document.
+     * A failure keeps the installed snapshot and does not compile. Standalone does not call this.
+     */
+    public ReloadResult applyRemote(sjws_nettask.cp.SignedSnapshot snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        this.reloadLock.lock();
+        try {
+            if (!(this.controlPlane instanceof sjws_nettask.cp.DataApply apply)) {
+                return ReloadResult.rejected(this.live.get(), java.util.List.of("control plane is not attached"));
+            }
+            var decision = apply.decide(snapshot, this.live.get());
+            if (decision.error() != null) {
+                return ReloadResult.rejected(this.live.get(), java.util.List.of(decision.error()));
+            }
+            if (decision.noop()) {
+                return new ReloadResult(true, this.live.get().generation(), java.util.List.of(), java.util.List.of(),
+                        java.util.List.of(), this.live.get(), null);
+            }
+            ConfigLoader.Loaded loaded;
+            try {
+                loaded = apply.parse(decision.yaml());
+            } catch (IOException e) {
+                return ReloadResult.rejected(this.live.get(), java.util.List.of("snapshot yaml: " + e.getMessage()));
+            }
+            if (!loaded.ok() || loaded.document() == null) {
+                var errors = loaded.errors().isEmpty() ? java.util.List.of("configuration rejected") : loaded.errors();
+                return ReloadResult.rejected(this.live.get(), errors);
+            }
+            var document = loaded.document();
+            if (document.bundleVersion() != snapshot.version()) {
+                document = ConfigDocument.of(document.server(), document.acme(), document.routing(),
+                        document.middleware(), document.access(), document.node(), snapshot.schema(),
+                        snapshot.version(), this.live.get().document().configFile(), document.contentHash());
+            }
+            var result = this.reloader.apply(this.live.get(), document, this.h3 != null, this.board, true);
+            if (result.applied() && snapshot.epoch() != result.snapshot().epoch()) {
+                var snap = result.snapshot().withEpoch(snapshot.epoch());
+                result = new ReloadResult(true, snap.generation(), result.warnings(), java.util.List.of(),
+                        result.needsRestart(), snap, result.tls());
+            }
+            var published = publish(result);
+            if (published.applied()) {
+                try {
+                    apply.remember(snapshot);
+                } catch (IOException e) {
+                    System.err.println("WARN: control-plane last-good was not saved: " + e.getMessage());
+                }
+            }
+            return published;
+        } finally {
+            this.reloadLock.unlock();
+        }
+    }
+
     private ReloadResult reloadLocked() {
-        return publish(this.reloader.reload(this.live.get(), this.h3 != null, this.board));
+        var result = this.reloader.reload(this.live.get(), this.h3 != null, this.board);
+        if (result.applied() && this.live.get().document().node().mode() == sjws_nettask.config.NodeSettings.Mode.DATA
+                && controlPlaneSectionsChanged(this.live.get().document(), result.snapshot().document())) {
+            return ReloadResult.rejected(this.live.get(), java.util.List.of(
+                    "SIGHUP cannot change control-plane sections on a data node: "
+                            + controlPlaneDetail(this.live.get().document(), result.snapshot().document())));
+        }
+        return publish(result);
+    }
+
+    private static boolean controlPlaneSectionsChanged(sjws_nettask.config.ConfigDocument current,
+            sjws_nettask.config.ConfigDocument next) {
+        return !controlPlaneDetail(current, next).isEmpty();
+    }
+
+    private static String controlPlaneDetail(sjws_nettask.config.ConfigDocument current,
+            sjws_nettask.config.ConfigDocument next) {
+        var changed = new StringBuilder();
+        if (!sameRouting(current.routing(), next.routing())) {
+            changed.append("routing ");
+        }
+        if (!current.middleware().equals(next.middleware())) {
+            changed.append("middleware ");
+        }
+        if (!current.access().equals(next.access())) {
+            changed.append("access ");
+        }
+        if (!current.acme().equals(next.acme())) {
+            changed.append("acme ");
+        }
+        return changed.toString().trim();
+    }
+
+    /** {@link sjws_nettask.config.RouteTable} does not define value equality. */
+    private static boolean sameRouting(sjws_nettask.config.Routing left, sjws_nettask.config.Routing right) {
+        return left.enabled() == right.enabled() && left.forwardedProto() == right.forwardedProto()
+                && left.trustedProxies().equals(right.trustedProxies()) && left.upstreams().equals(right.upstreams())
+                && left.routes().routes().equals(right.routes().routes());
     }
 
     private ReloadResult publish(ReloadResult result) {
@@ -532,9 +632,7 @@ public final class SjwsServer implements AutoCloseable {
             this.manager.reaper().update(server.idleTimeout(), server.headerTimeout(), server.writeTimeout());
         }
         if (this.h3 instanceof Http3Server http3) {
-            if (this.override == null) {
-                http3.replaceHandler(result.snapshot().handler()::handle);
-            }
+            http3.replaceHandler(request -> this.requestHandler().handle(request));
             if (result.tls() != null) {
                 http3.replaceTls(result.tls());
             }

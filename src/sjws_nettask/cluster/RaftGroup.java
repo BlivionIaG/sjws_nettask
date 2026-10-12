@@ -64,6 +64,7 @@ final class RaftGroup {
     private final GroupFacade facade = new GroupFacade();
     private GroupListener listener;
     private final List<java.util.function.BiConsumer<Long, Optional<NodeId>>> leaderListeners = new ArrayList<>();
+    private final List<java.util.function.BiConsumer<Long, Long>> noopListeners = new ArrayList<>();
 
     private long term;
     private NodeId votedFor;
@@ -138,6 +139,17 @@ final class RaftGroup {
         lock.lock();
         try {
             leaderListeners.add(listener);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Fired after the election no-op is applied, with that entry's term and index. */
+    void addNoopListener(java.util.function.BiConsumer<Long, Long> listener) {
+        Objects.requireNonNull(listener, "listener");
+        lock.lock();
+        try {
+            noopListeners.add(listener);
         } finally {
             lock.unlock();
         }
@@ -277,9 +289,10 @@ final class RaftGroup {
             matchIndex.put(peer, 0L);
         }
         appendRaw(new byte[] {NOOP});
+        // Leadership is visible before the no-op callback, so leaderReady stays false in onLeaderChange.
+        fireLeader(after);
         maybeCommit(after);
         replicate();
-        fireLeader(after);
     }
 
     private void onVote(ByteBuffer body, long now, List<Runnable> after) {
@@ -530,7 +543,14 @@ final class RaftGroup {
                 case JOINT -> applyJoint(data, after);
                 case NEW_CONFIG -> applyNew(data, after);
                 case NOOP -> {
-                    // Establishes the leader's term so earlier entries can commit.
+                    long entryTerm = termAt(index);
+                    long applied = index;
+                    var copy = List.copyOf(noopListeners);
+                    after.add(() -> {
+                        for (var listener : copy) {
+                            listener.accept(entryTerm, applied);
+                        }
+                    });
                 }
                 default -> {
                     // Leave unknown markers applied so a bad record cannot stall the group.
