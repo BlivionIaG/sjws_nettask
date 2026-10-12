@@ -62,5 +62,9 @@ class SourceGuardTest {
         assertFalse(all(Path.of("src/sjws_nettask/h3")).contains("sjws_nettask.http1"),
                 "h3 must not depend on the HTTP/1 package (shared rules live in core)");
         assertFalse(core.contains("java.net.Socket"), "core must not touch sockets");
+        var cluster = all(Path.of("src/sjws_nettask/cluster"));
+        assertFalse(cluster.contains("sjws_nettask.ha"), "cluster must not import the HTTP HA package");
+        assertFalse(cluster.contains("sjws_nettask.http1"), "cluster must not import HTTP/1");
+        assertFalse(cluster.contains("io.netty"), "cluster must not import Netty");
     }
 }
