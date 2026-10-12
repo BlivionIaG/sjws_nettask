@@ -107,6 +107,7 @@ public final class CpBench {
             compile[i] = System.nanoTime() - t;
         }
         System.out.println("routes=" + routes + " compile " + pct(compile));
+        System.out.println("routes=" + routes + " snapshot heap " + snapshotHeap(doc) + " bytes (GC'd heap delta, mean of 20)");
 
         var live = new LiveConfig(snaps[0]);
         int readers = Integer.parseInt(o.getOrDefault("readers", "4"));
@@ -156,6 +157,26 @@ public final class CpBench {
         sink = snaps;
     }
 
+    static long heapUsed() throws InterruptedException {
+        var mem = java.lang.management.ManagementFactory.getMemoryMXBean();
+        for (int i = 0; i < 3; i++) {
+            System.gc();
+            Thread.sleep(50);
+        }
+        return mem.getHeapMemoryUsage().getUsed();
+    }
+
+    static long snapshotHeap(sjws_nettask.config.ConfigDocument doc) throws InterruptedException {
+        var keep = new ConfigSnapshot[20];
+        long before = heapUsed();
+        for (int i = 0; i < keep.length; i++) {
+            keep[i] = ConfigSnapshot.compile(doc, null, i);
+        }
+        long after = heapUsed();
+        sink = keep;
+        return (after - before) / keep.length;
+    }
+
     static void route(Map<String, String> o) throws Exception {
         var loaded = load(o);
         var snap = ConfigSnapshot.compile(loaded.document(), null, 1);
@@ -163,8 +184,9 @@ public final class CpBench {
         double secs = Double.parseDouble(o.getOrDefault("seconds", "3"));
         var h = snap.handler();
         System.out.println("handler=" + h.getClass().getSimpleName() + " routes=" + n);
-        for (int idx : new int[] {0, n / 2, n - 1}) {
-            var req = new Request("GET", "/r" + idx + "/a", RequestHeaders.NONE);
+        for (int idx : new int[] {0, n / 2, n - 1, -1}) {
+            // -1: no route matches, so the static fallback answers (a 404 for a missing file)
+            var req = new Request("GET", idx < 0 ? "/unmatched/a" : "/r" + idx + "/a", RequestHeaders.NONE);
             for (int w = 0; w < 3; w++) { // warmup rounds
                 bench(h, req, 0.5);
             }
@@ -172,7 +194,7 @@ public final class CpBench {
             for (int rep = 0; rep < 5; rep++) {
                 best = Math.min(best, bench(h, req, secs / 5));
             }
-            System.out.printf("route[%d] best-of-5 %.1f ns/op  (%.2f M lookups/s)%n", idx, best, 1000 / best);
+            System.out.printf((idx < 0 ? "route[unmatched]" : "route[" + idx + "]") + " best-of-5 %.1f ns/op  (%.2f M lookups/s)%n", best, 1000 / best);
         }
     }
 
