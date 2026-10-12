@@ -40,13 +40,16 @@ handler do not run.
 `request.peer()` is the client `InetSocketAddress` (one per HTTP/1 connection, one per HTTP/3
 stream), or null if the transport could not read it. `request.secure()` is false on plain HTTP/1
 and true on HTTP/3. `request.headers().fields()` is the raw field map (lower-case name to values,
-first-seen order, pseudo-headers excluded). HTTP/1 stores the parser's map: `reset()` drops the
-parser's reference and does not clear that map, so a filter may retain the request. HTTP/3 copies
-the fields into its own map before the HEADERS frame is released, because the handler runs later
-on another thread; the copy does not follow later changes to the frame. `values(name)` does not
-allocate when the name is absent. `all()` flattens and allocates; the static file handler does
-not call it. `:authority` wins over `host` for `headers().host()`, and the `host` field stays in
-the map.
+first-seen order, pseudo-headers excluded). HTTP/1 stores the parser's map by reference: that map
+is built while parsing either way, and `RequestHeaders.of` does not copy it. `reset()` drops the
+parser's reference and does not clear the map, so a filter may retain the request. HTTP/3 copies
+every regular header only when a filter chain or a non-static terminal is installed (decided once
+at startup). With neither, it reads the six typed fields and leaves `fields()` empty, so a static
+request allocates no header map. When it does copy, that happens before the HEADERS frame is
+released, because the handler runs later on another thread; the copy does not follow later changes
+to the frame. `values(name)` does not allocate when the name is absent. `all()` flattens and
+allocates; the static file handler does not call it. `:authority` wins over `host` for
+`headers().host()`, and a copied `host` field stays in the map.
 
 A filter must be safe for concurrent requests. Call `proceed` synchronously, on the request
 thread. The chain rejects a second call on that thread (`IllegalStateException`, and the rest of

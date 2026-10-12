@@ -61,22 +61,39 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         this.connection = connection;
     }
 
-    /** Pseudo-headers and the fields the core understands; :authority wins over a host field. */
+    /** Six typed fields only. No header-map allocation. */
     static Request toRequest(Http3Headers h) {
-        return toRequest(h, null);
+        return toRequest(h, null, false);
+    }
+
+    /** @param peer client UDP address, or null */
+    static Request toRequest(Http3Headers h, InetSocketAddress peer) {
+        return toRequest(h, peer, false);
     }
 
     /**
-     * Copies regular fields before the HEADERS frame is released. Pseudo-headers (names starting
-     * with ':') stay out of the map; {@code :authority} still wins for {@link RequestHeaders#host()}.
-     * One map per request: the frame is not safe to retain.
+     * @param captureFields when true, copy every regular header before the HEADERS frame is
+     *        released (the handler runs later, on another thread, so the frame cannot be retained).
+     *        Pseudo-headers stay out of the map; {@code :authority} still wins for
+     *        {@link RequestHeaders#host()}. When false, only the six typed fields are read, which
+     *        is the static-handler path
      */
-    static Request toRequest(Http3Headers h, InetSocketAddress peer) {
+    static Request toRequest(Http3Headers h, InetSocketAddress peer, boolean captureFields) {
         var method = h.method();
         var path = h.path();
         var authority = h.authority();
-        return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(),
-                RequestHeaders.of(fieldMap(h), authority == null ? null : authority.toString()), peer, true);
+        var auth = authority == null ? null : authority.toString();
+        var headers = captureFields
+                ? RequestHeaders.of(fieldMap(h), auth)
+                : new RequestHeaders(first(h, "if-none-match"), first(h, "if-modified-since"), first(h, "if-range"),
+                        first(h, "range"), first(h, "accept-encoding"), auth != null ? auth : first(h, "host"));
+        return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(), headers,
+                peer, true);
+    }
+
+    private static String first(Http3Headers h, String name) {
+        var value = h.get(name);
+        return value == null ? null : value.toString();
     }
 
     /**
@@ -139,7 +156,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                     return;
                 }
             }
-            var request = toRequest(headers, peer(stream));
+            var request = toRequest(headers, peer(stream), this.shared.captureFields());
             start(stream, request, refusal(headers, request));
         } finally {
             ReferenceCountUtil.release(frame);

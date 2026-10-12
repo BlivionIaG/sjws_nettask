@@ -31,6 +31,11 @@ public final class Http1Requests {
     }
 
     /**
+     * The parser has already built the header map for the head. {@link RequestHeaders#of} keeps that
+     * map (it does not copy it), so this is not an extra allocation next to parsing. HTTP/3 is
+     * different: its codec owns the headers, and the full map is copied only when a filter or a
+     * non-static terminal is installed.
+     *
      * @param peer client address captured once for the connection, or null
      */
     public static Request toCore(Http1Parser.Head head, InetSocketAddress peer) {
