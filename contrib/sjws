@@ -1,0 +1,50 @@
+#!/bin/sh
+# Start, stop, status and restart sjws_nettask.
+#   SJWS_JAR       path to the jar (default: ../target/sjws_nettask-*.jar)
+#   SJWS_PID_FILE  pid file (default: ./sjws_nettask.pid)
+#   SJWS_LOG_FILE  log file (default: ./sjws_nettask.log)
+#   JAVA           java binary (default: java)
+# Extra arguments are passed through (port, document root, server options).
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+JAR=${SJWS_JAR:-}
+if [ -z "$JAR" ]; then
+    for c in "$ROOT"/target/sjws_nettask-*.jar; do
+        if [ -f "$c" ]; then
+            JAR=$c
+            break
+        fi
+    done
+fi
+if [ -z "$JAR" ] || [ ! -f "$JAR" ]; then
+    echo "sjws: cannot find the sjws_nettask jar (set SJWS_JAR)" >&2
+    exit 1
+fi
+
+PID=${SJWS_PID_FILE:-sjws_nettask.pid}
+LOG=${SJWS_LOG_FILE:-sjws_nettask.log}
+JAVA=${JAVA:-java}
+CMD=${1:-}
+if [ -n "$CMD" ]; then
+    shift
+fi
+
+case "$CMD" in
+    start)
+        exec "$JAVA" -jar "$JAR" --daemon --pid-file="$PID" --log-file="$LOG" "$@"
+        ;;
+    stop)
+        exec "$JAVA" -jar "$JAR" --stop --pid-file="$PID" "$@"
+        ;;
+    status)
+        exec "$JAVA" -jar "$JAR" --status --pid-file="$PID" "$@"
+        ;;
+    restart)
+        exec "$JAVA" -jar "$JAR" --restart --pid-file="$PID" --log-file="$LOG" "$@"
+        ;;
+    *)
+        echo "Usage: sjws {start|stop|status|restart} [server options]" >&2
+        exit 64
+        ;;
+esac
