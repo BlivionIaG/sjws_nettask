@@ -31,6 +31,7 @@ import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.handler.codec.http2.Http2HeadersFrame;
 import io.netty.handler.codec.http2.Http2StreamChannel;
 import io.netty.util.ReferenceCountUtil;
+import java.net.InetSocketAddress;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.DateClock;
@@ -58,13 +59,22 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
 
     /** Pseudo-headers and the fields the core understands; :authority wins over a host field. */
     static Request toRequest(Http2Headers h) {
+        return toRequest(h, null, false);
+    }
+
+    /**
+     * @param peer connection address, or null when it could not be read
+     * @param secure true on the TLS listener
+     */
+    static Request toRequest(Http2Headers h, InetSocketAddress peer, boolean secure) {
         var method = h.method();
         var path = h.path();
         var authority = h.authority();
         return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(),
                 new RequestHeaders(first(h, "if-none-match"), first(h, "if-modified-since"), first(h, "if-range"),
                         first(h, "range"), first(h, "accept-encoding"),
-                        authority != null ? authority.toString() : first(h, "host")));
+                        authority != null ? authority.toString() : first(h, "host")),
+                peer, secure, "HTTP/2");
     }
 
     private static String first(Http2Headers h, String name) {
@@ -102,11 +112,26 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         try {
             if (msg instanceof Http2HeadersFrame frame && !this.started) {
                 this.started = true;
-                start((Http2StreamChannel) ctx.channel(), toRequest(frame.headers()));
+                var stream = (Http2StreamChannel) ctx.channel();
+                start(stream, toRequest(frame.headers(), peer(stream), secure(stream)));
             }
         } finally {
             ReferenceCountUtil.release(msg);
         }
+    }
+
+    private static InetSocketAddress peer(Http2StreamChannel stream) {
+        var parent = stream.parent();
+        if (parent == null) {
+            return null;
+        }
+        var remote = parent.remoteAddress();
+        return remote instanceof InetSocketAddress inet ? inet : null;
+    }
+
+    private static boolean secure(Http2StreamChannel stream) {
+        var parent = stream.parent();
+        return parent != null && parent.pipeline().get(io.netty.handler.ssl.SslHandler.class) != null;
     }
 
     private void start(Http2StreamChannel stream, Request request) {
@@ -176,7 +201,8 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                 var refusal = refusal(this.request);
                 Response response;
                 try {
-                    response = refusal != null ? refusal : Http2StreamHandler.this.shared.handler().handle(this.request);
+                    response = refusal != null ? refusal
+                            : Http2StreamHandler.this.shared.live().handle(this.request);
                 } catch (RuntimeException e) {
                     response = StaticFileHandler.error(500, this.request.headOnly());
                 }

@@ -110,6 +110,35 @@ class H2ConfigAndWiringTest {
         }
     }
 
+    /** Observability on at startup: the HTTP/2 handler is the filter chain, and the peer is loopback. */
+    @Test
+    void recordingAtStartupCountsHttp2() throws Exception {
+        var config = config().toBuilder().metricsExposure(ServerConfig.MetricsExposure.LOCALHOST).build();
+        try (var server = SjwsServer.start(config);
+                var h2 = new RawH2(((Http2Server) server.h2()).h2cPort(), 65535)) {
+            h2.get(1, "/metrics");
+            assertEquals("200", awaitStatus(h2, 1));
+            var snap = awaitHttp2(server, 1);
+            assertEquals(0, snap.protocol("HTTP/1.1"));
+        }
+    }
+
+    /** A server that started dark still counts the next HTTP/2 request after metricsSnapshot(). */
+    @Test
+    void metricsSnapshotCountsTheNextHttp2Request() throws Exception {
+        try (var server = SjwsServer.start(config());
+                var h2 = new RawH2(((Http2Server) server.h2()).h2cPort(), 65535)) {
+            h2.get(1, "/a.txt");
+            assertEquals("200", awaitStatus(h2, 1));
+            assertEquals(0, server.metrics().snapshot().requests());
+            server.metricsSnapshot();
+            h2.get(3, "/a.txt");
+            assertEquals("200", awaitStatus(h2, 3));
+            var snap = awaitHttp2(server, 1);
+            assertEquals(0, snap.protocol("HTTP/1.1"));
+        }
+    }
+
     @Test
     void accessRulesApplyOverHttp2() throws Exception {
         Files.writeString(this.root.resolve("a.txt"), "a");
@@ -139,6 +168,31 @@ class H2ConfigAndWiringTest {
             assertArrayEquals(new String[] {"200", "403", "404", "404", "403"}, statuses,
                     "deny list 403, dotfile 404, hide rule 404 over HTTP/2");
         }
+    }
+
+    private static String awaitStatus(RawH2 h2, int stream) throws Exception {
+        var deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            var frame = h2.read();
+            if (frame != null && frame.type() == RawH2.HEADERS && frame.stream() == stream) {
+                return statusOf(frame.payload());
+            }
+        }
+        fail("no HEADERS on stream " + stream);
+        return "";
+    }
+
+    private static sjws_nettask.observe.Snapshot awaitHttp2(SjwsServer server, long atLeast) {
+        var deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+        var last = server.metrics().snapshot();
+        while (last.requests() < atLeast || last.protocol("HTTP/2") < atLeast) {
+            if (System.nanoTime() >= deadline) {
+                fail("counters stayed at requests=" + last.requests() + " http/2=" + last.protocol("HTTP/2"));
+            }
+            Thread.yield();
+            last = server.metrics().snapshot();
+        }
+        return last;
     }
 
     /** :status from a server HEADERS block: Netty encodes it as an indexed field (static table 8-14). */

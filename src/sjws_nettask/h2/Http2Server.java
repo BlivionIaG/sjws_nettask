@@ -62,6 +62,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
+import sjws_nettask.HandlerRef;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.Transport;
 import sjws_nettask.core.Handler;
@@ -128,9 +129,18 @@ public final class Http2Server implements Transport {
 
     static final io.netty.util.AttributeKey<Budget> BUDGET = io.netty.util.AttributeKey.valueOf("sjws-h2-budget");
 
-    /** What every stream handler needs. */
+    /**
+     * What every stream handler needs. {@link #live()} does one volatile read. A null value keeps
+     * {@code handler}, so a server that never arms calls the startup handler and nothing else.
+     */
     record Shared(Handler handler, ExecutorService executor, Semaphore inflight, Semaphore files,
-            Duration writeTimeout, LongAdder refused, Limits limits) {
+            Duration writeTimeout, LongAdder refused, Limits limits, HandlerRef armed) {
+
+        /** Startup handler, or the one published by a later metrics arm. */
+        Handler live() {
+            var published = this.armed.get();
+            return published != null ? published : this.handler;
+        }
 
         /** @return the connection's budget, created on first use */
         Budget budget(Channel connection) {
@@ -150,6 +160,8 @@ public final class Http2Server implements Transport {
 
     private final ServerConfig config;
     private final Handler handler;
+    /** Published by {@link #armHandler} after start. A null value keeps {@link #handler}. */
+    private final HandlerRef armed = new HandlerRef();
     private final Limits limits;
     private TlsMaterial tls;
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -184,6 +196,15 @@ public final class Http2Server implements Transport {
         return "HTTP/2";
     }
 
+    /**
+     * Installs the handler a later {@code metricsSnapshot()} published. The next stream uses it;
+     * streams already running keep the handler they entered with.
+     */
+    @Override
+    public void armHandler(Handler handler) {
+        this.armed.set(Objects.requireNonNull(handler, "handler"));
+    }
+
     @Override
     public Http2Server start() throws Exception {
         try {
@@ -194,7 +215,8 @@ public final class Http2Server implements Transport {
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h2-request-", 0).factory());
             this.perIp = new PerIpLimit(Math.min(this.config.maxConnectionsPerIp(), this.limits.maxConnectionsPerIp()));
             this.shared = new Shared(this.handler, this.executor, new Semaphore(this.limits.maxInflight()),
-                    new Semaphore(this.limits.maxOpenFiles()), this.config.writeTimeout(), this.refused, this.limits);
+                    new Semaphore(this.limits.maxOpenFiles()), this.config.writeTimeout(), this.refused, this.limits,
+                    this.armed);
             this.boss = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             this.workers = new MultiThreadIoEventLoopGroup(0, NioIoHandler.newFactory());
             this.tlsChannel = bind(this.config.h2Port(), new ChannelInitializer<SocketChannel>() {
