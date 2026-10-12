@@ -34,9 +34,12 @@ import sjws_nettask.ha.HaRuntime;
 import sjws_nettask.ha.HaSettings;
 import sjws_nettask.acme.AcmeService;
 import sjws_nettask.acme.AcmeStore;
+import sjws_nettask.acme.ControlLeadership;
+import sjws_nettask.acme.LocalLeadership;
 import sjws_nettask.acme.ChallengeBoard;
 import sjws_nettask.acme.ChallengeHttpServer;
 import sjws_nettask.config.ConfigDocument;
+import sjws_nettask.config.NodeSettings;
 import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.config.ConfigReloader;
 import sjws_nettask.config.ConfigSnapshot;
@@ -99,6 +102,8 @@ public final class SjwsServer implements AutoCloseable {
     private Thread acceptThread;
     private AutoCloseable reloadHook;
     private AcmeService acme;
+    /** Null on a data node. Not read by the request path. */
+    private ControlLeadership leadership;
     private ChallengeHttpServer challengeHttp;
 
     private SjwsServer(ConfigSnapshot snapshot, ConfigReloader reloader, ChallengeBoard board,
@@ -351,6 +356,7 @@ public final class SjwsServer implements AutoCloseable {
             server.close();
             throw e;
         }
+        server.leadership = leadershipFor(snapshot);
         server.reloadHook = ReloadHook.register(server::onReload);
         if (snapshot.document().acme().enabled()) {
             server.startAcme(snapshot);
@@ -449,8 +455,29 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
+    private static ControlLeadership leadershipFor(ConfigSnapshot snapshot) {
+        return switch (snapshot.document().node().mode()) {
+            case DATA -> null;
+            case CONTROL -> LocalLeadership.control();
+            case STANDALONE -> LocalLeadership.standalone();
+        };
+    }
+
+    /**
+     * Control-plane leadership for this process. Null when the node is {@code data}.
+     * Standalone is already leader-ready. Control stays idle until the group's election
+     * NOOP is applied through {@link LocalLeadership#ready(long, long)}.
+     */
+    public ControlLeadership leadership() {
+        return this.leadership;
+    }
+
     private void startAcme(ConfigSnapshot snapshot) {
-        this.acme = new AcmeService(snapshot.document().acme(), this.board, this::publishCertificate);
+        if (snapshot.document().node().mode() == NodeSettings.Mode.DATA || this.leadership == null) {
+            return;
+        }
+        this.acme = new AcmeService(snapshot.document().acme(), this.board, this::publishCertificate,
+                this.leadership);
         this.acme.start();
     }
 

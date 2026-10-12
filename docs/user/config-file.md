@@ -148,6 +148,12 @@ acme:
 ```
 
 When enabled, email, at least one domain and `accept_terms: true` are required.
+A standalone process issues as before. A control node issues only after
+`ControlLeadership.leaderReady(term, appliedIndex)`, which fires once that term's
+election NOOP is applied, and stops issuing when the term changes.
+`isLeader()` alone does not start an order. A data node does not start ACME;
+its certificate arrives with the pushed config. Logs drop a message that contains
+a private key or a certificate PEM.
 The same checks on shape (directory, domain spelling, durations) run when it is
 off, so a typo is still an error. CLI and environment overrides use `--acme`,
 `--no-acme`, `--acme-directory`, `--acme-email`, `--acme-domain` (repeatable),
