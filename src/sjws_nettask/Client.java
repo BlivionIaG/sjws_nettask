@@ -28,10 +28,10 @@ import java.nio.charset.StandardCharsets;
 
 import java.util.function.Supplier;
 
-import sjws_nettask.HTTP.HTML;
-import sjws_nettask.HTTP.Http1Parser;
-import sjws_nettask.HTTP.Http1Writer;
-import sjws_nettask.HTTP.ParseError;
+import sjws_nettask.http1.HTML;
+import sjws_nettask.http1.Http1Parser;
+import sjws_nettask.http1.Http1Writer;
+import sjws_nettask.http1.ParseError;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;

@@ -514,7 +514,7 @@ class Http3ServerTest {
             assertArrayEquals(java.util.Arrays.copyOfRange(all, 100_003, 1_100_003), r.body());
             assertEquals("1000000", r.header("content-length"));
             var out = new java.io.ByteArrayOutputStream();
-            sjws_nettask.HTTP.Http1Writer.write(out, seam.apply(null), true);
+            sjws_nettask.http1.Http1Writer.write(out, seam.apply(null), true);
             var h1 = sjws_nettask.HttpTestSupport.readResponse(new java.io.ByteArrayInputStream(out.toByteArray()));
             assertArrayEquals(h1.body(), r.body(), "same region as HTTP/1");
         }
@@ -577,7 +577,7 @@ class Http3ServerTest {
             var q = c.connect(s.localAddress());
             var r = H3TestClient.get(q, "/anything");
             var out = new java.io.ByteArrayOutputStream();
-            sjws_nettask.HTTP.Http1Writer.write(out, expected, true);
+            sjws_nettask.http1.Http1Writer.write(out, expected, true);
             var h1 = sjws_nettask.HttpTestSupport.readResponse(new java.io.ByteArrayInputStream(out.toByteArray()));
             assertArrayEquals(h1.body(), r.body());
             assertEquals(h1.headers().get("content-length"), r.header("content-length"));

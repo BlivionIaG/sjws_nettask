@@ -45,21 +45,21 @@ class SourceGuardTest {
         int count = src.split("computeIfAbsent\\(", -1).length - 1;
         // The only use: header list creation in Http1Parser (pure, no I/O).
         assertEquals(1, count, "review new computeIfAbsent uses: no file I/O inside (design review M12)");
-        assertTrue(Files.readString(Path.of("src/sjws_nettask/HTTP/Http1Parser.java"))
+        assertTrue(Files.readString(Path.of("src/sjws_nettask/http1/Http1Parser.java"))
                 .contains("computeIfAbsent(line.substring(0, colon).toLowerCase(Locale.ROOT), k -> new ArrayList<>())"));
     }
 
     @Test
     void noNettyInCoreOrHttp1() throws IOException {
         assertFalse(all(Path.of("src/sjws_nettask/core")).contains("io.netty"));
-        assertFalse(all(Path.of("src/sjws_nettask/HTTP")).contains("io.netty"));
+        assertFalse(all(Path.of("src/sjws_nettask/http1")).contains("io.netty"));
     }
 
     @Test
     void coreDoesNotDependOnTransports() throws IOException {
         var core = all(Path.of("src/sjws_nettask/core"));
-        assertFalse(core.contains("import sjws_nettask.HTTP"), "core must not import the HTTP/1 package");
-        assertFalse(all(Path.of("src/sjws_nettask/h3")).contains("sjws_nettask.HTTP"),
+        assertFalse(core.contains("import sjws_nettask.http1"), "core must not import the HTTP/1 package");
+        assertFalse(all(Path.of("src/sjws_nettask/h3")).contains("sjws_nettask.http1"),
                 "h3 must not depend on the HTTP/1 package (shared rules live in core)");
         assertFalse(core.contains("java.net.Socket"), "core must not touch sockets");
     }

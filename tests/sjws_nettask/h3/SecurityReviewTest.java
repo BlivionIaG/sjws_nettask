@@ -594,11 +594,11 @@ class SecurityReviewTest {
     /** What the HTTP/1.1 parser answers for this request line (0 = accepted). */
     static int http1Status(String method, String target) throws Exception {
         try {
-            sjws_nettask.HTTP.Http1Parser.read(new java.io.ByteArrayInputStream((method + " " + target
+            sjws_nettask.http1.Http1Parser.read(new java.io.ByteArrayInputStream((method + " " + target
                     + " HTTP/1.1\r\nHost: x\r\n\r\n").getBytes(java.nio.charset.StandardCharsets.ISO_8859_1)),
                     sjws_nettask.CONSTANTS.MAX_LINE_LENGTH, sjws_nettask.CONSTANTS.MAX_HEADERS);
             return 0;
-        } catch (sjws_nettask.HTTP.ParseError e) {
+        } catch (sjws_nettask.http1.ParseError e) {
             return e.status();
         }
     }

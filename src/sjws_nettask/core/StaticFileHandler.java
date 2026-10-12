@@ -244,7 +244,7 @@ public final class StaticFileHandler {
         return names;
     }
 
-    // --- response builders (shared with the legacy HTTP/Page API) -------------------------
+    // --- response builders (shared with the legacy http1/Page API) -------------------------
 
     public static Response html(int status, String html, boolean head) {
         var headers = ResponseHeaders.of()

@@ -33,7 +33,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
-import sjws_nettask.HTTP.Http1Writer;
+import sjws_nettask.http1.Http1Writer;
 import sjws_nettask.HttpTestSupport;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestHeaders;
