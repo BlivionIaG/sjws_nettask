@@ -356,6 +356,9 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h3 != null) {
             this.h3.armHandler(chain);
         }
+        if (this.h2 != null) {
+            this.h2.armHandler(chain);
+        }
     }
 
     /**

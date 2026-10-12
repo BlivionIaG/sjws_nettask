@@ -74,8 +74,8 @@ public interface Transport extends AutoCloseable {
 
     /**
      * Replaces the request handler after {@link #start()} so a late metrics arm is counted.
-     * The default ignores it. HTTP/3 installs the chain. No effect when the observe filter was
-     * already compiled into the startup chain.
+     * The default ignores it. HTTP/2 and HTTP/3 install the chain. No effect when the observe filter
+     * was already compiled into the startup chain.
      */
     default void armHandler(Handler handler) {
     }

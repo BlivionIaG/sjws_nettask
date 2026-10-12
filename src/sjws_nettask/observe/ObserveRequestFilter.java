@@ -34,7 +34,7 @@ import sjws_nettask.core.Response;
  * <p>
  * {@link #filter} samples the clock around {@code proceed}. That stops when the handler has built
  * the response, which is before the transport writes it. Protocol failures that never enter the
- * chain (HTTP/1 parse errors and 408, HTTP/3 refusals) are not recorded.
+ * chain (HTTP/1 parse errors and 408, HTTP/2 refusals, HTTP/3 refusals) are not recorded.
  */
 public final class ObserveRequestFilter implements RequestFilter {
 

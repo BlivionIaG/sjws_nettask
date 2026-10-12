@@ -57,10 +57,11 @@ Run:
 
 ### Observability
 
-Off by default, and off means the request path does not touch it. The transports are given
-`RequestObserver.NONE`. A request then does one volatile read of that slot and a reference compare,
-and stops: no `System.nanoTime`, no `LongAdder` update, no latency compare-and-set, and no inspection
-of the path for `/healthz` or `/metrics`. A file at either path is served from the document root, the
+Off by default, and off means the request path does not install an observe filter. A request then
+does not call `System.nanoTime`, does not update a `LongAdder`, does not compare-and-set a latency
+sample, and does not inspect the path for `/healthz` or `/metrics`. HTTP/1.1 calls the static file
+handler directly. HTTP/2 and HTTP/3 do the same after one volatile read of a handler slot that stays
+null until `metricsSnapshot()` arms it. A file at either path is served from the document root, the
 same as a build without this feature.
 
 Counters, the access log and the probes turn on only when something asks for them:
@@ -114,13 +115,13 @@ snap.latency().cumulative(i);     // Prometheus-style, through bucket i
 metrics.prometheus();             // text exposition 0.0.4
 ```
 
-Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. `bytes` is the body size the handler committed to, recorded when the filter returns, before the socket write. `/healthz` and `/metrics` are counted like any other response once those probes are enabled. A request that never enters the chain (an HTTP/1 parse error or 408, an HTTP/3 refusal) is not counted. With observability off, nothing is counted.
+Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. `bytes` is the body size the handler committed to, recorded when the filter returns, before the socket write. `/healthz` and `/metrics` are counted like any other response once those probes are enabled. A request that never enters the chain (an HTTP/1 parse error or 408, an HTTP/2 refusal, an HTTP/3 refusal) is not counted. With observability off, nothing is counted.
 
 **Latency histogram contract.** `sjws_http_request_duration_seconds` is a fixed log2 scale so a cluster can merge nodes by adding bucket `i` to bucket `i` (do not re-bin). The value is the time until the handler returns the response, which is before the transport writes the body. Bounds are inclusive and stable: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 and 16384 ms, then everything above. `Snapshot.latency().counts()` is not cumulative; index `i` is `(previous bound, upperBoundNanos()[i]]`. `upperBoundNanos()` is `ServerMetrics.LATENCY_BOUNDS_NANOS` (the last entry is `Long.MAX_VALUE`). `ServerMetrics.LATENCY_LE_LABELS` is the Prometheus `le` for that same index: `0.001`, `0.002`, `0.004`, `0.008`, `0.016`, `0.032`, `0.064`, `0.128`, `0.256`, `0.512`, `1.024`, `2.048`, `4.096`, `8.192`, `16.384`, `+Inf`. The `/metrics` histogram is cumulative at those labels; adding two nodes' series with the same `le` is the merged cumulative. Changing a bound or a label is a breaking change for that merge.
 
 `/metrics` on `localhost` answers only a loopback peer (403 otherwise), so it stays safe on a public bind. `on` answers every client. Behind a proxy that connects from 127.0.0.1, `localhost` is the proxy, not the browser. The endpoint is not a document-root file: when it is off, a file named `metrics` is served normally.
 
-The hook is `ObserveRequestFilter`, registered at order 0 through `RequestFilters.create().add(0, filter)` when `--access-log`, `--metrics` or `--healthz` is on. It is added before any caller filter, so among order 0 it is the outermost stage (a negative order still runs further out). The filter calls `intercept` only when `/healthz` or `/metrics` is enabled, then `complete` when `proceed` returns. While observability is off, that filter is not installed and the transports do not read the clock, update a counter, or check the path. `metricsSnapshot()` publishes the same filter on a server that started off, so the next request is counted.
+The hook is `ObserveRequestFilter`, registered at order 0 through `RequestFilters.create().add(0, filter)` when `--access-log`, `--metrics` or `--healthz` is on. It is added before any caller filter, so among order 0 it is the outermost stage (a negative order still runs further out). The filter calls `intercept` only when `/healthz` or `/metrics` is enabled, then `complete` when `proceed` returns. While observability is off, that filter is not installed and the transports do not read the clock, update a counter, or check the path. `metricsSnapshot()` publishes the same filter on a server that started off. HTTP/1.1 sees it on the next request of an already-accepted connection; HTTP/2 and HTTP/3 install it through `Transport.armHandler`.
 
 **HTTP/1.1 connections** run on blocking `SocketChannel`s, one virtual thread each. One timer thread
 enforces every deadline (no per-socket timeouts): `--idle-timeout` between requests,
