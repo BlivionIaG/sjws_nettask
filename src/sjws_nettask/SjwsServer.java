@@ -41,7 +41,7 @@ public final class SjwsServer implements AutoCloseable {
 
     private SjwsServer(ServerConfig config) {
         this.config = config;
-        this.handler = new StaticFileHandler(config.root());
+        this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs());
     }
 
     public static SjwsServer start(ServerConfig config) throws IOException {

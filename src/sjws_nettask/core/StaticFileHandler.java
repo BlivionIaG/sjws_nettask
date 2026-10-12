@@ -41,10 +41,26 @@ public final class StaticFileHandler {
     public static final String ACCEPT_RANGES = "none"; // Range is not implemented yet (S5)
 
     private final PathResolver resolver;
+    private final boolean allowUnlistableDirs;
 
     /** @throws UncheckedIOException if the root does not exist or is not a directory */
     public StaticFileHandler(Path root) {
+        this(root, false);
+    }
+
+    /**
+     * @param allowUnlistableDirs serve files below search-only directories by path (weaker; see
+     *        {@link SafeOpen}); false answers them 403
+     * @throws UncheckedIOException if the root does not exist or is not a directory
+     */
+    public StaticFileHandler(Path root, boolean allowUnlistableDirs) {
         this.resolver = new PathResolver(root);
+        this.allowUnlistableDirs = allowUnlistableDirs;
+    }
+
+    /** @return whether files below search-only directories are served (see the constructor) */
+    public boolean allowUnlistableDirs() {
+        return this.allowUnlistableDirs;
     }
 
     public Path root() {
@@ -106,7 +122,7 @@ public final class StaticFileHandler {
         }
         var attributes = Files.readAttributes(file.real(), BasicFileAttributes.class);
         return fileResponse(file.logical().getFileName().toString(), this.resolver.realRoot(), file.real(),
-                attributes, head, conditionals.ifModifiedSince());
+                attributes, head, conditionals.ifModifiedSince(), this.allowUnlistableDirs);
     }
 
     /**
@@ -126,6 +142,11 @@ public final class StaticFileHandler {
      */
     public static Response fileResponse(String name, Path realRoot, Path realPath, BasicFileAttributes attributes,
             boolean head, String ifModifiedSince) {
+        return fileResponse(name, realRoot, realPath, attributes, head, ifModifiedSince, false);
+    }
+
+    private static Response fileResponse(String name, Path realRoot, Path realPath, BasicFileAttributes attributes,
+            boolean head, String ifModifiedSince, boolean allowUnlistable) {
         var modified = attributes.lastModifiedTime().toInstant().truncatedTo(ChronoUnit.SECONDS);
         var headers = ResponseHeaders.of()
                 .add("last-modified", HttpDate.format(modified))
@@ -136,7 +157,8 @@ public final class StaticFileHandler {
             return new Response(304, headers, Body.Empty.INSTANCE, head);
         }
         return new Response(200, headers,
-                new Body.FileBody(realPath, 0, attributes.size(), Validator.of(attributes), realRoot), head);
+                new Body.FileBody(realPath, 0, attributes.size(), Validator.of(attributes), realRoot, allowUnlistable),
+                head);
     }
 
     /** Convenience for callers holding a plain path (no containment check). */

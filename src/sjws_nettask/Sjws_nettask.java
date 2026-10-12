@@ -67,6 +67,8 @@ public class Sjws_nettask {
         System.out.println("Server started: " + server.describe());
         sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
                 .ifPresent(w -> System.err.println("WARN: " + w));
+        sjws_nettask.core.SafeOpen.unlistableWarning(config.allowUnlistableDirs())
+                .ifPresent(w -> System.err.println("WARN: " + w));
         try {
             server.awaitTermination();
             System.out.println("Server Terminated properly !");

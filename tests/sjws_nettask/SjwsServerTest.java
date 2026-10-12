@@ -98,6 +98,29 @@ class SjwsServerTest {
         return HttpTestSupport.get(server.tcpPort(), path, 4000);
     }
 
+    /** Verification V7: --allow-unlistable-dirs reaches the handler shared by both transports. */
+    @org.junit.jupiter.params.ParameterizedTest(name = "allowUnlistable={0}")
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void allowUnlistableDirsIsWired(boolean allow) throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(sjws_nettask.core.SafeOpen.SECURE);
+        org.junit.jupiter.api.Assumptions.assumeFalse("root".equals(System.getProperty("user.name")));
+        var xo = Files.createDirectories(root.resolve("xo"));
+        Files.writeString(xo.resolve("f.txt"), "f");
+        var seen = new java.util.concurrent.atomic.AtomicReference<sjws_nettask.core.StaticFileHandler>();
+        var fake = new FakeTransport(4433, null);
+        server = SjwsServer.start(config(true).toBuilder().allowUnlistableDirs(allow).build(), (c, h) -> {
+            seen.set(h);
+            return fake;
+        });
+        assertEquals(allow, seen.get().allowUnlistableDirs(), "HTTP/3 gets the same policy");
+        java.nio.file.Files.setPosixFilePermissions(xo, java.nio.file.attribute.PosixFilePermissions.fromString("--x------"));
+        try {
+            assertEquals(allow ? 200 : 403, get("/xo/f.txt").statusCode());
+        } finally {
+            java.nio.file.Files.setPosixFilePermissions(xo, java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+        }
+    }
+
     @Test
     void h3DisabledMeansNoAltSvc() throws IOException {
         var fake = new FakeTransport(4433, null);

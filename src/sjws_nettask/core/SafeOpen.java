@@ -17,6 +17,7 @@
 package sjws_nettask.core;
 
 import java.io.IOException;
+import java.nio.file.AccessDeniedException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.DirectoryStream;
@@ -46,13 +47,17 @@ import java.util.Set;
  * regular file in the same (pinned, in-root) directory, and its length is enforced by the writers.
  * <p>
  * A directory on the way that can be searched but not read (mode {@code --x}, the classic "serve
- * but don't list" setup) can't be opened as a handle; that request then takes the fallback below,
- * which only needs search permission. Before anything is opened, the leaf's type is read without
+ * but don't list" setup) can't be opened as a handle. By default such a request is refused
+ * ({@link AccessDeniedException}, 403): anyone who can write in the root could create such a
+ * directory to force the weaker fallback and race it (security verification V7). With
+ * {@link Body.FileBody#allowUnlistable()} (opt-in {@code --allow-unlistable-dirs}) it takes the
+ * fallback below, which only needs search permission. Before anything is opened, the leaf's type is read without
  * following links (through the pinned directory in secure mode): anything but a regular file (FIFO,
- * device, socket) is refused, so a file swapped for a FIFO can't block the writer in {@code open}.
- * Only the tiny window between that check and the open remains (the JDK has no {@code O_NONBLOCK}).
+ * device, socket) is refused. A narrow window between that check and the open remains (the JDK has
+ * no {@code O_NONBLOCK}): someone with write access in the root who swaps a FIFO in exactly then
+ * blocks that writer thread in {@code open} until the FIFO is opened for writing.
  * <p>
- * <b>Fallback</b> (Windows; and per request, directories without read permission): the path is opened with
+ * <b>Fallback</b> (Windows; and, when allowed, directories without read permission): the path is opened with
  * {@code NOFOLLOW_LINKS} (last component only), then immediately re-resolved with
  * {@code toRealPath()}: it must still be the same real path inside the root, and the file key (where
  * the platform has one) must match. This narrows the race window to the time between the open and
@@ -79,8 +84,11 @@ public final class SafeOpen {
 
         private static final long serialVersionUID = 1L;
 
-        SearchOnly() {
+        final AccessDeniedException denied;
+
+        SearchOnly(AccessDeniedException denied) {
             super(null, null, false, false);
+            this.denied = denied;
         }
     }
 
@@ -93,13 +101,22 @@ public final class SafeOpen {
      * @return 403 if permission was denied, 404 if the file is gone, swapped or not a regular file, else 500
      */
     public static int status(IOException e) {
-        if (e instanceof java.nio.file.AccessDeniedException) {
+        if (e instanceof AccessDeniedException) {
             return 403;
         }
         if (e instanceof FileChangedException || e instanceof java.nio.file.NoSuchFileException) {
             return 404;
         }
         return 500;
+    }
+
+    /** @return a warning for the log if {@code --allow-unlistable-dirs} enables the weaker fallback */
+    public static java.util.Optional<String> unlistableWarning(boolean allowUnlistable) {
+        return allowUnlistable ? java.util.Optional.of("--allow-unlistable-dirs: files below directories the "
+                + "server can't read (mode --x) are opened by path and re-checked afterwards, which is weaker: "
+                + "anyone who can write in the document root can create such a directory and race a symlink "
+                + "swap to serve files outside it. Use only if no untrusted user can write in the root.")
+                : java.util.Optional.empty();
     }
 
     /** @return a warning for the log if files can only be opened in the weaker fallback mode */
@@ -139,14 +156,14 @@ public final class SafeOpen {
             DirectoryStream<Path> top;
             try {
                 top = Files.newDirectoryStream(root);
-            } catch (java.nio.file.AccessDeniedException e) { // root is search-only
-                return openFallback(file);
+            } catch (AccessDeniedException e) { // root is search-only
+                return searchOnly(file, e);
             }
             if (top instanceof SecureDirectoryStream<Path> sds) {
                 try {
                     return openSecure(sds, relative, file);
                 } catch (SearchOnly e) {
-                    return openFallback(file);
+                    return searchOnly(file, e.denied);
                 }
             }
             top.close();
@@ -162,8 +179,8 @@ public final class SafeOpen {
                 DirectoryStream<Path> next;
                 try {
                     next = dir.newDirectoryStream(relative.getName(i), LinkOption.NOFOLLOW_LINKS);
-                } catch (java.nio.file.AccessDeniedException e) { // --x directory: can't hold a handle on it
-                    throw new SearchOnly();
+                } catch (AccessDeniedException e) { // --x directory: can't hold a handle on it
+                    throw new SearchOnly(e);
                 } catch (IOException e) { // ELOOP / ENOTDIR: a component is now a symlink or a file
                     throw changed(file, e);
                 }
@@ -203,6 +220,14 @@ public final class SafeOpen {
         } finally {
             dir.close();
         }
+    }
+
+    /** Below a search-only directory: 403 unless the weaker fallback was explicitly allowed (V7). */
+    private static FileChannel searchOnly(Body.FileBody file, AccessDeniedException denied) throws IOException {
+        if (!file.allowUnlistable()) {
+            throw denied;
+        }
+        return openFallback(file);
     }
 
     private static FileChannel openFallback(Body.FileBody file) throws IOException {
