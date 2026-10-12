@@ -69,12 +69,7 @@ public final class ReloadHook {
             var handlerClass = Class.forName("sun.misc.SignalHandler");
             var signal = signalClass.getConstructor(String.class).newInstance("HUP");
             var handler = Proxy.newProxyInstance(handlerClass.getClassLoader(), new Class<?>[] {handlerClass},
-                    (proxy, method, args) -> {
-                        if ("handle".equals(method.getName())) {
-                            run();
-                        }
-                        return null;
-                    });
+                    (proxy, method, args) -> dispatchSignal(method.getName()));
             var previous = signalClass.getMethod("handle", signalClass, handlerClass).invoke(null, signal, handler);
             // Ignored at startup (no controlling terminal, GitHub Actions) or via SIG_IGN. handle()
             // returns SIG_IGN and leaves the disposition unchanged.
@@ -82,5 +77,17 @@ public final class ReloadHook {
         } catch (ReflectiveOperationException | LinkageError e) {
             return false;
         }
+    }
+
+    /**
+     * What the {@code SIGHUP} proxy calls. Only {@code handle} runs the hooks; the JDK also calls
+     * {@code equals}, {@code hashCode} and {@code toString} on a proxy. Package-visible so a test can
+     * exercise both sides when this process already ignores {@code SIGHUP} (GitHub Actions).
+     */
+    static Object dispatchSignal(String method) {
+        if ("handle".equals(method)) {
+            run();
+        }
+        return null;
     }
 }

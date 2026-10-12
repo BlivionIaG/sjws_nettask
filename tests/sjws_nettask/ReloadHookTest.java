@@ -67,4 +67,21 @@ class ReloadHookTest {
         assertTrue(Daemon.ignoreSignal("HUP"));
         assertFalse(ReloadHook.installSighup());
     }
+
+    @Test
+    @Order(5)
+    void signalDispatchRunsHooksOnlyForHandle() throws Exception {
+        var seen = new AtomicInteger();
+        var hook = ReloadHook.register(seen::incrementAndGet);
+        try {
+            assertNull(ReloadHook.dispatchSignal("equals"));
+            assertEquals(0, seen.get());
+            assertNull(ReloadHook.dispatchSignal("handle"));
+            assertEquals(1, seen.get());
+            assertNull(ReloadHook.dispatchSignal(null));
+            assertEquals(1, seen.get());
+        } finally {
+            hook.close();
+        }
+    }
 }
