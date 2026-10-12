@@ -23,6 +23,9 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |
+| `core/FilterDocumentTest` | declarative document: JSON round trip, scope, label selectors, rejected wire forms |
+| `core/ChainControlTest` | atomic snapshot swap, stale and invalid documents keep the live chain, in-flight requests finish on the old chain |
+| `ChainControlServerTest` | publishing a document onto a live server leaves the direct file path in place until the first apply |
 | `FilterIntegrationTest` | real HTTP/1.1 server: no chain by default, header/short-circuit filters, client address and raw headers, a replacement terminal handler, 500 then the next request on the same connection |
 | `h3/FilterHttp3Test` | default HTTP/3 factory runs the same chain; a filter failure is a 500 on that stream |
 | `core/PlatformEdgeCaseTest` | case/Unicode/`%2F` behaviour per file system |

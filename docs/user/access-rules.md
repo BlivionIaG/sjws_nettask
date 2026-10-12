@@ -20,6 +20,12 @@ directory listings, and a symlink whose target is a dotfile or a denied path is 
 
     --deny='*.bak,*~,/private' --access-rule=hide:/drafts --access-rule=allow:/.well-known/acme-challenge
 
+The same settings can live in the YAML `access:` section ([config-file.md](config-file.md#access)).
+They are merged with the flags, not replaced: deny lists are united, flag rules come before YAML rules
+(first match wins), `allow_dotfiles` and `require_world_readable` are on if either source sets them, and
+a `--require-owner` flag wins over the YAML value. A reload re-applies the YAML rules on HTTP/1.1, HTTP/2
+and HTTP/3.
+
 `--require-owner` and `--require-world-readable` check the file being served (POSIX file systems only;
 elsewhere such files answer 403). A change of owner or mode changes the file's ctime, so the
 small-file cache drops the entry and the check runs again (with a revalidation window, only after it).

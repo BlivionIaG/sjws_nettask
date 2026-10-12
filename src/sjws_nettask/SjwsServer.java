@@ -22,6 +22,8 @@ import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -46,8 +48,10 @@ import sjws_nettask.config.ConfigSnapshot;
 import sjws_nettask.config.LastGoodStore;
 import sjws_nettask.config.LiveConfig;
 import sjws_nettask.config.ReloadResult;
+import sjws_nettask.core.ChainControl;
 import sjws_nettask.core.FilterChain;
 import sjws_nettask.core.Handler;
+import sjws_nettask.core.RequestFilter;
 import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.h3.Http3Server;
@@ -79,6 +83,16 @@ public final class SjwsServer implements AutoCloseable {
     private final HandlerRef armed = new HandlerRef();
     /** Null when no filters were registered. */
     private final FilterChain chain;
+    /**
+     * Terminal under {@link #chain}, or the live file handler when nothing was compiled and the
+     * leaf is the static handler. Used only if a {@link ChainControl} is opened. Not read on the
+     * request path while that control is unpublished.
+     */
+    private final Handler chainLeaf;
+    /** Null until {@link #chainControl(RequestFilters, Set)} is called. Unpublished until the first apply. */
+    private volatile ChainControl control;
+    /** One observe filter shared by every chain-control snapshot. Null until observability is on. */
+    private ObserveRequestFilter observeFilter;
     /**
      * What HTTP/1.1 calls instead of the live snapshot. Null means the snapshot handler
      * (a concrete {@link StaticFileHandler#handle} when that is what the snapshot holds).
@@ -127,6 +141,7 @@ public final class SjwsServer implements AutoCloseable {
         this.observingAtStart = initial.recording();
         FilterChain built;
         Handler selected;
+        Handler chainLeaf;
         try {
             var files = snapshot.files();
             Handler injected = haSettings == null ? null : haSettings.handler();
@@ -141,8 +156,10 @@ public final class SjwsServer implements AutoCloseable {
             }
             // No caller filters: the observe chain reads the live snapshot, so a reload still
             // swaps the file handler. Caller filters keep the leaf they were compiled around.
-            Handler chainLeaf = leaf;
-            if (this.observingAtStart && filters == null && injected == null && leaf == files) {
+            // The same live read is what an empty chain-control document calls, so attaching a
+            // control plane does not freeze the file handler that reload swaps.
+            chainLeaf = leaf;
+            if (filters == null && injected == null && leaf == files) {
                 chainLeaf = request -> this.live.handler().handle(request);
             }
             built = registry == null ? null : registry.build(chainLeaf);
@@ -152,6 +169,7 @@ public final class SjwsServer implements AutoCloseable {
             throw e;
         }
         this.chain = built;
+        this.chainLeaf = chainLeaf;
         if (haSettings == null) {
             this.ha = null;
             this.override = selected;
@@ -445,6 +463,10 @@ public final class SjwsServer implements AutoCloseable {
         try {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
+            if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
+                // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies
+                http2.armHandler(request -> this.live.handler().handle(request));
+            }
             transport.start();
             this.h2 = transport;
         } catch (Exception | LinkageError e) {
@@ -724,14 +746,84 @@ public final class SjwsServer implements AutoCloseable {
 
     /**
      * @return the compiled filter chain, or null when none were registered (the request path does
-     *         not call into {@link FilterChain})
+     *         not call into {@link FilterChain}). After a chain-control document is published, this
+     *         is the snapshot now being served, or null when that snapshot calls the terminal directly.
      */
     public FilterChain filterChain() {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            var handler = control.published();
+            return handler instanceof FilterChain live ? live : null;
+        }
         var live = this.armed.get();
         if (live instanceof FilterChain liveChain) {
             return liveChain;
         }
         return this.chain;
+    }
+
+    /**
+     * Opens the control-plane filter slot for this process. Calling this does not change the
+     * request path. The first successful {@link ChainControl#apply} publishes one immutable
+     * snapshot; until then HTTP/1.1, HTTP/2 and HTTP/3 keep the handler they were started with,
+     * including the direct {@link StaticFileHandler#handle} call when no filters were registered.
+     * <p>
+     * A later apply replaces the compiled handler with a single volatile write on the slot each
+     * transport already reads. Requests already inside the previous handler finish on it. An
+     * invalid document throws and leaves the published handler in place. {@code registry} supplies
+     * the factories; bind them before applying, and do not mutate it concurrently with apply.
+     *
+     * @param nodeLabels labels of this data-plane node, matched when a document is compiled
+     */
+    public ChainControl chainControl(RequestFilters registry, Set<String> nodeLabels) {
+        Objects.requireNonNull(registry, "registry");
+        var existing = this.control;
+        if (existing != null) {
+            return existing;
+        }
+        this.reloadLock.lock();
+        try {
+            if (this.control != null) {
+                return this.control;
+            }
+            var opened = ChainControl.open(registry, nodeLabels, this.chainLeaf, this::observeOuter,
+                    null, this::armSnapshot);
+            this.control = opened;
+            return opened;
+        } finally {
+            this.reloadLock.unlock();
+        }
+    }
+
+    /**
+     * Observe filter for a chain-control snapshot, or null while observability is off. One instance,
+     * so a republish does not stack a second counter.
+     */
+    private RequestFilter observeOuter() {
+        if (!this.observingAtStart && !this.slot.get().recording()) {
+            return null;
+        }
+        var existing = this.observeFilter;
+        if (existing != null) {
+            return existing;
+        }
+        var created = new ObserveRequestFilter(this.slot);
+        this.observeFilter = created;
+        return created;
+    }
+
+    /**
+     * Stores the compiled snapshot where every transport already reads its handler. One volatile
+     * write per transport; the request path does not enter {@link ChainControl}.
+     */
+    private void armSnapshot(Handler handler) {
+        this.armed.set(handler);
+        if (this.h3 != null) {
+            this.h3.armHandler(handler);
+        }
+        if (this.h2 != null) {
+            this.h2.armHandler(handler);
+        }
     }
 
     /**
@@ -771,6 +863,11 @@ public final class SjwsServer implements AutoCloseable {
 
     /** Installs the observe filter once, outside whatever handler startup compiled. */
     private void publishArmed() {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            control.pinOuter(new ObserveRequestFilter(this.slot));
+            return;
+        }
         if (this.armed.get() != null) {
             return;
         }
