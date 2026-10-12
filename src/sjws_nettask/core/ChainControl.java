@@ -19,15 +19,19 @@ package sjws_nettask.core;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
- * Atomic holder for one compiled filter snapshot. {@link #handle} reads a single volatile
- * reference and then runs that snapshot; it does not allocate, take a lock, or read the document
- * again. {@link #apply} validates and compiles on the calling thread and publishes the new
- * snapshot only after that succeeds. A thrown exception leaves the previous snapshot in place.
- * A request that has already loaded a snapshot finishes on it, including a request inside
- * {@code proceed} when the publish happens.
+ * Atomic holder for one compiled filter snapshot. The server does not put this object on the
+ * request path. After every successful {@link #apply} or {@link #pinOuter} it hands the compiled
+ * handler to {@code onPublish}, and the transports store that handler in the volatile slot they
+ * already read. {@link #handle} is for a caller that invokes the control directly: one volatile
+ * read, then that snapshot, with no allocation, lock, or second look at the document.
+ * {@link #apply} validates and compiles on the calling thread and publishes only after that
+ * succeeds. A thrown exception leaves the previous snapshot in place. A request that has already
+ * loaded a handler finishes on it, including a request inside {@code proceed} when the publish
+ * happens.
  * <p>
  * The version must be greater than or equal to the version currently published. A lower version
  * is rejected and the live chain is unchanged. The first published version may be 0; before any
@@ -43,6 +47,7 @@ public final class ChainControl implements Handler {
     private final RequestFilters registry;
     private final Handler terminal;
     private final Runnable onLive;
+    private final Consumer<Handler> onPublish;
     private final Supplier<RequestFilter> outerSource;
     private volatile Set<String> nodeLabels;
     private volatile RequestFilter pinned;
@@ -51,31 +56,44 @@ public final class ChainControl implements Handler {
     private volatile boolean live;
 
     private ChainControl(RequestFilters registry, Set<String> nodeLabels, Handler terminal,
-            Supplier<RequestFilter> outerSource, Runnable onLive) {
+            Supplier<RequestFilter> outerSource, Runnable onLive, Consumer<Handler> onPublish) {
         this.registry = registry;
         this.nodeLabels = nodeLabels;
         this.terminal = terminal;
         this.outerSource = outerSource;
         this.onLive = onLive;
+        this.onPublish = onPublish;
         this.current = new Snapshot(-1, terminal);
+    }
+
+    /**
+     * @param onLive invoked once, after the first snapshot is published, on the applying thread.
+     *        Must not call {@link #apply} or {@link #pinOuter}: the publish lock is held
+     */
+    public static ChainControl open(RequestFilters registry, Set<String> nodeLabels, Handler terminal,
+            Supplier<RequestFilter> outer, Runnable onLive) {
+        return open(registry, nodeLabels, terminal, outer, onLive, null);
     }
 
     /**
      * @param registry factories used to compile each document; not mutated, and not read on the
      *        request path. Do not bind or replace a factory concurrently with {@link #apply}.
      * @param nodeLabels labels of this data-plane node; copied
-     * @param terminal handler under the chain. An empty document calls it directly, and a
+     * @param terminal handler under the chain. An empty document publishes it directly, and a
      *        {@link StaticFileHandler} is still a direct {@code handle} call
      * @param outer filter inserted at order 0 on every compiled snapshot, or a supplier that returns
      *        null when there is nothing to insert. Called from {@link #apply}, never from {@link #handle}
-     * @param onLive invoked once, after the first snapshot is published, on the applying thread
+     * @param onLive invoked once, after the first snapshot is published, on the applying thread.
+     *        Must not call {@link #apply} or {@link #pinOuter}: the publish lock is held
+     * @param onPublish invoked under the publish lock after every successful apply and pin, with the
+     *        compiled handler (not this control). Must not call {@link #apply} or {@link #pinOuter}
      */
     public static ChainControl open(RequestFilters registry, Set<String> nodeLabels, Handler terminal,
-            Supplier<RequestFilter> outer, Runnable onLive) {
+            Supplier<RequestFilter> outer, Runnable onLive, Consumer<Handler> onPublish) {
         Objects.requireNonNull(registry, "registry");
         Objects.requireNonNull(terminal, "terminal");
         var labels = Set.copyOf(nodeLabels == null ? Set.<String>of() : nodeLabels);
-        return new ChainControl(registry, labels, terminal, outer, onLive);
+        return new ChainControl(registry, labels, terminal, outer, onLive, onPublish);
     }
 
     /** @return the published config version, or {@code -1} before the first successful apply */
@@ -108,7 +126,8 @@ public final class ChainControl implements Handler {
 
     /**
      * Inserts {@code filter} at order 0 on the next compile. If a document is already live, it is
-     * recompiled and published at the same version. A second call is ignored.
+     * recompiled and published at the same version. A second call is ignored. A compile failure
+     * leaves the slot empty, so a later call can retry, and leaves the live snapshot unchanged.
      */
     public void pinOuter(RequestFilter filter) {
         Objects.requireNonNull(filter, "filter");
@@ -117,12 +136,21 @@ public final class ChainControl implements Handler {
             if (this.pinned != null) {
                 return;
             }
-            this.pinned = filter;
             var doc = this.document;
             if (doc == null) {
+                this.pinned = filter;
                 return;
             }
-            this.current = compile(doc);
+            this.pinned = filter;
+            Snapshot snapshot;
+            try {
+                snapshot = compile(doc);
+            } catch (RuntimeException e) {
+                this.pinned = null;
+                throw e;
+            }
+            this.current = snapshot;
+            notifyPublished(snapshot);
         } finally {
             this.publish.unlock();
         }
@@ -165,6 +193,7 @@ public final class ChainControl implements Handler {
                     this.onLive.run();
                 }
             }
+            notifyPublished(snapshot);
             return document;
         } finally {
             this.publish.unlock();
@@ -183,6 +212,13 @@ public final class ChainControl implements Handler {
     private Snapshot compile(FilterDocument document) {
         var chain = this.registry.compile(document, this.nodeLabels, this.terminal, outerFilter());
         return new Snapshot(document.version(), chain == null ? this.terminal : chain);
+    }
+
+    /** Hands the compiled handler to the server. Not called from {@link #handle}. */
+    private void notifyPublished(Snapshot snapshot) {
+        if (this.onPublish != null) {
+            this.onPublish.accept(snapshot.handler);
+        }
     }
 
     /** Pinned filter wins; otherwise the supplier. Not called from {@link #handle}. */

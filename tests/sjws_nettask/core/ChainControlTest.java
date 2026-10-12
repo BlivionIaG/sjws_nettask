@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -237,5 +238,80 @@ class ChainControlTest {
         control.nodeLabels(Set.of("other"));
         control.apply(doc(1, "hit", FilterScope.of("/only", "edge")));
         assertNull(control.handle(req("/only")).headers().get("x-mark"));
+    }
+
+    @Test
+    void publishConsumerReceivesTheCompiledHandler() {
+        var seen = new ArrayList<Handler>();
+        var terminal = echo();
+        var control = ChainControl.open(registry(), Set.of(), terminal, null, null, seen::add);
+        assertTrue(seen.isEmpty());
+        control.pinOuter((request, next) -> {
+            var response = next.proceed(request);
+            response.headers().set("x-outer", "1");
+            return response;
+        });
+        assertTrue(seen.isEmpty());
+        var early = ChainControl.open(registry(), Set.of(), terminal, null, null, seen::add);
+        early.apply(FilterDocument.empty(0));
+        assertSame(terminal, early.published());
+
+        control.apply(FilterDocument.empty(1));
+        assertEquals(2, seen.size());
+        assertSame(terminal, seen.get(0));
+        assertTrue(seen.get(1) instanceof FilterChain);
+        assertSame(control.published(), seen.get(1));
+        assertEquals("1", control.handle(req("/")).headers().get("x-outer"));
+
+        control.apply(doc(2, "a", FilterScope.all()));
+        assertEquals(3, seen.size());
+        assertTrue(seen.get(2) instanceof FilterChain);
+        assertSame(control.published(), seen.get(2));
+        assertFalse(seen.get(2) instanceof ChainControl);
+        assertEquals("a", control.handle(req("/")).headers().get("x-mark"));
+        assertEquals("1", control.handle(req("/")).headers().get("x-outer"));
+
+        var before = seen.size();
+        assertThrows(IllegalArgumentException.class,
+                () -> control.apply("{\"format\":1,\"version\":3,\"filters\":[{\"type\":\"missing\"}]}"));
+        assertEquals(before, seen.size());
+        assertSame(seen.get(2), control.published());
+    }
+
+    @Test
+    void failedPinOuterLeavesTheSlotRetryable() {
+        var fail = new AtomicInteger();
+        var filters = RequestFilters.create().factory("mark", spec -> {
+            if (fail.getAndIncrement() == 1) {
+                throw new IllegalArgumentException("boom");
+            }
+            return (request, next) -> {
+                var response = next.proceed(request);
+                response.headers().set("x-mark", "on");
+                return response;
+            };
+        });
+        var seen = new ArrayList<Handler>();
+        var control = ChainControl.open(filters, Set.of(), echo(), null, null, seen::add);
+        control.apply(FilterDocument.of(1, List.of(FilterDocument.FilterEntry.of("mark"))));
+        var published = control.published();
+        assertEquals(1, seen.size());
+        RequestFilter outer = (request, next) -> {
+            var response = next.proceed(request);
+            response.headers().set("x-outer", "1");
+            return response;
+        };
+        assertThrows(IllegalArgumentException.class, () -> control.pinOuter(outer));
+        assertSame(published, control.published());
+        assertEquals(1, seen.size());
+        assertNull(control.handle(req("/")).headers().get("x-outer"));
+        assertEquals("on", control.handle(req("/")).headers().get("x-mark"));
+        control.pinOuter(outer);
+        assertEquals("1", control.handle(req("/")).headers().get("x-outer"));
+        assertEquals("on", control.handle(req("/")).headers().get("x-mark"));
+        assertEquals(2, seen.size());
+        assertSame(control.published(), seen.get(1));
+        control.pinOuter((request, next) -> next.proceed(request));
+        assertEquals(2, seen.size());
     }
 }

@@ -232,14 +232,16 @@ The schema:
 the selector matches every node. Omitting `scope` matches every request on every node.
 
 `SjwsServer.chainControl(registry, nodeLabels)` opens a slot and does not change the request
-path. The first successful `apply` publishes the compiled snapshot. Until then a server with no
-filters still calls `StaticFileHandler.handle` directly, and a server that already has filters
-keeps that chain. `apply` validates and compiles on the calling thread. It publishes with one
-volatile write of an immutable snapshot. `handle` reads that reference once and does not
-allocate. A request that has already loaded a snapshot, including one blocked inside `proceed`,
-finishes on it. A document that fails to parse or compile throws, and the published snapshot
-stays. A version lower than the one being served is rejected the same way. An equal version is
-applied again, which is how a node picks up a label change without a new generation.
+path. The first successful `apply` compiles the snapshot and installs that handler into the
+volatile slot each transport already reads (the same slot a metrics arm uses). Until then a
+server with no filters still calls `StaticFileHandler.handle` directly, and a server that
+already has filters keeps that chain. `apply` validates and compiles on the calling thread, then
+publishes with that one write. The request path does not enter `ChainControl`, so it does not
+take the publish lock, read the document, or load a second snapshot reference. A request that
+has already loaded a handler, including one blocked inside `proceed`, finishes on it. A document
+that fails to parse or compile throws, and the published handler stays. A version lower than the
+one being served is rejected the same way. An equal version is applied again, which is how a
+node picks up a label change without a new generation.
 
 An empty `filters` array is valid and calls the terminal handler directly. When that terminal
 is the static file handler, the call is still `StaticFileHandler.handle`. Opening the slot

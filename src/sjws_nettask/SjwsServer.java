@@ -674,10 +674,10 @@ public final class SjwsServer implements AutoCloseable {
      * snapshot; until then HTTP/1.1, HTTP/2 and HTTP/3 keep the handler they were started with,
      * including the direct {@link StaticFileHandler#handle} call when no filters were registered.
      * <p>
-     * A later apply replaces that snapshot with a single volatile write. Requests already inside
-     * the previous snapshot finish on it. An invalid document throws and leaves the published
-     * snapshot in place. {@code registry} supplies the factories; bind them before applying, and
-     * do not mutate it concurrently with apply.
+     * A later apply replaces the compiled handler with a single volatile write on the slot each
+     * transport already reads. Requests already inside the previous handler finish on it. An
+     * invalid document throws and leaves the published handler in place. {@code registry} supplies
+     * the factories; bind them before applying, and do not mutate it concurrently with apply.
      *
      * @param nodeLabels labels of this data-plane node, matched when a document is compiled
      */
@@ -693,7 +693,7 @@ public final class SjwsServer implements AutoCloseable {
                 return this.control;
             }
             var opened = ChainControl.open(registry, nodeLabels, this.chainLeaf, this::observeOuter,
-                    this::publishControl);
+                    null, this::armSnapshot);
             this.control = opened;
             return opened;
         } finally {
@@ -718,15 +718,17 @@ public final class SjwsServer implements AutoCloseable {
         return created;
     }
 
-    /** Makes a published {@link ChainControl} the handler every transport enters on its next request. */
-    private void publishControl() {
-        var control = this.control;
-        this.armed.set(control);
+    /**
+     * Stores the compiled snapshot where every transport already reads its handler. One volatile
+     * write per transport; the request path does not enter {@link ChainControl}.
+     */
+    private void armSnapshot(Handler handler) {
+        this.armed.set(handler);
         if (this.h3 != null) {
-            this.h3.armHandler(control);
+            this.h3.armHandler(handler);
         }
         if (this.h2 != null) {
-            this.h2.armHandler(control);
+            this.h2.armHandler(handler);
         }
     }
 
