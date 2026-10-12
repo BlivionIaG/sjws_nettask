@@ -25,6 +25,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.Optional;
 import java.util.function.Consumer;
 import javax.net.ssl.SSLContext;
 import sjws_nettask.config.AcmeSettings;
@@ -47,7 +48,10 @@ public final class AcmeService implements AutoCloseable {
     private final AtomicReference<ScheduledFuture<?>> pending = new AtomicReference<>();
     private final ChallengeBoard board;
     private final Consumer<TlsMaterial> publish;
+    private final ControlLeadership leadership;
     private final AtomicInteger epoch = new AtomicInteger();
+    /** Term whose election NOOP has been applied. 0 until {@link ControlLeadership#leaderReady}. */
+    private volatile long readyTerm;
     private volatile AcmeSettings settings;
     private volatile SSLContext trust;
     private volatile int backoffSeconds = BACKOFF_START;
@@ -57,22 +61,59 @@ public final class AcmeService implements AutoCloseable {
     volatile Runnable beforeAttempt;
 
     public AcmeService(AcmeSettings settings, ChallengeBoard board, Consumer<TlsMaterial> publish) {
+        this(settings, board, publish, LocalLeadership.standalone());
+    }
+
+    public AcmeService(AcmeSettings settings, ChallengeBoard board, Consumer<TlsMaterial> publish,
+            ControlLeadership leadership) {
         this.settings = settings;
         this.board = board;
         this.publish = publish;
+        this.leadership = leadership;
     }
 
+    /**
+     * Subscribes to leadership. Issuing starts from {@link ControlLeadership#leaderReady}, not
+     * from {@link ControlLeadership#isLeader()} alone. A standalone leadership is already ready,
+     * so this still arms at once.
+     */
     public void start() {
-        arm(Duration.ZERO);
+        this.leadership.onLeaderChange(this::leadershipChanged);
+        this.leadership.leaderReady(this::leadershipReady);
     }
 
     public void update(AcmeSettings settings) {
         this.settings = settings;
         this.backoffSeconds = BACKOFF_START;
-        if (settings.enabled()) {
+        if (settings.enabled() && this.readyTerm != 0 && this.leadership.isLeader()) {
             arm(Duration.ZERO);
         } else {
             this.epoch.incrementAndGet();
+        }
+    }
+
+    private void leadershipChanged(long term, Optional<String> leaderId) {
+        if (this.readyTerm == 0) {
+            return;
+        }
+        if (term == this.readyTerm && this.leadership.isLeader()) {
+            return;
+        }
+        this.readyTerm = 0;
+        this.epoch.incrementAndGet();
+        var queued = this.pending.getAndSet(null);
+        if (queued != null) {
+            queued.cancel(false);
+        }
+    }
+
+    private void leadershipReady(long term, long appliedIndex) {
+        if (!this.leadership.isLeader() || term <= 0 || appliedIndex < 0) {
+            return;
+        }
+        this.readyTerm = term;
+        if (this.settings.enabled()) {
+            arm(Duration.ZERO);
         }
     }
 

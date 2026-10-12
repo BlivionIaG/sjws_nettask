@@ -37,6 +37,14 @@ jobs:
         run: mvn -B verify
       - name: End-to-end file serving (real listener, temp docroot, HTTP client)
         run: mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Multi-node cluster harness (live scenarios)
+        run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Install wrk
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wrk
+      - name: wrk standalone vs gateway-off
+        if: runner.os == 'Linux'
+        run: GATEWAY_BENCH_WARMUP=1s GATEWAY_BENCH_DURATION=3s tools/gateway-bench.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
