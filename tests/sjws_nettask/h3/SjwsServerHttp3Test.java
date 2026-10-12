@@ -114,6 +114,7 @@ class SjwsServerHttp3Test {
         var tcp = this.server.tcpPort();
         var h1 = HttpTestSupport.get(tcp, "/hello.txt", 4000);
         assertEquals(expected, h1.headers().get("alt-svc"));
+        assertTrue(this.server.metrics().snapshot().requests() >= 1);
         assertEquals(expected, HttpTestSupport.get(tcp, "/missing", 4000).headers().get("alt-svc"));
         assertEquals(expected, HttpTestSupport.rawRequest(tcp,
                 "HEAD /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n", 4000).headers().get("alt-svc"));
