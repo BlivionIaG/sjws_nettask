@@ -1,7 +1,9 @@
 package sjws_nettask;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -14,6 +16,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.core.ChainControl;
 import sjws_nettask.core.FilterChain;
 import sjws_nettask.core.FilterDocument;
 import sjws_nettask.core.FilterScope;
@@ -156,8 +159,12 @@ class ChainControlServerTest {
         var control = this.server.chainControl(registry(), Set.of());
         assertNull(armed.get());
         control.apply(doc(1, "h", FilterScope.all()));
-        assertEquals(control, armed.get());
-        assertEquals("h", HttpTestSupport.get(this.server.tcpPort(), "/hello.txt", 4000).headers().get("x-mark"));
+        assertSame(control.published(), armed.get());
+        assertFalse(armed.get() instanceof ChainControl);
+        assertTrue(armed.get() instanceof FilterChain);
+        control.apply(doc(2, "h2", FilterScope.all()));
+        assertSame(control.published(), armed.get());
+        assertEquals("h2", HttpTestSupport.get(this.server.tcpPort(), "/hello.txt", 4000).headers().get("x-mark"));
     }
 
     private SjwsServer stopAndStart(ServerConfig config, RequestFilters filters) throws Exception {
