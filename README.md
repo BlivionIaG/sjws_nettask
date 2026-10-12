@@ -62,7 +62,7 @@ also after a `100 Continue`) has arrived (then `408` and close: slowloris), and 
 is being written (a client that stops reading is closed; a slow download that keeps moving is not).
 Files larger than 64 KiB that are not in the cache go out with `sendfile` (`FileChannel.transferTo`);
 a file that shrinks during the transfer ends the connection (the response can't be completed).
-An idle keep-alive connection holds a 2 KiB input buffer and no output buffer.
+An idle keep-alive connection holds a 256 B input buffer (2 KiB only while a request needs it) and no output buffer.
 
 **Per-address caps behind a reverse proxy or NAT.** The caps count connections per client address
 (IPv4: the full address; IPv6: its /64 prefix, since one host can use any address of its /64). Behind a
@@ -306,8 +306,10 @@ Throughput at 1000 connections did not change with the backlog (1 KB 217k vs 219
 whose SYN retransmits (after 1 s, then 3 s) show up as timeouts and p99 spikes. A 50 MB response at 1000 connections
 takes longer than wrk's default 2 s timeout by itself (17 GB/s shared 1000 ways), so those runs use 30 s.
 
-Memory per idle keep-alive connection: ~6.3 KB of heap (~6.6 KB RSS) since S4, against ~78 KB before
-(a 2 KiB input buffer and the parser's 256 B line buffer; no output buffer). Caveats: these are
+Memory per idle keep-alive connection: ~3.8–4.2 KB of heap after GC (measured with
+`bench/footprint/run.sh` at 10k idle connections; ~6.6 KB before the idle-footprint changes, ~78 KB before S4):
+a 256 B idle input buffer, the parked virtual-thread stack (~2.2 KB), no retained request head and
+no output buffer. Caveats: these are
 loopback numbers with the client on the same machine, small working sets that sit in the page cache
 and wrk's closed-loop load (no think time); at fixed rates every variant could sustain (wrk2, 50k
 req/s for 1 KB, 30k req/s for 100 KB) p50/p99 were within noise of each other (0.8-3 ms / 2-10 ms), and
