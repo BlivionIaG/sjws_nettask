@@ -26,6 +26,7 @@ import io.netty.handler.codec.http2.DefaultHttp2Headers;
 import io.netty.handler.codec.http2.DefaultHttp2HeadersFrame;
 import io.netty.handler.codec.http2.DefaultHttp2ResetFrame;
 import io.netty.handler.codec.http2.Http2Error;
+import io.netty.handler.codec.http2.Http2Stream;
 import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.handler.codec.http2.Http2HeadersFrame;
 import io.netty.handler.codec.http2.Http2StreamChannel;
@@ -170,12 +171,27 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                 } catch (RuntimeException e) {
                     response = StaticFileHandler.error(500, this.request.headOnly());
                 }
-                new ResponseWriter(this, Http2StreamHandler.this.shared.writeTimeout(),
+                var outcome = new ResponseWriter(this, Http2StreamHandler.this.shared.writeTimeout(),
                         Http2StreamHandler.this.shared.files()).write(response);
+                if (outcome == ResponseWriter.Outcome.COMPLETE) {
+                    endRequest();
+                }
             } finally {
                 this.thread = null;
 
                 finish();
+            }
+        }
+
+        /**
+         * The response is complete but the peer never ended its side (request body we don't read):
+         * RST_STREAM(NO_ERROR) as RFC 9113 §8.1 allows, so a half-open stream can't hold the
+         * connection's idle timer and a concurrency slot forever.
+         */
+        private void endRequest() {
+            var state = this.stream.stream().state();
+            if (state == Http2Stream.State.OPEN || state == Http2Stream.State.HALF_CLOSED_LOCAL) {
+                this.stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.NO_ERROR));
             }
         }
 

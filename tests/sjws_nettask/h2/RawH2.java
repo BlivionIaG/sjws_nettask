@@ -36,7 +36,16 @@ final class RawH2 implements AutoCloseable {
 
     /** Connects, sends the preface and SETTINGS (initial stream window {@code initialWindow}). */
     RawH2(int port, int initialWindow) throws IOException {
-        this.socket = new Socket(InetAddress.getLoopbackAddress(), port);
+        this(port, initialWindow, 0);
+    }
+
+    /** @param receiveBuffer SO_RCVBUF to request before connecting, or 0 for the default */
+    RawH2(int port, int initialWindow, int receiveBuffer) throws IOException {
+        this.socket = new Socket();
+        if (receiveBuffer > 0) {
+            this.socket.setReceiveBufferSize(receiveBuffer);
+        }
+        this.socket.connect(new java.net.InetSocketAddress(InetAddress.getLoopbackAddress(), port));
         this.socket.setSoTimeout(10_000);
         this.in = new DataInputStream(this.socket.getInputStream());
         this.out = this.socket.getOutputStream();
