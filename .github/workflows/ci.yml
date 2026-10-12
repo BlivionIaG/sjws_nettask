@@ -45,7 +45,7 @@ jobs:
       - name: wrk standalone vs gateway-off
         if: runner.os == 'Linux'
         run: GATEWAY_BENCH_WARMUP=1s GATEWAY_BENCH_DURATION=3s tools/gateway-bench.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: jacoco-${{ matrix.os }}
@@ -64,7 +64,7 @@ jobs:
           java-version: '25'
           cache: maven
       - run: mvn -B -P pitest test-compile org.pitest:pitest-maven:mutationCoverage
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: pit-reports
