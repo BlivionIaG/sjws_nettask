@@ -3271,7 +3271,7 @@ Connection: close
 Content-Length: 72
 X-Content-Type-Options: nosniff
 Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
-Allow: GET, HEAD
+Allow: GET, HEAD, OPTIONS
 
 <!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>
 === 405-with-body ===
@@ -3284,7 +3284,7 @@ Connection: close
 Content-Length: 72
 X-Content-Type-Options: nosniff
 Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
-Allow: GET, HEAD
+Allow: GET, HEAD, OPTIONS
 
 <!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>
 === 400-bad-encoding ===
