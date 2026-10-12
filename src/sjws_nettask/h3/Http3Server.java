@@ -41,17 +41,18 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
+import sjws_nettask.Transport;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
@@ -70,7 +71,7 @@ import sjws_nettask.tls.TlsMaterial;
  * on its own virtual thread (handler + file reads + backpressured writes), so the event loop never
  * touches the file system.
  */
-public final class Http3Server implements AutoCloseable {
+public final class Http3Server implements Transport {
 
     /**
      * Receive flow-control windows (bytes) and concurrent request streams per connection. Requests are
@@ -94,9 +95,9 @@ public final class Http3Server implements AutoCloseable {
 
     private final ServerConfig config;
     private final Function<Request, Response> handler;
-    private final Set<QuicChannel> connections = ConcurrentHashMap.newKeySet();
     private final Map<QuicChannel, Connection> state = new ConcurrentHashMap<>();
-    private final AtomicInteger connectionCount = new AtomicInteger();
+    private final BooleanSupplier available;
+    private final Supplier<Throwable> unavailabilityCause;
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Map<Http3Writer.Outcome, LongAdder> outcomes = new EnumMap<>(Http3Writer.Outcome.class);
@@ -119,6 +120,14 @@ public final class Http3Server implements AutoCloseable {
 
     /** Test seam: any request-to-response function (e.g. one that changes files between handle and write). */
     Http3Server(ServerConfig config, Function<Request, Response> handler, TlsMaterial tls) {
+        this(config, handler, tls, Http3Server::isAvailable, Http3Server::unavailabilityCause);
+    }
+
+    /** Test seam: {@code available}/{@code unavailabilityCause} simulate missing natives. */
+    Http3Server(ServerConfig config, Function<Request, Response> handler, TlsMaterial tls, BooleanSupplier available,
+            Supplier<Throwable> unavailabilityCause) {
+        this.available = Objects.requireNonNull(available, "available");
+        this.unavailabilityCause = Objects.requireNonNull(unavailabilityCause, "unavailabilityCause");
         this.config = Objects.requireNonNull(config, "config");
         this.handler = Objects.requireNonNull(handler, "handler");
         this.tls = tls;
@@ -196,14 +205,17 @@ public final class Http3Server implements AutoCloseable {
      * @throws IOException if QUIC is unavailable, the TLS files are invalid or the port can't be bound
      *         (nothing is left running in that case)
      */
+    @Override
     public Http3Server start() throws IOException {
         if (!this.started.compareAndSet(false, true) || this.closed.get()) {
             throw new IllegalStateException("already started or closed");
         }
-        if (!isAvailable()) {
-            throw new IOException("HTTP/3 unavailable: native QUIC library could not be loaded "
-                    + "(set -Dio.netty.native.workdir to an exec-mounted directory if /tmp is noexec)",
-                    unavailabilityCause());
+        if (!this.available.getAsBoolean()) {
+            var cause = this.unavailabilityCause.get();
+            throw new IOException("native QUIC library not available on " + System.getProperty("os.name") + "/"
+                    + System.getProperty("os.arch") + " (" + (cause == null ? "unknown cause" : cause.toString())
+                    + "); if /tmp is mounted noexec, set -Dio.netty.native.workdir to an exec-mounted directory",
+                    cause);
         }
         if (this.tls == null) {
             try {
@@ -247,18 +259,11 @@ public final class Http3Server implements AutoCloseable {
 
     private void accept(QuicChannel quic) {
         boolean refused = this.closed.get(); // read once: close() may flip it concurrently
-        if (refused || this.connectionCount.incrementAndGet() > this.config.h3MaxConnections()) {
-            if (!refused) {
-                this.connectionCount.decrementAndGet();
-            }
+        // accept() and the closeFuture listeners run on the one event loop, so size() is exact here
+        if (refused || this.state.size() >= this.config.h3MaxConnections()) {
             quic.close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
             return;
         }
-        this.connections.add(quic);
-        quic.closeFuture().addListener(f -> {
-            this.connections.remove(quic);
-            this.connectionCount.decrementAndGet();
-        });
         var connection = new Connection(this.limits.newConnectionFiles());
         this.state.put(quic, connection);
         quic.closeFuture().addListener(f -> this.state.remove(quic));
@@ -275,6 +280,16 @@ public final class Http3Server implements AutoCloseable {
     /** @return requests currently being handled or sent */
     int inflight() {
         return this.shared == null ? 0 : this.limits.maxInflight() - this.shared.inflight().availablePermits();
+    }
+
+    @Override
+    public String name() {
+        return "HTTP/3";
+    }
+
+    @Override
+    public int port() {
+        return boundPort();
     }
 
     /** @return the UDP port actually bound (useful with port 0) */
@@ -296,7 +311,7 @@ public final class Http3Server implements AutoCloseable {
 
     /** @return QUIC connections currently open */
     public int connections() {
-        return this.connections.size();
+        return this.state.size();
     }
 
     /** @return how many responses ended with this outcome (completed, or why the stream was reset) */
@@ -320,7 +335,7 @@ public final class Http3Server implements AutoCloseable {
             drain(System.nanoTime() + this.limits.drain().toNanos());
         }
         var closing = new ArrayList<io.netty.channel.ChannelFuture>();
-        for (var quic : this.connections) {
+        for (var quic : this.state.keySet()) {
             closing.add(quic.close(true, Http3ErrorCode.H3_NO_ERROR.code(), Unpooled.EMPTY_BUFFER));
         }
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
@@ -354,7 +369,7 @@ public final class Http3Server implements AutoCloseable {
         while (System.nanoTime() < deadline) {
             boolean quiet = inflight() == 0;
             long quietFor = 100_000_000L; // at least 100 ms
-            for (var quic : this.connections) {
+            for (var quic : this.state.keySet()) {
                 try {
                     var stats = quic.collectStats().get(1, TimeUnit.SECONDS);
                     var path = quic.collectPathStats(0).get(1, TimeUnit.SECONDS);

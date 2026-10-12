@@ -189,7 +189,7 @@ class SjwsServerHttp3Test {
 
     @Test
     void missingNativesFallBackWithAClearWarning() throws Exception {
-        Transport.Factory missing = (c, h) -> new Http3Transport(c, h, () -> false,
+        Transport.Factory missing = (c, h) -> new Http3Server(c, h::handle, null, () -> false,
                 () -> new UnsatisfiedLinkError("no libnetty_quiche42 in java.library.path"));
         var log = new java.io.ByteArrayOutputStream();
         var err = System.err;
@@ -210,18 +210,18 @@ class SjwsServerHttp3Test {
 
     @Test
     void transportContract() throws Exception {
-        var unknown = new Http3Transport(config().build(), new sjws_nettask.core.StaticFileHandler(this.root),
-                () -> false, () -> null);
+        var unknown = new Http3Server(config().build(), new sjws_nettask.core.StaticFileHandler(this.root)::handle,
+                null, () -> false, () -> null);
         assertEquals("HTTP/3", unknown.name());
         assertThrows(IllegalStateException.class, unknown::port);
         assertTrue(assertThrows(IOException.class, unknown::start).getMessage().contains("unknown cause"));
-        unknown.close(); // safe before start
-        assertNull(unknown.server());
+        unknown.close(); // safe after a failed start
+        assertThrows(IllegalStateException.class, unknown::start, "not restartable");
 
-        var real = new Http3Transport(config().build(), new sjws_nettask.core.StaticFileHandler(this.root));
-        real.start();
+        Transport real = new Http3Server(config().build(), new sjws_nettask.core.StaticFileHandler(this.root));
+        assertEquals(real, real.start());
         try {
-            assertEquals(real.server().boundPort(), real.port());
+            assertEquals(((Http3Server) real).boundPort(), real.port());
             assertThrows(IllegalStateException.class, real::start);
         } finally {
             real.close();

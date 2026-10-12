@@ -30,8 +30,10 @@ public interface Transport extends AutoCloseable {
     /**
      * Binds and starts serving. Must either succeed completely or throw and leave nothing
      * running (the server then continues without this transport).
+     *
+     * @return this
      */
-    void start() throws Exception;
+    Transport start() throws Exception;
 
     /** @return the bound port; only valid after a successful {@link #start()} */
     int port();

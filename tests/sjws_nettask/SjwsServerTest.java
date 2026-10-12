@@ -40,11 +40,12 @@ class SjwsServerTest {
         }
 
         @Override
-        public void start() throws Exception {
+        public Transport start() throws Exception {
             starts.incrementAndGet();
             if (failure != null) {
                 throw failure;
             }
+            return this;
         }
 
         @Override
