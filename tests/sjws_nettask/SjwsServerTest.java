@@ -121,6 +121,20 @@ class SjwsServerTest {
         }
     }
 
+    /** N6: the configured backlog reaches listen(2) (Linux: ss shows it as Send-Q of the listener). */
+    @Test
+    void listenerUsesTheConfiguredBacklog() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(Files.isExecutable(Path.of("/usr/bin/ss"))
+                || Files.isExecutable(Path.of("/bin/ss")), "needs ss (Linux)");
+        server = SjwsServer.start(config(false).toBuilder().backlog(777).build(), (c, h) -> null);
+        var p = new ProcessBuilder("ss", "-ltnH", "sport = :" + server.tcpPort()).redirectErrorStream(true).start();
+        var out = new String(p.getInputStream().readAllBytes());
+        assertTrue(p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS));
+        var cols = out.trim().split("\\s+");
+        assertEquals("LISTEN", cols[0], out);
+        assertEquals("777", cols[2], "Send-Q of a listener is its backlog: " + out);
+    }
+
     @Test
     void h3DisabledMeansNoAltSvc() throws IOException {
         var fake = new FakeTransport(4433, null);

@@ -66,7 +66,7 @@ public final class SjwsServer implements AutoCloseable {
             server.startH3(h3Factory);
         }
         try {
-            server.tcp = bind(config.port());
+            server.tcp = bind(config.port(), config.backlog());
         } catch (IOException e) {
             server.close();
             throw e;
@@ -77,12 +77,12 @@ public final class SjwsServer implements AutoCloseable {
         return server;
     }
 
-    /** Wildcard address, default backlog (50), SO_REUSEADDR: as {@code new ServerSocket(port)}. */
-    static ServerSocketChannel bind(int port) throws IOException {
+    /** Wildcard address, SO_REUSEADDR (as {@code new ServerSocket(port)}), the configured backlog. */
+    static ServerSocketChannel bind(int port, int backlog) throws IOException {
         var channel = ServerSocketChannel.open();
         try {
             channel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
-            channel.bind(new InetSocketAddress(port), 50);
+            channel.bind(new InetSocketAddress(port), backlog);
             return channel;
         } catch (IOException | RuntimeException e) {
             channel.close();

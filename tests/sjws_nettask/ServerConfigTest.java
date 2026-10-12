@@ -145,6 +145,21 @@ class ServerConfigTest {
         assertEquals(Duration.ZERO, c.altSvcMaxAge());
     }
 
+    /** N6: the accept backlog is configurable (1024 by default instead of the JDK's 50). */
+    @Test
+    void backlogOption() {
+        assertEquals(1024, parse(Map.of()).config().backlog());
+        assertEquals(4096, parse(Map.of(), "--backlog=4096").config().backlog());
+        assertEquals(10, parse(Map.of("WEB_SERVER_BACKLOG", "10"), "--backlog=4096").config().backlog(), "environment wins");
+        var bad = parse(Map.of(), "--backlog=0");
+        assertEquals(1024, bad.config().backlog());
+        assertFalse(bad.warnings().isEmpty());
+        assertEquals(7, ServerConfig.builder(Path.of("/r")).backlog(7).build().toBuilder().build().backlog());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).backlog(0).build());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder(Path.of("/r")).backlog(65536).build());
+        assertTrue(ServerConfig.defaults("/r").toString().contains("backlog=1024"));
+    }
+
     /** Verification V7: the weaker search-only-directory fallback is opt-in. */
     @Test
     void allowUnlistableDirsIsOptIn() {
