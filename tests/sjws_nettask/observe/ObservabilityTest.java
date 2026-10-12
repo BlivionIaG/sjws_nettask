@@ -19,6 +19,7 @@ package sjws_nettask.observe;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -391,9 +392,9 @@ class ObservabilityTest {
                         "GET /index.html HTTP/1.1\r\nHost: h\r\nReferer: http://ref\r\nUser-Agent: ua \"x\"\r\n\r\n");
                 var ok = HttpTestSupport.readResponse(socket.getInputStream());
                 assertEquals(200, ok.statusCode());
-                var snap = server.metrics().snapshot();
+                // record() runs after the write, so the client can return before the counter moves.
+                var snap = awaitRecorded(server, 1, 1);
                 assertTrue(snap.http1Connections() >= 1, "gauge while the connection is open: " + snap.http1Connections());
-                assertTrue(snap.requests() >= 1);
                 assertEquals(1, snap.protocol("HTTP/1.1"));
             }
             var health = HttpTestSupport.get(server.tcpPort(), "/healthz", 2000);
@@ -412,7 +413,7 @@ class ObservabilityTest {
             var bad = HttpTestSupport.rawRequest(server.tcpPort(), "GET / HTTP/1.1\r\n\r\n", 2000);
             assertEquals(400, bad.statusCode());
         }
-        var text = Files.readString(log);
+        var text = awaitLog(log, "\"GET /index.html HTTP/1.1\" 200 5 \"http://ref\" \"ua ?x?\"");
         assertTrue(text.contains("\"GET /index.html HTTP/1.1\" 200 5 \"http://ref\" \"ua ?x?\""), text);
         assertTrue(text.contains("\"GET /healthz HTTP/1.1\" 200 3"), text);
         assertTrue(text.contains("\"GET /metrics HTTP/1.1\" 200"), text);
@@ -431,7 +432,7 @@ class ObservabilityTest {
             assertFalse(plain.describe().contains("healthz"), plain.describe());
             assertEquals(0, plain.metricsSnapshot().requests(), "arming counts only later requests");
             HttpTestSupport.get(plain.tcpPort(), "/index.html", 2000);
-            assertTrue(plain.metrics().snapshot().requests() >= 1);
+            assertTrue(awaitRecorded(plain, 1, -1).requests() >= 1);
             var stillFile = HttpTestSupport.get(plain.tcpPort(), "/healthz", 2000);
             assertEquals("from-disk\n", stillFile.bodyText(), "arming counters does not take /healthz");
         }
@@ -446,11 +447,11 @@ class ObservabilityTest {
             var health = HttpTestSupport.get(probe.tcpPort(), "/healthz", 2000);
             assertEquals(200, health.statusCode());
             assertEquals("ok\n", health.bodyText());
-            assertTrue(probe.metrics().snapshot().requests() >= 1);
+            assertTrue(awaitRecorded(probe, 1, -1).requests() >= 1);
             assertTrue(probe.describe().contains("healthz"), probe.describe());
         }
 
-        var commonText = Files.readString(commonLog);
+        var commonText = awaitLog(commonLog, "\"GET /index.html HTTP/1.1\" 200 5 ");
         assertTrue(commonText.contains("\"GET /index.html HTTP/1.1\" 200 5 "), commonText);
         assertFalse(commonText.contains("secret"), commonText);
     }
@@ -503,6 +504,37 @@ class ObservabilityTest {
         assertThrows(NullPointerException.class,
                 () -> new sjws_nettask.h3.Http3Server(ServerConfig.builder(dir).build(), new StaticFileHandler(dir))
                         .withSlot(null));
+    }
+
+    /**
+     * The response is written before {@code record}, so a caller that has the bytes can still
+     * observe a stale counter. Spin until the snapshot catches up, or fail at the deadline.
+     */
+    private static Snapshot awaitRecorded(SjwsServer server, long atLeast, long http11) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        Snapshot last = server.metrics().snapshot();
+        while (last.requests() < atLeast || (http11 >= 0 && last.protocol("HTTP/1.1") < http11)) {
+            if (System.nanoTime() >= deadline) {
+                fail("counters stayed at requests=" + last.requests() + " http/1.1=" + last.protocol("HTTP/1.1"));
+            }
+            Thread.yield();
+            last = server.metrics().snapshot();
+        }
+        return last;
+    }
+
+    /** Poll the access log until the writer has flushed {@code needle}, or fail at the deadline. */
+    private static String awaitLog(Path log, String needle) throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        String text = Files.exists(log) ? Files.readString(log) : "";
+        while (!text.contains(needle)) {
+            if (System.nanoTime() >= deadline) {
+                fail("access log did not contain " + needle + " within 2s: " + text);
+            }
+            Thread.yield();
+            text = Files.exists(log) ? Files.readString(log) : "";
+        }
+        return text;
     }
 
     private static String bodyText(sjws_nettask.core.Response response, java.nio.charset.Charset charset) {
