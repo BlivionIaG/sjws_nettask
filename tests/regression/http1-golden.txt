@@ -8,6 +8,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 hello world
 
@@ -21,6 +22,7 @@ Accept-Ranges: bytes
 Content-Type: text/css; charset=utf-8
 Connection: close
 Content-Length: 6
+X-Content-Type-Options: nosniff
 
 body{}
 === 200-binary ===
@@ -33,6 +35,7 @@ Accept-Ranges: bytes
 Content-Type: application/octet-stream
 Connection: close
 Content-Length: 139890
+X-Content-Type-Options: nosniff
 
 line 0 abcdefghijklmnopqrstuvwxyz0123456789
 line 1 abcdefghijklmnopqrstuvwxyz0123456789
@@ -3045,6 +3048,7 @@ Accept-Ranges: bytes
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 14
+X-Content-Type-Options: nosniff
 
 <h1>home</h1>
 
@@ -3058,6 +3062,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 hello world
 
@@ -3071,6 +3076,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 hello world
 
@@ -3084,6 +3090,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 hello world
 
@@ -3095,6 +3102,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 223
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>/sub/</title></head><body><h1>/sub/</h1><a href="/sub/a.css"> a.css </a><br><a href="/sub/b.txt"> b.txt </a><br><a href="/sub/nested/"> nested/ </a><br></body></html>
 === 200-listing-odd-names ===
@@ -3105,6 +3114,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 374
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>/odd/</title></head><body><h1>/odd/</h1><a href="/odd/100%25.txt"> 100%.txt </a><br><a href="/odd/%3Cx%3E%26%22%27.txt"> &lt;x&gt;&amp;&quot;&#39;.txt </a><br><a href="/odd/a%20b.txt"> a b.txt </a><br><a href="/odd/caf%C3%A9.txt"> café.txt </a><br><a href="/odd/plus%2Bsign.txt"> plus+sign.txt </a><br></body></html>
 === head-file ===
@@ -3117,6 +3128,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 
 === head-404 ===
@@ -3127,6 +3139,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 127
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 
 === 404 ===
@@ -3137,6 +3151,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 127
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>
 === 404-traversal ===
@@ -3147,6 +3163,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 127
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>
 === 404-dotfile ===
@@ -3157,6 +3175,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 127
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>
 === 301 ===
@@ -3167,6 +3187,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 66
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 Location: /sub/
 
 <!DOCTYPE html><html><body><a href="/sub/">Moved</a></body></html>
@@ -3178,6 +3200,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 80
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 Location: /sub/?x=1&y=%20
 
 <!DOCTYPE html><html><body><a href="/sub/?x=1&amp;y=%20">Moved</a></body></html>
@@ -3209,6 +3233,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 hello world
 
@@ -3220,6 +3245,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 127
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>
 === 403-file ===
@@ -3230,6 +3257,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 127
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>
 === 405-post ===
@@ -3240,7 +3269,9 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 72
-Allow: GET, HEAD
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
+Allow: GET, HEAD, OPTIONS
 
 <!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>
 === 405-with-body ===
@@ -3251,7 +3282,9 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 72
-Allow: GET, HEAD
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
+Allow: GET, HEAD, OPTIONS
 
 <!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>
 === 400-bad-encoding ===
@@ -3262,6 +3295,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 131
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1></body></html>
 === 400-parser ===
@@ -3272,6 +3307,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 131
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1></body></html>
 === 505 ===
@@ -3282,6 +3319,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 161
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>505 HTTP Version Not Supported</title></head><body><h1>505 HTTP Version Not Supported</h1></body></html>
 === 501-unknown-method ===
@@ -3292,6 +3331,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 139
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>501 Not Implemented</title></head><body><h1>501 Not Implemented</h1></body></html>
 === 206-range ===
@@ -3305,6 +3346,7 @@ Content-Type: application/octet-stream
 Content-Range: bytes 10-29/139890
 Connection: close
 Content-Length: 20
+X-Content-Type-Options: nosniff
 
 defghijklmnopqrstuvw
 === 206-suffix ===
@@ -3318,6 +3360,7 @@ Content-Type: text/plain; charset=utf-8
 Content-Range: bytes 6-11/12
 Connection: close
 Content-Length: 6
+X-Content-Type-Options: nosniff
 
 world
 
@@ -3332,6 +3375,7 @@ Content-Type: text/plain; charset=utf-8
 Content-Range: bytes 6-11/12
 Connection: close
 Content-Length: 6
+X-Content-Type-Options: nosniff
 
 world
 
@@ -3344,6 +3388,8 @@ Content-Type: text/html; charset=utf-8
 Content-Range: bytes */12
 Connection: close
 Content-Length: 151
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>416 Range Not Satisfiable</title></head><body><h1>416 Range Not Satisfiable</h1></body></html>
 === 200-multi-range ===
@@ -3356,6 +3402,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 hello world
 
@@ -3370,6 +3417,7 @@ Content-Type: text/plain; charset=utf-8
 Content-Range: bytes 0-4/12
 Connection: close
 Content-Length: 5
+X-Content-Type-Options: nosniff
 
 hello
 === 200-if-range-etag-mismatch ===
@@ -3382,6 +3430,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 hello world
 
@@ -3395,6 +3444,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: close
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 
 === 200-range-listing ===
@@ -3405,6 +3455,8 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 223
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>/sub/</title></head><body><h1>/sub/</h1><a href="/sub/a.css"> a.css </a><br><a href="/sub/b.txt"> b.txt </a><br><a href="/sub/nested/"> nested/ </a><br></body></html>
 === keepalive-pipelined ===
@@ -3417,6 +3469,7 @@ Accept-Ranges: bytes
 Content-Type: text/plain; charset=utf-8
 Connection: keep-alive
 Content-Length: 12
+X-Content-Type-Options: nosniff
 
 hello world
 HTTP/1.1 200 OK
@@ -3428,6 +3481,7 @@ Accept-Ranges: bytes
 Content-Type: text/css; charset=utf-8
 Connection: keep-alive
 Content-Length: 6
+X-Content-Type-Options: nosniff
 
 HTTP/1.1 404 Not Found
 Server: sjws_nettask web server/0.2
@@ -3436,5 +3490,7 @@ Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
 Content-Length: 127
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 
 <!DOCTYPE html><html><head><meta charset="UTF-8"/><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>

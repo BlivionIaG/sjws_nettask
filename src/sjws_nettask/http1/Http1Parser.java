@@ -63,9 +63,22 @@ public final class Http1Parser {
      * @param contentLength declared body length (0 if none)
      * @param keepAlive whether the connection may be reused after the response
      * @param expectContinue the client waits for "100 Continue" before sending the body
+     * @param chunked the body uses the chunked transfer coding ({@code contentLength} is then 0;
+     *        decode it with {@link ChunkedDecoder})
      */
     public record Head(String method, String target, String version, Map<String, List<String>> headers,
-            long contentLength, boolean keepAlive, boolean expectContinue) {
+            long contentLength, boolean keepAlive, boolean expectContinue, boolean chunked) {
+
+        /** Without a chunked body (source compatibility for callers that build heads directly). */
+        public Head(String method, String target, String version, Map<String, List<String>> headers,
+                long contentLength, boolean keepAlive, boolean expectContinue) {
+            this(method, target, version, headers, contentLength, keepAlive, expectContinue, false);
+        }
+
+        /** @return true if a message body follows the head (Content-Length &gt; 0 or chunked) */
+        public boolean hasBody() {
+            return this.chunked || this.contentLength > 0;
+        }
 
         public boolean headOnly() {
             return "HEAD".equals(this.method);
@@ -130,7 +143,10 @@ public final class Http1Parser {
 
         private final int maxLineLength;
         private final int maxHeaders;
-        private byte[] line = new byte[INITIAL_LINE];
+        private static final byte[] NO_LINE = new byte[0];
+
+        /** Allocated on the first byte of a head and dropped by {@link #reset()} (idle connections). */
+        private byte[] line = NO_LINE;
         private int lineLength;
         private boolean pendingCr;
         private int emptyLines;
@@ -147,11 +163,9 @@ public final class Http1Parser {
             this.maxHeaders = maxHeaders;
         }
 
-        /** Forgets the previous head (keep-alive); drops a line buffer grown by a long line. */
+        /** Forgets the previous head (keep-alive) and drops the line buffer. */
         public void reset() {
-            if (this.line.length > 4 * INITIAL_LINE) {
-                this.line = new byte[INITIAL_LINE];
-            }
+            this.line = NO_LINE;
             this.lineLength = 0;
             this.pendingCr = false;
             this.emptyLines = 0;
@@ -211,7 +225,7 @@ public final class Http1Parser {
                         throw new ParseError(this.inHeaders ? 431 : 414, "line too long");
                     }
                     if (this.lineLength == this.line.length) {
-                        this.line = Arrays.copyOf(this.line, Math.min(this.maxLineLength, 2 * this.line.length));
+                        this.line = Arrays.copyOf(this.line, Math.min(this.maxLineLength, Math.max(INITIAL_LINE, 2 * this.line.length)));
                     }
                     this.line[this.lineLength++] = b;
                 }
@@ -286,7 +300,14 @@ public final class Http1Parser {
             if (RequestRules.checkTarget(parts[1]) == 400) { // (longer than the line limit: 414 above)
                 throw new ParseError(400, "invalid character in request-target");
             }
-            this.target = originForm(parts[1]);
+            if (parts[1].equals("*")) { // asterisk-form (RFC 9112 §3.2.4): OPTIONS only
+                if (!m.equals("OPTIONS")) {
+                    throw new ParseError(400, "asterisk-form target is only allowed for OPTIONS");
+                }
+                this.target = "*";
+            } else {
+                this.target = originForm(parts[1]);
+            }
             this.method = m;
             this.version = v;
         }
@@ -317,9 +338,7 @@ public final class Http1Parser {
         if (hosts.size() > 1 || (version.equals("HTTP/1.1") && hosts.isEmpty())) {
             throw new ParseError(400, "missing or duplicate Host");
         }
-        if (headers.containsKey("transfer-encoding")) {
-            throw new ParseError(501, "Transfer-Encoding not supported"); // also covers TE + CL smuggling
-        }
+        boolean chunked = transferEncoding(version, headers);
         long contentLength = parseContentLength(headers.getOrDefault("content-length", List.of()));
 
         boolean close = false;
@@ -343,7 +362,47 @@ public final class Http1Parser {
 
         headers.replaceAll((k, v) -> Collections.unmodifiableList(v));
         return new Head(method, target, version, Collections.unmodifiableMap(headers),
-                contentLength, keepAlive, expectContinue);
+                contentLength, keepAlive, expectContinue, chunked);
+    }
+
+    /**
+     * Transfer-Encoding rules (RFC 9112 §6.1, §6.3). Every ambiguous case closes the connection:
+     * <ul>
+     * <li>absent: false;</li>
+     * <li>with Content-Length, or in an HTTP/1.0 request: 400 (smuggling vector, §6.1/§6.3 item 3);</li>
+     * <li>exactly "chunked" (case-insensitive, possibly split over lines as "chunked" only once): true;</li>
+     * <li>final coding not chunked, chunked applied twice, or an empty member: 400 (length undeterminable);</li>
+     * <li>another coding before chunked (gzip, chunked): 501 (we implement no other transfer coding).</li>
+     * </ul>
+     */
+    private static boolean transferEncoding(String version, Map<String, List<String>> headers) throws ParseError {
+        var values = headers.get("transfer-encoding");
+        if (values == null) {
+            return false;
+        }
+        if (headers.containsKey("content-length")) {
+            throw new ParseError(400, "Transfer-Encoding with Content-Length");
+        }
+        if (version.equals("HTTP/1.0")) {
+            throw new ParseError(400, "Transfer-Encoding in an HTTP/1.0 request");
+        }
+        var codings = new ArrayList<String>();
+        for (var value : values) {
+            for (var item : value.split(",", -1)) {
+                var c = trimOws(item).toLowerCase(Locale.ROOT);
+                if (c.isEmpty() || !TOKEN.matcher(c).matches()) {
+                    throw new ParseError(400, "invalid Transfer-Encoding");
+                }
+                codings.add(c);
+            }
+        }
+        if (!codings.get(codings.size() - 1).equals("chunked") || codings.indexOf("chunked") != codings.size() - 1) {
+            throw new ParseError(400, "Transfer-Encoding does not end with a single chunked");
+        }
+        if (codings.size() > 1) {
+            throw new ParseError(501, "unsupported transfer coding");
+        }
+        return true;
     }
 
     /** Converts origin-form or absolute-form (http/https) targets to origin-form. */

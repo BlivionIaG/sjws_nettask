@@ -17,13 +17,16 @@
 package sjws_nettask.core;
 
 /**
- * Protocol-neutral request handler: seam between transports and application logic.
+ * Protocol-neutral request handler: the seam between transports (HTTP/1.1, HTTP/3), which parse
+ * and serialize, and application logic (static files today; routing, rights checks or generated
+ * pages later), which decides the {@link Response}.
+ * <p>
  * {@link StaticFileHandler} is the file-serving implementation. A router, a redirect, or a proxy
  * is another implementation and replaces it as the terminal handler. {@link FilterChain} is a
  * handler too: it wraps whichever terminal is installed.
  * <p>
- * Implementations must be thread-safe and should never throw; unexpected failures become a 5xx
- * {@link Response}.
+ * Implementations must be thread-safe (one instance is shared by every connection) and should
+ * never throw: unexpected failures are expected to become a 5xx {@link Response}.
  */
 @FunctionalInterface
 public interface Handler {

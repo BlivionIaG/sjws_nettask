@@ -10,10 +10,12 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | Class | Covers |
 |---|---|
 | `http1/Http1ParserTest` | request-head parsing: smuggling vectors, limits, versions, absolute-form, Connection/Expect; every case runs through the stream API and the byte-level `HeadParser` (whole, chunked, every split, reused) with identical results |
+| `http1/ChunkedDecoderTest` | chunked request bodies (RFC 9112 §7.1): sizes, extensions, trailers, bare CR/LF, overflow, line/trailer/body limits, every input split stops exactly at the body's end |
 | `http1/HeaderTest`, `ToolsTest` | response head, dates, MIME, port parsing |
 | `http1/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
+| `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |
@@ -29,6 +31,8 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/StaticFileHandlerRangeTest` | S5 byte ranges: `Range` parser table (206 / ignored / 416), and per handler mode (uncached `FileBody` region, cache miss, cache hit slice): 206/416, multi and malformed ranges, If-Range strong ETag / exact date / weak / young versions, 304 precedence, HEAD ignores Range, listings/errors/405, index files, empty files |
 | `DocsConsistencyTest` | S6: every `--flag` and `WEB_SERVER_*` variable of `--help` is in the README option tables and vice versa, README defaults match the code, every source package has a JaCoCo gate |
 | `Http1TransportTest` | S4 channel transport: slowloris 408 at the head deadline (silent and trickling), idle keep-alive close, stalled reader closed by the write deadline, slow-but-progressing 50 MB download survives, sendfile exact bytes (50 MB, uncached 200 KB), file shrink during sendfile closes without spinning (process CPU check), fragmented pipelining with a body, timer deregistration, reaper sweep per state (FIN sent at once on expiry), bounded transfer stalls; S5: 50 MB download resumed from an offset with Range + If-Range byte-exact (sendfile), shrink during a ranged sendfile, uncached ranges on both write paths; perf review N1/N2: an unfinished body is cut at the head deadline with a 408, with or without `100 Continue` |
+| `core/SecurityHeadersTest` | `X-Content-Type-Options: nosniff` on every file and generated page; script-free, frame-free `Content-Security-Policy` on listings, errors and redirects |
+| `core/RenderingTest` | reason phrases for every registered status (empty for unregistered codes), error page titles, HEAD error heads, MIME/charset of the added static-file types |
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
@@ -41,6 +45,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `h3/JarLaunchTest` (`@Tag("jar")`) | `java -jar target/sjws_nettask-*.jar --h3` gets HTTP/3 200; runs after `package` |
 | `h3/QuicNativesReportTest` | prints whether the QUIC natives loaded (untagged, always runs) |
 | `MainTest` | entry point: `--help`/`-h` (exit 0), usage errors (64), bad root (2), busy port (1), warnings, startup/shutdown messages |
+| `DaemonTest` | `--daemon`/`--stop`/`--status`/`--restart`, pid-file lock and stale/reused pids, log file, graceful drain on close |
 | `ClientManagerFaultTest`, `Http1EdgeTest` | accept-loop faults (back-off, reset before registration, setOption failure), EOF/CR/body-drain edge cases, failure log |
 | `http1/LegacyApiTest`, `core/CoreApiTest` | legacy wrappers (HTML/Page/Header/CONSTANTS) and small core APIs (ResponseHeaders, Mime, Response, FileCache bounds) |
 
@@ -60,13 +65,14 @@ Every user-visible behaviour and the test that asserts it.
 
 | Behaviour | Asserted by |
 |---|---|
-| every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
+| every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
+| `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
 | `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |
 | `Server started: ...`, `HTTP/3 unavailable` fallback, `Server Terminated properly !` | `MainTest`, `SjwsServerTest`, `h3/SjwsServerHttp3Test` |
 | statuses 200 206 304 301 400 403 404 405 408 413 414 416 431 500 501 505 | `Http1GoldenTest`, `http1/Http1ParserTest`, `http1/FileServingTest`, `core/StaticFileHandlerRangeTest`, `Http1TransportTest`, `h3/Http3ServerTest`, `core/FilterChainTest`, `FilterIntegrationTest` |
-| headers Date, Server, Content-Type/charset, Content-Length, Last-Modified, ETag, Accept-Ranges, Content-Range, Location, Connection, Alt-Svc, Allow | `Http1GoldenTest`, `core/ETagTest`, `AltSvcTest`, `h3/Http3ServerTest` |
+| headers Date, Server, Content-Type/charset, Content-Length, Last-Modified, ETag, Accept-Ranges, Content-Range, Location, Connection, Alt-Svc, Allow, X-Content-Type-Options, Content-Security-Policy | `Http1GoldenTest`, `core/ETagTest`, `AltSvcTest`, `core/SecurityHeadersTest`, `h3/Http3ServerTest` |
 | HTTP/1.1 keep-alive, pipelining, timeouts, limits | `ServerIntegrationTest`, `HardeningIntegrationTest`, `Http1TransportTest` |
 | HTTP/3 parity, limits, Alt-Svc, launch from the jar | `h3/*` |
 
@@ -88,10 +94,10 @@ Lines JaCoCo reports as missed that no behaviour test can reach (or only by faki
 
 ## Known platform gaps (macOS)
 
-The suite is green on Linux. On macOS (CI run 38212694685, manual job only) three tests fail and need a fix in the code, not the test:
+The suite is green on Linux. On macOS (CI run 38212694685, manual job only) three tests failed and need a fix in the code, not the test:
 
 - `core/SafeOpenTest.parentSymlinkRaceNeverLeaksOverHttp1`: a file was served while a parent directory was swapped for a symlink (the race guard relies on Linux `SecureDirectoryStream`/`O_NOFOLLOW` behaviour).
-- `core/FileCacheTest.searchOnlyDirectoryStays403`: a cached file below an execute-only directory is answered 200 instead of 403.
+- ~~`core/FileCacheTest.searchOnlyDirectoryStays403`~~ (fixed): without `SecureDirectoryStream` every open took the path fallback, which skipped the search-only directory rule; the fallback now checks every directory from the root down (`SafeOpenTest.fallbackRefusesFilesBelowSearchOnlyDirectories`).
 - `HardeningIntegrationTest.trickledRequestIsCutOffAtDeadline`: the client sees a reset instead of the 408 (macOS sends RST when a socket with unread data is closed).
 
 ## Mutation testing

@@ -47,9 +47,11 @@ class Http1WriterTest {
         assertEquals("Content-Type: text/html; charset=utf-8", lines[4]);
         assertEquals("Connection: keep-alive", lines[5]);
         assertTrue(lines[6].startsWith("Content-Length: "));
-        assertEquals("Location: /x/", lines[7]);
-        assertEquals("Alt-Svc: h3=\":443\"; ma=86400", lines[8]); // hook output comes last
-        assertEquals(9, lines.length);
+        assertEquals("X-Content-Type-Options: nosniff", lines[7]);
+        assertEquals("Content-Security-Policy: " + StaticFileHandler.HTML_CSP, lines[8]);
+        assertEquals("Location: /x/", lines[9]);
+        assertEquals("Alt-Svc: h3=\":443\"; ma=86400", lines[10]); // hook output comes last
+        assertEquals(11, lines.length);
     }
 
     @Test

@@ -20,6 +20,9 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
+import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import sjws_nettask.core.FilterChain;
@@ -46,6 +49,9 @@ public final class SjwsServer implements AutoCloseable {
     private final Handler override;
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
+    /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
+    private final CountDownLatch shutdownDone = new CountDownLatch(1);
+    private volatile Duration shutdownTimeout = Daemon.DEFAULT_SHUTDOWN_TIMEOUT;
     private Transport h3;
     private Throwable h3Failure;
     private ServerSocketChannel tcp;
@@ -226,6 +232,19 @@ public final class SjwsServer implements AutoCloseable {
         return this.manager;
     }
 
+    /**
+     * How long {@link #close()} waits for HTTP/1 responses already in progress after it stops
+     * accepting. Idle connections are closed immediately. HTTP/3 keeps its own 2 s GOAWAY drain,
+     * run in parallel with this wait.
+     */
+    void shutdownTimeout(Duration timeout) {
+        if (timeout.isNegative() || timeout.toMillis() > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("shutdown timeout out of range");
+        }
+        this.shutdownTimeout = timeout;
+        this.manager.shutdownTimeout(timeout);
+    }
+
     /** One-line summary for the startup log (never contains secrets). */
     public String describe() {
         var sb = new StringBuilder("HTTP/1.1 on tcp/").append(tcpPort());
@@ -244,32 +263,60 @@ public final class SjwsServer implements AutoCloseable {
         this.acceptThread.join();
     }
 
-    /** Stops both listeners. Idempotent; safe if partially started. */
+    /**
+     * Stops both listeners. New connections are refused at once; responses already in progress
+     * are given {@link #shutdownTimeout(Duration)} to finish (HTTP/3 in parallel, up to its own
+     * 2 s drain). Idempotent: a second call waits for the first to finish. Safe if partially started.
+     */
     @Override
     public void close() {
+        long waitMs = this.shutdownTimeout.toMillis() + 3_000;
         if (!this.closed.compareAndSet(false, true)) {
-            return;
-        }
-        this.altSvc.withdraw();
-        if (this.h3 != null) {
-            this.h3.stopAccepting(); // together with TCP; its graceful drain happens below
-        }
-        if (this.manager != null) {
-            this.manager.close();
-        }
-        if (this.acceptThread != null) {
             try {
-                this.acceptThread.join(2000);
+                this.shutdownDone.await(waitMs, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+            return;
         }
-        if (this.h3 != null) {
-            try {
-                this.h3.close();
-            } catch (RuntimeException e) {
-                System.err.println("WARN: error closing " + this.h3.name() + ": " + e);
+        try {
+            this.altSvc.withdraw();
+            if (this.h3 != null) {
+                this.h3.stopAccepting(); // together with TCP, before the listen socket closes
             }
+            if (this.manager != null) {
+                this.manager.close();
+            }
+            Thread h3Shutdown = null;
+            if (this.h3 != null) {
+                var transport = this.h3;
+                h3Shutdown = new Thread(() -> {
+                    try {
+                        transport.close();
+                    } catch (RuntimeException e) {
+                        System.err.println("WARN: error closing " + transport.name() + ": " + e);
+                    }
+                }, "h3-shutdown");
+                h3Shutdown.start();
+            }
+            // An already-interrupted closer must still wait out the drain, then keep the flag.
+            boolean interrupted = Thread.interrupted();
+            try {
+                if (this.acceptThread != null) {
+                    this.acceptThread.join(waitMs);
+                }
+                if (h3Shutdown != null) {
+                    h3Shutdown.join(waitMs);
+                }
+            } catch (InterruptedException e) {
+                interrupted = true;
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        } finally {
+            this.shutdownDone.countDown();
         }
     }
 }

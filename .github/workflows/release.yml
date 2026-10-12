@@ -1,0 +1,69 @@
+name: Release
+
+# Push a tag `vX.Y.Z` (or `vX.Y.Z-rc.N`) to build, verify and publish a GitHub Release.
+# See RELEASING.md.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # create the release and upload assets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for generated notes
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Derive version from tag
+        id: v
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+      # The pom keeps a -SNAPSHOT version on master; the tag decides the released version.
+      - name: Set project version
+        run: mvn -B -q versions:set -DnewVersion="${{ steps.v.outputs.version }}" -DgenerateBackupPoms=false
+
+      - name: Build and verify (tests, jar tests, coverage gate)
+        run: mvn -B verify
+
+      - name: Package distribution
+        id: dist
+        run: |
+          name="sjws_nettask-${{ steps.v.outputs.version }}"
+          mkdir -p "dist/$name"
+          cp "target/$name.jar" "dist/$name/"
+          cp -r target/lib "dist/$name/lib"
+          cp LICENSE README.md "dist/$name/"
+          (cd dist && tar czf "$name.tar.gz" "$name" && zip -qr "$name.zip" "$name")
+          cp "target/$name.jar" dist/
+          (cd dist && sha256sum "$name.tar.gz" "$name.zip" "$name.jar" > SHA256SUMS)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="${{ steps.dist.outputs.name }}"
+          flags=(--title "sjws_nettask ${{ steps.v.outputs.tag }}" --generate-notes --verify-tag)
+          if [[ "${{ steps.v.outputs.prerelease }}" == true ]]; then flags+=(--prerelease); fi
+          gh release create "${{ steps.v.outputs.tag }}" "${flags[@]}" \
+            "dist/$name.tar.gz" "dist/$name.zip" "dist/$name.jar" dist/SHA256SUMS
