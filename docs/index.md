@@ -23,6 +23,7 @@ Back to the [README](../README.md) (quick start).
 - [Implementation overview and measured performance](design/implementation-and-performance.md)
 - [Request routing and reverse proxy (proposal)](design/proxy-routing.md)
 - [Messaging core (draft)](messaging/design.md)
+- [Messaging config and broker apply (draft)](messaging/config.md)
 - [High availability (draft)](ha/design.md)
 
 ## Development
