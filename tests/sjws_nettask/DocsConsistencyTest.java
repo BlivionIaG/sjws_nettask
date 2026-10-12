@@ -1,0 +1,71 @@
+package sjws_nettask;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.TreeSet;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import org.junit.jupiter.api.Test;
+
+/** S6: the README's option tables, {@code --help} and the coverage gates can't drift apart silently. */
+class DocsConsistencyTest {
+
+    private static final Pattern FLAG = Pattern.compile("--[a-z0-9]+(?:-[a-z0-9]+)*");
+    private static final Pattern ENV = Pattern.compile("WEB_SERVER_[A-Z0-9_]+");
+
+    private static TreeSet<String> all(Pattern p, String text) {
+        return p.matcher(text).results().map(m -> m.group()).collect(Collectors.toCollection(TreeSet::new));
+    }
+
+    /** The README's option tables: table rows whose first cell names an option or an argument. */
+    private static String readmeOptionRows() throws IOException {
+        return Files.readAllLines(Path.of("README.md")).stream()
+                .filter(l -> l.startsWith("| `-") || l.startsWith("| `[") || l.startsWith("| |"))
+                .collect(Collectors.joining("\n"));
+    }
+
+    @Test
+    void everyOptionAndVariableIsDocumentedInBothPlaces() throws IOException {
+        var usage = ServerConfig.usage();
+        var readme = readmeOptionRows();
+        assertEquals(all(FLAG, usage), all(FLAG, readme), "--flags: --help vs README option tables");
+        assertEquals(all(ENV, usage), all(ENV, readme), "environment variables: --help vs README option tables");
+        assertTrue(all(FLAG, usage).size() >= 20, "sanity: " + all(FLAG, usage));
+    }
+
+    @Test
+    void readmeDefaultsMatchTheCode() throws IOException {
+        var d = ServerConfig.defaults(".");
+        var readme = readmeOptionRows();
+        assertTrue(readme.contains("`--max-connections=N` | `WEB_SERVER_MAX_CONNECTIONS` | " + d.maxConnections() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_MAX_CONNECTIONS_PER_IP` | " + d.maxConnectionsPerIp() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_BACKLOG` | " + d.backlog() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_IDLE_TIMEOUT` | " + d.idleTimeout().toSeconds() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_HEADER_TIMEOUT` | " + d.headerTimeout().toSeconds() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_WRITE_TIMEOUT` | " + d.writeTimeout().toSeconds() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_CACHE_BYTES` | " + (d.cacheBytes() >> 20) + "m |"));
+        assertTrue(readme.contains("`WEB_SERVER_H3_MAX_CONNECTIONS` | " + d.h3MaxConnections() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP` | " + d.h3MaxConnectionsPerIp() + " |"));
+    }
+
+    @Test
+    void everySourcePackageHasACoverageGate() throws IOException {
+        var packages = new TreeSet<String>();
+        try (var walk = Files.walk(Path.of("src"))) {
+            walk.filter(p -> p.toString().endsWith(".java"))
+                    .forEach(p -> packages.add(Path.of("src").relativize(p.getParent()).toString().replace('/', '.')));
+        }
+        var pom = Files.readString(Path.of("pom.xml"));
+        var gated = new TreeSet<String>();
+        var m = Pattern.compile("<element>PACKAGE</element>\\s*<includes><include>([\\w.]+)</include></includes>")
+                .matcher(pom);
+        while (m.find()) {
+            gated.add(m.group(1));
+        }
+        assertEquals(packages, gated, "every package under src/ needs its own JaCoCo PACKAGE rule (and no stale ones)");
+    }
+}
