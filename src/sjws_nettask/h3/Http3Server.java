@@ -24,6 +24,7 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioDatagramChannel;
+import io.netty.handler.codec.http3.DefaultHttp3GoAwayFrame;
 import io.netty.handler.codec.http3.Http3;
 import io.netty.handler.codec.http3.Http3ErrorCode;
 import io.netty.handler.codec.http3.Http3ServerConnectionHandler;
@@ -84,6 +85,7 @@ public final class Http3Server implements AutoCloseable {
     private final ServerConfig config;
     private final Function<Request, Response> handler;
     private final Set<QuicChannel> connections = ConcurrentHashMap.newKeySet();
+    private final Map<QuicChannel, Connection> state = new ConcurrentHashMap<>();
     private final AtomicInteger connectionCount = new AtomicInteger();
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -127,6 +129,30 @@ public final class Http3Server implements AutoCloseable {
 
         void count(Http3Writer.Outcome outcome) {
             this.outcomes.get(outcome).increment();
+        }
+    }
+
+    /**
+     * Per-connection state. {@code nextStreamId} and {@code goAwayId} are only touched on the
+     * connection's event loop.
+     */
+    static final class Connection {
+
+        final Semaphore files;
+        long nextStreamId; // lowest client request stream id not seen yet
+        long goAwayId = -1; // -1 = no GOAWAY sent; else streams with id >= this are refused
+
+        Connection(Semaphore files) {
+            this.files = files;
+        }
+
+        /** @return false if the stream arrived after a GOAWAY that excluded it */
+        boolean admit(long streamId) {
+            if (this.goAwayId >= 0 && streamId >= this.goAwayId) {
+                return false;
+            }
+            this.nextStreamId = Math.max(this.nextStreamId, streamId + 4);
+            return true;
         }
     }
 
@@ -223,11 +249,13 @@ public final class Http3Server implements AutoCloseable {
             this.connections.remove(quic);
             this.connectionCount.decrementAndGet();
         });
-        var connectionFiles = this.limits.newConnectionFiles();
+        var connection = new Connection(this.limits.newConnectionFiles());
+        this.state.put(quic, connection);
+        quic.closeFuture().addListener(f -> this.state.remove(quic));
         quic.pipeline().addLast(new Http3ServerConnectionHandler(new ChannelInitializer<QuicStreamChannel>() {
             @Override
             protected void initChannel(QuicStreamChannel stream) {
-                stream.pipeline().addLast(new Http3RequestHandler(Http3Server.this.shared, connectionFiles));
+                stream.pipeline().addLast(new Http3RequestHandler(Http3Server.this.shared, connection));
             }
         }));
         quic.pipeline().addLast(QuietErrors.INSTANCE);
@@ -266,29 +294,99 @@ public final class Http3Server implements AutoCloseable {
     }
 
     /**
-     * Closes every connection with H3_NO_ERROR, unbinds the port, interrupts in-flight responses and
-     * stops the event loop. Idempotent; safe after a failed start.
+     * Graceful shutdown (RFC 9114 §5.2): refuses new connections, sends every connection a GOAWAY
+     * naming the first request stream it will not process, lets in-flight requests finish for up to
+     * {@link Limits#drain()}, then closes every connection with H3_NO_ERROR, unbinds the port,
+     * interrupts what is still running and stops the event loop. Idempotent; safe after a failed start.
      */
     @Override
     public void close() {
         if (!this.closed.compareAndSet(false, true)) {
             return;
         }
+        if (this.shared != null) {
+            goAway();
+            drain(System.nanoTime() + this.limits.drain().toNanos());
+        }
         var closing = new ArrayList<io.netty.channel.ChannelFuture>();
         for (var quic : this.connections) {
             closing.add(quic.close(true, Http3ErrorCode.H3_NO_ERROR.code(), Unpooled.EMPTY_BUFFER));
         }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         for (var f : closing) {
-            f.awaitUninterruptibly(1, TimeUnit.SECONDS);
+            f.awaitUninterruptibly(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
         }
         if (this.channel != null) {
             this.channel.close().awaitUninterruptibly(2, TimeUnit.SECONDS);
         }
         if (this.executor != null) {
-            this.executor.shutdownNow();
+            this.executor.shutdownNow(); // interrupts writers still waiting for a slot or for flow control
+            try {
+                this.executor.awaitTermination(1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         if (this.group != null) {
             this.group.shutdownGracefully(0, 2, TimeUnit.SECONDS).awaitUninterruptibly(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Waits until no request is in flight and every connection has stopped sending for two round
+     * trips (a completed response may still sit in quiche's send buffer, unacknowledged: closing the
+     * connection then would cut it), or until the deadline.
+     */
+    private void drain(long deadline) {
+        var lastSent = new java.util.HashMap<QuicChannel, Long>();
+        long quietSince = System.nanoTime();
+        while (System.nanoTime() < deadline) {
+            boolean quiet = inflight() == 0;
+            long quietFor = 100_000_000L; // at least 100 ms
+            for (var quic : this.connections) {
+                try {
+                    var stats = quic.collectStats().get(1, TimeUnit.SECONDS);
+                    var path = quic.collectPathStats(0).get(1, TimeUnit.SECONDS);
+                    quietFor = Math.max(quietFor, 2 * TimeUnit.MILLISECONDS.toNanos(Math.max(0, path.rtt() / 1_000_000)));
+                    Long before = lastSent.put(quic, stats.sentBytes());
+                    quiet &= before != null && before == stats.sentBytes();
+                } catch (Exception e) { // connection closed meanwhile: nothing left to drain on it
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+            if (!quiet) {
+                quietSince = System.nanoTime();
+            } else if (System.nanoTime() - quietSince >= quietFor) {
+                return;
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /** Sends GOAWAY(first unseen request stream id) on every connection's control stream. */
+    private void goAway() {
+        var sent = new ArrayList<io.netty.util.concurrent.Future<?>>();
+        for (var e : this.state.entrySet()) {
+            var quic = e.getKey();
+            var connection = e.getValue();
+            sent.add(quic.eventLoop().submit(() -> {
+                connection.goAwayId = connection.nextStreamId;
+                var control = Http3.getLocalControlStream(quic);
+                if (control != null && control.isActive()) {
+                    control.writeAndFlush(new DefaultHttp3GoAwayFrame(connection.goAwayId));
+                }
+            }));
+        }
+        for (var f : sent) {
+            f.awaitUninterruptibly(1, TimeUnit.SECONDS);
         }
     }
 }

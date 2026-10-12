@@ -27,7 +27,6 @@ import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.util.ReferenceCountUtil;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestHeaders;
@@ -42,17 +41,18 @@ import sjws_nettask.core.StaticFileHandler;
  * Each request takes one server-wide in-flight slot ({@link Limits#maxInflight()}), refused with
  * H3_REQUEST_REJECTED when none is free. The task is tied to the stream's lifetime: when the stream
  * closes (peer reset, connection gone) the task is cancelled, which interrupts a writer waiting for
- * a file slot or for flow control, and the slot is returned.
+ * a file slot or for flow control, and the slot is returned. Streams at or above the id announced
+ * in a GOAWAY (graceful shutdown) are refused the same way.
  */
 final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
 
     private final Http3Server.Shared shared;
-    private final Semaphore connectionFiles;
+    private final Http3Server.Connection connection;
     private boolean started; // event loop only
 
-    Http3RequestHandler(Http3Server.Shared shared, Semaphore connectionFiles) {
+    Http3RequestHandler(Http3Server.Shared shared, Http3Server.Connection connection) {
         this.shared = shared;
-        this.connectionFiles = connectionFiles;
+        this.connection = connection;
     }
 
     /** Pseudo-headers and the fields the core understands; :authority wins over a host field. */
@@ -86,7 +86,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
     }
 
     private void start(QuicStreamChannel stream, Request request) {
-        if (!this.shared.inflight().tryAcquire()) {
+        if (!this.connection.admit(stream.streamId()) || !this.shared.inflight().tryAcquire()) {
             reject(stream);
             return;
         }
@@ -142,7 +142,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                 }
                 var response = respond(this.request);
                 outcome = new Http3Writer(this.stream, Http3RequestHandler.this.shared.limits(),
-                        Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connectionFiles)
+                        Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connection.files)
                         .write(response);
             } finally {
                 finish(outcome);

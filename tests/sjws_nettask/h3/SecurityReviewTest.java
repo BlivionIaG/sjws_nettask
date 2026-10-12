@@ -193,8 +193,12 @@ class SecurityReviewTest {
 
     static Limits limits(int maxInflight, int maxOpenFiles, int perConnection, Duration slotWait,
             Duration writeTimeout, long minRate) {
-        return new Limits(maxInflight, maxOpenFiles, perConnection, slotWait, writeTimeout, minRate,
-                Duration.ofSeconds(2));
+        return limits(maxInflight, maxOpenFiles, perConnection, slotWait, writeTimeout, minRate, Duration.ofSeconds(2));
+    }
+
+    static Limits limits(int maxInflight, int maxOpenFiles, int perConnection, Duration slotWait,
+            Duration writeTimeout, long minRate, Duration drain) {
+        return new Limits(maxInflight, maxOpenFiles, perConnection, slotWait, writeTimeout, minRate, drain);
     }
 
     /**
@@ -360,6 +364,98 @@ class SecurityReviewTest {
             aq.close().sync();
             waitFor(() -> server.inflight() == 0, 5, "slots returned");
             H3Fixture.assertParity(this.handler, "GET", "/sub/", Map.of(), H3TestClient.get(vq, "/sub/"));
+        }
+    }
+
+    /** A client whose connections record every GOAWAY the server sends on its control stream. */
+    static QuicChannel goAwayRecordingConnection(io.netty.channel.EventLoopGroup group, TlsMaterial tls,
+            java.net.InetSocketAddress server, List<Long> goaways) throws Exception {
+        var ssl = io.netty.handler.codec.quic.QuicSslContextBuilder.forClient().trustManager(tls.certificate())
+                .applicationProtocols(io.netty.handler.codec.http3.Http3.supportedApplicationProtocols()).build();
+        var codec = io.netty.handler.codec.http3.Http3.newQuicClientCodecBuilder().sslContext(ssl)
+                .sslEngineProvider(qc -> ssl.newEngine(qc.alloc(), "localhost", 443))
+                .maxIdleTimeout(15000, TimeUnit.MILLISECONDS).initialMaxData(10_000_000)
+                .initialMaxStreamDataBidirectionalLocal(1_000_000).build();
+        var dg = new io.netty.bootstrap.Bootstrap().group(group)
+                .channel(io.netty.channel.socket.nio.NioDatagramChannel.class).handler(codec)
+                .bind(new java.net.InetSocketAddress("127.0.0.1", 0)).sync().channel();
+        var control = new io.netty.channel.ChannelInboundHandlerAdapter() {
+            @Override
+            public void channelRead(io.netty.channel.ChannelHandlerContext ctx, Object msg) {
+                if (msg instanceof io.netty.handler.codec.http3.Http3GoAwayFrame g) {
+                    goaways.add(g.id());
+                }
+                io.netty.util.ReferenceCountUtil.release(msg);
+            }
+        };
+        return QuicChannel.newBootstrap(dg)
+                .handler(new io.netty.handler.codec.http3.Http3ClientConnectionHandler(control, null, null, null, true))
+                .remoteAddress(server).localAddress(dg.localAddress()).connect().get(10, TimeUnit.SECONDS);
+    }
+
+    /**
+     * F4, inverted: close() sends GOAWAY first and lets an in-flight download finish within the drain
+     * window, then closes the connection.
+     */
+    @Test
+    void s3CloseSendsGoAwayAndDrainsInFlightDownloads() throws Exception {
+        var goaways = new java.util.concurrent.CopyOnWriteArrayList<Long>();
+        var group = new io.netty.channel.MultiThreadIoEventLoopGroup(1,
+                io.netty.channel.nio.NioIoHandler.newFactory());
+        try {
+            java.util.function.Function<sjws_nettask.core.Request, sjws_nettask.core.Response> slow = r -> {
+                if (r.target().equals("/large.bin")) {
+                    try {
+                        Thread.sleep(800); // still being handled when close() starts
+                    } catch (InterruptedException e) {
+                        throw new IllegalStateException(e);
+                    }
+                }
+                return this.handler.handle(r);
+            };
+            var server = new Http3Server(config().build(), slow, this.tls)
+                    .limits(limits(100, 100, 16, Duration.ofSeconds(5), Duration.ofSeconds(30), 0, Duration.ofSeconds(10)))
+                    .start();
+            var q = goAwayRecordingConnection(group, this.tls, server.localAddress(), goaways);
+            assertEquals(200, H3TestClient.get(q, "/hello.txt").status()); // stream 0
+            var inflight = H3TestClient.request(q, "GET", "/large.bin", Map.of()); // stream 4, handled slowly
+            waitFor(() -> server.inflight() == 1, 5, "download in flight");
+            long t0 = System.nanoTime();
+            var closer = Thread.ofPlatform().start(server::close);
+            assertFalse(inflight.isDone(), "the download is still in flight when close() starts");
+            var r = inflight.get(15, TimeUnit.SECONDS);
+            closer.join(15_000);
+            long took = System.nanoTime() - t0;
+            assertFalse(r.reset(), "the in-flight download completed: " + r.error() + " " + outcomes(server) + " took " + took / 1_000_000 + " ms, got " + r.body().length + " goaways " + goaways);
+            assertEquals(H3Fixture.LARGE, r.body().length);
+            assertArrayEquals(Files.readAllBytes(this.root.resolve("large.bin")), r.body());
+            assertEquals(List.of(8L), goaways, "GOAWAY names the first unprocessed request stream");
+            assertTrue(took > TimeUnit.MILLISECONDS.toNanos(500), "close() waited for the request");
+            assertTrue(took < TimeUnit.SECONDS.toNanos(9), "returned once drained, not after the full window");
+            assertEquals(1, server.responses(Http3Writer.Outcome.COMPLETE) - 1);
+            q.closeFuture().await(5, TimeUnit.SECONDS);
+            assertFalse(q.isActive(), "connection closed after the drain");
+        } finally {
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).await(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /** S3: the drain window is bounded: a download that doesn't progress is cut when it ends. */
+    @Test
+    void s3DrainWindowIsBounded() throws Exception {
+        var server = new Http3Server(config().build(), this.handler, this.tls)
+                .limits(limits(100, 100, 16, Duration.ofSeconds(5), Duration.ofSeconds(30), 0, Duration.ofMillis(500)))
+                .start();
+        try (var client = new H3TestClient(this.tls.certificate())) {
+            var q = client.connect(server.localAddress());
+            pausedDownloads(q, 1);
+            waitFor(() -> server.inflight() == 1, 5, "stalled download");
+            long t0 = System.nanoTime();
+            server.close();
+            long took = System.nanoTime() - t0;
+            assertTrue(took >= TimeUnit.MILLISECONDS.toNanos(450) && took < TimeUnit.SECONDS.toNanos(4),
+                    "close took " + took / 1_000_000 + " ms");
+            waitFor(() -> !q.isActive(), 5, "connection closed");
         }
     }
 }
