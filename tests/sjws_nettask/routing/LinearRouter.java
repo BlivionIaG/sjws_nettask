@@ -21,7 +21,9 @@ import java.util.Locale;
 
 /**
  * Reference matcher for the differential test: the first-match linear scan that {@link Router}
- * used before {@link CompiledRoutes}, copied verbatim so a change to {@code Router} cannot change it.
+ * used before {@link CompiledRoutes}, copied so a change to {@code Router} cannot change it. Since
+ * copying it, only the approved rule changes were applied: ASCII-only case folding, one trailing dot
+ * of the request host ignored, an unclosed {@code [} matching no host-specific route.
  */
 final class LinearRouter {
 
@@ -51,11 +53,17 @@ final class LinearRouter {
         }
         host = host.toLowerCase(Locale.ROOT);
         int end = hostEnd(requestHost);
+        if (end < 0) {
+            return false;
+        }
+        if (end > 0 && requestHost.charAt(0) != '['  && requestHost.charAt(end - 1) == '.') {
+            end--;
+        }
         if (host.startsWith("*.")) {
             int suffix = host.length() - 1;
-            return end > suffix && requestHost.regionMatches(true, end - suffix, host, 1, suffix);
+            return end > suffix && ascii(requestHost.substring(end - suffix, end)).equals(host.substring(1));
         }
-        return end == host.length() && requestHost.regionMatches(true, 0, host, 0, end);
+        return end == host.length() && ascii(requestHost.substring(0, end)).equals(host);
     }
 
     static boolean matchesPath(String prefix, String target, int pathEnd) {
@@ -66,10 +74,18 @@ final class LinearRouter {
         return n == pathEnd || prefix.charAt(n - 1) == '/' || target.charAt(n) == '/';
     }
 
+    static String ascii(String s) {
+        var sb = new StringBuilder(s.length());
+        for (char c : s.toCharArray()) {
+            sb.append(c >= 'A' && c <= 'Z' ? (char) (c + 32) : c);
+        }
+        return sb.toString();
+    }
+
     static int hostEnd(String host) {
         if (host.startsWith("[")) {
             int close = host.indexOf(']');
-            return close < 0 ? host.length() : close + 1;
+            return close < 0 ? -1 : close + 1;
         }
         int colon = host.indexOf(':');
         return colon < 0 ? host.length() : colon;

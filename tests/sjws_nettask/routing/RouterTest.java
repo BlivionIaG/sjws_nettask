@@ -63,7 +63,7 @@ class RouterTest {
         assertEquals("v6", router.handle(req("[::1]:80", "/")).headers().get("x-h"));
         assertEquals(404, router.handle(req("other.org", "/")).status());
         assertEquals(404, router.handle(req(null, "/")).status());
-        assertEquals(4, Router.hostEnd("[::1"));
+        assertEquals(-1, Router.hostEnd("[::1"));
         assertEquals(3, router.routes().size());
         assertEquals(404, router.handle(req("example.com.evil", "/")).status());
         assertEquals(404, router.handle(req("example.co", "/")).status());
@@ -71,6 +71,29 @@ class RouterTest {
         assertEquals(404, router.handle(req(".example.com", "/")).status());
         assertEquals(404, router.handle(req("xexample.com", "/")).status());
         assertEquals("wild", router.handle(req("A.B.EXAMPLE.COM:1", "/")).headers().get("x-h"));
+    }
+
+    @Test
+    void hostRules() {
+        var router = new Router(List.of(
+                new Route("example.com", "/", null, echo("exact")),
+                new Route("*.example.com", "/", null, echo("wild")),
+                new Route("k.test", "/", null, echo("k")),
+                new Route(null, "/", null, echo("any"))), null);
+        // one trailing dot of the request host is ignored, with or without a port
+        assertEquals("exact", router.handle(req("example.com.", "/")).headers().get("x-h"));
+        assertEquals("exact", router.handle(req("Example.COM.:8080", "/")).headers().get("x-h"));
+        assertEquals("wild", router.handle(req("a.example.com.", "/")).headers().get("x-h"));
+        assertEquals("any", router.handle(req("example.com..", "/")).headers().get("x-h"));
+        // ASCII-only case folding: KELVIN SIGN is not 'k'
+        assertEquals("k", router.handle(req("K.TEST", "/")).headers().get("x-h"));
+        assertEquals("any", router.handle(req("\u212a.test", "/")).headers().get("x-h"));
+        // an unclosed '[' matches host-less routes only
+        assertEquals("any", router.handle(req("[::1", "/")).headers().get("x-h"));
+        assertFalse(Router.hostMatches("[::1]", "[::1"));
+        assertTrue(Router.hostMatches("[::1]", "[::1]:443"));
+        assertTrue(Router.prefixCovers("/a/", "/a/b"));
+        assertFalse(Router.prefixCovers("/a/b", "/a/"));
     }
 
     @Test
@@ -113,6 +136,11 @@ class RouterTest {
         assertThrows(IllegalArgumentException.class, () -> new Route("", "/", null, echo("a")));
         assertThrows(IllegalArgumentException.class, () -> new Route("*.", "/", null, echo("a")));
         assertThrows(IllegalArgumentException.class, () -> new Route("h:80", "/", null, echo("a")));
+        assertThrows(IllegalArgumentException.class, () -> new Route("[::1", "/", null, echo("a")));
+        assertThrows(IllegalArgumentException.class, () -> new Route("[::1]x", "/", null, echo("a")));
+        assertThrows(IllegalArgumentException.class, () -> new Route("example.com.", "/", null, echo("a")));
+        assertThrows(IllegalArgumentException.class, () -> new Route(null, "/a?b", null, echo("a")));
+        assertThrows(IllegalArgumentException.class, () -> new Route(null, "/a#b", null, echo("a")));
         assertThrows(IllegalArgumentException.class, () -> new Route("x", echo("a")));
         assertThrows(IllegalArgumentException.class, () -> new Route(null, "/", "x", echo("a")));
         assertThrows(NullPointerException.class, () -> new Route(null, echo("a")));

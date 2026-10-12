@@ -58,7 +58,7 @@ final class RoutingCompiler {
                 case RouteSpec.Action.Redirect r -> new RedirectHandler(r.status(), r.location(), r.keepPath());
                 case RouteSpec.Action.Static s -> files;
             };
-            routes.add(new Router.Route(spec.host(), spec.prefix(), spec.rewrite(), handler));
+            routes.add(new Router.Route(spec.routerHost(), spec.prefix(), spec.rewrite(), handler));
         }
         return new Router(routes, files);
     }

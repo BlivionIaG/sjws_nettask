@@ -17,7 +17,6 @@
 package sjws_nettask.routing;
 
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
@@ -54,39 +53,29 @@ public final class Router implements Handler {
             if (!prefix.startsWith("/") || (rewrite != null && !rewrite.startsWith("/"))) {
                 throw new IllegalArgumentException("prefix and rewrite must start with /");
             }
-            if (host != null && (host.isEmpty() || host.equals("*.") || host.indexOf(':') >= 0 && !host.startsWith("["))) {
+            if (prefix.indexOf('?') >= 0 || prefix.indexOf('#') >= 0) {
+                throw new IllegalArgumentException("prefix must not contain ? or #: " + prefix);
+            }
+            if (host != null && (host.isEmpty() || host.equals("*.") || host.endsWith(".")
+                    || host.indexOf(':') >= 0 && !host.startsWith("[")
+                    || host.startsWith("[") && (!host.endsWith("]") || host.indexOf(']') != host.length() - 1))) {
                 throw new IllegalArgumentException("bad host: " + host);
             }
-            host = host == null ? null : host.toLowerCase(Locale.ROOT);
+            host = host == null ? null : asciiLower(host);
         }
 
         public Route(String prefix, Handler handler) {
             this(null, prefix, null, handler);
         }
 
-        /** Allocation-free: compares {@code host} with the request Host up to its port. */
+        /** Allocation-free; see {@link Router#hostMatches}. */
         boolean matchesHost(String requestHost) {
-            if (this.host == null) {
-                return true;
-            }
-            if (requestHost == null) {
-                return false;
-            }
-            int end = hostEnd(requestHost);
-            if (this.host.startsWith("*.")) {
-                int suffix = this.host.length() - 1; // ".example.com"
-                return end > suffix && requestHost.regionMatches(true, end - suffix, this.host, 1, suffix);
-            }
-            return end == this.host.length() && requestHost.regionMatches(true, 0, this.host, 0, end);
+            return hostMatches(this.host, requestHost);
         }
 
-        /** Allocation-free: {@code pathEnd} is the index of '?' in the target, or its length. */
+        /** Allocation-free; see {@link Router#pathMatches}. */
         boolean matchesPath(String target, int pathEnd) {
-            int n = this.prefix.length();
-            if (n > pathEnd || !target.startsWith(this.prefix)) {
-                return false;
-            }
-            return n == pathEnd || this.prefix.charAt(n - 1) == '/' || target.charAt(n) == '/';
+            return pathMatches(this.prefix, target, pathEnd);
         }
 
         String rewriteTarget(String target) {
@@ -126,8 +115,7 @@ public final class Router implements Handler {
     @Override
     public Response handle(Request request) {
         var target = request.target();
-        int q = target.indexOf('?');
-        int pathEnd = q < 0 ? target.length() : q;
+        int pathEnd = pathEnd(target);
         if (hasDotDot(target, pathEnd)) {
             return StaticFileHandler.error(400, request.headOnly());
         }
@@ -159,14 +147,97 @@ public final class Router implements Handler {
         return -1;
     }
 
-    /** End of the host name: before ":port", or after the "]" of an IPv6 literal. */
-    static int hostEnd(String host) {
+    /** Index of the first {@code ?} in {@code target}, or its length: where the path ends. */
+    public static int pathEnd(String target) {
+        int q = target.indexOf('?');
+        return q < 0 ? target.length() : q;
+    }
+
+    /**
+     * The path rule shared by the request path and config checks ({@code RouteSpec},
+     * {@code RouteTable.shadows()}): {@code target[0, pathEnd)} starts with {@code prefix}
+     * (case-sensitive, raw percent-encoded), and the prefix ends at the path end, ends in
+     * {@code /}, or is followed by {@code /}. Allocation-free.
+     */
+    public static boolean pathMatches(String prefix, String target, int pathEnd) {
+        int n = prefix.length();
+        if (n > pathEnd || !target.startsWith(prefix)) {
+            return false;
+        }
+        return n == pathEnd || prefix.charAt(n - 1) == '/' || target.charAt(n) == '/';
+    }
+
+    /** True when every target {@code later} matches is also matched by {@code earlier}. */
+    public static boolean prefixCovers(String earlier, String later) {
+        return pathMatches(earlier, later, later.length());
+    }
+
+    /**
+     * The host rule shared by the request path and config checks. {@code routeHost} is null (any
+     * request, also without Host), a lower-case exact name or {@code [v6]} literal, or
+     * {@code *.suffix} (a sub-domain at any depth, never the apex). Compared with ASCII-only case
+     * folding against the request host up to {@link #hostEnd}: port stripped, one trailing dot
+     * ignored, and an unclosed {@code [} matches no host-specific route. Allocation-free.
+     */
+    public static boolean hostMatches(String routeHost, String requestHost) {
+        if (routeHost == null) {
+            return true;
+        }
+        if (requestHost == null) {
+            return false;
+        }
+        int end = hostEnd(requestHost);
+        if (end < 0) {
+            return false;
+        }
+        if (routeHost.startsWith("*.")) {
+            int suffix = routeHost.length() - 1; // ".example.com"
+            return end > suffix && asciiRegionEquals(requestHost, end - suffix, routeHost, 1, suffix);
+        }
+        return end == routeHost.length() && asciiRegionEquals(requestHost, 0, routeHost, 0, end);
+    }
+
+    /**
+     * End of the host name in a Host value: before {@code :port} and one trailing dot, or after
+     * the {@code ]} of an IPv6 literal (a port is only stripped after it). -1 for an unclosed
+     * {@code [}.
+     */
+    public static int hostEnd(String host) {
         if (host.startsWith("[")) {
             int close = host.indexOf(']');
-            return close < 0 ? host.length() : close + 1;
+            return close < 0 ? -1 : close + 1;
         }
         int colon = host.indexOf(':');
-        return colon < 0 ? host.length() : colon;
+        int end = colon < 0 ? host.length() : colon;
+        return end > 0 && host.charAt(end - 1) == '.' ? end - 1 : end;
+    }
+
+    /** {@code a[aFrom, aFrom+n)} equals {@code b[bFrom, bFrom+n)} folding only A-Z to a-z. */
+    static boolean asciiRegionEquals(String a, int aFrom, String b, int bFrom, int n) {
+        for (int i = 0; i < n; i++) {
+            if (asciiLower(a.charAt(aFrom + i)) != asciiLower(b.charAt(bFrom + i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static char asciiLower(char c) {
+        return c >= 'A' && c <= 'Z' ? (char) (c + 32) : c;
+    }
+
+    static String asciiLower(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 'A' && c <= 'Z') {
+                var chars = s.toCharArray();
+                for (int j = i; j < chars.length; j++) {
+                    chars[j] = asciiLower(chars[j]);
+                }
+                return new String(chars);
+            }
+        }
+        return s;
     }
 
     /** True if a path segment of {@code target[0, end)} is "..", with either dot possibly "%2e". */

@@ -35,7 +35,7 @@ import sjws_nettask.routing.Router.Route;
 class CompiledRoutesTest {
 
     static final String[] ROUTE_HOSTS = {null, null, null, "example.com", "Example.COM", "*.example.com",
-            "*.b.example.com", "a.example.com", "[::1]", "[::1", "k.test", "*.test", "xn--bcher-kva.example"};
+            "*.b.example.com", "a.example.com", "[::1]", "k.test", "*.test", "xn--bcher-kva.example"};
     static final String[] PREFIXES = {"/", "/a", "/a/", "/ab", "/a/b", "/a/b/", "/b", "/b/c", "/%2e", "/a;x", "/A",
             "/a.b", "/api", "/api/v1", "/api/v1/", "/x/y/z"};
     static final String[] TARGETS = {"", "/", "/a", "/a/", "/ab", "/abc", "/a/b", "/a/b/c", "/a?x", "/a/?", "/A/b",
@@ -45,7 +45,7 @@ class CompiledRoutesTest {
     static final String[] HOSTS = {null, "", "example.com", "EXAMPLE.com:80", "a.example.com", "x.a.example.com",
             "b.example.com", "c.b.example.com", ".example.com", "example.com.", "[::1]", "[::1]:8080", "[::1", "::1",
             "k.test", "\u212a.test", "K.TEST:1", "a.b.example.com.", "test", "x.test", "XN--BCHER-KVA.example",
-            "[::2]", "example.com:", ":80"};
+            "[::2]", "example.com:", ":80", ".", "example.com..", "a.example.com.:443", "[::1].", "[::1]:80."};
 
     static Handler named(String name) {
         var response = new Response(200, ResponseHeaders.of().add("x-h", name), Body.Empty.INSTANCE);

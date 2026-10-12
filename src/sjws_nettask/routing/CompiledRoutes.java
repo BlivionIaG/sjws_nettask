@@ -67,8 +67,8 @@ final class CompiledRoutes {
     /** @param host the Host header or null; @return lowest matching index, or -1 */
     int match(String host, String target, int pathEnd) {
         int best = this.any.match(target, pathEnd, Integer.MAX_VALUE);
-        if (host != null) {
-            int end = HostTable.end(host);
+        int end = host == null ? -1 : Router.hostEnd(host);
+        if (end >= 0) { // null or an unclosed '[': host-less routes only
             var paths = this.exact.get(host, 0, end);
             if (paths != null) {
                 best = paths.match(target, pathEnd, best);
@@ -187,7 +187,7 @@ final class CompiledRoutes {
         }
     }
 
-    /** Lower-case host names (or ".suffix") to their {@link PathTable}, matched ignoring case. */
+    /** Lower-case host names (or ".suffix") to their {@link PathTable}, matched with ASCII-only case folding. */
     static final class HostTable {
 
         private final String[] keys;
@@ -204,11 +204,6 @@ final class CompiledRoutes {
             this.seed = seed;
         }
 
-        /** Same as {@link Router#hostEnd}. */
-        static int end(String host) {
-            return Router.hostEnd(host);
-        }
-
         PathTable get(String host, int from, int to) {
             int n = to - from;
             int h = hash(this.seed, host, from, to);
@@ -217,21 +212,16 @@ final class CompiledRoutes {
                 if (key == null) {
                     return null;
                 }
-                if (this.hashes[slot] == h && key.length() == n && host.regionMatches(true, from, key, 0, n)) {
+                if (this.hashes[slot] == h && key.length() == n && Router.asciiRegionEquals(host, from, key, 0, n)) {
                     return this.paths[slot];
                 }
             }
         }
 
-        /** Consistent with {@code regionMatches(true, ...)}: equal ignoring case implies equal fold. */
-        static char fold(char c) {
-            return Character.toLowerCase(Character.toUpperCase(c));
-        }
-
         static int hash(int seed, String s, int from, int to) {
             int h = seed;
             for (int i = from; i < to; i++) {
-                h = h * 31 + fold(s.charAt(i));
+                h = h * 31 + Router.asciiLower(s.charAt(i));
             }
             return mix(h);
         }
