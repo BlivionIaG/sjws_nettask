@@ -28,6 +28,8 @@ class SjwsServerTest {
         final Exception failure;
         final AtomicInteger starts = new AtomicInteger();
         final AtomicInteger closes = new AtomicInteger();
+        final java.util.List<String> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+        volatile int tcpPort = -1;
 
         FakeTransport(int port, Exception failure) {
             this.port = port;
@@ -54,7 +56,24 @@ class SjwsServerTest {
         }
 
         @Override
+        public void stopAccepting() {
+            if (tcpPort < 0) {
+                events.add("stopAccepting");
+                return;
+            }
+            boolean tcpOpen;
+            try (var s = new java.net.Socket()) {
+                s.connect(new java.net.InetSocketAddress("127.0.0.1", tcpPort), 500);
+                tcpOpen = true;
+            } catch (IOException e) {
+                tcpOpen = false;
+            }
+            events.add("stopAccepting tcp=" + (tcpOpen ? "open" : "closed"));
+        }
+
+        @Override
         public void close() {
+            events.add("close");
             closes.incrementAndGet();
         }
     }
@@ -168,6 +187,16 @@ class SjwsServerTest {
         assertEquals(4433, server.udpPort(), "HTTP/3 runs");
         assertNull(server.altSvc().current());
         assertNull(get("/hello.txt").headers().get("alt-svc"));
+    }
+
+    /** S-8: HTTP/3 stops accepting when TCP does (not after the TCP accept thread has been joined). */
+    @Test
+    void h3StopsAcceptingTogetherWithTcp() throws Exception {
+        var fake = new FakeTransport(4433, null);
+        server = SjwsServer.start(config(true), (c, h) -> fake);
+        fake.tcpPort = server.tcpPort();
+        server.close();
+        assertEquals(java.util.List.of("stopAccepting tcp=open", "close"), fake.events);
     }
 
     @Test

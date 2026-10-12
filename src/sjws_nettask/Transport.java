@@ -38,6 +38,14 @@ public interface Transport extends AutoCloseable {
     /** @return the bound port; only valid after a successful {@link #start()} */
     int port();
 
+    /**
+     * Refuses new connections from now on; existing ones keep being served until {@link #close()}.
+     * Called at the moment the HTTP/1.1 listener stops, so no protocol accepts clients longer than
+     * the other. Idempotent.
+     */
+    default void stopAccepting() {
+    }
+
     /** Stops serving and releases the port. Idempotent; safe after a failed start. */
     @Override
     void close();

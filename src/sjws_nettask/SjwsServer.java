@@ -147,6 +147,9 @@ public final class SjwsServer implements AutoCloseable {
             return;
         }
         this.altSvc.withdraw();
+        if (this.h3 != null) {
+            this.h3.stopAccepting(); // together with TCP; its graceful drain happens below
+        }
         if (this.manager != null) {
             this.manager.close();
         }

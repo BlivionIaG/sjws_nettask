@@ -100,6 +100,7 @@ public final class Http3Server implements Transport {
     private final Supplier<Throwable> unavailabilityCause;
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private volatile boolean accepting = true;
     private final Map<Http3Writer.Outcome, LongAdder> outcomes = new EnumMap<>(Http3Writer.Outcome.class);
     private Limits limits;
     private Shared shared;
@@ -258,7 +259,7 @@ public final class Http3Server implements Transport {
     }
 
     private void accept(QuicChannel quic) {
-        boolean refused = this.closed.get(); // read once: close() may flip it concurrently
+        boolean refused = !this.accepting; // read once: close() may flip it concurrently
         // accept() and the closeFuture listeners run on the one event loop, so size() is exact here
         if (refused || this.state.size() >= this.config.h3MaxConnections()) {
             // Close once the handshake is done: a close from initChannel never reaches the client,
@@ -333,6 +334,11 @@ public final class Http3Server implements Transport {
         return this.outcomes.get(outcome).sum();
     }
 
+    @Override
+    public void stopAccepting() {
+        this.accepting = false;
+    }
+
     /**
      * Graceful shutdown (RFC 9114 §5.2): refuses new connections, sends every connection a GOAWAY
      * naming the first request stream it will not process, lets in-flight requests finish for up to
@@ -344,6 +350,7 @@ public final class Http3Server implements Transport {
         if (!this.closed.compareAndSet(false, true)) {
             return;
         }
+        stopAccepting();
         if (this.shared != null) {
             goAway();
             drain(System.nanoTime() + this.limits.drain().toNanos());

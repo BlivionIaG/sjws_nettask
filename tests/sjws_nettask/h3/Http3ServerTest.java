@@ -724,6 +724,18 @@ class Http3ServerTest {
         }
     }
 
+    @Test
+    void stopAcceptingRefusesNewConnectionsButServesOpenOnes() throws Exception {
+        try (var s = new Http3Server(config().build(), this.handler, this.tls).start();
+                var c = new H3TestClient(this.tls.certificate())) {
+            var open = c.connect(s.localAddress());
+            s.stopAccepting();
+            s.stopAccepting();
+            assertRefused(c, s);
+            assertEquals(200, H3TestClient.get(open, "/hello.txt").status());
+        }
+    }
+
     /** The connection over the limit is closed promptly with H3_EXCESSIVE_LOAD (a hang fails). */
     static void assertRefused(H3TestClient c, Http3Server s) throws Exception {
         var close = new java.util.concurrent.atomic.AtomicReference<io.netty.handler.codec.quic.QuicConnectionCloseEvent>();
