@@ -186,12 +186,16 @@ final class Http1Connection implements Runnable {
             keepAlive = false; // answer, then close instead of reading the body
         } else if (length > 0) {
             if (request.expectContinue()) {
-                out.write(CONTINUE);
+                out.write(CONTINUE); // runs under the write deadline ...
+                timer.resumeHead(); // ... then the body is bounded by the head deadline again
             }
             // GET/HEAD bodies have no meaning; discard them (the head deadline still applies)
             long remaining = length;
             while (remaining > 0) {
                 if (!hasInput() && fill() < 0) {
+                    if (timer.headExpired()) { // no final response was sent yet (100 is interim)
+                        send(out, StaticFileHandler.error(408, false), false);
+                    }
                     return false;
                 }
                 int n = (int) Math.min(remaining, this.in.remaining());
