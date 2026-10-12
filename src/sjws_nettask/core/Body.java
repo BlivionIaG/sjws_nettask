@@ -63,25 +63,37 @@ public sealed interface Body permits Body.Empty, Body.Bytes, Body.FileBody {
     /**
      * A region of a file, streamed by the writer.
      * <p>
-     * Writer contract: open {@code realPath} with {@code LinkOption.NOFOLLOW_LINKS}; if
-     * {@code expected.fileKey()} is non-null, check it against the opened path before sending the
-     * head (a mismatch means the file was swapped: fail without sending anything); send exactly
-     * {@code length} bytes starting at {@code offset}; if the file ends early, abort the
+     * Writer contract: open the file with {@link SafeOpen#open} (never by path), which fails if
+     * {@code realPath} no longer names, inside {@code root}, the file identified by {@code expected}
+     * (swapped by a rename or a symlink in any component): then fail without sending anything; send
+     * exactly {@code length} bytes starting at {@code offset}; if the file ends early, abort the
      * connection/stream rather than send a short body.
      *
      * @param realPath fully resolved path inside the document root
      * @param offset first byte to send
      * @param length number of bytes to send
      * @param expected file identity at resolution time
+     * @param root real path of the document root the file was resolved in (a prefix of {@code realPath});
+     *        the writer opens every component below it without following symlinks
      */
-    record FileBody(Path realPath, long offset, long length, Validator expected) implements Body {
+    record FileBody(Path realPath, long offset, long length, Validator expected, Path root) implements Body {
 
         public FileBody {
             Objects.requireNonNull(realPath, "realPath");
             Objects.requireNonNull(expected, "expected");
+            Objects.requireNonNull(root, "root");
             if (offset < 0 || length < 0) {
                 throw new IllegalArgumentException("negative offset/length");
             }
+            if (!realPath.isAbsolute() || !realPath.startsWith(root)) {
+                throw new IllegalArgumentException("realPath must be absolute and inside root");
+            }
+        }
+
+        /** A file outside any document root: components are checked from the file-system root. */
+        public FileBody(Path realPath, long offset, long length, Validator expected) {
+            this(realPath, offset, length, expected, Objects.requireNonNull(realPath, "realPath").getRoot() == null
+                    ? realPath : realPath.getRoot());
         }
     }
 }

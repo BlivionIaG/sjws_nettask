@@ -105,8 +105,8 @@ public final class StaticFileHandler {
             return error(403, head);
         }
         var attributes = Files.readAttributes(file.real(), BasicFileAttributes.class);
-        return fileResponse(file.logical().getFileName().toString(), file.real(), attributes, head,
-                conditionals.ifModifiedSince());
+        return fileResponse(file.logical().getFileName().toString(), this.resolver.realRoot(), file.real(),
+                attributes, head, conditionals.ifModifiedSince());
     }
 
     /**
@@ -117,6 +117,15 @@ public final class StaticFileHandler {
      */
     public static Response fileResponse(String name, Path realPath, BasicFileAttributes attributes, boolean head,
             String ifModifiedSince) {
+        return fileResponse(name, realPath.getRoot() == null ? realPath : realPath.getRoot(), realPath, attributes,
+                head, ifModifiedSince);
+    }
+
+    /**
+     * Same, for a file resolved inside {@code realRoot} (the writer opens it relative to that root).
+     */
+    public static Response fileResponse(String name, Path realRoot, Path realPath, BasicFileAttributes attributes,
+            boolean head, String ifModifiedSince) {
         var modified = attributes.lastModifiedTime().toInstant().truncatedTo(ChronoUnit.SECONDS);
         var headers = ResponseHeaders.of()
                 .add("last-modified", HttpDate.format(modified))
@@ -127,7 +136,7 @@ public final class StaticFileHandler {
             return new Response(304, headers, Body.Empty.INSTANCE, head);
         }
         return new Response(200, headers,
-                new Body.FileBody(realPath, 0, attributes.size(), Validator.of(attributes)), head);
+                new Body.FileBody(realPath, 0, attributes.size(), Validator.of(attributes), realRoot), head);
     }
 
     /** Convenience for callers holding a plain path (no containment check). */

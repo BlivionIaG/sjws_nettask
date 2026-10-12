@@ -26,10 +26,6 @@ import io.netty.handler.codec.http3.Http3HeadersFrame;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
-import java.nio.file.StandardOpenOption;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -41,6 +37,7 @@ import sjws_nettask.HTTP.Http1Writer;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.HttpDate;
 import sjws_nettask.core.Response;
+import sjws_nettask.core.SafeOpen;
 
 /**
  * Serializes a core {@link Response} on one HTTP/3 request stream: a HEADERS frame
@@ -120,15 +117,11 @@ final class Http3Writer {
             try {
                 FileChannel fc;
                 try {
-                    fc = FileChannel.open(file.realPath(), StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+                    fc = SafeOpen.open(file);
                 } catch (IOException e) {
-                    return Outcome.SWAPPED; // deleted, replaced by a symlink (ELOOP) or unreadable: nothing sent
+                    return Outcome.SWAPPED; // deleted, swapped (symlink in any component, other inode), unreadable
                 }
                 try (fc) {
-                    if (file.expected().fileKey() != null && !file.expected().sameFile(Files.readAttributes(
-                            file.realPath(), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS))) {
-                        return Outcome.SWAPPED; // another inode (renamed over): nothing sent
-                    }
                     this.channel.write(head);
                     return sendFile(fc, file);
                 }
