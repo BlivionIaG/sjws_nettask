@@ -47,10 +47,15 @@ import sjws_nettask.core.SafeOpen;
  * Runs on a virtual thread, never on the event loop: file reads block, and before each chunk the
  * writer waits until the previous one has been accepted by the QUIC stream (its write future
  * completes only once quiche took all of it, i.e. within the peer's flow-control window). So at most
- * one chunk per stream waits in memory while the next is read, and a peer that stops reading
- * stalls the writer, which gives up after the write timeout. If the response cannot be completed (file swapped
- * before the head, file shrank, peer stopped reading, stream gone) the stream is reset instead of
- * ending with a short body.
+ * one chunk per stream waits in memory while the next is read. A peer that stops reading stalls the
+ * writer, which gives up after the write timeout; one that reads too slowly on average (drip
+ * reading) is cut off by the {@link RateGuard}.
+ * <p>
+ * A file response first takes a slot of its connection, then a server-wide one, each waiting at most
+ * {@link Limits#slotWait()}; if none frees up, the stream is refused with H3_REQUEST_REJECTED
+ * (RFC 9114 §4.1.1: safe to retry) before anything was sent. If the response cannot be completed
+ * (file swapped before the head, file shrank, peer stopped reading, stream gone) the stream is reset
+ * instead of ending with a short body.
  */
 final class Http3Writer {
 
@@ -60,18 +65,21 @@ final class Http3Writer {
     static final Set<String> NOT_COPIED = Set.of("connection", "keep-alive", "proxy-connection", "transfer-encoding",
             "upgrade", "te", "content-length", "date", "server", "alt-svc");
 
-    /** Why a response was not completed. */
-    enum Outcome { COMPLETE, SWAPPED, SHRANK, STALLED, CLOSED, FAILED }
+    /** How a response ended: completed, or why the stream was reset. */
+    enum Outcome { COMPLETE, SWAPPED, SHRANK, STALLED, SLOW, REJECTED, CLOSED, FAILED }
 
     private final QuicStreamChannel channel;
-    private final long writeTimeoutNanos;
-    private final Semaphore openFiles;
+    private final Limits limits;
+    private final Semaphore serverFiles;
+    private final Semaphore connectionFiles;
     private ChannelFuture previous; // last DATA write
+    private RateGuard rate;
 
-    Http3Writer(QuicStreamChannel channel, long writeTimeoutNanos, Semaphore openFiles) {
+    Http3Writer(QuicStreamChannel channel, Limits limits, Semaphore serverFiles, Semaphore connectionFiles) {
         this.channel = channel;
-        this.writeTimeoutNanos = writeTimeoutNanos;
-        this.openFiles = openFiles;
+        this.limits = limits;
+        this.serverFiles = serverFiles;
+        this.connectionFiles = connectionFiles;
     }
 
     static Http3HeadersFrame headersFrame(Response response, Instant now) {
@@ -96,16 +104,19 @@ final class Http3Writer {
         try {
             var outcome = send(response);
             if (outcome != Outcome.COMPLETE) {
-                reset();
+                reset(outcome);
             }
             return outcome;
-        } catch (InterruptedException e) {
+        } catch (InterruptedException e) { // cancelled: stream closed or server shutting down
             Thread.currentThread().interrupt();
-            reset();
+            reset(Outcome.CLOSED);
             return Outcome.CLOSED;
         } catch (IOException | RuntimeException e) {
-            reset();
+            reset(Outcome.FAILED);
             return Outcome.FAILED;
+        } catch (Error e) { // don't leave the stream open until the idle timeout
+            reset(Outcome.FAILED);
+            throw e;
         }
     }
 
@@ -113,20 +124,21 @@ final class Http3Writer {
         boolean sendBody = !response.headOnly() && response.mayHaveBody() && response.contentLength() > 0;
         var head = headersFrame(response, Instant.now());
         if (sendBody && response.body() instanceof Body.FileBody file) {
-            this.openFiles.acquire();
+            long deadline = System.nanoTime() + this.limits.slotWait().toNanos();
+            if (!this.connectionFiles.tryAcquire(this.limits.slotWait().toNanos(), TimeUnit.NANOSECONDS)) {
+                return Outcome.REJECTED;
+            }
             try {
-                FileChannel fc;
-                try {
-                    fc = SafeOpen.open(file);
-                } catch (IOException e) {
-                    return Outcome.SWAPPED; // deleted, swapped (symlink in any component, other inode), unreadable
+                if (!this.serverFiles.tryAcquire(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+                    return Outcome.REJECTED;
                 }
-                try (fc) {
-                    this.channel.write(head);
-                    return sendFile(fc, file);
+                try {
+                    return sendFile(head, file);
+                } finally {
+                    this.serverFiles.release();
                 }
             } finally {
-                this.openFiles.release();
+                this.connectionFiles.release();
             }
         }
         if (sendBody && response.body() instanceof Body.Bytes bytes) {
@@ -137,16 +149,34 @@ final class Http3Writer {
         return Outcome.COMPLETE;
     }
 
+    private Outcome sendFile(Http3HeadersFrame head, Body.FileBody file) throws IOException, InterruptedException {
+        if (!this.channel.isActive()) {
+            return Outcome.CLOSED; // reset while waiting for a slot: don't even open the file
+        }
+        FileChannel fc;
+        try {
+            fc = SafeOpen.open(file);
+        } catch (IOException e) {
+            return Outcome.SWAPPED; // deleted, swapped (symlink in any component, other inode), unreadable
+        }
+        try (fc) {
+            this.channel.write(head);
+            return sendFile(fc, file);
+        }
+    }
+
     private Outcome sendBytes(Body.Bytes bytes) throws InterruptedException {
         var data = bytes.data().duplicate();
+        long done = 0;
         while (data.hasRemaining()) {
-            var outcome = ready();
+            var outcome = ready(done);
             if (outcome != Outcome.COMPLETE) {
                 return outcome;
             }
             int n = Math.min(CHUNK, data.remaining());
             var chunk = data.slice(data.position(), n);
             data.position(data.position() + n);
+            done += n;
             emit(Unpooled.wrappedBuffer(chunk), !data.hasRemaining());
         }
         return Outcome.COMPLETE;
@@ -155,7 +185,7 @@ final class Http3Writer {
     private Outcome sendFile(FileChannel fc, Body.FileBody file) throws IOException, InterruptedException {
         long done = 0;
         while (done < file.length()) {
-            var outcome = ready();
+            var outcome = ready(done);
             if (outcome != Outcome.COMPLETE) {
                 return outcome;
             }
@@ -187,30 +217,40 @@ final class Http3Writer {
         }
     }
 
-    /** Waits until the previous chunk was taken by the stream; COMPLETE means "go on". */
-    private Outcome ready() throws InterruptedException {
+    /**
+     * Waits until the previous chunk was taken by the stream; COMPLETE means "go on".
+     *
+     * @param sent bytes handed to the stream so far (for the rate check)
+     */
+    private Outcome ready(long sent) throws InterruptedException {
         if (!this.channel.isActive()) {
             return Outcome.CLOSED;
         }
         if (this.previous == null) {
+            this.rate = new RateGuard(this.limits.writeTimeout().toNanos(), this.limits.minBytesPerSecond(),
+                    System.nanoTime());
             return Outcome.COMPLETE;
         }
         // CompletableFuture parks virtual threads cleanly (Netty's await() would pin the carrier).
         var done = new CompletableFuture<Void>();
         this.previous.addListener(f -> done.complete(null));
         try {
-            done.get(this.writeTimeoutNanos, TimeUnit.NANOSECONDS);
+            done.get(this.limits.writeTimeout().toNanos(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException e) {
             return Outcome.STALLED; // no progress: the peer stopped reading
         } catch (ExecutionException e) {
             throw new IllegalStateException(e); // never completed exceptionally
         }
-        return this.previous.isSuccess() ? Outcome.COMPLETE : Outcome.CLOSED;
+        if (!this.previous.isSuccess()) {
+            return Outcome.CLOSED;
+        }
+        return this.rate.ok(sent, System.nanoTime()) ? Outcome.COMPLETE : Outcome.SLOW;
     }
 
-    private void reset() {
+    private void reset(Outcome why) {
         if (this.channel.isActive()) {
-            this.channel.shutdown(Http3ErrorCode.H3_INTERNAL_ERROR.code());
+            this.channel.shutdown(why == Outcome.REJECTED ? Http3ErrorCode.H3_REQUEST_REJECTED.code()
+                    : Http3ErrorCode.H3_INTERNAL_ERROR.code());
         }
     }
 }

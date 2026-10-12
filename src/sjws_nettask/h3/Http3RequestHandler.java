@@ -25,12 +25,10 @@ import io.netty.handler.codec.http3.Http3HeadersFrame;
 import io.netty.handler.codec.http3.Http3RequestStreamInboundHandler;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.util.ReferenceCountUtil;
-import java.util.Map;
-import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.function.Function;
+import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
@@ -40,23 +38,21 @@ import sjws_nettask.core.StaticFileHandler;
  * One instance per request stream. Maps the HEADERS frame to a core {@link Request} as soon as it
  * arrives (request bodies are ignored, like on HTTP/1), runs the shared {@link StaticFileHandler}
  * and the {@link Http3Writer} on a virtual thread, and releases every inbound frame.
+ * <p>
+ * Each request takes one server-wide in-flight slot ({@link Limits#maxInflight()}), refused with
+ * H3_REQUEST_REJECTED when none is free. The task is tied to the stream's lifetime: when the stream
+ * closes (peer reset, connection gone) the task is cancelled, which interrupts a writer waiting for
+ * a file slot or for flow control, and the slot is returned.
  */
 final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
 
-    private final Function<Request, Response> handler;
-    private final Executor executor;
-    private final long writeTimeoutNanos;
-    private final Semaphore openFiles;
-    private final Map<Http3Writer.Outcome, LongAdder> outcomes;
+    private final Http3Server.Shared shared;
+    private final Semaphore connectionFiles;
     private boolean started; // event loop only
 
-    Http3RequestHandler(Function<Request, Response> handler, Executor executor, long writeTimeoutNanos,
-            Semaphore openFiles, Map<Http3Writer.Outcome, LongAdder> outcomes) {
-        this.handler = handler;
-        this.executor = executor;
-        this.writeTimeoutNanos = writeTimeoutNanos;
-        this.openFiles = openFiles;
-        this.outcomes = outcomes;
+    Http3RequestHandler(Http3Server.Shared shared, Semaphore connectionFiles) {
+        this.shared = shared;
+        this.connectionFiles = connectionFiles;
     }
 
     /** Pseudo-headers and the fields the core understands; :authority wins over a host field. */
@@ -82,25 +78,84 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                 return; // trailers
             }
             this.started = true;
-            var request = toRequest(frame.headers());
             var stream = (QuicStreamChannel) ctx.channel();
-            try {
-                this.executor.execute(() -> this.outcomes.get(
-                        new Http3Writer(stream, this.writeTimeoutNanos, this.openFiles).write(respond(request)))
-                        .increment());
-            } catch (RejectedExecutionException e) { // shutting down
-                stream.shutdown(Http3ErrorCode.H3_REQUEST_REJECTED.code());
-            }
+            start(stream, toRequest(frame.headers()));
         } finally {
             ReferenceCountUtil.release(frame);
         }
     }
 
+    private void start(QuicStreamChannel stream, Request request) {
+        if (!this.shared.inflight().tryAcquire()) {
+            reject(stream);
+            return;
+        }
+        var task = new Task(stream, request);
+        try {
+            task.future = this.shared.executor().submit(task);
+        } catch (RejectedExecutionException e) { // shutting down
+            task.finish(null);
+            reject(stream);
+            return;
+        }
+        // Peer reset / connection closed: stop waiting for slots or flow control, return the slot.
+        stream.closeFuture().addListener(f -> {
+            if (task.future.cancel(true)) {
+                task.finish(Http3Writer.Outcome.CLOSED); // no-op if the task already finished itself
+            }
+        });
+    }
+
+    private void reject(QuicStreamChannel stream) {
+        this.shared.count(Http3Writer.Outcome.REJECTED);
+        stream.shutdown(Http3ErrorCode.H3_REQUEST_REJECTED.code());
+    }
+
     private Response respond(Request request) {
         try {
-            return this.handler.apply(request);
+            return this.shared.handler().apply(request);
         } catch (RuntimeException e) { // StaticFileHandler never throws; a test seam might
             return StaticFileHandler.error(500, request.headOnly());
+        }
+    }
+
+    /** One request: handler + writer on a virtual thread; returns its in-flight slot exactly once. */
+    private final class Task implements Runnable {
+
+        private final QuicStreamChannel stream;
+        private final Request request;
+        private final AtomicBoolean finished = new AtomicBoolean();
+        volatile Future<?> future;
+
+        Task(QuicStreamChannel stream, Request request) {
+            this.stream = stream;
+            this.request = request;
+        }
+
+        @Override
+        public void run() {
+            Http3Writer.Outcome outcome = Http3Writer.Outcome.FAILED;
+            try {
+                if (!this.stream.isActive()) {
+                    outcome = Http3Writer.Outcome.CLOSED;
+                    return;
+                }
+                var response = respond(this.request);
+                outcome = new Http3Writer(this.stream, Http3RequestHandler.this.shared.limits(),
+                        Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connectionFiles)
+                        .write(response);
+            } finally {
+                finish(outcome);
+            }
+        }
+
+        void finish(Http3Writer.Outcome outcome) {
+            if (this.finished.compareAndSet(false, true)) {
+                Http3RequestHandler.this.shared.inflight().release();
+                if (outcome != null) {
+                    Http3RequestHandler.this.shared.count(outcome);
+                }
+            }
         }
     }
 
@@ -120,6 +175,9 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
             ((QuicStreamChannel) ctx.channel()).shutdown(Http3ErrorCode.H3_MESSAGE_ERROR.code());
             return;
         }
-        super.exceptionCaught(ctx, cause);
+        // QuicStreamResetException: the peer aborted the request (RESET_STREAM). Netty leaves the stream
+        // open in that case; close it so the task is cancelled. Http3Exception: the codec already closed
+        // the stream or the connection. Neither is worth a log line a remote client can trigger at will.
+        ctx.close();
     }
 }

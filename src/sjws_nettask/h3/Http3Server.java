@@ -78,8 +78,6 @@ public final class Http3Server implements AutoCloseable {
     static final long MAX_DATA = 1024L * 1024;
     static final long MAX_STREAM_DATA = 16L * 1024;
     static final long MAX_STREAMS = 64;
-    /** Files open for sending at once, across all connections (each in-flight stream holds one fd). */
-    static final int MAX_OPEN_FILES = 256;
     /** Address-validation token policy (security review M3). */
     static final QuicTokenHandler TOKENS = NoRetryTokenHandler.INSTANCE;
 
@@ -89,8 +87,9 @@ public final class Http3Server implements AutoCloseable {
     private final AtomicInteger connectionCount = new AtomicInteger();
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
-    private final Semaphore openFiles = new Semaphore(MAX_OPEN_FILES);
     private final Map<Http3Writer.Outcome, LongAdder> outcomes = new EnumMap<>(Http3Writer.Outcome.class);
+    private Limits limits;
+    private Shared shared;
     private TlsMaterial tls;
     private EventLoopGroup group;
     private ExecutorService executor;
@@ -111,9 +110,37 @@ public final class Http3Server implements AutoCloseable {
         this.config = Objects.requireNonNull(config, "config");
         this.handler = Objects.requireNonNull(handler, "handler");
         this.tls = tls;
+        this.limits = Limits.of(config);
         for (var o : Http3Writer.Outcome.values()) {
             this.outcomes.put(o, new LongAdder());
         }
+    }
+
+    /**
+     * State shared by every request stream of this server.
+     *
+     * @param inflight one permit per request being handled or sent ({@link Limits#maxInflight()})
+     * @param serverFiles one permit per file open for sending ({@link Limits#maxOpenFiles()})
+     */
+    record Shared(Function<Request, Response> handler, ExecutorService executor, Limits limits, Semaphore inflight,
+            Semaphore serverFiles, Map<Http3Writer.Outcome, LongAdder> outcomes) {
+
+        void count(Http3Writer.Outcome outcome) {
+            this.outcomes.get(outcome).increment();
+        }
+    }
+
+    /** Test seam: replaces the limits derived from the configuration; call before {@link #start()}. */
+    Http3Server limits(Limits newLimits) {
+        if (this.started.get()) {
+            throw new IllegalStateException("already started");
+        }
+        this.limits = Objects.requireNonNull(newLimits, "limits");
+        return this;
+    }
+
+    Limits limits() {
+        return this.limits;
     }
 
     /** @return true if the native QUIC library loads on this platform */
@@ -154,6 +181,8 @@ public final class Http3Server implements AutoCloseable {
             var ssl = QuicSslContextBuilder.forServer(this.tls.key(), null, this.tls.chain())
                     .applicationProtocols(Http3.supportedApplicationProtocols()).build();
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h3-request-", 0).factory());
+            this.shared = new Shared(this.handler, this.executor, this.limits, new Semaphore(this.limits.maxInflight()),
+                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             var codec = Http3.newQuicServerCodecBuilder()
                     .sslContext(ssl)
@@ -181,8 +210,9 @@ public final class Http3Server implements AutoCloseable {
     }
 
     private void accept(QuicChannel quic) {
-        if (this.closed.get() || this.connectionCount.incrementAndGet() > this.config.h3MaxConnections()) {
-            if (!this.closed.get()) {
+        boolean refused = this.closed.get(); // read once: close() may flip it concurrently
+        if (refused || this.connectionCount.incrementAndGet() > this.config.h3MaxConnections()) {
+            if (!refused) {
                 this.connectionCount.decrementAndGet();
             }
             quic.close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
@@ -193,15 +223,19 @@ public final class Http3Server implements AutoCloseable {
             this.connections.remove(quic);
             this.connectionCount.decrementAndGet();
         });
-        long writeTimeout = this.config.writeTimeout().toNanos();
+        var connectionFiles = this.limits.newConnectionFiles();
         quic.pipeline().addLast(new Http3ServerConnectionHandler(new ChannelInitializer<QuicStreamChannel>() {
             @Override
             protected void initChannel(QuicStreamChannel stream) {
-                stream.pipeline().addLast(new Http3RequestHandler(Http3Server.this.handler, Http3Server.this.executor,
-                        writeTimeout, Http3Server.this.openFiles, Http3Server.this.outcomes));
+                stream.pipeline().addLast(new Http3RequestHandler(Http3Server.this.shared, connectionFiles));
             }
         }));
         quic.pipeline().addLast(QuietErrors.INSTANCE);
+    }
+
+    /** @return requests currently being handled or sent */
+    int inflight() {
+        return this.shared == null ? 0 : this.limits.maxInflight() - this.shared.inflight().availablePermits();
     }
 
     /** @return the UDP port actually bound (useful with port 0) */
