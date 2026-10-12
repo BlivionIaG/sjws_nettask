@@ -707,7 +707,7 @@ class DaemonTest {
         var worker = new Thread(() -> code.set(Daemon.daemonize(opt, Map.of(), out, err,
                 List.of(script.toString(), childPid.toString()), Duration.ofSeconds(30))), "daemonize");
         worker.start();
-        waitFor(() -> Files.exists(childPid), 5_000, "child pid");
+        waitFor(() -> readablePid(childPid), 5_000, "child pid");
         worker.interrupt();
         worker.join(10_000);
         assertFalse(worker.isAlive(), "daemonize did not return after interrupt");
@@ -719,7 +719,7 @@ class DaemonTest {
         var stubborn = sleeperScript(tmp.resolve("stubborn.sh"), true);
         var process = new ProcessBuilder(stubborn.toString(), stubbornPid.toString()).start();
         try {
-            waitFor(() -> Files.exists(stubbornPid), 5_000, "stubborn pid");
+            waitFor(() -> readablePid(stubbornPid), 5_000, "stubborn pid");
             long recorded = readPid(stubbornPid);
             assertEquals(process.pid(), recorded);
             Files.writeString(tmp.resolve("stubborn.pidfile"), PidFile.text(recorded, startMillis(process)));

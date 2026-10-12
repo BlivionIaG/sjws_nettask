@@ -191,7 +191,7 @@ Results go into the PR description of each phase, with the commands, so others c
 
 ### Phase 1 results (2026-10-12, shared 8 vCPU box, server on CPUs 0-3, wrk on 4-7)
 
-Harness: `bench/proxy-routing/` (`BenchMain` + `run.sh`). wrk `-t4 -c64`, 3 × 10 s after a 3 s warm-up, median req/s (p99 of that run).
+Harness: `bench/proxy-routing/` (`run.sh`, real jar with `--config`). wrk `-t4 -c64`, 3 × 10 s after a 3 s warm-up, median req/s (p99 of that run).
 The box is shared, so differences under about 15 % are noise.
 
 | Scenario | req/s (median) | p99 |
