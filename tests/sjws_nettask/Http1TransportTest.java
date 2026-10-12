@@ -430,14 +430,15 @@ class Http1TransportTest {
             reaper.sweep(now);
             assertEquals(3, reaper.tracked(), "nothing due yet");
             reaper.sweep(now + Duration.ofMinutes(10).toNanos());
-            assertFalse(a.isOpen(), "idle expired: closed");
+            assertEquals(-1, pa.client.read(ByteBuffer.allocate(1)), "idle expired: the peer got its FIN at once");
+            waitFor(() -> !a.isOpen(), 2000, "idle expired: closed");
             assertTrue(b.isOpen(), "processing has no deadline");
             assertTrue(head.headExpired());
             assertTrue(c.isOpen(), "head expiry first shuts the input down (a 408 can still be sent)");
             assertEquals(-1, c.read(ByteBuffer.allocate(1)), "input shut down");
             assertEquals(2, reaper.tracked());
             reaper.sweep(now + Duration.ofMinutes(20).toNanos());
-            assertFalse(c.isOpen(), "closed when the 408 did not go out within the grace period");
+            waitFor(() -> !c.isOpen(), 2000, "closed when the 408 did not go out within the grace period");
             assertEquals(1, reaper.idleExpirations());
             assertEquals(1, reaper.headExpirations());
             assertEquals(0, reaper.writeExpirations());

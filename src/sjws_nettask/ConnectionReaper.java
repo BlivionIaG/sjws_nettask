@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.LongAdder;
  * {@link Timer}; the reaper scans all timers every {@link #TICK} and acts on expired ones:
  * <ul>
  * <li>{@link State#IDLE} (keep-alive, waiting for the first byte of a request): idle timeout
- * from the end of the previous response; expiry closes the channel.</li>
+ * from the end of the previous response; expiry ends the connection (see {@link #expire}).</li>
  * <li>{@link State#HEAD} (from the first byte of a request until its head and body are read):
  * header timeout, absolute; expiry shuts the input down so the connection answers 408 and
  * closes, and the channel is closed outright if that has not happened a write timeout later.</li>
@@ -187,13 +187,34 @@ final class ConnectionReaper implements AutoCloseable {
         }
     }
 
+    /**
+     * Ends a connection without ever blocking the reaper: {@code SocketChannel.close()} waits for a
+     * virtual thread parked in a read or write to run and release the channel, so under carrier
+     * pressure it could stall every other deadline (and no FIN would go out meanwhile). shutdown(2)
+     * on both directions is immediate: the peer gets its FIN, the parked read sees EOF and a parked
+     * write fails (EPIPE). The close itself then happens on the connection's own thread
+     * (try-with-resources), with a virtual-thread close as a backstop.
+     */
     private void expire(Timer t) {
         this.timers.remove(t); // the connection's own deregister() is then a no-op
+        var channel = t.channel;
         try {
-            t.channel.close(); // wakes a blocked read/write with AsynchronousCloseException
-        } catch (IOException e) {
-            // already closed
+            channel.shutdownOutput();
+        } catch (IOException | RuntimeException e) {
+            // already closed or reset
         }
+        try {
+            channel.shutdownInput();
+        } catch (IOException | RuntimeException e) {
+            // already closed or reset
+        }
+        Thread.startVirtualThread(() -> {
+            try {
+                channel.close();
+            } catch (IOException e) {
+                // already closed
+            }
+        });
     }
 
     @Override
