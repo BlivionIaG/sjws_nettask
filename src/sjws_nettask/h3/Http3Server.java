@@ -56,6 +56,7 @@ import sjws_nettask.Transport;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.tls.TlsMaterial;
 
 /**
@@ -111,6 +112,7 @@ public final class Http3Server implements Transport {
     private EventLoopGroup group;
     private ExecutorService executor;
     private Channel channel;
+    private RequestObserver observer = RequestObserver.NONE;
 
     /** Uses the configured PEM files, or a self-signed certificate if none are set. */
     public Http3Server(ServerConfig config, StaticFileHandler handler) {
@@ -142,13 +144,25 @@ public final class Http3Server implements Transport {
     }
 
     /**
+     * Counts and logs this listener's responses on {@code observer}. Call before {@link #start()}.
+     * The HTTP/1.1 side uses the same instance so one snapshot covers both protocols.
+     */
+    public Http3Server withObserver(RequestObserver observer) {
+        if (this.started.get()) {
+            throw new IllegalStateException("already started");
+        }
+        this.observer = observer == null ? RequestObserver.NONE : observer;
+        return this;
+    }
+
+    /**
      * State shared by every request stream of this server.
      *
      * @param inflight one permit per request being handled or sent ({@link Limits#maxInflight()})
      * @param serverFiles one permit per file open for sending ({@link Limits#maxOpenFiles()})
      */
     record Shared(Function<Request, Response> handler, ExecutorService executor, Limits limits, Semaphore inflight,
-            Semaphore serverFiles, Map<Http3Writer.Outcome, LongAdder> outcomes) {
+            Semaphore serverFiles, Map<Http3Writer.Outcome, LongAdder> outcomes, RequestObserver observer) {
 
         void count(Http3Writer.Outcome outcome) {
             this.outcomes.get(outcome).increment();
@@ -164,6 +178,9 @@ public final class Http3Server implements Transport {
         final Semaphore files;
         final java.util.concurrent.atomic.AtomicInteger inflight = new java.util.concurrent.atomic.AtomicInteger();
         final RateGuard rate;
+        /** Numeric peer address, set once the handshake completes. No reverse lookup. */
+        String remote = "-";
+        boolean loopback;
         long nextStreamId; // lowest client request stream id not seen yet
         long goAwayId = -1; // -1 = no GOAWAY sent; else streams with id >= this are refused
 
@@ -242,7 +259,7 @@ public final class Http3Server implements Transport {
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h3-request-", 0).factory());
             this.perIp = new sjws_nettask.core.PerIpLimit(this.limits.connectionsPerIp());
             this.shared = new Shared(this.handler, this.executor, this.limits, new Semaphore(this.limits.maxInflight()),
-                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes);
+                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.observer);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             var codec = Http3.newQuicServerCodecBuilder()
                     .sslContext(ssl)
@@ -342,6 +359,8 @@ public final class Http3Server implements Transport {
                 quic.close(true, Http3ErrorCode.H3_EXCESSIVE_LOAD.code(), Unpooled.EMPTY_BUFFER);
                 return;
             }
+            this.connection.remote = address == null ? "-" : address.getHostAddress();
+            this.connection.loopback = address != null && address.isLoopbackAddress();
             Http3Server.this.state.put(quic, this.connection);
             quic.closeFuture().addListener(f -> {
                 Http3Server.this.state.remove(quic);

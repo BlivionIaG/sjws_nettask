@@ -27,6 +27,17 @@ public final class H3Transports {
     }
 
     public static Transport.Factory defaultFactory() {
-        return (config, handler) -> new sjws_nettask.h3.Http3Server(config, handler);
+        return new Transport.Factory() {
+            @Override
+            public Transport create(ServerConfig config, sjws_nettask.core.StaticFileHandler handler) {
+                return new sjws_nettask.h3.Http3Server(config, handler);
+            }
+
+            @Override
+            public Transport create(ServerConfig config, sjws_nettask.core.StaticFileHandler handler,
+                    sjws_nettask.observe.RequestObserver observer) {
+                return new sjws_nettask.h3.Http3Server(config, handler).withObserver(observer);
+            }
+        };
     }
 }

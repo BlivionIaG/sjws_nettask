@@ -26,6 +26,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.function.Supplier;
 
 import sjws_nettask.core.Handler;
+import sjws_nettask.core.Request;
+import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
@@ -63,6 +65,17 @@ final class Http1Connection implements Runnable {
     private final Handler handler;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ConnectionReaper reaper;
+    private final RequestObserver observer;
+    /** Numeric client address (no reverse lookup), cached for the life of the connection. */
+    private final String clientHost;
+    private final boolean loopback;
+    private long startedAt;
+    private String method = "-";
+    private String target = "-";
+    private String protocol = "HTTP/1.1";
+    private int protocolId = RequestObserver.HTTP_1_1;
+    private String referer = "-";
+    private String userAgent = "-";
     private final Http1Parser.HeadParser parser = new Http1Parser.HeadParser(CONSTANTS.MAX_LINE_LENGTH,
             CONSTANTS.MAX_HEADERS);
     /** Discards chunked request bodies (GET/HEAD) up to {@link CONSTANTS#MAX_DRAINED_BODY}. */
@@ -76,10 +89,22 @@ final class Http1Connection implements Runnable {
      */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
+        this(channel, handler, extraHeaders, reaper, RequestObserver.NONE, "0.0.0.0", false);
+    }
+
+    /**
+     * @param clientHost numeric peer address, captured once at accept (never a DNS name)
+     * @param loopback peer is a loopback address; gates {@code /metrics} when it is localhost-only
+     */
+    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, RequestObserver observer, String clientHost, boolean loopback) {
         this.channel = channel;
         this.handler = handler;
         this.extraHeaders = extraHeaders;
         this.reaper = reaper;
+        this.observer = java.util.Objects.requireNonNull(observer, "observer");
+        this.clientHost = java.util.Objects.requireNonNull(clientHost, "clientHost");
+        this.loopback = loopback;
     }
 
     @Override
@@ -146,6 +171,17 @@ final class Http1Connection implements Runnable {
         }
         // ... then the whole head (and any body to discard) must arrive before the head deadline.
         timer.head();
+        if (this.observer.recording()) {
+            this.startedAt = System.nanoTime();
+            this.protocolId = RequestObserver.HTTP_1_1;
+        }
+        if (this.observer.logging()) {
+            this.method = "-";
+            this.target = "-";
+            this.protocol = "HTTP/1.1";
+            this.referer = "-";
+            this.userAgent = "-";
+        }
 
         Http1Parser.Head request;
         try {
@@ -175,12 +211,13 @@ final class Http1Connection implements Runnable {
         }
 
         var core = Http1Requests.toCore(request);
+        note(request);
         if (!core.headOnly() && !"GET".equals(core.method())) {
             // OPTIONS (200) or a known but unsupported method (405). Never read (possibly huge)
             // bodies just to reject them: keep the connection only if there is no body.
             boolean keepAlive = request.keepAlive() && !request.hasBody();
             timer.processing();
-            send(out, this.handler.handle(core), keepAlive);
+            send(out, respond(core), keepAlive);
             return keepAlive;
         }
 
@@ -219,8 +256,37 @@ final class Http1Connection implements Runnable {
         }
         timer.processing();
 
-        send(out, this.handler.handle(core), keepAlive);
+        send(out, respond(core), keepAlive);
         return keepAlive;
+    }
+
+    /** Copies the request into connection fields. Referer and User-Agent are read only when logged. */
+    private void note(Http1Parser.Head request) {
+        if (!this.observer.recording()) {
+            return;
+        }
+        this.protocolId = RequestObserver.protocolId(request.version());
+        if (!this.observer.logging()) {
+            return;
+        }
+        this.method = request.method();
+        this.target = request.target();
+        this.protocol = request.version();
+        if (this.observer.logHeaders()) {
+            var ref = request.headers().get("referer");
+            var ua = request.headers().get("user-agent");
+            if (ref != null && !ref.isEmpty()) {
+                this.referer = ref.get(0);
+            }
+            if (ua != null && !ua.isEmpty()) {
+                this.userAgent = ua.get(0);
+            }
+        }
+    }
+
+    private Response respond(Request core) {
+        var special = this.observer.intercept(core.method(), core.target(), this.loopback);
+        return special != null ? special : this.handler.handle(core);
     }
 
     /**
@@ -258,6 +324,25 @@ final class Http1Connection implements Runnable {
     }
 
     private void send(ChannelOutput out, Response response, boolean keepAlive) throws IOException {
-        Http1Writer.write(out, response, keepAlive, this.extraHeaders.get());
+        long bytes = 0;
+        IOException error = null;
+        try {
+            Http1Writer.write(out, response, keepAlive, this.extraHeaders.get());
+            bytes = response.sendsBody() ? Math.max(0L, response.contentLength()) : 0L;
+        } catch (IOException e) {
+            error = e;
+        }
+        if (this.observer.recording()) {
+            long nanos = System.nanoTime() - this.startedAt;
+            if (this.observer.logging()) {
+                this.observer.complete(response.status(), this.protocolId, bytes, nanos, this.clientHost, this.method,
+                        this.target, this.protocol, this.referer, this.userAgent);
+            } else {
+                this.observer.complete(response.status(), this.protocolId, bytes, nanos);
+            }
+        }
+        if (error != null) {
+            throw error;
+        }
     }
 }

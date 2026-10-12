@@ -469,4 +469,52 @@ class ServerConfigTest {
         assertEquals(0, parse(Map.of("WEB_SERVER_CACHE_BYTES", "0"), "--cache-bytes=1m").config().cacheBytes());
         assertTrue(ServerConfig.usage().contains("--cache-bytes"));
     }
+
+    @Test
+    void accessLogAndMetricsFlags() {
+        var off = parse(Map.of()).config();
+        assertNull(off.accessLog());
+        assertEquals(ServerConfig.AccessLogFormat.COMBINED, off.accessLogFormat());
+        assertEquals(ServerConfig.MetricsExposure.OFF, off.metricsExposure());
+        assertTrue(off.toString().contains("accessLogFormat=COMBINED"));
+        assertTrue(off.toString().contains("metricsExposure=OFF"));
+
+        var on = parse(Map.of(), "--access-log=-", "--access-log-format=json", "--metrics=on").config();
+        assertEquals("-", on.accessLog());
+        assertEquals(ServerConfig.AccessLogFormat.JSON, on.accessLogFormat());
+        assertEquals(ServerConfig.MetricsExposure.ON, on.metricsExposure());
+        assertEquals(on, on.toBuilder().build());
+
+        assertEquals(ServerConfig.MetricsExposure.LOCALHOST, parse(Map.of(), "--metrics").config().metricsExposure());
+        assertEquals(ServerConfig.MetricsExposure.OFF, parse(Map.of(), "--metrics", "--no-metrics").config().metricsExposure());
+        assertEquals(ServerConfig.AccessLogFormat.COMMON,
+                parse(Map.of(), "--access-log=/tmp/a.log", "--access-log-format=common").config().accessLogFormat());
+
+        var env = parse(Map.of("WEB_SERVER_ACCESS_LOG", "/env.log", "WEB_SERVER_ACCESS_LOG_FORMAT", "JSON",
+                "WEB_SERVER_METRICS", "localhost"), "--access-log=-", "--access-log-format=common", "--metrics=on");
+        assertTrue(env.warnings().isEmpty(), env.warnings().toString());
+        assertEquals("/env.log", env.config().accessLog());
+        assertEquals(ServerConfig.AccessLogFormat.JSON, env.config().accessLogFormat());
+        assertEquals(ServerConfig.MetricsExposure.LOCALHOST, env.config().metricsExposure());
+
+        var bad = parse(Map.of(), "--access-log-format=xml", "--metrics=everywhere", "--access-log");
+        assertEquals(ServerConfig.AccessLogFormat.COMBINED, bad.config().accessLogFormat());
+        assertEquals(ServerConfig.MetricsExposure.LOCALHOST, bad.config().metricsExposure());
+        assertNull(bad.config().accessLog());
+        assertTrue(bad.warnings().stream().anyMatch(w -> w.contains("access-log-format") && w.contains("xml")),
+                bad.warnings().toString());
+        assertTrue(bad.warnings().stream().anyMatch(w -> w.contains("without --access-log")), bad.warnings().toString());
+        assertTrue(bad.warnings().stream().anyMatch(w -> w.contains("everywhere")), bad.warnings().toString());
+        assertTrue(bad.warnings().stream().anyMatch(w -> w.contains("Missing value for --access-log")),
+                bad.warnings().toString());
+
+        var blank = parse(Map.of("WEB_SERVER_METRICS", "  ", "WEB_SERVER_ACCESS_LOG_FORMAT", ""), "--access-log=/x");
+        assertEquals(ServerConfig.MetricsExposure.OFF, blank.config().metricsExposure());
+        assertEquals(ServerConfig.AccessLogFormat.COMBINED, blank.config().accessLogFormat());
+        assertFalse(blank.warnings().isEmpty());
+        assertThrows(NullPointerException.class,
+                () -> ServerConfig.builder(Path.of("/r")).accessLogFormat(null).build());
+        assertThrows(NullPointerException.class,
+                () -> ServerConfig.builder(Path.of("/r")).metricsExposure(null).build());
+    }
 }
