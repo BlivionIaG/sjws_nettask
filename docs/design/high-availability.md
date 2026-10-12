@@ -60,8 +60,9 @@ All of these live in `sjws_nettask.cluster`. That package does not import HTTP, 
   does not store the log), and later `perSite(local majority) + global(majority of sites)`.
   Pure function over a voter set and an ack set — not over a live RPC.
 - `LeaderElection`: lease-based (term, lease expiry, monotonic clock) built on the Raft
-  term/leader below. The leader only coordinates sync rollouts and VIP ownership — never
-  requests.
+  term of one replication group. The `ha-control` leader coordinates sync rollouts and VIP
+  ownership and never sees requests. Message partitions elect separately (§13a, Decisions
+  for PR #16).
 - `FailoverPolicy`: `ACTIVE_PASSIVE` (VIP hook), `ACTIVE_ACTIVE` (external LB/DNS using
   `/healthz` and `/readyz`), later `GeoDns` / `Anycast` / `GSLB`.
 - `SnapshotHolder` (in `sjws_nettask.ha`): versioned (monotonic `generation` + content hash)
@@ -73,6 +74,11 @@ All of these live in `sjws_nettask.cluster`. That package does not import HTTP, 
 closes the TCP `ServerSocketChannel`, which is the rule the HTTP/3 transport already documents.
 
 ## 4. Modes
+
+Static HTTP is active on every node that has a snapshot, in both modes below. Raft
+leadership does not gate file serving. A node in a minority partition keeps serving the
+last generation (fail static). Messaging endpoints, when Messaging Core adds them, follow
+the partition leader; that redirect is not part of the static path.
 
 ### 4.1 Two nodes
 
@@ -149,8 +155,12 @@ closes the TCP `ServerSocketChannel`, which is the rule the HTTP/3 transport alr
   background thread. mTLS can replace the HMAC later behind the same `BundleTransport`.
 - Private keys are never copied into heartbeats. The bundle is transferred with the HMAC,
   and the key file is written mode `0600` via a temp file and `ATOMIC_MOVE`.
-- Two-phase rollout on the `ha-control` replicated log: STAGE on the quorum → pull to
-  reachable nodes → ACTIVATE with quorum. Apply of ACTIVATE is what publishes the snapshot.
+- Two-phase rollout on the `ha-control` replication group (one `groupId` on the shared
+  transport, not a private socket): STAGE on the quorum → pull to reachable nodes →
+  ACTIVATE with quorum. Apply of ACTIVATE is what publishes the snapshot. `ha-control`
+  uses strict durability: followers fsync the batch before they ack, so a completed
+  publish survives power loss of a minority. A group may instead be opened in relaxed
+  mode (quorum in memory, fsync later); static generation publish does not.
   A witness ack counts toward that quorum without storing the log. If the leader dies before
   a peer has the bytes, the peer keeps the last activated snapshot (fail static) and the new
   leader publishes again from `ConfigSource`. The log coordinates activation; it is not the
@@ -183,9 +193,13 @@ for a content request. Probes only read the precomputed board.
 - Unit: `QuorumPolicy` tables (n=1..7, witness), membership state machine (including
   incarnation refute and indirect probe), lease timing with a fake clock, snapshot
   compare-and-set, heartbeat codec (exactly 64 bytes, round-trip, checksum failure).
-- Raft: election, `NotLeaderException` hint, ordered apply, group commit, read barrier /
-  lease read, joint-consensus membership change, leadership transfer, witness ack without
-  a stored log, minority partition cannot commit.
+- Raft, per `groupId`: election, `NotLeaderException` hint, ordered apply inside one
+  group only (two groups do not share a commit index), batched `append` completing at
+  quorum commit, strict mode fsync-before-ack vs relaxed mode, read barrier / lease read,
+  joint-consensus membership change, leadership transfer, snapshot install then truncate
+  past an acked index, compaction hook, witness ack without a stored log, minority
+  partition cannot commit. Frames for two groups on one sim transport stay ordered per
+  group when interleaved.
 - Integration (in-JVM, loopback): `/healthz` and `/readyz` through a real
   `ServerSocketChannel`, 2-node failover, witness tie-break, 3-node partition (drop
   injection on the sim transport), drain with an in-flight request and `Connection: close`,
@@ -205,46 +219,172 @@ for a content request. Probes only read the precomputed board.
 
 The cluster layer is a standalone module (`sjws_nettask.cluster`, no HTTP dependency).
 HTTP failover (§4–§9) is one consumer; Messaging Core log replication is another.
-Leases in §3 are built on top of the Raft term/leader below, so there is one consensus core.
+There is no single global replication group. Total order holds **inside one `groupId`**
+(one partition, or the metadata/control group) and nowhere else. Every group is a Raft
+group. They share membership and **one** transport: frames carry `groupId`, and AppendEntries
+batches for many partitions are pipelined on the same connection. Opening a group does not
+open a socket.
+
+Leases in §3 are the Raft term and lease of the `ha-control` group. Messaging partitions
+elect their own leaders on their own groups. Static file bytes are not log entries.
 
 ```java
 interface ClusterNode extends AutoCloseable {
   NodeId self();
-  MembershipView membership();            // members, site, state, incarnation
-  void onMembershipChange(Consumer<MembershipView> l);
-  ReplicatedLog openLog(String name, StateMachine sm, LogOptions o); // many logs (sharding)
+  MembershipView membership();
+  void onMembershipChange(Consumer<MembershipView> listener);
+
+  /** Idempotent. Wires the per-group callback and snapshot hooks. One transport, many groups. */
+  ReplicationGroup openGroup(GroupId groupId, GroupOptions options, GroupListener listener);
+
+  /**
+   * Leader of {@code groupId} only; otherwise the future completes with NotLeaderException(hint).
+   * The future completes with the committed index after a quorum has the batch.
+   * Strict durability: that quorum has also fsynced the batch. Relaxed: in-memory quorum,
+   * fsync follows on the group's timer. One batch is one ordered span of indexes.
+   */
+  CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
+
+  /** Leadership of this group only. Fires on the group thread, not on a request thread. */
+  void onLeaderChange(GroupId groupId, BiConsumer<Long /*term*/, Optional<NodeId>> listener);
+
+  SnapshotControl snapshots(GroupId groupId);
 }
-interface ReplicatedLog {
-  long term(); Optional<NodeId> leader(); boolean isLeader();
-  CompletableFuture<LogPosition> append(ByteBuffer entry);         // leader only, else NotLeaderException(hint)
-  CompletableFuture<List<LogPosition>> appendBatch(List<ByteBuffer> entries); // group commit
-  long commitIndex(); long lastApplied();
-  CompletableFuture<Void> readBarrier();   // linearizable read (ReadIndex), optional lease reads
-  void onLeaderChange(BiConsumer<Long /*term*/, Optional<NodeId>> l);
+
+interface ReplicationGroup {
+  GroupId groupId();
+  long term();
+  Optional<NodeId> leader();
+  boolean isLeader();
+  long commitIndex();
+  long lastApplied();
+  CompletableFuture<Void> readBarrier(); // linearizable read; lease read when the lease is valid
   CompletableFuture<Void> changeMembership(Set<NodeId> voters, Set<NodeId> learners); // joint consensus
   void transferLeadership(NodeId target);
 }
-interface StateMachine {
-  void apply(long index, long term, ByteBuffer entry);  // called in order, single thread
-  LogSnapshot takeSnapshot(long lastIncludedIndex);     // streamed, off hot path
-  void restore(LogSnapshot s);
+
+/** Per-group committed-entry stream. Equivalent to a state-machine callback; both are in order. */
+interface GroupListener {
+  void onCommitted(CommittedEntry entry); // single thread per group, index order
 }
-record LogPosition(long term, long index) {}
-record LogOptions(Durability fsync /*ALWAYS|BATCHED|NONE*/, int maxBatchBytes,
-                  Duration electionTimeout, Duration heartbeat, long snapshotEveryEntries) {}
+
+interface SnapshotControl {
+  /** Build a snapshot covering every committed entry through lastIncludedIndex. Off the hot path. */
+  LogSnapshot take(long lastIncludedIndex);
+  void install(LogSnapshot snapshot);
+  /**
+   * Drop the log prefix at or below an index that is both snapshotted and acked
+   * (commit index, or a consumer offset Messaging Core passes in). Then compact.
+   */
+  CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor);
+}
+
+interface Compactor {
+  /** Latest value per key for compacted groups (offsets, metadata). Null keeps the snapshot as taken. */
+  byte[] compact(LogSnapshot snapshot);
+}
+
+record GroupId(String value) {}
+record CommittedIndex(GroupId groupId, long term, long index) {}
+record CommittedEntry(GroupId groupId, long term, long index, ByteBuffer entry) {}
+record LogSnapshot(GroupId groupId, long lastIncludedIndex, long lastIncludedTerm, byte[] data) {}
+record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout,
+                    Duration heartbeat, long snapshotEveryEntries) {}
+enum Durability {
+  /** Followers fsync the batch, then ack. The append future waits for that quorum. */
+  STRICT,
+  /** Quorum ack from memory. Fsync is batched afterwards and does not delay the future. */
+  RELAXED
+}
 ```
 
-Pluggable SPIs: `ClusterRpc` (in-JVM for tests, TCP length-prefixed frames for real peers;
-batching and pipelining on the TCP implementation), `LogStorage` (memory, or segmented
-append-only files with `FileChannel.force` for `ALWAYS` / `BATCHED` / `NONE`), `Clock`,
-`QuorumPolicy` (majority; witness voter-without-log for 2 data nodes; per-site hierarchical
-later). Learners (non-voting) support read replicas and cross-site async followers.
+`ha-control` is `openGroup(new GroupId("ha-control"), strictOptions, listener)`.
+Messaging Core calls `openGroup` once per partition and `append(groupId, batch)` on the
+broker's single writer for that partition. The HTTP request path never calls `append`.
 
-Low-latency notes: batching + pipelining of AppendEntries, `ByteBuffer` payloads copied
-once into the log, single-threaded apply, configurable fsync. The HTTP consumer uses one
-`ha-control` log (generation publishes, VIP ownership) and never touches the log per
-request. `openLog` may be called more than once on the same node (sharding); each name is
-an independent log that shares membership and the RPC transport.
+Pluggable SPIs: `ClusterRpc` (in-JVM for tests; one TCP connection per peer, length-prefixed
+frames demuxed by `groupId`, append batches pipelined), `LogStorage` (segmented append-only
+files per group, sparse index, `FileChannel.force` on the strict ack path), `Clock`,
+`QuorumPolicy` (majority; witness voter-without-log for the metadata group when running
+2 data nodes; per-site hierarchical later). Learners (non-voting) are read replicas and
+cross-site async followers. A witness votes in the metadata group and does not store
+partition logs.
+
+Latency target: batched append, p99 under 10 ms on a quiet LAN, strict mode included when
+the quorum fsyncs the batch once (not once per record). Per-record fsync is not a target.
+The architecture bench (PR #16, group commit, p50 about 1.1 ms at 64 producers) is the
+local-disk input to that budget; the network hop has to stay inside the same single-digit
+milliseconds. Low-latency mechanics: one writer thread per group, batching, pipelining,
+`ByteBuffer` payloads copied once into the log, apply/commit callback single-threaded per
+group.
+
+## Decisions for PR #16
+
+Answers to the High Availability questions in
+[PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) (`ARCHITECTURE.md` §A).
+PR #16's T4 asks for a choice; this section is that choice.
+
+1. **Witness for 2-node mode: yes.** Dual-node HA includes a third lightweight witness.
+   It votes and stores no log. Two data nodes alone are not a mode we fail over
+   automatically: after one dies, the survivor cannot form a majority, and promoting it
+   would be a split brain. `WitnessQuorum` is false unless the witness is in the ack set
+   and at least one data node is too ("no witness → no promotion"). The witness is a
+   normal member of the metadata/control Raft group, not a special TCP service. Option (b)
+   in T4 (manual or STONITH failover) and option (c) (async primary/standby that drops the
+   unreplicated tail) are not the default and are not implemented here.
+
+2. **Raft covers metadata and each message partition, not static files.** Recommended
+   shape, and the one this module implements:
+   - **Metadata / control:** one Raft group (`ha-control`): membership, partition
+     assignment, leader epochs, VIP ownership, static-generation STAGE/ACTIVATE.
+   - **Message log:** one Raft group per partition, multiplexed by `groupId` on the same
+     transport. Total order is per partition only. This is Raft for the data log, not a
+     second replication protocol.
+   - **Static content:** not in any log. Nodes serve local files and converge by pulling
+     a content-addressed snapshot. Leadership does not decide who may serve a file.
+
+   That declines T4's ISR-style pull replication for data (Kafka/KRaft). A second
+   protocol would split fencing, epochs, and acks. It also declines one global Raft group
+   for every byte (a single NATS-style data group): a slow partition would stall the
+   others, and static files do not need a log. Per-partition Raft keeps the commit rule,
+   the epoch, and the ack identical to metadata, at partition granularity.
+
+3. **RPO and RTO.**
+   - **RPO 0 for a committed log entry.** An `append` future that has completed will not
+     be lost, including across power loss of a minority, in `Durability.STRICT` (followers
+     fsync the batch before ack). The unacked tail is not covered; producers retry it.
+   - **Relaxed mode is configurable per group** and is not RPO 0 across power loss of the
+     quorum: the future completes on an in-memory quorum, and a later fsync can still be
+     lost. Process crash of a minority still keeps the entry while a strict peer holds it.
+     `ha-control` is strict. Messaging Core picks the mode per partition via `GroupOptions`.
+   - **Static content:** RPO is the last activated generation. A committed ACTIVATE is RPO 0
+     in the same sense as any strict log entry; bytes already swapped into the snapshot
+     stay served if a later publish is lost (fail static).
+   - **RTO, crash:** a new group leader is elected within one election timeout after the
+     lease expires. Defaults: heartbeat 500 ms, lease 1 s, election timeout 1.5 s, so a
+     crashed leader is replaced in about 2.5 s and inside the 2–6 s active/passive window.
+     Crash RTO target is **≤ election timeout + lease** (≤ 2.5 s with those defaults).
+   - **RTO, planned restart:** **election timeout + `drainDelay`**. The leaving node drains
+     first (default `drainDelay` 5 s) so the LB drops it before the lease moves. With the
+     defaults that is ≤ 6.5 s.
+   - **RTO, static active/active:** the upstream health-check interval. No election is on
+     the request path. These timeouts are what the heartbeat and election defaults are
+     sized to; changing them moves the RTO on purpose.
+
+4. **Follower fsync before ack in strict mode; relaxed is a per-group option.** Strict
+   (`Durability.STRICT`): each follower `fsync`s the appended batch, then sends the ack;
+   the leader commits and completes the future only after a quorum of those acks. That is
+   one fsync per batch (group commit), not per record. Relaxed (`Durability.RELAXED`):
+   the quorum ack is in-memory receipt; fsync runs on the storage timer and does not gate
+   the future. This matches the trade-off PR #16 documents for Kafka and NATS, and it is
+   visible on `GroupOptions`, not hidden. The strict path is the one that delivers RPO 0.
+
+5. **Static HTTP is active on all nodes.** Every node with a published snapshot serves
+   `GET`/`HEAD` whether or not it leads any Raft group. `/healthz` and `/readyz` are how
+   an external LB tells the nodes apart. Active/passive is only the VIP hook for a
+   deployment that has no LB; the passive node still serves on its own address, and it
+   does not stop the accept loop. Messaging requests that must hit a partition leader are
+   Messaging Core's concern (redirect or proxy); they are not how static files work.
 
 ## 13. N-node and multi-site roadmap
 
@@ -277,10 +417,12 @@ the PR body.
    `QuorumPolicy` (majority and witness), 64-byte heartbeat codec, UDP heartbeat thread,
    indirect probe, `ClusterNode` membership view. Fake-clock tests. No HTTP imports.
    Cluster-mode benchmark runs a second node and the heartbeat thread.
-3. **Lease and sync.** Raft `ReplicatedLog` (`openLog`, group commit, read barrier, joint
-   membership, leadership transfer, `LogStorage`) and the leader lease. `ConfigSource` /
-   `CertProvider`, HMAC bundle pull, two-phase generation publish, atomic cert rename.
-   HTTP uses the `ha-control` log only from the sync thread.
+3. **Lease and sync.** The §13a API: `append(groupId, batch)` → committed-index future,
+   per-group committed-entry callback, leadership events, snapshot take/install,
+   `truncateAndCompact`. One transport demuxed by `groupId`. Strict durability fsyncs on
+   the follower before ack; relaxed is the other `GroupOptions` value. Leader lease on
+   `ha-control`. `ConfigSource` / `CertProvider`, HMAC bundle pull, two-phase generation
+   publish, atomic cert rename. HTTP calls `append` only from the sync thread.
 4. **Failover tooling.** `VipHook` driven by the lease (claim on grant, release before
    expiry), preferred-node campaign delay, failback left off, `RollingRestart` gated on
    `/readyz`, and `SO_REUSEPORT` hand-over when the JVM opens the nio packages.
