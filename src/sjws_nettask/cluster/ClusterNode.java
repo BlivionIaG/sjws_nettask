@@ -16,11 +16,16 @@
  */
 package sjws_nettask.cluster;
 
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
- * Membership face of a cluster node. Replication ({@code append}, snapshots, leadership)
- * is added on this type by the lease-and-sync work; this package does not import HTTP.
+ * Membership plus per-group replication. HTTP failover and Messaging Core are callers.
+ * This package does not import HTTP. Total order holds inside one {@link GroupId} only.
  */
 public interface ClusterNode extends AutoCloseable {
 
@@ -29,6 +34,21 @@ public interface ClusterNode extends AutoCloseable {
     MembershipView membership();
 
     void onMembershipChange(Consumer<MembershipView> listener);
+
+    /** Idempotent. Wires the per-group callback and snapshot hooks. One transport, many groups. */
+    ReplicationGroup openGroup(GroupId groupId, GroupOptions options, GroupListener listener);
+
+    /**
+     * Leader only; otherwise the future completes with {@link NotLeaderException}. The future
+     * completes with the committed index after a quorum has the batch. Strict groups have also
+     * fsynced it. One batch is one ordered span of indexes.
+     */
+    CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
+
+    /** Leadership of this group only. Invoked off the request path. */
+    void onLeaderChange(GroupId groupId, BiConsumer<Long, Optional<NodeId>> listener);
+
+    SnapshotControl snapshots(GroupId groupId);
 
     @Override
     void close();

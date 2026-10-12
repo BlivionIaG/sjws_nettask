@@ -16,9 +16,13 @@
  */
 package sjws_nettask.cluster;
 
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /** A node whose membership is kept fresh by {@link HeartbeatService}. The caller owns the link. */
@@ -89,6 +93,26 @@ public final class LocalCluster implements ClusterNode {
     @Override
     public void onMembershipChange(Consumer<MembershipView> listener) {
         membership.onMembershipChange(listener);
+    }
+
+    @Override
+    public ReplicationGroup openGroup(GroupId groupId, GroupOptions options, GroupListener listener) {
+        throw new UnsupportedOperationException("membership-only node");
+    }
+
+    @Override
+    public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch) {
+        throw new UnsupportedOperationException("membership-only node");
+    }
+
+    @Override
+    public void onLeaderChange(GroupId groupId, BiConsumer<Long, Optional<NodeId>> listener) {
+        throw new UnsupportedOperationException("membership-only node");
+    }
+
+    @Override
+    public SnapshotControl snapshots(GroupId groupId) {
+        throw new UnsupportedOperationException("membership-only node");
     }
 
     @Override
