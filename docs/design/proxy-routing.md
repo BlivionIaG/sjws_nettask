@@ -209,6 +209,10 @@ The box is shared, so differences under about 15 % are noise.
 wrk2 at 10k req/s, 1 KiB: direct p50 0.72 ms / p99 1.86 ms / p99.9 2.13 ms; proxied p50 1.11 ms / p99 5.38 ms / p99.9 9.14 ms.
 Pooling: 68 upstream connections in total for every proxied request (64 client connections).
 
+Re-run after merging master 0050f4a (routing read from `--config`, `MODE=quick`, two rounds, median of 3 × 10 s):
+master 306,588 / 301,406 req/s (p99 1.63 / 1.41 ms); branch with `routing.enabled: false` 304,997 / 308,985 req/s
+(p99 1.18 / 1.70 ms). That is within noise.
+
 Reading: with routing disabled, and with the router in front of static files, throughput is within
 noise of master. The proxy costs about 6.8× throughput at 1 KiB and 5.9× at 64 KiB compared with
 hitting the upstream directly. That points at `HttpClient` (its own selector thread plus buffered
