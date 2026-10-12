@@ -143,7 +143,10 @@ public final class Http1Parser {
 
         private final int maxLineLength;
         private final int maxHeaders;
-        private byte[] line = new byte[INITIAL_LINE];
+        private static final byte[] NO_LINE = new byte[0];
+
+        /** Allocated on the first byte of a head and dropped by {@link #reset()} (idle connections). */
+        private byte[] line = NO_LINE;
         private int lineLength;
         private boolean pendingCr;
         private int emptyLines;
@@ -160,11 +163,9 @@ public final class Http1Parser {
             this.maxHeaders = maxHeaders;
         }
 
-        /** Forgets the previous head (keep-alive); drops a line buffer grown by a long line. */
+        /** Forgets the previous head (keep-alive) and drops the line buffer. */
         public void reset() {
-            if (this.line.length > 4 * INITIAL_LINE) {
-                this.line = new byte[INITIAL_LINE];
-            }
+            this.line = NO_LINE;
             this.lineLength = 0;
             this.pendingCr = false;
             this.emptyLines = 0;
@@ -224,7 +225,7 @@ public final class Http1Parser {
                         throw new ParseError(this.inHeaders ? 431 : 414, "line too long");
                     }
                     if (this.lineLength == this.line.length) {
-                        this.line = Arrays.copyOf(this.line, Math.min(this.maxLineLength, 2 * this.line.length));
+                        this.line = Arrays.copyOf(this.line, Math.min(this.maxLineLength, Math.max(INITIAL_LINE, 2 * this.line.length)));
                     }
                     this.line[this.lineLength++] = b;
                 }

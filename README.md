@@ -1,7 +1,23 @@
 # sjws_nettask
 Simple Java Web Server
 
-Basic multi-threaded (virtual threads) static file server. Requires Java 25+.
+Basic multi-threaded (virtual threads) static file server: HTTP/1.0 and 1.1 over TCP, plus opt-in
+HTTP/3 over QUIC, both served by the same protocol-neutral core. Requires Java 25+ (and Maven to build).
+
+**Vision (roadmap, not shipped):** the end goal is a reliable, fast, low-latency message-oriented
+middleware that is also a web server. Messaging is being designed now; today the server serves
+static files only.
+
+Documentation: [configuration reference](docs/configuration.md) ·
+[architecture](ARCHITECTURE.md) · [tests](tests/README.md) · [contributing](CONTRIBUTING.md) ·
+[releasing](RELEASING.md). The option tables below are the canonical list of options
+(`DocsConsistencyTest` keeps them in sync with `--help`).
+
+Quick start:
+
+    mvn -B -DskipTests package
+    java -jar target/sjws_nettask-0.2-SNAPSHOT.jar 8080 ./HTML
+    curl -i http://127.0.0.1:8080/
 
 Build and test:
 
@@ -31,6 +47,13 @@ Run:
 | `--cache-bytes=N[k\|m\|g]` | `WEB_SERVER_CACHE_BYTES` | 64m | small-file cache size (see below); `0` disables it |
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
 | `-h`, `--help` | | | print usage and exit |
+| `--daemon` | | | detach and run in the background; the parent exits once the child is listening |
+| `--pid-file=PATH` | `WEB_SERVER_PID_FILE` | sjws_nettask.pid | process-id file; written by `--daemon`, and whenever this option is set |
+| `--log-file=PATH` | `WEB_SERVER_LOG_FILE` | sjws_nettask.log | log file for `--daemon`, and for a foreground process when this option is set |
+| `--shutdown-timeout=S` | `WEB_SERVER_SHUTDOWN_TIMEOUT` | 10 | seconds to finish in-flight responses after SIGTERM/SIGINT (`0` closes them at once) |
+| `--stop` | | | stop the server recorded in the pid file (SIGTERM, then wait) |
+| `--status` | | | print whether that server is running |
+| `--restart` | | | `--stop`, then start in the background |
 
 **HTTP/1.1 connections** run on blocking `SocketChannel`s, one virtual thread each. One timer thread
 enforces every deadline (no per-socket timeouts): `--idle-timeout` between requests,
@@ -39,7 +62,7 @@ also after a `100 Continue`) has arrived (then `408` and close: slowloris), and 
 is being written (a client that stops reading is closed; a slow download that keeps moving is not).
 Files larger than 64 KiB that are not in the cache go out with `sendfile` (`FileChannel.transferTo`);
 a file that shrinks during the transfer ends the connection (the response can't be completed).
-An idle keep-alive connection holds a 2 KiB input buffer and no output buffer.
+An idle keep-alive connection holds a 256 B input buffer (2 KiB only while a request needs it) and no output buffer.
 
 **Per-address caps behind a reverse proxy or NAT.** The caps count connections per client address
 (IPv4: the full address; IPv6: its /64 prefix, since one host can use any address of its /64). Behind a
@@ -50,8 +73,47 @@ server is then limited to the per-address cap (256 HTTP/1.1 connections, 16 QUIC
 
 Environment variables override arguments. Invalid values are replaced by the default
 with a `WARN:` line; unknown options warn too. Exit codes: 0 = normal / `--help`,
-1 = cannot listen on the port, 2 = document root missing, 64 = configuration error
-(e.g. `--cert` without `--key`, unreadable key password file).
+1 = cannot listen on the port (also: already running, pid file or log file not writable,
+background start failed), 2 = document root missing, 64 = configuration error
+(e.g. `--cert` without `--key`, unreadable key password file, `--stop` combined with `--daemon`).
+`--status` uses 0 = running, 1 = pid file is stale, 3 = not running.
+
+### Running in the background
+
+`--daemon` starts a second JVM and exits once that process is listening. The child runs in a new
+session when `setsid` is available (`/usr/bin/setsid`), ignores `SIGHUP`, writes the pid file and
+appends stdout and stderr to the log file (default `sjws_nettask.log` in the working directory).
+JVM flags placed before `-jar` or the main class, such as `-Xmx`, are kept. Paths in `--pid-file`
+and `--log-file` are relative to the working directory; a service should use absolute paths.
+
+```
+java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --daemon --pid-file=/run/sjws_nettask.pid \
+    --log-file=/var/log/sjws_nettask.log 8080 /var/www/html
+java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --status --pid-file=/run/sjws_nettask.pid
+java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --stop --pid-file=/run/sjws_nettask.pid
+java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --restart --pid-file=/run/sjws_nettask.pid \
+    --log-file=/var/log/sjws_nettask.log 8080 /var/www/html
+```
+
+`--stop` sends SIGTERM and waits for `--shutdown-timeout` plus 5 seconds, then SIGKILL.
+`--status` prints `running pid=<n>`, `stopped`, or `stopped stale pid=<n>`. A pid file whose
+process is gone, or whose pid was reused (the start time no longer matches), is stale: `--stop`
+removes it and does not signal the new process. A file a live server has locked is left in place,
+so a restart cannot delete the pid file the new process just claimed. `--restart` is `--stop`
+followed by `--daemon`.
+
+SIGTERM and SIGINT (the shutdown hook) stop accepting on every listener, drop idle and
+half-read HTTP/1 connections immediately, and let responses already in progress finish until
+`--shutdown-timeout` (default 10 seconds). Whatever is still open is then closed. HTTP/3 sends
+GOAWAY and drains for up to 2 seconds in parallel with that wait. A foreground process with
+`--pid-file` writes the same file, so `--stop` works for it too; without `--log-file` it keeps
+logging to the console.
+
+`contrib/sjws` is a small start/stop/status/restart wrapper (`SJWS_JAR`, `SJWS_PID_FILE`,
+`SJWS_LOG_FILE`, `JAVA`). `contrib/sjws_nettask.service` is a systemd `Type=forking` example
+(`PIDFile` plus `--daemon`). Copy `target/lib/` next to the jar: `java -jar` loads Netty from the
+manifest `Class-Path`. On Windows, `--stop` ends the process without a POSIX SIGTERM, so the
+drain hook does not run; use a service manager that can signal the JVM there.
 
 ### HTTP/2
 
@@ -171,9 +233,14 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   opened after the response was decided (removed, swapped, permissions changed), the client gets a
   regular 404/403/500 response instead of a dropped connection.
 
-Serves GET and HEAD (other known methods: 405, unknown: 501), HTTP/1.0 and 1.1
-with keep-alive and pipelining, `ETag` / `If-None-Match` / `If-Modified-Since`, single byte ranges
-(`Range` / `If-Range`), directory listings, and `index.html`. Dotfiles and symlinks leading outside the root are never served.
+Serves GET and HEAD, and OPTIONS (`200` with `Allow: GET, HEAD, OPTIONS`, also for `OPTIONS *`); other
+known methods get 405, unknown ones 501. HTTP/1.0 and 1.1 with keep-alive and pipelining; request bodies
+(`Content-Length` or `chunked`) are read and discarded, `ETag` / `If-None-Match` / `If-Modified-Since`, single byte ranges
+(`Range` / `If-Range`), directory listings, and `index.html`.
+Responses carry the RFC 9110 reason phrase for every registered status code (plus 429); an unregistered
+code gets an empty phrase (`HTTP/1.1 599 `) and an error page titled with the bare code. File types come
+from the extension (`core.Mime`; unknown: `application/octet-stream`), with `charset=utf-8` on `text/*`,
+JavaScript, JSON, SVG, XML and web manifests. Dotfiles and symlinks leading outside the root are never served.
 
 ### Caching, validators and ranges
 
@@ -214,7 +281,24 @@ with keep-alive and pipelining, `ETag` / `If-None-Match` / `If-Modified-Since`, 
   `Range` and say `Accept-Ranges: none`. Dates are parsed in IMF-fixdate form only (an RFC 850/asctime
   `If-Range` or `If-Modified-Since` is treated as not matching). Empty files ignore `Range`.
 
+## Admin console
+
+A small terminal console (plain ANSI, no extra dependency) runs the server in-process and lets an
+admin see its status and configuration, tail logs, and start, stop or reload it:
+
+    java -cp "target/sjws_nettask-0.2-SNAPSHOT.jar:target/lib/*" sjws_nettask.admin.AdminMain [server arguments]
+
+It takes the same arguments and environment as the server, plus its own: `--log-file=PATH` (a file
+shown in the logs view, e.g. redirected output), `--no-color`, `--no-autostart`. Commands (letter +
+Enter): `s` start, `x` stop, `r` reload (re-reads arguments and environment; an invalid config
+leaves the server running, a config that fails to bind restores the previous one), `v`/`c`/`l`
+status/config/logs views, Enter refresh, `h` help, `q` quit (stops the server). The console talks to
+the server only through `sjws_nettask.admin.ServerControl`, so another implementation (e.g. one
+controlling a daemon) can be plugged in.
+
 ## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the layers, the `core.Handler` seam and the request flow.
 
 * **core** (`sjws_nettask.core`): protocol-neutral `Request`/`Response`/`Body` records, the
   `StaticFileHandler` (every status decision: path decoding and containment, index/listings, MIME,
@@ -262,8 +346,10 @@ Throughput at 1000 connections did not change with the backlog (1 KB 217k vs 219
 whose SYN retransmits (after 1 s, then 3 s) show up as timeouts and p99 spikes. A 50 MB response at 1000 connections
 takes longer than wrk's default 2 s timeout by itself (17 GB/s shared 1000 ways), so those runs use 30 s.
 
-Memory per idle keep-alive connection: ~6.3 KB of heap (~6.6 KB RSS) since S4, against ~78 KB before
-(a 2 KiB input buffer and the parser's 256 B line buffer; no output buffer). Caveats: these are
+Memory per idle keep-alive connection: ~3.8–4.2 KB of heap after GC (measured with
+`bench/footprint/run.sh` at 10k idle connections; ~6.6 KB before the idle-footprint changes, ~78 KB before S4):
+a 256 B idle input buffer, the parked virtual-thread stack (~2.2 KB), no retained request head and
+no output buffer. Caveats: these are
 loopback numbers with the client on the same machine, small working sets that sit in the page cache
 and wrk's closed-loop load (no think time); at fixed rates every variant could sustain (wrk2, 50k
 req/s for 1 KB, 30k req/s for 100 KB) p50/p99 were within noise of each other (0.8-3 ms / 2-10 ms), and

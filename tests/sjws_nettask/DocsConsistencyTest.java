@@ -30,7 +30,7 @@ class DocsConsistencyTest {
 
     @Test
     void everyOptionAndVariableIsDocumentedInBothPlaces() throws IOException {
-        var usage = ServerConfig.usage();
+        var usage = Sjws_nettask.usage();
         var readme = readmeOptionRows();
         assertEquals(all(FLAG, usage), all(FLAG, readme), "--flags: --help vs README option tables");
         assertEquals(all(ENV, usage), all(ENV, readme), "environment variables: --help vs README option tables");
@@ -50,6 +50,7 @@ class DocsConsistencyTest {
         assertTrue(readme.contains("`WEB_SERVER_CACHE_BYTES` | " + (d.cacheBytes() >> 20) + "m |"));
         assertTrue(readme.contains("`WEB_SERVER_H3_MAX_CONNECTIONS` | " + d.h3MaxConnections() + " |"));
         assertTrue(readme.contains("`WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP` | " + d.h3MaxConnectionsPerIp() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_SHUTDOWN_TIMEOUT` | " + Daemon.DEFAULT_SHUTDOWN_TIMEOUT.toSeconds() + " |"));
     }
 
     @Test
