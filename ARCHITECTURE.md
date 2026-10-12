@@ -1,46 +1,61 @@
 # Architecture
 
-## Current structure (master `a6a63fb`)
+How the code on `master` is organised. User-visible behaviour (options, limits, caching, ranges) is
+documented in the [README](README.md) and the [configuration reference](docs/configuration.md); the
+tests that pin each behaviour are listed in [tests/README.md](tests/README.md).
 
-| Layer | Classes | Responsibility |
+## Layers
+
+| Layer | Package / classes | Responsibility |
 |---|---|---|
-| Entry / config | `Sjws_nettask` (CLI), `ServerConfig` | parse arguments, validate, start |
-| Lifecycle | `SjwsServer` | build the handler, bind TCP, start HTTP/3 `Transport`, Alt-Svc, shutdown |
-| Connection handling | `ClientManager` (accept loop, per-IP limits, virtual threads), `ConnectionReaper` (deadlines), `ChannelOutput`, `Http1Connection` | socket lifecycle, keep-alive, timeouts, body draining |
-| HTTP/1 wire format | `http1.Http1Parser`, `http1.Http1Writer`, `http1.ParseError` | bytes ⇄ `Head` / `Response` |
-| HTTP/3 wire format | `h3.*` (Netty QUIC) | QUIC frames ⇄ core types |
-| Core contract | `core.Request`, `RequestHeaders`, `Response`, `ResponseHeaders`, `Body` | protocol-neutral request/response |
-| Application | `core.StaticFileHandler` + `PathResolver`, `SafeOpen`, `FileCache`, `ByteRanges`, `EntityTag`, `Mime` | every status decision for static files |
+| Entry / config | `Sjws_nettask` (CLI, exit codes), `ServerConfig` | parse arguments and `WEB_SERVER_*` variables, validate, start |
+| Lifecycle | `SjwsServer`, `Transport` (+ `Transport.Factory`), `AltSvc` | build the `StaticFileHandler`, bind TCP, start the optional HTTP/3 transport, Alt-Svc, shutdown |
+| HTTP/1.1 connections | `ClientManager` (accept loop, per-IP limit, one virtual thread per connection), `Http1Connection`, `ConnectionReaper` (single timer thread for all deadlines), `ChannelOutput` | socket lifecycle, keep-alive, pipelining, body draining, timeouts |
+| HTTP/1.1 wire format | `sjws_nettask.http1`: `Http1Parser`, `ChunkedDecoder`, `Http1Requests`, `Http1Writer`, `ParseError` (+ legacy `HTML`, `Page`, `Header`) | bytes ⇄ `Head`; `Head` → `core.Request`; `core.Response` → bytes |
+| HTTP/3 | `sjws_nettask.h3`: `Http3Server`, `Http3RequestHandler`, `Http3Writer`, `Limits`, `RateGuard`, `NoRetryTokenHandler` | Netty QUIC (quiche) ⇄ core types; file slots, fair share, min send rate, handshake caps, GOAWAY |
+| TLS | `sjws_nettask.tls`: `TlsMaterial`, `SelfSignedDer` | PEM certificate/key loading (encrypted keys), self-signed certificate |
+| Core contract | `sjws_nettask.core`: `Handler`, `Request`, `RequestHeaders`, `Response`, `ResponseHeaders`, `Body` | protocol-neutral request/response |
+| Application | `core.StaticFileHandler` + `PathResolver`, `RequestRules`, `SafeOpen`, `FileCache`, `FileMeta`, `ByteRanges`, `EntityTag`, `Validator`, `Mime`, `HttpDate`, `DateClock`, `PerIpLimit` | every status decision for static files |
 
-Data flow: `ClientManager` → `Http1Connection` → `Http1Parser` → *(mapping)* → `StaticFileHandler.handle(Request)` → `Response` → `Http1Writer`.
+`SourceGuardTest` enforces the boundaries: no Netty in core or HTTP/1, and `h3` does not import HTTP/1.
 
-### Problems
-1. **No handler abstraction.** Transports depend on the concrete `StaticFileHandler`, so nothing (routing, rights checks, admin/status pages, test stubs) can sit in front of it without editing every transport.
-2. **Protocol mapping is inlined** in `Http1Connection.serveOne`, mixed with I/O and deadline logic, and only testable through a socket.
-3. `StaticFileHandler` mixes routing-like decisions (method check, listing vs file) with file serving.
-4. `SjwsServer` both wires the object graph and runs lifecycle.
-
-## Target
+## Request flow
 
 ```
-transport (http1 / h3)  ──parse──▶ core.Request ──▶ core.Handler ──▶ core.Response ──serialize──▶
-                                                    │
-                                     (later) filters/decorators: rights, security headers, logging
-                                                    │
-                                              StaticFileHandler
+HTTP/1.1: ClientManager → Http1Connection → Http1Parser → Http1Requests.toCore ─┐
+                                                                                ├→ Handler.handle(Request) → Response
+HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ───────┘        │
+                                                                     Http1Writer / Http3Writer
 ```
 
-* `core.Handler` (`Response handle(Request)`) is the single seam between transports and application logic. Cross-cutting features are **decorators** (`Handler → Handler`) composed in one place (`SjwsServer`), not edits inside transports.
-* Each transport has a pure mapping step (`http1.Http1Requests`, later an h3 equivalent) unit-testable without sockets.
-* `SjwsServer` becomes the composition root: config → handler chain → transports.
+* `core.Handler` (`Response handle(Request)`) is the seam between transports and application logic.
+  `StaticFileHandler` implements it; `Http1Connection` depends on `Handler`.
+* Both transports call the same handler, so behaviour is identical by construction; a parity test
+  compares every HTTP/3 response with the HTTP/1.1 bytes for the same request.
+* Errors raised before a request reaches the handler (parse errors, 408 deadlines, 431 on HTTP/3) use
+  `StaticFileHandler.error(...)`, so their pages match the handler's. Status lines and
+  error-page titles use `StaticFileHandler.reasonPhrase` (all RFC 9110 codes plus 429, empty for
+  unregistered ones); `Mime` maps extensions to `Content-Type`.
 
-## Migration steps
-1. **(this PR)** Add `core.Handler`; `StaticFileHandler implements Handler`; `Http1Connection` depends on `Handler`; extract `Http1Requests.toCore`. Behavior-preserving; tests for both seams.
-2. Widen `ClientManager`, `Transport.Factory` and `h3` request handling to accept `Handler` (`handler()` accessors keep returning `StaticFileHandler` for compatibility).
-3. Compose the handler chain in `SjwsServer` (one `Handler` built from config); sibling features (rights, security headers, admin) plug in as decorators.
-4. Move the method check (405) into a small router decorator; keep file logic in `StaticFileHandler`.
+## Current gaps
 
-Each step is small and avoids file moves/renames so parallel workstreams don't conflict.
+These are true of `master` today and are the next refactoring steps (each small, without file
+moves, so parallel workstreams don't conflict):
+
+1. `ClientManager`, `SjwsServer`, `Transport.Factory` and `h3.Http3RequestHandler` still take the
+   concrete `StaticFileHandler`; widen them to `Handler` (keeping a compatible `handler()` accessor).
+2. Compose the handler chain in `SjwsServer` (one `Handler` built from config) so cross-cutting
+   features (rights, security headers, admin/status pages, logging) plug in as decorators
+   (`Handler → Handler`) instead of edits inside transports.
+3. Move the method check (405/OPTIONS) from `StaticFileHandler` into a small router decorator.
+4. HTTP/3 has no pure mapping step equivalent to `Http1Requests.toCore` yet.
+
+## Future direction
+
+The project's goal is a reliable, fast, low-latency message-oriented middleware that is also a web
+server. Messaging is still being designed and nothing of it exists in the code yet; the `core.Handler`
+seam and the protocol-neutral `Request`/`Response` contract are where such features are expected to
+plug in. The target design and migration plan follow below.
 
 ---
 
@@ -120,7 +135,7 @@ TCP :msg     ──▶ MsgConnection ───┴──────────�
 | 6 | Optional: Netty or io_uring front-end behind `Transport` if benchmarks justify it | Measured win > 20 % |
 
 ## B. Benchmarks (measured)
-Run on **b8055fe** (master + this PR's `bench/`). Machine: shared cloud VM, **8 vCPU Intel Xeon (model not exposed), 15 GiB RAM, Linux 6.12, virtio disk (`vda`, reported rotational), overlay root filesystem**, **OpenJDK 25.0.4.1 (Temurin)**, default JVM flags. Client and server ran on the same host over loopback, so treat the numbers as **relative baselines, not capacity claims**. Reproduce with `bench/README.md`.
+Run on **b8055fe** (master at the time + this PR's `bench/`; later master merges, e.g. daemon mode, were not re-benchmarked). Machine: shared cloud VM, **8 vCPU Intel Xeon (model not exposed), 15 GiB RAM, Linux 6.12, virtio disk (`vda`, reported rotational), overlay root filesystem**, **OpenJDK 25.0.4.1 (Temurin)**, default JVM flags. Client and server ran on the same host over loopback, so treat the numbers as **relative baselines, not capacity claims**. Reproduce with `bench/README.md`.
 
 ### B1. HTTP/1.1 keep-alive closed loop (`HttpBench`, 10 s after a 2 s warm-up, GET of a static file)
 | Connections | Body | req/s | p50 | p99 | p99.9 |
