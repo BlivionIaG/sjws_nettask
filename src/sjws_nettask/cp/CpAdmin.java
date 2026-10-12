@@ -32,82 +32,88 @@ public final class CpAdmin {
         this.ttlMillis = ttlMillis;
     }
 
-    public CpStore.Outcome handle(Role role, String method, String path, String query, String body) {
-        if (role == null) {
-            return CpStore.Outcome.error(401, "unauthorized");
-        }
+    public CpStore.Outcome handle(sjws_nettask.controlplane.Rbac.Credential credential, String method, String path,
+            String query, String body) {
         var route = path.endsWith("/") && path.length() > 1 ? path.substring(0, path.length() - 1) : path;
+        var permission = permission(method, route);
+        if (permission == null) {
+            return CpStore.Outcome.error(404, "not found");
+        }
+        var decision = store.authorize(credential, permission, route);
+        if (!decision.allowed()) {
+            var status = decision.operator() == null ? 401 : 403;
+            return CpStore.Outcome.error(status, decision.reason());
+        }
         if ("GET".equals(method) && "/cp/v1/health".equals(route)) {
-            return permit(role, Role.VIEW, store.healthJson());
+            return CpStore.Outcome.ok(store.healthJson(), 0);
         }
         if ("GET".equals(method) && "/cp/v1/config".equals(route)) {
-            return permit(role, Role.VIEW, store.configJson());
+            return CpStore.Outcome.ok(store.configJson(), 0);
         }
         if ("GET".equals(method) && "/cp/v1/config/diff".equals(route)) {
-            if (!role.atLeast(Role.VIEW)) {
-                return CpStore.Outcome.error(403, "forbidden");
-            }
             return store.diff(queryLong(query, "from"), queryLong(query, "to"), false);
         }
         if ("GET".equals(method) && "/cp/v1/nodes".equals(route)) {
-            return permit(role, Role.VIEW, store.nodesJson());
+            return CpStore.Outcome.ok(store.nodesJson(), 0);
         }
         if ("POST".equals(method) && "/cp/v1/config".equals(route)) {
-            if (!role.atLeast(Role.OPERATE)) {
-                return CpStore.Outcome.error(403, "forbidden");
-            }
             return store.propose(body == null ? "" : body);
         }
         if ("POST".equals(method) && "/cp/v1/rollout".equals(route)) {
-            if (!role.atLeast(Role.OPERATE)) {
-                return CpStore.Outcome.error(403, "forbidden");
-            }
             return store.rollout(selectors(body));
         }
         if ("POST".equals(method) && "/cp/v1/rollout/advance".equals(route)) {
-            if (!role.atLeast(Role.OPERATE)) {
-                return CpStore.Outcome.error(403, "forbidden");
-            }
             return store.advance();
         }
         if ("POST".equals(method) && "/cp/v1/rollback".equals(route)) {
-            if (!role.atLeast(Role.OPERATE)) {
-                return CpStore.Outcome.error(403, "forbidden");
-            }
             return store.rollback(jsonLong(body, "toVersion"), nowMillis, ttlMillis);
         }
         if ("POST".equals(method) && route.startsWith("/cp/v1/nodes/") && route.endsWith("/revoke")) {
-            if (!role.atLeast(Role.ADMIN)) {
-                return CpStore.Outcome.error(403, "forbidden");
-            }
             var id = route.substring("/cp/v1/nodes/".length(), route.length() - "/revoke".length());
             return store.revoke(id);
         }
         if ("POST".equals(method) && "/cp/v1/activate".equals(route)) {
-            if (!role.atLeast(Role.OPERATE)) {
-                return CpStore.Outcome.error(403, "forbidden");
-            }
             return store.activate(nowMillis, ttlMillis);
         }
-        if ("POST".equals(method) && "/cp/v1/rbac".equals(route)) {
-            if (!role.atLeast(Role.ADMIN)) {
-                return CpStore.Outcome.error(403, "forbidden");
-            }
-            var san = jsonString(body, "san");
-            var name = jsonString(body, "role");
-            if (san == null || name == null) {
-                return CpStore.Outcome.error(400, "rbac");
-            }
-            return store.grant(san, Role.parse(name));
+        var san = jsonString(body, "san");
+        var name = jsonString(body, "role");
+        if (san == null || name == null) {
+            return CpStore.Outcome.error(400, "rbac");
         }
-        return CpStore.Outcome.error(404, "not found");
+        return store.grant(san, parseRole(name));
     }
 
-    private static CpStore.Outcome permit(Role role, Role required, String body) {
-        if (!role.atLeast(required)) {
-            return CpStore.Outcome.error(403, "forbidden");
+    private static sjws_nettask.controlplane.Permission permission(String method, String route) {
+        if ("GET".equals(method) && ("/cp/v1/health".equals(route) || "/cp/v1/config".equals(route)
+                || "/cp/v1/config/diff".equals(route) || "/cp/v1/nodes".equals(route))) {
+            return sjws_nettask.controlplane.Permission.READ;
         }
-        return CpStore.Outcome.ok(body, 0);
+        if ("POST".equals(method) && "/cp/v1/config".equals(route)) {
+            return sjws_nettask.controlplane.Permission.EDIT_ROUTES;
+        }
+        if ("POST".equals(method) && ("/cp/v1/rollout".equals(route) || "/cp/v1/rollout/advance".equals(route)
+                || "/cp/v1/activate".equals(route))) {
+            return sjws_nettask.controlplane.Permission.ROLLOUT;
+        }
+        if ("POST".equals(method) && "/cp/v1/rollback".equals(route)) {
+            return sjws_nettask.controlplane.Permission.ROLLBACK;
+        }
+        if ("POST".equals(method) && route.startsWith("/cp/v1/nodes/") && route.endsWith("/revoke")) {
+            return sjws_nettask.controlplane.Permission.MANAGE_OPERATORS;
+        }
+        if ("POST".equals(method) && "/cp/v1/rbac".equals(route)) {
+            return sjws_nettask.controlplane.Permission.MANAGE_OPERATORS;
+        }
+        return null;
+    }
+
+    static sjws_nettask.controlplane.Role parseRole(String name) {
+        return switch (name) {
+            case "viewer" -> sjws_nettask.controlplane.Role.VIEWER;
+            case "operator" -> sjws_nettask.controlplane.Role.OPERATOR;
+            case "admin" -> sjws_nettask.controlplane.Role.ADMIN;
+            default -> throw new IllegalArgumentException("role");
+        };
     }
 
     static long queryLong(String query, String key) {

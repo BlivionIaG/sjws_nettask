@@ -65,8 +65,9 @@ public final class CpStore implements AutoCloseable {
     private ReplicationGroup group;
     private ControlLeadership leadership;
     private final KeyRing keys;
-    private final String bootstrapToken;
-    private final Map<String, Role> rbac = new LinkedHashMap<>();
+    private final Map<String, sjws_nettask.controlplane.Role> policy = new LinkedHashMap<>();
+    private sjws_nettask.controlplane.Rbac rights;
+    private sjws_nettask.controlplane.AuditLog audit;
     private final List<String> revoked = new ArrayList<>();
     private final List<String> selectors = new ArrayList<>();
     private final List<SignedSnapshot> history = new ArrayList<>();
@@ -74,15 +75,22 @@ public final class CpStore implements AutoCloseable {
     private final JoinTokens joins = new JoinTokens();
     private Staged staged;
     private int stage;
-    private boolean adminEnrolled;
 
-    private CpStore(ReplicatedNode node, KeyRing keys, String bootstrapToken) {
+    private CpStore(ReplicatedNode node, KeyRing keys) {
         this.node = node;
         this.keys = keys;
-        this.bootstrapToken = bootstrapToken;
     }
 
+    /** Opens a store whose first admin is the mTLS identity {@code urn:sjws:admin:root}. */
     public static CpStore open(java.nio.file.Path stateDir, KeyRing keys, Clock clock) throws IOException {
+        return open(stateDir, keys, clock, "urn:sjws:admin:root");
+    }
+
+    /**
+     * @param adminSan URI SAN or subject DN of the first admin certificate. There is no bearer token.
+     */
+    public static CpStore open(java.nio.file.Path stateDir, KeyRing keys, Clock clock, String adminSan)
+            throws IOException {
         var id = new NodeId(1, "cp-1");
         var member = new Member(id, new SiteId("local"), new InetSocketAddress("127.0.0.1", 21001), 1L,
                 MemberState.ALIVE, false);
@@ -91,7 +99,11 @@ public final class CpStore implements AutoCloseable {
                 new SimTransport());
         var options = new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40),
                 10_000);
-        var store = new CpStore(node, keys, token());
+        var store = new CpStore(node, keys);
+        store.audit = new sjws_nettask.controlplane.AuditLog(stateDir.resolve("audit.jsonl"),
+                java.time.Clock.systemUTC(), false);
+        store.policy.put(canonicalSan(adminSan), sjws_nettask.controlplane.Role.ADMIN);
+        store.rebuildRights();
         store.group = node.openGroup(GROUP, options, entry -> store.onCommitted(entry.entry()));
         store.leadership = ControlLeadership.attach(node, GROUP, store.group, id);
         return store;
@@ -139,8 +151,14 @@ public final class CpStore implements AutoCloseable {
         enrollment.attach(binding());
     }
 
-    public String bootstrapToken() {
-        return bootstrapToken;
+    public sjws_nettask.controlplane.Rbac rights() {
+        return rights;
+    }
+
+    public sjws_nettask.controlplane.Rbac.Decision authorize(sjws_nettask.controlplane.Rbac.Credential credential,
+            sjws_nettask.controlplane.Permission permission, String target) {
+        long version = activated() == null ? 0L : activated().version();
+        return rights.authorize(credential, permission, target, version);
     }
 
     public KeyRing keys() {
@@ -156,7 +174,7 @@ public final class CpStore implements AutoCloseable {
     }
 
     public boolean adminEnrolled() {
-        return adminEnrolled;
+        return policy.containsValue(sjws_nettask.controlplane.Role.ADMIN);
     }
 
     public List<SignedSnapshot> history() {
@@ -256,9 +274,14 @@ public final class CpStore implements AutoCloseable {
         return Outcome.ok(json.toString(), 0);
     }
 
-    public Outcome grant(String san, Role role) {
+    public Outcome grant(String san, sjws_nettask.controlplane.Role role) {
         if (!leadership.leaderReady()) {
             return Outcome.error(503, "leader not ready");
+        }
+        try {
+            san = canonicalSan(san);
+        } catch (IllegalArgumentException e) {
+            return Outcome.error(400, "san");
         }
         try {
             append(rbacEntry(san, role));
@@ -339,8 +362,12 @@ public final class CpStore implements AutoCloseable {
                 + LastGoodFiles.jsonString(current.canonicalYaml()) + "}";
     }
 
-    public Role roleOfSan(String san) {
-        return rbac.get(san);
+    public sjws_nettask.controlplane.Role roleOfSan(String san) {
+        try {
+            return policy.get(canonicalSan(san));
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     public List<String> revoked() {
@@ -431,10 +458,13 @@ public final class CpStore implements AutoCloseable {
             }
             case RBAC -> {
                 var san = readString(body);
-                var role = Role.values()[body.getInt()];
-                rbac.put(san, role);
-                if (role == Role.ADMIN) {
-                    adminEnrolled = true;
+                var role = sjws_nettask.controlplane.Role.values()[body.getInt()];
+                var next = new LinkedHashMap<>(policy);
+                next.put(san, role);
+                if (next.containsValue(sjws_nettask.controlplane.Role.ADMIN)) {
+                    policy.clear();
+                    policy.putAll(next);
+                    rebuildRights();
                 }
             }
             case REVOKE -> revoked.add(readString(body));
@@ -555,7 +585,41 @@ public final class CpStore implements AutoCloseable {
                 nonce, keyId, signature, rollback, yaml);
     }
 
-    private static ByteBuffer rbacEntry(String san, Role role) {
+    private void rebuildRights() {
+        var used = new java.util.HashSet<String>();
+        var ops = new ArrayList<sjws_nettask.controlplane.Operator>();
+        for (var entry : policy.entrySet()) {
+            ops.add(new sjws_nettask.controlplane.Operator(operatorId(entry.getKey(), used), entry.getValue(),
+                    entry.getKey(), null, true));
+        }
+        this.rights = new sjws_nettask.controlplane.Rbac(ops, audit);
+    }
+
+    private static String canonicalSan(String san) {
+        return new sjws_nettask.controlplane.Operator("n", sjws_nettask.controlplane.Role.VIEWER, san, null, false)
+                .certSubject();
+    }
+
+    private static String operatorId(String san, java.util.Set<String> used) {
+        int colon = san.lastIndexOf(':');
+        var tail = colon >= 0 && colon < san.length() - 1 ? san.substring(colon + 1) : san;
+        var base = tail.toLowerCase().replaceAll("[^a-z0-9_-]", "");
+        if (base.isEmpty() || !Character.isLetterOrDigit(base.charAt(0))) {
+            base = "n" + base;
+        }
+        if (base.length() > 60) {
+            base = base.substring(0, 60);
+        }
+        var id = base;
+        var n = 2;
+        while (!used.add(id)) {
+            id = base + n;
+            n++;
+        }
+        return id;
+    }
+
+    private static ByteBuffer rbacEntry(String san, sjws_nettask.controlplane.Role role) {
         var raw = san.getBytes(StandardCharsets.UTF_8);
         var buffer = ByteBuffer.allocate(1 + 4 + raw.length + 4);
         buffer.put(RBAC);
@@ -609,12 +673,6 @@ public final class CpStore implements AutoCloseable {
 
     private static String readString(ByteBuffer body) {
         return new String(readBytes(body), StandardCharsets.UTF_8);
-    }
-
-    private static String token() {
-        var raw = new byte[16];
-        new java.security.SecureRandom().nextBytes(raw);
-        return java.util.HexFormat.of().formatHex(raw);
     }
 
     private record Staged(long version, ConfigDocument document) {

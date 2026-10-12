@@ -21,31 +21,28 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
+import javax.security.auth.x500.X500Principal;
+import sjws_nettask.controlplane.Rbac;
 
 /**
- * Loopback admin listener. The single-node lab accepts the bootstrap bearer token as
- * {@link Role#ADMIN} until an admin SAN is enrolled. After that the token is rejected.
+ * Loopback admin listener. Identity is the verified client certificate. {@code Authorization}
+ * is ignored. A connection without a certificate is unauthorized.
  */
 public final class AdminServer implements AutoCloseable {
 
     private final HttpServer server;
     private final CpAdmin admin;
-    private final CpStore store;
-    private final byte[] tokenHash;
 
-    private AdminServer(HttpServer server, CpAdmin admin, CpStore store, byte[] tokenHash) {
+    private AdminServer(HttpServer server, CpAdmin admin) {
         this.server = server;
         this.admin = admin;
-        this.store = store;
-        this.tokenHash = tokenHash;
     }
 
     public static AdminServer start(CpStore store, long nowMillis, long ttlMillis) throws IOException {
         var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        var admin = new CpAdmin(store, nowMillis, ttlMillis);
-        var bound = new AdminServer(http, admin, store, sha256(store.bootstrapToken()));
+        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis));
         http.createContext("/", bound::handle);
         http.start();
         return bound;
@@ -56,10 +53,9 @@ public final class AdminServer implements AutoCloseable {
     }
 
     private void handle(HttpExchange exchange) throws IOException {
-        var role = role(exchange.getRequestHeaders().getFirst("Authorization"));
-        var query = exchange.getRequestURI().getRawQuery();
-        var body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-        var outcome = admin.handle(role, exchange.getRequestMethod(), exchange.getRequestURI().getPath(), query, body);
+        var outcome = admin.handle(credential(exchange), exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
+                exchange.getRequestURI().getRawQuery(),
+                new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
         var bytes = outcome.body().getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
         exchange.sendResponseHeaders(outcome.status(), bytes.length);
@@ -67,27 +63,37 @@ public final class AdminServer implements AutoCloseable {
         exchange.close();
     }
 
-    private Role role(String authorization) {
-        if (store.adminEnrolled() || authorization == null || !authorization.startsWith("Bearer ")) {
+    /** The verified peer certificate, or null when the connection did not present one. */
+    static Rbac.Credential credential(HttpExchange exchange) {
+        if (!(exchange instanceof com.sun.net.httpserver.HttpsExchange https)) {
             return null;
         }
-        var presented = sha256(authorization.substring("Bearer ".length()).trim());
-        if (!MessageDigest.isEqual(presented, tokenHash)) {
+        var session = https.getSSLSession();
+        if (session == null) {
             return null;
         }
-        return Role.ADMIN;
+        try {
+            Certificate[] chain = session.getPeerCertificates();
+            if (chain == null || chain.length == 0 || !(chain[0] instanceof X509Certificate cert)) {
+                return null;
+            }
+            var sans = cert.getSubjectAlternativeNames();
+            if (sans != null) {
+                for (var san : sans) {
+                    if (san.size() >= 2 && Integer.valueOf(6).equals(san.get(0)) && san.get(1) instanceof String uri
+                            && uri.startsWith("urn:")) {
+                        return new Rbac.ClientCert(uri);
+                    }
+                }
+            }
+            return new Rbac.ClientCert(cert.getSubjectX500Principal().getName(X500Principal.CANONICAL));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     @Override
     public void close() {
         server.stop(0);
-    }
-
-    private static byte[] sha256(String text) {
-        try {
-            return MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
     }
 }

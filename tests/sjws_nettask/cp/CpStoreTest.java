@@ -177,44 +177,48 @@ class CpStoreTest {
     }
 
     @Test
-    void adminRoutesRequireARoleAndTheTokenStopsAfterEnrollment() throws Exception {
+    void adminRoutesRequireAClientCertificate() throws Exception {
         var root = Files.createDirectory(dir.resolve("html"));
         var keys = KeyRing.generate("online-1", NOW + 86_400_000L, 0, Long.MAX_VALUE / 2);
         var clock = new FakeClock(0);
         try (var store = CpStore.open(dir.resolve("cp"), keys, clock); var http = AdminServer.start(store, NOW, TTL)) {
             elect(store, clock);
             var client = HttpClient.newHttpClient();
-            var health = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()
-                    + "/cp/v1/health")).header("Authorization", "Bearer " + store.bootstrapToken()).GET().build(),
+            var bearer = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()
+                    + "/cp/v1/health")).header("Authorization", "Bearer sjws_root.secret").GET().build(),
                     HttpResponse.BodyHandlers.ofString());
-            assertEquals(200, health.statusCode(), health.body());
-            assertTrue(health.body().contains("\"leaderReady\":true"));
+            assertEquals(401, bearer.statusCode(), bearer.body());
             var denied = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()
                     + "/cp/v1/health")).GET().build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(401, denied.statusCode());
             var yaml = "server:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n";
-            var post = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port() + "/cp/v1/config"))
-                    .header("Authorization", "Bearer " + store.bootstrapToken())
-                    .POST(HttpRequest.BodyPublishers.ofString(yaml)).build(), HttpResponse.BodyHandlers.ofString());
-            assertEquals(200, post.statusCode(), post.body());
+            var adminCert = new sjws_nettask.controlplane.Rbac.ClientCert("urn:sjws:admin:root");
+            var viewerCert = new sjws_nettask.controlplane.Rbac.ClientCert("urn:sjws:admin:viewer");
+            var operatorCert = new sjws_nettask.controlplane.Rbac.ClientCert("urn:sjws:admin:operator");
             var admin = new CpAdmin(store, NOW, TTL);
-            assertEquals(403, admin.handle(Role.VIEW, "POST", "/cp/v1/config", null, yaml).status());
-            assertEquals(403, admin.handle(Role.OPERATE, "POST", "/cp/v1/nodes/n1/revoke", null, "").status());
-            assertEquals(200, admin.handle(Role.OPERATE, "POST", "/cp/v1/rollout", null,
+            var health = admin.handle(adminCert, "GET", "/cp/v1/health", null, "");
+            assertEquals(200, health.status(), health.body());
+            assertTrue(health.body().contains("\"leaderReady\":true"));
+            assertEquals(200, admin.handle(adminCert, "POST", "/cp/v1/config", null, yaml).status());
+            assertEquals(401, admin.handle(viewerCert, "POST", "/cp/v1/config", null, yaml).status());
+            assertEquals(200, admin.handle(adminCert, "POST", "/cp/v1/rbac", null,
+                    "{\"san\":\"urn:sjws:admin:viewer\",\"role\":\"viewer\"}").status());
+            assertEquals(200, admin.handle(adminCert, "POST", "/cp/v1/rbac", null,
+                    "{\"san\":\"urn:sjws:admin:operator\",\"role\":\"operator\"}").status());
+            assertEquals(403, admin.handle(viewerCert, "POST", "/cp/v1/config", null, yaml).status());
+            assertEquals(403, admin.handle(operatorCert, "POST", "/cp/v1/nodes/n1/revoke", null, "").status());
+            assertEquals(200, admin.handle(operatorCert, "POST", "/cp/v1/rollout", null,
                     "{\"selectors\":[\"edge\",\"internal\"]}").status());
-            assertEquals(200, admin.handle(Role.OPERATE, "POST", "/cp/v1/rollout/advance", null, "").status());
+            assertEquals(200, admin.handle(operatorCert, "POST", "/cp/v1/rollout/advance", null, "").status());
             assertEquals(1, store.stage());
-            assertEquals(200, admin.handle(Role.ADMIN, "POST", "/cp/v1/nodes/n1/revoke", null, "").status());
+            assertEquals(200, admin.handle(adminCert, "POST", "/cp/v1/nodes/n1/revoke", null, "").status());
             assertTrue(store.revoked().contains("n1"));
-            assertEquals(200, admin.handle(Role.ADMIN, "POST", "/cp/v1/rbac", null,
-                    "{\"san\":\"urn:sjws:node:admin\",\"role\":\"admin\"}").status());
-            assertEquals(Role.ADMIN, store.roleOfSan("urn:sjws:node:admin"));
+            assertEquals(sjws_nettask.controlplane.Role.ADMIN, store.roleOfSan("urn:sjws:admin:root"));
+            assertEquals(sjws_nettask.controlplane.Role.VIEWER, store.roleOfSan("urn:sjws:admin:viewer"));
             assertTrue(store.adminEnrolled());
-            var after = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()
-                    + "/cp/v1/health")).header("Authorization", "Bearer " + store.bootstrapToken()).GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            assertEquals(401, after.statusCode());
-            assertEquals(404, admin.handle(Role.VIEW, "GET", "/cp/v1/missing", null, "").status());
+            assertEquals(401, admin.handle(new sjws_nettask.controlplane.Rbac.Token("sjws_root.secret"), "GET",
+                    "/cp/v1/health", null, "").status());
+            assertEquals(404, admin.handle(adminCert, "GET", "/cp/v1/missing", null, "").status());
             assertEquals(-1L, CpAdmin.queryLong("from=no", "from"));
             assertNull(CpAdmin.jsonString("{}", "san"));
         }
