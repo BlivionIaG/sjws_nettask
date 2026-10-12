@@ -22,7 +22,7 @@ class SjwsServerTest {
     SjwsServer server;
 
     /** Fake HTTP/3 transport. */
-    static final class FakeTransport implements Transport {
+    static class FakeTransport implements Transport {
 
         final int port;
         final Exception failure;
@@ -119,6 +119,74 @@ class SjwsServerTest {
         } finally {
             java.nio.file.Files.setPosixFilePermissions(xo, java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
         }
+    }
+
+    /** Runs {@code body} with System.err captured; returns what it printed. */
+    static String stderrOf(org.junit.jupiter.api.function.Executable body) throws Throwable {
+        var saved = System.err;
+        var bytes = new java.io.ByteArrayOutputStream();
+        System.setErr(new java.io.PrintStream(bytes, true, java.nio.charset.StandardCharsets.UTF_8));
+        try {
+            body.execute();
+        } finally {
+            System.setErr(saved);
+        }
+        return bytes.toString(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void cacheLargerThanHalfTheHeapIsWarnedAbout() throws Throwable {
+        long huge = Runtime.getRuntime().maxMemory();
+        var err = stderrOf(() -> server = SjwsServer.start(config(false).toBuilder().cacheBytes(huge).build(), (c, h) -> null));
+        assertTrue(err.contains("WARN: --cache-bytes=" + huge + " is more than half of the maximum heap"), err);
+        assertEquals(huge, server.config().cacheBytes());
+        assertNotNull(server.clientManager());
+        assertEquals(200, get("/hello.txt").statusCode());
+    }
+
+    @Test
+    void failedTransportIsClosedAndItsCloseErrorIsKept() throws Throwable {
+        var closeError = new IllegalStateException("close failed too");
+        var startError = new java.io.IOException("start failed");
+        var fake = new FakeTransport(4433, startError) {
+            @Override
+            public void close() {
+                super.close();
+                throw closeError;
+            }
+        };
+        var err = stderrOf(() -> server = SjwsServer.start(config(true), (c, h) -> fake));
+        assertSame(startError, server.h3Failure());
+        assertArrayEquals(new Throwable[] {closeError}, startError.getSuppressed());
+        assertTrue(err.contains("WARN: HTTP/3 not started, serving HTTP/1.1 only (no Alt-Svc): " + startError), err);
+        assertTrue(server.describe().contains(", HTTP/3 unavailable, serving "), server.describe());
+        assertEquals(200, get("/hello.txt").statusCode());
+    }
+
+    @Test
+    void errorClosingTheTransportIsReportedAndCloseStillCompletes() throws Throwable {
+        var fake = new FakeTransport(4433, null) {
+            @Override
+            public void close() {
+                super.close();
+                throw new IllegalStateException("boom");
+            }
+        };
+        server = SjwsServer.start(config(true), (c, h) -> fake);
+        int port = server.tcpPort();
+        var err = stderrOf(() -> server.close());
+        assertTrue(err.contains("WARN: error closing fake-h3: java.lang.IllegalStateException: boom"), err);
+        assertEquals(-1, server.tcpPort());
+        assertThrows(java.io.IOException.class, () -> HttpTestSupport.get(port, "/hello.txt", 1000));
+    }
+
+    @Test
+    void closeFromAnInterruptedThreadKeepsTheInterrupt() throws IOException {
+        server = SjwsServer.start(config(false), (c, h) -> null);
+        Thread.currentThread().interrupt();
+        server.close();
+        assertTrue(Thread.interrupted(), "interrupt status restored");
+        assertEquals(-1, server.tcpPort());
     }
 
     /** N6: the configured backlog reaches listen(2) (Linux: ss shows it as Send-Q of the listener). */
