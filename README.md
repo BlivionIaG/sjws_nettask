@@ -46,6 +46,7 @@ Run:
 | `--allow-unlistable-dirs` | `WEB_SERVER_ALLOW_UNLISTABLE_DIRS` | off | serve files below directories the server can't read (mode `--x`) through a weaker path-based open; see Platform notes |
 | `--cache-bytes=N[k\|m\|g]` | `WEB_SERVER_CACHE_BYTES` | 64m | small-file cache size (see below); `0` disables it |
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
+| `--config=PATH` | `WEB_SERVER_CONFIG` | | YAML configuration file (see [docs/config.md](docs/config.md)); the environment wins |
 | `-h`, `--help` | | | print usage and exit |
 | `--daemon` | | | detach and run in the background; the parent exits once the child is listening |
 | `--pid-file=PATH` | `WEB_SERVER_PID_FILE` | sjws_nettask.pid | process-id file; written by `--daemon`, and whenever this option is set |
@@ -137,74 +138,15 @@ server is then limited to the per-address cap (256 HTTP/1.1 connections, 16 QUIC
 `--max-connections-per-ip` / `--h3-max-connections-per-ip` there (e.g. to `--max-connections` /
 `--h3-max-connections`).
 
-Environment variables override arguments. Invalid values are replaced by the default
-with a `WARN:` line; unknown options warn too. Exit codes: 0 = normal / `--help`,
-1 = cannot listen on the port (also: already running, pid file or log file not writable,
-background start failed), 2 = document root missing, 64 = configuration error
-(e.g. `--cert` without `--key`, unreadable key password file, `--stop` combined with `--daemon`).
-`--status` uses 0 = running, 1 = pid file is stale, 3 = not running.
-
-### Running in the background
-
-`--daemon` starts a second JVM and exits once that process is listening. The child runs in a new
-session when `setsid` is available (`/usr/bin/setsid`), ignores `SIGHUP`, writes the pid file and
-appends stdout and stderr to the log file (default `sjws_nettask.log` in the working directory).
-JVM flags placed before `-jar` or the main class, such as `-Xmx`, are kept. Paths in `--pid-file`
-and `--log-file` are relative to the working directory; a service should use absolute paths.
-
-```
-java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --daemon --pid-file=/run/sjws_nettask.pid \
-    --log-file=/var/log/sjws_nettask.log 8080 /var/www/html
-java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --status --pid-file=/run/sjws_nettask.pid
-java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --stop --pid-file=/run/sjws_nettask.pid
-java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --restart --pid-file=/run/sjws_nettask.pid \
-    --log-file=/var/log/sjws_nettask.log 8080 /var/www/html
-```
-
-`--stop` sends SIGTERM and waits for `--shutdown-timeout` plus 5 seconds, then SIGKILL.
-`--status` prints `running pid=<n>`, `stopped`, or `stopped stale pid=<n>`. A pid file whose
-process is gone, or whose pid was reused (the start time no longer matches), is stale: `--stop`
-removes it and does not signal the new process. A file a live server has locked is left in place,
-so a restart cannot delete the pid file the new process just claimed. `--restart` is `--stop`
-followed by `--daemon`.
-
-SIGTERM and SIGINT (the shutdown hook) stop accepting on every listener, drop idle and
-half-read HTTP/1 connections immediately, and let responses already in progress finish until
-`--shutdown-timeout` (default 10 seconds). Whatever is still open is then closed. HTTP/3 sends
-GOAWAY and drains for up to 2 seconds in parallel with that wait. A foreground process with
-`--pid-file` writes the same file, so `--stop` works for it too; without `--log-file` it keeps
-logging to the console.
-
-`contrib/sjws` is a small start/stop/status/restart wrapper (`SJWS_JAR`, `SJWS_PID_FILE`,
-`SJWS_LOG_FILE`, `JAVA`). `contrib/sjws_nettask.service` is a systemd `Type=forking` example
-(`PIDFile` plus `--daemon`). Copy `target/lib/` next to the jar: `java -jar` loads Netty from the
-manifest `Class-Path`. On Windows, `--stop` ends the process without a POSIX SIGTERM, so the
-drain hook does not run; use a service manager that can signal the JVM there.
-
-### HTTP/2
-
-HTTP/2 is opt-in and runs on its **own TCP port**, next to HTTP/1.1 (whose listener and connection
-handling are unchanged by it), serving the same files through the same handler.
-
-| Option | Environment | Default | |
-|---|---|---|---|
-| `--h2` / `--no-h2` | `WEB_SERVER_H2` (`true/false/1/0/yes/no/on/off`) | off | enable HTTP/2 over TLS (ALPN `h2`, falling back to `http/1.1` for clients that don't offer it) |
-| `--h2-port=N` | `WEB_SERVER_H2_PORT` | 8443 | TCP port of the TLS listener; `0` = ephemeral |
-| `--h2c-port=N` | `WEB_SERVER_H2C_PORT` | off | cleartext HTTP/2 port: prior knowledge or `Upgrade: h2c`, otherwise HTTP/1.1; needs `--h2` |
-
-* The certificate options (`--cert`, `--key`, `--key-password-file`, below) are shared with HTTP/3;
-  without them a self-signed `localhost` certificate is generated.
-* Limits (`sjws_nettask.h2.Http2Server.Limits`): 100 concurrent streams per connection
-  (`SETTINGS_MAX_CONCURRENT_STREAMS`, extra streams get `REFUSED_STREAM`), 16 KiB header list
-  (`SETTINGS_MAX_HEADER_LIST_SIZE`), at most 100 `RST_STREAM` per 10 s from a client (rapid reset,
-  CVE-2023-44487: `GOAWAY ENHANCE_YOUR_CALM` and close), at most 16 consecutive small `CONTINUATION`
-  frames (CONTINUATION flood: `GOAWAY` and close), 4096 requests in flight and 512 file responses
-  streaming server-wide, `--max-connections` / `--max-connections-per-ip`, the TLS handshake within
-  `--header-timeout`, idle connections closed after `--idle-timeout`, and a stalled stream (peer
-  window exhausted) reset after `--write-timeout`. File bodies are sent at the pace of the peer's
-  flow-control windows, one 64 KiB chunk per stream in memory at most.
-* Quick check: `curl -k --http2 https://127.0.0.1:8443/` (h2), `curl --http2-prior-knowledge
-  http://127.0.0.1:<h2c-port>/` (h2c).
+Defaults, then the config file, then arguments, then environment variables.
+A bad value in the file is an error (exit 64). Invalid values of the server flags
+above are still replaced by the default with a `WARN:` line; unknown options warn too.
+Exit codes: 0 = normal / `--help`, 1 = cannot listen on the port, 2 = document root
+missing, 64 = configuration error (e.g. `--cert` without `--key`, a bad config file,
+unreadable key password file). Routing and middleware are file-only and are validated
+into the snapshot; this server does not proxy or apply a middleware chain.
+Reload re-reads the file through `ReloadHook` (see docs/config.md). ACME HTTP-01
+issuance uses the staging CA unless you select production.
 
 ### HTTP/3
 
@@ -224,6 +166,14 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 | | `WEB_SERVER_TLS_KEY_PASSWORD` | | key password itself (wins over the file) |
 | `--alt-svc` / `--no-alt-svc` | `WEB_SERVER_ALT_SVC` | off | send `Alt-Svc` on HTTP/1.1 responses (see below) |
 | `--alt-svc-max-age=S` | `WEB_SERVER_ALT_SVC_MA` | 86400 | `ma` of the `Alt-Svc` header |
+| `--acme` / `--no-acme` | `WEB_SERVER_ACME` | off | ACME (RFC 8555) certificate issuance; default CA is Let's Encrypt staging |
+| `--acme-directory=URL` | `WEB_SERVER_ACME_DIRECTORY` | staging | `staging`, `production`, or an ACME directory URL |
+| `--acme-email=ADDR` | `WEB_SERVER_ACME_EMAIL` | | account contact email (required when ACME is on) |
+| `--acme-domain=NAME` | `WEB_SERVER_ACME_DOMAINS` | | domain (repeat the flag; the variable is comma-separated) |
+| `--acme-storage=PATH` | `WEB_SERVER_ACME_STORAGE` | `./acme` | account key, domain key and certificate chain |
+| `--acme-http-port=N` | `WEB_SERVER_ACME_HTTP_PORT` | 0 | HTTP-01 port; 0 serves challenges on the main listener |
+| `--acme-accept-terms` | `WEB_SERVER_ACME_ACCEPT_TERMS` | off | agree to the CA terms of service (required when ACME is on) |
+| `--acme-renew-before=DUR` | `WEB_SERVER_ACME_RENEW_BEFORE` | 30d | renew this long before the certificate expires |
 
 * `--cert` and `--key` go together; without both, a self-signed `localhost` certificate is generated.
 * The key password is deliberately **not** accepted as a command-line argument (it would show in

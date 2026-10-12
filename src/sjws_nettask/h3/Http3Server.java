@@ -47,6 +47,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
@@ -58,8 +59,7 @@ import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
-import sjws_nettask.observe.ObserverSlot;
-import sjws_nettask.observe.RequestObserver;
+import sjws_nettask.tls.SwappableKeyManager;
 import sjws_nettask.tls.TlsMaterial;
 
 /**
@@ -98,9 +98,7 @@ public final class Http3Server implements Transport {
     static final QuicTokenHandler TOKENS = NoRetryTokenHandler.INSTANCE;
 
     private final ServerConfig config;
-    private final Function<Request, Response> handler;
-    /** Copied into every request only when a chain or a non-static terminal is installed. */
-    private final boolean captureFields;
+    private final AtomicReference<Function<Request, Response>> handlers;
     private final Map<QuicChannel, Connection> state = new ConcurrentHashMap<>();
     private final BooleanSupplier available;
     private final Supplier<Throwable> unavailabilityCause;
@@ -113,7 +111,8 @@ public final class Http3Server implements Transport {
     private final Map<Http3Writer.Outcome, LongAdder> outcomes = new EnumMap<>(Http3Writer.Outcome.class);
     private Limits limits;
     private Shared shared;
-    private TlsMaterial tls;
+    private volatile TlsMaterial tls;
+    private volatile SwappableKeyManager keys;
     private EventLoopGroup group;
     private ExecutorService executor;
     private Channel channel;
@@ -179,7 +178,7 @@ public final class Http3Server implements Transport {
         this.available = Objects.requireNonNull(available, "available");
         this.unavailabilityCause = Objects.requireNonNull(unavailabilityCause, "unavailabilityCause");
         this.config = Objects.requireNonNull(config, "config");
-        this.handler = Objects.requireNonNull(handler, "handler");
+        this.handlers = new AtomicReference<>(Objects.requireNonNull(handler, "handler"));
         this.tls = tls;
         this.captureFields = captureFields;
         this.limits = Limits.of(config);
@@ -317,12 +316,14 @@ public final class Http3Server implements Transport {
             }
         }
         try {
-            var ssl = QuicSslContextBuilder.forServer(this.tls.key(), null, this.tls.chain())
+            this.keys = new SwappableKeyManager(this.tls);
+            var ssl = QuicSslContextBuilder.forServer(this.keys, null)
                     .applicationProtocols(Http3.supportedApplicationProtocols()).build();
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h3-request-", 0).factory());
             this.perIp = new sjws_nettask.core.PerIpLimit(this.limits.connectionsPerIp());
-            this.shared = new Shared(this.handler, this.executor, this.limits, new Semaphore(this.limits.maxInflight()),
-                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.captureFields, this.slot);
+            this.shared = new Shared(request -> this.handlers.get().apply(request), this.executor, this.limits,
+                    new Semaphore(this.limits.maxInflight()),
+                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             var codec = Http3.newQuicServerCodecBuilder()
                     .sslContext(ssl)
@@ -473,9 +474,26 @@ public final class Http3Server implements Transport {
         return (InetSocketAddress) this.channel.localAddress();
     }
 
-    /** @return the TLS material in use (after {@link #start()}) */
+    /** @return the TLS material in use (after {@link #start()}, or the material set by {@link #replaceTls}) */
     public TlsMaterial tls() {
         return this.tls;
+    }
+
+    /**
+     * Certificate for new handshakes. Before {@link #start()} this replaces what start would load
+     * from the configuration. After start, BoringSSL reads it on the next handshake.
+     */
+    public void replaceTls(TlsMaterial material) {
+        this.tls = Objects.requireNonNull(material, "material");
+        var manager = this.keys;
+        if (manager != null) {
+            manager.set(material);
+        }
+    }
+
+    /** The next request uses this handler. A request already in the handler keeps the previous one. */
+    public void replaceHandler(Function<Request, Response> handler) {
+        this.handlers.set(Objects.requireNonNull(handler, "handler"));
     }
 
     /** @return QUIC connections currently open */

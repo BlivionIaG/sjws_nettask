@@ -1,0 +1,906 @@
+/*
+ * Copyright (C) 2026 BlivionIaG <BlivionIaG at chenco.tk>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package sjws_nettask.config;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Pattern;
+import sjws_nettask.ServerConfig;
+
+/**
+ * Loads YAML ({@code --config} / {@code WEB_SERVER_CONFIG}, environment wins) and merges it under
+ * the command line and the environment. The file is strict: a bad value is an error. Existing
+ * server flags stay lenient inside {@link ServerConfig#parse}. Precedence is defaults, then the
+ * file, then arguments, then the environment.
+ */
+public final class ConfigLoader {
+
+    private static final List<String> TOP = List.of("server", "http3", "tls", "acme", "routing", "middleware");
+    private static final Pattern HOST = Pattern.compile(
+            "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
+    private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
+
+    private ConfigLoader() {
+    }
+
+    public static Loaded load(String[] args, Map<String, String> env) {
+        return load(args, env, ServerConfig::readPasswordFile);
+    }
+
+    /** A server started from a {@link ServerConfig} alone (no file, so reload has nothing to read). */
+    public static Loaded standalone(ServerConfig config) {
+        return new Loaded(ConfigDocument.defaults(config), List.of(), List.of(), false, new String[0], Map.of(),
+                ServerConfig::readPasswordFile);
+    }
+
+    public static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
+        var arguments = args.clone();
+        var environment = Map.copyOf(env);
+        for (var arg : arguments) {
+            if (arg.equals("-h") || arg.equals("--help")) {
+                return new Loaded(null, List.of(), List.of(), true, arguments, environment, passwords);
+            }
+        }
+        try {
+            return loadFile(arguments, environment, passwords);
+        } catch (ConfigException e) {
+            return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords);
+        }
+    }
+
+    private static Loaded loadFile(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords)
+            throws ConfigException {
+        var warnings = new ArrayList<String>();
+        String fromArgs = null;
+        for (var arg : args) {
+            if (!arg.startsWith("--")) {
+                continue;
+            }
+            var name = optionName(arg);
+            if (name.equals("--config")) {
+                var value = optionValue(arg);
+                if (value == null || value.isBlank()) {
+                    throw new ConfigException("Missing value for --config (use --config=PATH)");
+                }
+                fromArgs = value;
+            }
+        }
+        var fromEnv = env.get("WEB_SERVER_CONFIG");
+        var configured = fromEnv != null ? fromEnv : fromArgs;
+        ServerConfig baseline = null;
+        AcmeSettings acme = AcmeSettings.disabled();
+        Routing routing = Routing.disabled();
+        MiddlewareChain middleware = MiddlewareChain.EMPTY;
+        Path configFile = null;
+        Path yamlPassword = null;
+        if (configured != null) {
+            configFile = Path.of(configured);
+            if (!Files.isRegularFile(configFile)) {
+                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath());
+            }
+            long size;
+            try {
+                size = Files.size(configFile);
+            } catch (IOException e) {
+                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath() + ": "
+                        + e.getMessage());
+            }
+            if (size > 1_000_000) {
+                throw new ConfigException("Config file " + configFile.toAbsolutePath() + " is larger than 1MB");
+            }
+            String text;
+            try {
+                text = Files.readString(configFile);
+            } catch (IOException e) {
+                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath() + ": "
+                        + e.getMessage());
+            }
+            var root = YamlValues.parse(text, configFile.toString());
+            YamlValues.knownKeys(root, TOP, "config");
+            var base = configFile.toAbsolutePath().getParent();
+            baseline = serverSection(root, base);
+            yamlPassword = tlsPassword(root, base);
+            acme = acmeSection(root, base);
+            routing = routingSection(root, warnings);
+            middleware = middlewareSection(root, warnings);
+        }
+        var parsed = baseline == null
+                ? ServerConfig.parse(args, env, passwords)
+                : ServerConfig.parse(args, env, baseline, passwords);
+        warnings.addAll(parsed.warnings());
+        if (!parsed.ok()) {
+            return new Loaded(null, warnings, parsed.errors(), parsed.helpRequested(), args, env, passwords);
+        }
+        var server = applyYamlPassword(parsed.config(), yamlPassword, args, env, passwords, warnings);
+        acme = overlayAcme(acme, args, env, configFile);
+        if (server.tlsCert() != null && acme.enabled()) {
+            throw new ConfigException("tls.cert and acme.enabled cannot both be set");
+        }
+        var document = new ConfigDocument(server, acme, routing, middleware, configFile);
+        return new Loaded(document, warnings, List.of(), false, args, env, passwords);
+    }
+
+    private static ServerConfig applyYamlPassword(ServerConfig server, Path yamlPassword, String[] args,
+            Map<String, String> env, ServerConfig.PasswordFileReader passwords, List<String> warnings) {
+        if (yamlPassword == null || server.tlsKeyPassword() != null || !server.h3Enabled()) {
+            return server;
+        }
+        if (env.containsKey("WEB_SERVER_TLS_KEY_PASSWORD") || env.containsKey("WEB_SERVER_TLS_KEY_PASSWORD_FILE")) {
+            return server;
+        }
+        for (var arg : args) {
+            if (arg.startsWith("--key-password-file")) {
+                return server;
+            }
+        }
+        try {
+            return server.toBuilder().tlsKeyPassword(passwords.read(yamlPassword)).build();
+        } catch (IOException | RuntimeException e) {
+            throw new ConfigException("Cannot read the key password file " + yamlPassword + ": " + e.getMessage());
+        }
+    }
+
+    private static ServerConfig serverSection(Map<String, Object> root, Path base) {
+        var builder = ServerConfig.builder(Path.of(sjws_nettask.CONSTANTS.DEFAULT_HTML_PATH));
+        if (root.get("server") instanceof Object server) {
+            var map = YamlValues.mapping(server, "server");
+            YamlValues.knownKeys(map, List.of("port", "root", "max_connections", "max_connections_per_ip", "backlog",
+                    "idle_timeout", "header_timeout", "write_timeout", "cache_bytes", "allow_unlistable_dirs",
+                    "access_log"), "server");
+            if (map.containsKey("port")) {
+                builder.port(integer(map.get("port"), "server.port", 0, 65535));
+            }
+            if (map.containsKey("root")) {
+                builder.root(resolve(base, text(map.get("root"), "server.root"), "server.root"));
+            }
+            if (map.containsKey("max_connections")) {
+                builder.maxConnections(integer(map.get("max_connections"), "server.max_connections", 1, 10_000_000));
+            }
+            if (map.containsKey("max_connections_per_ip")) {
+                builder.maxConnectionsPerIp(
+                        integer(map.get("max_connections_per_ip"), "server.max_connections_per_ip", 1, 10_000_000));
+            }
+            if (map.containsKey("backlog")) {
+                builder.backlog(integer(map.get("backlog"), "server.backlog", 1, 65535));
+            }
+            if (map.containsKey("idle_timeout")) {
+                builder.idleTimeout(Duration.ofSeconds(seconds(map.get("idle_timeout"), "server.idle_timeout", 1, 86_400)));
+            }
+            if (map.containsKey("header_timeout")) {
+                builder.headerTimeout(
+                        Duration.ofSeconds(seconds(map.get("header_timeout"), "server.header_timeout", 1, 86_400)));
+            }
+            if (map.containsKey("write_timeout")) {
+                builder.writeTimeout(
+                        Duration.ofSeconds(seconds(map.get("write_timeout"), "server.write_timeout", 1, 86_400)));
+            }
+            if (map.containsKey("cache_bytes")) {
+                builder.cacheBytes(Sizes.parse(sizeText(map.get("cache_bytes"), "server.cache_bytes"),
+                        ServerConfig.MAX_CACHE_BYTES, "server.cache_bytes"));
+            }
+            if (map.containsKey("allow_unlistable_dirs")) {
+                builder.allowUnlistableDirs(bool(map.get("allow_unlistable_dirs"), "server.allow_unlistable_dirs"));
+            }
+            if (map.containsKey("access_log")) {
+                builder.accessLog(accessLog(map.get("access_log")));
+            }
+        }
+        if (root.get("http3") instanceof Object http3) {
+            var map = YamlValues.mapping(http3, "http3");
+            YamlValues.knownKeys(map, List.of("enabled", "port", "host", "max_connections", "max_connections_per_ip",
+                    "min_rate", "alt_svc", "alt_svc_max_age"), "http3");
+            if (map.containsKey("enabled")) {
+                builder.h3Enabled(bool(map.get("enabled"), "http3.enabled"));
+            }
+            if (map.containsKey("port")) {
+                builder.h3Port(h3Port(map.get("port")));
+            }
+            if (map.containsKey("host")) {
+                builder.h3Host(text(map.get("host"), "http3.host"));
+            }
+            if (map.containsKey("max_connections")) {
+                builder.h3MaxConnections(integer(map.get("max_connections"), "http3.max_connections", 1, 10_000_000));
+            }
+            if (map.containsKey("max_connections_per_ip")) {
+                builder.h3MaxConnectionsPerIp(
+                        integer(map.get("max_connections_per_ip"), "http3.max_connections_per_ip", 1, 10_000_000));
+            }
+            if (map.containsKey("min_rate")) {
+                builder.h3MinRate(integer(map.get("min_rate"), "http3.min_rate", 0, 1_000_000_000));
+            }
+            if (map.containsKey("alt_svc")) {
+                builder.altSvc(bool(map.get("alt_svc"), "http3.alt_svc"));
+            }
+            if (map.containsKey("alt_svc_max_age")) {
+                builder.altSvcMaxAge(Duration.ofSeconds(
+                        seconds(map.get("alt_svc_max_age"), "http3.alt_svc_max_age", 0, 31_536_000)));
+            }
+        }
+        if (root.get("tls") instanceof Object tls) {
+            var map = YamlValues.mapping(tls, "tls");
+            if (map.containsKey("key_password")) {
+                throw new ConfigException("tls.key_password is not accepted (it would sit in the file in clear); "
+                        + "use tls.key_password_file");
+            }
+            YamlValues.knownKeys(map, List.of("cert", "key", "key_password_file"), "tls");
+            Path cert = map.containsKey("cert") ? resolve(base, text(map.get("cert"), "tls.cert"), "tls.cert") : null;
+            Path key = map.containsKey("key") ? resolve(base, text(map.get("key"), "tls.key"), "tls.key") : null;
+            if ((cert == null) != (key == null)) {
+                throw new ConfigException("tls.cert and tls.key must be given together");
+            }
+            builder.tlsCert(cert).tlsKey(key);
+        }
+        return builder.build();
+    }
+
+    private static Path tlsPassword(Map<String, Object> root, Path base) {
+        if (!(root.get("tls") instanceof Object tls)) {
+            return null;
+        }
+        var map = YamlValues.mapping(tls, "tls");
+        if (!map.containsKey("key_password_file")) {
+            return null;
+        }
+        return resolve(base, text(map.get("key_password_file"), "tls.key_password_file"), "tls.key_password_file");
+    }
+
+    private static AcmeSettings acmeSection(Map<String, Object> root, Path base) {
+        if (!(root.get("acme") instanceof Object acme)) {
+            return AcmeSettings.disabled();
+        }
+        var map = YamlValues.mapping(acme, "acme");
+        YamlValues.knownKeys(map, List.of("enabled", "directory", "email", "domains", "storage", "http_port",
+                "accept_terms", "renew_before"), "acme");
+        boolean enabled = map.containsKey("enabled") && bool(map.get("enabled"), "acme.enabled");
+        var directory = map.containsKey("directory")
+                ? directory(text(map.get("directory"), "acme.directory"), "acme.directory")
+                : AcmeSettings.STAGING;
+        var email = map.containsKey("email") ? text(map.get("email"), "acme.email") : "";
+        var domains = map.containsKey("domains") ? domains(map.get("domains"), "acme.domains") : List.<String>of();
+        var storage = map.containsKey("storage")
+                ? resolve(base, text(map.get("storage"), "acme.storage"), "acme.storage")
+                : Path.of("acme");
+        int httpPort = map.containsKey("http_port") ? integer(map.get("http_port"), "acme.http_port", 0, 65535) : 0;
+        boolean terms = map.containsKey("accept_terms") && bool(map.get("accept_terms"), "acme.accept_terms");
+        var renew = map.containsKey("renew_before")
+                ? renewBefore(Durations.parse(text(map.get("renew_before"), "acme.renew_before"), "acme.renew_before"))
+                : AcmeSettings.DEFAULT_RENEW_BEFORE;
+        if (!email.isEmpty()) {
+            checkEmail(email, "acme.email");
+        }
+        return checkEnabled(new AcmeSettings(enabled, directory, email, domains, storage, httpPort, terms, renew));
+    }
+
+    private static AcmeSettings overlayAcme(AcmeSettings file, String[] args, Map<String, String> env, Path configFile) {
+        boolean enabled = file.enabled();
+        var directory = file.directory();
+        var email = file.email();
+        var domains = new ArrayList<>(file.domains());
+        boolean domainsSet = false;
+        var storage = file.storage();
+        boolean storageFromFile = configFile != null;
+        int httpPort = file.httpPort();
+        boolean terms = file.acceptTerms();
+        var renew = file.renewBefore();
+        var cliDomains = new ArrayList<String>();
+        for (var arg : args) {
+            if (!arg.startsWith("--")) {
+                continue;
+            }
+            var name = optionName(arg);
+            var value = optionValue(arg);
+            switch (name) {
+                case "--acme" -> enabled = value == null || strictBool(value, "--acme");
+                case "--no-acme" -> enabled = false;
+                case "--acme-directory" -> directory = directory(required(value, name), name);
+                case "--acme-email" -> email = required(value, name);
+                case "--acme-domain" -> cliDomains.add(domain(required(value, name), name));
+                case "--acme-storage" -> {
+                    storage = Path.of(required(value, name));
+                    storageFromFile = false;
+                }
+                case "--acme-http-port" -> httpPort = strictInt(required(value, name), name, 0, 65535);
+                case "--acme-accept-terms" -> terms = value == null || strictBool(value, name);
+                case "--acme-renew-before" -> renew = renewBefore(Durations.parse(required(value, name), name));
+                default -> {
+                    // server flags are parsed by ServerConfig
+                }
+            }
+        }
+        if (!cliDomains.isEmpty()) {
+            domains = cliDomains;
+            domainsSet = true;
+        }
+        String envValue;
+        if ((envValue = env.get("WEB_SERVER_ACME")) != null) {
+            enabled = strictBool(envValue, "WEB_SERVER_ACME");
+        }
+        if ((envValue = env.get("WEB_SERVER_ACME_DIRECTORY")) != null) {
+            directory = directory(envValue, "WEB_SERVER_ACME_DIRECTORY");
+        }
+        if ((envValue = env.get("WEB_SERVER_ACME_EMAIL")) != null) {
+            email = envValue.trim();
+        }
+        if ((envValue = env.get("WEB_SERVER_ACME_DOMAINS")) != null) {
+            domains = new ArrayList<>();
+            for (var part : envValue.split(",", -1)) {
+                if (!part.isBlank()) {
+                    domains.add(domain(part.trim(), "WEB_SERVER_ACME_DOMAINS"));
+                }
+            }
+            if (domains.isEmpty()) {
+                throw new ConfigException("WEB_SERVER_ACME_DOMAINS: expected at least one domain");
+            }
+            domainsSet = true;
+        }
+        if ((envValue = env.get("WEB_SERVER_ACME_STORAGE")) != null) {
+            storage = Path.of(envValue.trim());
+            storageFromFile = false;
+        }
+        if ((envValue = env.get("WEB_SERVER_ACME_HTTP_PORT")) != null) {
+            httpPort = strictInt(envValue, "WEB_SERVER_ACME_HTTP_PORT", 0, 65535);
+        }
+        if ((envValue = env.get("WEB_SERVER_ACME_ACCEPT_TERMS")) != null) {
+            terms = strictBool(envValue, "WEB_SERVER_ACME_ACCEPT_TERMS");
+        }
+        if ((envValue = env.get("WEB_SERVER_ACME_RENEW_BEFORE")) != null) {
+            renew = renewBefore(Durations.parse(envValue.trim(), "WEB_SERVER_ACME_RENEW_BEFORE"));
+        }
+        if (!email.isEmpty()) {
+            checkEmail(email, "acme.email");
+        }
+        if (!domainsSet) {
+            domains = new ArrayList<>(file.domains());
+        }
+        if (storageFromFile && !storage.isAbsolute() && configFile != null) {
+            storage = configFile.toAbsolutePath().getParent().resolve(storage).normalize();
+        }
+        return checkEnabled(new AcmeSettings(enabled, directory, email, domains, storage, httpPort, terms, renew));
+    }
+
+    private static AcmeSettings checkEnabled(AcmeSettings settings) {
+        if (!settings.enabled()) {
+            return settings;
+        }
+        if (settings.email().isBlank()) {
+            throw new ConfigException("acme.email is required when acme.enabled is true");
+        }
+        if (settings.domains().isEmpty()) {
+            throw new ConfigException("acme.domains needs at least one name when acme.enabled is true");
+        }
+        if (!settings.acceptTerms()) {
+            throw new ConfigException("acme.accept_terms must be true when acme.enabled is true");
+        }
+        return settings;
+    }
+
+    private static Routing routingSection(Map<String, Object> root, List<String> warnings) {
+        if (!(root.get("routing") instanceof Object routing)) {
+            return Routing.disabled();
+        }
+        var map = YamlValues.mapping(routing, "routing");
+        YamlValues.knownKeys(map, List.of("enabled", "upstreams", "routes", "forwarded_proto", "trusted_proxies"),
+                "routing");
+        boolean enabled = map.containsKey("enabled") && bool(map.get("enabled"), "routing.enabled");
+        var proto = map.containsKey("forwarded_proto")
+                ? forwarded(text(map.get("forwarded_proto"), "routing.forwarded_proto"))
+                : ForwardedProto.AUTO;
+        var proxies = map.containsKey("trusted_proxies")
+                ? proxies(map.get("trusted_proxies"))
+                : List.<String>of();
+        var upstreams = map.containsKey("upstreams") ? upstreams(map.get("upstreams")) : Map.<String, Upstream>of();
+        var routes = map.containsKey("routes") ? routes(map.get("routes"), upstreams) : List.<RouteSpec>of();
+        var table = new RouteTable(routes);
+        warnings.addAll(table.shadows());
+        if (enabled) {
+            warnings.add("routing.enabled is true but proxy dispatch is not implemented; "
+                    + "requests are still served from the document root");
+        }
+        return new Routing(enabled, proto, proxies, upstreams, table);
+    }
+
+    private static Map<String, Upstream> upstreams(Object value) {
+        var map = YamlValues.mapping(value, "routing.upstreams");
+        var out = new LinkedHashMap<String, Upstream>();
+        for (var entry : map.entrySet()) {
+            var name = entry.getKey();
+            if (name.isBlank()) {
+                throw new ConfigException("routing.upstreams: empty name");
+            }
+            var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
+            YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
+                    "max_body", "preserve_host"), "routing.upstreams." + name);
+            if (!body.containsKey("url")) {
+                throw new ConfigException("routing.upstreams." + name + ".url is required");
+            }
+            var url = upstreamUrl(text(body.get("url"), "routing.upstreams." + name + ".url"), name);
+            var connect = body.containsKey("connect_timeout")
+                    ? timeout(text(body.get("connect_timeout"), "routing.upstreams." + name + ".connect_timeout"),
+                            "routing.upstreams." + name + ".connect_timeout")
+                    : Duration.ofSeconds(5);
+            var response = body.containsKey("response_timeout")
+                    ? timeout(text(body.get("response_timeout"), "routing.upstreams." + name + ".response_timeout"),
+                            "routing.upstreams." + name + ".response_timeout")
+                    : Duration.ofSeconds(30);
+            var idle = body.containsKey("idle_read_timeout")
+                    ? timeout(text(body.get("idle_read_timeout"), "routing.upstreams." + name + ".idle_read_timeout"),
+                            "routing.upstreams." + name + ".idle_read_timeout")
+                    : Duration.ofSeconds(30);
+            int maxBody = body.containsKey("max_body")
+                    ? maxBody(body.get("max_body"), "routing.upstreams." + name + ".max_body")
+                    : 16 << 20;
+            boolean preserve = body.containsKey("preserve_host")
+                    && bool(body.get("preserve_host"), "routing.upstreams." + name + ".preserve_host");
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve));
+        }
+        return Map.copyOf(out);
+    }
+
+    private static List<RouteSpec> routes(Object value, Map<String, Upstream> upstreams) {
+        var list = YamlValues.sequence(value, "routing.routes");
+        var out = new ArrayList<RouteSpec>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            var path = "routing.routes[" + i + "]";
+            var map = YamlValues.mapping(list.get(i), path);
+            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static"), path);
+            if (!map.containsKey("prefix")) {
+                throw new ConfigException(path + ".prefix is required");
+            }
+            var prefix = prefix(text(map.get("prefix"), path + ".prefix"), path + ".prefix");
+            String host = null;
+            boolean wildcard = false;
+            String suffix = null;
+            if (map.containsKey("host")) {
+                var parsed = host(text(map.get("host"), path + ".host"), path + ".host");
+                host = parsed.host();
+                wildcard = parsed.wildcard();
+                suffix = parsed.suffix();
+            }
+            String rewrite = null;
+            if (map.containsKey("rewrite")) {
+                rewrite = prefix(text(map.get("rewrite"), path + ".rewrite"), path + ".rewrite");
+            }
+            int actions = (map.containsKey("proxy") ? 1 : 0) + (map.containsKey("redirect") ? 1 : 0)
+                    + (map.containsKey("static") ? 1 : 0);
+            if (actions != 1) {
+                throw new ConfigException(path + ": exactly one of proxy, redirect or static is required");
+            }
+            RouteSpec.Action action;
+            if (map.containsKey("proxy")) {
+                var name = text(map.get("proxy"), path + ".proxy");
+                var upstream = upstreams.get(name);
+                if (upstream == null) {
+                    throw new ConfigException(path + ".proxy: unknown upstream '" + name + "'");
+                }
+                action = new RouteSpec.Action.Proxy(upstream);
+            } else if (map.containsKey("redirect")) {
+                action = redirect(map.get("redirect"), path + ".redirect");
+            } else if (!bool(map.get("static"), path + ".static")) {
+                throw new ConfigException(path + ".static must be true");
+            } else {
+                action = new RouteSpec.Action.Static();
+            }
+            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action));
+        }
+        return List.copyOf(out);
+    }
+
+    private static RouteSpec.Action.Redirect redirect(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("status", "location", "keep_path"), path);
+        if (!map.containsKey("status") || !map.containsKey("location")) {
+            throw new ConfigException(path + ": status and location are required");
+        }
+        int status = integer(map.get("status"), path + ".status", 100, 999);
+        if (!REDIRECT_STATUS.contains(status)) {
+            throw new ConfigException(path + ".status: expected 301, 302, 303, 307 or 308");
+        }
+        var location = text(map.get("location"), path + ".location");
+        if (location.indexOf('\r') >= 0 || location.indexOf('\n') >= 0) {
+            throw new ConfigException(path + ".location: control characters are not allowed");
+        }
+        boolean keep = map.containsKey("keep_path") && bool(map.get("keep_path"), path + ".keep_path");
+        return new RouteSpec.Action.Redirect(status, location, keep);
+    }
+
+    private static MiddlewareChain middlewareSection(Map<String, Object> root, List<String> warnings) {
+        if (!(root.get("middleware") instanceof Object middleware)) {
+            return MiddlewareChain.EMPTY;
+        }
+        var map = YamlValues.mapping(middleware, "middleware");
+        YamlValues.knownKeys(map, List.of("chain"), "middleware");
+        if (!map.containsKey("chain")) {
+            return MiddlewareChain.EMPTY;
+        }
+        var list = YamlValues.sequence(map.get("chain"), "middleware.chain");
+        var steps = new ArrayList<MiddlewareChain.Step>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            var path = "middleware.chain[" + i + "]";
+            var step = YamlValues.mapping(list.get(i), path);
+            YamlValues.knownKeys(step, List.of("name", "params"), path);
+            if (!step.containsKey("name")) {
+                throw new ConfigException(path + ".name is required");
+            }
+            var name = text(step.get("name"), path + ".name");
+            var params = new LinkedHashMap<String, String>();
+            if (step.containsKey("params")) {
+                var body = YamlValues.mapping(step.get("params"), path + ".params");
+                for (var entry : body.entrySet()) {
+                    params.put(entry.getKey(), scalar(entry.getValue(), path + ".params." + entry.getKey()));
+                }
+            }
+            steps.add(new MiddlewareChain.Step(name, params));
+        }
+        if (!steps.isEmpty()) {
+            warnings.add("middleware.chain is stored but not applied");
+        }
+        return new MiddlewareChain(steps);
+    }
+
+    private static String directory(String value, String path) {
+        var text = value.trim();
+        if (text.equalsIgnoreCase("staging")) {
+            return AcmeSettings.STAGING;
+        }
+        if (text.equalsIgnoreCase("production")) {
+            return AcmeSettings.PRODUCTION;
+        }
+        if (text.startsWith("https://") || text.startsWith("http://") || text.startsWith("acme://")) {
+            return text;
+        }
+        throw new ConfigException(path + ": expected staging, production, or an http(s):// or acme:// URL");
+    }
+
+    private static Duration renewBefore(Duration duration) {
+        if (duration.compareTo(Duration.ofDays(89)) > 0) {
+            throw new ConfigException("acme.renew_before must be at most 89 days");
+        }
+        return duration;
+    }
+
+    private static void checkEmail(String email, String path) {
+        if (email.indexOf('@') <= 0 || email.indexOf(' ') >= 0 || email.indexOf('\r') >= 0 || email.indexOf('\n') >= 0
+                || email.indexOf('@') != email.lastIndexOf('@')) {
+            throw new ConfigException(path + ": expected an email address");
+        }
+    }
+
+    private static List<String> domains(Object value, String path) {
+        var list = YamlValues.sequence(value, path);
+        var out = new ArrayList<String>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            out.add(domain(text(list.get(i), path + "[" + i + "]"), path + "[" + i + "]"));
+        }
+        return List.copyOf(out);
+    }
+
+    private static String domain(String value, String path) {
+        var name = value.trim().toLowerCase(Locale.ROOT);
+        if (name.indexOf('*') >= 0) {
+            throw new ConfigException(path + ": wildcards are not supported (HTTP-01)");
+        }
+        if (!HOST.matcher(name).matches()) {
+            throw new ConfigException(path + ": expected a domain name");
+        }
+        return name;
+    }
+
+    private static ForwardedProto forwarded(String value) {
+        return switch (value.trim().toLowerCase(Locale.ROOT)) {
+            case "http" -> ForwardedProto.HTTP;
+            case "https" -> ForwardedProto.HTTPS;
+            case "auto" -> ForwardedProto.AUTO;
+            default -> throw new ConfigException("routing.forwarded_proto: expected http, https or auto");
+        };
+    }
+
+    private static List<String> proxies(Object value) {
+        var list = YamlValues.sequence(value, "routing.trusted_proxies");
+        var out = new ArrayList<String>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            out.add(cidr(text(list.get(i), "routing.trusted_proxies[" + i + "]"), i));
+        }
+        return List.copyOf(out);
+    }
+
+    private static String cidr(String value, int index) {
+        var path = "routing.trusted_proxies[" + index + "]";
+        var text = value.trim();
+        int slash = text.lastIndexOf('/');
+        var literal = slash < 0 ? text : text.substring(0, slash);
+        if (literal.startsWith("[") && literal.endsWith("]")) {
+            literal = literal.substring(1, literal.length() - 1);
+        }
+        InetAddress address;
+        try {
+            address = InetAddress.ofLiteral(literal);
+        } catch (IllegalArgumentException e) {
+            throw new ConfigException(path + ": expected an IP address or CIDR, not a name");
+        }
+        if (slash >= 0) {
+            int max = address.getAddress().length == 4 ? 32 : 128;
+            int prefix;
+            try {
+                prefix = Integer.parseInt(text.substring(slash + 1));
+            } catch (NumberFormatException e) {
+                throw new ConfigException(path + ": bad prefix length");
+            }
+            if (prefix < 0 || prefix > max) {
+                throw new ConfigException(path + ": prefix length must be 0.." + max);
+            }
+        }
+        return text;
+    }
+
+    private static URI upstreamUrl(String value, String name) {
+        URI uri;
+        try {
+            uri = URI.create(value);
+        } catch (IllegalArgumentException e) {
+            throw new ConfigException("routing.upstreams." + name + ".url: " + e.getMessage());
+        }
+        var scheme = uri.getScheme();
+        if (uri.getHost() == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+            throw new ConfigException("routing.upstreams." + name + ".url: expected an absolute http(s) URL");
+        }
+        return uri;
+    }
+
+    private static Duration timeout(String value, String path) {
+        var duration = Durations.parse(value, path);
+        if (duration.toMillis() > Integer.MAX_VALUE) {
+            throw new ConfigException(path + ": duration is too long");
+        }
+        return duration;
+    }
+
+    private static int maxBody(Object value, String path) {
+        long bytes = Sizes.parse(sizeText(value, path), Integer.MAX_VALUE, path);
+        if (bytes < 1) {
+            throw new ConfigException(path + ": must be at least 1 byte");
+        }
+        return (int) bytes;
+    }
+
+    private static String prefix(String value, String path) {
+        if (value.isEmpty() || value.charAt(0) != '/' || value.indexOf('?') >= 0 || value.indexOf('#') >= 0
+                || value.indexOf('\\') >= 0 || value.contains("//")) {
+            throw new ConfigException(path + ": expected a path such as / or /api");
+        }
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) <= ' ' || value.charAt(i) == 127) {
+                throw new ConfigException(path + ": control characters are not allowed");
+            }
+        }
+        return value;
+    }
+
+    private record HostPattern(String host, boolean wildcard, String suffix) {
+    }
+
+    private static HostPattern host(String value, String path) {
+        var text = value.trim().toLowerCase(Locale.ROOT);
+        if (text.startsWith("*.")) {
+            var rest = text.substring(2);
+            if (rest.indexOf('*') >= 0 || !HOST.matcher(rest).matches() || rest.indexOf('.') < 0) {
+                throw new ConfigException(path + ": expected a name or *.suffix");
+            }
+            return new HostPattern(text, true, "." + rest);
+        }
+        if (text.indexOf('*') >= 0 || text.indexOf(':') >= 0) {
+            throw new ConfigException(path + ": expected a name or *.suffix");
+        }
+        try {
+            InetAddress.ofLiteral(text);
+            return new HostPattern(text, false, null);
+        } catch (IllegalArgumentException e) {
+            if (!HOST.matcher(text).matches()) {
+                throw new ConfigException(path + ": expected a name or *.suffix");
+            }
+            return new HostPattern(text, false, null);
+        }
+    }
+
+    private static String accessLog(Object value) {
+        if (value == null) {
+            return null;
+        }
+        var text = text(value, "server.access_log");
+        if (text.isBlank() || text.equalsIgnoreCase("off")) {
+            return null;
+        }
+        return text;
+    }
+
+    private static int h3Port(Object value) {
+        if (value instanceof String text && text.equalsIgnoreCase("same")) {
+            return ServerConfig.H3_PORT_SAME_AS_TCP;
+        }
+        return integer(value, "http3.port", -1, 65535);
+    }
+
+    private static int seconds(Object value, String path, int min, int max) {
+        if (value instanceof String text) {
+            if (min == 0 && text.trim().equals("0")) {
+                return 0;
+            }
+            var duration = Durations.parse(text, path);
+            if (duration.getNano() != 0) {
+                throw new ConfigException(path + ": must be a whole number of seconds");
+            }
+            return integer(duration.toSeconds(), path, min, max);
+        }
+        return integer(value, path, min, max);
+    }
+
+    private static int integer(Object value, String path, int min, int max) {
+        if (value instanceof Integer || value instanceof Long) {
+            return integer(((Number) value).longValue(), path, min, max);
+        }
+        if (value instanceof String text && text.trim().matches("-?[0-9]{1,18}")) {
+            return integer(Long.parseLong(text.trim()), path, min, max);
+        }
+        throw new ConfigException(path + ": expected an integer");
+    }
+
+    private static int integer(long value, String path, int min, int max) {
+        if (value < min || value > max) {
+            throw new ConfigException(path + ": expected " + min + ".." + max);
+        }
+        return (int) value;
+    }
+
+    private static int strictInt(String value, String path, int min, int max) {
+        if (value == null || !value.trim().matches("[0-9]{1,9}")) {
+            throw new ConfigException("Invalid " + path + " (value '" + value + "'), expected " + min + ".." + max);
+        }
+        return integer(Long.parseLong(value.trim()), path, min, max);
+    }
+
+    private static boolean bool(Object value, String path) {
+        if (value instanceof Boolean flag) {
+            return flag;
+        }
+        if (value instanceof String text) {
+            return strictBool(text, path);
+        }
+        throw new ConfigException(path + ": expected true or false");
+    }
+
+    private static boolean strictBool(String value, String path) {
+        return switch (value.trim().toLowerCase(Locale.ROOT)) {
+            case "true", "yes", "on", "1" -> true;
+            case "false", "no", "off", "0" -> false;
+            default -> throw new ConfigException(path + ": expected true or false");
+        };
+    }
+
+    private static String text(Object value, String path) {
+        if (value instanceof String text) {
+            if (text.isBlank()) {
+                throw new ConfigException(path + ": missing value");
+            }
+            return text.trim();
+        }
+        throw new ConfigException(path + ": expected a string");
+    }
+
+    private static String scalar(Object value, String path) {
+        if (value instanceof String || value instanceof Boolean || value instanceof Integer || value instanceof Long) {
+            return String.valueOf(value);
+        }
+        throw new ConfigException(path + ": expected a scalar");
+    }
+
+    private static String sizeText(Object value, String path) {
+        if (value instanceof Integer || value instanceof Long) {
+            return Long.toString(((Number) value).longValue());
+        }
+        return text(value, path);
+    }
+
+    private static Path resolve(Path base, String raw, String path) {
+        var file = Path.of(raw);
+        if (file.isAbsolute()) {
+            return file.normalize();
+        }
+        if (base == null) {
+            throw new ConfigException(path + ": relative path with no config directory");
+        }
+        return base.resolve(file).normalize();
+    }
+
+    private static String optionName(String arg) {
+        int eq = arg.indexOf('=');
+        return eq < 0 ? arg : arg.substring(0, eq);
+    }
+
+    private static String optionValue(String arg) {
+        int eq = arg.indexOf('=');
+        return eq < 0 ? null : arg.substring(eq + 1);
+    }
+
+    private static String required(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new ConfigException("Missing value for " + name + " (use " + name + "=VALUE)");
+        }
+        return value.trim();
+    }
+
+    /** Arguments and environment captured at startup so a reload reapplies them (the process env does not change). */
+    public static final class Loaded {
+        private final ConfigDocument document;
+        private final List<String> warnings;
+        private final List<String> errors;
+        private final boolean helpRequested;
+        private final String[] args;
+        private final Map<String, String> env;
+        private final ServerConfig.PasswordFileReader passwords;
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
+            this.document = document;
+            this.warnings = List.copyOf(warnings);
+            this.errors = List.copyOf(errors);
+            this.helpRequested = helpRequested;
+            this.args = args.clone();
+            this.env = Map.copyOf(env);
+            this.passwords = passwords;
+        }
+
+        public boolean ok() {
+            return this.errors.isEmpty();
+        }
+
+        public boolean helpRequested() {
+            return this.helpRequested;
+        }
+
+        public ConfigDocument document() {
+            return this.document;
+        }
+
+        public List<String> warnings() {
+            return this.warnings;
+        }
+
+        public List<String> errors() {
+            return this.errors;
+        }
+
+        String[] args() {
+            return this.args.clone();
+        }
+
+        Map<String, String> env() {
+            return this.env;
+        }
+
+        ServerConfig.PasswordFileReader passwords() {
+            return this.passwords;
+        }
+    }
+}

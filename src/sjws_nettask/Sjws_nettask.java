@@ -134,84 +134,39 @@ public class Sjws_nettask {
         }
     }
 
-    /**
-     * SIGTERM/SIGINT task: stop accepting, drain, then drop the pid file.
-     * <p>
-     * On a signal the JVM runs this hook and then halts, which aborts the main thread wherever
-     * it is. The "terminated" line is written on the main thread after {@code awaitTermination}
-     * returns; this hook waits for that write before returning so halt cannot drop it. If the
-     * main thread does not report in time, the hook writes the line itself.
-     */
-    static final class Shutdown implements Runnable {
-        private final SjwsServer server;
-        private final AtomicReference<PidFile> pid;
-        private final PrintStream out;
-        private final PrintStream err;
-        private final AtomicBoolean serving = new AtomicBoolean();
-        private final AtomicBoolean logged = new AtomicBoolean();
-        private final CountDownLatch reported = new CountDownLatch(1);
-        private volatile Thread hookThread;
-        /** How long a signal hook waits for the main thread to log termination before logging it. */
-        private Duration reportWait = Duration.ofSeconds(5);
-
-        Shutdown(SjwsServer server, AtomicReference<PidFile> pid, PrintStream out, PrintStream err) {
-            this.server = server;
-            this.pid = pid;
-            this.out = out;
-            this.err = err;
-        }
-
-        void bind(Thread hook) {
-            this.hookThread = hook;
-        }
-
-        /** Tests shrink the signal-hook wait so the fallback log path does not block. */
-        void reportWait(Duration timeout) {
-            this.reportWait = timeout;
-        }
-
-        void markServing() {
-            this.serving.set(true);
-        }
-
-        /** Logs termination once. Unblocks a signal hook waiting in {@link #run()}. */
-        void reportTerminated() {
-            if (this.serving.get() && this.logged.compareAndSet(false, true)) {
-                this.out.println("Server Terminated properly !");
-                this.out.flush();
-            }
-            this.reported.countDown();
-        }
-
-        @Override
-        public void run() {
-            try {
-                this.server.close();
-                if (Thread.currentThread() == this.hookThread && this.serving.get()) {
-                    boolean mainLogged = false;
-                    try {
-                        mainLogged = this.reported.await(this.reportWait.toMillis(), TimeUnit.MILLISECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                    if (!mainLogged) {
-                        reportTerminated();
-                    }
-                }
-            } finally {
-                releasePid(this.pid.get(), this.err);
-            }
-        }
-    }
-
-    private static void releasePid(PidFile file, PrintStream err) {
-        if (file == null) {
-            return;
-        }
+    /** Same as {@link #serve(ServerConfig, Transport.Factory, PrintStream, PrintStream, Consumer)} with a config file. */
+    private static int serveLoaded(sjws_nettask.config.ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
+            PrintStream out, PrintStream err, Consumer<SjwsServer> started) {
+        var config = loaded.document().server();
+        SjwsServer server;
         try {
-            file.release();
-        } catch (IOException e) {
-            err.println("WARN: could not remove pid file " + file.path() + ": " + e.getMessage());
+            server = SjwsServer.start(loaded, h3Factory);
+        } catch (BindException e) {
+            err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
+                    + " (already in use or not permitted).");
+            return EXIT_CANNOT_LISTEN;
+        } catch (IOException | UncheckedIOException e) {
+            err.println("Failed to start the server on port " + config.port() + ": " + e);
+            return EXIT_CANNOT_LISTEN;
+        }
+        var hook = new Thread(server::close, "shutdown");
+        Runtime.getRuntime().addShutdownHook(hook);
+        out.println("Server started: " + server.describe());
+        sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
+                .ifPresent(w -> err.println("WARN: " + w));
+        sjws_nettask.core.SafeOpen.unlistableWarning(config.allowUnlistableDirs())
+                .ifPresent(w -> err.println("WARN: " + w));
+        try {
+            started.accept(server);
+            server.awaitTermination();
+            out.println("Server Terminated properly !");
+            return EXIT_OK;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return EXIT_OK;
+        } finally {
+            server.close();
+            removeHook(hook);
         }
     }
 
@@ -243,72 +198,23 @@ public class Sjws_nettask {
      */
     static int run(String[] args, Map<String, String> env, PrintStream out, PrintStream err,
             Transport.Factory h3Factory, Consumer<SjwsServer> started) {
-        for (var arg : args) {
-            if (arg.equals("-h") || arg.equals("--help")) {
-                out.print(usage());
-                return EXIT_OK;
-            }
+        var loaded = sjws_nettask.config.ConfigLoader.load(args, env);
+        if (loaded.helpRequested()) {
+            out.print(ServerConfig.usage());
+            return EXIT_OK;
         }
-        var opt = Daemon.parse(args, env);
-        boolean child = "1".equals(env.get(Daemon.CHILD_ENV));
-        if (opt.action() == Daemon.Action.STOP || opt.action() == Daemon.Action.STATUS) {
-            return control(opt, out, err);
-        }
-        var parsed = ServerConfig.parse(opt.remaining(), env);
-        opt.warnings().forEach(w -> err.println("WARN: " + w));
-        parsed.warnings().forEach(w -> err.println("WARN: " + w));
-        if (!opt.ok() || !parsed.ok()) {
-            opt.errors().forEach(e -> err.println("ERROR: " + e));
-            parsed.errors().forEach(e -> err.println("ERROR: " + e));
+        loaded.warnings().forEach(w -> err.println("WARN: " + w));
+        if (!loaded.ok()) {
+            loaded.errors().forEach(e -> err.println("ERROR: " + e));
             err.println("See --help.");
             return EXIT_USAGE;
         }
-        if (!child && (opt.action() == Daemon.Action.DAEMON || opt.action() == Daemon.Action.RESTART)) {
-            if (opt.action() == Daemon.Action.RESTART) {
-                int stopped = Daemon.stop(opt.pidFile(), opt.shutdownTimeout(), out, err);
-                if (stopped != 0) {
-                    return stopped;
-                }
-            }
-            return Daemon.daemonize(opt, env, out, err);
+        var root = loaded.document().server().root();
+        if (!Files.isDirectory(root)) {
+            err.println("Document root " + root.toAbsolutePath() + " does not exist or is not a directory.");
+            return EXIT_BAD_ROOT;
         }
-        if (child) {
-            Daemon.ignoreSignal("HUP");
-        }
-        PrintStream logOut = out;
-        PrintStream logErr = err;
-        boolean ownLog = false;
-        if (opt.logToFile()) {
-            try {
-                var log = Daemon.openLog(opt.logFile());
-                logOut = log;
-                logErr = log;
-                ownLog = true;
-                if (child) {
-                    Daemon.redirectStandardStreams(log);
-                }
-            } catch (IOException e) {
-                err.println("Cannot write log file " + opt.logFile() + ": " + e.getMessage());
-                return EXIT_CANNOT_LISTEN;
-            }
-        }
-        try {
-            return serve(parsed.config(), h3Factory, logOut, logErr, started, opt.shutdownTimeout(),
-                    opt.trackPid() ? opt.pidFile() : null);
-        } finally {
-            if (ownLog) {
-                logOut.close();
-            }
-        }
-    }
-
-    /** {@code --stop} / {@code --status}: no server configuration is required. */
-    private static int control(Daemon.Options opt, PrintStream out, PrintStream err) {
-        opt.warnings().forEach(w -> err.println("WARN: " + w));
-        if (opt.action() == Daemon.Action.STATUS) {
-            return Daemon.status(opt.pidFile(), out, err);
-        }
-        return Daemon.stop(opt.pidFile(), opt.shutdownTimeout(), out, err);
+        return serveLoaded(loaded, h3Factory, out, err, started);
     }
 
     /**

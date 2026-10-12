@@ -47,10 +47,23 @@
       <groupId>io.netty</groupId>
       <artifactId>netty-codec-http3</artifactId>
     </dependency>
-    <!-- HTTP/2 (TLS with ALPN, h2c): same Netty version as HTTP/3, via the BOM. -->
+    <!-- One config file. YAML, because the routing workstream's schema is YAML and must
+         paste in unchanged. SafeConstructor only: no arbitrary types. -->
     <dependency>
-      <groupId>io.netty</groupId>
-      <artifactId>netty-codec-http2</artifactId>
+      <groupId>org.yaml</groupId>
+      <artifactId>snakeyaml</artifactId>
+      <version>2.4</version>
+    </dependency>
+    <!-- ACME (RFC 8555). HTTP-01 issuance and renewal. -->
+    <dependency>
+      <groupId>org.shredzone.acme4j</groupId>
+      <artifactId>acme4j-client</artifactId>
+      <version>5.1.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-nop</artifactId>
+      <version>2.0.17</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -188,6 +201,22 @@
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>${h3.gate.line}</minimum></limit>
                   <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>${h3.gate.branch}</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.config</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.80</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.75</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.acme</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.80</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.70</minimum></limit>
                 </limits>
               </rule>
               <rule>

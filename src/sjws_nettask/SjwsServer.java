@@ -20,43 +20,39 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
-import java.time.Duration;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.time.Instant;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Function;
-import sjws_nettask.core.FilterChain;
-import sjws_nettask.core.Handler;
-import sjws_nettask.core.RequestFilters;
+import java.util.concurrent.locks.ReentrantLock;
+import sjws_nettask.acme.AcmeService;
+import sjws_nettask.acme.AcmeStore;
+import sjws_nettask.acme.ChallengeBoard;
+import sjws_nettask.acme.ChallengeHttpServer;
+import sjws_nettask.config.ConfigLoader;
+import sjws_nettask.config.ConfigReloader;
+import sjws_nettask.config.ConfigSnapshot;
+import sjws_nettask.config.LiveConfig;
+import sjws_nettask.config.ReloadResult;
 import sjws_nettask.core.StaticFileHandler;
-import sjws_nettask.observe.ObserverSlot;
-import sjws_nettask.observe.RequestObserver;
-import sjws_nettask.observe.ServerMetrics;
-import sjws_nettask.observe.Snapshot;
+import sjws_nettask.h3.Http3Server;
+import sjws_nettask.tls.TlsMaterial;
 
 /**
  * Embeddable server: HTTP/1.1 on TCP plus, when enabled, an HTTP/3 {@link Transport}.
  * Alt-Svc (opt-in, {@link ServerConfig#altSvc()}) is advertised on HTTP/1.1 only after the HTTP/3
  * listener bound successfully, with its real port; if HTTP/3 fails, the failure is logged and
  * HTTP/1.1 keeps serving without Alt-Svc.
+ * <p>
+ * Each request reads one immutable {@link ConfigSnapshot}. {@link #reload()} (and {@link ReloadHook})
+ * publishes the next snapshot; the accept loop and the connection cap stay as they were at bind time.
  */
 public final class SjwsServer implements AutoCloseable {
 
-    private final ServerConfig config;
-    private final ObserverSlot slot;
-    private final StaticFileHandler handler;
-    /** Null when no filters were registered. */
-    private final FilterChain chain;
-    /**
-     * What HTTP/1.1 calls. Null means {@link #handler} directly (concrete {@code handle}, no
-     * {@link Handler} indirection). Otherwise the chain, or a terminal that is not the static handler.
-     */
-    private final Handler override;
+    private final LiveConfig live;
+    private final ConfigReloader reloader;
+    private final ChallengeBoard board;
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
-    /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
-    private final CountDownLatch shutdownDone = new CountDownLatch(1);
-    private volatile Duration shutdownTimeout = Daemon.DEFAULT_SHUTDOWN_TIMEOUT;
+    private final ReentrantLock reloadLock = new ReentrantLock();
     private Transport h3;
     private Throwable h3Failure;
     private Transport h2;
@@ -64,28 +60,19 @@ public final class SjwsServer implements AutoCloseable {
     private ServerSocketChannel tcp;
     private ClientManager manager;
     private Thread acceptThread;
+    private AutoCloseable reloadHook;
+    private AcmeService acme;
+    private ChallengeHttpServer challengeHttp;
 
-    private SjwsServer(ServerConfig config, RequestFilters filters, Function<StaticFileHandler, Handler> terminal)
-            throws IOException {
-        this.config = config;
-        RequestObserver initial = RequestObserver.NONE;
-        if (config.observe()) {
-            initial = RequestObserver.open(config);
-        }
-        this.slot = new ObserverSlot(initial);
-        try {
-            this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
-                    new sjws_nettask.core.FileCache(config.cacheBytes()));
-            var leaf = select(this.handler, terminal);
-            this.chain = filters == null ? null : filters.build(leaf);
-            this.override = this.chain != null ? this.chain : (leaf == this.handler ? null : leaf);
-        } catch (RuntimeException e) {
-            this.slot.close();
-            throw e;
-        }
+    private SjwsServer(ConfigSnapshot snapshot, ConfigReloader reloader, ChallengeBoard board) {
+        this.live = new LiveConfig(snapshot);
+        this.reloader = reloader;
+        this.board = board;
+        var config = snapshot.document().server();
         if (config.cacheBytes() > Runtime.getRuntime().maxMemory() / 2) {
-            System.err.println("WARN: --cache-bytes=" + config.cacheBytes() + " is more than half of the maximum heap ("
-                    + Runtime.getRuntime().maxMemory() + " bytes); raise -Xmx or lower it");
+            System.err.println("WARN: --cache-bytes=" + config.cacheBytes()
+                    + " is more than half of the maximum heap (" + Runtime.getRuntime().maxMemory()
+                    + " bytes); raise -Xmx or lower it");
         }
     }
 
@@ -113,97 +100,43 @@ public final class SjwsServer implements AutoCloseable {
      * @throws java.io.UncheckedIOException if the document root is not a directory
      */
     public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory) throws IOException {
-        return start(config, h3Factory, null, null);
+        return start(ConfigLoader.standalone(config), h3Factory);
     }
 
-    /**
-     * HTTP/1.1 and HTTP/3 share {@code filters}. Null or empty leaves the static file handler
-     * on the hot path ({@link #filterChain()} stays null).
-     */
-    public static SjwsServer start(ServerConfig config, RequestFilters filters) throws IOException {
-        return start(config, H3Transports.defaultFactory(), filters, null);
+    public static SjwsServer start(ConfigLoader.Loaded loaded) throws IOException {
+        return start(loaded, H3Transports.defaultFactory());
     }
 
-    /**
-     * @param terminal chooses the handler filters wrap (a router around {@code files}, or {@code files}
-     *        itself). Null keeps the static file handler. Per-route filters wrap that route's own
-     *        handler with {@link RequestFilters#wrapping} and do not use this selector
-     */
-    public static SjwsServer start(ServerConfig config, RequestFilters filters,
-            Function<StaticFileHandler, Handler> terminal) throws IOException {
-        return start(config, H3Transports.defaultFactory(), filters, terminal);
-    }
-
-    /**
-     * @param h3Factory used only when {@code config.h3Enabled()}
-     * @param filters request filters, or null; compiled once here and passed to both transports
-     * @throws IOException if the TCP port cannot be bound (nothing is left running)
-     * @throws java.io.UncheckedIOException if the document root is not a directory
-     */
-    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, RequestFilters filters)
-            throws IOException {
-        return start(config, h3Factory, filters, null);
-    }
-
-    /**
-     * @param h3Factory used only when {@code config.h3Enabled()}
-     * @param filters request filters, or null; compiled once here around {@code terminal} and passed
-     *        to both transports
-     * @param terminal chooses the leaf handler, or null for the static file handler. Filters wrap
-     *        that leaf. When this returns the static handler and {@code filters} is null or empty,
-     *        neither transport enters {@link FilterChain}
-     * @throws IOException if the TCP port cannot be bound (nothing is left running)
-     * @throws java.io.UncheckedIOException if the document root is not a directory
-     */
-    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, RequestFilters filters,
-            Function<StaticFileHandler, Handler> terminal) throws IOException {
-        return start(config, h3Factory, H2_FACTORY, filters, terminal);
-    }
-
-    /** Creates the HTTP/2 transport (TLS + optional h2c, see {@link sjws_nettask.h2.Http2Server}). */
-    public static final Transport.Factory H2_FACTORY = new Transport.Factory() {
-        @Override
-        public Transport create(ServerConfig config, StaticFileHandler handler) {
-            return new sjws_nettask.h2.Http2Server(config, handler);
-        }
-
-        /** HTTP/2 serves what HTTP/1.1 serves: the filter chain / router when there is one. */
-        @Override
-        public Transport create(ServerConfig config, StaticFileHandler handler, FilterChain chain, Handler terminal) {
-            return new sjws_nettask.h2.Http2Server(config, terminal != null ? terminal : handler);
-        }
-    };
-
-    /**
-     * @param h2Factory used only when {@code config.h2Enabled()}; HTTP/2 has its own port, so the
-     *        HTTP/1.1 listener and its connections are unchanged by it
-     */
-    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory)
-            throws IOException {
-        return start(config, h3Factory, h2Factory, null, null);
-    }
-
-    /** As {@link #start(ServerConfig, Transport.Factory, RequestFilters, Function)}, with an HTTP/2 factory. */
-    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory,
-            RequestFilters filters, Function<StaticFileHandler, Handler> terminal) throws IOException {
-        var server = new SjwsServer(config, filters, terminal);
-        if (config.h3Enabled()) {
-            server.startH3(h3Factory);
+    public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory) throws IOException {
+        var board = new ChallengeBoard();
+        var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
+        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board);
+        if (snapshot.document().server().h3Enabled()) {
+            server.startH3(h3Factory, storedCertificate(snapshot));
         }
         if (config.h2Enabled()) {
             server.startH2(h2Factory);
         }
         try {
-            server.tcp = bind(config.port(), config.backlog());
+            server.tcp = bind(snapshot.document().server().port(), snapshot.document().server().backlog());
         } catch (IOException e) {
             server.close();
             throw e;
         }
-        server.manager = new ClientManager(server.tcp, config, server.handler, server.altSvc, server.override,
-                server.slot);
-        server.attachGauges(server.slot.get().metrics());
+        server.manager = new ClientManager(server.tcp, snapshot.document().server(), server.live::handler,
+                server.altSvc);
         server.acceptThread = new Thread(server.manager, "accept-loop");
         server.acceptThread.start();
+        try {
+            server.openChallenge(snapshot);
+        } catch (IOException e) {
+            server.close();
+            throw e;
+        }
+        server.reloadHook = ReloadHook.register(server::onReload);
+        if (snapshot.document().acme().enabled()) {
+            server.startAcme(snapshot);
+        }
         return server;
     }
 
@@ -220,14 +153,20 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
-    private void startH3(Transport.Factory factory) {
+    private void startH3(Transport.Factory factory, TlsMaterial stored) {
         Transport transport = null;
         try {
-            transport = factory.create(this.config, this.handler, this.chain, this.override, this.slot);
+            transport = factory.create(config(), handler());
+            if (transport instanceof Http3Server http3) {
+                http3.replaceHandler(this.live.handler()::handle);
+                if (stored != null) {
+                    http3.replaceTls(stored);
+                }
+            }
             transport.start();
             this.h3 = transport;
-            if (this.config.altSvc()) {
-                this.altSvc.advertise(transport.port(), this.config.altSvcMaxAge());
+            if (config().altSvc()) {
+                this.altSvc.advertise(transport.port(), config().altSvcMaxAge());
             }
         } catch (Exception | LinkageError e) { // LinkageError: QUIC natives missing for this platform
             this.h3Failure = e;
@@ -242,46 +181,124 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
-    private void startH2(Transport.Factory factory) {
-        Transport transport = null;
+    private static TlsMaterial storedCertificate(ConfigSnapshot snapshot) {
+        var acme = snapshot.document().acme();
+        if (!acme.enabled()) {
+            return null;
+        }
         try {
-            transport = factory.create(this.config, this.handler, this.chain, this.override, this.slot);
-            transport.start();
-            this.h2 = transport;
-        } catch (Exception | LinkageError e) {
-            this.h2Failure = e;
-            if (transport != null) {
-                try {
-                    transport.close();
-                } catch (RuntimeException suppressed) {
-                    e.addSuppressed(suppressed);
-                }
+            var material = new AcmeStore(acme.storage()).loadCertificate();
+            if (material == null || !material.chain()[0].getNotAfter().toInstant().isAfter(Instant.now())) {
+                return null;
             }
-            System.err.println("WARN: HTTP/2 not started: " + e);
+            return material;
+        } catch (IOException e) {
+            System.err.println("WARN: stored ACME certificate was not loaded: " + e.getMessage());
+            return null;
         }
     }
 
-    /** @return the bound HTTP/2 (TLS) port, or -1 if HTTP/2 is not running */
-    public int h2Port() {
-        return this.h2 == null ? -1 : this.h2.port();
+    private void openChallenge(ConfigSnapshot snapshot) throws IOException {
+        var acme = snapshot.document().acme();
+        if (acme.enabled() && !acme.onMainListener(snapshot.document().server().port())) {
+            this.challengeHttp = ChallengeHttpServer.open(acme.httpPort(), this.board);
+        }
     }
 
-    /** @return the running HTTP/2 transport, or null */
-    public Transport h2() {
-        return this.h2;
+    private void startAcme(ConfigSnapshot snapshot) {
+        this.acme = new AcmeService(snapshot.document().acme(), this.board, this::publishCertificate);
+        this.acme.start();
     }
 
-    /** @return why HTTP/2 could not start, or null */
-    public Throwable h2Failure() {
-        return this.h2Failure;
+    private void publishCertificate(TlsMaterial material) {
+        if (this.h3 instanceof Http3Server http3) {
+            http3.replaceTls(material);
+        }
+    }
+
+    /** Logs the result. Registered with {@link ReloadHook}; not installed as a signal handler. */
+    private void onReload() {
+        var result = reload();
+        result.warnings().forEach(warning -> System.err.println("WARN: " + warning));
+        result.needsRestart().forEach(warning -> System.err.println("WARN: " + warning));
+        result.errors().forEach(error -> System.err.println("ERROR: " + error));
+    }
+
+    /**
+     * Re-reads the config file, compiles a new snapshot and swaps it in. Bind-time settings that
+     * changed are reported in {@link ReloadResult#needsRestart()} and left as they were. A bad file
+     * keeps the previous snapshot.
+     */
+    public ReloadResult reload() {
+        this.reloadLock.lock();
+        try {
+            return reloadLocked();
+        } finally {
+            this.reloadLock.unlock();
+        }
+    }
+
+    private ReloadResult reloadLocked() {
+        var result = this.reloader.reload(this.live.get(), this.h3 != null, this.board);
+        if (!result.applied()) {
+            return result;
+        }
+        ChallengeHttpServer opened = null;
+        boolean closeOld = false;
+        try {
+            var acmeSettings = result.snapshot().document().acme();
+            int port = result.snapshot().document().server().port();
+            boolean dedicated = acmeSettings.enabled() && !acmeSettings.onMainListener(port);
+            if (dedicated) {
+                if (this.challengeHttp == null || this.challengeHttp.port() != acmeSettings.httpPort()) {
+                    opened = ChallengeHttpServer.open(acmeSettings.httpPort(), this.board);
+                    closeOld = this.challengeHttp != null;
+                }
+            } else {
+                closeOld = this.challengeHttp != null;
+            }
+        } catch (IOException e) {
+            if (opened != null) {
+                opened.close();
+            }
+            return ReloadResult.rejected(this.live.get(), java.util.List.of("HTTP-01 listener: " + e.getMessage()));
+        }
+        this.live.set(result.snapshot());
+        var server = result.snapshot().document().server();
+        if (this.manager != null && this.manager.reaper() != null) {
+            this.manager.reaper().update(server.idleTimeout(), server.headerTimeout(), server.writeTimeout());
+        }
+        if (this.h3 instanceof Http3Server http3) {
+            http3.replaceHandler(result.snapshot().handler()::handle);
+            if (result.tls() != null) {
+                http3.replaceTls(result.tls());
+            }
+        }
+        if (closeOld && this.challengeHttp != null) {
+            this.challengeHttp.close();
+            this.challengeHttp = null;
+        }
+        if (opened != null) {
+            this.challengeHttp = opened;
+        }
+        if (result.snapshot().document().acme().enabled()) {
+            if (this.acme == null) {
+                startAcme(result.snapshot());
+            } else {
+                this.acme.update(result.snapshot().document().acme());
+            }
+        } else if (this.acme != null) {
+            this.acme.update(result.snapshot().document().acme());
+        }
+        return result;
     }
 
     public ServerConfig config() {
-        return this.config;
+        return this.live.get().document().server();
     }
 
     public StaticFileHandler handler() {
-        return this.handler;
+        return this.live.get().files();
     }
 
     /**
@@ -383,30 +400,12 @@ public final class SjwsServer implements AutoCloseable {
         var sb = new StringBuilder("HTTP/1.1 on tcp/").append(tcpPort());
         if (this.h3 != null) {
             sb.append(", HTTP/3 on udp/").append(udpPort()).append(" (")
-                    .append(this.config.tlsCert() == null ? "self-signed" : "cert " + this.config.tlsCert())
+                    .append(config().tlsCert() == null ? "self-signed" : "cert " + config().tlsCert())
                     .append(')');
-        } else if (this.config.h3Enabled()) {
+        } else if (config().h3Enabled()) {
             sb.append(", HTTP/3 unavailable");
         }
-        if (this.h2 != null) {
-            sb.append(", HTTP/2 on tcp/").append(h2Port());
-            if (this.h2 instanceof sjws_nettask.h2.Http2Server s && s.h2cPort() >= 0) {
-                sb.append(" (h2c tcp/").append(s.h2cPort()).append(')');
-            }
-        } else if (this.config.h2Enabled()) {
-            sb.append(", HTTP/2 unavailable");
-        }
-        sb.append(", serving ").append(this.config.root());
-        if (this.config.accessLog() != null) {
-            sb.append(", access log ").append(this.config.accessLog());
-        }
-        if (this.config.metricsExposure() != ServerConfig.MetricsExposure.OFF) {
-            sb.append(", metrics ").append(this.config.metricsExposure().name().toLowerCase(java.util.Locale.ROOT));
-        }
-        if (this.config.healthz()) {
-            sb.append(", healthz");
-        }
-        return sb.toString();
+        return sb.append(", serving ").append(config().root()).toString();
     }
 
     /** Blocks until the accept loop ends (after {@link #close()} or a fatal accept error). */
@@ -423,6 +422,29 @@ public final class SjwsServer implements AutoCloseable {
     public void close() {
         long waitMs = this.shutdownTimeout.toMillis() + 3_000;
         if (!this.closed.compareAndSet(false, true)) {
+            return;
+        }
+        if (this.reloadHook != null) {
+            try {
+                this.reloadHook.close();
+            } catch (Exception e) {
+                System.err.println("WARN: " + e);
+            }
+        }
+        if (this.acme != null) {
+            this.acme.close();
+        }
+        if (this.challengeHttp != null) {
+            this.challengeHttp.close();
+        }
+        this.altSvc.withdraw();
+        if (this.h3 != null) {
+            this.h3.stopAccepting(); // together with TCP; its graceful drain happens below
+        }
+        if (this.manager != null) {
+            this.manager.close();
+        }
+        if (this.acceptThread != null) {
             try {
                 this.shutdownDone.await(waitMs, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
