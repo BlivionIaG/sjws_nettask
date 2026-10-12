@@ -214,6 +214,9 @@ public final class SjwsServer implements AutoCloseable {
         }
         this.shutdownTimeout = timeout;
         this.manager.shutdownTimeout(timeout);
+        if (this.h2 != null) {
+            this.h2.shutdownTimeout(timeout);
+        }
     }
 
     /** One-line summary for the startup log (never contains secrets). */
@@ -269,12 +272,17 @@ public final class SjwsServer implements AutoCloseable {
             if (this.manager != null) {
                 this.manager.close();
             }
-            if (this.h2 != null) {
-                try {
-                    this.h2.close();
-                } catch (RuntimeException e) {
-                    System.err.println("WARN: error closing " + this.h2.name() + ": " + e);
-                }
+            Thread h2Shutdown = null;
+            if (this.h2 != null) { // GOAWAY was sent by stopAccepting; drains in parallel with HTTP/1
+                var transport = this.h2;
+                h2Shutdown = new Thread(() -> {
+                    try {
+                        transport.close();
+                    } catch (RuntimeException e) {
+                        System.err.println("WARN: error closing " + transport.name() + ": " + e);
+                    }
+                }, "h2-shutdown");
+                h2Shutdown.start();
             }
             Thread h3Shutdown = null;
             if (this.h3 != null) {
@@ -296,6 +304,9 @@ public final class SjwsServer implements AutoCloseable {
                 }
                 if (h3Shutdown != null) {
                     h3Shutdown.join(waitMs);
+                }
+                if (h2Shutdown != null) {
+                    h2Shutdown.join(waitMs);
                 }
             } catch (InterruptedException e) {
                 interrupted = true;
