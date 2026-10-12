@@ -17,5 +17,5 @@ The workflow:
 
 Tags with a suffix (`v0.2.0-rc.1`) are published as pre-releases. Run with
 `tar xzf sjws_nettask-<version>.tar.gz && java -jar sjws_nettask-<version>/sjws_nettask-<version>.jar --help`
-(Java 21+). Release notes can be edited on GitHub afterwards. A failed run publishes nothing;
+(Java 25+). Release notes can be edited on GitHub afterwards. A failed run publishes nothing;
 fix, delete and re-push the tag.
