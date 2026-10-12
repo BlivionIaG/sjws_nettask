@@ -19,7 +19,11 @@ package sjws_nettask.core;
 import java.net.InetAddress;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** Counts concurrent connections per client address and refuses those over a fixed limit. Thread-safe. */
+/**
+ * Counts concurrent connections per client address and refuses those over a fixed limit. IPv4
+ * addresses count individually; IPv6 addresses count per /64 prefix (a single host usually has a
+ * whole /64 to pick addresses from). Thread-safe.
+ */
 public final class PerIpLimit {
 
     private final int max;
@@ -36,7 +40,7 @@ public final class PerIpLimit {
     /** @return true if {@code address} had fewer than {@code max} connections; it now has one more */
     public boolean tryAcquire(InetAddress address) {
         var granted = new boolean[1];
-        this.counts.compute(address, (a, n) -> {
+        this.counts.compute(key(address), (a, n) -> {
             int current = n == null ? 0 : n;
             if (current >= this.max) {
                 return n;
@@ -49,15 +53,29 @@ public final class PerIpLimit {
 
     /** Ends one connection previously granted by {@link #tryAcquire}. */
     public void release(InetAddress address) {
-        this.counts.computeIfPresent(address, (a, n) -> n <= 1 ? null : n - 1);
+        this.counts.computeIfPresent(key(address), (a, n) -> n <= 1 ? null : n - 1);
     }
 
-    /** @return current connections from {@code address} */
+    /** @return current connections from {@code address} (its /64 for IPv6) */
     public int count(InetAddress address) {
-        return this.counts.getOrDefault(address, 0);
+        return this.counts.getOrDefault(key(address), 0);
     }
 
-    /** @return addresses with at least one connection (entries are removed at zero) */
+    /** @return the address itself for IPv4, its /64 network for IPv6 (IPv4-mapped addresses are IPv4 already) */
+    static InetAddress key(InetAddress address) {
+        if (!(address instanceof java.net.Inet6Address)) {
+            return address;
+        }
+        var bytes = address.getAddress(); // fresh copy; also drops the scope id
+        java.util.Arrays.fill(bytes, 8, 16, (byte) 0);
+        try {
+            return InetAddress.getByAddress(bytes);
+        } catch (java.net.UnknownHostException e) {
+            throw new IllegalStateException(e); // 16 bytes are always valid
+        }
+    }
+
+    /** @return addresses (IPv6: /64 networks) with at least one connection (entries are removed at zero) */
     public int addresses() {
         return this.counts.size();
     }
