@@ -16,8 +16,12 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
+| `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
+| `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |
+| `FilterIntegrationTest` | real HTTP/1.1 server: no chain by default, header/short-circuit filters, client address and raw headers, a replacement terminal handler, 500 then the next request on the same connection |
+| `h3/FilterHttp3Test` | default HTTP/3 factory runs the same chain; a filter failure is a 500 on that stream |
 | `core/PlatformEdgeCaseTest` | case/Unicode/`%2F` behaviour per file system |
 | `core/SafeOpenTest` | security review M4: symlink/rename swaps of any path component between resolve and send, both open strategies (secure + fallback), and an HTTP/1.1 race test |
 | `core/VerificationRegressionTest` | security verifications V3/V4/V6/V7: execute-only (711/0100) directories 403 by default and served with the opt-in, the attacker-made 311 directory race (0 served, 0 leaks), FIFO swapped in or present refused without blocking (thread + timeout guard), open failures after the decision answered 403/404, startup warnings |
@@ -64,11 +68,12 @@ Every user-visible behaviour and the test that asserts it.
 |---|---|
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
 | `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
+| access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
 | `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |
 | `Server started: ...`, `HTTP/3 unavailable` fallback, `Server Terminated properly !` | `MainTest`, `SjwsServerTest`, `h3/SjwsServerHttp3Test` |
-| statuses 200 206 304 301 400 403 404 405 408 413 414 416 431 500 501 505 | `Http1GoldenTest`, `http1/Http1ParserTest`, `http1/FileServingTest`, `core/StaticFileHandlerRangeTest`, `Http1TransportTest`, `h3/Http3ServerTest` |
+| statuses 200 206 304 301 400 403 404 405 408 413 414 416 431 500 501 505 | `Http1GoldenTest`, `http1/Http1ParserTest`, `http1/FileServingTest`, `core/StaticFileHandlerRangeTest`, `Http1TransportTest`, `h3/Http3ServerTest`, `core/FilterChainTest`, `FilterIntegrationTest` |
 | headers Date, Server, Content-Type/charset, Content-Length, Last-Modified, ETag, Accept-Ranges, Content-Range, Location, Connection, Alt-Svc, Allow, X-Content-Type-Options, Content-Security-Policy | `Http1GoldenTest`, `core/ETagTest`, `AltSvcTest`, `core/SecurityHeadersTest`, `h3/Http3ServerTest` |
 | HTTP/1.1 keep-alive, pipelining, timeouts, limits | `ServerIntegrationTest`, `HardeningIntegrationTest`, `Http1TransportTest` |
 | HTTP/3 parity, limits, Alt-Svc, launch from the jar | `h3/*` |

@@ -25,6 +25,12 @@ import io.netty.handler.codec.http3.Http3HeadersFrame;
 import io.netty.handler.codec.http3.Http3RequestStreamInboundHandler;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.util.ReferenceCountUtil;
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.Request;
@@ -32,6 +38,7 @@ import sjws_nettask.core.RequestRules;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.RequestObserver;
 
 /**
  * One instance per request stream. Maps the HEADERS frame to a core {@link Request} as soon as it
@@ -55,20 +62,83 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         this.connection = connection;
     }
 
-    /** Pseudo-headers and the fields the core understands; :authority wins over a host field. */
+    /** Six typed fields only. No header-map allocation. */
     static Request toRequest(Http3Headers h) {
+        return toRequest(h, null, false);
+    }
+
+    /** @param peer client UDP address, or null */
+    static Request toRequest(Http3Headers h, InetSocketAddress peer) {
+        return toRequest(h, peer, false);
+    }
+
+    /**
+     * @param captureFields when true, copy every regular header before the HEADERS frame is
+     *        released (the handler runs later, on another thread, so the frame cannot be retained).
+     *        Pseudo-headers stay out of the map; {@code :authority} still wins for
+     *        {@link RequestHeaders#host()}. When false, only the six typed fields are read, which
+     *        is the static-handler path
+     */
+    static Request toRequest(Http3Headers h, InetSocketAddress peer, boolean captureFields) {
         var method = h.method();
         var path = h.path();
         var authority = h.authority();
-        return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(),
-                new RequestHeaders(first(h, "if-none-match"), first(h, "if-modified-since"), first(h, "if-range"),
-                        first(h, "range"), first(h, "accept-encoding"),
-                        authority != null ? authority.toString() : first(h, "host")));
+        var auth = authority == null ? null : authority.toString();
+        var headers = captureFields
+                ? RequestHeaders.of(fieldMap(h), auth)
+                : new RequestHeaders(first(h, "if-none-match"), first(h, "if-modified-since"), first(h, "if-range"),
+                        first(h, "range"), first(h, "accept-encoding"), auth != null ? auth : first(h, "host"));
+        return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(), headers,
+                peer, true);
     }
 
     private static String first(Http3Headers h, String name) {
-        var v = h.get(name);
-        return v == null ? null : v.toString();
+        var value = h.get(name);
+        return value == null ? null : value.toString();
+    }
+
+    /**
+     * Client UDP address. {@link QuicStreamChannel#remoteAddress()} is a stream id, not the peer;
+     * the connection's {@code remoteSocketAddress} is the socket address.
+     */
+    static InetSocketAddress peer(QuicStreamChannel stream) {
+        var connection = stream.parent();
+        if (connection == null) {
+            return null;
+        }
+        var remote = connection.remoteSocketAddress();
+        if (remote instanceof InetSocketAddress inet) {
+            return inet;
+        }
+        return null;
+    }
+
+    /** Lower-case name to values, first-seen order, pseudo-headers excluded. Empty when there are none. */
+    private static Map<String, List<String>> fieldMap(Http3Headers headers) {
+        LinkedHashMap<String, List<String>> fields = null;
+        for (var entry : headers) {
+            var raw = entry.getKey();
+            if (raw.charAt(0) == ':') {
+                continue;
+            }
+            if (fields == null) {
+                fields = new LinkedHashMap<>();
+            }
+            var name = raw.toString();
+            var values = fields.get(name);
+            if (values == null) {
+                values = new ArrayList<>(1);
+                fields.put(name, values);
+            }
+            values.add(entry.getValue().toString());
+        }
+        if (fields == null) {
+            return Map.of();
+        }
+        for (var entry : fields.entrySet()) {
+            entry.setValue(List.copyOf(entry.getValue()));
+        }
+        return Collections.unmodifiableMap(fields);
     }
 
     @Override
@@ -87,8 +157,15 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                     return;
                 }
             }
-            var request = toRequest(headers);
-            start(stream, request, refusal(headers, request));
+            var request = toRequest(headers, peer(stream), this.shared.captureFields());
+            String referer = "-";
+            String userAgent = "-";
+            var obs = this.shared.observer();
+            if (obs != RequestObserver.NONE && obs.logHeaders()) {
+                referer = dash(first(headers, "referer"));
+                userAgent = dash(first(headers, "user-agent"));
+            }
+            start(stream, request, refusal(headers, request), referer, userAgent);
         } finally {
             ReferenceCountUtil.release(frame);
         }
@@ -114,7 +191,11 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         return status == 0 ? null : StaticFileHandler.error(status, request.headOnly());
     }
 
-    private void start(QuicStreamChannel stream, Request request, Response refusal) {
+    private static String dash(String value) {
+        return value == null || value.isEmpty() ? "-" : value;
+    }
+
+    private void start(QuicStreamChannel stream, Request request, Response refusal, String referer, String userAgent) {
         var limits = this.shared.limits();
         // Under pressure each connection gets only its share, so a few connections (one address) can't
         // hold the whole in-flight cap (verification V1); without pressure a client may use every stream.
@@ -125,7 +206,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
             return;
         }
         this.connection.inflight.incrementAndGet();
-        var task = new Task(stream, request, refusal);
+        var task = new Task(stream, request, refusal, referer, userAgent);
         try {
             this.shared.executor().execute(task);
         } catch (RejectedExecutionException e) { // shutting down
@@ -144,7 +225,13 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         stream.shutdown(Http3ErrorCode.H3_REQUEST_REJECTED.code());
     }
 
-    private Response respond(Request request) {
+    private Response respond(Request request, RequestObserver obs) {
+        if (obs != RequestObserver.NONE && obs.intercepts()) {
+            var special = obs.intercept(request.method(), request.target(), this.connection.loopback);
+            if (special != null) {
+                return special;
+            }
+        }
         try {
             return this.shared.handler().apply(request);
         } catch (RuntimeException e) { // StaticFileHandler never throws; a test seam might
@@ -158,14 +245,18 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         private final QuicStreamChannel stream;
         private final Request request;
         private final Response refusal;
+        private final String referer;
+        private final String userAgent;
         private final AtomicBoolean finished = new AtomicBoolean();
         private volatile Thread thread;
         private volatile boolean cancelled;
 
-        Task(QuicStreamChannel stream, Request request, Response refusal) {
+        Task(QuicStreamChannel stream, Request request, Response refusal, String referer, String userAgent) {
             this.stream = stream;
             this.request = request;
             this.refusal = refusal;
+            this.referer = referer;
+            this.userAgent = userAgent;
         }
 
         /** Interrupts the request's thread, or makes it return at once if it hasn't started yet. */
@@ -181,17 +272,41 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         public void run() {
             this.thread = Thread.currentThread();
             Http3Writer.Outcome outcome = Http3Writer.Outcome.FAILED;
+            Response response = null;
+            var obs = Http3RequestHandler.this.shared.observer();
+            boolean record = obs != RequestObserver.NONE;
+            long started = 0;
+            if (record) {
+                started = System.nanoTime();
+            }
             try {
                 if (this.cancelled || !this.stream.isActive()) {
                     outcome = Http3Writer.Outcome.CLOSED;
                     return;
                 }
-                var response = this.refusal != null ? this.refusal : respond(this.request);
+                response = this.refusal != null ? this.refusal : respond(this.request, obs);
                 outcome = new Http3Writer(this.stream, Http3RequestHandler.this.shared.limits(),
                         Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connection)
                         .write(response);
             } finally {
                 finish(outcome);
+                if (record && response != null) {
+                    observe(obs, response, outcome, started);
+                }
+            }
+        }
+
+        /** After the write, so the duration includes it. A reset before a response is not a request. */
+        private void observe(RequestObserver obs, Response response, Http3Writer.Outcome outcome, long started) {
+            long nanos = System.nanoTime() - started;
+            long bytes = outcome == Http3Writer.Outcome.COMPLETE && response.sendsBody()
+                    ? Math.max(0L, response.contentLength()) : 0L;
+            if (obs.logging()) {
+                var conn = Http3RequestHandler.this.connection;
+                obs.complete(response.status(), RequestObserver.HTTP_3, bytes, nanos, conn.remote, this.request.method(),
+                        this.request.target(), "HTTP/3", this.referer, this.userAgent);
+            } else {
+                obs.complete(response.status(), RequestObserver.HTTP_3, bytes, nanos);
             }
         }
 
