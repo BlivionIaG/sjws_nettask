@@ -122,16 +122,26 @@ public final class Http1Writer {
     /**
      * Writes head and body and flushes.
      *
-     * @throws IOException if the response could not be completed. If the file of a
-     *         {@link Body.FileBody} was swapped, this happens before anything is written; if it
-     *         shrinks during the transfer, after a partial body. Either way the caller must close
-     *         the connection.
+     * If the file of a {@link Body.FileBody} can't be opened as resolved (deleted, swapped, not a
+     * regular file, permission denied), nothing of {@code response} has been written yet, so the
+     * matching error response (404/403/500, see {@link SafeOpen#status}) is written instead.
+     *
+     * @throws IOException if the response could not be completed (the file shrank during the
+     *         transfer, after a partial body, or the client went away); the caller must close the
+     *         connection.
      */
     public static void write(OutputStream out, Response response, boolean keepAlive, ResponseHeaders extra)
             throws IOException {
         boolean sendBody = response.sendsBody();
         if (sendBody && response.body() instanceof Body.FileBody file) {
-            try (var channel = SafeOpen.open(file)) {
+            java.nio.channels.FileChannel opened;
+            try {
+                opened = SafeOpen.open(file);
+            } catch (IOException e) { // the status isn't committed yet: answer with the matching error
+                write(out, sjws_nettask.core.StaticFileHandler.error(SafeOpen.status(e), false), keepAlive, extra);
+                return;
+            }
+            try (var channel = opened) {
                 out.write(serializeHead(response, keepAlive, extra));
                 copy(channel, file, out);
             }

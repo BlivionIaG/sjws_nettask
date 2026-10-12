@@ -65,6 +65,8 @@ public class Sjws_nettask {
         var hook = new Thread(server::close, "shutdown");
         Runtime.getRuntime().addShutdownHook(hook);
         System.out.println("Server started: " + server.describe());
+        sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
+                .ifPresent(w -> System.err.println("WARN: " + w));
         try {
             server.awaitTermination();
             System.out.println("Server Terminated properly !");
