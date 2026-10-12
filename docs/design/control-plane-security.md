@@ -54,10 +54,12 @@ API and the admin TUI make before every action.
 | operator |  ✓   |      ✓      |    ✓    |    ✓     |     ✓      |                  |
 | admin    |  ✓   |      ✓      |    ✓    |    ✓     |     ✓      |        ✓         |
 
-* Identities: bearer tokens `sjws_<operator>.<256-bit secret>`. Only the token's SHA-256 is
-  stored, and it is compared in constant time. The other option is the RFC 2253 canonical
-  subject of an mTLS client certificate, and **the TLS layer must have verified that certificate
-  against the operator CA** before it hands over the subject.
+* The package can authenticate a bearer token `sjws_<operator>.<256-bit secret>` (only the
+  SHA-256 is stored, compared in constant time) or the subject of an mTLS client certificate.
+  **The control-plane design does not use the bearer.** Admin authentication is mTLS only
+  (`Rbac.ClientCert`). The TLS layer must have verified that certificate against the operator CA
+  before it hands over the subject. The only token outside that rule is the one-shot join token,
+  and it is not an admin credential (`docs/design/control-plane.md`, decision 13).
 * Deny by default: unknown, disabled or malformed credentials are refused, and so is any
   permission outside the role. If the audit write fails, the action is denied.
 * `putOperator` and `removeOperator` need `MANAGE_OPERATORS`. Each change is atomic and takes
