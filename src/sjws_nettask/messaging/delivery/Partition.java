@@ -27,8 +27,11 @@ import sjws_nettask.messaging.ledger.SegmentedLog;
  * <p>Durability: each operation's record follows the writer default (ASYNC: acked after write, background fsync)
  * unless an override is passed; the returned futures complete per {@link LedgerWriter}.
  *
- * <p>Inspection is lock-free: {@link #snapshot()} returns the last published immutable {@link DeliverySnapshot},
- * refreshing it only if the partition lock is free at that moment.
+ * <p>Inspection: {@link #counts()} is exact and lock-free (republished after every entry, O(groups)).
+ * {@link #snapshot()} (paged item lists) is lock-free on the fast path and rate-limited: it is rebuilt at most every
+ * {@code minRebuildNanos} (with {@code tryLock}, so a busy partition is never stalled), every list is capped at
+ * {@code maxItemsPerList} so a rebuild does bounded work under the lock, and a view older than {@code maxStaleNanos}
+ * is rebuilt with a blocking lock so staleness is bounded under contention.
  */
 public final class Partition implements AutoCloseable {
 
@@ -45,6 +48,11 @@ public final class Partition implements AutoCloseable {
     private final LongSupplier clockMs;
     private final ReentrantLock lock = new ReentrantLock();
     private final AtomicReference<DeliverySnapshot> snapshot = new AtomicReference<>();
+    private final AtomicReference<DeliveryCounts> counts = new AtomicReference<>();
+    private volatile long lastRebuildNanos;
+    private volatile long minRebuildNanos = 50_000_000L;
+    private volatile long maxStaleNanos = 1_000_000_000L;
+    private volatile int maxItemsPerList = 10_000;
 
     private Partition(String topic, SegmentedLog log, LedgerWriter writer, DeliveryState state, Partition dlq, LongSupplier clockMs) {
         this.topic = topic;
@@ -270,25 +278,53 @@ public final class Partition implements AutoCloseable {
 
     // ---- inspection ----
 
-    /** Latest immutable state; never blocks. Refreshed here only if stale and the lock is free right now. */
+    /** Exact counts as of the last applied entry. Lock-free, never stale. */
+    public DeliveryCounts counts() { return counts.get(); }
+
+    /**
+     * Paged view. Lock-free unless the view is older than {@code maxStaleNanos} while the partition stays busy, in
+     * which case this call waits for the lock once to rebuild (bounded by {@code maxItemsPerList} work).
+     */
     public DeliverySnapshot snapshot() {
         var s = snapshot.get();
-        if (s.version() != state.version && lock.tryLock()) {
-            try { s = rebuild(); } finally { lock.unlock(); }
+        if (s.version() == state.version) return s;
+        long age = System.nanoTime() - lastRebuildNanos;
+        if (age >= minRebuildNanos && lock.tryLock()) {
+            try { return rebuild(); } finally { lock.unlock(); }
         }
+        if (age >= maxStaleNanos) return freshSnapshot();
         return s;
+    }
+
+    /** Rebuilds under the lock and returns a view that includes every entry applied so far. */
+    public DeliverySnapshot freshSnapshot() {
+        lock.lock();
+        try { return rebuild(); } finally { lock.unlock(); }
+    }
+
+    /** Tuning: rebuild rate limit, staleness bound and per-list cap of {@link #snapshot()} (also applied to the DLQ). */
+    public void snapshotPolicy(long minRebuildNanos, long maxStaleNanos, int maxItemsPerList) {
+        if (minRebuildNanos < 0 || maxStaleNanos < minRebuildNanos || maxItemsPerList < 1) throw new IllegalArgumentException("snapshot policy");
+        this.minRebuildNanos = minRebuildNanos;
+        this.maxStaleNanos = maxStaleNanos;
+        this.maxItemsPerList = maxItemsPerList;
+        if (dlq != null) dlq.snapshotPolicy(minRebuildNanos, maxStaleNanos, maxItemsPerList);
     }
 
     private boolean eager;
 
-    /** When true, a full snapshot is rebuilt after every operation (tests, low-rate topics). Default lazy. */
+    /** When true, the paged view is rebuilt after every operation (tests, low-rate topics). Default: rate-limited. */
     public void eagerSnapshots(boolean on) { lock.lock(); try { eager = on; publish(); } finally { lock.unlock(); } }
 
-    private void publish() { if (eager || snapshot.get() == null) rebuild(); }
+    private void publish() {
+        counts.set(state.counts());
+        if (eager || snapshot.get() == null) rebuild();
+    }
 
     private DeliverySnapshot rebuild() {
-        var s = state.snapshot();
+        var s = state.snapshot(maxItemsPerList);
         snapshot.set(s);
+        lastRebuildNanos = System.nanoTime();
         return s;
     }
 

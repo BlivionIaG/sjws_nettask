@@ -34,6 +34,7 @@ class PartitionTest {
 
     Partition open(String topic) throws IOException {
         var p = Partition.open(dir, topic, POLICY, now::get, Durability.ASYNC, 64 * 1024);
+        p.snapshotPolicy(0, 0, 10_000); // tests read the view immediately after writing
         open.add(p);
         return p;
     }
@@ -366,5 +367,73 @@ class PartitionTest {
         try (var log = SegmentedLog.open(dir.resolve("bad"))) { log.append(List.of(new byte[] {99}), 0); }
         assertThrows(IOException.class, () -> Partition.open(dir, "bad", POLICY, now::get));
         assertThrows(IllegalArgumentException.class, () -> Partition.open(dir, "a/b", POLICY, now::get));
+    }
+
+    @Test
+    void countsAreExactWhileTheViewIsRateLimitedAndCapped() throws Exception {
+        var p = open("t");
+        p.snapshotPolicy(10_000_000_000L, 20_000_000_000L, 5);
+        var insp = new LedgerInspector(p);
+        p.subscribe("g", true);
+        assertEquals(0, insp.counts("g").enqueued(), "new group visible in counts at once");
+        for (int i = 0; i < 20; i++) p.produce(0, 0, b("m" + i));
+        assertEquals(20, insp.counts("g").enqueued());
+        assertEquals(20, p.counts().enqueuedTotal());
+        var stale = p.snapshot();
+        assertNotEquals(p.counts().version(), stale.version(), "view rate-limited");
+        var page = insp.page("g", MessageState.ENQUEUED, 0, 100); // group missing from the old view: one fresh rebuild
+        assertEquals(5, page.size(), "capped list");
+        var v = p.snapshot().groups().get("g");
+        assertTrue(v.truncated());
+        assertEquals(20, v.counts().enqueued(), "counts in the view stay exact");
+        p.poll("g", "c", 10, 1000);
+        assertEquals(10, insp.counts("g").inFlight());
+        assertTrue(p.freshSnapshot().groups().get("g").truncated());
+        assertThrows(IllegalArgumentException.class, () -> p.snapshotPolicy(-1, 0, 1));
+        assertThrows(IllegalArgumentException.class, () -> p.snapshotPolicy(5, 1, 1));
+        assertThrows(IllegalArgumentException.class, () -> p.snapshotPolicy(0, 0, 0));
+        assertThrows(IllegalArgumentException.class, () -> insp.page("nope", MessageState.ENQUEUED, 0, 1));
+    }
+
+    @Test
+    void staleViewIsRebuiltAfterTheInterval() throws Exception {
+        var p = open("t");
+        p.snapshotPolicy(1_000_000, 1_000_000, 100);
+        p.subscribe("g", true);
+        p.produce(0, 0, b("x"));
+        Thread.sleep(2);
+        var s = p.snapshot();
+        assertEquals(p.counts().version(), s.version(), "older than the rebuild interval: rebuilt on read");
+    }
+
+    @Test
+    void readersDuringWritesAlwaysSeeConsistentImmutableSnapshots() throws Exception {
+        var p = open("t");
+        p.snapshotPolicy(0, 1_000_000, 1000);
+        p.subscribe("g", true);
+        var stop = new java.util.concurrent.atomic.AtomicBoolean();
+        var errors = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var readers = new ArrayList<Thread>();
+        for (int i = 0; i < 4; i++) readers.add(Thread.ofPlatform().start(() -> {
+            long lastVersion = -1;
+            try {
+                while (!stop.get()) {
+                    var s = p.snapshot();
+                    assertTrue(s.version() >= lastVersion, "monotonic");
+                    lastVersion = s.version();
+                    var v = s.groups().get("g");
+                    if (v != null) assertEquals(v.counts().inFlight(), v.inFlight().size());
+                    var c = p.counts();
+                    assertTrue(c.version() >= s.version() || c.version() >= 0);
+                }
+            } catch (Throwable t) { errors.set(t); }
+        }));
+        for (int i = 0; i < 2000; i++) {
+            p.produce(0, 0, b("m"));
+            for (var d : p.poll("g", "c", 2, 1000)) p.ack("g", d.offset());
+        }
+        stop.set(true);
+        for (var t : readers) t.join();
+        assertNull(errors.get());
     }
 }

@@ -28,8 +28,12 @@ public record DeliverySnapshot(long version, long nextOffset, long enqueuedTotal
         @Override public int compareTo(Item o) { return Long.compare(offset, o.offset); }
     }
 
+    /**
+     * Lists are by offset and capped at the partition's {@code maxItemsPerList}; {@code truncated} is true when any
+     * list was cut (counts are always exact).
+     */
     public record GroupView(String group, long startOffset, long committedOffset, Counts counts, List<Item> enqueued,
-            List<Item> inFlight, List<Item> deadLettered) {
+            List<Item> inFlight, List<Item> deadLettered, boolean truncated) {
 
         /** Items in {@code state} with offset ≥ {@code fromOffset}, at most {@code limit}, by offset. ACKED is not listed. */
         public List<Item> page(MessageState state, long fromOffset, int limit) {

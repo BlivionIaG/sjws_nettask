@@ -214,23 +214,49 @@ final class DeliveryState {
 
     // ---- snapshot ----
 
-    DeliverySnapshot snapshot() {
+    DeliverySnapshot.Counts countsOf(Group g) {
+        return new DeliverySnapshot.Counts(g.freshCount + g.retry.size(), g.inFlight.size(), g.acked, g.deadLettered, g.redeliveries);
+    }
+
+    DeliveryCounts counts() {
+        var gs = new LinkedHashMap<String, DeliveryCounts.Group>();
+        for (var g : groups.values()) gs.put(g.name, new DeliveryCounts.Group(g.committedOffset, countsOf(g)));
+        return new DeliveryCounts(version, nextOffset, enqueued, messages.size(), gs);
+    }
+
+    /** Full view with every list capped at {@code cap} items (lowest offsets first): bounded work under the lock. */
+    DeliverySnapshot snapshot(int cap) {
         var gs = new LinkedHashMap<String, DeliverySnapshot.GroupView>();
         for (var g : groups.values()) {
+            boolean truncated = false;
             var enq = new ArrayList<DeliverySnapshot.Item>();
-            for (var r : g.retry.entrySet()) enq.add(item(r.getKey(), MessageState.ENQUEUED, r.getValue().attempts, "", r.getValue().notBeforeMs, ""));
-            for (var m : messages.tailMap(g.cursor, true).values()) enq.add(item(m.offset, MessageState.ENQUEUED, 0, "", 0, ""));
-            enq.sort(null);
+            var ri = g.retry.entrySet().iterator();
+            var fi = messages.tailMap(g.cursor, true).keySet().iterator();
+            Map.Entry<Long, Retry> r = ri.hasNext() ? ri.next() : null;
+            Long f = fi.hasNext() ? fi.next() : null;
+            while (r != null || f != null) {
+                if (enq.size() >= cap) { truncated = true; break; }
+                if (f == null || (r != null && r.getKey() < f)) {
+                    enq.add(item(r.getKey(), MessageState.ENQUEUED, r.getValue().attempts, "", r.getValue().notBeforeMs, ""));
+                    r = ri.hasNext() ? ri.next() : null;
+                } else {
+                    enq.add(item(f, MessageState.ENQUEUED, 0, "", 0, ""));
+                    f = fi.hasNext() ? fi.next() : null;
+                }
+            }
             var inf = new ArrayList<DeliverySnapshot.Item>();
             for (var e : g.inFlight.entrySet()) {
+                if (inf.size() >= cap) { truncated = true; break; }
                 var l = e.getValue();
                 inf.add(item(e.getKey(), MessageState.IN_FLIGHT, l.attempt, l.consumer, l.deadlineMs, ""));
             }
             var dl = new ArrayList<DeliverySnapshot.Item>();
-            for (var e : g.dead.entrySet()) dl.add(item(e.getKey(), MessageState.DEAD_LETTERED, e.getValue().attempts, "", 0, e.getValue().reason));
-            gs.put(g.name, new DeliverySnapshot.GroupView(g.name, g.startOffset, g.committedOffset,
-                    new DeliverySnapshot.Counts(enq.size(), inf.size(), g.acked, g.deadLettered, g.redeliveries),
-                    List.copyOf(enq), List.copyOf(inf), List.copyOf(dl)));
+            for (var e : g.dead.entrySet()) {
+                if (dl.size() >= cap) { truncated = true; break; }
+                dl.add(item(e.getKey(), MessageState.DEAD_LETTERED, e.getValue().attempts, "", 0, e.getValue().reason));
+            }
+            gs.put(g.name, new DeliverySnapshot.GroupView(g.name, g.startOffset, g.committedOffset, countsOf(g),
+                    List.copyOf(enq), List.copyOf(inf), List.copyOf(dl), truncated));
         }
         return new DeliverySnapshot(version, nextOffset, enqueued, messages.size(), gs);
     }
