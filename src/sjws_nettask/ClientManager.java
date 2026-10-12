@@ -146,23 +146,24 @@ public class ClientManager implements Runnable {
                 try {
                     // responses are written whole; don't wait for Nagle/delayed ACK
                     socket.setOption(StandardSocketOptions.TCP_NODELAY, true);
-                    this.active.incrementAndGet();
-                    executor.execute(() -> {
-                        try {
-                            new Http1Connection(socket, this.handler, this.extraHeaders, deadlines).run();
-                        } finally {
-                            this.active.decrementAndGet();
-                            this.perIp.release(address);
-                            this.permits.release();
-                        }
-                    });
                 } catch (IOException | RuntimeException e) {
-                    this.active.decrementAndGet();
                     this.perIp.release(address);
                     this.permits.release();
                     System.err.println("Could not start client: " + e);
                     closeQuietly(socket);
+                    continue;
                 }
+                this.active.incrementAndGet();
+                // never rejected: the executor is shut down only after this loop
+                executor.execute(() -> {
+                    try {
+                        new Http1Connection(socket, this.handler, this.extraHeaders, deadlines).run();
+                    } finally {
+                        this.active.decrementAndGet();
+                        this.perIp.release(address);
+                        this.permits.release();
+                    }
+                });
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
