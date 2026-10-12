@@ -256,25 +256,35 @@ class SecurityReviewTest {
         }
     }
 
-    /** M1: a reader that keeps every chunk moving but is slower than the minimum rate is cut off. */
+    /**
+     * M1: a reader that keeps every chunk moving but is slower than the minimum rate is cut off.
+     * <p>
+     * Deterministic: progress is bounded by bytes, not by timing. The client grants a 128 KiB stream
+     * window and consumes it with exactly one read per 100 ms tick, so the server can hand over at
+     * most ~1.3 MB/s: the 8 MB file needs over 6 s, while the rate guard judges after one 2 s window
+     * (and every 100 ms some data moves, far inside the 2 s write timeout, so it is never STALLED).
+     * A slower machine only makes the reader slower still.
+     */
     @Test
     void m1DripReaderBelowTheMinimumRateIsReset() throws Exception {
         try (var server = new Http3Server(config().build(), this.handler, this.tls)
-                .limits(limits(100, 1, 16, Duration.ofSeconds(5), Duration.ofSeconds(1), Long.MAX_VALUE / 4)) // contended
+                .limits(limits(100, 1, 16, Duration.ofSeconds(5), Duration.ofSeconds(2), Long.MAX_VALUE / 4)) // contended
                 .start();
-                var client = new H3TestClient(this.tls.certificate())) {
+                var client = new H3TestClient(this.tls.certificate(), 15_000, 128 * 1024,
+                        io.netty.handler.codec.http3.Http3.supportedApplicationProtocols())) {
             var q = client.connect(server.localAddress());
             var drip = new java.util.concurrent.atomic.AtomicReference<java.util.concurrent.ScheduledFuture<?>>();
+            long t0 = System.nanoTime();
             var f = H3TestClient.request(q, "GET", "/large.bin", Map.of(), null, s -> {
                 s.config().setAutoRead(false);
-                drip.set(s.eventLoop().scheduleAtFixedRate(() -> { // read for 10 ms every 300 ms
-                    s.config().setAutoRead(true);
-                    s.eventLoop().schedule(() -> s.config().setAutoRead(false), 10, TimeUnit.MILLISECONDS);
-                }, 300, 300, TimeUnit.MILLISECONDS));
+                // one read per tick: at most one stream window of new data each time
+                drip.set(s.eventLoop().scheduleAtFixedRate(s::read, 100, 100, TimeUnit.MILLISECONDS));
             });
-            waitFor(() -> finished(server) == 1, 10, "the download to end");
+            waitFor(() -> finished(server) == 1, 20, "the download to end");
+            long ms = (System.nanoTime() - t0) / 1_000_000;
             assertEquals(1, server.responses(Http3Writer.Outcome.SLOW), "slow reader cut off: " + outcomes(server));
             assertEquals(0, server.responses(Http3Writer.Outcome.STALLED), "it never stalled: each chunk moved");
+            assertTrue(ms >= 1900, "judged after a full rate window, not before: " + ms + " ms");
             drip.get().cancel(false);
             q.close().sync();
             assertTrue(f.get(5, TimeUnit.SECONDS).body().length < H3Fixture.LARGE);

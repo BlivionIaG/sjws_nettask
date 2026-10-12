@@ -72,6 +72,11 @@ final class H3TestClient implements AutoCloseable {
     }
 
     H3TestClient(X509Certificate trusted, long idleMillis, String... alpn) throws InterruptedException {
+        this(trusted, idleMillis, 1_000_000, alpn);
+    }
+
+    /** @param streamWindow receive window per request stream (bounds what one read can consume) */
+    H3TestClient(X509Certificate trusted, long idleMillis, long streamWindow, String... alpn) throws InterruptedException {
         this.idleMillis = idleMillis;
         var builder = QuicSslContextBuilder.forClient().applicationProtocols(alpn);
         QuicSslContext ssl = (trusted == null ? builder.trustManager(InsecureTrustManagerFactory.INSTANCE)
@@ -81,7 +86,7 @@ final class H3TestClient implements AutoCloseable {
                 .sslEngineProvider(q -> ssl.newEngine(q.alloc(), "localhost", 443))
                 .maxIdleTimeout(idleMillis, TimeUnit.MILLISECONDS)
                 .initialMaxData(10_000_000)
-                .initialMaxStreamDataBidirectionalLocal(1_000_000)
+                .initialMaxStreamDataBidirectionalLocal(streamWindow)
                 .build();
         this.datagram = new Bootstrap().group(this.group).channel(NioDatagramChannel.class).handler(codec)
                 .bind(new InetSocketAddress("127.0.0.1", 0)).sync().channel();
