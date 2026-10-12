@@ -45,7 +45,7 @@ class MainTest {
     @Test
     void helpPrintsUsageAndExitsZero() {
         assertEquals(Sjws_nettask.EXIT_OK, run(Map.of(), "--help"));
-        assertEquals(ServerConfig.usage(), out());
+        assertEquals(Sjws_nettask.usage(), out());
         assertEquals("", err());
         assertEquals(Sjws_nettask.EXIT_OK, run(Map.of(), "-h"));
     }
