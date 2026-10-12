@@ -17,6 +17,8 @@
 package sjws_nettask;
 
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserverSlot;
+import sjws_nettask.observe.RequestObserver;
 
 /**
  * An additional listener started by {@link SjwsServer} next to HTTP/1.1 (today: HTTP/3).
@@ -54,9 +56,31 @@ public interface Transport extends AutoCloseable {
     @Override
     void close();
 
-    /** Creates (but does not start) a transport. */
+    /** @return connections being served (0 when this transport does not track them) */
+    default int connections() {
+        return 0;
+    }
+
+    /**
+     * Creates (but does not start) a transport. {@link #create(ServerConfig, StaticFileHandler,
+     * RequestObserver)} is what {@link SjwsServer} calls; the default ignores the observer so existing
+     * factories keep working until they opt in.
+     */
     @FunctionalInterface
     interface Factory {
         Transport create(ServerConfig config, StaticFileHandler handler);
+
+        default Transport create(ServerConfig config, StaticFileHandler handler, RequestObserver observer) {
+            return create(config, handler);
+        }
+
+        /**
+         * What {@link SjwsServer} calls. The slot is shared, so an admin snapshot can replace
+         * {@link RequestObserver#NONE} after the transport has started. The default freezes whatever
+         * observer is installed now; HTTP/3's factory keeps the slot.
+         */
+        default Transport create(ServerConfig config, StaticFileHandler handler, ObserverSlot slot) {
+            return create(config, handler, slot.get());
+        }
     }
 }

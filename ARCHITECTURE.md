@@ -16,6 +16,7 @@ tests that pin each behaviour are listed in [tests/README.md](tests/README.md).
 | TLS | `sjws_nettask.tls`: `TlsMaterial`, `SelfSignedDer` | PEM certificate/key loading (encrypted keys), self-signed certificate |
 | Core contract | `sjws_nettask.core`: `Handler`, `Request`, `RequestHeaders`, `Response`, `ResponseHeaders`, `Body` | protocol-neutral request/response |
 | Application | `core.StaticFileHandler` + `PathResolver`, `RequestRules`, `SafeOpen`, `FileCache`, `FileMeta`, `ByteRanges`, `EntityTag`, `Validator`, `Mime`, `HttpDate`, `DateClock`, `PerIpLimit` | every status decision for static files |
+| Observability | `sjws_nettask.observe`: `RequestObserver`, `ServerMetrics`, `Snapshot`, `AccessLog` | access log, in-process metrics, `/healthz`, optional `/metrics` |
 
 `SourceGuardTest` enforces the boundaries: no Netty in core or HTTP/1, and `h3` does not import HTTP/1.
 
@@ -39,7 +40,7 @@ HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ──
 
 ## Current gaps
 
-These are true of `master` today and are the next refactoring steps (each small, without file
+These are true of this branch today and are the next refactoring steps (each small, without file
 moves, so parallel workstreams don't conflict):
 
 1. `ClientManager`, `SjwsServer`, `Transport.Factory` and `h3.Http3RequestHandler` still take the
@@ -56,3 +57,11 @@ The project's goal is a reliable, fast, low-latency message-oriented middleware 
 server. Messaging is still being designed and nothing of it exists in the code yet; the `core.Handler`
 seam and the protocol-neutral `Request`/`Response` contract are where such features are expected to
 plug in.
+
+## Observability
+
+`observe.RequestObserver` is the isolated hook. It is not a `Handler` decorator: the chain above is not composed in `SjwsServer` yet. Both transports share an `ObserverSlot`. While that slot is `RequestObserver.NONE` (the default) a request does not read the clock, does not update a counter, and does not look at the path for `/healthz` or `/metrics`, so a document-root file at `/healthz` is served. `--access-log`, `--metrics` (other than `off`) and `--healthz` install a recording observer at startup. The admin TUI's status view calls `SjwsServer.metricsSnapshot()`, which arms counters on the first call without enabling `/healthz`. When the chain exists, one decorator can make the `intercept` and `complete` calls and the transport calls go away; `ServerMetrics`, `Snapshot` and `AccessLog` stay where they are.
+
+Counters are `LongAdder`s, and only after the observer is recording. The access log is a bounded lock-free queue drained by one thread. Neither path blocks a request on I/O.
+
+The latency histogram is a fixed log2 scale (ratio 2, from 1 ms through 16.384 s, then `+Inf`). `ServerMetrics.LATENCY_BOUNDS_NANOS` and `LATENCY_LE_LABELS` are the stable contract: a cluster merges by summing `Snapshot.latency().counts()[i]` across nodes, or by summing Prometheus `sjws_http_request_duration_seconds_bucket` series that share an `le` label. The in-process counts are not cumulative; the exposition is.

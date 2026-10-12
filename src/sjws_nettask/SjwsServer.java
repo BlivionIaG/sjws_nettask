@@ -25,6 +25,10 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserverSlot;
+import sjws_nettask.observe.RequestObserver;
+import sjws_nettask.observe.ServerMetrics;
+import sjws_nettask.observe.Snapshot;
 
 /**
  * Embeddable server: HTTP/1.1 on TCP plus, when enabled, an HTTP/3 {@link Transport}.
@@ -35,6 +39,7 @@ import sjws_nettask.core.StaticFileHandler;
 public final class SjwsServer implements AutoCloseable {
 
     private final ServerConfig config;
+    private final ObserverSlot slot;
     private final StaticFileHandler handler;
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -49,10 +54,20 @@ public final class SjwsServer implements AutoCloseable {
     private ClientManager manager;
     private Thread acceptThread;
 
-    private SjwsServer(ServerConfig config) {
+    private SjwsServer(ServerConfig config) throws IOException {
         this.config = config;
-        this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
-                new sjws_nettask.core.FileCache(config.cacheBytes()));
+        RequestObserver initial = RequestObserver.NONE;
+        if (config.observe()) {
+            initial = RequestObserver.open(config);
+        }
+        this.slot = new ObserverSlot(initial);
+        try {
+            this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
+                    new sjws_nettask.core.FileCache(config.cacheBytes()));
+        } catch (RuntimeException e) {
+            this.slot.close();
+            throw e;
+        }
         if (config.cacheBytes() > Runtime.getRuntime().maxMemory() / 2) {
             System.err.println("WARN: --cache-bytes=" + config.cacheBytes() + " is more than half of the maximum heap ("
                     + Runtime.getRuntime().maxMemory() + " bytes); raise -Xmx or lower it");
@@ -94,7 +109,8 @@ public final class SjwsServer implements AutoCloseable {
             server.close();
             throw e;
         }
-        server.manager = new ClientManager(server.tcp, config, server.handler, server.altSvc);
+        server.manager = new ClientManager(server.tcp, config, server.handler, server.altSvc, server.slot);
+        server.attachGauges(server.slot.get().metrics());
         server.acceptThread = new Thread(server.manager, "accept-loop");
         server.acceptThread.start();
         return server;
@@ -116,7 +132,7 @@ public final class SjwsServer implements AutoCloseable {
     private void startH3(Transport.Factory factory) {
         Transport transport = null;
         try {
-            transport = factory.create(this.config, this.handler);
+            transport = factory.create(this.config, this.handler, this.slot);
             transport.start();
             this.h3 = transport;
             if (this.config.altSvc()) {
@@ -175,6 +191,50 @@ public final class SjwsServer implements AutoCloseable {
 
     public StaticFileHandler handler() {
         return this.handler;
+    }
+
+    /**
+     * Counters the transports are updating right now. While observability is off this is the empty
+     * {@link RequestObserver#NONE} registry: reading it does not turn recording on.
+     * {@link #metricsSnapshot()} does.
+     */
+    public ServerMetrics metrics() {
+        return this.slot.get().metrics();
+    }
+
+    /**
+     * Turns request counters on if they were off, then returns them. The admin TUI calls this
+     * (through {@link #metricsSnapshot()}) when it draws a status view.
+     * <p>
+     * The first call replaces {@link RequestObserver#NONE} in the shared {@link ObserverSlot}.
+     * The next request on each transport sees the recording observer and starts sampling the clock
+     * and updating {@link java.util.concurrent.atomic.LongAdder}s. Until that call, and unless
+     * {@code --healthz}, {@code --access-log} or {@code --metrics} was set at startup, the transports
+     * hold {@link RequestObserver#NONE}: no {@link System#nanoTime()}, no counter updates, no latency
+     * compare-and-set, and no {@code /healthz} or {@code /metrics} path checks.
+     * <p>
+     * Arming does not by itself answer {@code /healthz}. That probe stays opt-in ({@code --healthz}).
+     * A document-root file at {@code /healthz} keeps being served after the counters come on.
+     */
+    public ServerMetrics armMetrics() throws IOException {
+        var metrics = this.slot.arm(this.config).metrics();
+        if (this.manager != null) {
+            attachGauges(metrics);
+        }
+        return metrics;
+    }
+
+    /**
+     * The admin snapshot. Same as {@code armMetrics().snapshot()}: the first call is what turns
+     * counters on. Later calls only read.
+     */
+    public Snapshot metricsSnapshot() throws IOException {
+        return armMetrics().snapshot();
+    }
+
+    private void attachGauges(ServerMetrics metrics) {
+        metrics.setConnectionGauges(this.manager::activeConnections,
+                () -> this.h3 == null ? 0 : this.h3.connections());
     }
 
     public AltSvc altSvc() {
@@ -237,7 +297,17 @@ public final class SjwsServer implements AutoCloseable {
         } else if (this.config.h2Enabled()) {
             sb.append(", HTTP/2 unavailable");
         }
-        return sb.append(", serving ").append(this.config.root()).toString();
+        sb.append(", serving ").append(this.config.root());
+        if (this.config.accessLog() != null) {
+            sb.append(", access log ").append(this.config.accessLog());
+        }
+        if (this.config.metricsExposure() != ServerConfig.MetricsExposure.OFF) {
+            sb.append(", metrics ").append(this.config.metricsExposure().name().toLowerCase(java.util.Locale.ROOT));
+        }
+        if (this.config.healthz()) {
+            sb.append(", healthz");
+        }
+        return sb.toString();
     }
 
     /** Blocks until the accept loop ends (after {@link #close()} or a fatal accept error). */
@@ -318,5 +388,6 @@ public final class SjwsServer implements AutoCloseable {
         } finally {
             this.shutdownDone.countDown();
         }
+        this.slot.close();
     }
 }
