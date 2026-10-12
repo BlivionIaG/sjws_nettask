@@ -18,9 +18,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.Test;
@@ -127,6 +130,13 @@ class DaemonTest {
         assertEquals(Daemon.Action.DAEMON, opt.action());
         assertTrue(opt.trackPid());
         assertTrue(opt.logToFile());
+        var childOnly = Daemon.parse(new String[] {}, Map.of(Daemon.CHILD_ENV, "1"));
+        assertEquals(Daemon.Action.SERVE, childOnly.action());
+        assertTrue(childOnly.trackPid());
+        assertTrue(childOnly.logToFile());
+        var restart = Daemon.parse(new String[] {"--restart"}, Map.of());
+        assertTrue(restart.trackPid());
+        assertTrue(restart.logToFile());
         assertTrue(opt.childArgs().contains("--pid-file=" + Daemon.DEFAULT_PID_FILE));
         assertTrue(opt.childArgs().contains("--shutdown-timeout=10"));
     }
@@ -234,6 +244,8 @@ class DaemonTest {
         assertTrue(Daemon.isOurLaunch(new String[] {"-jar", "/opt/sjws_nettask.jar"}));
         assertTrue(Daemon.isOurLaunch(new String[] {"-cp", "a.jar", "sjws_nettask.Sjws_nettask"}));
         assertFalse(Daemon.isOurLaunch(new String[] {"-jar", "/surefire/surefirebooter.jar"}));
+        assertFalse(Daemon.isOurLaunch(new String[] {"-jar", "sjws_nettask-surefire.jar"}));
+        assertFalse(Daemon.isOurLaunch(new String[] {"-jar"}));
         assertFalse(Daemon.isOurLaunch(new String[] {"-version"}));
     }
 
@@ -251,6 +263,36 @@ class DaemonTest {
         var cmd = Daemon.childCommand(List.of("--pid-file=from-test"));
         assertTrue(cmd.contains("--pid-file=from-test"), cmd.toString());
         assertTrue(cmd.stream().anyMatch(a -> a.endsWith("java")), cmd.toString());
+
+        var ours = Daemon.childCommand(List.of("8080"),
+                Optional.of(new String[] {"-Xmx1g", "-jar", "/opt/sjws_nettask.jar", "--daemon"}),
+                "/java", "unused-cp");
+        assertEquals(List.of("/java", "-Xmx1g", "-jar", "/opt/sjws_nettask.jar", "8080"),
+                ours.subList(ours.indexOf("/java"), ours.size()));
+        var hidden = Daemon.childCommand(List.of("1"), Optional.empty(), "/java", "cp");
+        assertTrue(hidden.contains("cp") && hidden.contains("sjws_nettask.Sjws_nettask"), hidden.toString());
+        assertEquals(Path.of("/dev/null"), Daemon.discardInput(List.of("NUL", "/dev/null")));
+        assertNull(Daemon.discardInput(List.of("no-such-null-device")));
+
+        var env = new HashMap<String, String>();
+        var configured = new HashMap<String, String>();
+        configured.put("WEB_SERVER_PORT", null);
+        configured.put("WEB_SERVER_ROOT", "/www");
+        Daemon.applyServerEnv(env, configured);
+        assertEquals("/www", env.get("WEB_SERVER_ROOT"));
+        assertFalse(env.containsKey("WEB_SERVER_PORT"));
+
+        var yes = Daemon.parse(new String[] {"--daemon=yes"}, Map.of());
+        assertEquals(Daemon.Action.DAEMON, yes.action());
+        assertEquals(Daemon.Action.STOP, Daemon.parse(new String[] {"--stop=1"}, Map.of()).action());
+        assertEquals(Daemon.Action.STATUS, Daemon.parse(new String[] {"--status=on"}, Map.of()).action());
+        assertEquals(Daemon.Action.RESTART, Daemon.parse(new String[] {"--restart=true"}, Map.of()).action());
+        var blank = Daemon.parse(new String[] {"--shutdown-timeout"}, Map.of("WEB_SERVER_PID_FILE", " ",
+                "WEB_SERVER_LOG_FILE", ""));
+        assertFalse(blank.trackPid());
+        assertFalse(blank.logToFile());
+        assertEquals(Daemon.DEFAULT_SHUTDOWN_TIMEOUT, blank.shutdownTimeout());
+        assertThrows(IOException.class, () -> Daemon.openLog(Path.of("/")));
     }
 
     @Test
@@ -380,6 +422,10 @@ class DaemonTest {
         assertTrue(PidFile.sameOwner(snap, new PidFile.Snapshot(true, me, started, false)));
         assertFalse(PidFile.sameOwner(snap, PidFile.Snapshot.ABSENT));
         assertFalse(PidFile.sameOwner(snap, new PidFile.Snapshot(true, me + 1, started, true)));
+        assertFalse(PidFile.sameOwner(snap, new PidFile.Snapshot(true, me, started + 1, true)));
+        assertFalse(PidFile.Snapshot.ABSENT.stale());
+        assertFalse(new PidFile.Snapshot(false, me, started, true).stale());
+        assertFalse(snap.stale());
 
         var reused = tmp.resolve("reused.pid");
         Files.writeString(reused, PidFile.text(me, 1));
@@ -726,6 +772,9 @@ class DaemonTest {
             writing.processing();
             reaper.sweep(System.nanoTime());
             assertEquals(1, reaper.tracked(), "PROCESSING is not cut during the drain");
+            writing.writing();
+            reaper.sweep(System.nanoTime());
+            assertTrue(reaper.any(ConnectionReaper.State.WRITING), "a response in progress survives the drain sweep");
             writing.idle();
             reaper.sweep(0); // deadline is in the future; draining still ends an idle connection
             assertEquals(0, reaper.tracked());
@@ -870,6 +919,298 @@ class DaemonTest {
         assertTrue(text.contains("Usage:"), text);
     }
 
+    @Test
+    void pidLockLogAndStopEdges() throws Exception {
+        var root = Files.createDirectory(tmp.resolve("html"));
+        Files.writeString(root.resolve("hello.txt"), "hello");
+
+        var held = PidFile.claim(tmp.resolve("held.pid"));
+        assertTrue(held.acquired());
+        try (var ignored = held.file()) {
+            assertEquals(tmp.resolve("held.pid"), held.file().path());
+            reset();
+            int code = Sjws_nettask.run(new String[] {"--pid-file=" + held.file().path(), String.valueOf(freePort()),
+                    root.toString()}, Map.of(), out, err, NO_H3, SjwsServer::close);
+            assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, code, err());
+            assertTrue(err().contains("Already running with pid " + ProcessHandle.current().pid()), err());
+        }
+
+        var blocker = Files.writeString(tmp.resolve("not-a-log-dir"), "x");
+        reset();
+        int logCode = Sjws_nettask.run(new String[] {"--log-file=" + blocker.resolve("sjws.log"),
+                String.valueOf(freePort()), root.toString()}, Map.of(), out, err, NO_H3, SjwsServer::close);
+        assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, logCode, err());
+        assertTrue(err().contains("Cannot write log file"), err());
+
+        var ro = Files.createDirectory(tmp.resolve("ro-pid"));
+        var roPid = ro.resolve("sjws.pid");
+        reset();
+        try {
+            int code = Sjws_nettask.run(new String[] {"--pid-file=" + roPid, "--shutdown-timeout=1",
+                    String.valueOf(freePort()), root.toString()}, Map.of(), out, err, NO_H3, server -> {
+                        assertTrue(ro.toFile().setWritable(false));
+                        server.close();
+                    });
+            assertEquals(Sjws_nettask.EXIT_OK, code, err());
+            assertTrue(err().contains("could not remove pid file"), err());
+        } finally {
+            assertTrue(ro.toFile().setWritable(true));
+        }
+
+        var locked = tmp.resolve("py.pid");
+        Files.writeString(locked, "nope\n");
+        var python = Path.of("/usr/bin/python3");
+        if (Files.isExecutable(python)) {
+            var holder = new ProcessBuilder(python.toString(), "-c",
+                    "import fcntl, time, sys\n"
+                            + "f = open(sys.argv[1], 'a+')\n"
+                            + "fcntl.lockf(f, fcntl.LOCK_EX)\n"
+                            + "print('locked', flush=True)\n"
+                            + "time.sleep(30)\n",
+                    locked.toString()).redirectErrorStream(true).start();
+            try {
+                assertEquals("locked", holder.inputReader().readLine());
+                var refused = PidFile.claim(locked);
+                assertFalse(refused.acquired());
+                assertNull(refused.file());
+                reset();
+                int code = Sjws_nettask.run(new String[] {"--pid-file=" + locked, String.valueOf(freePort()),
+                        root.toString()}, Map.of(), out, err, NO_H3, SjwsServer::close);
+                assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, code, err());
+                assertTrue(err().contains("Already running with pid ?"), err());
+            } finally {
+                holder.destroyForcibly();
+                holder.waitFor(5, TimeUnit.SECONDS);
+            }
+        }
+
+        var owned = tmp.resolve("owned.pid");
+        var claim = PidFile.claim(owned);
+        assertTrue(claim.acquired());
+        PidFile.removeIfSame(PidFile.read(owned), owned);
+        assertTrue(Files.exists(owned), "this JVM already holds the lock");
+        claim.file().release();
+
+        var denied = tmp.resolve("denied.pid");
+        Files.writeString(denied, "nope\n");
+        var deniedSnap = PidFile.read(denied);
+        assertTrue(denied.toFile().setWritable(false));
+        PidFile.removeIfSame(deniedSnap, denied);
+        assertFalse(Files.exists(denied));
+
+        var kept = tmp.resolve("kept.pid");
+        Files.writeString(kept, "1\n1\n");
+        assertTrue(kept.toFile().setWritable(false));
+        PidFile.removeIfSame(PidFile.parse("nope\n"), kept);
+        assertTrue(kept.toFile().setWritable(true));
+        assertEquals("1\n1\n", Files.readString(kept));
+
+        var sleep = new ProcessBuilder("sleep", "60").start();
+        var sleepPid = tmp.resolve("sleep-edge.pid");
+        try {
+            long start = startMillis(sleep);
+            Files.writeString(sleepPid, PidFile.text(sleep.pid(), start));
+            reset();
+            assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(sleepPid, Duration.ofSeconds(-6), out, err, pid -> {
+                assertEquals(sleep.pid(), pid);
+                return Optional.of(new FakeHandle(start, true));
+            }));
+            assertTrue(sleep.isAlive(), "the stand-in handle is signalled, not the real process");
+            assertFalse(Files.exists(sleepPid));
+
+            Files.writeString(sleepPid, PidFile.text(sleep.pid(), start));
+            reset();
+            assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(sleepPid, Duration.ZERO, out, err, pid -> Optional.empty()));
+            assertTrue(out().contains("stopped stale"), out());
+            assertTrue(sleep.isAlive());
+
+            Files.writeString(sleepPid, PidFile.text(sleep.pid(), start));
+            reset();
+            assertEquals(Sjws_nettask.EXIT_OK,
+                    Daemon.stop(sleepPid, Duration.ZERO, out, err, pid -> Optional.of(new FakeHandle(start + 5, true))));
+            assertTrue(out().contains("stopped stale pid=" + sleep.pid()), out());
+            assertTrue(sleep.isAlive());
+            assertFalse(Files.exists(sleepPid));
+
+            Files.writeString(sleepPid, PidFile.text(sleep.pid(), start));
+            reset();
+            var stuck = new AtomicInteger(-1);
+            var worker = new Thread(() -> stuck.set(Daemon.stop(sleepPid, Duration.ofSeconds(-6), out, err,
+                    pid -> Optional.of(new FakeHandle(start, false)))), "stuck-stop");
+            worker.start();
+            Thread.sleep(100);
+            worker.interrupt();
+            worker.join(5_000);
+            assertFalse(worker.isAlive());
+            assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, stuck.get(), err());
+            assertTrue(err().contains("did not exit") || err().contains("Interrupted"), err());
+        } finally {
+            sleep.destroyForcibly();
+            sleep.waitFor(5, TimeUnit.SECONDS);
+        }
+
+        if (Files.isExecutable(python)) {
+            var childPid = tmp.resolve("ignores-term.pid");
+            var script = tmp.resolve("ignore_term.py");
+            Files.writeString(script, "import os, signal, sys, time\n"
+                    + "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                    + "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                    + "time.sleep(60)\n");
+            var opt = Daemon.parse(new String[] {"--daemon", "--pid-file=" + tmp.resolve("ig.pid"),
+                    "--log-file=" + tmp.resolve("ig.log")}, Map.of());
+            assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, Daemon.daemonize(opt, Map.of(), out, err,
+                    List.of(python.toString(), script.toString(), childPid.toString()), Duration.ofMillis(400)));
+            long child = readPid(childPid);
+            try {
+                waitFor(() -> !alive(child), 3_000, "SIGKILL after an ignored SIGTERM");
+            } finally {
+                ProcessHandle.of(child).ifPresent(ProcessHandle::destroyForcibly);
+            }
+        }
+
+        var savedOut = System.out;
+        var help = new java.io.ByteArrayOutputStream();
+        System.setOut(new PrintStream(help, true, StandardCharsets.UTF_8));
+        try {
+            Sjws_nettask.main(new String[] {"--help"});
+        } finally {
+            System.setOut(savedOut);
+        }
+        assertTrue(help.toString(StandardCharsets.UTF_8).contains("--daemon"));
+    }
+
+    @Test
+    void recycledPidFileAndRestartInterrupt() throws Exception {
+        assertThrows(IOException.class, () -> PidFile.claim(Path.of("/")));
+        assertFalse(PidFile.identifies(PidFile.Snapshot.ABSENT, ProcessHandle.current()));
+
+        var target = tmp.resolve("link-target.pid");
+        Files.writeString(target, "nope\n");
+        var link = tmp.resolve("link.pid");
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException | IOException e) {
+            org.junit.jupiter.api.Assumptions.abort("symlinks unavailable");
+        }
+        var linkSnap = PidFile.read(link);
+        Files.writeString(target, "1\n1\n");
+        PidFile.removeIfSame(linkSnap, link);
+        assertTrue(Files.isSymbolicLink(link), "a changed symlink target is not removed");
+
+        var sleep = new ProcessBuilder("sleep", "60").start();
+        var pid = tmp.resolve("foreign.pid");
+        try {
+            long start = startMillis(sleep);
+            assertFalse(PidFile.identifies(PidFile.parse(PidFile.text(sleep.pid(), start)), ProcessHandle.current()));
+            var claim = PidFile.claim(pid);
+            assertTrue(claim.acquired());
+            try (var ch = java.nio.channels.FileChannel.open(pid, java.nio.file.StandardOpenOption.WRITE)) {
+                ch.truncate(0);
+                ch.write(java.nio.ByteBuffer.wrap(PidFile.text(sleep.pid(), start).getBytes(StandardCharsets.UTF_8)));
+            }
+            claim.file().release();
+            assertEquals(sleep.pid(), PidFile.read(pid).pid(), "release must not delete a file now naming someone else");
+
+            Files.writeString(pid, sleep.pid() + "\n");
+            reset();
+            assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(pid, Duration.ofSeconds(-6), out, err,
+                    p -> Optional.of(new FakeHandle(-1, true))));
+            assertTrue(sleep.isAlive());
+
+            Files.writeString(pid, PidFile.text(sleep.pid(), start));
+            reset();
+            assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(pid, Duration.ofSeconds(-6), out, err,
+                    p -> Optional.of(new FakeHandle(-1, true))));
+            assertTrue(sleep.isAlive());
+        } finally {
+            sleep.destroyForcibly();
+            sleep.waitFor(5, TimeUnit.SECONDS);
+        }
+
+        var python = Path.of("/usr/bin/python3");
+        if (!Files.isExecutable(python)) {
+            return;
+        }
+        var root = Files.createDirectory(tmp.resolve("html"));
+        var childPid = tmp.resolve("restart-child.pid");
+        var script = tmp.resolve("ignore_restart.py");
+        Files.writeString(script, "import os, signal, sys, time\n"
+                + "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                + "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                + "time.sleep(60)\n");
+        var process = new ProcessBuilder(python.toString(), script.toString(), childPid.toString()).start();
+        try {
+            waitFor(() -> Files.exists(childPid), 5_000, "restart child");
+            long recorded = readPid(childPid);
+            var pidFile = tmp.resolve("restart.pid");
+            Files.writeString(pidFile, recorded + "\n");
+            var code = new AtomicInteger(-1);
+            var worker = new Thread(() -> code.set(Sjws_nettask.run(new String[] {"--restart", "--shutdown-timeout=0",
+                    "--pid-file=" + pidFile, String.valueOf(freePort()), root.toString()}, Map.of(), out, err, NO_H3,
+                    s -> {
+                    })), "restart");
+            worker.start();
+            Thread.sleep(150);
+            worker.interrupt();
+            worker.join(8_000);
+            assertFalse(worker.isAlive());
+            assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, code.get(), err());
+            assertTrue(process.isAlive());
+        } finally {
+            process.destroyForcibly();
+            process.waitFor(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void closeInterruptsTheDrainAndRejectsABadManagerTimeout() throws Exception {
+        var root = Files.createDirectory(tmp.resolve("html"));
+        var body = new byte[2 * 1024 * 1024];
+        java.util.Arrays.fill(body, (byte) 'z');
+        Files.write(root.resolve("big.bin"), body);
+        var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3);
+        server.shutdownTimeout(Duration.ofSeconds(3));
+        assertThrows(IllegalArgumentException.class, () -> server.clientManager().shutdownTimeout(Duration.ofMillis(-1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> server.clientManager().shutdownTimeout(Duration.ofMillis((long) Integer.MAX_VALUE + 1)));
+        int port = server.tcpPort();
+        try (var client = new Socket()) {
+            client.setReceiveBufferSize(4 * 1024);
+            client.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port));
+            HttpTestSupport.write(client.getOutputStream(), "GET /big.bin HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+            waitFor(() -> {
+                var reaper = server.clientManager().reaper();
+                return reaper != null && reaper.any(ConnectionReaper.State.WRITING);
+            }, 3000, "writing");
+            var closer = new Thread(server::close, "closer");
+            closer.start();
+            Thread.sleep(100);
+            Thread.getAllStackTraces().keySet().stream()
+                    .filter(t -> "accept-loop".equals(t.getName()))
+                    .forEach(Thread::interrupt);
+            var waiter = new Thread(server::close, "second-close");
+            waiter.start();
+            Thread.sleep(50);
+            waiter.interrupt();
+            closer.interrupt();
+            closer.join(8_000);
+            waiter.join(8_000);
+            assertFalse(closer.isAlive());
+            assertFalse(waiter.isAlive());
+        } finally {
+            server.close();
+            Thread.getAllStackTraces().keySet().stream()
+                    .filter(t -> "accept-loop".equals(t.getName()))
+                    .forEach(t -> {
+                        try {
+                            t.join(2_000);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    });
+        }
+    }
+
     // --- helpers ----------------------------------------------------------------------
 
     private int startDaemon(Path pid, Path log, Path root) {
@@ -958,6 +1299,106 @@ class DaemonTest {
             Thread.sleep(10);
         }
         fail("timed out waiting for " + what);
+    }
+
+    /** Stand-in {@link ProcessHandle} so stop's signal paths do not need a recycled pid. */
+    private static final class FakeHandle implements ProcessHandle {
+        private final long start;
+        private final boolean dieOnKill;
+        private boolean alive = true;
+
+        FakeHandle(long start, boolean dieOnKill) {
+            this.start = start;
+            this.dieOnKill = dieOnKill;
+        }
+
+        @Override
+        public long pid() {
+            return 1;
+        }
+
+        @Override
+        public Optional<ProcessHandle> parent() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Stream<ProcessHandle> children() {
+            return Stream.empty();
+        }
+
+        @Override
+        public Stream<ProcessHandle> descendants() {
+            return Stream.empty();
+        }
+
+        @Override
+        public Info info() {
+            return new Info() {
+                @Override
+                public Optional<String> command() {
+                    return Optional.empty();
+                }
+
+                @Override
+                public Optional<String> commandLine() {
+                    return Optional.empty();
+                }
+
+                @Override
+                public Optional<String[]> arguments() {
+                    return Optional.empty();
+                }
+
+                @Override
+                public Optional<Instant> startInstant() {
+                    return Optional.of(Instant.ofEpochMilli(start));
+                }
+
+                @Override
+                public Optional<Duration> totalCpuDuration() {
+                    return Optional.empty();
+                }
+
+                @Override
+                public Optional<String> user() {
+                    return Optional.empty();
+                }
+            };
+        }
+
+        @Override
+        public CompletableFuture<ProcessHandle> onExit() {
+            return new CompletableFuture<>();
+        }
+
+        @Override
+        public boolean supportsNormalTermination() {
+            return true;
+        }
+
+        @Override
+        public boolean destroy() {
+            return true;
+        }
+
+        @Override
+        public boolean destroyForcibly() {
+            if (this.dieOnKill) {
+                this.alive = false;
+            }
+            return true;
+        }
+
+        @Override
+        public boolean isAlive() {
+            return this.alive;
+        }
+
+        @Override
+        public int compareTo(ProcessHandle other) {
+            return Long.compare(pid(), other.pid());
+        }
     }
 
     /** A connected loopback channel pair. */
