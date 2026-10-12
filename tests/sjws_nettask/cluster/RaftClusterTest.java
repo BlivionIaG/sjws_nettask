@@ -233,6 +233,46 @@ class RaftClusterTest {
     }
 
     @Test
+    void preferredCampaignsSoonerAndFailbackDelaysTheDemotedLeader() {
+        var clock = new FakeClock(0L);
+        var net = new SimTransport();
+        var members = List.of(member(1, false), member(2, false), member(3, false));
+        var voters = Set.of(members.get(0).id(), members.get(1).id(), members.get(2).id());
+        var plain = options(Durability.STRICT, 1_000_000).withFailback(Duration.ofSeconds(1));
+        var preferred = plain.withPreferred(Duration.ofSeconds(1));
+        var nodes = new ArrayList<ReplicatedNode>();
+        for (var member : members) {
+            var opts = member.id().wire() == 3 ? preferred : plain;
+            var node = ReplicatedNode.open(member.id(), members, voters, QuorumPolicy.majority(), clock,
+                    new MemoryLogStorage(), net);
+            node.openGroup(GROUP, opts, null);
+            nodes.add(node);
+        }
+        clock.advance(Duration.ofMillis(20));
+        ReplicatedNode.driveAll(nodes);
+        var leader = nodes.get(2).openGroup(GROUP, preferred, null);
+        assertTrue(leader.isLeader());
+        assertFalse(nodes.get(0).openGroup(GROUP, plain, null).isLeader());
+        assertTrue(leader.leaseExpiresAt() > clock.nanoTime());
+        assertEquals(0L, nodes.get(0).openGroup(GROUP, plain, null).leaseExpiresAt());
+
+        leader.transferLeadership(members.get(1).id());
+        ReplicatedNode.driveAll(nodes);
+        assertTrue(nodes.get(1).openGroup(GROUP, plain, null).isLeader());
+        assertFalse(leader.isLeader());
+        net.cut(members.get(2).id(), members.get(0).id());
+        net.cut(members.get(2).id(), members.get(1).id());
+        long term = leader.term();
+        clock.advance(Duration.ofMillis(200));
+        ReplicatedNode.driveAll(nodes);
+        assertEquals(term, leader.term());
+        assertFalse(leader.isLeader());
+        clock.advance(Duration.ofSeconds(1));
+        ReplicatedNode.driveAll(nodes);
+        assertTrue(leader.term() > term);
+    }
+
+    @Test
     void fileLogRoundTripAndApiGuards() throws Exception {
         var root = Files.createTempDirectory("raft-log");
         var store = new FileLogStorage(root);
@@ -278,6 +318,8 @@ class RaftClusterTest {
                 () -> new GroupOptions(Durability.STRICT, 1, Duration.ZERO, Duration.ofMillis(1), 1));
         assertThrows(IllegalArgumentException.class,
                 () -> new GroupOptions(Durability.STRICT, 1, Duration.ofMillis(1), Duration.ofMillis(1), 0));
+        assertThrows(IllegalArgumentException.class, () -> options(Durability.STRICT, 1).withFailback(Duration.ofMillis(-1)));
+        assertThrows(NullPointerException.class, () -> options(Durability.STRICT, 1).withPreferred(null));
         assertThrows(IllegalArgumentException.class, () -> new CommittedIndex(GROUP, 0, 1));
         assertThrows(IllegalArgumentException.class, () -> new LogSnapshot(GROUP, -1, 0, null));
         assertEquals(0, new LogSnapshot(GROUP, 0, 0, null).data().length);

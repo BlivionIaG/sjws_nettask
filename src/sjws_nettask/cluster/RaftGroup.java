@@ -72,6 +72,7 @@ final class RaftGroup {
     private long commitIndex;
     private long lastApplied;
     private long electionDeadline;
+    private long campaignNotBefore;
     private long leaseExpires;
     private long nextHeartbeat;
     private final Set<NodeId> voters = new HashSet<>();
@@ -112,7 +113,11 @@ final class RaftGroup {
         this.listener = listener;
         this.voters.addAll(voters);
         long election = options.electionTimeout().toNanos();
-        this.electionDeadline = election + (self.wire() - 1L) * (election / 5);
+        if (options.preferred()) {
+            this.electionDeadline = Math.max(1L, election / 5);
+        } else {
+            this.electionDeadline = election + (self.wire() - 1L) * (election / 5);
+        }
     }
 
     GroupFacade facade() {
@@ -168,7 +173,7 @@ final class RaftGroup {
                     nextHeartbeat = now + options.heartbeat().toNanos();
                     replicate();
                 }
-            } else if (!witness && now >= electionDeadline) {
+            } else if (!witness && now >= electionDeadline && now >= campaignNotBefore) {
                 startElection(now, after);
             }
         } finally {
@@ -626,6 +631,14 @@ final class RaftGroup {
         }
         role = Role.FOLLOWER;
         if (wasLeader) {
+            long wait = options.failbackHysteresis().toNanos();
+            if (wait > 0) {
+                long until = clock.nanoTime() + wait;
+                campaignNotBefore = until;
+                if (electionDeadline < until) {
+                    electionDeadline = until;
+                }
+            }
             leader = null;
             var error = notLeader();
             var doomed = new ArrayList<>(pending.values());
@@ -841,6 +854,16 @@ final class RaftGroup {
         }
 
         @Override
+        public long leaseExpiresAt() {
+            lock.lock();
+            try {
+                return role == Role.LEADER ? leaseExpires : 0L;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
         public long commitIndex() {
             lock.lock();
             try {
@@ -924,7 +947,14 @@ final class RaftGroup {
                 rpc.send(target, new SimTransport.Frame(groupId, TIMEOUT_NOW, body.array()));
                 role = Role.FOLLOWER;
                 leader = null;
-                electionDeadline = clock.nanoTime() + options.leaseNanos() + options.electionTimeout().toNanos();
+                long now = clock.nanoTime();
+                long wait = options.leaseNanos() + options.electionTimeout().toNanos();
+                long failback = options.failbackHysteresis().toNanos();
+                if (failback > wait) {
+                    wait = failback;
+                }
+                campaignNotBefore = now + failback;
+                electionDeadline = now + wait;
                 fireLeader(after);
             } finally {
                 lock.unlock();
