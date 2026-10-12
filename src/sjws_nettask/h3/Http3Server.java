@@ -69,10 +69,15 @@ import sjws_nettask.tls.TlsMaterial;
  */
 public final class Http3Server implements AutoCloseable {
 
-    /** Initial QUIC flow-control windows (bytes) and concurrent request streams per connection. */
-    static final long MAX_DATA = 10L * 1024 * 1024;
-    static final long MAX_STREAM_DATA = 1024L * 1024;
-    static final long MAX_STREAMS = 100;
+    /**
+     * Receive flow-control windows (bytes) and concurrent request streams per connection. Requests are
+     * a HEADERS frame (a few KiB) and bodies are
+     * discarded, so the windows only need to fit that: they also bound what quiche must buffer for
+     * out-of-order data (security review S2).
+     */
+    static final long MAX_DATA = 1024L * 1024;
+    static final long MAX_STREAM_DATA = 16L * 1024;
+    static final long MAX_STREAMS = 64;
     /** Files open for sending at once, across all connections (each in-flight stream holds one fd). */
     static final int MAX_OPEN_FILES = 256;
     /** Address-validation token policy (security review M3). */
@@ -154,7 +159,6 @@ public final class Http3Server implements AutoCloseable {
                     .sslContext(ssl)
                     .maxIdleTimeout(this.config.idleTimeout().toMillis(), TimeUnit.MILLISECONDS)
                     .initialMaxData(MAX_DATA)
-                    .initialMaxStreamDataBidirectionalLocal(MAX_STREAM_DATA)
                     .initialMaxStreamDataBidirectionalRemote(MAX_STREAM_DATA)
                     .initialMaxStreamsBidirectional(MAX_STREAMS)
                     .tokenHandler(TOKENS) // no Retry: forged tokens can't bypass address validation
