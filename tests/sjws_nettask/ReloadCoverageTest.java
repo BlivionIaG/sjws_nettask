@@ -83,6 +83,22 @@ class ReloadCoverageTest {
     }
 
     @Test
+    void unchangedChallengePortIsLeftBoundUntilClose() throws Exception {
+        var root = directory("stay");
+        var yaml = dir.resolve("stay.yaml");
+        int port = freePort();
+        write(yaml, server(root));
+        try (var server = SjwsServer.start(load(yaml))) {
+            write(yaml, server(root) + acme(dir.resolve("stay-acme"), port, true));
+            assertTrue(server.reload().applied());
+            assertFalse(connectRefused(port));
+            assertTrue(server.reload().applied());
+            assertFalse(connectRefused(port));
+        }
+        assertTrue(connectRefused(port));
+    }
+
+    @Test
     void enablingAcmeOnReloadStartsTheRenewer() throws Exception {
         var root = directory("later");
         var yaml = dir.resolve("later.yaml");
