@@ -122,12 +122,43 @@ public record TlsMaterial(PrivateKey key, X509Certificate[] chain, boolean selfS
      */
     public static TlsMaterial resolve(ServerConfig config) throws IOException {
         if (config.tlsCert() != null) {
-            return fromPem(config.tlsCert(), config.tlsKey(), config.tlsKeyPassword());
+            var material = fromPem(config.tlsCert(), config.tlsKey(), config.tlsKeyPassword());
+            warnings(config.tlsKey(), material.certificate(), java.time.Instant.now())
+                    .forEach(w -> System.err.println("WARN: " + w));
+            return material;
         }
         var material = selfSigned("localhost");
         System.err.println("WARN: no TLS certificate configured, using a self-signed one for localhost (SHA-256 "
                 + material.fingerprint() + "); browsers will reject it, use curl -k or pin this fingerprint");
         return material;
+    }
+
+    /**
+     * Configuration smells that don't stop the server: a private key file other users can read, and
+     * a leaf certificate outside its validity period (clients will reject it).
+     */
+    static List<String> warnings(Path keyFile, X509Certificate leaf, java.time.Instant now) {
+        var list = new ArrayList<String>();
+        try {
+            var perms = Files.getPosixFilePermissions(keyFile);
+            if (perms.contains(java.nio.file.attribute.PosixFilePermission.GROUP_READ)
+                    || perms.contains(java.nio.file.attribute.PosixFilePermission.OTHERS_READ)) {
+                list.add("TLS key " + keyFile + " is readable by group/others ("
+                        + java.nio.file.attribute.PosixFilePermissions.toString(perms) + "); chmod 600 it");
+            }
+        } catch (UnsupportedOperationException | IOException e) {
+            // no POSIX permissions (Windows): nothing to check
+        }
+        try {
+            leaf.checkValidity(java.util.Date.from(now));
+        } catch (java.security.cert.CertificateExpiredException e) {
+            list.add("TLS certificate " + leaf.getSubjectX500Principal() + " expired on " + leaf.getNotAfter().toInstant()
+                    + "; clients will reject it");
+        } catch (java.security.cert.CertificateNotYetValidException e) {
+            list.add("TLS certificate " + leaf.getSubjectX500Principal() + " is not valid before "
+                    + leaf.getNotBefore().toInstant() + "; clients will reject it");
+        }
+        return list;
     }
 
     /**
@@ -228,7 +259,14 @@ public record TlsMaterial(PrivateKey key, X509Certificate[] chain, boolean selfS
             var algorithm = name.equals("PBES2") || name.equals("1.2.840.113549.1.5.13") ? params.toString() : name;
             var factory = SecretKeyFactory.getInstance(algorithm);
             var cipher = Cipher.getInstance(algorithm);
-            cipher.init(Cipher.DECRYPT_MODE, factory.generateSecret(new PBEKeySpec(password.toCharArray())), params);
+            var chars = password.toCharArray();
+            var spec = new PBEKeySpec(chars);
+            try {
+                cipher.init(Cipher.DECRYPT_MODE, factory.generateSecret(spec), params);
+            } finally {
+                spec.clearPassword(); // the copies we made; the caller's String can't be cleared
+                java.util.Arrays.fill(chars, '\0');
+            }
             return info.getKeySpec(cipher).getEncoded();
         } catch (GeneralSecurityException | IOException e) {
             throw new IOException("could not decrypt TLS key " + file + " (wrong password or unsupported scheme)", e);
