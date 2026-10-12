@@ -1,10 +1,17 @@
 # Control Plane / API Gateway Mode — sjws_nettask
 
 Status: Draft · Scope: control plane and config distribution
-Base: master `d592aaf` (Java 25)
-Consistent with: [high availability](../ha/design.md) (the document PR #14 added as `docs/design/high-availability.md`; PR #34 moved it) and the per-group Raft API shipped in [PR #29](https://github.com/BlivionIaG/sjws_nettask/pull/29).
+Base: master `459d98e` (Java 25), which includes the config model from [PR #42](https://github.com/BlivionIaG/sjws_nettask/pull/42)
+Consistent with: [high availability](../ha/design.md) (the document PR #14 added as `docs/design/high-availability.md`; PR #34 moved it), the per-group Raft API shipped in [PR #29](https://github.com/BlivionIaG/sjws_nettask/pull/29), and the cluster harness in `tests/sjws_nettask/clusterharness`.
 
-PR #29 is merged into the HA stack (`cursor/ha-vip-restart-5d15` and its parents). It is not on master `d592aaf`. This design calls that API. Implementation PRs merge the stack forward. They do not reimplement Raft.
+PR #29 is merged into the HA stack (`cursor/ha-vip-restart-5d15` and its parents). It is not on master `459d98e`. This design calls that API. Implementation PRs merge the stack forward. They do not reimplement Raft.
+
+Binding decisions, which override a review where the two disagree:
+
+1. One hash. `canonicalHash` is the SHA-256 of the canonical serialization (`ConfigCodec.text`). The signature covers `canonicalHash`, `version`, and `schema`, and also `parentVersion`, `kind`, and `keyId`.
+2. `ConfigDiff` is a per-section report. Distribution always sends a full signed snapshot. It never sends a patch.
+3. Signature checks and rollback checks run inside `SjwsServer.applyRemote` and fail closed.
+4. The control plane's last-good config is `<stateDir>/config/last-good.json`.
 
 ## 1. Context
 
@@ -16,7 +23,7 @@ The content request path reads the snapshot that is already installed. It does n
 
 ## 2. Principles
 
-1. **One binary, three startup roles.** `standalone` (the default), `control`, or `data`. The choice is made once at process start. `standalone` constructs no control-plane object, opens no `cp-config` group, and starts no watch. The HTTP path stays the path on master `d592aaf`.
+1. **One binary, three startup roles.** `standalone` (the default), `control`, or `data`. The choice is made once at process start. `standalone` constructs no control-plane object, opens no `cp-config` group, and starts no watch. The HTTP path stays the path on master `459d98e`.
 2. **Zero cost when the control plane is off.** With `standalone`, the accept loop and `Http1Connection` do not read a role, a lease, a generation from Raft, or a control-plane flag. Evidence for every PR, including this one, is a `wrk` / `wrk2` before/after on the same host. The gate is the same shape as HA: report req/s and p50/p90/p99/p99.9.
 3. **Lock-free hot path.** A request performs one volatile read of an immutable snapshot (`LiveConfig.get` / `handler()`), then runs that snapshot's `Handler`. Publish is an atomic swap (`AtomicReference.set`) of the whole snapshot. The handler chain, the HA generation leaf, and the HTTP/3 handler supplier all read that snapshot. They do not keep a leaf captured at startup (§5.6). Readers take no lock. An in-flight request keeps the handler it already loaded.
 4. **Raft I/O on dedicated threads.** Append, fsync, election, and `GroupListener.onCommitted` run on the cluster group's threads (PR #29: one apply thread per group, index order). Those threads are distinct from the accept loop and from request virtual threads.
@@ -53,8 +60,8 @@ The content request path reads the snapshot that is already installed. It does n
 
 | Package | Role |
 |---|---|
-| `sjws_nettask.cp` | Raft state machine, signing, diff apply, rollout, admin API, watch, registration. Depends on `sjws_nettask.cluster` and on the config model. Owns `SignedSnapshot`. |
-| `sjws_nettask.config` | Owns `ConfigDocument`, validation, `contentHash`, `ConfigSnapshot.compile`, `ConfigReloader`, `LiveConfig`. The remote entry takes verified canonical bytes (§5.6). It does not mention a `cp` type. |
+| `sjws_nettask.cp` | Raft state machine, signing, rollout, admin API, watch, registration. Depends on `sjws_nettask.cluster` and on the config model. Owns `SignedSnapshot`. Does not apply patches. |
+| `sjws_nettask.config` | Owns `ConfigDocument`, `ConfigCodec`, `canonicalHash`, `contentHash`, `ConfigValidator`, `ConfigDiff.between`, `ConfigSnapshot.compile`, `ConfigReloader.apply`, `LiveConfig`. It does not mention a `cp` type. Signature checks are not here; they are inside `SjwsServer.applyRemote` (§5.5). |
 | `sjws_nettask.cluster` | Per-group Raft from PR #29. Unchanged by this workstream. It imports neither `sjws_nettask.cp` nor `sjws_nettask.messaging`. |
 | Data plane (`http1`, `h2`, `h3`, `routing`, `core`, `messaging`, `acme` on a data node) | Sees a `Handler` or, for the broker and the composition root only, `AppliedConfig` (§3.2). Does not depend on `sjws_nettask.cp`. |
 
@@ -75,15 +82,15 @@ public interface AppliedConfig {
     long version();
     /** Raft term of cp-config that signed this snapshot. 0 when local. */
     long epoch();
-    /** Lowercase SHA-256 of the canonical YAML, or null when the process has no file bytes. */
-    String contentHash();
+    /** Lowercase SHA-256 of the canonical serialization. Empty when the snapshot never came from the CP. */
+    String canonicalHash();
     ConfigDocument document();
     /** Prebuilt handler. One volatile read at the call site, then plain invocation. */
     Handler handler();
 }
 ```
 
-`ConfigSnapshot` implements `AppliedConfig`. Adding `version` and `epoch` is two `long` fields on that record (0 on a standalone snapshot). That is the only change the request path pays for the fields. `LiveConfig` remains the `AtomicReference` holder.
+`ConfigSnapshot` implements `AppliedConfig`. `version()` is `ConfigDocument.bundleVersion()` (0 when unset). `canonicalHash()` is `ConfigDocument.canonicalHash()`. `epoch` is one extra `long` on the snapshot (0 when local). That field is the only new hot-path cost. `LiveConfig` remains the `AtomicReference` holder. The harness method `DataNode.contentHash()` returns this `canonicalHash`.
 
 Transports do not import `AppliedConfig`. They already depend on `Supplier<Handler>` and `HandlerRef`, which is the narrower seam, and that stays. HTTP/1, HTTP/2, and HTTP/3 read the supplier the publish step installs (§5.6). `AppliedConfig` is for the broker and the composition root. The messaging broker, when it is running, reads `document()` on its partition-writer thread to learn the desired topic set. That read is not on the HTTP request path and is not a call to the control plane.
 
@@ -149,9 +156,16 @@ Membership changes of the voters use `ReplicationGroup.changeMembership` (joint 
 
 ### 5.1 Reuse the config model
 
-`ConfigDocument` remains the validated configuration: `ServerConfig`, `AcmeSettings`, `Routing`, `List<MiddlewareSpec>`, `AccessSettings`, plus the topics section in §13.5. `ConfigDocument.contentHash()` remains the lowercase SHA-256 of the canonical YAML bytes. `ConfigLoader` remains the strict validator. `ConfigSnapshot.compile` remains the step that builds the handler, the router, and the ACME challenge wrapper. `ConfigReloader` remains the local-file reload path.
+The model is the one PR #42 merged: `ConfigDocument` (`ServerConfig`, `AcmeSettings`, `Routing`, `List<MiddlewareSpec>`, `AccessSettings`, `NodeSettings`, `schemaVersion`, `bundleVersion`), `ConfigCodec`, `ConfigValidator`, `ConfigDiff.between`, `ConfigReloader.apply`, and `SjwsServer.applyRemote`. The control plane does not grow a second document. Topics (§13.5) are added to that document, not beside it.
 
-The control plane adds a serializable envelope around those bytes. It does not duplicate fields into a parallel model.
+Two digests already exist, and they stay different:
+
+| Accessor | Bytes |
+|---|---|
+| `contentHash()` | SHA-256 of the operator file that was read. Null when there is no file. Key order in that file changes it. |
+| `canonicalHash()` | SHA-256 of `ConfigCodec.text`. Fixed key order, maps sorted, TLS key password omitted. This is the only hash the control plane signs. |
+
+`ConfigLoader` remains the strict parser. `ConfigSnapshot.compile` remains the step that builds the handler. `ConfigReloader.reload` remains the local-file path and is what `ReloadHook.run()` calls. A remote apply does not call `ReloadHook.run()`.
 
 ### 5.2 Identifiers
 
@@ -159,7 +173,8 @@ Three numbers, kept distinct on purpose:
 
 | Name | Meaning |
 |---|---|
-| `version` | Cluster-wide monotonic `long`. Assigned when `Activate` or `Rollback` commits. Strictly increasing. This is the number a data node resumes from. |
+| `version` | `ConfigDocument.bundleVersion()`. Cluster-wide monotonic `long`. Assigned when `Activate` or `Rollback` commits. Strictly increasing. `0` means unset, so a local edit with no version still applies. This is the number a data node resumes from. |
+| `schema` | `ConfigDocument.schemaVersion()`. Schema 1 is the only accepted value and is inside the canonical YAML. An unknown schema fails `ConfigValidator.validate` before compile. |
 | `epoch` | Raft term of `cp-config` at the moment the leader signs the envelope. Changes when leadership changes. |
 | `generation` | The existing process-local `ConfigSnapshot.generation` (`int`). It increases by one on every successful local reload and every successful remote apply in this process. Standalone keeps today's counter. |
 
@@ -170,66 +185,58 @@ Three numbers, kept distinct on purpose:
 ```java
 record SignedSnapshot(
     byte[] keyId,           // which online signing key produced the signature
-    long version,
+    long version,           // bundleVersion
+    int schema,             // schemaVersion; 1
     long epoch,
     long raftIndex,
-    long parentVersion,     // 0 when kind is full
-    byte kind,              // 1 = full, 2 = diff
+    long parentVersion,     // always 0; distribution does not send patches
+    byte kind,              // always 1 (full). A different value fails closed
     String projectionId,    // node id the bytes were cut for
-    byte[] documentHash,    // SHA-256 of the materialized canonical YAML
-    byte[] transmittedHash, // SHA-256 of the bytes in this frame (full YAML or the diff)
+    byte[] canonicalHash,   // SHA-256 of ConfigCodec.text, 32 raw bytes
     long issuedAtMillis,
     long expiresAtMillis,
     byte[] nonce,           // 16 bytes, covered by the signature; not stored as a set
-    byte[] payload,         // canonical YAML or the diff bytes
+    byte[] canonicalYaml,   // the full canonical document, never a patch
     byte[] signature) {}
 ```
 
-The signature input is the domain-separated encoding in §12.3. `documentHash` is the materialized document. `transmittedHash` is the bytes on the wire. A diff frame still carries the hash of the document those bytes must produce.
+The signature input is the domain-separated encoding in §12.3. It covers `canonicalHash`, `version`, and `schema`, and also `parentVersion`, `kind`, and `keyId`. There is no second hash of "transmitted bytes": the bytes on the wire are the canonical YAML, and `canonicalHash` is their digest.
 
-Canonical YAML, the only bytes that may be hashed as the document:
+Canonical YAML is `ConfigCodec.text` of the document:
 
-- UTF-8, LF line endings, no BOM.
-- Mappings emitted with keys sorted lexicographically at every level.
-- Block style. No anchors, no aliases, no tags, no merge keys.
-- Scalars emitted in a single canonical form (booleans `true`/`false`, integers in decimal without leading zeros, strings quoted when they could be another type).
-- SHA-256 over those exact bytes. `ConfigDocument.contentHash()` is that digest, lowercase hex, once the loader is given canonical bytes.
+- UTF-8, LF line endings, no BOM. The codec already emits a fixed key order with maps sorted.
+- The TLS key password is omitted.
+- `schema` and `version` are the first lines.
+- SHA-256 over those exact bytes, lowercase hex on `ConfigDocument.canonicalHash()`, raw 32 bytes in the envelope.
+
+`kind` is signed so a rewritten kind fails closed, and `applyRemote` rejects any value other than 1. `parentVersion` is signed and must be 0. A non-zero parent is a reject, not a request for a patch.
 
 ### 5.4 Diffs
 
-`ConfigDiff.diff(ConfigDocument before, ConfigDocument after)` returns a deterministic, section-scoped patch (server, acme, routing, middleware, access, topics, node). The same pair of documents produces the same bytes. `ConfigDiff.apply` rebuilds the later document or fails cleanly. The patch does not carry `rbac` or `trust`; those sections are not part of `Propose` (§12.7).
+`ConfigDiff.between(before, after, http3Running)` is a per-section report. Each `Change` names a section (`schema`, `version`, `node`, `server`, `http3`, `tls`, `acme`, `routing`, `middleware`, `access`, `startup`), an effect (`LIVE` or `RESTART`), and a comma-separated list of field names. It does not return bytes. There is no `ConfigDiff.apply`. A `Change` list is not turned back into a `ConfigDocument`.
 
-The Raft log stores either a full canonical document (`kind = full`, `parentVersion = 0`) or a diff against `parentVersion` (`kind = diff`). The state machine materializes the full document before `Activate` and records `documentHash` from that document. A watcher applies a diff only when its installed version equals the signed `parentVersion`, then recomputes SHA-256 of the materialized canonical YAML and requires it to equal the signed `documentHash`. A mismatch, or a diff whose `kind` was flipped, is a reject. A watcher that does not hold `parentVersion` receives the full envelope. There is no third representation.
+The report is what `GET /cp/v1/config/diff` returns. Field names never include a password, a PEM body, or file bytes.
 
-### 5.5 Validate
+Distribution does not use this report. The watch sends a full `SignedSnapshot` for every version (§8). The Raft log stores the full canonical YAML. `Activate` and `Rollback` both ship that full document.
 
-Verification lives in `sjws_nettask.cp`. Parsing and compile live in `sjws_nettask.config`. The signature is checked before any parse or diff apply (§12.8).
+### 5.5 Validate, inside `applyRemote`
 
-In `cp`, before `config` sees the bytes:
+`SjwsServer.applyRemote` is the data-plane entry. Signature verification and rollback verification run inside that method, under `reloadLock`, before `ConfigReloader.apply`. A failure returns `ReloadResult.rejected` with the snapshot that is already installed. The method does not publish, does not compile, and does not throw the previous snapshot away. That is fail closed.
 
-1. Frame size, then signature under the `keyId` named in the envelope (§12.3). The online key must be inside its `notAfter` and its allowed version range, and the root delegation that names it must verify.
-2. Anti-replay and freshness (§12.3). `version` is the primary order: it must be greater than the anti-rollback floor, `version - lastApplied` at most 2^20, and `version` at most `Long.MAX_VALUE - 2^20`. `epoch` greater than or equal to the highest epoch already applied is defense in depth against a deposed leader's key. It is not a second version number. `expiresAtMillis` must still be in the future. `issuedAtMillis` must not be ahead of the local clock by more than the skew bound (default 30 s).
-3. If `kind` is diff, `cp` applies it to the document at `parentVersion` and requires the recomputed document hash to match. A `Propose` whose materialized YAML contains `rbac` or `trust` is rejected here.
+Order inside the lock:
 
-In `config`, on bytes `cp` has already verified:
+1. Frame size, then the signature under the `keyId` in the envelope (§12.3). The online key must be inside its `notAfter` and its allowed version range, and the root delegation that names it must verify. `kind` must be 1 and `parentVersion` must be 0. `canonicalHash` must equal SHA-256 of `canonicalYaml`. `schema` in the envelope must equal the `schema` in that YAML.
+2. Anti-replay and freshness (§12.3). `version` must be greater than the anti-rollback floor, `version - lastApplied` at most 2^20, and `version` at most `Long.MAX_VALUE - 2^20`. `epoch` greater than or equal to the highest epoch already applied is defense in depth. `expiresAtMillis` must still be in the future. `issuedAtMillis` must not be ahead of the local clock by more than 30 s.
+3. Rollback check, when the activation is a rollback: `version` is strictly greater than the installed version, and `canonicalHash` equals the retained hash of `toVersion`. A missing retention, or a hash that does not match, is a reject. The historical document is what was re-signed; the old envelope is not replayed.
+4. A document whose YAML contains `rbac` or `trust` is rejected. Those sections are their own log entries (§12.7).
+5. Only then does `config` see the bytes. `ConfigValidator.validate` checks schema, the document root, cert and key files, and that `tls.cert` and `acme.enabled` are not both set. `ConfigReloader.apply(current, incoming, http3Running, board, keepLocalFile)` clamps bind-time fields. `keepLocalFile` is true, so a push does not retarget the local config path. A non-zero `bundleVersion` lower than the one already running is rejected. An equal version with the same `canonicalHash` is a successful no-op: ack, no second swap.
+6. Secret references pass the allowlist in §12.6 before any file open. `ConfigSnapshot.compile` runs against the local document root and the local challenge board. The snapshot is fully built before it is published.
 
-4. `ConfigLoader` strict-parses the canonical YAML, with the alias, depth, and code-point caps in §12.8.
-5. Secret references pass the allowlist in §12.6 before any file open.
-6. `ConfigSnapshot.compile` against the local document root and the local challenge board, bounded in time and output size. The snapshot is fully built, including any resources it owns, before it is published.
-
-Any failure leaves the previous `ConfigSnapshot` installed. The applicator records an error code for the admin API and writes an audit record. The error text does not include file contents or secret bytes. The content path is unchanged.
+`node.mode` is clamped like `server.port`: a new mode is reported in `needsRestart` and the running mode stays until process restart. Labels apply on the successful swap. The config package does not import `sjws_nettask.cp`. `SjwsServer.applyRemote` is the composition-root method that names `SignedSnapshot`, because the checks are inside it. `standalone` does not call that method.
 
 ### 5.6 Publish, one path for local reload and remote apply
 
-`sjws_nettask.config` does not accept a `SignedSnapshot`. After `cp` has verified an envelope it calls:
-
-```java
-ReloadResult applyVerified(byte[] canonicalYaml, long version, long epoch, ChallengeBoard board);
-```
-
-That call parses and compiles. It does not swap `LiveConfig` and it does not touch sockets. The composition root publishes the `ReloadResult`.
-
-`SjwsServer.publish(ReloadResult)` runs under `reloadLock`, the same lock as today's `reloadLocked()` (`SjwsServer` holds that lock around file reload). File reload and a remote apply share it. Generation is assigned only inside the lock: the process-local `generation` increases by one from the snapshot currently installed, and the cluster `version` is stored beside it. Two callers cannot both compute `generation + 1` from the same base. There is one generation authority.
+File reload and `applyRemote` share `reloadLock`, the lock `SjwsServer.reload()` already holds around `reloadLocked()`. `applyRemote` runs the checks in §5.5, then `ConfigReloader.apply`, then the same publish `reload()` uses: ACME listener, reaper timeouts, `live.set`, `replaceHandler`, `replaceTls`. It does not call `ReloadHook.run()`. Generation is assigned only inside the lock, from the snapshot currently installed. Two callers cannot both compute `generation + 1` from the same base. There is one generation authority.
 
 Role `data` does not let `ReloadHook` / `SIGHUP` publish CP-owned sections from the local file. Those sections are routing, middleware, access, topics, and ACME material that arrived in an envelope. A SIGHUP may still apply local-only fields the control plane does not own (this host's document-root path, the listen address). A SIGHUP that would change a CP-owned section is rejected and audited. Role `standalone` keeps today's full file reload.
 
@@ -247,7 +254,7 @@ Handler sources all read the snapshot that `publish` installed:
 - With HA, `generationLeaf` is `live::handler` (or the supplier-backed chain), not a captured `built`. `HaHandler` therefore serves the snapshot `publish` just set.
 - HTTP/3 is given that same supplier. `replaceHandler` runs on every successful publish, including when HA or filters installed an `override` at startup. `override` points at a handler that reads the live snapshot.
 
-A node acks a version only after `publish` returns applied. An ack means HTTP/1, HTTP/2, and HTTP/3 will observe the new leaf. After that, the applicator persists the floor, the trust bundle, and last-good (§5.8), then acks on the watch.
+A node acks a version only after `applyRemote` returns applied. An ack means HTTP/1, HTTP/2, and HTTP/3 will observe the new leaf. After that, the applicator persists the floor, the trust bundle, and `<stateDir>/config/last-good.json` (§5.8), then acks on the watch. The accept loop is not closed by apply. A test that samples the content port during `Activate` sees no non-2xx and no connection failure (§15).
 
 ### 5.7 Certificates
 
@@ -259,29 +266,33 @@ Data nodes install the chain through the same `TlsMaterial` / `Http3Server.repla
 
 ### 5.8 Last-good persistence and the anti-rollback floor
 
-After every successful apply the data node does two writes, each via a temp file, `ATOMIC_MOVE`, mode `0600`, and an `fsync` of the file and its directory:
+The control plane's last-good config is `<stateDir>/config/last-good.json`. After every successful `applyRemote` the data node writes three files, each via a temp file, `ATOMIC_MOVE`, mode `0600`, and an `fsync` of the file and its directory. The floor write finishes first:
 
-1. `stateDir/floor.cp` — the anti-rollback floor `(maxVersion, maxEpoch, keyId)`. This write finishes before `last-good.cp` is replaced.
-2. `stateDir/last-good.cp` — the signed envelope just applied.
+1. `<stateDir>/config/floor.json` — `(maxVersion, maxEpoch, keyId)`.
+2. `<stateDir>/config/trust.json` — the trust bundle that verified the envelope, so a restart after key rotation can check the signature while the control plane is down.
+3. `<stateDir>/config/last-good.json` — the signed snapshot: `schema`, `version`, `canonicalHash`, `keyId`, `epoch`, `parentVersion`, `kind`, `projectionId`, `issuedAtMillis`, `expiresAtMillis`, `nonce`, `signature`, and the canonical YAML.
 
-`standalone` creates neither file and does not create `stateDir` for the control plane.
+`standalone` creates none of these and does not create `stateDir` for the control plane.
+
+The config package still writes canonical YAML (no password) to the sibling `<config-file>.last-good` after a successful start or apply, and boots from that sibling only when the operator file is missing and `node.mode` is `data`. That sibling is not the signed envelope. A path that already ends in `.last-good` is not given a second suffix. Role `data` that has a `stateDir` serves CP-owned sections from `last-good.json`, not from the sibling.
 
 Precedence for role `data`, at boot and at runtime:
 
 | Source | What it wins |
 |---|---|
 | Pin file and join material, outside `stateDir` | Root public key and the root version floor. Required. A missing pin refuses to start. |
-| `stateDir/floor.cp` and `stateDir/trust.cp` | Highest applied `(version, epoch, keyId)` and the trust bundle that verified it. Read before last-good. |
-| `stateDir/last-good.cp` | CP-owned sections: routing, middleware, access, topics, ACME material delivered by the control plane. |
+| `<stateDir>/config/floor.json` and `trust.json` | Highest applied `(version, epoch, keyId)` and the trust bundle. Read before `last-good.json`. |
+| `<stateDir>/config/last-good.json` | CP-owned sections, after the same signature and rollback checks `applyRemote` uses. Fail closed: a bad file is not compiled. |
 | Local `--config` file | Bind-time and local-only fields: port, listen address, this host's document root, `stateDir`. It does not override CP-owned sections. |
+| `<config-file>.last-good` | Only the config package's missing-file boot. It does not override `last-good.json`. |
 
-On startup the process reads the pin, then `floor.cp` and `trust.cp`, and only then considers `last-good.cp`. Last-good is compiled when its signature verifies under the persisted bundle (which must chain to the pinned root), its `version` equals `maxVersion`, and its `epoch` is the epoch stored for that version. The bundle is what lets a node restart after a key rotation while the control plane is down: the key that verified the file is on disk next to the file.
+On startup the process reads the pin, then `floor.json` and `trust.json`, and only then considers `last-good.json`. The file is compiled when its signature verifies under the persisted bundle (which must chain to the pinned root), its `version` equals `maxVersion`, and its `canonicalHash` matches the canonical YAML in the file. Those checks are the boot path of `applyRemote`: a failure leaves the file uncompiled.
 
 An envelope at or below the floor, or a last-good file older than the floor, is not compiled. The process still binds the content listener and answers 503 (not ready) until a snapshot passes the check. It does not serve CP-owned sections from the local YAML. `/healthz` can be 200 while the process is up. `/readyz` is 503.
 
-A wipe or restore of `stateDir` deletes the local floor, the trust bundle, and last-good together, so those files cannot stop a replay by themselves. The floor that survives the wipe is the root version floor in the pin and in the join material (§12.3, §12.4). A node with an empty `stateDir` still refuses any envelope whose `version` is below that floor, and it binds 503 until a newer envelope arrives. The same check runs before `last-good.cp` is compiled when the pin floor is higher than the file.
+A wipe or restore of `stateDir` deletes `config/floor.json`, `config/trust.json`, and `config/last-good.json` together, so those files cannot stop a replay by themselves. The floor that survives the wipe is the root version floor in the pin and in the join material (§12.3, §12.4). A node with an empty `stateDir` still refuses any envelope whose `version` is below that floor, and it binds 503 until a newer envelope arrives.
 
-The watch connects in the background. If the control plane is down, the process serves the snapshot that passed the floor check. A corrupt or unverifiable file is not applied. The listener stays bound and answers 503 until a good snapshot is published. There is no "older snapshot in memory" at boot.
+The watch connects in the background. If the control plane is down, the process serves the snapshot that passed the floor check. A corrupt or unverifiable file is not applied. The listener stays bound and answers 503 until a good snapshot is published. There is no older snapshot in memory at boot.
 
 ## 6. Leadership interface
 
@@ -296,7 +307,8 @@ public interface ControlLeadership {
 
     /**
      * True after this term's election Noop has been committed and applied.
-     * isLeader() can be true while this is still false.
+     * isLeader() can be true while this is still false. The harness reads this
+     * on ControlNode. isLeader() alone is too early.
      */
     boolean leaderReady();
 
@@ -304,19 +316,23 @@ public interface ControlLeadership {
     long term();
 
     /**
-     * term, isLeader. Invoked on the group thread, as ClusterNode.onLeaderChange does.
+     * term, leader id. Empty when the leader is unknown. Group thread.
+     * Wired to ClusterNode.onLeaderChange(new GroupId("cp-config"), ...).
      * Never invoked on a content request thread.
      */
-    void onLeaderChange(BiConsumer<Long, Boolean> listener);
+    void onLeaderChange(BiConsumer<Long, Optional<String>> listener);
 
-    /** Completes with the term once that term's Noop has been applied. */
-    CompletableFuture<Long> whenReady();
+    /**
+     * Fired on the group thread only after this leader's election Noop is applied.
+     * appliedIndex is that entry. Not fired merely because isLeader() is true.
+     */
+    void leaderReady(BiConsumer<Long, Long> listener);
 }
 ```
 
-On each transition to leader, the new leader appends a single `Noop` in the new term before it proposes config or starts an ACME order. `leaderReady()` becomes true when `onCommitted` observes that `Noop`. This is the Raft rule that a leader learns the commit index by committing an entry in its own term, expressed on the interface config and ACME already need. `whenReady()` is that completion. A leadership loss completes a waiting `whenReady()` exceptionally and clears `leaderReady()`.
+On each transition to leader, the new leader appends a single `Noop` in the new term before it proposes config or starts an ACME order. `leaderReady()` becomes true, and `leaderReady(term, appliedIndex)` fires, when `onCommitted` observes that `Noop`. A leadership loss, or a leader id that is not this node, clears `leaderReady()` and cancels an in-flight ACME order. A later `leaderReady` for the new term may start again. ACME subscribes to `leaderReady(term, appliedIndex)` and does not contact the directory on `isLeader()` alone.
 
-`onLeaderChange` is wired to `ClusterNode.onLeaderChange(new GroupId("cp-config"), ...)`. The callback's term is the Raft term. ACME's renewal thread checks `leaderReady()` before it contacts the directory and stops work when the callback reports `isLeader == false`.
+`standalone` uses a local stub that is leader and fires `leaderReady` once at startup, so today's ACME path is unchanged. `control` uses the real group. `data` does not construct an `AcmeService`.
 
 `readBarrier` / lease reads stay inside the cluster package. Config publish uses `append` on the leader. The HTTP request path calls none of these methods.
 
@@ -336,19 +352,16 @@ HA's 64-byte UDP heartbeat remains the failure detector for `ha-control` members
 
 Transport: one mTLS connection (TLS 1.3) from the data node to the leader of `cp-config`. The listener is the control admin port's sibling, or the same port with a different ALPN (`sjws-cp-watch`). It is not the content port.
 
-Frames are length-prefixed. The maximum frame size is 16 MiB by default and is configurable downward. A larger frame closes the connection before the body is buffered (§12.8). The signature of a snapshot or freshness frame is verified before the payload is parsed or a diff is applied.
+Frames are length-prefixed. The maximum frame size is 16 MiB by default and is configurable downward. A larger frame closes the connection before the body is buffered (§12.8). The signature of a snapshot or freshness frame is verified inside `applyRemote` before the payload is parsed (§5.5). There is no diff frame.
 
 The client speaks first:
 
 1. `Register` (§7).
 2. `Watch { fromVersion }`, where `fromVersion` is the last version this node has applied and persisted, or `0`.
 
-The server then sends, in version order:
+The server then sends, in version order, a full `SignedSnapshot` for every version above `fromVersion`. A client that already holds the parent still receives the full document. Patches are not a frame type.
 
-- `Snapshot` (full `SignedSnapshot`) when the client has no parent, or
-- `Diff` when the client has `parentVersion` and the diff is still retained.
-
-After the client is caught up, the server sends each newly activated version. The client replies `Ack { version }` after `publish` has swapped the live snapshot, the side effects in §5.6 have run, and the floor, trust bundle, and last-good file are durable.
+After the client is caught up, the server sends each newly activated version the same way. The client replies `Ack { version }` after `applyRemote` has swapped the live snapshot, the side effects in §5.6 have run, and `floor.json`, `trust.json`, and `last-good.json` are durable.
 
 Backpressure: the server window is one unacked version by default (`maxInFlight`, configurable, minimum 1). It does not send version N+1 before `Ack` of N. The applicator queue on the client is bounded to that window. A slow apply stalls the stream. It does not buffer an unbounded log on the data node, and it does not stall Raft apply on the leader: the leader's push task reads the committed snapshot from memory and blocks on that one node's window only. Other nodes have their own windows.
 
@@ -370,7 +383,7 @@ The leader pushes the staged version only to nodes in the open stage. Other node
 
 `Activate` commits when the last stage has met its ack rule, or when an admin with role `operate` forces it. Activation publishes the version as desired. Nodes that have not acked still receive it (subject to their window) and still serve last-good until they apply.
 
-`Rollback { toVersion }` appends a new version whose `documentHash` and canonical YAML equal the retained activated snapshot `toVersion`. The new version is higher than any current version, so anti-replay still moves forward. The rollout of a rollback uses the same stage list unless the operator selects a single stage of all nodes. Nodes that never installed the bad version treat the rollback as a no-op if their installed hash already matches, and ack it.
+`Rollback { toVersion }` appends a new version whose `canonicalHash` and canonical YAML equal the retained activated snapshot `toVersion`. The new version is higher than any current version, so anti-replay still moves forward. The rollout of a rollback uses the same stage list unless the operator selects a single stage of all nodes. Nodes that never installed the bad version treat the rollback as a no-op if their installed hash already matches, and ack it.
 
 A proposal that fails validation is not appended. A failed `publish` on one node does not roll the others back automatically. The admin API shows the node error. The operator issues `Rollback`.
 
@@ -434,13 +447,13 @@ Two tiers of keys.
 The signature input is this canonical byte string, and nothing else is trusted outside it. Integers are unsigned big-endian, fixed width. Strings are a `uint16` length plus UTF-8 bytes. Hashes are 32 raw bytes.
 
 ```
-"sjws-cp-snapshot-v1" || keyId || version:u64 || epoch:u64 || raftIndex:u64
+"sjws-cp-snapshot-v1" || keyId || version:u64 || schema:u32 || epoch:u64 || raftIndex:u64
   || parentVersion:u64 || kind:u8 || projectionId
-  || sha256(materialized canonical YAML) || sha256(transmitted bytes)
+  || canonicalHash:32
   || issuedAtMillis:u64 || expiresAtMillis:u64 || nonce:16
 ```
 
-`kind` is 1 for a full document and 2 for a diff. `sha256(materialized canonical YAML)` is `documentHash` (§5.3). `sha256(transmitted bytes)` covers the full YAML or the diff bytes actually in the frame. After a diff is applied, the node recomputes the materialized hash and requires an exact match. Re-labeling `parentVersion` or `kind` breaks the signature.
+`canonicalHash` is the SHA-256 of `ConfigCodec.text` (§5.3). `version` is `bundleVersion`. `schema` is `schemaVersion`. `keyId`, `parentVersion`, and `kind` are in the same encoding, so changing any of them without re-signing fails closed. `kind` is 1 and `parentVersion` is 0 on every snapshot this design sends.
 
 A receiver rejects an envelope when any of the following holds:
 
@@ -448,7 +461,7 @@ A receiver rejects an envelope when any of the following holds:
 - `version` is less than or equal to the anti-rollback floor (§5.8);
 - `version - lastApplied` is greater than 2^20, or `version` is greater than `Long.MAX_VALUE - 2^20` (a jump to the top of the `long` range is a reject, not a publish);
 - `expiresAtMillis` is in the past, or `issuedAtMillis` is more than 30 s ahead of the local clock;
-- `documentHash` or `transmittedHash` does not match.
+- `canonicalHash` does not equal SHA-256 of the canonical YAML, or `schema` disagrees with the YAML;
 
 `version` is strictly monotonic, so a replay of an old envelope fails the floor check. The nonce is inside the signature so two signatures of the same body differ. It is not stored as a set. `epoch` is recorded and must be greater than or equal to the highest epoch already applied. That check is defense in depth against a deposed leader's key. `version` is what orders envelopes.
 
@@ -536,7 +549,7 @@ An append-only audit stream, separate from the access log, records actor SAN, ro
 
 ### 12.10 What `standalone` does not do
 
-Role `standalone` does not load `sjws_nettask.cp` or `sjws_nettask.cluster`, does not initialize a crypto provider for the control plane, does not create `stateDir` for it, and does not bind an admin or watch port. The proof is the class-load test in §15, not a throughput delta. `last-good.cp` is ignored outside role `data`.
+Role `standalone` does not load `sjws_nettask.cp` or `sjws_nettask.cluster`, does not initialize a crypto provider for the control plane, does not create `stateDir` for it, and does not bind an admin or watch port. The proof is the class-load test in §15, not a throughput delta. `<stateDir>/config/last-good.json` is ignored outside role `data`.
 
 ## 13. Integration points
 
@@ -556,7 +569,7 @@ Each consumer keeps its own runtime objects. The control plane's job ends when `
 
 ### 13.4 Config and ACME
 
-Local reload remains `ReloadHook` → `ConfigReloader.reload`, and both it and a remote apply publish through `SjwsServer.publish` under `reloadLock` (§5.6). On role `data`, SIGHUP does not replace CP-owned sections. ACME issuance is leader-only and waits on `ControlLeadership` (§5.7, §6). Challenge responses on a data node still use the in-memory `ChallengeBoard` that `ConfigSnapshot.compile` already wraps in front of the handler when HTTP-01 is on the main listener. Tokens are placed by the leader's publish of the challenge reference inside the snapshot the data node applies, before the leader tells the ACME directory to validate. That ordering is the same as today's local ACME flow (token on the board before `trigger`), moved to the leader and the watch.
+Local reload remains `ReloadHook` → `ConfigReloader.reload`. A remote apply is `SjwsServer.applyRemote`: signature and rollback checks, then `ConfigReloader.apply`, then the same swap, all under `reloadLock` (§5.5, §5.6). It does not call `ReloadHook.run()`. On role `data`, SIGHUP does not replace CP-owned sections. ACME issuance is leader-only and waits on `leaderReady(term, appliedIndex)` (§5.7, §6). Certificate bytes stay out of canonical YAML. Heartbeats carry `canonicalHash` and `version`, not PEM, passwords, or the process-local generation. Rotation accepts the previous CA and the new CA for one activated version, then drops the previous CA. Challenge responses on a data node still use the in-memory `ChallengeBoard` that `ConfigSnapshot.compile` already wraps in front of the handler when HTTP-01 is on the main listener. Tokens are placed by the leader's publish of the challenge reference inside the snapshot the data node applies, before the leader tells the ACME directory to validate. That ordering is the same as today's local ACME flow (token on the board before `trigger`), moved to the leader and the watch.
 
 ### 13.5 Messaging topics
 
@@ -574,7 +587,7 @@ The control role binds a dedicated admin address. The content port does not serv
 |---|---|---|---|
 | `GET` | `/cp/v1/health` | `view` | leader, term, `leaderReady`, voter count |
 | `GET` | `/cp/v1/config` | `view` | activated metadata and canonical YAML. Sealed blobs appear as ids and hashes. |
-| `GET` | `/cp/v1/config/diff?from=&to=` | `view` | diff between two retained versions, with the same secret omission |
+| `GET` | `/cp/v1/config/diff?from=&to=` | `view` | `ConfigDiff.between` for the two retained versions: section, `LIVE` or `RESTART`, field names. Not a patch. Sealed blobs are omitted. |
 | `POST` | `/cp/v1/config` | `operate` | canonical YAML to `Propose` |
 | `POST` | `/cp/v1/rollout` | `operate` | ordered selectors |
 | `POST` | `/cp/v1/rollout/advance` | `operate` | open the next stage, or force |
@@ -590,10 +603,29 @@ Responses are JSON. Mutations return the committed `version` and `raftIndex`, or
 
 In-JVM unless a row says otherwise. The cluster transport is the PR #29 sim transport when the assertion is about commit. `mvn verify` remains the CI command. New package `sjws_nettask.cp` gets its own JaCoCo `PACKAGE` rule, because `DocsConsistencyTest` requires one per directory under `src/`. The root package branch floor stays **0.96**. This workstream does not lower it.
 
+### 15.1 Harness seams
+
+The suite that will run the four outage scenarios is already in the tree: `tests/sjws_nettask/clusterharness`. `ClusterHarness.open(controlNodes, dataNodes, root, role, clock)` starts data nodes the way `FileServingEndToEndTest` does (`SjwsServer` on port 0). Control nodes go through `ControlPlane`. `PendingControlPlane` refuses every call until `sjws_nettask.cp` implements that interface. The implementation reads `ClusterClock` for election, heartbeat, suspect, dead, watch retry, max-staleness, and `delay`. `GroupOptions` durations are arguments of the test cluster, not only the production defaults. The four scenarios stay `@Disabled` until `ControlPlane.available()` is true. Enabling one is removing `@Disabled` and pointing `ClusterHarness.newControlPlane()` at the real factory.
+
+The in-JVM observation does not mint a `view` certificate. `ControlPlane` is the direct read: `leader()`, `ControlNode.leaderReady()`, `ControlNode.adminPort()`, `ControlNode.term()`, `push`, `rollback`, `contentHash(version)` (that value is `canonicalHash`), `partitionDataFromControl`, `heal`, `killLeader`, `delay`, and `awaitConverged`. A follower's leader address is data on that interface, not a log line. Admin and watch listeners bind `127.0.0.1:0` and return the bound port from `start`. A subprocess prints one line, `content=<port> admin=<port> watch=<port>`. Bootstrap returns the CA fingerprint and the join token to the caller. A test does not scrape stdout for either value.
+
+While the watch is down, the oracle is the data node, not the admin API. `DataNode.version()` and `DataNode.contentHash()` read `AppliedConfig` (`bundleVersion` and `canonicalHash`). Role `data` also exposes a loopback status with version, epoch, `canonicalHash`, and whether the watch is connected. Role `standalone` does not register that route. A standalone snapshot reports version `0`.
+
+`awaitConverged(version, timeout)` is the barrier: every data node in the open stage reports that `AppliedConfig.version()`. The deadline is time spent in the method. Election and delay move only when the clock advances. A node that missed an earlier canary stage stays on the previous version until its stage opens. History depth defaults to 8 and is settable on the test cluster so a rollback target is still present.
+
+| Scenario | Hook |
+|---|---|
+| Network partition | `partitionDataFromControl` isolates every data node from every voter. `heal` restores the watch. This is separate from the minority-voter cut. |
+| Leader kill | `killLeader` stops one in-process control node. One `ClusterClock.advance` of an election timeout makes a survivor `leaderReady` on its own admin port. `kill -9` stays the chaos row. |
+| Slow node | `delay(dataNodeId, duration)` is one-way on the watch. The node still acks, only later. Other nodes' windows stay independent. Content, including the slow node's, keeps answering. |
+| Config rollback | `rollback(toVersion)` appends `Rollback` and returns the new, higher version. Its `canonicalHash` equals `contentHash(toVersion)`. |
+
+`applyRemote` does not close the content listener. A row samples that port concurrently with `Activate` and expects no non-2xx and no connection failure.
+
 | Case | Assertion |
 |---|---|
-| Signature | A flipped byte, an unknown `keyId`, or a bad `documentHash` is rejected. The installed snapshot is unchanged. |
-| Unsigned field | Changing `parentVersion` or `kind` without re-signing is rejected. A diff applied to the wrong base fails the recomputed document hash. |
+| Signature | A flipped byte, an unknown `keyId`, or a bad `canonicalHash` is rejected inside `applyRemote`. The installed snapshot is unchanged. |
+| Unsigned field | Changing `parentVersion`, `kind`, or `schema` without re-signing is rejected. `kind` other than 1, or a non-zero `parentVersion`, is rejected. There is no patch to apply. |
 | Version jump | `version - lastApplied` above 2^20, or a version within 2^20 of `Long.MAX_VALUE`, is rejected. |
 | Expiry | An envelope past `expiresAtMillis`, or a node with no freshness frame past that expiry, is stale. Serving stays on last-good. |
 | Anti-replay | An envelope at or below the floor is rejected. `epoch` below the highest applied epoch is rejected. No nonce set is required. |
@@ -609,9 +641,9 @@ In-JVM unless a row says otherwise. The cluster transport is the PR #29 sim tran
 | Watch drop | The data node keeps serving. Reconnect with `fromVersion` receives only newer versions. |
 | Backpressure | A client that does not ack does not grow the server send queue past `maxInFlight`. Raft commit of a later version still completes. |
 | Canary | A node whose labels miss stage 1 does not observe the new version until its stage opens. |
-| Rollback | `toVersion` produces a higher version with the old hash. Nodes apply it or no-op when they already hold that hash. |
+| Rollback | `toVersion` produces a higher version with the old `canonicalHash`. `applyRemote` checks that hash against the retained version and fails closed on a mismatch. Nodes that already hold the hash ack without a second swap. |
 | Apply failure | `compile` throws. `LiveConfig` still returns the previous handler. |
-| CP down at boot | Role `data` serves `last-good.cp`. Role `standalone` does not read that file. |
+| CP down at boot | Role `data` serves `<stateDir>/config/last-good.json` after the signature check. Role `standalone` does not read that file. |
 | CP down at runtime | Requests succeed against the installed snapshot. No request thread blocks on the watch. |
 | Projection | A `broker` envelope fails verification on a `gateway` node id and contains no sealed blob for the gateway key. |
 | Join token | The second presentation of the same token fails. A presentation past TTL fails. The CSR is not signed before the token check. |
@@ -619,7 +651,7 @@ In-JVM unless a row says otherwise. The cluster transport is the PR #29 sim tran
 | Chain swap | With HA and caller filters enabled, a pushed routing change is observed on HTTP/1, HTTP/2, and HTTP/3. The accept loop stays open. No non-2xx and no connection failure on the content port during `publish`. |
 | One publisher | A remote apply and a SIGHUP overlap. One generation is assigned. Both run the ACME listener, reaper timeout, and `replaceTls` side effects. Role `data` rejects a SIGHUP that changes a CP-owned section. |
 | Class load | `standalone` under `-Xlog:class+load` (or a `jdk.ClassLoad` JFR event) loads no `sjws_nettask.cp.*` and no `sjws_nettask.cluster.*` class. No admin port, no `stateDir`, no crypto provider init for the control plane. |
-| Dependency cut | `cp` class files have no constant-pool reference to `sjws_nettask/messaging`. Nothing outside `cp` and `CpBootstrap` references `sjws_nettask/cp`. `config` sources do not reference `cp`. `cluster` sources reference neither `cp` nor `messaging`. |
+| Dependency cut | `cp` class files have no constant-pool reference to `sjws_nettask/messaging`. `config` sources do not reference `cp`. `SjwsServer.applyRemote` is the one composition-root method that names `SignedSnapshot`, because the checks run inside it; `standalone` does not call it. `cluster` sources reference neither `cp` nor `messaging`. |
 | Limits | A frame over the cap, and a YAML alias bomb, are rejected before compile. |
 | Redaction | A scan of logs, metrics, and admin JSON finds no token or sealed-blob bytes. `toString` of a `Secret` is `***`. |
 | Standalone hot path | No `cp-` thread. With no filters, the handler is the static file handler. |
@@ -649,7 +681,7 @@ This design PR changes no `.java` file. Its before/after pair is noise on identi
 Each PR is based on current master (this document's base or newer), merges the HA stack when it needs `ClusterNode`, keeps `mvn verify` green, does not lower the 0.96 root branch floor, and does not merge itself.
 
 1. **Design.** This document.
-2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, diff apply, `applyVerified` on the config side, and `SjwsServer.publish` under `reloadLock` with the live-snapshot supplier. Admin routes in §14 with RBAC kept out of `Propose`. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
-3. **Registration and distribution.** Watch client and server, projection, ack window, last-good file, staged rollout and rollback, label selection. Data role verifies in `cp`, compiles through `applyVerified`, and publishes through `SjwsServer.publish`. Tests for resume, backpressure, canary, partition, and revoke. Benchmark as §16.
+2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, and `ConfigDiff.between` as a report. `SjwsServer.applyRemote` verifies the signature and the rollback inside the lock and fails closed, then uses `ConfigReloader.apply`. The handler chain reads the live snapshot. Last-good is `<stateDir>/config/last-good.json`. Admin routes in §14 with RBAC kept out of `Propose`. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
+3. **Registration and distribution.** Watch client and server, projection, ack window, full snapshots only, `<stateDir>/config/last-good.json`, staged rollout and rollback, label selection. Data role calls `applyRemote`. Implement `ControlPlane` so the four harness scenarios can drop `@Disabled`. Tests for resume, backpressure, canary, partition, and revoke. Benchmark as §16.
 
 The request path in both implementation PRs stays a volatile read of the immutable snapshot.
