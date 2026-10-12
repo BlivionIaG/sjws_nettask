@@ -466,7 +466,8 @@ public final class ConfigLoader {
         for (int i = 0; i < list.size(); i++) {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
-            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static"), path);
+            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static",
+                    "listing", "errors", "problem_type"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -502,11 +503,44 @@ public final class ConfigLoader {
             } else if (!bool(map.get("static"), path + ".static")) {
                 throw new ConfigException(path + ".static must be true");
             } else {
-                action = new RouteSpec.Action.Static();
+                action = new RouteSpec.Action.Static(
+                        !map.containsKey("listing") || bool(map.get("listing"), path + ".listing"));
             }
-            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action));
+            if (map.containsKey("listing") && !(action instanceof RouteSpec.Action.Static)) {
+                throw new ConfigException(path + ".listing is only valid on a static route");
+            }
+            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path)));
         }
         return List.copyOf(out);
+    }
+
+    /** {@code errors: html | problem} (default html) and the optional {@code problem_type} URI base. */
+    private static RouteSpec.Errors errors(Map<String, Object> map, String path) {
+        boolean problem = false;
+        if (map.containsKey("errors")) {
+            var format = text(map.get("errors"), path + ".errors");
+            problem = switch (format) {
+                case "html" -> false;
+                case "problem" -> true;
+                default -> throw new ConfigException(path + ".errors: expected html or problem");
+            };
+        }
+        String type = null;
+        if (map.containsKey("problem_type")) {
+            if (!problem) {
+                throw new ConfigException(path + ".problem_type requires errors: problem");
+            }
+            type = text(map.get("problem_type"), path + ".problem_type");
+            try {
+                var uri = new java.net.URI(type);
+                if (!uri.isAbsolute()) {
+                    throw new ConfigException(path + ".problem_type: expected an absolute URI");
+                }
+            } catch (java.net.URISyntaxException e) {
+                throw new ConfigException(path + ".problem_type: not a URI");
+            }
+        }
+        return problem ? new RouteSpec.Errors(true, type) : RouteSpec.Errors.HTML;
     }
 
     private static RouteSpec.Action.Redirect redirect(Object value, String path) {
