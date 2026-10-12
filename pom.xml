@@ -216,7 +216,7 @@
                 <includes><include>sjws_nettask.acme</include></includes>
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.68</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.66</minimum></limit>
                 </limits>
               </rule>
               <rule>

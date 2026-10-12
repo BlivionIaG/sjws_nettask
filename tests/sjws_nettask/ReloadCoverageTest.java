@@ -258,6 +258,17 @@ class ReloadCoverageTest {
             var swapped = server.reload();
             assertTrue(swapped.applied(), swapped.errors().toString());
             assertEquals(secondCert.toAbsolutePath(), server.config().tlsCert().toAbsolutePath());
+            write(yaml, server(root) + """
+                    http3:
+                      enabled: true
+                      port: 0
+                      host: 127.0.0.1
+                      alt_svc: true
+                    """);
+            var dropped = server.reload();
+            assertTrue(dropped.applied(), dropped.errors().toString());
+            assertTrue(dropped.needsRestart().stream().anyMatch(w -> w.contains("removing tls.cert")));
+            assertNull(server.config().tlsCert());
         }
         var storage = dir.resolve("issued");
         Files.createDirectories(storage);
@@ -273,6 +284,38 @@ class ReloadCoverageTest {
             assertTrue(server.udpPort() > 0);
             Thread.sleep(500);
             assertNull(server.h3Failure());
+        }
+    }
+
+    @Test
+    void aMissingStoredCertificateLeavesHttp3OnItsGeneratedKey() throws Exception {
+        var root = directory("empty-acme");
+        var yaml = dir.resolve("empty.yaml");
+        write(yaml, server(root) + """
+                http3:
+                  enabled: true
+                  port: 0
+                  host: 127.0.0.1
+                """ + acme(dir.resolve("empty-store"), 0, true));
+        Transport.Factory fake = (config, handler) -> new Transport() {
+            public String name() {
+                return "fake";
+            }
+
+            public Transport start() {
+                return this;
+            }
+
+            public int port() {
+                return 1;
+            }
+
+            public void close() {
+            }
+        };
+        try (var server = SjwsServer.start(load(yaml), fake)) {
+            assertNull(server.h3Failure());
+            assertEquals(1, server.udpPort());
         }
     }
 
