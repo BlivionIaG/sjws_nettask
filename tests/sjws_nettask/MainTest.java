@@ -207,6 +207,27 @@ class MainTest {
         assertFalse(Sjws_nettask.checkValidPort(null));
     }
 
+    @Test
+    void pidFileOfALiveProcessBlocksAndAnAbsentFileStillStartsHttp2() throws Exception {
+        var pid = root.resolve("sjws.pid");
+        var me = ProcessHandle.current();
+        long started = me.info().startInstant().orElseThrow().toEpochMilli();
+        Files.writeString(pid, PidFile.text(me.pid(), started));
+        assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, Sjws_nettask.serve(
+                ServerConfig.builder(root).port(0).build(), NO_H3, out, err, SjwsServer::close,
+                Duration.ofSeconds(1), pid));
+        assertTrue(err().contains("Already running with pid " + me.pid()), err());
+
+        outBytes.reset();
+        errBytes.reset();
+        Files.delete(pid);
+        assertEquals(Sjws_nettask.EXIT_OK, Sjws_nettask.serve(
+                ServerConfig.builder(root).port(0).h2Enabled(true).h2cPort(0).build(),
+                NO_H3, out, err, SjwsServer::close, Duration.ofSeconds(1), pid), err());
+        assertTrue(out().contains("HTTP/2 on tcp/"), out());
+        assertTrue(out().contains("h2c tcp/"), out());
+    }
+
     static int freePort() {
         try (var s = new ServerSocket(0)) {
             return s.getLocalPort();

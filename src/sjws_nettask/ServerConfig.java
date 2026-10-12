@@ -28,7 +28,9 @@ import sjws_nettask.core.AccessRules;
  * Server settings: the complete field set of the merged plan (S1 superset contract).
  * Fields marked "not used yet" are carried for later milestones; their defaults keep the
  * current behaviour. See {@link #usage()} for flags and environment variables.
- * Precedence: defaults &lt; command line &lt; environment.
+ * Precedence: defaults, then the config file, then the command line, then the environment.
+ * {@code --config} and the {@code --acme*} flags are recognized here and applied by
+ * {@code config.ConfigLoader}; routing and middleware are file-only.
  *
  * @param port TCP port (0 = ephemeral)
  * @param root document root
@@ -374,18 +376,30 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --allow-dotfiles          serve names starting with '.' (off: 404)      WEB_SERVER_ALLOW_DOTFILES
                   --require-owner=USER      serve only files owned by USER (name or uid)  WEB_SERVER_REQUIRE_OWNER
                   --require-world-readable  serve only files with mode o+r (off)          WEB_SERVER_REQUIRE_WORLD_READABLE
+                  --config=PATH             YAML configuration file (see docs/config.md)  WEB_SERVER_CONFIG
+                  --acme | --no-acme        ACME certificate issuance (off; staging CA)   WEB_SERVER_ACME=true|false
+                  --acme-directory=URL      staging, production, or a directory URL       WEB_SERVER_ACME_DIRECTORY
+                  --acme-email=ADDR         account contact email                         WEB_SERVER_ACME_EMAIL
+                  --acme-domain=NAME        domain name (repeatable; the variable is a    WEB_SERVER_ACME_DOMAINS
+                                            comma-separated list)
+                  --acme-storage=PATH       account key and certificates (./acme)        WEB_SERVER_ACME_STORAGE
+                  --acme-http-port=N        HTTP-01 port (0 = the main listener)         WEB_SERVER_ACME_HTTP_PORT
+                  --acme-accept-terms       agree to the CA terms of service (required)  WEB_SERVER_ACME_ACCEPT_TERMS
+                  --acme-renew-before=DUR   renew this long before expiry (30d)          WEB_SERVER_ACME_RENEW_BEFORE
                   -h, --help                show this help
 
-                Environment variables override arguments. The key password is never accepted
-                on the command line (it would be visible in the process list).
+                Environment variables override arguments, which override the config file.
+                The file is strict (a bad value is an error). Invalid values of the server
+                flags above still warn and fall back. The key password is never accepted
+                on the command line (it would be visible in the process list) or in the file.
                 """;
     }
 
     public static Parsed parse(String[] args, Map<String, String> env) {
-        return parse(args, env, ServerConfig::readPasswordFile);
+        return parse(args, env, null, ServerConfig::readPasswordFile);
     }
 
-    private static String readPasswordFile(Path file) throws java.io.IOException {
+    public static String readPasswordFile(Path file) throws java.io.IOException {
         var text = java.nio.file.Files.readString(file, java.nio.charset.StandardCharsets.UTF_8);
         // a single trailing newline (as written by echo / editors) is not part of the password
         if (text.endsWith("\r\n")) {
@@ -400,40 +414,52 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String read(Path file) throws java.io.IOException;
     }
 
+    public static Parsed parse(String[] args, Map<String, String> env, PasswordFileReader passwordReader) {
+        return parse(args, env, null, passwordReader);
+    }
+
+    /** @param baseline file settings under the command line; null starts from the defaults */
+    public static Parsed parse(String[] args, Map<String, String> env, ServerConfig baseline) {
+        return parse(args, env, baseline, ServerConfig::readPasswordFile);
+    }
+
     /**
      * Parses arguments and environment. Pure apart from reading the key password file through
-     * {@code passwordReader}.
+     * {@code passwordReader}. A non-null {@code baseline} is the config file: arguments and then
+     * the environment override it.
      */
-    public static Parsed parse(String[] args, Map<String, String> env, PasswordFileReader passwordReader) {
+    public static Parsed parse(String[] args, Map<String, String> env, ServerConfig baseline,
+            PasswordFileReader passwordReader) {
         var warnings = new ArrayList<String>();
         var errors = new ArrayList<String>();
         boolean help = false;
-        var b = builder(Path.of(CONSTANTS.DEFAULT_HTML_PATH));
-        int port = DEFAULT_PORT;
-        int max = DEFAULT_MAX_CONNECTIONS;
-        long idle = DEFAULT_IDLE_TIMEOUT.toSeconds();
-        long header = DEFAULT_HEADER_TIMEOUT.toSeconds();
-        long write = DEFAULT_WRITE_TIMEOUT.toSeconds();
-        long cache = DEFAULT_CACHE_BYTES;
-        boolean altSvcOn = false;
-        boolean unlistable = false;
-        String dir = CONSTANTS.DEFAULT_HTML_PATH;
-        boolean h3 = false;
-        int h3Port = H3_PORT_SAME_AS_TCP;
-        String h3Host = DEFAULT_H3_HOST;
-        int h3Max = DEFAULT_H3_MAX_CONNECTIONS;
-        int perIp = DEFAULT_MAX_CONNECTIONS_PER_IP;
-        int backlog = DEFAULT_BACKLOG;
-        int h3PerIp = DEFAULT_H3_MAX_CONNECTIONS_PER_IP;
-        int minRate = (int) DEFAULT_H3_MIN_RATE;
-        String cert = null;
-        String key = null;
+        var base = baseline;
+        var b = builder(base == null ? Path.of(CONSTANTS.DEFAULT_HTML_PATH) : base.root());
+        int port = base == null ? DEFAULT_PORT : base.port();
+        int max = base == null ? DEFAULT_MAX_CONNECTIONS : base.maxConnections();
+        long idle = (base == null ? DEFAULT_IDLE_TIMEOUT : base.idleTimeout()).toSeconds();
+        long header = (base == null ? DEFAULT_HEADER_TIMEOUT : base.headerTimeout()).toSeconds();
+        long write = (base == null ? DEFAULT_WRITE_TIMEOUT : base.writeTimeout()).toSeconds();
+        long cache = base == null ? DEFAULT_CACHE_BYTES : base.cacheBytes();
+        boolean altSvcOn = base != null && base.altSvc();
+        boolean unlistable = base != null && base.allowUnlistableDirs();
+        String dir = base == null ? CONSTANTS.DEFAULT_HTML_PATH : base.root().toString();
+        boolean h3 = base != null && base.h3Enabled();
+        int h3Port = base == null ? H3_PORT_SAME_AS_TCP : base.h3Port();
+        String h3Host = base == null ? DEFAULT_H3_HOST : base.h3Host();
+        int h3Max = base == null ? DEFAULT_H3_MAX_CONNECTIONS : base.h3MaxConnections();
+        int perIp = base == null ? DEFAULT_MAX_CONNECTIONS_PER_IP : base.maxConnectionsPerIp();
+        int backlog = base == null ? DEFAULT_BACKLOG : base.backlog();
+        int h3PerIp = base == null ? DEFAULT_H3_MAX_CONNECTIONS_PER_IP : base.h3MaxConnectionsPerIp();
+        int minRate = (int) (base == null ? DEFAULT_H3_MIN_RATE : base.h3MinRate());
+        String cert = base == null || base.tlsCert() == null ? null : base.tlsCert().toString();
+        String key = base == null || base.tlsKey() == null ? null : base.tlsKey().toString();
         String passwordFile = null;
-        long altSvc = DEFAULT_ALT_SVC_MAX_AGE.toSeconds();
-        String accessLog = null;
-        var accessLogFormat = AccessLogFormat.COMBINED;
-        var metricsExposure = MetricsExposure.OFF;
-        boolean healthz = false;
+        String accessLog = base == null ? null : base.accessLog();
+        long altSvc = (base == null ? DEFAULT_ALT_SVC_MAX_AGE : base.altSvcMaxAge()).toSeconds();
+        var accessLogFormat = base == null ? AccessLogFormat.COMBINED : base.accessLogFormat();
+        var metricsExposure = base == null ? MetricsExposure.OFF : base.metricsExposure();
+        boolean healthz = base != null && base.healthz();
         boolean accessLogFormatSet = false;
         var explicitH3Options = new ArrayList<String>();
         boolean h2 = false;
@@ -541,6 +567,10 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     case "--alt-svc-max-age" -> {
                         altSvc = number(value, altSvc, 0, 31_536_000, name, warnings);
                         explicitH3Options.add(name);
+                    }
+                    case "--config", "--acme", "--no-acme", "--acme-directory", "--acme-email", "--acme-domain",
+                            "--acme-storage", "--acme-http-port", "--acme-accept-terms", "--acme-renew-before" -> {
+                        // applied by config.ConfigLoader; recognized so they are not unknown options
                     }
                     default -> warnings.add("Unknown option '" + name + "' (see --help)");
                 }
@@ -688,6 +718,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             } catch (java.io.IOException | RuntimeException e) {
                 errors.add("Cannot read the key password file " + passwordFile + ": " + e.getMessage());
             }
+        }
+        if (password == null && baseline != null && baseline.tlsKeyPassword() != null) {
+            password = baseline.tlsKeyPassword();
         }
         if (password != null && key == null) {
             warnings.add("A key password was given without --key/WEB_SERVER_TLS_KEY; ignoring it");
