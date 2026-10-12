@@ -25,9 +25,17 @@ Run:
 | `--max-connections=N` | `WEB_SERVER_MAX_CONNECTIONS` | 2048 | concurrent connections; extra ones wait in the backlog |
 | `--idle-timeout=S` | `WEB_SERVER_IDLE_TIMEOUT` | 30 | keep-alive idle timeout (seconds) |
 | `--header-timeout=S` | `WEB_SERVER_HEADER_TIMEOUT` | 10 | time to receive a complete request head (seconds) |
-| `--max-connections-per-ip=N` | `WEB_SERVER_MAX_CONNECTIONS_PER_IP` | 256 | HTTP/1.1 connections from one client address; extra ones are closed at once (generous because of NAT) |
+| `--max-connections-per-ip=N` | `WEB_SERVER_MAX_CONNECTIONS_PER_IP` | 256 | HTTP/1.1 connections from one client address (IPv6: one /64); extra ones are closed at once without a response |
+| `--allow-unlistable-dirs` | `WEB_SERVER_ALLOW_UNLISTABLE_DIRS` | off | serve files below directories the server can't read (mode `--x`) through a weaker path-based open; see Platform notes |
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | HTTP/3: reset a response that makes no progress for this long; also the window of the minimum send rate. Not used by HTTP/1.1 yet |
 | `-h`, `--help` | | | print usage and exit |
+
+**Per-address caps behind a reverse proxy or NAT.** The caps count connections per client address
+(IPv4: the full address; IPv6: its /64 prefix, since one host can use any address of its /64). Behind a
+reverse proxy, load balancer or a shared NAT every client arrives from the same address, so the whole
+server is then limited to the per-address cap (256 HTTP/1.1 connections, 16 QUIC connections): raise
+`--max-connections-per-ip` / `--h3-max-connections-per-ip` there (e.g. to `--max-connections` /
+`--h3-max-connections`).
 
 Environment variables override arguments. Invalid values are replaced by the default
 with a `WARN:` line; unknown options warn too. Exit codes: 0 = normal / `--help`,
@@ -44,7 +52,7 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 | `--h3-port=N` | `WEB_SERVER_H3_PORT` | same as TCP port | UDP port; `0` = ephemeral |
 | `--h3-host=ADDR` | `WEB_SERVER_H3_HOST` | `0.0.0.0` | UDP bind address |
 | `--h3-max-connections=N` | `WEB_SERVER_H3_MAX_CONNECTIONS` | 1024 | concurrent QUIC connections (counted once the handshake completes) |
-| `--h3-max-connections-per-ip=N` | `WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP` | 16 | QUIC connections from one client address; extra ones are closed with `H3_EXCESSIVE_LOAD` |
+| `--h3-max-connections-per-ip=N` | `WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP` | 16 | QUIC connections from one client address (IPv6: one /64); extra ones are closed with `H3_EXCESSIVE_LOAD` |
 | `--h3-min-rate=B` | `WEB_SERVER_H3_MIN_RATE` | 2048 | minimum send rate per connection, bytes/s, enforced only while file slots are contended; `0` = off |
 | `--cert=PATH` | `WEB_SERVER_TLS_CERT` | self-signed | certificate chain, PEM |
 | `--key=PATH` | `WEB_SERVER_TLS_KEY` | self-signed | private key, PKCS#8 PEM |
@@ -109,15 +117,23 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   check falls back to the size check during transfer.
 * Files are opened relative to the document root one directory at a time without following symlinks
   (`SecureDirectoryStream`, i.e. `openat`, on Linux and macOS), so a directory swapped for a symlink
-  between resolve and send is never followed. That needs read permission on each directory: below an
-  execute-only (e.g. `711`) directory, and where the API is missing (Windows; startup then prints a
+  between resolve and send is never followed. Where that API is missing (Windows; startup then prints a
   `WARN:` line), the server opens the path without following a final symlink and re-checks its real
   path (containment) and file key afterwards; that narrows but does not close the race, so don't serve
-  a tree that untrusted users can write to in that mode.
-* Only regular files are served: a FIFO, device or socket (also one swapped in after the request was
-  resolved) is refused before it is opened (404), so nothing blocks on it. If the file can't be opened
-  after the response was decided (removed, swapped, permissions changed), the client gets a regular
-  404/403/500 response instead of a dropped connection.
+  a tree that untrusted users can write to on such a platform.
+* **Unlistable directories.** Opening relative to a directory needs read permission on it. Files below
+  a directory the server can search but not read (mode `--x`, e.g. `711`), or below such a root, are
+  therefore answered **403** by default. `--allow-unlistable-dirs` serves them through the path-based
+  open described above (startup prints a `WARN:`). That is **weaker against local writers**: anyone who
+  can write in the document root can create their own `--x` directory and race a symlink swap below it
+  to get files from outside the root served. Use it only if no untrusted user can write in the root.
+* Only regular files are served: a FIFO, device or socket is refused (404) after a type check made
+  without following links, also when it was swapped in after the request was resolved. A narrow window
+  remains between that check and the open (Java can't open non-blocking): someone with write access
+  in the document root who swaps a FIFO in at exactly that moment, e.g. in a tight rename loop, can
+  block the thread serving that request until the FIFO is opened for writing. If the file can't be
+  opened after the response was decided (removed, swapped, permissions changed), the client gets a
+  regular 404/403/500 response instead of a dropped connection.
 
 Serves GET and HEAD (other known methods: 405, unknown: 501), HTTP/1.0 and 1.1
 with keep-alive and pipelining, `If-Modified-Since`, directory listings, and
