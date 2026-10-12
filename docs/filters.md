@@ -30,28 +30,38 @@ public final class AccessLog implements RequestFilter {
 }
 ```
 
-`Request` and `Response` are immutable records. Pass `request.withMethod` / `request.withTarget`
-into `proceed` to change what the rest of the chain sees; those copies keep the peer address,
+`Request` is an immutable record. `Response` is a record too; its `headers()` are a mutable
+map, and the chain does not copy them. Pass `request.withMethod` / `request.withTarget` into
+`proceed` to change what the rest of the chain sees; those copies keep the peer address,
 `secure`, and headers. Return a new `Response` to change the status or body, or mutate
-`response.headers()` in place (the chain does not copy them). Skip `proceed` to short-circuit;
-later filters and the terminal handler do not run.
+`response.headers()` in place. Skip `proceed` to short-circuit; later filters and the terminal
+handler do not run.
 
 `request.peer()` is the client `InetSocketAddress` (one per HTTP/1 connection, one per HTTP/3
 stream), or null if the transport could not read it. `request.secure()` is false on plain HTTP/1
 and true on HTTP/3. `request.headers().fields()` is the raw field map (lower-case name to values,
-first-seen order, pseudo-headers excluded) and is not copied on HTTP/1. `values(name)` does not
+first-seen order, pseudo-headers excluded). HTTP/1 stores the parser's map: `reset()` drops the
+parser's reference and does not clear that map, so a filter may retain the request. HTTP/3 copies
+the fields into its own map before the HEADERS frame is released, because the handler runs later
+on another thread; the copy does not follow later changes to the frame. `values(name)` does not
 allocate when the name is absent. `all()` flattens and allocates; the static file handler does
 not call it. `:authority` wins over `host` for `headers().host()`, and the `host` field stays in
 the map.
 
 A filter must be safe for concurrent requests. Call `proceed` synchronously, on the request
-thread, at most once. The time around `proceed` stops when the downstream handler has *built* the
-response. The transport writes the body after the chain returns, so this is not time-to-last-byte.
-`Date`, `Server`, `Connection`, `Content-Length` and `Alt-Svc` are added by the writers after the
-chain. Protocol failures that never reach the file handler (HTTP/1 parse errors and 408, HTTP/3
+thread. The chain rejects a second call on that thread (`IllegalStateException`, and the rest of
+the chain does not run again). That failure becomes the normal HTML 500 unless the filter catches
+it. The check is thread-local, so it does not treat another request's `proceed` as a duplicate,
+and it is not created when no filters are registered. The time around `proceed` stops when the
+downstream handler has *built* the response. The transport writes the body after the chain
+returns, so this is not time-to-last-byte. `Date`, `Server`, `Connection`, `Content-Length` and
+`Alt-Svc` are added by the writers after the chain. `X-Content-Type-Options` and
+`Content-Security-Policy` are put on the handler's response, so a filter sees them and can change
+them. Protocol failures that never reach the file handler (HTTP/1 parse errors and 408, HTTP/3
 431 / bad target / unknown method) do not enter the chain either. A runtime exception or a null
-return becomes the normal HTML 500 (`StaticFileHandler.error`); outer filters see that 500 as the
-return value of `proceed`, and the connection stays open.
+return, from a filter or from the terminal handler, becomes the normal HTML 500
+(`StaticFileHandler.error`); outer filters see that 500 as the return value of `proceed`, and the
+connection stays open. `Error` (including `AssertionError`) is not caught.
 
 ## Register
 

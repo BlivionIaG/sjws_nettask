@@ -42,16 +42,13 @@ HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ──
 
 ## Current gaps
 
-These are true of `master` today and are the next refactoring steps (each small, without file
-moves, so parallel workstreams don't conflict):
+Still open, each small and without file moves:
 
-1. `ClientManager`, `SjwsServer`, `Transport.Factory` and `h3.Http3RequestHandler` still take the
-   concrete `StaticFileHandler`; widen them to `Handler` (keeping a compatible `handler()` accessor).
-2. Compose the handler chain in `SjwsServer` (one `Handler` built from config) so cross-cutting
-   features (rights, security headers, admin/status pages, logging) plug in as decorators
-   (`Handler → Handler`) instead of edits inside transports.
-3. Move the method check (405/OPTIONS) from `StaticFileHandler` into a small router decorator.
-4. HTTP/3 has no pure mapping step equivalent to `Http1Requests.toCore` yet.
+1. OPTIONS and 405 are decided inside `StaticFileHandler`. HTTP/1.1 already passes those methods
+   through the handler (and therefore through filters, when any are registered).
+2. `X-Content-Type-Options` and `Content-Security-Policy` are applied by the file handler, so
+   filters see them on the way out. `Date`, `Server`, `Content-Length`, `Connection` and `Alt-Svc`
+   are still added by the writers after the chain returns.
 
 ## Future direction
 

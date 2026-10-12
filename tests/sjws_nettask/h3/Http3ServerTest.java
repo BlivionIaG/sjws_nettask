@@ -444,6 +444,17 @@ class Http3ServerTest {
         assertEquals(null, r2.headers().range());
         assertEquals(java.util.List.of("h.example"), r2.headers().values("host"));
         assertTrue(r2.secure());
+
+        h.add("x-trace", "one");
+        var copied = Http3RequestHandler.toRequest(h);
+        h.set("x-trace", "mutated");
+        h.add("x-new", "after");
+        h.clear();
+        assertEquals(java.util.List.of("one"), copied.headers().values("x-trace"));
+        assertTrue(copied.headers().values("x-new").isEmpty());
+        assertEquals("example.org:443", copied.headers().host());
+        assertThrows(UnsupportedOperationException.class, () -> copied.headers().fields().clear());
+        assertThrows(UnsupportedOperationException.class, () -> copied.headers().values("x-trace").add("z"));
     }
 
     @Test

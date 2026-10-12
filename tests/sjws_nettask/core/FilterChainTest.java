@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -433,6 +434,94 @@ class FilterChainTest {
         assertTrue(seen.get().secure());
         assertSame(headers, seen.get().headers());
         assertTrue(seen.get().headOnly());
+    }
+
+    @Test
+    void secondProceedDoesNotRunDownstreamAgain() {
+        var ran = new AtomicInteger();
+        var seen = new AtomicReference<Response>();
+        var err = stderr(() -> seen.set(RequestFilters.create()
+                .add((request, next) -> {
+                    var downstream = next.proceed(request);
+                    downstream.headers().set("x-saw", String.valueOf(downstream.status()));
+                    return downstream;
+                })
+                .add((request, next) -> {
+                    next.proceed(request);
+                    next.proceed(request.withTarget("/again"));
+                    return next.proceed(request);
+                })
+                .build(request -> {
+                    ran.incrementAndGet();
+                    return echo().handle(request);
+                })
+                .handle(req("GET", "/once"))));
+        assertEquals(1, ran.get());
+        assertEquals(500, seen.get().status());
+        assertEquals("500", seen.get().headers().get("x-saw"));
+        assertTrue(err.contains("proceed called twice"), err);
+    }
+
+    @Test
+    void nullHandlerReturnIs500SeenByTheOuterFilter() {
+        var seen = new AtomicReference<Response>();
+        var err = stderr(() -> seen.set(RequestFilters.create()
+                .add((request, next) -> next.proceed(request))
+                .build(request -> null)
+                .handle(req("HEAD", "/missing"))));
+        assertEquals(500, seen.get().status());
+        assertTrue(seen.get().headOnly());
+        assertTrue(err.contains("Request handler returned no response"), err);
+    }
+
+    @Test
+    void nestedChainRunsOnceAndAnErrorDoesNotStick() {
+        var inner = new AtomicInteger();
+        Handler wrapped = RequestFilters.create().add((request, next) -> {
+            inner.incrementAndGet();
+            return next.proceed(request);
+        }).wrapping(echo());
+        var boom = new AtomicBoolean(true);
+        var chain = RequestFilters.create().add((request, next) -> {
+            if (boom.getAndSet(false)) {
+                throw new AssertionError("not a 500");
+            }
+            return next.proceed(request);
+        }).build(wrapped);
+        assertThrows(AssertionError.class, () -> chain.handle(req("GET", "/boom")));
+        assertEquals(0, inner.get());
+        var response = chain.handle(req("GET", "/ok"));
+        assertEquals(200, response.status());
+        assertEquals(1, inner.get());
+        assertEquals("/ok", text(response.body()));
+    }
+
+    @Test
+    void concurrentRequestsDoNotTripTheOnceCheck() throws Exception {
+        var chain = RequestFilters.create()
+                .add((request, next) -> next.proceed(request))
+                .build(echo());
+        var start = new java.util.concurrent.CountDownLatch(1);
+        var failed = new AtomicReference<Throwable>();
+        var threads = new Thread[8];
+        for (int i = 0; i < threads.length; i++) {
+            threads[i] = new Thread(() -> {
+                try {
+                    start.await();
+                    for (int n = 0; n < 100; n++) {
+                        assertEquals(200, chain.handle(req("GET", "/c")).status());
+                    }
+                } catch (Throwable t) {
+                    failed.compareAndSet(null, t);
+                }
+            });
+            threads[i].start();
+        }
+        start.countDown();
+        for (var thread : threads) {
+            thread.join();
+        }
+        assertNull(failed.get());
     }
 
     @Test

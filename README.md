@@ -284,7 +284,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the layers, the `core.Handler` seam a
   (`RequestFilters`, see [docs/filters.md](docs/filters.md)) wrap whatever `Handler` is terminal
   (the static file handler, or a router when one is installed) on every transport. With none
   registered, and no other terminal, the static handler is called directly. `Request` carries the
-  client address and the raw header map.
+  client address, whether the connection is TLS, and the raw header map.
 * **HTTP/1.1** (`sjws_nettask` + `sjws_nettask.http1`): one virtual thread per connection on a blocking
   `SocketChannel`; an incremental, strict byte-level head parser (CL/TE smuggling, limits, obs-fold,
   Host, Expect); responses written whole (head and small bodies in one `write`, `Date` formatted once
