@@ -24,12 +24,12 @@ import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Immutable configuration for the request path: one prebuilt handler, swapped as a whole.
- * The route table, middleware list and access settings are stored on {@link #document()} and are
- * not consulted here. When ACME is on the main listener the challenge handler runs first, so
+ * With {@code routing.enabled} the handler is a {@code Router} built from {@link #document()}; the
+ * middleware list and access settings are stored there and not consulted here. When ACME is on the main listener the challenge handler runs first, so
  * {@code /.well-known/acme-challenge/} is answered before the file handler's dotfile check.
  *
  * @param files the static-file handler (also what {@code SjwsServer.handler()} returns)
- * @param handler what a request runs: {@code files}, or an ACME challenge wrapper in front of it
+ * @param handler what a request runs: {@code files} or a router over it, possibly behind the ACME challenge wrapper
  * @param generation increases by one on every successful reload
  */
 public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, Handler handler, int generation) {
@@ -39,9 +39,12 @@ public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, H
         var files = new StaticFileHandler(server.root(), server.allowUnlistableDirs(),
                 new FileCache(server.cacheBytes()), server.access());
         Handler handler = files;
+        if (document.routing().enabled()) {
+            handler = RoutingCompiler.compile(document.routing(), files);
+        }
         var acme = document.acme();
         if (acme.enabled() && acme.onMainListener(server.port())) {
-            handler = new AcmeChallengeHandler(board, files);
+            handler = new AcmeChallengeHandler(board, handler); // challenges are answered before any route
         }
         return new ConfigSnapshot(document, files, handler, generation);
     }

@@ -97,11 +97,12 @@ class ConfigLoaderTest {
     }
 
     @Test
-    void enabledRoutingWarnsAndIsNotRequiredToDispatch() throws Exception {
+    void enabledRoutingLoadsWithoutADispatchWarning() throws Exception {
         var loaded = ConfigLoader.load(new String[] {"--config=" + write(SAMPLE.replace("enabled: false", "enabled: true"))},
                 Map.of());
         assertTrue(loaded.ok(), loaded.errors().toString());
-        assertTrue(loaded.warnings().stream().anyMatch(w -> w.contains("not implemented")));
+        assertTrue(loaded.document().routing().enabled());
+        assertTrue(loaded.warnings().stream().noneMatch(w -> w.contains("not implemented")), loaded.warnings().toString());
     }
 
     @Test

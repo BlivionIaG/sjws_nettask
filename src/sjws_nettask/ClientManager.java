@@ -156,7 +156,7 @@ public class ClientManager implements Runnable {
      */
     public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
             Supplier<ResponseHeaders> extraHeaders, Handler override, ObserverSlot slot) {
-        this(server, config, () -> handler, extraHeaders, wrap(override, handler, slot), new HandlerRef());
+        this(server, config, () -> handler, extraHeaders, override, slot);
     }
 
     /**
@@ -187,19 +187,6 @@ public class ClientManager implements Runnable {
         this.armed = java.util.Objects.requireNonNull(armed, "armed");
         this.permits = new Semaphore(config.maxConnections());
         this.perIp = new sjws_nettask.core.PerIpLimit(config.maxConnectionsPerIp());
-    }
-
-    /**
-     * A recording observer becomes the outermost order-0 filter. {@link RequestObserver#NONE} returns
-     * {@code override} unchanged, so the static handler stays a direct call.
-     */
-    private static Handler wrap(Handler override, StaticFileHandler handler, ObserverSlot slot) {
-        var installed = java.util.Objects.requireNonNull(slot, "slot");
-        if (!installed.get().recording()) {
-            return override;
-        }
-        Handler leaf = override != null ? override : handler;
-        return ObserveRequestFilter.chain(installed, leaf);
     }
 
     /** @return connections closed at accept because their address already had the per-IP maximum */
