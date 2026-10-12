@@ -1,0 +1,48 @@
+# Example configuration. See docs/config.md.
+# Durations: a bare integer is seconds, 1m is one minute.
+# Sizes: 1m is one mebibyte.
+
+server:
+  port: 8080
+  root: ./HTML
+  idle_timeout: 30
+  header_timeout: 10
+  write_timeout: 30
+  cache_bytes: 64m
+
+http3:
+  enabled: false
+  port: same
+
+acme:
+  enabled: false
+  directory: staging          # or production, or an ACME directory URL
+  email: ops@example.com
+  domains: [example.com]
+  storage: ./acme
+  http_port: 0
+  accept_terms: false
+  renew_before: 30d
+
+routing:
+  enabled: false
+  upstreams:
+    api: { url: "http://127.0.0.1:9000", connect_timeout: 5s, response_timeout: 30s, max_body: 16m }
+  routes:   # ordered, first match wins
+    - host: "example.com"  # optional; exact or "*.suffix"
+      prefix: "/api"       # required, segment-boundary match
+      rewrite: "/"         # optional
+      proxy: api           # exactly one of proxy | redirect | static
+    - prefix: "/old"
+      redirect: { status: 301, location: "https://example.com/new/", keep_path: true }
+    - prefix: "/"
+      static: true
+  forwarded_proto: auto   # http|https|auto
+
+middleware: []   # list of {name, order, route, options}; empty = no chain
+
+access:
+  deny: []
+  rules: []
+  allow_dotfiles: false
+  require_world_readable: false

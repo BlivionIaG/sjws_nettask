@@ -74,12 +74,8 @@ final class Http1Connection implements Runnable {
     private static final byte[] CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final SocketChannel channel;
-    private final Handler handler;
-    /**
-     * Non-null only when {@link #handler} is the static file handler. {@link #apply} then calls
-     * {@link StaticFileHandler#handle} directly and does not go through {@link Handler}.
-     */
-    private final StaticFileHandler files;
+    /** One read per request: the live snapshot, or a filter chain captured at accept. */
+    private final Supplier<Handler> handlers;
     private final InetSocketAddress peer;
     /** Captured with {@link #peer} for the failure log; the channel may already be closed by then. */
     private final String remote;
@@ -90,7 +86,7 @@ final class Http1Connection implements Runnable {
      * are armed after start; null means this connection's {@link #handler}.
      */
     private final HandlerRef armed;
-    /** Null when HA is off: the keep-alive decision is unchanged. */
+    /** Null when HA is off: keep-alive never calls a supplier. */
     private final BooleanSupplier closeAfterResponse;
     private final Http1Parser.HeadParser parser = new Http1Parser.HeadParser(CONSTANTS.MAX_LINE_LENGTH,
             CONSTANTS.MAX_HEADERS);
@@ -107,29 +103,37 @@ final class Http1Connection implements Runnable {
      */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
-        this(channel, handler, extraHeaders, reaper, null, null);
+        this(channel, () -> handler, extraHeaders, reaper, (HandlerRef) null);
+    }
+
+    /** {@code handlers.get()} is one volatile read of the current snapshot handler, per request. */
+    Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper) {
+        this(channel, handlers, extraHeaders, reaper, (HandlerRef) null);
     }
 
     /**
-     * Clustering off: no drain supplier, so keep-alive never calls one.
-     *
      * @param armed handler published when counters are armed after start, or null when this
      *        connection's handler will not be replaced
      */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper, HandlerRef armed) {
-        this(channel, handler, extraHeaders, reaper, armed, null);
+        this(channel, () -> handler, extraHeaders, reaper, armed);
+    }
+
+    Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, HandlerRef armed) {
+        this(channel, handlers, extraHeaders, reaper, armed, null);
     }
 
     /**
      * @param closeAfterResponse when non-null and true, this response is the last on the connection.
      *        Null (clustering off) is never invoked
      */
-    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
+    Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper, HandlerRef armed, BooleanSupplier closeAfterResponse) {
         this.channel = channel;
-        this.handler = handler;
-        this.files = handler instanceof StaticFileHandler direct ? direct : null;
+        this.handlers = handlers;
         var peer = (InetSocketAddress) null;
         var remote = "(closed)";
         try {
@@ -158,9 +162,8 @@ final class Http1Connection implements Runnable {
     }
 
     /**
-     * Static files: one null test, then {@link StaticFileHandler#handle}. Anything else (a filter
-     * chain, a router, a test double) goes through {@link Handler}. The choice is fixed for the
-     * life of the connection.
+     * One snapshot read. A {@link StaticFileHandler} is called directly; a filter chain, a router
+     * or a test double goes through {@link Handler}.
      */
     private Response apply(Request request) {
         var armed = this.armed;
@@ -170,11 +173,11 @@ final class Http1Connection implements Runnable {
                 return live.handle(request);
             }
         }
-        var files = this.files;
-        if (files != null) {
+        var handler = this.handlers.get();
+        if (handler instanceof StaticFileHandler files) {
             return files.handle(request);
         }
-        return this.handler.handle(request);
+        return handler.handle(request);
     }
 
     @Override

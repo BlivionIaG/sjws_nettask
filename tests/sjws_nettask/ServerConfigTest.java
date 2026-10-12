@@ -545,6 +545,23 @@ class ServerConfigTest {
     }
 
     @Test
+    void fileBaselineKeepsUnlistableDirsHealthzAndKeyPassword() {
+        var baseline = ServerConfig.builder(Path.of("site"))
+                .allowUnlistableDirs(true)
+                .healthz(true)
+                .tlsCert(Path.of("c"))
+                .tlsKey(Path.of("k"))
+                .tlsKeyPassword("file-secret")
+                .build();
+        var parsed = ServerConfig.parse(new String[0], Map.of(), baseline);
+        assertTrue(parsed.ok(), parsed.errors().toString());
+        assertTrue(parsed.config().allowUnlistableDirs());
+        assertTrue(parsed.config().healthz());
+        assertEquals("file-secret", parsed.config().tlsKeyPassword());
+        assertFalse(parsed.config().toString().contains("file-secret"));
+    }
+
+    @Test
     void accessRulesFromArgumentsAndEnvironment() {
         var p = parse(Map.of(), "--deny=*.bak, /private", "--access-rule=hide:/drafts",
                 "--access-rule=allow:/.well-known/acme-challenge", "--require-world-readable");
