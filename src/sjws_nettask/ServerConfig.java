@@ -59,13 +59,19 @@ import java.util.Objects;
  *        verification V7: anyone who can write in the root could create such a directory to force it)
  * @param backlog TCP accept backlog: connections the kernel completes and queues before the server
  *        accepts them (capped by the OS, e.g. {@code net.core.somaxconn} on Linux)
+ * @param h2Enabled start the HTTP/2 listener (TLS, ALPN h2 with http/1.1 fallback; same certificate as HTTP/3)
+ * @param h2Port TCP port of the HTTP/2 TLS listener (0 = ephemeral)
+ * @param h2cPort TCP port for cleartext HTTP/2 (prior knowledge or Upgrade: h2c, else HTTP/1.1);
+ *        {@link #H2C_DISABLED} (-1) = off, 0 = ephemeral; only with {@code h2Enabled}
  */
 public record ServerConfig(int port, Path root, int maxConnections, Duration idleTimeout, Duration headerTimeout,
         Duration writeTimeout, boolean h3Enabled, int h3Port, String h3Host, int h3MaxConnections, Path tlsCert,
         Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc,
         int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate, boolean allowUnlistableDirs,
-        int backlog) {
+        int backlog, boolean h2Enabled, int h2Port, int h2cPort) {
 
+    public static final int DEFAULT_H2_PORT = 8443;
+    public static final int H2C_DISABLED = -1;
     public static final int DEFAULT_PORT = CONSTANTS.DEFAULT_PORT;
     /** Design review M11: 64 KB output buffer per connection, so 2048 x 64 KB = 128 MB worst case. */
     public static final int DEFAULT_MAX_CONNECTIONS = 2048;
@@ -86,6 +92,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
     public ServerConfig {
         if (port < 0 || port > 65535) {
             throw new IllegalArgumentException("port out of range: " + port);
+        }
+        if (h2Port < 0 || h2Port > 65535 || h2cPort < H2C_DISABLED || h2cPort > 65535) {
+            throw new IllegalArgumentException("h2Port/h2cPort out of range: " + h2Port + "/" + h2cPort);
         }
         if (h3Port < H3_PORT_SAME_AS_TCP || h3Port > 65535) {
             throw new IllegalArgumentException("h3Port out of range: " + h3Port);
@@ -161,7 +170,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 + ", cacheBytes=" + cacheBytes + ", accessLog=" + accessLog + ", altSvc=" + altSvc
                 + ", maxConnectionsPerIp=" + maxConnectionsPerIp + ", h3MaxConnectionsPerIp="
                 + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + ", allowUnlistableDirs=" + allowUnlistableDirs
-                + ", backlog=" + backlog + "]";
+                + ", backlog=" + backlog + ", h2Enabled=" + h2Enabled + ", h2Port=" + h2Port + ", h2cPort=" + h2cPort
+                + "]";
     }
 
     /** Mutable builder; new fields get a default here so existing callers keep compiling. */
@@ -189,6 +199,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         private boolean altSvc;
         private boolean allowUnlistableDirs;
         private int backlog = DEFAULT_BACKLOG;
+        private boolean h2Enabled;
+        private int h2Port = DEFAULT_H2_PORT;
+        private int h2cPort = H2C_DISABLED;
 
         private Builder(Path root) {
             this.root = root;
@@ -217,6 +230,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             this.altSvc = c.altSvc;
             this.allowUnlistableDirs = c.allowUnlistableDirs;
             this.backlog = c.backlog;
+            this.h2Enabled = c.h2Enabled;
+            this.h2Port = c.h2Port;
+            this.h2cPort = c.h2cPort;
         }
 
         public Builder port(int v) { this.port = v; return this; }
@@ -241,12 +257,15 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public Builder altSvc(boolean v) { this.altSvc = v; return this; }
         public Builder allowUnlistableDirs(boolean v) { this.allowUnlistableDirs = v; return this; }
         public Builder backlog(int v) { this.backlog = v; return this; }
+        public Builder h2Enabled(boolean v) { this.h2Enabled = v; return this; }
+        public Builder h2Port(int v) { this.h2Port = v; return this; }
+        public Builder h2cPort(int v) { this.h2cPort = v; return this; }
 
         public ServerConfig build() {
             return new ServerConfig(port, root, maxConnections, idleTimeout, headerTimeout, writeTimeout, h3Enabled,
                     h3Port, h3Host, h3MaxConnections, tlsCert, tlsKey, tlsKeyPassword, altSvcMaxAge, cacheBytes,
                     accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate, allowUnlistableDirs,
-                    backlog);
+                    backlog, h2Enabled, h2Port, h2cPort);
         }
     }
 
@@ -286,6 +305,10 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --h3-max-connections-per-ip=N  QUIC connections per client IP (16)   WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP
                   --h3-min-rate=B           bytes/s per connection while file slots are   WEB_SERVER_H3_MIN_RATE
                                             contended (2048; 0 = off)
+                  --h2 | --no-h2            enable HTTP/2 over TLS (ALPN h2, http/1.1     WEB_SERVER_H2=true|false
+                                            fallback) on its own port (off)
+                  --h2-port=N               TCP port for HTTP/2 over TLS (8443)           WEB_SERVER_H2_PORT
+                  --h2c-port=N              cleartext HTTP/2 port (off; needs --h2)       WEB_SERVER_H2C_PORT
                   --cert=PATH               TLS certificate chain, PEM (self-signed)      WEB_SERVER_TLS_CERT
                   --key=PATH                TLS private key, PKCS#8 PEM                   WEB_SERVER_TLS_KEY
                   --key-password-file=PATH  file holding the key password                 WEB_SERVER_TLS_KEY_PASSWORD_FILE
@@ -352,6 +375,10 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String passwordFile = null;
         long altSvc = DEFAULT_ALT_SVC_MAX_AGE.toSeconds();
         var explicitH3Options = new ArrayList<String>();
+        boolean h2 = false;
+        int h2Port = DEFAULT_H2_PORT;
+        int h2cPort = H2C_DISABLED;
+        var explicitH2Options = new ArrayList<String>();
 
         // command line: positional [port] [dir], --flags anywhere
         int positional = 0;
@@ -382,6 +409,16 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     case "--cache-bytes" -> cache = byteSize(value, cache, name, warnings);
                     case "--h3" -> h3 = value == null || bool(value, h3, name, warnings);
                     case "--no-h3" -> h3 = false;
+                    case "--h2" -> h2 = value == null || bool(value, h2, name, warnings);
+                    case "--no-h2" -> h2 = false;
+                    case "--h2-port" -> {
+                        h2Port = number(value, h2Port, 0, 65535, name, warnings);
+                        explicitH2Options.add(name);
+                    }
+                    case "--h2c-port" -> {
+                        h2cPort = number(value, h2cPort, 0, 65535, name, warnings);
+                        explicitH2Options.add(name);
+                    }
                     case "--h3-port" -> {
                         h3Port = number(value, h3Port, 0, 65535, name, warnings);
                         explicitH3Options.add(name);
@@ -480,6 +517,17 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         if ((v = env.get("WEB_SERVER_H3")) != null) {
             h3 = bool(v, h3, "WEB_SERVER_H3", warnings);
         }
+        if ((v = env.get("WEB_SERVER_H2")) != null) {
+            h2 = bool(v, h2, "WEB_SERVER_H2", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_H2_PORT")) != null) {
+            h2Port = number(v, h2Port, 0, 65535, "WEB_SERVER_H2_PORT", warnings);
+            explicitH2Options.add("WEB_SERVER_H2_PORT");
+        }
+        if ((v = env.get("WEB_SERVER_H2C_PORT")) != null) {
+            h2cPort = number(v, h2cPort, 0, 65535, "WEB_SERVER_H2C_PORT", warnings);
+            explicitH2Options.add("WEB_SERVER_H2C_PORT");
+        }
         if ((v = env.get("WEB_SERVER_H3_PORT")) != null) {
             h3Port = number(v, h3Port, 0, 65535, "WEB_SERVER_H3_PORT", warnings);
             explicitH3Options.add("WEB_SERVER_H3_PORT");
@@ -513,7 +561,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String password = env.get("WEB_SERVER_TLS_KEY_PASSWORD");
         if (password != null && passwordFile != null) {
             warnings.add("Both WEB_SERVER_TLS_KEY_PASSWORD and a key password file are set; using the variable");
-        } else if (passwordFile != null && h3) { // only HTTP/3 uses the key: don't fail over an unused file
+        } else if (passwordFile != null && (h3 || h2)) { // only HTTP/3 and HTTP/2 use the key: don't fail over an unused file
             try {
                 password = passwordReader.read(Path.of(passwordFile));
             } catch (java.io.IOException | RuntimeException e) {
@@ -542,6 +590,13 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         explicitH3Options.remove("--alt-svc-max-age");
         explicitH3Options.remove("WEB_SERVER_ALT_SVC_MA");
+        if (h2) { // the TLS options are shared with HTTP/2
+            explicitH3Options.removeIf(o -> o.startsWith("--cert") || o.startsWith("--key") || o.startsWith("WEB_SERVER_TLS"));
+        }
+        if (!h2 && !explicitH2Options.isEmpty()) {
+            warnings.add("HTTP/2 is disabled, so " + String.join(", ", explicitH2Options)
+                    + " ha" + (explicitH2Options.size() == 1 ? "s" : "ve") + " no effect (add --h2)");
+        }
         if (!h3 && !explicitH3Options.isEmpty()) {
             warnings.add("HTTP/3 is disabled, so " + String.join(", ", explicitH3Options)
                     + " ha" + (explicitH3Options.size() == 1 ? "s" : "ve") + " no effect (add --h3)");
@@ -553,7 +608,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 .writeTimeout(Duration.ofSeconds(write)).cacheBytes(cache).altSvc(altSvcOn).allowUnlistableDirs(unlistable)
                 .h3Enabled(h3).h3Port(h3Port).h3Host(h3Host).h3MaxConnections(h3Max)
                 .tlsCert(cert == null ? null : Path.of(cert)).tlsKey(key == null ? null : Path.of(key))
-                .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc)).build();
+                .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc))
+                .h2Enabled(h2).h2Port(h2Port).h2cPort(h2 ? h2cPort : H2C_DISABLED).build();
         return new Parsed(config, List.copyOf(warnings), List.copyOf(errors), help);
     }
 
