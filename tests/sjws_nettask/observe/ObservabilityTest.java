@@ -270,8 +270,9 @@ class ObservabilityTest {
         assertEquals(1, snap.http3Connections());
         assertEquals(4, snap.accessLogDropped());
         assertEquals(3, snap.latency().counts()[0]);
-        assertEquals(1, snap.latency().counts()[2]);
-        assertEquals(1, snap.latency().counts()[snap.latency().counts().length - 1]);
+        assertEquals(1, snap.latency().counts()[3]); // 6 ms sits in (4 ms, 8 ms]
+        assertEquals(1, snap.latency().counts()[14]); // 11 s sits in (8.192 s, 16.384 s]
+        assertEquals(0, snap.latency().counts()[15]);
         assertEquals(11_000_000_000L, snap.latency().maxNanos());
         assertTrue(snap.latency().meanNanos() > 0);
         assertEquals(snap.latency().count(), snap.latency().cumulative(99));
@@ -290,6 +291,36 @@ class ObservabilityTest {
         assertTrue(text.contains("sjws_access_log_dropped_total 4\n"), text);
         assertEquals(0, ServerMetrics.bucket(0));
         assertEquals(ServerMetrics.LATENCY_BOUNDS_NANOS.length - 1, ServerMetrics.bucket(Long.MAX_VALUE));
+        assertLatencyContract(text);
+    }
+
+    /** Bounds, indexes and Prometheus labels are one log2 scale a cluster can add bucket by bucket. */
+    private static void assertLatencyContract(String prometheus) {
+        var bounds = ServerMetrics.LATENCY_BOUNDS_NANOS;
+        var labels = ServerMetrics.LATENCY_LE_LABELS;
+        assertEquals(ServerMetrics.LATENCY_FINITE_BUCKETS + 1, bounds.length);
+        assertEquals(bounds.length, labels.length);
+        assertEquals(ServerMetrics.LATENCY_FIRST_BOUND_NANOS, bounds[0]);
+        assertEquals("0.001", labels[0]);
+        assertEquals("+Inf", labels[labels.length - 1]);
+        assertEquals(Long.MAX_VALUE, bounds[bounds.length - 1]);
+        for (int i = 1; i < ServerMetrics.LATENCY_FINITE_BUCKETS; i++) {
+            assertEquals(bounds[i - 1] * 2, bounds[i], "bound " + i);
+            assertEquals(i, ServerMetrics.bucket(bounds[i]));
+            assertEquals(i + 1, ServerMetrics.bucket(bounds[i] + 1));
+        }
+        assertEquals(0, ServerMetrics.bucket(bounds[0]));
+        assertEquals(1, ServerMetrics.bucket(bounds[0] + 1));
+        String[] expected = {"0.001", "0.002", "0.004", "0.008", "0.016", "0.032", "0.064", "0.128", "0.256",
+                "0.512", "1.024", "2.048", "4.096", "8.192", "16.384", "+Inf"};
+        assertArrayEquals(expected, labels);
+        int at = 0;
+        for (String le : expected) {
+            String line = "sjws_http_request_duration_seconds_bucket{le=\"" + le + "\"} ";
+            int found = prometheus.indexOf(line);
+            assertTrue(found > at, prometheus);
+            at = found;
+        }
     }
 
     @Test

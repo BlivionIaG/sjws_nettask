@@ -53,8 +53,10 @@ public record Snapshot(long requests, long bytesSent, int activeConnections, int
     }
 
     /**
-     * @param upperBoundNanos inclusive upper bound of each bucket; the last one is {@link Long#MAX_VALUE}
-     * @param counts responses in that bucket only (not cumulative)
+     * @param upperBoundNanos inclusive upper bound of each bucket, {@link ServerMetrics#LATENCY_BOUNDS_NANOS};
+     *        fixed log2 scale, last entry {@link Long#MAX_VALUE}. Merge clusters by index, not by re-binning
+     * @param counts responses in that bucket only (not cumulative). Index {@code i} matches
+     *        {@link ServerMetrics#LATENCY_LE_LABELS}{@code [i]}
      */
     public record Latency(long count, long sumNanos, long maxNanos, long[] upperBoundNanos, long[] counts) {
 

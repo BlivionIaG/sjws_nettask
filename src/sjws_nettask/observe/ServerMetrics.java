@@ -30,13 +30,36 @@ import java.util.function.LongSupplier;
  */
 public final class ServerMetrics {
 
-    /** Inclusive bucket bounds. The last bucket is everything above 10s. */
-    public static final long[] LATENCY_BOUNDS_NANOS = {
-            1_000_000L, 5_000_000L, 10_000_000L, 25_000_000L, 50_000_000L, 100_000_000L, 250_000_000L, 500_000_000L,
-            1_000_000_000L, 2_500_000_000L, 5_000_000_000L, 10_000_000_000L, Long.MAX_VALUE};
+    /**
+     * Stable latency histogram. Cluster code merges nodes by summing {@code counts[i]} with
+     * {@code counts[i]}: the index is the contract, and these bounds do not move.
+     * <p>
+     * Fixed log scale, ratio exactly 2, from 1 ms through 16.384 s, then one {@code +Inf} bucket.
+     * Index {@code i} counts samples in {@code (bound[i-1], bound[i]]} ({@code bound[-1]} is 0).
+     * The snapshot counts are not cumulative. Prometheus {@code le} labels are the same bounds in
+     * seconds ({@link #LATENCY_LE_LABELS}); that exposition is cumulative, so two nodes still merge
+     * by adding the series that share a label.
+     */
+    public static final int LATENCY_FINITE_BUCKETS = 15;
+    public static final long LATENCY_FIRST_BOUND_NANOS = 1_000_000L;
+    public static final long[] LATENCY_BOUNDS_NANOS;
+    /** Prometheus {@code le} label for each {@link #LATENCY_BOUNDS_NANOS} entry. The last is {@code +Inf}. */
+    public static final String[] LATENCY_LE_LABELS;
 
-    private static final String[] LE = {
-            "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf"};
+    static {
+        var bounds = new long[LATENCY_FINITE_BUCKETS + 1];
+        var labels = new String[bounds.length];
+        long nanos = LATENCY_FIRST_BOUND_NANOS;
+        for (int i = 0; i < LATENCY_FINITE_BUCKETS; i++) {
+            bounds[i] = nanos;
+            labels[i] = leSeconds(nanos);
+            nanos *= 2;
+        }
+        bounds[LATENCY_FINITE_BUCKETS] = Long.MAX_VALUE;
+        labels[LATENCY_FINITE_BUCKETS] = "+Inf";
+        LATENCY_BOUNDS_NANOS = bounds;
+        LATENCY_LE_LABELS = labels;
+    }
 
     private final LongAdder[] byStatus = new LongAdder[1000];
     private final LongAdder[] byProtocol = new LongAdder[RequestObserver.PROTOCOL_COUNT];
@@ -92,6 +115,14 @@ public final class ServerMetrics {
         while (nanos > prev && !this.latencyMax.weakCompareAndSetVolatile(prev, nanos)) {
             prev = this.latencyMax.get();
         }
+    }
+
+    /** Seconds label for a bound that is an integer number of milliseconds. Three fractional digits. */
+    private static String leSeconds(long nanos) {
+        long millis = nanos / 1_000_000L;
+        long whole = millis / 1000L;
+        int frac = (int) (millis % 1000L);
+        return whole + "." + (frac < 10 ? "00" : frac < 100 ? "0" : "") + frac;
     }
 
     static int bucket(long nanos) {
@@ -163,7 +194,7 @@ public final class ServerMetrics {
         var latency = snap.latency();
         for (int i = 0; i < latency.counts().length; i++) {
             cumulative += latency.counts()[i];
-            sb.append("sjws_http_request_duration_seconds_bucket{le=\"").append(LE[i]).append("\"} ")
+            sb.append("sjws_http_request_duration_seconds_bucket{le=\"").append(LATENCY_LE_LABELS[i]).append("\"} ")
                     .append(cumulative).append('\n');
         }
         sb.append("sjws_http_request_duration_seconds_sum ")
