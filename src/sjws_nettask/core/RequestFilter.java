@@ -21,10 +21,12 @@ package sjws_nettask.core;
  * <p>
  * Implementations must be safe for concurrent requests (the chain calls them on the request
  * thread of whichever transport accepted the connection, with no extra lock). Call
- * {@link Chain#proceed} at most once, synchronously, on that same thread. Skip the call to
- * answer the request here. The response from {@code proceed} may be returned as-is, returned
- * with a different status or body, or modified through {@link Response#headers()} (that map is
- * not copied by the chain).
+ * {@link Chain#proceed} synchronously, on that same thread. A second call on that thread throws
+ * {@link IllegalStateException} and does not run the rest of the chain again; the filter that
+ * called it then becomes a 500 unless it catches the exception. Skip the call to answer the
+ * request here. The response from {@code proceed} may be returned as-is, returned with a
+ * different status or body, or modified through {@link Response#headers()} (that map is not
+ * copied by the chain). {@link Response} is a record; its headers are mutable.
  * <p>
  * A runtime exception, or a null return, becomes the standard 500 page
  * ({@link StaticFileHandler#error}). Outer filters then observe that 500 as the value
@@ -43,6 +45,8 @@ public interface RequestFilter {
 
         /**
          * Runs the next filter, or the terminal handler when this was the last one.
+         * Once per entry of the chain on this thread: a second call throws
+         * {@link IllegalStateException} and does not run downstream again.
          *
          * @param request the request to pass down (the original, or a replacement)
          */

@@ -16,20 +16,36 @@
  */
 package sjws_nettask.core;
 
+import java.util.IdentityHashMap;
 import java.util.Objects;
 import java.util.function.Function;
 
 /**
  * Immutable filter chain compiled by {@link RequestFilters#build}. The nodes are allocated once
- * at startup and shared by every request, so {@link #handle} allocates nothing on the success
- * path. Not used at all when no filters are registered and the terminal is the static file
- * handler: transports then call {@link StaticFileHandler#handle} directly ({@link #dispatch}
+ * at startup and shared by every request. {@link #handle} does not allocate on the success path
+ * after the calling thread's first entry (that entry creates the thread-local once-check, which
+ * is then reused). Not used at all when no filters are registered and the terminal is the static
+ * file handler: transports then call {@link StaticFileHandler#handle} directly ({@link #dispatch}
  * returns that method reference). A different terminal (a router) is called through {@link Handler}
  * only when one is actually installed.
  * <p>
- * Thread-safe. Filters run inline on the calling thread.
+ * Thread-safe: the nodes are immutable, and the once-check below is thread-local, so concurrent
+ * requests do not coordinate. Filters run inline on the calling thread.
+ * <p>
+ * {@link RequestFilter.Chain#proceed} is once per entry of this chain on that thread. A second
+ * call throws {@link IllegalStateException} (the calling filter then becomes a 500) and does not
+ * run the rest of the chain again. The check lives only on this path. With no filters the
+ * transports never call {@link #handle}, so nothing here is allocated.
  */
 public final class FilterChain implements Handler {
+
+    /**
+     * One per thread that has entered a chain, reused for the life of that thread. HTTP/1.1
+     * handles a connection on one thread, so later requests on it do not allocate. The map is
+     * keyed by the shared node, not by the request, and a depth keeps a nested chain (per-route
+     * filters wrapping a handler that the outer chain calls) from clearing the outer marks.
+     */
+    private static final ThreadLocal<Guard> GUARDS = ThreadLocal.withInitial(Guard::new);
 
     private final RequestFilter.Chain head;
 
@@ -39,7 +55,38 @@ public final class FilterChain implements Handler {
 
     @Override
     public Response handle(Request request) {
-        return this.head.proceed(request);
+        var guard = GUARDS.get();
+        int depth = ++guard.depth;
+        try {
+            return this.head.proceed(request);
+        } finally {
+            release(guard, this.head, depth);
+            guard.depth = depth - 1;
+        }
+    }
+
+    /** Rejects a second {@code proceed} of this node on the thread already inside the chain. */
+    private static void enter(RequestFilter.Chain node) {
+        var guard = GUARDS.get();
+        if (guard.open.putIfAbsent(node, Integer.valueOf(guard.depth)) != null) {
+            throw new IllegalStateException("proceed called twice");
+        }
+    }
+
+    /** Drops marks this entry added. Marks at another depth belong to an outer chain. */
+    private static void release(Guard guard, RequestFilter.Chain node, int depth) {
+        var mark = Integer.valueOf(depth);
+        while (node != null) {
+            if (mark.equals(guard.open.get(node))) {
+                guard.open.remove(node);
+            }
+            node = node instanceof FilterNode filter ? filter.next : null;
+        }
+    }
+
+    private static final class Guard {
+        private final IdentityHashMap<RequestFilter.Chain, Integer> open = new IdentityHashMap<>(8);
+        private int depth;
     }
 
     /**
@@ -85,6 +132,7 @@ public final class FilterChain implements Handler {
 
         @Override
         public Response proceed(Request request) {
+            enter(this);
             Response response;
             try {
                 response = this.filter.filter(request, this.next);
@@ -134,12 +182,19 @@ public final class FilterChain implements Handler {
 
         @Override
         public Response proceed(Request request) {
+            enter(this);
+            Response response;
             try {
-                return this.terminal.handle(request);
+                response = this.terminal.handle(request);
             } catch (RuntimeException e) {
                 System.err.println("Request handler failed: " + e);
                 return failure(request);
             }
+            if (response == null) {
+                System.err.println("Request handler returned no response");
+                return failure(request);
+            }
+            return response;
         }
     }
 
