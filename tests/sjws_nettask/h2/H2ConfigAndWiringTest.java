@@ -139,6 +139,37 @@ class H2ConfigAndWiringTest {
         }
     }
 
+    @Test
+    void accessRulesApplyOverHttp2() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        Files.writeString(this.root.resolve("old.bak"), "old");
+        Files.writeString(this.root.resolve(".env"), "SECRET=1");
+        Files.createDirectories(this.root.resolve("private"));
+        Files.writeString(this.root.resolve("private/x.txt"), "x");
+        // the rules come from the command line, as in production
+        var parsed = ServerConfig.parse(new String[] {"--deny=*.bak", "--access-rule=hide:/private"}, Map.of());
+        assertTrue(parsed.ok(), parsed.errors().toString());
+        try (var server = SjwsServer.start(config().toBuilder().access(parsed.config().access()).build());
+                var h2 = new RawH2(((sjws_nettask.h2.Http2Server) server.h2()).h2cPort(), 65535)) {
+            String[] paths = {"/a.txt", "/old.bak", "/.env", "/private/x.txt", "/sub/../old.bak"};
+            var statuses = new String[paths.length];
+            for (int i = 0; i < paths.length; i++) {
+                h2.get(2 * i + 1, paths[i]);
+            }
+            int seen = 0;
+            var hpack = new io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder(); // stateful: dynamic table
+            for (RawH2.Frame f; seen < paths.length && (f = h2.read()) != null;) {
+                if (f.type() == RawH2.HEADERS && f.stream() % 2 == 1 && statuses[f.stream() / 2] == null) {
+                    var buf = io.netty.buffer.Unpooled.wrappedBuffer(f.payload());
+                    statuses[f.stream() / 2] = hpack.decodeHeaders(f.stream(), buf).status().toString();
+                    seen++;
+                }
+            }
+            assertArrayEquals(new String[] {"200", "403", "404", "404", "403"}, statuses,
+                    "deny list 403, dotfile 404, hide rule 404 over HTTP/2");
+        }
+    }
+
     private static String awaitStatus(RawH2 h2, int stream) throws Exception {
         var deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
         while (System.nanoTime() < deadline) {

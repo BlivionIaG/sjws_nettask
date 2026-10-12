@@ -44,6 +44,11 @@ Run:
 | `--header-timeout=S` | `WEB_SERVER_HEADER_TIMEOUT` | 10 | time to receive a complete request head (seconds) |
 | `--max-connections-per-ip=N` | `WEB_SERVER_MAX_CONNECTIONS_PER_IP` | 256 | HTTP/1.1 connections from one client address (IPv6: one /64); extra ones are closed at once without a response |
 | `--allow-unlistable-dirs` | `WEB_SERVER_ALLOW_UNLISTABLE_DIRS` | off | serve files below directories the server can't read (mode `--x`) through a weaker path-based open; see Platform notes |
+| `--deny=PAT[,PAT...]` | `WEB_SERVER_DENY` | none | answer 403 for paths matching these patterns; checked before every other rule (see Access rules) |
+| `--access-rule=ACTION:PAT` | `WEB_SERVER_ACCESS_RULES` (comma-separated) | none | `allow:`, `deny:` (403) or `hide:` (404) a path pattern; repeatable, first match wins |
+| `--allow-dotfiles` | `WEB_SERVER_ALLOW_DOTFILES` | off | serve names starting with `.`; off: they answer 404 and are never listed |
+| `--require-owner=USER` | `WEB_SERVER_REQUIRE_OWNER` | off | serve only files owned by this user (name or numeric uid); others answer 403 |
+| `--require-world-readable` | `WEB_SERVER_REQUIRE_WORLD_READABLE` | off | serve only files with mode `o+r`; others answer 403 |
 | `--cache-bytes=N[k\|m\|g]` | `WEB_SERVER_CACHE_BYTES` | 64m | small-file cache size (see below); `0` disables it |
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
 | `-h`, `--help` | | | print usage and exit |
@@ -272,6 +277,34 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   fallback path above and the warning names the cause.
 * Quick check: with `--h3 --alt-svc`, `curl -I http://127.0.0.1:<port>/` shows the `Alt-Svc` header, and
   `curl --http3-only -k https://127.0.0.1:<udp port>/` fetches over HTTP/3 (`-k` for the self-signed cert).
+
+### Access rules
+
+Which paths may be served is decided by `core.AccessRules` (behind the `core.AccessPolicy` seam)
+before any file is opened, on the normalized URL path and again on the real path once symlinks are
+resolved (so a link can't reach a refused path under another name, and on case-insensitive file
+systems the on-disk case is checked):
+
+1. `--deny` patterns: 403. They always win.
+2. `--access-rule` rules in order, first match wins: `allow:` serves, `deny:` answers 403, `hide:` 404.
+3. A path with a component starting with `.` answers 404 unless `--allow-dotfiles`.
+4. Everything else is served.
+
+Patterns are `/`-separated globs: `*` matches within one component, `?` one character, `**` any number of
+components. A pattern starting with `/` is anchored at the document root; one without matches at any
+depth (`*.bak` = `/**/*.bak`). A pattern also covers everything below what it matches (`/private` covers
+`/private/a/b`). As in a shell, wildcards in an `allow:` rule never match a name starting with `.`, so
+`allow:/**` can't expose `/.git`, while a literal name can: `--access-rule=allow:/.well-known/acme-challenge`
+serves ACME HTTP-01 tokens and keeps every other dotfile hidden. Denied and hidden entries are left out of
+directory listings, and a symlink whose target is a dotfile or a denied path is refused.
+
+    --deny='*.bak,*~,/private' --access-rule=hide:/drafts --access-rule=allow:/.well-known/acme-challenge
+
+`--require-owner` and `--require-world-readable` check the file being served (POSIX file systems only;
+elsewhere such files answer 403). A change of owner or mode changes the file's ctime, so the
+small-file cache drops the entry and the check runs again (with a revalidation window, only after it).
+An invalid pattern or unknown user stops startup (exit code 64). Matching costs tens of nanoseconds per
+request (see Performance).
 
 ### Platform notes
 

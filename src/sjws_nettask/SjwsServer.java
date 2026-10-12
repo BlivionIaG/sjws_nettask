@@ -81,7 +81,7 @@ public final class SjwsServer implements AutoCloseable {
         this.observingAtStart = initial.recording();
         try {
             this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
-                    new sjws_nettask.core.FileCache(config.cacheBytes()));
+                    new sjws_nettask.core.FileCache(config.cacheBytes()), config.access());
             var leaf = select(this.handler, terminal);
             RequestFilters registry = filters;
             if (this.observingAtStart) {
