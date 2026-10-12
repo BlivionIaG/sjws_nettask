@@ -1,6 +1,8 @@
 # Messaging Core Design — sjws_nettask
 
 Status: Draft · Base: master b8055fe · Owner: Messaging Core workstream
+Aligned with: ARCHITECTURE.md "Target: message-oriented middleware" (PR #16, T0–T6, §B, §A). Where this doc is more
+specific it refines PR #16; it does not contradict it. Benchmark numbers quoted from PR #16 §B2.
 
 ## 0. Scope
 sjws is heading toward reliable, low-latency message-oriented middleware. **Messaging Core =
@@ -28,24 +30,31 @@ acknowledged to the caller.
 ### 2.1 Layout (per partition directory)
 ```
 p-0007/
-  00000000000000000000.log   # append-only segment; records: len|crc32c|type|body
-  00000000000000000000.idx   # sparse offset -> file position (every 4 KiB)
+  00000000000000000000.log   # append-only segment (<baseOffset:020d>.log, 1 GiB default, per PR #16 T3)
+  00000000000000000000.index # sparse relative offset -> file position (every 4 KiB)
   state.snap                 # snapshot of the ledger state machine (+ covered index)
   MANIFEST                   # active segments + snapshot; updated by atomic rename
 ```
 Record types: `ENQUEUE(offset,msg)`, `DELIVER(group,offset,consumer,deadline,attempt)`,
 `ACK(group,offset|range)`, `NACK(group,offset)`, `DLQ(group,offset,reason)`,
 `OFFSET_COMMIT(group,offset)`. Messages and their state transitions share one ordered log, so the
-log defines the state exactly. Segments roll at 64 MiB (configurable) and are preallocated.
+log defines the state exactly. Framing follows PR #16 T3: records are grouped in batches
+`[len:int][crc32c:int][baseOffset:long][count][timestamp][producerId][producerSeq][records…]`;
+the CRC32C covers the batch. Batches are the unit of write, fsync, replication and fetch
+(disk format = wire format, see §10.5). Segments roll at 1 GiB (configurable) and are preallocated.
 
 ### 2.2 Group commit / fsync
-- One writer per partition (or per disk, with partitions multiplexed onto it) drains pending
+- One dedicated **platform thread** per partition writer (PR #16 T1: blocking file I/O must not pin
+  virtual-thread carriers), fed by a bounded queue (65 536 entries, also the backpressure signal), drains pending
   appends, writes them as one batch and issues one `force(false)` (fdatasync); completion
   futures are released after the fsync.
 - The batch closes on `maxBatchBytes` (256 KiB), `maxBatchDelay` (200 µs) or an idle queue, whichever comes first.
   Under load this amortizes fsync across thousands of records; when idle, latency is about one fsync.
-- Durability modes: `SYNC` (default, fsync before ack, batched) and `RELAXED` (ack after
-  write, fsync every N ms; documented loss window of N ms on a power failure).
+  Measured in PR #16 §B2: one fsync ≈ 0.5 ms, so per-record fsync (`each`) caps at ~1.7k rec/s,
+  while `group` reaches 48.6k rec/s at p50 1.12 ms / p99 4.95 ms with 64 producers. The linger
+  (`maxBatchDelay`) is PR #16's proposed "later option", which addresses the 1-producer case (1.7k rec/s).
+- Durability modes use PR #16's names: `group` (default single node), `each`, `none`
+  (≈489k rec/s, loses data on power failure), and `replicated` (§6).
 
 ### 2.3 In-memory state machine
 Per partition and group: `nextOffset`, `committedOffset`, an in-flight map backed by a deadline
@@ -91,7 +100,9 @@ rights decorator; metrics go to the observability `MetricsSink`.
 `ReplicatedLedger` (cluster adapter; a `LocalOnly` implementation until the cluster layer lands).
 
 ## 6. Replication via the cluster layer
-One replication group per partition. The leader proposes ledger record batches via `append`;
+One replication group per partition. PR #16 T4 proposes Raft for metadata plus Kafka-style
+follower fetch (ISR) for data, and leaves "Raft for data too" as HA open question 2. This doc depends only on the
+interface below, which either shape can implement; leader epochs (PR #16) are the `term` here. The leader proposes ledger record batches via `append`;
 every replica applies committed entries to `LedgerStateMachine` in index order; only the
 leader serves `poll`/`ack`. Offsets and in-flight state therefore fail over with the partition. The cluster
 log and the ledger may share segments (log index == ledger position), so each entry is fsynced once.
@@ -99,7 +110,9 @@ log and the ledger may share segments (log index == ledger position), so each en
 ### Requirements for the cluster layer
 1. **Per-partition total order**: one replicated log per group; entries are applied in index order everywhere.
 2. **Ack after quorum commit + fsync**: `append` completes once a majority has fsynced the entry.
-   A configurable **relaxed mode** completes after the leader's fsync plus majority receipt in memory (or the leader alone).
+   A configurable **relaxed mode** completes on majority receipt in memory, without a follower fsync (the Kafka/NATS
+   default cited in PR #16 T3 `replicated`). Note: PR #16 leans to relaxed as the default; Blivion's requirement
+   makes quorum+fsync the default, which PR #16's HA open question 4 is to settle.
 3. **Latency**: single-digit-ms p99 replication on a LAN, with batching and pipelined appends.
 4. **Multiplexing**: per-partition groups share one transport per node pair (shared heartbeats,
    batched cross-group frames), scaling to thousands of groups per node.
@@ -124,8 +137,9 @@ JMH for components plus a load generator (`tests/bench/`), run on NVMe and on a 
 - End-to-end produce→consume→ack latency and redelivery overhead.
 - Recovery time vs log size and snapshot interval.
 - Replicated: 3 nodes on a LAN, commit p99 vs batch size.
-Initial targets (1 node, NVMe, SYNC): ≥200k msg/s for 1 KiB messages with 64 producers; p99 append ≤2 ms;
-recovery ≤1 s per GiB of un-snapshotted log.
+Baselines: PR #16 §B2 on the shared VM (virtio disk), which this harness must reproduce first. Ledger overhead target:
+within 10 % of `LogBench` `group` (PR #16 phase 2 exit criterion), i.e. ≥ ~44k rec/s at 64 producers
+for 256 B payloads with p99 ≤ ~5.5 ms on that VM. NVMe targets are set after measuring. Recovery ≤ 1 s per GiB of un-snapshotted log.
 
 ## 8. Implementation plan (separate PRs)
 1. Segments, `GroupCommitWriter`, torn-write recovery; fault-injection tests.
@@ -134,6 +148,39 @@ recovery ≤1 s per GiB of un-snapshotted log.
 4. Retention, truncation and compaction.
 5. `ReplicatedLedger` on the HA cluster layer.
 
-## 9. Open questions
-- Client wire protocol (HTTP/3 streams vs custom framing): a separate doc.
-- Per-key log compaction in v1: assumed no.
+
+## 9. Remaining open questions
+- Per-key log compaction for user topics in v1: assumed no (internal topics only, as in PR #16 T3).
+
+## 10. Answers to architecture open questions (PR #16 §A, Messaging Core)
+**Proposals pending Blivion's decision.**
+
+1. **Protocol: custom binary vs Kafka/AMQP/MQTT compatibility.** *Recommendation: custom binary
+   protocol plus HTTP bindings, with compatibility adapters later.* The native framing mirrors the
+   on-disk batch (§2.1), so produce goes straight to append and fetch uses sendfile. Our state model
+   (per-message ack, DLQ, inspection) doesn't map cleanly onto the Kafka protocol, and implementing
+   Kafka's wire protocol faithfully (versioned APIs, group coordinator, transactions) is a multi-quarter
+   effort. AMQP 1.0 and MQTT 5 suit queue-style and IoT clients and can be thin gateways over the broker API
+   (phase 4+). Keep the framing versioned so adapters stay possible.
+2. **Exactly-once.** *Recommendation: not in v1.* Use at-least-once by default plus idempotent producers
+   (dedup by `(producerId, seq)` at the leader), giving effectively-once appends; consumers dedup
+   by `(partition, offset)` or use idempotent handlers. Exactly-once transactions add a coordinator
+   and markers to every read and cost latency, against our low-latency goal. Revisit if a concrete
+   consume-transform-produce use case appears.
+3. **Queues as consumer groups vs a separate store.** *Recommendation: a hybrid inside the same log.* A
+   queue is a topic with one shared consumer group (PR #16 T2), but per-message state
+   (DELIVER/ACK/NACK/DLQ records, §2.1) goes into the partition's own ledger, not a separate store.
+   This gives per-message ack, redelivery, DLQ and inspection (Blivion's hard requirements, which a
+   single committed offset cannot express) while keeping one ordered, replicated, crash-recoverable log.
+   The committed offset is then the low watermark of fully acked messages. A separate store would need its own
+   durability and replication path. Per-message TTL and priority are deferred; priority would
+   use multiple partitions or topics.
+4. **Group fsync as default.** *Recommendation: yes,* `group` is the single-node default, with a
+   linger of 0 by default and configurable up to ~200 µs. PR #16 §B2 data: 48.6k rec/s at p50 1.1 ms
+   with 64 producers vs 1.7k rec/s for `each`; `none` is unsafe as a default for a "reliable" MOM. In a
+   cluster the default is `replicated` with quorum+fsync (§6, req. 2), with relaxed as opt-in.
+5. **On-disk format = wire format.** *Recommendation: yes,* at batch granularity. Batches are
+   stored exactly as produced on the wire (after the leader assigns the base offset and
+   validates the CRC32C), which enables sendfile fetch for consumers and followers (PR #16 T1) and one
+   fsync per batch. State records (DELIVER/ACK…) use the same batch framing with a record-type field.
+   Upgrades use a batch `magic`/version byte; old segments stay readable.
