@@ -18,7 +18,7 @@ Fixed JVM flags: `-Xms256m -Xmx256m -XX:+UseG1GC -XX:NativeMemoryTracking=summar
 Server flags: `--max-connections=20000 --max-connections-per-ip=20000 --idle-timeout=3600 --header-timeout=3600 --backlog=4096`.
 
 Output in `bench/footprint/results/` (git-ignored): `results.json` (everything, incl. raw NMT
-categories) and `results.csv` (flat metrics). `baseline/` holds the run in `REPORT.md`.
+categories) and `results.csv` (flat metrics). `baseline/` holds the run in [docs/benchmarks/footprint-report.md](../../docs/benchmarks/footprint-report.md).
 
 Notes on interpretation:
 * `-Xms=-Xmx` means NMT "Java Heap" committed is constant; RSS still grows as heap pages are first

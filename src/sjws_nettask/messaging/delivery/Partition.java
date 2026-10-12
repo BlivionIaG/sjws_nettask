@@ -16,7 +16,7 @@ import sjws_nettask.messaging.ledger.RecordBatch;
 import sjws_nettask.messaging.ledger.SegmentedLog;
 
 /**
- * One topic partition with at-least-once delivery to consumer groups (docs/design/messaging.md §1–§3).
+ * One topic partition with at-least-once delivery to consumer groups (docs/messaging/design.md §1–§3).
  * Every operation validates against {@link DeliveryState}, appends one {@link LedgerEntry} to the
  * partition log via {@link LedgerWriter} and applies it, all under one lock, so log order equals apply
  * order and {@link #open} replays the log into exactly the same state. Dead-lettered messages are first

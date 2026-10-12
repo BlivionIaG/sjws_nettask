@@ -30,7 +30,7 @@ import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.tls.TlsMaterial;
 
 /**
- * The README command, literally: {@code java -jar target/sjws_nettask-<version>.jar <port> <root> --h3}.
+ * The documented command (docs/user/http3.md), literally: {@code java -jar target/sjws_nettask-<version>.jar <port> <root> --h3}.
  * Tagged "jar" so Maven runs it after {@code package} (surefire execution {@code jar-tests}).
  */
 @Tag("jar")

@@ -1,7 +1,7 @@
 # Integration and end-to-end tests
 
 How `sjws_nettask` is tested, from the suite in `tests/` and the workflow in
-`.github/workflows/ci.yml`. The catalog of individual classes is `tests/README.md`.
+`.github/workflows/ci.yml`. The catalog of individual classes is `docs/development/testing.md`.
 This file states the layering, the file-serving harness, and what the server does
 not implement yet.
 
@@ -115,7 +115,7 @@ child environment when the test wants the arguments to win (`HardeningIntegratio
 | HTTP/1.1 | TCP listener. Cleartext. This is what `curl http://` hits. | Unit parser and writer tests; socket integration tests; `FileServingEndToEndTest` via `HttpClient` with `Version.HTTP_1_1`. |
 | HTTP/2 | Not implemented. A request line `HTTP/2.0` is rejected by `Http1Parser` with status 505. There is no h2c upgrade and no HTTP/2 codec. | Only the 505 cases (`Http1ParserTest`, `Http1GoldenTest`, `HardeningIntegrationTest`). |
 | HTTP/3 | Opt-in (`--h3`). Netty `netty-codec-http3` and the bundled quiche natives (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64). TLS 1.3 is the QUIC handshake (`QuicSslContextBuilder`), with a configured PEM chain or a generated self-signed certificate. | `h3/*` when the natives load; otherwise the tests assume false and skip. JaCoCo gates for `sjws_nettask.h3` and `sjws_nettask.tls` are 0 off those platforms. |
-| TLS on TCP | Not implemented. `TlsMaterial.keyManagerFactory()` builds a JSSE `KeyManagerFactory` for a future HTTPS listener. No TCP socket uses it. The README states that browsers need HTTPS before they will follow `Alt-Svc`, and that this server does not provide that listener. | `tls/TlsMaterialTest` loads PEM material and checks the JDK still advertises TLS 1.3. No HTTPS client connects to the TCP port. |
+| TLS on TCP | Not implemented. `TlsMaterial.keyManagerFactory()` builds a JSSE `KeyManagerFactory` for a future HTTPS listener. No TCP socket uses it. The HTTP/3 docs state that browsers need HTTPS before they will follow `Alt-Svc`, and that this server does not provide that listener. | `tls/TlsMaterialTest` loads PEM material and checks the JDK still advertises TLS 1.3. No HTTPS client connects to the TCP port. |
 
 ## Timeouts and flakiness
 
@@ -137,7 +137,7 @@ The rest of the suite:
   window. Those sleeps are not a stand-in for "wait until the server is up".
 - There is no JUnit retry extension and no Surefire rerun. A failed assertion is
   a failed test. HTTP/3 does not retry a missing native library; it skips.
-- Known macOS failures are listed in `tests/README.md`. `.github/workflows/ci.yml`
+- Known macOS failures are listed in `docs/development/testing.md`. `.github/workflows/ci.yml`
   runs macOS only on `workflow_dispatch`. Linux is the required platform.
 
 ## CI layout

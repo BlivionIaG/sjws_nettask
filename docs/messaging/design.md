@@ -1,14 +1,14 @@
 # Messaging Core Design — sjws_nettask
 
 Status: Draft · Base: master b8055fe · Owner: Messaging Core workstream
-Aligned with: ARCHITECTURE.md "Target: message-oriented middleware" (PR #16, T0–T6, §B, §A). Where this doc is more
+Aligned with: docs/design/architecture.md "Target: message-oriented middleware" (PR #16, T0–T6, §B, §A). Where this doc is more
 specific it refines PR #16; it does not contradict it. Benchmark numbers quoted from PR #16 §B2.
 
 ## 0. Scope
 sjws is heading toward reliable, low-latency message-oriented middleware. **Messaging Core =
 the message queue/broker core**: partitions, a durable ledger, producers/consumers,
 acknowledgement, redelivery, dead-lettering, inspection, and replication through the
-cluster layer designed by the HA workstream (`docs/design/high-availability.md`).
+cluster layer designed by the HA workstream (`docs/ha/design.md`).
 Out of scope: the wire protocol for clients (it sits on the existing HTTP/1.1 and HTTP/3
 transports behind `core.Handler`; it gets its own doc), the admin TUI itself, and the metrics backend.
 

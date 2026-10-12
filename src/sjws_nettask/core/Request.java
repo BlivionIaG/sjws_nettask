@@ -25,7 +25,7 @@ import java.util.Objects;
  * {@link #peer}, {@link #secure} and {@link #headers}.
  * <p>
  * There is no body component. A later change can add a pull-style body (empty by default) without
- * moving these fields; see {@code docs/filters.md}. Do not buffer the body into a {@code byte[]}.
+ * moving these fields; see {@code docs/development/filters.md}. Do not buffer the body into a {@code byte[]}.
  *
  * @param method request method, case-sensitive ("GET", "HEAD", ...)
  * @param target origin-form request-target: raw (still percent-encoded) path plus optional "?query"

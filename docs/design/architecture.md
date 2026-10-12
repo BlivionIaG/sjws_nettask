@@ -1,8 +1,8 @@
 # Architecture
 
 How the code on `master` is organised. User-visible behaviour (options, limits, caching, ranges) is
-documented in the [README](README.md) and the [configuration reference](docs/configuration.md); the
-tests that pin each behaviour are listed in [tests/README.md](tests/README.md).
+documented under [docs/](../index.md) and the [configuration reference](../user/configuration.md); the
+tests that pin each behaviour are listed in [docs/development/testing.md](../development/testing.md).
 
 ## Layers
 
@@ -31,7 +31,7 @@ HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ──
 
 * `core.Handler` (`Response handle(Request)`) is the seam between transports and application logic.
   `StaticFileHandler` implements it; `Http1Connection` depends on `Handler`. Optional request
-  filters (`RequestFilters`, [docs/filters.md](docs/filters.md)) wrap that handler. With none
+  filters (`RequestFilters`, [docs/development/filters.md](../development/filters.md)) wrap that handler. With none
   registered, HTTP/1.1 still calls `StaticFileHandler.handle` directly.
 * Both transports call the same handler, so behaviour is identical by construction; a parity test
   compares every HTTP/3 response with the HTTP/1.1 bytes for the same request. `Request` carries
@@ -176,7 +176,7 @@ Updated 2026-10-12, 16:36 Paris time.
 ### Decided
 * **Cluster ack default** (Blivion, 2026-10-12): majority **in-memory** ack (`replicated`), with no follower fsync. Quorum + fsync (`replicated+fsync`) is an explicit per-stream/topic opt-in (T3). This settles the former HA open question "does a replicated ack require a follower fsync?".
 
-### Messaging Core: resolved by PR #17 (`docs/design/messaging.md`)
+### Messaging Core: resolved by PR #17 (`docs/messaging/design.md`)
 1. Protocol: **our own binary protocol plus HTTP**. AMQP/MQTT come later as gateways. No Kafka wire protocol.
 2. **No exactly-once in v1**; producer deduplication instead.
 3. Queues are **a shared consumer group, with per-message state records in the partition log** (no separate store).

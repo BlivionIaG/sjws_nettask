@@ -4,7 +4,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 /**
- * One ledger record in a partition log (docs/design/messaging.md §2.1). Messages and every per-group
+ * One ledger record in a partition log (docs/messaging/design.md §2.1). Messages and every per-group
  * state transition share the log, so replaying it in order rebuilds the delivery state exactly.
  * Encoding: {@code [type:byte]} then fields; strings are {@code [len:short][utf8]}.
  */

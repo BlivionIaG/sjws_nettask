@@ -1,7 +1,7 @@
 # Releasing sjws_nettask
 
 Releases are cut by pushing a version tag; `.github/workflows/release.yml` does the rest.
-See also [CONTRIBUTING.md](CONTRIBUTING.md) and the [README](README.md).
+See also [CONTRIBUTING.md](../../CONTRIBUTING.md) and the [README](../../README.md).
 
     git checkout master && git pull
     git tag -a v0.2.0 -m "sjws_nettask 0.2.0"

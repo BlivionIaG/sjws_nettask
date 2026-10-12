@@ -4,7 +4,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Read-only inspection API (docs/design/messaging.md §4) over {@link DeliverySnapshot}s: counts per state and
+ * Read-only inspection API (docs/messaging/design.md §4) over {@link DeliverySnapshot}s: counts per state and
  * paged listings of pending (ENQUEUED), IN_FLIGHT and DEAD_LETTERED items. Counts are exact and lock-free; pages
  * come from a rate-limited immutable {@link DeliverySnapshot} (see {@link Partition#snapshot()}); hold one snapshot
  * for consistent multi-call views.
