@@ -57,11 +57,14 @@ import java.util.Objects;
  * @param allowUnlistableDirs serve files below directories the server can search but not read (mode
  *        {@code --x}) through the weaker path-based open; off: such requests get 403 (security
  *        verification V7: anyone who can write in the root could create such a directory to force it)
+ * @param backlog TCP accept backlog: connections the kernel completes and queues before the server
+ *        accepts them (capped by the OS, e.g. {@code net.core.somaxconn} on Linux)
  */
 public record ServerConfig(int port, Path root, int maxConnections, Duration idleTimeout, Duration headerTimeout,
         Duration writeTimeout, boolean h3Enabled, int h3Port, String h3Host, int h3MaxConnections, Path tlsCert,
         Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc,
-        int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate, boolean allowUnlistableDirs) {
+        int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate, boolean allowUnlistableDirs,
+        int backlog) {
 
     public static final int DEFAULT_PORT = CONSTANTS.DEFAULT_PORT;
     /** Design review M11: 64 KB output buffer per connection, so 2048 x 64 KB = 128 MB worst case. */
@@ -77,6 +80,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
     public static final int DEFAULT_MAX_CONNECTIONS_PER_IP = 256;
     public static final int DEFAULT_H3_MAX_CONNECTIONS_PER_IP = 16;
     public static final long DEFAULT_H3_MIN_RATE = 2048;
+    /** Up from the JDK's 50, which made bursts of new connections time out (S5 benchmark, c1000). */
+    public static final int DEFAULT_BACKLOG = 1024;
 
     public ServerConfig {
         if (port < 0 || port > 65535) {
@@ -98,6 +103,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if (altSvcMaxAge.isNegative()) {
             throw new IllegalArgumentException("altSvcMaxAge must not be negative");
+        }
+        if (backlog < 1 || backlog > 65535) {
+            throw new IllegalArgumentException("backlog must be between 1 and 65535");
         }
         if (h3MinRate < 0) {
             throw new IllegalArgumentException("h3MinRate must not be negative");
@@ -152,7 +160,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 + ", tlsKeyPassword=" + (tlsKeyPassword == null ? "null" : "****") + ", altSvcMaxAge=" + altSvcMaxAge
                 + ", cacheBytes=" + cacheBytes + ", accessLog=" + accessLog + ", altSvc=" + altSvc
                 + ", maxConnectionsPerIp=" + maxConnectionsPerIp + ", h3MaxConnectionsPerIp="
-                + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + ", allowUnlistableDirs=" + allowUnlistableDirs + "]";
+                + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + ", allowUnlistableDirs=" + allowUnlistableDirs
+                + ", backlog=" + backlog + "]";
     }
 
     /** Mutable builder; new fields get a default here so existing callers keep compiling. */
@@ -179,6 +188,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         private String accessLog;
         private boolean altSvc;
         private boolean allowUnlistableDirs;
+        private int backlog = DEFAULT_BACKLOG;
 
         private Builder(Path root) {
             this.root = root;
@@ -206,6 +216,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             this.accessLog = c.accessLog;
             this.altSvc = c.altSvc;
             this.allowUnlistableDirs = c.allowUnlistableDirs;
+            this.backlog = c.backlog;
         }
 
         public Builder port(int v) { this.port = v; return this; }
@@ -229,11 +240,13 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public Builder accessLog(String v) { this.accessLog = v; return this; }
         public Builder altSvc(boolean v) { this.altSvc = v; return this; }
         public Builder allowUnlistableDirs(boolean v) { this.allowUnlistableDirs = v; return this; }
+        public Builder backlog(int v) { this.backlog = v; return this; }
 
         public ServerConfig build() {
             return new ServerConfig(port, root, maxConnections, idleTimeout, headerTimeout, writeTimeout, h3Enabled,
                     h3Port, h3Host, h3MaxConnections, tlsCert, tlsKey, tlsKeyPassword, altSvcMaxAge, cacheBytes,
-                    accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate, allowUnlistableDirs);
+                    accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate, allowUnlistableDirs,
+                    backlog);
         }
     }
 
@@ -261,6 +274,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   document root             folder to serve (default ./HTML)             WEB_SERVER_DIR
                   --max-connections=N       concurrent HTTP/1 connections (2048)          WEB_SERVER_MAX_CONNECTIONS
                   --max-connections-per-ip=N  HTTP/1 connections per client IP (256)      WEB_SERVER_MAX_CONNECTIONS_PER_IP
+                  --backlog=N               TCP accept backlog (1024; OS-capped)          WEB_SERVER_BACKLOG
                   --idle-timeout=S          keep-alive idle timeout, seconds (30)         WEB_SERVER_IDLE_TIMEOUT
                   --header-timeout=S        time to send a request head, seconds (10)     WEB_SERVER_HEADER_TIMEOUT
                   --write-timeout=S         end a response stalled this long, seconds (30) WEB_SERVER_WRITE_TIMEOUT
@@ -330,6 +344,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String h3Host = DEFAULT_H3_HOST;
         int h3Max = DEFAULT_H3_MAX_CONNECTIONS;
         int perIp = DEFAULT_MAX_CONNECTIONS_PER_IP;
+        int backlog = DEFAULT_BACKLOG;
         int h3PerIp = DEFAULT_H3_MAX_CONNECTIONS_PER_IP;
         int minRate = (int) DEFAULT_H3_MIN_RATE;
         String cert = null;
@@ -360,6 +375,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                         minRate = number(value, minRate, 0, 1_000_000_000, name, warnings);
                         explicitH3Options.add(name);
                     }
+                    case "--backlog" -> backlog = number(value, backlog, 1, 65535, name, warnings);
                     case "--idle-timeout" -> idle = number(value, idle, 1, 86_400, name, warnings);
                     case "--header-timeout" -> header = number(value, header, 1, 86_400, name, warnings);
                     case "--write-timeout" -> write = number(value, write, 1, 86_400, name, warnings);
@@ -428,6 +444,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if ((v = env.get("WEB_SERVER_MAX_CONNECTIONS_PER_IP")) != null) {
             perIp = number(v, perIp, 1, 10_000_000, "WEB_SERVER_MAX_CONNECTIONS_PER_IP", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_BACKLOG")) != null) {
+            backlog = number(v, backlog, 1, 65535, "WEB_SERVER_BACKLOG", warnings);
         }
         if ((v = env.get("WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP")) != null) {
             h3PerIp = number(v, h3PerIp, 1, 10_000_000, "WEB_SERVER_H3_MAX_CONNECTIONS_PER_IP", warnings);
@@ -528,7 +547,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     + " ha" + (explicitH3Options.size() == 1 ? "s" : "ve") + " no effect (add --h3)");
         }
 
-        var config = b.port(port).root(Path.of(dir)).maxConnections(max).maxConnectionsPerIp(perIp)
+        var config = b.port(port).root(Path.of(dir)).maxConnections(max).maxConnectionsPerIp(perIp).backlog(backlog)
                 .h3MaxConnectionsPerIp(h3PerIp).h3MinRate(minRate)
                 .idleTimeout(Duration.ofSeconds(idle)).headerTimeout(Duration.ofSeconds(header))
                 .writeTimeout(Duration.ofSeconds(write)).cacheBytes(cache).altSvc(altSvcOn).allowUnlistableDirs(unlistable)

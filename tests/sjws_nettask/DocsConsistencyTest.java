@@ -43,6 +43,7 @@ class DocsConsistencyTest {
         var readme = readmeOptionRows();
         assertTrue(readme.contains("`--max-connections=N` | `WEB_SERVER_MAX_CONNECTIONS` | " + d.maxConnections() + " |"));
         assertTrue(readme.contains("`WEB_SERVER_MAX_CONNECTIONS_PER_IP` | " + d.maxConnectionsPerIp() + " |"));
+        assertTrue(readme.contains("`WEB_SERVER_BACKLOG` | " + d.backlog() + " |"));
         assertTrue(readme.contains("`WEB_SERVER_IDLE_TIMEOUT` | " + d.idleTimeout().toSeconds() + " |"));
         assertTrue(readme.contains("`WEB_SERVER_HEADER_TIMEOUT` | " + d.headerTimeout().toSeconds() + " |"));
         assertTrue(readme.contains("`WEB_SERVER_WRITE_TIMEOUT` | " + d.writeTimeout().toSeconds() + " |"));
