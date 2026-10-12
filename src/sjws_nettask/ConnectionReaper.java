@@ -52,6 +52,7 @@ final class ConnectionReaper implements AutoCloseable {
         private volatile long deadline;
         private volatile State state = State.PROCESSING;
         private volatile boolean headExpired;
+        private long headDeadline; // connection thread only
         private long forceCloseAt; // reaper thread only
 
         private Timer(SocketChannel channel) {
@@ -64,7 +65,17 @@ final class ConnectionReaper implements AutoCloseable {
         }
 
         void head() {
-            this.deadline = System.nanoTime() + ConnectionReaper.this.headNanos;
+            this.headDeadline = System.nanoTime() + ConnectionReaper.this.headNanos;
+            this.deadline = this.headDeadline;
+            this.state = State.HEAD;
+        }
+
+        /**
+         * Back to the head deadline set by {@link #head()} (same absolute instant) after an interim
+         * write such as {@code 100 Continue}: the body that follows is still bounded by it.
+         */
+        void resumeHead() {
+            this.deadline = this.headDeadline;
             this.state = State.HEAD;
         }
 

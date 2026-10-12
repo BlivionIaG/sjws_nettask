@@ -27,6 +27,8 @@ import java.util.function.BooleanSupplier;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
@@ -153,6 +155,35 @@ class Http1TransportTest {
             long ms = (System.nanoTime() - t0) / 1_000_000;
             assertTrue(ms < 3000, "took " + ms + " ms");
         }
+    }
+
+    /**
+     * Perf review N1/N2: a body that never completes is cut at the head deadline whether or not
+     * {@code 100 Continue} was sent first (the interim write used to switch to the write deadline),
+     * and the client gets a 408 instead of a silent close.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unfinishedBodyGets408AtTheHeadDeadlineEvenAfter100Continue(boolean expectContinue) throws Exception {
+        start(Duration.ofSeconds(10), Duration.ofMillis(500), Duration.ofSeconds(4));
+        try (var s = connect()) {
+            long t0 = System.nanoTime();
+            var out = s.getOutputStream();
+            out.write(("GET /hello.txt HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n"
+                    + (expectContinue ? "Expect: 100-continue\r\n" : "") + "\r\nx").getBytes(StandardCharsets.ISO_8859_1));
+            out.flush(); // ... 999 body bytes never follow
+            var in = s.getInputStream();
+            if (expectContinue) {
+                assertTrue(readHead(in).startsWith("HTTP/1.1 100 Continue\r\n"));
+            }
+            var r = HttpTestSupport.readResponse(in);
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            assertEquals(408, r.statusCode());
+            assertEquals(-1, in.read(), "closed after the 408");
+            assertTrue(ms >= 450 && ms < 2500, "took " + ms + " ms (write deadline: 4000)");
+        }
+        assertEquals(1, manager.reaper().headExpirations());
+        assertEquals(0, manager.reaper().writeExpirations());
     }
 
     @Test
