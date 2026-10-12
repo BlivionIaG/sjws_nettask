@@ -2,18 +2,24 @@
 #   systemctl enable --now sjws_nettask-data@edge1
 #
 # Same account and file rules as sjws_nettask-control@.service.
-# Do not Requires= a control unit. The control plane may be down or on another host;
-# a data node still starts and serves the last good local snapshot. Optional same-host
-# ordering (does not stop this node when control fails):
+# Do not Requires= a control unit. The control plane may be down or on another host.
+# Optional same-host ordering (does not stop this node when control fails):
 #
 #   mkdir -p /etc/systemd/system/sjws_nettask-data@.service.d
 #   install -m 0644 contrib/sjws_nettask-data-same-host.conf \
 #       /etc/systemd/system/sjws_nettask-data@.service.d/same-host.conf
 #
-# No ExecReload. Config rollout is the control-plane watch, not a process restart.
+# ExecReload sends SIGHUP. After a control-plane config has been applied, that reload
+# refreshes local bootstrap settings only and does not replace the pushed document.
 # -XX:-HeapDumpOnOutOfMemoryError and LimitCORE=0 keep a join token out of crash dumps.
+# Active means the main process is up. This unit does not call sd_notify.
+# Readiness is /readyz and --status, not systemctl is-active.
+#
+# TimeoutStopSec covers the default drain budget (30s) plus the 5s SIGKILL margin plus about
+# 10s for the ExecStop JVM. Raising --drain-budget requires raising TimeoutStopSec to match.
 #
 #   install -D -m 0644 contrib/sjws_nettask-data@.service /etc/systemd/system/sjws_nettask-data@.service
+#   install -D -m 0640 contrib/sjws_nettask-data.yaml /etc/sjws_nettask/data-edge1/sjws_nettask-data.yaml
 #   systemctl daemon-reload
 
 [Unit]
@@ -31,11 +37,12 @@ RuntimeDirectory=sjws_nettask
 StateDirectory=sjws_nettask
 LogsDirectory=sjws_nettask
 WorkingDirectory=/var/www/html
-ExecStart=/usr/bin/java -XX:-HeapDumpOnOutOfMemoryError -jar /usr/share/sjws_nettask/sjws_nettask.jar --daemon --role=data --bootstrap=/etc/sjws_nettask/data-%i/bootstrap --pid-file=/run/sjws_nettask/data-%i.pid --log-file=/var/log/sjws_nettask/data-%i.log --shutdown-timeout=10 8080 /var/www/html
+ExecStart=/usr/bin/java -XX:-HeapDumpOnOutOfMemoryError -jar /usr/share/sjws_nettask/sjws_nettask.jar --daemon --role=data --config=/etc/sjws_nettask/data-%i/sjws_nettask-data.yaml --bootstrap=/etc/sjws_nettask/data-%i/bootstrap --pid-file=/run/sjws_nettask/data-%i.pid --log-file=/var/log/sjws_nettask/data-%i.log --shutdown-timeout=10 8080 /var/www/html
 ExecStop=/usr/bin/java -jar /usr/share/sjws_nettask/sjws_nettask.jar --stop --pid-file=/run/sjws_nettask/data-%i.pid --shutdown-timeout=10
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=90
+TimeoutStopSec=45
 LimitCORE=0
 NoNewPrivileges=true
 PrivateTmp=true

@@ -92,13 +92,13 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null);
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true);
     }
 
     /** Same lifecycle as {@link #serve}, starting from a loaded config file so reload can re-read it. */
     private static int serveLoaded(sjws_nettask.config.ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             PrintStream out, PrintStream err, Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile,
-            ServiceHooks hooks) {
+            ServiceHooks hooks, long drainBudgetMs, boolean bindContent) {
         var config = loaded.document().server();
         if (!Files.isDirectory(config.root())) {
             err.println("Document root " + config.root().toAbsolutePath() + " does not exist or is not a directory.");
@@ -113,7 +113,7 @@ public class Sjws_nettask {
         }
         SjwsServer server;
         try {
-            server = SjwsServer.start(loaded, h3Factory);
+            server = SjwsServer.start(loaded, h3Factory, bindContent);
         } catch (BindException e) {
             err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
                     + " (already in use or not permitted).");
@@ -122,11 +122,13 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks);
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
+                bindContent);
     }
 
     private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,
-            Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile, ServiceHooks hooks) {
+            Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile, ServiceHooks hooks,
+            long drainBudgetMs, boolean bindContent) {
         server.shutdownTimeout(shutdownTimeout);
         var pid = new AtomicReference<PidFile>();
         var task = new Shutdown(server, pid, out, err);
@@ -167,7 +169,10 @@ public class Sjws_nettask {
                     out.println(line);
                 }
             } else {
-                publishHaDrainBudget(server, pidFile, shutdownTimeout);
+                publishHaDrainBudget(server, pidFile, drainBudgetMs);
+            }
+            if (!bindContent) {
+                out.println("content port not bound");
             }
             out.println("Server started: " + server.describe());
             sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
@@ -278,19 +283,16 @@ public class Sjws_nettask {
     }
 
     /**
-     * How long {@link sjws_nettask.ha.Lifecycle#drain()} can take before {@link SjwsServer#close()},
-     * or {@code -1} when high availability is not attached. {@code --stop} uses this as a wait
-     * budget. Standalone without HA stays {@code -1}, which keeps today's shutdown timeout.
+     * Authoritative drain budget in milliseconds. Negative means {@link Daemon#DEFAULT_DRAIN_BUDGET_MS}.
+     * Values above ten minutes are capped. This is not derived from HA drain settings;
+     * {@code --shutdown-timeout} is a separate in-process limit.
      */
-    public static long drainBudgetMillis(SjwsServer server, Duration shutdownTimeout) {
-        if (server == null || shutdownTimeout == null || server.ha() == null) {
-            return -1L;
+    public static long drainBudgetMillis(long configuredMillis) {
+        long budget = configuredMillis < 0 ? Daemon.DEFAULT_DRAIN_BUDGET_MS : configuredMillis;
+        if (budget > sjws_nettask.service.ServiceStatus.MAX_BUDGET_MS) {
+            return sjws_nettask.service.ServiceStatus.MAX_BUDGET_MS;
         }
-        long delay = Math.max(0L, server.ha().settings().drainDelay().toMillis());
-        long drain = Math.max(0L, server.ha().settings().drainTimeout().toMillis());
-        long shut = Math.max(0L, shutdownTimeout.toMillis());
-        long budget = delay + drain + 1_000L + shut + 3_000L;
-        return budget < 0 ? 600_000L : budget;
+        return Math.max(0L, budget);
     }
 
     /**
@@ -299,7 +301,7 @@ public class Sjws_nettask {
      * carries the budget) and not called when HA is off, so that path does not load
      * {@code sjws_nettask.service}.
      */
-    static void publishHaDrainBudget(SjwsServer server, Path pidFile, Duration shutdownTimeout) {
+    static void publishHaDrainBudget(SjwsServer server, Path pidFile, long configuredBudgetMs) {
         if (server.ha() == null || pidFile == null) {
             return;
         }
@@ -309,7 +311,7 @@ public class Sjws_nettask {
                     .orElse(-1L);
             Class.forName("sjws_nettask.service.ServiceStatus")
                     .getMethod("writeStandaloneDrain", Path.class, long.class, long.class, long.class)
-                    .invoke(null, pidFile, pid, started, drainBudgetMillis(server, shutdownTimeout));
+                    .invoke(null, pidFile, pid, started, drainBudgetMillis(configuredBudgetMs));
         } catch (ReflectiveOperationException e) {
             System.err.println("WARN: could not record the drain budget");
         }
@@ -382,9 +384,14 @@ public class Sjws_nettask {
             err.println("See --help.");
             return EXIT_USAGE;
         }
+        var choice = RoleChoice.resolve(opt, loaded.document(), err);
+        if (!choice.ok()) {
+            err.println("See --help.");
+            return EXIT_USAGE;
+        }
         if (!child && (opt.action() == Daemon.Action.DAEMON || opt.action() == Daemon.Action.RESTART)) {
             if (opt.action() == Daemon.Action.RESTART) {
-                int stopped = Daemon.stop(opt.pidFile(), opt.shutdownTimeout(), out, err);
+                int stopped = Daemon.stop(opt.pidFile(), opt.shutdownTimeout(), opt.drainBudgetMs(), out, err);
                 if (stopped != 0) {
                     return stopped;
                 }
@@ -398,14 +405,16 @@ public class Sjws_nettask {
                 return EXIT_USAGE;
             }
             try {
-                hooks = loadServiceHooks(opt);
+                hooks = loadServiceHooks(opt.bootstrap(), choice.expectedRole(), opt.drainBudgetMs());
             } catch (IOException e) {
                 err.println("ERROR: " + safeMessage(e.getMessage()));
                 return EXIT_USAGE;
             }
         }
+        loaded = applyProcessMode(loaded, choice, hooks);
+        boolean bindContent = resolveBind(opt, loaded, err);
         if (child) {
-            Daemon.ignoreSignal("HUP");
+            ReloadHook.installSighup();
         }
         PrintStream logOut = out;
         PrintStream logErr = err;
@@ -426,7 +435,7 @@ public class Sjws_nettask {
         }
         try {
             return serveLoaded(loaded, h3Factory, logOut, logErr, started, opt.shutdownTimeout(),
-                    opt.trackPid() ? opt.pidFile() : null, hooks);
+                    opt.trackPid() ? opt.pidFile() : null, hooks, opt.drainBudgetMs(), bindContent);
         } finally {
             if (ownLog) {
                 logOut.close();
@@ -437,9 +446,132 @@ public class Sjws_nettask {
     /**
      * Loads the control/data bootstrap. Only called when {@code --bootstrap} is set, so a standalone
      * process does not resolve {@code sjws_nettask.service}.
+     *
+     * @param expectedRole {@code control} or {@code data} from {@code --role} or {@code node.mode},
+     *        or null to take the role from the bootstrap file
      */
-    private static ServiceHooks loadServiceHooks(Daemon.Options opt) throws IOException {
-        return sjws_nettask.service.ServiceLaunch.prepare(opt.bootstrap(), opt.role());
+    private static ServiceHooks loadServiceHooks(Path bootstrap, String expectedRole, long drainBudgetMs)
+            throws IOException {
+        return sjws_nettask.service.ServiceLaunch.prepare(bootstrap, expectedRole, drainBudgetMs);
+    }
+
+    /**
+     * Applies the resolved role onto the document so leadership and the content port follow it.
+     * {@code --role} and {@code WEB_SERVER_ROLE} already won in {@link RoleChoice}; a bootstrap file
+     * supplies the mode only when neither of those, and no config file, named one.
+     */
+    static sjws_nettask.config.ConfigLoader.Loaded applyProcessMode(sjws_nettask.config.ConfigLoader.Loaded loaded,
+            RoleChoice choice, ServiceHooks hooks) {
+        String mode = choice.processMode();
+        if (mode == null && hooks != null) {
+            mode = hooks.nodeMode();
+        }
+        if (mode == null) {
+            return loaded;
+        }
+        var node = loaded.document().node();
+        if (mode.equals(node.mode().wire())) {
+            return loaded;
+        }
+        return loaded.withDocument(loaded.document().withNode(
+                new sjws_nettask.config.NodeSettings(sjws_nettask.config.NodeSettings.Mode.parse(mode), node.labels())));
+    }
+
+    /**
+     * Content port: an explicit flag or variable, then {@code server.bind_content}, then off for
+     * {@code control} and on otherwise. A difference from the role default is logged.
+     */
+    static boolean resolveBind(Daemon.Options opt, sjws_nettask.config.ConfigLoader.Loaded loaded, PrintStream err) {
+        var mode = loaded.document().node().mode();
+        boolean byRole = mode != sjws_nettask.config.NodeSettings.Mode.CONTROL;
+        Boolean chosen = opt.bindContent();
+        String source = opt.bindFromEnv() ? "WEB_SERVER_BIND_CONTENT" : "--bind-content";
+        if (chosen == null) {
+            chosen = loaded.yamlBindContent();
+            source = "server.bind_content";
+        }
+        if (chosen == null) {
+            return byRole;
+        }
+        if (chosen.booleanValue() != byRole) {
+            err.println("WARN: " + source + "=" + chosen + " overrides the " + mode.wire()
+                    + " content-port default");
+        }
+        return chosen;
+    }
+
+    /**
+     * Role for this process. The schema field is {@code node.mode} (there is no {@code node.role}).
+     * Precedence is {@code --role}, then {@code WEB_SERVER_ROLE}, then {@code node.mode}. A difference
+     * is logged here, once the process is starting. No flag, no variable, and no config file leaves
+     * the choice to the bootstrap file, or standalone when that file is absent. Does not load
+     * {@code sjws_nettask.service}.
+     */
+    static RoleChoice roleChoice(Daemon.Options opt, sjws_nettask.config.ConfigDocument document, PrintStream err) {
+        return RoleChoice.resolve(opt, document, err);
+    }
+
+    static final class RoleChoice {
+        private final boolean ok;
+        /** {@code control}, {@code data}, {@code standalone}, or null to read the bootstrap file. */
+        private final String processMode;
+
+        private RoleChoice(boolean ok, String processMode) {
+            this.ok = ok;
+            this.processMode = processMode;
+        }
+
+        boolean ok() {
+            return this.ok;
+        }
+
+        /** {@code control} or {@code data} for the bootstrap check, or null for standalone / unread. */
+        String expectedRole() {
+            if ("control".equals(this.processMode) || "data".equals(this.processMode)) {
+                return this.processMode;
+            }
+            return null;
+        }
+
+        String processMode() {
+            return this.processMode;
+        }
+
+        static RoleChoice resolve(Daemon.Options opt, sjws_nettask.config.ConfigDocument document, PrintStream err) {
+            var mode = document.node().mode().wire();
+            boolean fromFile = document.configFile() != null;
+            if (opt.cliRole() != null && opt.envRole() != null && !opt.cliRole().equals(opt.envRole())) {
+                err.println("WARN: --role=" + opt.cliRole() + " overrides WEB_SERVER_ROLE=" + opt.envRole());
+            }
+            var flagged = opt.role();
+            String role;
+            if (flagged != null) {
+                role = flagged;
+                if (fromFile && !flagged.equals(mode)) {
+                    String source = opt.cliRole() != null ? "--role" : "WEB_SERVER_ROLE";
+                    err.println("WARN: " + source + "=" + flagged + " overrides node.mode=" + mode);
+                }
+            } else if (fromFile) {
+                role = mode;
+            } else {
+                role = null;
+            }
+            if ("control".equals(role) || "data".equals(role)) {
+                if (opt.bootstrap() == null) {
+                    err.println("ERROR: node.mode=" + role + " requires --bootstrap=PATH");
+                    return new RoleChoice(false, null);
+                }
+                return new RoleChoice(true, role);
+            }
+            if ("standalone".equals(role) && opt.bootstrap() != null) {
+                err.println("ERROR: node.mode=standalone cannot be combined with --bootstrap");
+                return new RoleChoice(false, null);
+            }
+            if ("standalone".equals(role)) {
+                return new RoleChoice(true, "standalone");
+            }
+            return new RoleChoice(true, null);
+        }
     }
 
     /** {@code --stop} / {@code --status}: no server configuration is required. */
@@ -448,7 +580,7 @@ public class Sjws_nettask {
         if (opt.action() == Daemon.Action.STATUS) {
             return Daemon.status(opt.pidFile(), out, err);
         }
-        return Daemon.stop(opt.pidFile(), opt.shutdownTimeout(), out, err);
+        return Daemon.stop(opt.pidFile(), opt.shutdownTimeout(), opt.drainBudgetMs(), out, err);
     }
 
     /**

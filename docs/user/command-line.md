@@ -23,18 +23,21 @@ Run:
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | a response that makes no progress for this long is closed (HTTP/1.1) or reset (HTTP/3); for HTTP/3 also the window of the minimum send rate |
 | `--config=PATH` | `WEB_SERVER_CONFIG` | | YAML configuration file (see [docs/user/config-file.md](config-file.md)); the environment wins |
 | `-h`, `--help` | | | print usage and exit |
-| `--daemon` | | | detach and run in the background; the parent exits once the child is listening |
+| `--daemon` | | | detach and run in the background; the parent exits once the child is up |
 | `--pid-file=PATH` | `WEB_SERVER_PID_FILE` | sjws_nettask.pid | process-id file; written by `--daemon`, and whenever this option is set |
 | `--log-file=PATH` | `WEB_SERVER_LOG_FILE` | sjws_nettask.log | log file for `--daemon`, and for a foreground process when this option is set |
-| `--shutdown-timeout=S` | `WEB_SERVER_SHUTDOWN_TIMEOUT` | 10 | seconds to finish in-flight responses after SIGTERM/SIGINT (`0` closes them at once) |
-| `--stop` | | | stop the server recorded in the pid file (SIGTERM, then wait) |
-| `--status` | | | print whether that server is running |
+| `--shutdown-timeout=S` | `WEB_SERVER_SHUTDOWN_TIMEOUT` | 10 | seconds to finish in-flight responses after SIGTERM/SIGINT (`0` closes them at once). Not added to the `--stop` wait |
+| `--drain-budget=S` | `WEB_SERVER_DRAIN_BUDGET` | 30 | seconds `--stop` waits for drain before the 5s SIGKILL margin (`0` waits only that margin). The status file's `drain-ms` wins when present. Capped at 600 |
+| `--stop` | | | stop the server recorded in the pid file (SIGTERM, then the drain budget plus 5s, then SIGKILL) |
+| `--status` | | | print whether that server is running. Readiness is this line and `/readyz`, not systemd `active` |
 | `--restart` | | | `--stop`, then start in the background |
-| `--role=ROLE` | `WEB_SERVER_ROLE` | standalone | `standalone` (default), `control`, or `data`. `control` and `data` require `--bootstrap` and `--pid-file`. The environment wins |
+| `--role=ROLE` | `WEB_SERVER_ROLE` | standalone | `standalone` (default), `control`, or `data`. Same values as `node.mode`. Precedence is `--role`, then `WEB_SERVER_ROLE`, then `node.mode`. A difference is logged at startup. `control` and `data` require `--bootstrap` and `--pid-file` |
 | `--bootstrap=PATH` | `WEB_SERVER_BOOTSTRAP` | | absolute or relative path of the control/data bootstrap file. Names the pin and the join-token file; the token secret is not a flag or a variable. See [Control-plane service](../operations/control-plane-service.md) |
+| `--bind-content=BOOL` | `WEB_SERVER_BIND_CONTENT` | on, except control | bind the content port. Control leaves it unbound unless this is true or `server.bind_content` is true |
 
 
 Defaults, then the config file, then arguments, then environment variables.
+The role is the exception: `--role`, then `WEB_SERVER_ROLE`, then `node.mode`.
 A bad value in the file is an error (exit 64). Invalid values of the server flags
 above are still replaced by the default with a `WARN:` line; unknown options warn too.
 Exit codes: 0 = normal / `--help`, 1 = cannot listen on the port (also: already running,

@@ -35,21 +35,42 @@ public final class ServiceLaunch {
     }
 
     public static ServiceHooks prepare(Path bootstrapFile, String expectedRole) throws IOException {
-        return new Hooks(Bootstrap.load(bootstrapFile, expectedRole));
+        return prepare(bootstrapFile, expectedRole, -1L);
+    }
+
+    public static ServiceHooks prepare(Path bootstrapFile, String expectedRole, long drainBudgetMs) throws IOException {
+        return new Hooks(Bootstrap.load(bootstrapFile, expectedRole), drainBudgetMs);
     }
 
     private static final class Hooks implements ServiceHooks {
         private final Bootstrap bootstrap;
+        private final long drainBudgetMs;
         private NodeEnrollment enrollment;
 
-        private Hooks(Bootstrap bootstrap) {
+        private Hooks(Bootstrap bootstrap, long drainBudgetMs) {
             this.bootstrap = bootstrap;
+            this.drainBudgetMs = drainBudgetMs;
         }
 
         @Override
         public void onListening(SjwsServer server, Path pidFile, Duration shutdownTimeout) throws IOException {
-            long budget = Sjws_nettask.drainBudgetMillis(server, shutdownTimeout);
+            long budget = Sjws_nettask.drainBudgetMillis(this.drainBudgetMs);
             this.enrollment = NodeEnrollment.open(this.bootstrap, pidFile, budget);
+            server.setLocalReload(this::reloadLocal);
+        }
+
+        @Override
+        public String nodeMode() {
+            return this.bootstrap.role().wire();
+        }
+
+        private void reloadLocal() {
+            try {
+                var fresh = Bootstrap.load(this.bootstrap.source(), this.bootstrap.role().wire());
+                this.enrollment.adoptLocal(fresh);
+            } catch (IOException e) {
+                throw new IllegalStateException("bootstrap reload failed");
+            }
         }
 
         @Override

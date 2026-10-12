@@ -155,6 +155,33 @@ public final class Bootstrap {
         return this.source;
     }
 
+    /**
+     * A copy that keeps this node's identity and join material and takes listen, peers, labels,
+     * contact, capabilities, and the pin from {@code fresh}. The fresh join secret is wiped.
+     * An identity change is refused; the caller must restart.
+     */
+    Bootstrap adoptLocal(Bootstrap fresh) {
+        try {
+            if (fresh.role != this.role || !this.nodeId.equals(fresh.nodeId)
+                    || !java.util.Objects.equals(this.dataRole, fresh.dataRole)) {
+                throw new IllegalStateException("bootstrap identity changed; restart to apply");
+            }
+            return new Bootstrap(this.role, this.dataRole, this.nodeId, fresh.controlPlane, fresh.listen, fresh.peers,
+                    fresh.capabilities, fresh.labels, fresh.pinFile, fresh.pin.clone(), this.stateDir, this.source,
+                    this.joinedBefore, this.join);
+        } finally {
+            if (fresh.join != null) {
+                fresh.join.wipeMemory();
+                fresh.join = null;
+            }
+            Arrays.fill(fresh.pin, (byte) 0);
+        }
+    }
+
+    void wipePin() {
+        Arrays.fill(this.pin, (byte) 0);
+    }
+
     /** True when {@code stateDir/node.id} already matched this node. The token file may still be absent. */
     public boolean joinedBefore() {
         return this.joinedBefore;

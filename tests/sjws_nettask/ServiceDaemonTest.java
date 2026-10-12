@@ -78,8 +78,12 @@ class ServiceDaemonTest {
 
         var env = Daemon.parse(new String[] {"--role=data", "--bootstrap=/from/args"},
                 Map.of("WEB_SERVER_ROLE", "control", "WEB_SERVER_BOOTSTRAP", "/from/env"));
-        assertEquals("control", env.role());
+        assertEquals("data", env.role());
+        assertEquals("data", env.cliRole());
+        assertEquals("control", env.envRole());
         assertEquals(Path.of("/from/env"), env.bootstrap());
+        assertTrue(env.childArgs().stream().anyMatch(a -> a.equals("--role=data")));
+        assertTrue(env.childArgs().stream().noneMatch(a -> a.contains("--role=control")));
 
         var missing = Daemon.parse(new String[] {"--role=data"}, Map.of());
         assertFalse(missing.ok());
@@ -108,11 +112,142 @@ class ServiceDaemonTest {
     }
 
     @Test
-    void stopWaitKeepsTheStandaloneBudgetAndCapsAHostileOne() {
-        assertEquals(15_000, Daemon.stopWaitMillis(Duration.ofSeconds(10), -1));
-        assertEquals(15_000, Daemon.stopWaitMillis(Duration.ofSeconds(10), 0));
-        assertEquals(55_000, Daemon.stopWaitMillis(Duration.ofSeconds(10), 50_000));
-        assertEquals(605_000, Daemon.stopWaitMillis(Duration.ofSeconds(10), 9_000_000));
+    void nodeModeFollowsTheFileUnlessTheFlagDiffers() throws Exception {
+        var html = Files.createDirectory(tmp.resolve("html"));
+        var yaml = tmp.resolve("node.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\nserver:\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+
+        var missingBootstrap = Daemon.parse(new String[] {"--config=" + yaml}, Map.of());
+        var refused = Sjws_nettask.roleChoice(missingBootstrap, loaded.document(), err);
+        assertFalse(refused.ok());
+        assertTrue(err().contains("node.mode=data requires --bootstrap"), err());
+
+        errBytes.reset();
+        var dataBoot = bootstrap(tmp, "data");
+        var fromFile = Daemon.parse(
+                new String[] {"--config=" + yaml, "--bootstrap=" + dataBoot, "--pid-file=" + tmp.resolve("a.pid")},
+                Map.of());
+        var taken = Sjws_nettask.roleChoice(fromFile, loaded.document(), err);
+        assertTrue(taken.ok(), err());
+        assertEquals("data", taken.expectedRole());
+        assertFalse(err().contains("overrides"), err());
+
+        errBytes.reset();
+        Files.createDirectories(tmp.resolve("cp"));
+        var controlBoot = bootstrap(tmp.resolve("cp"), "control");
+        var flagged = Daemon.parse(new String[] {"--role=control", "--config=" + yaml, "--bootstrap=" + controlBoot},
+                Map.of());
+        var overridden = Sjws_nettask.roleChoice(flagged, loaded.document(), err);
+        assertTrue(overridden.ok(), err());
+        assertEquals("control", overridden.expectedRole());
+        assertTrue(err().contains("--role=control overrides node.mode=data"), err());
+
+        errBytes.reset();
+        var matched = Daemon.parse(new String[] {"--role=data", "--config=" + yaml, "--bootstrap=" + dataBoot},
+                Map.of());
+        var same = Sjws_nettask.roleChoice(matched, loaded.document(), err);
+        assertEquals("data", same.expectedRole());
+        assertFalse(err().contains("overrides"), err());
+
+        errBytes.reset();
+        var env = Daemon.parse(new String[] {"--role=data", "--config=" + yaml, "--bootstrap=" + controlBoot},
+                Map.of("WEB_SERVER_ROLE", "control"));
+        assertEquals("data", env.role());
+        var fromEnv = Sjws_nettask.roleChoice(env, loaded.document(), err);
+        assertEquals("data", fromEnv.expectedRole());
+        assertTrue(err().contains("--role=data overrides WEB_SERVER_ROLE=control"), err());
+        assertFalse(err().contains("overrides node.mode"), err());
+
+        errBytes.reset();
+        var onlyEnv = Daemon.parse(new String[] {"--config=" + yaml, "--bootstrap=" + controlBoot},
+                Map.of("WEB_SERVER_ROLE", "control"));
+        assertEquals("control", onlyEnv.role());
+        assertNull(onlyEnv.cliRole());
+        var envOverFile = Sjws_nettask.roleChoice(onlyEnv, loaded.document(), err);
+        assertEquals("control", envOverFile.expectedRole());
+        assertTrue(err().contains("WEB_SERVER_ROLE=control overrides node.mode=data"), err());
+
+        errBytes.reset();
+        var bothData = Daemon.parse(new String[] {"--role=data", "--config=" + yaml, "--bootstrap=" + dataBoot},
+                Map.of("WEB_SERVER_ROLE", "data"));
+        var sameSource = Sjws_nettask.roleChoice(bothData, loaded.document(), err);
+        assertEquals("data", sameSource.expectedRole());
+        assertFalse(err().contains("overrides WEB_SERVER_ROLE"), err());
+
+        errBytes.reset();
+        var standaloneFile = tmp.resolve("alone.yaml");
+        Files.writeString(standaloneFile, "schema: 1\nnode:\n  mode: standalone\nserver:\n  root: "
+                + html.toAbsolutePath() + "\n");
+        var alone = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + standaloneFile}, Map.of());
+        var combined = Daemon.parse(new String[] {"--config=" + standaloneFile, "--bootstrap=" + dataBoot}, Map.of());
+        var rejected = Sjws_nettask.roleChoice(combined, alone.document(), err);
+        assertFalse(rejected.ok());
+        assertTrue(err().contains("node.mode=standalone cannot be combined"), err());
+
+        errBytes.reset();
+        var noFile = Daemon.parse(new String[] {"--bootstrap=" + dataBoot}, Map.of());
+        var deferred = Sjws_nettask.roleChoice(noFile,
+                sjws_nettask.config.ConfigLoader.load(noFile.remaining(), Map.of()).document(), err);
+        assertTrue(deferred.ok(), err());
+        assertNull(deferred.expectedRole());
+
+        errBytes.reset();
+        var plain = Daemon.parse(new String[] {html.toString()}, Map.of());
+        var untouched = Sjws_nettask.roleChoice(plain,
+                sjws_nettask.config.ConfigLoader.load(plain.remaining(), Map.of()).document(), err);
+        assertTrue(untouched.ok());
+        assertNull(untouched.expectedRole());
+        assertEquals("", err());
+
+        errBytes.reset();
+        var down = Daemon.parse(new String[] {"--role=standalone", "--config=" + yaml}, Map.of());
+        var forced = Sjws_nettask.roleChoice(down, loaded.document(), err);
+        assertTrue(forced.ok(), err());
+        assertNull(forced.expectedRole());
+        assertEquals("standalone", forced.processMode());
+        assertTrue(err().contains("overrides node.mode=data"), err());
+    }
+
+    @Test
+    void aConfigFileSuppliesDataAndTheFlagCanOverrideIt() throws Exception {
+        var html = Files.createDirectory(tmp.resolve("www"));
+        Files.writeString(html.resolve("hello.txt"), "hello");
+        var yaml = tmp.resolve("data.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\nserver:\n  root: " + html.toAbsolutePath() + "\n");
+        var boot = bootstrap(tmp, "data");
+        var pid = tmp.resolve("from-file.pid");
+        int code = Sjws_nettask.run(new String[] {"--config=" + yaml, "--bootstrap=" + boot, "--pid-file=" + pid,
+                "--shutdown-timeout=2", Integer.toString(freePort()), html.toString()}, Map.of(), out, err, NO_H3,
+                SjwsServer::close);
+        assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
+        assertTrue(out().contains("role=data/gateway"), out());
+        assertFalse(err().contains("overrides"), err());
+
+        outBytes.reset();
+        errBytes.reset();
+        Files.createDirectories(tmp.resolve("cp"));
+        var controlBoot = bootstrap(tmp.resolve("cp"), "control");
+        var pid2 = tmp.resolve("override.pid");
+        code = Sjws_nettask.run(new String[] {"--role=control", "--config=" + yaml, "--bootstrap=" + controlBoot,
+                "--pid-file=" + pid2, "--shutdown-timeout=2", Integer.toString(freePort()), html.toString()}, Map.of(),
+                out, err, NO_H3, SjwsServer::close);
+        assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
+        assertTrue(err().contains("--role=control overrides node.mode=data"), err());
+        assertTrue(out().contains("role=control "), out());
+        assertFalse(out().contains(SECRET), out());
+    }
+
+    @Test
+    void stopWaitUsesTheDrainBudgetPlusFiveSeconds() {
+        assertEquals(35_000, Daemon.stopWaitMillis(Duration.ofSeconds(10), -1));
+        assertEquals(5_000, Daemon.stopWaitMillis(Duration.ofSeconds(10), 0));
+        assertEquals(55_000, Daemon.stopWaitMillis(Duration.ofSeconds(600), 50_000));
+        assertEquals(605_000, Daemon.stopWaitMillis(Duration.ofSeconds(1), 9_000_000));
+        assertEquals(30_000L, Sjws_nettask.drainBudgetMillis(-1));
+        assertEquals(0L, Sjws_nettask.drainBudgetMillis(0));
+        assertEquals(600_000L, Sjws_nettask.drainBudgetMillis(9_000_000));
     }
 
     @Test
@@ -121,7 +256,7 @@ class ServiceDaemonTest {
         assertEquals("bootstrap failed", Sjws_nettask.safeMessage(" \n "));
         assertEquals("a b", Sjws_nettask.safeMessage("a\nb"));
         assertEquals(240, Sjws_nettask.safeMessage("x".repeat(400)).length());
-        assertEquals(-1, Sjws_nettask.drainBudgetMillis(null, Duration.ofSeconds(1)));
+        assertEquals(30_000L, Sjws_nettask.drainBudgetMillis(-5));
     }
 
     @Test
@@ -262,7 +397,6 @@ class ServiceDaemonTest {
                     }
                 }).build();
         try (var server = SjwsServer.start(ServerConfig.defaults(root).withPort(0), settings)) {
-            assertTrue(Sjws_nettask.drainBudgetMillis(server, Duration.ofSeconds(10)) > 15_000);
             var task = new Sjws_nettask.Shutdown(server, new AtomicReference<>(), out, err);
             task.markServing();
             task.run();
@@ -311,29 +445,19 @@ class ServiceDaemonTest {
                 .build();
         try (var server = SjwsServer.start(ServerConfig.defaults(root).withPort(0), settings)) {
             var pid = tmp.resolve("ha.pid");
-            Sjws_nettask.publishHaDrainBudget(server, null, Duration.ofSeconds(1));
-            Sjws_nettask.publishHaDrainBudget(server, pid, Duration.ofSeconds(10));
+            Sjws_nettask.publishHaDrainBudget(server, null, -1L);
+            Sjws_nettask.publishHaDrainBudget(server, pid, 40_000L);
             long me = ProcessHandle.current().pid();
             long started = ProcessHandle.current().info().startInstant().orElseThrow().toEpochMilli();
             assertEquals("", ServiceStatus.runningSuffix(pid, me, started));
-            assertTrue(ServiceStatus.drainBudget(pid, me, started) > 0);
+            assertEquals(40_000L, ServiceStatus.drainBudget(pid, me, started));
             var blocker = Files.writeString(tmp.resolve("not-a-dir"), "x");
-            Sjws_nettask.publishHaDrainBudget(server, blocker.resolve("x.pid"), Duration.ofSeconds(1));
+            Sjws_nettask.publishHaDrainBudget(server, blocker.resolve("x.pid"), 1_000L);
         }
         try (var plain = SjwsServer.start(ServerConfig.defaults(root).withPort(0))) {
-            assertEquals(-1, Sjws_nettask.drainBudgetMillis(plain, Duration.ofSeconds(1)));
-        }
-    }
-
-    @Test
-    void hugeDrainBudgetIsCapped() throws Exception {
-        var root = Files.createDirectory(tmp.resolve("html"));
-        var settings = HaSettings.builder()
-                .drainDelay(Duration.ofMillis(Long.MAX_VALUE / 2))
-                .drainTimeout(Duration.ofMillis(Long.MAX_VALUE / 2))
-                .build();
-        try (var server = SjwsServer.start(ServerConfig.defaults(root).withPort(0), settings)) {
-            assertEquals(600_000L, Sjws_nettask.drainBudgetMillis(server, Duration.ofSeconds(10)));
+            var pid = tmp.resolve("plain.pid");
+            Sjws_nettask.publishHaDrainBudget(plain, pid, 50_000L);
+            assertFalse(Files.exists(ServiceStatus.beside(pid)));
         }
     }
 
@@ -389,23 +513,244 @@ class ServiceDaemonTest {
             assertTrue(unit.contains("--bootstrap="), unit);
             assertTrue(unit.contains("-XX:-HeapDumpOnOutOfMemoryError"), unit);
             assertTrue(unit.contains("LimitCORE=0"), unit);
-            assertTrue(unit.contains("TimeoutStopSec=90"), unit);
+            assertTrue(unit.contains("TimeoutStopSec=45"), unit);
             assertTrue(unit.contains("UMask=0077"), unit);
-            assertFalse(hasDirective(unit, "ExecReload"), unit);
+            assertTrue(hasDirective(unit, "ExecReload=/bin/kill -HUP $MAINPID"), unit);
             assertFalse(hasDirective(unit, "Requires="), unit);
             assertFalse(hasDirective(unit, "secret="), unit);
             assertFalse(unit.contains(SECRET), unit);
         }
         assertTrue(control.contains("--role=control"), control);
         assertTrue(data.contains("--role=data"), data);
+        assertTrue(control.contains("--config=/etc/sjws_nettask/control-%i/sjws_nettask-control.yaml"), control);
+        assertTrue(data.contains("--config=/etc/sjws_nettask/data-%i/sjws_nettask-data.yaml"), data);
+        assertTrue(standalone.contains("--config=/etc/sjws_nettask/sjws_nettask-standalone.yaml"), standalone);
         assertTrue(dropIn.contains("After=sjws_nettask-control@1.service"), dropIn);
         assertFalse(dropIn.contains("Requires="), dropIn);
         assertFalse(standalone.contains("--role="), standalone);
         assertFalse(standalone.contains("HeapDumpOnOutOfMemoryError"), standalone);
+        assertTrue(standalone.contains("TimeoutStopSec=45"), standalone);
+        assertTrue(hasDirective(standalone, "ExecReload=/bin/kill -HUP $MAINPID"), standalone);
+        assertFalse(control.lines().anyMatch(line -> !line.strip().startsWith("#") && line.contains("--bind-content")),
+                control);
         var doc = Files.readString(Path.of("docs/operations/control-plane-service.md"));
         assertTrue(doc.contains("Lifecycle.drain()"), doc);
         assertTrue(doc.contains("leaderReady"), doc);
         assertTrue(doc.contains("SIGHUP"), doc);
+        assertTrue(doc.contains("/readyz"), doc);
+        assertTrue(doc.contains("idempotent"), doc);
+    }
+
+    @Test
+    void drainBudgetAndContentPortFollowTheFlags() throws Exception {
+        var budget = Daemon.parse(new String[] {"--drain-budget=12", "--bind-content=false"},
+                Map.of("WEB_SERVER_DRAIN_BUDGET", "3", "WEB_SERVER_BIND_CONTENT", "true"));
+        assertEquals(3_000L, budget.drainBudgetMs());
+        assertEquals(Boolean.TRUE, budget.bindContent());
+        assertTrue(budget.bindFromEnv());
+        assertTrue(budget.childArgs().contains("--drain-budget=3"));
+        assertTrue(budget.childArgs().contains("--bind-content=true"));
+        var bare = Daemon.parse(new String[] {"--bind-content", "--drain-budget=4"}, Map.of());
+        assertEquals(Boolean.TRUE, bare.bindContent());
+        assertEquals(4_000L, bare.drainBudgetMs());
+        assertFalse(bare.bindFromEnv());
+        var invalid = Daemon.parse(new String[] {"--drain-budget=601", "--drain-budget=no"},
+                Map.of("WEB_SERVER_DRAIN_BUDGET", "x"));
+        assertEquals(-1L, invalid.drainBudgetMs());
+        assertTrue(invalid.warnings().size() >= 2, invalid.warnings().toString());
+        var kept = Daemon.parse(new String[] {"--drain-budget=4"}, Map.of("WEB_SERVER_DRAIN_BUDGET", "nope"));
+        assertEquals(4_000L, kept.drainBudgetMs());
+
+        var html = Files.createDirectory(tmp.resolve("bind-html"));
+        Files.writeString(html.resolve("index.html"), "hi");
+        var controlBoot = bootstrap(tmp, "control");
+        var yaml = tmp.resolve("bind.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: control\nserver:\n  bind_content: false\n  root: "
+                + html.toAbsolutePath() + "\n");
+        var loaded = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertEquals(Boolean.FALSE, loaded.yamlBindContent());
+        var implicit = Daemon.parse(new String[] {"--config=" + yaml}, Map.of());
+        errBytes.reset();
+        assertFalse(Sjws_nettask.resolveBind(implicit, loaded, err));
+        assertEquals("", err());
+        var opted = Daemon.parse(new String[] {"--bind-content=true"}, Map.of());
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(opted, loaded, err));
+        assertTrue(err().contains("--bind-content=true overrides the control"), err());
+        var fromEnv = Daemon.parse(new String[] {}, Map.of("WEB_SERVER_BIND_CONTENT", "true"));
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(fromEnv, loaded, err));
+        assertTrue(err().contains("WEB_SERVER_BIND_CONTENT=true"), err());
+        var dataYaml = tmp.resolve("bind-data.yaml");
+        Files.writeString(dataYaml, "schema: 1\nnode:\n  mode: data\nserver:\n  bind_content: false\n  root: "
+                + html.toAbsolutePath() + "\n");
+        var dataLoaded = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + dataYaml}, Map.of());
+        errBytes.reset();
+        assertFalse(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), dataLoaded, err));
+        assertTrue(err().contains("server.bind_content=false overrides the data"), err());
+        var matched = Daemon.parse(new String[] {"--bind-content=true"}, Map.of());
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(matched, dataLoaded, err));
+        assertEquals("", err());
+
+        ServiceHooks nameless = new ServiceHooks() {
+            @Override
+            public void onListening(SjwsServer server, Path pidFile, java.time.Duration shutdownTimeout) {
+            }
+
+            @Override
+            public void onShutdown() {
+            }
+
+            @Override
+            public String startupLine() {
+                return null;
+            }
+        };
+        assertNull(nameless.nodeMode());
+        var plain = sjws_nettask.config.ConfigLoader.load(new String[] {html.toString()}, Map.of());
+        var noRole = Sjws_nettask.roleChoice(Daemon.parse(new String[] {html.toString()}, Map.of()), plain.document(),
+                err);
+        assertSame(plain, Sjws_nettask.applyProcessMode(plain, noRole, null));
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), plain, err));
+        assertEquals("", err());
+        var asData = Sjws_nettask.applyProcessMode(plain, noRole, new ServiceHooks() {
+            @Override
+            public void onListening(SjwsServer server, Path pidFile, java.time.Duration shutdownTimeout) {
+            }
+
+            @Override
+            public void onShutdown() {
+            }
+
+            @Override
+            public String startupLine() {
+                return null;
+            }
+
+            @Override
+            public String nodeMode() {
+                return "data";
+            }
+        });
+        assertEquals(sjws_nettask.config.NodeSettings.Mode.DATA, asData.document().node().mode());
+        Files.createDirectories(tmp.resolve("already"));
+        var already = Sjws_nettask.roleChoice(
+                Daemon.parse(new String[] {"--role=data", "--bootstrap=" + bootstrap(tmp.resolve("already"), "data")},
+                        Map.of()),
+                asData.document(), err);
+        assertSame(asData, Sjws_nettask.applyProcessMode(asData, already, null));
+
+        var pid = tmp.resolve("nobind.pid");
+        int code = Sjws_nettask.run(new String[] {"--role=control", "--bootstrap=" + controlBoot, "--pid-file=" + pid,
+                "--shutdown-timeout=1", "9", html.toString()}, Map.of(), out, err, NO_H3, server -> {
+                    assertEquals(-1, server.tcpPort());
+                    assertEquals("content port not bound", server.describe());
+                    server.shutdownTimeout(Duration.ofSeconds(1));
+                    server.close();
+                });
+        assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
+        assertTrue(out().contains("content port not bound"), out());
+
+        outBytes.reset();
+        errBytes.reset();
+        var pid2 = tmp.resolve("bind.pid");
+        code = Sjws_nettask.run(new String[] {"--role=control", "--bind-content", "--bootstrap=" + controlBoot,
+                "--pid-file=" + pid2, "--shutdown-timeout=1", Integer.toString(freePort()), html.toString()}, Map.of(),
+                out, err, NO_H3, server -> {
+                    assertTrue(server.tcpPort() > 0);
+                    server.close();
+                });
+        assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
+
+        outBytes.reset();
+        errBytes.reset();
+        code = Sjws_nettask.run(new String[] {"--shutdown-timeout=1", Integer.toString(freePort()), html.toString()},
+                Map.of(Daemon.CHILD_ENV, "1"), out, err, NO_H3, SjwsServer::close);
+        assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
+    }
+
+    @Test
+    void dataReloadKeepsPushedConfigAndRefreshesTheBootstrap() throws Exception {
+        var one = Files.createDirectory(tmp.resolve("one"));
+        var two = Files.createDirectory(tmp.resolve("two"));
+        var three = Files.createDirectory(tmp.resolve("three"));
+        Files.writeString(one.resolve("hello.txt"), "one");
+        Files.writeString(two.resolve("hello.txt"), "two");
+        Files.writeString(three.resolve("hello.txt"), "three");
+        var yaml = tmp.resolve("live.yaml");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
+                + one.toAbsolutePath() + "\n");
+        var boot = bootstrap(tmp, "data");
+        var pid = tmp.resolve("live.pid");
+        int code = Sjws_nettask.run(new String[] {"--config=" + yaml, "--role=data", "--bootstrap=" + boot,
+                "--pid-file=" + pid, "--shutdown-timeout=1"}, Map.of(), out, err, NO_H3, server -> {
+                    try {
+                        Files.writeString(yaml, "schema: 1\nversion: 2\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
+                                + two.toAbsolutePath() + "\n");
+                        var local = server.reload();
+                        assertTrue(local.applied(), local.errors().toString());
+                        assertEquals(two.toAbsolutePath(), server.config().root());
+                        var base = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of())
+                                .document();
+                        var pushed = sjws_nettask.config.ConfigDocument.of(
+                                base.server().toBuilder().root(three).build(), base.acme(), base.routing(),
+                                base.middleware(), base.access(), base.node(), 1, 3, null, null);
+                        var applied = server.applyRemote(pushed);
+                        assertTrue(applied.applied(), applied.errors().toString());
+                        assertEquals(three.toAbsolutePath(), server.config().root());
+                        Files.writeString(yaml, "schema: 1\nversion: 4\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
+                                + one.toAbsolutePath() + "\n");
+                        Files.writeString(boot, Files.readString(boot) + "listen=127.0.0.1:9\n");
+                        Files.setPosixFilePermissions(boot, PosixFilePermissions.fromString("rw-------"));
+                        var kept = server.reload();
+                        assertFalse(kept.applied());
+                        assertTrue(kept.warnings().toString().contains("reloaded local bootstrap"), kept.warnings().toString());
+                        assertEquals(three.toAbsolutePath(), server.config().root());
+                        assertEquals("127.0.0.1:9", NodeEnrollment.current().bootstrap().listen());
+                        var text = Files.readString(boot).replace("node-id=gw-1", "node-id=other");
+                        Files.writeString(boot, text);
+                        Files.setPosixFilePermissions(boot, PosixFilePermissions.fromString("rw-------"));
+                        var rejected = server.reload();
+                        assertTrue(rejected.warnings().toString().contains("failed"), rejected.warnings().toString());
+                        assertEquals(three.toAbsolutePath(), server.config().root());
+                        Files.delete(boot);
+                        var missing = server.reload();
+                        assertTrue(missing.warnings().toString().contains("failed"), missing.warnings().toString());
+                        var enrollment = NodeEnrollment.current();
+                        enrollment.close();
+                        var again = bootstrap(tmp, "data");
+                        var fresh = Bootstrap.load(again, "data");
+                        assertThrows(IllegalStateException.class, () -> enrollment.adoptLocal(fresh));
+                        assertThrows(IllegalArgumentException.class, () -> enrollment.adoptLocal(null));
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    } finally {
+                        server.close();
+                    }
+                });
+        assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
+
+        var direct = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        try (var server = SjwsServer.start(direct, NO_H3)) {
+            var doc = direct.document();
+            var pushed = sjws_nettask.config.ConfigDocument.of(doc.server().toBuilder().root(three).build(), doc.acme(),
+                    doc.routing(), doc.middleware(), doc.access(), doc.node(), 1, 5, null, null);
+            assertTrue(server.applyRemote(pushed).applied());
+            var kept = server.reload();
+            assertTrue(kept.warnings().toString().contains("no local bootstrap"), kept.warnings().toString());
+            assertEquals(three.toAbsolutePath(), server.config().root());
+            server.setLocalReload(() -> {
+                throw new IllegalStateException("x");
+            });
+            assertTrue(server.reload().warnings().toString().contains("failed"));
+            var seen = new AtomicInteger();
+            server.setLocalReload(seen::incrementAndGet);
+            assertTrue(server.reload().warnings().toString().contains("reloaded local bootstrap"));
+            assertEquals(1, seen.get());
+            assertEquals(three.toAbsolutePath(), server.config().root());
+        }
     }
 
     @Test
@@ -436,6 +781,21 @@ class ServiceDaemonTest {
             assertFalse(status.contains(SECRET), status);
             assertFalse(Files.readString(log).contains(SECRET));
             long child = Long.parseLong(status.replaceAll("(?s).*pid=([0-9]+).*", "$1"));
+            if (Files.isExecutable(Path.of("/usr/bin/setsid"))) {
+                var ps = new ProcessBuilder("ps", "-o", "sid=", "-p", Long.toString(child)).start();
+                String sid = new String(ps.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                assertEquals(0, ps.waitFor());
+                assertEquals(Long.toString(child), sid, "detached session survives terminal hangup");
+            }
+            boolean hangupIgnored = sighupIgnored();
+            var kill = new ProcessBuilder("kill", "-HUP", Long.toString(child)).start();
+            assertEquals(0, kill.waitFor());
+            Thread.sleep(300);
+            assertTrue(ProcessHandle.of(child).orElseThrow().isAlive(), "SIGHUP must not kill the child");
+            if (!hangupIgnored) {
+                var logged = Files.readString(log);
+                assertTrue(logged.contains("no config file") || logged.contains("reload"), logged);
+            }
             var cmdline = Files.readString(Path.of("/proc", Long.toString(child), "cmdline"),
                     StandardCharsets.ISO_8859_1);
             assertFalse(cmdline.contains(SECRET), "secret on the command line");
@@ -449,6 +809,21 @@ class ServiceDaemonTest {
         } finally {
             Daemon.stop(pid, Duration.ofSeconds(2), out, err);
         }
+    }
+
+    /** SIGHUP is signal 1, the least significant bit of SigIgn. */
+    private static boolean sighupIgnored() throws Exception {
+        var status = Path.of("/proc/self/status");
+        if (!Files.isRegularFile(status)) {
+            return false;
+        }
+        for (var line : Files.readAllLines(status)) {
+            if (line.startsWith("SigIgn:")) {
+                var hex = line.substring("SigIgn:".length()).trim();
+                return new java.math.BigInteger(hex, 16).testBit(0);
+            }
+        }
+        return false;
     }
 
     /** A systemd assignment, ignoring comments that name a directive we refuse to set. */

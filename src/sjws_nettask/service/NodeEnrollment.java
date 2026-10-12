@@ -33,7 +33,7 @@ public final class NodeEnrollment {
     private static final ReentrantLock OPEN = new ReentrantLock();
 
     private final ReentrantLock lock = new ReentrantLock();
-    private final Bootstrap bootstrap;
+    private Bootstrap bootstrap;
     private final Path pidFile;
     private final long pid;
     private final long startedMillis;
@@ -73,6 +73,28 @@ public final class NodeEnrollment {
 
     public Bootstrap bootstrap() {
         return this.bootstrap;
+    }
+
+    /**
+     * Replaces listen, peers, labels, contact, and the pin from a re-read bootstrap file.
+     * Identity (role, data-role, node id) must match. The join token already held is kept.
+     * Does not change the config snapshot and does not drain.
+     */
+    public void adoptLocal(Bootstrap fresh) {
+        if (fresh == null) {
+            throw new IllegalArgumentException("fresh");
+        }
+        this.lock.lock();
+        try {
+            if (this.closed) {
+                throw new IllegalStateException("enrollment is closed");
+            }
+            var previous = this.bootstrap;
+            this.bootstrap = previous.adoptLocal(fresh);
+            previous.wipePin();
+        } finally {
+            this.lock.unlock();
+        }
     }
 
     public ControlPlaneBinding binding() {

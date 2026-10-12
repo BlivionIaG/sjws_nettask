@@ -58,7 +58,7 @@ public final class ConfigLoader {
     /** A server started from a {@link ServerConfig} alone (no file, so reload has nothing to read). */
     public static Loaded standalone(ServerConfig config) {
         return new Loaded(ConfigDocument.defaults(config), List.of(), List.of(), false, new String[0], Map.of(),
-                ServerConfig::readPasswordFile);
+                ServerConfig::readPasswordFile, null);
     }
 
     public static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
@@ -66,13 +66,13 @@ public final class ConfigLoader {
         var environment = Map.copyOf(env);
         for (var arg : arguments) {
             if (arg.equals("-h") || arg.equals("--help")) {
-                return new Loaded(null, List.of(), List.of(), true, arguments, environment, passwords);
+                return new Loaded(null, List.of(), List.of(), true, arguments, environment, passwords, null);
             }
         }
         try {
             return loadFile(arguments, environment, passwords);
         } catch (ConfigException e) {
-            return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords);
+            return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords, null);
         }
     }
 
@@ -106,6 +106,7 @@ public final class ConfigLoader {
         NodeSettings node = NodeSettings.STANDALONE;
         int schemaVersion = ConfigDocument.SCHEMA;
         long bundleVersion = 0;
+        Boolean yamlBind = null;
         if (configured != null) {
             var requested = Path.of(configured);
             configFile = requested;
@@ -136,7 +137,9 @@ public final class ConfigLoader {
             bundleVersion = versionOf(root);
             node = nodeSection(root);
             var base = configFile.toAbsolutePath().getParent();
-            baseline = serverSection(root, base);
+            var bindHolder = new Boolean[1];
+            baseline = serverSection(root, base, bindHolder);
+            yamlBind = bindHolder[0];
             yamlPassword = tlsPassword(root, base);
             acme = acmeSection(root, base);
             routing = routingSection(root, warnings);
@@ -148,7 +151,7 @@ public final class ConfigLoader {
                 : ServerConfig.parse(args, env, baseline, passwords);
         warnings.addAll(parsed.warnings());
         if (!parsed.ok()) {
-            return new Loaded(null, warnings, parsed.errors(), parsed.helpRequested(), args, env, passwords);
+            return new Loaded(null, warnings, parsed.errors(), parsed.helpRequested(), args, env, passwords, null);
         }
         var server = applyYamlPassword(parsed.config(), yamlPassword, args, env, passwords, warnings);
         acme = overlayAcme(acme, args, env, configFile);
@@ -160,7 +163,7 @@ public final class ConfigLoader {
         }
         var document = ConfigDocument.of(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion,
                 configFile, contentHash);
-        return new Loaded(document, warnings, List.of(), false, args, env, passwords);
+        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind);
     }
 
     private static int schemaOf(Map<String, Object> root) {
@@ -244,13 +247,16 @@ public final class ConfigLoader {
         }
     }
 
-    private static ServerConfig serverSection(Map<String, Object> root, Path base) {
+    private static ServerConfig serverSection(Map<String, Object> root, Path base, Boolean[] bindContent) {
         var builder = ServerConfig.builder(Path.of(sjws_nettask.CONSTANTS.DEFAULT_HTML_PATH));
         if (root.get("server") instanceof Object server) {
             var map = YamlValues.mapping(server, "server");
             YamlValues.knownKeys(map, List.of("port", "root", "max_connections", "max_connections_per_ip", "backlog",
                     "idle_timeout", "header_timeout", "write_timeout", "cache_bytes", "allow_unlistable_dirs",
-                    "access_log"), "server");
+                    "access_log", "bind_content"), "server");
+            if (map.containsKey("bind_content")) {
+                bindContent[0] = bool(map.get("bind_content"), "server.bind_content");
+            }
             if (map.containsKey("port")) {
                 builder.port(integer(map.get("port"), "server.port", 0, 65535));
             }
@@ -1075,9 +1081,12 @@ public final class ConfigLoader {
         private final String[] args;
         private final Map<String, String> env;
         private final ServerConfig.PasswordFileReader passwords;
+        /** {@code server.bind_content} from the file, or null when the key was omitted. */
+        private final Boolean yamlBindContent;
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
-                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent) {
             this.document = document;
             this.warnings = List.copyOf(warnings);
             this.errors = List.copyOf(errors);
@@ -1085,6 +1094,18 @@ public final class ConfigLoader {
             this.args = args.clone();
             this.env = Map.copyOf(env);
             this.passwords = passwords;
+            this.yamlBindContent = yamlBindContent;
+        }
+
+        /** Same load, with the document replaced. The file's {@code bind_content} is kept. */
+        public Loaded withDocument(ConfigDocument document) {
+            return new Loaded(document, this.warnings, this.errors, this.helpRequested, this.args, this.env,
+                    this.passwords, this.yamlBindContent);
+        }
+
+        /** {@code server.bind_content}, or null when the file did not set it. Not part of the canonical document. */
+        public Boolean yamlBindContent() {
+            return this.yamlBindContent;
         }
 
         public boolean ok() {

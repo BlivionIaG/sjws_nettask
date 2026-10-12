@@ -23,13 +23,14 @@ import java.nio.file.Path;
 
 /**
  * Sidecar of the pid file ({@code name.pid.status}). It carries the role, the control-plane
- * connection, the applied config version, and how long {@code --stop} should wait for
- * {@code Lifecycle.drain()}. A file whose pid or start time does not match the pid file is ignored,
+ * connection, the applied config version, and the authoritative {@code drain-ms} budget
+ * {@code --stop} waits for. A pending or disconnected connection is not a drain: this class never
+ * stops the process. A file whose pid or start time does not match the pid file is ignored,
  * so a recycled pid cannot inherit another node's version.
  */
 public final class ServiceStatus {
 
-    /** No HA drain budget; {@code --stop} keeps today's shutdown-timeout plus margin. */
+    /** No recorded budget; {@code --stop} uses the 30s default plus the 5s margin. */
     public static final long NO_BUDGET = -1L;
     /** A corrupt or hostile budget cannot make {@code --stop} wait longer than this. */
     public static final long MAX_BUDGET_MS = 600_000L;
