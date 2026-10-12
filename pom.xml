@@ -212,6 +212,14 @@
               </rule>
               <rule>
                 <element>PACKAGE</element>
+                <includes><include>sjws_nettask.admin.cp</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.95</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
                 <includes><include>sjws_nettask.admin</include></includes>
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.95</minimum></limit>

@@ -16,6 +16,7 @@ Back to the [README](../README.md) (quick start).
 - [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API
 - [Running in the background (daemon)](operations/daemon.md)
 - [Admin console (TUI)](operations/admin-console.md)
+- [Control-plane console (mockup)](operations/cp-console.md)
 - [Releasing](operations/releasing.md)
 
 ## Design
