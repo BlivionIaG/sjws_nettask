@@ -107,6 +107,7 @@ class SjwsServerHttp3Test {
     @Test
     void altSvcAdvertisesTheRealUdpPortAndHttp3MatchesHttp1() throws Exception {
         this.server = SjwsServer.start(config().build());
+        this.server.armMetrics(); // the gauge lambda must run on the recording registry, with h3 up
         assertNull(this.server.h3Failure());
         int udp = this.server.udpPort();
         assertTrue(udp > 0);
@@ -114,6 +115,7 @@ class SjwsServerHttp3Test {
         var tcp = this.server.tcpPort();
         var h1 = HttpTestSupport.get(tcp, "/hello.txt", 4000);
         assertEquals(expected, h1.headers().get("alt-svc"));
+        assertTrue(this.server.metrics().snapshot().requests() >= 1);
         assertEquals(expected, HttpTestSupport.get(tcp, "/missing", 4000).headers().get("alt-svc"));
         assertEquals(expected, HttpTestSupport.rawRequest(tcp,
                 "HEAD /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n", 4000).headers().get("alt-svc"));
