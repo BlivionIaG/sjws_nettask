@@ -168,7 +168,7 @@ public final class SafeOpen {
             }
             top.close();
         }
-        return openFallback(file);
+        return openFallback(file, true);
     }
 
     private static FileChannel openSecure(SecureDirectoryStream<Path> top, Path relative, Body.FileBody file)
@@ -227,11 +227,18 @@ public final class SafeOpen {
         if (!file.allowUnlistable()) {
             throw denied;
         }
-        return openFallback(file);
+        return openFallback(file, false);
     }
 
-    private static FileChannel openFallback(Body.FileBody file) throws IOException {
+    /**
+     * @param checkDirs whether to apply the search-only rule (V3/V7) here: secure mode refuses such
+     *        directories when it tries to open them, the fallback (macOS, Windows) must check them itself
+     */
+    private static FileChannel openFallback(Body.FileBody file, boolean checkDirs) throws IOException {
         var path = file.realPath();
+        if (checkDirs && !file.allowUnlistable()) {
+            requireListableDirs(file);
+        }
         // lstat first: never open() a FIFO/device/socket (it may block) or a symlink
         check(Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS), file);
         FileChannel channel;
@@ -253,6 +260,19 @@ public final class SafeOpen {
         } catch (IOException | RuntimeException e) {
             channel.close();
             throw e;
+        }
+    }
+
+    /**
+     * Same answer as secure mode below a directory the server can't read (mode {@code --x}): 403,
+     * whatever the platform, unless {@code --allow-unlistable-dirs}.
+     */
+    private static void requireListableDirs(Body.FileBody file) throws AccessDeniedException {
+        var root = file.root();
+        for (var d = file.realPath().getParent(); d != null && d.startsWith(root); d = d.getParent()) {
+            if (!Files.isReadable(d)) { // access(2) R_OK, like opendir(3) in secure mode
+                throw new AccessDeniedException(d.toString(), null, "directory not readable (search-only)");
+            }
         }
     }
 
