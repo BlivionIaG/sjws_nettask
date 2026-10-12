@@ -91,7 +91,8 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
             var request = toRequest(headers);
             String referer = "-";
             String userAgent = "-";
-            if (this.shared.observer().logHeaders()) {
+            var obs = this.shared.observer();
+            if (obs != RequestObserver.NONE && obs.logHeaders()) {
                 referer = dash(first(headers, "referer"));
                 userAgent = dash(first(headers, "user-agent"));
             }
@@ -155,10 +156,12 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         stream.shutdown(Http3ErrorCode.H3_REQUEST_REJECTED.code());
     }
 
-    private Response respond(Request request) {
-        var special = this.shared.observer().intercept(request.method(), request.target(), this.connection.loopback);
-        if (special != null) {
-            return special;
+    private Response respond(Request request, RequestObserver obs) {
+        if (obs != RequestObserver.NONE && obs.intercepts()) {
+            var special = obs.intercept(request.method(), request.target(), this.connection.loopback);
+            if (special != null) {
+                return special;
+            }
         }
         try {
             return this.shared.handler().apply(request);
@@ -201,28 +204,31 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
             this.thread = Thread.currentThread();
             Http3Writer.Outcome outcome = Http3Writer.Outcome.FAILED;
             Response response = null;
-            long started = System.nanoTime();
+            var obs = Http3RequestHandler.this.shared.observer();
+            boolean record = obs != RequestObserver.NONE;
+            long started = 0;
+            if (record) {
+                started = System.nanoTime();
+            }
             try {
                 if (this.cancelled || !this.stream.isActive()) {
                     outcome = Http3Writer.Outcome.CLOSED;
                     return;
                 }
-                response = this.refusal != null ? this.refusal : respond(this.request);
+                response = this.refusal != null ? this.refusal : respond(this.request, obs);
                 outcome = new Http3Writer(this.stream, Http3RequestHandler.this.shared.limits(),
                         Http3RequestHandler.this.shared.serverFiles(), Http3RequestHandler.this.connection)
                         .write(response);
             } finally {
                 finish(outcome);
-                observe(response, outcome, started);
+                if (record && response != null) {
+                    observe(obs, response, outcome, started);
+                }
             }
         }
 
         /** After the write, so the duration includes it. A reset before a response is not a request. */
-        private void observe(Response response, Http3Writer.Outcome outcome, long started) {
-            var obs = Http3RequestHandler.this.shared.observer();
-            if (!obs.recording() || response == null) {
-                return;
-            }
+        private void observe(RequestObserver obs, Response response, Http3Writer.Outcome outcome, long started) {
             long nanos = System.nanoTime() - started;
             long bytes = outcome == Http3Writer.Outcome.COMPLETE && response.sendsBody()
                     ? Math.max(0L, response.contentLength()) : 0L;

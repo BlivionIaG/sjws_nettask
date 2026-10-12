@@ -74,9 +74,16 @@ public final class EmbeddedServerControl implements ServerControl {
                     : new ServerStatus(ServerStatus.State.FAILED, -1, -1, -1, Duration.ZERO, err, view);
         }
         var manager = s.clientManager();
+        String summary = s.describe();
+        try {
+            // First status read arms counters when the server was started with observability off.
+            summary = summary + ", requests " + s.metricsSnapshot().requests();
+        } catch (IOException e) {
+            this.log.add("metrics snapshot failed: " + e.getMessage());
+        }
         return new ServerStatus(ServerStatus.State.RUNNING, s.tcpPort(), s.udpPort(),
                 manager == null ? -1 : manager.activeConnections(),
-                Duration.between(this.startedAt, this.clock.instant()), s.describe(), view);
+                Duration.between(this.startedAt, this.clock.instant()), summary, view);
     }
 
     @Override

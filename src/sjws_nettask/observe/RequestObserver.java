@@ -24,13 +24,15 @@ import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 
 /**
- * Transport hook for access logging, in-process metrics and the {@code /healthz} and {@code /metrics}
- * responses.
+ * Transport hook for access logging, in-process metrics and the optional {@code /healthz} and
+ * {@code /metrics} responses.
  * <p>
  * There is no handler chain to decorate yet ({@link sjws_nettask.core.Handler} is only the seam).
- * Each transport calls {@link #intercept} before the application handler and {@link #complete} after
- * the response bytes have been written. A future chain can call those two methods from one decorator
- * and delete the calls at the transports; nothing else in this package has to move.
+ * Each transport reads an {@link ObserverSlot}. When that read is {@link #NONE} the transport does
+ * not call {@link System#nanoTime()}, does not update a counter, and does not inspect the path.
+ * Otherwise it calls {@link #intercept} before the application handler (only when {@link #intercepts()}
+ * is true) and {@link #complete} after the response bytes have been written. A future chain can make
+ * those two calls from one decorator; nothing else in this package has to move.
  * <p>
  * With access logging off, {@link #complete(int, int, long, long)} only touches striped counters.
  * Logging adds one line-{@code byte[]} and a lock-free enqueue. Neither path waits on I/O.
@@ -45,8 +47,13 @@ public final class RequestObserver implements AutoCloseable {
     public static final int PROTOCOL_COUNT = 5;
     public static final String[] PROTOCOL_NAMES = {"HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3", "other"};
 
-    /** No counters and no log. Tests and transports that were not given an observer use this. */
-    public static final RequestObserver NONE = new RequestObserver(new ServerMetrics(), null, MetricsExposure.OFF, false);
+    /**
+     * Observability off. Transports compare with {@code ==} and skip the hook: no clock read, no
+     * counter update, no {@code /healthz} or {@code /metrics} path check. A document-root file at
+     * those paths is served as on a build without this package.
+     */
+    public static final RequestObserver NONE = new RequestObserver(new ServerMetrics(), null, MetricsExposure.OFF, false,
+            false);
 
     private static final String HEALTH = "/healthz";
     private static final String METRICS = "/metrics";
@@ -62,12 +69,15 @@ public final class RequestObserver implements AutoCloseable {
     private final AccessLog log;
     private final MetricsExposure exposure;
     private final boolean recording;
+    private final boolean healthz;
 
-    private RequestObserver(ServerMetrics metrics, AccessLog log, MetricsExposure exposure, boolean recording) {
+    private RequestObserver(ServerMetrics metrics, AccessLog log, MetricsExposure exposure, boolean recording,
+            boolean healthz) {
         this.metrics = metrics;
         this.log = log;
         this.exposure = exposure;
         this.recording = recording;
+        this.healthz = healthz;
         if (log != null) {
             metrics.setDropped(log::dropped);
         }
@@ -76,7 +86,7 @@ public final class RequestObserver implements AutoCloseable {
     /** @throws java.io.IOException the access-log file cannot be opened */
     public static RequestObserver open(ServerConfig config) throws java.io.IOException {
         AccessLog log = config.accessLog() == null ? null : AccessLog.start(config.accessLog(), config.accessLogFormat());
-        return new RequestObserver(new ServerMetrics(), log, config.metricsExposure(), true);
+        return new RequestObserver(new ServerMetrics(), log, config.metricsExposure(), true, config.healthz());
     }
 
     public ServerMetrics metrics() {
@@ -99,9 +109,19 @@ public final class RequestObserver implements AutoCloseable {
     }
 
     /**
+     * @return true when {@link #intercept} might replace the handler. False for {@link #NONE} and for
+     *         a recording observer whose {@code /healthz} and {@code /metrics} are both off, so the
+     *         transport can skip the path check.
+     */
+    public boolean intercepts() {
+        return this.healthz || this.exposure != MetricsExposure.OFF;
+    }
+
+    /**
      * @return a response that replaces the application handler, or null to serve the request normally.
-     *         {@code /healthz} is always answered. {@code /metrics} is answered only when enabled, and
-     *         only to a loopback peer when the exposure is {@link MetricsExposure#LOCALHOST}.
+     *         {@code /healthz} is answered only when this observer was opened with the probe enabled.
+     *         {@code /metrics} is answered only when enabled, and only to a loopback peer when the
+     *         exposure is {@link MetricsExposure#LOCALHOST}.
      */
     public Response intercept(String method, String target, boolean loopback) {
         if (!this.recording || target.length() < HEALTH.length() || target.charAt(0) != '/') {
@@ -111,7 +131,7 @@ public final class RequestObserver implements AutoCloseable {
         if (second != 'h' && second != 'm') {
             return null;
         }
-        if (isExact(target, HEALTH)) {
+        if (this.healthz && isExact(target, HEALTH)) {
             if ("GET".equals(method)) {
                 return HEALTH_GET;
             }

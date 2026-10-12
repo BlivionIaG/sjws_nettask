@@ -38,6 +38,12 @@ public final class H3Transports {
                     sjws_nettask.observe.RequestObserver observer) {
                 return new sjws_nettask.h3.Http3Server(config, handler).withObserver(observer);
             }
+
+            @Override
+            public Transport create(ServerConfig config, sjws_nettask.core.StaticFileHandler handler,
+                    sjws_nettask.observe.ObserverSlot slot) {
+                return new sjws_nettask.h3.Http3Server(config, handler).withSlot(slot);
+            }
         };
     }
 }

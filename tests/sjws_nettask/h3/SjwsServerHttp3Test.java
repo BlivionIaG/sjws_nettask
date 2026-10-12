@@ -107,6 +107,7 @@ class SjwsServerHttp3Test {
     @Test
     void altSvcAdvertisesTheRealUdpPortAndHttp3MatchesHttp1() throws Exception {
         this.server = SjwsServer.start(config().build());
+        this.server.armMetrics(); // the gauge lambda must run on the recording registry, with h3 up
         assertNull(this.server.h3Failure());
         int udp = this.server.udpPort();
         assertTrue(udp > 0);

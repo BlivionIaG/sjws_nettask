@@ -49,7 +49,7 @@ class ObservabilityHttp3Test {
         var log = dir.resolve("h3.log");
         var config = ServerConfig.builder(dir).h3Enabled(true).h3Host("127.0.0.1").h3Port(0)
                 .accessLog(log.toString()).accessLogFormat(AccessLogFormat.COMBINED)
-                .metricsExposure(MetricsExposure.LOCALHOST).build();
+                .metricsExposure(MetricsExposure.LOCALHOST).healthz(true).build();
         var observer = RequestObserver.open(config);
         var tls = TlsMaterial.selfSigned("localhost");
         var server = new Http3Server(config, new StaticFileHandler(dir), tls).withObserver(observer).start();
