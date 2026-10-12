@@ -132,4 +132,27 @@ class Http1WriterSingleWriteTest {
         Http1Writer.write(out, r, true, ResponseHeaders.of());
         assertTrue(out.toString(StandardCharsets.ISO_8859_1).endsWith("\r\n\r\nfile-body"));
     }
+
+    @Test
+    void emptyBodyWith200IsOneWriteWithZeroLength() throws IOException {
+        var sink = new Recording();
+        Http1Writer.write(new BufferedOutputStream(sink, 64 * 1024),
+                new Response(200, ResponseHeaders.of(), Body.Empty.INSTANCE), true, ResponseHeaders.of());
+        assertEquals(1, sink.writes.size());
+        var s = sink.data.toString(StandardCharsets.ISO_8859_1);
+        assertTrue(s.contains("\r\nContent-Length: 0\r\n") && s.endsWith("\r\n\r\n"), s);
+    }
+
+    @Test
+    void namesOutsideTheTableAreTitleCased() throws IOException {
+        assertEquals("X-Custom-Name", Http1Writer.canonicalName("x-custom-name"));
+        assertEquals("Content-Type", Http1Writer.canonicalName("content-type"));
+        assertEquals("ETag", Http1Writer.canonicalName("etag"));
+        assertEquals("A", Http1Writer.canonicalName("a"));
+        assertEquals("X--Y", Http1Writer.canonicalName("x--y"));
+        var out = new ByteArrayOutputStream();
+        Http1Writer.write(out, new Response(200, ResponseHeaders.of().add("x-frame-options", "DENY"),
+                Body.Bytes.of(new byte[] {'k'})), true, ResponseHeaders.of());
+        assertTrue(out.toString(StandardCharsets.ISO_8859_1).contains("\r\nX-Frame-Options: DENY\r\n"));
+    }
 }
