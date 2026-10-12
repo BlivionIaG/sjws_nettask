@@ -2,17 +2,22 @@ package sjws_nettask.acme;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Set;
-import org.junit.jupiter.api.AfterEach;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -26,12 +31,6 @@ class AcmeTest {
 
     @TempDir
     Path dir;
-
-    /** {@code renewalDelayAndARefusedDirectoryBacksOff} leaves the renew thread writing this directory. */
-    @AfterEach
-    void awaitAcmeWritersBeforeTempDirCleanup() throws InterruptedException {
-        AcmeCleanup.awaitWriters();
-    }
 
     @Test
     void challengeHandlerAnswersOnlyKnownTokens() {
@@ -177,8 +176,113 @@ class AcmeTest {
             store.saveAccount(url, "http://ca.example/dir");
             assertEquals(url, store.accountUrl("http://ca.example/dir"));
             assertNull(store.accountUrl("http://other.example/dir"));
-            assertTrue(Files.readString(root.resolve("account.key")).contains("-----BEGIN PRIVATE KEY-----"));
+            var keyText = Files.readString(root.resolve("account.key"));
+            assertTrue(keyText.startsWith("-----BEGIN PRIVATE KEY-----"), keyText);
+            assertTrue(keyText.trim().endsWith("-----END PRIVATE KEY-----"), keyText);
+            try (var list = Files.list(root)) {
+                var names = list.map(path -> path.getFileName().toString()).toList();
+                assertTrue(names.stream().noneMatch(name -> name.startsWith(".acme-")), names.toString());
+            }
         }
+    }
+
+    @Test
+    void secretFilesAppearAtomicallyWithOwnerOnlyPermissions() throws Exception {
+        var root = dir.resolve("atomic");
+        var store = new AcmeStore(root);
+        var key = store.accountKey();
+        assertNotNull(store.domainKey().getPublic());
+        store.saveAccount(URI.create("https://example.com/acme/acct/3").toURL(), "http://ca.example/directory");
+        store.saveAccount(URI.create("https://example.com/acme/acct/4").toURL(), "http://ca.example/directory");
+        assertEquals(URI.create("https://example.com/acme/acct/4").toURL(), store.accountUrl("http://ca.example/directory"));
+        assertEquals(key.getPublic(), store.accountKey().getPublic());
+        assertEquals("https://example.com/acme/acct/4\n", Files.readString(root.resolve("account.url")));
+        assertEquals("http://ca.example/directory\n", Files.readString(root.resolve("directory")));
+        try (var list = Files.list(root)) {
+            var names = list.map(path -> path.getFileName().toString()).toList();
+            assertTrue(names.stream().noneMatch(name -> name.startsWith(".acme-")), names.toString());
+        }
+        for (var name : new String[] {"account.key", "domain.key", "account.url", "directory"}) {
+            var path = root.resolve(name);
+            var text = Files.readString(path);
+            assertFalse(text.isBlank(), name);
+            if (name.endsWith(".key")) {
+                assertTrue(text.startsWith("-----BEGIN PRIVATE KEY-----"), name);
+                assertTrue(text.trim().endsWith("-----END PRIVATE KEY-----"), name);
+            }
+            assertEquals(Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
+                    Files.getPosixFilePermissions(path), name);
+        }
+        assertEquals(Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
+                PosixFilePermission.OWNER_EXECUTE), Files.getPosixFilePermissions(root));
+    }
+
+    @Test
+    @Timeout(20)
+    void closeWaitsForTheInFlightRenewalThenLeavesACompleteStore() throws Exception {
+        var storage = dir.resolve("closing");
+        var settings = refused(storage);
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var service = new AcmeService(settings, new ChallengeBoard(), material -> {
+        });
+        service.beforeAttempt = () -> {
+            entered.countDown();
+            try {
+                if (!release.await(15, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("renew was not released");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("stopped");
+            }
+        };
+        service.start();
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        var returned = new AtomicBoolean();
+        var closer = new Thread(() -> {
+            service.close();
+            returned.set(true);
+        });
+        closer.start();
+        Thread.sleep(100);
+        assertFalse(returned.get(), "close returned while the renew attempt was still running");
+        release.countDown();
+        closer.join(15_000);
+        assertTrue(returned.get());
+        assertFalse(closer.isAlive());
+        assertCompleteStore(storage);
+        service.update(settings); // scheduler is already shut down; this must not start another attempt
+    }
+
+    @Test
+    void closeLogsWhenTheRenewThreadExceedsTheTimeout() throws Exception {
+        var storage = dir.resolve("slow");
+        var service = new AcmeService(refused(storage), new ChallengeBoard(), material -> {
+        });
+        service.closeWait = Duration.ofMillis(200);
+        var entered = new CountDownLatch(1);
+        service.beforeAttempt = () -> {
+            entered.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("stopped");
+            }
+        };
+        service.start();
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        var err = new ByteArrayOutputStream();
+        var previous = System.err;
+        System.setErr(new PrintStream(err, true, StandardCharsets.UTF_8));
+        try {
+            service.close();
+        } finally {
+            System.setErr(previous);
+        }
+        assertTrue(err.toString().contains("WARN: ACME renew thread did not stop within 200 ms"), err.toString());
+        assertCompleteStore(storage);
     }
 
     @Test
@@ -318,6 +422,33 @@ class AcmeTest {
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    private static AcmeSettings refused(Path storage) {
+        return new AcmeSettings(true, "http://127.0.0.1:1/directory", "ops@example.com", java.util.List.of("example.com"),
+                storage, 0, true, Duration.ofDays(30));
+    }
+
+    private static void assertCompleteStore(Path storage) throws java.io.IOException {
+        if (!Files.isDirectory(storage)) {
+            return;
+        }
+        try (var list = Files.list(storage)) {
+            for (var path : list.toList()) {
+                var name = path.getFileName().toString();
+                assertFalse(name.startsWith(".acme-"), name);
+                if (!name.endsWith(".key") && !name.equals("cert.pem")) {
+                    continue;
+                }
+                var text = Files.readString(path);
+                assertTrue(text.startsWith("-----BEGIN "), text);
+                assertTrue(text.trim().endsWith("-----"), text);
+                assertEquals(Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
+                        Files.getPosixFilePermissions(path), name);
+            }
+        }
+        assertEquals(Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
+                PosixFilePermission.OWNER_EXECUTE), Files.getPosixFilePermissions(storage));
     }
 
     private static byte[] bytes(Response response) {

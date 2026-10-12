@@ -19,9 +19,12 @@ package sjws_nettask.acme;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import javax.net.ssl.SSLContext;
 import sjws_nettask.config.AcmeSettings;
@@ -41,12 +44,17 @@ public final class AcmeService implements AutoCloseable {
 
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
             Thread.ofPlatform().daemon().name("acme-renew").factory());
+    private final AtomicReference<ScheduledFuture<?>> pending = new AtomicReference<>();
     private final ChallengeBoard board;
     private final Consumer<TlsMaterial> publish;
     private final AtomicInteger epoch = new AtomicInteger();
     private volatile AcmeSettings settings;
     private volatile SSLContext trust;
     private volatile int backoffSeconds = BACKOFF_START;
+    /** How long {@link #close()} waits for the in-flight attempt to finish its store write. */
+    Duration closeWait = Duration.ofSeconds(5);
+    /** Test hook. Runs at the start of an attempt that still owns its ticket, before the store is touched. */
+    volatile Runnable beforeAttempt;
 
     public AcmeService(AcmeSettings settings, ChallengeBoard board, Consumer<TlsMaterial> publish) {
         this.settings = settings;
@@ -82,9 +90,21 @@ public final class AcmeService implements AutoCloseable {
     }
 
     private void arm(Duration delay) {
+        if (this.scheduler.isShutdown()) {
+            return;
+        }
         int ticket = this.epoch.incrementAndGet();
         long millis = Math.max(0, delay.toMillis());
-        this.scheduler.schedule(() -> attempt(ticket), millis, TimeUnit.MILLISECONDS);
+        ScheduledFuture<?> future;
+        try {
+            future = this.scheduler.schedule(() -> attempt(ticket), millis, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            return;
+        }
+        this.pending.set(future);
+        if (this.scheduler.isShutdown()) {
+            future.cancel(false);
+        }
     }
 
     private void attempt(int ticket) {
@@ -92,6 +112,10 @@ public final class AcmeService implements AutoCloseable {
             return;
         }
         try {
+            var hook = this.beforeAttempt;
+            if (hook != null) {
+                hook.run();
+            }
             var store = new AcmeStore(this.settings.storage());
             var existing = store.loadCertificate();
             if (existing != null) {
@@ -129,10 +153,30 @@ public final class AcmeService implements AutoCloseable {
         }
     }
 
+    /**
+     * Stops the renew loop without interrupting an attempt that is already writing the store.
+     * A queued delay is cancelled. {@link #close()} waits up to {@link #closeWait} for the
+     * in-flight attempt to finish, then interrupts it and logs if it is still running.
+     */
     @Override
     public void close() {
         this.epoch.incrementAndGet();
-        this.scheduler.shutdownNow();
+        var queued = this.pending.getAndSet(null);
+        if (queued != null) {
+            queued.cancel(false);
+        }
+        this.scheduler.shutdown();
+        try {
+            if (!this.scheduler.awaitTermination(Math.max(1, this.closeWait.toMillis()), TimeUnit.MILLISECONDS)) {
+                System.err.println(
+                        "WARN: ACME renew thread did not stop within " + this.closeWait.toMillis() + " ms");
+                this.scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("WARN: interrupted while waiting for the ACME renew thread");
+            this.scheduler.shutdownNow();
+        }
         this.board.clear();
     }
 }

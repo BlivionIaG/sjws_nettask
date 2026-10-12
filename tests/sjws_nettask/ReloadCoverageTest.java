@@ -17,10 +17,8 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import sjws_nettask.acme.AcmeCleanup;
 import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.h3.Http3Server;
 import sjws_nettask.tls.TlsMaterial;
@@ -30,12 +28,6 @@ class ReloadCoverageTest {
 
     @TempDir
     Path dir;
-
-    /** Every method that enables ACME shares this directory and the renew thread. */
-    @AfterEach
-    void awaitAcmeWritersBeforeTempDirCleanup() throws InterruptedException {
-        AcmeCleanup.awaitWriters();
-    }
 
     @Test
     void dedicatedChallengePortRebindsAndABusyPortIsRejected() throws Exception {
