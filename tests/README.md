@@ -86,10 +86,10 @@ Lines JaCoCo reports as missed that no behaviour test can reach (or only by faki
 
 ## Known platform gaps (macOS)
 
-The suite is green on Linux. On macOS (CI run 38212694685, manual job only) three tests fail and need a fix in the code, not the test:
+The suite is green on Linux. On macOS (CI run 38212694685, manual job only) three tests failed and need a fix in the code, not the test:
 
 - `core/SafeOpenTest.parentSymlinkRaceNeverLeaksOverHttp1`: a file was served while a parent directory was swapped for a symlink (the race guard relies on Linux `SecureDirectoryStream`/`O_NOFOLLOW` behaviour).
-- `core/FileCacheTest.searchOnlyDirectoryStays403`: a cached file below an execute-only directory is answered 200 instead of 403.
+- ~~`core/FileCacheTest.searchOnlyDirectoryStays403`~~ (fixed): without `SecureDirectoryStream` every open took the path fallback, which skipped the search-only directory rule; the fallback now checks every directory from the root down (`SafeOpenTest.fallbackRefusesFilesBelowSearchOnlyDirectories`).
 - `HardeningIntegrationTest.trickledRequestIsCutOffAtDeadline`: the client sees a reset instead of the 408 (macOS sends RST when a socket with unread data is closed).
 
 ## Mutation testing
