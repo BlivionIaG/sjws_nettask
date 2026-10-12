@@ -25,19 +25,20 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.function.Supplier;
 
-import sjws_nettask.core.Request;
-import sjws_nettask.core.RequestHeaders;
+import sjws_nettask.core.Handler;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.http1.Http1Parser;
+import sjws_nettask.http1.Http1Requests;
 import sjws_nettask.http1.Http1Writer;
 import sjws_nettask.http1.ParseError;
 
 /**
  * HTTP/1.x adapter for one connection on a blocking {@link SocketChannel} (run on a virtual
- * thread): parses with {@link Http1Parser.HeadParser}, maps to a core {@link Request}, asks the
- * {@link StaticFileHandler}, serializes with {@link Http1Writer}. Deadlines (idle keep-alive,
+ * thread): parses with {@link Http1Parser.HeadParser}, maps to a core
+ * {@link sjws_nettask.core.Request} ({@link Http1Requests}), asks the {@link Handler} (in production
+ * the {@link StaticFileHandler}), serializes with {@link Http1Writer}. Deadlines (idle keep-alive,
  * request head, writes) are enforced by the shared {@link ConnectionReaper}, not by socket
  * timeouts.
  * <p>
@@ -58,7 +59,7 @@ final class Http1Connection implements Runnable {
     private static final byte[] CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final SocketChannel channel;
-    private final StaticFileHandler handler;
+    private final Handler handler;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ConnectionReaper reaper;
     private final Http1Parser.HeadParser parser = new Http1Parser.HeadParser(CONSTANTS.MAX_LINE_LENGTH,
@@ -69,7 +70,7 @@ final class Http1Connection implements Runnable {
     /**
      * @param extraHeaders transport-level fields added to every response (e.g. Alt-Svc); called per response
      */
-    Http1Connection(SocketChannel channel, StaticFileHandler handler, Supplier<ResponseHeaders> extraHeaders,
+    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
         this.channel = channel;
         this.handler = handler;
@@ -169,9 +170,7 @@ final class Http1Connection implements Runnable {
             return false;
         }
 
-        var core = new Request(request.method(), request.target(), new RequestHeaders(
-                request.header("if-none-match"), request.ifModifiedSince(), request.header("if-range"),
-                request.header("range"), request.header("accept-encoding"), request.header("host")));
+        var core = Http1Requests.toCore(request);
         if (!core.headOnly() && !"GET".equals(core.method())) {
             // Known but unsupported method (the handler answers 405). Never read (possibly huge)
             // bodies just to reject them: keep the connection only if there is no body.
