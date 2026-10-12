@@ -162,9 +162,7 @@ public final class SjwsServer implements AutoCloseable {
             throw new IllegalArgumentException("shutdown timeout out of range");
         }
         this.shutdownTimeout = timeout;
-        if (this.manager != null) {
-            this.manager.shutdownTimeout(timeout);
-        }
+        this.manager.shutdownTimeout(timeout);
     }
 
     /** One-line summary for the startup log (never contains secrets). */

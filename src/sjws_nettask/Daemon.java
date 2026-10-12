@@ -29,7 +29,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongFunction;
 
 /**
  * Background-service controls: {@code --daemon}, {@code --stop}, {@code --status}, {@code --restart},
@@ -247,18 +249,27 @@ final class Daemon {
      */
     static List<String> childCommand(List<String> appArgs) {
         var java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        return childCommand(appArgs, ProcessHandle.current().info().arguments(), java,
+                System.getProperty("java.class.path"));
+    }
+
+    /**
+     * @param current arguments of this process, without the executable; empty when the OS hides them
+     */
+    static List<String> childCommand(List<String> appArgs, Optional<String[]> current, String javaBin,
+            String classPath) {
         var cmd = new ArrayList<String>();
-        var current = ProcessHandle.current().info().arguments();
         // Surefire itself is launched with -jar surefirebooter.jar. Only reuse the current
         // command line when it is actually this server, so a test run does not re-exec itself.
-        if (current.isEmpty() || !isOurLaunch(current.get()) || !splice(cmd, java, current.get(), appArgs)) {
-            cmd.clear();
-            cmd.add(java);
-            cmd.add("-cp");
-            cmd.add(System.getProperty("java.class.path"));
-            cmd.add("sjws_nettask.Sjws_nettask");
-            cmd.addAll(appArgs);
+        if (current.isPresent() && isOurLaunch(current.get()) && splice(cmd, javaBin, current.get(), appArgs)) {
+            return detach(cmd, SETSID);
         }
+        cmd.clear();
+        cmd.add(javaBin);
+        cmd.add("-cp");
+        cmd.add(classPath);
+        cmd.add("sjws_nettask.Sjws_nettask");
+        cmd.addAll(appArgs);
         return detach(cmd, SETSID);
     }
 
@@ -352,13 +363,8 @@ final class Daemon {
         applyServerEnv(pb.environment(), env);
         pb.redirectErrorStream(true);
         pb.redirectOutput(ProcessBuilder.Redirect.appendTo(opt.logFile().toFile()));
-        var devNull = Path.of("/dev/null");
-        if (!Files.exists(devNull)) {
-            devNull = Path.of("NUL"); // Windows
-        }
-        if (Files.exists(devNull)) {
-            pb.redirectInput(ProcessBuilder.Redirect.from(devNull.toFile()));
-        }
+        // /dev/null (Unix) or NUL (Windows). One of them exists on the platforms we run.
+        pb.redirectInput(ProcessBuilder.Redirect.from(discardInput(List.of("/dev/null", "NUL")).toFile()));
         Process process;
         try {
             process = pb.start();
@@ -399,6 +405,12 @@ final class Daemon {
     }
 
     static int stop(Path pidFile, Duration timeout, PrintStream out, PrintStream err) {
+        return stop(pidFile, timeout, out, err, ProcessHandle::of);
+    }
+
+    /** {@code processes} resolves a pid. Tests supply a handle whose lifetime they control. */
+    static int stop(Path pidFile, Duration timeout, PrintStream out, PrintStream err,
+            LongFunction<Optional<ProcessHandle>> processes) {
         var snap = PidFile.read(pidFile);
         if (!snap.present()) {
             out.println("stopped");
@@ -409,7 +421,7 @@ final class Daemon {
             out.println("stopped stale pid=" + displayPid(snap));
             return Sjws_nettask.EXIT_OK;
         }
-        var handle = ProcessHandle.of(snap.pid()).orElse(null);
+        var handle = processes.apply(snap.pid()).orElse(null);
         if (handle == null || !PidFile.isLive(snap.pid(), snap.startedMillis())) {
             deleteIfUnchanged(snap, pidFile, err);
             out.println("stopped stale pid=" + displayPid(snap));
@@ -516,6 +528,17 @@ final class Daemon {
         }
     }
 
+    /** First existing path of {@code names}, or null. {@code NUL} is the Windows null device. */
+    static Path discardInput(List<String> names) {
+        for (var name : names) {
+            var path = Path.of(name);
+            if (Files.exists(path)) {
+                return path;
+            }
+        }
+        return null;
+    }
+
     private static boolean bool(String value, boolean fallback, String what, List<String> warnings) {
         switch (value.trim().toLowerCase(Locale.ROOT)) {
             case "true", "1", "yes", "on":
@@ -540,7 +563,8 @@ final class Daemon {
             List<String> warnings) {
         if (value != null && value.matches("[0-9]{1,9}")) {
             long n = Long.parseLong(value);
-            if (n >= min && n <= maxValue) {
+            // Digits only, and min is 0, so there is no lower bound to apply.
+            if (n <= maxValue) {
                 return n;
             }
         }

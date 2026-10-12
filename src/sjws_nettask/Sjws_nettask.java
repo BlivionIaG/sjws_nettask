@@ -91,13 +91,8 @@ public class Sjws_nettask {
         }
         server.shutdownTimeout(shutdownTimeout);
         var pid = new AtomicReference<PidFile>();
-        var hook = new Thread(() -> {
-            try {
-                server.close();
-            } finally {
-                releasePid(pid.get(), err);
-            }
-        }, "shutdown");
+        var task = new Shutdown(server, pid, err);
+        var hook = new Thread(task, "shutdown");
         Runtime.getRuntime().addShutdownHook(hook);
         try {
             if (pidFile != null) {
@@ -129,9 +124,30 @@ public class Sjws_nettask {
             Thread.currentThread().interrupt();
             return EXIT_OK;
         } finally {
-            server.close();
-            releasePid(pid.get(), err);
+            task.run();
             removeHook(hook);
+        }
+    }
+
+    /** SIGTERM/SIGINT task: stop accepting, drain, then drop the pid file. */
+    static final class Shutdown implements Runnable {
+        private final SjwsServer server;
+        private final AtomicReference<PidFile> pid;
+        private final PrintStream err;
+
+        Shutdown(SjwsServer server, AtomicReference<PidFile> pid, PrintStream err) {
+            this.server = server;
+            this.pid = pid;
+            this.err = err;
+        }
+
+        @Override
+        public void run() {
+            try {
+                this.server.close();
+            } finally {
+                releasePid(this.pid.get(), this.err);
+            }
         }
     }
 
@@ -186,10 +202,6 @@ public class Sjws_nettask {
             return control(opt, out, err);
         }
         var parsed = ServerConfig.parse(opt.remaining(), env);
-        if (parsed.helpRequested()) {
-            out.print(usage());
-            return EXIT_OK;
-        }
         opt.warnings().forEach(w -> err.println("WARN: " + w));
         parsed.warnings().forEach(w -> err.println("WARN: " + w));
         if (!opt.ok() || !parsed.ok()) {
@@ -240,11 +252,6 @@ public class Sjws_nettask {
     /** {@code --stop} / {@code --status}: no server configuration is required. */
     private static int control(Daemon.Options opt, PrintStream out, PrintStream err) {
         opt.warnings().forEach(w -> err.println("WARN: " + w));
-        if (!opt.ok()) {
-            opt.errors().forEach(e -> err.println("ERROR: " + e));
-            err.println("See --help.");
-            return EXIT_USAGE;
-        }
         if (opt.action() == Daemon.Action.STATUS) {
             return Daemon.status(opt.pidFile(), out, err);
         }
