@@ -220,7 +220,10 @@ final class DeliveryState {
 
     DeliveryCounts counts() {
         var gs = new LinkedHashMap<String, DeliveryCounts.Group>();
-        for (var g : groups.values()) gs.put(g.name, new DeliveryCounts.Group(g.committedOffset, countsOf(g)));
+        for (var g : groups.values()) {
+            var oldest = messages.ceilingEntry(g.committedOffset);
+            gs.put(g.name, new DeliveryCounts.Group(g.committedOffset, countsOf(g), oldest == null ? 0 : oldest.getValue().timestampMs()));
+        }
         return new DeliveryCounts(version, nextOffset, enqueued, messages.size(), gs);
     }
 
