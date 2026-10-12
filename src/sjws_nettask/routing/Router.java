@@ -16,33 +16,34 @@
  */
 package sjws_nettask.routing;
 
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
-import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
-import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Routes a request to the first matching {@link Route} (virtual host + path prefix), optionally
  * rewriting the prefix, or to the fallback handler when none matches.
  * <p>
- * Immutable and thread-safe; a plain {@link Handler}, so it composes with decorators.
+ * Matching does not allocate: it works on the raw (still percent-encoded) target and Host value.
+ * A target with a {@code ..} path segment (also percent-encoded) is answered 400 before any route
+ * is tried, so a prefix can never be escaped. Immutable and thread-safe.
  */
 public final class Router implements Handler {
 
     /**
      * One rule.
      *
-     * @param host exact host ("example.com"), wildcard ("*.example.com", matches sub-domains only),
-     *        or null for any host; compared case-insensitively, port ignored
+     * @param host exact host ("example.com"), wildcard ("*.example.com", sub-domains only), or null
+     *        for any host; compared case-insensitively, port ignored
      * @param prefix path prefix starting with "/"; matches on a segment boundary ("/api" matches
-     *        "/api" and "/api/x", not "/apix")
-     * @param rewrite replacement for the matched prefix (e.g. "/" strips "/api"), or null to keep the target
-     * @param handler where matching requests go
+     *        "/api", "/api/x" and "/api?q", not "/apix")
+     * @param rewrite replacement for the matched prefix (e.g. "/" strips "/api"), or null
+     * @param handler where matching requests go (wrap it with {@code RequestFilters.wrapping} for
+     *        per-route filters)
      */
     public record Route(String host, String prefix, String rewrite, Handler handler) {
 
@@ -52,6 +53,9 @@ public final class Router implements Handler {
             if (!prefix.startsWith("/") || (rewrite != null && !rewrite.startsWith("/"))) {
                 throw new IllegalArgumentException("prefix and rewrite must start with /");
             }
+            if (host != null && (host.isEmpty() || host.equals("*.") || host.indexOf(':') >= 0 && !host.startsWith("["))) {
+                throw new IllegalArgumentException("bad host: " + host);
+            }
             host = host == null ? null : host.toLowerCase(Locale.ROOT);
         }
 
@@ -59,6 +63,7 @@ public final class Router implements Handler {
             this(null, prefix, null, handler);
         }
 
+        /** Allocation-free: compares {@code host} with the request Host up to its port. */
         boolean matchesHost(String requestHost) {
             if (this.host == null) {
                 return true;
@@ -66,11 +71,12 @@ public final class Router implements Handler {
             if (requestHost == null) {
                 return false;
             }
-            var h = stripPort(requestHost).toLowerCase(Locale.ROOT);
+            int end = hostEnd(requestHost);
             if (this.host.startsWith("*.")) {
-                return h.endsWith(this.host.substring(1));
+                int suffix = this.host.length() - 1; // ".example.com"
+                return end > suffix && requestHost.regionMatches(true, end - suffix, this.host, 1, suffix);
             }
-            return h.equals(this.host);
+            return end == this.host.length() && requestHost.regionMatches(true, 0, this.host, 0, end);
         }
 
         /** Allocation-free: {@code pathEnd} is the index of '?' in the target, or its length. */
@@ -83,9 +89,6 @@ public final class Router implements Handler {
         }
 
         String rewriteTarget(String target) {
-            if (this.rewrite == null) {
-                return target;
-            }
             var rest = target.substring(this.prefix.length());
             if (this.rewrite.endsWith("/") && rest.startsWith("/")) {
                 rest = rest.substring(1);
@@ -96,17 +99,17 @@ public final class Router implements Handler {
         }
     }
 
-    private final List<Route> routes;
+    private final Route[] routes;
     private final Handler fallback;
 
     /** @param fallback used when no route matches; null answers 404 */
     public Router(List<Route> routes, Handler fallback) {
-        this.routes = List.copyOf(routes);
+        this.routes = routes.toArray(Route[]::new);
         this.fallback = fallback;
     }
 
     public List<Route> routes() {
-        return this.routes;
+        return List.of(this.routes);
     }
 
     @Override
@@ -114,30 +117,60 @@ public final class Router implements Handler {
         var target = request.target();
         int q = target.indexOf('?');
         int pathEnd = q < 0 ? target.length() : q;
+        if (hasDotDot(target, pathEnd)) {
+            return StaticFileHandler.error(400, request.headOnly());
+        }
+        var host = request.headers().host();
         for (var r : this.routes) {
-            if (r.matchesHost(request.headers().host()) && r.matchesPath(target, pathEnd)) {
-                var req = r.rewrite() == null ? request
-                        : new Request(request.method(), r.rewriteTarget(target), request.headers());
-                return r.handler().handle(req);
+            if (r.matchesPath(target, pathEnd) && r.matchesHost(host)) {
+                return r.handler().handle(r.rewrite() == null ? request : request.withTarget(r.rewriteTarget(target)));
             }
         }
         if (this.fallback != null) {
             return this.fallback.handle(request);
         }
-        return text(404, "Not Found", request.headOnly());
+        return StaticFileHandler.error(404, request.headOnly());
     }
 
-    static String stripPort(String host) {
+    /** End of the host name: before ":port", or after the "]" of an IPv6 literal. */
+    static int hostEnd(String host) {
         if (host.startsWith("[")) {
-            int end = host.indexOf(']');
-            return end < 0 ? host : host.substring(0, end + 1);
+            int close = host.indexOf(']');
+            return close < 0 ? host.length() : close + 1;
         }
         int colon = host.indexOf(':');
-        return colon < 0 ? host : host.substring(0, colon);
+        return colon < 0 ? host.length() : colon;
     }
 
-    static Response text(int status, String message, boolean head) {
-        var headers = ResponseHeaders.of().add("content-type", "text/plain; charset=utf-8");
-        return new Response(status, headers, Body.Bytes.of((message + "\n").getBytes(StandardCharsets.UTF_8)), head);
+    /** True if a path segment of {@code target[0, end)} is "..", with either dot possibly "%2e". */
+    static boolean hasDotDot(String target, int end) {
+        int i = 0;
+        while (i < end) {
+            int segEnd = target.indexOf('/', i);
+            if (segEnd < 0 || segEnd > end) {
+                segEnd = end;
+            }
+            int j = dot(target, i, segEnd);
+            if (j > 0) {
+                j = dot(target, j, segEnd);
+                if (j == segEnd) {
+                    return true;
+                }
+            }
+            i = segEnd + 1;
+        }
+        return false;
+    }
+
+    /** @return the index after a "." or "%2e" at {@code i}, or -1 */
+    private static int dot(String s, int i, int end) {
+        if (i < end && s.charAt(i) == '.') {
+            return i + 1;
+        }
+        if (i + 3 <= end && s.charAt(i) == '%' && s.charAt(i + 1) == '2'
+                && (s.charAt(i + 2) == 'e' || s.charAt(i + 2) == 'E')) {
+            return i + 3;
+        }
+        return -1;
     }
 }

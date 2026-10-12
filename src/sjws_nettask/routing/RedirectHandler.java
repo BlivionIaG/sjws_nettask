@@ -20,6 +20,7 @@ import java.util.Set;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
+import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Answers every request with a redirect to {@code location}; with {@code keepPath} the request
@@ -45,7 +46,7 @@ public record RedirectHandler(int status, String location, boolean keepPath) imp
         if (this.keepPath) {
             loc = loc.endsWith("/") && target.startsWith("/") ? loc + target.substring(1) : loc + target;
         }
-        var r = Router.text(this.status, "Moved: " + loc, request.headOnly());
+        var r = StaticFileHandler.error(this.status, request.headOnly());
         r.headers().set("location", loc);
         return r;
     }

@@ -79,7 +79,7 @@ class ProxyHandlerTest {
     }
 
     private ProxyHandler proxy(URI uri, Duration timeout, int max) {
-        return new ProxyHandler(new ProxyHandler.Settings(uri, Duration.ofSeconds(2), timeout, max, "https"));
+        return new ProxyHandler(new ProxyHandler.Settings(uri, Duration.ofSeconds(2), timeout, max, "https", null));
     }
 
     @Test
@@ -114,6 +114,7 @@ class ProxyHandlerTest {
         assertEquals(200, head.status());
         assertTrue(head.headOnly());
         assertEquals("proto=http", this.seen.get().getFirst("Forwarded"));
+        assertTrue(head.body() instanceof Body.Empty);
         assertNull(this.seen.get().getFirst("X-Forwarded-Host"));
         assertEquals(this.base, p.settings().upstream());
     }
@@ -165,16 +166,82 @@ class ProxyHandlerTest {
         }
     }
 
+    private static Request withFields(String method, String target, java.util.Map<String, java.util.List<String>> f,
+            String peer, boolean secure) {
+        var addr = peer == null ? null : new InetSocketAddress(peer, 40000);
+        return new Request(method, target, RequestHeaders.of(new java.util.LinkedHashMap<>(f)), addr, secure);
+    }
+
+    @Test
+    void forwardsArbitraryHeadersAndDropsHopByHop() {
+        var p = new ProxyHandler(new ProxyHandler.Settings(this.base));
+        var f = new java.util.LinkedHashMap<String, java.util.List<String>>();
+        f.put("host", java.util.List.of("site.test"));
+        f.put("x-custom", java.util.List.of("a", "b"));
+        f.put("connection", java.util.List.of("keep-alive, X-Secret"));
+        f.put("x-secret", java.util.List.of("s"));
+        f.put("keep-alive", java.util.List.of("timeout=5"));
+        f.put("x-forwarded-for", java.util.List.of("6.6.6.6"));
+        f.put("forwarded", java.util.List.of("for=6.6.6.6"));
+        f.put("content-length", java.util.List.of("0"));
+        var r = p.handle(withFields("GET", "/", f, "192.0.2.7", true));
+        assertEquals(200, r.status());
+        var s = this.seen.get();
+        assertEquals(java.util.List.of("a", "b"), s.get("X-custom"));
+        assertNull(s.getFirst("X-secret"));
+        assertNull(s.getFirst("Keep-alive"));
+        assertEquals("192.0.2.7", s.getFirst("X-Forwarded-For"), "untrusted peer: replaced");
+        assertEquals("https", s.getFirst("X-Forwarded-Proto"), "auto proto follows secure()");
+        assertEquals("site.test", s.getFirst("X-Forwarded-Host"));
+        assertEquals("for=192.0.2.7;proto=https;host=\"site.test\"", s.getFirst("Forwarded"));
+    }
+
+    @Test
+    void trustedProxyChainIsExtended() {
+        var d = Duration.ofSeconds(2);
+        var p = new ProxyHandler(new ProxyHandler.Settings(this.base, d, d, 1024, null,
+                java.util.List.of(Cidr.parse("127.0.0.0/8"), Cidr.parse("::1"))));
+        var f = new java.util.LinkedHashMap<String, java.util.List<String>>();
+        f.put("x-forwarded-for", java.util.List.of("203.0.113.1", "198.51.100.2"));
+        f.put("forwarded", java.util.List.of("for=203.0.113.1"));
+        p.handle(withFields("GET", "/", f, "127.0.0.1", false));
+        var s = this.seen.get();
+        assertEquals("203.0.113.1, 198.51.100.2, 127.0.0.1", s.getFirst("X-Forwarded-For"));
+        assertEquals("for=203.0.113.1, for=127.0.0.1;proto=http", s.getFirst("Forwarded"));
+        p.handle(withFields("GET", "/", java.util.Map.of(), "::1", false));
+        assertEquals("for=\"[0:0:0:0:0:0:0:1]\";proto=http", this.seen.get().getFirst("Forwarded"));
+        assertEquals("0:0:0:0:0:0:0:1", this.seen.get().getFirst("X-Forwarded-For"));
+        var unresolved = new Request("GET", "/", RequestHeaders.NONE, InetSocketAddress.createUnresolved("x", 1), false);
+        p.handle(unresolved);
+        assertNull(this.seen.get().getFirst("X-Forwarded-For"));
+    }
+
+    @Test
+    void requestsWithABodyAre501() {
+        var p = new ProxyHandler(new ProxyHandler.Settings(this.base));
+        assertEquals(501, p.handle(withFields("POST", "/", java.util.Map.of("content-length", java.util.List.of("3")), null, false)).status());
+        assertEquals(501, p.handle(withFields("POST", "/", java.util.Map.of("transfer-encoding", java.util.List.of("chunked")), null, false)).status());
+        assertEquals(200, p.handle(withFields("POST", "/", java.util.Map.of("content-length", java.util.List.of("0")), null, false)).status());
+    }
+
+    @Test
+    void badHeaderValueIs400() {
+        var p = new ProxyHandler(new ProxyHandler.Settings(this.base));
+        assertEquals(400, p.handle(withFields("GET", "/", java.util.Map.of("x-bad", java.util.List.of("a\u0001b")), null, false)).status());
+    }
+
     @Test
     void settingsValidation() {
         var d = Duration.ofSeconds(1);
         assertThrows(IllegalArgumentException.class, () -> new ProxyHandler.Settings(URI.create("ftp://x")));
         assertThrows(IllegalArgumentException.class, () -> new ProxyHandler.Settings(URI.create("/rel")));
-        assertThrows(IllegalArgumentException.class, () -> new ProxyHandler.Settings(this.base, d, d, -1, "http"));
-        assertThrows(NullPointerException.class, () -> new ProxyHandler.Settings(null, d, d, 1, "http"));
-        assertThrows(NullPointerException.class, () -> new ProxyHandler.Settings(this.base, null, d, 1, "http"));
-        assertThrows(NullPointerException.class, () -> new ProxyHandler.Settings(this.base, d, null, 1, "http"));
-        assertThrows(NullPointerException.class, () -> new ProxyHandler.Settings(this.base, d, d, 1, null));
+        assertThrows(IllegalArgumentException.class, () -> new ProxyHandler.Settings(this.base, d, d, -1, "http", null));
+        assertThrows(NullPointerException.class, () -> new ProxyHandler.Settings(null, d, d, 1, "http", null));
+        assertThrows(NullPointerException.class, () -> new ProxyHandler.Settings(this.base, null, d, 1, "http", null));
+        assertThrows(NullPointerException.class, () -> new ProxyHandler.Settings(this.base, d, null, 1, "http", null));
+        assertThrows(IllegalArgumentException.class, () -> new ProxyHandler.Settings(this.base, d, d, 1, "ftp", null));
+        assertThrows(IllegalArgumentException.class, () -> new ProxyHandler.Settings(URI.create("http://h/?q"), d, d, 1, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new ProxyHandler.Settings(URI.create("http://h/#f"), d, d, 1, null, null));
         assertNotNull(new ProxyHandler(new ProxyHandler.Settings(URI.create("https://h"))).settings());
     }
 }

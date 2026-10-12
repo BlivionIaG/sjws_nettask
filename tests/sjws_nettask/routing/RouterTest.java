@@ -63,8 +63,14 @@ class RouterTest {
         assertEquals("v6", router.handle(req("[::1]:80", "/")).headers().get("x-h"));
         assertEquals(404, router.handle(req("other.org", "/")).status());
         assertEquals(404, router.handle(req(null, "/")).status());
-        assertEquals("[::1", Router.stripPort("[::1"));
-        assertEquals("routes", List.of(router.routes().get(0).host()).size() == 1 ? "routes" : "");
+        assertEquals(4, Router.hostEnd("[::1"));
+        assertEquals(3, router.routes().size());
+        assertEquals(404, router.handle(req("example.com.evil", "/")).status());
+        assertEquals(404, router.handle(req("example.co", "/")).status());
+        assertEquals("exact", router.handle(req("example.com", "/")).headers().get("x-h"));
+        assertEquals(404, router.handle(req(".example.com", "/")).status());
+        assertEquals(404, router.handle(req("xexample.com", "/")).status());
+        assertEquals("wild", router.handle(req("A.B.EXAMPLE.COM:1", "/")).headers().get("x-h"));
     }
 
     @Test
@@ -92,7 +98,21 @@ class RouterTest {
     }
 
     @Test
+    void dotDotSegmentsAre400() {
+        var router = new Router(List.of(new Route("/api", echo("api"))), echo("fb"));
+        for (var t : new String[] {"/api/../secret", "/..", "/a/%2e%2e/b", "/a/.%2E", "/a/%2E.?x", "/api/.."}) {
+            assertEquals(400, router.handle(req(null, t)).status(), t);
+        }
+        for (var t : new String[] {"/api/.x", "/a/...", "/a/..b", "/a/.", "/a?x=/../", "/%2e", "/a/%2", "/a/%2f%2e"}) {
+            assertNotEquals(400, router.handle(req(null, t)).status(), t);
+        }
+    }
+
+    @Test
     void routeValidation() {
+        assertThrows(IllegalArgumentException.class, () -> new Route("", "/", null, echo("a")));
+        assertThrows(IllegalArgumentException.class, () -> new Route("*.", "/", null, echo("a")));
+        assertThrows(IllegalArgumentException.class, () -> new Route("h:80", "/", null, echo("a")));
         assertThrows(IllegalArgumentException.class, () -> new Route("x", echo("a")));
         assertThrows(IllegalArgumentException.class, () -> new Route(null, "/", "x", echo("a")));
         assertThrows(NullPointerException.class, () -> new Route(null, echo("a")));

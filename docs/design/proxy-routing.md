@@ -189,6 +189,32 @@ Netty echo server), pinned with `taskset` where possible. Every run gets a 5 s w
 
 Results go into the PR description of each phase, with the commands, so others can reproduce them.
 
+### Phase 1 results (2026-10-12, shared 8 vCPU box, server on CPUs 0-3, wrk on 4-7)
+
+Harness: `bench/proxy-routing/` (`BenchMain` + `run.sh`). wrk `-t4 -c64`, 3 × 10 s after a 3 s warm-up, median req/s (p99 of that run).
+The box is shared, so differences under about 15 % are noise.
+
+| Scenario | req/s (median) | p99 |
+|---|---|---|
+| master dc5346c, `/index.html` | 225,718 | 2.15 ms |
+| branch, routing disabled | 258,865 | 2.01 ms |
+| branch, 1 route (match) | 280,318 | 3.57 ms |
+| branch, 10 routes (match on last) | 284,710 | 4.04 ms |
+| branch, 50 routes (match on last) | 257,274 | 1.96 ms |
+| direct upstream, 1 KiB | 257,411 | 1.99 ms |
+| proxied, 1 KiB | 37,892 | 4.39 ms |
+| direct upstream, 64 KiB | 93,776 | 1.98 ms |
+| proxied, 64 KiB | 15,957 | 9.56 ms |
+
+wrk2 at 10k req/s, 1 KiB: direct p50 0.72 ms / p99 1.86 ms / p99.9 2.13 ms; proxied p50 1.11 ms / p99 5.38 ms / p99.9 9.14 ms.
+Pooling: 68 upstream connections in total for every proxied request (64 client connections).
+
+Reading: with routing disabled, and with the router in front of static files, throughput is within
+noise of master. The proxy costs about 6.8× throughput at 1 KiB and 5.9× at 64 KiB compared with
+hitting the upstream directly. That points at `HttpClient` (its own selector thread plus buffered
+copies), not at routing. This is the trigger in §5/§11 Q6 to evaluate a Netty or blocking-socket
+upstream client in phase 2.
+
 ## 10. Phased rollout
 
 0. **This document.** It is reviewed and agreed with Middleware Chain and Config & ACME.
