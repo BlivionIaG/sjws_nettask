@@ -420,10 +420,6 @@ public final class ConfigLoader {
         var routes = map.containsKey("routes") ? routes(map.get("routes"), upstreams) : List.<RouteSpec>of();
         var table = new RouteTable(routes);
         warnings.addAll(table.shadows());
-        if (enabled) {
-            warnings.add("routing.enabled is true but proxy dispatch is not implemented; "
-                    + "requests are still served from the document root");
-        }
         return new Routing(enabled, proto, proxies, upstreams, table);
     }
 

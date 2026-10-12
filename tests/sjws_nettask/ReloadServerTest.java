@@ -98,7 +98,7 @@ class ReloadServerTest {
     }
 
     @Test
-    void enabledRoutingStillServesFiles() throws Exception {
+    void enabledRoutingDispatchesToTheUpstream() throws Exception {
         var root = dir.resolve("www");
         Files.createDirectory(root);
         Files.writeString(root.resolve("index.html"), "static");
@@ -112,13 +112,15 @@ class ReloadServerTest {
                   upstreams:
                     api: { url: "http://127.0.0.1:9", connect_timeout: 5s, response_timeout: 30s, max_body: 16m }
                   routes:
-                    - prefix: /
+                    - prefix: /api
                       proxy: api
                 """.formatted(root.toAbsolutePath()));
         var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
         assertTrue(loaded.ok(), loaded.errors().toString());
         try (var server = SjwsServer.start(loaded)) {
             assertEquals("static", HttpTestSupport.get(server.tcpPort(), "/", 2000).bodyText());
+            // port 9 (discard) is closed: the proxied route answers 502, not the document root
+            assertTrue(HttpTestSupport.get(server.tcpPort(), "/api/x", 5000).bodyText().contains("502 Bad Gateway"));
         }
     }
 }
