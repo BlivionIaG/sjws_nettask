@@ -272,7 +272,7 @@ class ConfigLoaderTest {
         assertEquals("www-data", access.requireOwner());
         assertTrue(access.requireWorldReadable());
         assertEquals(sha256(bytes), loaded.document().contentHash());
-        assertTrue(loaded.warnings().stream().anyMatch(w -> w.contains("not enforced")));
+        assertTrue(loaded.warnings().stream().noneMatch(w -> w.contains("not enforced")));
         var injected = ConfigLoader.load(new String[] {"--config=" + write("""
                 acme:
                   enabled: true
