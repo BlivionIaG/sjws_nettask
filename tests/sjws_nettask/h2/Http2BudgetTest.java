@@ -149,6 +149,38 @@ class Http2BudgetTest {
         }
     }
 
+    /**
+     * The PR #38 CI flake: small files used to queue for the connection's file budget behind
+     * large ones and were refused after the 100 ms wait on a slow machine. A file that fits in one
+     * DATA frame now holds a slot only while it is read, outside the connection's budget.
+     */
+    @Test
+    void smallFilesAreNotQueuedBehindTheConnectionsLargeFiles() throws Exception {
+        start(limits(4096, 512, 100, 2, Duration.ofSeconds(30), 16));
+        try (var h2 = new RawH2(this.server.h2cPort(), 0)) { // window 0: the large files never finish
+            h2.get(1, "/big.bin");
+            h2.get(3, "/big.bin"); // the connection's whole file budget (2) is now held
+            Thread.sleep(300);
+            h2.windowUpdate(0, 1 << 20);
+            for (int i = 0; i < 10; i++) {
+                int id = 5 + 2 * i;
+                h2.get(id, "/hello.txt");
+                h2.windowUpdate(id, 1 << 16);
+            }
+            int done = 0;
+            h2.socket.setSoTimeout(5000);
+            for (RawH2.Frame f; done < 10 && (f = h2.read()) != null;) {
+                if (f.stream() >= 5 && f.type() == RawH2.RST_STREAM) {
+                    throw new AssertionError("small file refused on stream " + f.stream() + ": " + f.errorCode());
+                }
+                if (f.stream() >= 5 && f.type() == RawH2.DATA && (f.flags() & RawH2.END_STREAM) != 0) {
+                    done++;
+                }
+            }
+            assertEquals(10, done, "every small file answered while the budget is held");
+        }
+    }
+
     @Test
     void streamsBeyondTheConnectionsInflightBudgetAreRefused() throws Exception {
         start(limits(4096, 512, 2, 8, Duration.ofSeconds(30), 16));
