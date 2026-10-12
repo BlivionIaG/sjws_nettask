@@ -498,6 +498,28 @@ class Http3ServerTest {
     }
 
     @Test
+    void fileRegionHonoursOffsetAndLength() throws Exception {
+        // Range (S5) will hand writers FileBody slices; the HTTP/3 writer must send exactly that region.
+        var large = this.root.resolve("large.bin");
+        Function<Request, Response> seam = req -> {
+            var full = this.handler.handle(new Request("GET", "/large.bin"));
+            var body = (sjws_nettask.core.Body.FileBody) full.body();
+            var region = new sjws_nettask.core.Body.FileBody(body.realPath(), 100_003, 1_000_000, body.expected());
+            return new Response(200, full.headers(), region);
+        };
+        try (var s = seamServer(seam, config().build()); var c = new H3TestClient(this.tls.certificate())) {
+            var r = H3TestClient.get(c.connect(s.localAddress()), "/large.bin");
+            var all = Files.readAllBytes(large);
+            assertArrayEquals(java.util.Arrays.copyOfRange(all, 100_003, 1_100_003), r.body());
+            assertEquals("1000000", r.header("content-length"));
+            var out = new java.io.ByteArrayOutputStream();
+            sjws_nettask.HTTP.Http1Writer.write(out, seam.apply(null), true);
+            var h1 = sjws_nettask.HttpTestSupport.readResponse(new java.io.ByteArrayInputStream(out.toByteArray()));
+            assertArrayEquals(h1.body(), r.body(), "same region as HTTP/1");
+        }
+    }
+
+    @Test
     void handlerExceptionBecomes500() throws Exception {
         Function<Request, Response> seam = req -> {
             throw new IllegalStateException("boom");
