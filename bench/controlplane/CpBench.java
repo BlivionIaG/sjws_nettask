@@ -53,6 +53,9 @@ public final class CpBench {
                 .append("  header_timeout: 3600\n");
         if (o.containsKey("mode")) {
             sb.append("node:\n  mode: ").append(o.get("mode")).append("\n");
+            if (o.containsKey("root")) {
+                sb.append("  state_dir: ").append(o.get("root")).append("\n");
+            }
         }
         if (n > 0) {
             sb.append("routing:\n  enabled: true\n  routes:\n");

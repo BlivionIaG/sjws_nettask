@@ -89,7 +89,7 @@ class ControlPlaneSecurityTest {
         var cfg = sjws_nettask.config.ConfigDocument.of(server, sjws_nettask.config.ConfigDocument.defaults(server).acme(),
                 sjws_nettask.config.ConfigDocument.defaults(server).routing(), List.of(), access,
                 new sjws_nettask.config.NodeSettings(sjws_nettask.config.NodeSettings.Mode.DATA, Map.of("zone", "eu:1")),
-                1, 12, null, "");
+                1, 12, null);
         var d = AccessPolicyDocument.fromConfig(cfg, Scope.label("zone", "eu:1"));
         assertEquals(12, d.version());
         var live = LivePolicy.forNode(cfg.node(), AccessRules.DEFAULT);

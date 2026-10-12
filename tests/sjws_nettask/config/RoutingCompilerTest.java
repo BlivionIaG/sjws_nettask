@@ -132,7 +132,7 @@ class RoutingCompilerTest {
                     - { prefix: /old, rewrite: /, redirect: { status: 308, location: /new/, keep_path: true } }
                     - { prefix: /files, rewrite: /, static: true }
                 """.formatted(up.getAddress().getPort()));
-        try (var server = SjwsServer.start(loaded, null)) {
+        try (var server = SjwsServer.start(loaded)) {
             var client = HttpClient.newHttpClient();
             var base = "http://127.0.0.1:" + server.tcpPort();
             var api = get(client, base + "/api/x?q=1");

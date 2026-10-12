@@ -568,8 +568,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                         altSvc = number(value, altSvc, 0, 31_536_000, name, warnings);
                         explicitH3Options.add(name);
                     }
-                    case "--config", "--acme", "--no-acme", "--acme-directory", "--acme-email", "--acme-domain",
-                            "--acme-storage", "--acme-http-port", "--acme-accept-terms", "--acme-renew-before" -> {
+                    case "--config", "--state-dir", "--acme", "--no-acme", "--acme-directory", "--acme-email",
+                            "--acme-domain", "--acme-storage", "--acme-http-port", "--acme-accept-terms",
+                            "--acme-renew-before" -> {
                         // applied by config.ConfigLoader; recognized so they are not unknown options
                     }
                     default -> warnings.add("Unknown option '" + name + "' (see --help)");
