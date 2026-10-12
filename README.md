@@ -1,7 +1,7 @@
 # sjws_nettask
 Simple Java Web Server
 
-Basic multi-threaded (virtual threads) static file server. Requires Java 21+.
+Basic multi-threaded (virtual threads) static file server. Requires Java 25+.
 
 Build and test:
 
