@@ -100,4 +100,31 @@ class SecurityReviewTest {
         assertEquals(0, leaked, "served " + served);
         assertTrue(served > 0);
     }
+
+    /** F5, inverted: the server's token handler accepts no token, so a forged one can't skip address validation. */
+    @Test
+    void m3ForgedRetryTokenIsRejected() throws Exception {
+        var victim = new java.net.InetSocketAddress(java.net.InetAddress.getByName("203.0.113.7"), 443);
+        var forged = io.netty.buffer.Unpooled.buffer()
+                .writeBytes("netty".getBytes(java.nio.charset.StandardCharsets.US_ASCII))
+                .writeBytes(victim.getAddress().getAddress()).writeBytes(new byte[] {1, 2, 3, 4, 5, 6, 7, 8});
+        try {
+            assertTrue(io.netty.handler.codec.quic.InsecureQuicTokenHandler.INSTANCE.validateToken(forged.slice(),
+                    victim) > 0, "the repro: Netty's insecure handler accepts it");
+            assertEquals(-1, Http3Server.TOKENS.validateToken(forged.slice(), victim));
+            assertEquals(0, Http3Server.TOKENS.maxTokenLength());
+            var out = io.netty.buffer.Unpooled.buffer();
+            assertFalse(Http3Server.TOKENS.writeToken(out, io.netty.buffer.Unpooled.wrappedBuffer(new byte[8]), victim),
+                    "no Retry packets");
+            assertEquals(0, out.readableBytes());
+            out.release();
+        } finally {
+            forged.release();
+        }
+        // and clients still connect (no Retry round trip needed)
+        try (var server = new Http3Server(config().build(), this.handler, this.tls).start();
+                var client = new H3TestClient(this.tls.certificate())) {
+            assertEquals(200, H3TestClient.get(client.connect(server.localAddress()), "/hello.txt").status());
+        }
+    }
 }
