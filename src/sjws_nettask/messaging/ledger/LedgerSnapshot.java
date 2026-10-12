@@ -6,6 +6,7 @@ package sjws_nettask.messaging.ledger;
  * consistent snapshot with a single volatile load and never touch the writer's mutable state.
  *
  * @param nextOffset        first offset not yet committed (readers must not read at or past it)
+ * @param durableOffset     every offset below this is fsynced (≤ nextOffset; equal in GROUP/EACH)
  * @param startOffset       first offset still on disk
  * @param committedBatches  batches committed since open
  * @param committedRecords  records committed since open
@@ -16,6 +17,8 @@ package sjws_nettask.messaging.ledger;
  * @param commitSeq         monotonically increasing per publication (0 = state right after open)
  * @param lastCommitNanos   {@link System#nanoTime()} of the publication
  */
-public record LedgerSnapshot(long nextOffset, long startOffset, long committedBatches, long committedRecords,
+public record LedgerSnapshot(long nextOffset, long durableOffset, long startOffset, long committedBatches, long committedRecords,
         long committedBytes, long fsyncs, int segmentCount, Durability durability, long commitSeq, long lastCommitNanos) {
+    /** Records acked but not yet fsynced: the local power-loss window at this instant. */
+    public long unsyncedRecords() { return nextOffset - durableOffset; }
 }

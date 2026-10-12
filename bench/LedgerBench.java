@@ -13,7 +13,7 @@ import sjws_nettask.messaging.ledger.SegmentedLog;
  * comparable: N producers each append one 1-record batch, wait for the ack, repeat; latency = enqueue -> ack.
  *
  *   mvn -q -DskipTests compile
- *   java -cp target/classes bench/LedgerBench.java <dir> <none|group|each> <producers> <payloadBytes> <seconds> [lingerMicros]
+ *   java -cp target/classes bench/LedgerBench.java <dir> <none|async|group|each> <producers> <payloadBytes> <seconds> [lingerMicros]
  */
 public class LedgerBench {
     public static void main(String[] a) throws Exception {
