@@ -303,4 +303,24 @@ class TlsMaterialTest {
         ctx.init(kmf.getKeyManagers(), null, null);
         assertTrue(java.util.List.of(ctx.createSSLEngine().getSupportedProtocols()).contains("TLSv1.3"));
     }
+
+    @Test
+    void warnsAboutReadableKeyAndCertificateOutsideItsValidity() throws Exception {
+        var material = TlsMaterial.selfSigned("localhost");
+        var key = java.nio.file.Files.writeString(this.tmp.resolve("k.pem"), "x");
+        org.junit.jupiter.api.Assumptions.assumeTrue(key.getFileSystem().supportedFileAttributeViews().contains("posix"));
+        java.nio.file.Files.setPosixFilePermissions(key, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        var now = java.time.Instant.now();
+        assertTrue(TlsMaterial.warnings(key, material.certificate(), now).isEmpty());
+        java.nio.file.Files.setPosixFilePermissions(key, java.nio.file.attribute.PosixFilePermissions.fromString("rw-r-----"));
+        var w = TlsMaterial.warnings(key, material.certificate(), now);
+        assertEquals(1, w.size(), w.toString());
+        assertTrue(w.get(0).contains("readable by group/others"));
+        java.nio.file.Files.setPosixFilePermissions(key, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        assertTrue(TlsMaterial.warnings(key, material.certificate(), now.plus(java.time.Duration.ofDays(400)))
+                .get(0).contains("expired"));
+        assertTrue(TlsMaterial.warnings(key, material.certificate(), now.minus(java.time.Duration.ofDays(2)))
+                .get(0).contains("not valid before"));
+        assertTrue(TlsMaterial.warnings(this.tmp.resolve("missing.pem"), material.certificate(), now).isEmpty());
+    }
 }
