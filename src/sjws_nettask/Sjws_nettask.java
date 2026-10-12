@@ -17,11 +17,14 @@
 package sjws_nettask;
 
 import java.io.IOException;
+import java.io.PrintStream;
 import java.io.UncheckedIOException;
 import java.net.BindException;
-import java.io.PrintStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -54,10 +57,26 @@ public class Sjws_nettask {
      */
     static int serve(ServerConfig config, Transport.Factory h3Factory, PrintStream out, PrintStream err,
             Consumer<SjwsServer> started) {
+        return serve(config, h3Factory, out, err, started, Daemon.DEFAULT_SHUTDOWN_TIMEOUT, null);
+    }
+
+    /**
+     * @param pidFile written once the server is listening, and removed on shutdown; null to skip
+     * @param shutdownTimeout how long in-flight responses may finish after SIGTERM/SIGINT
+     */
+    static int serve(ServerConfig config, Transport.Factory h3Factory, PrintStream out, PrintStream err,
+            Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile) {
         var root = config.root();
         if (!Files.isDirectory(root)) {
             err.println("Document root " + root.toAbsolutePath() + " does not exist or is not a directory.");
             return EXIT_BAD_ROOT;
+        }
+        if (pidFile != null) {
+            var existing = PidFile.read(pidFile);
+            if (PidFile.blocksStart(existing)) {
+                err.println("Already running with pid " + existing.pid() + " (" + pidFile + ").");
+                return EXIT_CANNOT_LISTEN;
+            }
         }
         SjwsServer server;
         try {
@@ -70,14 +89,38 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        var hook = new Thread(server::close, "shutdown");
+        server.shutdownTimeout(shutdownTimeout);
+        var pid = new AtomicReference<PidFile>();
+        var hook = new Thread(() -> {
+            try {
+                server.close();
+            } finally {
+                releasePid(pid.get(), err);
+            }
+        }, "shutdown");
         Runtime.getRuntime().addShutdownHook(hook);
-        out.println("Server started: " + server.describe());
-        sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
-                .ifPresent(w -> err.println("WARN: " + w));
-        sjws_nettask.core.SafeOpen.unlistableWarning(config.allowUnlistableDirs())
-                .ifPresent(w -> err.println("WARN: " + w));
         try {
+            if (pidFile != null) {
+                PidFile.Claim claim;
+                try {
+                    claim = PidFile.claim(pidFile);
+                } catch (IOException e) {
+                    err.println("Cannot write pid file " + pidFile + ": " + e.getMessage());
+                    return EXIT_CANNOT_LISTEN;
+                }
+                if (!claim.acquired()) {
+                    var owner = claim.snapshot();
+                    err.println("Already running with pid " + (owner.pid() > 0 ? owner.pid() : "?") + " (" + pidFile
+                            + ").");
+                    return EXIT_CANNOT_LISTEN;
+                }
+                pid.set(claim.file());
+            }
+            out.println("Server started: " + server.describe());
+            sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
+                    .ifPresent(w -> err.println("WARN: " + w));
+            sjws_nettask.core.SafeOpen.unlistableWarning(config.allowUnlistableDirs())
+                    .ifPresent(w -> err.println("WARN: " + w));
             started.accept(server);
             server.awaitTermination();
             out.println("Server Terminated properly !");
@@ -87,7 +130,19 @@ public class Sjws_nettask {
             return EXIT_OK;
         } finally {
             server.close();
+            releasePid(pid.get(), err);
             removeHook(hook);
+        }
+    }
+
+    private static void releasePid(PidFile file, PrintStream err) {
+        if (file == null) {
+            return;
+        }
+        try {
+            file.release();
+        } catch (IOException e) {
+            err.println("WARN: could not remove pid file " + file.path() + ": " + e.getMessage());
         }
     }
 
@@ -107,6 +162,11 @@ public class Sjws_nettask {
         return value > 0 && value < 65536;
     }
 
+    /** {@link ServerConfig#usage()} plus the daemon controls. */
+    public static String usage() {
+        return ServerConfig.usage() + Daemon.usage();
+    }
+
     /**
      * Everything {@link #main} does except exiting the process.
      *
@@ -114,22 +174,85 @@ public class Sjws_nettask {
      */
     static int run(String[] args, Map<String, String> env, PrintStream out, PrintStream err,
             Transport.Factory h3Factory, Consumer<SjwsServer> started) {
-        var parsed = ServerConfig.parse(args, env);
+        for (var arg : args) {
+            if (arg.equals("-h") || arg.equals("--help")) {
+                out.print(usage());
+                return EXIT_OK;
+            }
+        }
+        var opt = Daemon.parse(args, env);
+        boolean child = "1".equals(env.get(Daemon.CHILD_ENV));
+        if (opt.action() == Daemon.Action.STOP || opt.action() == Daemon.Action.STATUS) {
+            return control(opt, out, err);
+        }
+        var parsed = ServerConfig.parse(opt.remaining(), env);
         if (parsed.helpRequested()) {
-            out.print(ServerConfig.usage());
+            out.print(usage());
             return EXIT_OK;
         }
+        opt.warnings().forEach(w -> err.println("WARN: " + w));
         parsed.warnings().forEach(w -> err.println("WARN: " + w));
-        if (!parsed.ok()) {
+        if (!opt.ok() || !parsed.ok()) {
+            opt.errors().forEach(e -> err.println("ERROR: " + e));
             parsed.errors().forEach(e -> err.println("ERROR: " + e));
             err.println("See --help.");
             return EXIT_USAGE;
         }
-        return serve(parsed.config(), h3Factory, out, err, started);
+        if (!child && (opt.action() == Daemon.Action.DAEMON || opt.action() == Daemon.Action.RESTART)) {
+            if (opt.action() == Daemon.Action.RESTART) {
+                int stopped = Daemon.stop(opt.pidFile(), opt.shutdownTimeout(), out, err);
+                if (stopped != 0) {
+                    return stopped;
+                }
+            }
+            return Daemon.daemonize(opt, env, out, err);
+        }
+        if (child) {
+            Daemon.ignoreSignal("HUP");
+        }
+        PrintStream logOut = out;
+        PrintStream logErr = err;
+        boolean ownLog = false;
+        if (opt.logToFile()) {
+            try {
+                var log = Daemon.openLog(opt.logFile());
+                logOut = log;
+                logErr = log;
+                ownLog = true;
+                if (child) {
+                    Daemon.redirectStandardStreams(log);
+                }
+            } catch (IOException e) {
+                err.println("Cannot write log file " + opt.logFile() + ": " + e.getMessage());
+                return EXIT_CANNOT_LISTEN;
+            }
+        }
+        try {
+            return serve(parsed.config(), h3Factory, logOut, logErr, started, opt.shutdownTimeout(),
+                    opt.trackPid() ? opt.pidFile() : null);
+        } finally {
+            if (ownLog) {
+                logOut.close();
+            }
+        }
+    }
+
+    /** {@code --stop} / {@code --status}: no server configuration is required. */
+    private static int control(Daemon.Options opt, PrintStream out, PrintStream err) {
+        opt.warnings().forEach(w -> err.println("WARN: " + w));
+        if (!opt.ok()) {
+            opt.errors().forEach(e -> err.println("ERROR: " + e));
+            err.println("See --help.");
+            return EXIT_USAGE;
+        }
+        if (opt.action() == Daemon.Action.STATUS) {
+            return Daemon.status(opt.pidFile(), out, err);
+        }
+        return Daemon.stop(opt.pidFile(), opt.shutdownTimeout(), out, err);
     }
 
     /**
-     * See {@link ServerConfig#usage()}.
+     * See {@link #usage()}.
      *
      * @param args the command line arguments
      */
