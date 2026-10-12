@@ -1,11 +1,14 @@
 package sjws_nettask;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
+import java.time.Duration;
+import java.util.HashSet;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
@@ -38,6 +41,26 @@ class SingleNodeHotPathTest {
                 var name = thread.getName();
                 assertTrue(!name.startsWith("ha-heartbeat") && !name.startsWith("raft-"), name);
             }
+        }
+    }
+
+    @Test
+    void reaperStaysUpIfInterruptedBeforeClose() throws Exception {
+        var before = new HashSet<>(Thread.getAllStackTraces().keySet());
+        var reaper = new ConnectionReaper(Duration.ofSeconds(30), Duration.ofSeconds(30), Duration.ofSeconds(30));
+        try {
+            Thread created = null;
+            for (var thread : Thread.getAllStackTraces().keySet()) {
+                if ("http1-reaper".equals(thread.getName()) && !before.contains(thread)) {
+                    created = thread;
+                }
+            }
+            assertNotNull(created);
+            created.interrupt();
+            Thread.sleep(40);
+            assertTrue(created.isAlive());
+        } finally {
+            reaper.close();
         }
     }
 }
