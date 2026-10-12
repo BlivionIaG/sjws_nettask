@@ -12,6 +12,16 @@ Binding decisions, which override a review where the two disagree:
 2. `ConfigDiff` is a per-section report. Distribution always sends a full signed snapshot. It never sends a patch.
 3. Signature checks and rollback checks run inside `SjwsServer.applyRemote` and fail closed.
 4. The control plane's last-good config is `<stateDir>/config/last-good.json`.
+5. SIGHUP reloads local settings only. It never pulls a snapshot from the control plane.
+6. Drain finishes inside the daemon's `drain-ms` budget. The default budget is 30 seconds.
+7. systemd `active` is not readiness. Readiness is `GET /readyz` returning 200. A control node is ready only when that probe is 200 and `leaderReady()` is true.
+8. A data node whose control plane is down serves last-good. With no last-good it stays not-ready and keeps retrying the watch.
+9. Past max-staleness, readiness goes false and the node keeps serving. Max-staleness does not drain.
+10. A join token is idempotent for one node identity for its TTL. Presenting it again from that same identity is the same join.
+11. The control role does not bind the content port unless the operator sets an explicit content listener.
+12. Role precedence is the command line, then the environment, then YAML.
+
+These twelve override [PR #65](https://github.com/BlivionIaG/sjws_nettask/pull/65) where that daemon slice assumed a different lifecycle (a SIGHUP that cannot run, max-staleness calling `drain()`, a content port on the control role, and an open question on role precedence).
 
 ## 1. Context
 
@@ -99,12 +109,14 @@ Transports do not import `AppliedConfig`. They already depend on `Supplier<Handl
 | Startup role | Process |
 |---|---|
 | `standalone` | Today's server. Control-plane code is not started. |
-| `control` | Voter of `cp-config`. Admin API. ACME only while leader-ready (§6). No content request path that consults Raft. |
+| `control` | Voter of `cp-config`. Admin API. ACME only while leader-ready (§6). Does not bind the content port unless the operator sets an explicit content listener. No content request path that consults Raft. |
 | `data` | One data role: `gateway`, `static`, `broker`, or `edge`. Registers, watches, applies, serves from `LiveConfig`. |
 
 A data node also carries labels (`String` map) and capabilities (`http1`, `http2`, `http3`, `proxy`, `static`, `messaging`). Labels select rollout stages. Capabilities bound the projection in §12.4.
 
-The config workstream owns the YAML keys (`node.mode`, `node.role`, `node.labels`, `node.capabilities`) and the command-line flags. This design names them. The parser stays in `sjws_nettask.config`. Until the operator selects `control` or `data`, behavior matches `standalone`.
+The role is chosen once, before any socket is bound. Precedence is the command line (`--role`), then the environment (`WEB_SERVER_ROLE`), then YAML (`node.mode` for `standalone` / `control` / `data`, and `node.role` for the data-plane role). A later source does not override an earlier one. When none of the three names `control` or `data`, the process is `standalone`.
+
+The control role binds the admin listener (§14) and does not bind the content port by default. `listen=` in the daemon bootstrap is the admin address, not a content listener. A content port on a control process exists only when the operator sets one. Firewall rules for the control unit therefore do not assume a content listener.
 
 ### 3.4 Threading
 
@@ -238,7 +250,7 @@ Order inside the lock:
 
 File reload and `applyRemote` share `reloadLock`, the lock `SjwsServer.reload()` already holds around `reloadLocked()`. `applyRemote` runs the checks in §5.5, then `ConfigReloader.apply`, then the same publish `reload()` uses: ACME listener, reaper timeouts, `live.set`, `replaceHandler`, `replaceTls`. It does not call `ReloadHook.run()`. Generation is assigned only inside the lock, from the snapshot currently installed. Two callers cannot both compute `generation + 1` from the same base. There is one generation authority.
 
-Role `data` does not let `ReloadHook` / `SIGHUP` publish CP-owned sections from the local file. Those sections are routing, middleware, access, topics, and ACME material that arrived in an envelope. A SIGHUP may still apply local-only fields the control plane does not own (this host's document-root path, the listen address). A SIGHUP that would change a CP-owned section is rejected and audited. Role `standalone` keeps today's full file reload.
+SIGHUP, and the in-process `ReloadHook.run()` it maps to on a process that still has a terminal, reloads local settings only. The reload reads the local config file. It does not open the watch, does not call the control plane, and does not pull a snapshot. On role `data` the CP-owned sections stay as last applied: routing, middleware, access, topics, and ACME material that arrived in an envelope. A file that would change one of those sections is rejected and audited. Local-only fields still apply: this host's document root, labels, and the listen address. Role `standalone` keeps today's full file reload. The detached daemon child ignores SIGHUP so a closed terminal does not kill it, and the role units have no `ExecReload`. That absence is not a pull. Nothing on the reload path fetches from the control plane.
 
 The publish step, for a file reload and for a remote apply:
 
@@ -288,11 +300,13 @@ Precedence for role `data`, at boot and at runtime:
 
 On startup the process reads the pin, then `floor.json` and `trust.json`, and only then considers `last-good.json`. The file is compiled when its signature verifies under the persisted bundle (which must chain to the pinned root), its `version` equals `maxVersion`, and its `canonicalHash` matches the canonical YAML in the file. Those checks are the boot path of `applyRemote`: a failure leaves the file uncompiled.
 
-An envelope at or below the floor, or a last-good file older than the floor, is not compiled. The process still binds the content listener and answers 503 (not ready) until a snapshot passes the check. It does not serve CP-owned sections from the local YAML. `/healthz` can be 200 while the process is up. `/readyz` is 503.
+An envelope at or below the floor, or a last-good file older than the floor, is not compiled. The process does not serve CP-owned sections from the local YAML.
 
-A wipe or restore of `stateDir` deletes `config/floor.json`, `config/trust.json`, and `config/last-good.json` together, so those files cannot stop a replay by themselves. The floor that survives the wipe is the root version floor in the pin and in the join material (§12.3, §12.4). A node with an empty `stateDir` still refuses any envelope whose `version` is below that floor, and it binds 503 until a newer envelope arrives.
+When the control plane is down, a data node that already has a verified `last-good.json` keeps serving that snapshot. The watch retries in the background. The request path does not wait on the retry. `/healthz` can be 200 while the process is up.
 
-The watch connects in the background. If the control plane is down, the process serves the snapshot that passed the floor check. A corrupt or unverifiable file is not applied. The listener stays bound and answers 503 until a good snapshot is published. There is no older snapshot in memory at boot.
+When there is no verified last-good (first boot, a wipe, or a file that failed the signature and floor checks), the node stays not-ready. `/readyz` is 503. The watch keeps retrying. The process does not exit and does not drain itself. A later snapshot that passes `applyRemote` is what makes the node ready.
+
+A wipe or restore of `stateDir` deletes `config/floor.json`, `config/trust.json`, and `config/last-good.json` together, so those files cannot stop a replay by themselves. The floor that survives the wipe is the root version floor in the pin and in the join material (§12.3, §12.4). A node with an empty `stateDir` still refuses any envelope whose `version` is below that floor, stays not-ready, and keeps retrying until a newer envelope arrives.
 
 ## 6. Leadership interface
 
@@ -335,6 +349,20 @@ On each transition to leader, the new leader appends a single `Noop` in the new 
 `standalone` uses a local stub that is leader and fires `leaderReady` once at startup, so today's ACME path is unchanged. `control` uses the real group. `data` does not construct an `AcmeService`.
 
 `readBarrier` / lease reads stay inside the cluster package. Config publish uses `append` on the leader. The HTTP request path calls none of these methods.
+
+### 6.1 Daemon lifecycle
+
+[PR #65](https://github.com/BlivionIaG/sjws_nettask/pull/65) starts the process. This design owns what "up" means after that.
+
+systemd `active` means the pid file exists. It is not readiness. Readiness is `GET /readyz` returning 200. A control node is ready only when `/readyz` is 200 and `leaderReady()` is true. `isLeader()` alone is not ready: the election `Noop` has to be applied first. A data node is ready when it is serving a verified snapshot that is still inside max-staleness. `/healthz` stays a liveness probe and can be 200 while `/readyz` is 503.
+
+`--status` reports the control plane through `sjws_nettask.service.ControlPlaneBinding`: `connectionState()` is one of `pending`, `connecting`, `connected`, `disconnected`, `leader`, `follower`, and `configVersion()` is the applied version or `0`. The store publishes an implementation with `NodeEnrollment.attach`. Until `attach`, `--status` stays `connection=pending` and `config-version=0`. `NodeEnrollment.current()` is null in a standalone process, and that class is not loaded there. Drain is still `SjwsServer.drain()`. `ControlPlaneBinding` has no stop method.
+
+`NodeEnrollment.copySecret()` returns a clone of the join secret. The caller wipes the clone. `NodeEnrollment.tokenConsumed()` runs after the join commit: it writes `stateDir/node.id` and then deletes the token file. A restart before that call presents the same token again, which is the same join (§12.4).
+
+Drain is one call, `SjwsServer.drain()`. With HA attached that is `Lifecycle.drain()` (not-ready, deregistration delay, `Connection: close`, then close). With HA absent it is `close()`. The call has to finish inside the daemon's `drain-ms` budget. The default budget is 30 seconds, which covers the HA defaults (`drainDelay` 5 s plus `drainTimeout` 15 s) and leaves slack for the accept-loop join. A deployment that raises `drainDelay` or `drainTimeout` past that budget has to raise `drain-ms` in the same change. `--stop` waits for the recorded budget, capped at 10 minutes. The role units' `TimeoutStopSec` stays above the budget. There is no second drain API.
+
+The control role does not bind the content port by default (§3.3). Role precedence is CLI, then environment, then YAML (§3.3).
 
 ## 7. Registration and heartbeats
 
@@ -391,7 +419,7 @@ A proposal that fails validation is not appended. A failed `publish` on one node
 
 A partition that leaves a minority of control nodes unable to reach a majority cannot commit. Those nodes do not sign a new version. Data nodes that can still see a leader keep watching. Data nodes that cannot see a leader keep the installed snapshot and keep answering requests.
 
-Stale means `installed version < desired version` while the watch is down or the node has not acked. The watch thread publishes a gauge. The content path does not read it. `/readyz`, when HA's `HealthBoard` is in use, may report `config_stale` as text and still return 200. An optional max-staleness policy (off by default) flips readiness to 503 after the configured age. It does not close the accept loop by itself. Drain remains `Lifecycle.drain()` from the HA design, invoked by an operator or by that policy's explicit drain action.
+Stale means the installed snapshot is past the signed freshness window (§12.3), or `installed version < desired version` while the watch is down. The watch thread publishes a gauge. The content path does not read it. Past max-staleness, `/readyz` returns 503 and the node keeps serving the installed snapshot. Max-staleness does not close the accept loop and does not call `SjwsServer.drain()`. Drain remains the operator action in §6.1.
 
 On reconnect the node resumes from the persisted version. It does not drop the snapshot it is serving while the catch-up compile runs. The swap happens only after the new snapshot compiles.
 
@@ -465,7 +493,7 @@ A receiver rejects an envelope when any of the following holds:
 
 `version` is strictly monotonic, so a replay of an old envelope fails the floor check. The nonce is inside the signature so two signatures of the same body differ. It is not stored as a set. `epoch` is recorded and must be greater than or equal to the highest epoch already applied. That check is defense in depth against a deposed leader's key. `version` is what orders envelopes.
 
-Every envelope carries `issuedAtMillis` and `expiresAtMillis` (default lifetime 15 minutes). While a version stays current, the leader also pushes a signed freshness frame at least every 30 s: `version`, `issuedAtMillis`, `expiresAtMillis`, `keyId`, and a signature over those fields with domain `"sjws-cp-freshness-v1"`. Max-staleness compares the local clock to that signed expiry. A withheld update and a quiet version are different: quiet still refreshes the freshness frame. A node past expiry without a new frame treats the snapshot as stale for readiness. It keeps serving last-good unless the operator turned max-staleness drain on (§10).
+Every envelope carries `issuedAtMillis` and `expiresAtMillis` (default lifetime 15 minutes). While a version stays current, the leader also pushes a signed freshness frame at least every 30 s: `version`, `issuedAtMillis`, `expiresAtMillis`, `keyId`, and a signature over those fields with domain `"sjws-cp-freshness-v1"`. Max-staleness compares the local clock to that signed expiry. A withheld update and a quiet version are different: quiet still refreshes the freshness frame. A node past expiry without a new frame treats the snapshot as stale for readiness. Readiness goes false. The node keeps serving last-good. There is no automatic drain (§10).
 
 Key compromise: the operator signs a new `TrustBundle` with the root. The bundle names the replacement online keys and a **version floor**. Every envelope signed by a retired `keyId`, and every envelope below that floor, fails verification even on a node whose `stateDir` was wiped. The floor is also written into the pin file and into join material so a node that has not yet seen the bundle still enforces it.
 
@@ -473,15 +501,15 @@ Key compromise: the operator signs a new `TrustBundle` with the root. The bundle
 
 ### 12.4 Join tokens and bootstrap
 
-A join token is `{tokenId, secret}`. The control plane stores the hash of `secret`, a TTL (default 1 hour, maximum 24 hours), the role, the labels, the capabilities, and an optional expected node id or SAN. The token is single-use.
+A join token is `{tokenId, secret}` issued for one node identity. The control plane stores the hash of `secret`, a TTL (default 1 hour, maximum 24 hours), the role, the labels, the capabilities, and the node id. Within that TTL the token is idempotent for that identity: presenting it again, including after a restart that still has the token file and including after a leadership change, is the same join. The committed consume entry is returned again. A second enrollment is not created. A different node identity is rejected. A presentation after the TTL is rejected.
 
 The data node checks the pinned CA fingerprint **before** it sends the token. Role `data` has no trust-on-first-use path. A lab process may pass `--insecure-tofu`, and that flag is refused when the role is `data` or when the group has more than one voter. The bootstrap API returns the fingerprint and the token to its caller. A test does not scrape stdout for either value.
 
 Role, labels, and capabilities come from the token record. The leader writes them into the node certificate (SAN and a role extension). The projection is derived from that certificate. `Register` cannot raise them. A `Register` that claims a different role is rejected.
 
-`ConsumeToken` and `Register` are one Raft entry. The leader appends that entry and waits until it commits, and only then returns the certificate. A leadership change cannot accept the same token again: the consume is already in the log, or it is not and the certificate was not sent. Failed presentations are rate-limited and audited per source address. The token is checked before any CSR is signed, so an unauthenticated joiner does not cost a signature.
+`ConsumeToken` and `Register` are one Raft entry. The leader appends that entry and waits until it commits, and only then returns the certificate. A leadership change does not mint a second join for the same token and the same identity: the consume is already in the log and the re-presentation returns it, or it is not committed and the certificate was not sent. A different identity does not reuse that entry. Failed presentations are rate-limited and audited per source address. The token is checked before any CSR is signed, so an unauthenticated joiner does not cost a signature. `NodeEnrollment.tokenConsumed()` runs only after that commit (§6.1).
 
-Voter bootstrap tokens follow the same TTL, hash, and single-use rules, and an enrolled `admin` must approve them. The one-voter lab configuration is not a production deployment. Production failure tests use 3 voters. The operator retires the one-voter group before data nodes join.
+Voter bootstrap tokens follow the same TTL, hash, and per-identity idempotency rules, and an enrolled `admin` must approve them. The one-voter lab configuration is not a production deployment. Production failure tests use 3 voters. The operator retires the one-voter group before data nodes join.
 
 ### 12.5 Compromised data-plane node
 
@@ -581,7 +609,7 @@ Desired topic state and the message log are different Raft groups. Losing the co
 
 ## 14. Admin API and the TUI
 
-The control role binds a dedicated admin address. The content port does not serve these routes.
+The control role binds a dedicated admin address and does not bind the content port by default (§3.3). The content port, when a control process has one, does not serve these routes.
 
 | Method | Path | Role | Body |
 |---|---|---|---|
@@ -633,7 +661,7 @@ While the watch is down, the oracle is the data node, not the admin API. `DataNo
 | `operate` RBAC | A `Propose` that contains `rbac` or `trust` is rejected. The `Rbac` entry is unchanged. |
 | Secret path | A reference outside the secrets directory, including `..` and a symlink escape, is rejected. The error has no file bytes. |
 | Learner revoke | A learner watch server drops a revoked node on the next handshake and on apply of `Revoke`. |
-| Token replay | After a leader change, the same join token is rejected. The certificate was returned only after `ConsumeToken` committed. |
+| Token replay | After a leader change, the same join token from the same node identity is the same join. A different identity is rejected. The certificate was returned only after `ConsumeToken` committed. |
 | Role claim | `Register` claiming a role other than the token's role is rejected. The projection follows the certificate. |
 | `Noop` | `leaderReady()` is false after the election callback and true only after the `Noop` is applied. ACME's directory client is not invoked before that. |
 | Minority | With 3 voters and one link cut, the minority cannot `Activate`. |
@@ -643,10 +671,15 @@ While the watch is down, the oracle is the data node, not the admin API. `DataNo
 | Canary | A node whose labels miss stage 1 does not observe the new version until its stage opens. |
 | Rollback | `toVersion` produces a higher version with the old `canonicalHash`. `applyRemote` checks that hash against the retained version and fails closed on a mismatch. Nodes that already hold the hash ack without a second swap. |
 | Apply failure | `compile` throws. `LiveConfig` still returns the previous handler. |
-| CP down at boot | Role `data` serves `<stateDir>/config/last-good.json` after the signature check. Role `standalone` does not read that file. |
+| CP down at boot | Role `data` with a verified `<stateDir>/config/last-good.json` serves it while the control plane is down. With no last-good, `/readyz` stays 503 and the watch keeps retrying. Role `standalone` does not read that file. |
 | CP down at runtime | Requests succeed against the installed snapshot. No request thread blocks on the watch. |
+| Max-staleness | Past the freshness window, `/readyz` is 503 and the node keeps serving. `SjwsServer.drain()` is not called. |
+| Drain budget | `SjwsServer.drain()` returns inside `drain-ms`. The default budget is 30 seconds. |
+| Readiness | systemd `active` is not consulted. A control node is ready only when `/readyz` is 200 and `leaderReady()` is true. |
+| Content port | Role `control` does not bind the content port unless a content listener was set. |
+| Role precedence | `--role` wins over `WEB_SERVER_ROLE`, which wins over YAML. |
 | Projection | A `broker` envelope fails verification on a `gateway` node id and contains no sealed blob for the gateway key. |
-| Join token | The second presentation of the same token fails. A presentation past TTL fails. The CSR is not signed before the token check. |
+| Join token | A second presentation from the same identity within the TTL is the same join. A different identity fails. A presentation past TTL fails. The CSR is not signed before the token check. |
 | Revoke | The node receives no version committed after `Revoke`. Secrets wrapped to it are rotated. |
 | Chain swap | With HA and caller filters enabled, a pushed routing change is observed on HTTP/1, HTTP/2, and HTTP/3. The accept loop stays open. No non-2xx and no connection failure on the content port during `publish`. |
 | One publisher | A remote apply and a SIGHUP overlap. One generation is assigned. Both run the ACME listener, reaper timeout, and `replaceTls` side effects. Role `data` rejects a SIGHUP that changes a CP-owned section. |
@@ -681,7 +714,7 @@ This design PR changes no `.java` file. Its before/after pair is noise on identi
 Each PR is based on current master (this document's base or newer), merges the HA stack when it needs `ClusterNode`, keeps `mvn verify` green, does not lower the 0.96 root branch floor, and does not merge itself.
 
 1. **Design.** This document.
-2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, and `ConfigDiff.between` as a report. `SjwsServer.applyRemote` verifies the signature and the rollback inside the lock and fails closed, then uses `ConfigReloader.apply`. The handler chain reads the live snapshot. Last-good is `<stateDir>/config/last-good.json`. Admin routes in §14 with RBAC kept out of `Propose`. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
+2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, and `ConfigDiff.between` as a report. `SjwsServer.applyRemote` verifies the signature and the rollback inside the lock and fails closed, then uses `ConfigReloader.apply`. The handler chain reads the live snapshot. Last-good is `<stateDir>/config/last-good.json`. Admin routes in §14 with RBAC kept out of `Propose`. Expose `sjws_nettask.service.ControlPlaneBinding` and `NodeEnrollment` with the signatures in §6.1. SIGHUP stays a local reload. Drain stays inside the 30 s `drain-ms` budget. Readiness is `/readyz` plus `leaderReady()` on a control node. Join tokens are idempotent per node identity. The control role does not bind the content port by default. Role precedence is CLI, then environment, then YAML. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
 3. **Registration and distribution.** Watch client and server, projection, ack window, full snapshots only, `<stateDir>/config/last-good.json`, staged rollout and rollback, label selection. Data role calls `applyRemote`. Implement `ControlPlane` so the four harness scenarios can drop `@Disabled`. Tests for resume, backpressure, canary, partition, and revoke. Benchmark as §16.
 
 The request path in both implementation PRs stays a volatile read of the immutable snapshot.
