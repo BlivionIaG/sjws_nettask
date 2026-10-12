@@ -458,4 +458,64 @@ class SecurityReviewTest {
             waitFor(() -> !q.isActive(), 5, "connection closed");
         }
     }
+
+    /** What the HTTP/1.1 parser answers for this request line (0 = accepted). */
+    static int http1Status(String method, String target) throws Exception {
+        try {
+            sjws_nettask.HTTP.Http1Parser.read(new java.io.ByteArrayInputStream((method + " " + target
+                    + " HTTP/1.1\r\nHost: x\r\n\r\n").getBytes(java.nio.charset.StandardCharsets.ISO_8859_1)),
+                    sjws_nettask.CONSTANTS.MAX_LINE_LENGTH, sjws_nettask.CONSTANTS.MAX_HEADERS);
+            return 0;
+        } catch (sjws_nettask.HTTP.ParseError e) {
+            return e.status();
+        }
+    }
+
+    /**
+     * F3, inverted: request validation matches RFC 9114 §4.2 and the HTTP/1.1 parser; nothing answers 500,
+     * and an oversized request is a stream error, not a connection error.
+     */
+    @Test
+    void s4RequestValidationMatchesHttp1() throws Exception {
+        try (var server = new Http3Server(config().build(), this.handler, this.tls).start();
+                var client = new H3TestClient(this.tls.certificate())) {
+            var q = client.connect(server.localAddress());
+            for (var name : new String[] {"transfer-encoding", "keep-alive", "upgrade", "proxy-connection"}) {
+                var r = H3TestClient.request(q, "GET", "/hello.txt", Map.of(name, "x")).get(10, TimeUnit.SECONDS);
+                assertTrue(r.reset(), name + ": malformed, stream reset");
+                assertEquals(-1, r.status(), name + ": no response");
+            }
+            // CR/LF can't even be sent in an HTTP/1.1 request line; a raw space or DEL is 400 there
+            var crlf = H3TestClient.request(q, "GET", "/sub?a\r\nset-cookie: pwn=1", Map.of()).get(10, TimeUnit.SECONDS);
+            assertEquals(400, crlf.status(), "not 500, and no header injection");
+            assertNull(crlf.header("set-cookie"));
+            assertNull(crlf.header("location"));
+            for (var target : new String[] {"/a b+c.txt", "/hello.txt\u007f", "/caf\u00e9"}) {
+                var r = H3TestClient.request(q, "GET", target, Map.of()).get(10, TimeUnit.SECONDS);
+                assertEquals(400, r.status(), target);
+                if (target.indexOf('\u00e9') < 0) {
+                    assertEquals(400, http1Status("GET", target), "HTTP/1: " + target);
+                }
+                assertArrayEquals(H3Fixture.http1Body(StaticFileHandler.error(400, false)), r.body());
+            }
+            for (var method : new String[] {"FOO", "get"}) {
+                var r = H3TestClient.request(q, method, "/hello.txt", Map.of()).get(10, TimeUnit.SECONDS);
+                assertEquals(501, r.status(), method);
+                assertEquals(501, http1Status(method, "/hello.txt"), "HTTP/1: " + method);
+            }
+            assertEquals(405, H3TestClient.request(q, "POST", "/hello.txt", Map.of()).get(10, TimeUnit.SECONDS).status());
+            var conn = H3TestClient.request(q, "CONNECT", null, Map.of()).get(10, TimeUnit.SECONDS);
+            assertTrue(conn.reset(), "CONNECT without :authority/:path stays malformed");
+            var huge = H3TestClient.request(q, "GET", "/hello.txt?" + "a".repeat(9000), Map.of())
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(414, huge.status());
+            var big = new java.util.LinkedHashMap<String, String>();
+            for (int i = 0; i < 20; i++) {
+                big.put("x-filler-" + i, "b".repeat(1000));
+            }
+            assertEquals(431, H3TestClient.request(q, "GET", "/hello.txt", big).get(10, TimeUnit.SECONDS).status());
+            assertTrue(q.isActive(), "stream errors only: the connection survives");
+            H3Fixture.assertParity(this.handler, "GET", "/hello.txt", Map.of(), H3TestClient.get(q, "/hello.txt"));
+        }
+    }
 }

@@ -29,6 +29,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
+import sjws_nettask.core.RequestRules;
 
 /**
  * Strict HTTP/1.x request-head parser (RFC 9112). Anything ambiguous enough to
@@ -41,8 +42,7 @@ import java.util.regex.Pattern;
 public final class Http1Parser {
 
     /** Methods we recognise; of these only GET and HEAD are implemented (others: 405). */
-    public static final Set<String> KNOWN_METHODS = Set.of(
-            "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH");
+    public static final Set<String> KNOWN_METHODS = RequestRules.KNOWN_METHODS;
 
     public static final int MAX_LEADING_EMPTY_LINES = 4;
 
@@ -121,14 +121,11 @@ public final class Http1Parser {
         if (!version.equals("HTTP/1.1") && !version.equals("HTTP/1.0")) {
             throw new ParseError(505, "unsupported HTTP version");
         }
-        if (!KNOWN_METHODS.contains(method)) {
+        if (RequestRules.checkMethod(method) != 0) {
             throw new ParseError(501, "unknown method");
         }
-        for (int i = 0; i < parts[1].length(); i++) {
-            char c = parts[1].charAt(i);
-            if (c <= 0x20 || c >= 0x7f) {
-                throw new ParseError(400, "invalid character in request-target");
-            }
+        if (RequestRules.checkTarget(parts[1]) == 400) { // (longer than the line limit: 414 above)
+            throw new ParseError(400, "invalid character in request-target");
         }
         var target = originForm(parts[1]);
 

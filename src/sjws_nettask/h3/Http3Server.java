@@ -25,9 +25,11 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.http3.DefaultHttp3GoAwayFrame;
+import io.netty.handler.codec.http3.DefaultHttp3SettingsFrame;
 import io.netty.handler.codec.http3.Http3;
 import io.netty.handler.codec.http3.Http3ErrorCode;
 import io.netty.handler.codec.http3.Http3ServerConnectionHandler;
+import io.netty.handler.codec.http3.Http3Settings;
 import io.netty.handler.codec.quic.QuicTokenHandler;
 import io.netty.handler.codec.quic.Quic;
 import io.netty.handler.codec.quic.QuicChannel;
@@ -79,6 +81,14 @@ public final class Http3Server implements AutoCloseable {
     static final long MAX_DATA = 1024L * 1024;
     static final long MAX_STREAM_DATA = 16L * 1024;
     static final long MAX_STREAMS = 64;
+    /** Largest request field section answered normally (RFC 9114 §4.2.2 size); larger gets 431. */
+    static final long MAX_FIELD_SECTION = 16 * 1024;
+    /**
+     * SETTINGS_MAX_FIELD_SECTION_SIZE advertised to (and enforced by) the codec. Netty treats a larger
+     * section as a connection error, so it sits above {@link #MAX_FIELD_SECTION}: oversized requests are
+     * refused per stream (431) and the connection's other requests survive.
+     */
+    static final long CODEC_MAX_FIELD_SECTION = 64 * 1024;
     /** Address-validation token policy (security review M3). */
     static final QuicTokenHandler TOKENS = NoRetryTokenHandler.INSTANCE;
 
@@ -257,7 +267,8 @@ public final class Http3Server implements AutoCloseable {
             protected void initChannel(QuicStreamChannel stream) {
                 stream.pipeline().addLast(new Http3RequestHandler(Http3Server.this.shared, connection));
             }
-        }));
+        }, null, null, new DefaultHttp3SettingsFrame(Http3Settings.defaultSettings()
+                .maxFieldSectionSize(CODEC_MAX_FIELD_SECTION)), true));
         quic.pipeline().addLast(QuietErrors.INSTANCE);
     }
 
