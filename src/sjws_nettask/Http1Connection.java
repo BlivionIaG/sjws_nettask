@@ -25,6 +25,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import sjws_nettask.core.Handler;
@@ -86,6 +87,8 @@ final class Http1Connection implements Runnable {
     private final String remote;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ConnectionReaper reaper;
+    /** Null when HA is off: the keep-alive decision is unchanged. */
+    private final BooleanSupplier closeAfterResponse;
     private final ObserverSlot slot;
     /** Numeric client address (no reverse lookup), cached for the life of the connection. */
     private final String clientHost;
@@ -126,8 +129,15 @@ final class Http1Connection implements Runnable {
         this(channel, handler, extraHeaders, reaper, new ObserverSlot(observer), clientHost, loopback);
     }
 
+    /** Clustering off: no drain supplier, so keep-alive never calls one. */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper, ObserverSlot slot, String clientHost, boolean loopback) {
+        this(channel, handler, extraHeaders, reaper, slot, clientHost, loopback, null);
+    }
+
+    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, ObserverSlot slot, String clientHost, boolean loopback,
+            BooleanSupplier closeAfterResponse) {
         this.channel = channel;
         this.handler = handler;
         this.files = handler instanceof StaticFileHandler direct ? direct : null;
@@ -149,6 +159,15 @@ final class Http1Connection implements Runnable {
         this.slot = java.util.Objects.requireNonNull(slot, "slot");
         this.clientHost = java.util.Objects.requireNonNull(clientHost, "clientHost");
         this.loopback = loopback;
+        this.closeAfterResponse = closeAfterResponse;
+    }
+
+    private boolean keep(boolean keepAlive) {
+        if (!keepAlive) {
+            return false;
+        }
+        var signal = this.closeAfterResponse;
+        return signal == null || !signal.getAsBoolean();
     }
 
     /**
@@ -296,13 +315,13 @@ final class Http1Connection implements Runnable {
         if (!core.headOnly() && !"GET".equals(core.method())) {
             // OPTIONS (200) or a known but unsupported method (405). Never read (possibly huge)
             // bodies just to reject them: keep the connection only if there is no body.
-            boolean keepAlive = request.keepAlive() && !request.hasBody();
+            boolean keepAlive = keep(request.keepAlive() && !request.hasBody());
             timer.processing();
             send(out, respond(core), keepAlive);
             return keepAlive;
         }
 
-        boolean keepAlive = request.keepAlive();
+        boolean keepAlive = keep(request.keepAlive());
         long length = request.contentLength();
         if (request.chunked()) {
             if (request.expectContinue()) {

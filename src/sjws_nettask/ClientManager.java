@@ -27,6 +27,8 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import java.util.function.BooleanSupplier;
+import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 
 import sjws_nettask.core.Handler;
@@ -53,11 +55,15 @@ public class ClientManager implements Runnable {
     private final StaticFileHandler handler;
     /**
      * Null when connections should call {@link #handler} directly. Otherwise the filter chain,
-     * or another terminal handler (a router).
+     * another terminal (a router), or the HA handler when clustering is on.
      */
     private final Handler override;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ObserverSlot slot;
+    private volatile BooleanSupplier drainSignal;
+    private volatile IntSupplier acceptPause;
+    private volatile long gracefulDrainMs;
+    private volatile Runnable acceptLoopExit;
     private final Semaphore permits;
     private final AtomicInteger active = new AtomicInteger();
     private final sjws_nettask.core.PerIpLimit perIp;
@@ -163,6 +169,54 @@ public class ClientManager implements Runnable {
         return this.active.get();
     }
 
+    /** When non-null, each response closes the connection once it returns true. HA-off leaves this null. */
+    public void setDrainSignal(BooleanSupplier drainSignal) {
+        this.drainSignal = drainSignal;
+    }
+
+    /**
+     * Active/passive only. Returning a positive value pauses the accept loop that many milliseconds.
+     * Null (active/active and single-node) does not read a role on the accept path.
+     */
+    public void setAcceptPause(IntSupplier acceptPause) {
+        this.acceptPause = acceptPause;
+    }
+
+    public void onAcceptLoopExit(Runnable acceptLoopExit) {
+        this.acceptLoopExit = acceptLoopExit;
+    }
+
+    /** Null when clustering is off. The accept loop does not call a role supplier in that case. */
+    IntSupplier acceptPause() {
+        return this.acceptPause;
+    }
+
+    /** Null when clustering is off. Keep-alive does not call a drain supplier in that case. */
+    BooleanSupplier drainSignal() {
+        return this.drainSignal;
+    }
+
+    /** Next time the listen socket closes, in-flight tasks get this long before they are interrupted. */
+    public void prepareGracefulDrain(long waitMs) {
+        if (waitMs < 1) {
+            throw new IllegalArgumentException("waitMs must be positive");
+        }
+        this.gracefulDrainMs = waitMs;
+    }
+
+    /** Closes idle keep-alives the way a deadline does, and leaves requests that are being handled. */
+    public void expireIdleConnections() {
+        var deadlines = this.reaper;
+        if (deadlines != null) {
+            deadlines.expireIdle();
+        }
+    }
+
+    /** Stops the accept loop. In-flight connections stay up when {@link #prepareGracefulDrain} was called. */
+    public void stopAccepting() {
+        closeQuietly(this.server);
+    }
+
     @Override
     public void run() {
         var executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -170,8 +224,17 @@ public class ClientManager implements Runnable {
         var deadlines = new ConnectionReaper(this.config.idleTimeout(), this.config.headerTimeout(),
                 this.config.writeTimeout());
         this.reaper = deadlines;
+        var signal = this.drainSignal;
         try {
             while (this.server.isOpen()) {
+                var pause = this.acceptPause;
+                if (pause != null) {
+                    int ms = pause.getAsInt();
+                    if (ms > 0) {
+                        Thread.sleep(ms);
+                        continue;
+                    }
+                }
                 // At the cap, stop accepting: further clients wait in the kernel backlog.
                 if (!this.permits.tryAcquire(200, TimeUnit.MILLISECONDS)) {
                     continue;
@@ -221,9 +284,16 @@ public class ClientManager implements Runnable {
                 // never rejected: the executor is shut down only after this loop
                 executor.execute(() -> {
                     try {
+                        // Null override calls the static file handler directly. A null drain signal
+                        // (clustering off) uses the constructor that never reads a supplier.
                         var terminal = this.override != null ? this.override : this.handler;
-                        new Http1Connection(socket, terminal, this.extraHeaders, deadlines, this.slot, host, loopback)
-                                .run();
+                        if (signal == null) {
+                            new Http1Connection(socket, terminal, this.extraHeaders, deadlines, this.slot, host,
+                                    loopback).run();
+                        } else {
+                            new Http1Connection(socket, terminal, this.extraHeaders, deadlines, this.slot, host,
+                                    loopback, signal).run();
+                        }
                     } finally {
                         this.active.decrementAndGet();
                         this.perIp.release(address);
@@ -240,9 +310,10 @@ public class ClientManager implements Runnable {
             try {
                 deadlines.beginDrain();
                 executor.shutdown();
+                long wait = this.gracefulDrainMs > 0 ? this.gracefulDrainMs : this.shutdownTimeoutMs;
                 boolean finished = false;
                 try {
-                    finished = executor.awaitTermination(this.shutdownTimeoutMs, TimeUnit.MILLISECONDS);
+                    finished = executor.awaitTermination(wait, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException e) {
                     interrupted = true;
                 }
@@ -250,7 +321,7 @@ public class ClientManager implements Runnable {
                     int still = this.active.get();
                     if (still > 0) {
                         System.err.println("Shutdown: " + still + " connection(s) still open after "
-                                + this.shutdownTimeoutMs + " ms; closing them");
+                                + wait + " ms; closing them");
                     }
                     deadlines.forceAll();
                     executor.shutdownNow();
@@ -262,6 +333,10 @@ public class ClientManager implements Runnable {
                 }
             } finally {
                 deadlines.close();
+                var exit = this.acceptLoopExit;
+                if (exit != null) {
+                    exit.run();
+                }
                 if (interrupted) {
                     Thread.currentThread().interrupt();
                 }

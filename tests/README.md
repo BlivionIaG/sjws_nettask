@@ -36,6 +36,8 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/RenderingTest` | reason phrases for every registered status (empty for unregistered codes), error page titles, HEAD error heads, MIME/charset of the added static-file types |
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
+| `ha/SnapshotHolderTest`, `ha/HealthBoardTest`, `ha/HaLifecycleTest` | atomic snapshot publish, precomputed `/healthz` and `/readyz`, drain (delay, in-flight, `Connection: close`), accept pause |
+| `SingleNodeHotPathTest` | clustering off: file handler, no role supplier, no drain supplier, no heartbeat or raft thread |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
 | `tls/TlsMaterialTest` | PEM/encrypted keys, self-signed certificates, key-file/validity warnings |
 | `h2/Http2ServerTest` | HTTP/2: ALPN h2 + http/1.1 fallback, parity with HTTP/1.1, concurrent streams, h2c Upgrade and prior knowledge, stream cap, rapid reset (GOAWAY ENHANCE_YOUR_CALM), CONTINUATION flood, header list size, flow control on a large file, stalled stream, in-flight cap |

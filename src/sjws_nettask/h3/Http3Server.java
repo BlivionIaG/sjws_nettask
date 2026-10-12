@@ -64,7 +64,7 @@ import sjws_nettask.tls.TlsMaterial;
 
 /**
  * HTTP/3 listener: QUIC on UDP ({@code h3Host}:{@code effectiveH3Port()}), TLS 1.3 with ALPN
- * {@code h3}, serving the shared {@link StaticFileHandler}.
+ * {@code h3}, serving the shared {@link Handler}.
  * <pre>
  *   var h3 = new Http3Server(config, handler).start();   // binds, or throws
  *   int udpPort = h3.boundPort();
@@ -139,8 +139,10 @@ public final class Http3Server implements Transport {
 
     /**
      * @param chain compiled filters, or null when none are registered
-     * @param terminal another terminal handler (a router), or null to call {@code handler} directly
-     *        when {@code chain} is also null. A non-null chain already wraps the terminal
+     * @param terminal another terminal handler (a router, or the HA handler), or null to call
+     *        {@code handler} directly when {@code chain} is also null. A non-null chain already
+     *        wraps its terminal, so a caller that must run a handler around the chain passes a
+     *        null chain and that handler here
      */
     public Http3Server(ServerConfig config, StaticFileHandler handler, TlsMaterial tls, FilterChain chain,
             Handler terminal) {

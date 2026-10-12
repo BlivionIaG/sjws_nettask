@@ -109,7 +109,7 @@ class SjwsServerTest {
         var seen = new java.util.concurrent.atomic.AtomicReference<sjws_nettask.core.StaticFileHandler>();
         var fake = new FakeTransport(4433, null);
         server = SjwsServer.start(config(true).toBuilder().allowUnlistableDirs(allow).build(), (c, h) -> {
-            seen.set(h);
+            seen.set((sjws_nettask.core.StaticFileHandler) h);
             return fake;
         });
         assertEquals(allow, seen.get().allowUnlistableDirs(), "HTTP/3 gets the same policy");
@@ -330,11 +330,12 @@ class SjwsServerTest {
 
     @Test
     void handlerIsSharedWithTheTransport() throws IOException {
-        var seen = new java.util.concurrent.atomic.AtomicReference<sjws_nettask.core.StaticFileHandler>();
+        var seen = new java.util.concurrent.atomic.AtomicReference<sjws_nettask.core.Handler>();
         server = SjwsServer.start(config(true), (c, h) -> {
             seen.set(h);
             return new FakeTransport(1, null);
         });
+        assertSame(server.requestHandler(), seen.get());
         assertSame(server.handler(), seen.get());
     }
 
