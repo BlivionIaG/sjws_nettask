@@ -559,20 +559,17 @@ class DaemonTest {
             assertTrue(out().startsWith("Started sjws_nettask (pid "), out());
             long child = waitUntilRunning(pid);
             int port = waitForPort(log, -1);
-            var response = HttpTestSupport.get(port, "/hello.txt", 4000);
-            assertEquals(200, response.statusCode());
-            assertEquals("hello", response.bodyText());
+            waitFor(() -> helloServed(port), 5_000, "GET /hello.txt");
             assertEquals(0, Daemon.status(pid, out, err));
             reset();
             assertEquals(Sjws_nettask.EXIT_OK, Sjws_nettask.run(new String[] {"--stop", "--pid-file=" + pid,
                     "--shutdown-timeout=2"}, Map.of(), out, err, NO_H3, s -> {
                     }));
             assertTrue(out().contains("stopped pid=" + child), out());
-            assertFalse(Files.exists(pid));
-            assertFalse(ProcessHandle.of(child).map(ProcessHandle::isAlive).orElse(false));
-            var logged = Files.readString(log);
-            assertTrue(logged.contains("Server Terminated properly !"), logged);
-            assertThrows(IOException.class, () -> HttpTestSupport.get(port, "/hello.txt", 1000));
+            waitFor(() -> !alive(child), 5_000, "process exit");
+            waitFor(() -> !Files.exists(pid), 5_000, "pid file removed");
+            waitFor(() -> logContains(log, "Server Terminated properly !"), 5_000, "termination log");
+            waitFor(() -> !portAccepts(port), 5_000, "port closed");
         } finally {
             Daemon.stop(pid, Duration.ofSeconds(2), out, err);
         }
@@ -1273,6 +1270,34 @@ class DaemonTest {
 
     private static boolean alive(long pid) {
         return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
+    }
+
+    /** True when a fresh connection receives the hello.txt body. A refused connect is not ready yet. */
+    private static boolean helloServed(int port) {
+        try {
+            var response = HttpTestSupport.get(port, "/hello.txt", 1_000);
+            return response.statusCode() == 200 && "hello".equals(response.bodyText());
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** True when a TCP connect to {@code port} is accepted. Connection refused is closed. */
+    private static boolean portAccepts(int port) {
+        try (var socket = new Socket()) {
+            socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 200);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private static boolean logContains(Path log, String text) {
+        try {
+            return Files.exists(log) && Files.readString(log).contains(text);
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private static int freePort() {

@@ -24,6 +24,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -91,8 +94,9 @@ public class Sjws_nettask {
         }
         server.shutdownTimeout(shutdownTimeout);
         var pid = new AtomicReference<PidFile>();
-        var task = new Shutdown(server, pid, err);
+        var task = new Shutdown(server, pid, out, err);
         var hook = new Thread(task, "shutdown");
+        task.bind(hook);
         Runtime.getRuntime().addShutdownHook(hook);
         try {
             if (pidFile != null) {
@@ -117,8 +121,9 @@ public class Sjws_nettask {
             sjws_nettask.core.SafeOpen.unlistableWarning(config.allowUnlistableDirs())
                     .ifPresent(w -> err.println("WARN: " + w));
             started.accept(server);
+            task.markServing();
             server.awaitTermination();
-            out.println("Server Terminated properly !");
+            task.reportTerminated();
             return EXIT_OK;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -129,22 +134,70 @@ public class Sjws_nettask {
         }
     }
 
-    /** SIGTERM/SIGINT task: stop accepting, drain, then drop the pid file. */
+    /**
+     * SIGTERM/SIGINT task: stop accepting, drain, then drop the pid file.
+     * <p>
+     * On a signal the JVM runs this hook and then halts, which aborts the main thread wherever
+     * it is. The "terminated" line is written on the main thread after {@code awaitTermination}
+     * returns; this hook waits for that write before returning so halt cannot drop it. If the
+     * main thread does not report in time, the hook writes the line itself.
+     */
     static final class Shutdown implements Runnable {
         private final SjwsServer server;
         private final AtomicReference<PidFile> pid;
+        private final PrintStream out;
         private final PrintStream err;
+        private final AtomicBoolean serving = new AtomicBoolean();
+        private final AtomicBoolean logged = new AtomicBoolean();
+        private final CountDownLatch reported = new CountDownLatch(1);
+        private volatile Thread hookThread;
+        /** How long a signal hook waits for the main thread to log termination before logging it. */
+        private Duration reportWait = Duration.ofSeconds(5);
 
-        Shutdown(SjwsServer server, AtomicReference<PidFile> pid, PrintStream err) {
+        Shutdown(SjwsServer server, AtomicReference<PidFile> pid, PrintStream out, PrintStream err) {
             this.server = server;
             this.pid = pid;
+            this.out = out;
             this.err = err;
+        }
+
+        void bind(Thread hook) {
+            this.hookThread = hook;
+        }
+
+        /** Tests shrink the signal-hook wait so the fallback log path does not block. */
+        void reportWait(Duration timeout) {
+            this.reportWait = timeout;
+        }
+
+        void markServing() {
+            this.serving.set(true);
+        }
+
+        /** Logs termination once. Unblocks a signal hook waiting in {@link #run()}. */
+        void reportTerminated() {
+            if (this.serving.get() && this.logged.compareAndSet(false, true)) {
+                this.out.println("Server Terminated properly !");
+                this.out.flush();
+            }
+            this.reported.countDown();
         }
 
         @Override
         public void run() {
             try {
                 this.server.close();
+                if (Thread.currentThread() == this.hookThread && this.serving.get()) {
+                    boolean mainLogged = false;
+                    try {
+                        mainLogged = this.reported.await(this.reportWait.toMillis(), TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    if (!mainLogged) {
+                        reportTerminated();
+                    }
+                }
             } finally {
                 releasePid(this.pid.get(), this.err);
             }

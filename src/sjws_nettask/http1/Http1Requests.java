@@ -16,6 +16,7 @@
  */
 package sjws_nettask.http1;
 
+import java.net.InetSocketAddress;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestHeaders;
 
@@ -26,8 +27,18 @@ public final class Http1Requests {
     }
 
     public static Request toCore(Http1Parser.Head head) {
-        return new Request(head.method(), head.target(), new RequestHeaders(head.header("if-none-match"),
-                head.ifModifiedSince(), head.header("if-range"), head.header("range"),
-                head.header("accept-encoding"), head.header("host")));
+        return toCore(head, null);
+    }
+
+    /**
+     * The parser has already built the header map for the head. {@link RequestHeaders#of} keeps that
+     * map (it does not copy it), so this is not an extra allocation next to parsing. HTTP/3 is
+     * different: its codec owns the headers, and the full map is copied only when a filter or a
+     * non-static terminal is installed.
+     *
+     * @param peer client address captured once for the connection, or null
+     */
+    public static Request toCore(Http1Parser.Head head, InetSocketAddress peer) {
+        return new Request(head.method(), head.target(), RequestHeaders.of(head.headers()), peer, false);
     }
 }
