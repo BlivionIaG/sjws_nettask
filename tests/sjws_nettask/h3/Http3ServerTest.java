@@ -504,7 +504,7 @@ class Http3ServerTest {
         Function<Request, Response> seam = req -> {
             var full = this.handler.handle(new Request("GET", "/large.bin"));
             var body = (sjws_nettask.core.Body.FileBody) full.body();
-            var region = new sjws_nettask.core.Body.FileBody(body.realPath(), 100_003, 1_000_000, body.expected());
+            var region = new sjws_nettask.core.Body.FileBody(body.realPath(), 100_003, 1_000_000, body.expected(), body.root());
             return new Response(200, full.headers(), region);
         };
         try (var s = seamServer(seam, config().build()); var c = new H3TestClient(this.tls.certificate())) {

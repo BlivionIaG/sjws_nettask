@@ -21,10 +21,6 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
-import java.nio.file.StandardOpenOption;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.Map;
@@ -32,6 +28,7 @@ import java.util.Set;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.HttpDate;
 import sjws_nettask.core.Response;
+import sjws_nettask.core.SafeOpen;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
 
@@ -135,7 +132,7 @@ public final class Http1Writer {
             throws IOException {
         boolean sendBody = !response.headOnly() && response.mayHaveBody();
         if (sendBody && response.body() instanceof Body.FileBody file) {
-            try (var channel = open(file)) {
+            try (var channel = SafeOpen.open(file)) {
                 out.write(serializeHead(response, keepAlive, extra));
                 copy(channel, file, out);
             }
@@ -152,22 +149,6 @@ public final class Http1Writer {
             }
         }
         out.flush();
-    }
-
-    private static FileChannel open(Body.FileBody file) throws IOException {
-        var channel = FileChannel.open(file.realPath(), StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
-        try {
-            if (file.expected().fileKey() != null) {
-                var now = Files.readAttributes(file.realPath(), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                if (!file.expected().sameFile(now)) {
-                    throw new IOException("file replaced since it was resolved: " + file.realPath());
-                }
-            }
-            return channel;
-        } catch (IOException | RuntimeException e) {
-            channel.close();
-            throw e;
-        }
     }
 
     private static void copy(FileChannel channel, Body.FileBody file, OutputStream out) throws IOException {
