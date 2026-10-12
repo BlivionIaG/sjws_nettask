@@ -60,7 +60,7 @@ class ConfigLoaderTest {
 
     @Test
     void missingFileIsAnError() {
-        var loaded = ConfigLoader.load(new String[] {"--config=/no/such/sjws.yaml"}, Map.of());
+        var loaded = ConfigLoader.load(new String[] {"--config=/no/such/sjws.yaml", "--state-dir=" + dir}, Map.of());
         assertFalse(loaded.ok());
         assertTrue(loaded.errors().get(0).contains("Cannot read config file"));
     }

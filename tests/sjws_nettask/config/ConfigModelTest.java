@@ -148,11 +148,11 @@ class ConfigModelTest {
         var root = Files.createDirectory(dir.resolve("html"));
         var yaml = dir.resolve("sjws.yaml");
         Files.writeString(yaml, "server:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n");
-        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml, "--state-dir=" + dir}, Map.of());
         LastGoodStore.write(loaded.document());
         assertFalse(LastGoodStore.dataPlane(LastGoodStore.beside(yaml)));
         Files.delete(yaml);
-        var missing = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var missing = ConfigLoader.load(new String[] {"--config=" + yaml, "--state-dir=" + dir}, Map.of());
         assertFalse(missing.ok());
         assertTrue(missing.errors().get(0).contains("Cannot read config file"));
         assertFalse(missing.errors().get(0).contains("booted"));
@@ -334,7 +334,8 @@ class ConfigModelTest {
         Files.writeString(first.resolve("index.html"), "one");
         Files.writeString(second.resolve("index.html"), "two");
         var yaml = dir.resolve("sjws.yaml");
-        Files.writeString(yaml, "version: 2\nserver:\n  port: 0\n  root: " + first.toAbsolutePath() + "\n");
+        Files.writeString(yaml, "version: 2\nnode:\n  state_dir: " + dir.resolve("state").toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + first.toAbsolutePath() + "\n");
         var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
         try (var server = SjwsServer.start(loaded)) {
             assertEquals("one", HttpTestSupport.get(server.tcpPort(), "/", 2000).bodyText());
