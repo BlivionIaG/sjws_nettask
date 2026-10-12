@@ -333,7 +333,10 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                         key = text(value, key, name, warnings);
                         explicitH3Options.add(name);
                     }
-                    case "--key-password-file" -> passwordFile = text(value, passwordFile, name, warnings);
+                    case "--key-password-file" -> {
+                        passwordFile = text(value, passwordFile, name, warnings);
+                        explicitH3Options.add(name);
+                    }
                     case "--key-password" -> warnings.add("--key-password is not accepted on the command line "
                             + "(visible to other users); use WEB_SERVER_TLS_KEY_PASSWORD or --key-password-file");
                     case "--alt-svc" -> {
@@ -409,6 +412,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if ((v = env.get("WEB_SERVER_TLS_KEY_PASSWORD_FILE")) != null) {
             passwordFile = text(v, passwordFile, "WEB_SERVER_TLS_KEY_PASSWORD_FILE", warnings);
+            explicitH3Options.add("WEB_SERVER_TLS_KEY_PASSWORD_FILE");
         }
         if ((v = env.get("WEB_SERVER_ALT_SVC_MA")) != null) {
             altSvc = number(v, altSvc, 0, 31_536_000, "WEB_SERVER_ALT_SVC_MA", warnings);
@@ -419,7 +423,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String password = env.get("WEB_SERVER_TLS_KEY_PASSWORD");
         if (password != null && passwordFile != null) {
             warnings.add("Both WEB_SERVER_TLS_KEY_PASSWORD and a key password file are set; using the variable");
-        } else if (passwordFile != null) {
+        } else if (passwordFile != null && h3) { // only HTTP/3 uses the key: don't fail over an unused file
             try {
                 password = passwordReader.read(Path.of(passwordFile));
             } catch (java.io.IOException | RuntimeException e) {
