@@ -18,6 +18,8 @@ package sjws_nettask;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -25,6 +27,7 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.function.Supplier;
 
+import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
@@ -37,7 +40,8 @@ import sjws_nettask.http1.ParseError;
 /**
  * HTTP/1.x adapter for one connection on a blocking {@link SocketChannel} (run on a virtual
  * thread): parses with {@link Http1Parser.HeadParser}, maps to a core {@link Request}, asks the
- * {@link StaticFileHandler}, serializes with {@link Http1Writer}. Deadlines (idle keep-alive,
+ * {@link StaticFileHandler} (or {@link #override}, the filter chain or another terminal handler,
+ * when one was installed), serializes with {@link Http1Writer}. Deadlines (idle keep-alive,
  * request head, writes) are enforced by the shared {@link ConnectionReaper}, not by socket
  * timeouts.
  * <p>
@@ -59,6 +63,14 @@ final class Http1Connection implements Runnable {
 
     private final SocketChannel channel;
     private final StaticFileHandler handler;
+    /**
+     * Null when the terminal is {@link #handler} and no filters are registered. {@link #apply} then
+     * calls {@link StaticFileHandler#handle} and does not go through {@link Handler}.
+     */
+    private final Handler override;
+    private final InetSocketAddress peer;
+    /** Captured with {@link #peer} for the failure log; the channel may already be closed by then. */
+    private final String remote;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ConnectionReaper reaper;
     private final Http1Parser.HeadParser parser = new Http1Parser.HeadParser(CONSTANTS.MAX_LINE_LENGTH,
@@ -71,16 +83,55 @@ final class Http1Connection implements Runnable {
      */
     Http1Connection(SocketChannel channel, StaticFileHandler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
+        this(channel, handler, null, extraHeaders, reaper);
+    }
+
+    /**
+     * @param override compiled filters, or another terminal handler, or null to call {@code handler}
+     *        directly (no extra indirection on the hot path)
+     */
+    Http1Connection(SocketChannel channel, StaticFileHandler handler, Handler override,
+            Supplier<ResponseHeaders> extraHeaders, ConnectionReaper reaper) {
         this.channel = channel;
         this.handler = handler;
+        this.override = override;
+        var remote = peerOf(channel);
+        this.peer = remote.peer;
+        this.remote = remote.label;
         this.extraHeaders = extraHeaders;
         this.reaper = reaper;
+    }
+
+    private record Peer(InetSocketAddress peer, String label) {
+    }
+
+    /** One {@code getRemoteAddress} for every request on this connection and for the failure log. */
+    private static Peer peerOf(SocketChannel channel) {
+        try {
+            SocketAddress address = channel.getRemoteAddress();
+            var peer = address instanceof InetSocketAddress inet ? inet : null;
+            return new Peer(peer, String.valueOf(address));
+        } catch (IOException e) {
+            return new Peer(null, "(closed)");
+        }
+    }
+
+    /**
+     * No override: one null test, then the same {@link StaticFileHandler#handle} call as without a
+     * chain. The test is constant for the life of the connection.
+     */
+    private Response apply(Request request) {
+        var terminal = this.override;
+        if (terminal == null) {
+            return this.handler.handle(request);
+        }
+        return terminal.handle(request);
     }
 
     @Override
     public void run() {
         var timer = this.reaper.register(this.channel);
-        var remote = remote(); // read now: the channel is closed by the time a failure is logged
+        var remote = this.remote; // captured at construction: the channel is closed by the time a failure is logged
         try (var ch = this.channel) {
             var out = new ChannelOutput(ch, timer);
             while (serveOne(timer, out)) {
@@ -92,14 +143,6 @@ final class Http1Connection implements Runnable {
             }
         } finally {
             this.reaper.deregister(timer);
-        }
-    }
-
-    private String remote() {
-        try {
-            return String.valueOf(this.channel.getRemoteAddress());
-        } catch (IOException e) {
-            return "(closed)";
         }
     }
 
@@ -169,15 +212,14 @@ final class Http1Connection implements Runnable {
             return false;
         }
 
-        var core = new Request(request.method(), request.target(), new RequestHeaders(
-                request.header("if-none-match"), request.ifModifiedSince(), request.header("if-range"),
-                request.header("range"), request.header("accept-encoding"), request.header("host")));
+        var core = new Request(request.method(), request.target(), RequestHeaders.of(request.headers()), this.peer,
+                false);
         if (!core.headOnly() && !"GET".equals(core.method())) {
             // Known but unsupported method (the handler answers 405). Never read (possibly huge)
             // bodies just to reject them: keep the connection only if there is no body.
             boolean keepAlive = request.keepAlive() && request.contentLength() == 0;
             timer.processing();
-            send(out, this.handler.handle(core), keepAlive);
+            send(out, apply(core), keepAlive);
             return keepAlive;
         }
 
@@ -206,7 +248,7 @@ final class Http1Connection implements Runnable {
         }
         timer.processing();
 
-        send(out, this.handler.handle(core), keepAlive);
+        send(out, apply(core), keepAlive);
         return keepAlive;
     }
 

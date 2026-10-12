@@ -34,7 +34,7 @@ import java.util.List;
  * <p>
  * Thread-safe and lock-free: it holds only immutable state.
  */
-public final class StaticFileHandler {
+public final class StaticFileHandler implements Handler {
 
     public static final String ALLOW = "GET, HEAD";
     /** Accept-Ranges of file responses (single byte ranges, see {@link ByteRanges}). */

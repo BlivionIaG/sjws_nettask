@@ -53,6 +53,8 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.Transport;
+import sjws_nettask.core.FilterChain;
+import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
@@ -119,7 +121,25 @@ public final class Http3Server implements Transport {
 
     /** @param tls key material to use, or null to resolve it from the configuration at {@link #start()} */
     public Http3Server(ServerConfig config, StaticFileHandler handler, TlsMaterial tls) {
-        this(config, Objects.requireNonNull(handler, "handler")::handle, tls);
+        this(config, handler, tls, null, null);
+    }
+
+    /**
+     * @param chain compiled filters, or null to call {@code handler} directly
+     *        ({@link FilterChain#dispatch} does not put the chain on that path)
+     */
+    public Http3Server(ServerConfig config, StaticFileHandler handler, TlsMaterial tls, FilterChain chain) {
+        this(config, handler, tls, chain, null);
+    }
+
+    /**
+     * @param chain compiled filters, or null when none are registered
+     * @param terminal another terminal handler (a router), or null to call {@code handler} directly
+     *        when {@code chain} is also null. A non-null chain already wraps the terminal
+     */
+    public Http3Server(ServerConfig config, StaticFileHandler handler, TlsMaterial tls, FilterChain chain,
+            Handler terminal) {
+        this(config, FilterChain.dispatch(handler, terminal, chain), tls);
     }
 
     /** Test seam: any request-to-response function (e.g. one that changes files between handle and write). */
