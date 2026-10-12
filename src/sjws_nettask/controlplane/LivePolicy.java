@@ -55,6 +55,11 @@ public final class LivePolicy implements AccessPolicy {
         this.active = new AtomicReference<>(new Active(0, Objects.requireNonNull(initial, "initial")));
     }
 
+    /** For a node configured by {@code node.labels} in the config file. */
+    public static LivePolicy forNode(sjws_nettask.config.NodeSettings node, AccessRules initial) {
+        return new LivePolicy(node.labels(), initial);
+    }
+
     public Active active() {
         return this.active.get();
     }

@@ -75,11 +75,28 @@ class ControlPlaneSecurityTest {
         assertFalse(Scope.parse("label:env=prod").appliesToNode(Map.of("env", "dev")));
         assertFalse(Scope.parse("route:api").appliesToNode(Map.of("env", "prod")));
         assertEquals("route:api", Scope.parse("route:api").toString());
-        for (var bad : List.of("label:env", "label:=x", "label:a=b c", "route:", "route:a/b", "node:x")) {
+        for (var bad : List.of("label:env", "label:=x", "label:a=", "label:a=b c", "route:", "route:a/b", "node:x")) {
             assertThrows(IllegalArgumentException.class, () -> Scope.parse(bad), bad);
         }
         assertThrows(IllegalArgumentException.class, () -> new Scope(Scope.Kind.ALL, "x", ""));
         assertThrows(IllegalArgumentException.class, () -> new Scope(Scope.Kind.ROUTE, "a", "b"));
+    }
+
+    @Test
+    void seamsToTheConfigModel() {
+        var server = sjws_nettask.ServerConfig.defaults(tmp);
+        var access = new AccessSettings(List.of("/private"), List.of(), false, null, false);
+        var cfg = sjws_nettask.config.ConfigDocument.of(server, sjws_nettask.config.ConfigDocument.defaults(server).acme(),
+                sjws_nettask.config.ConfigDocument.defaults(server).routing(), List.of(), access,
+                new sjws_nettask.config.NodeSettings(sjws_nettask.config.NodeSettings.Mode.DATA, Map.of("zone", "eu:1")),
+                1, 12, null, "");
+        var d = AccessPolicyDocument.fromConfig(cfg, Scope.label("zone", "eu:1"));
+        assertEquals(12, d.version());
+        var live = LivePolicy.forNode(cfg.node(), AccessRules.DEFAULT);
+        assertEquals(LivePolicy.Result.APPLIED, live.apply(d.encode()));
+        assertEquals(403, live.check("private", 0));
+        assertThrows(IllegalArgumentException.class, () -> AccessPolicyDocument.fromConfig(
+                sjws_nettask.config.ConfigDocument.defaults(server), Scope.ALL), "unversioned local config");
     }
 
     // ---- hot swap ----

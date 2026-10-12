@@ -40,7 +40,9 @@ public record Scope(Kind kind, String key, String value) {
                 }
             }
             case LABEL -> {
-                if (!key.matches("[A-Za-z0-9][A-Za-z0-9._/-]{0,62}") || !value.matches("[A-Za-z0-9._-]{0,63}")) {
+                // same alphabet as node.labels (NodeSettings.LABEL)
+                if (!sjws_nettask.config.NodeSettings.LABEL.matcher(key).matches()
+                        || !sjws_nettask.config.NodeSettings.LABEL.matcher(value).matches()) {
                     throw new IllegalArgumentException("bad label scope '" + key + "=" + value + "'");
                 }
             }

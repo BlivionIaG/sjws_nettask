@@ -24,6 +24,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import sjws_nettask.config.AccessSettings;
+import sjws_nettask.config.ConfigDocument;
 import sjws_nettask.core.AccessRules;
 
 /**
@@ -195,6 +196,15 @@ public record AccessPolicyDocument(long version, Scope scope, AccessSettings set
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e); // every JDK ships SHA-256
         }
+    }
+
+    /**
+     * The {@code access} section of a CP-versioned config document, under its bundle version.
+     *
+     * @throws IllegalArgumentException if the document carries no control-plane version
+     */
+    public static AccessPolicyDocument fromConfig(ConfigDocument doc, Scope scope) {
+        return new AccessPolicyDocument(doc.bundleVersion(), scope, doc.access());
     }
 
     /** Helper for callers holding raw lists. */
