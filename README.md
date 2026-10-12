@@ -27,6 +27,7 @@ Run:
 | `--header-timeout=S` | `WEB_SERVER_HEADER_TIMEOUT` | 10 | time to receive a complete request head (seconds) |
 | `--max-connections-per-ip=N` | `WEB_SERVER_MAX_CONNECTIONS_PER_IP` | 256 | HTTP/1.1 connections from one client address (IPv6: one /64); extra ones are closed at once without a response |
 | `--allow-unlistable-dirs` | `WEB_SERVER_ALLOW_UNLISTABLE_DIRS` | off | serve files below directories the server can't read (mode `--x`) through a weaker path-based open; see Platform notes |
+| `--cache-bytes=N[k\|m\|g]` | `WEB_SERVER_CACHE_BYTES` | 64m | small-file cache size (see below); `0` disables it |
 | `--write-timeout=S` | `WEB_SERVER_WRITE_TIMEOUT` | 30 | HTTP/3: reset a response that makes no progress for this long; also the window of the minimum send rate. Not used by HTTP/1.1 yet |
 | `-h`, `--help` | | | print usage and exit |
 
@@ -136,5 +137,25 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   regular 404/403/500 response instead of a dropped connection.
 
 Serves GET and HEAD (other known methods: 405, unknown: 501), HTTP/1.0 and 1.1
-with keep-alive and pipelining, `If-Modified-Since`, directory listings, and
+with keep-alive and pipelining, `ETag` / `If-None-Match` / `If-Modified-Since`, directory listings, and
 `index.html`. Dotfiles and symlinks leading outside the root are never served.
+
+### Caching and validators
+
+* **Small-file cache.** Files up to 256 KiB are kept in memory (both protocols), up to
+  `--cache-bytes` in total (body + key + ~256 bytes per entry) and 4096 entries, least recently used
+  first out. The key is the decoded, normalized path without the query, so `?v=1`, `%68ello`, `./`
+  spellings share one entry and can't push others out; 404s are never cached. **Every hit stats the
+  file** and compares file key (inode), mtime in ns, size and ctime; any change drops the entry and
+  the request is resolved again from scratch (containment, no-follow open). A file is read through the
+  same no-follow open as when it is sent, and is cached only if it did not change while being read.
+  Limits: on a platform without file keys and ctime (Windows) an edit that keeps both size and mtime
+  is not noticed; on Linux, file timestamps tick every few ms, so a same-size rewrite that also
+  restores the mtime within one tick of the previous change is not noticed either. Directory listings
+  are not cached. Files below unreadable (`--x`) directories, HEAD requests and 304s never load an
+  entry (they don't open the file), so they behave as without a cache.
+* **ETag** is `"<inode hash>-<mtime ns>-<size>"` (hex). A file version first seen less than 1 s after its
+  mtime gets a weak tag (`W/"..."`) and keeps it while unchanged: on file systems with a coarse mtime a
+  second write within that second could otherwise keep the tag. `If-None-Match` (lists, `*`, weak
+  comparison) takes precedence over `If-Modified-Since`; a 304 carries `ETag`, `Last-Modified` and
+  `Date` only.
