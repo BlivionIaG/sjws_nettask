@@ -115,7 +115,10 @@ def main():
                 r = {"startup_ms": round(start_ms, 1), "rss_kb": fp.rss_kb(p.pid), "threads": fp.threads(p.pid),
                      "heap_after_gc_kb": fp.heap_used_kb(a.java_home, p.pid),
                      "nmt_total_kb": fp.nmt(a.java_home, p.pid).get("Total"),
-                     "last_good_file": os.path.exists(mcfg + ".last-good")}
+                     "last_good_beside_config": os.path.exists(mcfg + ".last-good"),
+                     "last_good_state_json": os.path.exists(os.path.join(root, "config", "last-good.json")),
+                     "last_good_file": os.path.exists(mcfg + ".last-good")
+                     or os.path.exists(os.path.join(root, "config", "last-good.json"))}
                 print(f"== (d) mode={mode}", json.dumps(r)); res["footprint"][mode] = r
             finally:
                 p.terminate(); p.wait(10)

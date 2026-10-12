@@ -48,6 +48,7 @@ final class Daemon {
     static final Duration DEFAULT_SHUTDOWN_TIMEOUT = Duration.ofSeconds(10);
     static final String DEFAULT_PID_FILE = "sjws_nettask.pid";
     static final String DEFAULT_LOG_FILE = "sjws_nettask.log";
+
     static final Duration READY_TIMEOUT = Duration.ofSeconds(20);
     /** Extra wait after {@code --shutdown-timeout} so HTTP/3's own drain can finish. */
     static final Duration STOP_MARGIN = Duration.ofSeconds(5);
@@ -98,6 +99,8 @@ final class Daemon {
 
                   --daemon                  run in the background (detach)
                   --pid-file=PATH           pid file (sjws_nettask.pid)               WEB_SERVER_PID_FILE
+                  --state-dir=PATH          data directory for last-good config       WEB_SERVER_STATE_DIR
+                                            (the working directory)
                   --log-file=PATH           log file when daemonized, or when set     WEB_SERVER_LOG_FILE
                                             (sjws_nettask.log)
                   --shutdown-timeout=S      finish in-flight responses for S seconds  WEB_SERVER_SHUTDOWN_TIMEOUT

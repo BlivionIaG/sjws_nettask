@@ -38,18 +38,26 @@ version: 0          # control-plane bundle version; 0 means unset
 node:
   mode: standalone  # standalone (default), control, or data
   labels: {}        # up to 64 keys; each key and value is 1..63 of [A-Za-z0-9_.:-]
+  state_dir: /var/lib/sjws_nettask   # optional; local, not part of the canonical hash
 ```
 
 `schema` must be 1 when it is present. A reload or a remote apply rejects a non-zero
 `version` that is lower than the one already running. `node.mode` is kept until
 restart; `labels` apply on the next successful apply.
 
-A data-plane process whose config file is missing boots from the sibling
-`<file>.last-good` when that file exists and its `node.mode` is `data`. Standalone
-and control do not: a missing file is still an error. After a successful start or
-apply the process writes that sibling atomically, mode `0600`. The bytes are the
-canonical document, so they do not contain a key password. A failed apply leaves
-both the running config and this file as they were.
+A data-plane process whose config file is missing boots from
+`<stateDir>/config/last-good.json` when that file exists, the hash in the envelope
+matches the embedded document, and `node.mode` is `data`. `stateDir` is
+`node.state_dir`, or `--state-dir` / `WEB_SERVER_STATE_DIR` (those win over the
+file), and otherwise the daemon's data directory: the working directory, where the
+default pid and log files are written. The `config` directory is mode `0700` and
+the file is mode `0600`. The bytes are a JSON envelope around the canonical
+document, so they do not contain a key password. The temp file and its directory
+are fsynced before the atomic rename, and the write runs after the reload lock is
+released. Standalone and control do not write this file and do not boot from it.
+A file left by an older build at `<file>.last-good` is still read once when the
+JSON file is absent. A failed apply leaves both the running config and this file
+as they were.
 
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
 `h`, `d`). In a size, a bare integer is bytes and `1m` is one mebibyte (`k`, `m`,
@@ -101,9 +109,17 @@ start of `close`. The hook re-reads the file, reapplies the original arguments
 and the environment captured at startup, and on success compiles a new immutable
 snapshot and publishes it with one `AtomicReference` write. A validation error,
 a missing root, or an unreadable certificate keeps the previous snapshot.
-`SjwsServer.applyRemote` validates and publishes a pushed document through that
-same swap. It does not re-read the file and it does not replace the file: the
-user's YAML stays put, and the last-good sibling is updated only after the swap.
+`SjwsServer.applyRemote` checks the injected signature verifier, then validates and
+publishes a pushed document through that same swap. A data or control process
+that was not given a verifier rejects the push. Standalone uses a no-op verifier.
+A bad signature, a canonical hash that is not the SHA-256 of the canonical
+document, or a lower non-zero `version` is rejected before the swap. An incoming
+canonical hash equal to the running snapshot's is a no-op: the file cache and
+upstream pools are left in place. It does not re-read the file and it does not
+replace the file: the user's YAML stays put. A data node writes last-good only
+after the swap, and only after the reload lock is released. HTTP/1 and HTTP/3
+can observe the new snapshot a moment apart: the publish updates the live
+reference, then the HTTP/3 handler and certificate.
 
 The request path is that one volatile read and then the handler that was built
 with the snapshot. It does not parse YAML, match routes, or take the reload lock.
@@ -284,18 +300,21 @@ the access settings. Building that snapshot is the only time the file is parsed.
 
 ## ConfigStore rollout
 
-The bundle is this YAML file. `ConfigDocument.contentHash()` is the lowercase
-SHA-256 of the file bytes. A process that was started without a file has no file
-hash. `canonicalHash()` is a second lowercase SHA-256, of the canonical YAML of
-the effective document (fixed key order, sorted maps, no key password). Reordering
-keys in the file changes `contentHash()` and leaves `canonicalHash()` the same.
-`version` (`bundleVersion()`) is the control-plane bundle version, separate from
-both hashes. Each successful reload also bumps a generation counter on the
-snapshot; that counter is how many times this process has swapped, not the bundle
-version. The file hash is of the file, not of the file after arguments and
-environment variables have been applied. Bind-time fields that are clamped back
-to the running value are reflected in the canonical hash of the snapshot that was
-published, so that hash can differ from the hash of the bundle that was pushed.
+The bundle is this YAML file. `canonicalHash()` is the lowercase SHA-256 of the
+canonical YAML of the effective document (fixed key order, sorted maps, no key
+password, and not the hash itself). Reordering keys in the file leaves it
+unchanged. A signature covers that hash, the bundle `version`, and `schema`:
+the bytes are `schema`, a newline, `version`, a newline, and the hex hash.
+Distribution sends the full signed document. `ConfigDiff` reports which keys
+were added, removed, or changed in each section. It is not a patch and it cannot
+rebuild a document. `version` (`bundleVersion()`) is the control-plane bundle
+version. Each apply that actually changes the snapshot bumps a generation counter;
+that counter is how many times this process has swapped, not the bundle version.
+A repeated push of the same canonical hash does not bump it. Bind-time fields
+that are clamped back to the running value are reflected in the canonical hash of
+the snapshot that was published, so that hash can differ from the hash of the
+bundle that was pushed. The canonical text is rendered once for that hash and
+reused for the last-good envelope.
 
 Applied live, on the next request, with no drain: document root, cache budget,
 unlistable directories, HTTP/1 timeouts when HTTP/3 is not running, the stored

@@ -271,7 +271,9 @@ class ConfigLoaderTest {
         assertFalse(access.allowDotfiles());
         assertEquals("www-data", access.requireOwner());
         assertTrue(access.requireWorldReadable());
-        assertEquals(sha256(bytes), loaded.document().contentHash());
+        assertEquals(sjws_nettask.config.ConfigCodec.sha256(loaded.document().canonicalText()),
+                loaded.document().canonicalHash());
+        assertNotEquals(sha256(bytes), loaded.document().canonicalHash());
         assertTrue(loaded.warnings().stream().anyMatch(w -> w.contains("not enforced")));
         var injected = ConfigLoader.load(new String[] {"--config=" + write("""
                 acme:
@@ -283,7 +285,8 @@ class ConfigLoaderTest {
         assertEquals(List.of(AccessSettings.ACME_CHALLENGE_RULE), injected.document().access().rules());
         assertTrue(injected.warnings().stream().noneMatch(w -> w.contains("not enforced")));
         assertTrue(error("access:\n  rules: [permit:/x]\n").contains("allow:"));
-        assertNull(ConfigLoader.standalone(ServerConfig.defaults(dir)).document().contentHash());
+        assertTrue(ConfigLoader.standalone(ServerConfig.defaults(dir)).document().canonicalHash()
+                .matches("[0-9a-f]{64}"));
     }
 
     @Test
