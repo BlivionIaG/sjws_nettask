@@ -26,6 +26,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
@@ -33,11 +34,16 @@ import sjws_nettask.ha.HaRuntime;
 import sjws_nettask.ha.HaSettings;
 import sjws_nettask.acme.AcmeService;
 import sjws_nettask.acme.AcmeStore;
+import sjws_nettask.acme.ControlLeadership;
+import sjws_nettask.acme.LocalLeadership;
 import sjws_nettask.acme.ChallengeBoard;
 import sjws_nettask.acme.ChallengeHttpServer;
+import sjws_nettask.config.ConfigDocument;
+import sjws_nettask.config.NodeSettings;
 import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.config.ConfigReloader;
 import sjws_nettask.config.ConfigSnapshot;
+import sjws_nettask.config.LastGoodStore;
 import sjws_nettask.config.LiveConfig;
 import sjws_nettask.config.ReloadResult;
 import sjws_nettask.core.FilterChain;
@@ -96,6 +102,8 @@ public final class SjwsServer implements AutoCloseable {
     private Thread acceptThread;
     private AutoCloseable reloadHook;
     private AcmeService acme;
+    /** Null on a data node. Not read by the request path. */
+    private ControlLeadership leadership;
     private ChallengeHttpServer challengeHttp;
 
     private SjwsServer(ConfigSnapshot snapshot, ConfigReloader reloader, ChallengeBoard board,
@@ -348,10 +356,12 @@ public final class SjwsServer implements AutoCloseable {
             server.close();
             throw e;
         }
+        server.leadership = leadershipFor(snapshot);
         server.reloadHook = ReloadHook.register(server::onReload);
         if (snapshot.document().acme().enabled()) {
             server.startAcme(snapshot);
         }
+        server.persistLastGood(snapshot.document());
         return server;
     }
 
@@ -445,8 +455,29 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
+    private static ControlLeadership leadershipFor(ConfigSnapshot snapshot) {
+        return switch (snapshot.document().node().mode()) {
+            case DATA -> null;
+            case CONTROL -> LocalLeadership.control();
+            case STANDALONE -> LocalLeadership.standalone();
+        };
+    }
+
+    /**
+     * Control-plane leadership for this process. Null when the node is {@code data}.
+     * Standalone is already leader-ready. Control stays idle until the group's election
+     * NOOP is applied through {@link LocalLeadership#ready(long, long)}.
+     */
+    public ControlLeadership leadership() {
+        return this.leadership;
+    }
+
     private void startAcme(ConfigSnapshot snapshot) {
-        this.acme = new AcmeService(snapshot.document().acme(), this.board, this::publishCertificate);
+        if (snapshot.document().node().mode() == NodeSettings.Mode.DATA || this.leadership == null) {
+            return;
+        }
+        this.acme = new AcmeService(snapshot.document().acme(), this.board, this::publishCertificate,
+                this.leadership);
         this.acme.start();
     }
 
@@ -478,8 +509,27 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
+    /**
+     * Applies a document pushed by a control plane. Validation, clamping and compilation are
+     * {@link ConfigReloader#apply}; the swap is the same one {@link #reload()} publishes, so a
+     * failure keeps the current snapshot. This does not call {@link ReloadHook#run()}: that
+     * re-reads the local file.
+     */
+    public ReloadResult applyRemote(ConfigDocument incoming) {
+        Objects.requireNonNull(incoming, "incoming");
+        this.reloadLock.lock();
+        try {
+            return publish(this.reloader.apply(this.live.get(), incoming, this.h3 != null, this.board, true));
+        } finally {
+            this.reloadLock.unlock();
+        }
+    }
+
     private ReloadResult reloadLocked() {
-        var result = this.reloader.reload(this.live.get(), this.h3 != null, this.board);
+        return publish(this.reloader.reload(this.live.get(), this.h3 != null, this.board));
+    }
+
+    private ReloadResult publish(ReloadResult result) {
         if (!result.applied()) {
             return result;
         }
@@ -532,7 +582,16 @@ public final class SjwsServer implements AutoCloseable {
         } else if (this.acme != null) {
             this.acme.update(result.snapshot().document().acme());
         }
+        persistLastGood(result.snapshot().document());
         return result;
+    }
+
+    private void persistLastGood(ConfigDocument document) {
+        try {
+            LastGoodStore.write(document);
+        } catch (IOException e) {
+            System.err.println("WARN: last good config was not saved: " + e.getMessage());
+        }
     }
 
     public ServerConfig config() {
