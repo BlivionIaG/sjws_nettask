@@ -44,8 +44,8 @@ class GenerationSyncTest {
             members.add(member);
             voters.add(member.id());
         }
-        var options = new GroupOptions(Durability.STRICT, 1 << 20, Duration.ofMillis(100), Duration.ofMillis(40),
-                1_000_000L);
+        var options = new GroupOptions(1 << 20, Duration.ofMillis(100), Duration.ofMillis(40), 1_000_000L);
+        assertEquals(Durability.RELAXED, options.durability());
         var group = new GroupId("ha-control");
         var nodes = new ArrayList<ReplicatedNode>();
         for (var member : members) {

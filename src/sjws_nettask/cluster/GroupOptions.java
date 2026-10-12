@@ -19,9 +19,18 @@ package sjws_nettask.cluster;
 import java.time.Duration;
 import java.util.Objects;
 
-/** Per-group knobs. The lease is two heartbeats; an election waits for the lease and then this timeout. */
+/**
+ * Per-group log options. The lease is two heartbeats; an election waits for the lease and then this
+ * timeout. The constructor that omits durability uses {@link Durability#RELAXED} (majority in memory).
+ * Pass {@link Durability#STRICT} to opt into quorum commit plus fsync.
+ */
 public record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
         long snapshotEveryEntries) {
+
+    /** Default ack mode: majority in memory. Fsync-before-ack is the {@link Durability} overload. */
+    public GroupOptions(int maxBatchBytes, Duration electionTimeout, Duration heartbeat, long snapshotEveryEntries) {
+        this(Durability.RELAXED, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries);
+    }
 
     public GroupOptions {
         Objects.requireNonNull(durability, "durability");

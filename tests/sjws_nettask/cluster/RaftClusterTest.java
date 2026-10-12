@@ -95,6 +95,29 @@ class RaftClusterTest {
     }
 
     @Test
+    void defaultAckIsMajorityInMemoryAndStrictStaysOptIn() throws Exception {
+        var defaults = new GroupOptions(1024, Duration.ofMillis(100), Duration.ofMillis(40), 1_000_000);
+        assertEquals(Durability.RELAXED, defaults.durability());
+        var cluster = cluster(3, false, defaults.durability(), 1_000_000);
+        elect(cluster);
+        var leader = leader(cluster);
+        var committed = leader.append(GROUP, List.of(bytes("mem")));
+        ReplicatedNode.driveAll(cluster.nodes);
+        assertTrue(committed.isDone());
+        assertTrue(cluster.nodes.get(1).ackedFromMemory(GROUP));
+        assertFalse(cluster.nodes.get(1).forcedBeforeAck(GROUP));
+
+        var strict = cluster(3, false, Durability.STRICT, 1_000_000);
+        elect(strict);
+        var strictLeader = leader(strict);
+        var fsynced = strictLeader.append(GROUP, List.of(bytes("disk")));
+        ReplicatedNode.driveAll(strict.nodes);
+        assertTrue(fsynced.isDone());
+        assertTrue(strict.nodes.get(1).forcedBeforeAck(GROUP));
+        assertFalse(strict.nodes.get(1).ackedFromMemory(GROUP));
+    }
+
+    @Test
     void relaxedAcksBeforeFsyncAndTwoGroupsStayOrdered() throws Exception {
         var cluster = cluster(3, false, Durability.RELAXED, 1);
         elect(cluster);

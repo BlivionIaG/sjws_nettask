@@ -18,8 +18,8 @@ package sjws_nettask.cluster;
 
 /** How a replication group treats follower disk before it acks. */
 public enum Durability {
-    /** Followers fsync the batch, then ack. The append future waits for that quorum. */
+    /** Opt-in. Followers fsync the batch, then ack. The append future waits for that quorum. */
     STRICT,
-    /** Quorum ack from memory. Fsync is batched afterwards and does not delay the future. */
+    /** Default. Quorum ack from memory. Fsync is batched afterwards and does not delay the future. */
     RELAXED
 }
