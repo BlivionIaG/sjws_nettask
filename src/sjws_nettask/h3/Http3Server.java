@@ -27,7 +27,7 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.http3.Http3;
 import io.netty.handler.codec.http3.Http3ErrorCode;
 import io.netty.handler.codec.http3.Http3ServerConnectionHandler;
-import io.netty.handler.codec.quic.InsecureQuicTokenHandler;
+import io.netty.handler.codec.quic.QuicTokenHandler;
 import io.netty.handler.codec.quic.Quic;
 import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicSslContextBuilder;
@@ -75,6 +75,8 @@ public final class Http3Server implements AutoCloseable {
     static final long MAX_STREAMS = 100;
     /** Files open for sending at once, across all connections (each in-flight stream holds one fd). */
     static final int MAX_OPEN_FILES = 256;
+    /** Address-validation token policy (security review M3). */
+    static final QuicTokenHandler TOKENS = NoRetryTokenHandler.INSTANCE;
 
     private final ServerConfig config;
     private final Function<Request, Response> handler;
@@ -155,8 +157,7 @@ public final class Http3Server implements AutoCloseable {
                     .initialMaxStreamDataBidirectionalLocal(MAX_STREAM_DATA)
                     .initialMaxStreamDataBidirectionalRemote(MAX_STREAM_DATA)
                     .initialMaxStreamsBidirectional(MAX_STREAMS)
-                    // Dev-grade address validation; an internet-facing deployment wants a real QuicTokenHandler.
-                    .tokenHandler(InsecureQuicTokenHandler.INSTANCE)
+                    .tokenHandler(TOKENS) // no Retry: forged tokens can't bypass address validation
                     .handler(new ChannelInitializer<QuicChannel>() {
                         @Override
                         protected void initChannel(QuicChannel quic) {
