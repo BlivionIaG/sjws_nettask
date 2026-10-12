@@ -25,7 +25,6 @@ import io.netty.handler.codec.http3.Http3HeadersFrame;
 import io.netty.handler.codec.http3.Http3RequestStreamInboundHandler;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.util.ReferenceCountUtil;
-import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.Request;
@@ -122,18 +121,16 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         }
         var task = new Task(stream, request, refusal);
         try {
-            task.future = this.shared.executor().submit(task);
+            this.shared.executor().execute(task);
         } catch (RejectedExecutionException e) { // shutting down
             task.finish(null);
             reject(stream);
             return;
         }
-        // Peer reset / connection closed: stop waiting for slots or flow control, return the slot.
-        stream.closeFuture().addListener(f -> {
-            if (task.future.cancel(true)) {
-                task.finish(Http3Writer.Outcome.CLOSED); // no-op if the task already finished itself
-            }
-        });
+        // Peer reset / connection closed: stop waiting for slots or flow control. The slot is returned
+        // when the thread actually ends (not Future.cancel: JDK 21's thread-per-task executor then
+        // forgets the thread at once, so neither the in-flight cap nor awaitTermination would see it).
+        stream.closeFuture().addListener(f -> task.cancel());
     }
 
     private void reject(QuicStreamChannel stream) {
@@ -156,7 +153,8 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         private final Request request;
         private final Response refusal;
         private final AtomicBoolean finished = new AtomicBoolean();
-        volatile Future<?> future;
+        private volatile Thread thread;
+        private volatile boolean cancelled;
 
         Task(QuicStreamChannel stream, Request request, Response refusal) {
             this.stream = stream;
@@ -164,11 +162,21 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
             this.refusal = refusal;
         }
 
+        /** Interrupts the request's thread, or makes it return at once if it hasn't started yet. */
+        void cancel() {
+            this.cancelled = true;
+            var t = this.thread;
+            if (t != null) {
+                t.interrupt(); // harmless if the thread has already ended
+            }
+        }
+
         @Override
         public void run() {
+            this.thread = Thread.currentThread();
             Http3Writer.Outcome outcome = Http3Writer.Outcome.FAILED;
             try {
-                if (!this.stream.isActive()) {
+                if (this.cancelled || !this.stream.isActive()) {
                     outcome = Http3Writer.Outcome.CLOSED;
                     return;
                 }

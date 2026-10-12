@@ -561,6 +561,34 @@ class SecurityReviewTest {
         }
     }
 
+    /** S-8: close() interrupts request threads and returns only once they have finished. */
+    @Test
+    void closeWaitsForRequestThreadsToFinish() throws Exception {
+        var finished = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.function.Function<sjws_nettask.core.Request, sjws_nettask.core.Response> stubborn = r -> {
+            try {
+                Thread.sleep(60_000);
+            } catch (InterruptedException e) {
+                long t = System.nanoTime(); // takes a while to wind down after the interrupt
+                while (System.nanoTime() - t < TimeUnit.MILLISECONDS.toNanos(500)) {
+                    Thread.onSpinWait();
+                }
+                finished.set(true);
+            }
+            return this.handler.handle(r);
+        };
+        var server = new Http3Server(config().build(), stubborn, this.tls)
+                .limits(limits(100, 100, 16, Duration.ofSeconds(5), Duration.ofSeconds(5), 0, Duration.ofMillis(100)))
+                .start();
+        try (var client = new H3TestClient(this.tls.certificate())) {
+            H3TestClient.request(client.connect(server.localAddress()), "GET", "/hello.txt", Map.of());
+            waitFor(() -> server.inflight() == 1, 5, "request running");
+            server.close();
+            assertTrue(finished.get(), "close() returned while a request thread was still running");
+            assertEquals(0, server.inflight());
+        }
+    }
+
     /** What the HTTP/1.1 parser answers for this request line (0 = accepted). */
     static int http1Status(String method, String target) throws Exception {
         try {
