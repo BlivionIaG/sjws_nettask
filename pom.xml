@@ -9,9 +9,11 @@
   <packaging>jar</packaging>
 
   <properties>
-    <maven.compiler.release>21</maven.compiler.release>
+    <maven.compiler.release>25</maven.compiler.release>
+    <!-- Default for @{argLine} when the JaCoCo agent isn't set (e.g. -Djacoco.skip). -->
+    <argLine></argLine>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <junit.version>5.11.4</junit.version>
+    <junit.version>6.1.3</junit.version>
     <!-- Run only the green suite with: mvn test -DexcludedGroups=bug -->
     <excludedGroups></excludedGroups>
     <netty.version>4.2.19.Final</netty.version>
@@ -62,15 +64,17 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.13.0</version>
+        <version>3.16.0</version>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.2</version>
+        <version>3.6.0</version>
         <configuration>
           <excludedGroups>jar,${excludedGroups}</excludedGroups>
           <workingDirectory>${project.basedir}</workingDirectory>
+          <!-- @{argLine} keeps the JaCoCo agent; native access for Netty's QUIC natives (JEP 472). -->
+          <argLine>@{argLine} --enable-native-access=ALL-UNNAMED</argLine>
         </configuration>
         <executions>
           <!-- Tests tagged "jar" run the packaged jar (java -jar target/sjws_nettask-*.jar), so they run
@@ -83,7 +87,7 @@
               <groups>jar</groups>
               <!-- Non-empty values: an empty element would inherit the plugin-level config. -->
               <excludedGroups>bug-only-placeholder,${excludedGroups}</excludedGroups>
-              <argLine>-Dsjws.jarTests=true</argLine>
+              <argLine>-Dsjws.jarTests=true --enable-native-access=ALL-UNNAMED</argLine>
               <failIfNoSpecifiedTests>false</failIfNoSpecifiedTests>
             </configuration>
           </execution>
@@ -94,7 +98,7 @@
       <plugin>
         <groupId>org.jacoco</groupId>
         <artifactId>jacoco-maven-plugin</artifactId>
-        <version>0.8.12</version>
+        <version>0.8.15</version>
         <executions>
           <execution>
             <id>prepare-agent</id>
@@ -164,7 +168,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
-        <version>3.4.2</version>
+        <version>3.5.1</version>
         <configuration>
           <!-- Runnable with `java -jar target/sjws_nettask-<version>.jar`: dependencies (Netty + the
                QUIC natives) are copied to target/lib and listed in the manifest Class-Path. -->
@@ -174,13 +178,17 @@
               <addClasspath>true</addClasspath>
               <classpathPrefix>lib/</classpathPrefix>
             </manifest>
+            <manifestEntries>
+              <!-- JDK 22+: lets Netty load the QUIC natives without a warning (blocked in future JDKs). -->
+              <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+            </manifestEntries>
           </archive>
         </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
-        <version>3.7.0</version>
+        <version>3.11.0</version>
         <executions>
           <execution>
             <id>copy-runtime-deps</id>
@@ -205,12 +213,12 @@
           <plugin>
             <groupId>org.pitest</groupId>
             <artifactId>pitest-maven</artifactId>
-            <version>1.17.4</version>
+            <version>1.30.0</version>
             <dependencies>
               <dependency>
                 <groupId>org.pitest</groupId>
                 <artifactId>pitest-junit5-plugin</artifactId>
-                <version>1.2.1</version>
+                <version>1.2.3</version>
               </dependency>
             </dependencies>
             <configuration>
