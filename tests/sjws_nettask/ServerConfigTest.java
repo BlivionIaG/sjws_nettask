@@ -489,6 +489,13 @@ class ServerConfigTest {
         assertEquals(ServerConfig.MetricsExposure.OFF, parse(Map.of(), "--metrics", "--no-metrics").config().metricsExposure());
         assertEquals(ServerConfig.AccessLogFormat.COMMON,
                 parse(Map.of(), "--access-log=/tmp/a.log", "--access-log-format=common").config().accessLogFormat());
+        assertEquals(ServerConfig.AccessLogFormat.COMBINED,
+                parse(Map.of(), "--access-log=/tmp/a.log", "--access-log-format=combined").config().accessLogFormat());
+        var bareFormat = parse(Map.of(), "--access-log-format");
+        assertEquals(ServerConfig.AccessLogFormat.COMBINED, bareFormat.config().accessLogFormat());
+        assertTrue(bareFormat.warnings().stream().anyMatch(w -> w.contains("Missing value for --access-log-format")),
+                bareFormat.warnings().toString());
+        assertEquals(ServerConfig.MetricsExposure.OFF, parse(Map.of(), "--metrics=off").config().metricsExposure());
 
         var env = parse(Map.of("WEB_SERVER_ACCESS_LOG", "/env.log", "WEB_SERVER_ACCESS_LOG_FORMAT", "JSON",
                 "WEB_SERVER_METRICS", "localhost"), "--access-log=-", "--access-log-format=common", "--metrics=on");

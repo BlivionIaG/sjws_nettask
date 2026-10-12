@@ -21,6 +21,7 @@ import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.time.Duration;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -99,10 +100,21 @@ public class ClientManager implements Runnable {
     }
 
     private volatile ConnectionReaper reaper;
+    /** How long {@link #run()}'s shutdown waits for a response already being written. */
+    private volatile long shutdownTimeoutMs = Daemon.DEFAULT_SHUTDOWN_TIMEOUT.toMillis();
 
     /** @return the deadline enforcer (null before {@link #run()} starts) */
     ConnectionReaper reaper() {
         return this.reaper;
+    }
+
+    /** How long shutdown waits for responses already in progress (idle connections are closed at once). */
+    void shutdownTimeout(Duration timeout) {
+        long ms = timeout.toMillis();
+        if (ms < 0 || ms > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("shutdown timeout out of range");
+        }
+        this.shutdownTimeoutMs = ms;
     }
 
     /** @return number of connections currently being served */
@@ -180,9 +192,38 @@ public class ClientManager implements Runnable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
-            close();
-            executor.shutdownNow(); // interrupting a channel read/write closes the connection
-            deadlines.close();
+            close(); // stop accepting; in-flight responses are drained below
+            // A signalled accept thread must still be able to wait out the drain.
+            boolean interrupted = Thread.interrupted();
+            try {
+                deadlines.beginDrain();
+                executor.shutdown();
+                boolean finished = false;
+                try {
+                    finished = executor.awaitTermination(this.shutdownTimeoutMs, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+                if (!finished) {
+                    int still = this.active.get();
+                    if (still > 0) {
+                        System.err.println("Shutdown: " + still + " connection(s) still open after "
+                                + this.shutdownTimeoutMs + " ms; closing them");
+                    }
+                    deadlines.forceAll();
+                    executor.shutdownNow();
+                    try {
+                        executor.awaitTermination(1, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                deadlines.close();
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 
