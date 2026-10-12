@@ -274,13 +274,13 @@ class SjwsServerHttp3Test {
             int udp = -1;
             while ((line = reader.readLine()) != null) {
                 log.append(line).append('\n');
-                var m = Pattern.compile("^HTTP/1\\.1 on tcp/(\\d+), HTTP/3 on udp/(\\d+)").matcher(line);
+                var m = Pattern.compile("^Server started: HTTP/1\\.1 on tcp/(\\d+), HTTP/3 on udp/(\\d+)").matcher(line);
                 if (m.find()) {
                     assertEquals(port, Integer.parseInt(m.group(1)));
                     udp = Integer.parseInt(m.group(2));
                     break;
                 }
-                if (line.startsWith("HTTP/1.1 on tcp/")) {
+                if (line.startsWith("Server started")) {
                     break;
                 }
             }

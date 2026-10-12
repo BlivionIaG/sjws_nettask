@@ -36,7 +36,7 @@ import sjws_nettask.core.StaticFileHandler;
 /**
  * One instance per request stream. Maps the HEADERS frame to a core {@link Request} as soon as it
  * arrives (request bodies are ignored, like on HTTP/1), runs the shared {@link StaticFileHandler}
- * and the {@link Http3Writer} on a virtual thread, and releases every inbound frame.
+ * and the {@link Http3Writer} on a virtual thread, and releases every inbound DATA frame.
  * <p>
  * Each request takes one server-wide in-flight slot ({@link Limits#maxInflight()}), refused with
  * H3_REQUEST_REJECTED when none is free. The task is tied to the stream's lifetime: when the stream

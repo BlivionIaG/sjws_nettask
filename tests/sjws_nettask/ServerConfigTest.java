@@ -203,7 +203,7 @@ class ServerConfigTest {
         assertEquals("pa ss", p.config().tlsKeyPassword());
         java.nio.file.Files.writeString(f, "x\r\n");
         assertEquals("x", ServerConfig.parse(new String[] {"--cert=/c", "--key=/k"},
-                Map.of("WEB_SERVER_TLS_KEY_PASSWORD_FILE", f.toString())).config().tlsKeyPassword());
+                Map.of("WEB_SERVER_H3", "true", "WEB_SERVER_TLS_KEY_PASSWORD_FILE", f.toString())).config().tlsKeyPassword());
     }
 
     @Test
@@ -222,6 +222,18 @@ class ServerConfigTest {
                 Map.of("WEB_SERVER_TLS_KEY_PASSWORD", "env"), f -> "file");
         assertEquals("env", p.config().tlsKeyPassword());
         assertEquals(1, p.warnings().stream().filter(w -> w.contains("using the variable")).count());
+    }
+
+    @Test
+    void passwordFileIsNotReadWithoutH3() {
+        var p = ServerConfig.parse(new String[] {"--cert=/c", "--key=/k", "--key-password-file=/nope/pw"}, Map.of(),
+                f -> {
+                    throw new java.io.IOException("must not be read");
+                });
+        assertTrue(p.errors().isEmpty(), p.errors().toString());
+        assertNull(p.config().tlsKeyPassword());
+        assertTrue(p.warnings().stream().anyMatch(w -> w.contains("--key-password-file") && w.contains("no effect")),
+                p.warnings().toString());
     }
 
     @Test

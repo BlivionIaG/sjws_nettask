@@ -64,8 +64,7 @@ public class Sjws_nettask {
         }
         var hook = new Thread(server::close, "shutdown");
         Runtime.getRuntime().addShutdownHook(hook);
-        System.out.println("Server started on port : " + server.tcpPort() + " (serving " + root + ")");
-        System.out.println(server.describe());
+        System.out.println("Server started: " + server.describe());
         try {
             server.awaitTermination();
             System.out.println("Server Terminated properly !");
