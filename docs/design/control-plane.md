@@ -18,7 +18,7 @@ The content request path reads the snapshot that is already installed. It does n
 
 1. **One binary, three startup roles.** `standalone` (the default), `control`, or `data`. The choice is made once at process start. `standalone` constructs no control-plane object, opens no `cp-config` group, and starts no watch. The HTTP path stays the path on master `d592aaf`.
 2. **Zero cost when the control plane is off.** With `standalone`, the accept loop and `Http1Connection` do not read a role, a lease, a generation from Raft, or a control-plane flag. Evidence for every PR, including this one, is a `wrk` / `wrk2` before/after on the same host. The gate is the same shape as HA: report req/s and p50/p90/p99/p99.9.
-3. **Lock-free hot path.** A request performs one volatile read of an immutable snapshot (`LiveConfig.get` / `handler()`), then runs the prebuilt `Handler`. Publish is an atomic swap (`AtomicReference.set`). Readers take no lock. An in-flight request keeps the handler it already loaded.
+3. **Lock-free hot path.** A request performs one volatile read of an immutable snapshot (`LiveConfig.get` / `handler()`), then runs that snapshot's `Handler`. Publish is an atomic swap (`AtomicReference.set`) of the whole snapshot. The handler chain, the HA generation leaf, and the HTTP/3 handler supplier all read that snapshot. They do not keep a leaf captured at startup (§5.6). Readers take no lock. An in-flight request keeps the handler it already loaded.
 4. **Raft I/O on dedicated threads.** Append, fsync, election, and `GroupListener.onCommitted` run on the cluster group's threads (PR #29: one apply thread per group, index order). Those threads are distinct from the accept loop and from request virtual threads.
 5. **The control plane bootstraps without the broker.** `sjws_nettask.cp` does not import `sjws_nettask.messaging`. Messaging does not import `sjws_nettask.cp`. Topic *desired state* lives in the config document. The broker opens partitions from the applied document on its own threads.
 6. **Fail static.** A data-plane node that cannot reach a leader keeps the last successfully applied snapshot, including across a restart from the persisted last-good file. A minority of control nodes cannot publish.
@@ -53,14 +53,14 @@ The content request path reads the snapshot that is already installed. It does n
 
 | Package | Role |
 |---|---|
-| `sjws_nettask.cp` | Raft state machine for desired config, signing, rollout, admin API, watch server, registration. Depends on `sjws_nettask.cluster` and on the config model. |
-| `sjws_nettask.config` | Owns `ConfigDocument`, validation, `contentHash`, `ConfigSnapshot.compile`, `ConfigReloader`, `LiveConfig`. Gains the serializable snapshot, diff, and apply-from-remote entry points described in §5. |
-| `sjws_nettask.cluster` | Per-group Raft from PR #29. Unchanged by this workstream. |
-| Data plane (`http1`, `h2`, `h3`, `routing`, `core`, `messaging`, `acme` on a data node) | Depends on the narrow applied-config view in §3.2. Does not depend on `sjws_nettask.cp`. |
+| `sjws_nettask.cp` | Raft state machine, signing, diff apply, rollout, admin API, watch, registration. Depends on `sjws_nettask.cluster` and on the config model. Owns `SignedSnapshot`. |
+| `sjws_nettask.config` | Owns `ConfigDocument`, validation, `contentHash`, `ConfigSnapshot.compile`, `ConfigReloader`, `LiveConfig`. The remote entry takes verified canonical bytes (§5.6). It does not mention a `cp` type. |
+| `sjws_nettask.cluster` | Per-group Raft from PR #29. Unchanged by this workstream. It imports neither `sjws_nettask.cp` nor `sjws_nettask.messaging`. |
+| Data plane (`http1`, `h2`, `h3`, `routing`, `core`, `messaging`, `acme` on a data node) | Sees a `Handler` or, for the broker and the composition root only, `AppliedConfig` (§3.2). Does not depend on `sjws_nettask.cp`. |
 
-`sjws_nettask.cp` does not import `sjws_nettask.messaging`, `sjws_nettask.routing`, `sjws_nettask.http1`, `sjws_nettask.h2`, or `sjws_nettask.h3`. A control process can open `cp-config` and serve the admin API with no broker class initialized.
+`sjws_nettask.cp` does not import `sjws_nettask.messaging`, `sjws_nettask.routing`, `sjws_nettask.http1`, `sjws_nettask.h2`, or `sjws_nettask.h3`. A control process can open `cp-config` and serve the admin API with no broker class initialized. `cp-config` has its own log directory and its own segments. It does not share the messaging ledger's segments, so compaction or truncation of one cannot affect the other.
 
-The composition root is `Sjws_nettask` / `SjwsServer`. It is the only place that may mention both a data-plane server and `sjws_nettask.cp`. The reference is behind the startup role. `standalone` does not execute it.
+The composition root is `Sjws_nettask` / `SjwsServer`. It is the only place that may mention both a data-plane server and `sjws_nettask.cp`, and only through `sjws_nettask.cp.CpBootstrap`, reached from the `control` or `data` branch. `standalone` does not name that class, so the verifier does not load `sjws_nettask.cp` or `sjws_nettask.cluster` (§16).
 
 ### 3.2 Narrow snapshot interface
 
@@ -83,7 +83,9 @@ public interface AppliedConfig {
 }
 ```
 
-`ConfigSnapshot` implements `AppliedConfig`. `LiveConfig` remains the `AtomicReference` holder. HTTP keeps calling `LiveConfig.handler()` and does not grow a second read. The messaging broker, when it is running, reads `document()` on its partition-writer thread to learn the desired topic set. That read is not on the HTTP request path and is not a call to the control plane.
+`ConfigSnapshot` implements `AppliedConfig`. Adding `version` and `epoch` is two `long` fields on that record (0 on a standalone snapshot). That is the only change the request path pays for the fields. `LiveConfig` remains the `AtomicReference` holder.
+
+Transports do not import `AppliedConfig`. They already depend on `Supplier<Handler>` and `HandlerRef`, which is the narrower seam, and that stays. HTTP/1, HTTP/2, and HTTP/3 read the supplier the publish step installs (§5.6). `AppliedConfig` is for the broker and the composition root. The messaging broker, when it is running, reads `document()` on its partition-writer thread to learn the desired topic set. That read is not on the HTTP request path and is not a call to the control plane.
 
 ### 3.3 Roles in the one binary
 
@@ -101,11 +103,12 @@ The config workstream owns the YAML keys (`node.mode`, `node.role`, `node.labels
 
 | Work | Thread |
 |---|---|
-| Accept, parse, `Handler.handle` | Existing accept loop and request virtual threads. They read `LiveConfig` only. |
-| Raft election, append, fsync, apply | `sjws_nettask.cluster` group threads. |
-| Snapshot compile, signature check, disk write of last-good | A control-plane applicator thread on the data node, started only for role `data`. |
+| Accept, parse, `Handler.handle` | Existing accept loop and request virtual threads. They read the live snapshot supplier only. |
+| Raft election, append, fsync, apply | `sjws_nettask.cluster` group threads. `onCommitted` does not compile or sign. |
+| Compile and sign on a control leader | A dedicated compiler thread. A large document cannot stall Raft apply. |
+| Verify, compile, `publish` on a data node | One applicator thread per process, started only for role `data`. It is the only caller of remote `publish`, so it serializes with itself. |
 | Admin API | Its own listener and virtual threads, control role only, distinct port from content. |
-| Watch stream | One connection per data node, read on a virtual thread that is not a content request. |
+| Watch stream | One virtual thread per data node, not a content request. A slow ack blocks that thread only. |
 | ACME | Existing ACME thread, and only on the control leader after `leaderReady()`. |
 
 ## 4. CP Raft store
@@ -132,9 +135,11 @@ The state machine, applied in index order on the group thread:
 | `Advance` | Marks the next stage eligible for push. |
 | `Activate` | The staged proposal becomes the desired version. |
 | `Rollback` | A new version whose content hash equals an older activated version. |
-| `Register` / `Heartbeat` / `Revoke` | Data-node liveness and denylist. |
-| `TrustBundle` | Signing-key rotation and the CA bundle used to verify node certs. |
-| `CertReference` | ACME result: chain reference and sealed key material (§5.7, §12.5). |
+| `Register` / `Heartbeat` / `Revoke` | Data-node liveness and denylist. `Register` commits in the same entry as `ConsumeToken` (§12.4). |
+| `TrustBundle` | Root-signed delegation of per-voter online signing keys, CA intermediates, and the version floor (§12.3). `admin` only. |
+| `Rbac` | SAN-to-role map and the secrets-directory allowlist (§12.7). `admin` only. A `Propose` that carries either is rejected. |
+| `Audit` | One control-plane audit record (§12.10). Replicated so one voter cannot drop it. |
+| `CertReference` | ACME result: chain reference and envelope-encrypted key material (§5.7, §12.6). |
 
 `SnapshotControl.take` / `install` / `truncateAndCompact` compact the log to the latest activated snapshot plus the live registration table. Compaction runs off the request path, on the group thread, past an index that is both snapshotted and acked. The compactor keeps the latest value per key (current desired snapshot, denylist, registrations). History required for rollback is retained for a configured number of activated versions (default 8) inside the snapshot payload, then dropped.
 
@@ -164,47 +169,85 @@ Three numbers, kept distinct on purpose:
 
 ```java
 record SignedSnapshot(
+    byte[] keyId,           // which online signing key produced the signature
     long version,
     long epoch,
     long raftIndex,
-    String contentHash,
-    byte[] canonicalYaml,
-    byte[] diff,            // empty when this envelope carries the full document
-    long parentVersion,     // 0 when diff is empty
-    String projectionId,    // "full", or the node id / selector the bytes were cut for
-    byte[] nonce,           // 16 bytes, unique per signature
+    long parentVersion,     // 0 when kind is full
+    byte kind,              // 1 = full, 2 = diff
+    String projectionId,    // node id the bytes were cut for
+    byte[] documentHash,    // SHA-256 of the materialized canonical YAML
+    byte[] transmittedHash, // SHA-256 of the bytes in this frame (full YAML or the diff)
+    long issuedAtMillis,
+    long expiresAtMillis,
+    byte[] nonce,           // 16 bytes, covered by the signature; not stored as a set
+    byte[] payload,         // canonical YAML or the diff bytes
     byte[] signature) {}
 ```
 
-The signature input is the canonical encoding of `version`, `epoch`, `raftIndex`, `contentHash`, `projectionId`, and `nonce` (§12.2). The YAML and the diff are covered by `contentHash` (hash of the exact bytes in this envelope).
+The signature input is the domain-separated encoding in §12.3. `documentHash` is the materialized document. `transmittedHash` is the bytes on the wire. A diff frame still carries the hash of the document those bytes must produce.
+
+Canonical YAML, the only bytes that may be hashed as the document:
+
+- UTF-8, LF line endings, no BOM.
+- Mappings emitted with keys sorted lexicographically at every level.
+- Block style. No anchors, no aliases, no tags, no merge keys.
+- Scalars emitted in a single canonical form (booleans `true`/`false`, integers in decimal without leading zeros, strings quoted when they could be another type).
+- SHA-256 over those exact bytes. `ConfigDocument.contentHash()` is that digest, lowercase hex, once the loader is given canonical bytes.
 
 ### 5.4 Diffs
 
-`ConfigDiff.diff(ConfigDocument before, ConfigDocument after)` returns a deterministic, section-scoped patch (server, acme, routing, middleware, access, topics, node). The same pair of documents produces the same bytes. `ConfigDiff.apply` rebuilds the later document or fails cleanly.
+`ConfigDiff.diff(ConfigDocument before, ConfigDocument after)` returns a deterministic, section-scoped patch (server, acme, routing, middleware, access, topics, node). The same pair of documents produces the same bytes. `ConfigDiff.apply` rebuilds the later document or fails cleanly. The patch does not carry `rbac` or `trust`; those sections are not part of `Propose` (§12.7).
 
-The Raft log stores either a full canonical document or a diff against `parentVersion`. The state machine materializes the full document before `Activate`. A watcher that has `parentVersion` may receive the diff. A watcher that does not, including a node that resumes after compaction, receives the full envelope. There is no third representation.
+The Raft log stores either a full canonical document (`kind = full`, `parentVersion = 0`) or a diff against `parentVersion` (`kind = diff`). The state machine materializes the full document before `Activate` and records `documentHash` from that document. A watcher applies a diff only when its installed version equals the signed `parentVersion`, then recomputes SHA-256 of the materialized canonical YAML and requires it to equal the signed `documentHash`. A mismatch, or a diff whose `kind` was flipped, is a reject. A watcher that does not hold `parentVersion` receives the full envelope. There is no third representation.
 
 ### 5.5 Validate
 
-Validation order, off the request path:
+Verification lives in `sjws_nettask.cp`. Parsing and compile live in `sjws_nettask.config`. The signature is checked before any parse or diff apply (§12.8).
 
-1. Signature, then anti-replay (§12.2): `version` greater than the last applied version, `epoch` greater than or equal to the highest epoch already applied, `nonce` unused for that version.
-2. `ConfigLoader` strict parse of the canonical YAML (or of the document obtained by applying the diff).
-3. `ConfigSnapshot.compile` against the local document root and the local challenge board.
+In `cp`, before `config` sees the bytes:
 
-Any failure leaves the previous `ConfigSnapshot` installed. The applicator records the error for the admin API. The content path is unchanged.
+1. Frame size, then signature under the `keyId` named in the envelope (§12.3). The online key must be inside its `notAfter` and its allowed version range, and the root delegation that names it must verify.
+2. Anti-replay and freshness (§12.3). `version` is the primary order: it must be greater than the anti-rollback floor, `version - lastApplied` at most 2^20, and `version` at most `Long.MAX_VALUE - 2^20`. `epoch` greater than or equal to the highest epoch already applied is defense in depth against a deposed leader's key. It is not a second version number. `expiresAtMillis` must still be in the future. `issuedAtMillis` must not be ahead of the local clock by more than the skew bound (default 30 s).
+3. If `kind` is diff, `cp` applies it to the document at `parentVersion` and requires the recomputed document hash to match. A `Propose` whose materialized YAML contains `rbac` or `trust` is rejected here.
 
-### 5.6 Apply-from-remote
+In `config`, on bytes `cp` has already verified:
 
-`ConfigReloader.applyRemote(SignedSnapshot envelope, ConfigSnapshot current, ChallengeBoard board)` verifies, validates, compiles, and returns a `ReloadResult` in the same shape as a file reload (applied snapshot, or rejected with the current snapshot retained). On success the data node:
+4. `ConfigLoader` strict-parses the canonical YAML, with the alias, depth, and code-point caps in §12.8.
+5. Secret references pass the allowlist in §12.6 before any file open.
+6. `ConfigSnapshot.compile` against the local document root and the local challenge board, bounded in time and output size. The snapshot is fully built, including any resources it owns, before it is published.
 
-1. Swaps `LiveConfig` to the new snapshot.
-2. Persists the envelope as last-good (§5.8).
-3. Acks the version on the watch stream.
+Any failure leaves the previous `ConfigSnapshot` installed. The applicator records an error code for the admin API and writes an audit record. The error text does not include file contents or secret bytes. The content path is unchanged.
 
-`ReloadHook` stays the local entry. The data-node applicator is registered as a hook so a later local `ReloadHook.run()` still runs, and a remote apply is a direct call to `applyRemote` from the applicator thread. A remote apply does not re-enter the hook list recursively.
+### 5.6 Publish, one path for local reload and remote apply
 
-Bind-time fields keep the `ConfigReloader` rule already on master: port, backlog, connection caps, and an HTTP/3 listener's timeouts are reported as needing a restart and are not silently changed under a live listener.
+`sjws_nettask.config` does not accept a `SignedSnapshot`. After `cp` has verified an envelope it calls:
+
+```java
+ReloadResult applyVerified(byte[] canonicalYaml, long version, long epoch, ChallengeBoard board);
+```
+
+That call parses and compiles. It does not swap `LiveConfig` and it does not touch sockets. The composition root publishes the `ReloadResult`.
+
+`SjwsServer.publish(ReloadResult)` runs under `reloadLock`, the same lock as today's `reloadLocked()` (`SjwsServer` holds that lock around file reload). File reload and a remote apply share it. Generation is assigned only inside the lock: the process-local `generation` increases by one from the snapshot currently installed, and the cluster `version` is stored beside it. Two callers cannot both compute `generation + 1` from the same base. There is one generation authority.
+
+Role `data` does not let `ReloadHook` / `SIGHUP` publish CP-owned sections from the local file. Those sections are routing, middleware, access, topics, and ACME material that arrived in an envelope. A SIGHUP may still apply local-only fields the control plane does not own (this host's document-root path, the listen address). A SIGHUP that would change a CP-owned section is rejected and audited. Role `standalone` keeps today's full file reload.
+
+The publish step, for a file reload and for a remote apply:
+
+1. The new snapshot is already compiled, including resources it owns (a router and its upstream pools, once that snapshot carries them). Compile finishes before the swap.
+2. Under `reloadLock`: open or close the dedicated ACME HTTP-01 listener, update `ConnectionReaper` timeouts, `live.set`, and `Http3Server.replaceHandler` / `replaceTls`. The same side effects today's `reloadLocked()` performs.
+3. The previous snapshot is closed after the swap, on the publisher thread, not on a request thread. Requests that already loaded the old handler keep it.
+4. The accept loop stays open. Bind-time fields (port, backlog, connection caps, and an HTTP/3 listener's timeouts) are still reported as needing a restart and are not silently changed.
+
+Handler sources all read the snapshot that `publish` installed:
+
+- With no filters and no HA, HTTP/1 keeps the direct file-handler call when the leaf is a `StaticFileHandler`, and reads `live.handler()` when the leaf is anything else. That is the path on master today.
+- With caller filters, a custom terminal, or an observe chain, the chain's leaf is a supplier of `live.handler()`, not a handler captured at startup. When the filter list itself changes, `publish` builds the new chain against that supplier and swaps the chain reference under the same lock.
+- With HA, `generationLeaf` is `live::handler` (or the supplier-backed chain), not a captured `built`. `HaHandler` therefore serves the snapshot `publish` just set.
+- HTTP/3 is given that same supplier. `replaceHandler` runs on every successful publish, including when HA or filters installed an `override` at startup. `override` points at a handler that reads the live snapshot.
+
+A node acks a version only after `publish` returns applied. An ack means HTTP/1, HTTP/2, and HTTP/3 will observe the new leaf. After that, the applicator persists the floor, the trust bundle, and last-good (§5.8), then acks on the watch.
 
 ### 5.7 Certificates
 
@@ -212,13 +255,33 @@ ACME runs on the control leader only, and only after `leaderReady()` (§6). Foll
 
 The leader publishes a `CertReference`: the certificate chain, the content hash, and key material sealed to the data nodes that terminate TLS (§12.5). The plaintext private key is written on the leader with the existing ACME store rules (mode `0600`, temp file, atomic move). It is not placed in `canonicalYaml` and it is not placed in a heartbeat.
 
-Data nodes install the chain through the same `TlsMaterial` / `Http3Server.replaceTls` path a local reload uses, after `applyRemote` succeeds.
+Data nodes install the chain through the same `TlsMaterial` / `Http3Server.replaceTls` path a local reload uses, inside `publish` (§5.6).
 
-### 5.8 Last-good persistence
+### 5.8 Last-good persistence and the anti-rollback floor
 
-After every successful apply, the data node writes the signed envelope to `stateDir/last-good.cp` (temp file in the same directory, `ATOMIC_MOVE`, mode `0600`). `standalone` does not create this file.
+After every successful apply the data node does two writes, each via a temp file, `ATOMIC_MOVE`, mode `0600`, and an `fsync` of the file and its directory:
 
-On startup in role `data`, the process compiles `last-good.cp` if it is present and the signature still verifies under the pinned trust bundle, then binds the content listener. The watch connects in the background. If the control plane is down, the process serves that snapshot. A corrupt or unverifiable file is not applied; the process logs the failure and, if no older snapshot is in memory, stays not-ready until an operator provides a file or the control plane returns.
+1. `stateDir/floor.cp` — the anti-rollback floor `(maxVersion, maxEpoch, keyId)`. This write finishes before `last-good.cp` is replaced.
+2. `stateDir/last-good.cp` — the signed envelope just applied.
+
+`standalone` creates neither file and does not create `stateDir` for the control plane.
+
+Precedence for role `data`, at boot and at runtime:
+
+| Source | What it wins |
+|---|---|
+| Pin file and join material, outside `stateDir` | Root public key and the root version floor. Required. A missing pin refuses to start. |
+| `stateDir/floor.cp` and `stateDir/trust.cp` | Highest applied `(version, epoch, keyId)` and the trust bundle that verified it. Read before last-good. |
+| `stateDir/last-good.cp` | CP-owned sections: routing, middleware, access, topics, ACME material delivered by the control plane. |
+| Local `--config` file | Bind-time and local-only fields: port, listen address, this host's document root, `stateDir`. It does not override CP-owned sections. |
+
+On startup the process reads the pin, then `floor.cp` and `trust.cp`, and only then considers `last-good.cp`. Last-good is compiled when its signature verifies under the persisted bundle (which must chain to the pinned root), its `version` equals `maxVersion`, and its `epoch` is the epoch stored for that version. The bundle is what lets a node restart after a key rotation while the control plane is down: the key that verified the file is on disk next to the file.
+
+An envelope at or below the floor, or a last-good file older than the floor, is not compiled. The process still binds the content listener and answers 503 (not ready) until a snapshot passes the check. It does not serve CP-owned sections from the local YAML. `/healthz` can be 200 while the process is up. `/readyz` is 503.
+
+A wipe or restore of `stateDir` deletes the local floor, the trust bundle, and last-good together, so those files cannot stop a replay by themselves. The floor that survives the wipe is the root version floor in the pin and in the join material (§12.3, §12.4). A node with an empty `stateDir` still refuses any envelope whose `version` is below that floor, and it binds 503 until a newer envelope arrives. The same check runs before `last-good.cp` is compiled when the pin floor is higher than the file.
+
+The watch connects in the background. If the control plane is down, the process serves the snapshot that passed the floor check. A corrupt or unverifiable file is not applied. The listener stays bound and answers 503 until a good snapshot is published. There is no "older snapshot in memory" at boot.
 
 ## 6. Leadership interface
 
@@ -259,11 +322,13 @@ On each transition to leader, the new leader appends a single `Noop` in the new 
 
 ## 7. Registration and heartbeats
 
-A data node connects to a control node over the watch (§8). The first message is `Register`: node id, data role, capabilities, labels, current applied version, and the fingerprint of its node certificate.
+A data node connects to a control node over the watch (§8). The first message after the handshake is `Register`: node id, the fingerprint of its node certificate, and the applied version. Role, labels, and capabilities are not taken from this message. They are the values the control plane wrote into the certificate when it consumed the join token (§12.4). A `Register` whose role, labels, or capabilities differ from that certificate is an authentication failure and an audit event. The connection closes. The projection is derived from the certificate.
 
-The leader appends `Register` to `cp-config`. Followers learn it through Raft. A follower that receives a watch redirects the node to the leader (the hint is the same idea as `NotLeaderException`: leader id and address). The data node retries against the hint.
+The leader appends one Raft entry that is both `ConsumeToken` and `Register`, and only then returns the certificate (§12.4). Followers learn the registration through Raft. A follower that receives a watch redirects the node to the leader (the hint is the same idea as `NotLeaderException`: leader id and address). The data node retries against the hint.
 
-Heartbeats are records on that same stream, default interval 1 s, carrying the applied version and a monotonic send time. The leader appends a coalesced `Heartbeat` (at most one committed entry per node per interval; intermediate beats update an in-memory freshness table on the leader and are included in the next entry). A node with no beat for 5 s is `SUSPECT`. A node with no beat for 15 s is `DEAD` for rollout accounting. Neither state changes what the data node is serving. Dead nodes are skipped by the current stage and do not block a stage whose policy allows a configured minimum of acks; a policy of "all targeted nodes" waits.
+Liveness heartbeats are records on that same stream, default interval 1 s, carrying the applied version and a monotonic send time. The leader appends a coalesced `Heartbeat` (at most one committed entry per node per interval; intermediate beats update an in-memory freshness table on the leader and are included in the next entry). A node with no beat for 5 s is `SUSPECT`. A node with no beat for 15 s is `DEAD` for rollout accounting. Neither state changes what the data node is serving. Dead nodes are skipped by the current stage and do not block a stage whose policy allows a configured minimum of acks; a policy of "all targeted nodes" waits.
+
+Separately, the leader pushes a signed **freshness** frame at least every 30 s, including when the desired version has not changed (§12.3). That frame is how a data node distinguishes "nothing new" from "a newer version is being withheld". It is not the liveness heartbeat above.
 
 HA's 64-byte UDP heartbeat remains the failure detector for `ha-control` membership. Data-plane registration uses the mTLS watch so the identity is the node certificate. The two protocols are not merged.
 
@@ -271,7 +336,9 @@ HA's 64-byte UDP heartbeat remains the failure detector for `ha-control` members
 
 Transport: one mTLS connection (TLS 1.3) from the data node to the leader of `cp-config`. The listener is the control admin port's sibling, or the same port with a different ALPN (`sjws-cp-watch`). It is not the content port.
 
-Frames are length-prefixed. The client speaks first:
+Frames are length-prefixed. The maximum frame size is 16 MiB by default and is configurable downward. A larger frame closes the connection before the body is buffered (§12.8). The signature of a snapshot or freshness frame is verified before the payload is parsed or a diff is applied.
+
+The client speaks first:
 
 1. `Register` (§7).
 2. `Watch { fromVersion }`, where `fromVersion` is the last version this node has applied and persisted, or `0`.
@@ -281,13 +348,15 @@ The server then sends, in version order:
 - `Snapshot` (full `SignedSnapshot`) when the client has no parent, or
 - `Diff` when the client has `parentVersion` and the diff is still retained.
 
-After the client is caught up, the server sends each newly activated version. The client replies `Ack { version }` after `applyRemote` has swapped `LiveConfig` and the last-good file is durable.
+After the client is caught up, the server sends each newly activated version. The client replies `Ack { version }` after `publish` has swapped the live snapshot, the side effects in §5.6 have run, and the floor, trust bundle, and last-good file are durable.
 
 Backpressure: the server window is one unacked version by default (`maxInFlight`, configurable, minimum 1). It does not send version N+1 before `Ack` of N. The applicator queue on the client is bounded to that window. A slow apply stalls the stream. It does not buffer an unbounded log on the data node, and it does not stall Raft apply on the leader: the leader's push task reads the committed snapshot from memory and blocks on that one node's window only. Other nodes have their own windows.
 
 Resume: a dropped connection reconnects with `Watch { fromVersion = last acked }`. The server sends only higher versions. Duplicate `Ack`s are idempotent. A version already applied is not compiled again (`version` equal to the installed version is a successful no-op).
 
 The content request path does not read this socket.
+
+Watcher cap: the leader runs at most one push task per node id, and at most a configured number of watch connections in total (default 1024). A connection past the cap is refused. Join and CSR work is rate-limited per source address (§12.8) and does not run on the Raft apply thread.
 
 ## 9. Staged rollout, canary, and rollback
 
@@ -301,9 +370,9 @@ The leader pushes the staged version only to nodes in the open stage. Other node
 
 `Activate` commits when the last stage has met its ack rule, or when an admin with role `operate` forces it. Activation publishes the version as desired. Nodes that have not acked still receive it (subject to their window) and still serve last-good until they apply.
 
-`Rollback { toVersion }` appends a new version whose `contentHash` and canonical YAML equal the retained activated snapshot `toVersion`. The new version is higher than any current version, so anti-replay still moves forward. The rollout of a rollback uses the same stage list unless the operator selects a single stage of all nodes. Nodes that never installed the bad version treat the rollback as a no-op if their installed hash already matches, and ack it.
+`Rollback { toVersion }` appends a new version whose `documentHash` and canonical YAML equal the retained activated snapshot `toVersion`. The new version is higher than any current version, so anti-replay still moves forward. The rollout of a rollback uses the same stage list unless the operator selects a single stage of all nodes. Nodes that never installed the bad version treat the rollback as a no-op if their installed hash already matches, and ack it.
 
-A proposal that fails validation is not appended. A failed `applyRemote` on one node does not roll the others back automatically. The admin API shows the node error. The operator issues `Rollback`.
+A proposal that fails validation is not appended. A failed `publish` on one node does not roll the others back automatically. The admin API shows the node error. The operator issues `Rollback`.
 
 ## 10. Partitions and stale config
 
@@ -329,7 +398,7 @@ A later deployment that wants an independent per-site control plane is a separat
 
 ### 12.1 Assets and boundaries
 
-Assets: the desired config, TLS private keys for content certificates, node identity keys, the snapshot signing key, admin credentials, join tokens, and topic definitions. Message payloads stay in the messaging ledger. The control plane does not store them.
+Assets: the desired config, TLS private keys for content certificates, node identity keys, the offline root key, the per-voter online signing keys, admin credentials, join tokens, and topic definitions. Message payloads stay in the messaging ledger. The control plane does not store them.
 
 Boundaries:
 
@@ -345,43 +414,67 @@ The content listener is outside the control-plane trust boundary. Compromise of 
 
 ### 12.2 mTLS, identity, and cert rotation
 
-Every control node and data node has an identity certificate. The SAN is `urn:sjws:node:<nodeId>` plus a DNS name where an operator needs one. The watch, the admin API, and the voter-to-voter transport require TLS 1.3 mutual authentication against the pinned CA bundle.
+TLS is 1.3 only. There is no fallback to 1.2, no 0-RTT early data, and no session-ticket resumption across an identity change (ticket keys rotate with the identity). Leaf keys are Ed25519 or ECDSA P-256. The URI SAN is exactly `urn:sjws:node:<nodeId>`. A verifier matches that SAN to the peer it expected: a voter checks a voter id, and a data node checks that the peer is a voter or learner id named by the trust bundle, not merely that the CA signed something. Extended key usage splits `serverAuth` and `clientAuth`.
 
-Rotation is a `TrustBundle` log entry followed by a config version that carries the new bundle. Verifiers accept the previous CA and the new CA for one overlap window (the next activated version, or a configured time bound stored in the bundle). The following version drops the previous CA. Node certificates are renewed by a CSR the node generates locally: the private key is created on the node, the leader signs the CSR only while `leaderReady()`, and the node installs the new certificate on the applicator thread. The control plane never receives the node private key.
+Three intermediates, each signed by the offline root (§12.3): one for voters, one for data nodes, one for admin clients. A data-node certificate cannot authenticate as a voter or as an admin. The online intermediate private keys live on the control leader only while `leaderReady()`, mode `0600`. The root private key does not.
+
+Node certificates last 24 hours. The node renews by CSR at two thirds of that lifetime. The private key is generated on the node. The leader signs the CSR only while `leaderReady()` and only after the join token or the existing certificate has been checked. The control plane never receives the node private key. A sealing key (§12.6) is a different key from the identity key. There is no conversion of an Ed25519 identity key into an X25519 sealing key.
 
 A peer that fails verification closes the watch or the admin connection. The data node keeps last-good. Content connections are unaffected.
 
-Until the cluster transport grows mTLS, voter-to-voter frames use the HMAC-SHA256 shared secret HA §9 already specifies for bundles, with the same rule that private keys are absent from heartbeats. The watch and the admin API are mTLS from the first implementation PR that exposes them. Replacing the HMAC with the node identity on the cluster transport is a follow-through on the same `BundleTransport` seam HA names, not a second trust model.
+Voter-to-voter mTLS is a ship blocker for every deployment except a single-node lab. A group with more than one voter refuses to start until voter mTLS is on. The HMAC shared secret from HA §9 is allowed only in that lab, behind an explicit flag, and it is not a production identity. The watch and the admin API are mTLS in every role, including the lab.
 
-### 12.3 Signed snapshots and anti-replay
+### 12.3 Keys, signatures, freshness, and anti-replay
 
-The signing key is an Ed25519 key held by the control plane. The private half lives in `stateDir` mode `0600` on voters and is replicated only as a sealed blob inside a `TrustBundle` entry addressed to the other voters' identity keys. It is not in `canonicalYaml`.
+Two tiers of keys.
 
-The signature covers `version`, `epoch`, `raftIndex`, `contentHash`, `projectionId`, and `nonce`.
+- The **root** is offline and operator-held. It signs `TrustBundle` entries. Data nodes pin the root public key in the pin file outside `stateDir`. They do not pin an online key as the trust anchor.
+- Each voter has its own **online signing key** (Ed25519), named by `keyId`. The root delegates it in a `TrustBundle` with `notAfter` and an allowed version range. A compromised voter is revoked by a new bundle that drops that `keyId`. The other voters keep signing. There is no single signing key sealed to every voter.
+
+The signature input is this canonical byte string, and nothing else is trusted outside it. Integers are unsigned big-endian, fixed width. Strings are a `uint16` length plus UTF-8 bytes. Hashes are 32 raw bytes.
+
+```
+"sjws-cp-snapshot-v1" || keyId || version:u64 || epoch:u64 || raftIndex:u64
+  || parentVersion:u64 || kind:u8 || projectionId
+  || sha256(materialized canonical YAML) || sha256(transmitted bytes)
+  || issuedAtMillis:u64 || expiresAtMillis:u64 || nonce:16
+```
+
+`kind` is 1 for a full document and 2 for a diff. `sha256(materialized canonical YAML)` is `documentHash` (§5.3). `sha256(transmitted bytes)` covers the full YAML or the diff bytes actually in the frame. After a diff is applied, the node recomputes the materialized hash and requires an exact match. Re-labeling `parentVersion` or `kind` breaks the signature.
 
 A receiver rejects an envelope when any of the following holds:
 
-- the signature does not verify under the current or overlap signing key;
-- `version` is less than or equal to the last applied version (monotonic version);
-- `epoch` is less than the highest epoch the node has already applied (a signed envelope from an older term cannot be reused after a newer term has been seen);
-- the pair `(version, nonce)` has already been accepted (the nonce cuts a duplicate of the same version);
-- `contentHash` does not match the bytes.
+- the signature fails under `keyId`, or the root delegation for that key is missing, expired, or outside the key's version range;
+- `version` is less than or equal to the anti-rollback floor (§5.8);
+- `version - lastApplied` is greater than 2^20, or `version` is greater than `Long.MAX_VALUE - 2^20` (a jump to the top of the `long` range is a reject, not a publish);
+- `expiresAtMillis` is in the past, or `issuedAtMillis` is more than 30 s ahead of the local clock;
+- `documentHash` or `transmittedHash` does not match.
 
-`Rollback` allocates a fresh version and a fresh nonce. Replaying the old envelope fails the version check. The retained historical document is re-signed in the current epoch.
+`version` is strictly monotonic, so a replay of an old envelope fails the floor check. The nonce is inside the signature so two signatures of the same body differ. It is not stored as a set. `epoch` is recorded and must be greater than or equal to the highest epoch already applied. That check is defense in depth against a deposed leader's key. `version` is what orders envelopes.
+
+Every envelope carries `issuedAtMillis` and `expiresAtMillis` (default lifetime 15 minutes). While a version stays current, the leader also pushes a signed freshness frame at least every 30 s: `version`, `issuedAtMillis`, `expiresAtMillis`, `keyId`, and a signature over those fields with domain `"sjws-cp-freshness-v1"`. Max-staleness compares the local clock to that signed expiry. A withheld update and a quiet version are different: quiet still refreshes the freshness frame. A node past expiry without a new frame treats the snapshot as stale for readiness. It keeps serving last-good unless the operator turned max-staleness drain on (§10).
+
+Key compromise: the operator signs a new `TrustBundle` with the root. The bundle names the replacement online keys and a **version floor**. Every envelope signed by a retired `keyId`, and every envelope below that floor, fails verification even on a node whose `stateDir` was wiped. The floor is also written into the pin file and into join material so a node that has not yet seen the bundle still enforces it.
+
+`Rollback` allocates a fresh version and is signed by a current online key. The historical document is what gets re-signed. The old envelope is not replayed.
 
 ### 12.4 Join tokens and bootstrap
 
-The first control node starts with an admin token read from a file mode `0600`, opens a one-voter `cp-config` group, and prints the CA fingerprint. Additional voters join by `changeMembership` after they present a bootstrap token. The operator retires the one-voter configuration before serving data nodes. Production failure tests use 3 voters.
+A join token is `{tokenId, secret}`. The control plane stores the hash of `secret`, a TTL (default 1 hour, maximum 24 hours), the role, the labels, the capabilities, and an optional expected node id or SAN. The token is single-use.
 
-A data node joins with a one-time token. The token is bound to a role and to a label constraint, stored on the control plane as a hash, and accepted once. The first watch presents the token and a CSR. The leader, if `leaderReady()`, signs the node certificate, appends `Register`, and consumes the token. Later connections present the node certificate only. A reused token is an authentication failure and an audit event.
+The data node checks the pinned CA fingerprint **before** it sends the token. Role `data` has no trust-on-first-use path. A lab process may pass `--insecure-tofu`, and that flag is refused when the role is `data` or when the group has more than one voter. The bootstrap API returns the fingerprint and the token to its caller. A test does not scrape stdout for either value.
 
-The operator pins the CA fingerprint out of band (the admin token file's sibling, or the TUI's first-run prompt). A data node refuses a watch peer whose CA does not match the pin.
+Role, labels, and capabilities come from the token record. The leader writes them into the node certificate (SAN and a role extension). The projection is derived from that certificate. `Register` cannot raise them. A `Register` that claims a different role is rejected.
+
+`ConsumeToken` and `Register` are one Raft entry. The leader appends that entry and waits until it commits, and only then returns the certificate. A leadership change cannot accept the same token again: the consume is already in the log, or it is not and the certificate was not sent. Failed presentations are rate-limited and audited per source address. The token is checked before any CSR is signed, so an unauthenticated joiner does not cost a signature.
+
+Voter bootstrap tokens follow the same TTL, hash, and single-use rules, and an enrolled `admin` must approve them. The one-voter lab configuration is not a production deployment. Production failure tests use 3 voters. The operator retires the one-voter group before data nodes join.
 
 ### 12.5 Compromised data-plane node
 
 A data node is not a voter and cannot append to `cp-config`. It cannot become leader and cannot sign snapshots.
 
-The leader pushes a **projection**, not necessarily the full document. The projection is the subset of the canonical document that the node's role and capabilities require:
+The leader pushes a **projection**, not the full document. The projection is the subset the certificate's role and capabilities allow:
 
 | Role | Projection |
 |---|---|
@@ -390,32 +483,60 @@ The leader pushes a **projection**, not necessarily the full document. The proje
 | `broker` | topics section |
 | `edge` | the gateway projection plus the topics it is labeled to ingress |
 
-`projectionId` is the node id. The signature covers that id and the hash of the projected bytes, so one node's envelope does not verify on another node. Sealed secrets in the projection are encrypted to that node's identity key.
+`projectionId` is the node id from the certificate. The signature covers that id, so one node's envelope does not verify on another node. Secrets in the projection use the envelope encryption in §12.6, wrapped to that node's sealing key.
 
-`Revoke` appends the node id and the certificate fingerprint to the denylist. The leader closes that node's watch and refuses a new one. The node continues to serve whatever it already applied. It receives no later version and no later sealed secret. Revocation does not remotely wipe the last-good file; an operator who needs that pulls the host.
+`Revoke` is a signed log entry: node id, certificate fingerprint, and the join-token ids issued for that identity. Every watch server, voter or learner, and every admin listener checks the denylist on handshake and again when the entry is applied, and drops a live connection that matches. A 24-hour certificate plus "no renewal" is what makes revocation stick on a peer that has not yet seen the denylist. On revoke, any secret previously wrapped to that node's sealing key is rotated, and the audit log records the rotation. The node keeps serving what it already applied. It receives no later version. Revocation does not remotely wipe last-good. An operator who needs that pulls the host.
 
-A compromised node can still answer its own clients with the config it already has, or with local tampering. Containment is: it cannot move the desired version, it cannot read another node's projection, and the operator has a denylist entry that stops further distribution.
+A compromised node can still answer its own clients with the config it already has, or with local tampering. Containment is: it cannot move the desired version, it cannot read another node's projection, and further distribution stops.
 
 ### 12.6 Secrets
 
-`canonicalYaml` contains no private keys, passwords, join tokens, or admin tokens. Those values are either:
+`canonicalYaml` contains no private keys, passwords, join tokens, or admin tokens. A secret is either a reference or ciphertext.
 
-- a reference (a path the receiving node already owns, mode `0600`), or
-- a ciphertext sealed to the recipient node's identity key (X25519 sealed box). The Raft log stores the ciphertext. Apply decrypts on the recipient and writes the plaintext with the ACME store's atomic `0600` write.
+References are paths inside a secrets directory named by the `Rbac` entry (§12.7). The path is canonicalized. `realPath` must stay inside that directory. Symlinks that leave it are rejected. An error is a code. It does not include file bytes. A proposal that names `/etc/shadow` or a `..` path fails this check and is not opened.
 
-Admin tokens and join tokens are stored as hashes. Heartbeats, registration entries, and audit logs carry node ids and versions, not secret bytes. The existing config rule stands: the YAML loader does not interpolate `${env:}` or `${file:}` into the document.
+Ciphertext is envelope encryption. Each version generates a data key. The secret is AES-256-GCM under that key, with AAD `version || nodeId || secretName`. The data key is wrapped to the recipient's current X25519 sealing key, which is separate from the identity key and rotates on its own `TrustBundle` entry. The Raft log stores the ciphertext and the wrapped data key. Only the recipient unwraps it, and only into a `byte[]`. After the `0600` atomic write, the buffer is wiped with `Arrays.fill`. Secrets are not Java `String`s. They are not placed in exception messages. `PrivateKey.destroy()` is not relied on.
+
+A `Secret` value's `toString` is `***`. Logs, metrics, admin JSON, and validation errors are scanned in tests for token and sealed-blob patterns. `GET /cp/v1/config` and `GET /cp/v1/config/diff` return ids and hashes of sealed blobs, not the blobs.
+
+Heap dumps and core dumps are in scope. The service unit sets `-XX:-HeapDumpOnOutOfMemoryError` and `ulimit -c 0`.
+
+Admin tokens and join tokens are stored as hashes. Heartbeats and audit records carry node ids and versions, not secret bytes. The YAML loader does not interpolate `${env:}` or `${file:}`.
 
 ### 12.7 Admin RBAC
 
-The admin API authenticates the client certificate and maps the SAN to a role stored in the signed config:
+The admin API authenticates the client certificate. The SAN maps to a role stored in the `Rbac` log entry, which only `admin` can append. `Propose` is rejected when the YAML contains `rbac` or `trust`. An `operate` identity cannot grant itself `admin`, and it cannot rotate keys or issue join tokens.
 
 | Role | Allowed |
 |---|---|
-| `view` | Read desired config, diffs, nodes, leadership, per-node applied version. |
+| `view` | Read desired config, diffs, nodes, leadership, per-node applied version. Responses omit sealed blobs. |
 | `operate` | `view`, plus propose, stage, advance, activate, rollback. |
-| `admin` | `operate`, plus voter membership, revoke, signing-key rotation, join-token issue. |
+| `admin` | `operate`, plus voter membership, revoke, `TrustBundle`, `Rbac`, join-token issue. |
 
-An unknown SAN is rejected. The bootstrap token maps to `admin` and works only from a connection that also presents the bootstrap file's holder, until the first admin identity is enrolled. The TUI uses this API. It does not get a side channel into the content server.
+An unknown SAN is rejected. The bootstrap token maps to `admin` until the first admin identity is enrolled, and only from a connection that also presents that token's holder. The TUI uses this API. It does not get a side channel into the content server.
+
+### 12.8 Limits
+
+| Limit | Default |
+|---|---|
+| Frame size | 16 MiB, configurable downward |
+| Materialized document | 4 MiB |
+| YAML aliases | `LoaderOptions.setMaxAliasesForCollections` at 50 |
+| YAML nesting depth | 32 |
+| YAML code points | the materialized-document cap |
+| TLS handshake and idle | 10 s handshake, 60 s idle |
+| Watch connections | 1024 total, one push task per node id |
+| Join, CSR, and admin mutations | per-identity and per-source-address token buckets |
+
+The signature is verified before a payload is parsed or decompressed. Compile is bounded in time and output size. An unauthenticated join is rejected on the token check before any signing work.
+
+### 12.9 Audit
+
+An append-only audit stream, separate from the access log, records actor SAN, role, action, target, `version`, `raftIndex`, result, source address, and timestamp. It covers every admin mutation, join success and failure, revoke, key and CA rotation, signature and anti-replay rejection, and admin authentication failure. Control-plane events are `Audit` log entries, so one voter cannot drop them. The stream never contains token or secret bytes (§12.6).
+
+### 12.10 What `standalone` does not do
+
+Role `standalone` does not load `sjws_nettask.cp` or `sjws_nettask.cluster`, does not initialize a crypto provider for the control plane, does not create `stateDir` for it, and does not bind an admin or watch port. The proof is the class-load test in §15, not a throughput delta. `last-good.cp` is ignored outside role `data`.
 
 ## 13. Integration points
 
@@ -427,7 +548,7 @@ Each consumer keeps its own runtime objects. The control plane's job ends when `
 
 ### 13.2 Filter chain
 
-`List<MiddlewareSpec>` is stored as the document already stores it (`name`, `order`, `route`, `options`). Compile behavior is unchanged: an empty list builds no chain; names are not resolved inside the control plane. A data node that has factories bound applies them when it compiles, on the applicator thread. A document that names an unknown factory fails `applyRemote` and leaves the previous snapshot.
+`List<MiddlewareSpec>` is stored as the document already stores it (`name`, `order`, `route`, `options`). Compile behavior is unchanged: an empty list builds no chain; names are not resolved inside the control plane. A data node that has factories bound applies them when it compiles, on the applicator thread, before `publish`. A document that names an unknown factory fails that compile and leaves the previous snapshot.
 
 ### 13.3 Access rules
 
@@ -435,11 +556,11 @@ Each consumer keeps its own runtime objects. The control plane's job ends when `
 
 ### 13.4 Config and ACME
 
-Local reload remains `ReloadHook` → `ConfigReloader.reload` (re-read the file, clamp bind-time fields, compile, swap). Remote apply is `ConfigReloader.applyRemote` (§5.6). ACME issuance is leader-only and waits on `ControlLeadership` (§5.7, §6). Challenge responses on a data node still use the in-memory `ChallengeBoard` that `ConfigSnapshot.compile` already wraps in front of the handler when HTTP-01 is on the main listener. Tokens are placed by the leader's publish of the challenge reference inside the snapshot the data node applies, before the leader tells the ACME directory to validate. That ordering is the same as today's local ACME flow (token on the board before `trigger`), moved to the leader and the watch.
+Local reload remains `ReloadHook` → `ConfigReloader.reload`, and both it and a remote apply publish through `SjwsServer.publish` under `reloadLock` (§5.6). On role `data`, SIGHUP does not replace CP-owned sections. ACME issuance is leader-only and waits on `ControlLeadership` (§5.7, §6). Challenge responses on a data node still use the in-memory `ChallengeBoard` that `ConfigSnapshot.compile` already wraps in front of the handler when HTTP-01 is on the main listener. Tokens are placed by the leader's publish of the challenge reference inside the snapshot the data node applies, before the leader tells the ACME directory to validate. That ordering is the same as today's local ACME flow (token on the board before `trigger`), moved to the leader and the watch.
 
 ### 13.5 Messaging topics
 
-The document gains a `topics:` list: name, partition count, and the durability mode messaging already defines (`async` / `group` / `each` / `none`, and the cluster ack `replicated` / `strict`). The control plane stores that list inside the canonical YAML and projects it to `broker` and labeled `edge` nodes.
+The document gains a `topics:` list: name, partition count, a local ledger mode, and a cluster ack. Local modes are the names `LedgerWriter` already uses: `async` (the default), `group`, `each`, and `none`. The cluster ack uses the HA vocabulary from [high availability](../ha/design.md): `relaxed` is the default and means majority in memory (`Durability.RELAXED`); `strict` is opt-in and means quorum commit plus fsync (`Durability.STRICT`). The control plane stores that list inside the canonical YAML and projects it to `broker` and labeled `edge` nodes. `cp-config` itself is opened with the same default: majority in memory, quorum-plus-fsync only when the group options say so.
 
 The broker reads the list from `AppliedConfig.document()` after apply and opens or closes `Partition`s on its writer threads. `sjws_nettask.cp` does not call `Partition.open`, does not touch the ledger, and does not append to a partition group. `sjws_nettask.messaging` does not call `ControlLeadership` or the watch. A control-role process starts with no partition directory.
 
@@ -452,8 +573,8 @@ The control role binds a dedicated admin address. The content port does not serv
 | Method | Path | Role | Body |
 |---|---|---|---|
 | `GET` | `/cp/v1/health` | `view` | leader, term, `leaderReady`, voter count |
-| `GET` | `/cp/v1/config` | `view` | activated `SignedSnapshot` metadata and canonical YAML |
-| `GET` | `/cp/v1/config/diff?from=&to=` | `view` | `ConfigDiff` between two retained versions |
+| `GET` | `/cp/v1/config` | `view` | activated metadata and canonical YAML. Sealed blobs appear as ids and hashes. |
+| `GET` | `/cp/v1/config/diff?from=&to=` | `view` | diff between two retained versions, with the same secret omission |
 | `POST` | `/cp/v1/config` | `operate` | canonical YAML to `Propose` |
 | `POST` | `/cp/v1/rollout` | `operate` | ordered selectors |
 | `POST` | `/cp/v1/rollout/advance` | `operate` | open the next stage, or force |
@@ -471,8 +592,17 @@ In-JVM unless a row says otherwise. The cluster transport is the PR #29 sim tran
 
 | Case | Assertion |
 |---|---|
-| Signature | A flipped byte, an unknown key, or a bad `contentHash` is rejected. The installed snapshot is unchanged. |
-| Anti-replay | An envelope with an old `version`, an old `epoch` after a newer epoch was applied, or a repeated nonce is rejected. |
+| Signature | A flipped byte, an unknown `keyId`, or a bad `documentHash` is rejected. The installed snapshot is unchanged. |
+| Unsigned field | Changing `parentVersion` or `kind` without re-signing is rejected. A diff applied to the wrong base fails the recomputed document hash. |
+| Version jump | `version - lastApplied` above 2^20, or a version within 2^20 of `Long.MAX_VALUE`, is rejected. |
+| Expiry | An envelope past `expiresAtMillis`, or a node with no freshness frame past that expiry, is stale. Serving stays on last-good. |
+| Anti-replay | An envelope at or below the floor is rejected. `epoch` below the highest applied epoch is rejected. No nonce set is required. |
+| Wiped `stateDir` | With the pin floor set, a pre-floor envelope is rejected and the listener answers 503. Last-good is not compiled. |
+| `operate` RBAC | A `Propose` that contains `rbac` or `trust` is rejected. The `Rbac` entry is unchanged. |
+| Secret path | A reference outside the secrets directory, including `..` and a symlink escape, is rejected. The error has no file bytes. |
+| Learner revoke | A learner watch server drops a revoked node on the next handshake and on apply of `Revoke`. |
+| Token replay | After a leader change, the same join token is rejected. The certificate was returned only after `ConsumeToken` committed. |
+| Role claim | `Register` claiming a role other than the token's role is rejected. The projection follows the certificate. |
 | `Noop` | `leaderReady()` is false after the election callback and true only after the `Noop` is applied. ACME's directory client is not invoked before that. |
 | Minority | With 3 voters and one link cut, the minority cannot `Activate`. |
 | Leader loss mid-rollout | The new leader's `Noop` commits, then push resumes. A version already acked is not applied twice. |
@@ -484,33 +614,42 @@ In-JVM unless a row says otherwise. The cluster transport is the PR #29 sim tran
 | CP down at boot | Role `data` serves `last-good.cp`. Role `standalone` does not read that file. |
 | CP down at runtime | Requests succeed against the installed snapshot. No request thread blocks on the watch. |
 | Projection | A `broker` envelope fails verification on a `gateway` node id and contains no sealed blob for the gateway key. |
-| Join token | The second presentation of the same token fails. |
-| Revoke | The node receives no version committed after `Revoke`. |
-| Standalone hot path | No `cp-` thread and no `cp-config` group. `SingleNodeHotPathTest` style: the handler is the static file handler when no filters are configured. |
-| Dependency cut | A compilation unit of `sjws_nettask.cp` that imports `sjws_nettask.messaging` fails review; a test lists `cp` class files and rejects a constant-pool reference to `sjws_nettask/messaging`. |
+| Join token | The second presentation of the same token fails. A presentation past TTL fails. The CSR is not signed before the token check. |
+| Revoke | The node receives no version committed after `Revoke`. Secrets wrapped to it are rotated. |
+| Chain swap | With HA and caller filters enabled, a pushed routing change is observed on HTTP/1, HTTP/2, and HTTP/3. The accept loop stays open. No non-2xx and no connection failure on the content port during `publish`. |
+| One publisher | A remote apply and a SIGHUP overlap. One generation is assigned. Both run the ACME listener, reaper timeout, and `replaceTls` side effects. Role `data` rejects a SIGHUP that changes a CP-owned section. |
+| Class load | `standalone` under `-Xlog:class+load` (or a `jdk.ClassLoad` JFR event) loads no `sjws_nettask.cp.*` and no `sjws_nettask.cluster.*` class. No admin port, no `stateDir`, no crypto provider init for the control plane. |
+| Dependency cut | `cp` class files have no constant-pool reference to `sjws_nettask/messaging`. Nothing outside `cp` and `CpBootstrap` references `sjws_nettask/cp`. `config` sources do not reference `cp`. `cluster` sources reference neither `cp` nor `messaging`. |
+| Limits | A frame over the cap, and a YAML alias bomb, are rejected before compile. |
+| Redaction | A scan of logs, metrics, and admin JSON finds no token or sealed-blob bytes. `toString` of a `Secret` is `***`. |
+| Standalone hot path | No `cp-` thread. With no filters, the handler is the static file handler. |
 | Last-good mode | The file is `0600` on a POSIX filesystem. A crash between compile and rename leaves the previous file in place. |
 
 Chaos that stays scripted, not a required CI step: `kill -9` of a leader, pause, asymmetric partition. The sim-transport rows cover the partition assertion the unit suite can make deterministic.
 
 ## 16. Benchmark gate
 
-Every PR in this workstream, including a docs-only PR, reports `wrk` and `wrk2` on the same host, before and after, with the control plane off (`standalone` / the current server).
+Every PR in this workstream reports `wrk` and `wrk2` on the same host, before and after, with the control plane off (`standalone`).
 
 ```
 wrk  -t4 -c128 -d30s --latency http://127.0.0.1:<port>/index.html
 wrk2 -t4 -c128 -d30s -R50000 -L http://127.0.0.1:<port>/index.html
 ```
 
-1 KiB file, loopback, four threads, 128 connections. The table in the PR body has req/s and p50/p90/p99/p99.9 for before and after, and the overhead. `standalone` must show no request-path work added by this mode: the after binary, when the role is off, does not open `cp-config` and does not start a watch. Shared-VM noise of the kind HA already recorded (throughput inside a few percent, fixed-rate p99 in the same band) is the comparison band. A regression that comes from a new read on the request path is a failed gate.
+1 KiB file, loopback, four threads, 128 connections. `wrk2 -R` stays well below saturation. Implementation PRs run at least five alternating before/after pairs. The PR body reports the median and the spread (min and max) of req/s and of p50/p90/p99/p99.9, plus the JDK, the commit, and the machine. `wrk` and the server are pinned with `taskset` to disjoint CPUs.
 
-Implementation PRs also record a "control plane running, data node serving last-good, watch connected" column, to show the watch thread is off the request path. That column is not a license to add a per-request call.
+A new read on the request path is caught by the class-load test and by a `SingleNodeHotPathTest`-style assertion (§15), not by wrk. wrk cannot see one extra volatile read. The numbers still go in the PR body so a real throughput shift is visible. Shared-VM noise of the kind HA already recorded is the comparison band when the runs are not pinned. Pinned runs should sit tighter than that.
+
+Implementation PRs also record a column for "control plane running, data node serving last-good, watch connected" and, when the change touches handler wiring, a column with HA and caller filters enabled. Those columns show the watch thread and the chain supplier are off the accept path. They are not a license to add a per-request call.
+
+This design PR changes no `.java` file. Its before/after pair is noise on identical classes. The repeated pinned method above is the gate for the implementation PRs. The numbers already measured for this document are in the PR body.
 
 ## 17. Implementation plan
 
 Each PR is based on current master (this document's base or newer), merges the HA stack when it needs `ClusterNode`, keeps `mvn verify` green, does not lower the 0.96 root branch floor, and does not merge itself.
 
 1. **Design.** This document.
-2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, `ConfigDiff`, `applyRemote` on the config side, and the admin routes in §14 with RBAC. Tests from §15 that do not need a data-node watch. Benchmark as §16.
-3. **Registration and distribution.** Watch client and server, projection, ack window, last-good file, staged rollout and rollback, label selection. Data role applies through `applyRemote` and `LiveConfig`. Tests for resume, backpressure, canary, partition, and revoke. Benchmark as §16.
+2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, diff apply, `applyVerified` on the config side, and `SjwsServer.publish` under `reloadLock` with the live-snapshot supplier. Admin routes in §14 with RBAC kept out of `Propose`. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
+3. **Registration and distribution.** Watch client and server, projection, ack window, last-good file, staged rollout and rollback, label selection. Data role verifies in `cp`, compiles through `applyVerified`, and publishes through `SjwsServer.publish`. Tests for resume, backpressure, canary, partition, and revoke. Benchmark as §16.
 
 The request path in both implementation PRs stays a volatile read of the immutable snapshot.
