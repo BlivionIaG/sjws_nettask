@@ -74,6 +74,17 @@ class Http1GoldenTest {
         c.put("400-parser", "GET / HTTP/1.1\r\nHost: h\r\nContent-Length : 5\r\n\r\n");
         c.put("505", "GET / HTTP/2.0\r\nHost: h\r\n\r\n");
         c.put("501-unknown-method", "BREW / HTTP/1.1\r\nHost: h\r\n\r\n");
+        c.put("206-range", "GET /blob.bin HTTP/1.1\r\nHost: h\r\nRange: bytes=10-29\r\nConnection: close\r\n\r\n");
+        c.put("206-suffix", "GET /hello.txt HTTP/1.1\r\nHost: h\r\nRange: bytes=-6\r\nConnection: close\r\n\r\n");
+        c.put("206-open-end", "GET /hello.txt HTTP/1.1\r\nHost: h\r\nRange: bytes=6-\r\nConnection: close\r\n\r\n");
+        c.put("416", "GET /hello.txt HTTP/1.1\r\nHost: h\r\nRange: bytes=100-\r\nConnection: close\r\n\r\n");
+        c.put("200-multi-range", "GET /hello.txt HTTP/1.1\r\nHost: h\r\nRange: bytes=0-1,3-4\r\nConnection: close\r\n\r\n");
+        c.put("206-if-range-date", "GET /hello.txt HTTP/1.1\r\nHost: h\r\nRange: bytes=0-4\r\n"
+                + "If-Range: Sat, 03 Feb 2001 04:05:06 GMT\r\nConnection: close\r\n\r\n");
+        c.put("200-if-range-etag-mismatch", "GET /hello.txt HTTP/1.1\r\nHost: h\r\nRange: bytes=0-4\r\n"
+                + "If-Range: \"other\"\r\nConnection: close\r\n\r\n");
+        c.put("head-range", "HEAD /hello.txt HTTP/1.1\r\nHost: h\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n");
+        c.put("200-range-listing", "GET /sub/ HTTP/1.1\r\nHost: h\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n");
         c.put("keepalive-pipelined", "GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n"
                 + "HEAD /sub/a.css HTTP/1.1\r\nHost: h\r\n\r\n"
                 + "GET /missing HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");

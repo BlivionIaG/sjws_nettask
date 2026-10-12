@@ -299,6 +299,104 @@ class Http1TransportTest {
     }
 
     @Test
+    void interruptedLargeDownloadResumesByteExactFromAnOffset() throws Exception {
+        var file = largeFile();
+        // an established file: a version written this very second has only weak validators, and
+        // If-Range needs a strong one (a resume would then restart with a 200, also correct)
+        Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.from(java.time.Instant.parse("2020-01-01T00:00:00Z")));
+        var all = Files.readAllBytes(file);
+        start(Duration.ofSeconds(10), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        int cut = 12_345_678; // not chunk-aligned
+        var got = new byte[LARGE];
+        try (var s = connect()) { // first attempt: dropped after `cut` bytes
+            var in = s.getInputStream();
+            HttpTestSupport.write(s.getOutputStream(), "GET /large.bin HTTP/1.1\r\nHost: h\r\n\r\n");
+            var head = readHead(in);
+            var etag = head.lines().filter(l -> l.startsWith("ETag: ")).findFirst().orElseThrow().substring(6);
+            assertFalse(etag.startsWith("W/"), etag);
+            assertTrue(head.contains("Accept-Ranges: bytes\r\n"), head);
+            in.readNBytes(got, 0, cut);
+            s.close();
+            try (var resume = connect()) { // resume with Range + If-Range (what browsers and curl -C do)
+                var rin = resume.getInputStream();
+                HttpTestSupport.write(resume.getOutputStream(), "GET /large.bin HTTP/1.1\r\nHost: h\r\nRange: bytes="
+                        + cut + "-\r\nIf-Range: " + etag + "\r\n\r\n");
+                var rhead = readHead(rin);
+                assertTrue(rhead.startsWith("HTTP/1.1 206 Partial Content\r\n"), rhead);
+                assertTrue(rhead.contains("Content-Range: bytes " + cut + "-" + (LARGE - 1) + "/" + LARGE + "\r\n"), rhead);
+                assertTrue(rhead.contains("Content-Length: " + (LARGE - cut) + "\r\n"), rhead);
+                assertEquals(LARGE - cut, rin.readNBytes(got, cut, LARGE - cut));
+                // keep-alive still works after a ranged sendfile
+                HttpTestSupport.write(resume.getOutputStream(), "GET /hello.txt HTTP/1.1\r\nHost: h\r\nRange: bytes=1-3\r\n\r\n");
+                assertEquals("ell", HttpTestSupport.readResponse(rin).bodyText());
+            }
+        }
+        assertArrayEquals(all, got);
+    }
+
+    @Test
+    void fileShrinkingDuringARangedSendfileClosesWithoutSpinning() throws Exception {
+        var file = largeFile();
+        start(Duration.ofSeconds(10), Duration.ofSeconds(5), Duration.ofSeconds(10));
+        int from = 20 * 1024 * 1024;
+        try (var s = connect()) {
+            s.setReceiveBufferSize(64 * 1024);
+            var in = s.getInputStream();
+            HttpTestSupport.write(s.getOutputStream(), "GET /large.bin HTTP/1.1\r\nHost: h\r\nRange: bytes=" + from
+                    + "-\r\n\r\n");
+            assertTrue(readHead(in).startsWith("HTTP/1.1 206 "));
+            var first = in.readNBytes(1024 * 1024);
+            var all = Files.readAllBytes(file);
+            assertArrayEquals(java.util.Arrays.copyOfRange(all, from, from + first.length), first, "starts at the offset");
+            try (var w = FileChannel.open(file, StandardOpenOption.WRITE)) {
+                w.truncate(from + 2 * 1024 * 1024); // inside the range
+            }
+            long cpu0 = cpuNanos();
+            long t0 = System.nanoTime();
+            long got = first.length;
+            var buf = new byte[64 * 1024];
+            try {
+                for (int n; (n = in.read(buf)) > 0;) {
+                    got += n;
+                }
+            } catch (IOException reset) {
+                // fine: the response could not be completed
+            }
+            assertTrue(got < LARGE - from, "short response: " + got);
+            waitFor(() -> manager.activeConnections() == 0, 3000, "connection closed");
+            Thread.sleep(500);
+            long wall = System.nanoTime() - t0;
+            long cpu = cpuNanos() - cpu0;
+            assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
+        }
+        assertEquals(0, manager.reaper().writeExpirations(), "ended by shrink detection");
+    }
+
+    @Test
+    void uncachedRangesUseBothWritePaths() throws Exception {
+        var data = new byte[200 * 1024];
+        new Random(9).nextBytes(data);
+        Files.write(root.resolve("medium.bin"), data);
+        start(ServerConfig.defaults(root.toString()).toBuilder().cacheBytes(0).build());
+        try (var s = connect()) {
+            var in = s.getInputStream();
+            for (int[] r : new int[][] {{1000, 1999}, {10_000, 150_000}, {0, data.length - 1}, {data.length - 1, data.length - 1}}) {
+                HttpTestSupport.write(s.getOutputStream(), "GET /medium.bin HTTP/1.1\r\nHost: h\r\nRange: bytes="
+                        + r[0] + "-" + r[1] + "\r\n\r\n");
+                var head = readHead(in);
+                assertTrue(head.contains("Content-Range: bytes " + r[0] + "-" + r[1] + "/" + data.length), head);
+                int len = r[1] - r[0] + 1;
+                assertArrayEquals(java.util.Arrays.copyOfRange(data, r[0], r[1] + 1), in.readNBytes(len));
+            }
+            HttpTestSupport.write(s.getOutputStream(), "GET /medium.bin HTTP/1.1\r\nHost: h\r\nRange: bytes="
+                    + data.length + "-\r\n\r\n");
+            var r416 = HttpTestSupport.readResponse(in);
+            assertEquals(416, r416.statusCode());
+            assertEquals("bytes */" + data.length, r416.headers().get("content-range"));
+        }
+    }
+
+    @Test
     void pipelinedRequestsWithAFragmentedBodyAreAnsweredInOrder() throws Exception {
         start(Duration.ofSeconds(10), Duration.ofSeconds(5), Duration.ofSeconds(5));
         Files.writeString(root.resolve("b.txt"), "bee");

@@ -29,7 +29,7 @@ import java.util.List;
 
 /**
  * Protocol-neutral static file handler: decoding, containment, index.html, listings,
- * MIME types, dates and every status decision (200/301/304/400/403/404/405/500).
+ * MIME types, dates, byte ranges and every status decision (200/206/301/304/400/403/404/405/416/500).
  * Transports only parse requests and serialize the returned {@link Response}.
  * <p>
  * Thread-safe and lock-free: it holds only immutable state.
@@ -37,7 +37,10 @@ import java.util.List;
 public final class StaticFileHandler {
 
     public static final String ALLOW = "GET, HEAD";
-    public static final String ACCEPT_RANGES = "none"; // Range is not implemented yet (S5)
+    /** Accept-Ranges of file responses (single byte ranges, see {@link ByteRanges}). */
+    public static final String ACCEPT_RANGES = "bytes";
+    /** Accept-Ranges of generated pages (errors, listings, redirects): Range is ignored there. */
+    public static final String NO_RANGES = "none";
 
     /** Used by the static helpers, which have no handler (and so no per-version memory). */
     private static final EntityTag.Policy STATIC_POLICY = new EntityTag.Policy(java.time.InstantSource.system());
@@ -217,6 +220,20 @@ public final class StaticFileHandler {
             return new Response(304, meta.headers304(), Body.Empty.INSTANCE, head);
         }
         var v = meta.validator();
+        if (!head) { // only GET has range semantics (RFC 9110 §14.2)
+            switch (ByteRanges.decide(conditionals, meta)) {
+                case ByteRanges.Partial p -> {
+                    return new Response(206, meta.headers200().add("content-range", p.contentRange()),
+                            new Body.FileBody(realPath, p.offset(), p.length(), v, realRoot, allowUnlistable), false);
+                }
+                case ByteRanges.Unsatisfiable u -> {
+                    return rangeNotSatisfiable(u);
+                }
+                case ByteRanges.Full f -> {
+                    // whole file below
+                }
+            }
+        }
         return new Response(200, meta.headers200(),
                 new Body.FileBody(realPath, 0, v.size(), v, realRoot, allowUnlistable), head);
     }
@@ -248,7 +265,7 @@ public final class StaticFileHandler {
 
     public static Response html(int status, String html, boolean head) {
         var headers = ResponseHeaders.of()
-                .add("accept-ranges", ACCEPT_RANGES)
+                .add("accept-ranges", NO_RANGES)
                 .add("content-type", Mime.contentType("text/html"));
         return new Response(status, headers, Body.Bytes.of(html.getBytes(StandardCharsets.UTF_8)), head);
     }
@@ -257,6 +274,13 @@ public final class StaticFileHandler {
         var title = status + " " + reasonPhrase(status);
         return html(status, "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"/><title>" + title
                 + "</title></head><body><h1>" + title + "</h1></body></html>", head);
+    }
+
+    /** 416 for a GET whose single byte range lies outside the file. */
+    public static Response rangeNotSatisfiable(ByteRanges.Unsatisfiable u) {
+        var r = error(416, false);
+        r.headers().add("content-range", u.contentRange());
+        return r;
     }
 
     public static Response methodNotAllowed() {
@@ -292,6 +316,7 @@ public final class StaticFileHandler {
         return switch (code) {
             case 100 -> "Continue";
             case 200 -> "OK";
+            case 206 -> "Partial Content";
             case 301 -> "Moved Permanently";
             case 304 -> "Not Modified";
             case 400 -> "Bad Request";
@@ -301,6 +326,7 @@ public final class StaticFileHandler {
             case 408 -> "Request Timeout";
             case 413 -> "Content Too Large";
             case 414 -> "URI Too Long";
+            case 416 -> "Range Not Satisfiable";
             case 417 -> "Expectation Failed";
             case 431 -> "Request Header Fields Too Large";
             case 500 -> "Internal Server Error";

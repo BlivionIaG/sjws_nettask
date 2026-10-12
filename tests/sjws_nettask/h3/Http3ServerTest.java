@@ -302,6 +302,46 @@ class Http3ServerTest {
         }
     }
 
+    /** S5: byte ranges over HTTP/3 are exactly what HTTP/1.1 sends for the same handler decision. */
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource(delimiter = '|', value = {
+        "GET|/hello.txt|bytes=0-4", "GET|/hello.txt|bytes=-5", "GET|/hello.txt|bytes=6-", "GET|/hello.txt|bytes=0-999",
+        "GET|/hello.txt|bytes=999-", "GET|/hello.txt|bytes=-0", "GET|/hello.txt|bytes=0-1,4-5", "GET|/hello.txt|bytes=5-4",
+        "GET|/hello.txt|lines=1-2", "HEAD|/hello.txt|bytes=0-4", "HEAD|/hello.txt|bytes=999-",
+        "GET|/bin.dat|bytes=1000-70000", "GET|/bin.dat|bytes=-65537",
+        "GET|/large.bin|bytes=1048575-3145728", "GET|/large.bin|bytes=8388000-", "GET|/large.bin|bytes=-100",
+        "GET|/empty.txt|bytes=0-0", "GET|/sub/|bytes=0-4", "GET|/sub2/|bytes=3-7", "GET|/missing|bytes=0-1",
+        "POST|/hello.txt|bytes=0-1"})
+    void rangeParity(String method, String path, String range) throws Exception {
+        var r = send(method, path, Map.of("range", range));
+        assertParity(this.handler, method, path, Map.of("range", range), r);
+    }
+
+    @Test
+    void rangedLargeFileIsByteExactOverHttp3() throws Exception {
+        var all = Files.readAllBytes(this.root.resolve("large.bin"));
+        int from = 3 * Http3Writer.CHUNK + 17;
+        var r = send("GET", "/large.bin", Map.of("range", "bytes=" + from + "-"));
+        assertEquals(206, r.status());
+        assertEquals("bytes " + from + "-" + (all.length - 1) + "/" + all.length, r.header("content-range"));
+        assertArrayEquals(java.util.Arrays.copyOfRange(all, from, all.length), r.body());
+    }
+
+    @Test
+    void ifRangeParity() throws Exception {
+        var plain = send("GET", "/hello.txt", Map.of());
+        var etag = plain.header("etag");
+        var lastModified = plain.header("last-modified");
+        for (var ifRange : new String[] {etag, lastModified, "\"other\"", "W/" + etag, "not a date"}) {
+            var headers = Map.of("range", "bytes=1-3", "if-range", ifRange);
+            var r = send("GET", "/hello.txt", headers);
+            assertParity(this.handler, "GET", "/hello.txt", headers, r);
+        }
+        var fresh = Map.of("range", "bytes=1-3", "if-none-match", etag);
+        assertEquals(304, send("GET", "/hello.txt", fresh).status());
+        parity("GET", "/hello.txt", fresh);
+    }
+
     @Test
     void largeFileWithFlowControl() throws Exception {
         var r = send("GET", "/large.bin", Map.of());
