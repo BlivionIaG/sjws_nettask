@@ -596,17 +596,20 @@ class Http3ServerTest {
 
     @Test
     void clientCancellingADownloadStopsTheWriter() throws Exception {
-        try (var s = new Http3Server(config().build(), this.handler, this.tls).start();
-                var c = new H3TestClient(this.tls.certificate())) {
+        try (var s = new Http3Server(config().writeTimeout(Duration.ofSeconds(20)).build(), this.handler, this.tls)
+                .start(); var c = new H3TestClient(this.tls.certificate())) {
             var q = c.connect(s.localAddress());
             var stream = new java.util.concurrent.atomic.AtomicReference<io.netty.handler.codec.quic.QuicStreamChannel>();
-            var future = H3TestClient.request(q, "GET", "/large.bin", Map.of(), null, stream::set);
+            H3TestClient.request(q, "GET", "/large.bin", Map.of(), null, st -> {
+                st.config().setAutoRead(false); // the transfer cannot finish before the cancel
+                stream.set(st);
+            });
             waitFor(() -> stream.get() != null);
-            Thread.sleep(50);
+            Thread.sleep(300);
             // STOP_SENDING + RESET_STREAM from the client
             stream.get().shutdown(io.netty.handler.codec.http3.Http3ErrorCode.H3_REQUEST_CANCELLED.code());
-            waitFor(() -> s.responses(Http3Writer.Outcome.CLOSED) == 1); // writer noticed and stopped
-            assertFalse(future.isDone() && future.join().body().length == H3Fixture.LARGE, "download was not cut");
+            waitFor(() -> s.responses(Http3Writer.Outcome.CLOSED) + s.responses(Http3Writer.Outcome.STALLED) == 1);
+            assertEquals(1, s.responses(Http3Writer.Outcome.CLOSED), "writer must notice the cancel, not time out");
             stream.get().close();
             assertEquals(200, H3TestClient.get(q, "/hello.txt").status(), "connection survives");
         }
