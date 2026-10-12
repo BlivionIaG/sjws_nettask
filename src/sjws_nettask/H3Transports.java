@@ -16,49 +16,17 @@
  */
 package sjws_nettask;
 
-import java.io.IOException;
-
 /**
- * Where {@link SjwsServer} gets its HTTP/3 transport from.
+ * Where {@link SjwsServer} gets its HTTP/3 transport from. The h3 package (and Netty) is only
+ * loaded when the factory is invoked, i.e. when {@code --h3} is set; a missing native library or
+ * missing Netty classes make {@code SjwsServer} log a warning and serve HTTP/1.1 only, without Alt-Svc.
  */
 public final class H3Transports {
 
     private H3Transports() {
     }
 
-    /**
-     * TODO(merge h3-transport): return the real transport, e.g.
-     * {@code (config, handler) -> new Http3ServerTransport(new Http3Server(config, handler))},
-     * once the {@code sjws_nettask.h3} package lands. Until then HTTP/3 always "fails to bind",
-     * so {@code --h3} logs a warning and the server stays HTTP/1.1-only without Alt-Svc.
-     */
     public static Transport.Factory defaultFactory() {
-        return Unavailable::new;
-    }
-
-    /** Placeholder transport: refuses to start. */
-    static final class Unavailable implements Transport {
-
-        Unavailable(ServerConfig config, sjws_nettask.core.StaticFileHandler handler) {
-        }
-
-        @Override
-        public String name() {
-            return "HTTP/3";
-        }
-
-        @Override
-        public void start() throws IOException {
-            throw new IOException("HTTP/3 support is not included in this build");
-        }
-
-        @Override
-        public int port() {
-            throw new IllegalStateException("not started");
-        }
-
-        @Override
-        public void close() {
-        }
+        return (config, handler) -> new sjws_nettask.h3.Http3Transport(config, handler);
     }
 }
