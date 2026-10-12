@@ -33,10 +33,12 @@ routing:
       prefix: "/api"       # required, segment-boundary match
       rewrite: "/"         # optional
       proxy: api           # exactly one of proxy | redirect | static
+      errors: html         # html (default) | problem (RFC 9457 problem+json); see config-file.md
     - prefix: "/old"
       redirect: { status: 301, location: "https://example.com/new/", keep_path: true }
     - prefix: "/"
       static: true
+      listing: true        # static only; false answers index-less directories 404
   forwarded_proto: auto   # http|https|auto
 
 middleware: []   # list of {name, order, route, options}; empty = no chain

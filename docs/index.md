@@ -31,6 +31,7 @@ Back to the [README](../README.md) (quick start).
 - [Test suite catalog](development/testing.md)
 - [Integration and end-to-end tests](development/integration-tests.md)
 - [Request filters](development/filters.md)
+- [Perf-regression gate (CI)](development/perf-gate.md)
 
 ## Benchmarks
 - [Footprint report](benchmarks/footprint-report.md); harnesses: [bench/](../bench/README.md), [bench/footprint/](../bench/footprint/README.md)
