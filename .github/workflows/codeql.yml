@@ -20,7 +20,7 @@ jobs:
       security-events: write
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Buildless extraction: no JDK/Maven build needed, so the JDK version the project targets
       # (25) doesn't have to be supported by the CodeQL autobuilder.
       - uses: github/codeql-action/init@v3
