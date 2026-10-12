@@ -24,9 +24,14 @@ import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
@@ -37,12 +42,20 @@ import java.util.function.LongSupplier;
  * <ul>
  * <li><b>Key</b>: the decoded, normalized path (query and fragment stripped by the handler), so query
  * strings and percent-encoding variants of one path share one entry; 404s are never cached.</li>
- * <li><b>Bounds</b>: total bytes (body + key + a fixed overhead per entry) and entry count; least
- * recently used entries are evicted.</li>
+ * <li><b>Bounds</b>: total bytes (body + key + a fixed overhead per entry) and entry count; eviction
+ * is CLOCK (second chance, an approximation of least recently used): a hit only sets a flag, without
+ * any lock, and an insert into a full cache costs amortized O(1).</li>
+ * <li><b>Loads in flight</b> are bounded too: a load reserves its size from a byte budget of
+ * {@code min(maxBytes, 16 * maxFileSize)} (4 MiB by default) first; without room the request is served
+ * the uncached (streaming) way. Concurrent misses on one key share a single read (single-flight): the
+ * others wait for it, without any lock held, and use its entry.</li>
  * <li><b>Validity</b>: by default every hit stats the file (one {@code stat}) and compares file key,
  * mtime in ns, size and, where available, ctime (catches {@code chmod}, {@code cp -p}, renames with
  * preserved mtime). Any difference drops the entry and the request takes the full path again
- * (containment via {@code toRealPath}, {@link SafeOpen}). A revalidation window can be configured
+ * (containment via {@code toRealPath}, {@link SafeOpen}). Unless unlistable directories are allowed,
+ * a hit also checks that the root and every directory down to the file are still readable
+ * ({@code access(2)}, one per level): {@link SafeOpen} refuses files below search-only directories
+ * (403), and a {@code chmod} on a directory leaves the file's own stamp unchanged. A revalidation window can be configured
  * for tests or embedding; the server uses none.</li>
  * <li><b>Loading</b> goes through {@link SafeOpen} (same no-follow guarantees as the writers), reads
  * exactly the expected size, stats again afterwards and caches nothing if anything changed or the
@@ -105,20 +118,32 @@ public final class FileCache {
         final ResponseHeaders headers200;
         final ResponseHeaders headers304;
         final long charge;
-        volatile long lastUsed;
+        /** Directories that must stay readable (root first), empty when unlistable ones are allowed. */
+        final Path[] readableDirs;
+        /** CLOCK reference bit: set by hits (no lock), cleared by the eviction hand. */
+        volatile boolean referenced;
         volatile long validatedAt;
 
         Entry(String key, Path statPath, Stamp stamp, FileMeta meta, Body.Bytes body, long now) {
+            this(key, statPath, stamp, meta, body, now, NO_DIRS);
+        }
+
+        Entry(String key, Path statPath, Stamp stamp, FileMeta meta, Body.Bytes body, long now, Path[] readableDirs) {
             this.key = key;
             this.statPath = statPath;
+            this.readableDirs = readableDirs;
             this.stamp = stamp;
             this.meta = meta;
             this.body = body;
             this.headers200 = meta.headers200();
             this.headers304 = meta.headers304();
             this.charge = body.length() + 4L * key.length() + ENTRY_OVERHEAD; // key + statPath, UTF-16
-            this.lastUsed = now;
             this.validatedAt = now;
+        }
+
+        /** @return whether this version has a weak entity tag */
+        boolean weak() {
+            return this.meta.etag().startsWith("W/");
         }
 
         public FileMeta meta() {
@@ -159,15 +184,26 @@ public final class FileCache {
     private final long maxFileSize;
     private final long revalidateNanos;
     private final LongSupplier nanoClock;
+    private static final Path[] NO_DIRS = {};
+    /** Loads in flight reserve their size here first (bounds the transient heap of concurrent misses). */
+    static final long LOAD_FILES_IN_FLIGHT = 16;
+
     private final ConcurrentHashMap<String, Entry> entries = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CompletableFuture<Entry>> loading = new ConcurrentHashMap<>();
+    private final Semaphore loadBytes;
+    private final int loadBytesMax;
     private final ReentrantLock lock = new ReentrantLock();
     private long bytes; // guarded by lock
+    /** CLOCK ring in insertion order (guarded by lock); may hold stale entries, skipped when reached. */
+    private final ArrayDeque<Entry> clock = new ArrayDeque<>();
     private final LongAdder hits = new LongAdder();
     private final LongAdder misses = new LongAdder();
     private final LongAdder loads = new LongAdder();
     private final LongAdder discarded = new LongAdder();
     private final LongAdder evictions = new LongAdder();
     private final LongAdder invalidations = new LongAdder();
+    private final LongAdder busy = new LongAdder();
+    private final LongAdder coalesced = new LongAdder();
     /** Test seam: runs after a load read the bytes and before it re-checks the attributes. */
     volatile Runnable afterRead = () -> {
     };
@@ -196,6 +232,9 @@ public final class FileCache {
         this.maxFileSize = maxFileSize;
         this.revalidateNanos = revalidateAfter.toNanos();
         this.nanoClock = nanoClock;
+        this.loadBytesMax = (int) Math.min(Integer.MAX_VALUE,
+                Math.min(maxBytes, LOAD_FILES_IN_FLIGHT * Math.max(maxFileSize, 1)));
+        this.loadBytes = new Semaphore(this.loadBytesMax);
     }
 
     public boolean enabled() {
@@ -224,56 +263,133 @@ public final class FileCache {
             } catch (IOException | RuntimeException x) {
                 current = null; // gone, unreadable parent, ...
             }
-            if (!e.stamp.equals(current)) {
+            if (!e.stamp.equals(current) || !readable(e.readableDirs)) {
                 invalidate(e);
                 this.misses.increment();
                 return null;
             }
             e.validatedAt = now;
         }
-        e.lastUsed = now;
+        if (!e.referenced) {
+            e.referenced = true; // plain flag, no lock: the next eviction pass gives it a second chance
+        }
         this.hits.increment();
         return e;
+    }
+
+    private static boolean readable(Path[] dirs) {
+        for (var d : dirs) {
+            if (!Files.isReadable(d)) { // access(2): a search-only directory now refuses SafeOpen (403)
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The real directories from {@code root} down to the file's parent, which SafeOpen opens. */
+    private static Path[] dirsToCheck(Body.FileBody file) {
+        if (file.allowUnlistable()) {
+            return NO_DIRS;
+        }
+        var root = file.root();
+        var parent = file.realPath().getParent();
+        if (parent == null || !parent.startsWith(root)) {
+            return NO_DIRS; // SafeOpen refuses such a body anyway
+        }
+        var rel = root.relativize(parent);
+        int depth = rel.toString().isEmpty() ? 0 : rel.getNameCount();
+        var dirs = new Path[depth + 1];
+        var d = root;
+        dirs[0] = d;
+        for (int i = 0; i < depth; i++) {
+            d = d.resolve(rel.getName(i));
+            dirs[i + 1] = d;
+        }
+        return dirs;
+    }
+
+    /** Drops {@code e} (if still current), e.g. because its entity tag no longer agrees with the policy. */
+    void drop(Entry e) {
+        invalidate(e);
     }
 
     /**
      * Reads {@code file} (through {@link SafeOpen}, outside any lock) and caches it under {@code key}.
      *
      * @param statPath the request's logical path of the file, statted (following links) on later hits
-     * @return the entry, or null if the file changed while it was being read (nothing was cached; the
-     *         caller serves the file the usual way)
+     * @return the entry, or null if nothing was cached: the file changed while it was being read, the
+     *         budget for loads in flight is used up, or the concurrent load this one waited for failed
+     *         (the caller serves the file the usual way, streaming it)
      * @throws IOException from {@link SafeOpen#open}: map it with {@link SafeOpen#status}
      */
     public Entry load(String key, Path statPath, Body.FileBody file, FileMeta meta) throws IOException {
+        var mine = new CompletableFuture<Entry>();
+        var running = this.loading.putIfAbsent(key, mine);
+        if (running != null) { // single-flight: wait for that read (no lock held), then use its entry
+            this.coalesced.increment();
+            try {
+                return running.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (ExecutionException e) {
+                return null; // not thrown: the leader completes normally
+            }
+        }
+        Entry result = null;
+        try {
+            result = loadOnce(key, statPath, file, meta);
+            return result;
+        } finally {
+            this.loading.remove(key, mine);
+            mine.complete(result); // waiters fall back to the uncached path on null
+        }
+    }
+
+    private Entry loadOnce(String key, Path statPath, Body.FileBody file, FileMeta meta) throws IOException {
         var before = Stamp.read(file.realPath(), LinkOption.NOFOLLOW_LINKS);
         if (!before.matches(file.expected())) {
             this.discarded.increment();
             return null;
         }
-        int size = (int) file.length();
-        var data = new byte[size];
-        int read = 0;
-        boolean grew;
-        try (var channel = SafeOpen.open(file)) {
-            var buffer = ByteBuffer.wrap(data);
-            while (buffer.hasRemaining()) {
-                int n = channel.read(buffer, buffer.position());
-                if (n < 0) {
-                    break;
-                }
-            }
-            read = buffer.position();
-            grew = channel.read(ByteBuffer.allocate(1), size) > 0;
+        var cached = this.entries.get(key); // a load of this version finished since our lookup missed
+        if (cached != null && cached.stamp.equals(before) && cached.meta.etag().equals(meta.etag())) {
+            return cached;
         }
-        this.afterRead.run();
-        var after = Stamp.read(file.realPath(), LinkOption.NOFOLLOW_LINKS);
-        if (read != size || grew || !after.equals(before)) {
-            this.discarded.increment();
+        int size = (int) file.length();
+        if (!this.loadBytes.tryAcquire(size)) {
+            this.busy.increment();
             return null;
         }
-        this.loads.increment();
-        var entry = new Entry(key, statPath, before, meta, Body.Bytes.of(data), this.nanoClock.getAsLong());
-        return insert(entry);
+        byte[] data;
+        int read = 0;
+        boolean grew;
+        try {
+            data = new byte[size];
+            try (var channel = SafeOpen.open(file)) {
+                var buffer = ByteBuffer.wrap(data);
+                while (buffer.hasRemaining()) {
+                    int n = channel.read(buffer, buffer.position());
+                    if (n < 0) {
+                        break;
+                    }
+                }
+                read = buffer.position();
+                grew = channel.read(ByteBuffer.allocate(1), size) > 0;
+            }
+            this.afterRead.run();
+            var after = Stamp.read(file.realPath(), LinkOption.NOFOLLOW_LINKS);
+            if (read != size || grew || !after.equals(before)) {
+                this.discarded.increment();
+                return null;
+            }
+            this.loads.increment();
+            var entry = new Entry(key, statPath, before, meta, Body.Bytes.of(data), this.nanoClock.getAsLong(),
+                    dirsToCheck(file));
+            return insert(entry);
+        } finally {
+            this.loadBytes.release(size); // the bytes now belong to the entry (counted in the budget) or are garbage
+        }
     }
 
     private Entry insert(Entry entry) {
@@ -292,8 +408,13 @@ public final class FileCache {
             }
             this.entries.put(entry.key, entry);
             this.bytes += entry.charge;
+            this.clock.addLast(entry);
             while (this.bytes > this.maxBytes || this.entries.size() > this.maxEntries) {
-                evictOldest(entry);
+                evictOne(entry);
+            }
+            if (this.clock.size() > 2 * this.entries.size() + 64) {
+                // stale nodes of replaced/invalidated entries: compact (O(n) once per ~n inserts)
+                this.clock.removeIf(e -> this.entries.get(e.key) != e);
             }
             return entry;
         } finally {
@@ -301,20 +422,34 @@ public final class FileCache {
         }
     }
 
-    /** Called with the lock held. Never evicts {@code keep} unless it is the only entry. */
-    private void evictOldest(Entry keep) {
-        Entry oldest = null;
-        for (var e : this.entries.values()) {
-            if (e != keep && (oldest == null || e.lastUsed < oldest.lastUsed)) {
-                oldest = e;
+    /**
+     * CLOCK step, called with the lock held: entries hit since the hand last passed get a second
+     * chance; each hit buys at most one requeue, so eviction is amortized O(1). Never evicts
+     * {@code keep} (the entry being inserted) unless it is the only entry.
+     */
+    private void evictOne(Entry keep) {
+        while (true) {
+            var e = this.clock.pollFirst();
+            if (e == null) {
+                return; // unreachable while over bounds (every live entry is in the ring)
             }
+            if (this.entries.get(e.key) != e) {
+                continue; // stale node
+            }
+            if (e == keep && this.entries.size() > 1) {
+                this.clock.addLast(e);
+                continue;
+            }
+            if (e.referenced && e != keep) {
+                e.referenced = false;
+                this.clock.addLast(e);
+                continue;
+            }
+            this.entries.remove(e.key);
+            this.bytes -= e.charge;
+            this.evictions.increment();
+            return;
         }
-        if (oldest == null) {
-            oldest = keep;
-        }
-        this.entries.remove(oldest.key);
-        this.bytes -= oldest.charge;
-        this.evictions.increment();
     }
 
     private void invalidate(Entry e) {
@@ -370,6 +505,36 @@ public final class FileCache {
 
     public long invalidations() {
         return this.invalidations.sum();
+    }
+
+    /** @return misses served uncached because the budget for loads in flight was used up */
+    public long busy() {
+        return this.busy.sum();
+    }
+
+    /** @return misses that waited for a concurrent load of the same key instead of reading */
+    public long coalesced() {
+        return this.coalesced.sum();
+    }
+
+    /** @return bytes currently reserved by loads in flight */
+    public long loadingBytes() {
+        return this.loadBytesMax - this.loadBytes.availablePermits();
+    }
+
+    /** @return the budget for loads in flight, in bytes */
+    public long loadingBytesMax() {
+        return this.loadBytesMax;
+    }
+
+    /** @return nodes in the CLOCK ring, stale ones included (tests: it must stay bounded) */
+    int ringSize() {
+        this.lock.lock();
+        try {
+            return this.clock.size();
+        } finally {
+            this.lock.unlock();
+        }
     }
 
     boolean contains(String key) {

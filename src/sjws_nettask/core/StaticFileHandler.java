@@ -82,6 +82,11 @@ public final class StaticFileHandler {
         this.cache = java.util.Objects.requireNonNull(cache, "cache");
     }
 
+    /** The entity-tag policy (tests). */
+    EntityTag.Policy etags() {
+        return this.etags;
+    }
+
     public FileCache cache() {
         return this.cache;
     }
@@ -125,7 +130,12 @@ public final class StaticFileHandler {
             key = decoded.endsWith("/") ? logical + "/" : logical.toString();
             var hit = this.cache.lookup(key);
             if (hit != null) {
-                return hit.response(head, request.headers());
+                if (!hit.weak() || this.etags.weak(hit.meta().validator())) {
+                    return hit.response(head, request.headers());
+                }
+                // The policy forgot this young version (bounded memory) and now tags it strong:
+                // rebuild the entry so cached and uncached answers keep the same ETag.
+                this.cache.drop(hit);
             }
         }
         var resolved = this.resolver.resolve(decoded);
