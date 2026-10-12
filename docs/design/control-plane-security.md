@@ -54,14 +54,15 @@ API and the admin TUI make before every action.
 | operator |  ✓   |      ✓      |    ✓    |    ✓     |     ✓      |                  |
 | admin    |  ✓   |      ✓      |    ✓    |    ✓     |     ✓      |        ✓         |
 
-* Identities: bearer tokens `sjws_<operator>.<256-bit secret>`. Only the token's SHA-256 is
-  stored, and it is compared in constant time. The other option is the RFC 2253 canonical
-  subject of an mTLS client certificate, and **the TLS layer must have verified that certificate
-  against the operator CA** before it hands over the subject.
+* Identities: mTLS only (v1). The operator is the URI SAN (e.g. `urn:sjws:admin:alice`) or the
+  RFC 2253 canonical subject DN of its client certificate, mapped to a role in the CP-distributed
+  operator table (#38 §12.7). **The TLS layer must have verified the certificate against the
+  admin CA** before it hands over the identity. There are no admin bearer tokens; the only tokens
+  in the control plane are the one-shot node join tokens (#38 §12.4).
 * Deny by default: unknown, disabled or malformed credentials are refused, and so is any
   permission outside the role. If the audit write fails, the action is denied.
 * `putOperator` and `removeOperator` need `MANAGE_OPERATORS`. Each change is atomic and takes
-  effect immediately, so a revoked token fails on its next use. A change that would leave no
+  effect immediately, so a removed or disabled operator is refused on its next request. A change that would leave no
   enabled admin is refused.
 
 ## Audit trail

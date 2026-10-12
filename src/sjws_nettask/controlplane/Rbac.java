@@ -18,11 +18,6 @@ package sjws_nettask.controlplane;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.SecureRandom;
-import java.util.Base64;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,9 +28,9 @@ import javax.security.auth.x500.X500Principal;
 /**
  * Control-plane authorization: one call for the CP API and the admin TUI before any action.
  * <ul>
- * <li>Identity: a bearer token ({@code sjws_<operator>.<secret>}, only its SHA-256 is stored) or
- * the subject of an mTLS client certificate <b>already verified</b> by the TLS layer against the
- * operator CA.</li>
+ * <li>Identity: mTLS only. The URI SAN or subject DN of a client certificate <b>already
+ * verified</b> by the TLS layer against the admin CA, mapped to a role by the CP-distributed
+ * operator table. There are no admin bearer tokens.</li>
  * <li>Deny by default: unknown, disabled or malformed credentials and permissions outside the
  * role are refused.</li>
  * <li>Every decision, allowed or denied, is written to the {@link AuditLog} before it is returned;
@@ -48,15 +43,7 @@ import javax.security.auth.x500.X500Principal;
 public final class Rbac {
 
     /** How a caller proved who it is. */
-    public sealed interface Credential permits Token, ClientCert {
-    }
-
-    /** {@code Authorization: Bearer <token>} value. */
-    public record Token(String token) implements Credential {
-        @Override
-        public String toString() {
-            return "Token[redacted]";
-        }
+    public sealed interface Credential permits ClientCert {
     }
 
     /** URI SAN or subject DN of a client certificate the TLS layer verified. */
@@ -68,8 +55,6 @@ public final class Rbac {
             String reason) {
     }
 
-    private static final String TOKEN_PREFIX = "sjws_";
-    private static final SecureRandom RANDOM = new SecureRandom();
 
     private final AtomicReference<Map<String, Operator>> operators;
     private final AuditLog audit;
@@ -81,17 +66,6 @@ public final class Rbac {
 
     public List<Operator> operators() {
         return List.copyOf(this.operators.get().values());
-    }
-
-    /** Fresh random token for {@code operatorId}; give it to the operator once, store {@link #hashToken}. */
-    public static String newToken(String operatorId) {
-        var b = new byte[32];
-        RANDOM.nextBytes(b);
-        return TOKEN_PREFIX + operatorId + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(b);
-    }
-
-    public static String hashToken(String token) {
-        return HexFormat.of().formatHex(AccessPolicyDocument.sha256(token.getBytes(StandardCharsets.UTF_8)));
     }
 
     /**
@@ -116,21 +90,6 @@ public final class Rbac {
     /** @return the enabled operator behind the credential, or null */
     public Operator authenticate(Credential c) {
         var ops = this.operators.get();
-        if (c instanceof Token(String t)) {
-            if (t == null || !t.startsWith(TOKEN_PREFIX)) {
-                return null;
-            }
-            int dot = t.indexOf('.', TOKEN_PREFIX.length());
-            if (dot < 0) {
-                return null;
-            }
-            var presented = hashToken(t).getBytes(StandardCharsets.US_ASCII); // hash first: same work either way
-            var op = ops.get(t.substring(TOKEN_PREFIX.length(), dot));
-            if (op == null || op.tokenHash() == null || !op.enabled()) {
-                return null;
-            }
-            return MessageDigest.isEqual(presented, op.tokenHash().getBytes(StandardCharsets.US_ASCII)) ? op : null;
-        }
         if (c instanceof ClientCert(String subject)) {
             if (subject == null) {
                 return null;
@@ -232,7 +191,7 @@ public final class Rbac {
         if (d.operator() != null) {
             return d.operator();
         }
-        return c instanceof ClientCert(String s) ? "unknown-cert:" + s : "unknown-token";
+        return c instanceof ClientCert(String s) ? "unknown-cert:" + s : "unknown";
     }
 
     private static Map<String, Operator> index(List<Operator> ops) {
