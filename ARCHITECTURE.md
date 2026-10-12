@@ -30,9 +30,12 @@ HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ──
 ```
 
 * `core.Handler` (`Response handle(Request)`) is the seam between transports and application logic.
-  `StaticFileHandler` implements it; `Http1Connection` depends on `Handler`.
+  `StaticFileHandler` implements it; `Http1Connection` depends on `Handler`. Optional request
+  filters (`RequestFilters`, [docs/filters.md](docs/filters.md)) wrap that handler. With none
+  registered, HTTP/1.1 still calls `StaticFileHandler.handle` directly.
 * Both transports call the same handler, so behaviour is identical by construction; a parity test
-  compares every HTTP/3 response with the HTTP/1.1 bytes for the same request.
+  compares every HTTP/3 response with the HTTP/1.1 bytes for the same request. `Request` carries
+  the client address, whether the connection is TLS, and the raw header map.
 * Errors raised before a request reaches the handler (parse errors, 408 deadlines, 431 on HTTP/3) use
   `StaticFileHandler.error(...)`, so their pages match the handler's. Status lines and
   error-page titles use `StaticFileHandler.reasonPhrase` (all RFC 9110 codes plus 429, empty for
@@ -40,16 +43,13 @@ HTTP/3:   Http3Server → Http3RequestHandler (virtual thread per stream) ──
 
 ## Current gaps
 
-These are true of this branch today and are the next refactoring steps (each small, without file
-moves, so parallel workstreams don't conflict):
+Still open, each small and without file moves:
 
-1. `ClientManager`, `SjwsServer`, `Transport.Factory` and `h3.Http3RequestHandler` still take the
-   concrete `StaticFileHandler`; widen them to `Handler` (keeping a compatible `handler()` accessor).
-2. Compose the handler chain in `SjwsServer` (one `Handler` built from config) so cross-cutting
-   features (rights, security headers, admin/status pages, logging) plug in as decorators
-   (`Handler → Handler`) instead of edits inside transports.
-3. Move the method check (405/OPTIONS) from `StaticFileHandler` into a small router decorator.
-4. HTTP/3 has no pure mapping step equivalent to `Http1Requests.toCore` yet.
+1. OPTIONS and 405 are decided inside `StaticFileHandler`. HTTP/1.1 already passes those methods
+   through the handler (and therefore through filters, when any are registered).
+2. `X-Content-Type-Options` and `Content-Security-Policy` are applied by the file handler, so
+   filters see them on the way out. `Date`, `Server`, `Content-Length`, `Connection` and `Alt-Svc`
+   are still added by the writers after the chain returns.
 
 ## Future direction
 
@@ -60,7 +60,7 @@ plug in.
 
 ## Observability
 
-`observe.RequestObserver` is the isolated hook. It is not a `Handler` decorator: the chain above is not composed in `SjwsServer` yet. Both transports share an `ObserverSlot`. While that slot is `RequestObserver.NONE` (the default) a request does not read the clock, does not update a counter, and does not look at the path for `/healthz` or `/metrics`, so a document-root file at `/healthz` is served. `--access-log`, `--metrics` (other than `off`) and `--healthz` install a recording observer at startup. The admin TUI's status view calls `SjwsServer.metricsSnapshot()`, which arms counters on the first call without enabling `/healthz`. When the chain exists, one decorator can make the `intercept` and `complete` calls and the transport calls go away; `ServerMetrics`, `Snapshot` and `AccessLog` stay where they are.
+`observe.RequestObserver` is a transport hook, not a filter. Filters wrap the handler; the observer stays beside that chain. Both transports share an `ObserverSlot`. While that slot is `RequestObserver.NONE` (the default) a request does not read the clock, does not update a counter, and does not look at the path for `/healthz` or `/metrics`, so a document-root file at `/healthz` is served. `--access-log`, `--metrics` (other than `off`) and `--healthz` install a recording observer at startup. The admin TUI's status view calls `SjwsServer.metricsSnapshot()`, which arms counters on the first call without enabling `/healthz`. `ServerMetrics`, `Snapshot` and `AccessLog` stay in `observe`.
 
 Counters are `LongAdder`s, and only after the observer is recording. The access log is a bounded lock-free queue drained by one thread. Neither path blocks a request on I/O.
 
