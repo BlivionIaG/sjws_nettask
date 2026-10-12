@@ -31,9 +31,10 @@ public final class AccessLog implements RequestFilter {
 ```
 
 `Request` is an immutable record. `Response` is a record too; its `headers()` are a mutable
-map, and the chain does not copy them. Pass `request.withMethod` / `request.withTarget` into
-`proceed` to change what the rest of the chain sees; those copies keep the peer address,
-`secure`, and headers. Return a new `Response` to change the status or body, or mutate
+map, and the chain does not copy them. Pass `request.withMethod`, `request.withTarget` or `request.withHeaders` into
+`proceed` to change what the rest of the chain sees. `withMethod` and `withTarget` keep the
+peer address, `secure`, and headers. `withHeaders` keeps the method, target, peer, `secure`
+and protocol. Return a new `Response` to change the status or body, or mutate
 `response.headers()` in place. Skip `proceed` to short-circuit; later filters and the terminal
 handler do not run.
 
@@ -248,3 +249,6 @@ When observability was on at startup, or counters are armed later, the observe f
 inserted at order 0 on the compiled snapshot (a negative order still runs further out). Arming
 counters after a document is live recompiles that document in place so the next request is
 counted. The observe filter is not installed when observability is off.
+
+The gateway filters (`api-key`, `jwt`, `rate-limit`, `cors`, `request-size`, `header-rewrite`)
+are factories on this same document. See [API gateway filters](gateway.md).

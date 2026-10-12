@@ -75,4 +75,9 @@ public record Request(String method, String target, RequestHeaders headers, Inet
     public Request withMethod(String method) {
         return new Request(method, this.target, this.headers, this.peer, this.secure, this.protocol);
     }
+
+    /** Same request, different headers. Keeps method, target, peer, secure and protocol. */
+    public Request withHeaders(RequestHeaders headers) {
+        return new Request(this.method, this.target, headers, this.peer, this.secure, this.protocol);
+    }
 }
