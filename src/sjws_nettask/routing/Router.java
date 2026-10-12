@@ -28,7 +28,8 @@ import sjws_nettask.core.StaticFileHandler;
  * Routes a request to the first matching {@link Route} (virtual host + path prefix), optionally
  * rewriting the prefix, or to the fallback handler when none matches.
  * <p>
- * Matching does not allocate: it works on the raw (still percent-encoded) target and Host value.
+ * Matching does not allocate: tables with more than {@link #LINEAR_MAX} routes are compiled
+ * once into hash tables ({@link CompiledRoutes}) with the same first-match result. It works on the raw (still percent-encoded) target and Host value.
  * A target with a {@code ..} path segment (also percent-encoded) is answered 400 before any route
  * is tried, so a prefix can never be escaped. Immutable and thread-safe.
  */
@@ -99,13 +100,23 @@ public final class Router implements Handler {
         }
     }
 
+    /** Up to this many routes a linear scan is used; above it, {@link CompiledRoutes}. */
+    static final int LINEAR_MAX = 8;
+
     private final Route[] routes;
     private final Handler fallback;
+    /** Null when the table is small enough to scan. */
+    private final CompiledRoutes compiled;
 
     /** @param fallback used when no route matches; null answers 404 */
     public Router(List<Route> routes, Handler fallback) {
+        this(routes, fallback, routes.size() > LINEAR_MAX);
+    }
+
+    Router(List<Route> routes, Handler fallback, boolean compile) {
         this.routes = routes.toArray(Route[]::new);
         this.fallback = fallback;
+        this.compiled = compile ? new CompiledRoutes(this.routes) : null;
     }
 
     public List<Route> routes() {
@@ -120,16 +131,32 @@ public final class Router implements Handler {
         if (hasDotDot(target, pathEnd)) {
             return StaticFileHandler.error(400, request.headOnly());
         }
-        var host = request.headers().host();
-        for (var r : this.routes) {
-            if (r.matchesPath(target, pathEnd) && r.matchesHost(host)) {
-                return r.handler().handle(r.rewrite() == null ? request : request.withTarget(r.rewriteTarget(target)));
-            }
+        int i = matchIndex(request.headers().host(), target, pathEnd);
+        if (i >= 0) {
+            var r = this.routes[i];
+            return r.handler().handle(r.rewrite() == null ? request : request.withTarget(r.rewriteTarget(target)));
         }
         if (this.fallback != null) {
             return this.fallback.handle(request);
         }
         return StaticFileHandler.error(404, request.headOnly());
+    }
+
+    /**
+     * Declaration index of the first route matching {@code host} and {@code target[0, pathEnd)},
+     * or -1. Does not allocate.
+     */
+    int matchIndex(String host, String target, int pathEnd) {
+        if (this.compiled != null) {
+            return this.compiled.match(host, target, pathEnd);
+        }
+        for (int i = 0; i < this.routes.length; i++) {
+            var r = this.routes[i];
+            if (r.matchesPath(target, pathEnd) && r.matchesHost(host)) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /** End of the host name: before ":port", or after the "]" of an IPv6 literal. */
