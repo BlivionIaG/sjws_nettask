@@ -139,12 +139,22 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     private final String authority;
 
     public ProxyHandler(Settings settings) {
+        this(settings, ByteBudget.shared());
+    }
+
+    /** @param budget the global in-flight body-byte budget (F5); tests pass their own */
+    public ProxyHandler(Settings settings, ByteBudget budget) {
         this.settings = settings;
-        this.pool = new UpstreamPool(settings.upstream(), settings.connectTimeout(), settings.maxIdle());
+        this.pool = new UpstreamPool(settings.upstream(), settings.connectTimeout(), settings.maxIdle(), budget);
         var path = settings.upstream().getRawPath();
         this.basePath = path == null || path.isEmpty() || path.equals("/") ? ""
                 : path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
         this.authority = settings.upstream().getRawAuthority();
+    }
+
+    /** The in-flight byte budget this proxy counts against (hook for the F5 slow-client test). */
+    public ByteBudget budget() {
+        return this.pool.budget();
     }
 
     public Settings settings() {
@@ -213,24 +223,24 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             throws IOException, InterruptedException {
         var lease = this.pool.acquire();
         var ch = lease.channel();
-        var ex = new UpstreamPool.Exchange(ch);
+        var ex = new UpstreamPool.Exchange(ch, this.settings.idleReadTimeout(), this.pool.budget());
         HttpResponse response;
         try {
-            ex.start();
             if (length > 0) {
+                ex.start();
                 await(ch.writeAndFlush(out), this.settings.responseTimeout());
                 sendBody(request, ch, length);
+                ex.armHeadTimer(this.settings.responseTimeout());
             } else {
-                ch.writeAndFlush(out);
+                ex.send(out, this.settings.responseTimeout());
             }
-            response = ex.head.get(this.settings.responseTimeout().toNanos(), TimeUnit.NANOSECONDS);
-        } catch (TimeoutException e) {
-            ex.abandon();
-            ch.close();
-            throw new ResponseTimeout();
+            response = ex.head.get(); // the event loop's head timer bounds this wait
         } catch (ExecutionException e) {
             ex.abandon();
             ch.close();
+            if (e.getCause() instanceof UpstreamPool.HeadTimeout) {
+                throw new ResponseTimeout();
+            }
             if (lease.reused() && mayRetry && length == 0) {
                 return exchange(request, rebuild(out), length, false); // stale keep-alive connection
             }
@@ -465,7 +475,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
                 return null;
             }
             try {
-                var o = this.ex.take(this.idle);
+                var o = this.ex.take();
                 if (UpstreamPool.isEnd(o)) {
                     return null;
                 }

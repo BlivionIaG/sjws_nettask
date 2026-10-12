@@ -44,15 +44,23 @@ class ProxyEdgeTest {
         var server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
         Thread.ofVirtual().start(() -> {
             for (var reply : replies) {
-                try (var s = server.accept()) {
-                    readHead(s.getInputStream());
-                    s.getOutputStream().write(reply.getBytes(StandardCharsets.ISO_8859_1));
-                    s.getOutputStream().flush();
-                    s.shutdownOutput();
-                    s.getInputStream().read();
+                java.net.Socket accepted;
+                try {
+                    accepted = server.accept();
                 } catch (IOException e) {
                     return;
                 }
+                Thread.ofVirtual().start(() -> { // one thread per connection: slow readers do not serialise
+                    try (var s = accepted) {
+                        readHead(s.getInputStream());
+                        s.getOutputStream().write(reply.getBytes(StandardCharsets.ISO_8859_1));
+                        s.getOutputStream().flush();
+                        s.shutdownOutput();
+                        s.getInputStream().read();
+                    } catch (IOException e) {
+                        // the proxy closed first
+                    }
+                });
             }
         });
         return server;
@@ -191,6 +199,70 @@ class ProxyEdgeTest {
         }
         try (var defaultPort = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://example.test")))) {
             assertEquals(0, defaultPort.idleConnections());
+        }
+    }
+
+    /** F5: a slow reader never makes the proxy hold the upstream response; the global budget bounds the rest. */
+    @Test
+    void slowReadersAreBoundedByTheWindowAndTheGlobalBudget() throws Exception {
+        int size = 8 << 20;
+        var big = "HTTP/1.1 200 OK\r\nContent-Length: " + size + "\r\n\r\n" + "x".repeat(size);
+        try (var s = script(big, big)) {
+            var budget = new ByteBudget(64 * 1024);
+            assertThrows(IllegalArgumentException.class, () -> new ByteBudget(0));
+            var d = Duration.ofSeconds(5);
+            try (var p = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://127.0.0.1:" + s.getLocalPort()), d, d, d,
+                    1 << 20, null, List.of(), false, 4), budget)) {
+                assertSame(budget, p.budget());
+                var a = (Body.Stream) p.handle(new Request("GET", "/a")).body();
+                var b = (Body.Stream) p.handle(new Request("GET", "/b")).body();
+                long max = 0;
+                long total = 0;
+                try (var sa = a.source(); var sb = b.source()) {
+                    for (var bufA = sa.next(); bufA != null; bufA = sa.next()) {
+                        total += bufA.remaining();
+                        Thread.sleep(0, 200_000); // a slow client
+                        max = Math.max(max, budget.inFlight());
+                        var bufB = sb.next();
+                        if (bufB != null) {
+                            total += bufB.remaining();
+                        }
+                    }
+                    for (var bufB = sb.next(); bufB != null; bufB = sb.next()) {
+                        total += bufB.remaining();
+                    }
+                }
+                assertEquals(2L * size, total);
+                // the limit plus at most one socket read (128 KiB) per active exchange
+                assertTrue(max <= budget.limit() + 2 * 128 * 1024 + 2 * 64 * 1024, "in flight peaked at " + max);
+                assertEquals(0, budget.inFlight());
+                assertTrue(ByteBudget.shared().limit() > 0);
+            }
+        }
+    }
+
+    @Test
+    void closingAStreamEarlyReturnsItsBytesToTheBudget() throws Exception {
+        int size = 4 << 20;
+        try (var s = script("HTTP/1.1 200 OK\r\nContent-Length: " + size + "\r\n\r\n" + "y".repeat(size))) {
+            var budget = new ByteBudget(1 << 20);
+            var d = Duration.ofSeconds(5);
+            try (var p = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://127.0.0.1:" + s.getLocalPort()), d, d, d,
+                    1 << 20, null, List.of(), false, 4), budget)) {
+                var body = (Body.Stream) p.handle(new Request("GET", "/big")).body();
+                var src = body.source();
+                assertNotNull(src.next());
+                for (int i = 0; i < 100 && budget.inFlight() < 64 * 1024; i++) {
+                    Thread.sleep(10); // let the event loop read ahead
+                }
+                assertTrue(budget.inFlight() > 0);
+                src.close(); // the client went away: queued buffers are released, the connection is not reused
+                for (int i = 0; i < 100 && budget.inFlight() != 0; i++) {
+                    Thread.sleep(10);
+                }
+                assertEquals(0, budget.inFlight());
+                assertEquals(0, p.idleConnections());
+            }
         }
     }
 

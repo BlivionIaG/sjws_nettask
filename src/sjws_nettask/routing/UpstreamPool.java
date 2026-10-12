@@ -60,6 +60,13 @@ import javax.net.ssl.SSLException;
 final class UpstreamPool implements AutoCloseable {
 
     /** Connect timeouts surface as this (mapped to 504); other connect failures are plain IOExceptions (502). */
+    /** No response head within the response timeout (a 504, never retried). */
+    static final class HeadTimeout extends IOException {
+        HeadTimeout() {
+            super("no response head in time");
+        }
+    }
+
     static final class ConnectTimeout extends IOException {
         ConnectTimeout(String message) {
             super(message);
@@ -78,7 +85,10 @@ final class UpstreamPool implements AutoCloseable {
     private final Bootstrap bootstrap;
     private volatile boolean closed;
 
-    UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle) {
+    private final ByteBudget budget;
+
+    UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget) {
+        this.budget = java.util.Objects.requireNonNull(budget);
         boolean tls = "https".equals(upstream.getScheme());
         this.host = upstream.getHost();
         this.port = upstream.getPort() > 0 ? upstream.getPort() : tls ? 443 : 80;
@@ -97,6 +107,8 @@ final class UpstreamPool implements AutoCloseable {
                 .option(ChannelOption.AUTO_READ, false)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.SO_KEEPALIVE, true)
+                // start at 16 KiB and grow to 128 KiB: big bodies move in few large chunks (fewer hand-offs and writes)
+                .option(ChannelOption.RCVBUF_ALLOCATOR, new io.netty.channel.AdaptiveRecvByteBufAllocator(4096, 16384, 128 * 1024))
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) Math.min(Integer.MAX_VALUE, connectTimeout.toMillis()))
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
@@ -105,7 +117,7 @@ final class UpstreamPool implements AutoCloseable {
                             ch.pipeline().addLast(sslContext.newHandler(ch.alloc(), UpstreamPool.this.host,
                                     UpstreamPool.this.port));
                         }
-                        ch.pipeline().addLast(new HttpClientCodec(4096, 64 * 1024, 64 * 1024), new Relay());
+                        ch.pipeline().addLast(new HttpClientCodec(4096, 64 * 1024, 128 * 1024), new Relay());
                     }
                 });
     }
@@ -179,6 +191,10 @@ final class UpstreamPool implements AutoCloseable {
         }
     }
 
+    ByteBudget budget() {
+        return this.budget;
+    }
+
     int idleCount() {
         return this.idle.size();
     }
@@ -202,9 +218,13 @@ final class UpstreamPool implements AutoCloseable {
     /** End-of-response and failure markers in an exchange's queue. */
     private static final Object END = new Object();
 
+    /** Body bytes the event loop may queue ahead of the request thread before it stops reading. */
+    static final int READ_AHEAD = 256 * 1024;
+
     /**
-     * One request/response on a channel. The event loop fills {@link #queue}; the request thread
-     * drains it and asks for more with {@code channel.read()} only when it is empty.
+     * One request/response on a channel. The event loop fills {@link #queue} and keeps reading while
+     * fewer than {@link #READ_AHEAD} bytes are queued; past that it pauses, and the request thread
+     * resumes it with {@code channel.read()} once it has drained half (bounded-window backpressure).
      */
     static final class Exchange {
         final Channel channel;
@@ -215,30 +235,115 @@ final class UpstreamPool implements AutoCloseable {
         /** Event loop only: inside a 1xx interim response that is being skipped. */
         boolean interim;
         boolean keepAlive;
+        /** Bytes offered by the event loop and not yet taken. */
+        final java.util.concurrent.atomic.AtomicLong queued = new java.util.concurrent.atomic.AtomicLong();
+        /** Set by the event loop when it stopped reading because the window was full. */
+        volatile boolean paused;
+        /** Event loop only: LastHttpContent was seen, nothing more to read for this exchange. */
+        boolean complete;
 
-        Exchange(Channel channel) {
+        private final long idleNanos;
+        /** Last time body bytes arrived, for the idle timer. */
+        volatile long lastRead;
+        /** Event loop only: the pending head or idle timer. */
+        private io.netty.util.concurrent.Future<?> timer;
+
+        final ByteBudget budget;
+
+        Exchange(Channel channel, Duration idle, ByteBudget budget) {
             this.channel = channel;
+            this.budget = budget;
+            this.idleNanos = idle.toNanos();
         }
 
+        /** Binds the exchange and starts reading; the request is written by the caller (it has a body). */
         void start() {
             this.channel.attr(Relay.CURRENT).set(this);
             this.channel.read();
         }
 
-        /** Next content chunk, or {@link #END}; throws on failure or when no byte came within {@code idle}. */
-        Object take(Duration idle) throws IOException, InterruptedException {
-            var next = this.queue.poll();
-            if (next == null) {
+        /**
+         * Binds the exchange, writes a bodyless request, starts reading and arms the head timer, all
+         * in one event-loop task (one hand-off per request instead of three).
+         */
+        void send(io.netty.handler.codec.http.HttpRequest request, Duration headTimeout) {
+            this.channel.attr(Relay.CURRENT).set(this);
+            this.channel.eventLoop().execute(() -> {
+                this.channel.writeAndFlush(request).addListener(this::writeDone);
                 this.channel.read();
-                next = this.queue.poll(idle.toNanos(), TimeUnit.NANOSECONDS);
-                if (next == null) {
-                    throw new IOException("upstream sent nothing for " + idle);
+                armHead(headTimeout);
+            });
+        }
+
+        /** After the caller wrote the request body: wait at most {@code headTimeout} for the head. */
+        void armHeadTimer(Duration headTimeout) {
+            this.channel.eventLoop().execute(() -> armHead(headTimeout));
+        }
+
+        private void writeDone(io.netty.util.concurrent.Future<? super Void> f) {
+            if (!f.isSuccess()) {
+                Relay.fail(this, new IOException("upstream write failed: " + f.cause(), f.cause()));
+            }
+        }
+
+        private void armHead(Duration headTimeout) {
+            if (!this.head.isDone()) {
+                this.timer = this.channel.eventLoop().schedule(() -> {
+                    if (!this.head.isDone()) {
+                        Relay.fail(this, new HeadTimeout());
+                    }
+                }, headTimeout.toNanos(), TimeUnit.NANOSECONDS);
+            }
+        }
+
+        /** Event loop: the head arrived; from now on the idle timer guards the gaps between body bytes. */
+        void headArrived() {
+            cancelTimer();
+            this.lastRead = System.nanoTime();
+            if (!this.complete) {
+                this.timer = this.channel.eventLoop().schedule(this::idleCheck, this.idleNanos, TimeUnit.NANOSECONDS);
+            }
+        }
+
+        private void idleCheck() {
+            if (this.complete || this.abandoned) {
+                return;
+            }
+            long now = System.nanoTime();
+            if (this.paused) { // the client is the slow side; its write timeout applies, not ours
+                this.lastRead = now;
+            }
+            long quiet = now - this.lastRead;
+            if (quiet >= this.idleNanos) {
+                Relay.fail(this, new IOException("upstream sent nothing for " + Duration.ofNanos(this.idleNanos)));
+                this.channel.close();
+                return;
+            }
+            this.timer = this.channel.eventLoop().schedule(this::idleCheck, this.idleNanos - quiet, TimeUnit.NANOSECONDS);
+        }
+
+        /** Event loop only. */
+        void cancelTimer() {
+            if (this.timer != null) {
+                this.timer.cancel(false);
+                this.timer = null;
+            }
+        }
+
+        /** Next content chunk, or {@link #END}; throws on failure (including the idle timer firing). */
+        Object take() throws IOException, InterruptedException {
+            var next = this.queue.take();
+            if (next instanceof ByteBuf buf) {
+                int n = buf.readableBytes();
+                this.budget.release(n);
+                long left = this.queued.addAndGet(-n);
+                if (this.paused && (left == 0 || left < READ_AHEAD / 2 && !this.budget.exhausted())) {
+                    this.paused = false;
+                    this.channel.read();
                 }
-            }
-            if (next instanceof Throwable t) {
-                throw t instanceof IOException io ? io : new IOException(t.toString(), t);
-            }
-            if (next == END) {
+            } else if (next instanceof IOException failure) { // Relay.fail only queues IOExceptions
+                throw failure;
+            } else if (next == END) {
                 this.ended = true;
             }
             return next;
@@ -252,6 +357,10 @@ final class UpstreamPool implements AutoCloseable {
 
         void drain() {
             for (var o = this.queue.poll(); o != null; o = this.queue.poll()) {
+                if (o instanceof ByteBuf buf) {
+                    this.budget.release(buf.readableBytes());
+                    this.queued.addAndGet(-buf.readableBytes());
+                }
                 ReferenceCountUtil.release(o);
             }
         }
@@ -283,13 +392,19 @@ final class UpstreamPool implements AutoCloseable {
                     return;
                 }
                 ex.head.complete(response);
+                ex.headArrived();
             }
             if (msg instanceof HttpContent content) {
                 ByteBuf data = content.content();
                 if (data.isReadable()) {
+                    ex.lastRead = System.nanoTime();
+                    ex.queued.addAndGet(data.readableBytes());
+                    ex.budget.add(data.readableBytes());
                     ex.queue.offer(data.retain());
                 }
                 if (content instanceof LastHttpContent) {
+                    ex.complete = true;
+                    ex.cancelTimer();
                     ex.queue.offer(END);
                 }
                 content.release();
@@ -302,8 +417,20 @@ final class UpstreamPool implements AutoCloseable {
         @Override
         public void channelReadComplete(ChannelHandlerContext ctx) {
             var ex = ctx.channel().attr(CURRENT).get();
-            if (ex != null && !ex.head.isDone()) {
-                ctx.read(); // the head is still incomplete: keep reading without waiting for the consumer
+            if (ex == null || ex.abandoned || ex.complete) {
+                return;
+            }
+            long q = ex.queued.get();
+            boolean full = q >= READ_AHEAD || q > 0 && ex.budget.exhausted(); // window, or the global F5 budget
+            if (!ex.head.isDone() || !full) {
+                ctx.read(); // read ahead while there is room, without waiting for the consumer
+            } else {
+                ex.paused = true;
+                q = ex.queued.get();
+                if (q == 0 || q < READ_AHEAD / 2 && !ex.budget.exhausted()) { // drained between check and flag
+                    ex.paused = false;
+                    ctx.read();
+                }
             }
         }
 
@@ -324,7 +451,7 @@ final class UpstreamPool implements AutoCloseable {
             ctx.close();
         }
 
-        private static void fail(Exchange ex, IOException cause) {
+        static void fail(Exchange ex, IOException cause) {
             if (!ex.head.isDone()) {
                 ex.head.completeExceptionally(cause);
             }
