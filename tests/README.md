@@ -41,6 +41,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `h3/JarLaunchTest` (`@Tag("jar")`) | `java -jar target/sjws_nettask-*.jar --h3` gets HTTP/3 200; runs after `package` |
 | `h3/QuicNativesReportTest` | prints whether the QUIC natives loaded (untagged, always runs) |
 | `MainTest` | entry point: `--help`/`-h` (exit 0), usage errors (64), bad root (2), busy port (1), warnings, startup/shutdown messages |
+| `DaemonTest` | `--daemon`/`--stop`/`--status`/`--restart`, pid-file lock and stale/reused pids, log file, graceful drain on close |
 | `ClientManagerFaultTest`, `Http1EdgeTest` | accept-loop faults (back-off, reset before registration, setOption failure), EOF/CR/body-drain edge cases, failure log |
 | `http1/LegacyApiTest`, `core/CoreApiTest` | legacy wrappers (HTML/Page/Header/CONSTANTS) and small core APIs (ResponseHeaders, Mime, Response, FileCache bounds) |
 
@@ -60,7 +61,8 @@ Every user-visible behaviour and the test that asserts it.
 
 | Behaviour | Asserted by |
 |---|---|
-| every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
+| every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and README in sync |
+| `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |
 | `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |
@@ -88,10 +90,10 @@ Lines JaCoCo reports as missed that no behaviour test can reach (or only by faki
 
 ## Known platform gaps (macOS)
 
-The suite is green on Linux. On macOS (CI run 38212694685, manual job only) three tests fail and need a fix in the code, not the test:
+The suite is green on Linux. On macOS (CI run 38212694685, manual job only) three tests failed and need a fix in the code, not the test:
 
 - `core/SafeOpenTest.parentSymlinkRaceNeverLeaksOverHttp1`: a file was served while a parent directory was swapped for a symlink (the race guard relies on Linux `SecureDirectoryStream`/`O_NOFOLLOW` behaviour).
-- `core/FileCacheTest.searchOnlyDirectoryStays403`: a cached file below an execute-only directory is answered 200 instead of 403.
+- ~~`core/FileCacheTest.searchOnlyDirectoryStays403`~~ (fixed): without `SecureDirectoryStream` every open took the path fallback, which skipped the search-only directory rule; the fallback now checks every directory from the root down (`SafeOpenTest.fallbackRefusesFilesBelowSearchOnlyDirectories`).
 - `HardeningIntegrationTest.trickledRequestIsCutOffAtDeadline`: the client sees a reset instead of the 408 (macOS sends RST when a socket with unread data is closed).
 
 ## Mutation testing
