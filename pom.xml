@@ -197,6 +197,44 @@
   </build>
 
   <profiles>
+    <!-- Mutation testing: mvn -P pitest test-compile org.pitest:pitest-maven:mutationCoverage (slow: not part of verify) -->
+    <profile>
+      <id>pitest</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.pitest</groupId>
+            <artifactId>pitest-maven</artifactId>
+            <version>1.17.4</version>
+            <dependencies>
+              <dependency>
+                <groupId>org.pitest</groupId>
+                <artifactId>pitest-junit5-plugin</artifactId>
+                <version>1.2.1</version>
+              </dependency>
+            </dependencies>
+            <configuration>
+              <targetClasses>
+                <param>sjws_nettask.*</param>
+              </targetClasses>
+              <targetTests>
+                <param>sjws_nettask.*</param>
+              </targetTests>
+              <excludedGroups>
+                <param>jar</param>
+              </excludedGroups>
+              <threads>4</threads>
+              <timeoutConstant>8000</timeoutConstant>
+              <outputFormats>
+                <param>HTML</param>
+                <param>XML</param>
+              </outputFormats>
+              <timestampedReports>false</timestampedReports>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
     <!-- One per platform with Netty QUIC natives (activation conditions are ANDed, so one each). -->
     <profile>
       <id>h3-gate-linux-x86_64</id>
