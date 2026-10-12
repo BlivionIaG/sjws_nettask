@@ -38,6 +38,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
 | `ha/SnapshotHolderTest`, `ha/HealthBoardTest`, `ha/HaLifecycleTest` | atomic snapshot publish, precomputed `/healthz` and `/readyz`, drain (delay, in-flight, `Connection: close`), accept pause |
 | `cluster/QuorumPolicyTest`, `cluster/HeartbeatCodecTest`, `cluster/MembershipTest`, `cluster/HeartbeatServiceTest` | majority and witness quorums, 64-byte heartbeat codec, failure detector (suspect, dead, incarnation refute, indirect probe), simulated loss and UDP heartbeats |
+| `cluster/RaftClusterTest`, `ha/GenerationSyncTest` | per-group Raft (election, batch commit, strict vs relaxed fsync, witness, minority, joint membership, transfer, snapshot compact), HMAC generation publish and key mode 0600 |
 | `ha/ClusterBenchTest` | cluster-mode bench process runs a second node and the heartbeat thread |
 | `SingleNodeHotPathTest` | clustering off: file handler, no role supplier, no drain supplier, no heartbeat or raft thread |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |

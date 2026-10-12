@@ -3,11 +3,11 @@ package sjws_nettask.cluster;
 import java.time.Duration;
 
 /** Monotonic clock that only moves when a test says so. {@code sleep} advances it and returns. */
-final class FakeClock implements Clock {
+public final class FakeClock implements Clock {
 
     private long nanos;
 
-    FakeClock(long nanos) {
+    public FakeClock(long nanos) {
         this.nanos = nanos;
     }
 
@@ -16,7 +16,7 @@ final class FakeClock implements Clock {
         return nanos;
     }
 
-    void advance(Duration duration) {
+    public void advance(Duration duration) {
         nanos += duration.toNanos();
     }
 
