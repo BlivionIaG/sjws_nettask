@@ -83,6 +83,26 @@ public final class PathResolver {
      *         (also via symlinks), names a dotfile, or is a dangling symlink
      */
     public Resolved resolve(String decodedPath) {
+        var candidate = logical(decodedPath);
+        if (candidate == null) {
+            return null;
+        }
+        Path real;
+        try {
+            real = candidate.toRealPath();
+        } catch (IOException e) {
+            return null; // missing, dangling symlink, or inaccessible parent
+        }
+        return real.startsWith(this.realRoot) ? new Resolved(candidate, real) : null;
+    }
+
+    /**
+     * The lexical part of {@link #resolve} (no file-system access): normalizes the path below the
+     * root and refuses anything escaping it or naming a hidden component.
+     *
+     * @return the normalized logical path, or null (the request is a 404)
+     */
+    public Path logical(String decodedPath) {
         Path candidate;
         try {
             candidate = this.root.resolve(decodedPath.substring(1)).normalize();
@@ -97,13 +117,7 @@ public final class PathResolver {
                 return null; // hidden files and folders are never served
             }
         }
-        Path real;
-        try {
-            real = candidate.toRealPath();
-        } catch (IOException e) {
-            return null; // missing, dangling symlink, or inaccessible parent
-        }
-        return real.startsWith(this.realRoot) ? new Resolved(candidate, real) : null;
+        return candidate;
     }
 
     /** @return true if a directory entry may be shown in a listing */

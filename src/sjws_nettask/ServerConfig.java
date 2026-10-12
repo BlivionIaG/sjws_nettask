@@ -44,7 +44,7 @@ import java.util.Objects;
  * @param tlsKey PKCS#8 PEM private key (must be set together with tlsCert)
  * @param tlsKeyPassword key password, or null (masked in {@link #toString()})
  * @param altSvcMaxAge {@code ma} of the Alt-Svc header advertising HTTP/3
- * @param cacheBytes not used yet (S3): small-file cache budget in bytes (0 = disabled)
+ * @param cacheBytes small-file cache budget in bytes (0 = disabled), see {@code core.FileCache}
  * @param accessLog not used yet: "-" for stdout, a file path, or null for off
  * @param altSvc send {@code Alt-Svc} on HTTP/1.1 responses once HTTP/3 is bound (opt-in: browsers
  *        ignore it on plain http:// origins, see the README)
@@ -264,6 +264,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --idle-timeout=S          keep-alive idle timeout, seconds (30)         WEB_SERVER_IDLE_TIMEOUT
                   --header-timeout=S        time to send a request head, seconds (10)     WEB_SERVER_HEADER_TIMEOUT
                   --write-timeout=S         HTTP/3: reset a stalled response, seconds (30) WEB_SERVER_WRITE_TIMEOUT
+                  --cache-bytes=N[k|m|g]    small-file cache size (64m; 0 = off)          WEB_SERVER_CACHE_BYTES
                   --h3 | --no-h3            enable HTTP/3 over QUIC (off)                 WEB_SERVER_H3=true|false
                   --h3-port=N               UDP port (default: the TCP port; 0 = ephemeral) WEB_SERVER_H3_PORT
                   --h3-host=ADDR            UDP bind address (0.0.0.0)                    WEB_SERVER_H3_HOST
@@ -320,6 +321,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         long idle = DEFAULT_IDLE_TIMEOUT.toSeconds();
         long header = DEFAULT_HEADER_TIMEOUT.toSeconds();
         long write = DEFAULT_WRITE_TIMEOUT.toSeconds();
+        long cache = DEFAULT_CACHE_BYTES;
         boolean altSvcOn = false;
         boolean unlistable = false;
         String dir = CONSTANTS.DEFAULT_HTML_PATH;
@@ -361,6 +363,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     case "--idle-timeout" -> idle = number(value, idle, 1, 86_400, name, warnings);
                     case "--header-timeout" -> header = number(value, header, 1, 86_400, name, warnings);
                     case "--write-timeout" -> write = number(value, write, 1, 86_400, name, warnings);
+                    case "--cache-bytes" -> cache = byteSize(value, cache, name, warnings);
                     case "--h3" -> h3 = value == null || bool(value, h3, name, warnings);
                     case "--no-h3" -> h3 = false;
                     case "--h3-port" -> {
@@ -442,6 +445,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if ((v = env.get("WEB_SERVER_WRITE_TIMEOUT")) != null) {
             write = number(v, write, 1, 86_400, "WEB_SERVER_WRITE_TIMEOUT", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_CACHE_BYTES")) != null) {
+            cache = byteSize(v, cache, "WEB_SERVER_CACHE_BYTES", warnings);
         }
         if ((v = env.get("WEB_SERVER_ALT_SVC")) != null) {
             altSvcOn = bool(v, altSvcOn, "WEB_SERVER_ALT_SVC", warnings);
@@ -525,7 +531,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         var config = b.port(port).root(Path.of(dir)).maxConnections(max).maxConnectionsPerIp(perIp)
                 .h3MaxConnectionsPerIp(h3PerIp).h3MinRate(minRate)
                 .idleTimeout(Duration.ofSeconds(idle)).headerTimeout(Duration.ofSeconds(header))
-                .writeTimeout(Duration.ofSeconds(write)).altSvc(altSvcOn).allowUnlistableDirs(unlistable)
+                .writeTimeout(Duration.ofSeconds(write)).cacheBytes(cache).altSvc(altSvcOn).allowUnlistableDirs(unlistable)
                 .h3Enabled(h3).h3Port(h3Port).h3Host(h3Host).h3MaxConnections(h3Max)
                 .tlsCert(cert == null ? null : Path.of(cert)).tlsKey(key == null ? null : Path.of(key))
                 .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc)).build();
@@ -550,6 +556,31 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             return fallback;
         }
         return value;
+    }
+
+    /** Largest accepted cache size (the heap is the real limit; see the startup warning). */
+    public static final long MAX_CACHE_BYTES = 16L << 30;
+
+    /** "N", "Nk", "Nm", "Ng" (binary units, case-insensitive) in 0..{@link #MAX_CACHE_BYTES}. */
+    static long byteSize(String value, long fallback, String what, List<String> warnings) {
+        if (value != null) {
+            var m = java.util.regex.Pattern.compile("([0-9]{1,11})([kKmMgG]?)").matcher(value.trim());
+            if (m.matches()) {
+                long n = Long.parseLong(m.group(1));
+                int shift = switch (m.group(2).toLowerCase(java.util.Locale.ROOT)) {
+                    case "k" -> 10;
+                    case "m" -> 20;
+                    case "g" -> 30;
+                    default -> 0;
+                };
+                if (n <= (MAX_CACHE_BYTES >> shift)) {
+                    return n << shift;
+                }
+            }
+        }
+        warnings.add("Invalid " + what + " (value '" + value + "'), expected a size such as 0, 65536, 64k, 64m or 1g"
+                + " (at most 16g); using " + fallback);
+        return fallback;
     }
 
     private static int number(String value, int fallback, int min, int maxValue, String what, List<String> warnings) {

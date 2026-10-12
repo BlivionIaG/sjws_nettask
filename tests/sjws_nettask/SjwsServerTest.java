@@ -255,4 +255,20 @@ class SjwsServerTest {
         });
         assertSame(server.handler(), seen.get());
     }
+
+    @Test
+    void cacheBytesReachTheHandler() throws IOException {
+        server = SjwsServer.start(config(false));
+        assertEquals(ServerConfig.DEFAULT_CACHE_BYTES, server.handler().cache().maxBytes());
+        assertEquals(200, get("/hello.txt").statusCode());
+        var r = get("/hello.txt");
+        assertEquals("hello", r.bodyText());
+        assertNotNull(r.headers().get("etag"));
+        assertEquals(1, server.handler().cache().hits());
+        server.close();
+        server = SjwsServer.start(ServerConfig.builder(root).port(0).cacheBytes(0).build());
+        assertFalse(server.handler().cache().enabled());
+        assertEquals("hello", get("/hello.txt").bodyText());
+        assertEquals(0, server.handler().cache().size());
+    }
 }
