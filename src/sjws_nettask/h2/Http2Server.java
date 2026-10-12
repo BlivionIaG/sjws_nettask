@@ -94,19 +94,53 @@ public final class Http2Server implements Transport {
      * @param maxSmallContinuationFrames consecutive small CONTINUATION frames accepted
      * @param maxInflight requests handled at once, server-wide (extra streams: REFUSED_STREAM)
      * @param maxOpenFiles file responses streaming at once, server-wide
+     * @param inflightPerConnection requests handled at once on one connection (extra: REFUSED_STREAM)
+     * @param filesPerConnection file responses streaming at once on one connection
+     * @param fileWait how long a response waits for a file slot before REFUSED_STREAM
+     * @param zeroWindowTimeout how long a peer may keep a stream's send window closed (then CANCEL)
+     * @param maxConnectionsPerIp HTTP/2 connections per client address (capped by the server-wide setting)
      */
+    public record Limits(int maxConcurrentStreams, int maxHeaderListSize, int maxRstFrames, int rstWindowSeconds,
+            int maxSmallContinuationFrames, int maxInflight, int maxOpenFiles, int inflightPerConnection,
+            int filesPerConnection, Duration fileWait, Duration zeroWindowTimeout, int maxConnectionsPerIp) {
+
+        public static final Limits DEFAULT = new Limits(100, 16 * 1024, 100, 10, 16, 4096, 512);
+
+        /** The global limits with the default per-connection and per-client budgets. */
+        public Limits(int maxConcurrentStreams, int maxHeaderListSize, int maxRstFrames, int rstWindowSeconds,
+                int maxSmallContinuationFrames, int maxInflight, int maxOpenFiles) {
+            this(maxConcurrentStreams, maxHeaderListSize, maxRstFrames, rstWindowSeconds, maxSmallContinuationFrames,
+                    maxInflight, maxOpenFiles, 32, 8, Duration.ofMillis(100), Duration.ofSeconds(5), 16);
+        }
+    }
+
     /** Unflushed PING/SETTINGS ACKs (and RSTs) allowed before the connection is closed. */
     static final int MAX_QUEUED_CONTROL_FRAMES = 1000;
 
-    public record Limits(int maxConcurrentStreams, int maxHeaderListSize, int maxRstFrames, int rstWindowSeconds,
-            int maxSmallContinuationFrames, int maxInflight, int maxOpenFiles) {
-
-        public static final Limits DEFAULT = new Limits(100, 16 * 1024, 100, 10, 16, 4096, 512);
+    /** One connection's share of the server-wide budgets. */
+    record Budget(Semaphore inflight, Semaphore files) {
     }
+
+    static final io.netty.util.AttributeKey<Budget> BUDGET = io.netty.util.AttributeKey.valueOf("sjws-h2-budget");
 
     /** What every stream handler needs. */
     record Shared(Handler handler, ExecutorService executor, Semaphore inflight, Semaphore files,
-            Duration writeTimeout, LongAdder refused) {
+            Duration writeTimeout, LongAdder refused, Limits limits) {
+
+        /** @return the connection's budget, created on first use */
+        Budget budget(Channel connection) {
+            var attr = connection.attr(BUDGET);
+            var b = attr.get();
+            if (b == null) {
+                b = new Budget(new Semaphore(this.limits.inflightPerConnection()),
+                        new Semaphore(this.limits.filesPerConnection()));
+                var prev = attr.setIfAbsent(b);
+                if (prev != null) {
+                    b = prev;
+                }
+            }
+            return b;
+        }
     }
 
     private final ServerConfig config;
@@ -117,6 +151,9 @@ public final class Http2Server implements Transport {
     private final AtomicInteger connections = new AtomicInteger();
     private final LongAdder refused = new LongAdder();
     private volatile boolean accepting = true;
+    private volatile Duration drainTimeout = Duration.ofSeconds(10);
+    private final io.netty.channel.group.ChannelGroup open =
+            new io.netty.channel.group.DefaultChannelGroup(io.netty.util.concurrent.GlobalEventExecutor.INSTANCE);
     private PerIpLimit perIp;
     private Shared shared;
     private EventLoopGroup boss;
@@ -150,9 +187,9 @@ public final class Http2Server implements Transport {
             }
             var ssl = sslContext(this.tls);
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h2-request-", 0).factory());
-            this.perIp = new PerIpLimit(this.config.maxConnectionsPerIp());
+            this.perIp = new PerIpLimit(Math.min(this.config.maxConnectionsPerIp(), this.limits.maxConnectionsPerIp()));
             this.shared = new Shared(this.handler, this.executor, new Semaphore(this.limits.maxInflight()),
-                    new Semaphore(this.limits.maxOpenFiles()), this.config.writeTimeout(), this.refused);
+                    new Semaphore(this.limits.maxOpenFiles()), this.config.writeTimeout(), this.refused, this.limits);
             this.boss = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             this.workers = new MultiThreadIoEventLoopGroup(0, NioIoHandler.newFactory());
             this.tlsChannel = bind(this.config.h2Port(), new ChannelInitializer<SocketChannel>() {
@@ -219,6 +256,7 @@ public final class Http2Server implements Transport {
             ch.close();
             return false;
         }
+        this.open.add(ch);
         ch.closeFuture().addListener(f -> {
             this.connections.decrementAndGet();
             this.perIp.release(address);
@@ -374,9 +412,27 @@ public final class Http2Server implements Transport {
         return this.refused.sum();
     }
 
+    /** How long {@link #close()} lets streams in progress finish after GOAWAY. */
+    @Override
+    public void shutdownTimeout(Duration timeout) {
+        this.drainTimeout = timeout;
+    }
+
+    /** Refuses new connections and tells every HTTP/2 peer GOAWAY(NO_ERROR): no new streams. */
     @Override
     public void stopAccepting() {
         this.accepting = false;
+        for (var ch : this.open) {
+            if (ch.pipeline().get(Http2FrameCodec.class) != null) {
+                ch.writeAndFlush(new io.netty.handler.codec.http2.DefaultHttp2GoAwayFrame(
+                        io.netty.handler.codec.http2.Http2Error.NO_ERROR));
+            }
+        }
+    }
+
+    /** @return requests currently being handled */
+    int inflight() {
+        return this.shared == null ? 0 : this.limits.maxInflight() - this.shared.inflight().availablePermits();
     }
 
     @Override
@@ -384,10 +440,29 @@ public final class Http2Server implements Transport {
         if (!this.closed.compareAndSet(false, true)) {
             return;
         }
-        stopAccepting();
+        stopAccepting(); // GOAWAY(NO_ERROR) to every HTTP/2 peer
         for (var ch : new Channel[] {this.tlsChannel, this.h2cChannel}) {
             if (ch != null) {
                 ch.close().awaitUninterruptibly(2, TimeUnit.SECONDS);
+            }
+        }
+        boolean interrupted = false;
+        long deadline = System.nanoTime() + this.drainTimeout.toNanos();
+        while (inflight() > 0 && System.nanoTime() < deadline) { // let responses in progress finish
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                interrupted = true;
+                break;
+            }
+        }
+        this.open.close().awaitUninterruptibly(2, TimeUnit.SECONDS);
+        if (this.executor != null) {
+            this.executor.shutdownNow(); // only stragglers past the drain are left
+            try {
+                this.executor.awaitTermination(1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                interrupted = true;
             }
         }
         if (this.workers != null) {
@@ -396,13 +471,8 @@ public final class Http2Server implements Transport {
         if (this.boss != null) {
             this.boss.shutdownGracefully(0, 2, TimeUnit.SECONDS).awaitUninterruptibly(5, TimeUnit.SECONDS);
         }
-        if (this.executor != null) {
-            this.executor.shutdownNow();
-            try {
-                this.executor.awaitTermination(1, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 }

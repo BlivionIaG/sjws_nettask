@@ -110,12 +110,19 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
     }
 
     private void start(Http2StreamChannel stream, Request request) {
-        if (!this.shared.inflight().tryAcquire()) {
+        var budget = this.shared.budget(stream.parent());
+        if (!budget.inflight().tryAcquire()) { // one connection can't take the whole server's share
             this.shared.refused().increment();
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
             return;
         }
-        var task = new Task(stream, request);
+        if (!this.shared.inflight().tryAcquire()) {
+            budget.inflight().release();
+            this.shared.refused().increment();
+            stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
+            return;
+        }
+        var task = new Task(stream, request, budget);
         try {
             this.shared.executor().execute(task);
         } catch (RejectedExecutionException e) { // shutting down
@@ -140,13 +147,15 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
 
         private final Http2StreamChannel stream;
         private final Request request;
+        private final Http2Server.Budget budget;
         private final AtomicBoolean finished = new AtomicBoolean();
         private volatile Thread thread;
         private volatile boolean cancelled;
 
-        Task(Http2StreamChannel stream, Request request) {
+        Task(Http2StreamChannel stream, Request request, Http2Server.Budget budget) {
             this.stream = stream;
             this.request = request;
+            this.budget = budget;
         }
 
         void cancel() {
@@ -171,8 +180,9 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                 } catch (RuntimeException e) {
                     response = StaticFileHandler.error(500, this.request.headOnly());
                 }
-                var outcome = new ResponseWriter(this, Http2StreamHandler.this.shared.writeTimeout(),
-                        Http2StreamHandler.this.shared.files()).write(response);
+                var shared = Http2StreamHandler.this.shared;
+                var outcome = new ResponseWriter(this, shared.writeTimeout(), this.budget.files(), shared.files(),
+                        shared.limits().fileWait(), shared.limits().zeroWindowTimeout()).write(response);
                 if (outcome == ResponseWriter.Outcome.COMPLETE) {
                     endRequest();
                 }
@@ -198,6 +208,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         void finish() {
             if (this.finished.compareAndSet(false, true)) {
                 Http2StreamHandler.this.shared.inflight().release();
+                this.budget.inflight().release();
             }
         }
 
@@ -218,6 +229,11 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         }
 
         @Override
+        public boolean writable() {
+            return this.stream.isWritable(); // follows the stream's remote flow-control window
+        }
+
+        @Override
         public ByteBufAllocator alloc() {
             return this.stream.alloc();
         }
@@ -226,7 +242,11 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         public void abort(ResponseWriter.Outcome why) {
             if (this.stream.isActive()) {
                 this.stream.writeAndFlush(new DefaultHttp2ResetFrame(
-                        why == ResponseWriter.Outcome.REJECTED ? Http2Error.REFUSED_STREAM : Http2Error.INTERNAL_ERROR));
+                        switch (why) {
+                            case REJECTED -> Http2Error.REFUSED_STREAM;
+                            case STARVED -> Http2Error.CANCEL;
+                            default -> Http2Error.INTERNAL_ERROR;
+                        }));
             }
         }
     }

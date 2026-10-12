@@ -28,6 +28,7 @@ import io.netty.handler.codec.http.DefaultHttpResponse;
 import io.netty.handler.codec.http.DefaultLastHttpContent;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
@@ -98,11 +99,25 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
 
     private void run(Task task) {
         this.busy = true;
+        if (!this.shared.inflight().tryAcquire()) { // the same server-wide cap as HTTP/2 streams
+            this.shared.refused().increment();
+            task.channel.writeAndFlush(unavailable()).addListener(ChannelFutureListener.CLOSE);
+            return;
+        }
         try {
             this.shared.executor().execute(task);
         } catch (RejectedExecutionException e) {
+            this.shared.inflight().release();
             task.channel.close();
         }
+    }
+
+    /** 503 with Retry-After, then the connection closes (server busy). */
+    static DefaultFullHttpResponse unavailable() {
+        var r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.SERVICE_UNAVAILABLE);
+        r.headers().add("Server", ServerInfo.NAME).add("Date", DateClock.SYSTEM.now())
+                .add("Content-Length", "0").add("Retry-After", "1").add("Connection", "close");
+        return r;
     }
 
     /** On the event loop, after a response was written completely (and the connection stays open). */
@@ -166,9 +181,11 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
                 } catch (RuntimeException e) {
                     response = StaticFileHandler.error(500, this.request.headOnly());
                 }
-                outcome = new ResponseWriter(this, Http1FallbackHandler.this.shared.writeTimeout(),
-                        Http1FallbackHandler.this.shared.files()).write(response);
+                var shared = Http1FallbackHandler.this.shared;
+                outcome = new ResponseWriter(this, shared.writeTimeout(), null, shared.files(),
+                        shared.limits().fileWait(), shared.writeTimeout()).write(response);
             } finally {
+                Http1FallbackHandler.this.shared.inflight().release();
                 this.channel.closeFuture().removeListener(interrupt);
                 if (outcome == ResponseWriter.Outcome.COMPLETE && this.keepAlive && this.refusal == null) {
                     this.channel.eventLoop().execute(() -> next(this.channel));
@@ -217,6 +234,10 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
 
         @Override
         public void abort(ResponseWriter.Outcome why) {
+            if (why == ResponseWriter.Outcome.REJECTED) { // no file slot: nothing was sent yet
+                this.channel.writeAndFlush(unavailable()).addListener(ChannelFutureListener.CLOSE);
+                return;
+            }
             this.channel.close();
         }
     }

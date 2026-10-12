@@ -51,7 +51,9 @@ final class ResponseWriter {
     static final Set<String> NOT_COPIED = Set.of("connection", "keep-alive", "proxy-connection", "transfer-encoding",
             "upgrade", "te", "content-length", "date", "server", "alt-svc");
 
-    enum Outcome { COMPLETE, SWAPPED, SHRANK, STALLED, REJECTED, CLOSED, FAILED }
+    private static final long POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(50);
+
+    enum Outcome { COMPLETE, SWAPPED, SHRANK, STALLED, STARVED, REJECTED, CLOSED, FAILED }
 
     /** Where a response goes. Every method is called from the writer's thread. */
     interface Sink {
@@ -63,6 +65,11 @@ final class ResponseWriter {
 
         boolean active();
 
+        /** @return false while the peer's flow-control window holds our data back (HTTP/2) */
+        default boolean writable() {
+            return true;
+        }
+
         ByteBufAllocator alloc();
 
         /** The response cannot be completed: reset the stream / close the connection. */
@@ -72,13 +79,30 @@ final class ResponseWriter {
     private final Sink sink;
     private final Duration writeTimeout;
     private final Semaphore files;
+    private final Semaphore connectionFiles;
+    private final Duration fileWait;
+    private final Duration zeroWindow;
     private ChannelFuture previous;
     private boolean answered;
 
     ResponseWriter(Sink sink, Duration writeTimeout, Semaphore files) {
+        this(sink, writeTimeout, null, files, writeTimeout, writeTimeout);
+    }
+
+    /**
+     * @param connectionFiles the connection's own file budget, or null
+     * @param fileWait how long to wait for a file slot before refusing (REJECTED)
+     * @param zeroWindow how long the peer may keep the send window closed before the stream is
+     *        cancelled (STARVED), so a client that never reads can't pin slots for writeTimeout
+     */
+    ResponseWriter(Sink sink, Duration writeTimeout, Semaphore connectionFiles, Semaphore files, Duration fileWait,
+            Duration zeroWindow) {
         this.sink = sink;
         this.writeTimeout = writeTimeout;
+        this.connectionFiles = connectionFiles;
         this.files = files;
+        this.fileWait = fileWait;
+        this.zeroWindow = zeroWindow;
     }
 
     /** Writes the whole response; on failure the sink has been aborted. */
@@ -101,13 +125,24 @@ final class ResponseWriter {
     private Outcome send(Response response) throws IOException, InterruptedException {
         boolean sendBody = response.sendsBody() && response.contentLength() > 0;
         if (sendBody && response.body() instanceof Body.FileBody file) {
-            if (!this.files.tryAcquire(this.writeTimeout.toNanos(), TimeUnit.NANOSECONDS)) {
+            long deadline = System.nanoTime() + this.fileWait.toNanos();
+            if (this.connectionFiles != null && !this.connectionFiles.tryAcquire(this.fileWait.toNanos(),
+                    TimeUnit.NANOSECONDS)) {
                 return Outcome.REJECTED;
             }
             try {
-                return sendFile(response, file);
+                if (!this.files.tryAcquire(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+                    return Outcome.REJECTED;
+                }
+                try {
+                    return sendFile(response, file);
+                } finally {
+                    this.files.release();
+                }
             } finally {
-                this.files.release();
+                if (this.connectionFiles != null) {
+                    this.connectionFiles.release();
+                }
             }
         }
         if (sendBody && response.body() instanceof Body.Bytes bytes) {
@@ -190,10 +225,30 @@ final class ResponseWriter {
         }
         var done = new CompletableFuture<Void>(); // parks virtual threads cleanly
         this.previous.addListener(f -> done.complete(null));
-        try {
-            done.get(this.writeTimeout.toNanos(), TimeUnit.NANOSECONDS);
-        } catch (TimeoutException | ExecutionException e) {
-            return Outcome.STALLED;
+        long start = System.nanoTime();
+        long deadline = start + this.writeTimeout.toNanos();
+        long closedSince = -1;
+        while (true) {
+            long now = System.nanoTime();
+            long slice = Math.min(POLL_NANOS, deadline - now);
+            if (slice <= 0) {
+                return Outcome.STALLED;
+            }
+            try {
+                done.get(slice, TimeUnit.NANOSECONDS);
+                break;
+            } catch (ExecutionException e) {
+                break;
+            } catch (TimeoutException e) {
+                now = System.nanoTime();
+                if (this.sink.writable()) {
+                    closedSince = -1;
+                } else if (closedSince < 0) {
+                    closedSince = now;
+                } else if (now - closedSince >= this.zeroWindow.toNanos()) {
+                    return Outcome.STARVED;
+                }
+            }
         }
         return this.previous.isSuccess() ? Outcome.COMPLETE : Outcome.CLOSED;
     }

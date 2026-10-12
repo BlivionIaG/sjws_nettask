@@ -36,6 +36,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `tls/TlsMaterialTest` | PEM/encrypted keys, self-signed certificates, key-file/validity warnings |
 | `h2/Http2ServerTest` | HTTP/2: ALPN h2 + http/1.1 fallback, parity with HTTP/1.1, concurrent streams, h2c Upgrade and prior knowledge, stream cap, rapid reset (GOAWAY ENHANCE_YOUR_CALM), CONTINUATION flood, header list size, flow control on a large file, stalled stream, in-flight cap |
 | `h2/Http2JuryTest` | security jury regressions: PINGs / unfinished header block don't keep an idle h2 connection, open streams do, never-ending request reset with NO_ERROR, slowloris on the HTTP/1.x fallback, header timeout vs keep-alive and upgrade, PING flood without reading |
+| `h2/Http2BudgetTest` | review fixes: zero-window clients don't delay another client (<1 s), per-connection file/in-flight budgets (REFUSED_STREAM), zero-window CANCEL, per-IP cap, HTTP/1 fallback in-flight slot (503), GOAWAY on stopAccepting, drain on close |
 | `h2/Http2EdgeTest` | HTTP/2 listener edges: HTTP/1.x fallback keep-alive/pipelining/close, refusals, 500s, connection caps, idle close, stopAccepting/close, busy port, header mapping |
 | `h2/H2ConfigAndWiringTest` | `--h2`, `--h2-port`, `--h2c-port` parsing/warnings and `SjwsServer` wiring (fallback when HTTP/2 fails) |
 | `h2/ResponseWriterTest` | HTTP/2 response writer outcomes: swapped/shrunk files, stall, rejected, closed, sink failures |
