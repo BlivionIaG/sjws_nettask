@@ -133,12 +133,16 @@ class TlsMaterialTest {
         assertArrayEquals(rsa.key().getEncoded(), loaded.key().getEncoded());
     }
 
-    /** RSA pair made with the JDK's keytool (the server only generates EC itself). */
     static TlsMaterial rsaMaterial() throws Exception {
+        return keytoolMaterial("RSA");
+    }
+
+    /** Key pair + certificate made with the JDK's keytool (the server only generates EC itself). */
+    static TlsMaterial keytoolMaterial(String algorithm) throws Exception {
         var dir = Files.createTempDirectory("rsa");
         var store = dir.resolve("ks.p12");
         var keytool = Path.of(System.getProperty("java.home"), "bin", "keytool").toString();
-        var p = new ProcessBuilder(keytool, "-genkeypair", "-alias", "a", "-keyalg", "RSA", "-keysize", "2048",
+        var p = new ProcessBuilder(keytool, "-genkeypair", "-alias", "a", "-keyalg", algorithm,
                 "-dname", "CN=localhost", "-validity", "2", "-storetype", "PKCS12", "-keystore", store.toString(),
                 "-storepass", "changeit", "-keypass", "changeit").redirectErrorStream(true).start();
         p.getInputStream().readAllBytes();
@@ -149,6 +153,24 @@ class TlsMaterialTest {
         }
         return new TlsMaterial((PrivateKey) ks.getKey("a", "changeit".toCharArray()),
                 new X509Certificate[] {(X509Certificate) ks.getCertificate("a")}, false);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"RSA", "Ed25519", "DSA", "RSASSA-PSS"})
+    void pemRoundTripOtherKeyTypes(String algorithm) throws Exception {
+        var m = keytoolMaterial(algorithm);
+        var files = writePem(Files.createDirectory(this.tmp.resolve(algorithm)), m);
+        var loaded = TlsMaterial.fromPem(files[0], files[1], null);
+        assertArrayEquals(m.key().getEncoded(), loaded.key().getEncoded());
+        assertEquals(m.certificate(), loaded.certificate());
+    }
+
+    @Test
+    void unreadableKeyFile() throws Exception {
+        var files = writePem(this.tmp, TlsMaterial.selfSigned("localhost"));
+        Files.setPosixFilePermissions(files[1], java.nio.file.attribute.PosixFilePermissions.fromString("---------"));
+        var e = assertThrows(IOException.class, () -> TlsMaterial.fromPem(files[0], files[1], null));
+        assertTrue(e.getMessage().contains("not readable"), e.getMessage());
     }
 
     @Test
