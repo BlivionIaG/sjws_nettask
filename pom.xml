@@ -80,8 +80,8 @@
             <phase>verify</phase>
             <goals><goal>report</goal></goals>
           </execution>
-          <!-- Gate: per-package rules (measured 2026-10-12, set ~3 pts below). Only the packages
-               listed are gated, so sjws_nettask.h3 is not, until the h3-transport merge adds its rule. -->
+          <!-- Gate: per-package rules (measured 2026-10-12, set ~2-3 pts below). Every production
+               package is gated; h3 (92.5/91.5) and tls (93.1/94.1) were measured on the merged http3 branch. -->
           <execution>
             <id>check</id>
             <phase>verify</phase>
@@ -111,6 +111,22 @@
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.80</minimum></limit>
                   <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.78</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.h3</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.89</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.tls</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.91</minimum></limit>
                 </limits>
               </rule>
               </rules>
