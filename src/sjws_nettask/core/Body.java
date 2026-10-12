@@ -75,8 +75,11 @@ public sealed interface Body permits Body.Empty, Body.Bytes, Body.FileBody {
      * @param expected file identity at resolution time
      * @param root real path of the document root the file was resolved in (a prefix of {@code realPath});
      *        the writer opens every component below it without following symlinks
+     * @param allowUnlistable below a directory that can be searched but not read, open by path (weaker,
+     *        see {@link SafeOpen}) instead of refusing with 403
      */
-    record FileBody(Path realPath, long offset, long length, Validator expected, Path root) implements Body {
+    record FileBody(Path realPath, long offset, long length, Validator expected, Path root, boolean allowUnlistable)
+            implements Body {
 
         public FileBody {
             Objects.requireNonNull(realPath, "realPath");
@@ -88,6 +91,11 @@ public sealed interface Body permits Body.Empty, Body.Bytes, Body.FileBody {
             if (!realPath.isAbsolute() || !realPath.startsWith(root)) {
                 throw new IllegalArgumentException("realPath must be absolute and inside root");
             }
+        }
+
+        /** Refuses files below unlistable directories (the default). */
+        public FileBody(Path realPath, long offset, long length, Validator expected, Path root) {
+            this(realPath, offset, length, expected, root, false);
         }
 
         /** A file outside any document root: components are checked from the file-system root. */

@@ -54,11 +54,14 @@ import java.util.Objects;
  *        needs one)
  * @param h3MinRate HTTP/3: minimum average send rate per connection, bytes/s, enforced only while file
  *        slots are contended (0 = off)
+ * @param allowUnlistableDirs serve files below directories the server can search but not read (mode
+ *        {@code --x}) through the weaker path-based open; off: such requests get 403 (security
+ *        verification V7: anyone who can write in the root could create such a directory to force it)
  */
 public record ServerConfig(int port, Path root, int maxConnections, Duration idleTimeout, Duration headerTimeout,
         Duration writeTimeout, boolean h3Enabled, int h3Port, String h3Host, int h3MaxConnections, Path tlsCert,
         Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc,
-        int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate) {
+        int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate, boolean allowUnlistableDirs) {
 
     public static final int DEFAULT_PORT = CONSTANTS.DEFAULT_PORT;
     /** Design review M11: 64 KB output buffer per connection, so 2048 x 64 KB = 128 MB worst case. */
@@ -149,7 +152,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 + ", tlsKeyPassword=" + (tlsKeyPassword == null ? "null" : "****") + ", altSvcMaxAge=" + altSvcMaxAge
                 + ", cacheBytes=" + cacheBytes + ", accessLog=" + accessLog + ", altSvc=" + altSvc
                 + ", maxConnectionsPerIp=" + maxConnectionsPerIp + ", h3MaxConnectionsPerIp="
-                + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + "]";
+                + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + ", allowUnlistableDirs=" + allowUnlistableDirs + "]";
     }
 
     /** Mutable builder; new fields get a default here so existing callers keep compiling. */
@@ -175,6 +178,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         private long cacheBytes = DEFAULT_CACHE_BYTES;
         private String accessLog;
         private boolean altSvc;
+        private boolean allowUnlistableDirs;
 
         private Builder(Path root) {
             this.root = root;
@@ -201,6 +205,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             this.cacheBytes = c.cacheBytes;
             this.accessLog = c.accessLog;
             this.altSvc = c.altSvc;
+            this.allowUnlistableDirs = c.allowUnlistableDirs;
         }
 
         public Builder port(int v) { this.port = v; return this; }
@@ -223,11 +228,12 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public Builder cacheBytes(long v) { this.cacheBytes = v; return this; }
         public Builder accessLog(String v) { this.accessLog = v; return this; }
         public Builder altSvc(boolean v) { this.altSvc = v; return this; }
+        public Builder allowUnlistableDirs(boolean v) { this.allowUnlistableDirs = v; return this; }
 
         public ServerConfig build() {
             return new ServerConfig(port, root, maxConnections, idleTimeout, headerTimeout, writeTimeout, h3Enabled,
                     h3Port, h3Host, h3MaxConnections, tlsCert, tlsKey, tlsKeyPassword, altSvcMaxAge, cacheBytes,
-                    accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate);
+                    accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate, allowUnlistableDirs);
         }
     }
 
@@ -272,6 +278,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --alt-svc | --no-alt-svc  advertise HTTP/3 with Alt-Svc on HTTP/1.1 (off) WEB_SERVER_ALT_SVC=true|false
                                             (browsers ignore it on http:// origins)
                   --alt-svc-max-age=S       Alt-Svc max-age, seconds (86400)              WEB_SERVER_ALT_SVC_MA
+                  --allow-unlistable-dirs   serve below unreadable (--x) directories by   WEB_SERVER_ALLOW_UNLISTABLE_DIRS
+                                            path (weaker against local writers; off: 403)
                   -h, --help                show this help
 
                 Environment variables override arguments. The key password is never accepted
@@ -313,6 +321,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         long header = DEFAULT_HEADER_TIMEOUT.toSeconds();
         long write = DEFAULT_WRITE_TIMEOUT.toSeconds();
         boolean altSvcOn = false;
+        boolean unlistable = false;
         String dir = CONSTANTS.DEFAULT_HTML_PATH;
         boolean h3 = false;
         int h3Port = H3_PORT_SAME_AS_TCP;
@@ -385,6 +394,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                         explicitH3Options.add(name);
                     }
                     case "--no-alt-svc" -> altSvcOn = false;
+                    case "--allow-unlistable-dirs" -> unlistable = value == null || bool(value, unlistable, name, warnings);
                     case "--alt-svc-max-age" -> {
                         altSvc = number(value, altSvc, 0, 31_536_000, name, warnings);
                         explicitH3Options.add(name);
@@ -438,6 +448,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             if (altSvcOn) {
                 explicitH3Options.add("WEB_SERVER_ALT_SVC");
             }
+        }
+        if ((v = env.get("WEB_SERVER_ALLOW_UNLISTABLE_DIRS")) != null) {
+            unlistable = bool(v, unlistable, "WEB_SERVER_ALLOW_UNLISTABLE_DIRS", warnings);
         }
         if ((v = env.get("WEB_SERVER_H3")) != null) {
             h3 = bool(v, h3, "WEB_SERVER_H3", warnings);
@@ -512,7 +525,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         var config = b.port(port).root(Path.of(dir)).maxConnections(max).maxConnectionsPerIp(perIp)
                 .h3MaxConnectionsPerIp(h3PerIp).h3MinRate(minRate)
                 .idleTimeout(Duration.ofSeconds(idle)).headerTimeout(Duration.ofSeconds(header))
-                .writeTimeout(Duration.ofSeconds(write)).altSvc(altSvcOn)
+                .writeTimeout(Duration.ofSeconds(write)).altSvc(altSvcOn).allowUnlistableDirs(unlistable)
                 .h3Enabled(h3).h3Port(h3Port).h3Host(h3Host).h3MaxConnections(h3Max)
                 .tlsCert(cert == null ? null : Path.of(cert)).tlsKey(key == null ? null : Path.of(key))
                 .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc)).build();

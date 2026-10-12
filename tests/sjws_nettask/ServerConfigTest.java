@@ -145,6 +145,24 @@ class ServerConfigTest {
         assertEquals(Duration.ZERO, c.altSvcMaxAge());
     }
 
+    /** Verification V7: the weaker search-only-directory fallback is opt-in. */
+    @Test
+    void allowUnlistableDirsIsOptIn() {
+        assertFalse(parse(Map.of()).config().allowUnlistableDirs());
+        assertTrue(parse(Map.of(), "--allow-unlistable-dirs").config().allowUnlistableDirs());
+        assertFalse(parse(Map.of(), "--allow-unlistable-dirs=false").config().allowUnlistableDirs());
+        assertTrue(parse(Map.of("WEB_SERVER_ALLOW_UNLISTABLE_DIRS", "yes")).config().allowUnlistableDirs());
+        assertFalse(parse(Map.of("WEB_SERVER_ALLOW_UNLISTABLE_DIRS", "0"), "--allow-unlistable-dirs").config()
+                .allowUnlistableDirs(), "environment wins");
+        var p = parse(Map.of(), "--allow-unlistable-dirs");
+        assertTrue(p.ok() && p.warnings().isEmpty(), p.warnings().toString());
+        var c = ServerConfig.builder(Path.of("/r")).allowUnlistableDirs(true).build();
+        assertTrue(c.toBuilder().build().allowUnlistableDirs());
+        assertTrue(c.toString().contains("allowUnlistableDirs=true"));
+        assertTrue(ServerConfig.usage().contains("--allow-unlistable-dirs"));
+        assertTrue(ServerConfig.usage().contains("WEB_SERVER_ALLOW_UNLISTABLE_DIRS"));
+    }
+
     /** Verification V1/V5: per-address caps and the HTTP/3 minimum rate. */
     @Test
     void perAddressAndRateFlags() {

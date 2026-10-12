@@ -337,14 +337,21 @@ class VerificationTest {
         }
     }
 
-    /** V3 over HTTP/3: files in execute-only (711) directories, and below a 0100 root, are served. */
-    @Test
-    void v3ExecuteOnlyDirectoriesAreServed() throws Exception {
+    /**
+     * V3 + V7 over HTTP/3: below an execute-only (711) directory and a 0100 root, 403 by default; served
+     * with {@code --allow-unlistable-dirs}.
+     */
+    @ParameterizedTest(name = "allowUnlistable={0}")
+    @ValueSource(booleans = {false, true})
+    void v3ExecuteOnlyDirectories(boolean allowUnlistable) throws Exception {
         Assumptions.assumeFalse("root".equals(System.getProperty("user.name")), "root ignores permissions");
+        Assumptions.assumeTrue(sjws_nettask.core.SafeOpen.SECURE);
         var xo = Files.createDirectories(this.root.resolve("xonly"));
         Files.writeString(xo.resolve("f.txt"), "in x-only dir");
         var changed = new ArrayList<Path>();
-        try (var server = new Http3Server(config().build(), this.handler, this.tls).start();
+        var config = config().allowUnlistableDirs(allowUnlistable).build();
+        var handler = new StaticFileHandler(this.root, config.allowUnlistableDirs());
+        try (var server = new Http3Server(config, handler, this.tls).start();
                 var client = new H3TestClient(this.tls.certificate())) {
             var q = client.connect(server.localAddress());
             changed.add(xo);
@@ -352,13 +359,36 @@ class VerificationTest {
             changed.add(this.root);
             Files.setPosixFilePermissions(this.root, PosixFilePermissions.fromString("--x------"));
             var r = H3TestClient.get(q, "/xonly/f.txt");
-            assertEquals(200, r.status());
-            assertEquals("in x-only dir", H3Fixture.text(r));
-            assertEquals(200, H3TestClient.get(q, "/hello.txt").status());
+            assertFalse(r.reset(), "answered, not reset");
+            assertEquals(allowUnlistable ? 200 : 403, r.status());
+            assertEquals(allowUnlistable, H3Fixture.text(r).equals("in x-only dir"));
+            assertEquals(allowUnlistable ? 200 : 403, H3TestClient.get(q, "/hello.txt").status());
         } finally {
             for (var p : changed.reversed()) {
                 Files.setPosixFilePermissions(p, PosixFilePermissions.fromString("rwx------"));
             }
+        }
+    }
+
+    /** V7 inverted over HTTP/3: the attacker's own 311 directory can't force the by-path fallback. */
+    @Test
+    void v7SearchOnlyDirectoryCannotForceTheFallback() throws Exception {
+        Assumptions.assumeFalse("root".equals(System.getProperty("user.name")), "root ignores permissions");
+        Assumptions.assumeTrue(sjws_nettask.core.SafeOpen.SECURE);
+        try (var server = new Http3Server(config().build(), this.handler, this.tls).start();
+                var client = new H3TestClient(this.tls.certificate())) {
+            var q = client.connect(server.localAddress());
+            var result = VerificationRegressionTest.searchOnlyRace(this.base, this.root, Duration.ofSeconds(3), path -> {
+                try {
+                    var r = H3TestClient.get(q, path);
+                    return Map.entry(r.reset() ? 0 : r.status(), H3Fixture.text(r));
+                } catch (Exception e) {
+                    return Map.entry(0, "");
+                }
+            });
+            assertEquals(0, result.leaked(), result.toString());
+            assertEquals(0, result.served(), "no 200 below a search-only directory: " + result);
+            assertTrue(result.denied() > 0, result.toString());
         }
     }
 

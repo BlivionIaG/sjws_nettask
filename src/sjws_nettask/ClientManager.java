@@ -65,7 +65,7 @@ public class ClientManager implements Runnable {
      * @param extraHeaders fields added to every HTTP/1 response (Alt-Svc hook); called per response
      */
     public ClientManager(ServerSocket server, ServerConfig config, Supplier<ResponseHeaders> extraHeaders) {
-        this(server, config, new StaticFileHandler(config.root()), extraHeaders);
+        this(server, config, new StaticFileHandler(config.root(), config.allowUnlistableDirs()), extraHeaders);
     }
 
     /** Shares {@code handler} with other transports (HTTP/3). */

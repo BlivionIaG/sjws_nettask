@@ -81,27 +81,53 @@ public class VerificationRegressionTest {
         return new Body.FileBody(file, 0, a.size(), Validator.of(a), root);
     }
 
-    /** V3 repro executeOnlyDirectories, inverted: 0111 subdirectory and 0100 root serve their files. */
-    @Test
-    void executeOnlyDirectoriesServeTheirFiles() throws Exception {
+    /**
+     * V3 + V7: below an execute-only (711) directory, or a 0100 root, the default is 403 (no weaker
+     * by-path fallback an attacker could force); with {@code --allow-unlistable-dirs} the files are served.
+     */
+    @ParameterizedTest(name = "allowUnlistable={0}")
+    @ValueSource(booleans = {false, true})
+    void executeOnlyDirectories(boolean allowUnlistable) throws Exception {
+        Assumptions.assumeTrue(SafeOpen.SECURE, "only secure mode can tell");
         var xo = Files.createDirectories(this.root.resolve("xonly"));
         Files.writeString(xo.resolve("f.txt"), "in x-only dir");
         Files.writeString(this.root.resolve("top.txt"), "top file");
-        var h = new StaticFileHandler(this.root);
+        var h = new StaticFileHandler(this.root, allowUnlistable);
+        assertEquals(allowUnlistable, h.allowUnlistableDirs());
         chmod(xo, "--x--x--x");
         var wire = http1(h, "/xonly/f.txt");
-        assertTrue(wire.startsWith("HTTP/1.1 200 ") && wire.endsWith("in x-only dir"), wire);
+        if (allowUnlistable) {
+            assertTrue(wire.startsWith("HTTP/1.1 200 ") && wire.endsWith("in x-only dir"), wire);
+        } else {
+            assertTrue(wire.startsWith("HTTP/1.1 403 ") && !wire.contains("in x-only dir"), wire);
+        }
         chmod(xo, "rwx------");
         chmod(this.root, "--x------");
         wire = http1(h, "/top.txt");
-        assertTrue(wire.startsWith("HTTP/1.1 200 ") && wire.endsWith("top file"), wire);
+        assertTrue(wire.startsWith(allowUnlistable ? "HTTP/1.1 200 " : "HTTP/1.1 403 "), wire);
     }
 
-    @ParameterizedTest(name = "secure={0}")
-    @ValueSource(booleans = {true, false})
-    void safeOpenWalksSearchOnlyDirectories(boolean secure) throws Exception {
+    @Test
+    void searchOnlyDirectoriesAreDeniedByDefault() throws Exception {
+        Assumptions.assumeTrue(SafeOpen.SECURE);
         var f = Files.writeString(Files.createDirectories(this.root.resolve("a/b")).resolve("f.txt"), "deep");
         var expected = body(f, this.root);
+        assertFalse(expected.allowUnlistable());
+        chmod(this.root.resolve("a"), "--x------");
+        var e = assertThrows(java.nio.file.AccessDeniedException.class, () -> SafeOpen.open(expected, true).close());
+        assertEquals(403, SafeOpen.status(e));
+        chmod(this.root.resolve("a"), "rwx------");
+        chmod(this.root, "--x------");
+        assertThrows(java.nio.file.AccessDeniedException.class, () -> SafeOpen.open(expected, true).close());
+    }
+
+    /** With the opt-in, search-only directories are walked by the verified path fallback. */
+    @ParameterizedTest(name = "secure={0}")
+    @ValueSource(booleans = {true, false})
+    void optInWalksSearchOnlyDirectories(boolean secure) throws Exception {
+        var f = Files.writeString(Files.createDirectories(this.root.resolve("a/b")).resolve("f.txt"), "deep");
+        var a = Files.readAttributes(f, java.nio.file.attribute.BasicFileAttributes.class);
+        var expected = new Body.FileBody(f, 0, a.size(), Validator.of(a), this.root, true);
         chmod(this.root.resolve("a"), "--x------");
         try (var ch = SafeOpen.open(expected, secure)) {
             assertEquals(4, ch.size());
@@ -114,8 +140,80 @@ public class VerificationRegressionTest {
         Files.createSymbolicLink(this.root.resolve("a/b"), outside);
         chmod(this.root.resolve("a"), "--x------");
         var forged = new Body.FileBody(f, 0, 4, Validator.of(Files.readAttributes(outside.resolve("f.txt"),
-                java.nio.file.attribute.BasicFileAttributes.class)), this.root); // identity check alone would pass
+                java.nio.file.attribute.BasicFileAttributes.class)), this.root, true); // identity alone would pass
         assertThrows(SafeOpen.FileChangedException.class, () -> SafeOpen.open(forged, secure).close());
+    }
+
+    /** Result of {@link #searchOnlyRace}: requests answered 200, answered 403, and leaks of the outside file. */
+    public record RaceResult(int tries, int served, int denied, int leaked) {
+    }
+
+    /**
+     * V7 repro (Verify2SafeOpen.searchOnlyDirForcesFallbackRace): someone with write access in the root
+     * makes their own directory {@code -wx} (311) and flips a directory below it to a symlink to outside
+     * while {@code request} runs. Builds {@code root/x/d/a.txt} and {@code base/outside/a.txt}.
+     *
+     * @param request fetches {@code /x/d/a.txt}; returns the status and the body text
+     */
+    public static RaceResult searchOnlyRace(Path base, Path root, java.time.Duration duration,
+            java.util.function.Function<String, java.util.Map.Entry<Integer, String>> request) throws Exception {
+        var outside = Files.createDirectories(base.resolve("outside"));
+        Files.writeString(outside.resolve("a.txt"), "SECRET-OUTSIDE-ROOT-0123456789");
+        var x = Files.createDirectories(root.resolve("x"));
+        var d = Files.createDirectories(x.resolve("d"));
+        Files.writeString(d.resolve("a.txt"), "public-inside-root-abcdefghijk");
+        var dReal = x.resolve("d.real");
+        Files.setPosixFilePermissions(x, PosixFilePermissions.fromString("-wx------"));
+        var stop = new java.util.concurrent.atomic.AtomicBoolean();
+        var flipper = Thread.ofPlatform().start(() -> {
+            while (!stop.get()) {
+                try {
+                    Files.move(d, dReal, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                    Files.createSymbolicLink(d, outside);
+                    Files.delete(d);
+                    Files.move(dReal, d, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                } catch (IOException e) {
+                    // lost a step of the race: keep flipping
+                }
+            }
+        });
+        int tries = 0;
+        int served = 0;
+        int denied = 0;
+        int leaked = 0;
+        long end = System.nanoTime() + duration.toNanos();
+        try {
+            while (System.nanoTime() < end) {
+                tries++;
+                var r = request.apply("/x/d/a.txt");
+                served += r.getKey() == 200 ? 1 : 0;
+                denied += r.getKey() == 403 ? 1 : 0;
+                leaked += r.getValue().contains("SECRET-OUTSIDE") ? 1 : 0;
+            }
+        } finally {
+            stop.set(true);
+            flipper.join();
+            Files.setPosixFilePermissions(x, PosixFilePermissions.fromString("rwx------"));
+        }
+        return new RaceResult(tries, served, denied, leaked);
+    }
+
+    /** V7 inverted over HTTP/1.1: by default nothing is served below the attacker's 311 directory, nothing leaks. */
+    @Test
+    void searchOnlyDirectoryCannotForceTheFallback() throws Exception {
+        Assumptions.assumeTrue(SafeOpen.SECURE);
+        var h = new StaticFileHandler(this.root);
+        var result = searchOnlyRace(this.base, this.root, java.time.Duration.ofSeconds(3), target -> {
+            try {
+                var wire = http1(h, target);
+                return java.util.Map.entry(Integer.parseInt(wire.substring(9, 12)), wire);
+            } catch (IOException e) {
+                return java.util.Map.entry(0, "");
+            }
+        });
+        assertEquals(0, result.leaked(), result.toString());
+        assertEquals(0, result.served(), "no 200 below a search-only directory: " + result);
+        assertTrue(result.denied() > 0, result.toString());
     }
 
     /** V3, second half: an open that fails after the handler's 200 is answered (403/404), not dropped. */
@@ -234,5 +332,8 @@ public class VerificationRegressionTest {
         assertTrue(SafeOpen.startupWarning(true).isEmpty());
         var w = SafeOpen.startupWarning(false).orElseThrow();
         assertTrue(w.contains("SecureDirectoryStream") && w.contains("untrusted"), w);
+        assertTrue(SafeOpen.unlistableWarning(false).isEmpty(), "V7: off by default, nothing to warn about");
+        var u = SafeOpen.unlistableWarning(true).orElseThrow();
+        assertTrue(u.contains("--allow-unlistable-dirs") && u.contains("weaker"), u);
     }
 }
