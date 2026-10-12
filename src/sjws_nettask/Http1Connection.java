@@ -25,6 +25,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import sjws_nettask.core.Handler;
@@ -85,6 +86,8 @@ final class Http1Connection implements Runnable {
      * are armed after start; null means this connection's {@link #handler}.
      */
     private final HandlerRef armed;
+    /** Null when HA is off: keep-alive never calls a supplier. */
+    private final BooleanSupplier closeAfterResponse;
     private final Http1Parser.HeadParser parser = new Http1Parser.HeadParser(CONSTANTS.MAX_LINE_LENGTH,
             CONSTANTS.MAX_HEADERS);
     /** Discards chunked request bodies (GET/HEAD) up to {@link CONSTANTS#MAX_DRAINED_BODY}. */
@@ -120,6 +123,15 @@ final class Http1Connection implements Runnable {
 
     Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper, HandlerRef armed) {
+        this(channel, handlers, extraHeaders, reaper, armed, null);
+    }
+
+    /**
+     * @param closeAfterResponse when non-null and true, this response is the last on the connection.
+     *        Null (clustering off) is never invoked
+     */
+    Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, HandlerRef armed, BooleanSupplier closeAfterResponse) {
         this.channel = channel;
         this.handlers = handlers;
         var peer = (InetSocketAddress) null;
@@ -138,6 +150,15 @@ final class Http1Connection implements Runnable {
         this.extraHeaders = extraHeaders;
         this.reaper = reaper;
         this.armed = armed;
+        this.closeAfterResponse = closeAfterResponse;
+    }
+
+    private boolean keep(boolean keepAlive) {
+        if (!keepAlive) {
+            return false;
+        }
+        var signal = this.closeAfterResponse;
+        return signal == null || !signal.getAsBoolean();
     }
 
     /**
@@ -276,13 +297,13 @@ final class Http1Connection implements Runnable {
         if (!core.headOnly() && !"GET".equals(core.method())) {
             // OPTIONS (200) or a known but unsupported method (405). Never read (possibly huge)
             // bodies just to reject them: keep the connection only if there is no body.
-            boolean keepAlive = request.keepAlive() && !request.hasBody();
+            boolean keepAlive = keep(request.keepAlive() && !request.hasBody());
             timer.processing();
             send(out, apply(core), keepAlive);
             return keepAlive;
         }
 
-        boolean keepAlive = request.keepAlive();
+        boolean keepAlive = keep(request.keepAlive());
         long length = request.contentLength();
         if (request.chunked()) {
             if (request.expectContinue()) {

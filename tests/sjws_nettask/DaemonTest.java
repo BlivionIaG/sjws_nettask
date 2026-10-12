@@ -698,6 +698,7 @@ class DaemonTest {
         PidFile.removeIfSame(snap, pid);
         assertTrue(Files.exists(pid), "content that changed after the snapshot is kept");
         Files.delete(pid);
+        PidFile.removeIfSame(snap, pid);
 
         var childPid = tmp.resolve("child.pid");
         var script = sleeperScript(tmp.resolve("detach-sleeper.sh"), false);

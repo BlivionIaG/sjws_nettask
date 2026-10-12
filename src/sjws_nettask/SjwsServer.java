@@ -27,7 +27,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
+import java.util.function.IntSupplier;
 import java.util.function.Supplier;
+import sjws_nettask.ha.HaRuntime;
+import sjws_nettask.ha.HaSettings;
 import sjws_nettask.acme.AcmeService;
 import sjws_nettask.acme.AcmeStore;
 import sjws_nettask.acme.ChallengeBoard;
@@ -76,6 +79,8 @@ public final class SjwsServer implements AutoCloseable {
      * Otherwise the chain, or a terminal that is not the static handler. Fixed at start.
      */
     private final Handler override;
+    /** Null when the server was started without {@link HaSettings}. */
+    private final HaRuntime ha;
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final ReentrantLock reloadLock = new ReentrantLock();
@@ -94,7 +99,8 @@ public final class SjwsServer implements AutoCloseable {
     private ChallengeHttpServer challengeHttp;
 
     private SjwsServer(ConfigSnapshot snapshot, ConfigReloader reloader, ChallengeBoard board,
-            RequestFilters filters, Function<StaticFileHandler, Handler> terminal) throws IOException {
+            RequestFilters filters, Function<StaticFileHandler, Handler> terminal, HaSettings haSettings)
+            throws IOException {
         this.live = new LiveConfig(snapshot);
         this.reloader = reloader;
         this.board = board;
@@ -109,7 +115,8 @@ public final class SjwsServer implements AutoCloseable {
         Handler selected;
         try {
             var files = snapshot.files();
-            var leaf = select(files, terminal);
+            Handler injected = haSettings == null ? null : haSettings.handler();
+            var leaf = injected != null ? injected : select(files, terminal);
             RequestFilters registry = filters;
             if (this.observingAtStart) {
                 // Order 0, added first, so it stays outermost among equal orders.
@@ -121,7 +128,7 @@ public final class SjwsServer implements AutoCloseable {
             // No caller filters: the observe chain reads the live snapshot, so a reload still
             // swaps the file handler. Caller filters keep the leaf they were compiled around.
             Handler chainLeaf = leaf;
-            if (this.observingAtStart && filters == null && leaf == files) {
+            if (this.observingAtStart && filters == null && injected == null && leaf == files) {
                 chainLeaf = request -> this.live.handler().handle(request);
             }
             built = registry == null ? null : registry.build(chainLeaf);
@@ -131,7 +138,22 @@ public final class SjwsServer implements AutoCloseable {
             throw e;
         }
         this.chain = built;
-        this.override = selected;
+        if (haSettings == null) {
+            this.ha = null;
+            this.override = selected;
+        } else {
+            // One handler read. The config snapshot is that handler until a generation is published.
+            Supplier<Handler> generationLeaf;
+            if (built != null) {
+                generationLeaf = () -> built;
+            } else if (selected != null) {
+                generationLeaf = () -> selected;
+            } else {
+                generationLeaf = this.live::handler;
+            }
+            this.ha = HaRuntime.create(haSettings, generationLeaf);
+            this.override = this.ha.handler();
+        }
         if (config.cacheBytes() > Runtime.getRuntime().maxMemory() / 2) {
             System.err.println("WARN: --cache-bytes=" + config.cacheBytes()
                     + " is more than half of the maximum heap (" + Runtime.getRuntime().maxMemory()
@@ -157,6 +179,11 @@ public final class SjwsServer implements AutoCloseable {
         return start(config, H3Transports.defaultFactory(), null, null);
     }
 
+    /** @param ha null leaves the server on the single-node path */
+    public static SjwsServer start(ServerConfig config, HaSettings ha) throws IOException {
+        return start(config, H3Transports.defaultFactory(), H2_FACTORY, null, null, ha);
+    }
+
     /**
      * @param h3Factory used only when {@code config.h3Enabled()}
      * @throws IOException if the TCP port cannot be bound (nothing is left running)
@@ -164,6 +191,11 @@ public final class SjwsServer implements AutoCloseable {
      */
     public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory) throws IOException {
         return start(config, h3Factory, null, null);
+    }
+
+    /** @param ha null leaves filters and the file handler on the single-node path */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, HaSettings ha) throws IOException {
+        return start(config, h3Factory, H2_FACTORY, null, null, ha);
     }
 
     /**
@@ -210,6 +242,15 @@ public final class SjwsServer implements AutoCloseable {
         return start(config, h3Factory, H2_FACTORY, filters, terminal);
     }
 
+    /**
+     * @param ha null leaves {@code filters} and {@code terminal} exactly as the single-node server does.
+     *        HTTP/2 uses {@link #H2_FACTORY}
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, RequestFilters filters,
+            Function<StaticFileHandler, Handler> terminal, HaSettings ha) throws IOException {
+        return start(config, h3Factory, H2_FACTORY, filters, terminal, ha);
+    }
+
     /** Creates the HTTP/2 transport (TLS + optional h2c, see {@link sjws_nettask.h2.Http2Server}). */
     public static final Transport.Factory H2_FACTORY = new Transport.Factory() {
         @Override
@@ -236,7 +277,17 @@ public final class SjwsServer implements AutoCloseable {
     /** As {@link #start(ServerConfig, Transport.Factory, RequestFilters, Function)}, with an HTTP/2 factory. */
     public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory,
             RequestFilters filters, Function<StaticFileHandler, Handler> terminal) throws IOException {
-        return start(ConfigLoader.standalone(config), h3Factory, h2Factory, filters, terminal);
+        return start(config, h3Factory, h2Factory, filters, terminal, null);
+    }
+
+    /**
+     * @param ha null leaves {@code filters} and {@code terminal} exactly as the single-node server does.
+     *        Non-null answers probes in the HA handler and reads the config snapshot for everything else
+     *        until a generation is published.
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory,
+            RequestFilters filters, Function<StaticFileHandler, Handler> terminal, HaSettings ha) throws IOException {
+        return start(ConfigLoader.standalone(config), h3Factory, h2Factory, filters, terminal, ha);
     }
 
     public static SjwsServer start(ConfigLoader.Loaded loaded) throws IOException {
@@ -250,9 +301,21 @@ public final class SjwsServer implements AutoCloseable {
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal)
             throws IOException {
+        return start(loaded, h3Factory, h2Factory, filters, terminal, null);
+    }
+
+    private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
+            Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
+            HaSettings ha) throws IOException {
         var board = new ChallengeBoard();
         var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
-        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal);
+        if (ha != null && ha.handler() instanceof StaticFileHandler injected) {
+            // A test or embedder supplied the file handler. Keep that instance as the snapshot
+            // instead of compiling a second one beside it.
+            Handler visible = snapshot.handler() == snapshot.files() ? injected : snapshot.handler();
+            snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation());
+        }
+        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha);
         if (snapshot.document().server().h3Enabled()) {
             server.startH3(h3Factory, storedCertificate(snapshot));
         }
@@ -269,6 +332,14 @@ public final class SjwsServer implements AutoCloseable {
         server.manager = new ClientManager(server.tcp, snapshot.document().server(), handlers, server.altSvc,
                 null, server.armed);
         server.attachGauges(server.slot.get().metrics());
+        if (server.ha != null) {
+            server.manager.setDrainSignal(server.ha.lifecycle()::closeAfterResponse);
+            server.manager.onAcceptLoopExit(() -> server.ha.health().setAlive(false));
+            IntSupplier pause = server.ha.settings().acceptPause();
+            if (pause != null) {
+                server.manager.setAcceptPause(pause);
+            }
+        }
         server.acceptThread = new Thread(server.manager, "accept-loop");
         server.acceptThread.start();
         try {
@@ -300,7 +371,10 @@ public final class SjwsServer implements AutoCloseable {
     private void startH3(Transport.Factory factory, TlsMaterial stored) {
         Transport transport = null;
         try {
-            transport = factory.create(config(), handler(), this.chain, this.override, this.slot);
+            // A non-null chain makes FilterChain.dispatch ignore the terminal. With HA attached the
+            // handler already wraps the chain, so HTTP/3 must see that handler and not the chain beside it.
+            FilterChain published = this.ha == null ? this.chain : null;
+            transport = factory.create(config(), handler(), published, this.override, this.slot);
             if (transport instanceof Http3Server http3) {
                 if (this.override == null) {
                     http3.replaceHandler(this.live.handler()::handle);
@@ -330,7 +404,8 @@ public final class SjwsServer implements AutoCloseable {
     private void startH2(Transport.Factory factory) {
         Transport transport = null;
         try {
-            transport = factory.create(config(), handler(), this.chain, this.override, this.slot);
+            FilterChain published = this.ha == null ? this.chain : null;
+            transport = factory.create(config(), handler(), published, this.override, this.slot);
             transport.start();
             this.h2 = transport;
         } catch (Exception | LinkageError e) {
@@ -466,6 +541,63 @@ public final class SjwsServer implements AutoCloseable {
 
     public StaticFileHandler handler() {
         return this.live.get().files();
+    }
+
+    /**
+     * Handler the listeners call. The live config snapshot when no filter chain, replacement
+     * terminal, or HA handler is installed, so that path is the concrete file-handler call.
+     */
+    public Handler requestHandler() {
+        if (this.ha != null) {
+            return this.ha.handler();
+        }
+        return this.override != null ? this.override : this.live.handler();
+    }
+
+    /** @return null when this server was started without {@link HaSettings} */
+    public HaRuntime ha() {
+        return this.ha;
+    }
+
+    /**
+     * LB deregistration delay, then stop accepting and finish in-flight work.
+     * With HA detached this is {@link #close()}.
+     */
+    public void drain() throws InterruptedException {
+        if (this.ha == null) {
+            close();
+            return;
+        }
+        this.ha.lifecycle().drain(this::stopAcceptingForDrain, this::awaitAcceptLoop);
+        close();
+    }
+
+    private void stopAcceptingForDrain() {
+        if (this.manager != null) {
+            this.manager.prepareGracefulDrain(this.ha.settings().drainTimeout().toMillis());
+            this.manager.expireIdleConnections();
+        }
+        if (this.h3 != null) {
+            this.h3.stopAccepting();
+        }
+        if (this.h2 != null) {
+            this.h2.stopAccepting();
+        }
+        if (this.manager != null) {
+            this.manager.stopAccepting();
+        }
+    }
+
+    private void awaitAcceptLoop() {
+        if (this.acceptThread == null) {
+            return;
+        }
+        try {
+            long wait = this.ha.settings().drainTimeout().toMillis() + 1_000;
+            this.acceptThread.join(wait);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**

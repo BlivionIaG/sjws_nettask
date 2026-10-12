@@ -177,6 +177,16 @@ final class ConnectionReaper implements AutoCloseable {
         }
     }
 
+    /** Ends idle keep-alives immediately. Connections in {@link State#PROCESSING} or writing are left alone. */
+    void expireIdle() {
+        for (var t : this.timers) {
+            if (t.state == State.IDLE) {
+                this.idleExpired.increment();
+                expire(t);
+            }
+        }
+    }
+
     /**
      * Ends idle and half-read connections immediately. A response already being handled
      * ({@link State#PROCESSING} or {@link State#WRITING}) is left alone until {@link #forceAll()}.
