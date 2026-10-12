@@ -393,7 +393,8 @@ class ObservabilityTest {
                 assertEquals(200, ok.statusCode());
                 var snap = server.metrics().snapshot();
                 assertTrue(snap.http1Connections() >= 1, "gauge while the connection is open: " + snap.http1Connections());
-                assertTrue(snap.requests() >= 1);
+                awaitRequests(server, 1);
+                assertTrue(server.metrics().snapshot().requests() >= 1);
                 assertEquals(1, snap.protocol("HTTP/1.1"));
             }
             var health = HttpTestSupport.get(server.tcpPort(), "/healthz", 2000);
@@ -431,6 +432,7 @@ class ObservabilityTest {
             assertFalse(plain.describe().contains("healthz"), plain.describe());
             assertEquals(0, plain.metricsSnapshot().requests(), "arming counts only later requests");
             HttpTestSupport.get(plain.tcpPort(), "/index.html", 2000);
+            awaitRequests(plain, 1);
             assertTrue(plain.metrics().snapshot().requests() >= 1);
             var stillFile = HttpTestSupport.get(plain.tcpPort(), "/healthz", 2000);
             assertEquals("from-disk\n", stillFile.bodyText(), "arming counters does not take /healthz");
@@ -446,6 +448,7 @@ class ObservabilityTest {
             var health = HttpTestSupport.get(probe.tcpPort(), "/healthz", 2000);
             assertEquals(200, health.statusCode());
             assertEquals("ok\n", health.bodyText());
+            awaitRequests(probe, 1);
             assertTrue(probe.metrics().snapshot().requests() >= 1);
             assertTrue(probe.describe().contains("healthz"), probe.describe());
         }
@@ -510,6 +513,17 @@ class ObservabilityTest {
         var raw = new byte[data.remaining()];
         data.get(raw);
         return new String(raw, charset);
+    }
+
+    /**
+     * The connection thread updates counters after the response bytes are written, so a client can
+     * finish reading before {@code requests()} moves.
+     */
+    private static void awaitRequests(SjwsServer server, long minimum) throws InterruptedException {
+        long deadline = System.nanoTime() + 1_000_000_000L;
+        while (server.metrics().snapshot().requests() < minimum && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
     }
 
     private static String line(AccessLogFormat format, int status, long bytes, long nanos, String referer, String ua) {
