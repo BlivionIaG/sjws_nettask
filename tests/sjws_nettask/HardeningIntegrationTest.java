@@ -350,6 +350,7 @@ class HardeningIntegrationTest {
     }
 
     @Test
+    @org.junit.jupiter.api.Timeout(30) // waitForLine blocks on the child's output
     void h3BusyUdpPortFallsBackToHttp1() throws Exception {
         Files.writeString(root.resolve("hello.txt"), "hello");
         int port;
@@ -361,7 +362,7 @@ class HardeningIntegrationTest {
         try {
             try (var busyUdp = new java.net.DatagramSocket(port)) {
                 p = launch(String.valueOf(port), root.toString(), "--h3");
-                waitForLine(p, "HTTP/1.1 on tcp/");
+                waitForLine(p, "Server started: HTTP/1.1 on tcp/");
             }
             var log = this.lastLog;
             assertTrue(log.toString().contains("WARN: HTTP/3 not started"), log.toString());
