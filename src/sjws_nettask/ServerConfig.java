@@ -50,7 +50,7 @@ import sjws_nettask.core.AccessRules;
  * @param cacheBytes small-file cache budget in bytes (0 = disabled), see {@code core.FileCache}
  * @param accessLog "-" for stdout, a file path to append, or null for off
  * @param altSvc send {@code Alt-Svc} on HTTP/1.1 responses once HTTP/3 is bound (opt-in: browsers
- *        ignore it on plain http:// origins, see the README)
+ *        ignore it on plain http:// origins, see docs/user/http3.md)
  * @param maxConnectionsPerIp concurrent HTTP/1.1 connections from one client IP address (generous:
  *        browsers open ~6 per host, and many users may share one NAT address)
  * @param h3MaxConnectionsPerIp established QUIC connections from one client IP address (a browser
@@ -376,7 +376,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --allow-dotfiles          serve names starting with '.' (off: 404)      WEB_SERVER_ALLOW_DOTFILES
                   --require-owner=USER      serve only files owned by USER (name or uid)  WEB_SERVER_REQUIRE_OWNER
                   --require-world-readable  serve only files with mode o+r (off)          WEB_SERVER_REQUIRE_WORLD_READABLE
-                  --config=PATH             YAML configuration file (see docs/config.md)  WEB_SERVER_CONFIG
+                  --config=PATH             YAML config file (docs/user/config-file.md)   WEB_SERVER_CONFIG
                   --acme | --no-acme        ACME certificate issuance (off; staging CA)   WEB_SERVER_ACME=true|false
                   --acme-directory=URL      staging, production, or a directory URL       WEB_SERVER_ACME_DIRECTORY
                   --acme-email=ADDR         account contact email                         WEB_SERVER_ACME_EMAIL

@@ -5,13 +5,14 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.Test;
 
-/** S6: the README's option tables, {@code --help} and the coverage gates can't drift apart silently. */
+/** S6: the documented option tables, {@code --help} and the coverage gates can't drift apart silently. */
 class DocsConsistencyTest {
 
     private static final Pattern FLAG = Pattern.compile("--[a-z0-9]+(?:-[a-z0-9]+)*");
@@ -21,19 +22,28 @@ class DocsConsistencyTest {
         return p.matcher(text).results().map(m -> m.group()).collect(Collectors.toCollection(TreeSet::new));
     }
 
-    /** The README's option tables: table rows whose first cell names an option or an argument. */
+    /** The docs pages that hold the option tables (moved out of the README into docs/). */
+    static final List<Path> OPTION_DOCS = List.of(Path.of("docs/user/command-line.md"),
+            Path.of("docs/user/http2.md"), Path.of("docs/user/http3.md"),
+            Path.of("docs/operations/observability.md"));
+
+    /** The option tables: table rows whose first cell names an option or an argument. */
     private static String readmeOptionRows() throws IOException {
-        return Files.readAllLines(Path.of("README.md")).stream()
-                .filter(l -> l.startsWith("| `-") || l.startsWith("| `[") || l.startsWith("| |"))
-                .collect(Collectors.joining("\n"));
+        var rows = new java.util.ArrayList<String>();
+        for (var doc : OPTION_DOCS) {
+            Files.readAllLines(doc).stream()
+                    .filter(l -> l.startsWith("| `-") || l.startsWith("| `[") || l.startsWith("| |"))
+                    .forEach(rows::add);
+        }
+        return String.join("\n", rows);
     }
 
     @Test
     void everyOptionAndVariableIsDocumentedInBothPlaces() throws IOException {
         var usage = Sjws_nettask.usage();
         var readme = readmeOptionRows();
-        assertEquals(all(FLAG, usage), all(FLAG, readme), "--flags: --help vs README option tables");
-        assertEquals(all(ENV, usage), all(ENV, readme), "environment variables: --help vs README option tables");
+        assertEquals(all(FLAG, usage), all(FLAG, readme), "--flags: --help vs docs option tables");
+        assertEquals(all(ENV, usage), all(ENV, readme), "environment variables: --help vs docs option tables");
         assertTrue(all(FLAG, usage).size() >= 20, "sanity: " + all(FLAG, usage));
     }
 

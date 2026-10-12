@@ -1,7 +1,7 @@
 name: Release
 
 # Push a tag `vX.Y.Z` (or `vX.Y.Z-rc.N`) to build, verify and publish a GitHub Release.
-# See RELEASING.md.
+# See docs/operations/releasing.md.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']

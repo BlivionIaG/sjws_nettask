@@ -18,7 +18,7 @@ concurrency:
 jobs:
   verify:
     # macOS (QUIC natives load there) runs on manual dispatch only: three Linux-specific
-    # expectations still fail on it (see tests/README.md, "Known platform gaps").
+    # expectations still fail on it (see docs/development/testing.md, "Known platform gaps").
     if: github.event_name != 'schedule'
     strategy:
       fail-fast: false

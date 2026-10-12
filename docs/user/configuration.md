@@ -1,9 +1,9 @@
 # Configuration reference
 
 The canonical list of options, environment variables and defaults is the option tables in the
-[README](../README.md#sjws_nettask) (HTTP/1.1 options and the [HTTP/3](../README.md#http3) table);
+[command-line page](command-line.md) (HTTP/1.1 options and the [HTTP/3](http3.md) table);
 `java -jar sjws_nettask-<version>.jar --help` prints the same list. `DocsConsistencyTest` fails the
-build if the README tables and `--help` disagree. This page explains how values are read.
+build if those tables and `--help` disagree. This page explains how values are read.
 
 ## Sources and precedence
 
@@ -23,7 +23,7 @@ build if the README tables and `--help` disagree. This page explains how values 
 | numbers (ports, counts, seconds, bytes/s) | 1 to 9 decimal digits, within the option's range | `8080`, `30` |
 | byte sizes (`--cache-bytes`) | digits with an optional binary suffix `k`/`m`/`g` (case-insensitive), at most `16g` | `0`, `65536`, `64k`, `64m`, `1g` |
 | booleans (`WEB_SERVER_H3`, `WEB_SERVER_ALT_SVC`, ...) | `true/false`, `1/0`, `yes/no`, `on/off` (case-insensitive) | `on` |
-| flags on the command line | `--x` / `--no-x` where the README lists both | `--h3`, `--no-alt-svc` |
+| flags on the command line | `--x` / `--no-x` where the option tables list both | `--h3`, `--no-alt-svc` |
 | paths | any non-blank value | `--cert=/etc/sjws/cert.pem` |
 
 An invalid value is replaced by the default and a `WARN:` line names it; unknown options also warn
@@ -54,5 +54,5 @@ An invalid value is replaced by the default and a `WARN:` line names it; unknown
         443 /srv/www --h3 --cert=/etc/sjws/cert.pem --key=/etc/sjws/key.pem --alt-svc
 
 Copy `target/lib/` next to the jar: it holds Netty and the QUIC natives named in the manifest
-`Class-Path`. See the README's [Platform notes](../README.md#platform-notes) for
-`--allow-unlistable-dirs` and the [HTTP/3](../README.md#http3) section for reaching HTTP/3 from clients.
+`Class-Path`. See the [Platform notes](platform-notes.md) for
+`--allow-unlistable-dirs` and the [HTTP/3](http3.md) section for reaching HTTP/3 from clients.

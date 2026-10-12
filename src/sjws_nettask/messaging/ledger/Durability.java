@@ -1,7 +1,7 @@
 package sjws_nettask.messaging.ledger;
 
 /**
- * When an append is acknowledged relative to fsync (docs/design/messaging.md §2.2, ARCHITECTURE.md T3).
+ * When an append is acknowledged relative to fsync (docs/messaging/design.md §2.2, docs/design/architecture.md T3).
  * Usable as a writer default and as a per-append override.
  */
 public enum Durability {

@@ -23,7 +23,7 @@ Out of scope (owned by other workstreams, consumed here as interfaces this works
 config file format and ACME (`ConfigSource`, `CertProvider`), reverse proxy, the observability
 backend (`MetricsSink`), daemon/service mode (signals, PID), and the CI workflow. `HaSettings`
 is attached in code (`SjwsServer.start(config, ha)`). This workstream does not add flags to
-`ServerConfig` — that parser, `--help`, and the README option tables stay with the config
+`ServerConfig` — that parser, `--help`, and the docs option tables stay with the config
 workstream. The process shutdown hook in `Sjws_nettask.serve` still calls `close()`; signal
 wiring that should drain instead belongs to daemon mode, which can call `Lifecycle.drain()`.
 
@@ -349,7 +349,7 @@ group.
 ## Decisions for PR #16
 
 Answers to the High Availability questions in
-[PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) (`ARCHITECTURE.md` §A).
+[PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) (`docs/design/architecture.md` §A).
 PR #16's T4 asks for a choice; this section is that choice.
 
 1. **Witness for 2-node mode: yes.** Dual-node HA includes a third lightweight witness.
