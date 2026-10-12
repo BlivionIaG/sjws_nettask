@@ -83,8 +83,9 @@ percent-decoded.
 
 ## Configuration hook
 
-This server does not read a config file. The configuration workstream parses a `middleware` list
-into `MiddlewareSpec` and passes it here after binding each name:
+The config file parses a `middleware` list into `MiddlewareSpec` and stores it on the
+snapshot. It does not call `addAll` (no factories are bound at startup, so an unknown name
+would fail the build). A caller that has bound factories passes the list itself:
 
 ```java
 var filters = RequestFilters.create()

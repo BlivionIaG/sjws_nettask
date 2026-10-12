@@ -59,6 +59,8 @@ import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserverSlot;
+import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.tls.SwappableKeyManager;
 import sjws_nettask.tls.TlsMaterial;
 
@@ -99,6 +101,8 @@ public final class Http3Server implements Transport {
 
     private final ServerConfig config;
     private final AtomicReference<Function<Request, Response>> handlers;
+    /** Copied into every request only when a chain or a non-static terminal is installed. */
+    private final boolean captureFields;
     private final Map<QuicChannel, Connection> state = new ConcurrentHashMap<>();
     private final BooleanSupplier available;
     private final Supplier<Throwable> unavailabilityCause;
@@ -323,7 +327,7 @@ public final class Http3Server implements Transport {
             this.perIp = new sjws_nettask.core.PerIpLimit(this.limits.connectionsPerIp());
             this.shared = new Shared(request -> this.handlers.get().apply(request), this.executor, this.limits,
                     new Semaphore(this.limits.maxInflight()),
-                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes);
+                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.captureFields, this.slot);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             var codec = Http3.newQuicServerCodecBuilder()
                     .sslContext(ssl)

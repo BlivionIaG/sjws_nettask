@@ -19,6 +19,7 @@ package sjws_nettask.config;
 import java.nio.file.Path;
 import java.util.List;
 import sjws_nettask.ServerConfig;
+import sjws_nettask.core.MiddlewareSpec;
 
 /**
  * One validated configuration: server settings plus the sections other workstreams fill in.

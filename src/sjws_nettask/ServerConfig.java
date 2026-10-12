@@ -353,6 +353,16 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --alt-svc-max-age=S       Alt-Svc max-age, seconds (86400)              WEB_SERVER_ALT_SVC_MA
                   --allow-unlistable-dirs   serve below unreadable (--x) directories by   WEB_SERVER_ALLOW_UNLISTABLE_DIRS
                                             path (weaker against local writers; off: 403)
+                  --access-log=PATH         access log: - is stdout, or a file to append  WEB_SERVER_ACCESS_LOG
+                                            (unset: off). One line per response, written
+                                            off the request thread
+                  --access-log-format=FMT   common, combined (default) or json           WEB_SERVER_ACCESS_LOG_FORMAT
+                  --metrics[=MODE]          /metrics: off (default), localhost or on     WEB_SERVER_METRICS
+                                            (a bare --metrics means localhost)
+                  --no-metrics              leave /metrics disabled
+                  --healthz | --no-healthz  GET/HEAD /healthz answers "ok" (off).        WEB_SERVER_HEALTHZ=true|false
+                                            Off: a document-root file at /healthz is
+                                            served. On also turns request counters on
                   --config=PATH             YAML configuration file (see docs/config.md)  WEB_SERVER_CONFIG
                   --acme | --no-acme        ACME certificate issuance (off; staging CA)   WEB_SERVER_ACME=true|false
                   --acme-directory=URL      staging, production, or a directory URL       WEB_SERVER_ACME_DIRECTORY
@@ -434,6 +444,10 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String passwordFile = null;
         String accessLog = base == null ? null : base.accessLog();
         long altSvc = (base == null ? DEFAULT_ALT_SVC_MAX_AGE : base.altSvcMaxAge()).toSeconds();
+        var accessLogFormat = base == null ? AccessLogFormat.COMBINED : base.accessLogFormat();
+        var metricsExposure = base == null ? MetricsExposure.OFF : base.metricsExposure();
+        boolean healthz = base != null && base.healthz();
+        boolean accessLogFormatSet = false;
         var explicitH3Options = new ArrayList<String>();
         boolean h2 = false;
         int h2Port = DEFAULT_H2_PORT;
@@ -700,7 +714,10 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 .writeTimeout(Duration.ofSeconds(write)).cacheBytes(cache).altSvc(altSvcOn).allowUnlistableDirs(unlistable)
                 .h3Enabled(h3).h3Port(h3Port).h3Host(h3Host).h3MaxConnections(h3Max)
                 .tlsCert(cert == null ? null : Path.of(cert)).tlsKey(key == null ? null : Path.of(key))
-                .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc)).accessLog(accessLog).build();
+                .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc))
+                .accessLog(accessLog).accessLogFormat(accessLogFormat).metricsExposure(metricsExposure)
+                .healthz(healthz)
+                .h2Enabled(h2).h2Port(h2Port).h2cPort(h2 ? h2cPort : H2C_DISABLED).build();
         return new Parsed(config, List.copyOf(warnings), List.copyOf(errors), help);
     }
 

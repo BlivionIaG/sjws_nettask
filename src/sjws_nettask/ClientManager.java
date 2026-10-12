@@ -50,6 +50,10 @@ public class ClientManager implements Runnable {
 
     private final ServerSocketChannel server;
     private final ServerConfig config;
+    /**
+     * Read once per request. A fixed filter chain or other terminal is captured here at
+     * construction; a null override keeps the live snapshot supplier.
+     */
     private final Supplier<Handler> handlers;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ObserverSlot slot;
@@ -81,7 +85,16 @@ public class ClientManager implements Runnable {
     /** Shares {@code handler} with other transports (HTTP/3). */
     public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
             Supplier<ResponseHeaders> extraHeaders) {
-        this(server, config, () -> handler, extraHeaders);
+        this(server, config, handler, extraHeaders, null, new ObserverSlot(RequestObserver.NONE));
+    }
+
+    /**
+     * @param override compiled filters or another terminal handler, or null to call {@code handler}
+     *        directly
+     */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, Handler override) {
+        this(server, config, handler, extraHeaders, override, new ObserverSlot(RequestObserver.NONE));
     }
 
     /**
@@ -90,9 +103,58 @@ public class ClientManager implements Runnable {
      */
     public ClientManager(ServerSocketChannel server, ServerConfig config, Supplier<Handler> handlers,
             Supplier<ResponseHeaders> extraHeaders) {
+        this(server, config, handlers, extraHeaders, null, new ObserverSlot(RequestObserver.NONE));
+    }
+
+    /** Shares {@code handler} and one {@link RequestObserver} with other transports. */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, RequestObserver observer) {
+        this(server, config, handler, extraHeaders, null, new ObserverSlot(observer));
+    }
+
+    /** Shares one {@link ObserverSlot} with other transports. */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, Supplier<Handler> handlers,
+            Supplier<ResponseHeaders> extraHeaders, RequestObserver observer) {
+        this(server, config, handlers, extraHeaders, null, new ObserverSlot(observer));
+    }
+
+    /** Shares {@code handler} and the server's {@link ObserverSlot} with other transports. */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, ObserverSlot slot) {
+        this(server, config, handler, extraHeaders, null, slot);
+    }
+
+    /**
+     * @param override compiled filters or another terminal, or null to call {@code handler} directly
+     * @param observer {@link RequestObserver#NONE} leaves the hook off the request path
+     */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, Handler override, RequestObserver observer) {
+        this(server, config, handler, extraHeaders, override, new ObserverSlot(observer));
+    }
+
+    /**
+     * {@code handlers} is read once per request. {@code slot} is the same observer HTTP/3 reads.
+     */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, Supplier<Handler> handlers,
+            Supplier<ResponseHeaders> extraHeaders, ObserverSlot slot) {
+        this(server, config, handlers, extraHeaders, null, slot);
+    }
+
+    /**
+     * @param override compiled filters or another terminal, or null to call {@code handler} directly
+     * @param slot shared observer slot
+     */
+    public ClientManager(ServerSocketChannel server, ServerConfig config, StaticFileHandler handler,
+            Supplier<ResponseHeaders> extraHeaders, Handler override, ObserverSlot slot) {
+        this(server, config, () -> handler, extraHeaders, override, slot);
+    }
+
+    private ClientManager(ServerSocketChannel server, ServerConfig config, Supplier<Handler> handlers,
+            Supplier<ResponseHeaders> extraHeaders, Handler override, ObserverSlot slot) {
         this.server = server;
         this.config = config;
-        this.handlers = handlers;
+        this.handlers = override != null ? () -> override : handlers;
         this.extraHeaders = extraHeaders;
         this.slot = java.util.Objects.requireNonNull(slot, "slot");
         this.permits = new Semaphore(config.maxConnections());
@@ -185,7 +247,8 @@ public class ClientManager implements Runnable {
                 // never rejected: the executor is shut down only after this loop
                 executor.execute(() -> {
                     try {
-                        new Http1Connection(socket, this.handlers, this.extraHeaders, deadlines).run();
+                        new Http1Connection(socket, this.handlers, this.extraHeaders, deadlines, this.slot, host,
+                                loopback).run();
                     } finally {
                         this.active.decrementAndGet();
                         this.perIp.release(address);

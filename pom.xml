@@ -47,6 +47,11 @@
       <groupId>io.netty</groupId>
       <artifactId>netty-codec-http3</artifactId>
     </dependency>
+    <!-- HTTP/2 (TLS with ALPN, h2c): same Netty version as HTTP/3, via the BOM. -->
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-codec-http2</artifactId>
+    </dependency>
     <!-- One config file. YAML, because the routing workstream's schema is YAML and must
          paste in unchanged. SafeConstructor only: no arbitrary types. -->
     <dependency>
@@ -130,7 +135,8 @@
             <goals><goal>report</goal></goals>
           </execution>
           <!-- Gate: per-package rules, set ~1-2 points under measured coverage (2026-10-12).
-               Root after the daemon merge is about 96.7/95.6. config 83.6/69.5, acme 86.8/68.6. -->
+               Root after the daemon merge is about 96.7/95.6. config 83.6/69.5, acme 86.8/68.6.
+               observe 97.0/88.3. -->
           <execution>
             <id>check</id>
             <phase>verify</phase>

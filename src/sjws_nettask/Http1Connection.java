@@ -75,7 +75,11 @@ final class Http1Connection implements Runnable {
     private static final byte[] CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final SocketChannel channel;
+    /** One read per request: the live snapshot, or a filter chain captured at accept. */
     private final Supplier<Handler> handlers;
+    private final InetSocketAddress peer;
+    /** Captured with {@link #peer} for the failure log; the channel may already be closed by then. */
+    private final String remote;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ConnectionReaper reaper;
     private final ObserverSlot slot;
@@ -106,14 +110,46 @@ final class Http1Connection implements Runnable {
      */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
-        this(channel, () -> handler, extraHeaders, reaper);
+        this(channel, handler, extraHeaders, reaper, RequestObserver.NONE, "0.0.0.0", false);
     }
 
     /** {@code handlers.get()} is one volatile read of the current snapshot handler, per request. */
     Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper) {
+        this(channel, handlers, extraHeaders, reaper, new ObserverSlot(RequestObserver.NONE), "0.0.0.0", false);
+    }
+
+    /**
+     * @param clientHost numeric peer address, captured once at accept (never a DNS name)
+     * @param loopback peer is a loopback address; gates {@code /metrics} when it is localhost-only
+     */
+    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, RequestObserver observer, String clientHost, boolean loopback) {
+        this(channel, () -> handler, extraHeaders, reaper, new ObserverSlot(observer), clientHost, loopback);
+    }
+
+    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, ObserverSlot slot, String clientHost, boolean loopback) {
+        this(channel, () -> handler, extraHeaders, reaper, slot, clientHost, loopback);
+    }
+
+    Http1Connection(SocketChannel channel, Supplier<Handler> handlers, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, ObserverSlot slot, String clientHost, boolean loopback) {
         this.channel = channel;
         this.handlers = handlers;
+        var peer = (InetSocketAddress) null;
+        var remote = "(closed)";
+        try {
+            SocketAddress address = channel.getRemoteAddress();
+            remote = String.valueOf(address);
+            if (address instanceof InetSocketAddress inet) {
+                peer = inet;
+            }
+        } catch (IOException e) {
+            // already closed
+        }
+        this.peer = peer;
+        this.remote = remote;
         this.extraHeaders = extraHeaders;
         this.reaper = reaper;
         this.slot = java.util.Objects.requireNonNull(slot, "slot");
@@ -122,16 +158,15 @@ final class Http1Connection implements Runnable {
     }
 
     /**
-     * Static files: one null test, then {@link StaticFileHandler#handle}. Anything else (a filter
-     * chain, a router, a test double) goes through {@link Handler}. The choice is fixed for the
-     * life of the connection.
+     * One snapshot read. A {@link StaticFileHandler} is called directly; a filter chain, a router
+     * or a test double goes through {@link Handler}.
      */
     private Response apply(Request request) {
-        var files = this.files;
-        if (files != null) {
+        var handler = this.handlers.get();
+        if (handler instanceof StaticFileHandler files) {
             return files.handle(request);
         }
-        return this.handler.handle(request);
+        return handler.handle(request);
     }
 
     @Override
@@ -268,7 +303,7 @@ final class Http1Connection implements Runnable {
             // bodies just to reject them: keep the connection only if there is no body.
             boolean keepAlive = request.keepAlive() && !request.hasBody();
             timer.processing();
-            send(out, this.handlers.get().handle(core), keepAlive);
+            send(out, respond(core), keepAlive);
             return keepAlive;
         }
 
@@ -307,7 +342,7 @@ final class Http1Connection implements Runnable {
         }
         timer.processing();
 
-        send(out, this.handlers.get().handle(core), keepAlive);
+        send(out, respond(core), keepAlive);
         return keepAlive;
     }
 

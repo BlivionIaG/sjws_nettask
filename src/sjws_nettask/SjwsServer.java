@@ -20,9 +20,14 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import sjws_nettask.acme.AcmeService;
 import sjws_nettask.acme.AcmeStore;
 import sjws_nettask.acme.ChallengeBoard;
@@ -32,8 +37,15 @@ import sjws_nettask.config.ConfigReloader;
 import sjws_nettask.config.ConfigSnapshot;
 import sjws_nettask.config.LiveConfig;
 import sjws_nettask.config.ReloadResult;
+import sjws_nettask.core.FilterChain;
+import sjws_nettask.core.Handler;
+import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.h3.Http3Server;
+import sjws_nettask.observe.ObserverSlot;
+import sjws_nettask.observe.RequestObserver;
+import sjws_nettask.observe.ServerMetrics;
+import sjws_nettask.observe.Snapshot;
 import sjws_nettask.tls.TlsMaterial;
 
 /**
@@ -50,9 +62,21 @@ public final class SjwsServer implements AutoCloseable {
     private final LiveConfig live;
     private final ConfigReloader reloader;
     private final ChallengeBoard board;
+    private final ObserverSlot slot;
+    /** Null when no filters were registered. */
+    private final FilterChain chain;
+    /**
+     * What HTTP/1.1 calls instead of the live snapshot. Null means the snapshot handler
+     * (a concrete {@link StaticFileHandler#handle} when that is what the snapshot holds).
+     * Otherwise the chain, or a terminal that is not the static handler. Fixed at start.
+     */
+    private final Handler override;
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final ReentrantLock reloadLock = new ReentrantLock();
+    /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
+    private final CountDownLatch shutdownDone = new CountDownLatch(1);
+    private volatile Duration shutdownTimeout = Daemon.DEFAULT_SHUTDOWN_TIMEOUT;
     private Transport h3;
     private Throwable h3Failure;
     private Transport h2;
@@ -64,11 +88,30 @@ public final class SjwsServer implements AutoCloseable {
     private AcmeService acme;
     private ChallengeHttpServer challengeHttp;
 
-    private SjwsServer(ConfigSnapshot snapshot, ConfigReloader reloader, ChallengeBoard board) {
+    private SjwsServer(ConfigSnapshot snapshot, ConfigReloader reloader, ChallengeBoard board,
+            RequestFilters filters, Function<StaticFileHandler, Handler> terminal) throws IOException {
         this.live = new LiveConfig(snapshot);
         this.reloader = reloader;
         this.board = board;
         var config = snapshot.document().server();
+        RequestObserver initial = RequestObserver.NONE;
+        if (config.observe()) {
+            initial = RequestObserver.open(config);
+        }
+        this.slot = new ObserverSlot(initial);
+        FilterChain built;
+        Handler selected;
+        try {
+            var files = snapshot.files();
+            var leaf = select(files, terminal);
+            built = filters == null ? null : filters.build(leaf);
+            selected = built != null ? built : (leaf == files ? null : leaf);
+        } catch (RuntimeException e) {
+            this.slot.close();
+            throw e;
+        }
+        this.chain = built;
+        this.override = selected;
         if (config.cacheBytes() > Runtime.getRuntime().maxMemory() / 2) {
             System.err.println("WARN: --cache-bytes=" + config.cacheBytes()
                     + " is more than half of the maximum heap (" + Runtime.getRuntime().maxMemory()
@@ -100,7 +143,80 @@ public final class SjwsServer implements AutoCloseable {
      * @throws java.io.UncheckedIOException if the document root is not a directory
      */
     public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory) throws IOException {
-        return start(ConfigLoader.standalone(config), h3Factory);
+        return start(config, h3Factory, null, null);
+    }
+
+    /**
+     * HTTP/1.1 and HTTP/3 share {@code filters}. Null or empty leaves the static file handler
+     * on the hot path ({@link #filterChain()} stays null).
+     */
+    public static SjwsServer start(ServerConfig config, RequestFilters filters) throws IOException {
+        return start(config, H3Transports.defaultFactory(), filters, null);
+    }
+
+    /**
+     * @param terminal chooses the handler filters wrap (a router around {@code files}, or {@code files}
+     *        itself). Null keeps the static file handler. Per-route filters wrap that route's own
+     *        handler with {@link RequestFilters#wrapping} and do not use this selector
+     */
+    public static SjwsServer start(ServerConfig config, RequestFilters filters,
+            Function<StaticFileHandler, Handler> terminal) throws IOException {
+        return start(config, H3Transports.defaultFactory(), filters, terminal);
+    }
+
+    /**
+     * @param h3Factory used only when {@code config.h3Enabled()}
+     * @param filters request filters, or null; compiled once here and passed to both transports
+     * @throws IOException if the TCP port cannot be bound (nothing is left running)
+     * @throws java.io.UncheckedIOException if the document root is not a directory
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, RequestFilters filters)
+            throws IOException {
+        return start(config, h3Factory, filters, null);
+    }
+
+    /**
+     * @param h3Factory used only when {@code config.h3Enabled()}
+     * @param filters request filters, or null; compiled once here around {@code terminal} and passed
+     *        to both transports
+     * @param terminal chooses the leaf handler, or null for the static file handler. Filters wrap
+     *        that leaf. When this returns the static handler and {@code filters} is null or empty,
+     *        neither transport enters {@link FilterChain}
+     * @throws IOException if the TCP port cannot be bound (nothing is left running)
+     * @throws java.io.UncheckedIOException if the document root is not a directory
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, RequestFilters filters,
+            Function<StaticFileHandler, Handler> terminal) throws IOException {
+        return start(config, h3Factory, H2_FACTORY, filters, terminal);
+    }
+
+    /** Creates the HTTP/2 transport (TLS + optional h2c, see {@link sjws_nettask.h2.Http2Server}). */
+    public static final Transport.Factory H2_FACTORY = new Transport.Factory() {
+        @Override
+        public Transport create(ServerConfig config, StaticFileHandler handler) {
+            return new sjws_nettask.h2.Http2Server(config, handler);
+        }
+
+        /** HTTP/2 serves what HTTP/1.1 serves: the filter chain / router when there is one. */
+        @Override
+        public Transport create(ServerConfig config, StaticFileHandler handler, FilterChain chain, Handler terminal) {
+            return new sjws_nettask.h2.Http2Server(config, terminal != null ? terminal : handler);
+        }
+    };
+
+    /**
+     * @param h2Factory used only when {@code config.h2Enabled()}; HTTP/2 has its own port, so the
+     *        HTTP/1.1 listener and its connections are unchanged by it
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory)
+            throws IOException {
+        return start(config, h3Factory, h2Factory, null, null);
+    }
+
+    /** As {@link #start(ServerConfig, Transport.Factory, RequestFilters, Function)}, with an HTTP/2 factory. */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory,
+            RequestFilters filters, Function<StaticFileHandler, Handler> terminal) throws IOException {
+        return start(ConfigLoader.standalone(config), h3Factory, h2Factory, filters, terminal);
     }
 
     public static SjwsServer start(ConfigLoader.Loaded loaded) throws IOException {
@@ -108,13 +224,19 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory) throws IOException {
+        return start(loaded, h3Factory, H2_FACTORY, null, null);
+    }
+
+    private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
+            Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal)
+            throws IOException {
         var board = new ChallengeBoard();
         var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
-        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board);
+        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal);
         if (snapshot.document().server().h3Enabled()) {
             server.startH3(h3Factory, storedCertificate(snapshot));
         }
-        if (config.h2Enabled()) {
+        if (snapshot.document().server().h2Enabled()) {
             server.startH2(h2Factory);
         }
         try {
@@ -123,8 +245,10 @@ public final class SjwsServer implements AutoCloseable {
             server.close();
             throw e;
         }
-        server.manager = new ClientManager(server.tcp, snapshot.document().server(), server.live::handler,
-                server.altSvc);
+        Supplier<Handler> handlers = server.override != null ? () -> server.override : server.live::handler;
+        server.manager = new ClientManager(server.tcp, snapshot.document().server(), handlers, server.altSvc,
+                server.slot);
+        server.attachGauges(server.slot.get().metrics());
         server.acceptThread = new Thread(server.manager, "accept-loop");
         server.acceptThread.start();
         try {
@@ -156,9 +280,11 @@ public final class SjwsServer implements AutoCloseable {
     private void startH3(Transport.Factory factory, TlsMaterial stored) {
         Transport transport = null;
         try {
-            transport = factory.create(config(), handler());
+            transport = factory.create(config(), handler(), this.chain, this.override, this.slot);
             if (transport instanceof Http3Server http3) {
-                http3.replaceHandler(this.live.handler()::handle);
+                if (this.override == null) {
+                    http3.replaceHandler(this.live.handler()::handle);
+                }
                 if (stored != null) {
                     http3.replaceTls(stored);
                 }
@@ -178,6 +304,25 @@ public final class SjwsServer implements AutoCloseable {
                 }
             }
             System.err.println("WARN: HTTP/3 not started, serving HTTP/1.1 only (no Alt-Svc): " + e);
+        }
+    }
+
+    private void startH2(Transport.Factory factory) {
+        Transport transport = null;
+        try {
+            transport = factory.create(config(), handler(), this.chain, this.override, this.slot);
+            transport.start();
+            this.h2 = transport;
+        } catch (Exception | LinkageError e) {
+            this.h2Failure = e;
+            if (transport != null) {
+                try {
+                    transport.close();
+                } catch (RuntimeException suppressed) {
+                    e.addSuppressed(suppressed);
+                }
+            }
+            System.err.println("WARN: HTTP/2 not started: " + e);
         }
     }
 
@@ -269,7 +414,9 @@ public final class SjwsServer implements AutoCloseable {
             this.manager.reaper().update(server.idleTimeout(), server.headerTimeout(), server.writeTimeout());
         }
         if (this.h3 instanceof Http3Server http3) {
-            http3.replaceHandler(result.snapshot().handler()::handle);
+            if (this.override == null) {
+                http3.replaceHandler(result.snapshot().handler()::handle);
+            }
             if (result.tls() != null) {
                 http3.replaceTls(result.tls());
             }
@@ -333,7 +480,7 @@ public final class SjwsServer implements AutoCloseable {
      * A document-root file at {@code /healthz} keeps being served after the counters come on.
      */
     public ServerMetrics armMetrics() throws IOException {
-        var metrics = this.slot.arm(this.config).metrics();
+        var metrics = this.slot.arm(config()).metrics();
         if (this.manager != null) {
             attachGauges(metrics);
         }
@@ -375,6 +522,21 @@ public final class SjwsServer implements AutoCloseable {
         return this.h3Failure;
     }
 
+    /** @return the bound HTTP/2 (TLS) port, or -1 if HTTP/2 is not running */
+    public int h2Port() {
+        return this.h2 == null ? -1 : this.h2.port();
+    }
+
+    /** @return the running HTTP/2 transport, or null */
+    public Transport h2() {
+        return this.h2;
+    }
+
+    /** @return why HTTP/2 could not start, or null */
+    public Throwable h2Failure() {
+        return this.h2Failure;
+    }
+
     public ClientManager clientManager() {
         return this.manager;
     }
@@ -405,7 +567,26 @@ public final class SjwsServer implements AutoCloseable {
         } else if (config().h3Enabled()) {
             sb.append(", HTTP/3 unavailable");
         }
-        return sb.append(", serving ").append(config().root()).toString();
+        if (this.h2 != null) {
+            sb.append(", HTTP/2 on tcp/").append(h2Port());
+            if (this.h2 instanceof sjws_nettask.h2.Http2Server s && s.h2cPort() >= 0) {
+                sb.append(" (h2c tcp/").append(s.h2cPort()).append(')');
+            }
+        } else if (config().h2Enabled()) {
+            sb.append(", HTTP/2 unavailable");
+        }
+        var config = config();
+        sb.append(", serving ").append(config.root());
+        if (config.accessLog() != null) {
+            sb.append(", access log ").append(config.accessLog());
+        }
+        if (config.metricsExposure() != ServerConfig.MetricsExposure.OFF) {
+            sb.append(", metrics ").append(config.metricsExposure().name().toLowerCase(java.util.Locale.ROOT));
+        }
+        if (config.healthz()) {
+            sb.append(", healthz");
+        }
+        return sb.toString();
     }
 
     /** Blocks until the accept loop ends (after {@link #close()} or a fatal accept error). */
@@ -422,29 +603,6 @@ public final class SjwsServer implements AutoCloseable {
     public void close() {
         long waitMs = this.shutdownTimeout.toMillis() + 3_000;
         if (!this.closed.compareAndSet(false, true)) {
-            return;
-        }
-        if (this.reloadHook != null) {
-            try {
-                this.reloadHook.close();
-            } catch (Exception e) {
-                System.err.println("WARN: " + e);
-            }
-        }
-        if (this.acme != null) {
-            this.acme.close();
-        }
-        if (this.challengeHttp != null) {
-            this.challengeHttp.close();
-        }
-        this.altSvc.withdraw();
-        if (this.h3 != null) {
-            this.h3.stopAccepting(); // together with TCP; its graceful drain happens below
-        }
-        if (this.manager != null) {
-            this.manager.close();
-        }
-        if (this.acceptThread != null) {
             try {
                 this.shutdownDone.await(waitMs, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
@@ -453,6 +611,19 @@ public final class SjwsServer implements AutoCloseable {
             return;
         }
         try {
+            if (this.reloadHook != null) {
+                try {
+                    this.reloadHook.close();
+                } catch (Exception e) {
+                    System.err.println("WARN: " + e);
+                }
+            }
+            if (this.acme != null) {
+                this.acme.close();
+            }
+            if (this.challengeHttp != null) {
+                this.challengeHttp.close();
+            }
             this.altSvc.withdraw();
             if (this.h3 != null) {
                 this.h3.stopAccepting(); // together with TCP, before the listen socket closes

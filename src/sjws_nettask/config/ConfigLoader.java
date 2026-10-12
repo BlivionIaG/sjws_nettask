@@ -32,6 +32,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 import sjws_nettask.ServerConfig;
+import sjws_nettask.core.MiddlewareSpec;
+import sjws_nettask.core.RoutePattern;
 
 /**
  * Loads YAML ({@code --config} / {@code WEB_SERVER_CONFIG}, environment wins) and merges it under
@@ -567,7 +569,7 @@ public final class ConfigLoader {
 
     /**
      * {@code *} and blank match every request and are stored as null. Otherwise {@code /exact},
-     * {@code /prefix/*}, or {@code /*}.
+     * {@code /prefix/*}, or {@code /*}, checked with {@link RoutePattern#parse}.
      */
     private static String route(Object value, String path) {
         if (value == null) {
@@ -576,25 +578,14 @@ public final class ConfigLoader {
         if (!(value instanceof String raw)) {
             throw new ConfigException(path + ": expected a string");
         }
-        var r = raw.trim();
-        if (r.isEmpty() || "*".equals(r)) {
-            return null;
-        }
-        int star = r.indexOf('*');
-        if (star >= 0) {
-            if (star != r.length() - 1 || !r.endsWith("/*")) {
-                throw new ConfigException(path + ": expected *, /exact, or /prefix/*");
+        try {
+            if (RoutePattern.parse(raw).isAll()) {
+                return null;
             }
-            var prefix = r.substring(0, r.length() - 2);
-            if (!prefix.isEmpty() && !prefix.startsWith("/")) {
-                throw new ConfigException(path + ": expected *, /exact, or /prefix/*");
-            }
-            return r;
+        } catch (IllegalArgumentException e) {
+            throw new ConfigException(path + ": " + e.getMessage());
         }
-        if (!r.startsWith("/")) {
-            throw new ConfigException(path + ": expected *, /exact, or /prefix/*");
-        }
-        return r;
+        return raw.trim();
     }
 
     private static AccessSettings accessSection(Map<String, Object> root, List<String> warnings) {

@@ -188,10 +188,12 @@ covers is a warning. The sample above does not shadow itself.
 A list, stored and not applied. An empty list (or a missing key) is no chain and
 does not warn. A non-empty list warns. The same `name` may appear more than once.
 File order is kept; a lower `order` is further out, and ties stay in that order
-when a filter chain sorts them. This record is
-`MiddlewareSpec.of(name, order, route, options)`, the same call
-`RequestFilters.addAll` expects. This server does not reference that workstream's
-classes.
+when a filter chain sorts them. Each entry is
+`sjws_nettask.core.MiddlewareSpec.of(name, order, route, options)`, and `route`
+is checked with `RoutePattern.parse`. The snapshot holds that list. Startup does
+not call `RequestFilters.addAll`: no factories are bound, and an unknown name
+would fail the build. A caller that has bound factories can still pass
+`RequestFilters` to `SjwsServer.start`.
 
 ```yaml
 middleware:
