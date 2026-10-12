@@ -71,7 +71,9 @@ snap.latency().cumulative(i);     // Prometheus-style, through bucket i
 metrics.prometheus();             // text exposition 0.0.4
 ```
 
-Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. Latency buckets are 1, 5, 10, 25, 50, 100, 250 and 500 ms, then 1, 2.5, 5 and 10 s, then everything above. `bytes` is the body size the handler committed to; a write that throws counts the request and 0 bytes. `/healthz` and `/metrics` are counted like any other response.
+Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. `bytes` is the body size the handler committed to; a write that throws counts the request and 0 bytes. `/healthz` and `/metrics` are counted like any other response.
+
+**Latency histogram contract.** `sjws_http_request_duration_seconds` is a fixed log2 scale so a cluster can merge nodes by adding bucket `i` to bucket `i` (do not re-bin). Bounds are inclusive and stable: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 and 16384 ms, then everything above. `Snapshot.latency().counts()` is not cumulative; index `i` is `(previous bound, upperBoundNanos()[i]]`. `upperBoundNanos()` is `ServerMetrics.LATENCY_BOUNDS_NANOS` (the last entry is `Long.MAX_VALUE`). `ServerMetrics.LATENCY_LE_LABELS` is the Prometheus `le` for that same index: `0.001`, `0.002`, `0.004`, `0.008`, `0.016`, `0.032`, `0.064`, `0.128`, `0.256`, `0.512`, `1.024`, `2.048`, `4.096`, `8.192`, `16.384`, `+Inf`. The `/metrics` histogram is cumulative at those labels; adding two nodes' series with the same `le` is the merged cumulative. Changing a bound or a label is a breaking change for that merge.
 
 `/metrics` on `localhost` answers only a loopback peer (403 otherwise), so it stays safe on a public bind. `on` answers every client. Behind a proxy that connects from 127.0.0.1, `localhost` is the proxy, not the browser. The endpoint is not a document-root file: when it is off, a file named `metrics` is served normally.
 
