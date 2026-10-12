@@ -59,6 +59,9 @@ class ContractTest {
         assertFalse(new Response(304, ResponseHeaders.of(), Body.Empty.INSTANCE).mayHaveBody());
         assertFalse(new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE).mayHaveBody());
         assertTrue(new Response(200, ResponseHeaders.of(), Body.Empty.INSTANCE).mayHaveBody());
+        assertTrue(new Response(200, ResponseHeaders.of(), Body.Empty.INSTANCE).sendsBody());
+        assertFalse(new Response(200, ResponseHeaders.of(), Body.Empty.INSTANCE, true).sendsBody(), "HEAD");
+        assertFalse(new Response(304, ResponseHeaders.of(), Body.Empty.INSTANCE).sendsBody());
         assertThrows(IllegalArgumentException.class, () -> new Response(42, ResponseHeaders.of(), Body.Empty.INSTANCE));
     }
 

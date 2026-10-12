@@ -398,7 +398,7 @@ class Http3ServerTest {
         assertEquals("1", h.get("x-extra").toString());
         assertEquals("3", h.get("content-length").toString());
         assertEquals(1, h.getAll("content-length").size());
-        assertEquals(sjws_nettask.HTTP.Http1Writer.SERVER, h.get("server").toString());
+        assertEquals(sjws_nettask.core.ServerInfo.NAME, h.get("server").toString());
         assertEquals("Thu, 01 Jan 1970 00:00:00 GMT", h.get("date").toString());
         for (var name : new String[] {"connection", "transfer-encoding", "keep-alive", "upgrade",
             "proxy-connection", "te", "alt-svc"}) {

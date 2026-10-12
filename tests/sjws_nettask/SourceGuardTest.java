@@ -59,6 +59,8 @@ class SourceGuardTest {
     void coreDoesNotDependOnTransports() throws IOException {
         var core = all(Path.of("src/sjws_nettask/core"));
         assertFalse(core.contains("import sjws_nettask.HTTP"), "core must not import the HTTP/1 package");
+        assertFalse(all(Path.of("src/sjws_nettask/h3")).contains("sjws_nettask.HTTP"),
+                "h3 must not depend on the HTTP/1 package (shared rules live in core)");
         assertFalse(core.contains("java.net.Socket"), "core must not touch sockets");
     }
 }

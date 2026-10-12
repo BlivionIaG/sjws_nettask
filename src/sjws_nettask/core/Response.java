@@ -48,4 +48,9 @@ public record Response(int status, ResponseHeaders headers, Body body, boolean h
     public boolean mayHaveBody() {
         return this.status >= 200 && this.status != 204 && this.status != 304;
     }
+
+    /** @return true if a body goes on the wire: not HEAD and a status that may carry content */
+    public boolean sendsBody() {
+        return !this.headOnly && mayHaveBody();
+    }
 }
