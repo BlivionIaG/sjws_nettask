@@ -14,7 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import sjws_nettask.HTTP.Http1Writer;
+import sjws_nettask.http1.Http1Writer;
 
 /**
  * Platform edge cases from the core review (W5): missing fileKey (Windows), encoded

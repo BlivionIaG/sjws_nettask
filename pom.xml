@@ -126,7 +126,7 @@
               </rule>
               <rule>
                 <element>PACKAGE</element>
-                <includes><include>sjws_nettask.HTTP</include></includes>
+                <includes><include>sjws_nettask.http1</include></includes>
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
                   <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.88</minimum></limit>

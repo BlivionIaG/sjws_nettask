@@ -14,7 +14,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package sjws_nettask.HTTP;
+package sjws_nettask.http1;
 
 /**
  * A request head that must be answered with an error status (400, 414, 417,

@@ -18,7 +18,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
-import sjws_nettask.HTTP.Http1Writer;
+import sjws_nettask.http1.Http1Writer;
 
 /** S3: ETag generation, the young/weak rule, If-None-Match matrix, 304 heads. */
 class ETagTest {

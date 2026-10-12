@@ -1,4 +1,4 @@
-package sjws_nettask.HTTP;
+package sjws_nettask.http1;
 
 import static org.junit.jupiter.api.Assertions.*;
 

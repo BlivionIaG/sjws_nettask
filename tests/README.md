@@ -9,19 +9,19 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 
 | Class | Covers |
 |---|---|
-| `HTTP/Http1ParserTest` | request-head parsing: smuggling vectors, limits, versions, absolute-form, Connection/Expect |
-| `HTTP/HeaderTest`, `ToolsTest` | response head, dates, MIME, port parsing |
-| `HTTP/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
+| `http1/Http1ParserTest` | request-head parsing: smuggling vectors, limits, versions, absolute-form, Connection/Expect |
+| `http1/HeaderTest`, `ToolsTest` | response head, dates, MIME, port parsing |
+| `http1/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
-| `Http1GoldenTest`, `HTTP/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
+| `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/PlatformEdgeCaseTest` | case/Unicode/`%2F` behaviour per file system |
 | `core/SafeOpenTest` | security review M4: symlink/rename swaps of any path component between resolve and send, both open strategies (secure + fallback), and an HTTP/1.1 race test |
 | `core/VerificationRegressionTest` | security verifications V3/V4/V6/V7: execute-only (711/0100) directories 403 by default and served with the opt-in, the attacker-made 311 directory race (0 served, 0 leaks), FIFO swapped in or present refused without blocking (thread + timeout guard), open failures after the decision answered 403/404, startup warnings |
 | `core/FileCacheTest` | S3 small-file cache: hit/miss, HEAD/304 don't load, index under the directory key, spellings share one entry, query-string/404 flooding can't evict, LRU by entries and bytes, every hit validated (edit, same-size + restored mtime, rename swap, symlink/parent-dir swap to outside, chmod, delete), revalidation window with a fake clock, change during load not cached, load through `SafeOpen`, no I/O under the lock, concurrent accounting |
 | `core/ETagTest` | strong/weak ETag rule (fake clock, sticky per version, bounded memo), If-None-Match matrix (lists, `*`, `W/`, malformed), INM over IMS precedence, 304 heads |
-| `core/DateClockTest`, `HTTP/Http1WriterSingleWriteTest` | Date formatted once per second (fake clock); head + body in one `write` |
+| `core/DateClockTest`, `http1/Http1WriterSingleWriteTest` | Date formatted once per second (fake clock); head + body in one `write` |
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
