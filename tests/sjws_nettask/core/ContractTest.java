@@ -22,6 +22,9 @@ class ContractTest {
         assertTrue(r.headers().all().isEmpty());
         assertNull(r.peer());
         assertFalse(r.secure());
+        assertEquals("HTTP/1.1", r.protocol());
+        assertEquals("HTTP/3", new Request("GET", "/x", RequestHeaders.NONE, null, true).protocol());
+        assertEquals("HTTP/1.0", new Request("GET", "/x", RequestHeaders.NONE, null, false, "HTTP/1.0").protocol());
         assertTrue(r.headOnly());
         assertFalse(new Request("GET", "/x").headOnly());
         assertThrows(NullPointerException.class, () -> new Request(null, "/"));
@@ -59,6 +62,7 @@ class ContractTest {
         assertSame(peer, rewritten.peer());
         assertTrue(rewritten.secure());
         assertSame(headers, rewritten.headers());
+        assertEquals("HTTP/3", rewritten.protocol());
         assertEquals("/y", rewritten.target());
         assertTrue(rewritten.headOnly());
     }

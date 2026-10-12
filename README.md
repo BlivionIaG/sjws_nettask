@@ -75,8 +75,9 @@ Counters, the access log and the probes turn on only when something asks for the
 | `--no-healthz` | | | leave `/healthz` to the document root |
 
 The admin TUI is the other switch. `EmbeddedServerControl.status()` calls `server.metricsSnapshot()`,
-which is `armMetrics().snapshot()`. The first call replaces `NONE` with a recording observer; the next
-request on each transport starts sampling the clock and updating counters. That snapshot does not
+which is `armMetrics().snapshot()`. The first call replaces `NONE` with a recording observer and, when
+the observe filter was not installed at startup, publishes that filter. The next request on each
+transport enters it and starts sampling the clock and updating counters. That snapshot does not
 enable `/healthz` or `/metrics` — those stay at the flags above — so a document-root `/healthz` file
 is still served after the TUI has armed the counters. Reading `server.metrics()` without
 `metricsSnapshot()` does not arm anything; it returns the empty `NONE` registry.
@@ -113,13 +114,13 @@ snap.latency().cumulative(i);     // Prometheus-style, through bucket i
 metrics.prometheus();             // text exposition 0.0.4
 ```
 
-Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. `bytes` is the body size the handler committed to; a write that throws counts the request and 0 bytes. `/healthz` and `/metrics` are counted like any other response once those probes are enabled. With observability off, nothing is counted.
+Status and protocol are counted separately (not as a cross product) so the hot path stays a pair of array increments. `bytes` is the body size the handler committed to, recorded when the filter returns, before the socket write. `/healthz` and `/metrics` are counted like any other response once those probes are enabled. A request that never enters the chain (an HTTP/1 parse error or 408, an HTTP/3 refusal) is not counted. With observability off, nothing is counted.
 
-**Latency histogram contract.** `sjws_http_request_duration_seconds` is a fixed log2 scale so a cluster can merge nodes by adding bucket `i` to bucket `i` (do not re-bin). Bounds are inclusive and stable: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 and 16384 ms, then everything above. `Snapshot.latency().counts()` is not cumulative; index `i` is `(previous bound, upperBoundNanos()[i]]`. `upperBoundNanos()` is `ServerMetrics.LATENCY_BOUNDS_NANOS` (the last entry is `Long.MAX_VALUE`). `ServerMetrics.LATENCY_LE_LABELS` is the Prometheus `le` for that same index: `0.001`, `0.002`, `0.004`, `0.008`, `0.016`, `0.032`, `0.064`, `0.128`, `0.256`, `0.512`, `1.024`, `2.048`, `4.096`, `8.192`, `16.384`, `+Inf`. The `/metrics` histogram is cumulative at those labels; adding two nodes' series with the same `le` is the merged cumulative. Changing a bound or a label is a breaking change for that merge.
+**Latency histogram contract.** `sjws_http_request_duration_seconds` is a fixed log2 scale so a cluster can merge nodes by adding bucket `i` to bucket `i` (do not re-bin). The value is the time until the handler returns the response, which is before the transport writes the body. Bounds are inclusive and stable: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 and 16384 ms, then everything above. `Snapshot.latency().counts()` is not cumulative; index `i` is `(previous bound, upperBoundNanos()[i]]`. `upperBoundNanos()` is `ServerMetrics.LATENCY_BOUNDS_NANOS` (the last entry is `Long.MAX_VALUE`). `ServerMetrics.LATENCY_LE_LABELS` is the Prometheus `le` for that same index: `0.001`, `0.002`, `0.004`, `0.008`, `0.016`, `0.032`, `0.064`, `0.128`, `0.256`, `0.512`, `1.024`, `2.048`, `4.096`, `8.192`, `16.384`, `+Inf`. The `/metrics` histogram is cumulative at those labels; adding two nodes' series with the same `le` is the merged cumulative. Changing a bound or a label is a breaking change for that merge.
 
 `/metrics` on `localhost` answers only a loopback peer (403 otherwise), so it stays safe on a public bind. `on` answers every client. Behind a proxy that connects from 127.0.0.1, `localhost` is the proxy, not the browser. The endpoint is not a document-root file: when it is off, a file named `metrics` is served normally.
 
-The hook is `RequestObserver`, held in a shared `ObserverSlot`. While the slot is `NONE` the transports do not call `intercept` or `complete`. When it is a recording observer they call `intercept` only if `/healthz` or `/metrics` is enabled, and `complete` after the response is written. `core.Handler` is the seam a middleware chain will decorate; that chain is not composed in the server yet, so the calls stay at the two transports and can move into one decorator later without changing the counters or the log.
+The hook is `ObserveRequestFilter`, registered at order 0 through `RequestFilters.create().add(0, filter)` when `--access-log`, `--metrics` or `--healthz` is on. It is added before any caller filter, so among order 0 it is the outermost stage (a negative order still runs further out). The filter calls `intercept` only when `/healthz` or `/metrics` is enabled, then `complete` when `proceed` returns. While observability is off, that filter is not installed and the transports do not read the clock, update a counter, or check the path. `metricsSnapshot()` publishes the same filter on a server that started off, so the next request is counted.
 
 **HTTP/1.1 connections** run on blocking `SocketChannel`s, one virtual thread each. One timer thread
 enforces every deadline (no per-socket timeouts): `--idle-timeout` between requests,

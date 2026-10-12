@@ -70,7 +70,7 @@ class Http1RequestsTest {
     @Test
     void absentHeadersAreNull() {
         var head = new Http1Parser.Head("GET", "/", "HTTP/1.0", Map.of(), 0, false, false);
-        assertEquals(new Request("GET", "/", new RequestHeaders(null, null, null, null, null, null)),
-                Http1Requests.toCore(head));
+        assertEquals(new Request("GET", "/", new RequestHeaders(null, null, null, null, null, null), null, false,
+                "HTTP/1.0"), Http1Requests.toCore(head));
     }
 }
