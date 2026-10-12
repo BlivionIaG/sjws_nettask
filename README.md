@@ -371,7 +371,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the layers, the `core.Handler` seam a
   validators, conditionals, ranges), `SafeOpen` (no-follow, `openat`-based opens checked against the
   resolved file identity), the small-file `FileCache` and the per-address connection counter. Both
   transports call the same handler, so behaviour is identical by construction; a parity test compares
-  every HTTP/3 response with the HTTP/1.1 bytes for the same request.
+  every HTTP/3 response with the HTTP/1.1 bytes for the same request. Optional request filters
+  (`RequestFilters`, see [docs/filters.md](docs/filters.md)) wrap whatever `Handler` is terminal
+  (the static file handler, or a router when one is installed) on every transport. With none
+  registered, and no other terminal, the static handler is called directly. `Request` carries the
+  client address, whether the connection is TLS, and the raw header map.
 * **HTTP/1.1** (`sjws_nettask` + `sjws_nettask.http1`): one virtual thread per connection on a blocking
   `SocketChannel`; an incremental, strict byte-level head parser (CL/TE smuggling, limits, obs-fold,
   Host, Expect); responses written whole (head and small bodies in one `write`, `Date` formatted once
