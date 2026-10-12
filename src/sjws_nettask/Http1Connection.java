@@ -27,6 +27,7 @@ import java.util.function.Supplier;
 
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
+import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
@@ -74,10 +75,12 @@ final class Http1Connection implements Runnable {
     private final Handler handler;
     private final Supplier<ResponseHeaders> extraHeaders;
     private final ConnectionReaper reaper;
-    private final RequestObserver observer;
+    private final ObserverSlot slot;
     /** Numeric client address (no reverse lookup), cached for the life of the connection. */
     private final String clientHost;
     private final boolean loopback;
+    /** Observer captured for the request in progress. {@link RequestObserver#NONE} skips the hook. */
+    private RequestObserver active = RequestObserver.NONE;
     private long startedAt;
     private String method = "-";
     private String target = "-";
@@ -107,11 +110,16 @@ final class Http1Connection implements Runnable {
      */
     Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
             ConnectionReaper reaper, RequestObserver observer, String clientHost, boolean loopback) {
+        this(channel, handler, extraHeaders, reaper, new ObserverSlot(observer), clientHost, loopback);
+    }
+
+    Http1Connection(SocketChannel channel, Handler handler, Supplier<ResponseHeaders> extraHeaders,
+            ConnectionReaper reaper, ObserverSlot slot, String clientHost, boolean loopback) {
         this.channel = channel;
         this.handler = handler;
         this.extraHeaders = extraHeaders;
         this.reaper = reaper;
-        this.observer = java.util.Objects.requireNonNull(observer, "observer");
+        this.slot = java.util.Objects.requireNonNull(slot, "slot");
         this.clientHost = java.util.Objects.requireNonNull(clientHost, "clientHost");
         this.loopback = loopback;
     }
@@ -209,11 +217,13 @@ final class Http1Connection implements Runnable {
     private boolean serveRequest(ConnectionReaper.Timer timer, ChannelOutput out) throws IOException {
         // run() waited for the first byte under the idle timeout; now the whole head (and any body to discard) must arrive before the head deadline.
         timer.head();
-        if (this.observer.recording()) {
+        // One volatile read. NONE skips the clock, the counters and every probe path check.
+        this.active = this.slot.get();
+        if (this.active != RequestObserver.NONE) {
             this.startedAt = System.nanoTime();
             this.protocolId = RequestObserver.HTTP_1_1;
         }
-        if (this.observer.logging()) {
+        if (this.active != RequestObserver.NONE && this.active.logging()) {
             this.method = "-";
             this.target = "-";
             this.protocol = "HTTP/1.1";
@@ -301,17 +311,17 @@ final class Http1Connection implements Runnable {
 
     /** Copies the request into connection fields. Referer and User-Agent are read only when logged. */
     private void note(Http1Parser.Head request) {
-        if (!this.observer.recording()) {
+        if (this.active == RequestObserver.NONE) {
             return;
         }
         this.protocolId = RequestObserver.protocolId(request.version());
-        if (!this.observer.logging()) {
+        if (!this.active.logging()) {
             return;
         }
         this.method = request.method();
         this.target = request.target();
         this.protocol = request.version();
-        if (this.observer.logHeaders()) {
+        if (this.active.logHeaders()) {
             var ref = request.headers().get("referer");
             var ua = request.headers().get("user-agent");
             if (ref != null && !ref.isEmpty()) {
@@ -324,8 +334,13 @@ final class Http1Connection implements Runnable {
     }
 
     private Response respond(Request core) {
-        var special = this.observer.intercept(core.method(), core.target(), this.loopback);
-        return special != null ? special : this.handler.handle(core);
+        if (this.active != RequestObserver.NONE && this.active.intercepts()) {
+            var special = this.active.intercept(core.method(), core.target(), this.loopback);
+            if (special != null) {
+                return special;
+            }
+        }
+        return this.handler.handle(core);
     }
 
     /**
@@ -397,13 +412,13 @@ final class Http1Connection implements Runnable {
         } catch (IOException e) {
             error = e;
         }
-        if (this.observer.recording()) {
+        if (this.active != RequestObserver.NONE) {
             long nanos = System.nanoTime() - this.startedAt;
-            if (this.observer.logging()) {
-                this.observer.complete(response.status(), this.protocolId, bytes, nanos, this.clientHost, this.method,
+            if (this.active.logging()) {
+                this.active.complete(response.status(), this.protocolId, bytes, nanos, this.clientHost, this.method,
                         this.target, this.protocol, this.referer, this.userAgent);
             } else {
-                this.observer.complete(response.status(), this.protocolId, bytes, nanos);
+                this.active.complete(response.status(), this.protocolId, bytes, nanos);
             }
         }
         if (error != null) {

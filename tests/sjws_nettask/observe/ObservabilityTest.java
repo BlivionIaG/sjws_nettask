@@ -332,11 +332,13 @@ class ObservabilityTest {
         assertEquals(before, RequestObserver.NONE.metrics().snapshot().requests());
         assertFalse(RequestObserver.NONE.logging());
         assertFalse(RequestObserver.NONE.logHeaders());
+        assertFalse(RequestObserver.NONE.intercepts());
         RequestObserver.NONE.close();
 
-        var cfg = ServerConfig.builder(dir).metricsExposure(MetricsExposure.LOCALHOST).build();
+        var cfg = ServerConfig.builder(dir).metricsExposure(MetricsExposure.LOCALHOST).healthz(true).build();
         try (var obs = RequestObserver.open(cfg)) {
             assertFalse(obs.logging());
+            assertTrue(obs.intercepts());
             assertEquals(200, obs.intercept("GET", "/healthz", false).status());
             assertEquals("ok\n", bodyText(obs.intercept("GET", "/healthz?ready", true), StandardCharsets.US_ASCII));
             assertTrue(obs.intercept("HEAD", "/healthz", true).headOnly());
@@ -355,10 +357,13 @@ class ObservabilityTest {
         var open = ServerConfig.builder(dir).metricsExposure(MetricsExposure.ON).build();
         try (var obs = RequestObserver.open(open)) {
             assertEquals(200, obs.intercept("GET", "/metrics", false).status());
+            assertNull(obs.intercept("GET", "/healthz", true), "the probe is opt-in");
         }
         var disabled = ServerConfig.builder(dir).metricsExposure(MetricsExposure.OFF).build();
         try (var obs = RequestObserver.open(disabled)) {
+            assertFalse(obs.intercepts());
             assertNull(obs.intercept("GET", "/metrics", true));
+            assertNull(obs.intercept("GET", "/healthz", true));
         }
         assertThrows(IOException.class, () -> RequestObserver.open(ServerConfig.builder(dir).accessLog(dir.toString()).build()));
         assertEquals(RequestObserver.HTTP_1_1, RequestObserver.protocolId("HTTP/1.1"));
@@ -372,12 +377,14 @@ class ObservabilityTest {
     void httpServerLogsAndServesProbes() throws Exception {
         Files.writeString(dir.resolve("index.html"), "hello");
         Files.writeString(dir.resolve("metrics"), "not-the-endpoint");
+        Files.writeString(dir.resolve("healthz"), "from-disk\n");
         var log = dir.resolve("access.log");
         var config = ServerConfig.builder(dir).port(0).accessLog(log.toString()).accessLogFormat(AccessLogFormat.COMBINED)
-                .metricsExposure(MetricsExposure.LOCALHOST).build();
+                .metricsExposure(MetricsExposure.LOCALHOST).healthz(true).build();
         try (var server = SjwsServer.start(config)) {
             assertTrue(server.describe().contains("access log " + log), server.describe());
             assertTrue(server.describe().contains("metrics localhost"), server.describe());
+            assertTrue(server.describe().contains("healthz"), server.describe());
             try (var socket = new Socket(InetAddress.getLoopbackAddress(), server.tcpPort())) {
                 socket.setSoTimeout(2000);
                 HttpTestSupport.write(socket.getOutputStream(),
@@ -416,8 +423,17 @@ class ObservabilityTest {
             var file = HttpTestSupport.get(plain.tcpPort(), "/metrics", 2000);
             assertEquals(200, file.statusCode());
             assertEquals("not-the-endpoint", file.bodyText());
-            assertTrue(plain.metrics().snapshot().requests() >= 1);
+            var healthFile = HttpTestSupport.get(plain.tcpPort(), "/healthz", 2000);
+            assertEquals(200, healthFile.statusCode());
+            assertEquals("from-disk\n", healthFile.bodyText());
+            assertEquals(0, plain.metrics().snapshot().requests(), "NONE does not count");
             assertFalse(plain.describe().contains("access log"), plain.describe());
+            assertFalse(plain.describe().contains("healthz"), plain.describe());
+            assertEquals(0, plain.metricsSnapshot().requests(), "arming counts only later requests");
+            HttpTestSupport.get(plain.tcpPort(), "/index.html", 2000);
+            assertTrue(plain.metrics().snapshot().requests() >= 1);
+            var stillFile = HttpTestSupport.get(plain.tcpPort(), "/healthz", 2000);
+            assertEquals("from-disk\n", stillFile.bodyText(), "arming counters does not take /healthz");
         }
 
         var commonLog = dir.resolve("common.log");
@@ -426,6 +442,14 @@ class ObservabilityTest {
             HttpTestSupport.rawRequest(common.tcpPort(),
                     "GET /index.html HTTP/1.1\r\nHost: h\r\nReferer: http://secret\r\n\r\n", 2000);
         }
+        try (var probe = SjwsServer.start(ServerConfig.builder(dir).port(0).healthz(true).build())) {
+            var health = HttpTestSupport.get(probe.tcpPort(), "/healthz", 2000);
+            assertEquals(200, health.statusCode());
+            assertEquals("ok\n", health.bodyText());
+            assertTrue(probe.metrics().snapshot().requests() >= 1);
+            assertTrue(probe.describe().contains("healthz"), probe.describe());
+        }
+
         var commonText = Files.readString(commonLog);
         assertTrue(commonText.contains("\"GET /index.html HTTP/1.1\" 200 5 "), commonText);
         assertFalse(commonText.contains("secret"), commonText);
@@ -454,10 +478,31 @@ class ObservabilityTest {
                 // start() sets the started flag before the native check, then leaves nothing bound
             }
             assertThrows(IllegalStateException.class, () -> http3.withObserver(observer));
+            assertThrows(IllegalStateException.class, () -> http3.withSlot(new ObserverSlot(observer)));
         } finally {
             http3.close();
             observer.close();
         }
+    }
+
+    @Test
+    void aLostArmClosesTheSpareObserver() throws Exception {
+        var slot = new ObserverSlot(null);
+        assertSame(RequestObserver.NONE, slot.get());
+        slot.set(null);
+        assertSame(RequestObserver.NONE, slot.get());
+        var winner = RequestObserver.open(ServerConfig.builder(dir).build());
+        assertSame(winner, slot.replace(winner));
+        assertSame(winner, slot.arm(ServerConfig.builder(dir).healthz(true).build()));
+        var spareLog = dir.resolve("spare.log");
+        var spare = RequestObserver.open(ServerConfig.builder(dir).accessLog(spareLog.toString()).build());
+        assertSame(winner, slot.replace(spare));
+        assertSame(winner, slot.get());
+        assertTrue(Files.isRegularFile(spareLog));
+        slot.close();
+        assertThrows(NullPointerException.class,
+                () -> new sjws_nettask.h3.Http3Server(ServerConfig.builder(dir).build(), new StaticFileHandler(dir))
+                        .withSlot(null));
     }
 
     private static String bodyText(sjws_nettask.core.Response response, java.nio.charset.Charset charset) {

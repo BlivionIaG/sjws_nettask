@@ -17,6 +17,7 @@
 package sjws_nettask;
 
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 
 /**
@@ -67,6 +68,15 @@ public interface Transport extends AutoCloseable {
 
         default Transport create(ServerConfig config, StaticFileHandler handler, RequestObserver observer) {
             return create(config, handler);
+        }
+
+        /**
+         * What {@link SjwsServer} calls. The slot is shared, so an admin snapshot can replace
+         * {@link RequestObserver#NONE} after the transport has started. The default freezes whatever
+         * observer is installed now; HTTP/3's factory keeps the slot.
+         */
+        default Transport create(ServerConfig config, StaticFileHandler handler, ObserverSlot slot) {
+            return create(config, handler, slot.get());
         }
     }
 }

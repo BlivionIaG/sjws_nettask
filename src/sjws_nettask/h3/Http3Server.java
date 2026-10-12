@@ -56,6 +56,7 @@ import sjws_nettask.Transport;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.tls.TlsMaterial;
 
@@ -112,7 +113,7 @@ public final class Http3Server implements Transport {
     private EventLoopGroup group;
     private ExecutorService executor;
     private Channel channel;
-    private RequestObserver observer = RequestObserver.NONE;
+    private ObserverSlot slot = new ObserverSlot(RequestObserver.NONE);
 
     /** Uses the configured PEM files, or a self-signed certificate if none are set. */
     public Http3Server(ServerConfig config, StaticFileHandler handler) {
@@ -151,7 +152,19 @@ public final class Http3Server implements Transport {
         if (this.started.get()) {
             throw new IllegalStateException("already started");
         }
-        this.observer = observer == null ? RequestObserver.NONE : observer;
+        this.slot.set(observer);
+        return this;
+    }
+
+    /**
+     * Shares the server's slot so a later {@link sjws_nettask.SjwsServer#metricsSnapshot()} is visible
+     * on this listener. Call before {@link #start()}.
+     */
+    public Http3Server withSlot(ObserverSlot slot) {
+        if (this.started.get()) {
+            throw new IllegalStateException("already started");
+        }
+        this.slot = Objects.requireNonNull(slot, "slot");
         return this;
     }
 
@@ -162,10 +175,15 @@ public final class Http3Server implements Transport {
      * @param serverFiles one permit per file open for sending ({@link Limits#maxOpenFiles()})
      */
     record Shared(Function<Request, Response> handler, ExecutorService executor, Limits limits, Semaphore inflight,
-            Semaphore serverFiles, Map<Http3Writer.Outcome, LongAdder> outcomes, RequestObserver observer) {
+            Semaphore serverFiles, Map<Http3Writer.Outcome, LongAdder> outcomes, ObserverSlot slot) {
 
         void count(Http3Writer.Outcome outcome) {
             this.outcomes.get(outcome).increment();
+        }
+
+        /** Live observer. {@link RequestObserver#NONE} until logging, a probe, or an admin snapshot. */
+        RequestObserver observer() {
+            return this.slot.get();
         }
     }
 
@@ -259,7 +277,7 @@ public final class Http3Server implements Transport {
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h3-request-", 0).factory());
             this.perIp = new sjws_nettask.core.PerIpLimit(this.limits.connectionsPerIp());
             this.shared = new Shared(this.handler, this.executor, this.limits, new Semaphore(this.limits.maxInflight()),
-                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.observer);
+                    new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.slot);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             var codec = Http3.newQuicServerCodecBuilder()
                     .sslContext(ssl)

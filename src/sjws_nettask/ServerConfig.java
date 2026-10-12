@@ -61,12 +61,13 @@ import java.util.Objects;
  *        accepts them (capped by the OS, e.g. {@code net.core.somaxconn} on Linux)
  * @param accessLogFormat common, combined (default) or json; ignored when {@code accessLog} is null
  * @param metricsExposure who may read {@code /metrics} ({@link MetricsExposure#OFF} by default)
+ * @param healthz answer GET/HEAD {@code /healthz} with {@code ok} instead of a document-root file
  */
 public record ServerConfig(int port, Path root, int maxConnections, Duration idleTimeout, Duration headerTimeout,
         Duration writeTimeout, boolean h3Enabled, int h3Port, String h3Host, int h3MaxConnections, Path tlsCert,
         Path tlsKey, String tlsKeyPassword, Duration altSvcMaxAge, long cacheBytes, String accessLog, boolean altSvc,
         int maxConnectionsPerIp, int h3MaxConnectionsPerIp, long h3MinRate, boolean allowUnlistableDirs,
-        int backlog, AccessLogFormat accessLogFormat, MetricsExposure metricsExposure) {
+        int backlog, AccessLogFormat accessLogFormat, MetricsExposure metricsExposure, boolean healthz) {
 
     public static final int DEFAULT_PORT = CONSTANTS.DEFAULT_PORT;
     /** Design review M11: 64 KB output buffer per connection, so 2048 x 64 KB = 128 MB worst case. */
@@ -128,6 +129,16 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
     /** Who is answered at {@code /metrics}. {@link #OFF} leaves that path to the document root. */
     public enum MetricsExposure { OFF, LOCALHOST, ON }
 
+    /**
+     * @return true when startup should install a recording observer. False leaves the transports on
+     *         {@link sjws_nettask.observe.RequestObserver#NONE} (no clock read, no counters, no probe
+     *         path checks). The admin TUI can still arm counters later via
+     *         {@link SjwsServer#metricsSnapshot()}.
+     */
+    public boolean observe() {
+        return this.healthz || this.accessLog != null || this.metricsExposure != MetricsExposure.OFF;
+    }
+
     /** @return the UDP port HTTP/3 binds to (resolving {@link #H3_PORT_SAME_AS_TCP}) */
     public int effectiveH3Port() {
         return this.h3Port == H3_PORT_SAME_AS_TCP ? this.port : this.h3Port;
@@ -172,7 +183,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 + ", maxConnectionsPerIp=" + maxConnectionsPerIp + ", h3MaxConnectionsPerIp="
                 + h3MaxConnectionsPerIp + ", h3MinRate=" + h3MinRate + ", allowUnlistableDirs=" + allowUnlistableDirs
                 + ", backlog=" + backlog + ", accessLogFormat=" + accessLogFormat + ", metricsExposure="
-                + metricsExposure + "]";
+                + metricsExposure + ", healthz=" + healthz + "]";
     }
 
     /** Mutable builder; new fields get a default here so existing callers keep compiling. */
@@ -202,6 +213,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         private int backlog = DEFAULT_BACKLOG;
         private AccessLogFormat accessLogFormat = AccessLogFormat.COMBINED;
         private MetricsExposure metricsExposure = MetricsExposure.OFF;
+        private boolean healthz;
 
         private Builder(Path root) {
             this.root = root;
@@ -232,6 +244,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
             this.backlog = c.backlog;
             this.accessLogFormat = c.accessLogFormat;
             this.metricsExposure = c.metricsExposure;
+            this.healthz = c.healthz;
         }
 
         public Builder port(int v) { this.port = v; return this; }
@@ -258,12 +271,13 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         public Builder backlog(int v) { this.backlog = v; return this; }
         public Builder accessLogFormat(AccessLogFormat v) { this.accessLogFormat = v; return this; }
         public Builder metricsExposure(MetricsExposure v) { this.metricsExposure = v; return this; }
+        public Builder healthz(boolean v) { this.healthz = v; return this; }
 
         public ServerConfig build() {
             return new ServerConfig(port, root, maxConnections, idleTimeout, headerTimeout, writeTimeout, h3Enabled,
                     h3Port, h3Host, h3MaxConnections, tlsCert, tlsKey, tlsKeyPassword, altSvcMaxAge, cacheBytes,
                     accessLog, altSvc, maxConnectionsPerIp, h3MaxConnectionsPerIp, h3MinRate, allowUnlistableDirs,
-                    backlog, accessLogFormat, metricsExposure);
+                    backlog, accessLogFormat, metricsExposure, healthz);
         }
     }
 
@@ -319,6 +333,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                   --metrics[=MODE]          /metrics: off (default), localhost or on     WEB_SERVER_METRICS
                                             (a bare --metrics means localhost)
                   --no-metrics              leave /metrics disabled
+                  --healthz | --no-healthz  GET/HEAD /healthz answers "ok" (off).        WEB_SERVER_HEALTHZ=true|false
+                                            Off: a document-root file at /healthz is
+                                            served. On also turns request counters on
                   -h, --help                show this help
 
                 Environment variables override arguments. The key password is never accepted
@@ -378,6 +395,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         String accessLog = null;
         var accessLogFormat = AccessLogFormat.COMBINED;
         var metricsExposure = MetricsExposure.OFF;
+        boolean healthz = false;
         boolean accessLogFormatSet = false;
         var explicitH3Options = new ArrayList<String>();
 
@@ -449,6 +467,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                     }
                     case "--metrics" -> metricsExposure = metricsMode(value, MetricsExposure.LOCALHOST, name, warnings);
                     case "--no-metrics" -> metricsExposure = MetricsExposure.OFF;
+                    case "--healthz" -> healthz = value == null || bool(value, healthz, name, warnings);
+                    case "--no-healthz" -> healthz = false;
                     case "--alt-svc-max-age" -> {
                         altSvc = number(value, altSvc, 0, 31_536_000, name, warnings);
                         explicitH3Options.add(name);
@@ -521,6 +541,9 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         }
         if ((v = env.get("WEB_SERVER_METRICS")) != null) {
             metricsExposure = metricsMode(v, metricsExposure, "WEB_SERVER_METRICS", warnings);
+        }
+        if ((v = env.get("WEB_SERVER_HEALTHZ")) != null) {
+            healthz = bool(v, healthz, "WEB_SERVER_HEALTHZ", warnings);
         }
         if ((v = env.get("WEB_SERVER_H3")) != null) {
             h3 = bool(v, h3, "WEB_SERVER_H3", warnings);
@@ -602,7 +625,8 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 .h3Enabled(h3).h3Port(h3Port).h3Host(h3Host).h3MaxConnections(h3Max)
                 .tlsCert(cert == null ? null : Path.of(cert)).tlsKey(key == null ? null : Path.of(key))
                 .tlsKeyPassword(password).altSvcMaxAge(Duration.ofSeconds(altSvc))
-                .accessLog(accessLog).accessLogFormat(accessLogFormat).metricsExposure(metricsExposure).build();
+                .accessLog(accessLog).accessLogFormat(accessLogFormat).metricsExposure(metricsExposure)
+                .healthz(healthz).build();
         return new Parsed(config, List.copyOf(warnings), List.copyOf(errors), help);
     }
 

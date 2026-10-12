@@ -60,8 +60,8 @@ plug in.
 
 ## Observability
 
-`observe.RequestObserver` is the isolated hook. It is not a `Handler` decorator: the chain above is not composed in `SjwsServer` yet. HTTP/1.1 (`Http1Connection`) and HTTP/3 (`Http3RequestHandler`) each call `intercept` (for `/healthz` and `/metrics`) and `complete` (after the response write). When the chain exists, one decorator can make those two calls and the transport calls go away; `ServerMetrics`, `Snapshot` and `AccessLog` stay where they are.
+`observe.RequestObserver` is the isolated hook. It is not a `Handler` decorator: the chain above is not composed in `SjwsServer` yet. Both transports share an `ObserverSlot`. While that slot is `RequestObserver.NONE` (the default) a request does not read the clock, does not update a counter, and does not look at the path for `/healthz` or `/metrics`, so a document-root file at `/healthz` is served. `--access-log`, `--metrics` (other than `off`) and `--healthz` install a recording observer at startup. The admin TUI's status view calls `SjwsServer.metricsSnapshot()`, which arms counters on the first call without enabling `/healthz`. When the chain exists, one decorator can make the `intercept` and `complete` calls and the transport calls go away; `ServerMetrics`, `Snapshot` and `AccessLog` stay where they are.
 
-Counters are `LongAdder`s. The access log is a bounded lock-free queue drained by one thread. Neither path blocks a request on I/O.
+Counters are `LongAdder`s, and only after the observer is recording. The access log is a bounded lock-free queue drained by one thread. Neither path blocks a request on I/O.
 
 The latency histogram is a fixed log2 scale (ratio 2, from 1 ms through 16.384 s, then `+Inf`). `ServerMetrics.LATENCY_BOUNDS_NANOS` and `LATENCY_LE_LABELS` are the stable contract: a cluster merges by summing `Snapshot.latency().counts()[i]` across nodes, or by summing Prometheus `sjws_http_request_duration_seconds_bucket` series that share an `le` label. The in-process counts are not cumulative; the exposition is.
