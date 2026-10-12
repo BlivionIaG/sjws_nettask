@@ -24,7 +24,6 @@ import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -40,8 +39,12 @@ public final class StaticFileHandler {
     public static final String ALLOW = "GET, HEAD";
     public static final String ACCEPT_RANGES = "none"; // Range is not implemented yet (S5)
 
+    /** Used by the static helpers, which have no handler (and so no per-version memory). */
+    private static final EntityTag.Policy STATIC_POLICY = new EntityTag.Policy(java.time.InstantSource.system());
+
     private final PathResolver resolver;
     private final boolean allowUnlistableDirs;
+    private final EntityTag.Policy etags;
 
     /** @throws UncheckedIOException if the root does not exist or is not a directory */
     public StaticFileHandler(Path root) {
@@ -54,8 +57,14 @@ public final class StaticFileHandler {
      * @throws UncheckedIOException if the root does not exist or is not a directory
      */
     public StaticFileHandler(Path root, boolean allowUnlistableDirs) {
+        this(root, allowUnlistableDirs, java.time.InstantSource.system());
+    }
+
+    /** @param clock decides which file versions are "young" (weak ETag); tests inject a fake one */
+    public StaticFileHandler(Path root, boolean allowUnlistableDirs, java.time.InstantSource clock) {
         this.resolver = new PathResolver(root);
         this.allowUnlistableDirs = allowUnlistableDirs;
+        this.etags = new EntityTag.Policy(clock);
     }
 
     /** @return whether files below search-only directories are served (see the constructor) */
@@ -121,8 +130,8 @@ public final class StaticFileHandler {
             return error(403, head);
         }
         var attributes = Files.readAttributes(file.real(), BasicFileAttributes.class);
-        return fileResponse(file.logical().getFileName().toString(), this.resolver.realRoot(), file.real(),
-                attributes, head, conditionals.ifModifiedSince(), this.allowUnlistableDirs);
+        var meta = FileMeta.of(Validator.of(attributes), file.logical().getFileName().toString(), this.etags);
+        return fileResponse(meta, this.resolver.realRoot(), file.real(), head, conditionals, this.allowUnlistableDirs);
     }
 
     /**
@@ -147,18 +156,19 @@ public final class StaticFileHandler {
 
     private static Response fileResponse(String name, Path realRoot, Path realPath, BasicFileAttributes attributes,
             boolean head, String ifModifiedSince, boolean allowUnlistable) {
-        var modified = attributes.lastModifiedTime().toInstant().truncatedTo(ChronoUnit.SECONDS);
-        var headers = ResponseHeaders.of()
-                .add("last-modified", HttpDate.format(modified))
-                .add("accept-ranges", ACCEPT_RANGES)
-                .add("content-type", Mime.contentType(Mime.of(name)));
-        var since = HttpDate.parse(ifModifiedSince);
-        if (since != null && !modified.isAfter(since)) {
-            return new Response(304, headers, Body.Empty.INSTANCE, head);
+        var meta = FileMeta.of(Validator.of(attributes), name, STATIC_POLICY);
+        return fileResponse(meta, realRoot, realPath, head, RequestHeaders.ifModifiedSince(ifModifiedSince),
+                allowUnlistable);
+    }
+
+    private static Response fileResponse(FileMeta meta, Path realRoot, Path realPath, boolean head,
+            RequestHeaders conditionals, boolean allowUnlistable) {
+        if (meta.notModified(conditionals)) {
+            return new Response(304, meta.headers304(), Body.Empty.INSTANCE, head);
         }
-        return new Response(200, headers,
-                new Body.FileBody(realPath, 0, attributes.size(), Validator.of(attributes), realRoot, allowUnlistable),
-                head);
+        var v = meta.validator();
+        return new Response(200, meta.headers200(),
+                new Body.FileBody(realPath, 0, v.size(), v, realRoot, allowUnlistable), head);
     }
 
     /** Convenience for callers holding a plain path (no containment check). */

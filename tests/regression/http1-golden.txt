@@ -3,6 +3,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
 Accept-Ranges: none
 Content-Type: text/plain; charset=utf-8
 Connection: close
@@ -15,6 +16,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-6"
 Accept-Ranges: none
 Content-Type: text/css; charset=utf-8
 Connection: close
@@ -26,6 +28,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-22272"
 Accept-Ranges: none
 Content-Type: application/octet-stream
 Connection: close
@@ -3037,6 +3040,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-e"
 Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
@@ -3049,6 +3053,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
 Accept-Ranges: none
 Content-Type: text/plain; charset=utf-8
 Connection: close
@@ -3061,6 +3066,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
 Accept-Ranges: none
 Content-Type: text/plain; charset=utf-8
 Connection: close
@@ -3073,6 +3079,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
 Accept-Ranges: none
 Content-Type: text/plain; charset=utf-8
 Connection: close
@@ -3105,6 +3112,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
 Accept-Ranges: none
 Content-Type: text/plain; charset=utf-8
 Connection: close
@@ -3177,9 +3185,8 @@ Location: /sub/?x=1&y=%20
 HTTP/1.1 304 Not Modified
 Server: sjws_nettask web server/0.2
 Date: <normalised>
+ETag: "<key>-d9dd3bdce4bf400-c"
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
-Accept-Ranges: none
-Content-Type: text/plain; charset=utf-8
 Connection: close
 
 
@@ -3187,9 +3194,8 @@ Connection: close
 HTTP/1.1 304 Not Modified
 Server: sjws_nettask web server/0.2
 Date: <normalised>
+ETag: "<key>-d9dd3bdce4bf400-c"
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
-Accept-Ranges: none
-Content-Type: text/plain; charset=utf-8
 Connection: close
 
 
@@ -3198,6 +3204,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
 Accept-Ranges: none
 Content-Type: text/plain; charset=utf-8
 Connection: close
@@ -3292,6 +3299,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-c"
 Accept-Ranges: none
 Content-Type: text/plain; charset=utf-8
 Connection: keep-alive
@@ -3302,6 +3310,7 @@ HTTP/1.1 200 OK
 Server: sjws_nettask web server/0.2
 Date: <normalised>
 Last-Modified: Sat, 03 Feb 2001 04:05:06 GMT
+ETag: "<key>-d9dd3bdce4bf400-6"
 Accept-Ranges: none
 Content-Type: text/css; charset=utf-8
 Connection: keep-alive
