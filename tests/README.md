@@ -26,6 +26,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/StaticFileHandlerRangeTest` | S5 byte ranges: `Range` parser table (206 / ignored / 416), and per handler mode (uncached `FileBody` region, cache miss, cache hit slice): 206/416, multi and malformed ranges, If-Range strong ETag / exact date / weak / young versions, 304 precedence, HEAD ignores Range, listings/errors/405, index files, empty files |
 | `DocsConsistencyTest` | S6: every `--flag` and `WEB_SERVER_*` variable of `--help` is in the README option tables and vice versa, README defaults match the code, every source package has a JaCoCo gate |
 | `Http1TransportTest` | S4 channel transport: slowloris 408 at the head deadline (silent and trickling), idle keep-alive close, stalled reader closed by the write deadline, slow-but-progressing 50 MB download survives, sendfile exact bytes (50 MB, uncached 200 KB), file shrink during sendfile closes without spinning (process CPU check), fragmented pipelining with a body, timer deregistration, reaper sweep per state (FIN sent at once on expiry), bounded transfer stalls; S5: 50 MB download resumed from an offset with Range + If-Range byte-exact (sendfile), shrink during a ranged sendfile, uncached ranges on both write paths; perf review N1/N2: an unfinished body is cut at the head deadline with a 408, with or without `100 Continue` |
+| `core/SecurityHeadersTest` | `X-Content-Type-Options: nosniff` on every file and generated page; script-free, frame-free `Content-Security-Policy` on listings, errors and redirects |
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
@@ -65,7 +66,7 @@ Every user-visible behaviour and the test that asserts it.
 | `WARN: Unknown option`, `--allow-unlistable-dirs`, cache > heap/2, key-file permissions, cert validity | `MainTest`, `SjwsServerTest`, `tls/TlsMaterialTest` |
 | `Server started: ...`, `HTTP/3 unavailable` fallback, `Server Terminated properly !` | `MainTest`, `SjwsServerTest`, `h3/SjwsServerHttp3Test` |
 | statuses 200 206 304 301 400 403 404 405 408 413 414 416 431 500 501 505 | `Http1GoldenTest`, `http1/Http1ParserTest`, `http1/FileServingTest`, `core/StaticFileHandlerRangeTest`, `Http1TransportTest`, `h3/Http3ServerTest` |
-| headers Date, Server, Content-Type/charset, Content-Length, Last-Modified, ETag, Accept-Ranges, Content-Range, Location, Connection, Alt-Svc, Allow | `Http1GoldenTest`, `core/ETagTest`, `AltSvcTest`, `h3/Http3ServerTest` |
+| headers Date, Server, Content-Type/charset, Content-Length, Last-Modified, ETag, Accept-Ranges, Content-Range, Location, Connection, Alt-Svc, Allow, X-Content-Type-Options, Content-Security-Policy | `Http1GoldenTest`, `core/ETagTest`, `AltSvcTest`, `core/SecurityHeadersTest`, `h3/Http3ServerTest` |
 | HTTP/1.1 keep-alive, pipelining, timeouts, limits | `ServerIntegrationTest`, `HardeningIntegrationTest`, `Http1TransportTest` |
 | HTTP/3 parity, limits, Alt-Svc, launch from the jar | `h3/*` |
 

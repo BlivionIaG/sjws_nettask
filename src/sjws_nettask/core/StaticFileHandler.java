@@ -34,7 +34,7 @@ import java.util.List;
  * <p>
  * Thread-safe and lock-free: it holds only immutable state.
  */
-public final class StaticFileHandler {
+public final class StaticFileHandler implements Handler {
 
     public static final String ALLOW = "GET, HEAD";
     /** Accept-Ranges of file responses (single byte ranges, see {@link ByteRanges}). */
@@ -105,6 +105,7 @@ public final class StaticFileHandler {
     }
 
     /** Never throws: unexpected filesystem errors become 500. */
+    @Override
     public Response handle(Request request) {
         boolean head = request.headOnly();
         if (!head && !"GET".equals(request.method())) {
@@ -273,10 +274,21 @@ public final class StaticFileHandler {
 
     // --- response builders (shared with the legacy http1/Page API) -------------------------
 
+    /** Stops browsers from MIME-sniffing served content into an executable type (e.g. text/plain as HTML). */
+    public static final String NOSNIFF = "nosniff";
+
+    /**
+     * Generated pages (listings, errors) need no script, frame or external resource: a CSP that
+     * forbids them neutralises any markup injected through a file name, and stops framing.
+     */
+    public static final String HTML_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+
     public static Response html(int status, String html, boolean head) {
         var headers = ResponseHeaders.of()
                 .add("accept-ranges", NO_RANGES)
-                .add("content-type", Mime.contentType("text/html"));
+                .add("content-type", Mime.contentType("text/html"))
+                .add("x-content-type-options", NOSNIFF)
+                .add("content-security-policy", HTML_CSP);
         return new Response(status, headers, Body.Bytes.of(html.getBytes(StandardCharsets.UTF_8)), head);
     }
 
