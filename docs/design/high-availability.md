@@ -158,10 +158,10 @@ the partition leader; that redirect is not part of the static path.
 - Two-phase rollout on the `ha-control` replication group (one `groupId` on the shared
   transport, not a private socket): STAGE on the quorum → pull to reachable nodes →
   ACTIVATE with quorum. Apply of ACTIVATE is what publishes the snapshot. `ha-control`
-  uses strict durability: followers fsync the batch before they ack, so a completed
-  publish survives power loss of a minority. A group may instead be opened in relaxed
-  mode (quorum in memory, fsync later); static generation publish does not.
-  A witness ack counts toward that quorum without storing the log. If the leader dies before
+  uses the default ack mode: followers ack once the batch is in memory, and fsync
+  follows. A completed publish can be lost if a majority crashes at the same time.
+  Quorum commit plus fsync (`Durability.STRICT`) is opt-in for a group that must
+  survive that. A witness ack counts toward the quorum without storing the log. If the leader dies before
   a peer has the bytes, the peer keeps the last activated snapshot (fail static) and the new
   leader publishes again from `ConfigSource`. The log coordinates activation; it is not the
   only copy of the bytes.
@@ -239,9 +239,10 @@ interface ClusterNode extends AutoCloseable {
 
   /**
    * Leader of {@code groupId} only; otherwise the future completes with NotLeaderException(hint).
-   * The future completes with the committed index after a quorum has the batch.
-   * Strict durability: that quorum has also fsynced the batch. Relaxed: in-memory quorum,
-   * fsync follows on the group's timer. One batch is one ordered span of indexes.
+   * The future completes with the committed index after a majority has the batch.
+   * Default (majority in memory): fsync follows on the group's timer and does not gate
+   * the future. Opt-in quorum commit plus fsync: that majority has also fsynced the batch.
+   * One batch is one ordered span of indexes.
    */
   CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
 
@@ -289,39 +290,44 @@ record CommittedIndex(GroupId groupId, long term, long index) {}
 record CommittedEntry(GroupId groupId, long term, long index, ByteBuffer entry) {}
 record LogSnapshot(GroupId groupId, long lastIncludedIndex, long lastIncludedTerm, byte[] data) {}
 record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout,
-                    Duration heartbeat, long snapshotEveryEntries) {}
+                    Duration heartbeat, long snapshotEveryEntries) {
+  /** Log options with the default ack mode: majority in memory. */
+  GroupOptions(int maxBatchBytes, Duration electionTimeout, Duration heartbeat, long snapshotEveryEntries) {
+    this(Durability.RELAXED, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries);
+  }
+}
 enum Durability {
-  /** Followers fsync the batch, then ack. The append future waits for that quorum. */
+  /** Opt-in. Followers fsync the batch, then ack. The append future waits for that quorum. */
   STRICT,
-  /** Quorum ack from memory. Fsync is batched afterwards and does not delay the future. */
+  /** Default. Quorum ack from memory. Fsync is batched afterwards and does not delay the future. */
   RELAXED
 }
 ```
 
-`ha-control` is `openGroup(new GroupId("ha-control"), strictOptions, listener)`.
+`GroupOptions` is the cluster API's per-group log options. The constructor that omits
+durability is the default: `Durability.RELAXED` (majority in memory). `ha-control` is
+`openGroup(new GroupId("ha-control"), defaultLogOptions, listener)` with that default.
 Messaging Core calls `openGroup` once per partition and `append(groupId, batch)` on the
 broker's single writer for that partition. The HTTP request path never calls `append`.
-Callers pass `Durability.STRICT` unless they opt into relaxed mode.
+Callers pass `Durability.STRICT` only when they opt into quorum commit plus fsync.
 
 ## Default ack mode
 
-Blivion's decision is pending. These are the two default-ack options named by
+Blivion has decided. The questions were
 [PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) (HA open question 4, T3 `replicated`)
 and [PR #17](https://github.com/BlivionIaG/sjws_nettask/pull/17) (§6 requirement 2 and §10 answer 4).
 
-1. **Quorum commit plus fsync — proposed default.** `Durability.STRICT`. Followers fsync
-   the batch, then ack. `append` completes only after a majority has done that. This is
-   the default this design follows throughout: `ha-control` is opened in this mode,
-   Messaging Core passes it unless a partition opts out, and RPO 0 in the decisions
-   below applies to a completed append. One fsync per batch (group commit), not per record.
-2. **Majority in-memory.** `Durability.RELAXED`. `append` completes once a majority holds
-   the batch in memory. Fsync runs afterwards and does not gate the ack. PR #16 leans
-   toward this as the cluster default, matching the Kafka and NATS behaviour it cites.
-   It stays available on `GroupOptions` for a caller that opts in. It is not the default
-   used by this design or by the implementation.
+1. **Majority in-memory — the default.** `Durability.RELAXED`. `append` completes once a
+   majority holds the batch in memory. Fsync runs afterwards and does not gate the ack.
+   This is the `GroupOptions` / log-options default: `ha-control` is opened this way, and
+   Messaging Core passes it unless a partition opts out. A committed entry in this mode
+   can be lost if a majority crashes at the same time. One fsync per batch still happens
+   later (group commit), not per record, and it does not gate the future.
+2. **Quorum commit plus fsync — opt-in.** `Durability.STRICT`. Followers fsync the batch,
+   then ack. `append` completes only after a majority has done that. RPO 0 in the
+   decisions below applies only to a group opened in this mode.
 
-Either choice is one line on `GroupOptions`. Switching the default later does not change
-the API. Until Blivion picks, the code keeps quorum commit plus fsync.
+The choice is one argument on `GroupOptions`. The API does not change.
 
 Pluggable SPIs: `ClusterRpc` (in-JVM for tests; one TCP connection per peer, length-prefixed
 frames demuxed by `groupId`, append batches pipelined), `LogStorage` (segmented append-only
@@ -331,8 +337,9 @@ files per group, sparse index, `FileChannel.force` on the strict ack path), `Clo
 cross-site async followers. A witness votes in the metadata group and does not store
 partition logs.
 
-Latency target: batched append, p99 under 10 ms on a quiet LAN, strict mode included when
-the quorum fsyncs the batch once (not once per record). Per-record fsync is not a target.
+Latency target: batched append, p99 under 10 ms on a quiet LAN, including the fsync
+opt-in when the quorum fsyncs the batch once (not once per record). Per-record fsync is
+not a target. The default in-memory ack does not wait for that fsync.
 The architecture bench (PR #16, group commit, p50 about 1.1 ms at 64 producers) is the
 local-disk input to that budget; the network hop has to stay inside the same single-digit
 milliseconds. Low-latency mechanics: one writer thread per group, batching, pipelining,
@@ -371,16 +378,19 @@ PR #16's T4 asks for a choice; this section is that choice.
    the epoch, and the ack identical to metadata, at partition granularity.
 
 3. **RPO and RTO.**
-   - **RPO 0 for a committed log entry.** An `append` future that has completed will not
-     be lost, including across power loss of a minority, in `Durability.STRICT` (followers
-     fsync the batch before ack). The unacked tail is not covered; producers retry it.
-   - **Relaxed mode is configurable per group** and is not RPO 0 across power loss of the
-     quorum: the future completes on an in-memory quorum, and a later fsync can still be
-     lost. Process crash of a minority still keeps the entry while a strict peer holds it.
-     `ha-control` is strict. Messaging Core picks the mode per partition via `GroupOptions`.
-   - **Static content:** RPO is the last activated generation. A committed ACTIVATE is RPO 0
-     in the same sense as any strict log entry; bytes already swapped into the snapshot
-     stay served if a later publish is lost (fail static).
+   - **RPO 0 only in fsync mode.** An `append` future that has completed in
+     `Durability.STRICT` (opt-in: followers fsync the batch before ack) will not be lost,
+     including across power loss of a minority. The unacked tail is not covered; producers
+     retry it.
+   - **The default mode is not RPO 0.** `Durability.RELAXED` completes once a majority
+     holds the entry in memory. Those committed entries can be lost if a majority crashes
+     at the same time, before the later fsync. A crash of a minority still keeps the entry
+     while a surviving peer holds it. `ha-control` and each Messaging Core partition use
+     this default unless that group is opened with `Durability.STRICT`.
+   - **Static content:** RPO is the last activated generation that survived. A committed
+     ACTIVATE is RPO 0 only when `ha-control` was opened in fsync mode. In the default
+     mode it can be lost with a simultaneous majority crash. Bytes already swapped into
+     the snapshot stay served if a later publish is lost (fail static).
    - **RTO, crash:** a new group leader is elected within one election timeout after the
      lease expires. Defaults: heartbeat 500 ms, lease 1 s, election timeout 1.5 s, so a
      crashed leader is replaced in about 2.5 s and inside the 2–6 s active/passive window.
@@ -392,15 +402,13 @@ PR #16's T4 asks for a choice; this section is that choice.
      the request path. These timeouts are what the heartbeat and election defaults are
      sized to; changing them moves the RTO on purpose.
 
-4. **Ack mode: both options, decision pending.** See **Default ack mode** above.
-   The proposed default, and the one the implementation follows, is quorum commit plus
-   fsync (`Durability.STRICT`). The other option is majority in-memory
-   (`Durability.RELAXED`): the quorum ack is receipt in memory, and fsync does not gate
-   the future. That is the Kafka/NATS trade-off PR #16 documents, and the relaxed mode
-   PR #17 keeps configurable. Blivion has not chosen the default yet
-   ([PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) question 4,
-   [PR #17](https://github.com/BlivionIaG/sjws_nettask/pull/17) §6.2 and §10.4).
-   Until that decision, `ha-control` and every group this workstream opens use strict.
+4. **Ack mode: decided.** See **Default ack mode** above. The default is majority
+   in-memory (`Durability.RELAXED`): the quorum ack is receipt in memory, and fsync does
+   not gate the future. Quorum commit plus fsync (`Durability.STRICT`) is opt-in. This
+   closes [PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) question 4 and
+   [PR #17](https://github.com/BlivionIaG/sjws_nettask/pull/17) §6.2 and §10.4.
+   `ha-control` and every group this workstream opens use the in-memory default unless
+   the caller passes `Durability.STRICT`.
 
 5. **Static HTTP is active on all nodes.** Every node with a published snapshot serves
    `GET`/`HEAD` whether or not it leads any Raft group. `/healthz` and `/readyz` are how
@@ -442,8 +450,8 @@ the PR body.
    Cluster-mode benchmark runs a second node and the heartbeat thread.
 3. **Lease and sync.** The §13a API: `append(groupId, batch)` → committed-index future,
    per-group committed-entry callback, leadership events, snapshot take/install,
-   `truncateAndCompact`. One transport demuxed by `groupId`. Strict durability fsyncs on
-   the follower before ack; relaxed is the other `GroupOptions` value. Leader lease on
+   `truncateAndCompact`. One transport demuxed by `groupId`. The default ack is majority
+   in memory. Opt-in strict durability fsyncs on the follower before ack. Leader lease on
    `ha-control`. `ConfigSource` / `CertProvider`, HMAC bundle pull, two-phase generation
    publish, atomic cert rename. HTTP calls `append` only from the sync thread.
 4. **Failover tooling.** `VipHook` driven by the lease (claim on grant, release before
