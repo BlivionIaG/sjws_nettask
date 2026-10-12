@@ -37,6 +37,8 @@ public final class SjwsServer implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     private Transport h3;
     private Throwable h3Failure;
+    private Transport h2;
+    private Throwable h2Failure;
     private ServerSocketChannel tcp;
     private ClientManager manager;
     private Thread acceptThread;
@@ -61,9 +63,24 @@ public final class SjwsServer implements AutoCloseable {
      * @throws java.io.UncheckedIOException if the document root is not a directory
      */
     public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory) throws IOException {
+        return start(config, h3Factory, H2_FACTORY);
+    }
+
+    /** Creates the HTTP/2 transport (TLS + optional h2c, see {@link sjws_nettask.h2.Http2Server}). */
+    public static final Transport.Factory H2_FACTORY = sjws_nettask.h2.Http2Server::new;
+
+    /**
+     * @param h2Factory used only when {@code config.h2Enabled()}; HTTP/2 has its own port, so the
+     *        HTTP/1.1 listener and its connections are unchanged by it
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, Transport.Factory h2Factory)
+            throws IOException {
         var server = new SjwsServer(config);
         if (config.h3Enabled()) {
             server.startH3(h3Factory);
+        }
+        if (config.h2Enabled()) {
+            server.startH2(h2Factory);
         }
         try {
             server.tcp = bind(config.port(), config.backlog());
@@ -112,6 +129,40 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
+    private void startH2(Transport.Factory factory) {
+        Transport transport = null;
+        try {
+            transport = factory.create(this.config, this.handler);
+            transport.start();
+            this.h2 = transport;
+        } catch (Exception | LinkageError e) {
+            this.h2Failure = e;
+            if (transport != null) {
+                try {
+                    transport.close();
+                } catch (RuntimeException suppressed) {
+                    e.addSuppressed(suppressed);
+                }
+            }
+            System.err.println("WARN: HTTP/2 not started: " + e);
+        }
+    }
+
+    /** @return the bound HTTP/2 (TLS) port, or -1 if HTTP/2 is not running */
+    public int h2Port() {
+        return this.h2 == null ? -1 : this.h2.port();
+    }
+
+    /** @return the running HTTP/2 transport, or null */
+    public Transport h2() {
+        return this.h2;
+    }
+
+    /** @return why HTTP/2 could not start, or null */
+    public Throwable h2Failure() {
+        return this.h2Failure;
+    }
+
     public ServerConfig config() {
         return this.config;
     }
@@ -156,6 +207,14 @@ public final class SjwsServer implements AutoCloseable {
         } else if (this.config.h3Enabled()) {
             sb.append(", HTTP/3 unavailable");
         }
+        if (this.h2 != null) {
+            sb.append(", HTTP/2 on tcp/").append(h2Port());
+            if (this.h2 instanceof sjws_nettask.h2.Http2Server s && s.h2cPort() >= 0) {
+                sb.append(" (h2c tcp/").append(s.h2cPort()).append(')');
+            }
+        } else if (this.config.h2Enabled()) {
+            sb.append(", HTTP/2 unavailable");
+        }
         return sb.append(", serving ").append(this.config.root()).toString();
     }
 
@@ -174,6 +233,9 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h3 != null) {
             this.h3.stopAccepting(); // together with TCP; its graceful drain happens below
         }
+        if (this.h2 != null) {
+            this.h2.stopAccepting();
+        }
         if (this.manager != null) {
             this.manager.close();
         }
@@ -182,6 +244,13 @@ public final class SjwsServer implements AutoCloseable {
                 this.acceptThread.join(2000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            }
+        }
+        if (this.h2 != null) {
+            try {
+                this.h2.close();
+            } catch (RuntimeException e) {
+                System.err.println("WARN: error closing " + this.h2.name() + ": " + e);
             }
         }
         if (this.h3 != null) {
