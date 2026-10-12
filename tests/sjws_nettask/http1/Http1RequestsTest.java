@@ -17,7 +17,13 @@
 package sjws_nettask.http1;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -28,12 +34,37 @@ class Http1RequestsTest {
 
     @Test
     void mapsMethodTargetAndNegotiationHeaders() {
-        var head = new Http1Parser.Head("HEAD", "/a%20b?q=1", "HTTP/1.1", Map.of(
+        var headers = Map.of(
                 "if-none-match", List.of("\"x\"", "\"y\""), "if-modified-since", List.of("Mon, 12 Oct 2026 00:00:00 GMT"),
                 "if-range", List.of("\"x\""), "range", List.of("bytes=0-1"), "accept-encoding", List.of("gzip"),
-                "host", List.of("example"), "user-agent", List.of("ignored")), 0, true, false);
-        assertEquals(new Request("HEAD", "/a%20b?q=1", new RequestHeaders("\"x\"", "Mon, 12 Oct 2026 00:00:00 GMT",
-                "\"x\"", "bytes=0-1", "gzip", "example")), Http1Requests.toCore(head));
+                "host", List.of("example"), "user-agent", List.of("ignored"));
+        var head = new Http1Parser.Head("HEAD", "/a%20b?q=1", "HTTP/1.1", headers, 0, true, false, false);
+        var request = Http1Requests.toCore(head);
+        assertEquals(new Request("HEAD", "/a%20b?q=1", RequestHeaders.of(headers)), request);
+        assertSame(headers, request.headers().fields());
+        assertEquals(List.of("ignored"), request.headers().values("user-agent"));
+        assertNull(request.peer());
+        assertFalse(request.secure());
+        var peer = new InetSocketAddress("127.0.0.1", 9);
+        assertSame(peer, Http1Requests.toCore(head, peer).peer());
+    }
+
+    @Test
+    void retainedRequestKeepsTheHeaderMapAfterParserReset() throws Exception {
+        var parser = new Http1Parser.HeadParser(8192, 100);
+        var first = "GET /a HTTP/1.1\r\nHost: example\r\nX-Trace: one\r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        assertEquals(first.length, parser.feed(first, 0, first.length));
+        var request = Http1Requests.toCore(parser.head(), new InetSocketAddress("127.0.0.1", 9));
+        parser.reset();
+        assertEquals(List.of("one"), request.headers().values("x-trace"));
+        assertEquals("example", request.headers().host());
+        assertThrows(UnsupportedOperationException.class, () -> request.headers().fields().clear());
+        assertThrows(UnsupportedOperationException.class, () -> request.headers().values("x-trace").add("z"));
+        var second = "GET /b HTTP/1.1\r\nHost: other\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
+        assertEquals(second.length, parser.feed(second, 0, second.length));
+        assertEquals(List.of("one"), request.headers().values("x-trace"));
+        assertEquals(List.of("other"), Http1Requests.toCore(parser.head()).headers().values("host"));
     }
 
     @Test

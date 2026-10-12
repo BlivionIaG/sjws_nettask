@@ -24,6 +24,10 @@ import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+import sjws_nettask.core.FilterChain;
+import sjws_nettask.core.Handler;
+import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
@@ -41,6 +45,13 @@ public final class SjwsServer implements AutoCloseable {
     private final ServerConfig config;
     private final ObserverSlot slot;
     private final StaticFileHandler handler;
+    /** Null when no filters were registered. */
+    private final FilterChain chain;
+    /**
+     * What HTTP/1.1 calls. Null means {@link #handler} directly (concrete {@code handle}, no
+     * {@link Handler} indirection). Otherwise the chain, or a terminal that is not the static handler.
+     */
+    private final Handler override;
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
     /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
@@ -52,7 +63,8 @@ public final class SjwsServer implements AutoCloseable {
     private ClientManager manager;
     private Thread acceptThread;
 
-    private SjwsServer(ServerConfig config) throws IOException {
+    private SjwsServer(ServerConfig config, RequestFilters filters, Function<StaticFileHandler, Handler> terminal)
+            throws IOException {
         this.config = config;
         RequestObserver initial = RequestObserver.NONE;
         if (config.observe()) {
@@ -62,6 +74,9 @@ public final class SjwsServer implements AutoCloseable {
         try {
             this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
                     new sjws_nettask.core.FileCache(config.cacheBytes()));
+            var leaf = select(this.handler, terminal);
+            this.chain = filters == null ? null : filters.build(leaf);
+            this.override = this.chain != null ? this.chain : (leaf == this.handler ? null : leaf);
         } catch (RuntimeException e) {
             this.slot.close();
             throw e;
@@ -72,8 +87,22 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
+    /**
+     * A null selector, a null return, or the static handler itself all keep the direct file-handler call.
+     */
+    private static Handler select(StaticFileHandler files, Function<StaticFileHandler, Handler> terminal) {
+        if (terminal == null) {
+            return files;
+        }
+        var selected = terminal.apply(files);
+        if (selected == null || selected == files) {
+            return files;
+        }
+        return selected;
+    }
+
     public static SjwsServer start(ServerConfig config) throws IOException {
-        return start(config, H3Transports.defaultFactory());
+        return start(config, H3Transports.defaultFactory(), null, null);
     }
 
     /**
@@ -82,7 +111,51 @@ public final class SjwsServer implements AutoCloseable {
      * @throws java.io.UncheckedIOException if the document root is not a directory
      */
     public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory) throws IOException {
-        var server = new SjwsServer(config);
+        return start(config, h3Factory, null, null);
+    }
+
+    /**
+     * HTTP/1.1 and HTTP/3 share {@code filters}. Null or empty leaves the static file handler
+     * on the hot path ({@link #filterChain()} stays null).
+     */
+    public static SjwsServer start(ServerConfig config, RequestFilters filters) throws IOException {
+        return start(config, H3Transports.defaultFactory(), filters, null);
+    }
+
+    /**
+     * @param terminal chooses the handler filters wrap (a router around {@code files}, or {@code files}
+     *        itself). Null keeps the static file handler. Per-route filters wrap that route's own
+     *        handler with {@link RequestFilters#wrapping} and do not use this selector
+     */
+    public static SjwsServer start(ServerConfig config, RequestFilters filters,
+            Function<StaticFileHandler, Handler> terminal) throws IOException {
+        return start(config, H3Transports.defaultFactory(), filters, terminal);
+    }
+
+    /**
+     * @param h3Factory used only when {@code config.h3Enabled()}
+     * @param filters request filters, or null; compiled once here and passed to both transports
+     * @throws IOException if the TCP port cannot be bound (nothing is left running)
+     * @throws java.io.UncheckedIOException if the document root is not a directory
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, RequestFilters filters)
+            throws IOException {
+        return start(config, h3Factory, filters, null);
+    }
+
+    /**
+     * @param h3Factory used only when {@code config.h3Enabled()}
+     * @param filters request filters, or null; compiled once here around {@code terminal} and passed
+     *        to both transports
+     * @param terminal chooses the leaf handler, or null for the static file handler. Filters wrap
+     *        that leaf. When this returns the static handler and {@code filters} is null or empty,
+     *        neither transport enters {@link FilterChain}
+     * @throws IOException if the TCP port cannot be bound (nothing is left running)
+     * @throws java.io.UncheckedIOException if the document root is not a directory
+     */
+    public static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, RequestFilters filters,
+            Function<StaticFileHandler, Handler> terminal) throws IOException {
+        var server = new SjwsServer(config, filters, terminal);
         if (config.h3Enabled()) {
             server.startH3(h3Factory);
         }
@@ -92,7 +165,8 @@ public final class SjwsServer implements AutoCloseable {
             server.close();
             throw e;
         }
-        server.manager = new ClientManager(server.tcp, config, server.handler, server.altSvc, server.slot);
+        server.manager = new ClientManager(server.tcp, config, server.handler, server.altSvc, server.override,
+                server.slot);
         server.attachGauges(server.slot.get().metrics());
         server.acceptThread = new Thread(server.manager, "accept-loop");
         server.acceptThread.start();
@@ -115,7 +189,7 @@ public final class SjwsServer implements AutoCloseable {
     private void startH3(Transport.Factory factory) {
         Transport transport = null;
         try {
-            transport = factory.create(this.config, this.handler, this.slot);
+            transport = factory.create(this.config, this.handler, this.chain, this.override, this.slot);
             transport.start();
             this.h3 = transport;
             if (this.config.altSvc()) {
@@ -140,6 +214,14 @@ public final class SjwsServer implements AutoCloseable {
 
     public StaticFileHandler handler() {
         return this.handler;
+    }
+
+    /**
+     * @return the compiled filter chain, or null when none were registered (the request path does
+     *         not call into {@link FilterChain})
+     */
+    public FilterChain filterChain() {
+        return this.chain;
     }
 
     /**
