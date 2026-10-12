@@ -80,7 +80,7 @@ public class ClientManager implements Runnable {
      */
     public ClientManager(ServerSocketChannel server, ServerConfig config, Supplier<ResponseHeaders> extraHeaders) {
         this(server, config, new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
-                new sjws_nettask.core.FileCache(config.cacheBytes())), extraHeaders);
+                new sjws_nettask.core.FileCache(config.cacheBytes()), config.access()), extraHeaders);
     }
 
     /** Shares {@code handler} with other transports (HTTP/3). */

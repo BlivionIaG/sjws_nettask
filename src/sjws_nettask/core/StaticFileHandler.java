@@ -76,7 +76,17 @@ public final class StaticFileHandler implements Handler {
 
     public StaticFileHandler(Path root, boolean allowUnlistableDirs, java.time.InstantSource clock,
             FileCache cache) {
-        this.resolver = new PathResolver(root);
+        this(root, allowUnlistableDirs, clock, cache, AccessRules.DEFAULT);
+    }
+
+    /** With an access policy (path rules, dotfiles, owner/permissions; see {@link AccessRules}). */
+    public StaticFileHandler(Path root, boolean allowUnlistableDirs, FileCache cache, AccessPolicy policy) {
+        this(root, allowUnlistableDirs, java.time.InstantSource.system(), cache, policy);
+    }
+
+    public StaticFileHandler(Path root, boolean allowUnlistableDirs, java.time.InstantSource clock,
+            FileCache cache, AccessPolicy policy) {
+        this.resolver = new PathResolver(root, policy);
         this.allowUnlistableDirs = allowUnlistableDirs;
         this.etags = new EntityTag.Policy(clock);
         this.cache = java.util.Objects.requireNonNull(cache, "cache");
@@ -128,14 +138,30 @@ public final class StaticFileHandler implements Handler {
         if (decoded == null) {
             return error(400, head);
         }
+        var logical = this.resolver.normalize(decoded);
+        if (logical == null) {
+            return error(404, head);
+        }
+        int denied = this.resolver.access(logical); // lexical checks run on cache hits too
+        if (denied != 0) {
+            return error(denied, head);
+        }
         String key = null;
         if (this.cache.enabled()) {
-            var logical = this.resolver.logical(decoded); // lexical checks run on hits too
-            if (logical == null) {
-                return error(404, head);
-            }
             key = decoded.endsWith("/") ? logical + "/" : logical.toString();
             var hit = this.cache.lookup(key);
+            if (hit != null && this.resolver.policy().checksFiles()) {
+                // ctime has coarse granularity: a chmod/chown right after the load may not change the
+                // stamp, so an opt-in file policy is re-checked on every hit (one more stat)
+                try {
+                    int refused = this.resolver.policy().checkFile(hit.statPath);
+                    if (refused != 0) {
+                        return error(refused, head);
+                    }
+                } catch (IOException e) {
+                    hit = null; // gone or unreadable: take the full path, which answers it
+                }
+            }
             if (hit != null) {
                 if (!hit.weak() || this.etags.weak(hit.meta().validator())) {
                     return hit.response(head, request.headers());
@@ -145,9 +171,13 @@ public final class StaticFileHandler implements Handler {
                 this.cache.drop(hit);
             }
         }
-        var resolved = this.resolver.resolve(decoded);
+        var resolved = this.resolver.resolveLogical(logical);
         if (resolved == null) {
             return error(404, head);
+        }
+        denied = this.resolver.accessResolved(resolved);
+        if (denied != 0) {
+            return error(denied, head);
         }
         try {
             var attributes = Files.readAttributes(resolved.real(), BasicFileAttributes.class);
@@ -160,7 +190,7 @@ public final class StaticFileHandler implements Handler {
                 if (index != null && Files.isRegularFile(index.real())) {
                     return file(index, head, request.headers(), key);
                 }
-                return listing(listVisible(resolved.real()), decoded, head);
+                return listing(listVisible(resolved.real(), logical), decoded, head);
             }
             if (!attributes.isRegularFile()) {
                 return error(404, head);
@@ -178,6 +208,10 @@ public final class StaticFileHandler implements Handler {
             throws IOException {
         if (!Files.isReadable(file.real())) {
             return error(403, head);
+        }
+        int refused = this.resolver.policy().checkFile(file.real());
+        if (refused != 0) {
+            return error(refused, head);
         }
         var name = file.logical().getFileName().toString();
         var attributes = Files.readAttributes(file.real(), BasicFileAttributes.class);
@@ -262,11 +296,11 @@ public final class StaticFileHandler implements Handler {
                 Files.readAttributes(real, BasicFileAttributes.class), head, ifModifiedSince);
     }
 
-    private List<String> listVisible(Path folder) throws IOException {
+    private List<String> listVisible(Path folder, Path logicalFolder) throws IOException {
         List<String> names = new ArrayList<>();
         try (var entries = Files.list(folder)) {
             for (var p : (Iterable<Path>) entries::iterator) {
-                if (this.resolver.isVisible(p)) {
+                if (this.resolver.isVisible(logicalFolder, p)) {
                     var name = p.getFileName().toString();
                     names.add(Files.isDirectory(p) ? name + "/" : name);
                 }

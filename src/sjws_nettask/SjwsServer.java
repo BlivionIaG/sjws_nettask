@@ -75,7 +75,7 @@ public final class SjwsServer implements AutoCloseable {
         this.slot = new ObserverSlot(initial);
         try {
             this.handler = new StaticFileHandler(config.root(), config.allowUnlistableDirs(),
-                    new sjws_nettask.core.FileCache(config.cacheBytes()));
+                    new sjws_nettask.core.FileCache(config.cacheBytes()), config.access());
             var leaf = select(this.handler, terminal);
             this.chain = filters == null ? null : filters.build(leaf);
             this.override = this.chain != null ? this.chain : (leaf == this.handler ? null : leaf);
