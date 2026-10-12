@@ -284,6 +284,22 @@ class HardeningIntegrationTest {
 
     // --- process level ----------------------------------------------------------
 
+    private StringBuilder lastLog = new StringBuilder();
+
+    /** Reads the child's output until a line starts with {@code prefix}; the lines go to {@link #lastLog}. */
+    private void waitForLine(Process p, String prefix) throws IOException {
+        var reader = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
+        this.lastLog = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            this.lastLog.append(line).append('\n');
+            if (line.startsWith(prefix)) {
+                return;
+            }
+        }
+        throw new AssertionError("child exited before '" + prefix + "':\n" + this.lastLog);
+    }
+
     private Process launch(String... args) throws IOException {
         String javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         var cmd = new java.util.ArrayList<>(java.util.List.of(javaBin, "-cp", System.getProperty("java.class.path"),
@@ -334,31 +350,31 @@ class HardeningIntegrationTest {
     }
 
     @Test
-    void h3UnavailableFallsBackToHttp1() throws Exception {
+    void h3BusyUdpPortFallsBackToHttp1() throws Exception {
         Files.writeString(root.resolve("hello.txt"), "hello");
         int port;
         try (var probe = new ServerSocket(0)) {
             port = probe.getLocalPort();
         }
-        Process p = launch(String.valueOf(port), root.toString(), "--h3");
+        // HTTP/3 defaults to the TCP port number on UDP 0.0.0.0: hold that UDP port so the bind fails.
+        Process p = null;
         try {
-            var reader = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
-            var log = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                log.append(line).append('\n');
-                if (line.startsWith("HTTP/1.1 on tcp/")) {
-                    break;
-                }
+            try (var busyUdp = new java.net.DatagramSocket(port)) {
+                p = launch(String.valueOf(port), root.toString(), "--h3");
+                waitForLine(p, "HTTP/1.1 on tcp/");
             }
+            var log = this.lastLog;
             assertTrue(log.toString().contains("WARN: HTTP/3 not started"), log.toString());
+            assertTrue(log.toString().contains("udp/0.0.0.0:" + port), log.toString());
             assertTrue(log.toString().contains("HTTP/3 unavailable"), log.toString());
             Response r = HttpTestSupport.get(port, "/hello.txt", TIMEOUT_MS);
             assertEquals("hello", r.bodyText());
             assertNull(r.headers().get("alt-svc"));
         } finally {
-            p.destroyForcibly();
-            p.waitFor(5, TimeUnit.SECONDS);
+            if (p != null) {
+                p.destroyForcibly();
+                p.waitFor(5, TimeUnit.SECONDS);
+            }
         }
     }
 }
