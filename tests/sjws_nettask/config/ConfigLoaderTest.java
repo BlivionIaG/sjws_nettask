@@ -156,7 +156,7 @@ class ConfigLoaderTest {
                   routes:
                     - prefix: /old
                       redirect: { status: 301, location: "https://example.com/\\r\\nX" }
-                """.replace("\\r\\n", "\r\n")).contains("control"));
+                """).contains("control"));
         assertTrue(error("tls:\n  key_password: secret\n").contains("key_password"));
         assertTrue(error("tls:\n  cert: a.pem\n").contains("together"));
         assertTrue(error("server:\n  port: 1\nserver:\n  port: 2\n").toLowerCase().contains("duplicate")

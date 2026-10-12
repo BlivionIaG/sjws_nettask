@@ -17,22 +17,31 @@
 package sjws_nettask.acme;
 
 import java.io.IOException;
+import java.io.StringReader;
 import java.io.StringWriter;
 import java.net.URI;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
+import java.security.GeneralSecurityException;
+import java.security.KeyFactory;
 import java.security.KeyPair;
+import java.security.interfaces.RSAPrivateCrtKey;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.RSAPublicKeySpec;
+import java.util.Base64;
 import java.util.EnumSet;
 import java.util.Set;
 import org.shredzone.acme4j.util.KeyPairUtils;
 import sjws_nettask.tls.TlsMaterial;
 
 /**
- * Account key, domain key and certificate chain on disk. Keys are owner-read/write when the
- * filesystem allows it. If {@code directory} does not match the CA the account URL was issued by,
- * the URL is ignored and the key is kept.
+ * Account key, domain key and certificate chain on disk. New keys are PKCS#8 PEM ({@code PRIVATE
+ * KEY}) so {@link TlsMaterial#fromPem} can load the domain key, and owner-read/write when the
+ * filesystem allows it. A legacy PKCS#1 {@code RSA PRIVATE KEY} file is still read. If
+ * {@code directory} does not match the CA the account URL was issued by, the URL is ignored and
+ * the key is kept.
  */
 public final class AcmeStore {
 
@@ -97,19 +106,46 @@ public final class AcmeStore {
         Files.createDirectories(this.directory);
         var path = this.directory.resolve(name);
         if (Files.isRegularFile(path)) {
-            try (var reader = Files.newBufferedReader(path)) {
-                return KeyPairUtils.readKeyPair(reader);
-            }
+            return readKey(path);
         }
         var pair = KeyPairUtils.createKeyPair(2048);
-        var writer = new StringWriter();
-        KeyPairUtils.writeKeyPair(pair, writer);
-        Files.writeString(path, writer.toString());
+        var body = Base64.getMimeEncoder(64, new byte[] {'\n'}).encodeToString(pair.getPrivate().getEncoded());
+        Files.writeString(path, "-----BEGIN PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----\n");
         try {
             Files.setPosixFilePermissions(path, OWNER_ONLY);
         } catch (UnsupportedOperationException e) {
             // filesystems without POSIX permissions keep the process umask
         }
         return pair;
+    }
+
+    private static KeyPair readKey(Path path) throws IOException {
+        var pem = Files.readString(path);
+        if (pem.contains("-----BEGIN PRIVATE KEY-----")) {
+            return pkcs8(pem, path);
+        }
+        try (var reader = new StringReader(pem)) {
+            return KeyPairUtils.readKeyPair(reader);
+        }
+    }
+
+    private static KeyPair pkcs8(String pem, Path path) throws IOException {
+        int begin = pem.indexOf("-----BEGIN PRIVATE KEY-----");
+        int end = pem.indexOf("-----END PRIVATE KEY-----", begin);
+        if (end < 0) {
+            throw new IOException("invalid PKCS#8 key in " + path);
+        }
+        var body = pem.substring(begin + "-----BEGIN PRIVATE KEY-----".length(), end).replaceAll("\\s", "");
+        try {
+            var factory = KeyFactory.getInstance("RSA");
+            var privateKey = factory.generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(body)));
+            if (!(privateKey instanceof RSAPrivateCrtKey crt)) {
+                throw new IOException("ACME key " + path + " is not an RSA key");
+            }
+            var publicKey = factory.generatePublic(new RSAPublicKeySpec(crt.getModulus(), crt.getPublicExponent()));
+            return new KeyPair(publicKey, privateKey);
+        } catch (GeneralSecurityException | IllegalArgumentException e) {
+            throw new IOException("invalid PKCS#8 key in " + path, e);
+        }
     }
 }

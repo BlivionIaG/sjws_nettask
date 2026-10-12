@@ -17,7 +17,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
 | `config/ConfigLoaderTest`, `config/RouteTableTest`, `config/ReloadServerTest` | YAML file, routing table validation (not dispatched), immutable snapshot reload |
 | `ReloadHookTest` | reload hook registry |
-| `acme/AcmeTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, hot cert swap |
+| `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance (linux/amd64), hot cert swap |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |

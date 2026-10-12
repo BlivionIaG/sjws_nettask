@@ -30,7 +30,8 @@ class RouteTableTest {
         assertEquals("/api", table.match("example.com", "/api?x=1").prefix());
         assertEquals("/", table.match("example.com", "/apix").prefix());
         assertEquals("/old", table.match(null, "/old").prefix());
-        assertNull(table.match("other.test", "/api"));
+        assertEquals("/", table.match("other.test", "/api").prefix());
+        assertNull(new RouteTable(List.of(route("example.com", false, null, "/api"))).match("other.test", "/api"));
         assertEquals("/", table.match("example.com", "/").prefix());
     }
 

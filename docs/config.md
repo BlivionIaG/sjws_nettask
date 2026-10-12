@@ -132,9 +132,10 @@ HTTP/1.1 listener that only serves challenges. `/.well-known/acme-challenge/` is
 matched before the static handler whenever ACME is on the main listener. An
 unknown token is 404 and is not served as a file.
 
-Storage (created on first issue): `account.key`, `domain.key` (mode 0600 where
-the filesystem allows it), `cert.pem`, `account.url`, `directory`. If the
-directory URL changes, the account URL is ignored and the account key is kept.
+Storage (created on first issue): `account.key`, `domain.key` (PKCS#8 `PRIVATE KEY`,
+mode 0600 where the filesystem allows it), `cert.pem`, `account.url`, `directory`.
+If the directory URL changes, the account URL is ignored and the account key is kept.
+An integration test issues a certificate against Pebble on linux/amd64.
 
 Issuance and renewal run on a daemon thread, never on a request. A certificate
 already on disk is published immediately when it is still valid. Renewal is

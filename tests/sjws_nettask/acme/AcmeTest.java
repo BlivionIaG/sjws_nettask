@@ -76,6 +76,13 @@ class AcmeTest {
         assertEquals(first.getPublic(), again.getPublic());
         var perms = Files.getPosixFilePermissions(dir.resolve("account.key"));
         assertEquals(Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE), perms);
+        assertTrue(Files.readString(dir.resolve("account.key")).contains("-----BEGIN PRIVATE KEY-----"));
+        var legacyDir = dir.resolve("legacy");
+        Files.createDirectories(legacyDir);
+        var writer = new java.io.StringWriter();
+        org.shredzone.acme4j.util.KeyPairUtils.writeKeyPair(first, writer);
+        Files.writeString(legacyDir.resolve("account.key"), writer.toString());
+        assertEquals(first.getPublic(), new AcmeStore(legacyDir).accountKey().getPublic());
         assertNull(store.accountUrl(AcmeSettings.STAGING));
         var url = URI.create("https://example.com/acme/acct/1").toURL();
         store.saveAccount(url, AcmeSettings.STAGING);
