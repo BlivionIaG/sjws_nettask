@@ -105,6 +105,9 @@ def main():
             if mode != "omit":
                 args += ["--mode", mode]
             run(a, *args)
+            for leftover in (mcfg + ".last-good", os.path.join(root, "config", "last-good.json")):
+                if os.path.lexists(leftover):
+                    os.remove(leftover)
             cmd = [java(a), *fp.JVM_FLAGS, "-jar", a.jar, f"--config={mcfg}"]
             t0 = time.monotonic()
             p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

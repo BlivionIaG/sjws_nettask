@@ -432,6 +432,120 @@ class ConfigModelTest {
         }
     }
 
+    @Test
+    void verifierRejectsATamperedHashAndLastGoodIgnoresCorruptFiles() throws Exception {
+        var key = "edge-key".getBytes(StandardCharsets.UTF_8);
+        assertThrows(IllegalArgumentException.class, () -> new MacSnapshotVerifier(null));
+        assertThrows(IllegalArgumentException.class, () -> new MacSnapshotVerifier(new byte[0]));
+        var verifier = new MacSnapshotVerifier(key);
+        var twin = new MacSnapshotVerifier(key.clone());
+        assertEquals(verifier, twin);
+        assertEquals(verifier.hashCode(), twin.hashCode());
+        assertNotEquals(verifier, new MacSnapshotVerifier("other-key".getBytes(StandardCharsets.UTF_8)));
+        assertNotEquals(verifier, "other-key");
+
+        var root = Files.createDirectory(dir.resolve("edge-html"));
+        var yaml = dir.resolve("edge.yaml");
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var base = loaded.document();
+        var emptySig = assertThrows(ConfigException.class, () -> verifier.verify(base.withSignature(new byte[0])));
+        assertTrue(emptySig.getMessage().contains("signature"));
+        var tampered = new ConfigDocument(base.server(), base.acme(), base.routing(), base.middleware(),
+                base.access(), base.node(), base.schemaVersion(), base.bundleVersion(), base.configFile(),
+                base.stateDir(), "ab", base.canonicalText(), new byte[] {1});
+        var hashMismatch = assertThrows(ConfigException.class, () -> verifier.verify(tampered));
+        assertTrue(hashMismatch.getMessage().contains("canonical hash"));
+        assertThrows(IllegalArgumentException.class, () -> new ConfigDocument(base.server(), base.acme(),
+                base.routing(), base.middleware(), base.access(), base.node(), -1, 0, null, null, null, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new ConfigDocument(base.server(), base.acme(),
+                base.routing(), base.middleware(), base.access(), base.node(), 1, -1, null, null, "", null, null));
+        var clearedHash = new ConfigDocument(base.server(), base.acme(), base.routing(), base.middleware(),
+                base.access(), base.node(), 1, 0, null, base.stateDir(), null, null, null);
+        assertEquals("", clearedHash.canonicalHash());
+        var signed = base.withSignature(new byte[] {9});
+        assertArrayEquals(new byte[] {9}, signed.withNode(signed.node()).signature());
+        assertEquals(LastGoodStore.defaultStateDir(), base.withStateDir(null).stateDir());
+        var clearedFile = base.withConfigFile(null);
+        assertNull(clearedFile.configFile());
+        assertSame(clearedFile, clearedFile.withConfigFile(null));
+        assertEquals(yaml, clearedFile.withConfigFile(yaml).configFile());
+        assertEquals(Path.of("sjws.yaml.last-good"), LastGoodStore.beside(Path.of("sjws.yaml")));
+
+        var data = ConfigDocument.of(base.server(), base.acme(), base.routing(), base.middleware(), base.access(),
+                new NodeSettings(NodeSettings.Mode.DATA, Map.of("site", "edge")),
+                1, 4, yaml).withStateDir(dir.resolve("edge-state"));
+        var path = dir.resolve("edge.json");
+        LastGoodStore.write(path, data);
+        assertEquals(data.canonicalText(), LastGoodStore.dataPlaneYaml(path));
+        var special = data.withServer(data.server().toBuilder().root(dir.resolve("a\"b\\c\t\r\u0001")).build());
+        var specialPath = dir.resolve("special.json");
+        LastGoodStore.write(specialPath, special);
+        var specialJson = Files.readString(specialPath);
+        assertTrue(specialJson.contains("\\u0001"), specialJson);
+        assertTrue(specialJson.contains("\\t"), specialJson);
+        assertTrue(specialJson.contains("\\r"), specialJson);
+        var rendered = new ConfigDocument(data.server(), data.acme(), data.routing(), data.middleware(),
+                data.access(), data.node(), data.schemaVersion(), data.bundleVersion(), data.configFile(),
+                data.stateDir(), data.canonicalHash(), null, null);
+        var nullText = dir.resolve("null-text.json");
+        LastGoodStore.write(nullText, rendered);
+        assertEquals(data.canonicalText(), LastGoodStore.dataPlaneYaml(nullText));
+        assertNull(LastGoodStore.signature(nullText));
+
+        var blank = dir.resolve("blank.json");
+        Files.writeString(blank, " \n");
+        assertNull(LastGoodStore.dataPlaneYaml(blank));
+        assertNull(LastGoodStore.signature(blank));
+        assertFalse(LastGoodStore.dataPlane(blank));
+        Files.writeString(dir.resolve("stand.yaml"), "node:\n  mode: standalone\n");
+        assertNull(LastGoodStore.dataPlaneYaml(dir.resolve("stand.yaml")));
+        Files.writeString(dir.resolve("nonode.yaml"), "server:\n  port: 1\n");
+        assertNull(LastGoodStore.dataPlaneYaml(dir.resolve("nonode.yaml")));
+        Files.writeString(dir.resolve("spaced.yaml"), "node:\n  mode: \" data \"\n");
+        assertNotNull(LastGoodStore.dataPlaneYaml(dir.resolve("spaced.yaml")));
+        Files.writeString(dir.resolve("num.yaml"), "node:\n  mode: 1\n");
+        assertNull(LastGoodStore.dataPlaneYaml(dir.resolve("num.yaml")));
+        var brokenHash = Files.readString(path).replace(data.canonicalHash(), "00");
+        Files.writeString(dir.resolve("bad-hash.json"), brokenHash);
+        assertNull(LastGoodStore.dataPlaneYaml(dir.resolve("bad-hash.json")));
+        Files.writeString(dir.resolve("not-object.json"), "[1]");
+        assertNull(LastGoodStore.dataPlaneYaml(dir.resolve("not-object.json")));
+        assertNull(LastGoodStore.signature(dir.resolve("not-object.json")));
+        Files.writeString(dir.resolve("no-colon.json"), "{\"schema\" 1}");
+        assertNull(LastGoodStore.dataPlaneYaml(dir.resolve("no-colon.json")));
+        Files.writeString(dir.resolve("bad-unicode.json"), "{\"canonical\":\"\\u12\"}");
+        assertNull(LastGoodStore.dataPlaneYaml(dir.resolve("bad-unicode.json")));
+        var simple = "node:\n  mode: data\n";
+        var simpleHash = ConfigCodec.sha256(simple);
+        Files.writeString(dir.resolve("unicode.json"),
+                "{\"schema\":1,\"version\":1,\"canonicalHash\":\"" + simpleHash
+                        + "\",\"signature\":\"\",\"canonical\":\"node:\\n  mode: \\u0064ata\\n\"}\n");
+        assertEquals(simple, LastGoodStore.dataPlaneYaml(dir.resolve("unicode.json")));
+        var raw = Files.readString(path);
+        var extra = "{\"extra\":1,\"note\":\"z\",\"neg\":-2," + raw.substring(1);
+        Files.writeString(dir.resolve("extra.json"), extra);
+        assertEquals(data.canonicalText(), LastGoodStore.dataPlaneYaml(dir.resolve("extra.json")));
+
+        var shifted = base.server().toBuilder().tlsKeyPassword("pw").build();
+        var hashed = ConfigDocument.of(shifted, base.acme(), base.routing(), base.middleware(), base.access(),
+                base.node(), base.schemaVersion(), 2, base.configFile());
+        var bare = new ConfigDocument(shifted, base.acme(), base.routing(), base.middleware(), base.access(),
+                base.node(), hashed.schemaVersion(), hashed.bundleVersion(), hashed.configFile(), hashed.stateDir(),
+                hashed.canonicalHash(), null, new byte[] {7, 7});
+        var board = new ChallengeBoard();
+        var current = ConfigSnapshot.compile(base, board, 1);
+        var reloader = new ConfigReloader(loaded);
+        var copied = reloader.apply(current, bare, false, board, true);
+        assertTrue(copied.applied(), copied.errors().toString());
+        assertArrayEquals(new byte[] {7, 7}, copied.snapshot().document().signature());
+        var empty = new ConfigDocument(base.server(), base.acme(), base.routing(), base.middleware(), base.access(),
+                base.node(), base.schemaVersion(), base.bundleVersion(), base.configFile(), base.stateDir(), "",
+                base.canonicalText(), null);
+        assertTrue(reloader.apply(current, empty, false, board, false).applied());
+    }
+
     private String error(String yaml) throws Exception {
         var file = dir.resolve("bad-" + sha256(yaml.getBytes(StandardCharsets.UTF_8)).substring(0, 8) + ".yaml");
         Files.writeString(file, yaml);
