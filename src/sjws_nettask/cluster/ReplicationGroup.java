@@ -31,6 +31,9 @@ public interface ReplicationGroup {
 
     boolean isLeader();
 
+    /** Monotonic nanos when this leader's lease ends. {@code 0} when this node is not leader. */
+    long leaseExpiresAt();
+
     long commitIndex();
 
     long lastApplied();

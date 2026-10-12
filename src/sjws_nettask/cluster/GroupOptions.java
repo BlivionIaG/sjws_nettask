@@ -22,10 +22,17 @@ import java.util.Objects;
 /**
  * Per-group log options. The lease is two heartbeats; an election waits for the lease and then this
  * timeout. The constructor that omits durability uses {@link Durability#RELAXED} (majority in memory).
- * Pass {@link Durability#STRICT} to opt into quorum commit plus fsync.
+ * Pass {@link Durability#STRICT} to opt into quorum commit plus fsync. A preferred node campaigns
+ * sooner. Failback hysteresis keeps a demoted leader from campaigning again until that delay has
+ * elapsed.
  */
 public record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
-        long snapshotEveryEntries) {
+        long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis) {
+
+    public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
+            long snapshotEveryEntries) {
+        this(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, false, Duration.ZERO);
+    }
 
     /** Default ack mode: majority in memory. Fsync-before-ack is the {@link Durability} overload. */
     public GroupOptions(int maxBatchBytes, Duration electionTimeout, Duration heartbeat, long snapshotEveryEntries) {
@@ -36,6 +43,7 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
         Objects.requireNonNull(durability, "durability");
         Objects.requireNonNull(electionTimeout, "electionTimeout");
         Objects.requireNonNull(heartbeat, "heartbeat");
+        Objects.requireNonNull(failbackHysteresis, "failback");
         if (maxBatchBytes < 1) {
             throw new IllegalArgumentException("maxBatchBytes");
         }
@@ -45,9 +53,22 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
         if (snapshotEveryEntries < 1) {
             throw new IllegalArgumentException("snapshotEveryEntries");
         }
+        if (failbackHysteresis.isNegative()) {
+            throw new IllegalArgumentException("failback");
+        }
     }
 
     public long leaseNanos() {
         return heartbeat.toNanos() * 2;
+    }
+
+    public GroupOptions withPreferred(Duration failbackHysteresis) {
+        return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, true,
+                failbackHysteresis);
+    }
+
+    public GroupOptions withFailback(Duration failbackHysteresis) {
+        return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
+                failbackHysteresis);
     }
 }
