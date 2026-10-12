@@ -28,9 +28,30 @@ import sjws_nettask.routing.Router;
  *        {@code wildcard} is true; null matches every host
  * @param hostSuffix for a wildcard, the dotted suffix ({@code *.example.com} stores
  *        {@code .example.com}); null otherwise
+ * @param errors how server-generated error pages of this route are rendered
  */
 public record RouteSpec(String host, boolean wildcard, String hostSuffix, String prefix, String rewrite,
-        RouteSpec.Action action) {
+        RouteSpec.Action action, RouteSpec.Errors errors) {
+
+    public RouteSpec {
+        java.util.Objects.requireNonNull(errors, "errors");
+    }
+
+    /** HTML error pages (the default). */
+    public RouteSpec(String host, boolean wildcard, String hostSuffix, String prefix, String rewrite, Action action) {
+        this(host, wildcard, hostSuffix, prefix, rewrite, action, Errors.HTML);
+    }
+
+    /**
+     * {@code errors: html | problem} and {@code problem_type}.
+     *
+     * @param problem render supported statuses as RFC 9457 {@code application/problem+json}
+     * @param typeBase URI the status is appended to for {@code type}; null gives "about:blank"
+     */
+    public record Errors(boolean problem, String typeBase) {
+
+        public static final Errors HTML = new Errors(false, null);
+    }
 
     /** Exactly one of proxy, redirect or static. */
     public sealed interface Action permits Action.Proxy, Action.Redirect, Action.Static {
@@ -46,8 +67,17 @@ public record RouteSpec(String host, boolean wildcard, String hostSuffix, String
         record Redirect(int status, String location, boolean keepPath) implements Action {
         }
 
-        /** {@code static: true}: the document root. */
-        record Static() implements Action {
+        /**
+         * {@code static: true}: the document root.
+         *
+         * @param listing {@code listing:} (default true); false answers directories without
+         *        index.html with 404
+         */
+        record Static(boolean listing) implements Action {
+
+            public Static() {
+                this(true);
+            }
         }
     }
 

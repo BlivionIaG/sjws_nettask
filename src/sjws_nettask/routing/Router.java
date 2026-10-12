@@ -28,8 +28,10 @@ import sjws_nettask.core.StaticFileHandler;
  * rewriting the prefix, or to the fallback handler when none matches.
  * <p>
  * Matching does not allocate: tables with more than {@link #LINEAR_MAX} routes are compiled
- * once into hash tables ({@link CompiledRoutes}) with the same first-match result. It works on the raw (still percent-encoded) target and Host value.
- * A target with a {@code ..} path segment (also percent-encoded) is answered 400 before any route
+ * once into hash tables ({@link CompiledRoutes}) with the same first-match result. It works on
+ * the raw (still percent-encoded) target and Host value.
+ * A target with a {@code ..} path segment (also percent-encoded, or delimited by {@code ;},
+ * a backslash or an encoded slash) is answered 400 before any route
  * is tried, so a prefix can never be escaped. Immutable and thread-safe.
  */
 public final class Router implements Handler {
@@ -240,24 +242,56 @@ public final class Router implements Handler {
         return s;
     }
 
-    /** True if a path segment of {@code target[0, end)} is "..", with either dot possibly "%2e". */
+    /**
+     * True if a path segment of {@code target[0, end)} is "..", with either dot possibly "%2e".
+     * Segments are also split at the separators an upstream may decode or honour ({@code \\},
+     * {@code %2f}, {@code %5c}), and a segment ends at {@code ;} (path parameters: some servlet
+     * containers read {@code ..;x} as {@code ..}), so none of these spellings can step out of a
+     * route prefix once the target is forwarded.
+     */
     static boolean hasDotDot(String target, int end) {
         int i = 0;
-        while (i < end) {
-            int segEnd = target.indexOf('/', i);
-            if (segEnd < 0 || segEnd > end) {
-                segEnd = end;
-            }
-            int j = dot(target, i, segEnd);
+        while (i <= end) {
+            int j = dot(target, i, end);
             if (j > 0) {
-                j = dot(target, j, segEnd);
-                if (j == segEnd) {
+                j = dot(target, j, end);
+                if (j > 0 && (j == end || target.charAt(j) == ';' || separator(target, j, end) > 0)) {
                     return true;
                 }
             }
-            i = segEnd + 1;
+            // next segment
+            int k = i;
+            int next = -1;
+            while (k < end) {
+                int sep = separator(target, k, end);
+                if (sep > 0) {
+                    next = k + sep;
+                    break;
+                }
+                k++;
+            }
+            if (next < 0) {
+                return false;
+            }
+            i = next;
         }
         return false;
+    }
+
+    /** @return the length of a segment separator at {@code i} ("/", "\\", "%2f", "%5c"), or 0 */
+    private static int separator(String s, int i, int end) {
+        char c = s.charAt(i);
+        if (c == '/' || c == '\\') {
+            return 1;
+        }
+        if (c == '%' && i + 3 <= end) {
+            char a = s.charAt(i + 1);
+            char b = Character.toLowerCase(s.charAt(i + 2));
+            if ((a == '2' && b == 'f') || (a == '5' && b == 'c')) {
+                return 3;
+            }
+        }
+        return 0;
     }
 
     /** @return the index after a "." or "%2e" at {@code i}, or -1 */

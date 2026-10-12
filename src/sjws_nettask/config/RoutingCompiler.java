@@ -21,6 +21,7 @@ import java.util.HashMap;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.routing.Cidr;
+import sjws_nettask.routing.ProblemErrorHandler;
 import sjws_nettask.routing.ProxyHandler;
 import sjws_nettask.routing.RedirectHandler;
 import sjws_nettask.routing.Router;
@@ -56,9 +57,15 @@ final class RoutingCompiler {
                     yield shared;
                 }
                 case RouteSpec.Action.Redirect r -> new RedirectHandler(r.status(), r.location(), r.keepPath());
-                case RouteSpec.Action.Static s -> files;
+                case RouteSpec.Action.Static s -> files.withListings(s.listing());
             };
-            routes.add(new Router.Route(spec.routerHost(), spec.prefix(), spec.rewrite(), handler));
+            var errors = spec.errors();
+            if (errors.problem()) { // opt-in wrapper; it applies the rewrite so "instance" is the client's path
+                handler = new ProblemErrorHandler(handler, spec.prefix(), spec.rewrite(), errors.typeBase());
+                routes.add(new Router.Route(spec.routerHost(), spec.prefix(), null, handler));
+            } else {
+                routes.add(new Router.Route(spec.routerHost(), spec.prefix(), spec.rewrite(), handler));
+            }
         }
         return new Router(routes, files);
     }

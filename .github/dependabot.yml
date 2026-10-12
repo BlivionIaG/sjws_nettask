@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      netty:
+        patterns: ["io.netty:*"]
+      bouncycastle:
+        patterns: ["org.bouncycastle:*"]
+      maven-plugins:
+        patterns: ["org.apache.maven.plugins:*", "org.jacoco:*", "org.pitest:*", "org.codehaus.mojo:*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
