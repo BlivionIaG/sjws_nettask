@@ -36,6 +36,15 @@ final class ChannelOutput extends OutputStream implements Http1Writer.FileSink {
 
     static final int WRITE_CHUNK = 64 * 1024;
 
+    /**
+     * Most bytes requested from one transferTo (sendfile) call. Measured in S5 (3 reps, medians):
+     * 256 KiB / 1 MiB changed 50 MB downloads by +4.8% / +1.6% (100 connections) and -3.4% / +2.4%
+     * (1000), under the 5% bar, so it stays at 64 KiB. (Uncached ~100 KB files would gain ~6%: one
+     * call instead of two.) On a virtual thread each call returns after partial progress anyway,
+     * so the size does not affect the write deadline.
+     */
+    static final int TRANSFER_CHUNK = 64 * 1024;
+
     /** Bytes sent with a parking write when sendfile reports a full socket buffer. */
     static final int BLOCKING_SLICE = 16 * 1024;
 
@@ -88,7 +97,7 @@ final class ChannelOutput extends OutputStream implements Http1Writer.FileSink {
         ByteBuffer slice = null; // only for clients slower than the network path
         while (pos < end) {
             this.timer.writing();
-            long n = source.transferTo(pos, Math.min(WRITE_CHUNK, end - pos), this.channel);
+            long n = source.transferTo(pos, Math.min(TRANSFER_CHUNK, end - pos), this.channel);
             if (n > 0) {
                 pos += n;
                 stalls = 0;
