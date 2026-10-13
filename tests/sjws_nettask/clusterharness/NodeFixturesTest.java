@@ -105,16 +105,13 @@ class NodeFixturesTest {
     }
 
     @Test
-    void connectedDataNodeIsRefusedRatherThanFaked() {
+    void pendingControlPlaneIsOnlyTheNullObject() throws Exception {
         assertFalse(new PendingControlPlane().available());
-        assertFalse(NodeFixtures.dataRoleCanJoin());
-        var thrown = assertThrows(ControlPlanePendingException.class, () -> NodeFixtures.connected(root));
-        assertTrue(thrown.getMessage().startsWith("TODO"), thrown.getMessage());
-        assertTrue(thrown.getMessage().contains("ServiceLaunch"), thrown.getMessage());
-        assertTrue(thrown.getMessage().contains("watch"), thrown.getMessage());
-        assertTrue(thrown.getMessage().contains(ControlPlaneDesign.PR), thrown.getMessage());
+        try (var live = ClusterHarness.newControlPlane()) {
+            assertTrue(live.available());
+        }
+        assertTrue(NodeFixtures.dataRoleCanJoin());
         assertNull(NodeEnrollment.current());
         assertThrows(IllegalArgumentException.class, () -> NodeFixtures.pending(root, "standalone"));
-        assertThrows(ControlPlanePendingException.class, ConnectedDataNode::new);
     }
 }

@@ -359,4 +359,17 @@ class Http1ParserTest {
         assertEquals(java.util.List.of(), r.headers("x-missing"));
         assertFalse(parse("GET / HTTP/1.1\r\nHost: h\r\n\r\n").headOnly());
     }
+
+    @org.junit.jupiter.api.Test
+    void headParserReadsADirectBufferWithAbsoluteGets() throws Exception {
+        var p = new Http1Parser.HeadParser(8192, 100);
+        var bytes = "GET /a HTTP/1.1\r\nHost: h\r\n\r\nNEXT".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+        var buf = java.nio.ByteBuffer.allocateDirect(bytes.length).put(bytes).flip();
+        org.junit.jupiter.api.Assertions.assertEquals(bytes.length - 4, p.feed(buf, 0, bytes.length));
+        org.junit.jupiter.api.Assertions.assertEquals(0, buf.position(), "position untouched");
+        org.junit.jupiter.api.Assertions.assertEquals("/a", p.head().target());
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> p.feed(buf, 0, 1));
+        p.reset();
+        org.junit.jupiter.api.Assertions.assertEquals(3, p.feed(buf, 0, 3), "an incomplete head consumes all");
+    }
 }

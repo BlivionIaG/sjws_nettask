@@ -89,9 +89,17 @@ public final class EmbeddedServerControl implements ServerControl {
                 Duration.between(this.startedAt, this.clock.instant()), summary, view);
     }
 
-    /** Attaches the control-plane aggregate the TUI reads. Null detaches it. */
+    /**
+     * Attaches the control-plane aggregate the TUI reads, and the same view on {@code /metrics}
+     * when that endpoint is enabled. Null detaches both. A board attached before {@link #start}
+     * is published when the server comes up, including after a reload.
+     */
     public void attachCluster(ClusterBoard board) {
         this.cluster = board;
+        var server = this.server;
+        if (server != null) {
+            server.attachClusterMetrics(board == null ? null : board::status);
+        }
     }
 
     @Override
@@ -174,6 +182,10 @@ public final class EmbeddedServerControl implements ServerControl {
             this.startedAt = this.clock.instant(); // before publishing: status() reads server first
             this.lastError = null;
             this.server = started;
+            var board = this.cluster;
+            if (board != null) {
+                started.attachClusterMetrics(board::status);
+            }
             this.log.add("started: " + started.describe());
         } catch (IOException | UncheckedIOException e) {
             this.lastError = "start failed on port " + c.port() + ": " + e.getMessage();

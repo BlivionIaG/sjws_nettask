@@ -90,75 +90,96 @@ public final class ChunkedDecoder {
         int end = off + len;
         while (i < end && this.state != State.DONE && !overLimit()) {
             if (this.state == State.DATA) {
-                int n = (int) Math.min(this.remaining, end - i);
-                i += n;
-                this.remaining -= n;
-                if (this.remaining == 0) {
-                    this.state = State.DATA_CR;
-                }
+                i += data(end - i);
                 continue;
             }
-            byte b = buf[i++];
-            if ((this.state == State.SIZE || this.state == State.EXT) && b != '\r' && b != '\n') {
-                lineByte();
-            }
-            switch (this.state) {
-                case SIZE -> {
-                    int d = Character.digit(b, 16);
-                    if (d >= 0) {
-                        if (++this.digits > 16 || (this.digits == 16 && this.chunkSize >= 0x0800_0000_0000_0000L)) {
-                            throw new ParseError(400, "chunk size too large");
-                        }
-                        this.chunkSize = this.chunkSize * 16 + d;
-                    } else if (this.digits == 0) {
-                        throw new ParseError(400, "missing chunk size");
-                    } else if (b == ';' || b == ' ' || b == '\t') {
-                        this.state = State.EXT; // BWS before ';' is tolerated (RFC 9112 §7.1.1)
-                    } else {
-                        endSizeLine(b);
-                    }
-                }
-                case EXT -> {
-                    if (b == '\r' || b == '\n') {
-                        endSizeLine(b);
-                    } else if ((b < 0x20 && b != '\t') || b == 0x7f) {
-                        throw new ParseError(400, "control character in chunk extension");
-                    }
-                }
-                case SIZE_LF, TRAILER_LF -> {
-                    if (b != '\n') {
-                        throw new ParseError(400, "bare CR");
-                    }
-                    afterLine();
-                }
-                case DATA_CR -> {
-                    if (b != '\r') {
-                        throw new ParseError(400, "missing CRLF after chunk data");
-                    }
-                    this.state = State.DATA_LF;
-                }
-                case DATA_LF -> {
-                    if (b != '\n') {
-                        throw new ParseError(400, "missing CRLF after chunk data");
-                    }
-                    startSizeLine();
-                }
-                case TRAILER -> {
-                    if (b == '\r') {
-                        this.state = State.TRAILER_LF;
-                    } else if (b == '\n') {
-                        afterLine();
-                    } else {
-                        if ((b < 0x20 && b != '\t') || b == 0x7f) {
-                            throw new ParseError(400, "control character in trailer");
-                        }
-                        lineByte();
-                    }
-                }
-                default -> throw new IllegalStateException(this.state.name());
-            }
+            step(buf[i++]);
         }
         return i - off;
+    }
+
+    /** As {@link #feed(byte[], int, int)}, reading {@code buf} (heap or direct) with absolute gets from {@code off}. */
+    public int feed(java.nio.ByteBuffer buf, int off, int len) throws ParseError {
+        int i = off;
+        int end = off + len;
+        while (i < end && this.state != State.DONE && !overLimit()) {
+            if (this.state == State.DATA) {
+                i += data(end - i);
+                continue;
+            }
+            step(buf.get(i++));
+        }
+        return i - off;
+    }
+
+    private int data(int available) {
+        int n = (int) Math.min(this.remaining, available);
+        this.remaining -= n;
+        if (this.remaining == 0) {
+            this.state = State.DATA_CR;
+        }
+        return n;
+    }
+
+    private void step(byte b) throws ParseError {
+        if ((this.state == State.SIZE || this.state == State.EXT) && b != '\r' && b != '\n') {
+            lineByte();
+        }
+        switch (this.state) {
+            case SIZE -> {
+                int d = Character.digit(b, 16);
+                if (d >= 0) {
+                    if (++this.digits > 16 || (this.digits == 16 && this.chunkSize >= 0x0800_0000_0000_0000L)) {
+                        throw new ParseError(400, "chunk size too large");
+                    }
+                    this.chunkSize = this.chunkSize * 16 + d;
+                } else if (this.digits == 0) {
+                    throw new ParseError(400, "missing chunk size");
+                } else if (b == ';' || b == ' ' || b == '\t') {
+                    this.state = State.EXT; // BWS before ';' is tolerated (RFC 9112 §7.1.1)
+                } else {
+                    endSizeLine(b);
+                }
+            }
+            case EXT -> {
+                if (b == '\r' || b == '\n') {
+                    endSizeLine(b);
+                } else if ((b < 0x20 && b != '\t') || b == 0x7f) {
+                    throw new ParseError(400, "control character in chunk extension");
+                }
+            }
+            case SIZE_LF, TRAILER_LF -> {
+                if (b != '\n') {
+                    throw new ParseError(400, "bare CR");
+                }
+                afterLine();
+            }
+            case DATA_CR -> {
+                if (b != '\r') {
+                    throw new ParseError(400, "missing CRLF after chunk data");
+                }
+                this.state = State.DATA_LF;
+            }
+            case DATA_LF -> {
+                if (b != '\n') {
+                    throw new ParseError(400, "missing CRLF after chunk data");
+                }
+                startSizeLine();
+            }
+            case TRAILER -> {
+                if (b == '\r') {
+                    this.state = State.TRAILER_LF;
+                } else if (b == '\n') {
+                    afterLine();
+                } else {
+                    if ((b < 0x20 && b != '\t') || b == 0x7f) {
+                        throw new ParseError(400, "control character in trailer");
+                    }
+                    lineByte();
+                }
+            }
+            default -> throw new IllegalStateException(this.state.name());
+        }
     }
 
     private void lineByte() throws ParseError {

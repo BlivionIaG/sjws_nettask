@@ -125,6 +125,22 @@ class BootstrapTest {
     }
 
     @Test
+    void cpTlsBlockIsOptionalAndAllOrNothing() throws Exception {
+        var fix = dataTree();
+        Files.writeString(fix.boot, baseData(fix));
+        Files.setPosixFilePermissions(fix.boot, OWNER_RW);
+        assertNull(Bootstrap.load(fix.boot, "data").cpTls(), "off by default");
+        Files.writeString(fix.boot, baseData(fix) + "cp-tls-cert=/etc/sjws/node.pem\ncp-tls-key=/etc/sjws/node-key.pem\n"
+                + "cp-tls-ca=/etc/sjws/cp-ca.pem\ncp-tls-peer=urn:sjws:cp\n");
+        var tls = Bootstrap.load(fix.boot, "data").cpTls();
+        assertEquals(Path.of("/etc/sjws/cp-ca.pem"), tls.ca());
+        assertEquals("urn:sjws:cp", tls.peer());
+        assertRejected(baseData(dataTree()) + "cp-tls-cert=/a.pem\n", "together");
+        assertRejected(baseData(dataTree()) + "cp-tls-peer=urn:sjws:cp\n", "cp-tls-peer needs");
+        assertRejected(baseData(dataTree()) + "cp-tls-cert=a.pem\ncp-tls-key=/k\ncp-tls-ca=/c\n", "absolute");
+    }
+
+    @Test
     void rejectedShapes() throws Exception {
         assertRejected("role=standalone\n", "role must be control or data");
         assertRejected(baseData(dataTree()).replace("data-role=gateway\n", ""), "data-role");

@@ -12,13 +12,19 @@ class ChunkedDecoderTest {
 
     private static final String NEXT = "GET / HTTP/1.1\r\n";
 
-    /** @return bytes consumed when fed in pieces of {@code step} (0 = whole) */
+    /**
+     * @return bytes consumed when fed in pieces of {@code step} (0 = whole). Odd steps feed a direct
+     *         {@link java.nio.ByteBuffer} (the pooled HTTP/1 input path), a negative step the whole input from one
+     */
     private static int consume(ChunkedDecoder d, String input, int step) throws ParseError {
         var bytes = input.getBytes(StandardCharsets.ISO_8859_1);
+        boolean direct = step < 0 || (step & 1) == 1;
+        var buffer = java.nio.ByteBuffer.allocateDirect(bytes.length + 3).position(3).put(bytes);
+        step = Math.max(0, step);
         int pos = 0;
         while (pos < bytes.length && !d.isComplete() && !d.overLimit()) {
             int n = step == 0 ? bytes.length - pos : Math.min(step, bytes.length - pos);
-            int used = d.feed(bytes, pos, n);
+            int used = direct ? d.feed(buffer, 3 + pos, n) : d.feed(bytes, pos, n);
             pos += used;
             if (used < n) {
                 break;
@@ -101,6 +107,16 @@ class ChunkedDecoderTest {
         assertTrue(d.overLimit());
         assertFalse(d.isComplete());
         assertEquals(5, used, "nothing past the size line is read");
+    }
+
+    @Test
+    void directBufferStopsAtTheLimitAndAtTheEnd() throws ParseError {
+        var d = decoder();
+        assertEquals(5, consume(d, "801\r\n" + "x".repeat(100), -1));
+        assertTrue(d.overLimit());
+        d.reset();
+        assertEquals(5, consume(d, "0\r\n\r\n" + NEXT, -1), "the next request is left untouched");
+        assertTrue(d.isComplete());
     }
 
     @Test

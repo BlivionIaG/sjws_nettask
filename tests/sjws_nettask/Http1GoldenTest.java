@@ -33,6 +33,7 @@ import org.junit.jupiter.api.io.TempDir;
  * {@code mvn test -Dtest=Http1GoldenTest -Dgolden.jar=/path/to/before.jar}
  * (runs the jar as a subprocess and rewrites the golden file instead of asserting).
  */
+@org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class Http1GoldenTest {
 
     static final Path GOLDEN = Path.of("tests", "regression", "http1-golden.txt");

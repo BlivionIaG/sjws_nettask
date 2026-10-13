@@ -39,7 +39,8 @@ public final class DataApply {
     private final byte[] rootPublic;
     private final long pinFloor;
     private final List<TrustKey> keys;
-    private final byte[] trustSignature;
+    /** Exact root-signed {@link TrustBundle} bytes. */
+    private final byte[] trustBundle;
     private final long trustFloor;
     private final Path stateDir;
     private final LongSupplier nowMillis;
@@ -48,12 +49,12 @@ public final class DataApply {
     private long appliedVersion;
     private long appliedEpoch;
 
-    private DataApply(byte[] rootPublic, long pinFloor, List<TrustKey> keys, byte[] trustSignature, long trustFloor,
+    private DataApply(byte[] rootPublic, long pinFloor, List<TrustKey> keys, byte[] trustBundle, long trustFloor,
             Path stateDir, LongSupplier nowMillis) {
         this.rootPublic = rootPublic;
         this.pinFloor = pinFloor;
         this.keys = List.copyOf(keys);
-        this.trustSignature = trustSignature;
+        this.trustBundle = trustBundle.clone();
         this.trustFloor = trustFloor;
         this.stateDir = stateDir;
         this.nowMillis = nowMillis;
@@ -62,8 +63,32 @@ public final class DataApply {
     public static DataApply open(KeyRing keys, Path pin, Path stateDir, LongSupplier nowMillis) throws IOException {
         LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
         var read = LastGoodFiles.readPin(pin);
-        return new DataApply(read.rootPublic(), read.versionFloor(), keys.keys(), keys.trustSignature(),
-                keys.versionFloor(), stateDir, nowMillis);
+        return new DataApply(read.rootPublic(), read.versionFloor(), keys.bundle().keys(), keys.bundle().encoded(),
+                keys.bundle().versionFloor(), stateDir, nowMillis);
+    }
+
+    /**
+     * A data node's applicator: the root key and floor come from the pinned file, the online keys
+     * from the control plane. The bundle must verify under the pinned root and its floor may not be
+     * below the pin's; otherwise this throws and nothing is attached (fail closed).
+     */
+    public static DataApply trusted(Path pin, WatchWire.Message bundle, Path stateDir, LongSupplier nowMillis)
+            throws IOException {
+        var read = LastGoodFiles.readPin(pin);
+        TrustBundle parsed;
+        try {
+            parsed = TrustBundle.parse(bundle.bundle(), read.rootPublic());
+        } catch (CpKeyException e) {
+            throw new IOException("trust bundle does not verify under the pinned root: " + e.getMessage(), e);
+        }
+        if (parsed.versionFloor() < read.versionFloor()) {
+            throw new IOException("trust bundle floor is below the pinned floor");
+        }
+        if (nowMillis.getAsLong() > parsed.notAfterMillis()) {
+            throw new IOException("trust bundle has expired");
+        }
+        return new DataApply(read.rootPublic(), read.versionFloor(), parsed.keys(), parsed.encoded(),
+                parsed.versionFloor(), stateDir, nowMillis);
     }
 
     public record Decision(String error, boolean noop, String yaml) {
@@ -105,8 +130,9 @@ public final class DataApply {
         if (key == null) {
             return Decision.reject("keyId");
         }
-        var root = SnapshotCrypto.publicKey(rootPublic);
-        if (root == null || !SnapshotCrypto.verify(root, SnapshotCrypto.trustInput(trustFloor, keys), trustSignature)) {
+        try {
+            TrustBundle.parse(trustBundle, rootPublic);
+        } catch (CpKeyException e) {
             return Decision.reject("trust");
         }
         var onlineKey = SnapshotCrypto.publicKey(key.publicKey());
@@ -132,6 +158,12 @@ public final class DataApply {
         }
         if (snapshot.version() > Long.MAX_VALUE - SnapshotCrypto.MAX_VERSION_JUMP) {
             return Decision.reject("version");
+        }
+        if (snapshot.version() == appliedVersion && snapshot.version() == installed.version()
+                && snapshot.canonicalHashHex().equals(retained.get(appliedVersion))) {
+            // The envelope this node already applied. The installed document can hash differently
+            // (node-local clamps such as node.mode), so the recorded envelope hash decides.
+            return Decision.same();
         }
         long floor = Math.max(pinFloor, Math.max(trustFloor, appliedVersion));
         if (snapshot.version() <= floor && !(snapshot.version() == installed.version()
@@ -171,7 +203,15 @@ public final class DataApply {
         }
     }
 
+    /** Records the applied envelope (floor, epoch, retained hash) and persists last-good. */
     public void remember(SignedSnapshot snapshot) throws IOException {
+        record(snapshot);
+        LastGoodFiles.write(stateDir, appliedVersion, appliedEpoch, snapshot.keyId(), keys, trustFloor, trustBundle,
+                snapshot);
+    }
+
+    /** In-memory part of {@link #remember}: the anti-rollback floor holds even where nothing is written. */
+    public void record(SignedSnapshot snapshot) {
         appliedVersion = snapshot.version();
         appliedEpoch = snapshot.epoch();
         retained.put(snapshot.version(), snapshot.canonicalHashHex());
@@ -179,8 +219,6 @@ public final class DataApply {
         while (order.size() > 8) {
             retained.remove(order.removeFirst());
         }
-        LastGoodFiles.write(stateDir, appliedVersion, appliedEpoch, snapshot.keyId(), keys, trustFloor, trustSignature,
-                snapshot);
     }
 
     public String retainedHash(long version) {
@@ -212,7 +250,11 @@ public final class DataApply {
 
     /** Reads a snapshot back out of {@code last-good.json}. The caller still runs {@link #decide}. */
     public static SignedSnapshot readLastGood(Path stateDir) throws IOException {
-        var text = Files.readString(LastGoodFiles.configDir(stateDir).resolve("last-good.json"));
+        return parseSnapshot(Files.readString(LastGoodFiles.configDir(stateDir).resolve("last-good.json")));
+    }
+
+    /** Parses {@link LastGoodFiles#snapshotJson}. Fields are not verified here; {@link #decide} does that. */
+    static SignedSnapshot parseSnapshot(String text) throws IOException {
         int schema = (int) LastGoodFiles.readLong(text, "schema");
         long version = LastGoodFiles.readLong(text, "version");
         long epoch = LastGoodFiles.readLong(text, "epoch");

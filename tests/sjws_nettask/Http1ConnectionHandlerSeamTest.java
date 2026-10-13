@@ -36,6 +36,7 @@ import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 
 /** The HTTP/1.1 connection depends only on the {@link Handler} seam, not on static files. */
+@org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class Http1ConnectionHandlerSeamTest {
 
     @Test

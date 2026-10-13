@@ -20,16 +20,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.clusterharness.ClusterHarness.DataRole;
 
 /**
- * Data-role node joined to a live control plane. Disabled until
- * {@link NodeFixtures#dataRoleCanJoin()} is true. Enabling this against
- * {@link PendingControlPlane}, or by attaching a binding in the test, is a fake connection.
+ * Data-role node joined to a live control plane through the real watch client. The test does
+ * not attach a binding: {@code connected} and the version come from the node's own watch.
  */
 @Tag("cluster")
 class ConnectedDataNodeTest {
@@ -38,13 +36,12 @@ class ConnectedDataNodeTest {
     Path root;
 
     @Test
-    @Disabled(NodeFixtures.CONNECTED_PENDING)
     void dataNodeReportsConnectedAndAppliesPushedVersion() throws Exception {
         try (var node = NodeFixtures.connected(root)) {
             assertEquals(DataRole.DATA, node.role());
             assertEquals("connected", node.connection());
             assertTrue(node.httpPort() > 0);
-            long version = node.push("schema: 1\nserver:\n  port: 0\n");
+            long version = node.push("schema: 1\nserver:\n  port: 0\n  root: " + node.documentRoot() + "\n");
             assertTrue(version > 0L);
             assertEquals(version, node.configVersion());
             assertEquals("connected", node.connection());

@@ -36,6 +36,7 @@ import org.junit.jupiter.api.io.TempDir;
  * write/minimum progress), sendfile for large files with shrink detection, pipelining and
  * timer deregistration.
  */
+@org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class Http1TransportTest {
 
     private static final int LARGE = 50 * 1024 * 1024;

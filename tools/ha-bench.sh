@@ -20,6 +20,16 @@ fi
 
 run_mode() {
   mode="$1"
+  # Cluster heartbeats are authenticated. The key is an environment variable, never an
+  # argument, and this script does not print it. Single mode leaves it unset.
+  if [ "$mode" = "cluster" ]; then
+    WEB_SERVER_HA_CLUSTER_KEY="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+    export WEB_SERVER_HA_CLUSTER_KEY
+    unset WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS
+  else
+    unset WEB_SERVER_HA_CLUSTER_KEY
+    unset WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS
+  fi
   "$JAVA" -cp "$CP" sjws_nettask.ha.BenchServer --mode="$mode" --port="$PORT" --root="$ROOT/html" &
   PID=$!
   i=0

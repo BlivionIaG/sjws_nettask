@@ -412,7 +412,7 @@ public class Sjws_nettask {
                 return EXIT_USAGE;
             }
             try {
-                hooks = loadServiceHooks(opt.bootstrap(), choice.expectedRole(), opt.drainBudgetMs());
+                hooks = loadServiceHooks(opt.bootstrap(), choice.expectedRole(), opt.drainBudgetMs(), loaded);
             } catch (IOException e) {
                 err.println("ERROR: " + safeMessage(e.getMessage()));
                 return EXIT_USAGE;
@@ -457,9 +457,10 @@ public class Sjws_nettask {
      * @param expectedRole {@code control} or {@code data} from {@code --role} or {@code node.mode},
      *        or null to take the role from the bootstrap file
      */
-    private static ServiceHooks loadServiceHooks(Path bootstrap, String expectedRole, long drainBudgetMs)
-            throws IOException {
-        return sjws_nettask.service.ServiceLaunch.prepare(bootstrap, expectedRole, drainBudgetMs);
+    private static ServiceHooks loadServiceHooks(Path bootstrap, String expectedRole, long drainBudgetMs,
+            sjws_nettask.config.ConfigLoader.Loaded loaded) throws IOException {
+        return sjws_nettask.service.ServiceLaunch.prepare(bootstrap, expectedRole, drainBudgetMs, loaded.yamlCp(),
+                loaded.configBase());
     }
 
     /**

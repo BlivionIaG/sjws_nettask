@@ -98,4 +98,34 @@ class SourceGuardTest {
             }
         }
     }
+
+    /**
+     * control-plane-hosting.md §5: outside the cp package nothing names the CONTROL-role types, so a data or
+     * standalone process cannot load them; ServiceLaunch reaches the role through the CpLaunch name only.
+     */
+    @Test
+    void controlRoleTypesStayInsideCp() throws IOException {
+        var heavy = java.util.regex.Pattern.compile(
+                "sjws_nettask\\.cp\\.(CpStore|KeyRing|WatchServer|AdminServer|CpHost|CpWitness|CpLaunch|CpConfig)\\b");
+        var offenders = new ArrayList<String>();
+        try (var walk = Files.walk(Path.of("src"))) {
+            for (var p : (Iterable<Path>) walk::iterator) {
+                var name = p.toString().replace('\\', '/');
+                if (!name.endsWith(".java") || name.startsWith("src/sjws_nettask/cp/")) {
+                    continue;
+                }
+                var m = heavy.matcher(Files.readString(p));
+                while (m.find()) {
+                    if (!(name.equals("src/sjws_nettask/service/ServiceLaunch.java")
+                            && m.group().equals("sjws_nettask.cp.CpLaunch"))) {
+                        offenders.add(name + ": " + m.group());
+                    }
+                }
+            }
+        }
+        assertTrue(offenders.isEmpty(), "CONTROL-role types named outside cp: " + offenders);
+        var launch = Files.readString(Path.of("src/sjws_nettask/service/ServiceLaunch.java"));
+        assertEquals(1, launch.split("\"sjws_nettask\\.cp\\.CpLaunch\"", -1).length - 1,
+                "ServiceLaunch names CpLaunch once, as a string");
+    }
 }

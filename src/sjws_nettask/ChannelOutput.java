@@ -32,7 +32,7 @@ import sjws_nettask.http1.Http1Writer;
  * progress pushes the connection's write deadline forward. Large files go through
  * {@link FileChannel#transferTo} (sendfile).
  */
-final class ChannelOutput extends OutputStream implements Http1Writer.FileSink, Http1Writer.BufferSink {
+final class ChannelOutput extends OutputStream implements Http1Writer.FileSink, Http1Writer.PooledSink {
 
     static final int WRITE_CHUNK = 64 * 1024;
 
@@ -54,9 +54,51 @@ final class ChannelOutput extends OutputStream implements Http1Writer.FileSink, 
     private final SocketChannel channel;
     private final ConnectionReaper.Timer timer;
 
+    /** The shared pool's {@code http} budget, or null when the pool is off. */
+    private final sjws_nettask.core.buf.BufferBudget buffers;
+    private ByteBuffer[] pair;
+
     ChannelOutput(SocketChannel channel, ConnectionReaper.Timer timer) {
+        this(channel, timer, null);
+    }
+
+    ChannelOutput(SocketChannel channel, ConnectionReaper.Timer timer, sjws_nettask.core.buf.BufferBudget buffers) {
         this.channel = channel;
         this.timer = timer;
+        this.buffers = buffers;
+    }
+
+    @Override
+    public sjws_nettask.core.buf.BufferBudget buffers() {
+        return this.buffers;
+    }
+
+    /**
+     * One gathering write for head + body when the heap part (copied by the JDK into its temporary direct buffer)
+     * stays within {@link #WRITE_CHUNK}; otherwise the head, then the body in slices.
+     */
+    @Override
+    public void write(ByteBuffer head, ByteBuffer body) throws IOException {
+        if (!body.isDirect() && body.remaining() > WRITE_CHUNK) {
+            write(head);
+            write(body);
+            return;
+        }
+        var bufs = this.pair;
+        if (bufs == null) {
+            bufs = this.pair = new ByteBuffer[2];
+        }
+        bufs[0] = head;
+        bufs[1] = body;
+        try {
+            for (long left = (long) head.remaining() + body.remaining(); left > 0;) {
+                this.timer.writing();
+                left -= this.channel.write(bufs);
+            }
+        } finally {
+            bufs[0] = null;
+            bufs[1] = null;
+        }
     }
 
     @Override

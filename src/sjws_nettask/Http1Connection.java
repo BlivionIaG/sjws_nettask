@@ -33,6 +33,9 @@ import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.core.buf.BufferBudget;
+import sjws_nettask.core.buf.BufferPool;
+import sjws_nettask.core.buf.PooledBuffer;
 import sjws_nettask.http1.ChunkedDecoder;
 import sjws_nettask.http1.Http1Parser;
 import sjws_nettask.http1.Http1Requests;
@@ -95,6 +98,24 @@ final class Http1Connection implements Runnable {
             CONSTANTS.MAX_DRAINED_BODY);
     /** Unread input between position and limit; null until the first read. */
     private ByteBuffer in;
+    /**
+     * The shared pool's {@code http} budget, or null when the pool is off (heap arrays as before). With the pool on,
+     * both input buffers are pooled direct buffers: the small one is held while idle, the large one only while a
+     * request needs it, and both go back to the pool when the connection ends.
+     */
+    private BufferBudget buffers = budget(BufferPool.shared());
+    private PooledBuffer smallLease;
+    private PooledBuffer largeLease;
+
+    private static BufferBudget budget(BufferPool pool) {
+        return pool.enabled() ? pool.budget(BufferPool.HTTP) : null;
+    }
+
+    /** Tests: use {@code pool} instead of the shared one (call before {@link #run()}). */
+    Http1Connection withPool(BufferPool pool) {
+        this.buffers = budget(pool);
+        return this;
+    }
 
     /**
      * @param extraHeaders transport-level fields added to every response (e.g. Alt-Svc); called per response
@@ -185,7 +206,7 @@ final class Http1Connection implements Runnable {
         var timer = this.reaper.register(this.channel);
         var remote = this.remote; // captured at construction: the channel is closed by the time a failure is logged
         try (var ch = this.channel) {
-            var out = new ChannelOutput(ch, timer);
+            var out = new ChannelOutput(ch, timer, this.buffers);
             // Idle wait lives here, not in serveOne: a parked virtual thread keeps its frames, so
             // waiting in this shallow frame keeps the idle stack chunk small.
             do {
@@ -200,6 +221,20 @@ final class Http1Connection implements Runnable {
             }
         } finally {
             this.reaper.deregister(timer);
+            releaseBuffers();
+        }
+    }
+
+    private void releaseBuffers() {
+        this.in = null;
+        this.small = null;
+        if (this.largeLease != null) {
+            this.largeLease.release();
+            this.largeLease = null;
+        }
+        if (this.smallLease != null) {
+            this.smallLease.release();
+            this.smallLease = null;
         }
     }
 
@@ -224,7 +259,16 @@ final class Http1Connection implements Runnable {
      * large buffer is released and the read goes into the small one.
      */
     private int idleFill() throws IOException {
-        if (this.small == null) {
+        if (this.buffers != null) {
+            if (this.largeLease != null) { // idle: only the small buffer stays with the connection
+                this.largeLease.release();
+                this.largeLease = null;
+            }
+            if (this.smallLease == null) {
+                this.smallLease = this.buffers.acquire(IDLE_BUFFER);
+                this.small = this.smallLease.buffer();
+            }
+        } else if (this.small == null) {
             this.small = ByteBuffer.allocate(IDLE_BUFFER);
         }
         this.in = this.small;
@@ -237,7 +281,12 @@ final class Http1Connection implements Runnable {
      */
     private int fill() throws IOException {
         if (this.in == this.small && this.in.limit() == this.in.capacity()) {
-            this.in = ByteBuffer.allocate(INPUT_BUFFER);
+            if (this.buffers != null) { // only idleFill() switches back to small, and it released the large one
+                this.largeLease = this.buffers.acquire(INPUT_BUFFER);
+                this.in = this.largeLease.buffer();
+            } else {
+                this.in = ByteBuffer.allocate(INPUT_BUFFER);
+            }
         }
         return read();
     }
@@ -269,8 +318,9 @@ final class Http1Connection implements Runnable {
         try {
             this.parser.reset();
             while (true) {
-                int used = this.parser.feed(this.in.array(), this.in.arrayOffset() + this.in.position(),
-                        this.in.remaining());
+                int used = this.in.hasArray()
+                        ? this.parser.feed(this.in.array(), this.in.arrayOffset() + this.in.position(), this.in.remaining())
+                        : this.parser.feed(this.in, this.in.position(), this.in.remaining());
                 this.in.position(this.in.position() + used);
                 if (this.parser.isComplete()) {
                     request = this.parser.head();
@@ -431,8 +481,10 @@ final class Http1Connection implements Runnable {
         try {
             while (true) {
                 if (hasInput()) {
-                    int used = this.chunks.feed(this.in.array(), this.in.arrayOffset() + this.in.position(),
-                            this.in.remaining());
+                    int used = this.in.hasArray()
+                            ? this.chunks.feed(this.in.array(), this.in.arrayOffset() + this.in.position(),
+                                    this.in.remaining())
+                            : this.chunks.feed(this.in, this.in.position(), this.in.remaining());
                     this.in.position(this.in.position() + used);
                     if (this.chunks.isComplete()) {
                         return 1;

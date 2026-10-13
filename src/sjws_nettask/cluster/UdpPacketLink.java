@@ -27,7 +27,7 @@ import java.nio.channels.DatagramChannel;
 public final class UdpPacketLink implements PacketLink {
 
     private final DatagramChannel channel;
-    private final ByteBuffer receive = ByteBuffer.allocate(HeartbeatCodec.BYTES);
+    private final ByteBuffer receive = ByteBuffer.allocate(HeartbeatAuthenticator.PACKET_BYTES);
     private final InetSocketAddress local;
 
     public UdpPacketLink(InetSocketAddress bind) throws IOException {
