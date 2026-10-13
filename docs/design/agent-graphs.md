@@ -45,14 +45,19 @@ A *graph* is a versioned definition of steps (agent calls) and edges. A *run* is
 ### 3.3 Fan-out / fan-in and join semantics
 A step with several incoming edges declares `join`:
 - `all` (default): wait for every non-skipped predecessor. A skipped predecessor (its `when` was false) counts as satisfied, so conditional branches do not deadlock the join.
-- `any`: fire on the first completed predecessor; the remaining in-flight predecessors are **cancelled** (§6.1) unless `cancel_losers: false`.
+- `any`: fire on the first completed predecessor; the remaining in-flight predecessors are **cancelled by default** (§6.1, decided §11.1) unless the step sets `cancel_losers: false`.
 - `quorum(k)`: fire after `k` completions; the rest are cancelled the same way. Publish-time validation rejects `k` larger than the in-degree.
 - Failed predecessors: `all` fails the step; `any`/`quorum(k)` fail only when success has become impossible (`completed + still_possible < k`).
 
 A join records **which** predecessor results it consumed in the `StepReady` event (§4.2), so resume never re-evaluates a race differently.
 
 ### 3.4 Conditional edges
-- `when:` is an expression over the JSON output of the source step and the run input: comparisons, boolean operators, field access, `in`, `len`. No functions with side effects, no loops, bounded evaluation cost (expression size limit at publish time).
+- `when:` is an expression over the JSON output of the source step and the run input, written in a **JSONPath subset** (decided §11.1; not CEL). The subset, based on [RFC 9535](https://www.rfc-editor.org/rfc/rfc9535):
+  - **Paths:** root `$` (the run context: `$.input`, `$.<stepId>` for completed step outputs), member access `.name` or `['name']`, array index `[n]` (non-negative). No wildcards, slices, recursive descent (`..`) or filter selectors, so every path selects at most one value.
+  - **Literals:** strings, numbers, `true`, `false`, `null`.
+  - **Operators:** `== != < <= > >=`, `&&`, `||`, `!`, parentheses, `in` (value in a literal list), and the one function `len(path)` (string, array or object size).
+  - **Missing values:** a path that does not resolve yields `null`; comparisons with `null` other than `==`/`!=` are false.
+  - No user functions, no loops, no side effects. Expression size is limited at publish time, so evaluation cost is bounded.
 - Evaluated once, in the runner, when the source step completes; the outcome (taken / skipped) is written to the run log, so replay uses the recorded outcome, not a re-evaluation.
 - Precedent: conditional edges in [LangGraph](https://langchain-ai.github.io/langgraph/concepts/low_level/#conditional-edges) and branching in [Airflow](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html#branching). Unlike LangGraph, the condition is declarative data, not a Python function, so the server can evaluate it and the CP can distribute it.
 
@@ -65,7 +70,7 @@ A join records **which** predecessor results it consumed in the `StepReady` even
 ### 3.6 Subgraphs and dynamic spawning
 - **Subgraph step:** starts a child run of a pinned `name@version` with `parentRunId`, `parentStepId`. The child inherits deadline, budget slice and trace context (§6). Its result is the parent step's result. Max nesting depth is a server limit; recursion (graph calling itself) is allowed only within that depth.
 - **Map step (dynamic fan-out):** `map: {over: <expr yielding a list>, step: <template>, max_items: N, concurrency: C, join: all|any|quorum(k)}`. The runner records the resolved list length in the log before spawning, refuses lists longer than `max_items` (fails the step, no truncation), and keeps at most `C` instances in flight (backpressure, §5.3).
-- **Agent-requested spawn:** an agent may return a `spawn` directive (list of step templates already declared in the graph as `spawnable`). It is bounded per step (`max_spawn`) and per run (`max_steps_per_run`), and charged to the run budget. Agents cannot introduce services or graphs that the version does not name, so `AgentPolicy` (swarm §6) still governs every task.
+- **Agent-requested spawn: deferred to G4** (decided §11.1). Through G3, map steps are the only dynamic fan-out. The G4 design, for reference: an agent may return a `spawn` directive (list of step templates already declared in the graph as `spawnable`). It is bounded per step (`max_spawn`) and per run (`max_steps_per_run`), and charged to the run budget. Agents cannot introduce services or graphs that the version does not name, so `AgentPolicy` (swarm §6) still governs every task.
 - Precedent: Airflow [dynamic task mapping](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/dynamic-task-mapping.html) (`max_map_length`), LangGraph [`Send`](https://langchain-ai.github.io/langgraph/concepts/low_level/#send) for map-reduce.
 
 ## 4. Execution
@@ -118,7 +123,7 @@ How:
 - The only shared structures are per-shard (the shard `Partition`, which has its own `ReentrantLock`, `Partition.java:65`) and per-pool (`tasks.<pool>`). There is no global lock and no global counter on the dispatch path. Budget counters are striped (§5.4).
 - Worker side is unchanged: thousands of agents are thousands of consumers on pools, each claiming via `TaskService.claim` (`TaskService.java:89-94`) and heartbeating through the batched `LeaseKeeper` (`swarm/LeaseKeeper.java:41`, `:117`).
 - Pool contention is the current limit, not the graph layer: 16-worker claim p99 is **458 µs after #103** (measured by Messaging Core) against the S1c target of < 100 µs. Graphs that fan out to one pool inherit that until the S1c gate is met; multi-partition pools (gap 5) are the scale-out path.
-- Shard count `S` is fixed per deployment at first (changing it requires draining). Resharding is an open question (§11).
+- Shard count `S` is **fixed per deployment** (decided §11.1); changing it requires draining. Online resharding is deferred and not scheduled in G0–G5.
 - Multi-node: shards are assigned to broker nodes by the CP once messaging replicates (gap 9). Until then, graphs are single-node, like the rest of the swarm.
 
 ### 5.2 Thousands of concurrent runs: memory model
@@ -134,7 +139,7 @@ Bounded at every level, and admission refuses rather than queues unboundedly:
 
 ### 5.4 Budgets: per graph, per run, per agent
 - **Rates** reuse `routing.GcraTable` (`routing/GcraTable.java:31`; `admit(slot)` at `:90`): one table for run starts keyed by graph-name hash, and the existing per-agent tables (swarm §8) for step tasks. No allocation per check.
-- **Spend** reuses swarm `BudgetLedger` (swarm §8; it is an S2 deliverable and does not exist on master yet). The graph layer adds two budget scopes, debited alongside the agent's: **per run** (`budget.max_tokens`/`max_cost` in the run request, capped by the graph's default) and **per graph** (window budget across all runs of a graph name).
+- **Spend** reuses swarm `BudgetLedger` (swarm §8; it is an S2 deliverable and does not exist on master yet). The graph layer adds two budget scopes, debited alongside the agent's: **per run** (`budget.max_tokens`/`max_cost` in the run request, capped by the graph's default) and **per graph** (window budget across all runs of a graph name; ships in G3, decided §11.1).
 - Every step debits its estimate before dispatch and settles on `StepResult.usage`. A run that exceeds its budget stops dispatching, cancels in-flight steps (§6.1), and finishes with `budget-exhausted`.
 - The soft global cap and its overshoot bound from swarm §8 apply unchanged per scope; for a run, in-flight steps are bounded by `max_inflight_steps`, which plays the role of `F` in that formula.
 - Loops and spawns are charged as they happen, so `max_iterations` × step estimate gives the operator a static worst case per run at publish time; the admin API shows it.
@@ -228,15 +233,15 @@ Added to the swarm handler mounted through `HandlerContributor` (PR #101; `Swarm
 - **Off-mode wrk A/B** (§12, item 4).
 
 ## 9. Phases (fit with S2+)
-Graph phases start only after the **S1c gate** (claim p99 < 100 µs, heartbeat < 2 %, request/reply p99 < 500 µs; inceptor) and depend on swarm phases as listed.
+**G0 starts only after the S1c gate is met** (reaffirmed 2026-10-13); every graph phase therefore starts after the **S1c gate** (claim p99 < 100 µs, heartbeat < 2 %, request/reply p99 < 500 µs; inceptor) and depend on swarm phases as listed.
 
 | Phase | Deliverable | Depends on | Exit criteria |
 |---|---|---|---|
 | **G0** | This doc approved; JSON Schema for graph docs; dependency + class-load guards for `swarm.graph` (empty package, lazy hook) | S1c gate; Blivion approval | Guards green; off-mode wrk A/B within A/A band |
 | **G1** | Single-node runner, `S = 1..n` shards: static DAG, `all` join, event log + checkpoints + resume, step retries/timeouts, runner-side result fencing, idempotency key, run start/get/cancel API, local-directory graph loading | S2 (`LeaseKeeper` + `extend`, cancellation, trace propagation) | Crash-resume tests (kill runner at every event type, results identical); stale-result fencing test; duplicate-submit test; per-hop latency and 1k fan-out targets (§12) met or recorded |
-| **G2** | Conditional edges, `any`/`quorum`, bounded loops, map steps, subgraphs, deadline inheritance, recursive cancel, per-edge spans | G1 | Loop-bound and spawn-bound tests; join race replay test; cancellation reaches all descendants within one runner tick; trace for a 3-level subgraph |
-| **G3** | Budgets per run/graph on `BudgetLedger`, GCRA run admission, backpressure (lag-based), Python SDK builder + run API, `GraphDocument` in the CP (signed, versioned, pinned runs), `GRAPH_PUBLISH` | S2 (`BudgetLedger`, `AgentPolicy`) ; CP document plumbing | Budget overshoot within swarm §8 bound per scope; 10k concurrent-run target (§12) met or recorded; version pinning test across a publish |
-| **G4** | Agent-requested spawn; TUI run view; OTLP export of run/edge spans | G3; S4 (OTLP exporter) | Spawn limits tests; TUI drill-down |
+| **G2** | Conditional edges (JSONPath subset, §3.4), `any`/`quorum`, bounded loops, map steps, subgraphs, deadline inheritance, recursive cancel, per-edge spans | G1 | Loop-bound and spawn-bound tests; join race replay test; cancellation reaches all descendants within one runner tick; trace for a 3-level subgraph |
+| **G3** | Budgets per run and **per-graph window** on `BudgetLedger`, GCRA run admission, backpressure (lag-based), Python SDK builder + run API, `GraphDocument` in the CP (signed, versioned, pinned runs), `GRAPH_PUBLISH` | S2 (`BudgetLedger`, `AgentPolicy`) ; CP document plumbing | Budget overshoot within swarm §8 bound per scope; 10k concurrent-run target (§12) met or recorded; version pinning test across a publish |
+| **G4** | Agent-requested spawn (deferred here from the model; map steps only before G4); TUI run view; OTLP export of run/edge spans | G3; S4 (OTLP exporter) | Spawn limits tests; TUI drill-down |
 | **G5** | Multi-node: shard assignment by the CP, shard failover | Messaging network protocol + replication (swarm §4.8 gap 9); HA | Shard failover test without lost or duplicated accepted results |
 
 ## 10. Risks
@@ -249,16 +254,19 @@ Graph phases start only after the **S1c gate** (claim p99 < 100 µs, heartbeat <
 | Runaway cost from loops/spawns | Mandatory `max_iterations`, `max_items`, `max_spawn`, `max_steps_per_run`; static worst case shown at publish (§5.4) |
 | Producer-id expiry breaks runner dedup | Expiry TTL > max run duration (§4.4); messaging gap 8 |
 | Graph layer leaks into swarm or core | §8 guards fail the build |
-| Fixed shard count limits growth | Documented; resharding open question |
+| Fixed shard count limits growth | Decided for now (§11.1); size `S` for expected peak; resharding deferred |
 
 ## 11. Open questions
-**For inceptor / Blivion**
-1. Shard count `S`: fixed per deployment (proposed for G1–G4) or reshardable online?
-2. Should `any`/`quorum` losers be cancelled by default (proposed) or left to finish (their spend is otherwise wasted)?
-3. Agent-requested spawn (G4): needed at all, or are map steps enough?
-4. Graph doc condition language: our minimal JSONPath-like subset (proposed) or an existing spec such as [CEL](https://github.com/google/cel-spec)?
-5. Is a per-graph window budget needed in G3, or is per-run plus per-agent enough?
+### 11.1 Decided (2026-10-13, Blivion via inceptor)
+1. **Shard count:** fixed per deployment for now; online resharding is deferred (§5.1).
+2. **Join losers:** losing `any`/`quorum` branches are cancelled by default; `cancel_losers: false` opts out (§3.3).
+3. **Dynamic fan-out:** map steps only; agent-requested spawn is deferred to G4 (§3.6, §9).
+4. **Conditions:** a JSONPath subset (RFC 9535 based, defined in §3.4), not CEL.
+5. **Budgets:** a per-graph window budget ships in G3, alongside per-run and per-agent budgets (§5.4, §9).
 
+No inceptor/Blivion questions remain open.
+
+### 11.2 Open
 **For Messaging Core**
 1. Is a worker writing its `StepResult` directly into `graph.runs.<shard>` (via `replyTo`) acceptable, or should results land on a reply topic and the runner copy them (one extra append, but a single producer per shard)?
 2. Can the runner consume its shard and produce into it with the existing single-partition API without a self-feedback cost, or should decisions and results be two topics per shard?
