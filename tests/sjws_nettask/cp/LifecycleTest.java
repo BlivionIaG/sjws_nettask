@@ -37,6 +37,7 @@ class LifecycleTest {
         assertTrue(NodeLifecycle.bindsContentPort(NodeLifecycle.Startup.DATA, false));
         assertFalse(NodeLifecycle.sighupPullsFromControlPlane());
         assertFalse(NodeLifecycle.controlReady(true, false));
+        assertFalse(NodeLifecycle.controlReady(false, true));
         assertTrue(NodeLifecycle.controlReady(true, true));
         var down = NodeLifecycle.dataPlane(false, false, false);
         assertFalse(down.ready());
@@ -50,6 +51,13 @@ class LifecycleTest {
         var quiet = NodeLifecycle.dataPlane(false, true, false);
         assertTrue(quiet.ready());
         assertTrue(quiet.retrying());
+        var caughtUp = NodeLifecycle.dataPlane(true, true, false);
+        assertTrue(caughtUp.ready());
+        assertFalse(caughtUp.retrying());
+        var staleDown = NodeLifecycle.dataPlane(false, true, true);
+        assertFalse(staleDown.ready());
+        assertTrue(staleDown.retrying());
+        assertFalse(staleDown.drain());
         assertEquals(NodeLifecycle.DRAIN_BUDGET_MS, NodeLifecycle.drainBudgetMillis(false, 60_000, 60_000));
         assertEquals(NodeLifecycle.DRAIN_BUDGET_MS, NodeLifecycle.drainBudgetMillis(true, 5_000, 15_000));
         assertThrows(IllegalArgumentException.class, () -> NodeLifecycle.drainBudgetMillis(true, 20_000, 20_000));
@@ -69,6 +77,9 @@ class LifecycleTest {
         assertEquals(created.join(), again.join());
         assertEquals("identity", tokens.present("other", "tok", secret, 1_000, 1_000).error());
         assertEquals("identity", tokens.present(null, "tok", secret, 1_000, 1_000).error());
+        assertEquals("token", tokens.present("edge-2", null, secret, 1_000, 1_000).error());
+        assertEquals("token", tokens.present("edge-2", "tok2", null, 1_000, 1_000).error());
+        assertFalse(tokens.present("edge-2", null, secret, 1_000, 1_000).accepted());
         assertEquals("identity", tokens.present("bad id", "tok", secret, 1_000, 1_000).error());
         assertEquals("token", tokens.present("edge-2", " ", secret, 1_000, 1_000).error());
         assertEquals("token", tokens.present("edge-2", "tok2", new byte[8], 1_000, 1_000).error());
