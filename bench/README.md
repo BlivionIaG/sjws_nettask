@@ -66,3 +66,16 @@ java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply 10000 10      # R
 - **Comparisons.** Compare `heartbeat off` and `heartbeat keeper` with 5 alternating runs pinned with `taskset`.
 - **Request/reply latency.** It is measured from each call's scheduled send time, so a stall also counts against the calls queued behind it.
 - **Results.** The S1 PR body has the numbers measured on the dev box.
+
+## Partition log over `/messaging/v1` (`MessagingLogBench`, `messaging-http/run.sh`)
+
+These are the produce/fetch benches for plain log topics (docs/design/partition-log.md R11). `MessagingLogBench` drives the public handler in-process, without the network:
+
+```
+mvn -q compile
+java -cp target/classes bench/MessagingLogBench.java /tmp/mlb produce 1024 4 10          # writer default (async)
+java -cp target/classes bench/MessagingLogBench.java /tmp/mlb produce 1024 4 10 group    # fsync opt-in
+java -cp target/classes bench/MessagingLogBench.java /tmp/mlb fetch   1024 4 10
+```
+
+`messaging-http/run.sh <jar> [sizes]` runs the same operations end to end over HTTP with wrk (default sizes are 100 B, 1 KiB, 16 KiB and 256 KiB). Run every bench as `flock /tmp/sjws-bench.lock …`, only when the 1-minute load is under 4, and record that load next to the numbers.
