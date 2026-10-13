@@ -78,9 +78,12 @@ no counter: see how observability is wired). Docs, test, CI and dependency-only 
 - Small, focused PRs; avoid file moves/renames that make parallel branches conflict.
 - To catch up, **merge `master` into your branch** instead of rebasing.
 - **inceptor** (the project-manager agent) merges PRs and decides conflicts between workstreams.
+  Area owners: [docs/development/ownership.md](docs/development/ownership.md).
 
 ## Security
 
+- Vulnerability reports and disclosure follow [SECURITY.md](SECURITY.md). Never describe an unfixed
+  exploitable issue in a public issue, PR title or commit message.
 - The control-plane admin listener is **mTLS only** (`cp.AdminServer`: client certificate required,
   identity from the certificate, `Authorization` ignored; it refuses to bind without the material).
   See [control-plane security](docs/design/control-plane-security.md) and the [audit](docs/security/audit.md).

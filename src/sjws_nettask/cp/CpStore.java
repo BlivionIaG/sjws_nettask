@@ -62,6 +62,8 @@ public final class CpStore implements AutoCloseable {
     private static final byte ADVANCE = 8;
     /** Wraps a mutation so a retried Idempotency-Key is not applied twice after replay. */
     private static final byte IDEM = 9;
+    private static final byte JOIN_ISSUE = 10;
+    private static final byte JOIN_CONSUME = 11;
     private static final int HISTORY = 8;
 
     private final ReplicatedNode node;
@@ -148,9 +150,83 @@ public final class CpStore implements AutoCloseable {
         return NodeLifecycle.dataPlane(controlPlaneUp, hasLastGood, pastMaxStaleness);
     }
 
-    /** Same node identity and token within the TTL returns the join already recorded. */
+    /**
+     * Issues a one-shot join token (replicated). Only the SHA-256 of {@code secret} is stored.
+     */
+    public Outcome issueJoinToken(String tokenId, byte[] secret, long nowMillis, long ttlMillis) {
+        var bad = JoinTokens.checkIssue(tokenId, secret, ttlMillis);
+        if (bad != null) {
+            return Outcome.error(400, bad);
+        }
+        if (!leadership.leaderReady()) {
+            return Outcome.error(503, "leader not ready");
+        }
+        long expires = nowMillis + ttlMillis;
+        try {
+            append(joinEntry(JOIN_ISSUE, tokenId, JoinTokens.sha256(secret), expires, nowMillis));
+        } catch (ExecutionException e) {
+            return Outcome.error(503, "log");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Outcome.error(503, "log");
+        }
+        return Outcome.ok("{\"token\":" + LastGoodFiles.jsonString(tokenId) + ",\"expiresAtMillis\":" + expires + "}", 0);
+    }
+
+    /**
+     * Presents a join token. The first successful use burns it through a replicated consume entry
+     * (atomic: of two concurrent first uses one wins, the other is "used"). A retry from the node that
+     * joined, with the same token, returns the recorded join ({@code replay}) without consuming again.
+     */
     public JoinTokens.Result presentJoin(String nodeId, String tokenId, byte[] secret, long nowMillis) {
-        return joins.present(nodeId, tokenId, secret, nowMillis, JoinTokens.DEFAULT_TTL_MILLIS);
+        var hash = secret == null || secret.length < 16 ? null : JoinTokens.sha256(secret);
+        var decision = joins.evaluate(nodeId, tokenId, hash, nowMillis);
+        if (!decision.accepted() || decision.replay()) {
+            return decision;
+        }
+        if (!leadership.leaderReady()) {
+            return new JoinTokens.Result(null, false, "leader not ready");
+        }
+        try {
+            append(joinEntry(JOIN_CONSUME, nodeId, tokenId, hash, nowMillis));
+        } catch (ExecutionException e) {
+            return new JoinTokens.Result(null, false, "log");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new JoinTokens.Result(null, false, "log");
+        }
+        var join = joins.joined(nodeId);
+        if (join != null && join.tokenId().equals(tokenId)) {
+            return new JoinTokens.Result(join, false, null);
+        }
+        return new JoinTokens.Result(null, false, "used");
+    }
+
+    private static ByteBuffer joinEntry(byte type, String a, String b, long n1, long n2) {
+        var ra = a.getBytes(StandardCharsets.UTF_8);
+        var rb = b.getBytes(StandardCharsets.UTF_8);
+        var buffer = ByteBuffer.allocate(1 + 4 + ra.length + 4 + rb.length + 16);
+        buffer.put(type);
+        put(buffer, ra);
+        put(buffer, rb);
+        buffer.putLong(n1);
+        buffer.putLong(n2);
+        buffer.flip();
+        return buffer;
+    }
+
+    private static ByteBuffer joinEntry(byte type, String nodeId, String tokenId, String hash, long now) {
+        var rn = nodeId.getBytes(StandardCharsets.UTF_8);
+        var rt = tokenId.getBytes(StandardCharsets.UTF_8);
+        var rh = hash.getBytes(StandardCharsets.UTF_8);
+        var buffer = ByteBuffer.allocate(1 + 12 + rn.length + rt.length + rh.length + 8);
+        buffer.put(type);
+        put(buffer, rn);
+        put(buffer, rt);
+        put(buffer, rh);
+        buffer.putLong(now);
+        buffer.flip();
+        return buffer;
     }
 
     public void publishBinding(sjws_nettask.service.NodeEnrollment enrollment) throws java.io.IOException {
@@ -689,6 +765,19 @@ public final class CpStore implements AutoCloseable {
                 }
             }
             case REVOKE -> revoked.add(readString(body));
+            case JOIN_ISSUE -> {
+                var tokenId = readString(body);
+                var hash = readString(body);
+                long expires = body.getLong();
+                long now = body.getLong();
+                joins.issue(tokenId, hash, expires, now);
+            }
+            case JOIN_CONSUME -> {
+                var nodeId = readString(body);
+                var tokenId = readString(body);
+                var hash = readString(body);
+                joins.consume(nodeId, tokenId, hash, body.getLong());
+            }
             case ROLLOUT -> {
                 selectors.clear();
                 int count = body.getInt();
