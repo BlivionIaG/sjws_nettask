@@ -173,4 +173,24 @@ class HeartbeatAuthTest {
         assertThrows(IllegalArgumentException.class, () -> ClusterKey.of(CURRENT, new byte[15]));
         assertThrows(NullPointerException.class, () -> new HeartbeatAuthenticator(null));
     }
+
+    /**
+     * A restarted member builds a new authenticator, so its sequence starts again at 1.
+     * Peers that already accepted a higher sequence from that wire id must still accept it.
+     */
+    @Test
+    void restartedNodeIsNotRejected() {
+        var receiver = new HeartbeatAuthenticator(ClusterKey.of(CURRENT, null));
+        var running = new HeartbeatAuthenticator(ClusterKey.of(CURRENT, null));
+        long now = 1_700_000_000_000L;
+        var packet = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        for (int i = 0; i < 5; i++) {
+            running.seal(body(2, 1), packet, now);
+            assertNotNull(receiver.open(packet, now));
+        }
+        var restarted = new HeartbeatAuthenticator(ClusterKey.of(CURRENT, null));
+        restarted.seal(body(2, 1), packet, now);
+        assertNotNull(receiver.open(packet, now), "a restarted node must not be rejected");
+        assertEquals(0, receiver.rejected());
+    }
 }
