@@ -24,34 +24,40 @@ config file format and ACME (`ConfigSource`, `CertProvider`), reverse proxy, the
 backend (`MetricsSink`), daemon/service mode (signals, PID), and the CI workflow. `HaSettings`
 is attached in code (`SjwsServer.start(config, ha)`). This workstream does not add flags to
 `ServerConfig` — that parser, `--help`, and the docs option tables stay with the config
-workstream. The process shutdown hook in `Sjws_nettask.serve` still calls `close()`; signal
-wiring that should drain instead belongs to daemon mode, which can call `Lifecycle.drain()`.
+workstream. The process shutdown hook calls `SjwsServer.drain()`, which is `close()` unless HA
+is attached, and then `Lifecycle.drain()`.
 
-What exists in the code today (solid) and what this document only designs (dashed):
+What the code has today. Solid boxes run in a shipped process (`java -jar`). Dotted boxes are built, but only
+tests, an embedder or the HA bench reach them, because `HaSettings` is attached only there. The YAML `ha:` section is
+validated and starts nothing yet. The dashed box lists what is still only designed:
 
 ```mermaid
-flowchart TB
-    hh["ha.HaHandler<br/>probes, then the<br/>published generation"]
-    hb["ha.HealthBoard<br/>precomputed probes"]
-    sh["ha.SnapshotHolder<br/>atomic publish"]
-    lc["ha.Lifecycle.drain()<br/>and ClientManager hooks"]
+flowchart LR
+        hh["HaHandler: probes, then<br/>the published generation"]
+        hb["HealthBoard: precomputed<br/>probes. Nothing sets<br/>quorumOk yet"]
+        sh["SnapshotHolder: atomic<br/>publish. Nothing<br/>publishes yet"]
+        lc["Lifecycle.drain() and<br/>ClientManager hooks"]
+        gs["GenerationSync: STAGE and<br/>ACTIVATE over Raft"]
+        vip["VipHook, VipFence,<br/>FailoverPolicy"]
+        hh --> hb
+        hh --> sh
+        lc --> hb
+        raft["RaftGroup and<br/>ReplicatedNode: pre-vote,<br/>lease, witness, RELAXED<br/>and STRICT"]
+        pol["QuorumPolicy and VoterSet"]
+        tcp["TcpTransport"]
+        mem["Membership and<br/>HeartbeatService:<br/>authenticated UDP<br/>heartbeats, not connected<br/>to Raft"]
+        raft --> pol
+        raft --> tcp
+    cp["cp.CpStore, the one<br/>shipped user: group<br/>cp-config, one voter on<br/>an in-process transport"]
+    gs --> raft
+    vip --> raft
+    cp --> raft
 
-    mem["cluster: Membership<br/>and QuorumPolicy"]
-    raft["cluster: Raft groups<br/>ha-control, one per partition"]
-    sync["cluster: config, certificate<br/>and content sync"]
-    vip["cluster: VipHook and<br/>failover policy"]
-
-    hh --> hb
-    hh --> sh
-    lc --> hb
-    mem -.-> raft
-    vip -.-> raft
-    raft -.->|"quorum ok"| hb
-    raft -.-> sync
-    sync -.->|"publishes a generation"| sh
-
+    classDef lib stroke-dasharray: 2 4
+    class hh,hb,sh,lc,gs,vip,mem,tcp lib
+    np["Not built: a Raft group<br/>per partition, content<br/>sync, and a failure<br/>detector that feeds<br/>quorum and /readyz"]
     classDef design stroke-dasharray: 5 5
-    class mem,raft,sync,vip design
+    class np design
 ```
 
 ## 2. Design principles
@@ -160,7 +166,8 @@ The two-node choice (witness versus async primary/standby), the failure matrix, 
   The accept loop's one volatile role read (passive mode only) feeds that hook and the
   `ha_role` gauge; it does not run per request.
 
-Two data nodes and a witness (design only, the cluster layer is not built):
+Two data nodes and a witness. The Raft side is built in `cluster` and runs only in tests: no shipped process
+runs an `ha-control` voter beside the content listener (dotted boxes, as above):
 
 ```mermaid
 flowchart TB
@@ -176,16 +183,16 @@ flowchart TB
         rb["ha-control voter"]
     end
 
-    w["Witness<br/>votes, stores no log"]
+    w["Witness<br/>votes and acks, never leads,<br/>keeps a cursor, not the log"]
 
     lb --> sa
     lb --> sb
-    ra <--> rb
+    ra <-->|"Raft: any 2 of 3 commit"| rb
     ra <--> w
     rb <--> w
 
-    classDef design stroke-dasharray: 5 5
-    class ra,rb,w design
+    classDef lib stroke-dasharray: 2 4
+    class ra,rb,w lib
 ```
 
 ### 4.2 Three nodes
@@ -217,15 +224,30 @@ flowchart TB
 - Peer failure detection: UDP heartbeat plus an indirect probe (k=2 via other members when
   N≥3). Defaults: interval 500 ms, suspect after 3 misses, dead after 5 s.
 
-  Member states (design only):
+  Member states, as `cluster.Membership` implements them. Only the HA bench and tests run it, and nothing
+  connects it to Raft or `/readyz` yet:
 
   ```mermaid
   stateDiagram-v2
       [*] --> ALIVE
-      ALIVE --> SUSPECT: 3 missed heartbeats
-      SUSPECT --> ALIVE: a heartbeat, or a higher incarnation refutes the suspicion
-      SUSPECT --> DEAD: dead after 5 s, by default
-      note right of ALIVE: also probed indirectly through 2 other members when N is 3 or more
+      ALIVE --> SUSPECT: silent for 3 intervals
+      ALIVE --> DEAD: silent for deadAfter
+      SUSPECT --> DEAD: silent for deadAfter
+      SUSPECT --> ALIVE: a heartbeat or an indirect ack
+      DEAD --> ALIVE: a heartbeat
+      note right of SUSPECT
+          deadAfter counts from the
+          last heartbeat heard, 5 s
+          by default. A heartbeat
+          counts when its incarnation
+          is the same or higher
+      end note
+      note left of ALIVE
+          also probed indirectly
+          through up to 2 other
+          members, when 3 or more
+          are listed
+      end note
   ```
 
 ## 6. Failover
@@ -300,26 +322,24 @@ sequenceDiagram
   leader publishes again from `ConfigSource`. The log coordinates activation; it is not the
   only copy of the bytes.
 
-The rollout (design only, the cluster layer is not built):
+The rollout, as `ha.GenerationSync` implements it. It runs only in tests, inside one JVM: the bundle store is an
+in-process map, heartbeats do not announce generations, and nothing publishes a `SnapshotHolder` from ACTIVATE yet:
 
 ```mermaid
 sequenceDiagram
-    participant CS as ConfigSource and<br/>CertProvider
-    participant Ld as ha-control leader
-    participant Q as Quorum and<br/>the witness
-    participant P as Peer node
+    participant P as publishFrom caller
+    participant R as ha-control group
+    participant N as Every node
 
-    Ld->>CS: pull the bundle
-    Note over Ld: compute the generation<br/>and the content hash
-    Ld->>Q: STAGE
-    Q-->>Ld: committed on a majority
-    Ld-->>P: (generation, hash)
-    Note over Ld,P: announced in heartbeats
-    P->>Ld: pull the bundle
-    Note over Ld,P: over TCP, authenticated with HMAC-SHA256
-    Ld->>Q: ACTIVATE
-    Q-->>P: committed
-    Note over P: applying ACTIVATE publishes the snapshot.<br/>If the leader dies before a peer has the bytes,<br/>the peer keeps its last activated snapshot<br/>and the new leader publishes again
+    Note over P: load config, certificate and key<br/>from ConfigSource and CertProvider.<br/>Store the payload in HmacBundles,<br/>an in-process map
+    P->>R: append STAGE, generation and SHA-256
+    Note over R: a follower's append fails<br/>with NotLeaderException
+    R-->>N: STAGE committed
+    Note over N: pull the payload from HmacBundles,<br/>check the HMAC and the hash, rewrite<br/>the key file (mode 0600, ATOMIC_MOVE)
+    R-->>P: the STAGE future completes
+    P->>R: append ACTIVATE at once
+    R-->>N: ACTIVATE committed
+    Note over N: onActivate(generation), a caller<br/>callback, a no-op by default
 ```
 
 ## 10. Shared state

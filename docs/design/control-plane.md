@@ -46,13 +46,15 @@ The content request path reads the snapshot that is already installed. It does n
 
 ```mermaid
 flowchart TD
-    tui["Admin TUI"] -.->|"mTLS admin API"| cp["Control role, 3 or 5 nodes<br/>sjws_nettask.cp<br/>group cp-config"]
-    cp -.-|"Raft"| raft["cluster.ClusterNode"]
-    cp -.-> w{{"mTLS watch:<br/>push, ack, resume"}}
-    w -.-> g["data: gateway"]
-    w -.-> st["data: static"]
-    w -.-> b["data: broker"]
-    w -.-> e["data: edge"]
+    tui["Admin TUI"] -->|"mTLS admin API"| cp["Control role<br/>sjws_nettask.cp<br/>group cp-config"]
+    cp --- raft["cluster.ClusterNode"]
+    cp -.-> mv["3 or 5 voters<br/>over TCP"]
+    cp --> w{{"mTLS watch:<br/>long poll, ack"}}
+    w --> g["data: gateway"]
+    w --> st["data: static"]
+    w --> b["data: broker"]
+    w --> e["data: edge"]
+    w -.-> pj["role projection"]
     g --> sw{{"atomic swap,<br/>off the request path"}}
     st --> sw
     b --> sw
@@ -62,12 +64,14 @@ flowchart TD
     live -.-> bl["broker loop"]
 
     classDef design stroke-dasharray: 5 5
-    class cp,raft,w,bl design
+    class mv,pj,bl design
 ```
 
-Dashed boxes and arrows are not in the tree yet. The solid ones exist, though the data roles are only
-their names plus the bootstrap and status slice described in
-[Control-plane and data-node service](../operations/control-plane-service.md).
+Dashed boxes and arrows are not in the tree yet. The solid ones exist. A control process hosts one voter on an
+in-process transport: voter sets of 3, 5 or 2 + witness run only in tests, because the shipped dependencies refuse
+`cp.peers`. Every data role runs the same watch client against the whole document, with no per-role projection. See
+[Control-plane and data-node service](../operations/control-plane-service.md) and
+[Control-plane process hosting](control-plane-hosting.md).
 
 ### 3.1 Packages and the dependency cut
 
@@ -394,7 +398,7 @@ The client speaks first:
 
 The server then sends, in version order, a full `SignedSnapshot` for every version above `fromVersion`. A client that already holds the parent still receives the full document. Patches are not a frame type.
 
-The exchange, from a data node's side:
+The exchange as designed, from a data node's side:
 
 ```mermaid
 sequenceDiagram
@@ -412,6 +416,30 @@ sequenceDiagram
     Note over L: at most maxInFlight versions<br/>unacked, 1 by default
     L-->>D: freshness frame, at least every 30 s
     D-->>L: heartbeat, every 1 s
+```
+
+As built, the watch is a long poll, not a stream. `DataWatch` asks any control voter for the newest activated
+version, and `WatchServer` answers from that voter's applied state, so a follower serves it too. There is no
+`Register`, no heartbeat, no freshness frame and no window of unacked versions, and a node that is behind gets only
+the newest envelope. A rejected envelope is logged and skipped, and it is not acked:
+
+```mermaid
+sequenceDiagram
+    participant D as Data node, DataWatch
+    participant V as Any control voter, WatchServer
+
+    loop until the node stops
+        D->>V: GET /cp/v1/watch?after=N&waitMs=25000
+        Note over V: TLS 1.3 with a client certificate. The node id<br/>is in X-Sjws-Node-Id, with the join token if<br/>there is one. The request is held for 30 s at most
+        alt nothing newer than N
+            V-->>D: 204
+        else a newer activated version
+            V-->>D: 200, the newest envelope and the trust bundle
+            Note over D: applyRemote: DataApply.decide checks the<br/>signature and the envelope rules, then the swap,<br/>then the last-good, floor and trust files
+            D->>V: POST /cp/v1/watch/ack?version=V
+            V-->>D: 204
+        end
+    end
 ```
 
 After the client is caught up, the server sends each newly activated version the same way. The client replies after `applyRemote` has swapped the live snapshot, the side effects in §5.6 have run, and `floor.json`, `trust.json`, and `last-good.json` are durable. Swapping the snapshot is not the whole ack when the node hosts partitions. Opening a partition can take seconds, so a broker ack names each partition:
@@ -446,7 +474,7 @@ The leader pushes the staged version only to nodes in the open stage. Other node
 
 `Activate` commits when the last stage has met its ack rule, or when an identity with role `operator` forces it. Activation publishes the version as desired. Nodes that have not acked still receive it (subject to their window) and still serve last-good until they apply.
 
-A proposal moves through these states:
+As designed, a proposal moves through these states:
 
 ```mermaid
 stateDiagram-v2
@@ -465,6 +493,36 @@ stateDiagram-v2
         older activated content
         and rolls it out the
         same way
+    end note
+```
+
+As built, the stages are bookkeeping. Nothing is pushed before `Activate`, and every watcher then gets the newest
+activated version:
+
+```mermaid
+stateDiagram-v2
+    [*] --> STAGED: propose
+    STAGED --> STAGED: rollout, advance
+    STAGED --> DESIRED: activate
+    DESIRED --> [*]
+    note right of STAGED
+        one staged proposal
+        at a time, a second
+        propose is 409.
+        rollout and advance
+        only record selectors
+        and a stage counter.
+        Acks are not consulted
+    end note
+    note left of DESIRED
+        signed, kept in a
+        history of 8, served
+        to every watcher.
+        Rollback is a new
+        higher version with the
+        old content, immediate,
+        and it drops a staged
+        proposal
     end note
 ```
 
@@ -566,7 +624,9 @@ Role, labels, and capabilities come from the token record. The leader writes the
 
 `ConsumeToken` and `Register` are one Raft entry. The leader appends that entry and waits until it commits, and only then returns the certificate. A leadership change does not mint a second join for the same token and the same identity: the consume is already in the log and the re-presentation returns it, or it is not committed and the certificate was not sent. A different identity does not reuse that entry. Failed presentations are rate-limited and audited per source address. The token is checked before any CSR is signed, so an unauthenticated joiner does not cost a signature. `NodeEnrollment.tokenConsumed()` runs only after that commit (§6.1).
 
-The join, in order:
+The join, in order, as designed. As built, a node presents its token, or its certificate, in headers on the watch,
+the leader commits one `JOIN_CONSUME` entry for a token, and there is no `Register`, no CSR and no node certificate
+issued. No admin route issues join tokens yet:
 
 ```mermaid
 sequenceDiagram

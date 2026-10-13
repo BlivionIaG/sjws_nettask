@@ -118,6 +118,32 @@ refuses the pre-vote, so the term does not move and the leader that holds the wi
 stays leader. `onTimeoutNow` (leadership transfer) still starts a real election; it does
 not go through the pre-vote.
 
+One election, from the first deadline to the lease. The Raft side runs in tests and in a control process
+(group `cp-config`, one voter), not yet in an HA pair:
+
+```mermaid
+sequenceDiagram
+    participant F as Candidate
+    participant P as Other data node
+    participant W as Witness
+
+    Note over F: its election deadline passes, and it<br/>is not a witness
+    F->>P: PRE_VOTE, the term is unchanged
+    F->>W: PRE_VOTE
+    Note over P,W: refused while a leader is fresh. Otherwise granted<br/>if the candidate's log is up to date, the witness<br/>compares its forced cursor
+    Note over F: a pre-vote quorum starts the election:<br/>term + 1 and a vote for itself
+    F->>P: VOTE
+    F->>W: VOTE
+    Note over P,W: granted when the log is up to date and<br/>no other candidate has this term's vote
+    Note over F: a vote quorum makes it leader:<br/>lease = now + 2 heartbeats, append a NOOP
+    loop every heartbeat
+        F->>P: AppendEntries
+        P-->>F: ack
+        Note over F: a quorum ack of the last index<br/>renews the lease
+    end
+    Note over P,W: an append or a granted vote moves the election<br/>deadline to now + lease + election timeout
+```
+
 ## Leader lease
 
 `GroupOptions.leaseNanos()` is `heartbeat.toNanos() * 2`. The lease is a deadline on
@@ -198,6 +224,19 @@ accepts a lower epoch, and `HeartbeatService` passes the membership dead interva
 `LocalCluster` and `ReplicatedNode` use 5 s. A timestamp older than this process's boot
 is dropped. A destination other than this node is dropped. A sender that is not a member
 is dropped. Skew warnings are rate-limited to once per 5 s (`WARN_EVERY_MILLIS`).
+
+The order in which `HeartbeatAuthenticator.open` checks a datagram, and the reason that is counted when one check fails:
+
+```mermaid
+flowchart TB
+    c1["1. Shape and tag: 124<br/>bytes, version 1, key id 0<br/>or 1 (else MALFORMED),<br/>then the HMAC-SHA256 tag<br/>under that key (else TAG)"]
+    c2["2. Time: within 5 s of now<br/>either way, and not before<br/>this process booted (else<br/>TIME)"]
+    c3["3. Body and address: the<br/>body decodes (else BODY)<br/>and is addressed to this<br/>node (else DEST)"]
+    c4["4. Epoch: the boot epoch<br/>is not later than the<br/>packet timestamp by more<br/>than 5 s (else EPOCH)"]
+    c5["5. Replay state: the<br/>sender is a member (else<br/>MEMBER) and the sequence<br/>is above 0 (else SEQ). A<br/>new sender, a newer boot<br/>epoch, or a lower one<br/>after silence resets the<br/>sequence. Otherwise a<br/>lower epoch is EPOCH and a<br/>sequence not above the<br/>last is SEQ"]
+    ok["Accepted:<br/>Membership.onHeartbeat.<br/>Every drop is counted<br/>under its reason"]
+    c1 --> c2 --> c3 --> c4 --> c5 --> ok
+```
 
 Rotation is the previous key. Put the new secret in `ha.cluster_key` or
 `ha.cluster_key_file` and the key still in use in `ha.cluster_key_previous` or
