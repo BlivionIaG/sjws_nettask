@@ -4,3 +4,6 @@ test/
 nbproject/private/
 target/
 bench/controlplane/results/
+# Default data-node state and daemon log when a run leaves the paths unset.
+config/last-good.json
+sjws_nettask.log
