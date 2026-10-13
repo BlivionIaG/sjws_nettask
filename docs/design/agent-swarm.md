@@ -59,7 +59,7 @@ How this is enforced is in §3.3.
 3. **Single entry point** (shipped in #90). `sjws_nettask.OptionalModules` is the only code outside `swarm` that names the swarm, and it does so only as the string constant `SWARM_CLASS = "sjws_nettask.swarm.SwarmModule"` (`src/sjws_nettask/OptionalModules.java:33-35`).
    - When the JVM property `-Dsjws.swarm.enabled=true` is set, or the environment variable `SJWS_SWARM_ENABLED=true` (the property wins), it loads `SwarmModule` by reflection, `Class.forName(...).asSubclass(OptionalModule.class)` (`OptionalModules.java:52-65`).
    - Otherwise it returns a shared no-op `OptionalModules.NONE`, so no swarm class is loaded or verified.
-   - Both startup paths call it once, after the server starts and outside any request path: `try (var modules = OptionalModules.start(err))` in `Sjws_nettask.serve` (`src/sjws_nettask/Sjws_nettask.java:95,127`).
+   - Both startup paths call it once, before the listener accepts and outside any request path, so a module that implements `core.HandlerContributor` can mount handlers. `SwarmModule` mounts `/swarm/v1/*` (501 until S1). With the swarm off that class is not loaded and no mount table is installed.
    - The YAML key `swarm.enabled` replaces the property/env gate in S1 (§12).
    - No existing package used this pattern before #90: `service/Bootstrap.java:43` is only the `"messaging"` capability string, not a gate.
 4. **Off-mode wrk gate** (§13, item 3). It is the backstop, not the proof. wrk cannot resolve a single extra volatile read; tests 1–3 can.

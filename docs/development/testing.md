@@ -25,6 +25,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `observe/ClusterBoardTest` | cluster aggregate: per-node rate from cumulative snapshots, restart zeroes the interval, merged p99, errors by node and route, config drift, label-name cap |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
+| `core/HandlerMountTest`, `HandlerMountServerTest`, `h3/HandlerMountHttp3Test` | startup prefix mounts: none (same handler), one, several, overlap rejected before bind, router and global filters on HTTP/1.1, the same table on HTTP/3 |
 | `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |
 | `core/FilterDocumentTest` | declarative document: JSON round trip, scope, label selectors, rejected wire forms |
 | `core/ChainControlTest` | atomic snapshot swap, stale and invalid documents keep the live chain, in-flight requests finish on the old chain |

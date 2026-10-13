@@ -17,13 +17,17 @@
 package sjws_nettask;
 
 import java.io.PrintStream;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import sjws_nettask.core.HandlerContributor;
 
 /**
  * The single entry point for optional modules (docs/design/agent-swarm.md §3.3, item 3). The swarm is
  * referenced only as a class name string and loaded reflectively when enabled, so with the swarm off no
  * {@code sjws_nettask.swarm} class is loaded or verified. Nothing on a request path calls this class.
+ * An enabled module that implements {@link HandlerContributor} is handed to the server before it
+ * accepts, so the module can mount handlers. Service providers are discovered beside that list.
  * <p>
  * Gate, first one set wins: system property {@value #SWARM_PROPERTY}, environment variable {@value #SWARM_ENV},
  * then the YAML key {@code swarm.enabled} (S1). Off when none is set.
@@ -75,6 +79,17 @@ final class OptionalModules {
 
     static OptionalModule start(Boolean yaml, PrintStream err) {
         return start(System::getProperty, System.getenv(), yaml, err);
+    }
+
+    /**
+     * The enabled module when it mounts handlers, otherwise an empty list. Does not load service
+     * providers; the server does that while it compiles the terminal.
+     */
+    static List<HandlerContributor> contributors(OptionalModule module) {
+        if (module instanceof HandlerContributor contributor) {
+            return List.of(contributor);
+        }
+        return List.of();
     }
 
     static OptionalModule load(String className, PrintStream err) {

@@ -247,4 +247,57 @@ public final class RoutePattern {
         }
         return n;
     }
+
+    /**
+     * True when some well-formed origin path matches both patterns. An ambiguous target matches
+     * every specific pattern, so it is not used here: overlap is decided on paths that have one
+     * meaning. {@code *} overlaps everything. A prefix overlaps a path when that path equals the
+     * prefix or sits under it.
+     */
+    public boolean overlaps(RoutePattern other) {
+        if (other == null) {
+            return false;
+        }
+        if (this.kind == Kind.ALL || other.kind == Kind.ALL) {
+            return true;
+        }
+        if (this.kind == Kind.EXACT && other.kind == Kind.EXACT) {
+            return this.path.equals(other.path);
+        }
+        if (this.kind == Kind.PREFIX && other.kind == Kind.PREFIX) {
+            return prefixOverlaps(this.path, other.path);
+        }
+        var exact = this.kind == Kind.EXACT ? this.path : other.path;
+        var prefix = this.kind == Kind.PREFIX ? this.path : other.path;
+        return prefixCovers(prefix, exact);
+    }
+
+    @Override
+    public String toString() {
+        if (this.kind == Kind.ALL) {
+            return "*";
+        }
+        if (this.kind == Kind.EXACT) {
+            return this.path;
+        }
+        return this.path.length() == 1 ? "/*" : this.path + "/*";
+    }
+
+    private static boolean prefixOverlaps(String a, String b) {
+        if ("/".equals(a) || "/".equals(b) || a.equals(b)) {
+            return true;
+        }
+        return prefixCovers(a, b) || prefixCovers(b, a);
+    }
+
+    /** {@code prefix} is the stored prefix ({@code /} for {@code /*}). {@code path} is an exact path or a longer prefix. */
+    private static boolean prefixCovers(String prefix, String path) {
+        if ("/".equals(prefix)) {
+            return path.startsWith("/");
+        }
+        if (path.equals(prefix)) {
+            return true;
+        }
+        return path.startsWith(prefix) && path.length() > prefix.length() && path.charAt(prefix.length()) == '/';
+    }
 }

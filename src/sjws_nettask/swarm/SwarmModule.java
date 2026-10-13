@@ -17,20 +17,36 @@
 package sjws_nettask.swarm;
 
 import sjws_nettask.OptionalModule;
+import sjws_nettask.core.HandlerContributor;
+import sjws_nettask.core.HandlerMounts;
+import sjws_nettask.core.Request;
+import sjws_nettask.core.Response;
+import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Entry point of the optional agent-swarm layer (docs/design/agent-swarm.md). Loaded only by name from
  * {@code sjws_nettask.OptionalModules} when the swarm is enabled; nothing outside this package imports it.
  * <p>
- * Phase S0 delivers only the guard rails: this class starts no thread, opens no partition and binds no
- * port. Task, lease and reply services arrive in S1.
+ * Phase S0 delivers the guard rails and the {@code /swarm/v1/*} mount. This class starts no thread,
+ * opens no partition and binds no port. Requests under that prefix get 501 until the task, lease and
+ * reply services arrive in S1.
  */
-public final class SwarmModule implements OptionalModule {
+public final class SwarmModule implements OptionalModule, HandlerContributor {
 
     private volatile boolean closed;
 
     public SwarmModule() {
         // S0: no services yet.
+    }
+
+    @Override
+    public void contribute(HandlerMounts mounts) {
+        mounts.mount("/swarm/v1", SwarmModule::unavailable);
+    }
+
+    /** Placeholder for the S1 task API. */
+    private static Response unavailable(Request request) {
+        return StaticFileHandler.error(501, request.headOnly());
     }
 
     public boolean closed() {

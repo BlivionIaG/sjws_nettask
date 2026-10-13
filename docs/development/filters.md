@@ -154,6 +154,42 @@ filters were registered, even if a router is installed: HTTP/1.1 then calls the 
 `Handler.handle`, and HTTP/3 uses `FilterChain.dispatch(files, router, null)`, which is
 `router::handle`.
 
+## Prefix mounts
+
+An optional module can own a path prefix without a routing entry and without a swarm (or any
+other module) type in `core`. It implements `HandlerContributor` and, only at startup, calls
+`HandlerMounts.mount`:
+
+```java
+public final class SwarmModule implements OptionalModule, HandlerContributor {
+    public void contribute(HandlerMounts mounts) {
+        Handler api = RequestFilters.create()
+                .add(0, (request, next) -> next.proceed(request))
+                .wrapping(this::handle);
+        mounts.mount("/swarm/v1", api); // also accepts "/swarm/v1/" and "/swarm/v1/*"
+    }
+}
+```
+
+`mount(String, Handler)` is a prefix: the path equals it or sits under it. `mount(RoutePattern, Handler)`
+is the exact form (`/only`) or any other accepted pattern. Two mounts that can match the same
+well-formed path, including a duplicate, fail startup before the port is bound. `*` overlaps
+everything.
+
+The server discovers contributors once, before it accepts: `ServiceLoader` on
+`HandlerContributor`, plus an explicit list. `OptionalModules` adds the enabled module when that
+module implements `HandlerContributor`. The swarm module is not a service provider, so it stays
+unloaded while the swarm is off. `SjwsServer.start(config, filters, terminal, contributors)` is
+the same hook for an embedder.
+
+With no contributors, or when every contributor mounts nothing, the terminal is the one startup
+already chose: a direct `StaticFileHandler.handle` when that is the leaf and no filters are
+registered, or the router when routing is enabled. No mount table is built, and the request path
+does not branch on "are there mounts". When at least one prefix is mounted, one dispatcher sits
+in front of that terminal (the live router when routing is on, otherwise the live file handler)
+and global filters wrap the dispatcher. A miss calls the terminal. Per-mount filters are just
+`RequestFilters.wrapping` on the handler passed to `mount`.
+
 Per-route filters do not need a router feature. Wrap that route's target handler. An empty
 registry returns the same instance, so a route with no filters allocates nothing:
 
