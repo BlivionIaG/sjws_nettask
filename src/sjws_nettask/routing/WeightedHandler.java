@@ -76,8 +76,7 @@ public final class WeightedHandler implements Handler {
     private final Handler[] handlers;
     private final Match[] pins; // null when no backend is pinned
     private final Match sticky;
-    private final double[] prob;
-    private final int[] alias;
+    private final AliasTable table;
 
     public WeightedHandler(List<Backend> backends, Match sticky) {
         if (backends.isEmpty()) {
@@ -86,58 +85,18 @@ public final class WeightedHandler implements Handler {
         int n = backends.size();
         this.handlers = new Handler[n];
         var pins = new Match[n];
+        var weights = new long[n];
         boolean anyPin = false;
-        long total = 0;
         for (int i = 0; i < n; i++) {
             var b = backends.get(i);
             this.handlers[i] = b.handler();
             pins[i] = b.pin();
             anyPin |= b.pin() != null;
-            total += b.weight();
-        }
-        if (total <= 0) {
-            throw new IllegalArgumentException("total weight must be > 0");
+            weights[i] = b.weight();
         }
         this.pins = anyPin ? pins : null;
         this.sticky = sticky;
-        this.prob = new double[n];
-        this.alias = new int[n];
-        // Vose: scaled weights, small and large work lists
-        var scaled = new double[n];
-        var small = new int[n];
-        var large = new int[n];
-        int s = 0;
-        int l = 0;
-        for (int i = 0; i < n; i++) {
-            scaled[i] = (double) backends.get(i).weight() * n / total;
-            if (scaled[i] < 1.0) {
-                small[s++] = i;
-            } else {
-                large[l++] = i;
-            }
-        }
-        while (s > 0 && l > 0) {
-            int lo = small[--s];
-            int hi = large[--l];
-            this.prob[lo] = scaled[lo];
-            this.alias[lo] = hi;
-            scaled[hi] = scaled[hi] + scaled[lo] - 1.0;
-            if (scaled[hi] < 1.0) {
-                small[s++] = hi;
-            } else {
-                large[l++] = hi;
-            }
-        }
-        while (l > 0) {
-            int i = large[--l];
-            this.prob[i] = 1.0;
-            this.alias[i] = i;
-        }
-        while (s > 0) { // rounding leftovers
-            int i = small[--s];
-            this.prob[i] = 1.0;
-            this.alias[i] = i;
-        }
+        this.table = new AliasTable(weights);
     }
 
     @Override
@@ -164,35 +123,20 @@ public final class WeightedHandler implements Handler {
         return pick(ThreadLocalRandom.current().nextLong());
     }
 
-    /** High 32 bits choose the column, low 32 bits the coin. */
     int pick(long bits) {
-        int n = this.prob.length;
-        int column = (int) (((bits >>> 32) * n) >>> 32);
-        double coin = (bits & 0xFFFF_FFFFL) * 0x1.0p-32;
-        return coin < this.prob[column] ? column : this.alias[column];
+        return this.table.pick(bits);
     }
 
-    /** Exact probability of backend {@code i} implied by the alias table, for tests. */
     double share(int i) {
-        int n = this.prob.length;
-        double mass = this.prob[i];
-        for (int j = 0; j < n; j++) {
-            if (this.alias[j] == i && j != i) {
-                mass += 1.0 - this.prob[j];
-            }
-        }
-        return mass / n;
+        return this.table.share(i);
     }
 
     int size() {
         return this.handlers.length;
     }
 
-    /** SplitMix64 finalizer. */
     static long mix(long z) {
-        z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
-        z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
-        return z ^ (z >>> 31);
+        return AliasTable.mix(z);
     }
 
     /** RFC 6265 {@code name=value; name2=value2}: the value of {@code name}, or null. Allocates only on a hit. */
