@@ -299,6 +299,34 @@ success. An upstream is a single endpoint, so an open circuit is an outage of th
 a dead or overloaded upstream, not a flaky one. At 20% random 503s and 5000 req/s, `failures: 5`
 trips about once a second (see `bench/proxy-routing/resilience.sh`). Pair it with `retry`, or raise
 `failures`, when the upstream has a steady error rate.
+
+An upstream can list several endpoints instead of one `url` (exactly one of the two). It then
+balances over them, with one pool per endpoint and a circuit per endpoint:
+
+```yaml
+upstreams:
+  api:
+    endpoints:
+      - "http://10.0.0.1:9000"
+      - { url: "http://10.0.0.2:9000", weight: 3, zone: b, id: api-2, labels: { tier: canary } }
+    lb: weighted_random            # default; round_robin | least_request
+    retry: { attempts: 2 }         # a retry goes to a different endpoint
+    circuit: { failures: 5, eject_for: 10s, error_rate: 50%, min_requests: 20, window: 10s, max_ejection: 50% }  # defaults
+```
+
+All endpoints share one scheme and path (no query, fragment or userinfo); up to 1024, default
+weight 1 (0..1000000, 0 = only used when nothing weighted is left). `weighted_random` draws from an
+alias table (O(1)); `round_robin` cycles; `least_request` takes the less busy of two random
+endpoints (requests waiting for response headers). On a multi-endpoint upstream the circuit is
+always on with the defaults above, per endpoint, per attempt: an endpoint is ejected after
+`failures` consecutive failures, or when at least `min_requests` in the last `window` fail at
+`error_rate` or more. It comes back after `eject_for` through one probe, doubling on each repeat
+(up to 32×). If more than `max_ejection` of the endpoints are ejected, the balancer ignores ejection
+("panic") and spreads over all of them. When every endpoint is ejected or tried, the request still
+goes somewhere rather than failing fast. The endpoint list can be replaced at run time by the
+control plane (see `docs/ha/discovery.md`); a reload keeps a list the control plane has set.
+A plain `url` upstream is unchanged and pays nothing for this.
+
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml
