@@ -472,6 +472,44 @@ public final class Partition implements AutoCloseable {
         }
     }
 
+    /**
+     * Batched fenced ack (one worker settling many leases): every lease still held under its attempt is acked,
+     * all in one ledger write (one writer hand-off, one durability wait). Returns one result per input, in order,
+     * and the batch's durability future (null when nothing was acked). A duplicate offset acks once; the
+     * second copy reports NOT_IN_FLIGHT, exactly as two single acks would.
+     */
+    public BatchAckResult ack(String group, long[] offsets, int[] attempts, Durability durability) {
+        if (offsets.length != attempts.length) throw new IllegalArgumentException("ack");
+        var out = new LeaseResult[offsets.length];
+        lock.lock();
+        try {
+            var g = state.group(group);
+            var entries = new ArrayList<LedgerEntry>(offsets.length);
+            var accepted = new long[offsets.length];
+            java.util.HashSet<Long> seen = offsets.length > 32 ? new java.util.HashSet<>() : null;
+            for (int i = 0; i < offsets.length; i++) {
+                var r = fence(g.inFlight.get(offsets[i]), attempts[i]);
+                if (r == null && (seen != null ? !seen.add(offsets[i]) : contains(accepted, entries.size(), offsets[i]))) {
+                    r = LeaseResult.NOT_IN_FLIGHT; // already acked earlier in this batch
+                }
+                if (r == null) {
+                    accepted[entries.size()] = offsets[i];
+                    entries.add(new LedgerEntry.Ack(group, offsets[i]));
+                    r = LeaseResult.OK;
+                }
+                out[i] = r;
+            }
+            return new BatchAckResult(List.of(out), entries.isEmpty() ? null : appendAll(entries, durability));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static boolean contains(long[] a, int n, long v) {
+        for (int j = 0; j < n; j++) if (a[j] == v) return true;
+        return false;
+    }
+
     private void deadLetter(String group, long offset, int attempts, String reason) {
         var m = state.messages.get(offset);
         if (dlq != null) {
@@ -505,10 +543,18 @@ public final class Partition implements AutoCloseable {
      * order) matches apply order.
      */
     private CompletableFuture<Long> append(LedgerEntry e, Durability durability) {
+        return appendAll(List.of(e), durability);
+    }
+
+    /** As {@link #append}, for several entries written as one batch; the future yields the first offset. */
+    private CompletableFuture<Long> appendAll(List<LedgerEntry> es, Durability durability) {
         long offset = state.nextOffset;
         CompletableFuture<Long> f;
         try {
-            f = writer.append(List.of(LedgerEntry.encode(e)), durability);
+            List<byte[]> enc;
+            if (es.size() == 1) enc = List.of(LedgerEntry.encode(es.get(0)));
+            else { enc = new ArrayList<>(es.size()); for (var e : es) enc.add(LedgerEntry.encode(e)); }
+            f = writer.append(enc, durability);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("interrupted", ie);
@@ -516,9 +562,12 @@ public final class Partition implements AutoCloseable {
         if (f.isCompletedExceptionally()) {
             f.join(); // rethrows: the writer is fenced; nothing was applied
         }
-        if (e instanceof LedgerEntry.Enqueue x) cachePayload(offset, x.payloadRef());
-        state.apply(offset, e);
-        if (!waiters.isEmpty()) wake(e);
+        for (int i = 0; i < es.size(); i++) {
+            var e = es.get(i);
+            if (e instanceof LedgerEntry.Enqueue x) cachePayload(offset + i, x.payloadRef());
+            state.apply(offset + i, e);
+            if (!waiters.isEmpty()) wake(e);
+        }
         publish();
         // Amortized O(1) per entry: a snapshot costs O(live state), so wait at least twice that many entries.
         long since = state.nextOffset - lastSnapshotTrigger;
