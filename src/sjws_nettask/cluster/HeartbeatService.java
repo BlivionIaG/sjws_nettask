@@ -57,11 +57,18 @@ public final class HeartbeatService implements AutoCloseable {
         this.link = Objects.requireNonNull(link, "link");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.events = Objects.requireNonNull(events, "events");
-        this.auth = new HeartbeatAuthenticator(Objects.requireNonNull(key, "cluster key"), this.clock);
+        this.auth = new HeartbeatAuthenticator(Objects.requireNonNull(key, "cluster key"), this.clock,
+                deadAfterMillis(membership));
         if (interval == null || interval.isZero() || interval.isNegative()) {
             throw new IllegalArgumentException("interval");
         }
         this.interval = interval;
+    }
+
+    /** Membership dead interval in milliseconds. Sub-millisecond values still allow one millisecond. */
+    private static long deadAfterMillis(Membership membership) {
+        long millis = membership.deadAfterNanos() / 1_000_000L;
+        return millis > 0L ? millis : 1L;
     }
 
     public void announce(long term, long generation, long contentHash, int leaseRemainingMs) {
