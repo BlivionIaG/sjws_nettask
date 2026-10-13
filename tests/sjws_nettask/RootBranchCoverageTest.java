@@ -49,8 +49,9 @@ class RootBranchCoverageTest {
             Files.setPosixFilePermissions(blocked, saved);
             Files.deleteIfExists(pid);
         }
-        assertEquals(-1, PidFile.parse("42").startedMillis());
-        assertFalse(PidFile.parse("42").running());
+        var oneLine = PidFile.parse("4000000001");
+        assertEquals(-1, oneLine.startedMillis());
+        assertFalse(oneLine.running());
     }
 
     @Test
