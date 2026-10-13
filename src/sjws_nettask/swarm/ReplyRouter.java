@@ -23,7 +23,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Request/reply (agent-swarm.md §5.1). This node or process has one reply topic, {@code reply.<id>}. Replies
@@ -36,18 +35,15 @@ import java.util.concurrent.locks.LockSupport;
  * <li>With no call pending and nothing read for {@code idleCloseMs} (default 10 min), the poller stops and the
  * topic is closed; its files are kept. The next {@link #call} reopens it.</li>
  * </ul>
- * Polling is adaptive: the poller spins briefly while replies are due, then parks for up to 20 us while a call is pending and up to 1 ms when none is. Messaging has
- * no blocking poll; see the Messaging Core note in the S1 PR.
+ * The poller blocks in {@code Partition.poll(..., waitNanos)} (#99), woken by the reply's append: no spinning.
  */
 public final class ReplyRouter implements AutoCloseable {
 
     public static final String GROUP = "router";
     public static final long DEFAULT_IDLE_CLOSE_MS = TimeUnit.MINUTES.toMillis(10);
     private static final SecureRandom RANDOM = new SecureRandom();
-    private static final int SPINS = 2_000;
-    private static final long MAX_PARK_NS = 1_000_000;
-    /** Longest park while a caller waits, so a reply is noticed within ~20 us after the spin phase. */
-    private static final long WAITING_PARK_NS = 20_000;
+    /** Longest blocking poll; also bounds how late the idle check and {@link #close} are noticed. */
+    private static final long POLL_WAIT_NS = TimeUnit.MILLISECONDS.toNanos(50);
 
     private final Topics topics;
     private final TaskService tasks;
@@ -61,12 +57,7 @@ public final class ReplyRouter implements AutoCloseable {
     private volatile boolean closed;
     private final AtomicLong late = new AtomicLong();
 
-    private record Key(long hi, long lo) {
-        static Key of(byte[] id) {
-            var b = ByteBuffer.wrap(id);
-            return new Key(b.getLong(), b.getLong());
-        }
-    }
+    private record Key(long hi, long lo) { }
 
     /**
      * @param id         node or process id; the reply topic is {@code reply.<id>}
@@ -100,11 +91,19 @@ public final class ReplyRouter implements AutoCloseable {
         return this.poller != null;
     }
 
-    /** New 16-byte id for a task or a correlation. */
+    /** New random 16-byte id (SecureRandom; for one-off ids such as HTTP submits). */
     public static byte[] newId() {
         var id = new byte[16];
         RANDOM.nextBytes(id);
         return id;
+    }
+
+    /** Per-router random high half: ids are unique across processes without a SecureRandom call per call. */
+    private final long idPrefix = RANDOM.nextLong();
+    private final AtomicLong idCounter = new AtomicLong(RANDOM.nextLong());
+
+    private byte[] nextId() {
+        return ByteBuffer.allocate(16).putLong(this.idPrefix).putLong(this.idCounter.incrementAndGet()).array();
     }
 
     /**
@@ -116,9 +115,9 @@ public final class ReplyRouter implements AutoCloseable {
         if (this.closed) {
             throw new IllegalStateException("closed");
         }
-        var id = newId();
-        var env = new TaskEnvelope(id, id, this.topic, deadlineMs, traceparent, "", "", contentType, body);
-        var key = Key.of(id);
+        var id = nextId();
+        var env = TaskEnvelope.owned(id, id, this.topic, deadlineMs, traceparent, contentType, body.clone());
+        var key = new Key(this.idPrefix, ByteBuffer.wrap(id).getLong(8));
         var f = new CompletableFuture<TaskEnvelope>();
         this.pending.put(key, f);
         ensurePolling();
@@ -148,46 +147,47 @@ public final class ReplyRouter implements AutoCloseable {
 
     /** One poll of the reply topic: completes waiting callers and acks every reply. Returns replies read. */
     int pollOnce() {
+        return pollOnce(0);
+    }
+
+    /** As {@link #pollOnce()}, blocking up to {@code waitNanos} for a reply (#99); no spin, no park loop. */
+    int pollOnce(long waitNanos) {
         var p = this.topics.partition(this.topic);
-        var got = p.poll(GROUP, "router", 256, 30_000);
-        for (var d : got) {
+        var got = waitNanos > 0 ? p.poll(GROUP, "router", 256, 30_000, waitNanos) : p.poll(GROUP, "router", 256, 30_000);
+        int n = got.size();
+        if (n == 0) {
+            return 0;
+        }
+        var offs = new long[n];
+        var atts = new int[n];
+        for (int i = 0; i < n; i++) {
+            var d = got.get(i);
+            offs[i] = d.offset();
+            atts[i] = d.attempt();
             TaskEnvelope env = null;
             try {
                 env = TaskEnvelope.decode(d.payload());
             } catch (IllegalArgumentException e) {
-                // not an envelope: ack and drop below
+                // not an envelope: acked and dropped below
             }
-            var f = env == null ? null : this.pending.remove(Key.of(env.correlationId()));
+            var f = env == null ? null : this.pending.remove(new Key(env.correlationHi(), env.correlationLo()));
             if (f == null || !f.complete(env)) {
                 this.late.incrementAndGet();
             }
-            p.ack(GROUP, d.offset(), d.attempt());
         }
+        p.ack(GROUP, offs, atts, null); // one batched fenced ack (#100) for every reply read
         return got.size();
     }
 
     private void pollLoop() {
         long lastActive = this.topics.clock().getAsLong();
-        int idleSpins = 0;
-        long park = 1_000;
         while (!this.closed) {
-            int n = pollOnce();
+            int n = pollOnce(POLL_WAIT_NS);
             long now = this.topics.clock().getAsLong();
             if (n > 0) {
                 lastActive = now;
-                idleSpins = 0;
-                park = 1_000;
-                continue;
-            }
-            if (this.pending.isEmpty() && now - lastActive >= this.idleCloseMs && idleClose()) {
+            } else if (this.pending.isEmpty() && now - lastActive >= this.idleCloseMs && idleClose()) {
                 return;
-            }
-            boolean waiting = !this.pending.isEmpty();
-            if (waiting && ++idleSpins < SPINS) {
-                Thread.onSpinWait();
-            } else {
-                LockSupport.parkNanos(park);
-                park = Math.min(waiting ? WAITING_PARK_NS : MAX_PARK_NS, park * 2);
             }
         }
     }
@@ -219,7 +219,7 @@ public final class ReplyRouter implements AutoCloseable {
             this.lifecycle.unlock();
         }
         if (t != null) {
-            LockSupport.unpark(t);
+            t.interrupt(); // ends a blocking poll at once; the loop then sees closed
             try {
                 t.join(2_000);
             } catch (InterruptedException e) {

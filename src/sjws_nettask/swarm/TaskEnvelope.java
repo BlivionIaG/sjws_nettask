@@ -16,12 +16,9 @@
  */
 package sjws_nettask.swarm;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.io.UncheckedIOException;
+import java.nio.BufferUnderflowException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -30,46 +27,109 @@ import java.util.Objects;
  * (docs/design/agent-swarm.md §4.5). Layout, version 1, big-endian:
  * {@code [version:u8][taskId:16][correlationId:16][deadlineMs:i64][replyTo][traceparent][tracestate][budgetRef]
  * [contentType][bodyLen:i32][body]}, where each text field is {@code [len:u16][UTF-8]}.
+ * <p>
+ * Immutable. The public constructor and accessors copy arrays; the codec and the swarm's own hot path
+ * (encode, decode, reply) do not, so a request/reply round trip copies a body only where messaging does.
  */
-public record TaskEnvelope(byte[] taskId, byte[] correlationId, String replyTo, long deadlineMs, String traceparent,
-        String tracestate, String budgetRef, String contentType, byte[] body) {
+public final class TaskEnvelope {
 
     public static final int VERSION = 1;
     /** Inline body limit (§5.2, Messaging Core): larger results go to the swarm-owned blob store by reference. */
     public static final int MAX_INLINE_BODY = 1 << 20;
     /** No deadline. */
     public static final long NO_DEADLINE = Long.MAX_VALUE;
+    private static final int MAX_TEXT = 0xffff;
 
-    public TaskEnvelope {
+    private final byte[] taskId;
+    private final byte[] correlationId;
+    private final String replyTo;
+    private final long deadlineMs;
+    private final String traceparent;
+    private final String tracestate;
+    private final String budgetRef;
+    private final String contentType;
+    private final byte[] body;
+
+    public TaskEnvelope(byte[] taskId, byte[] correlationId, String replyTo, long deadlineMs, String traceparent,
+            String tracestate, String budgetRef, String contentType, byte[] body) {
+        this(taskId.clone(), correlationId.clone(), replyTo, deadlineMs, traceparent, tracestate, budgetRef,
+                contentType, body.clone(), false);
+    }
+
+    /** Takes ownership of the arrays. */
+    private TaskEnvelope(byte[] taskId, byte[] correlationId, String replyTo, long deadlineMs, String traceparent,
+            String tracestate, String budgetRef, String contentType, byte[] body, boolean owned) {
         if (taskId.length != 16 || correlationId.length != 16) {
             throw new IllegalArgumentException("taskId and correlationId are 16 bytes");
         }
         if (body.length > MAX_INLINE_BODY) {
             throw new IllegalArgumentException("body larger than " + MAX_INLINE_BODY + " bytes; store it by reference");
         }
-        taskId = taskId.clone();
-        correlationId = correlationId.clone();
-        replyTo = Objects.requireNonNullElse(replyTo, "");
-        traceparent = Objects.requireNonNullElse(traceparent, "");
-        tracestate = Objects.requireNonNullElse(tracestate, "");
-        budgetRef = Objects.requireNonNullElse(budgetRef, "");
-        contentType = Objects.requireNonNullElse(contentType, "");
-        body = body.clone();
+        this.taskId = taskId;
+        this.correlationId = correlationId;
+        this.replyTo = Objects.requireNonNullElse(replyTo, "");
+        this.deadlineMs = deadlineMs;
+        this.traceparent = Objects.requireNonNullElse(traceparent, "");
+        this.tracestate = Objects.requireNonNullElse(tracestate, "");
+        this.budgetRef = Objects.requireNonNullElse(budgetRef, "");
+        this.contentType = Objects.requireNonNullElse(contentType, "");
+        this.body = body;
     }
 
-    @Override
+    /** As the public constructor, taking ownership of {@code ids} and {@code body} (the caller must not reuse them). */
+    static TaskEnvelope owned(byte[] taskId, byte[] correlationId, String replyTo, long deadlineMs, String traceparent,
+            String contentType, byte[] body) {
+        return new TaskEnvelope(taskId, correlationId, replyTo, deadlineMs, traceparent, "", "", contentType, body, true);
+    }
+
     public byte[] taskId() {
         return this.taskId.clone();
     }
 
-    @Override
     public byte[] correlationId() {
         return this.correlationId.clone();
     }
 
-    @Override
+    public String replyTo() {
+        return this.replyTo;
+    }
+
+    public long deadlineMs() {
+        return this.deadlineMs;
+    }
+
+    public String traceparent() {
+        return this.traceparent;
+    }
+
+    public String tracestate() {
+        return this.tracestate;
+    }
+
+    public String budgetRef() {
+        return this.budgetRef;
+    }
+
+    public String contentType() {
+        return this.contentType;
+    }
+
     public byte[] body() {
         return this.body.clone();
+    }
+
+    /** The body without a copy; callers must not modify it. */
+    byte[] bodyView() {
+        return this.body;
+    }
+
+    /** High and low halves of the correlation id, for the reply table key. */
+    long correlationHi() {
+        return ByteBuffer.wrap(this.correlationId).getLong(0);
+    }
+
+    long correlationLo() {
+        return ByteBuffer.wrap(this.correlationId).getLong(8);
     }
 
     /** True when the caller's deadline is set and has passed at {@code nowMs}. */
@@ -77,53 +137,83 @@ public record TaskEnvelope(byte[] taskId, byte[] correlationId, String replyTo, 
         return this.deadlineMs != NO_DEADLINE && nowMs >= this.deadlineMs;
     }
 
-    /** The reply to this task: same ids, empty {@code replyTo}, the given body. */
+    /** The reply to this task: same ids, empty {@code replyTo}, the given body (copied). */
     public TaskEnvelope reply(String contentType, byte[] body) {
+        return replyOwned(contentType, body.clone());
+    }
+
+    /** As {@link #reply}, taking ownership of {@code body}. */
+    TaskEnvelope replyOwned(String contentType, byte[] body) {
         return new TaskEnvelope(this.taskId, this.correlationId, "", this.deadlineMs, this.traceparent, this.tracestate,
-                this.budgetRef, contentType, body);
+                this.budgetRef, contentType, body, true);
+    }
+
+    private static byte[] utf8(String s) {
+        var b = s.getBytes(StandardCharsets.UTF_8);
+        if (b.length > MAX_TEXT) {
+            throw new IllegalArgumentException("text field longer than " + MAX_TEXT + " bytes");
+        }
+        return b;
     }
 
     public byte[] encode() {
-        var buf = new ByteArrayOutputStream(64 + this.body.length);
-        try (var out = new DataOutputStream(buf)) {
-            out.writeByte(VERSION);
-            out.write(this.taskId);
-            out.write(this.correlationId);
-            out.writeLong(this.deadlineMs);
-            for (var s : new String[] {this.replyTo, this.traceparent, this.tracestate, this.budgetRef, this.contentType}) {
-                out.writeUTF(s);
-            }
-            out.writeInt(this.body.length);
-            out.write(this.body);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
+        var replyTo = utf8(this.replyTo);
+        var tp = this.traceparent.isEmpty() ? EMPTY : utf8(this.traceparent);
+        var ts = this.tracestate.isEmpty() ? EMPTY : utf8(this.tracestate);
+        var br = this.budgetRef.isEmpty() ? EMPTY : utf8(this.budgetRef);
+        var ct = this.contentType.isEmpty() ? EMPTY : utf8(this.contentType);
+        int n = 1 + 16 + 16 + 8 + 10 + replyTo.length + tp.length + ts.length + br.length + ct.length + 4 + this.body.length;
+        var out = ByteBuffer.allocate(n);
+        out.put((byte) VERSION).put(this.taskId).put(this.correlationId).putLong(this.deadlineMs);
+        for (var s : new byte[][] {replyTo, tp, ts, br, ct}) {
+            out.putShort((short) s.length).put(s);
         }
-        return buf.toByteArray();
+        out.putInt(this.body.length).put(this.body);
+        return out.array();
+    }
+
+    private static final byte[] EMPTY = new byte[0];
+
+    private static String text(ByteBuffer in) {
+        int len = Short.toUnsignedInt(in.getShort());
+        if (len == 0) {
+            return "";
+        }
+        var s = new String(in.array(), in.arrayOffset() + in.position(), len, StandardCharsets.UTF_8);
+        in.position(in.position() + len);
+        return s;
     }
 
     /** Decodes {@link #encode()}; a wrong version or a truncated payload is an {@link IllegalArgumentException}. */
     public static TaskEnvelope decode(byte[] payload) {
-        try (var in = new DataInputStream(new ByteArrayInputStream(payload))) {
-            int version = in.readUnsignedByte();
+        try {
+            var in = ByteBuffer.wrap(payload);
+            int version = Byte.toUnsignedInt(in.get());
             if (version != VERSION) {
                 throw new IllegalArgumentException("envelope version " + version);
             }
-            var taskId = in.readNBytes(16);
-            var correlationId = in.readNBytes(16);
-            long deadline = in.readLong();
-            var replyTo = in.readUTF();
-            var traceparent = in.readUTF();
-            var tracestate = in.readUTF();
-            var budgetRef = in.readUTF();
-            var contentType = in.readUTF();
-            int len = in.readInt();
-            if (len < 0 || len > in.available()) {
+            var taskId = new byte[16];
+            in.get(taskId);
+            var correlationId = new byte[16];
+            in.get(correlationId);
+            long deadline = in.getLong();
+            if (in.remaining() < 10) {
+                throw new BufferUnderflowException();
+            }
+            var replyTo = text(in);
+            var traceparent = text(in);
+            var tracestate = text(in);
+            var budgetRef = text(in);
+            var contentType = text(in);
+            int len = in.getInt();
+            if (len < 0 || len > in.remaining()) {
                 throw new IllegalArgumentException("envelope body length " + len);
             }
-            var body = in.readNBytes(len);
+            var body = new byte[len];
+            in.get(body);
             return new TaskEnvelope(taskId, correlationId, replyTo, deadline, traceparent, tracestate, budgetRef,
-                    contentType, body);
-        } catch (IOException e) {
+                    contentType, body, true);
+        } catch (BufferUnderflowException | IndexOutOfBoundsException e) {
             throw new IllegalArgumentException("truncated envelope", e);
         }
     }

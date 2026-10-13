@@ -277,6 +277,36 @@ class TaskServiceTest {
     }
 
     @Test
+    void replyAllWritesEveryReplyThenOneBatchedAck() throws Exception {
+        for (int i = 0; i < 3; i++) {
+            this.tasks.submit("p", 1, i + 1, env("q" + i, "reply.all", TaskEnvelope.NO_DEADLINE));
+        }
+        var got = this.tasks.claim("p", "w", 3, 10_000);
+        var bodies = new ArrayList<byte[]>();
+        for (var t : got) {
+            bodies.add(("a" + t.offset()).getBytes(StandardCharsets.UTF_8));
+        }
+        var acks = this.tasks.replyAll(got, 9, 100, "text/plain", bodies).get(5, TimeUnit.SECONDS);
+        assertEquals(List.of(LeaseResult.OK, LeaseResult.OK, LeaseResult.OK), acks);
+        var reply = this.topics.partition("reply.all");
+        reply.subscribe("r", true);
+        var rs = reply.poll("r", "r", 10, 1_000);
+        assertEquals(3, rs.size());
+        assertEquals(102, rs.get(2).seq());
+        assertEquals("a" + got.get(1).offset(), new String(TaskEnvelope.decode(rs.get(1).payload()).body(), StandardCharsets.UTF_8));
+        assertEquals(List.of(LeaseResult.NOT_IN_FLIGHT), this.tasks.replyAll(List.of(got.get(0)), 9, 200, "",
+                List.of(new byte[0])).get(5, TimeUnit.SECONDS));
+        assertEquals(List.of(), this.tasks.replyAll(List.of(), 9, 1, "", List.of()).get());
+        assertThrows(IllegalArgumentException.class, () -> this.tasks.replyAll(got, 9, 1, "", List.of()));
+        var other = new Task("q", 0, 1, 0, got.get(0).envelope());
+        assertThrows(IllegalArgumentException.class,
+                () -> this.tasks.replyAll(List.of(got.get(0), other), 9, 1, "", List.of(new byte[0], new byte[0])));
+        var noReply = new Task("p", 0, 1, 0, env("x", "", TaskEnvelope.NO_DEADLINE));
+        assertThrows(IllegalArgumentException.class, () -> this.tasks.replyAll(List.of(noReply), 9, 1, "", List.of(new byte[0])));
+        assertThrows(IllegalArgumentException.class, () -> env("x", "r".repeat(70_000), 0).encode());
+    }
+
+    @Test
     void envelopeEqualityCoversEveryField() {
         byte[] a = new byte[16], b = new byte[16];
         b[0] = 1;
