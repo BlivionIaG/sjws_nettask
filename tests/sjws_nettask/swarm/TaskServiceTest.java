@@ -187,6 +187,10 @@ class TaskServiceTest {
         this.now.addAndGet(600);
         keeper.tick();
         assertEquals(2, keeper.batches(), "one extend call per pool");
+        long until = System.nanoTime() + 5_000_000_000L; // the extend record reaches the log via the async writer
+        while (this.tasks.partition("a").logBytes() <= recordsBefore && System.nanoTime() < until) {
+            Thread.onSpinWait();
+        }
         assertTrue(this.tasks.partition("a").logBytes() > recordsBefore);
         this.now.addAndGet(900); // 1.5 s after claim: without the keeper every lease would have expired
         assertTrue(this.tasks.claim("a", "w2", 5, 1_000).isEmpty(), "kept leases are not redelivered");

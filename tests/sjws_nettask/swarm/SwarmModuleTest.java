@@ -32,11 +32,12 @@ import sjws_nettask.core.StaticFileHandler;
 class SwarmModuleTest {
 
     @Test
-    void s0ModuleStartsNothingAndCloses() {
+    void moduleStartsNothingUntilUsedAndCloses() {
         int threads = Thread.activeCount();
         var module = new SwarmModule();
         assertFalse(module.closed());
-        assertTrue(Thread.activeCount() <= threads, "S0 starts no thread");
+        assertTrue(Thread.activeCount() <= threads, "constructing the module starts no thread");
+        assertFalse(module.swarm().replies().polling());
         module.close();
         assertTrue(module.closed());
         module.close(); // idempotent
@@ -50,13 +51,33 @@ class SwarmModuleTest {
             seen.set(request.target());
             return StaticFileHandler.error(404, request.headOnly());
         };
-        var handler = HandlerMounts.install(List.of(new SwarmModule()), fallback);
-        assertEquals(501, handler.handle(new Request("GET", "/swarm/v1")).status());
-        assertEquals(501, handler.handle(new Request("GET", "/swarm/v1/tasks?x=1")).status());
-        assertEquals(501, handler.handle(new Request("HEAD", "/swarm/v1/leases/1:ack")).status());
+        var module = new SwarmModule();
+        var handler = HandlerMounts.install(List.of(module), fallback);
+        assertEquals(405, handler.handle(new Request("GET", "/swarm/v1")).status());
+        assertEquals(405, handler.handle(new Request("GET", "/swarm/v1/tasks?x=1")).status());
+        assertEquals(405, handler.handle(new Request("HEAD", "/swarm/v1/leases/1:ack")).status());
+        assertEquals(404, handler.handle(new Request("POST", "/swarm/v1")).status());
+        module.close();
         var miss = handler.handle(new Request("GET", "/swarm/v2"));
         assertEquals(404, miss.status());
         assertEquals("/swarm/v2", seen.get());
         assertSame(fallback, HandlerMounts.install(List.of(), fallback));
+    }
+
+    @Test
+    void settingsReadPropertyThenEnvironmentThenDefault() {
+        System.setProperty("sjws.swarm.test.x", " v ");
+        try {
+            assertEquals("v", SwarmModule.setting("sjws.swarm.test.x", "SJWS_NO_SUCH_ENV", "d"));
+        } finally {
+            System.clearProperty("sjws.swarm.test.x");
+        }
+        assertEquals("d", SwarmModule.setting("sjws.swarm.test.x", "SJWS_NO_SUCH_ENV", "d"));
+        System.setProperty("sjws.swarm.test.x", " ");
+        try {
+            assertEquals("d", SwarmModule.setting("sjws.swarm.test.x", "SJWS_NO_SUCH_ENV", "d"));
+        } finally {
+            System.clearProperty("sjws.swarm.test.x");
+        }
     }
 }

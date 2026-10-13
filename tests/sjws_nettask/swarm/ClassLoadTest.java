@@ -80,7 +80,7 @@ class ClassLoadTest {
 
     @Test
     void enabledLoadsTheSwarmModule() throws Exception {
-        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 501, "sjws_nettask.Sjws_nettask",
+        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 405, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml());
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
     }
@@ -94,7 +94,7 @@ class ClassLoadTest {
 
     @Test
     void yamlKeyTrueLoadsTheSwarmModule() throws Exception {
-        var text = run(List.of(), "Server started:", 501, "sjws_nettask.Sjws_nettask",
+        var text = run(List.of(), "Server started:", 405, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml("swarm:\n  enabled: true\n"));
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
     }

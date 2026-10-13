@@ -35,8 +35,8 @@ jobs:
           cache: maven
       - name: Unit and integration tests, package, coverage gate
         run: mvn -B verify
-      - name: Python SDK wire conformance (golden frames)
-        run: python3 -m unittest discover -s sdk/python/tests -v
+      - name: Python SDK conformance and end-to-end (golden frames; Java server + Python unary client)
+        run: SJWS_JAR="$(ls target/sjws_nettask-*.jar | head -1)" python3 -B -m unittest discover -s sdk/python/tests -v
       - name: End-to-end file serving (real listener, temp docroot, HTTP client)
         run: mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test
       - name: Multi-node cluster harness (live scenarios)

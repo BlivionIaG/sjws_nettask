@@ -69,8 +69,14 @@ public final class TaskService {
      * A payload that is not an envelope is rejected with reason {@code bad-envelope}.
      */
     public List<Task> claim(String pool, String worker, int max, long visibilityMs) {
+        return claim(pool, worker, max, visibilityMs, 0);
+    }
+
+    /** As {@link #claim(String, String, int, long)}, waiting up to {@code waitNanos} for a task (#99). */
+    public List<Task> claim(String pool, String worker, int max, long visibilityMs, long waitNanos) {
         var p = partition(pool);
-        var got = p.poll(WORKERS, worker, max, visibilityMs);
+        var got = waitNanos > 0 ? p.poll(WORKERS, worker, max, visibilityMs, waitNanos)
+                : p.poll(WORKERS, worker, max, visibilityMs);
         if (got.isEmpty()) {
             return List.of();
         }

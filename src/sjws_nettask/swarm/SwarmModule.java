@@ -16,37 +16,55 @@
  */
 package sjws_nettask.swarm;
 
+import java.nio.file.Path;
+import java.security.SecureRandom;
 import sjws_nettask.OptionalModule;
 import sjws_nettask.core.HandlerContributor;
 import sjws_nettask.core.HandlerMounts;
-import sjws_nettask.core.Request;
-import sjws_nettask.core.Response;
-import sjws_nettask.core.StaticFileHandler;
 
 /**
  * Entry point of the optional agent-swarm layer (docs/design/agent-swarm.md). Loaded only by name from
  * {@code sjws_nettask.OptionalModules} when the swarm is enabled; nothing outside this package imports it.
  * <p>
- * Phase S0 delivers the guard rails and the {@code /swarm/v1/*} mount. This class starts no thread,
- * opens no partition and binds no port. Requests under that prefix get 501 until the task, lease and
- * reply services arrive in S1.
+ * S1b: mounts the unary {@code /swarm/v1/*} endpoints ({@link SwarmHttp}) at startup. The services start
+ * no thread and touch no file until the first request: partitions open on first use under
+ * {@code -Dsjws.swarm.dir} / {@code SJWS_SWARM_DIR} (default {@code swarm-data} in the working directory),
+ * and the reply topic is {@code reply.<sjws.swarm.node | SJWS_SWARM_NODE | swarm-<pid>>}.
  */
 public final class SwarmModule implements OptionalModule, HandlerContributor {
 
+    static final String DIR_PROPERTY = "sjws.swarm.dir";
+    static final String DIR_ENV = "SJWS_SWARM_DIR";
+    static final String NODE_PROPERTY = "sjws.swarm.node";
+    static final String NODE_ENV = "SJWS_SWARM_NODE";
+
+    private final Swarm swarm;
     private volatile boolean closed;
 
     public SwarmModule() {
-        // S0: no services yet.
+        this(Swarm.open(Path.of(setting(DIR_PROPERTY, DIR_ENV, "swarm-data")),
+                setting(NODE_PROPERTY, NODE_ENV, "swarm-" + ProcessHandle.current().pid()), new SecureRandom().nextLong()));
+    }
+
+    SwarmModule(Swarm swarm) {
+        this.swarm = swarm;
+    }
+
+    static String setting(String property, String env, String dflt) {
+        var v = System.getProperty(property);
+        if (v == null || v.isBlank()) {
+            v = System.getenv(env);
+        }
+        return v == null || v.isBlank() ? dflt : v.trim();
+    }
+
+    public Swarm swarm() {
+        return this.swarm;
     }
 
     @Override
     public void contribute(HandlerMounts mounts) {
-        mounts.mount("/swarm/v1", SwarmModule::unavailable);
-    }
-
-    /** Placeholder for the S1 task API. */
-    private static Response unavailable(Request request) {
-        return StaticFileHandler.error(501, request.headOnly());
+        mounts.mount("/swarm/v1", new SwarmHttp(this.swarm, new SecureRandom().nextLong()));
     }
 
     public boolean closed() {
@@ -55,6 +73,9 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
 
     @Override
     public void close() {
-        this.closed = true;
+        if (!this.closed) {
+            this.closed = true;
+            this.swarm.close();
+        }
     }
 }
