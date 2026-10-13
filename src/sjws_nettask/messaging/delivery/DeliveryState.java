@@ -222,6 +222,14 @@ final class DeliveryState {
         return new DeliverySnapshot.Counts(g.freshCount + g.retry.size(), g.inFlight.size(), g.acked, g.deadLettered, g.redeliveries);
     }
 
+    /** Lowest committed offset over all groups (everything below is settled for every group); MIN_VALUE without groups. */
+    long minCommitted() {
+        if (groups.isEmpty()) return Long.MIN_VALUE;
+        long m = Long.MAX_VALUE;
+        for (var g : groups.values()) m = Math.min(m, g.committedOffset);
+        return m;
+    }
+
     DeliveryCounts counts() {
         var gs = new LinkedHashMap<String, DeliveryCounts.Group>();
         for (var g : groups.values()) {
