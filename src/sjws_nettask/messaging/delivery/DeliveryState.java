@@ -216,15 +216,6 @@ final class DeliveryState {
     }
 
     /** Candidates for delivery at {@code nowMs}: due redeliveries first (by due time), then fresh in offset order. */
-    List<Long> dueRedeliveries(Group g, long nowMs, int max) {
-        var out = new ArrayList<Long>();
-        for (var d : g.due) {
-            if (d.atMs > nowMs || out.size() >= max) break;
-            out.add(d.offset);
-        }
-        return out;
-    }
-
     // ---- snapshot ----
 
     DeliverySnapshot.Counts countsOf(Group g) {

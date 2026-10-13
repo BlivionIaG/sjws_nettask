@@ -50,3 +50,19 @@ standalone explicitly. The two wrk columns should stay in the same band.
 `rate-limit` document (`by=ip`, `buckets=4096`). `--capacity` (default `1000000`) and
 `--refill` (default `1000000000`) set that document. `standalone` and `gateway-off` do not
 call `chainControl`. Feature-off file serving is still `java -jar` with no chain.
+
+## Swarm S1 (`SwarmBench`)
+
+`bench/SwarmBench.java` measures the swarm against the targets in `docs/design/agent-swarm.md` §13. Everything runs on a single node and in-process, with the ASYNC ledger:
+
+```sh
+mvn -B -q -DskipTests package
+java -cp target/classes bench/SwarmBench.java /tmp/sb dispatch 16 5          # claim(1)+fenced ack, 1 KiB, prefilled
+java -cp target/classes bench/SwarmBench.java /tmp/sb heartbeat off 20       # dispatch with no keeper
+java -cp target/classes bench/SwarmBench.java /tmp/sb heartbeat keeper 20    # + LeaseKeeper: 10k leases, batched tick every 5 s
+java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply 10000 10      # ReplyRouter.call, open loop at 10k/s
+```
+
+- **Comparisons.** Compare `heartbeat off` and `heartbeat keeper` with 5 alternating runs pinned with `taskset`.
+- **Request/reply latency.** It is measured from each call's scheduled send time, so a stall also counts against the calls queued behind it.
+- **Results.** The S1 PR body has the numbers measured on the dev box.

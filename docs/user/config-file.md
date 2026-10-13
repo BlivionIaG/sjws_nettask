@@ -478,6 +478,7 @@ canonical document, so the control plane does not distribute it and a config rec
 last-good starts with the swarm off. The JVM property `-Dsjws.swarm.enabled` and then the
 environment variable `SJWS_SWARM_ENABLED` win over the key when set. With the swarm off no
 `sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet.
+The key is read once, at startup: changing it takes effect on restart, not on reload.
 
 ## Request path
 

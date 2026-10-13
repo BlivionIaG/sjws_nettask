@@ -226,29 +226,111 @@ public final class Partition implements AutoCloseable {
         if (max < 1 || visibilityMs < 1) throw new IllegalArgumentException("max/visibility");
         lock.lock();
         try {
-            var g = state.group(group);
-            long now = clockMs.getAsLong();
-            var out = new ArrayList<Delivery>();
-            var policy = state.policy();
-            for (long o : state.dueRedeliveries(g, now, Integer.MAX_VALUE)) {
-                if (out.size() >= max) break;
-                var lease = g.inFlight.get(o);
-                int attempts = lease != null ? lease.attempt() : g.retry.get(o).attempts();
-                if (attempts >= policy.maxAttempts()) {
-                    deadLetter(g.name, o, attempts, lease != null ? "lease-expired:max-attempts" : "nacked:max-attempts");
-                    continue;
-                }
-                out.add(deliver(group, o, consumer, now + visibilityMs, attempts + 1));
-            }
-            while (out.size() < max) {
-                Long o = state.messages.ceilingKey(g.cursor);
-                if (o == null) break;
-                out.add(deliver(group, o, consumer, now + visibilityMs, 1));
-            }
-            return out;
+            return pollLocked(group, consumer, max, visibilityMs);
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Blocking poll: as {@link #poll(String, String, int, long)}, but when nothing is deliverable it parks (no spin)
+     * for up to {@code waitNanos} until a message is appended, or until the group's earliest redelivery is due.
+     * Returns early with what it got; an empty list means the wait elapsed (or the partition closed / the thread
+     * was interrupted, with the interrupt flag kept). Wakeups come from the append path and cost nothing when no
+     * caller is waiting.
+     */
+    public List<Delivery> poll(String group, String consumer, int max, long visibilityMs, long waitNanos) {
+        if (max < 1 || visibilityMs < 1 || waitNanos < 0) throw new IllegalArgumentException("max/visibility/wait");
+        long deadline = System.nanoTime() + waitNanos;
+        lock.lock();
+        try {
+            while (true) {
+                var out = pollLocked(group, consumer, max, visibilityMs);
+                if (!out.isEmpty() || closed) return out;
+                long left = deadline - System.nanoTime();
+                if (left <= 0) return out;
+                var g = state.group(group);
+                long firstDue = g.due.isEmpty() ? Long.MAX_VALUE : g.due.first().atMs();
+                long wait = left;
+                if (firstDue != Long.MAX_VALUE) {
+                    long ms = Math.max(1, firstDue - clockMs.getAsLong());
+                    wait = Math.min(wait, ms * 1_000_000L);
+                }
+                var w = waiters.get(group);
+                if (w == null) { w = new Waiters(lock.newCondition()); waiters.put(group, w); }
+                w.count++;
+                if (firstDue < w.sleepUntilDueMs) w.sleepUntilDueMs = firstDue;
+                try {
+                    w.cond.awaitNanos(wait);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return out;
+                } finally {
+                    if (--w.count == 0) waiters.remove(group);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Lock held. Waiters of one group: blocked in {@link #poll(String, String, int, long, long)}. */
+    private static final class Waiters {
+        final java.util.concurrent.locks.Condition cond;
+        int count;
+        /** Earliest redelivery due time any current waiter planned to wake at (MAX = none). */
+        long sleepUntilDueMs = Long.MAX_VALUE;
+        Waiters(java.util.concurrent.locks.Condition c) { cond = c; }
+    }
+
+    private final java.util.HashMap<String, Waiters> waiters = new java.util.HashMap<>();
+    private volatile boolean closed;
+
+    /** Lock held, after {@code e} was applied, only when someone waits. */
+    private void wake(LedgerEntry e) {
+        switch (e) {
+            case LedgerEntry.Enqueue x -> { for (var w : waiters.values()) w.cond.signal(); } // one waiter per group per message
+            case LedgerEntry.Deliver x -> dueChanged(x.group(), x.deadlineMs());
+            case LedgerEntry.Nack x -> dueChanged(x.group(), x.notBeforeMs());
+            case LedgerEntry.Extend x -> dueChanged(x.group(), x.deadlineMs());
+            default -> { }
+        }
+    }
+
+    /** A redelivery may now be due at or after {@code atMs}: wake the group's waiters if they sleep past it. */
+    private void dueChanged(String group, long atMs) {
+        var w = waiters.get(group);
+        if (w != null && atMs < w.sleepUntilDueMs) {
+            w.sleepUntilDueMs = atMs;
+            w.cond.signalAll();
+        }
+    }
+
+    private List<Delivery> pollLocked(String group, String consumer, int max, long visibilityMs) {
+        var g = state.group(group);
+        long now = clockMs.getAsLong();
+        var out = new ArrayList<Delivery>();
+        var policy = state.policy();
+        // Due redeliveries in due order. Each step removes the head (redelivered or dead-lettered), so this reads
+        // only what it uses instead of materialising every due entry per poll.
+        while (out.size() < max && !g.due.isEmpty()) {
+            var d = g.due.first();
+            if (d.atMs() > now) break;
+            long o = d.offset();
+            var lease = g.inFlight.get(o);
+            int attempts = lease != null ? lease.attempt() : g.retry.get(o).attempts();
+            if (attempts >= policy.maxAttempts()) {
+                deadLetter(g.name, o, attempts, lease != null ? "lease-expired:max-attempts" : "nacked:max-attempts");
+                continue;
+            }
+            out.add(deliver(group, o, consumer, now + visibilityMs, attempts + 1));
+        }
+        while (out.size() < max) {
+            Long o = state.messages.ceilingKey(g.cursor);
+            if (o == null) break;
+            out.add(deliver(group, o, consumer, now + visibilityMs, 1));
+        }
+        return out;
     }
 
     private Delivery deliver(String group, long o, String consumer, long deadline, int attempt) {
@@ -484,6 +566,7 @@ public final class Partition implements AutoCloseable {
             var e = es.get(i);
             if (e instanceof LedgerEntry.Enqueue x) cachePayload(offset + i, x.payloadRef());
             state.apply(offset + i, e);
+            if (!waiters.isEmpty()) wake(e);
         }
         publish();
         // Amortized O(1) per entry: a snapshot costs O(live state), so wait at least twice that many entries.
@@ -778,6 +861,13 @@ public final class Partition implements AutoCloseable {
     String canonicalState() { lock.lock(); try { return state.canonical(); } finally { lock.unlock(); } }
 
     @Override public void close() throws IOException {
+        lock.lock();
+        try {
+            closed = true;
+            for (var w : waiters.values()) w.cond.signalAll();
+        } finally {
+            lock.unlock();
+        }
         try {
             writer.close();
             snapshotter.shutdown();
