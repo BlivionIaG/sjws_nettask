@@ -75,4 +75,25 @@ class TopicDurabilityTest {
             m.close();
         }
     }
+
+    @Test
+    void requestHeaderCanOnlyStrengthenTheTopicPolicy() throws Exception {
+        assertEquals(Durability.GROUP, MessagingHttp.atLeast(Durability.NONE, Durability.GROUP));  // clamped up
+        assertEquals(Durability.GROUP, MessagingHttp.atLeast(Durability.ASYNC, Durability.GROUP));
+        assertEquals(Durability.GROUP, MessagingHttp.atLeast(Durability.GROUP, Durability.NONE));  // strengthening is kept
+        assertEquals(Durability.NONE, MessagingHttp.atLeast(Durability.NONE, Durability.NONE));
+        assertEquals(null, MessagingHttp.atLeast(null, Durability.GROUP));                         // no header: writer default
+        var m = new MessagingModule(dir, 1 << 20, LogRetention.NONE, 10_000, Durability.ASYNC, Map.of("safe", Durability.GROUP));
+        try {
+            var h = new MessagingHttp(m.topics());
+            for (int i = 0; i < 20; i++) {
+                // "none" is not rejected, it is clamped: the ack still waits for the fsync of the GROUP topic
+                assertEquals(200, MessagingHttpTest.post(h, "safe", MessagingHttpTest.recs("v" + i), "none").status());
+                var snap = m.topics().get("safe", false).writer().snapshot();
+                assertEquals(snap.nextOffset(), snap.durableOffset());
+            }
+        } finally {
+            m.close();
+        }
+    }
 }

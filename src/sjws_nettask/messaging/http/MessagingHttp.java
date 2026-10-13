@@ -91,7 +91,8 @@ final class MessagingHttp implements Handler {
     }
 
     private Response produce(String topic, Request request) throws BadRequest, IOException {
-        var durability = durability(request.headers().values("durability"));
+        // A request may only strengthen the topic's policy: a weaker Durability header is clamped up to it.
+        var durability = atLeast(durability(request.headers().values("durability")), this.topics.durability(topic));
         var records = records(request);
         var log = this.topics.get(topic, true);
         try {
@@ -143,6 +144,16 @@ final class MessagingHttp implements Handler {
     /** Whether a frame of {@code frameBytes} may follow {@code written} bytes: the first frame always fits. */
     static boolean fits(long written, long frameBytes, long maxBytes) {
         return written == 0 || written + frameBytes <= maxBytes;
+    }
+
+    /**
+     * The per-append mode actually used: {@code requested} unless it is weaker than the topic's writer default, in
+     * which case the default (null keeps the writer default). Strength follows {@link Durability} order:
+     * NONE < ASYNC < GROUP < EACH.
+     */
+    static Durability atLeast(Durability requested, Durability topicDefault) {
+        if (requested == null || requested.ordinal() >= topicDefault.ordinal()) return requested;
+        return topicDefault;
     }
 
     static Durability durability(List<String> values) throws BadRequest {
