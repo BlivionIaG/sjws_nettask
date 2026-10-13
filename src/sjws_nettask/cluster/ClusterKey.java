@@ -17,7 +17,9 @@
 package sjws_nettask.cluster;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 
@@ -63,8 +65,9 @@ public final class ClusterKey {
     }
 
     /**
-     * Reads the key from an environment map. A missing or empty current key is refused.
-     * The map values are not copied into the exception text.
+     * Reads the key from an environment map. A missing or blank current key is refused.
+     * The map values are not copied into the exception text. Whitespace is trimmed.
+     * {@code base64:} and {@code hex:} prefixes are decoded; anything else is UTF-8.
      */
     public static ClusterKey fromEnvironment(Map<String, String> env) {
         Objects.requireNonNull(env, "env");
@@ -82,9 +85,55 @@ public final class ClusterKey {
             if (previous == null || previous.isBlank()) {
                 throw new IllegalArgumentException(ENV_PREVIOUS + " is empty");
             }
-            prev = previous.getBytes(StandardCharsets.UTF_8);
+            prev = parse(previous);
         }
-        return of(current.getBytes(StandardCharsets.UTF_8), prev);
+        return of(parse(current), prev);
+    }
+
+    /**
+     * Decodes one secret. Leading and trailing whitespace is removed, including a trailing
+     * newline from a file. {@code base64:} and {@code hex:} select those encodings; otherwise
+     * the trimmed text is UTF-8. The result is at least {@link #MIN_BYTES} bytes. The text is
+     * not copied into the exception.
+     */
+    public static byte[] parse(String raw) {
+        Objects.requireNonNull(raw, "cluster key");
+        var text = raw.trim();
+        if (text.isEmpty()) {
+            throw new IllegalArgumentException("cluster key is empty");
+        }
+        byte[] bytes;
+        if (text.startsWith("base64:")) {
+            try {
+                bytes = Base64.getDecoder().decode(text.substring("base64:".length()).trim());
+            } catch (IllegalArgumentException failed) {
+                throw new IllegalArgumentException("cluster key base64 is invalid");
+            }
+        } else if (text.startsWith("hex:")) {
+            bytes = decodeHex(text.substring("hex:".length()).trim());
+        } else {
+            bytes = text.getBytes(StandardCharsets.UTF_8);
+        }
+        if (bytes.length < MIN_BYTES) {
+            throw new IllegalArgumentException("cluster key must be at least " + MIN_BYTES + " bytes");
+        }
+        return bytes;
+    }
+
+    private static byte[] decodeHex(String hex) {
+        if ((hex.length() & 1) != 0) {
+            throw new IllegalArgumentException("cluster key hex is invalid");
+        }
+        var out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            int hi = Character.digit(hex.charAt(i * 2), 16);
+            int lo = Character.digit(hex.charAt(i * 2 + 1), 16);
+            if (hi < 0 || lo < 0) {
+                throw new IllegalArgumentException("cluster key hex is invalid");
+            }
+            out[i] = (byte) ((hi << 4) | lo);
+        }
+        return out;
     }
 
     /** @return a copy of the current key. Do not log it. */
@@ -103,8 +152,14 @@ public final class ClusterKey {
 
     @Override
     public boolean equals(Object other) {
-        return other instanceof ClusterKey key && Arrays.equals(this.current, key.current)
-                && Arrays.equals(this.previous, key.previous);
+        return other instanceof ClusterKey key && same(this.current, key.current) && same(this.previous, key.previous);
+    }
+
+    private static boolean same(byte[] left, byte[] right) {
+        if (left == null || right == null) {
+            return left == right;
+        }
+        return MessageDigest.isEqual(left, right);
     }
 
     @Override
