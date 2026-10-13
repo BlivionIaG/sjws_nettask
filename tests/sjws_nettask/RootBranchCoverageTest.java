@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.net.Socket;
 import java.nio.channels.SocketChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -352,6 +354,34 @@ class RootBranchCoverageTest {
             timer.head();
             reaper.sweep(System.nanoTime());
             assertEquals(0, reaper.tracked());
+        }
+    }
+
+    @Test
+    void relaunchFallsBackAndAClosedSocketEndsTheRequestHead() throws Exception {
+        var hidden = Daemon.childCommand(java.util.List.of("--help"), java.util.Optional.empty(), "java", "app.jar");
+        assertTrue(hidden.contains("sjws_nettask.Sjws_nettask"));
+        var foreign = Daemon.childCommand(java.util.List.of("--help"), java.util.Optional.of(new String[] {"java", "-version"}),
+                "java", "app.jar");
+        assertTrue(foreign.contains("-cp"));
+        var ours = Daemon.childCommand(java.util.List.of("--help"),
+                java.util.Optional.of(new String[] {"java", "-cp", "app.jar", "sjws_nettask.Sjws_nettask"}), "java", "app.jar");
+        assertFalse(ours.isEmpty());
+
+        var html = Files.createDirectory(this.dir.resolve("closed"));
+        Files.writeString(html.resolve("index.html"), "hi");
+        try (var server = SjwsServer.start(ServerConfig.builder(html).port(0).h3Enabled(false).build())) {
+            try (var socket = new Socket(InetAddress.getLoopbackAddress(), server.tcpPort())) {
+                socket.setSoTimeout(2000);
+                socket.shutdownOutput();
+                assertTrue(socket.getInputStream().read() < 0);
+            }
+            try (var socket = new Socket(InetAddress.getLoopbackAddress(), server.tcpPort())) {
+                socket.setSoTimeout(2000);
+                socket.getOutputStream().write("POST /index.html HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n".getBytes());
+                socket.shutdownOutput();
+                assertTrue(socket.getInputStream().read() >= 0);
+            }
         }
     }
 
