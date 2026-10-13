@@ -67,7 +67,7 @@ public final class WatchWire {
                 throw new IOException("keyCount");
             }
             var keys = new ArrayList<TrustKey>();
-            for (int i = 0; i < count; i++) {
+            for (long i = 0; i < count; i++) {
                 keys.add(new TrustKey(LastGoodFiles.readString(json, "k" + i + ".keyId"),
                         b64.decode(LastGoodFiles.readString(json, "k" + i + ".publicKey")),
                         LastGoodFiles.readLong(json, "k" + i + ".notAfter"),
