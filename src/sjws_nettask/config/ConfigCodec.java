@@ -143,8 +143,15 @@ public final class ConfigCodec {
         out.append("  renew_before: ").append(quote(duration(acme.renewBefore()))).append('\n');
     }
 
+    private static String limit(sjws_nettask.routing.RateLimitFilter.Limit l) {
+        return "{ by: " + l.by().name().toLowerCase(java.util.Locale.ROOT)
+                + (l.header() == null ? "" : ", header: " + quote(l.header()))
+                + ", rate: " + quote(l.rate()) + ", burst: " + l.burst() + ", buckets: " + l.buckets() + " }";
+    }
+
     private static void routing(StringBuilder out, Routing routing) {
-        if (!routing.enabled() && routing.trustedProxies().isEmpty() && routing.upstreams().isEmpty()
+        if (!routing.enabled() && routing.rateLimit() == null && routing.trustedProxies().isEmpty()
+                && routing.upstreams().isEmpty()
                 && routing.routes().routes().isEmpty() && routing.forwardedProto() == ForwardedProto.AUTO) {
             return;
         }
@@ -152,6 +159,9 @@ public final class ConfigCodec {
         out.append("  enabled: ").append(routing.enabled()).append('\n');
         out.append("  forwarded_proto: ").append(routing.forwardedProto().name().toLowerCase(java.util.Locale.ROOT))
                 .append('\n');
+        if (routing.rateLimit() != null) {
+            out.append("  rate_limit: ").append(limit(routing.rateLimit())).append('\n');
+        }
         if (!routing.trustedProxies().isEmpty()) {
             out.append("  trusted_proxies: [");
             for (int i = 0; i < routing.trustedProxies().size(); i++) {
@@ -175,6 +185,29 @@ public final class ConfigCodec {
                         .append('\n');
                 out.append("      max_body: ").append(upstream.maxBody()).append('\n');
                 out.append("      preserve_host: ").append(upstream.preserveHost()).append('\n');
+                var resilience = upstream.resilience();
+                if (resilience != null && resilience.retry() != null) {
+                    var retry = resilience.retry();
+                    out.append("      retry: { attempts: ").append(retry.attempts()).append(", on: [");
+                    var on = new java.util.ArrayList<String>();
+                    for (var kind : sjws_nettask.routing.Resilience.On.values()) { // enum order: canonical
+                        if (retry.on().contains(kind)) {
+                            on.add(switch (kind) {
+                                case CONNECT -> "connect";
+                                case TIMEOUT -> "timeout";
+                                case RESET -> "reset";
+                                case STATUS_502 -> "502";
+                                case STATUS_503 -> "503";
+                                case STATUS_504 -> "504";
+                            });
+                        }
+                    }
+                    out.append(String.join(", ", on)).append("], budget: ").append(retry.budgetPercent()).append(" }\n");
+                }
+                if (resilience != null && resilience.circuit() != null) {
+                    out.append("      circuit: { failures: ").append(resilience.circuit().failures())
+                            .append(", eject_for: ").append(quote(duration(resilience.circuit().openFor()))).append(" }\n");
+                }
             }
         }
         if (!routing.routes().routes().isEmpty()) {
@@ -210,6 +243,9 @@ public final class ConfigCodec {
                         out.append("        keep_path: ").append(redirect.keepPath()).append('\n');
                     }
                     case RouteSpec.Action.Static ignored -> out.append("      static: true\n");
+                }
+                if (route.rateLimit() != null) {
+                    out.append("      rate_limit: ").append(limit(route.rateLimit())).append('\n');
                 }
             }
         }

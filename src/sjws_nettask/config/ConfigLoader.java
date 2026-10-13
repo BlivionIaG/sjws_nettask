@@ -552,8 +552,8 @@ public final class ConfigLoader {
             return Routing.disabled();
         }
         var map = YamlValues.mapping(routing, "routing");
-        YamlValues.knownKeys(map, List.of("enabled", "upstreams", "routes", "forwarded_proto", "trusted_proxies"),
-                "routing");
+        YamlValues.knownKeys(map, List.of("enabled", "upstreams", "routes", "forwarded_proto", "trusted_proxies",
+                "rate_limit"), "routing");
         boolean enabled = map.containsKey("enabled") && bool(map.get("enabled"), "routing.enabled");
         var proto = map.containsKey("forwarded_proto")
                 ? forwarded(text(map.get("forwarded_proto"), "routing.forwarded_proto"))
@@ -565,7 +565,8 @@ public final class ConfigLoader {
         var routes = map.containsKey("routes") ? routes(map.get("routes"), upstreams) : List.<RouteSpec>of();
         var table = new RouteTable(routes);
         warnings.addAll(table.shadows());
-        return new Routing(enabled, proto, proxies, upstreams, table);
+        var limit = map.containsKey("rate_limit") ? rateLimit(map.get("rate_limit"), "routing.rate_limit", false) : null;
+        return new Routing(enabled, proto, proxies, upstreams, table, limit);
     }
 
     private static Map<String, Upstream> upstreams(Object value) {
@@ -671,7 +672,7 @@ public final class ConfigLoader {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
             YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "backends", "sticky", "redirect",
-                    "static", "listing", "errors", "problem_type"), path);
+                    "static", "listing", "errors", "problem_type", "rate_limit"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -718,10 +719,76 @@ public final class ConfigLoader {
             if (map.containsKey("listing") && !(action instanceof RouteSpec.Action.Static)) {
                 throw new ConfigException(path + ".listing is only valid on a static route");
             }
-            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path)));
+            var limit = map.containsKey("rate_limit") ? rateLimit(map.get("rate_limit"), path + ".rate_limit", true) : null;
+            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path), limit));
         }
         return List.copyOf(out);
     }
+
+    /**
+     * {@code rate_limit: {by: peer|header|route, header, rate: 100/s, burst, buckets}}. {@code by: route}
+     * (one bucket for the route) is only valid on a route.
+     */
+    private static sjws_nettask.routing.RateLimitFilter.Limit rateLimit(Object value, String path, boolean onRoute) {
+        var m = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(m, List.of("by", "header", "rate", "burst", "buckets"), path);
+        var byText = m.containsKey("by") ? text(m.get("by"), path + ".by").trim().toLowerCase(Locale.ROOT) : "peer";
+        var by = switch (byText) {
+            case "peer" -> sjws_nettask.routing.RateLimitFilter.By.PEER;
+            case "header" -> sjws_nettask.routing.RateLimitFilter.By.HEADER;
+            case "route" -> {
+                if (!onRoute) {
+                    throw new ConfigException(path + ".by: route is only valid on a route (use peer or header here)");
+                }
+                yield sjws_nettask.routing.RateLimitFilter.By.ROUTE;
+            }
+            default -> throw new ConfigException(path + ".by: expected peer, header or route");
+        };
+        String header = null;
+        if (by == sjws_nettask.routing.RateLimitFilter.By.HEADER) {
+            if (!m.containsKey("header")) {
+                throw new ConfigException(path + ".header is required with by: header");
+            }
+            header = text(m.get("header"), path + ".header").trim();
+            if (header.isEmpty() || !header.chars().allMatch(c -> c > 32 && c < 127 && TSPECIALS.indexOf(c) < 0)) {
+                throw new ConfigException(path + ".header: invalid name '" + header + "'");
+            }
+        } else if (m.containsKey("header")) {
+            throw new ConfigException(path + ".header is only valid with by: header");
+        }
+        if (!m.containsKey("rate")) {
+            throw new ConfigException(path + ".rate is required (for example 100/s, 600/m, 1000/h)");
+        }
+        var rate = String.valueOf(m.get("rate")).trim();
+        long count;
+        char unit = 's';
+        int slash = rate.indexOf('/');
+        try {
+            if (slash >= 0) {
+                var u = rate.substring(slash + 1).trim();
+                if (u.length() != 1 || "smh".indexOf(u.charAt(0)) < 0) {
+                    throw new NumberFormatException();
+                }
+                unit = u.charAt(0);
+                rate = rate.substring(0, slash).trim();
+            }
+            count = Long.parseLong(rate);
+        } catch (NumberFormatException e) {
+            throw new ConfigException(path + ".rate: expected N/s, N/m or N/h");
+        }
+        if (count < 1 || count > 1_000_000_000L) {
+            throw new ConfigException(path + ".rate: must be 1..1000000000 per unit");
+        }
+        int burst = m.containsKey("burst") ? integer(m.get("burst"), path + ".burst", 1, 1_000_000)
+                : (int) Math.min(1_000_000, unit == 's' ? count : 1);
+        int buckets = m.containsKey("buckets") ? integer(m.get("buckets"), path + ".buckets", 1, 1 << 20) : 4096;
+        if (Integer.bitCount(buckets) != 1) {
+            throw new ConfigException(path + ".buckets: must be a power of two");
+        }
+        return new sjws_nettask.routing.RateLimitFilter.Limit(by, header, count, unit, burst, buckets);
+    }
+
+    private static final String TSPECIALS = "()<>@,;:\\\"/[]?={}";
 
     /** {@code backends: [{upstream, weight (default 1), pin}]} and {@code sticky}. */
     private static RouteSpec.Action.Weighted weighted(Map<String, Object> route, Map<String, Upstream> upstreams,

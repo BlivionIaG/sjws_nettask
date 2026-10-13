@@ -26,13 +26,20 @@ import java.util.Map;
  *
  * @param trustedProxies validated CIDR literals, declaration order
  * @param upstreams insertion order
+ * @param rateLimit global {@code routing.rate_limit:} applied before any route, or null
  */
 public record Routing(boolean enabled, ForwardedProto forwardedProto, List<String> trustedProxies,
-        Map<String, Upstream> upstreams, RouteTable routes) {
+        Map<String, Upstream> upstreams, RouteTable routes, sjws_nettask.routing.RateLimitFilter.Limit rateLimit) {
 
     public Routing {
         trustedProxies = List.copyOf(trustedProxies);
         upstreams = Map.copyOf(upstreams);
+    }
+
+    /** No global rate limit. */
+    public Routing(boolean enabled, ForwardedProto forwardedProto, List<String> trustedProxies,
+            Map<String, Upstream> upstreams, RouteTable routes) {
+        this(enabled, forwardedProto, trustedProxies, upstreams, routes, null);
     }
 
     public static Routing disabled() {
