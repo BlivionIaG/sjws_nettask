@@ -65,7 +65,7 @@ public final class JoinTokens {
 
     /** Apply: records an issued token (an existing id is left unchanged). */
     public boolean issue(String tokenId, String secretHash, long expiresAtMillis, long nowMillis) {
-        if (tokens.containsKey(tokenId)) {
+        if (!isHash(secretHash) || tokens.containsKey(tokenId)) {
             return false;
         }
         if (tokens.size() >= MAX_TOKENS) {
@@ -124,6 +124,15 @@ public final class JoinTokens {
     /** @return the join recorded for {@code nodeId}, or null */
     public Join joined(String nodeId) {
         return byNode.get(nodeId);
+    }
+
+    /**
+     * True for a stored secret in its only accepted form, a lowercase hex SHA-256. Anything else (for
+     * example a plaintext secret from an older log) is rejected on apply, fail closed: that node must
+     * join again with a freshly issued token.
+     */
+    public static boolean isHash(String secretHash) {
+        return secretHash != null && secretHash.matches("[0-9a-f]{64}");
     }
 
     public static String sha256(byte[] secret) {

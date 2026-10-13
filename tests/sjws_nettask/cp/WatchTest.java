@@ -272,4 +272,50 @@ class WatchTest {
             Thread.sleep(10);
         }
     }
+
+    /** Only the SHA-256 is accepted as a stored secret: a plaintext one (e.g. an old log) is refused. */
+    @Test
+    void storedSecretMustBeAHashAndPlaintextIsRejected() {
+        var tokens = new JoinTokens();
+        var hash = JoinTokens.sha256(SECRET.getBytes(StandardCharsets.UTF_8));
+        assertTrue(JoinTokens.isHash(hash));
+        assertFalse(JoinTokens.isHash(SECRET));
+        assertFalse(JoinTokens.isHash(null));
+        assertFalse(JoinTokens.isHash(hash.toUpperCase()));
+        assertFalse(tokens.issue("plain", SECRET, Long.MAX_VALUE, 0L), "plaintext refused on apply");
+        assertFalse(tokens.evaluate("gw-1", "plain", SECRET, 0L).accepted());
+        assertTrue(tokens.issue("t", hash, Long.MAX_VALUE, 0L));
+        assertTrue(tokens.consume("gw-1", "t", hash, 0L).accepted());
+        assertEquals(hash, tokens.joined("gw-1").secretHash());
+    }
+
+    /** Revocation is checked on every poll, and again when a long poll already in progress returns. */
+    @Test
+    void revokedNodeIsRefusedIncludingAnInFlightPoll() throws Exception {
+        var keys = keys();
+        try (var store = elected(this.dir.resolve("cp"), keys);
+                var watch = WatchServer.start(store, 0, System::currentTimeMillis)) {
+            int p = watch.port();
+            var ok = Base64.getEncoder().encodeToString(SECRET.getBytes(StandardCharsets.UTF_8));
+            issue(store, "t");
+            assertEquals(204, call(p, "GET", "/cp/v1/watch?waitMs=0", "gw-1", "t", ok).statusCode());
+            var raw = SECRET.getBytes(StandardCharsets.UTF_8);
+            assertTrue(store.authenticateWatch("gw-1", "t", raw, System.currentTimeMillis()).accepted());
+            var pending = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                try {
+                    return call(p, "GET", "/cp/v1/watch?after=0&waitMs=2000", "gw-1", "t", ok).statusCode();
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            Thread.sleep(200);
+            assertEquals(200, store.revoke("gw-1").status());
+            assertEquals(200, store.propose("server:\n  port: 0\n  root: " + root() + "\n").status());
+            assertEquals(200, store.activate(System.currentTimeMillis(), 60_000L).status());
+            assertEquals(403, pending.get(5, java.util.concurrent.TimeUnit.SECONDS), "in-flight poll gets no snapshot");
+            assertEquals("revoked", store.authenticateWatch("gw-1", "t", raw, System.currentTimeMillis()).error());
+            assertEquals(403, call(p, "GET", "/cp/v1/watch?after=0&waitMs=0", "gw-1", "t", ok).statusCode());
+            assertEquals(403, call(p, "POST", "/cp/v1/watch/ack?version=1", "gw-1", "t", ok).statusCode());
+        }
+    }
 }
