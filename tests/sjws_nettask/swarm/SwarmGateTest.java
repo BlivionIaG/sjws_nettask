@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
@@ -257,6 +258,7 @@ class SwarmGateTest {
     void tokensFileOwnedByAnotherUserIsRefused() throws Exception {
         var f = tokensFile("foreign", "rw-------");
         var me = System.getProperty("user.name");
+        assumeTrue(canChown(f, me), "sudo -n chown is not available");
         chown(f, "nobody");
         try {
             int uid = ((Integer) Files.getAttribute(f, "unix:uid")).intValue();
@@ -265,6 +267,18 @@ class SwarmGateTest {
             assertRefused(f);
         } finally {
             chown(f, me);
+        }
+    }
+
+    /** Whether {@code sudo -n chown} works here (a no-op chown to the current owner). */
+    private static boolean canChown(Path path, String owner) {
+        try {
+            var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true)
+                    .start();
+            proc.getInputStream().readAllBytes();
+            return proc.waitFor() == 0;
+        } catch (Exception e) {
+            return false;
         }
     }
 
