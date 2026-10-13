@@ -1,6 +1,6 @@
 # Messaging metrics
 
-Status: proposal, revised 2026-10-13 with input from sjws Messaging Core. Names in the [proposed](#proposed-names) section are **not implemented** and are **not stable**. They are marked `PROPOSED` so Messaging Core can change them before anything is scraped. The [shipped](#shipped-partition-lag) lag gauges are already in the tree; this doc does not rename them.
+Status: proposal, revised 2026-10-13 with input from sjws Messaging Core. The produce and fetch histogram names are decided (`*_duration_seconds`) and are not implemented yet. The gauge names in the [proposed](#proposed-names) section are still `PROPOSED` and not stable, so Messaging Core can change them before anything is scraped. The [shipped](#shipped-partition-lag) lag gauges are already in the tree; this doc does not rename them.
 
 No code in this change. Nothing here adds a `ServerConfig` flag, a request-path branch, or a series on `/metrics`.
 
@@ -62,9 +62,9 @@ The scale is fixed log2, ratio exactly 2, from 1 ms through 16.384 s, then one `
 
 ## Proposed names
 
-Every name in this section is `PROPOSED`.
+Histogram names are decided. The gauge names in this section are still `PROPOSED`.
 
-The histogram names use the `*_duration_seconds` suffix so they match `sjws_http_request_duration_seconds`. sjws Messaging Core suggested `sjws_messaging_produce_seconds`. That shorter name is an open question; this proposal keeps `*_duration_seconds` until they pick one. Fetch uses the same suffix so the two histograms stay a pair.
+Histogram names follow the Prometheus convention and use the `*_duration_seconds` suffix, matching `sjws_http_request_duration_seconds`. The project manager settled this on 2026-10-13: `sjws_messaging_produce_duration_seconds` and `sjws_messaging_fetch_duration_seconds`. The shorter `sjws_messaging_produce_seconds` form is not used.
 
 ### Produce latency
 
@@ -157,8 +157,7 @@ Off means the listener is absent. The cost is the same shape as HTTP observabili
 
 ## Open points for sjws Messaging Core
 
-- Confirm or replace every `PROPOSED` name before it is scraped.
-- Naming: this proposal is `sjws_messaging_produce_duration_seconds` and `sjws_messaging_fetch_duration_seconds`, matching `sjws_http_request_duration_seconds`. Messaging Core suggested `sjws_messaging_produce_seconds`. Say which form to keep. Fetch should use the same suffix as produce.
+- Confirm or replace every remaining `PROPOSED` gauge name before it is scraped. The produce and fetch histogram names are already decided.
 - Produce samples include duplicate hits, with no extra label. Say if duplicates should be dropped instead.
 - `sjws_messaging_high_watermark_offset` on one node follows their rule (the durable offset, and `nextOffset` in `async` mode). In a cluster it follows HA `commitIndex` until `durableIndex` from PR #29 is a public field. Say if `durableIndex` should replace `commitIndex` as soon as it exists, or be a second gauge.
 - `partition="other"` is a non-integer label value used only for the topic overflow bucket on the proposed series.
