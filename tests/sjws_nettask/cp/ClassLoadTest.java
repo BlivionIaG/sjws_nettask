@@ -56,6 +56,7 @@ class ClassLoadTest {
                 assertFalse(text.contains("sjws_nettask.cp." + cp + " "), cp);
             }
             assertFalse(text.contains("sjws_nettask.cluster."), text);
+            assertFalse(text.contains("sjws_nettask.cluster.TcpTransport"), text);
             assertFalse(text.contains("sjws_nettask.service."), text);
         } finally {
             process.destroy();

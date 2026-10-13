@@ -18,9 +18,6 @@ package sjws_nettask.cluster;
 
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
@@ -66,8 +63,8 @@ import javax.crypto.spec.SecretKeySpec;
 public final class HeartbeatAuthenticator {
 
     public static final int VERSION = 1;
-    public static final int KEY_CURRENT = 0;
-    public static final int KEY_PREVIOUS = 1;
+    public static final int KEY_CURRENT = AuthReplay.KEY_CURRENT;
+    public static final int KEY_PREVIOUS = AuthReplay.KEY_PREVIOUS;
     public static final int BODY_BYTES = HeartbeatCodec.BYTES;
     public static final int BODY_OFFSET = 2;
     public static final int TS_OFFSET = BODY_OFFSET + BODY_BYTES;
@@ -78,7 +75,7 @@ public final class HeartbeatAuthenticator {
     public static final int MAC_LENGTH = 32;
     public static final int PACKET_BYTES = MAC_OFFSET + MAC_LENGTH;
     /** Inclusive skew window. A packet at exactly ±5 seconds is accepted. */
-    public static final long WINDOW_MILLIS = 5_000L;
+    public static final long WINDOW_MILLIS = AuthReplay.WINDOW_MILLIS;
 
     private static final String HMAC = "HmacSHA256";
     private static final byte[] LABEL = "sjws-ha-hb\0".getBytes(StandardCharsets.US_ASCII);
@@ -105,7 +102,7 @@ public final class HeartbeatAuthenticator {
     private final byte[] macBuf = new byte[MAC_LENGTH];
     private final byte[] tagBuf = new byte[MAC_LENGTH];
     private final byte[] body = new byte[BODY_BYTES];
-    private final Map<Integer, Sender> last = new HashMap<>();
+    private final AuthReplay replay = new AuthReplay();
     private final AtomicInteger[] rejected = new AtomicInteger[Reason.values().length];
     private long sendSeq;
     private long lastTimeWarnMillis = Long.MIN_VALUE;
@@ -142,7 +139,7 @@ public final class HeartbeatAuthenticator {
     public int trackedSenders() {
         this.lock.lock();
         try {
-            return this.last.size();
+            return this.replay.trackedSenders();
         } finally {
             this.lock.unlock();
         }
@@ -153,7 +150,7 @@ public final class HeartbeatAuthenticator {
         Objects.requireNonNull(members, "members");
         this.lock.lock();
         try {
-            this.last.keySet().removeIf(id -> !contains(members, count, id));
+            this.replay.retainMembers(id -> contains(members, count, id));
         } finally {
             this.lock.unlock();
         }
@@ -227,36 +224,25 @@ public final class HeartbeatAuthenticator {
                 return drop(Reason.BODY);
             }
             int dest = ((packet[DEST_OFFSET] & 0xFF) << 8) | (packet[DEST_OFFSET + 1] & 0xFF);
-            if (dest != selfWire || beat.toWire() != selfWire) {
+            if (beat.toWire() != selfWire) {
                 return drop(Reason.DEST);
-            }
-            if (!contains(members, count, beat.fromWire())) {
-                return drop(Reason.MEMBER);
             }
             long epoch = getLong(packet, EPOCH_OFFSET);
             long seq = getLong(packet, SEQ_OFFSET);
-            if (seq <= 0) {
-                return drop(Reason.SEQ);
-            }
-            // A boot epoch is a time, so it cannot lead the packet or the receiver by more than
-            // the skew window. Reject before touching replay state.
-            if (epochAfter(epoch, timestamp) || epochAfter(epoch, nowMillis)) {
+            // A boot epoch is a time, so it cannot lead the packet timestamp by more than the
+            // skew window. Reject before touching replay state.
+            if (AuthReplay.epochAfter(epoch, timestamp)) {
                 return drop(Reason.EPOCH);
             }
-            var sender = this.last.get(beat.fromWire());
-            if (sender == null || epoch > sender.epoch || lowerEpochAfterSilence(sender, epoch, nowMillis)) {
-                this.last.put(beat.fromWire(), new Sender(epoch, seq, nowMillis));
-                return beat;
-            }
-            if (epoch < sender.epoch) {
-                return drop(Reason.EPOCH);
-            }
-            if (seq <= sender.seq) {
-                return drop(Reason.SEQ);
-            }
-            sender.seq = seq;
-            sender.seenMillis = nowMillis;
-            return beat;
+            var decision = this.replay.accept(beat.fromWire(), dest, selfWire, epoch, seq, nowMillis,
+                    this.deadAfterMillis, id -> contains(members, count, id));
+            return switch (decision) {
+                case OK -> beat;
+                case DEST -> drop(Reason.DEST);
+                case MEMBER -> drop(Reason.MEMBER);
+                case EPOCH -> drop(Reason.EPOCH);
+                case SEQ -> drop(Reason.SEQ);
+            };
         } finally {
             this.lock.unlock();
         }
@@ -272,25 +258,6 @@ public final class HeartbeatAuthenticator {
         }
         write(dest, body, nowMillis, seq, bootEpoch, destWire, keyId);
         writeMac(mac(derive(key)), dest);
-    }
-
-    /** True when {@code epoch} is later than {@code time} by more than {@link #WINDOW_MILLIS}. */
-    private static boolean epochAfter(long epoch, long time) {
-        long limit = time > Long.MAX_VALUE - WINDOW_MILLIS ? Long.MAX_VALUE : time + WINDOW_MILLIS;
-        return epoch > limit;
-    }
-
-    /**
-     * A member silent for {@code max(deadAfter, 5s)} may come back with an earlier boot epoch.
-     * Its clock stepped backwards across the restart. A live member is not reset, and a dead
-     * interval shorter than the skew window does not open that window to a captured packet.
-     */
-    private boolean lowerEpochAfterSilence(Sender sender, long epoch, long nowMillis) {
-        if (this.deadAfterMillis <= 0 || epoch >= sender.epoch) {
-            return false;
-        }
-        long required = Math.max(this.deadAfterMillis, WINDOW_MILLIS);
-        return nowMillis - sender.seenMillis >= required;
     }
 
     private Heartbeat drop(Reason reason) {
@@ -328,7 +295,7 @@ public final class HeartbeatAuthenticator {
             throw new IllegalStateException(failed);
         }
         System.arraycopy(packet, MAC_OFFSET, this.tagBuf, 0, MAC_LENGTH);
-        return MessageDigest.isEqual(this.macBuf, this.tagBuf);
+        return AuthReplay.tagEquals(this.macBuf, this.tagBuf);
     }
 
     private static void writeMac(Mac mac, byte[] dest) {
@@ -395,17 +362,5 @@ public final class HeartbeatAuthenticator {
             value = (value << 8) | (src[offset + i] & 0xFFL);
         }
         return value;
-    }
-
-    private static final class Sender {
-        private final long epoch;
-        private long seq;
-        private long seenMillis;
-
-        private Sender(long epoch, long seq, long seenMillis) {
-            this.epoch = epoch;
-            this.seq = seq;
-            this.seenMillis = seenMillis;
-        }
     }
 }

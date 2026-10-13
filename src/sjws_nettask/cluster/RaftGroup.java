@@ -30,6 +30,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
@@ -120,11 +121,10 @@ final class RaftGroup {
         this.clock = clock;
         this.listener = listener;
         this.voters.addAll(voters);
-        long election = options.electionTimeout().toNanos();
         if (options.preferred()) {
-            this.electionDeadline = Math.max(1L, election / 5);
+            this.electionDeadline = Math.max(1L, options.electionTimeout().toNanos() / 5);
         } else {
-            this.electionDeadline = election + (self.wire() - 1L) * (election / 5);
+            this.electionDeadline = staggeredTimeout();
         }
     }
 
@@ -283,7 +283,7 @@ final class RaftGroup {
         role = Role.PRE_CANDIDATE;
         votes.clear();
         votes.add(self);
-        electionDeadline = now + options.electionTimeout().toNanos();
+        electionDeadline = now + retryTimeout();
         if (isQuorum(votes)) {
             startElection(now, after);
             return;
@@ -298,11 +298,33 @@ final class RaftGroup {
         leader = null;
         votes.clear();
         votes.add(self);
-        electionDeadline = now + options.electionTimeout().toNanos();
+        electionDeadline = now + retryTimeout();
         send(VOTE, voteBody(term));
         if (isQuorum(votes)) {
             becomeLeader(now, after);
         }
+    }
+
+    /**
+     * The election timeout plus a fresh per-node jitter in {@code [0, election)}. Redrawn on
+     * every retry so two candidates that share a first-deadline slot (sparse wire ids such as
+     * 1 and 7 with three voters) cannot split the vote forever. The wait stays under
+     * {@code 2 * election}, unlike the old {@code (wire - 1) * (election / 5)} growth.
+     */
+    private long retryTimeout() {
+        long election = options.electionTimeout().toNanos();
+        long jitter = election == 0 ? 0 : ThreadLocalRandom.current().nextLong(election);
+        return election + jitter;
+    }
+
+    /**
+     * First-deadline stagger: {@code ((wire - 1) mod voterCount) * (election / voterCount)}.
+     * Contiguous ids {@code 1..n} keep node 1 first; sparse ids stay inside one election period.
+     */
+    private long staggeredTimeout() {
+        long election = options.electionTimeout().toNanos();
+        int count = Math.max(1, voters.size());
+        return election + (long) Math.floorMod(self.wire() - 1, count) * (election / count);
     }
 
     private byte[] voteBody(long voteTerm) {
@@ -391,7 +413,10 @@ final class RaftGroup {
         long candidateTerm = body.getLong();
         var candidate = byWire.apply(candidateWire);
         boolean grant = false;
-        boolean leaderFresh = role == Role.LEADER || (leader != null && now < electionDeadline);
+        // A pre-candidate has already timed out on its leader, and its own pre-vote moved
+        // electionDeadline, so that deadline no longer says the leader is fresh.
+        boolean leaderFresh = role == Role.LEADER
+                || (role == Role.FOLLOWER && leader != null && now < electionDeadline);
         if (theirTerm >= term && candidate != null && !leaderFresh && (!witness || witnessForced())) {
             long ourLast = witness ? witnessCursorIndex() : lastIndex();
             long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);

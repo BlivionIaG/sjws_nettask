@@ -19,8 +19,9 @@ package sjws_nettask.cluster;
 import java.util.function.BiConsumer;
 
 /**
- * Carries {@link SimTransport.Frame}s between nodes. {@link SimTransport} is the in-process one.
- * Handlers run only inside {@link #deliver}, on the caller's thread, so a Raft group sees one thread.
+ * Carries {@link SimTransport.Frame}s between nodes. {@link SimTransport} is the in-process one;
+ * {@link TcpTransport} crosses processes. Handlers run only inside {@link #deliver}, on the
+ * caller's thread, so a Raft group sees one thread.
  */
 public interface ClusterTransport {
 

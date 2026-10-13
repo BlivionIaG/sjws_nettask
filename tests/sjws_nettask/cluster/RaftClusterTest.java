@@ -360,6 +360,110 @@ class RaftClusterTest {
         assertEquals(0L, memory.lastIndex(GROUP));
     }
 
+    @Test
+    void sparseWireIdsBoundElectionTimeoutAndFailover() throws Exception {
+        // Non-contiguous wire ids: the old (wire - 1) * (election / 5) stagger made node 42
+        // wait ~9 election periods. The bounded first deadline plus redrawn retry jitter keep
+        // both the first election and a leader-kill failover inside a few election periods.
+        var clock = new FakeClock(0L);
+        var net = new SimTransport();
+        var wires = List.of(1, 7, 42);
+        var members = new ArrayList<Member>();
+        var voters = new java.util.LinkedHashSet<NodeId>();
+        for (int wire : wires) {
+            var member = member(wire, false);
+            members.add(member);
+            voters.add(member.id());
+        }
+        var opts = options(Durability.STRICT, 1_000_000);
+        long election = opts.electionTimeout().toNanos();
+        int count = voters.size();
+        long maxFirst = 0L;
+        for (int wire : wires) {
+            long first = election + (long) Math.floorMod(wire - 1, count) * (election / count);
+            maxFirst = Math.max(maxFirst, first);
+            assertTrue(first < election * 2,
+                    "first deadline for wire " + wire + " must stay under 2 * election");
+        }
+        assertTrue(maxFirst < election + election,
+                "sparse wire ids must not grow the first stagger past one election");
+
+        var nodes = new ArrayList<ReplicatedNode>();
+        var logs = new ArrayList<MemoryLogStorage>();
+        for (var member : members) {
+            var log = new MemoryLogStorage();
+            logs.add(log);
+            var node = ReplicatedNode.open(member.id(), members, voters, QuorumPolicy.majority(), clock, log, net);
+            node.openGroup(GROUP, opts, null);
+            nodes.add(node);
+        }
+        var cluster = new Cluster(clock, net, nodes, logs, opts);
+
+        long electBound = election * 6;
+        long started = clock.nanoTime();
+        while (clock.nanoTime() - started <= electBound) {
+            clock.advance(Duration.ofMillis(20));
+            ReplicatedNode.driveAll(cluster.nodes);
+            if (optionalLeader(cluster).isPresent()) {
+                break;
+            }
+        }
+        var leader = leader(cluster);
+        assertTrue(clock.nanoTime() - started <= electBound,
+                "first election with wires 1,7,42 must finish within 6 election periods");
+        var committed = leader.append(GROUP, List.of(bytes("before")));
+        ReplicatedNode.driveAll(cluster.nodes);
+        assertTrue(committed.isDone());
+
+        var dead = leader.self();
+        for (var member : members) {
+            if (!member.id().equals(dead)) {
+                cluster.net.cut(dead, member.id());
+            }
+        }
+
+        long failStart = clock.nanoTime();
+        long failBound = election * 4;
+        NodeId next = null;
+        while (clock.nanoTime() - failStart <= failBound) {
+            clock.advance(Duration.ofMillis(20));
+            ReplicatedNode.driveAll(cluster.nodes);
+            for (var node : cluster.nodes) {
+                if (!node.self().equals(dead) && node.openGroup(GROUP, opts, null).isLeader()) {
+                    next = node.self();
+                    break;
+                }
+            }
+            if (next != null) {
+                break;
+            }
+        }
+        assertNotNull(next, "failover with sparse wire ids must elect inside 4 election periods");
+        assertNotEquals(dead, next);
+        assertTrue(clock.nanoTime() - failStart <= failBound);
+        final NodeId successorId = next;
+        ReplicatedNode successor = null;
+        for (var node : cluster.nodes) {
+            if (node.self().equals(successorId)) {
+                successor = node;
+                break;
+            }
+        }
+        assertNotNull(successor);
+        var after = successor.append(GROUP, List.of(bytes("after")));
+        ReplicatedNode.driveAll(cluster.nodes);
+        assertTrue(after.isDone());
+    }
+
+    private static Optional<NodeId> optionalLeader(Cluster cluster) {
+        for (var node : cluster.nodes) {
+            if (node.openGroup(GROUP, cluster.options, null).isLeader()) {
+                return Optional.of(node.self());
+            }
+        }
+        return Optional.empty();
+    }
+
     private Cluster fourNodeCluster() {
         var clock = new FakeClock(0L);
         var net = new SimTransport();
