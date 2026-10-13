@@ -241,7 +241,7 @@ Added to the swarm handler mounted through `HandlerContributor` (PR #101; `Swarm
 - **Off-mode wrk A/B** (§12, item 4).
 
 ## 9. Phases (fit with S2+)
-**G0 starts only after the S1c gate is met** (reaffirmed 2026-10-13); every graph phase therefore starts after the **S1c gate** (claim p99 < 100 µs, heartbeat < 2 %, request/reply p99 < 500 µs; inceptor) and depend on swarm phases as listed.
+**G0 starts only after the S1c gate is met** (reaffirmed 2026-10-13); every graph phase therefore starts after the **S1c gate** (claim p99 < 100 µs with workers = vCPU count, heartbeat < 2 %, request/reply p99 < 500 µs; inceptor; see swarm §13) and depend on swarm phases as listed.
 
 | Phase | Deliverable | Depends on | Exit criteria |
 |---|---|---|---|
