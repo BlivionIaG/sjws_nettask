@@ -25,8 +25,8 @@ import java.util.function.Function;
  * referenced only as a class name string and loaded reflectively when enabled, so with the swarm off no
  * {@code sjws_nettask.swarm} class is loaded or verified. Nothing on a request path calls this class.
  * <p>
- * S0 gate: system property {@value #SWARM_PROPERTY} or environment variable {@value #SWARM_ENV} equal to
- * {@code true}. The YAML key {@code swarm.enabled} belongs to the config owner and comes with S1.
+ * Gate, first one set wins: system property {@value #SWARM_PROPERTY}, environment variable {@value #SWARM_ENV},
+ * then the YAML key {@code swarm.enabled} (S1). Off when none is set.
  */
 final class OptionalModules {
 
@@ -41,23 +41,40 @@ final class OptionalModules {
     }
 
     static boolean swarmEnabled(Function<String, String> properties, Map<String, String> env) {
+        return swarmEnabled(properties, env, null);
+    }
+
+    /** {@code yaml} is {@code swarm.enabled} from the config file, or null when the file did not set it. */
+    static boolean swarmEnabled(Function<String, String> properties, Map<String, String> env, Boolean yaml) {
         String value = properties.apply(SWARM_PROPERTY);
         if (value == null) {
             value = env.get(SWARM_ENV);
         }
-        return "true".equalsIgnoreCase(value == null ? null : value.trim());
+        if (value == null) {
+            return Boolean.TRUE.equals(yaml);
+        }
+        return "true".equalsIgnoreCase(value.trim());
     }
 
     /** Starts the enabled modules; {@link #NONE} when none is. A module that fails to load is logged and skipped. */
     static OptionalModule start(Function<String, String> properties, Map<String, String> env, PrintStream err) {
-        if (!swarmEnabled(properties, env)) {
+        return start(properties, env, null, err);
+    }
+
+    static OptionalModule start(Function<String, String> properties, Map<String, String> env, Boolean yaml,
+            PrintStream err) {
+        if (!swarmEnabled(properties, env, yaml)) {
             return NONE;
         }
         return load(SWARM_CLASS, err);
     }
 
     static OptionalModule start(PrintStream err) {
-        return start(System::getProperty, System.getenv(), err);
+        return start(System::getProperty, System.getenv(), null, err);
+    }
+
+    static OptionalModule start(Boolean yaml, PrintStream err) {
+        return start(System::getProperty, System.getenv(), yaml, err);
     }
 
     static OptionalModule load(String className, PrintStream err) {

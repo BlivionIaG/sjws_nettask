@@ -465,6 +465,20 @@ also gain `allow:/.well-known/acme-challenge` if it is not already there: a
 wildcard allow does not match a dot component, and that literal is the form the
 access-rule list needs. A dedicated HTTP-01 port never consults the file handler.
 
+## Swarm
+
+```yaml
+swarm:
+  enabled: false   # default
+```
+
+`swarm.enabled: true` starts the optional agent-swarm module (`docs/design/agent-swarm.md`)
+after the server is up. It is node-local, like `server.bind_content`: it is not part of the
+canonical document, so the control plane does not distribute it and a config recovered from
+last-good starts with the swarm off. The JVM property `-Dsjws.swarm.enabled` and then the
+environment variable `SJWS_SWARM_ENABLED` win over the key when set. With the swarm off no
+`sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet.
+
 ## Request path
 
 `LiveConfig` holds an `AtomicReference` of `ConfigSnapshot`. The snapshot carries

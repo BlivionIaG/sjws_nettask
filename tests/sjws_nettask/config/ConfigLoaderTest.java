@@ -66,6 +66,28 @@ class ConfigLoaderTest {
     }
 
     @Test
+    void swarmEnabledIsNodeLocalAndOffByDefault() throws Exception {
+        var none = ConfigLoader.load(new String[] {"--config=" + write("# nothing\n")}, Map.of());
+        assertTrue(none.ok(), none.errors().toString());
+        assertNull(none.yamlSwarmEnabled());
+        var on = ConfigLoader.load(new String[] {"--config=" + write("swarm:\n  enabled: true\n")}, Map.of());
+        assertTrue(on.ok(), on.errors().toString());
+        assertEquals(Boolean.TRUE, on.yamlSwarmEnabled());
+        assertFalse(on.document().canonicalText().contains("swarm"), on.document().canonicalText());
+        assertEquals(Boolean.TRUE, on.withDocument(on.document()).yamlSwarmEnabled());
+        var off = ConfigLoader.load(new String[] {"--config=" + write("swarm:\n  enabled: false\n")}, Map.of());
+        assertEquals(Boolean.FALSE, off.yamlSwarmEnabled());
+        var empty = ConfigLoader.load(new String[] {"--config=" + write("swarm: {}\n")}, Map.of());
+        assertTrue(empty.ok(), empty.errors().toString());
+        assertNull(empty.yamlSwarmEnabled());
+        var unknown = ConfigLoader.load(new String[] {"--config=" + write("swarm:\n  pools: 3\n")}, Map.of());
+        assertFalse(unknown.ok());
+        var bad = ConfigLoader.load(new String[] {"--config=" + write("swarm:\n  enabled: maybe\n")}, Map.of());
+        assertFalse(bad.ok());
+        assertTrue(bad.errors().get(0).contains("swarm.enabled"), bad.errors().toString());
+    }
+
+    @Test
     void emptyFileIsDefaults() throws Exception {
         var file = write("# nothing\n");
         var loaded = ConfigLoader.load(new String[] {"--config=" + file}, Map.of());
