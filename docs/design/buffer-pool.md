@@ -193,3 +193,20 @@ Questions 3, 5, 6 and 7 in §13 are answered. Still open: 1 (decoded record view
 - Config comes from system properties for now: `sjws.buf.pool` (default false), `sjws.buf.maxBytes`, `sjws.buf.budgets`, `sjws.buf.debug`, `sjws.buf.leakSample`, `sjws.buf.magazine`. The YAML key comes with PR (b).
 - Leak tracking is sampled, 1 in `leakSample`. An unsampled leaked handle keeps its chunk and its budget charge forever. Debug mode tracks every acquire.
 - Default `leakSample=64`, chosen from the measured Cleaner cost (bench/BufferPoolBench.java, see the PR description). Single thread, 2 KiB, ReentrantLock build: sample 0 = 114.9 ns/op, 1/64 = 126.0 ns/op (about 1.9 B/op), 1/1 = 252.8 ns/op (160 B/op). These were measured on a shared, heavily loaded box (load 9–84 on 8 cores), so treat them as indicative. Known follow-up: with 8 platform threads hammering one class, the pool on was slower than heap allocation (about 1.4 µs vs 0.8 µs per op), so stripe and magazine contention needs work before callers land.
+
+## 16. Contention fix (follow-up to PR (a))
+
+Profiling by ablation (8 platform threads, one 2 KiB class, magazines on): the shared state touched on every operation was what hurt, not the stripes:
+
+| variant | ns/op per thread |
+|---|---|
+| as merged | 1213.4 |
+| without the budget CAS | 682.7 |
+| without the per-slab free counter and `lastFreeNanos` write | 1092.4 |
+| without both | 135.2 |
+
+The magazines already served almost every acquire, so stripe selection and the stripe locks were not on the hot path.
+
+Fix:
+- **Budgets** keep per-stripe credit in padded cells (128 B apart, indexed by thread id). A charge or refund is a CAS on the thread's own cell. The shared `used` counter is touched only to lease a batch (at most min(256 KiB, limit / 4·cells)) or to return the excess above 2 batches. When a lease would exceed the limit, the budget first takes back every cell's parked credit, so a denial is still exact. `usedBytes()` excludes parked credit.
+- **Slabs** no longer keep a shared free counter. Each slot records when it was last freed (written by the releasing thread). `trim` checks idleness and membership under the stripe locks.
