@@ -61,6 +61,21 @@ public class MessagingLogBench {
         return b.array();
     }
 
+    /** Consumes a response body like a transport would (closing a stream releases its pooled buffer); returns its bytes. */
+    static long drain(Body body) {
+        if (body instanceof Body.Stream st) {
+            long n = 0;
+            try (var src = st.source()) {
+                java.nio.ByteBuffer b;
+                while ((b = src.next()) != null) { n += b.remaining(); b.position(b.limit()); }
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+            return n;
+        }
+        return body.length();
+    }
+
     static long pct(long[] a, int n, double p) { return n == 0 ? 0 : a[Math.min(n - 1, (int) (n * p))]; }
 
     public static void main(String[] args) throws Exception {
@@ -103,7 +118,8 @@ public class MessagingLogBench {
                             : h.handle(new Request("GET", topic + "?offset=" + rnd.nextInt(committed) + "&maxBytes=1"));
                     long t1 = System.nanoTime();
                     if (r.status() != 200) throw new IllegalStateException("status " + r.status());
-                    if (r.body() instanceof Body.Bytes b && mode.equals("fetch") && b.data().remaining() < bytes) throw new IllegalStateException("short fetch");
+                    long got = drain(r.body()); // a streamed (pooled) body must be consumed and closed, as a transport does
+                    if (mode.equals("fetch") && got < bytes) throw new IllegalStateException("short fetch");
                     if (t0 >= warmEnd && n < l.length) l[n++] = t1 - t0;
                 }
                 counts[id] = n;
