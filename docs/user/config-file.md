@@ -219,7 +219,7 @@ routing:
   upstreams:
     api: { url: "http://127.0.0.1:9000", connect_timeout: 5s, response_timeout: 30s, max_body: 16m }
   routes:   # ordered, first match wins
-    - host: "example.com"  # optional; exact or "*.suffix"
+    - host: "example.com"  # optional; exact, "*.suffix" or "[ipv6]"
       prefix: "/api"       # required, segment-boundary match
       rewrite: "/"         # optional
       proxy: api           # exactly one of proxy | redirect | static
@@ -233,7 +233,10 @@ routing:
 `prefix` matches on a segment boundary (`/api` matches `/api`, `/api/…` and
 `/api?…`, not `/apix`) against the raw percent-encoded target. `host` is
 case-insensitive; a port in the request's Host header is ignored; `*.example.com`
-matches a subdomain and not the apex. A route that an earlier route completely
+matches a subdomain and not the apex. An IPv6 address is written bracketed, as in a
+Host header (`host: "[::1]"` or `"[2001:db8::1]"`); it must be a real IPv6 literal (no
+zone id, checked without DNS) and is compared lower-case. A bare `::1` or a `host:port`
+is rejected. A route that an earlier route completely
 covers is a warning. The sample above does not shadow itself.
 
 ### Per-route error format and listings
