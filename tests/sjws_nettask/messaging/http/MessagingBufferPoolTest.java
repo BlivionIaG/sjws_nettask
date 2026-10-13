@@ -161,4 +161,13 @@ class MessagingBufferPoolTest {
         var last = seen.get(seen.size() - 1).split(" ");
         return last[3];
     }
+
+    @org.junit.jupiter.api.Test
+    void chunkIsSizedFromTheFramesNotTheFetchTotal() {
+        assertEquals(100, MessagingHttp.chunkBytes(100, 100));                       // one small frame
+        assertEquals(MessagingHttp.MIN_CHUNK, MessagingHttp.chunkBytes(100, 1 << 20)); // many small frames
+        assertEquals(16_413, MessagingHttp.chunkBytes(16_413, 16_413));              // maxBytes=1, one 16 KiB record
+        assertEquals(40_000, MessagingHttp.chunkBytes(40_000, 1 << 20));
+        assertEquals(sjws_nettask.core.buf.BufferPool.MAX_CLASS, MessagingHttp.chunkBytes(1 << 20, 4 << 20)); // heap fallback
+    }
 }

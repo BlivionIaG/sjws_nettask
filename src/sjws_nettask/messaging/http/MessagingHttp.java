@@ -150,6 +150,7 @@ final class MessagingHttp implements Handler {
         if (offset < start) return problem(416, "offset out of range", "log starts at " + start);
         long next = offset;
         var batches = new ArrayList<RecordBatch>();
+        int largest = 0;
         long total = 0; // long: compared with the long maxBytes without int overflow
         log.reads().readLock().lock();
         try {
@@ -159,6 +160,7 @@ final class MessagingHttp implements Handler {
                 int size = RecordBatch.encodedSize(b.records());
                 if (!fits(total, size, maxBytes)) break;
                 batches.add(b);
+                largest = Math.max(largest, size);
                 total += size;
                 next = b.nextOffset();
             }
@@ -170,7 +172,7 @@ final class MessagingHttp implements Handler {
         if (batches.isEmpty()) return new Response(200, h, Body.Bytes.of(new byte[0]));
         // Frames are encoded off-lock into one pooled buffer of the messaging budget, reused chunk by chunk; under
         // budget pressure the fetch is shed (503 + Retry-After) instead of allocating (partition-log.md §2.4).
-        var buf = this.budget.tryAcquire((int) Math.min(total, BufferPool.MAX_CLASS));
+        var buf = this.budget.tryAcquire(chunkBytes(largest, total));
         if (buf == null) {
             var r = problem(503, "busy", "messaging buffer budget exhausted");
             r.headers().set("retry-after", RETRY_AFTER_SECONDS);
@@ -178,6 +180,14 @@ final class MessagingHttp implements Handler {
         }
         return new Response(200, h, new Body.Stream(total, new FrameSource(batches, buf)));
     }
+
+    /** Chunk size, sized from the frames: the largest frame (so one frame fits a chunk), or the batch total up to
+     * {@link #MIN_CHUNK} when frames are small; capped at {@link BufferPool#MAX_CLASS} (larger frames go out as heap). */
+    static int chunkBytes(int largestFrame, long total) {
+        return (int) Math.min(BufferPool.MAX_CLASS, Math.min(total, Math.max(largestFrame, MIN_CHUNK)));
+    }
+
+    static final int MIN_CHUNK = 16 << 10;
 
     /** Streams whole frames; a frame larger than the pooled buffer goes out as its own heap buffer. */
     static final class FrameSource implements Body.Stream.Source {
@@ -211,7 +221,6 @@ final class MessagingHttp implements Handler {
         @Override
         public void close() {
             if (this.buf != null) {
-                this.buf.buffer().clear(); // limit = capacity on release (see records())
                 this.buf.release();
                 this.buf = null;
             }
@@ -266,7 +275,6 @@ final class MessagingHttp implements Handler {
                 }
                 return parse(b.flip());
             } finally {
-                pb.buffer().clear(); // the pool's debug poison writes up to capacity: hand it back with limit = capacity
                 pb.release();
             }
         }

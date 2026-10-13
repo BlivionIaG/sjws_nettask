@@ -33,6 +33,7 @@ import sjws_nettask.messaging.http.MessagingModule;
  * Partition-log benches (docs/design/partition-log.md R11, gap G4), in-process through the public
  * {@code /messaging/v1} handler, so they measure the handler + log + writer without the network:
  *   produce <bytes> <threads> <secs> [durability]  each thread POSTs one record of <bytes>; prints records/s, MB/s, p50/p99/p999
+ *   fetch-fixed <bytes> <threads> <secs>           as fetch, but every GET reads offset 0 (hot readahead chunk)
  *   fetch   <bytes> <threads> <secs>               prefills 10 000 records of <bytes>, then each thread GETs one batch at a
  *                                                  random committed offset (page cache hot); prints fetches/s, MB/s, p50/p99/p999
  * End-to-end over HTTP (wrk): bench/messaging-http/run.sh.
@@ -93,11 +94,12 @@ public class MessagingLogBench {
         var rec = record(bytes);
         var headers = durability == null ? RequestHeaders.of(Map.of()) : RequestHeaders.of(Map.of("durability", List.of(durability)));
         int prefill = 0;
-        if (mode.equals("fetch")) {
+        if (mode.startsWith("fetch")) {
             prefill = 10_000;
             for (int i = 0; i < prefill; i++) h.handle(new Request("POST", topic, headers).withBody(body(rec)));
         }
         final int committed = prefill;
+        final boolean fixed = mode.equals("fetch-fixed");
         var lat = new long[threads][];
         var counts = new int[threads];
         var ts = new Thread[threads];
@@ -115,11 +117,11 @@ public class MessagingLogBench {
                     if (t0 > end) break;
                     var r = mode.equals("produce")
                             ? h.handle(new Request("POST", topic, headers).withBody(body(rec)))
-                            : h.handle(new Request("GET", topic + "?offset=" + rnd.nextInt(committed) + "&maxBytes=1"));
+                            : h.handle(new Request("GET", topic + "?offset=" + (fixed ? 0 : rnd.nextInt(committed)) + "&maxBytes=1"));
                     long t1 = System.nanoTime();
                     if (r.status() != 200) throw new IllegalStateException("status " + r.status());
                     long got = drain(r.body()); // a streamed (pooled) body must be consumed and closed, as a transport does
-                    if (mode.equals("fetch") && got < bytes) throw new IllegalStateException("short fetch");
+                    if (mode.startsWith("fetch") && got < bytes) throw new IllegalStateException("short fetch");
                     if (t0 >= warmEnd && n < l.length) l[n++] = t1 - t0;
                 }
                 counts[id] = n;
