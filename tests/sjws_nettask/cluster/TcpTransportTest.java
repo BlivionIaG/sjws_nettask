@@ -234,6 +234,109 @@ class TcpTransportTest {
         }
     }
 
+    @Test
+    void slowlorisConnectionIsClosedAfterTheReadTimeout() throws Exception {
+        var members = members(false, false, false);
+        var b = TcpTransport.open(members.get(1).id(), members, KEY, Clock.SYSTEM, 4, 300);
+        open.add(b);
+        try (var raw = new Socket("127.0.0.1", b.localPort())) {
+            var out = new java.io.DataOutputStream(raw.getOutputStream());
+            out.writeInt(TcpTransport.MAX_FRAME_BYTES - 1);
+            out.write(new byte[10]);
+            out.flush();
+            raw.setSoTimeout(5_000);
+            long started = System.nanoTime();
+            // Keep trickling: each byte resets SO_TIMEOUT, but the whole-frame deadline still fires.
+            int got = 0;
+            while (got >= 0 && System.nanoTime() - started < TimeUnit.SECONDS.toNanos(4)) {
+                try {
+                    out.write(0);
+                    out.flush();
+                    Thread.sleep(50);
+                } catch (IOException reset) {
+                    break;
+                }
+                if (b.inboundConnections() == 0) {
+                    break;
+                }
+            }
+            await(() -> b.inboundConnections() == 0, "slowloris closed");
+            assertTrue(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(3), "closed by the deadline");
+        }
+        // An idle connection that never sends a prefix is closed too.
+        try (var idle = new Socket("127.0.0.1", b.localPort())) {
+            idle.setSoTimeout(5_000);
+            assertEquals(-1, idle.getInputStream().read(), "idle socket closed by the server");
+        }
+    }
+
+    @Test
+    void hugeLengthPrefixDoesNotAllocateBeforeTheMac() throws Exception {
+        var members = members(false, false, false);
+        var b = TcpTransport.open(members.get(1).id(), members, KEY, Clock.SYSTEM, 4, 300);
+        open.add(b);
+        try (var raw = new Socket("127.0.0.1", b.localPort())) {
+            var out = new java.io.DataOutputStream(raw.getOutputStream());
+            out.writeInt(TcpTransport.MAX_FRAME_BYTES - 1);
+            out.write(new byte[100]);
+            out.flush();
+            await(() -> b.inboundConnections() == 0, "closed");
+        }
+        assertTrue(b.peakReadBuffer() > 0);
+        assertTrue(b.peakReadBuffer() <= TcpTransport.PREAUTH_CHUNK_BYTES, "peak " + b.peakReadBuffer());
+    }
+
+    @Test
+    void inboundConnectionsBeyondTheCapAreRefused() throws Exception {
+        var members = members(false, false, false); // 2 peers: cap is 4
+        var b = TcpTransport.open(members.get(1).id(), members, KEY, Clock.SYSTEM, 4);
+        open.add(b);
+        var held = new ArrayList<Socket>();
+        try {
+            for (int i = 0; i < 4; i++) {
+                held.add(new Socket("127.0.0.1", b.localPort()));
+            }
+            await(() -> b.inboundConnections() == 4, "four accepted");
+            try (var extra = new Socket("127.0.0.1", b.localPort())) {
+                extra.setSoTimeout(5_000);
+                assertEquals(-1, extra.getInputStream().read(), "extra connection closed");
+            }
+            assertEquals(1, b.inboundRefused());
+            assertEquals(4, b.inboundConnections());
+        } finally {
+            for (var s : held) {
+                s.close();
+            }
+        }
+        await(() -> b.inboundConnections() == 0, "released");
+        try (var again = new Socket("127.0.0.1", b.localPort())) {
+            await(() -> b.inboundConnections() == 1, "accepted after release");
+        }
+    }
+
+    @Test
+    void anOversizeOutboundFrameIsDroppedAndTheWriterKeepsGoing() throws Exception {
+        var members = members(false, false, false);
+        var a = TcpTransport.open(members.get(0).id(), members, KEY, Clock.SYSTEM, 64);
+        var b = TcpTransport.open(members.get(1).id(), members, KEY, Clock.SYSTEM, 64);
+        open.add(a);
+        open.add(b);
+        var got = new ArrayList<SimTransport.Frame>();
+        var rpc = a.attach(members.get(0).id(), (from, frame) -> { });
+        b.attach(members.get(1).id(), (from, frame) -> got.add(frame));
+        var to = members.get(1).id();
+        rpc.send(to, new SimTransport.Frame(new GroupId("g".repeat(70_000)), 1, new byte[1]));
+        rpc.send(to, new SimTransport.Frame(GROUP, 2, new byte[TcpTransport.MAX_FRAME_BYTES]));
+        rpc.send(to, new SimTransport.Frame(GROUP, 3, new byte[] {3}));
+        await(() -> {
+            b.deliver(100);
+            return got.size() == 1;
+        }, "next frame delivered");
+        assertEquals(3, got.get(0).type());
+        assertEquals(2, a.oversizeDrops());
+        assertEquals(2, a.sendDrops());
+    }
+
     private byte[] sealFrom(NodeId from, List<Member> base, NodeId to, long now, SimTransport.Frame frame)
             throws IOException {
         var withStranger = new ArrayList<>(base);

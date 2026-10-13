@@ -65,6 +65,23 @@ import javax.crypto.spec.SecretKeySpec;
  * queue and counts a drop when it is full. Writer and reader threads are virtual. Inbound
  * frames wait in a bounded queue until {@link #deliver} runs them on the Raft thread. Every
  * socket comes from one {@link SocketFactory}, which is where mTLS plugs in.
+ *
+ * <p>Pre-authentication limits: accepted sockets get a read timeout ({@link #READ_TIMEOUT_MILLIS}
+ * by default) that bounds both idle time between frames and the time to receive one whole frame,
+ * so a slowloris sender is closed. At most {@code 2 x peers} inbound connections are open at once;
+ * extra ones are closed at accept and counted in {@link #inboundRefused}. A frame body is read into
+ * a buffer that starts at {@link #PREAUTH_CHUNK_BYTES} and grows with the bytes actually received,
+ * so a large length prefix alone does not allocate. An idle follower-to-follower link that the
+ * receiver timed out costs at most one dropped frame before the writer reconnects.
+ *
+ * <p>Sequence numbers come from one counter shared by all peers; the receiver tracks the high-water
+ * mark per sender, and ordering relies on exactly one TCP stream per peer. The writer always seals
+ * with the current key while readers also accept the previous one, so a rotation must reach every
+ * node (accepting the new key) before any node sends with it. The boot epoch is wall-clock
+ * milliseconds, like heartbeats: a restart within the same millisecond, or after a backwards clock
+ * step with under {@link #EPOCH_SILENCE_MILLIS} of silence, is refused until that silence floor.
+ * When Security swaps in an mTLS {@link SocketFactory}, the handshake must run on the reader thread
+ * (not the acceptor) and is covered by the same read timeout.
  */
 public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
@@ -78,6 +95,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private static final byte[] HKDF_INFO = "sjws-raft-frame-v1".getBytes(StandardCharsets.US_ASCII);
     private static final long RECONNECT_MILLIS = 50;
     private static final int CONNECT_TIMEOUT_MILLIS = 1_000;
+    /** Default idle and whole-frame read deadline on accepted sockets. */
+    public static final int READ_TIMEOUT_MILLIS = 10_000;
+    /** Largest step the pre-auth read buffer grows by. */
+    static final int PREAUTH_CHUNK_BYTES = 64 << 10;
 
     /** Why an inbound frame was dropped. */
     public enum Reason {
@@ -128,6 +149,12 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private final AtomicLong sendSeq = new AtomicLong();
     private final AtomicLong sendDrops = new AtomicLong();
     private final AtomicLong inboundDrops = new AtomicLong();
+    private final AtomicLong inboundRefused = new AtomicLong();
+    private final AtomicLong oversizeDrops = new AtomicLong();
+    private final AtomicLong peakReadBuffer = new AtomicLong();
+    private final AtomicInteger inboundCount = new AtomicInteger();
+    private final int readTimeoutMillis;
+    private final int maxInbound;
     private final AtomicInteger[] rejected = new AtomicInteger[Reason.values().length];
     private final ReentrantLock replayLock = new ReentrantLock();
     private final AuthReplay replay = new AuthReplay();
@@ -148,11 +175,17 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
     public static TcpTransport open(NodeId self, List<Member> members, ClusterKey key, Clock clock,
             int queueCapacity, SocketFactory sockets) throws IOException {
-        return new TcpTransport(self, members, key, clock, queueCapacity, sockets);
+        return new TcpTransport(self, members, key, clock, queueCapacity, sockets, READ_TIMEOUT_MILLIS);
+    }
+
+    /** Test seam for a shorter read deadline. */
+    static TcpTransport open(NodeId self, List<Member> members, ClusterKey key, Clock clock, int queueCapacity,
+            int readTimeoutMillis) throws IOException {
+        return new TcpTransport(self, members, key, clock, queueCapacity, SocketFactory.PLAIN, readTimeoutMillis);
     }
 
     private TcpTransport(NodeId self, List<Member> members, ClusterKey key, Clock clock, int queueCapacity,
-            SocketFactory sockets) throws IOException {
+            SocketFactory sockets, int readTimeoutMillis) throws IOException {
         this.self = Objects.requireNonNull(self, "self");
         Objects.requireNonNull(key, "key");
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -160,6 +193,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         if (queueCapacity < 1) {
             throw new IllegalArgumentException("queueCapacity");
         }
+        if (readTimeoutMillis < 1) {
+            throw new IllegalArgumentException("readTimeoutMillis");
+        }
+        this.readTimeoutMillis = readTimeoutMillis;
         for (int i = 0; i < rejected.length; i++) {
             rejected[i] = new AtomicInteger();
         }
@@ -181,6 +218,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         if (bind == null) {
             throw new IllegalArgumentException("self is not a member");
         }
+        this.maxInbound = Math.max(2, 2 * peers.size());
         this.server = sockets.listen(bind);
         this.acceptor = Thread.ofVirtual().name("raft-accept-" + self.name()).start(this::accept);
     }
@@ -234,6 +272,26 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         return inboundDrops.get();
     }
 
+    /** Inbound connections closed at accept because {@code 2 x peers} were already open. */
+    public long inboundRefused() {
+        return inboundRefused.get();
+    }
+
+    /** Outbound frames dropped because they could not be sealed (body or group too large). */
+    public long oversizeDrops() {
+        return oversizeDrops.get();
+    }
+
+    /** Largest pre-auth read buffer any reader has allocated, for the allocation test. */
+    long peakReadBuffer() {
+        return peakReadBuffer.get();
+    }
+
+    /** Inbound connections currently open. */
+    int inboundConnections() {
+        return inboundCount.get();
+    }
+
     public int rejected(Reason reason) {
         return rejected[Objects.requireNonNull(reason, "reason").ordinal()].get();
     }
@@ -272,10 +330,26 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 }
                 continue;
             }
+            if (inboundCount.incrementAndGet() > maxInbound) {
+                inboundCount.decrementAndGet();
+                inboundRefused.incrementAndGet();
+                closeQuietly(socket);
+                continue;
+            }
             inboundSockets.add(socket);
             if (!open) {
                 closeQuietly(socket);
+                inboundSockets.remove(socket);
+                inboundCount.decrementAndGet();
                 return;
+            }
+            try {
+                socket.setSoTimeout(readTimeoutMillis);
+            } catch (IOException failed) {
+                closeQuietly(socket);
+                inboundSockets.remove(socket);
+                inboundCount.decrementAndGet();
+                continue;
             }
             Thread.ofVirtual().name("raft-read-" + self.name()).start(() -> read(socket));
         }
@@ -285,15 +359,19 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         try (socket; var in = new DataInputStream(new BufferedInputStream(socket.getInputStream()))) {
             var current = mac(currentKey);
             var previous = previousKey == null ? null : mac(previousKey);
+            var tag = new byte[MAC_LENGTH];
             while (open) {
+                socket.setSoTimeout(readTimeoutMillis);
                 int length = in.readInt();
                 if (length < HEADER_BYTES + MAC_LENGTH || length > MAX_FRAME_BYTES) {
                     drop(Reason.MALFORMED);
                     return;
                 }
-                var bytes = new byte[length];
-                in.readFully(bytes);
-                var accepted = open(bytes, current, previous, clock.currentTimeMillis());
+                var bytes = readFrame(socket, in, length);
+                if (bytes == null) {
+                    return; // whole-frame deadline passed: slowloris
+                }
+                var accepted = open(bytes, current, previous, clock.currentTimeMillis(), tag);
                 if (accepted != null && !cut.contains(accepted.from) && !inbound.offer(accepted)) {
                     inboundDrops.incrementAndGet();
                 }
@@ -302,11 +380,50 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             // Peer went away or we are closing; the peer's writer reconnects.
         } finally {
             inboundSockets.remove(socket);
+            inboundCount.decrementAndGet();
         }
+    }
+
+    /**
+     * Reads {@code length} bytes into a buffer that starts at {@link #PREAUTH_CHUNK_BYTES} and
+     * doubles only once full, so memory stays within 2x of what the sender actually sent. Returns null once the whole-frame
+     * deadline has passed.
+     */
+    private byte[] readFrame(Socket socket, DataInputStream in, int length) throws IOException {
+        long deadline = System.nanoTime() + readTimeoutMillis * 1_000_000L;
+        var bytes = new byte[Math.min(length, PREAUTH_CHUNK_BYTES)];
+        notePeak(bytes.length);
+        int filled = 0;
+        while (filled < length) {
+            if (filled == bytes.length) {
+                bytes = java.util.Arrays.copyOf(bytes, (int) Math.min(length, 2L * bytes.length));
+                notePeak(bytes.length);
+            }
+            long left = (deadline - System.nanoTime()) / 1_000_000L;
+            if (left <= 0) {
+                drop(Reason.MALFORMED);
+                return null;
+            }
+            socket.setSoTimeout((int) Math.min(left, readTimeoutMillis));
+            int n = in.read(bytes, filled, bytes.length - filled);
+            if (n < 0) {
+                throw new java.io.EOFException();
+            }
+            filled += n;
+        }
+        return bytes;
+    }
+
+    private void notePeak(long size) {
+        peakReadBuffer.accumulateAndGet(size, Math::max);
     }
 
     /** Checks one frame. Returns it, or null after counting why it was dropped. */
     Inbound open(byte[] bytes, Mac current, Mac previous, long nowMillis) {
+        return open(bytes, current, previous, nowMillis, new byte[MAC_LENGTH]);
+    }
+
+    private Inbound open(byte[] bytes, Mac current, Mac previous, long nowMillis, byte[] tag) {
         var buf = ByteBuffer.wrap(bytes);
         int version = buf.get();
         int keyId = buf.get();
@@ -314,7 +431,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             return drop(Reason.MALFORMED);
         }
         var mac = keyId == AuthReplay.KEY_CURRENT ? current : previous;
-        if (mac == null || !tagMatches(mac, bytes)) {
+        if (mac == null || !tagMatches(mac, bytes, tag)) {
             return drop(Reason.TAG);
         }
         int from = buf.getShort() & 0xFFFF;
@@ -381,13 +498,22 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         return mac(currentKey);
     }
 
-    private static boolean tagMatches(Mac mac, byte[] bytes) {
+    /** Constant-time tag check into a reused per-reader buffer; no allocation per frame. */
+    private static boolean tagMatches(Mac mac, byte[] bytes, byte[] tag) {
         mac.reset();
         mac.update(LABEL);
-        mac.update(bytes, 0, bytes.length - MAC_LENGTH);
-        var tag = mac.doFinal();
-        return AuthReplay.tagEquals(tag, java.util.Arrays.copyOfRange(bytes, bytes.length - MAC_LENGTH,
-                bytes.length));
+        int at = bytes.length - MAC_LENGTH;
+        mac.update(bytes, 0, at);
+        try {
+            mac.doFinal(tag, 0);
+        } catch (GeneralSecurityException failed) {
+            throw new IllegalStateException(failed);
+        }
+        int diff = 0;
+        for (int i = 0; i < MAC_LENGTH; i++) {
+            diff |= tag[i] ^ bytes[at + i];
+        }
+        return diff == 0;
     }
 
     private Inbound drop(Reason reason) {
@@ -452,13 +578,30 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 if (to == null) {
                     to = peerId();
                 }
+                byte[] bytes;
+                try {
+                    bytes = seal(mac, HeartbeatAuthenticator.KEY_CURRENT, to, bootEpoch,
+                            sendSeq.incrementAndGet(), frame);
+                } catch (IllegalArgumentException | IllegalStateException unsealable) {
+                    // Oversize body or group: drop this frame only and keep the writer alive.
+                    oversizeDrops.incrementAndGet();
+                    sendDrops.incrementAndGet();
+                    if (out != null && queue.isEmpty()) {
+                        try {
+                            out.flush();
+                        } catch (IOException failed) {
+                            closeQuietly(socket);
+                            socket = null;
+                            out = null;
+                        }
+                    }
+                    continue;
+                }
                 try {
                     if (out == null) {
                         socket = sockets.connect(address);
                         out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
                     }
-                    var bytes = seal(mac, HeartbeatAuthenticator.KEY_CURRENT, to, bootEpoch,
-                            sendSeq.incrementAndGet(), frame);
                     out.writeInt(bytes.length);
                     out.write(bytes);
                     if (queue.isEmpty()) {
