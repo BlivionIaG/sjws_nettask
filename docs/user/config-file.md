@@ -85,7 +85,7 @@ copy does not store it and startup logs do not print it. Java keeps the characte
 ```yaml
 ha:
   enabled: true
-  cluster_key_file: /etc/sjws/cluster.key   # preferred; mode 0600 or 0400, not a symlink
+  cluster_key_file: /etc/sjws/cluster.key   # preferred; mode 0600 or 0400, owned by this process, not a symlink
   # cluster_key: "base64:...."              # inline alternative; not together with the file
   # cluster_key_previous_file: /etc/sjws/cluster.key.prev
 ```
@@ -104,9 +104,18 @@ so the same secret is not a tag for any other protocol. The MAC covers a domain 
 version, a key id, the 64-byte body, the timestamp, the sequence, a boot epoch, and the
 destination wire id. Key id 0 is the current key and key id 1 is the previous key; a packet is
 checked against that one key. Each sender's sequence starts over when its boot epoch is newer
-than the last one accepted, which is how a restarted node stays reachable. A timestamp older
+than the last one accepted, which is how a restarted node stays reachable. The epoch must not
+lead the packet timestamp, or the receiver's clock, by more than the ±5 second window; a
+later epoch is dropped and does not stick. A lower epoch is accepted only after that sender
+has been silent for the dead interval. A timestamp older
 than the receiver's own boot is dropped. Clocks must stay within ±5 seconds (NTP). A larger
 step drops heartbeats until they agree, and a rate-limited warning names the skew.
+
+Key rotation: put the new secret in `ha.cluster_key` or `ha.cluster_key_file` and the key
+that is still in use in `ha.cluster_key_previous` or `ha.cluster_key_previous_file`. Roll
+that config to every node, wait until heartbeats are using the new key, then remove the
+previous key. The key file is opened with `NOFOLLOW_LINKS`, must be mode 0600 or 0400, and
+must be owned by the server's uid.
 
 ## Server
 

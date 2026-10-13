@@ -19,6 +19,7 @@ package sjws_nettask.cluster;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -141,6 +142,10 @@ public final class ReplicatedNode implements ClusterNode {
         return group(groupId).ackedFromMemory();
     }
 
+    boolean campaigning(GroupId groupId) {
+        return group(groupId).campaigning();
+    }
+
     Set<NodeId> voters(GroupId groupId) {
         return group(groupId).voters();
     }
@@ -201,13 +206,17 @@ public final class ReplicatedNode implements ClusterNode {
             return existing.facade();
         }
         var peers = new ArrayList<NodeId>();
+        var witnesses = new HashSet<NodeId>();
         for (var member : members) {
+            if (member.witness()) {
+                witnesses.add(member.id());
+            }
             if (!member.id().equals(self)) {
                 peers.add(member.id());
             }
         }
-        var group = new RaftGroup(groupId, self, witness, voters, peers, byWire::get, quorum, options, storage, rpc,
-                clock, listener);
+        var group = new RaftGroup(groupId, self, witness, witnesses, voters, peers, byWire::get, quorum, options,
+                storage, rpc, clock, listener);
         groups.put(groupId, group);
         return group.facade();
     }
