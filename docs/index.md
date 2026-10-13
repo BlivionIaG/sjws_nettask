@@ -33,6 +33,7 @@ Back to the [README](../README.md) (quick start).
 - [Agent swarm layer (optional, draft)](design/agent-swarm.md)
 - [Agent graphs (swarm addendum, draft)](design/agent-graphs.md)
 - [Swarm research mode (draft)](design/swarm-research-mode.md)
+- [Shared buffer pool and zero-copy (draft)](design/buffer-pool.md)
 
 ## Security
 - [Security policy and vulnerability reporting](../SECURITY.md)
