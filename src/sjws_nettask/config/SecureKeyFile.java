@@ -23,6 +23,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.function.Consumer;
@@ -35,14 +36,24 @@ import java.util.function.Consumer;
  * <p>The parent directory is resolved with {@link Path#toRealPath()} (directory symlinks are
  * followed once, here). The leaf name under that directory is opened with
  * {@link LinkOption#NOFOLLOW_LINKS} and is never resolved, so a symlink swapped in for the
- * file is refused. Owner and mode come from that opened file: a regular file, mode 0600 or
- * 0400, owned by this process. On Linux those attributes are {@code fstat} of the descriptor
- * ({@code /proc/self/fd}).
+ * file is refused. The file must be a regular file, mode 0600 or 0400, owned by this process.
  *
- * <p>Every directory from that resolved parent up to the root is refused when it is group- or
- * world-writable, unless it is sticky and owned by root or this process (the {@code /tmp}
- * case). A directory another user owns is allowed when it is not group- or world-writable.
- * The file bytes are not part of the error text. Java keeps the returned copy; it is not wiped.
+ * <p>On Linux, owner and mode are {@code fstat} of {@code /proc/self/fd/N}. That descriptor is
+ * trusted only when its {@link BasicFileAttributes#fileKey() fileKey} (device and inode) equals
+ * the opened file. Another descriptor of the same inode is the same file. A descriptor whose
+ * fileKey differs is ignored.
+ *
+ * <p>With no {@code /proc} (non-Linux), there is no descriptor to identify. Owner and mode are
+ * a {@code NOFOLLOW} {@code lstat} of the path while the channel is still open, so a replace
+ * between that check and the read can still change which inode was accepted. The numeric uid
+ * is unknown. A parent is accepted, and a sticky directory is exempt, when its owner name is
+ * {@code root} or {@code user.name}. The file owner is compared to {@code user.name} the same
+ * way. Whoever starts the JVM can set {@code user.name}; they already control the process.
+ *
+ * <p>Every directory from that resolved parent up to the root must be owned by root or this
+ * process. A group- or world-writable directory is refused unless it is sticky and owned by
+ * root or this process (the {@code /tmp} case). The file bytes are not part of the error text.
+ * Java keeps the returned copy; it is not wiped.
  */
 public final class SecureKeyFile {
 
@@ -112,9 +123,12 @@ public final class SecureKeyFile {
     }
 
     /**
-     * Refuses when any directory from {@code resolvedParent} up to the root is group- or
-     * world-writable, unless that directory is sticky and owned by root or this process.
+     * Refuses when any directory from {@code resolvedParent} up to the root is not owned by
+     * root or this process, or is group- or world-writable without the sticky bit. A sticky
+     * directory owned by root or this process may be group- or world-writable.
      * {@code resolvedParent} must already be absolute and free of symlinks ({@link Path#toRealPath()}).
+     * Without {@code /proc}, "this process" is the owner name {@code user.name} and root is the
+     * owner name {@code root}.
      */
     public static void requireSecureParents(Path resolvedParent, String name) {
         int self = selfUid();
@@ -124,18 +138,17 @@ public final class SecureKeyFile {
             try {
                 mode = ((Integer) Files.getAttribute(dir, "unix:mode", LinkOption.NOFOLLOW_LINKS)).intValue();
                 uid = ((Integer) Files.getAttribute(dir, "unix:uid", LinkOption.NOFOLLOW_LINKS)).intValue();
+                if (!ownedByRootOrUs(dir, uid, self)) {
+                    throw new ConfigException(name + " has a parent directory not owned by root or this process");
+                }
             } catch (UnsupportedOperationException e) {
                 throw new ConfigException(name + " cannot be checked (filesystem has no POSIX permissions)");
             } catch (IOException e) {
                 throw new ConfigException("Cannot read " + name);
             }
-            if ((mode & GROUP_OR_OTHER_WRITE) == 0) {
-                continue;
+            if ((mode & GROUP_OR_OTHER_WRITE) != 0 && (mode & STICKY) == 0) {
+                throw new ConfigException(name + " has a group- or world-writable parent directory");
             }
-            if ((mode & STICKY) != 0 && (uid == 0 || uid == self)) {
-                continue;
-            }
-            throw new ConfigException(name + " has a group- or world-writable parent directory");
         }
     }
 
@@ -148,6 +161,9 @@ public final class SecureKeyFile {
         int owner;
         var procFd = linuxFd(opened, name);
         if (procFd != null) {
+            if (!sameFile(opened, procFd)) {
+                throw new ConfigException(name + " cannot be checked");
+            }
             attrs = Files.readAttributes(procFd, PosixFileAttributes.class);
             owner = ((Integer) Files.getAttribute(procFd, "unix:uid")).intValue();
         } else {
@@ -184,12 +200,35 @@ public final class SecureKeyFile {
                 return ((Integer) Files.getAttribute(self, "unix:uid")).intValue();
             }
         } catch (IOException ignored) {
-            // no numeric uid; only a root-owned sticky directory is exempt
+            // no numeric uid; owner names root and user.name are the fallback
         }
         return -1;
     }
 
-    /** This process's uid when {@code /proc/self} exists; otherwise the same owner name. */
+    /**
+     * Root, or this process. With a numeric uid that is {@code uid == 0} or {@code uid == self}.
+     * Without one, the owner name {@code root} or {@code user.name}.
+     */
+    private static boolean ownedByRootOrUs(Path dir, int uid, int self) throws IOException {
+        if (uid == 0 || (self >= 0 && uid == self)) {
+            return true;
+        }
+        if (self >= 0) {
+            return false;
+        }
+        var owner = Files.readAttributes(dir, PosixFileAttributes.class, LinkOption.NOFOLLOW_LINKS).owner();
+        if ("root".equals(owner.getName())) {
+            return true;
+        }
+        var me = dir.getFileSystem().getUserPrincipalLookupService()
+                .lookupPrincipalByName(System.getProperty("user.name"));
+        return me.equals(owner);
+    }
+
+    /**
+     * Numeric uid from {@code /proc/self}, or the owner name {@code user.name} when that file is
+     * absent. Whoever starts the JVM can set {@code user.name}; they already control the process.
+     */
     private static boolean ownedByThisProcess(Path opened, int ownerUid, PosixFileAttributes attrs) throws IOException {
         int uid = selfUid();
         if (uid >= 0) {
@@ -201,36 +240,47 @@ public final class SecureKeyFile {
     }
 
     /**
-     * {@code /proc/self/fd/N} for the single descriptor whose target is {@code opened}, or null
-     * when this system has no proc fd directory. More than one match fails closed.
-     * {@code stat} of that path is {@code fstat} of the descriptor.
+     * A {@code /proc/self/fd/N} whose device and inode are the opened file, or null when this
+     * system has no proc fd directory. {@code stat} of that path is {@code fstat} of the
+     * descriptor. The descriptor is not trusted until {@link #sameFile} matches.
      */
     private static Path linuxFd(Path opened, String name) throws IOException {
         var dir = Path.of("/proc/self/fd");
         if (!Files.isDirectory(dir)) {
             return null;
         }
-        String want = opened.toString();
-        int found = -1;
-        int matches = 0;
+        Object want = fileKey(opened, true);
+        if (want == null) {
+            throw new ConfigException(name + " cannot be checked");
+        }
         try (var stream = Files.newDirectoryStream(dir)) {
             for (var entry : stream) {
-                Path link;
+                Path candidate = dir.resolve(entry.getFileName().toString());
                 try {
-                    link = Files.readSymbolicLink(entry);
+                    Object key = fileKey(candidate, false);
+                    if (want.equals(key) && sameFile(opened, candidate)) {
+                        return candidate;
+                    }
                 } catch (IOException ignored) {
                     continue;
                 }
-                if (!link.toString().equals(want)) {
-                    continue;
-                }
-                matches++;
-                found = Integer.parseInt(entry.getFileName().toString());
             }
         }
-        if (matches != 1) {
-            throw new ConfigException(name + " cannot be checked");
-        }
-        return dir.resolve(Integer.toString(found));
+        throw new ConfigException(name + " cannot be checked");
+    }
+
+    /** Device and inode of {@code descriptor} are the opened file. Package tests call this. */
+    static boolean sameFile(Path opened, Path descriptor) throws IOException {
+        Object want = fileKey(opened, true);
+        Object got = fileKey(descriptor, false);
+        return want != null && want.equals(got);
+    }
+
+    /** {@code st_dev} and {@code st_ino}. {@code nofollow} is {@code lstat}; otherwise {@code stat}. */
+    private static Object fileKey(Path path, boolean nofollow) throws IOException {
+        BasicFileAttributes attrs = nofollow
+                ? Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS)
+                : Files.readAttributes(path, BasicFileAttributes.class);
+        return attrs.fileKey();
     }
 }
