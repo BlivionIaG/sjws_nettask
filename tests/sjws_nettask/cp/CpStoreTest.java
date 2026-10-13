@@ -160,7 +160,8 @@ class CpStoreTest {
         }
         var yaml = dir.resolve("data.yaml");
         Files.writeString(yaml, "node:\n  mode: data\nserver:\n  port: 0\n  root: " + first.toAbsolutePath() + "\n");
-        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, java.util.Map.of());
+        var loaded = ConfigLoader.load(
+                new String[] {"--config=" + yaml, "--state-dir=" + dir.resolve("data-state")}, java.util.Map.of());
         try (var server = SjwsServer.start(loaded)) {
             Files.writeString(yaml, "node:\n  mode: data\nserver:\n  port: 0\n  root: " + second.toAbsolutePath()
                     + "\nrouting:\n  enabled: true\n");
@@ -181,11 +182,13 @@ class CpStoreTest {
         var root = Files.createDirectory(dir.resolve("html"));
         var keys = KeyRing.generate("online-1", NOW + 86_400_000L, 0, Long.MAX_VALUE / 2);
         var clock = new FakeClock(0);
-        try (var store = CpStore.open(dir.resolve("cp"), keys, clock); var http = AdminServer.start(store, NOW, TTL)) {
+        try (var store = CpStore.open(dir.resolve("cp"), keys, clock);
+                var http = AdminServer.startPlainForTests(store, NOW, TTL)) {
             elect(store, clock);
             var client = HttpClient.newHttpClient();
             var bearer = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()
-                    + "/cp/v1/health")).header("Authorization", "Bearer sjws_root.secret").GET().build(),
+                    + "/cp/v1/health")).header("Authorization", "Bearer sjws_root.secret")
+                    .header("Idempotency-Key", "retry-1").GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(401, bearer.statusCode(), bearer.body());
             var denied = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()

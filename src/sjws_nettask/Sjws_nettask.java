@@ -124,7 +124,7 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        try (var modules = OptionalModules.start(err)) {
+        try (var modules = OptionalModules.start(loaded.yamlSwarmEnabled(), err)) {
             return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
                     bindContent);
         }
@@ -593,10 +593,22 @@ public class Sjws_nettask {
      * @param args the command line arguments
      */
     public static void main(String[] args) {
-        int code = run(args, System.getenv(), System.out, System.err, H3Transports.defaultFactory(), s -> {
+        main(args, System.getenv(), System.out, System.err, code -> {
+            if (code != 0) {
+                System.exit(code);
+            }
         });
-        if (code != 0) {
-            System.exit(code);
-        }
+    }
+
+    /**
+     * The body of {@link #main(String[])} with streams and the exit hook supplied by the caller.
+     * A normal launch passes a hook that calls {@link System#exit(int)} only for a non-zero code.
+     * Tests pass a hook that records the code, so {@code --help} can be checked in this JVM.
+     */
+    static void main(String[] args, Map<String, String> env, PrintStream out, PrintStream err,
+            Consumer<Integer> exit) {
+        int code = run(args, env, out, err, H3Transports.defaultFactory(), server -> {
+        });
+        exit.accept(code);
     }
 }

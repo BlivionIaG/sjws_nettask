@@ -221,8 +221,8 @@ class ServiceDaemonTest {
         var boot = bootstrap(tmp, "data");
         var pid = tmp.resolve("from-file.pid");
         int code = Sjws_nettask.run(new String[] {"--config=" + yaml, "--bootstrap=" + boot, "--pid-file=" + pid,
-                "--shutdown-timeout=2", Integer.toString(freePort()), html.toString()}, Map.of(), out, err, NO_H3,
-                SjwsServer::close);
+                "--state-dir=" + tmp.resolve("last-good"), "--shutdown-timeout=2", Integer.toString(freePort()),
+                html.toString()}, Map.of(), out, err, NO_H3, SjwsServer::close);
         assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
         assertTrue(out().contains("role=data/gateway"), out());
         assertFalse(err().contains("overrides"), err());
@@ -314,7 +314,8 @@ class ServiceDaemonTest {
         var seen = new AtomicReference<String>();
         int port = freePort();
         int code = Sjws_nettask.run(new String[] {"--role=data", "--bootstrap=" + fix, "--pid-file=" + pid,
-                "--shutdown-timeout=2", Integer.toString(port), html.toString()}, Map.of(), out, err, NO_H3, server -> {
+                "--state-dir=" + tmp.resolve("last-good"), "--shutdown-timeout=2", Integer.toString(port),
+                html.toString()}, Map.of(), out, err, NO_H3, server -> {
                     try {
                         var buf = new ByteArrayOutputStream();
                         assertEquals(0, Daemon.status(pid, new PrintStream(buf, true, StandardCharsets.UTF_8), err));
@@ -668,7 +669,8 @@ class ServiceDaemonTest {
 
         outBytes.reset();
         errBytes.reset();
-        code = Sjws_nettask.run(new String[] {"--shutdown-timeout=1", Integer.toString(freePort()), html.toString()},
+        code = Sjws_nettask.run(new String[] {"--shutdown-timeout=1", "--pid-file=" + tmp.resolve("child.pid"),
+                "--log-file=" + tmp.resolve("child.log"), Integer.toString(freePort()), html.toString()},
                 Map.of(Daemon.CHILD_ENV, "1"), out, err, NO_H3, SjwsServer::close);
         assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
     }
@@ -704,7 +706,8 @@ class ServiceDaemonTest {
                                 .document();
                         var pushed = sjws_nettask.config.ConfigDocument.of(
                                 base.server().toBuilder().root(three).build(), base.acme(), base.routing(),
-                                base.middleware(), base.access(), base.node(), 1, 3, null);
+                                base.middleware(), base.access(), base.node(), 1, 3, null)
+                                .withStateDir(base.stateDir());
                         var applied = server.applyRemote(pushed);
                         assertTrue(applied.applied(), applied.errors().toString());
                         assertEquals(three.toAbsolutePath(), server.config().root());
@@ -742,7 +745,8 @@ class ServiceDaemonTest {
         try (var server = SjwsServer.start(direct, SnapshotVerifier.noop())) {
             var doc = direct.document();
             var pushed = sjws_nettask.config.ConfigDocument.of(doc.server().toBuilder().root(three).build(), doc.acme(),
-                    doc.routing(), doc.middleware(), doc.access(), doc.node(), 1, 5, null);
+                    doc.routing(), doc.middleware(), doc.access(), doc.node(), 1, 5, null)
+                    .withStateDir(doc.stateDir());
             assertTrue(server.applyRemote(pushed).applied());
             var kept = server.reload();
             assertTrue(kept.warnings().toString().contains("no local bootstrap"), kept.warnings().toString());
@@ -767,8 +771,9 @@ class ServiceDaemonTest {
         var pid = tmp.resolve("daemon.pid");
         var log = tmp.resolve("daemon.log");
         int code = Sjws_nettask.run(new String[] {"--daemon", "--role=data", "--bootstrap=" + fix,
-                "--shutdown-timeout=2", "--pid-file=" + pid, "--log-file=" + log, Integer.toString(freePort()),
-                html.toString()}, Map.of(), out, err, NO_H3, s -> {
+                "--shutdown-timeout=2", "--pid-file=" + pid, "--log-file=" + log,
+                "--state-dir=" + tmp.resolve("last-good"), Integer.toString(freePort()), html.toString()}, Map.of(),
+                out, err, NO_H3, s -> {
                 });
         assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
         try {

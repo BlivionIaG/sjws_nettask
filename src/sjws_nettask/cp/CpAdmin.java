@@ -34,6 +34,15 @@ public final class CpAdmin {
 
     public CpStore.Outcome handle(sjws_nettask.controlplane.Rbac.Credential credential, String method, String path,
             String query, String body) {
+        return handle(credential, method, path, query, body, null);
+    }
+
+    /**
+     * {@code idempotencyKey} is the {@code Idempotency-Key} header. There is no bearer token.
+     * A repeated key returns the first outcome and does not append again.
+     */
+    public CpStore.Outcome handle(sjws_nettask.controlplane.Rbac.Credential credential, String method, String path,
+            String query, String body, String idempotencyKey) {
         var route = path.endsWith("/") && path.length() > 1 ? path.substring(0, path.length() - 1) : path;
         var permission = permission(method, route);
         if (permission == null) {
@@ -53,27 +62,48 @@ public final class CpAdmin {
         if ("GET".equals(method) && "/cp/v1/config/diff".equals(route)) {
             return store.diff(queryLong(query, "from"), queryLong(query, "to"), false);
         }
+        if ("GET".equals(method) && route.startsWith("/cp/v1/config/")) {
+            try {
+                return store.configVersion(Long.parseLong(route.substring("/cp/v1/config/".length())));
+            } catch (NumberFormatException e) {
+                return CpStore.Outcome.error(404, "version");
+            }
+        }
         if ("GET".equals(method) && "/cp/v1/nodes".equals(route)) {
             return CpStore.Outcome.ok(store.nodesJson(), 0);
         }
+        if ("GET".equals(method) && "/cp/v1/rollout".equals(route)) {
+            return CpStore.Outcome.ok(store.rolloutJson(), 0);
+        }
+        if ("GET".equals(method) && "/cp/v1/audit".equals(route)) {
+            try {
+                int limit = (int) queryLong(query, "limit");
+                return CpStore.Outcome.ok(store.auditJson(queryLong(query, "after"), limit), 0);
+            } catch (java.io.IOException e) {
+                return CpStore.Outcome.error(503, "audit");
+            }
+        }
+        if ("POST".equals(method) && "/cp/v1/config:validate".equals(route)) {
+            return store.validate(body == null ? "" : body);
+        }
         if ("POST".equals(method) && "/cp/v1/config".equals(route)) {
-            return store.propose(body == null ? "" : body);
+            return store.propose(body == null ? "" : body, idempotencyKey);
         }
         if ("POST".equals(method) && "/cp/v1/rollout".equals(route)) {
-            return store.rollout(selectors(body));
+            return store.rollout(selectors(body), idempotencyKey);
         }
         if ("POST".equals(method) && "/cp/v1/rollout/advance".equals(route)) {
-            return store.advance();
+            return store.advance(idempotencyKey);
         }
         if ("POST".equals(method) && "/cp/v1/rollback".equals(route)) {
-            return store.rollback(jsonLong(body, "toVersion"), nowMillis, ttlMillis);
+            return store.rollback(jsonLong(body, "toVersion"), nowMillis, ttlMillis, idempotencyKey);
         }
         if ("POST".equals(method) && route.startsWith("/cp/v1/nodes/") && route.endsWith("/revoke")) {
             var id = route.substring("/cp/v1/nodes/".length(), route.length() - "/revoke".length());
-            return store.revoke(id);
+            return store.revoke(id, idempotencyKey);
         }
         if ("POST".equals(method) && "/cp/v1/activate".equals(route)) {
-            return store.activate(nowMillis, ttlMillis);
+            return store.activate(nowMillis, ttlMillis, idempotencyKey);
         }
         var san = jsonString(body, "san");
         var name = jsonString(body, "role");
@@ -85,10 +115,12 @@ public final class CpAdmin {
 
     private static sjws_nettask.controlplane.Permission permission(String method, String route) {
         if ("GET".equals(method) && ("/cp/v1/health".equals(route) || "/cp/v1/config".equals(route)
-                || "/cp/v1/config/diff".equals(route) || "/cp/v1/nodes".equals(route))) {
+                || "/cp/v1/config/diff".equals(route) || "/cp/v1/nodes".equals(route)
+                || "/cp/v1/rollout".equals(route) || "/cp/v1/audit".equals(route)
+                || versionPath(route))) {
             return sjws_nettask.controlplane.Permission.READ;
         }
-        if ("POST".equals(method) && "/cp/v1/config".equals(route)) {
+        if ("POST".equals(method) && ("/cp/v1/config".equals(route) || "/cp/v1/config:validate".equals(route))) {
             return sjws_nettask.controlplane.Permission.EDIT_ROUTES;
         }
         if ("POST".equals(method) && ("/cp/v1/rollout".equals(route) || "/cp/v1/rollout/advance".equals(route)
@@ -105,6 +137,22 @@ public final class CpAdmin {
             return sjws_nettask.controlplane.Permission.MANAGE_OPERATORS;
         }
         return null;
+    }
+
+    private static boolean versionPath(String route) {
+        if (!route.startsWith("/cp/v1/config/")) {
+            return false;
+        }
+        var tail = route.substring("/cp/v1/config/".length());
+        if (tail.isEmpty() || "diff".equals(tail)) {
+            return false;
+        }
+        for (int i = 0; i < tail.length(); i++) {
+            if (!Character.isDigit(tail.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     static sjws_nettask.controlplane.Role parseRole(String name) {
