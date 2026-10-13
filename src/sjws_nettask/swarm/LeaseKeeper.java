@@ -43,7 +43,9 @@ public final class LeaseKeeper implements AutoCloseable {
     private final TaskService tasks;
     private final long visibilityMs;
     private final BiConsumer<Task, LeaseResult> lost;
-    private record Key(String pool, long offset) { }
+    private record Key(String pool, int shard, long offset) { }
+
+    private record PoolShard(String pool, int shard) { }
 
     private final Map<Key, Task> held = new LinkedHashMap<>();
     private final ReentrantLock lock = new ReentrantLock();
@@ -64,7 +66,7 @@ public final class LeaseKeeper implements AutoCloseable {
     }
 
     private static Key key(Task t) {
-        return new Key(t.pool(), t.offset());
+        return new Key(t.pool(), t.shard(), t.offset());
     }
 
     public void hold(Task t) {
@@ -119,7 +121,7 @@ public final class LeaseKeeper implements AutoCloseable {
             throw new IllegalArgumentException("max");
         }
         long now = this.tasks.clock().getAsLong();
-        var byPool = new LinkedHashMap<String, List<Task>>();
+        var byPool = new LinkedHashMap<PoolShard, List<Task>>();
         var expiring = new ArrayList<Task>();
         this.lock.lock();
         try {
@@ -139,10 +141,11 @@ public final class LeaseKeeper implements AutoCloseable {
                     it.remove();
                     expiring.add(t);
                 } else {
-                    var list = byPool.get(t.pool());
+                    var ps = new PoolShard(t.pool(), t.shard());
+                    var list = byPool.get(ps);
                     if (list == null) {
                         list = new ArrayList<>();
-                        byPool.put(t.pool(), list);
+                        byPool.put(ps, list);
                     }
                     list.add(t);
                 }
@@ -158,7 +161,7 @@ public final class LeaseKeeper implements AutoCloseable {
                 offs[i] = list.get(i).offset();
                 atts[i] = list.get(i).attempt();
             }
-            var results = this.tasks.extend(e.getKey(), offs, atts, this.visibilityMs);
+            var results = this.tasks.extend(e.getKey().pool(), e.getKey().shard(), offs, atts, this.visibilityMs);
             this.lock.lock();
             try {
                 this.batches++;

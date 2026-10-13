@@ -36,6 +36,14 @@ public final class TaskService {
     private final Topics topics;
 
     /**
+     * Partitions per pool (S1c step 2). Shard 0 is topic {@code tasks.P} (so a 1-shard pool is exactly the old
+     * layout); shard {@code i > 0} is {@code tasks.P#i}. Each shard has its own lock, ledger and DLQ, so claim/ack
+     * on different shards never contend. Default {@code sjws.swarm.pool.shards} (1).
+     */
+    private final int shards;
+    private final java.util.concurrent.atomic.AtomicLong roundRobin = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
      * Runs the post-durability acks of {@link #reply}/{@link #replyAll}. Without it the ack (which takes the
      * pool partition's lock) ran on the reply topic's ledger-writer thread, stalling that writer behind the lock.
      */
@@ -46,7 +54,36 @@ public final class TaskService {
     });
 
     public TaskService(Topics topics) {
+        this(topics, Integer.getInteger("sjws.swarm.pool.shards", 1));
+    }
+
+    public TaskService(Topics topics, int shards) {
+        if (shards < 1 || shards > 256) throw new IllegalArgumentException("shards 1..256: " + shards);
         this.topics = topics;
+        this.shards = shards;
+    }
+
+    public int shards() {
+        return this.shards;
+    }
+
+    /** Topic of one shard of {@code pool}. */
+    public static String topic(String pool, int shard) {
+        return shard == 0 ? topic(pool) : topic(pool) + "#" + shard;
+    }
+
+    /**
+     * Shard of a submit. Deterministic in {@code (producerId, seq)} so a retried submit lands on the shard that holds
+     * its dedup window, and a producer's seqs stay increasing within each shard; anonymous submits go round-robin.
+     */
+    int shardOf(long producerId, long seq) {
+        if (this.shards == 1) return 0;
+        if (producerId == 0) return (int) Long.remainderUnsigned(this.roundRobin.getAndIncrement(), this.shards);
+        long h = (producerId * 0x9E3779B97F4A7C15L) ^ seq;
+        h ^= h >>> 33;
+        h *= 0xff51afd7ed558ccdL;
+        h ^= h >>> 33;
+        return (int) Long.remainderUnsigned(h, this.shards);
     }
 
     public static String topic(String pool) {
@@ -63,7 +100,12 @@ public final class TaskService {
 
     /** The pool's partition; the worker group reads from the oldest retained task. */
     Partition partition(String pool) {
-        var p = this.topics.partition(topic(pool));
+        return partition(pool, 0);
+    }
+
+    /** One shard's partition. */
+    Partition partition(String pool, int shard) {
+        var p = this.topics.partition(topic(pool, shard));
         p.subscribe(WORKERS, true);
         return p;
     }
@@ -73,9 +115,14 @@ public final class TaskService {
         return partition(pool).deadLetterQueue();
     }
 
+    /** The dead-letter queue of one shard. */
+    public Partition deadLetters(String pool, int shard) {
+        return partition(pool, shard).deadLetterQueue();
+    }
+
     /** Submits a task; a repeated {@code (producerId, seq)} in the dedup window is dropped (§4.4). */
     public Partition.ProduceResult submit(String pool, long producerId, long seq, TaskEnvelope task) {
-        return partition(pool).produce(producerId, seq, task.encode());
+        return partition(pool, shardOf(producerId, seq)).produce(producerId, seq, task.encode());
     }
 
     /**
@@ -92,9 +139,41 @@ public final class TaskService {
 
     /** As {@link #claim(String, String, int, long)}, waiting up to {@code waitNanos} for a task (#99). */
     public List<Task> claim(String pool, String worker, int max, long visibilityMs, long waitNanos) {
-        var p = partition(pool);
-        var got = waitNanos > 0 ? p.poll(WORKERS, worker, max, visibilityMs, waitNanos)
-                : p.poll(WORKERS, worker, max, visibilityMs);
+        if (this.shards == 1) {
+            var p = partition(pool, 0);
+            return tasks(pool, 0, p, waitNanos > 0 ? p.poll(WORKERS, worker, max, visibilityMs, waitNanos)
+                    : p.poll(WORKERS, worker, max, visibilityMs));
+        }
+        // Sharded: start at the worker's home shard (spreads workers over the locks), then sweep the others.
+        int home = Math.floorMod(worker.hashCode(), this.shards);
+        long deadline = waitNanos > 0 ? System.nanoTime() + waitNanos : 0;
+        while (true) {
+            for (int i = 0; i < this.shards; i++) {
+                int s = (home + i) % this.shards;
+                var p = partition(pool, s);
+                var got = p.poll(WORKERS, worker, max, visibilityMs);
+                if (!got.isEmpty()) {
+                    var out = tasks(pool, s, p, got);
+                    if (!out.isEmpty()) return out;
+                }
+            }
+            long left = deadline - System.nanoTime();
+            if (waitNanos <= 0 || left <= 0) return List.of();
+            // Park on the home shard (woken by its appends), in slices so tasks landing on other shards are seen.
+            var p = partition(pool, home);
+            var got = p.poll(WORKERS, worker, max, visibilityMs, Math.min(left, SHARD_WAIT_SLICE_NANOS));
+            if (!got.isEmpty()) {
+                var out = tasks(pool, home, p, got);
+                if (!out.isEmpty()) return out;
+            }
+        }
+    }
+
+    /** Longest park on the home shard of a waiting sharded claim before the other shards are swept again. */
+    static final long SHARD_WAIT_SLICE_NANOS = 2_000_000;
+
+    /** Decodes, deadline-checks and lease-shortens one shard's deliveries. */
+    private List<Task> tasks(String pool, int shard, Partition p, List<sjws_nettask.messaging.delivery.Delivery> got) {
         if (got.isEmpty()) {
             return List.of();
         }
@@ -126,14 +205,14 @@ public final class TaskService {
                 shortest = Math.min(shortest, env.deadlineMs() - now);
                 lease = env.deadlineMs();
             }
-            out.add(new Task(pool, d.offset(), d.attempt(), lease, env));
+            out.add(new Task(pool, d.offset(), d.attempt(), lease, env, shard));
         }
         if (n > 0) {
             // One EXTEND record for the batch; it uses the shortest remaining deadline for every shortened lease.
             p.extend(WORKERS, java.util.Arrays.copyOf(shortOff, n), java.util.Arrays.copyOf(shortAtt, n), shortest);
             for (int i = 0; i < n; i++) {
                 var t = out.get(shortIdx[i]);
-                out.set(shortIdx[i], new Task(t.pool(), t.offset(), t.attempt(), now + shortest, t.envelope()));
+                out.set(shortIdx[i], t.withDeadline(now + shortest));
             }
         }
         return out;
@@ -145,21 +224,26 @@ public final class TaskService {
 
     /** Batched, fenced heartbeat: one EXTEND record for all {@code offsets} (§4.2). */
     public List<LeaseResult> extend(String pool, long[] offsets, int[] attempts, long visibilityMs) {
-        return partition(pool).extend(WORKERS, offsets, attempts, visibilityMs);
+        return extend(pool, 0, offsets, attempts, visibilityMs);
+    }
+
+    /** As {@link #extend(String, long[], int[], long)}, for leases of one shard. */
+    public List<LeaseResult> extend(String pool, int shard, long[] offsets, int[] attempts, long visibilityMs) {
+        return partition(pool, shard).extend(WORKERS, offsets, attempts, visibilityMs);
     }
 
     public LeaseResult ack(Task t) {
-        return partition(t.pool()).ack(WORKERS, t.offset(), t.attempt());
+        return partition(t.pool(), t.shard()).ack(WORKERS, t.offset(), t.attempt());
     }
 
     /** Transient failure: redelivered after {@code max(delayMs, backoff)}, dead-lettered at max attempts. */
     public LeaseResult nack(Task t, long delayMs) {
-        return partition(t.pool()).nack(WORKERS, t.offset(), t.attempt(), delayMs);
+        return partition(t.pool(), t.shard()).nack(WORKERS, t.offset(), t.attempt(), delayMs);
     }
 
     /** Deterministic failure: straight to the pool's DLQ with {@code rejected:<reason>}. */
     public LeaseResult reject(Task t, String reason) {
-        return partition(t.pool()).reject(WORKERS, t.offset(), t.attempt(), reason);
+        return partition(t.pool(), t.shard()).reject(WORKERS, t.offset(), t.attempt(), reason);
     }
 
     /**
@@ -181,13 +265,14 @@ public final class TaskService {
             return CompletableFuture.completedFuture(List.of());
         }
         var pool = tasks.get(0).pool();
+        int shard = tasks.get(0).shard();
         var offs = new long[tasks.size()];
         var atts = new int[tasks.size()];
         var durable = new java.util.ArrayList<CompletableFuture<Long>>(tasks.size());
         for (int i = 0; i < tasks.size(); i++) {
             var t = tasks.get(i);
-            if (!t.pool().equals(pool)) {
-                throw new IllegalArgumentException("tasks from one pool");
+            if (!t.pool().equals(pool) || t.shard() != shard) {
+                throw new IllegalArgumentException("tasks from one pool (and shard)");
             }
             var to = t.envelope().replyTo();
             if (to.isEmpty()) {
@@ -200,7 +285,7 @@ public final class TaskService {
         }
         // Different reply topics are different logs, so wait for each topic's futures (normally one topic).
         return CompletableFuture.allOf(durable.toArray(CompletableFuture[]::new))
-                .thenApplyAsync(x -> partition(pool).ack(WORKERS, offs, atts, null).results(), ACKER);
+                .thenApplyAsync(x -> partition(pool, shard).ack(WORKERS, offs, atts, null).results(), ACKER);
     }
 
     public CompletableFuture<LeaseResult> reply(Task t, long producerId, long seq, String contentType, byte[] body) {
