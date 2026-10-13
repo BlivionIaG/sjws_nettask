@@ -23,10 +23,50 @@ import java.util.Objects;
 /**
  * Response body. Writers must handle every variant.
  */
-public sealed interface Body permits Body.Empty, Body.Bytes, Body.FileBody {
+public sealed interface Body permits Body.Empty, Body.Bytes, Body.FileBody, Body.Stream {
 
-    /** @return number of bytes the body has (also for HEAD responses, which don't send them) */
+    /**
+     * @return number of bytes the body has (also for HEAD responses, which don't send them), or -1
+     *         for a {@link Stream} of unknown length
+     */
     long length();
+
+    /**
+     * Content pulled from a producer (a proxied upstream), with backpressure: the writer asks for
+     * the next buffer only after the previous one was handed to the transport.
+     * <p>
+     * Writer contract: call {@link Source#close()} exactly once in every case (sent, HEAD, error,
+     * aborted). With a known {@code length}, send exactly that many bytes or abort the
+     * connection/stream (never a short response). With an unknown length (-1): HTTP/1.1 keep-alive
+     * uses chunked framing, HTTP/1.0 or a closing connection is delimited by close, HTTP/2 and
+     * HTTP/3 end the stream. A {@link java.io.IOException} from {@link Source#next()} after the head
+     * was sent aborts the connection/stream.
+     *
+     * @param length body length in bytes, or -1 when unknown
+     */
+    record Stream(long length, Source source) implements Body {
+
+        public Stream {
+            Objects.requireNonNull(source, "source");
+            if (length < -1) {
+                throw new IllegalArgumentException("length < -1");
+            }
+        }
+
+        /** Pull-style producer. Not thread-safe: one writer thread calls it. */
+        public interface Source extends AutoCloseable {
+
+            /**
+             * @return the next non-empty chunk (valid until the next call or {@link #close()}; the
+             *         writer copies or sends it before asking again), or null at the end
+             */
+            ByteBuffer next() throws java.io.IOException;
+
+            /** Releases the producer (e.g. returns a pooled connection, or discards it if unfinished). */
+            @Override
+            void close();
+        }
+    }
 
     /** No content. */
     record Empty() implements Body {

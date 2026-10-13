@@ -215,8 +215,10 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
                 }
             }
             h.add("Connection", this.keepAlive && this.refusal == null ? "keep-alive" : "close");
-            if (response.mayHaveBody()) {
+            if (response.mayHaveBody() && response.contentLength() >= 0) {
                 h.add("Content-Length", Long.toString(response.contentLength()));
+            } else if (response.mayHaveBody() && !response.headOnly()) {
+                h.add("Transfer-Encoding", "chunked"); // Body.Stream of unknown length
             }
             if (endOfResponse) {
                 this.channel.write(r);

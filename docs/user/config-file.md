@@ -207,10 +207,16 @@ document root, and a path with a `..` segment is 400. ACME challenges are
 answered before any route. With `enabled: false` (the default) no router is built
 and the request path is unchanged. The records map onto `Route(host, prefix, rewrite,
 handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
-maxBody, proto, trustedProxies)`. Phase 1 proxies requests without a body
-(501 otherwise); see `docs/design/proxy-routing.md`. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
-TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) and `preserve_host`
-(default false) are parsed but not applied yet (phase 2).
+idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
+HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
+response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
+streamed upstream (over `max_body` is 413). A chunked request body, or a body on HTTP/2 or
+HTTP/3, is 501 for now; see `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
+bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
+and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
+growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
+closes the replaced pools.
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml

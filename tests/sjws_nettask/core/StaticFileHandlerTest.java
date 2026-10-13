@@ -48,6 +48,17 @@ class StaticFileHandlerTest {
     static byte[] content(Body body) throws IOException {
         return switch (body) {
             case Body.Empty e -> new byte[0];
+            case Body.Stream st -> {
+                try (var source = st.source()) {
+                    var all = new java.io.ByteArrayOutputStream();
+                    for (var d = source.next(); d != null; d = source.next()) {
+                        var chunk = new byte[d.remaining()];
+                        d.get(chunk);
+                        all.write(chunk);
+                    }
+                    yield all.toByteArray();
+                }
+            }
             case Body.Bytes b -> {
                 var d = b.data().duplicate();
                 var out = new byte[d.remaining()];

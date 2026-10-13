@@ -88,7 +88,7 @@ class ProxyHandlerTest {
         var h = new RequestHeaders("\"e\"", "Mon, 12 Oct 2026 00:00:00 GMT", "\"r\"", "bytes=0-1", "gzip", "site.test:8443");
         var r = p.handle(new Request("GET", "/x?y=1", h));
         assertEquals(200, r.status());
-        assertEquals("hello /base/x", StandardCharsets.UTF_8.decode(((Body.Bytes) r.body()).data()).toString());
+        assertEquals("hello /base/x", text(r));
         assertEquals("1", r.headers().get("x-up"));
         assertNull(r.headers().get("connection"));
         assertNull(r.headers().get("keep-alive"));
@@ -142,9 +142,40 @@ class ProxyHandlerTest {
         assertEquals(502, r.status());
     }
 
+    /** Drains a proxied body (a {@link Body.Stream}) as UTF-8; the source goes back to the pool. */
+    static String text(sjws_nettask.core.Response r) {
+        if (!(r.body() instanceof Body.Stream st)) {
+            return r.body() instanceof Body.Bytes b ? StandardCharsets.UTF_8.decode(b.data()).toString() : "";
+        }
+        try (var source = st.source()) {
+            var all = new java.io.ByteArrayOutputStream();
+            for (var d = source.next(); d != null; d = source.next()) {
+                var chunk = new byte[d.remaining()];
+                d.get(chunk);
+                all.write(chunk, 0, chunk.length);
+            }
+            return all.toString(StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
     @Test
-    void oversizeIs502() {
-        assertEquals(502, proxy(this.base, Duration.ofSeconds(5), 10).handle(new Request("GET", "/big")).status());
+    void bodyOverMaxIs413() {
+        var body = new sjws_nettask.core.RequestBody() {
+            @Override
+            public long length() {
+                return 100;
+            }
+
+            @Override
+            public int read(byte[] into, int off, int len) {
+                return -1;
+            }
+        };
+        var p = proxy(this.base, Duration.ofSeconds(5), 10);
+        assertEquals(413, p.handle(new Request("POST", "/").withBody(body)).status());
+        p.close();
     }
 
     @Test
