@@ -22,6 +22,7 @@ import sjws_nettask.OptionalModule;
 import sjws_nettask.core.HandlerContributor;
 import sjws_nettask.core.HandlerMounts;
 import sjws_nettask.messaging.ledger.LedgerWriter;
+import sjws_nettask.messaging.ledger.SegmentedLog;
 
 /**
  * Mounts produce / fetch on plain log topics at {@code /messaging/v1} (docs/design/partition-log.md §2.2). Off by
@@ -32,14 +33,63 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String DIR_PROPERTY = "sjws.messaging.dir";
     static final String DIR_ENV = "SJWS_MESSAGING_DIR";
 
+    static final String SEGMENT_BYTES_PROPERTY = "sjws.messaging.segment.bytes";
+    static final String SEGMENT_BYTES_ENV = "SJWS_MESSAGING_SEGMENT_BYTES";
+    static final String RETENTION_BYTES_PROPERTY = "sjws.messaging.retention.bytes";
+    static final String RETENTION_BYTES_ENV = "SJWS_MESSAGING_RETENTION_BYTES";
+    static final String RETENTION_MS_PROPERTY = "sjws.messaging.retention.ms";
+    static final String RETENTION_MS_ENV = "SJWS_MESSAGING_RETENTION_MS";
+    static final String RETENTION_CHECK_MS_PROPERTY = "sjws.messaging.retention.check.ms";
+    static final String RETENTION_CHECK_MS_ENV = "SJWS_MESSAGING_RETENTION_CHECK_MS";
+
     private final LogTopics topics;
+    /** Null unless a retention limit is set: no thread when retention is off. */
+    private final java.util.concurrent.ScheduledExecutorService retentionTimer;
 
     public MessagingModule() {
-        this(Path.of(setting(DIR_PROPERTY, DIR_ENV, "messaging-data")));
+        this(Path.of(setting(DIR_PROPERTY, DIR_ENV, "messaging-data")),
+                number(setting(SEGMENT_BYTES_PROPERTY, SEGMENT_BYTES_ENV, ""), SegmentedLog.DEFAULT_SEGMENT_BYTES),
+                new LogRetention(number(setting(RETENTION_BYTES_PROPERTY, RETENTION_BYTES_ENV, ""), 0),
+                        number(setting(RETENTION_MS_PROPERTY, RETENTION_MS_ENV, ""), 0)),
+                number(setting(RETENTION_CHECK_MS_PROPERTY, RETENTION_CHECK_MS_ENV, ""), 10_000));
     }
 
     MessagingModule(Path dir) {
-        this.topics = new LogTopics(dir, LedgerWriter.DEFAULT_DURABILITY);
+        this(dir, SegmentedLog.DEFAULT_SEGMENT_BYTES, LogRetention.NONE, 10_000);
+    }
+
+    MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs) {
+        this.topics = new LogTopics(dir, LedgerWriter.DEFAULT_DURABILITY, segmentBytes, retention, System::currentTimeMillis);
+        if (retention.unlimited()) {
+            this.retentionTimer = null;
+        } else {
+            this.retentionTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+                    r -> Thread.ofPlatform().name("messaging-retention").daemon().unstarted(r));
+            this.retentionTimer.scheduleWithFixedDelay(this::retain, checkMs, checkMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+    }
+
+    void retain() {
+        try {
+            this.topics.enforceRetention();
+        } catch (java.io.IOException | RuntimeException e) {
+            System.err.println("WARN: messaging retention: " + e);
+        }
+    }
+
+    boolean retentionScheduled() {
+        return this.retentionTimer != null;
+    }
+
+    static long number(String v, long dflt) {
+        if (v.isEmpty()) return dflt;
+        try {
+            long n = Long.parseLong(v);
+            return n < 0 ? dflt : n;
+        } catch (NumberFormatException e) {
+            System.err.println("WARN: messaging setting not a number: " + v);
+            return dflt;
+        }
     }
 
     static String setting(String property, String env, String dflt) {
@@ -55,6 +105,7 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     @Override
     public void close() {
+        if (this.retentionTimer != null) this.retentionTimer.shutdownNow();
         this.topics.close();
     }
 }
