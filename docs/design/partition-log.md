@@ -21,7 +21,7 @@ the open decisions, and lists the small PRs that close the gaps.
 | R10 | kill -9 and truncated-tail crash tests | **Exist** for the ledger; gap for the HTTP path | `LedgerCrashTest.noAckedRecordLostAfterSigkill` (child JVM, `destroyForcibly`) plus the torn-tail tests in R5. G1 adds a kill -9 test through produce over HTTP. |
 | R11 | LogBench-style benches: append throughput, p99 produce/fetch | **Partial** | `bench/LogBench.java` (prototype write path) and `bench/LedgerBench.java` (append throughput by durability mode). No fetch bench and no end-to-end HTTP produce/fetch p99. Gap G4. |
 | R12 | Zero cost on the static path when off | **To be shown** | The module will load only when configured (same pattern as `OptionalModules`/`SwarmModule`). Proof: wrk before/after on static files with the module off (G1 acceptance). |
-| R13 | Designed around JVM Footprint's shared buffer pool | **Not available yet** | No PR or branch for the pool exists (searched open, closed and remote branches). It is planned in `architecture.md` §(step 1: "Introduce the buffer pool (HTTP only)"). §2.4 shows how the log plugs into it. |
+| R13 | Designed around JVM Footprint's shared buffer pool | **Agreed design, not merged** | `core.buf.BufferPool` (proposal: `sjws-slab-allocator-design.md`, JVM Footprint). Decisions are in §2.4. |
 
 ## 2. Decisions
 
@@ -36,7 +36,7 @@ returns sub-batch slices.
 ### 2.2 Produce / fetch HTTP surface (G1)
 - `MessagingHttp implements core.Handler`, mounted at `/messaging/v1` through `HandlerContributor`. It is **off by default**; with the module off, no class loads.
 - `POST /messaging/v1/topics/{t}/records`: the body is one or more records (length-prefixed). Optional headers `Producer-Id` and `Producer-Seq` (dedup, as `Partition.produce`) and `Durability: none|group`. The response is `{baseOffset}` once the requested durability holds.
-- `GET /messaging/v1/topics/{t}/records?offset=&maxBytes=`: the body is raw `RecordBatch` frames (`application/vnd.sjws.batch`), starting at the batch that contains `offset` and stopping before `maxBytes`. The handler copies file bytes straight to the response (FileChannel → pooled buffer or `transferTo`); it never decodes.
+- `GET /messaging/v1/topics/{t}/records?offset=&maxBytes=`: the body is raw `RecordBatch` frames (`application/vnd.sjws.batch`), starting at the batch that contains `offset` and stopping before `maxBytes`. The handler copies file bytes straight to the response (`transferTo` on plain TCP, otherwise a pooled buffer via `tryAcquire`, 503 under pressure); it never decodes.
 - Errors are RFC 9457 problems, like `SwarmHttp`.
 - Access goes through the existing rights or filters chain; no new auth.
 
@@ -46,10 +46,14 @@ fetch API). These delete the oldest sealed segments past either limit. Topics wi
 nothing at or above the low watermark is deleted. A size cap may still not override it; it only reports `retention.blocked`
 in `MessagingStats`. This keeps work-queue semantics exact.
 
-### 2.4 Buffers
-- Append already encodes into one buffer per batch (`RecordBatch.encode` into `b`).
-- Fetch is the hot allocation path, so it uses `transferTo`, or a buffer borrowed from the shared pool once it exists. Until then it uses a small per-handler `ThreadLocal`-free scratch: a pool interface `BufferSource { ByteBuffer take(int); void give(ByteBuffer); }` with a trivial allocating implementation. JVM Footprint's pool can implement it later.
-- When off, the log allocates nothing.
+### 2.4 Buffers (agreed with JVM Footprint, `core.buf.BufferPool`)
+- **Public API copies:** public `records()` keeps returning `byte[]` copies. An opt-in zero-copy view is used only by fetch/sendfile and by replication.
+- **Writer:** it encodes into its own per-partition group buffer. Writer and syncer threads may use per-thread pool caches.
+- **Recovery:** scan buffers come from the pool's large cache, and only during recovery.
+- **Fetch:** the fetch frame is byte-identical to the on-disk batch, so plain TCP uses sendfile (`FileChannel.transferTo`). There is no TLS in v1. Fetch takes buffers with `tryAcquire` and answers `503` + `Retry-After` under pool pressure instead of blocking.
+- **Budget:** one pool cap, with a messaging sub-budget.
+- **Observability:** it will define `sjws_messaging_*` metrics with `topic`/`partition`/`group` labels. The log leaves hook points (append bytes and latency, fetch bytes and 503s, pool acquire failures, retention deletes or blocks) and does not define metric names itself.
+- **When off:** the log allocates nothing.
 
 ## 3. Gap PRs (each one change)
 1. **G1a**: `MessagingHttp` produce and fetch handler, off by default, with tests and a wrk static-path check (R9, R12).
