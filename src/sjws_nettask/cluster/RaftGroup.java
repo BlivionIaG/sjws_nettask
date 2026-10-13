@@ -36,8 +36,9 @@ import java.util.function.Function;
 /**
  * One Raft group. A witness votes and acks without storing entries. Before that ack, and again
  * before a vote grant, it forces the last acked {@code (index, term)} and refuses a candidate
- * whose log is behind that mark. User bytes are not the on-disk record: a leading marker
- * separates user data, configuration, and the leader's no-op.
+ * whose log is behind that mark. A campaign asks for a pre-vote first, so a partitioned
+ * candidate cannot raise the term until a majority would elect it. User bytes are not the
+ * on-disk record: a leading marker separates user data, configuration, and the leader's no-op.
  */
 final class RaftGroup {
 
@@ -51,11 +52,14 @@ final class RaftGroup {
     static final int APPEND = 3;
     static final int APPEND_RESP = 4;
     static final int TIMEOUT_NOW = 5;
+    static final int PRE_VOTE = 6;
+    static final int PRE_VOTE_RESP = 7;
 
     private final ReentrantLock lock = new ReentrantLock();
     private final GroupId groupId;
     private final NodeId self;
     private final boolean witness;
+    private final Set<NodeId> witnesses;
     private final List<NodeId> peers;
     private final Function<Integer, NodeId> byWire;
     private final QuorumPolicy quorum;
@@ -97,15 +101,16 @@ final class RaftGroup {
     private boolean ackedFromMemory;
 
     private enum Role {
-        FOLLOWER, CANDIDATE, LEADER
+        FOLLOWER, PRE_CANDIDATE, CANDIDATE, LEADER
     }
 
-    RaftGroup(GroupId groupId, NodeId self, boolean witness, Set<NodeId> voters, List<NodeId> peers,
-            Function<Integer, NodeId> byWire, QuorumPolicy quorum, GroupOptions options, LogStorage storage,
-            ClusterRpc rpc, Clock clock, GroupListener listener) {
+    RaftGroup(GroupId groupId, NodeId self, boolean witness, Set<NodeId> witnesses, Set<NodeId> voters,
+            List<NodeId> peers, Function<Integer, NodeId> byWire, QuorumPolicy quorum, GroupOptions options,
+            LogStorage storage, ClusterRpc rpc, Clock clock, GroupListener listener) {
         this.groupId = groupId;
         this.self = self;
         this.witness = witness;
+        this.witnesses = Set.copyOf(witnesses);
         this.peers = List.copyOf(peers);
         this.byWire = byWire;
         this.quorum = quorum;
@@ -165,6 +170,16 @@ final class RaftGroup {
         return ackedFromMemory;
     }
 
+    /** True while a pre-vote or a vote is in progress. An isolated pre-vote does not raise the term. */
+    boolean campaigning() {
+        lock.lock();
+        try {
+            return role == Role.PRE_CANDIDATE || role == Role.CANDIDATE;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     Set<NodeId> voters() {
         lock.lock();
         try {
@@ -188,7 +203,7 @@ final class RaftGroup {
                     replicate();
                 }
             } else if (!witness && now >= electionDeadline && now >= campaignNotBefore) {
-                startElection(now, after);
+                startPreVote(now, after);
             }
         } finally {
             lock.unlock();
@@ -204,6 +219,8 @@ final class RaftGroup {
             switch (frame.type()) {
                 case VOTE -> onVote(body, now, after);
                 case VOTE_RESP -> onVoteResp(body, now, after);
+                case PRE_VOTE -> onPreVote(body, now, after);
+                case PRE_VOTE_RESP -> onPreVoteResp(body, now, after);
                 case APPEND -> onAppend(from, body, now, after);
                 case APPEND_RESP -> onAppendResp(body, now, after);
                 case TIMEOUT_NOW -> onTimeoutNow(body, now, after);
@@ -261,6 +278,19 @@ final class RaftGroup {
         return future;
     }
 
+    /** Ask whether a majority would elect us. The term stays put until that comes back true. */
+    private void startPreVote(long now, List<Runnable> after) {
+        role = Role.PRE_CANDIDATE;
+        votes.clear();
+        votes.add(self);
+        electionDeadline = now + options.electionTimeout().toNanos();
+        if (isQuorum(votes)) {
+            startElection(now, after);
+            return;
+        }
+        send(PRE_VOTE, voteBody(term));
+    }
+
     private void startElection(long now, List<Runnable> after) {
         term++;
         role = Role.CANDIDATE;
@@ -269,16 +299,20 @@ final class RaftGroup {
         votes.clear();
         votes.add(self);
         electionDeadline = now + options.electionTimeout().toNanos();
-        long last = lastIndex();
-        var body = ByteBuffer.allocate(8 + 4 + 8 + 8).order(java.nio.ByteOrder.BIG_ENDIAN);
-        body.putLong(term);
-        body.putInt(self.wire());
-        body.putLong(last);
-        body.putLong(termAt(last));
-        send(VOTE, body.array());
+        send(VOTE, voteBody(term));
         if (isQuorum(votes)) {
             becomeLeader(now, after);
         }
+    }
+
+    private byte[] voteBody(long voteTerm) {
+        long last = lastIndex();
+        var body = ByteBuffer.allocate(8 + 4 + 8 + 8).order(java.nio.ByteOrder.BIG_ENDIAN);
+        body.putLong(voteTerm);
+        body.putInt(self.wire());
+        body.putLong(last);
+        body.putLong(termAt(last));
+        return body.array();
     }
 
     private void becomeLeader(long now, List<Runnable> after) {
@@ -346,6 +380,52 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * A pre-vote does not change {@code term} or {@code votedFor}. A node that still has a leader
+     * refuses, so a partitioned candidate cannot preempt the side that holds a quorum.
+     */
+    private void onPreVote(ByteBuffer body, long now, List<Runnable> after) {
+        long theirTerm = body.getLong();
+        int candidateWire = body.getInt();
+        long candidateIndex = body.getLong();
+        long candidateTerm = body.getLong();
+        var candidate = byWire.apply(candidateWire);
+        boolean grant = false;
+        boolean leaderFresh = role == Role.LEADER || (leader != null && now < electionDeadline);
+        if (theirTerm >= term && candidate != null && !leaderFresh && (!witness || witnessForced())) {
+            long ourLast = witness ? witnessCursorIndex() : lastIndex();
+            long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);
+            grant = candidateTerm > ourTerm || (candidateTerm == ourTerm && candidateIndex >= ourLast);
+        }
+        var reply = ByteBuffer.allocate(8 + 4 + 1).order(java.nio.ByteOrder.BIG_ENDIAN);
+        reply.putLong(Math.max(term, theirTerm));
+        reply.putInt(self.wire());
+        reply.put((byte) (grant ? 1 : 0));
+        if (candidate != null) {
+            rpc.send(candidate, new SimTransport.Frame(groupId, PRE_VOTE_RESP, reply.array()));
+        }
+    }
+
+    private void onPreVoteResp(ByteBuffer body, long now, List<Runnable> after) {
+        long theirTerm = body.getLong();
+        int voterWire = body.getInt();
+        boolean granted = body.get() == 1;
+        if (theirTerm > term) {
+            stepDown(theirTerm, after);
+            return;
+        }
+        if (role != Role.PRE_CANDIDATE || theirTerm != term || !granted) {
+            return;
+        }
+        var voter = byWire.apply(voterWire);
+        if (voter != null) {
+            votes.add(voter);
+        }
+        if (isQuorum(votes)) {
+            startElection(now, after);
+        }
+    }
+
     private void onAppend(NodeId from, ByteBuffer body, long now, List<Runnable> after) {
         long theirTerm = body.getLong();
         int leaderWire = body.getInt();
@@ -368,7 +448,7 @@ final class RaftGroup {
         if (theirTerm > term) {
             stepDown(theirTerm, after);
         }
-        if (role == Role.CANDIDATE || role == Role.LEADER) {
+        if (role == Role.CANDIDATE || role == Role.PRE_CANDIDATE || role == Role.LEADER) {
             role = Role.FOLLOWER;
         }
         var newLeader = byWire.apply(leaderWire);
@@ -620,15 +700,40 @@ final class RaftGroup {
 
     private boolean quorumFor(long index) {
         var acks = new HashSet<NodeId>();
+        int dataAcks = 0;
         if (countsAsStored(self)) {
             acks.add(self);
+            dataAcks++;
         }
         for (var peer : peers) {
             if (matchIndex.getOrDefault(peer, 0L) >= index && isVoter(peer)) {
                 acks.add(peer);
+                if (!witnesses.contains(peer)) {
+                    dataAcks++;
+                }
             }
         }
-        return isQuorum(acks);
+        if (!isQuorum(acks)) {
+            return false;
+        }
+        return options.durability() != Durability.STRICT || dataAcks >= dataCopiesRequired();
+    }
+
+    /** STRICT needs two data disks when the group has two data voters and a witness. */
+    private int dataCopiesRequired() {
+        int dataVoters = 0;
+        boolean witnessVotes = false;
+        for (var id : voters) {
+            if (witnesses.contains(id)) {
+                witnessVotes = true;
+            } else {
+                dataVoters++;
+            }
+        }
+        if (!witnessVotes || dataVoters < 2) {
+            return 1;
+        }
+        return 2;
     }
 
     private boolean countsAsStored(NodeId id) {
