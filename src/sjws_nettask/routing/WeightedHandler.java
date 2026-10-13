@@ -172,6 +172,18 @@ public final class WeightedHandler implements Handler {
         return coin < this.prob[column] ? column : this.alias[column];
     }
 
+    /** Exact probability of backend {@code i} implied by the alias table, for tests. */
+    double share(int i) {
+        int n = this.prob.length;
+        double mass = this.prob[i];
+        for (int j = 0; j < n; j++) {
+            if (this.alias[j] == i && j != i) {
+                mass += 1.0 - this.prob[j];
+            }
+        }
+        return mass / n;
+    }
+
     int size() {
         return this.handlers.length;
     }

@@ -230,6 +230,26 @@ and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wai
 growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
 closes the replaced pools.
 
+Weighted and canary routes list `backends` instead of `proxy` (a plain `proxy:` route is unchanged):
+
+```yaml
+routes:
+  - prefix: /api
+    backends:
+      - { upstream: stable, weight: 95 }
+      - { upstream: canary, weight: 5, pin: { header: X-Canary, value: "1" } }
+      - { upstream: canary, weight: 0, pin: { cookie: beta } }   # pinned clients only
+    sticky: { cookie: session }                                  # optional
+```
+
+`weight` (default 1, 0 needs a `pin`) is a relative share, picked through a precomputed alias table:
+O(1) per request, no allocation, exact to the configured ratio. A `pin` (`header` or `cookie`, with an
+optional exact `value`; without one, presence is enough) sends a matching request to that backend
+whatever the weights; pins are checked in order. `sticky` hashes that header or cookie value so a
+client keeps its backend while the weights are unchanged; requests without it are picked at random.
+Each upstream keeps one pool and its own `retry` and `circuit`, however many routes or backends name it.
+Up to 64 backends per route.
+
 Retries and circuit breaking are per upstream and off unless configured (no cost when absent):
 
 ```yaml
@@ -265,7 +285,7 @@ routing:
     - host: "example.com"  # optional; exact, "*.suffix" or "[ipv6]"
       prefix: "/api"       # required, segment-boundary match
       rewrite: "/"         # optional
-      proxy: api           # exactly one of proxy | redirect | static
+      proxy: api           # exactly one of proxy | backends | redirect | static
     - prefix: "/old"
       redirect: { status: 301, location: "https://example.com/new/", keep_path: true }
     - prefix: "/"
