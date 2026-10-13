@@ -16,6 +16,8 @@
  */
 package sjws_nettask.core.buf;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -27,7 +29,17 @@ public final class BufferBudget {
     final BufferPool pool;
     private final String name;
     private final long limit;
+    /** Bytes taken from {@link #limit}: held buffers plus credit parked in {@link #cells}. Touched only on lease/return. */
     final AtomicLong used = new AtomicLong();
+    /**
+     * Per-thread-stripe credit (bytes already counted in {@link #used}), one padded cell per stripe so that a charge or
+     * refund is a CAS on a cell the thread usually owns alone, not on one shared counter. Indexed by thread id.
+     */
+    private final long[] cells;
+    private final int mask;
+    private final long batch;
+    private static final int STRIDE = 16; // 128 bytes per cell: no false sharing between stripes
+    private static final VarHandle CELL = MethodHandles.arrayElementVarHandle(long[].class);
     final LongAdder denied = new LongAdder();
     final LongAdder fallbacks = new LongAdder();
     final LongAdder acquired = new LongAdder();
@@ -36,6 +48,11 @@ public final class BufferBudget {
         this.pool = pool;
         this.name = name;
         this.limit = limit;
+        int cpus = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int n = Integer.highestOneBit(cpus * 2 - 1) << 1;
+        this.mask = n - 1;
+        this.cells = new long[(n + 1) * STRIDE];
+        this.batch = Math.min(256 << 10, limit / (4L * n)); // at most a quarter of the limit parked as credit
     }
 
     /**
@@ -77,12 +94,43 @@ public final class BufferBudget {
         return this.limit;
     }
 
-    /** Bytes currently held through this budget. */
+    /** Bytes currently held through this budget (exact when no charge or release is in flight). */
     public long usedBytes() {
-        return this.used.get();
+        long u = this.used.get();
+        for (int i = STRIDE; i < this.cells.length; i += STRIDE) {
+            u -= (long) CELL.getVolatile(this.cells, i);
+        }
+        return Math.max(0, u);
+    }
+
+    private int cell() {
+        return (((int) Thread.currentThread().threadId() & this.mask) + 1) * STRIDE;
     }
 
     boolean charge(int bytes) {
+        int i = cell();
+        for (;;) {
+            long c = (long) CELL.getVolatile(this.cells, i);
+            if (c < bytes) {
+                break;
+            }
+            if (CELL.compareAndSet(this.cells, i, c, c - bytes)) {
+                return true;
+            }
+        }
+        long want = Math.max(bytes, this.batch);
+        if (want > bytes && lease(want)) {
+            CELL.getAndAdd(this.cells, i, want - bytes);
+            return true;
+        }
+        if (lease(bytes)) {
+            return true;
+        }
+        reclaim(); // other stripes' idle credit counts against the limit: take it back, then decide exactly
+        return lease(bytes);
+    }
+
+    private boolean lease(long bytes) {
         for (;;) {
             long u = this.used.get();
             if (u + bytes > this.limit) {
@@ -94,7 +142,23 @@ public final class BufferBudget {
         }
     }
 
+    private void reclaim() {
+        for (int i = STRIDE; i < this.cells.length; i += STRIDE) {
+            long c = (long) CELL.getAndSet(this.cells, i, 0L);
+            if (c > 0) {
+                this.used.addAndGet(-c);
+            }
+        }
+    }
+
     void refund(int bytes) {
-        this.used.addAndGet(-bytes);
+        int i = cell();
+        long c = (long) CELL.getAndAdd(this.cells, i, (long) bytes) + bytes;
+        if (c > 2 * this.batch) {
+            long excess = c - this.batch;
+            if (CELL.compareAndSet(this.cells, i, c, c - excess)) {
+                this.used.addAndGet(-excess);
+            }
+        }
     }
 }
