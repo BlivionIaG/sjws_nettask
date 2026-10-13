@@ -16,19 +16,42 @@
  */
 package sjws_nettask.config;
 
+import sjws_nettask.routing.Router;
+
 /**
  * One route, in declaration order. Maps onto {@code Route(host, prefix, rewrite, handler)} from
  * the proxy workstream: {@code host} is null when the route matches every host, {@code rewrite}
- * is null when the path is left unchanged, and {@link Action} is the handler kind. Matching is
- * allocation-free and is not called from a transport until that workstream builds a router.
+ * is null when the path is left unchanged, and {@link Action} is the handler kind. Matching uses
+ * the same rules as {@link Router} and is not called from a transport.
  *
  * @param host lower-case exact host, or the lower-case pattern including {@code *.} when
  *        {@code wildcard} is true; null matches every host
  * @param hostSuffix for a wildcard, the dotted suffix ({@code *.example.com} stores
  *        {@code .example.com}); null otherwise
+ * @param errors how server-generated error pages of this route are rendered
  */
 public record RouteSpec(String host, boolean wildcard, String hostSuffix, String prefix, String rewrite,
-        RouteSpec.Action action) {
+        RouteSpec.Action action, RouteSpec.Errors errors) {
+
+    public RouteSpec {
+        java.util.Objects.requireNonNull(errors, "errors");
+    }
+
+    /** HTML error pages (the default). */
+    public RouteSpec(String host, boolean wildcard, String hostSuffix, String prefix, String rewrite, Action action) {
+        this(host, wildcard, hostSuffix, prefix, rewrite, action, Errors.HTML);
+    }
+
+    /**
+     * {@code errors: html | problem} and {@code problem_type}.
+     *
+     * @param problem render supported statuses as RFC 9457 {@code application/problem+json}
+     * @param typeBase URI the status is appended to for {@code type}; null gives "about:blank"
+     */
+    public record Errors(boolean problem, String typeBase) {
+
+        public static final Errors HTML = new Errors(false, null);
+    }
 
     /** Exactly one of proxy, redirect or static. */
     public sealed interface Action permits Action.Proxy, Action.Redirect, Action.Static {
@@ -44,64 +67,36 @@ public record RouteSpec(String host, boolean wildcard, String hostSuffix, String
         record Redirect(int status, String location, boolean keepPath) implements Action {
         }
 
-        /** {@code static: true}: the document root. */
-        record Static() implements Action {
-        }
-    }
+        /**
+         * {@code static: true}: the document root.
+         *
+         * @param listing {@code listing:} (default true); false answers directories without
+         *        index.html with 404
+         */
+        record Static(boolean listing) implements Action {
 
-    /** Segment-boundary prefix match on the raw (still percent-encoded) request target. */
-    public boolean matchesPath(String target) {
-        if (target == null || target.isEmpty() || target.charAt(0) != '/') {
-            return false;
-        }
-        if (this.prefix.equals("/")) {
-            return true;
-        }
-        int length = this.prefix.length();
-        if (target.length() < length || !target.regionMatches(0, this.prefix, 0, length)) {
-            return false;
-        }
-        if (target.length() == length) {
-            return true;
-        }
-        char next = target.charAt(length);
-        return next == '/' || next == '?';
-    }
-
-    /** Exact or {@code *.suffix} host. A port in the header is ignored. Null pattern matches all. */
-    public boolean matchesHost(String hostHeader) {
-        if (this.host == null) {
-            return true;
-        }
-        if (hostHeader == null || hostHeader.isEmpty()) {
-            return false;
-        }
-        int end = hostEnd(hostHeader);
-        if (end <= 0) {
-            return false;
-        }
-        if (this.wildcard) {
-            int suffix = this.hostSuffix.length();
-            return end > suffix && hostHeader.regionMatches(true, end - suffix, this.hostSuffix, 0, suffix);
-        }
-        int start = 0;
-        if (hostHeader.charAt(0) == '[') {
-            if (hostHeader.charAt(end - 1) != ']') {
-                return false;
+            public Static() {
+                this(true);
             }
-            start = 1;
-            end--;
         }
-        int length = end - start;
-        return length == this.host.length() && hostHeader.regionMatches(true, start, this.host, 0, length);
     }
 
-    private static int hostEnd(String header) {
-        if (header.charAt(0) == '[') {
-            int close = header.indexOf(']');
-            return close < 0 ? -1 : close + 1;
-        }
-        int colon = header.indexOf(':');
-        return colon < 0 ? header.length() : colon;
+    /** {@link Router#pathMatches} on the raw (still percent-encoded) request target. */
+    public boolean matchesPath(String target) {
+        return target != null && Router.pathMatches(this.prefix, target, Router.pathEnd(target));
+    }
+
+    /** {@link Router#hostMatches} against {@link #routerHost()}. Null pattern matches all. */
+    public boolean matchesHost(String hostHeader) {
+        return Router.hostMatches(routerHost(), hostHeader);
+    }
+
+    /**
+     * The host as {@link Router.Route} takes it: an IPv6 literal ({@code ::1} in the file) is
+     * bracketed ({@code [::1]}), as it appears in a Host header.
+     */
+    public String routerHost() {
+        return this.host != null && !this.wildcard && this.host.indexOf(':') >= 0 ? "[" + this.host + "]"
+                : this.host;
     }
 }

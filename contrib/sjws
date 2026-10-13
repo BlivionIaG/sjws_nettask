@@ -4,7 +4,8 @@
 #   SJWS_PID_FILE  pid file (default: ./sjws_nettask.pid)
 #   SJWS_LOG_FILE  log file (default: ./sjws_nettask.log)
 #   JAVA           java binary (default: java)
-# Extra arguments are passed through (port, document root, server options).
+# Extra arguments are passed through (port, document root, server options, --role, --bootstrap).
+# The join-token secret is a file named by the bootstrap, not an argument.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)

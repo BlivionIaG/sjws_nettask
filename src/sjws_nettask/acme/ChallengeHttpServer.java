@@ -22,7 +22,10 @@ import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.concurrent.Semaphore;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
@@ -32,30 +35,50 @@ import sjws_nettask.core.StaticFileHandler;
 
 /**
  * A small HTTP/1.1 listener for HTTP-01 when {@code acme.http_port} is not the main server port.
- * One request per connection, then close. The head is capped at 8 KiB.
+ * One request per connection, then close. The head is capped at 8 KiB and must arrive within
+ * {@link #HEAD_DEADLINE} in total (not per read, so trickling one byte at a time does not extend
+ * it). At most {@link #MAX_CONNECTIONS} connections are served at once; extra ones are closed on
+ * accept, so this public port cannot pin the process's file descriptors (shared with the main
+ * server). The CA retries failed validations, and one request at a time is all it needs.
  */
 public final class ChallengeHttpServer implements AutoCloseable {
 
     static final int MAX_HEAD = 8192;
+    static final int MAX_CONNECTIONS = 64;
+    static final Duration HEAD_DEADLINE = Duration.ofSeconds(10);
     private static final byte[] CRLFCRLF = new byte[] {'\r', '\n', '\r', '\n'};
 
     private final ServerSocket socket;
     private final Thread thread;
     private volatile boolean closed;
+    private final int maxConnections;
+    private final Semaphore slots;
+    private final long headDeadlineNanos;
 
-    private ChallengeHttpServer(ServerSocket socket, Handler handler) {
+    private ChallengeHttpServer(ServerSocket socket, Handler handler, int maxConnections, Duration headDeadline) {
         this.socket = socket;
+        this.maxConnections = maxConnections;
+        this.slots = new Semaphore(maxConnections);
+        this.headDeadlineNanos = headDeadline.toNanos();
         this.thread = Thread.ofPlatform().daemon().name("acme-http-01").unstarted(() -> acceptLoop(handler));
         this.thread.start();
     }
 
     public static ChallengeHttpServer open(int port, ChallengeBoard board) throws IOException {
+        return open(port, board, MAX_CONNECTIONS, HEAD_DEADLINE);
+    }
+
+    static ChallengeHttpServer open(int port, ChallengeBoard board, int maxConnections, Duration headDeadline)
+            throws IOException {
+        if (maxConnections < 1 || headDeadline.isNegative() || headDeadline.isZero()) {
+            throw new IllegalArgumentException("maxConnections >= 1 and a positive head deadline required");
+        }
         var socket = new ServerSocket();
         socket.setReuseAddress(true);
         socket.bind(new InetSocketAddress(port), 64);
         var handler = new AcmeChallengeHandler(board,
                 request -> StaticFileHandler.error(404, request.headOnly()));
-        return new ChallengeHttpServer(socket, handler);
+        return new ChallengeHttpServer(socket, handler, maxConnections, headDeadline);
     }
 
     public int port() {
@@ -73,35 +96,76 @@ public final class ChallengeHttpServer implements AutoCloseable {
                 }
                 return;
             }
-            Thread.ofVirtual().start(() -> {
-                try (client) {
-                    client.setSoTimeout(10_000);
-                    serve(client, handler);
-                } catch (IOException e) {
-                    // the CA retries
-                }
-            });
+            if (!this.slots.tryAcquire()) {
+                closeQuietly(client); // over the cap: shed at once, the CA retries
+                continue;
+            }
+            try {
+                Thread.ofVirtual().start(() -> {
+                    try (client) {
+                        serve(client, handler, System.nanoTime() + this.headDeadlineNanos);
+                    } catch (IOException e) {
+                        // the CA retries
+                    } finally {
+                        this.slots.release();
+                    }
+                });
+            } catch (RuntimeException | Error e) {
+                this.slots.release();
+                closeQuietly(client);
+                throw e;
+            }
+        }
+    }
+
+    /** @return connections being served right now */
+    int activeConnections() {
+        return this.maxConnections - this.slots.availablePermits();
+    }
+
+    private static void closeQuietly(Socket s) {
+        try {
+            s.close();
+        } catch (IOException e) {
+            // nothing to do
         }
     }
 
     static void serve(Socket client, Handler handler) throws IOException {
-        var head = readHead(client.getInputStream());
+        serve(client, handler, System.nanoTime() + HEAD_DEADLINE.toNanos());
+    }
+
+    /** @param deadline {@link System#nanoTime()} by which the whole head must have arrived */
+    static void serve(Socket client, Handler handler, long deadline) throws IOException {
+        byte[] head;
+        try {
+            head = readHead(client, deadline);
+        } catch (SocketTimeoutException e) {
+            return; // head deadline: close without an answer
+        }
         var response = head == null
                 ? StaticFileHandler.error(400, false)
                 : handler.handle(request(head));
         write(client, response);
     }
 
-    private static byte[] readHead(InputStream in) throws IOException {
+    private static byte[] readHead(Socket client, long deadline) throws IOException {
+        InputStream in = client.getInputStream();
         var data = new byte[MAX_HEAD];
         int n = 0;
         while (n < data.length) {
+            long left = deadline - System.nanoTime();
+            if (left <= 0) {
+                throw new SocketTimeoutException("head deadline");
+            }
+            client.setSoTimeout((int) Math.max(1, Math.min(Integer.MAX_VALUE, left / 1_000_000)));
             int read = in.read(data, n, data.length - n);
             if (read < 0) {
                 return null;
             }
+            int from = Math.max(0, n - (CRLFCRLF.length - 1)); // only rescan what this read could complete
             n += read;
-            if (indexOf(data, n, CRLFCRLF) >= 0) {
+            if (indexOf(data, from, n, CRLFCRLF) >= 0) {
                 var head = new byte[n];
                 System.arraycopy(data, 0, head, 0, n);
                 return head;
@@ -167,8 +231,8 @@ public final class ChallengeHttpServer implements AutoCloseable {
         return new byte[0];
     }
 
-    private static int indexOf(byte[] data, int length, byte[] needle) {
-        outer: for (int i = 0; i + needle.length <= length; i++) {
+    private static int indexOf(byte[] data, int from, int length, byte[] needle) {
+        outer: for (int i = from; i + needle.length <= length; i++) {
             for (int j = 0; j < needle.length; j++) {
                 if (data[i + j] != needle[j]) {
                     continue outer;

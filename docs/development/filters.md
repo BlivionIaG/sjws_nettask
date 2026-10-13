@@ -33,8 +33,8 @@ public final class AccessLog implements RequestFilter {
 `Request` is an immutable record. `Response` is a record too; its `headers()` are a mutable
 map, and the chain does not copy them. Pass `request.withMethod`, `request.withTarget` or `request.withHeaders` into
 `proceed` to change what the rest of the chain sees. `withMethod` and `withTarget` keep the
-peer address, `secure`, and headers. `withHeaders` keeps the method, target, peer, `secure`
-and protocol. Return a new `Response` to change the status or body, or mutate
+peer address, `secure`, headers and body. `withHeaders` keeps the method, target, peer,
+`secure`, protocol and body. Return a new `Response` to change the status or body, or mutate
 `response.headers()` in place. Skip `proceed` to short-circuit; later filters and the terminal
 handler do not run.
 
@@ -89,8 +89,12 @@ when `proceed` returns, before the socket write. Parse errors, 408, HTTP/2 refus
 refusals do not enter the chain, so they are not logged or counted.
 
 `RoutePattern` is `*` (or omitted) for every request, `/exact`, or `/prefix/*` (the path equals
-`/prefix` or starts with `/prefix/`). The query and fragment are ignored. The path is not
-percent-decoded.
+`/prefix` or starts with `/prefix/`). The query and fragment are ignored. The path is matched
+after percent-decoding and dot-segment normalisation, so `/%61dmin`, `//admin` and `/x/../admin`
+all match `/admin/*`. Spellings that different readers resolve differently (`%2f`, `%5c`, `\`,
+`;` path parameters, a `%` left after decoding, malformed escapes, `..` above the root) match
+every route, so a scoped filter fails closed instead of being skipped. Plain paths are matched in
+place without allocating.
 
 ## Configuration hook
 

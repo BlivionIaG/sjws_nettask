@@ -22,8 +22,6 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -58,7 +56,7 @@ public final class ConfigLoader {
     /** A server started from a {@link ServerConfig} alone (no file, so reload has nothing to read). */
     public static Loaded standalone(ServerConfig config) {
         return new Loaded(ConfigDocument.defaults(config), List.of(), List.of(), false, new String[0], Map.of(),
-                ServerConfig::readPasswordFile);
+                ServerConfig::readPasswordFile, null);
     }
 
     public static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
@@ -66,13 +64,13 @@ public final class ConfigLoader {
         var environment = Map.copyOf(env);
         for (var arg : arguments) {
             if (arg.equals("-h") || arg.equals("--help")) {
-                return new Loaded(null, List.of(), List.of(), true, arguments, environment, passwords);
+                return new Loaded(null, List.of(), List.of(), true, arguments, environment, passwords, null);
             }
         }
         try {
             return loadFile(arguments, environment, passwords);
         } catch (ConfigException e) {
-            return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords);
+            return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords, null);
         }
     }
 
@@ -101,42 +99,60 @@ public final class ConfigLoader {
         List<MiddlewareSpec> middleware = List.of();
         AccessSettings access = AccessSettings.DEFAULT;
         Path configFile = null;
-        String contentHash = null;
         Path yamlPassword = null;
         NodeSettings node = NodeSettings.STANDALONE;
         int schemaVersion = ConfigDocument.SCHEMA;
         long bundleVersion = 0;
+        Boolean yamlBind = null;
+        byte[] bootSignature = null;
+        String recoveredHash = null;
+        Path yamlState = null;
+        String text;
+        Path readFrom = null;
         if (configured != null) {
             var requested = Path.of(configured);
             configFile = requested;
             if (!Files.isRegularFile(requested)) {
-                var lastGood = LastGoodStore.beside(requested);
-                if (Files.isRegularFile(lastGood) && LastGoodStore.dataPlane(lastGood)) {
-                    warnings.add("config file " + requested.toAbsolutePath()
-                            + " is missing; booted from last good config " + lastGood.toAbsolutePath());
-                    configFile = lastGood;
-                } else {
+                var state = stateDir(args, env, null, requested.toAbsolutePath().getParent());
+                var json = LastGoodStore.file(state);
+                var recovered = LastGoodStore.dataPlaneYaml(json);
+                var source = json;
+                if (recovered == null) {
+                    var legacy = LastGoodStore.beside(requested);
+                    recovered = LastGoodStore.dataPlaneYaml(legacy);
+                    source = legacy;
+                }
+                if (recovered == null) {
                     throw new ConfigException("Cannot read config file " + requested.toAbsolutePath());
                 }
+                warnings.add("config file " + requested.toAbsolutePath()
+                        + " is missing; booted from last good config " + source.toAbsolutePath());
+                text = recovered;
+                readFrom = source;
+                bootSignature = LastGoodStore.signature(source);
+                recoveredHash = ConfigCodec.sha256(recovered);
+            } else {
+                try {
+                    text = Files.readString(requested);
+                } catch (IOException e) {
+                    throw new ConfigException("Cannot read config file " + requested.toAbsolutePath() + ": "
+                            + e.getMessage());
+                }
+                readFrom = requested;
             }
-            byte[] bytes;
-            try {
-                bytes = Files.readAllBytes(configFile);
-            } catch (IOException e) {
-                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath() + ": "
-                        + e.getMessage());
+            if (text.getBytes(StandardCharsets.UTF_8).length > 1_000_000) {
+                throw new ConfigException("Config file " + readFrom.toAbsolutePath() + " is larger than 1MB");
             }
-            if (bytes.length > 1_000_000) {
-                throw new ConfigException("Config file " + configFile.toAbsolutePath() + " is larger than 1MB");
-            }
-            contentHash = sha256(bytes);
-            var root = YamlValues.parse(new String(bytes, StandardCharsets.UTF_8), configFile.toString());
+            var root = YamlValues.parse(text, readFrom.toString());
             YamlValues.knownKeys(root, TOP, "config");
             schemaVersion = schemaOf(root);
             bundleVersion = versionOf(root);
             node = nodeSection(root);
             var base = configFile.toAbsolutePath().getParent();
-            baseline = serverSection(root, base);
+            var bindHolder = new Boolean[1];
+            yamlState = stateDirKey(root, base);
+            baseline = serverSection(root, base, bindHolder);
+            yamlBind = bindHolder[0];
             yamlPassword = tlsPassword(root, base);
             acme = acmeSection(root, base);
             routing = routingSection(root, warnings);
@@ -148,7 +164,7 @@ public final class ConfigLoader {
                 : ServerConfig.parse(args, env, baseline, passwords);
         warnings.addAll(parsed.warnings());
         if (!parsed.ok()) {
-            return new Loaded(null, warnings, parsed.errors(), parsed.helpRequested(), args, env, passwords);
+            return new Loaded(null, warnings, parsed.errors(), parsed.helpRequested(), args, env, passwords, null);
         }
         var server = applyYamlPassword(parsed.config(), yamlPassword, args, env, passwords, warnings);
         acme = overlayAcme(acme, args, env, configFile);
@@ -158,9 +174,13 @@ public final class ConfigLoader {
         if (acme.enabled()) {
             access = access.withAcmeChallenge();
         }
+        var base = configFile == null ? null : configFile.toAbsolutePath().getParent();
         var document = ConfigDocument.of(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion,
-                configFile, contentHash);
-        return new Loaded(document, warnings, List.of(), false, args, env, passwords);
+                configFile).withStateDir(stateDir(args, env, yamlState, base));
+        if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
+            document = document.withSignature(bootSignature);
+        }
+        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind);
     }
 
     private static int schemaOf(Map<String, Object> root) {
@@ -198,12 +218,58 @@ public final class ConfigLoader {
             return NodeSettings.STANDALONE;
         }
         var map = YamlValues.mapping(node, "node");
-        YamlValues.knownKeys(map, List.of("mode", "labels"), "node");
+        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir"), "node");
         var mode = map.containsKey("mode")
                 ? NodeSettings.Mode.parse(text(map.get("mode"), "node.mode"))
                 : NodeSettings.Mode.STANDALONE;
         var labels = map.containsKey("labels") ? labels(map.get("labels")) : Map.<String, String>of();
         return new NodeSettings(mode, labels);
+    }
+
+    private static Path stateDirKey(Map<String, Object> root, Path base) {
+        if (!(root.get("node") instanceof Object node)) {
+            return null;
+        }
+        var map = YamlValues.mapping(node, "node");
+        if (!map.containsKey("state_dir")) {
+            return null;
+        }
+        var path = Path.of(text(map.get("state_dir"), "node.state_dir"));
+        if (!path.isAbsolute() && base != null) {
+            path = base.resolve(path);
+        }
+        return path;
+    }
+
+    /**
+     * Environment, then {@code --state-dir}, then {@code node.state_dir}, then {@link LastGoodStore#defaultStateDir()}.
+     * Paths from the file are already resolved against the file. Flag and environment paths stay relative
+     * to the working directory.
+     */
+    private static Path stateDir(String[] args, Map<String, String> env, Path fromYaml, Path base) {
+        var envDir = env.get("WEB_SERVER_STATE_DIR");
+        if (envDir != null && !envDir.isBlank()) {
+            return Path.of(envDir.trim()).toAbsolutePath().normalize();
+        }
+        String fromArgs = null;
+        for (var arg : args) {
+            if (!arg.startsWith("--") || !optionName(arg).equals("--state-dir")) {
+                continue;
+            }
+            var value = optionValue(arg);
+            if (value == null || value.isBlank()) {
+                throw new ConfigException("Missing value for --state-dir (use --state-dir=PATH)");
+            }
+            fromArgs = value.trim();
+        }
+        if (fromArgs != null) {
+            return Path.of(fromArgs).toAbsolutePath().normalize();
+        }
+        if (fromYaml != null) {
+            var path = fromYaml.isAbsolute() || base == null ? fromYaml : base.resolve(fromYaml);
+            return path.toAbsolutePath().normalize();
+        }
+        return LastGoodStore.defaultStateDir();
     }
 
     private static Map<String, String> labels(Object value) {
@@ -244,13 +310,16 @@ public final class ConfigLoader {
         }
     }
 
-    private static ServerConfig serverSection(Map<String, Object> root, Path base) {
+    private static ServerConfig serverSection(Map<String, Object> root, Path base, Boolean[] bindContent) {
         var builder = ServerConfig.builder(Path.of(sjws_nettask.CONSTANTS.DEFAULT_HTML_PATH));
         if (root.get("server") instanceof Object server) {
             var map = YamlValues.mapping(server, "server");
             YamlValues.knownKeys(map, List.of("port", "root", "max_connections", "max_connections_per_ip", "backlog",
                     "idle_timeout", "header_timeout", "write_timeout", "cache_bytes", "allow_unlistable_dirs",
-                    "access_log"), "server");
+                    "access_log", "bind_content"), "server");
+            if (map.containsKey("bind_content")) {
+                bindContent[0] = bool(map.get("bind_content"), "server.bind_content");
+            }
             if (map.containsKey("port")) {
                 builder.port(integer(map.get("port"), "server.port", 0, 65535));
             }
@@ -542,7 +611,8 @@ public final class ConfigLoader {
         for (int i = 0; i < list.size(); i++) {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
-            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static"), path);
+            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static",
+                    "listing", "errors", "problem_type"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -578,11 +648,44 @@ public final class ConfigLoader {
             } else if (!bool(map.get("static"), path + ".static")) {
                 throw new ConfigException(path + ".static must be true");
             } else {
-                action = new RouteSpec.Action.Static();
+                action = new RouteSpec.Action.Static(
+                        !map.containsKey("listing") || bool(map.get("listing"), path + ".listing"));
             }
-            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action));
+            if (map.containsKey("listing") && !(action instanceof RouteSpec.Action.Static)) {
+                throw new ConfigException(path + ".listing is only valid on a static route");
+            }
+            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path)));
         }
         return List.copyOf(out);
+    }
+
+    /** {@code errors: html | problem} (default html) and the optional {@code problem_type} URI base. */
+    private static RouteSpec.Errors errors(Map<String, Object> map, String path) {
+        boolean problem = false;
+        if (map.containsKey("errors")) {
+            var format = text(map.get("errors"), path + ".errors");
+            problem = switch (format) {
+                case "html" -> false;
+                case "problem" -> true;
+                default -> throw new ConfigException(path + ".errors: expected html or problem");
+            };
+        }
+        String type = null;
+        if (map.containsKey("problem_type")) {
+            if (!problem) {
+                throw new ConfigException(path + ".problem_type requires errors: problem");
+            }
+            type = text(map.get("problem_type"), path + ".problem_type");
+            try {
+                var uri = new java.net.URI(type);
+                if (!uri.isAbsolute()) {
+                    throw new ConfigException(path + ".problem_type: expected an absolute URI");
+                }
+            } catch (java.net.URISyntaxException e) {
+                throw new ConfigException(path + ".problem_type: not a URI");
+            }
+        }
+        return problem ? new RouteSpec.Errors(true, type) : RouteSpec.Errors.HTML;
     }
 
     private static RouteSpec.Action.Redirect redirect(Object value, String path) {
@@ -677,9 +780,6 @@ public final class ConfigLoader {
         boolean world = map.containsKey("require_world_readable")
                 && bool(map.get("require_world_readable"), "access.require_world_readable");
         var settings = new AccessSettings(deny, rules, dotfiles, owner, world);
-        if (!settings.isDefault()) {
-            warnings.add("access is stored but not enforced");
-        }
         return settings;
     }
 
@@ -726,20 +826,6 @@ public final class ConfigLoader {
             throw new ConfigException(path + ": pattern is required");
         }
         return action + ":" + pattern;
-    }
-
-    private static String sha256(byte[] bytes) {
-        try {
-            var digest = MessageDigest.getInstance("SHA-256").digest(bytes);
-            var hex = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                hex.append(Character.forDigit((b >> 4) & 0xf, 16));
-                hex.append(Character.forDigit(b & 0xf, 16));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
     }
 
     private static String directory(String value, String path) {
@@ -883,6 +969,30 @@ public final class ConfigLoader {
     private record HostPattern(String host, boolean wildcard, String suffix) {
     }
 
+    /**
+     * {@code [v6]} route host: a real IPv6 literal (parsed without DNS, no zone id, no port),
+     * returned lower-case without brackets; {@link RouteSpec#routerHost()} brackets it again
+     * as {@code [::1]}, the form a Host header carries.
+     */
+    private static String ipv6Literal(String text, String path) {
+        var bad = new ConfigException(path + ": expected a bracketed IPv6 literal such as [::1] (no port)");
+        if (text.length() < 3 || text.indexOf(']') != text.length() - 1) {
+            throw bad;
+        }
+        var inner = text.substring(1, text.length() - 1);
+        if (inner.indexOf(':') < 0 || inner.indexOf('%') >= 0 || inner.indexOf('[') >= 0) {
+            throw bad;
+        }
+        try {
+            if (!(InetAddress.ofLiteral(inner) instanceof java.net.Inet6Address)) {
+                throw bad;
+            }
+        } catch (IllegalArgumentException e) {
+            throw bad;
+        }
+        return inner;
+    }
+
     private static HostPattern host(String value, String path) {
         var text = value.trim().toLowerCase(Locale.ROOT);
         if (text.startsWith("*.")) {
@@ -892,8 +1002,11 @@ public final class ConfigLoader {
             }
             return new HostPattern(text, true, "." + rest);
         }
+        if (text.startsWith("[")) {
+            return new HostPattern(ipv6Literal(text, path), false, null);
+        }
         if (text.indexOf('*') >= 0 || text.indexOf(':') >= 0) {
-            throw new ConfigException(path + ": expected a name or *.suffix");
+            throw new ConfigException(path + ": expected a name, *.suffix or [ipv6]");
         }
         try {
             InetAddress.ofLiteral(text);
@@ -1041,9 +1154,12 @@ public final class ConfigLoader {
         private final String[] args;
         private final Map<String, String> env;
         private final ServerConfig.PasswordFileReader passwords;
+        /** {@code server.bind_content} from the file, or null when the key was omitted. */
+        private final Boolean yamlBindContent;
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
-                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent) {
             this.document = document;
             this.warnings = List.copyOf(warnings);
             this.errors = List.copyOf(errors);
@@ -1051,6 +1167,18 @@ public final class ConfigLoader {
             this.args = args.clone();
             this.env = Map.copyOf(env);
             this.passwords = passwords;
+            this.yamlBindContent = yamlBindContent;
+        }
+
+        /** Same load, with the document replaced. The file's {@code bind_content} is kept. */
+        public Loaded withDocument(ConfigDocument document) {
+            return new Loaded(document, this.warnings, this.errors, this.helpRequested, this.args, this.env,
+                    this.passwords, this.yamlBindContent);
+        }
+
+        /** {@code server.bind_content}, or null when the file did not set it. Not part of the canonical document. */
+        public Boolean yamlBindContent() {
+            return this.yamlBindContent;
         }
 
         public boolean ok() {

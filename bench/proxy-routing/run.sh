@@ -1,12 +1,12 @@
 #!/bin/bash
 # Routing/proxy benchmarks through the real entry point (--config).
-# usage: MASTER_JAR=/path/master.jar WWW=/dir/with/index.html,1k.bin,64k.bin [JAVA=java] [MODE=quick] bench/proxy-routing/run.sh
+# usage: MASTER_JAR=/path/master.jar WWW=/dir/with/index.html,1k.bin,64k.bin,4m.bin [JAVA=java] [MODE=quick] bench/proxy-routing/run.sh
 # Build this branch first (mvn package). Server on CPUs 0-3, wrk/wrk2 on 4-7.
 set -u
 J=${JAVA:-java}
 BR=$(cd "$(dirname "$0")/../.." && pwd)/target/sjws_nettask-0.2-SNAPSHOT.jar
 MJ=${MASTER_JAR:?path to the master jar}
-W=${WWW:?document root with index.html, 1k.bin, 64k.bin}
+W=${WWW:?document root with index.html, 1k.bin, 64k.bin, 4m.bin}
 T=$(mktemp -d)
 P=18101; U=http://127.0.0.1:$P
 start(){ taskset -c 0-3 "$@" >/dev/null 2>&1 & echo $! > $T/pid; sleep 3; }
@@ -20,11 +20,17 @@ echo "== master index.html"; start $J -jar $MJ $P $W; w $U/index.html; stop
 echo "== branch routing disabled"; start $J -jar $BR --config=$(cfg "routing:\n  enabled: false\n"); w $U/index.html; stop
 [ "${MODE:-full}" = quick ] && exit 0
 for n in 1 10 50; do echo "== branch routes=$n"; start $J -jar $BR --config=$(cfg "$(routes $n)"); w $U/index.html; stop; done
+# upstream: the master static server on CPUs 0-3 beside the proxy (the client keeps 4-7)
 taskset -c 0-3 $J -jar $MJ 18200 $W >/dev/null 2>&1 & UP=$!; sleep 3
-for f in 1k.bin 64k.bin; do echo "== direct $f"; w http://127.0.0.1:18200/$f; done
-echo "== wrk2 direct 1k R=10000"; w2 http://127.0.0.1:18200/1k.bin 10000
-start $J -jar $BR --config=$(cfg 'routing:\n  enabled: true\n  upstreams:\n    up: { url: "http://127.0.0.1:18200" }\n  routes:\n    - { prefix: /, proxy: up }\n')
-for f in 1k.bin 64k.bin; do echo "== proxied $f"; w $U/$f; done
-echo "== wrk2 proxied 1k R=10000"; w2 $U/1k.bin 10000
-ss -tn state established '( dport = :18200 )' | wc -l | awk '{print "upstream conns established:", $1-1}'
-stop; kill $UP; rm -rf $T
+for f in 1k.bin 64k.bin 4m.bin; do echo "== direct $f"; w http://127.0.0.1:18200/$f; done
+for r in "1k.bin 10000" "64k.bin 5000" "4m.bin 200"; do set -- $r; echo "== wrk2 direct $1 R=$2"; w2 http://127.0.0.1:18200/$1 $2; done
+PROXY='routing:\n  enabled: true\n  upstreams:\n    up: { url: "http://127.0.0.1:18200" }\n  routes:\n    - { prefix: /, proxy: up }\n'
+for side in master branch; do
+  [ $side = master ] && JAR=$MJ || JAR=$BR
+  start $J -jar $JAR --config=$(cfg "$PROXY")
+  for f in 1k.bin 64k.bin 4m.bin; do echo "== $side proxied $f"; w $U/$f; done
+  for r in "1k.bin 10000" "64k.bin 5000" "4m.bin 200"; do set -- $r; echo "== wrk2 $side proxied $1 R=$2"; w2 $U/$1 $2; done
+  ss -tn state established '( dport = :18200 )' | wc -l | awk -v s=$side '{print s, "upstream conns established:", $1-1}'
+  stop
+done
+kill $UP; rm -rf $T

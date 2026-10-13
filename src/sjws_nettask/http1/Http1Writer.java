@@ -81,6 +81,11 @@ public final class Http1Writer {
      * An output that can send file ranges itself (sendfile). {@link #write} hands it file bodies
      * larger than {@link #SMALL_FILE_MAX} after writing the head.
      */
+    /** An output that can send a {@link ByteBuffer} (also a direct one) without copying it. */
+    public interface BufferSink {
+        void write(ByteBuffer data) throws IOException;
+    }
+
     public interface FileSink {
         /**
          * @throws IOException if the file ends before {@code position + count} (it shrank) or the
@@ -170,6 +175,13 @@ public final class Http1Writer {
     public static void write(OutputStream out, Response response, boolean keepAlive, ResponseHeaders extra)
             throws IOException {
         boolean sendBody = response.sendsBody();
+        if (response.body() instanceof Body.Stream stream) {
+            try (var source = stream.source()) {
+                writeStream(out, response, stream, source, keepAlive, extra, sendBody);
+            }
+            out.flush();
+            return;
+        }
         if (sendBody && response.body() instanceof Body.FileBody file) {
             java.nio.channels.FileChannel opened;
             try {
@@ -216,6 +228,65 @@ public final class Http1Writer {
             }
         }
         out.flush();
+    }
+
+    private static final byte[] LAST_CHUNK = "0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
+
+    /**
+     * Known length: Content-Length and exactly that many bytes. Unknown length: chunked when the
+     * connection stays open, otherwise no framing (the close ends the body).
+     *
+     * @throws IOException if the source fails or does not produce exactly the announced length
+     */
+    private static void writeStream(OutputStream out, Response response, Body.Stream stream, Body.Stream.Source source,
+            boolean keepAlive, ResponseHeaders extra, boolean sendBody) throws IOException {
+        long length = stream.length();
+        boolean chunked = sendBody && length < 0 && keepAlive;
+        var fields = extra;
+        if (chunked) {
+            fields = ResponseHeaders.of();
+            for (var e : extra.entries()) {
+                fields.add(e.getKey(), e.getValue());
+            }
+            fields.add("transfer-encoding", "chunked");
+        }
+        out.write(head(response.status(), response.headers(), response.mayHaveBody() && length >= 0, length, keepAlive,
+                fields, DateClock.SYSTEM.now()).getBytes(StandardCharsets.ISO_8859_1));
+        if (!sendBody) {
+            return;
+        }
+        long sent = 0;
+        byte[] copy = null;
+        for (var data = source.next(); data != null; data = source.next()) {
+            int n = data.remaining();
+            sent += n;
+            if (length >= 0 && sent > length) {
+                throw new IOException("stream body longer than its length " + length);
+            }
+            if (chunked) {
+                out.write((Integer.toHexString(n) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+            }
+            if (out instanceof BufferSink sink) {
+                sink.write(data);
+            } else if (data.hasArray()) {
+                out.write(data.array(), data.arrayOffset() + data.position(), n);
+            } else {
+                if (copy == null || copy.length < n) {
+                    copy = new byte[Math.max(n, TRANSFER_BUFFER)];
+                }
+                data.get(copy, 0, n);
+                out.write(copy, 0, n);
+            }
+            if (chunked) {
+                out.write(LAST_CHUNK, 3, 2); // CRLF
+            }
+        }
+        if (length >= 0 && sent != length) {
+            throw new IOException("stream body ended after " + sent + " of " + length + " bytes");
+        }
+        if (chunked) {
+            out.write(LAST_CHUNK);
+        }
     }
 
     private static void readFully(FileChannel channel, Body.FileBody file, ByteBuffer into) throws IOException {

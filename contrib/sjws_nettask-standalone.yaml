@@ -1,0 +1,11 @@
+# Sample standalone node. Schema 1 (docs/user/config-file.md).
+# Packaged path: contrib/sjws_nettask-standalone.yaml
+# Installed path used by contrib/sjws_nettask.service:
+#   install -D -m 0644 contrib/sjws_nettask-standalone.yaml /etc/sjws_nettask/sjws_nettask-standalone.yaml
+schema: 1
+version: 0
+node:
+  mode: standalone
+server:
+  port: 8080
+  root: /var/www/html

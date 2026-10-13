@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestBody;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.ResponseHeaders;
 
@@ -24,9 +25,20 @@ class HeaderRewriteFilterTest {
                 "response-remove", "x-old",
                 "response-set", "x-out: 1\nx-out: 2")));
         var seen = new AtomicReference<Request>();
+        RequestBody body = new RequestBody() {
+            @Override
+            public long length() {
+                return 4;
+            }
+
+            @Override
+            public int read(byte[] into, int off, int len) {
+                return -1;
+            }
+        };
         var original = new Request("GET", "/a", RequestHeaders.of(Map.of(
                 "x-drop", List.of("gone"),
-                "x-keep", List.of("yes"))), new InetSocketAddress("127.0.0.1", 9), false);
+                "x-keep", List.of("yes"))), new InetSocketAddress("127.0.0.1", 9), false, "HTTP/1.1", body);
         var response = filter.filter(original, request -> {
             seen.set(request);
             var out = GatewayTestSupport.ok(request);
@@ -39,6 +51,7 @@ class HeaderRewriteFilterTest {
         assertEquals(List.of("edge"), seen.get().headers().values("x-from"));
         assertEquals("app.example", seen.get().headers().host());
         assertEquals(original.peer(), seen.get().peer());
+        assertSame(body, seen.get().body());
         assertEquals(List.of("gone"), original.headers().values("x-drop"));
         assertNull(response.headers().get("x-old"));
         assertEquals("2", response.headers().get("x-out"));

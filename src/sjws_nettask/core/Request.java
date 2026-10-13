@@ -20,12 +20,12 @@ import java.net.InetSocketAddress;
 import java.util.Objects;
 
 /**
- * Protocol-neutral request. Immutable. A filter that changes the method or target passes a
- * {@link #withMethod} / {@link #withTarget} copy into {@code proceed}; those copies keep
- * {@link #peer}, {@link #secure} and {@link #headers}.
+ * Protocol-neutral request. Immutable. A filter that changes the method, target or headers passes a
+ * {@link #withMethod} / {@link #withTarget} / {@link #withHeaders} copy into {@code proceed}.
+ * Those copies keep {@link #peer}, {@link #secure} and {@link #body}.
  * <p>
- * There is no body component. A later change can add a pull-style body (empty by default) without
- * moving these fields; see {@code docs/development/filters.md}. Do not buffer the body into a {@code byte[]}.
+ * {@link #body} is a pull-style request body ({@link RequestBody#EMPTY} unless the transport
+ * attached one). Do not buffer it into a {@code byte[]}.
  *
  * @param method request method, case-sensitive ("GET", "HEAD", ...)
  * @param target origin-form request-target: raw (still percent-encoded) path plus optional "?query"
@@ -37,9 +37,10 @@ import java.util.Objects;
  * @param protocol the version token ({@code HTTP/1.0}, {@code HTTP/1.1}, {@code HTTP/3}, ...).
  *        Null becomes {@code HTTP/3} when {@code secure} is true and {@code HTTP/1.1} otherwise,
  *        so existing constructors keep a protocol without an extra allocation
+ * @param body request content; null becomes {@link RequestBody#EMPTY}
  */
 public record Request(String method, String target, RequestHeaders headers, InetSocketAddress peer, boolean secure,
-        String protocol) {
+        String protocol, RequestBody body) {
 
     public Request {
         Objects.requireNonNull(method, "method");
@@ -48,6 +49,14 @@ public record Request(String method, String target, RequestHeaders headers, Inet
         if (protocol == null) {
             protocol = secure ? "HTTP/3" : "HTTP/1.1";
         }
+        if (body == null) {
+            body = RequestBody.EMPTY;
+        }
+    }
+
+    public Request(String method, String target, RequestHeaders headers, InetSocketAddress peer, boolean secure,
+            String protocol) {
+        this(method, target, headers, peer, secure, protocol, RequestBody.EMPTY);
     }
 
     public Request(String method, String target, RequestHeaders headers, InetSocketAddress peer, boolean secure) {
@@ -66,18 +75,23 @@ public record Request(String method, String target, RequestHeaders headers, Inet
         return "HEAD".equals(this.method);
     }
 
-    /** Same request, different target. Keeps headers, peer, secure and protocol. */
+    /** Same request, different target. Keeps headers, peer, secure, protocol and body. */
     public Request withTarget(String target) {
-        return new Request(this.method, target, this.headers, this.peer, this.secure, this.protocol);
+        return new Request(this.method, target, this.headers, this.peer, this.secure, this.protocol, this.body);
     }
 
-    /** Same request, different method. Keeps headers, peer, secure and protocol. */
+    /** Same request, different method. Keeps headers, peer, secure, protocol and body. */
     public Request withMethod(String method) {
-        return new Request(method, this.target, this.headers, this.peer, this.secure, this.protocol);
+        return new Request(method, this.target, this.headers, this.peer, this.secure, this.protocol, this.body);
     }
 
-    /** Same request, different headers. Keeps method, target, peer, secure and protocol. */
+    /** Same request with {@code body}. */
+    public Request withBody(RequestBody body) {
+        return new Request(this.method, this.target, this.headers, this.peer, this.secure, this.protocol, body);
+    }
+
+    /** Same request, different headers. Keeps method, target, peer, secure, protocol and body. */
     public Request withHeaders(RequestHeaders headers) {
-        return new Request(this.method, this.target, headers, this.peer, this.secure, this.protocol);
+        return new Request(this.method, this.target, headers, this.peer, this.secure, this.protocol, this.body);
     }
 }

@@ -103,7 +103,7 @@ final class Http3Writer {
                 h.add(e.getKey(), e.getValue());
             }
         }
-        if (response.mayHaveBody()) {
+        if (response.mayHaveBody() && response.contentLength() >= 0) {
             h.add("content-length", Long.toString(response.contentLength()));
         }
         return frame;
@@ -135,8 +135,14 @@ final class Http3Writer {
     }
 
     private Outcome send(Response response) throws IOException, InterruptedException {
-        boolean sendBody = response.sendsBody() && response.contentLength() > 0;
+        if (response.body() instanceof Body.Stream stream) {
+            try (var source = stream.source()) { // closed even if the head cannot be built
+                return sendStream(headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now()), response, stream,
+                        source);
+            }
+        }
         var head = headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now());
+        boolean sendBody = response.sendsBody() && response.contentLength() > 0;
         if (sendBody && response.body() instanceof Body.FileBody file) {
             long deadline = System.nanoTime() + this.limits.slotWait().toNanos();
             if (!this.connectionFiles.tryAcquire(this.limits.slotWait().toNanos(), TimeUnit.NANOSECONDS)) {
@@ -225,6 +231,37 @@ final class Http3Writer {
             emit(buf, done == file.length());
         }
         return Outcome.COMPLETE;
+    }
+
+    /** Pulls the next chunk only after the previous one was taken by the stream (backpressure). */
+    private Outcome sendStream(Http3HeadersFrame head, Response response, Body.Stream stream, Body.Stream.Source source)
+            throws IOException, InterruptedException {
+        if (!response.sendsBody() || stream.length() == 0) {
+            this.channel.writeAndFlush(head).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
+            return Outcome.COMPLETE;
+        }
+        this.channel.write(head);
+        long sent = 0;
+        while (true) {
+            var outcome = ready(sent);
+            if (outcome != Outcome.COMPLETE) {
+                return outcome;
+            }
+            var data = source.next();
+            if (data == null) {
+                if (stream.length() >= 0 && sent != stream.length()) {
+                    return Outcome.SHRANK;
+                }
+                this.channel.flush(); // the head, when the body was empty
+                this.channel.shutdownOutput(); // every DATA frame was already taken (ready above)
+                return Outcome.COMPLETE;
+            }
+            sent += data.remaining();
+            if (stream.length() >= 0 && sent > stream.length()) {
+                return Outcome.SHRANK;
+            }
+            emit(Unpooled.copiedBuffer(data), false);
+        }
     }
 
     private void emit(ByteBuf content, boolean lastChunk) {

@@ -26,6 +26,7 @@
     <h3.gate.branch>0</h3.gate.branch>
     <tls.gate.line>0</tls.gate.line>
     <tls.gate.branch>0</tls.gate.branch>
+    <bouncycastle.version>1.86</bouncycastle.version>
   </properties>
 
   <dependencyManagement>
@@ -36,6 +37,24 @@
         <version>${netty.version}</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+      <!-- Bouncy Castle comes in through acme4j-client (which pins 1.83). Override it until acme4j
+           releases with a fixed version: 1.83 has CVE-2025-14813, CVE-2026-0636, CVE-2026-5588,
+           CVE-2026-5598, CVE-2026-8763 and CVE-2026-13506 (fixed in 1.84/1.85). -->
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcprov-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcpkix-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcutil-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
       </dependency>
     </dependencies>
   </dependencyManagement>
@@ -57,7 +76,7 @@
     <dependency>
       <groupId>org.yaml</groupId>
       <artifactId>snakeyaml</artifactId>
-      <version>2.4</version>
+      <version>2.7</version>
     </dependency>
     <!-- ACME (RFC 8555). HTTP-01 issuance and renewal. -->
     <dependency>
@@ -68,7 +87,7 @@
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-nop</artifactId>
-      <version>2.0.17</version>
+      <version>2.0.20</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -175,6 +194,14 @@
               </rule>
               <rule>
                 <element>PACKAGE</element>
+                <includes><include>sjws_nettask.controlplane</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.80</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
                 <includes><include>sjws_nettask.ha</include></includes>
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
@@ -259,6 +286,14 @@
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.88</minimum></limit>
                   <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.76</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
+                <includes><include>sjws_nettask.service</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
                 </limits>
               </rule>
               <rule>

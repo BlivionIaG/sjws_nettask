@@ -16,6 +16,8 @@
  */
 package sjws_nettask.admin;
 
+import sjws_nettask.observe.ClusterStatus;
+
 /**
  * Control/status abstraction the admin TUI drives. The in-process implementation is
  * {@link EmbeddedServerControl}; a daemon mode can supply its own (e.g. talking to a running
@@ -27,6 +29,14 @@ public interface ServerControl extends AutoCloseable {
 
     /** Snapshot of the server state; never throws, never blocks on I/O for long. */
     ServerStatus status();
+
+    /**
+     * Cluster aggregate for the admin TUI, or null when this control is not attached to a
+     * control plane. Never throws.
+     */
+    default ClusterStatus clusterStatus() {
+        return null;
+    }
 
     /** Starts the server if stopped. @throws ControlException if it cannot start */
     void start() throws ControlException;
