@@ -68,6 +68,8 @@ class RootBranchCoverageTest {
         assertEquals(Boolean.TRUE, envOnly.bindContent());
         var envAfterOn = Daemon.parse(new String[] {"--bind-content=true"}, Map.of("WEB_SERVER_BIND_CONTENT", "1"));
         assertEquals(Boolean.TRUE, envAfterOn.bindContent());
+        var bareBudget = Daemon.parse(new String[] {"--drain-budget"}, Map.of());
+        assertTrue(bareBudget.warnings().stream().anyMatch(w -> w.contains("drain-budget")));
         var badBudget = Daemon.parse(new String[] {"--drain-budget=nope"}, Map.of());
         assertTrue(badBudget.warnings().stream().anyMatch(w -> w.contains("default")));
         var replacedBudget = Daemon.parse(new String[] {"--drain-budget=10", "--drain-budget=9999"}, Map.of());
@@ -77,6 +79,8 @@ class RootBranchCoverageTest {
         assertTrue(world.config().access().requireWorldReadable());
         var worldOff = ServerConfig.parse(new String[] {"--require-world-readable=false"}, Map.of());
         assertFalse(worldOff.config().access().requireWorldReadable());
+        var worldOn = ServerConfig.parse(new String[] {"--require-world-readable=true"}, Map.of());
+        assertTrue(worldOn.config().access().requireWorldReadable());
     }
 
     @Test
@@ -142,6 +146,15 @@ class RootBranchCoverageTest {
             Files.writeString(yaml, head + "routing:\n  forwarded_proto: https\n");
             assertFalse(server.reload().applied());
             Files.writeString(yaml, head + "routing:\n  trusted_proxies: [\"127.0.0.1\"]\n");
+            assertFalse(server.reload().applied());
+            Files.writeString(yaml, head + """
+                    routing:
+                      enabled: true
+                      upstreams:
+                        api: { url: "http://127.0.0.1:9" }
+                      routes:
+                        - { prefix: /api, proxy: api }
+                    """);
             assertFalse(server.reload().applied());
         }
     }
@@ -266,6 +279,36 @@ class RootBranchCoverageTest {
         }
         try (var server = SjwsServer.start(config, ha)) {
             assertNotNull(server.ha());
+        }
+        var routed = this.dir.resolve("routed.yaml");
+        Files.writeString(routed, """
+                server:
+                  port: 0
+                  root: %s
+                routing:
+                  enabled: true
+                  routes:
+                    - { prefix: /x, static: true }
+                """.formatted(html.toAbsolutePath()));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + routed}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded, document -> {
+            throw new sjws_nettask.config.ConfigException(null);
+        })) {
+            var pushed = loaded.document();
+            var rejected = server.applyRemote(pushed);
+            assertFalse(rejected.applied());
+            assertTrue(rejected.errors().toString().contains("configuration rejected"), rejected.errors().toString());
+        }
+        var method = SjwsServer.class.getDeclaredMethod("start", ConfigLoader.Loaded.class,
+                sjws_nettask.Transport.Factory.class, sjws_nettask.Transport.Factory.class, RequestFilters.class,
+                java.util.function.Function.class, sjws_nettask.ha.HaSettings.class,
+                sjws_nettask.config.SnapshotVerifier.class, boolean.class);
+        method.setAccessible(true);
+        var routedServer = (SjwsServer) method.invoke(null, loaded, H3Transports.defaultFactory(), SjwsServer.H2_FACTORY,
+                null, null, ha, SnapshotVerifier.noop(), true);
+        try (routedServer) {
+            assertNotNull(routedServer.ha());
         }
         long me = ProcessHandle.current().pid();
         long started = ProcessHandle.current().info().startInstant().map(java.time.Instant::toEpochMilli).orElse(-1L);
