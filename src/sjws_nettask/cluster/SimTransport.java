@@ -53,6 +53,18 @@ public final class SimTransport implements ClusterTransport {
         }
     }
 
+    /** Drops {@code self}'s handler and its queued frames, so a restarted node can attach again. */
+    @Override
+    public void detach(NodeId self) {
+        lock.lock();
+        try {
+            handlers.remove(self);
+            queue.removeIf(envelope -> envelope.to.equals(self) || envelope.from.equals(self));
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public void cut(NodeId a, NodeId b) {
         lock.lock();
         try {

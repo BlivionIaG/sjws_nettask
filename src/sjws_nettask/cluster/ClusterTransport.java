@@ -29,4 +29,7 @@ public interface ClusterTransport {
 
     /** Run up to {@code max} queued inbound handlers. Returns how many ran. */
     int deliver(int max);
+
+    /** Drop {@code self}'s handler and queued frames so it can attach again. No-op by default. */
+    default void detach(NodeId self) {}
 }
