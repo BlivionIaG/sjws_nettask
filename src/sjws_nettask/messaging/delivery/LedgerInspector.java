@@ -37,7 +37,7 @@ public final class LedgerInspector {
         return view(s, group).page(state, fromOffset, limit);
     }
 
-    /** DLQ topic listing (its own groups' views), or null for a DLQ topic. */
+    /** DLQ topic listing (its own groups' views), or null for a DLQ topic or a topic opened without a DLQ. */
     public LedgerInspector deadLetterQueue() {
         var d = partition.deadLetterQueue();
         return d == null ? null : new LedgerInspector(d);

@@ -112,9 +112,23 @@ public final class Partition implements AutoCloseable {
 
     public static Partition open(Path dir, String topic, RetryPolicy policy, LongSupplier clockMs, Durability durability,
             long segmentBytes) throws IOException {
+        return open(dir, topic, policy, clockMs, durability, segmentBytes, true);
+    }
+
+    /**
+     * As {@link #open(Path, String, RetryPolicy, LongSupplier, Durability, long)}; {@code deadLetterQueue = false}
+     * opens the topic without a {@code <topic>.dlq} partition (no directory, no writer, syncer or snapshotter
+     * threads for it). A message that exhausts {@code maxAttempts}, or is rejected, is then dropped in place: its
+     * own log records DEAD_LETTERED with the reason (it is counted in {@code deadLettered}, listed by inspection,
+     * never delivered again, and its payload becomes reclaimable by retention), but no copy is kept anywhere.
+     * An existing {@code <topic>.dlq} directory is left untouched, so reopening with a DLQ later still sees it.
+     */
+    public static Partition open(Path dir, String topic, RetryPolicy policy, LongSupplier clockMs, Durability durability,
+            long segmentBytes, boolean deadLetterQueue) throws IOException {
         if (topic.isEmpty() || topic.contains("/") || topic.contains("\\")) throw new IllegalArgumentException("topic");
         boolean isDlq = topic.endsWith(DLQ_SUFFIX);
-        Partition dlq = isDlq ? null : open(dir, topic + DLQ_SUFFIX, RetryPolicy.NO_DLQ, clockMs, durability, segmentBytes);
+        Partition dlq = isDlq || !deadLetterQueue ? null
+                : open(dir, topic + DLQ_SUFFIX, RetryPolicy.NO_DLQ, clockMs, durability, segmentBytes, false);
         var logDir = dir.resolve(topic);
         var log = SegmentedLog.open(logDir, segmentBytes);
         var policyFor = isDlq ? RetryPolicy.NO_DLQ : policy;
@@ -175,7 +189,7 @@ public final class Partition implements AutoCloseable {
 
     public String topic() { return topic; }
 
-    /** The {@code <topic>.dlq} partition, or null for a DLQ topic itself. */
+    /** The {@code <topic>.dlq} partition, or null for a DLQ topic itself or a topic opened without one. */
     public Partition deadLetterQueue() { return dlq; }
 
     // ---- producer ----
