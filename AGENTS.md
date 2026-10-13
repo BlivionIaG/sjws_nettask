@@ -78,6 +78,7 @@ no counter: see how observability is wired). Docs, test, CI and dependency-only 
 - Small, focused PRs; avoid file moves/renames that make parallel branches conflict.
 - To catch up, **merge `master` into your branch** instead of rebasing.
 - **inceptor** (the project-manager agent) merges PRs and decides conflicts between workstreams.
+  Area owners: [docs/development/ownership.md](docs/development/ownership.md).
 
 ## Security
 

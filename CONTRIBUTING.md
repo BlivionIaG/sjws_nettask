@@ -1,6 +1,7 @@
 # Contributing to sjws_nettask
 
-Coding agents: read [AGENTS.md](AGENTS.md) first (rules for authors, PRs, perf numbers, security).
+Coding agents: read [AGENTS.md](AGENTS.md) first (rules for authors, PRs, perf numbers, security), and
+[docs/development/ownership.md](docs/development/ownership.md) for who owns which area.
 
 ## Setup
 
