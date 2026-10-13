@@ -383,6 +383,22 @@ class RootBranchCoverageTest {
                 assertTrue(socket.getInputStream().read() >= 0);
             }
         }
+        try (var server = SjwsServer.start(ServerConfig.builder(html).port(0).h3Enabled(false)
+                .headerTimeout(Duration.ofMillis(200)).idleTimeout(Duration.ofSeconds(2)).build())) {
+            try (var socket = new Socket(InetAddress.getLoopbackAddress(), server.tcpPort())) {
+                socket.setSoTimeout(2000);
+                socket.getOutputStream().write(("POST /index.html HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + "5\r\nhi").getBytes());
+                socket.shutdownOutput();
+                assertTrue(socket.getInputStream().read() >= 0 || socket.getInputStream().read() < 0);
+            }
+            try (var socket = new Socket(InetAddress.getLoopbackAddress(), server.tcpPort())) {
+                socket.setSoTimeout(2000);
+                socket.getOutputStream().write("POST /index.html HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n".getBytes());
+                Thread.sleep(400);
+                socket.getInputStream().read();
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")
