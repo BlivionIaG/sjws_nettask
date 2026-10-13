@@ -292,7 +292,10 @@ class BufferPoolTest {
                     var rnd = ThreadLocalRandom.current();
                     for (int i = 0; i < 2000; i++) {
                         var budget = p.budget(rnd.nextBoolean() ? BufferPool.HTTP : BufferPool.MESSAGING);
-                        var b = rnd.nextInt(4) == 0 ? budget.tryAcquire(1 + rnd.nextInt(65536)) : budget.acquire(1 + rnd.nextInt(65536));
+                        // >= 8 bytes: over budget, acquire() falls back to a heap buffer of exactly the
+                        // requested size, and the putLong(0) below needs 8 (flaked with sizes 1..7)
+                        int size = Long.BYTES + rnd.nextInt(65536 - Long.BYTES + 1);
+                        var b = rnd.nextInt(4) == 0 ? budget.tryAcquire(size) : budget.acquire(size);
                         if (b == null) {
                             continue;
                         }

@@ -531,6 +531,21 @@ environment variable `SJWS_SWARM_ENABLED` win over the key when set. With the sw
 `sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet.
 The key is read once, at startup: changing it takes effect on restart, not on reload.
 
+## Buffers
+
+```yaml
+buffers:
+  pool: false   # default
+```
+
+`buffers.pool: true` turns on the shared pool of direct buffers (`docs/design/buffer-pool.md`). HTTP/1
+then reads requests into pooled buffers (an idle connection keeps only a 256-byte one) and sends
+in-memory bodies and files up to 64 KiB with one gathering write instead of copying them into a new
+array; larger files still go through sendfile. The key sets the JVM property `sjws.buf.pool`; a
+`-Dsjws.buf.pool=on|off` given on the command line wins. Node-local like `swarm.enabled`, and read
+once, at startup: changing it takes effect on restart, not on reload. The other pool settings
+(`sjws.buf.maxBytes`, `sjws.buf.budgets`) are JVM properties only.
+
 ## Request path
 
 `LiveConfig` holds an `AtomicReference` of `ConfigSnapshot`. The snapshot carries

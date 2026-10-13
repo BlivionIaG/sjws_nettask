@@ -90,6 +90,37 @@ class ConfigLoaderTest {
     }
 
     @Test
+    void buffersPoolMapsToThePropertyUnlessSet() throws Exception {
+        var saved = System.getProperty("sjws.buf.pool");
+        try {
+            System.clearProperty("sjws.buf.pool");
+            var on = ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  pool: true\n")}, Map.of());
+            assertTrue(on.ok(), on.errors().toString());
+            assertEquals("on", System.getProperty("sjws.buf.pool"));
+            assertFalse(on.document().canonicalText().contains("buffers"), on.document().canonicalText());
+            var kept = ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  pool: false\n")}, Map.of());
+            assertTrue(kept.ok(), kept.errors().toString());
+            assertEquals("on", System.getProperty("sjws.buf.pool")); // a property already set wins
+            System.clearProperty("sjws.buf.pool");
+            assertTrue(ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  pool: false\n")}, Map.of()).ok());
+            assertEquals("off", System.getProperty("sjws.buf.pool"));
+            System.clearProperty("sjws.buf.pool");
+            assertTrue(ConfigLoader.load(new String[] {"--config=" + write("buffers: {}\n")}, Map.of()).ok());
+            assertNull(System.getProperty("sjws.buf.pool"));
+            assertFalse(ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  slabs: 3\n")}, Map.of()).ok());
+            var bad = ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  pool: maybe\n")}, Map.of());
+            assertFalse(bad.ok());
+            assertTrue(bad.errors().get(0).contains("buffers.pool"), bad.errors().toString());
+        } finally {
+            if (saved == null) {
+                System.clearProperty("sjws.buf.pool");
+            } else {
+                System.setProperty("sjws.buf.pool", saved);
+            }
+        }
+    }
+
+    @Test
     void emptyFileIsDefaults() throws Exception {
         var file = write("# nothing\n");
         var loaded = ConfigLoader.load(new String[] {"--config=" + file}, Map.of());

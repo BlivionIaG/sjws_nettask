@@ -75,7 +75,8 @@ public final class Http1Writer {
     private static final int TRANSFER_BUFFER = 64 * 1024;
 
     /** Files up to this size are read whole and leave with their head in one write. */
-    static final int SMALL_FILE_MAX = TRANSFER_BUFFER;
+    static final int SMALL_FILE_MAX = Math.max(0, Math.min(TRANSFER_BUFFER,
+            Integer.getInteger("sjws.http1.smallFileMax", TRANSFER_BUFFER)));
 
     /**
      * An output that can send file ranges itself (sendfile). {@link #write} hands it file bodies
@@ -84,6 +85,18 @@ public final class Http1Writer {
     /** An output that can send a {@link ByteBuffer} (also a direct one) without copying it. */
     public interface BufferSink {
         void write(ByteBuffer data) throws IOException;
+    }
+
+    /**
+     * A {@link BufferSink} that can lend buffers from the shared pool ({@code http} budget) and send two buffers
+     * with one gathering write. {@link #buffers()} is null when the pool is off: the writer then takes exactly the
+     * pool-off path (byte[] head + body in one array).
+     */
+    public interface PooledSink extends BufferSink {
+        sjws_nettask.core.buf.BufferBudget buffers();
+
+        /** Sends {@code head} then {@code body} (heap or direct), gathered when small. */
+        void write(ByteBuffer head, ByteBuffer body) throws IOException;
     }
 
     public interface FileSink {
@@ -182,6 +195,10 @@ public final class Http1Writer {
             out.flush();
             return;
         }
+        if (out instanceof PooledSink pooled && pooled.buffers() instanceof sjws_nettask.core.buf.BufferBudget budget
+                && writePooled(pooled, budget, response, keepAlive, extra, sendBody)) {
+            return;
+        }
         if (sendBody && response.body() instanceof Body.FileBody file) {
             java.nio.channels.FileChannel opened;
             try {
@@ -228,6 +245,94 @@ public final class Http1Writer {
             }
         }
         out.flush();
+    }
+
+    /**
+     * Pool-on path for the responses the connection answers whole: the head is encoded into a pooled direct buffer
+     * and sent with the body in one gathering write (no head+body array); a small file is read straight into a
+     * pooled direct buffer. Larger files still go to sendfile.
+     *
+     * @return false when the response is not one of those (or its head does not fit a pooled class): the caller
+     *         then writes it as with the pool off
+     */
+    private static boolean writePooled(PooledSink out, sjws_nettask.core.buf.BufferBudget budget, Response response,
+            boolean keepAlive, ResponseHeaders extra, boolean sendBody) throws IOException {
+        Body.FileBody file = null;
+        ByteBuffer bytes = null;
+        if (sendBody && response.body() instanceof Body.FileBody f && f.length() <= SMALL_FILE_MAX) {
+            file = f;
+        } else if (sendBody && response.body() instanceof Body.Bytes b && b.length() <= SINGLE_WRITE_MAX) {
+            bytes = b.data();
+        } else if (sendBody || response.body() instanceof Body.Stream) {
+            return false;
+        }
+        if (file == null) {
+            var text = head(response.status(), response.headers(), response.mayHaveBody(), response.contentLength(),
+                    keepAlive, extra, DateClock.SYSTEM.now());
+            if (text.length() > sjws_nettask.core.buf.BufferPool.MAX_CLASS) {
+                return false;
+            }
+            var head = encode(budget, text);
+            try {
+                out.write(head.buffer(), bytes == null ? EMPTY : bytes.duplicate());
+            } finally {
+                head.release();
+            }
+            return true;
+        }
+        java.nio.channels.FileChannel opened;
+        try {
+            opened = SafeOpen.open(file);
+        } catch (IOException e) { // the status isn't committed yet: answer with the matching error
+            write((java.io.OutputStream) out, StaticFileHandler.error(SafeOpen.status(e), false), keepAlive, extra);
+            return true;
+        }
+        try (var channel = opened) {
+            var text = head(response.status(), response.headers(), response.mayHaveBody(), response.contentLength(),
+                    keepAlive, extra, DateClock.SYSTEM.now());
+            if (text.length() > sjws_nettask.core.buf.BufferPool.MAX_CLASS) {
+                return writeUnpooledFile(out, response, keepAlive, extra, channel, file);
+            }
+            var body = budget.acquire(Math.max(1, (int) file.length()));
+            try {
+                var b = body.buffer().limit((int) file.length());
+                readFully(channel, file, b); // a file that shrank is detected before anything is sent
+                var head = encode(budget, text);
+                try {
+                    out.write(head.buffer(), b.flip());
+                } finally {
+                    head.release();
+                }
+            } finally {
+                body.release();
+            }
+        }
+        return true;
+    }
+
+    /** {@code text} as ISO-8859-1 (unmappable as '?', like {@link String#getBytes}) in a pooled buffer, flipped. */
+    private static sjws_nettask.core.buf.PooledBuffer encode(sjws_nettask.core.buf.BufferBudget budget, String text) {
+        var lease = budget.acquire(text.length());
+        var h = lease.buffer();
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            h.put(c <= 0xFF ? (byte) c : (byte) '?');
+        }
+        h.flip();
+        return lease;
+    }
+
+    private static final ByteBuffer EMPTY = ByteBuffer.allocate(0).asReadOnlyBuffer();
+
+    /** A small file whose head is too large for a pooled buffer: as with the pool off. */
+    private static boolean writeUnpooledFile(PooledSink out, Response response, boolean keepAlive,
+            ResponseHeaders extra, java.nio.channels.FileChannel channel, Body.FileBody file) throws IOException {
+        var head = serializeHead(response, keepAlive, extra);
+        var all = new byte[head.length + (int) file.length()];
+        System.arraycopy(head, 0, all, 0, head.length);
+        readFully(channel, file, ByteBuffer.wrap(all, head.length, (int) file.length()));
+        ((java.io.OutputStream) out).write(all);
+        return true;
     }
 
     private static final byte[] LAST_CHUNK = "0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
@@ -302,16 +407,29 @@ public final class Http1Writer {
 
     private static void copy(FileChannel channel, Body.FileBody file, OutputStream out) throws IOException {
         long size = file.length();
-        var buffer = ByteBuffer.allocate((int) Math.min(TRANSFER_BUFFER, Math.max(size, 1)));
-        long done = 0;
-        while (done < size) {
-            buffer.clear().limit((int) Math.min(buffer.capacity(), size - done));
-            int n = channel.read(buffer, file.offset() + done);
-            if (n < 0) {
-                throw new IOException("file shrank during transfer: " + file.realPath());
+        int capacity = (int) Math.min(TRANSFER_BUFFER, Math.max(size, 1));
+        // a pooled sink without sendfile: a pooled direct transfer buffer, sent without a copy
+        var lease = out instanceof PooledSink sink && sink.buffers() != null ? sink.buffers().acquire(capacity) : null;
+        var buffer = lease != null ? lease.buffer() : ByteBuffer.allocate(capacity);
+        try {
+            long done = 0;
+            while (done < size) {
+                buffer.clear().limit((int) Math.min(capacity, size - done));
+                int n = channel.read(buffer, file.offset() + done);
+                if (n < 0) {
+                    throw new IOException("file shrank during transfer: " + file.realPath());
+                }
+                if (lease != null) {
+                    ((BufferSink) out).write(buffer.flip());
+                } else {
+                    out.write(buffer.array(), 0, n);
+                }
+                done += n;
             }
-            out.write(buffer.array(), 0, n);
-            done += n;
+        } finally {
+            if (lease != null) {
+                lease.release();
+            }
         }
     }
 }
