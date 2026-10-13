@@ -66,6 +66,19 @@ How this is enforced is in §3.3.
    - No existing package used this pattern before #90: `service/Bootstrap.java:43` is only the `"messaging"` capability string, not a gate.
 4. **Off-mode wrk gate** (§13, item 3). It is the backstop, not the proof. wrk cannot resolve a single extra volatile read; tests 1–3 can.
 
+As built in S1, from the gate to the mount. `swarm` itself imports only `core`, `messaging.delivery`, `messaging.ledger`,
+`swarm.wire` and `config.SecureKeyFile`, and the guard tests above keep every other package from naming it:
+
+```mermaid
+flowchart TB
+    g["Gate, first one set wins:<br/>-Dsjws.swarm.enabled,<br/>then SJWS_SWARM_ENABLED,<br/>then the YAML key<br/>swarm.enabled. Only the<br/>text true enables"]
+    g -->|"off, the default"| off["OptionalModules.start<br/>returns at once: no swarm<br/>class is loaded, no<br/>thread, no dispatcher.<br/>/swarm/v1 is a<br/>static-file miss (404)"]
+    g -->|on| ld["Class.forName by name:<br/>sjws_nettask.swarm.SwarmModule.<br/>A load failure is a WARN<br/>and the module is skipped"]
+    ld --> m["SwarmModule opens the<br/>Swarm (partitions and the<br/>reply poller start on<br/>first use) and reads the<br/>agent tokens. None, or a<br/>bad file: a deny-all<br/>gate, every request is<br/>401"]
+    m --> mt["Before the listener<br/>accepts, contribute()<br/>mounts SwarmHttp at<br/>/swarm/v1, in front of<br/>the request handler"]
+    mt --> rq["Each request: SwarmHttp,<br/>then TaskService and<br/>ReplyRouter over<br/>delivery.Partition"]
+```
+
 ## 4. Task model on messaging (Co-author: Messaging Core; their notes integrated 2026-10-13, pending their review of this text)
 
 This section is grounded in what is merged: #21 ledger, #33 delivery, #69 snapshots/retention, #37 stats, #39 config schema (doc only). Items marked **GAP** do not exist on master.
@@ -153,6 +166,31 @@ When headers land (**GAP 3** in §4.8), the metadata fields move to headers and 
   - The requester times out locally and answers the HTTP caller with a 504-class error. A late reply is acked and discarded.
   - Broker-side TTL is §4.6.
 - **Durability:** replies are written with `Durability.ASYNC` (`messaging/ledger/Durability.java`), and the task is acked only after the reply is durable (§4.4). `NONE` is not used for replies: a crash after the ack would lose both the reply and the task.
+
+As built in S1, one request and reply through `/swarm/v1`. Streaming, quotas and tracing are not built yet:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as SwarmHttp
+    participant M as Partition
+
+    C->>S: a caller: POST /swarm/v1/tasks/POOL:call<br/>TASK frame, optional deadlineMs
+    Note over S: token (else 401), size (413), POST only (405),<br/>pool allowed (403)
+    S->>M: produce on tasks.POOL, replyTo reply.NODE
+    Note over S: the first call opens reply.NODE<br/>and starts its poller thread
+    C->>S: a worker: POST .../tasks/POOL:claim
+    S->>M: poll group workers
+    M-->>S: tasks leased, attempt n
+    S-->>C: 200, a LEASE frame per task,<br/>id POOL~offset~attempt (204: none)
+    C->>S: the worker: POST .../leases/ID:extend
+    S->>M: extend, fenced by the attempt
+    C->>S: the worker: POST .../leases/ID:reply
+    S->>M: produce on reply.NODE (ASYNC),<br/>then ack the task, fenced
+    M-->>S: the poller reads the reply and completes<br/>the waiting call by correlation id
+    S-->>C: to the caller: 200 RESULT frame,<br/>or 504 at the deadline
+    Note over S: ack, nack and reject are lease verbs too:<br/>204, or 409 STALE_ATTEMPT or NOT_IN_FLIGHT<br/>when the lease was lost
+```
 
 ### 5.2 Token streaming
 There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP leg is Architecture's.

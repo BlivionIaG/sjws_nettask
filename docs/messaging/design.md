@@ -29,16 +29,20 @@ stateDiagram-v2
     ENQUEUED --> IN_FLIGHT: poll leases it to a consumer
     IN_FLIGHT --> ACKED: ack
     IN_FLIGHT --> ENQUEUED: nack
-    IN_FLIGHT --> IN_FLIGHT: expired lease, redelivered by poll
-    IN_FLIGHT --> DEAD_LETTERED: reject, or nack or expiry after maxAttempts deliveries
+    IN_FLIGHT --> IN_FLIGHT: extend, or expiry redelivery
+    IN_FLIGHT --> DEAD_LETTERED: reject, or max attempts
     ACKED --> [*]
     DEAD_LETTERED --> [*]
 
     note right of ENQUEUED: redelivered after its backoff, attempt + 1
-    note right of DEAD_LETTERED: copied to the topic.dlq partition first
+    note right of DEAD_LETTERED: copied to the topic.dlq partition first, if the topic has one
 ```
 
-This is what `messaging.delivery.Partition` implements today.
+This is what `messaging.delivery.Partition` implements today. A settle (ack, nack, reject, extend) carries
+the attempt it was leased under, and an older attempt is refused as `STALE_ATTEMPT`. `extend` keeps the
+attempt and moves the lease deadline. A lease expires lazily: nothing fires at the deadline, and the next
+poll of the group redelivers it as attempt + 1 once the deadline plus the backoff has passed, or
+dead-letters it when it has used `maxAttempts`.
 
 ## 2. Durable ledger
 Every non-acked message and each of its state transitions is durable before it is
@@ -101,7 +105,7 @@ sequenceDiagram
         Note over W,S: W fsyncs inline if its default is GROUP<br/>or EACH. Otherwise S does it
     end
     S->>L: force(false)
-    Note left of S: ASYNC writers, and appends that<br/>wait for a fsync. Then durableOffset<br/>advances and a LedgerSnapshot<br/>is published
+    Note left of S: S runs when an ASYNC writer<br/>is dirty or an append waits for<br/>an fsync. W wakes it after every<br/>write. Then durableOffset advances<br/>and a LedgerSnapshot is published
 ```
 
 ### 2.3 In-memory state machine
@@ -186,35 +190,35 @@ The lag gauges already rendered by `PartitionStatsRegistry` are listed there as 
 `ReplicatedLedger` (cluster adapter; a `LocalOnly` implementation until the cluster layer lands).
 
 The list above is the original plan. Some names changed when the code was written. This is what exists
-(solid) and what the rest of the design still needs (dashed); nothing outside `sjws_nettask.messaging`
-uses the package yet:
+(solid) and what the rest of the design still needs (dashed). Two modules reach it, both opt-in and off by
+default: the messaging HTTP module (`sjws.messaging.enabled`), which logs plain topics without a `Partition`,
+and the swarm (`sjws.swarm.enabled`), the only production user of `Partition`:
 
 ```mermaid
-flowchart TB
-    bind["HTTP bindings and<br/>native binary protocol"]
-    adm["Admin endpoint<br/>for the inspector"]
-    br["Broker<br/>topics, partitions,<br/>consumer groups"]
-    insp["delivery.LedgerInspector<br/>counts and paged listings"]
-    part["delivery.Partition<br/>produce, subscribe, poll,<br/>ack, nack, reject,<br/>snapshots, maintain"]
-    ds["delivery.DeliveryState<br/>cursor, leases, retries,<br/>dead letters, dedup,<br/>snapshot encoding"]
-    dlq["Partition for topic.dlq<br/>dead-lettered copies"]
-    lw["ledger.LedgerWriter<br/>writer thread, bounded queue,<br/>group commit, syncer"]
-    sl["ledger.SegmentedLog<br/>segments, CRC batches,<br/>recovery, scans,<br/>readahead, compaction"]
-    rep["Replication through<br/>the cluster layer"]
+flowchart LR
+    mh["messaging.http:<br/>MessagingModule and<br/>MessagingHttp at<br/>/messaging/v1"]
+    sh["swarm: SwarmHttp,<br/>TaskService and Topics<br/>at /swarm/v1"]
+    br["Broker and native binary<br/>protocol"]
+    tools["delivery.LedgerInspector<br/>and messaging.stats:<br/>only tests call them"]
+    rep["Replication through the<br/>cluster layer"]
+    lt["messaging.http.LogTopics:<br/>one log and writer per<br/>topic, retention timer"]
+    part["delivery.Partition:<br/>produce, poll, extend,<br/>ack, nack, reject,<br/>snapshots, maintain<br/>(nothing schedules it)"]
+    ds["delivery.DeliveryState:<br/>cursor, leases, retries,<br/>dead letters, dedup"]
+    dlq["Partition for topic.dlq:<br/>dead-lettered copies"]
+    led["ledger.LedgerWriter and<br/>SegmentedLog: writer<br/>thread, group commit,<br/>syncer, segments,<br/>recovery, compaction"]
 
-    bind -.-> br
+    mh --> lt
+    lt --> led
+    sh --> part
     br -.-> part
-    adm -.-> insp
-    insp --> part
+    tools --> part
     part --> ds
-    part --> lw
-    part --> sl
     part --> dlq
-    lw --> sl
-    rep -.-> lw
+    part --> led
+    rep -.-> led
 
     classDef design stroke-dasharray: 5 5
-    class bind,adm,br,rep design
+    class br,rep design
 ```
 
 ## 6. Replication via the cluster layer
