@@ -117,11 +117,12 @@ class ClassLoadTest {
         assertFalse(text.contains(SECRET), "the token never reaches the output");
     }
 
-    static final String SECRET = "s3cret-token-for-classload-test";
+    static final String SECRET = "s3cret-token-for-classload-test-0123456789abcdefXYZ";
 
     private Path tokens() throws Exception {
         var f = this.dir.resolve("tokens-" + System.nanoTime());
         Files.writeString(f, "agent-1 " + SECRET + " *\n");
+        Files.setPosixFilePermissions(f, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
         return f;
     }
 

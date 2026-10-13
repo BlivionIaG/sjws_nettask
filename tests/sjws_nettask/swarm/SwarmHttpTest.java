@@ -255,7 +255,7 @@ class SwarmHttpTest {
                 return n;
             }
         };
-        assertEquals(400, this.http.handle(new Request("POST", "/swarm/v1/tasks/a", RequestHeaders.NONE, null, false,
+        assertEquals(413, this.http.handle(new Request("POST", "/swarm/v1/tasks/a", RequestHeaders.NONE, null, false,
                 null, unknownLength)).status());
         var failing = new RequestBody() {
             @Override

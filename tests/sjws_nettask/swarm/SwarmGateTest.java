@@ -29,6 +29,7 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,8 +45,8 @@ import sjws_nettask.swarm.wire.Frame;
 
 class SwarmGateTest {
 
-    static final String ALICE = "alice-token-0123456789abcdef";
-    static final String BOB = "bob-token-0123456789abcdefgh";
+    static final String ALICE = "alice-token-0123456789abcdef0123456789abcdefXY";
+    static final String BOB = "bob-token-0123456789abcdef0123456789abcdefghXY";
 
     @TempDir
     Path dir;
@@ -94,7 +95,7 @@ class SwarmGateTest {
         var r = post("/swarm/v1/tasks/a", null, task(), true);
         assertEquals(401, r.status());
         assertEquals("Bearer realm=\"sjws-swarm\"", r.headers().get("www-authenticate"));
-        assertEquals(401, post("/swarm/v1/tasks/a", "Bearer wrong-token-0123456789", task(), true).status());
+        assertEquals(401, post("/swarm/v1/tasks/a", "Bearer wrong-token-0123456789abcdef0123456789abcdef", task(), true).status());
         assertEquals(401, post("/swarm/v1/tasks/a", "Basic " + ALICE, task(), true).status());
         assertEquals(401, post("/swarm/v1/tasks/a", "Bearer ", task(), true).status());
         // nothing was enqueued by the refused requests
@@ -125,8 +126,8 @@ class SwarmGateTest {
     void requestSizeCap() {
         var big = new Frame(Frame.Type.TASK, 0, new byte[5000]).encode();
         assertEquals(413, post("/swarm/v1/tasks/a", "Bearer " + ALICE, big, true).status());
-        // unknown length (chunked): cut off while reading
-        assertEquals(400, post("/swarm/v1/tasks/a", "Bearer " + ALICE, big, false).status());
+        // unknown length (chunked): cut off while reading, still 413
+        assertEquals(413, post("/swarm/v1/tasks/a", "Bearer " + ALICE, big, false).status());
         assertEquals(202, post("/swarm/v1/tasks/a", "Bearer " + ALICE, task(), false).status());
         assertThrows(IllegalArgumentException.class, () -> new TokenGate(List.of("a " + ALICE + " *"), 0));
         assertThrows(IllegalArgumentException.class,
@@ -163,6 +164,7 @@ class SwarmGateTest {
     void tokensFromAFileOrTheEnvironmentAndNeverInLogsOrToString() throws Exception {
         var file = this.dir.resolve("tokens");
         Files.writeString(file, "alice " + ALICE + " a\n");
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
         var err = new ByteArrayOutputStream();
         var out = new PrintStream(err, true, StandardCharsets.UTF_8);
         var fromFile = TokenGate.configured(k -> TokenGate.FILE_PROPERTY.equals(k) ? file.toString() : null, Map.of(), out);
@@ -185,5 +187,133 @@ class SwarmGateTest {
         for (var text : List.of(log, SwarmHttpTest.text(r), r.headers().toString(), this.gate.toString())) {
             assertFalse(text.contains(ALICE) || text.contains(BOB), text);
         }
+    }
+
+    // --- fix-forward of the #165 Security review ---
+
+    SwarmGate fromFile(Path file, ByteArrayOutputStream err) {
+        return TokenGate.configured(k -> TokenGate.FILE_PROPERTY.equals(k) ? file.toString() : null, Map.of(),
+                new PrintStream(err, true, StandardCharsets.UTF_8));
+    }
+
+    Path tokensFile(String name, String perms) throws Exception {
+        var f = this.dir.resolve(name);
+        Files.writeString(f, "alice " + ALICE + " a\n");
+        Files.setPosixFilePermissions(f, PosixFilePermissions.fromString(perms));
+        return f;
+    }
+
+    void assertRefused(Path file) {
+        var err = new ByteArrayOutputStream();
+        assertSame(SwarmGate.DENY_ALL, fromFile(file, err));
+        var log = err.toString(StandardCharsets.UTF_8);
+        assertTrue(log.startsWith("WARN: swarm: tokens file " + file + " refused"), log);
+        assertFalse(log.contains(ALICE), log);
+    }
+
+    @Test
+    void tokensFileModeMustBe0600Or0400() throws Exception {
+        assertTrue(fromFile(tokensFile("t600", "rw-------"), new ByteArrayOutputStream()) instanceof TokenGate);
+        assertTrue(fromFile(tokensFile("t400", "r--------"), new ByteArrayOutputStream()) instanceof TokenGate);
+        assertRefused(tokensFile("t644", "rw-r--r--"));
+        assertRefused(tokensFile("t640", "rw-r-----"));
+        assertRefused(tokensFile("t604", "rw----r--"));
+    }
+
+    @Test
+    void tokensFileSymlinkIsRefused() throws Exception {
+        var real = tokensFile("real", "rw-------");
+        var link = this.dir.resolve("link");
+        Files.createSymbolicLink(link, real);
+        assertRefused(link);
+    }
+
+    @Test
+    void tokensFileMissingOrADirectoryOrTooLargeIsRefused() throws Exception {
+        assertRefused(this.dir.resolve("missing"));
+        var d = Files.createDirectory(this.dir.resolve("adir"));
+        assertRefused(d);
+        var big = this.dir.resolve("big");
+        Files.write(big, new byte[TokenGate.MAX_FILE_BYTES + 1]);
+        Files.setPosixFilePermissions(big, PosixFilePermissions.fromString("rw-------"));
+        assertRefused(big);
+    }
+
+    @Test
+    void tokensFileInAGroupOrWorldWritableDirectoryIsRefused() throws Exception {
+        var loose = Files.createDirectory(this.dir.resolve("loose"));
+        var f = loose.resolve("tokens");
+        Files.writeString(f, "alice " + ALICE + " a\n");
+        Files.setPosixFilePermissions(f, PosixFilePermissions.fromString("rw-------"));
+        Files.setPosixFilePermissions(loose, PosixFilePermissions.fromString("rwxrwxrwx"));
+        try {
+            assertRefused(f);
+        } finally {
+            Files.setPosixFilePermissions(loose, PosixFilePermissions.fromString("rwx------"));
+        }
+    }
+
+    @Test
+    void tokensFileOwnedByAnotherUserIsRefused() throws Exception {
+        var f = tokensFile("foreign", "rw-------");
+        var me = System.getProperty("user.name");
+        chown(f, "nobody");
+        try {
+            int uid = ((Integer) Files.getAttribute(f, "unix:uid")).intValue();
+            int self = ((Integer) Files.getAttribute(Path.of("/proc/self"), "unix:uid")).intValue();
+            assertTrue(uid != self, "chown took effect");
+            assertRefused(f);
+        } finally {
+            chown(f, me);
+        }
+    }
+
+    private static void chown(Path path, String owner) throws Exception {
+        var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
+        String out = new String(proc.getInputStream().readAllBytes());
+        assertEquals(0, proc.waitFor(), out);
+    }
+
+    @Test
+    void inlineEnvTokensWarnToPreferTheFile() {
+        var err = new ByteArrayOutputStream();
+        var g = TokenGate.configured(k -> null, Map.of(TokenGate.TOKENS_ENV, "alice " + ALICE + " a"),
+                new PrintStream(err, true, StandardCharsets.UTF_8));
+        assertTrue(g instanceof TokenGate);
+        var log = err.toString(StandardCharsets.UTF_8);
+        assertTrue(log.contains("WARN: swarm: tokens from " + TokenGate.TOKENS_ENV), log);
+        assertTrue(log.contains("prefer " + TokenGate.FILE_ENV), log);
+        assertFalse(log.contains(ALICE), log);
+    }
+
+    @Test
+    void tokensShorterThan32RandomBytesAreRefused() {
+        var shortToken = "x".repeat(TokenGate.MIN_TOKEN_CHARS - 1);
+        assertThrows(IllegalArgumentException.class, () -> new TokenGate(List.of("a " + shortToken + " *"), 4096));
+        assertTrue(new TokenGate(List.of("a " + "y".repeat(TokenGate.MIN_TOKEN_CHARS) + " *"), 4096)
+                .authenticate(new Request("POST", "/x")) == null);
+    }
+
+    @Test
+    void chunkedBodyOverTheConfiguredLimitIs413() {
+        // max + 1 bytes of body, unknown length: 413 like a declared length, not 400
+        var over = new byte[4096 + 1];
+        assertEquals(413, post("/swarm/v1/tasks/a", "Bearer " + ALICE, over, false).status());
+        assertEquals(413, post("/swarm/v1/tasks/a", "Bearer " + ALICE, over, true).status());
+        var exact = new Frame(Frame.Type.TASK, 0, new byte[4096 - Frame.HEADER]).encode();
+        assertEquals(4096, exact.length);
+        assertEquals(202, post("/swarm/v1/tasks/a", "Bearer " + ALICE, exact, false).status());
+    }
+
+    @Test
+    void failedAuthIsCountedAndAPresentedTokenGetsInvalidToken() {
+        assertEquals(0, this.http.failedAuth());
+        var none = post("/swarm/v1/tasks/a", null, task(), true);
+        assertEquals("Bearer realm=\"sjws-swarm\"", none.headers().get("www-authenticate"));
+        var bad = post("/swarm/v1/tasks/a", "Bearer nope", task(), true);
+        assertEquals("Bearer realm=\"sjws-swarm\", error=\"invalid_token\"", bad.headers().get("www-authenticate"));
+        assertEquals(2, this.http.failedAuth());
+        assertEquals(202, post("/swarm/v1/tasks/a", "Bearer " + ALICE, task(), true).status());
+        assertEquals(2, this.http.failedAuth());
     }
 }
