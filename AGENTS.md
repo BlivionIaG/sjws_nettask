@@ -79,6 +79,19 @@ no counter: see how observability is wired). Docs, test, CI and dependency-only 
 - To catch up, **merge `master` into your branch** instead of rebasing.
 - **inceptor** (the project-manager agent) merges PRs and decides conflicts between workstreams.
   Area owners: [docs/development/ownership.md](docs/development/ownership.md).
+- inceptor merges once CI is green. `Do not merge` in a PR body holds the PR out of the merge sweep.
+- A blocking review is a comment containing `CHANGES REQUESTED`; a later `APPROVED` comment from the
+  same reviewer clears it.
+
+## Shared box etiquette
+
+The box (8 cores, 15 GB RAM) is shared by every bot.
+
+- Run every benchmark (wrk, wrk2, JMH, `LogBench`, the swarm benches) as `flock /tmp/sjws-bench.lock <cmd>`.
+- Run local builds as `nice -n 10 mvn ...`, one build per bot at a time; prefer CI where possible.
+- Benchmark only when the 1-minute load average is under 4. Record the load at the start and end of
+  the run in the PR body; if it goes above 4 during the run, mark the numbers noisy and rerun in a
+  quiet window.
 
 ## Security
 
