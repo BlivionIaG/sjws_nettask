@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import sjws_nettask.messaging.delivery.LeaseResult;
 
@@ -45,7 +46,7 @@ public final class LeaseKeeper implements AutoCloseable {
     private record Key(String pool, long offset) { }
 
     private final Map<Key, Task> held = new LinkedHashMap<>();
-    private final Object lock = new Object();
+    private final ReentrantLock lock = new ReentrantLock();
     private volatile Thread thread;
     private volatile boolean closed;
     private long batches;
@@ -64,28 +65,40 @@ public final class LeaseKeeper implements AutoCloseable {
     }
 
     public void hold(Task t) {
-        synchronized (this.lock) {
+        this.lock.lock();
+        try {
             this.held.put(key(t), t);
+        } finally {
+            this.lock.unlock();
         }
     }
 
     /** Stops extending {@code t} (call it after a settle). */
     public void release(Task t) {
-        synchronized (this.lock) {
+        this.lock.lock();
+        try {
             this.held.remove(key(t));
+        } finally {
+            this.lock.unlock();
         }
     }
 
     public int size() {
-        synchronized (this.lock) {
+        this.lock.lock();
+        try {
             return this.held.size();
+        } finally {
+            this.lock.unlock();
         }
     }
 
     /** Extend calls (one per pool per tick) sent so far. */
     public long batches() {
-        synchronized (this.lock) {
+        this.lock.lock();
+        try {
             return this.batches;
+        } finally {
+            this.lock.unlock();
         }
     }
 
@@ -94,16 +107,24 @@ public final class LeaseKeeper implements AutoCloseable {
         long now = this.tasks.clock().getAsLong();
         var byPool = new LinkedHashMap<String, List<Task>>();
         var expiring = new ArrayList<Task>();
-        synchronized (this.lock) {
+        this.lock.lock();
+        try {
             for (var it = this.held.values().iterator(); it.hasNext();) {
                 var t = it.next();
                 if (t.envelope().deadlineMs() - now < this.visibilityMs) {
                     it.remove();
                     expiring.add(t);
                 } else {
-                    byPool.computeIfAbsent(t.pool(), k -> new ArrayList<>()).add(t);
+                    var list = byPool.get(t.pool());
+                    if (list == null) {
+                        list = new ArrayList<>();
+                        byPool.put(t.pool(), list);
+                    }
+                    list.add(t);
                 }
             }
+        } finally {
+            this.lock.unlock();
         }
         for (var e : byPool.entrySet()) {
             var list = e.getValue();
@@ -114,8 +135,11 @@ public final class LeaseKeeper implements AutoCloseable {
                 atts[i] = list.get(i).attempt();
             }
             var results = this.tasks.extend(e.getKey(), offs, atts, this.visibilityMs);
-            synchronized (this.lock) {
+            this.lock.lock();
+            try {
                 this.batches++;
+            } finally {
+                this.lock.unlock();
             }
             for (int i = 0; i < offs.length; i++) {
                 if (!results.get(i).ok()) {

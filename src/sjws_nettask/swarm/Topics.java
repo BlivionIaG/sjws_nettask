@@ -35,6 +35,7 @@ public final class Topics implements AutoCloseable {
     private final RetryPolicy policy;
     private final LongSupplier clockMs;
     private final ConcurrentHashMap<String, Partition> open = new ConcurrentHashMap<>();
+    private final java.util.concurrent.locks.ReentrantLock opening = new java.util.concurrent.locks.ReentrantLock();
     private volatile boolean closed;
 
     public Topics(Path dir, RetryPolicy policy, LongSupplier clockMs) {
@@ -52,13 +53,23 @@ public final class Topics implements AutoCloseable {
         if (this.closed) {
             throw new IllegalStateException("closed");
         }
-        return this.open.computeIfAbsent(topic, t -> {
-            try {
-                return Partition.open(this.dir, t, this.policy, this.clockMs);
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
+        var p = this.open.get(topic);
+        if (p != null) {
+            return p;
+        }
+        this.opening.lock(); // opening does I/O: not inside computeIfAbsent
+        try {
+            p = this.open.get(topic);
+            if (p == null) {
+                p = Partition.open(this.dir, topic, this.policy, this.clockMs);
+                this.open.put(topic, p);
             }
-        });
+            return p;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        } finally {
+            this.opening.unlock();
+        }
     }
 
     public boolean isOpen(String topic) {

@@ -56,7 +56,7 @@ public final class ReplyRouter implements AutoCloseable {
     private final long idleCloseMs;
     private final AtomicLong seq = new AtomicLong();
     private final ConcurrentHashMap<Key, CompletableFuture<TaskEnvelope>> pending = new ConcurrentHashMap<>();
-    private final Object lifecycle = new Object();
+    private final java.util.concurrent.locks.ReentrantLock lifecycle = new java.util.concurrent.locks.ReentrantLock();
     private volatile Thread poller;
     private volatile boolean closed;
     private final AtomicLong late = new AtomicLong();
@@ -134,12 +134,15 @@ public final class ReplyRouter implements AutoCloseable {
 
     /** Always under the lock, so a call never races an idle close into a stranded reply. */
     private void ensurePolling() {
-        synchronized (this.lifecycle) {
+        this.lifecycle.lock();
+        try {
             if (this.poller == null && !this.closed) {
                 var p = this.topics.partition(this.topic);
                 p.subscribe(GROUP, false);
                 this.poller = Thread.ofPlatform().daemon().name("swarm-" + this.topic).start(this::pollLoop);
             }
+        } finally {
+            this.lifecycle.unlock();
         }
     }
 
@@ -191,23 +194,29 @@ public final class ReplyRouter implements AutoCloseable {
 
     /** Stops the poller and closes the topic if still idle; a call racing in keeps it open. */
     private boolean idleClose() {
-        synchronized (this.lifecycle) {
+        this.lifecycle.lock();
+        try {
             if (!this.pending.isEmpty()) {
                 return false;
             }
             this.poller = null;
             this.topics.close(this.topic);
             return true;
+        } finally {
+            this.lifecycle.unlock();
         }
     }
 
     @Override
     public void close() {
         Thread t;
-        synchronized (this.lifecycle) {
+        this.lifecycle.lock();
+        try {
             this.closed = true;
             t = this.poller;
             this.poller = null;
+        } finally {
+            this.lifecycle.unlock();
         }
         if (t != null) {
             LockSupport.unpark(t);
