@@ -7,11 +7,11 @@ from. The path is already decoded, normalized and checked against the access rul
 flowchart TD
     k{"Entry in the cache?"} -->|yes| v{"Entry still valid?"}
     k -->|no| r
-    v -->|yes| hit["Answer from memory<br/>conditionals and ranges<br/>apply to the cached bytes"]
+    v -->|yes| hit["Answer from memory<br/>conditionals and ranges<br/>apply to the cached bytes<br/>owner and world-readable<br/>rules, when set, are<br/>checked on every hit"]
     v -->|no| r["Resolve from scratch,<br/>dropping a stale entry<br/>containment, no-follow<br/>open, access rules on<br/>the real path"]
     r --> f{"Cacheable?"}
     f -->|yes| l["Read the file once<br/>into the cache<br/>concurrent misses of one<br/>file share that read"]
-    f -->|no| s["Serve from disk, not cached<br/>sendfile above 64 KiB"]
+    f -->|no| s["Serve from disk, not cached<br/>HTTP/1.1 uses sendfile above 64 KiB<br/>HTTP/2 and HTTP/3 read it in<br/>64 KiB chunks"]
 ```
 
 *Still valid* means a `stat` shows the same inode, mtime in ns, size and ctime, and (unless

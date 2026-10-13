@@ -20,10 +20,14 @@ flowchart TB
     d["Built-in defaults"] -->|"overridden by"| f["YAML file<br/>--config, or WEB_SERVER_CONFIG"]
     f -->|"overridden by"| a["Command-line arguments"]
     a -->|"overridden by"| e["Environment variables<br/>WEB_SERVER_*"]
-    e --> doc["ConfigDocument, validated"]
+    e --> doc["ConfigDocument,<br/>parsed strictly"]
     doc --> snap["ConfigSnapshot<br/>immutable, one<br/>prebuilt handler"]
-    snap --> live["LiveConfig<br/>one AtomicReference,<br/>read once per request"]
+    snap --> live["LiveConfig<br/>one AtomicReference,<br/>swapped on reload"]
 ```
+
+Two settings do not follow this chain: the role (`--role`, then `WEB_SERVER_ROLE`, then `node.mode`, see
+[Node](#node)) and the access rules, which are merged with the flags
+(see [Precedence with the command line](#precedence-with-the-command-line)).
 
 The file is strict: an unknown key or a bad value is an error and the process exits
 64. The existing server flags stay lenient (a bad number warns and falls back).
@@ -162,22 +166,23 @@ No config file means reload reports `no config file` and changes nothing.
 document that a control plane pushed instead. *Valid* means it parses, `ConfigValidator` accepts it
 (schema version, document root is a directory, certificate and key files, no `tls.cert` together with
 ACME, node labels), the certificate loads, and a new HTTP-01 port can be opened. A pushed document is
-also refused when its non-zero `version` is lower than the running one:
+also refused when its non-zero `version` is lower than the running one. The steps, in order, with
+every rejection leaving the previous snapshot in place:
 
 ```mermaid
 flowchart TD
-    a["ReloadHook.run() or<br/>SjwsServer.reload()<br/>re-read the config file"] --> has{"Started with a<br/>config file?"}
-    has -->|no| rej0["Rejected: no config<br/>file, nothing changes"]
-    has -->|yes| val
-    b["SjwsServer.applyRemote<br/>a document pushed by<br/>a control plane"] --> val{"Valid, and not an<br/>older bundle version?"}
-    val -->|no| keep["Rejected: the<br/>previous snapshot<br/>stays"]
-    val -->|yes| cp["Bind-time settings and node.mode keep<br/>their old value, reported as needsRestart<br/>Compile the next ConfigSnapshot:<br/>generation + 1, fresh router<br/>and upstream pools"]
-    cp --> sw["Publish it with one<br/>AtomicReference write<br/>the next request reads it"]
-    sw --> se["Apply the side effects:<br/>HTTP/1 timeouts, when HTTP/3<br/>is not running<br/>the HTTP/3 handler and certificate<br/>the HTTP-01 listener<br/>the ACME schedule"]
-    se --> lg["Write the last-good copy<br/>next to the config file"]
+    s1["1. reload() on a data node<br/>that already accepted a<br/>push: keep that config,<br/>re-read only the local<br/>bootstrap settings, stop"]
+    s1 --> s2["2. reload() re-reads the file<br/>(none or invalid: rejected)<br/>applyRemote first asks the<br/>signature verifier<br/>(refused: rejected)"]
+    s2 --> s3["3. Valid, and not an older<br/>bundle version, else rejected"]
+    s3 --> s4["4. Same canonical hash as the<br/>running snapshot: applied as<br/>a no-op, nothing is swapped"]
+    s4 --> s5["5. Bind-time settings and<br/>node.mode keep their old<br/>value (needsRestart), the<br/>certificate loads, the next<br/>snapshot compiles, a new<br/>HTTP-01 listener opens,<br/>else rejected"]
+    s5 --> s6["6. Publish with one<br/>AtomicReference write, close<br/>the old snapshot's pools, then<br/>the side effects: HTTP/3<br/>handler and certificate, the<br/>old HTTP-01 listener, ACME"]
+    s6 --> s7["7. After the lock is released,<br/>a data node writes last-good"]
 ```
 
-HTTP/2 takes its handler when it starts and is not swapped here; see
+HTTP/2 reads the live snapshot on every request, as HTTP/1.1 does, so a reload reaches it with
+the publish. Its TLS certificate is read when it starts: a reload or an ACME renewal replaces
+the certificate on HTTP/3 only (`Http3Server.replaceTls`). See
 [Handler composition](../design/architecture.md#handler-composition).
 
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
@@ -246,8 +251,10 @@ sequenceDiagram
 
     Note over R: starts once this node is leader-ready:<br/>a standalone node at once, a control node<br/>after leaderReady, a data node never
     Note over R: load the stored certificate
-    alt valid, outside the renewal window
+    opt it is still valid
         R->>H3: replaceTls(stored)
+    end
+    alt valid, and the renewal point is a minute or more away
         Note over R: sleep until notAfter minus renew_before
     else missing, expired or inside the window
         R->>CA: place an order
@@ -263,7 +270,7 @@ sequenceDiagram
         Note over R: write it to the store,<br/>remove the token from the board
         R->>H3: replaceTls(new)
     end
-    Note over R: A failure is logged and retried after 30 s,<br/>doubling up to 15 min.<br/>Losing leadership stops issuing
+    Note over R: A failure is logged and retried after 30 s,<br/>doubling up to 15 min. Losing leadership<br/>cancels the queued attempt, one already<br/>running still finishes
 ```
 
 The published chain is installed with `Http3Server.replaceTls`. BoringSSL asks

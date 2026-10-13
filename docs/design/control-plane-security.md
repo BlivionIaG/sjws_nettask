@@ -40,6 +40,19 @@ publishes them with a compare-and-set:
   proxy router to attach to a route, never as a node default.
 * An invalid document throws, and the active policy stays in place.
 
+In order, `apply` does this:
+
+```mermaid
+flowchart TD
+    a["LivePolicy.apply(document)"] --> s{"The scope matches<br/>this node's labels?"}
+    s -->|no| nf["NOT_FOR_THIS_NODE<br/>nothing is compiled"]
+    s -->|yes| c["Compile the rules<br/>a bad pattern or owner throws,<br/>the active policy stays"]
+    c --> v{"Version above<br/>the active one?"}
+    v -->|no| st["STALE"]
+    v -->|yes| p["Publish version and rules together<br/>with a compare-and-set"]
+    p --> ap["APPLIED<br/>the next policy call reads it"]
+```
+
 To install it, build the handler with `new StaticFileHandler(root, …, livePolicy)` in place of
 the static `AccessRules`, only when the node is CP-managed.
 
@@ -65,6 +78,18 @@ API and the admin TUI make before every action.
 * `putOperator` and `removeOperator` need `MANAGE_OPERATORS`. Each change is atomic and takes
   effect immediately, so a removed or disabled operator is refused on its next request. A change that would leave no
   enabled admin is refused.
+
+What `authorize` does, in order. The first two steps end in a denial when their condition holds. The
+audit write then sits on every path, and an allowed decision whose line cannot be written is denied:
+
+```mermaid
+flowchart TD
+    a["Rbac.authorize(certificate,<br/>permission, target, version)"] --> c1["1. No known, enabled operator for<br/>the certificate subject: the<br/>decision is denied, unauthenticated"]
+    c1 --> c2["2. The operator's role does not<br/>allow the permission: the<br/>decision is denied"]
+    c2 --> c3["3. Otherwise the decision<br/>is allowed"]
+    c3 --> c4["4. The decision, whichever it is, is<br/>appended to the audit log. If the<br/>append fails, it becomes denied:<br/>audit unavailable"]
+    c4 --> c5["5. The decision is returned. After<br/>the action, complete() records<br/>ok or failed"]
+```
 
 ## Audit trail
 

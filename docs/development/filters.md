@@ -4,8 +4,8 @@ Filters sit between protocol decoding and the terminal `Handler`. That terminal 
 `StaticFileHandler` unless a caller installs another one (a router). HTTP/1.1, HTTP/2 and HTTP/3 use
 one chain. With nothing registered, and the terminal still the
 static file handler, that chain is not built and not called: HTTP/1.1 calls
-`StaticFileHandler.handle` directly, and HTTP/2 and HTTP/3 call the handler they were given
-at start.
+`StaticFileHandler.handle` directly, and HTTP/2 and HTTP/3 call the live config snapshot's
+handler.
 
 Register before start. `SjwsServer.start(config, filters)` compiles the registry once and shares
 it. `filterChain()` is null when the registry was null or empty. `handler()` stays the
@@ -20,15 +20,15 @@ sequenceDiagram
     participant F as Your filter<br/>order 100
     participant H as Terminal handler
 
-    T->>O: handle(request)
+    T->>O: request
     O->>F: proceed(request)
     F->>H: proceed(request)
     H-->>F: Response
     F-->>O: Response
     O-->>T: Response
     Note over F,H: The response is built, not yet written.<br/>A filter may return it or a new one
-    Note over T: writes it, adding Date, Server,<br/>Content-Length, Connection, Alt-Svc
-    Note over F,H: A filter that skips proceed short-circuits:<br/>later filters and the handler do not run
+    Note over T: writes it, adding the fields it owns,<br/>such as Date, Server and Content-Length
+    Note over F,H: A filter that skips proceed short-circuits: later<br/>filters and the handler do not run. The observe<br/>filter does so for /healthz and /metrics
     Note over O,H: A RuntimeException or a null return<br/>becomes the normal HTML 500. Outer filters<br/>see it as the result of proceed,<br/>and the connection stays open
 ```
 
@@ -216,12 +216,14 @@ default exists so a factory that already overrides it still receives the chain; 
 default forwards to it and drops `terminal`. Dispatch with
 `FilterChain.dispatch(handler, terminal, chain)`: a non-null chain is `chain::handle` (the chain
 already closes over its terminal); a null chain and a null or static-handler terminal is
-`handler::handle`; any other terminal is `terminal::handle`. HTTP/2 and HTTP/3 do this, so the empty
-path stays a direct call on the concrete handler.
+`handler::handle`; any other terminal is `terminal::handle`. HTTP/3 does this, and HTTP/2 takes `terminal`
+when there is one and `handler` otherwise, so the empty path stays a direct call on the concrete handler.
 
 ```mermaid
 flowchart TD
-    s["At startup:<br/>FilterChain.dispatch(files,<br/>terminal, chain)"] --> c{"chain is not null?"}
+    a{"A handler was published<br/>through armHandler?"} -->|"yes: a metrics arm,<br/>a ChainControl snapshot,<br/>or the live snapshot"| ar["Call that handler"]
+    a -->|no| s["The startup choice:<br/>FilterChain.dispatch(files,<br/>terminal, chain)"]
+    s --> c{"chain is not null?"}
     c -->|yes| ch["Call chain.handle<br/>the chain already<br/>closes over its<br/>terminal"]
     c -->|no| t{"terminal is null, or is<br/>the static file handler?"}
     t -->|yes| fl["Call files.handle directly<br/>no chain object on<br/>the request path"]
@@ -276,6 +278,18 @@ has already loaded a handler, including one blocked inside `proceed`, finishes o
 that fails to parse or compile throws, and the published handler stays. A version lower than the
 one being served is rejected the same way. An equal version is applied again, which is how a
 node picks up a label change without a new generation.
+
+In outline, `apply` does this:
+
+```mermaid
+flowchart TD
+    a["ChainControl.apply(document)<br/>under the publish lock"] --> v{"Version below<br/>the one being served?"}
+    v -->|yes| rej["Rejected: the published<br/>handler stays"]
+    v -->|no| c{"Does it compile?<br/>Every entry is built, so<br/>one bad param fails it all"}
+    c -->|no| rej
+    c -->|yes| m["Leave out entries whose label<br/>selector misses this node, sort by order<br/>The observe filter goes first, order 0"]
+    m --> w["Publish the new FilterChain,<br/>or the terminal itself if nothing is left<br/>One volatile write per transport,<br/>replacing the startup chain"]
+```
 
 An empty `filters` array is valid and calls the terminal handler directly. When that terminal
 is the static file handler, the call is still `StaticFileHandler.handle`. Opening the slot

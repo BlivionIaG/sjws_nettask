@@ -25,7 +25,8 @@ stateDiagram-v2
     [*] --> IDLE
     IDLE --> HEAD: first byte
     HEAD --> PROCESSING: head received
-    PROCESSING --> WRITING: handler returned
+    PROCESSING --> WRITING: response ready, or the handler waits for body bytes
+    WRITING --> PROCESSING: request body bytes arrived
     WRITING --> IDLE: keep-alive
     IDLE --> CLOSED: idle timeout
     HEAD --> CLOSED: header timeout, 408
@@ -39,6 +40,7 @@ stateDiagram-v2
     PROCESSING : no deadline
     WRITING : WRITING
     WRITING : --write-timeout
+    WRITING : also while the handler waits for a request body
 ```
 
 **Admission.** The connection cap is applied before `accept`, so clients over it wait in the kernel's

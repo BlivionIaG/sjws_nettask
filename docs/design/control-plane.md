@@ -44,28 +44,30 @@ The content request path reads the snapshot that is already installed. It does n
 
 ## 3. Architecture
 
+```mermaid
+flowchart TD
+    tui["Admin TUI"] -.->|"mTLS admin API"| cp["Control role, 3 or 5 nodes<br/>sjws_nettask.cp<br/>group cp-config"]
+    cp -.-|"Raft"| raft["cluster.ClusterNode"]
+    cp -.-> w{{"mTLS watch:<br/>push, ack, resume"}}
+    w -.-> g["data: gateway"]
+    w -.-> st["data: static"]
+    w -.-> b["data: broker"]
+    w -.-> e["data: edge"]
+    g --> sw{{"atomic swap,<br/>off the request path"}}
+    st --> sw
+    b --> sw
+    e --> sw
+    sw --> live["LiveConfig / ConfigSnapshot"]
+    live --> use["HTTP, filters, router"]
+    live -.-> bl["broker loop"]
+
+    classDef design stroke-dasharray: 5 5
+    class cp,raft,w,bl design
 ```
-                    admin TUI
-                        │  mTLS admin API
-                        ▼
-              ┌─────────────────────┐
-              │  control role (3|5) │
-              │  sjws_nettask.cp    │
-              │  group: cp-config   │── Raft (cluster.ClusterNode)
-              └──────────┬──────────┘
-                         │  mTLS watch: push, ack, resume
-           ┌─────────────┼──────────────┐
-           ▼             ▼              ▼
-     data: gateway   data: static   data: broker    data: edge
-           │             │              │
-           └─────────────┴──────────────┘
-                         │  atomic swap, off the request path
-                         ▼
-              LiveConfig / ConfigSnapshot
-                         │
-                         ▼
-              HTTP, filters, router, broker loop
-```
+
+Dashed boxes and arrows are not in the tree yet. The solid ones exist, though the data roles are only
+their names plus the bootstrap and status slice described in
+[Control-plane and data-node service](../operations/control-plane-service.md).
 
 ### 3.1 Packages and the dependency cut
 
@@ -392,6 +394,26 @@ The client speaks first:
 
 The server then sends, in version order, a full `SignedSnapshot` for every version above `fromVersion`. A client that already holds the parent still receives the full document. Patches are not a frame type.
 
+The exchange, from a data node's side:
+
+```mermaid
+sequenceDiagram
+    participant D as Data node
+    participant L as Control leader
+
+    D->>L: Register
+    Note over D,L: one mTLS connection to the<br/>leader of cp-config
+    D->>L: Watch fromVersion
+    loop each version above fromVersion, then each new one
+        L->>D: full SignedSnapshot
+        Note over D: applyRemote, then persist<br/>floor, trust and last-good
+        D->>L: Ack
+    end
+    Note over L: at most maxInFlight versions<br/>unacked, 1 by default
+    L-->>D: freshness frame, at least every 30 s
+    D-->>L: heartbeat, every 1 s
+```
+
 After the client is caught up, the server sends each newly activated version the same way. The client replies after `applyRemote` has swapped the live snapshot, the side effects in §5.6 have run, and `floor.json`, `trust.json`, and `last-good.json` are durable. Swapping the snapshot is not the whole ack when the node hosts partitions. Opening a partition can take seconds, so a broker ack names each partition:
 
 ```
@@ -423,6 +445,28 @@ The leader pushes the staged version only to nodes in the open stage. Other node
 `Advance` opens the next stage after the open stage has enough `Ack`s. The default requirement is every targeted node that is `ALIVE`. A stage that targets brokers advances when those brokers report `serving` for the partitions that stage opened, not when they have only swapped the snapshot (§13.5). The operator can set a minimum count. A node that is `DEAD` is reported and, under the default policy, blocks advance; the operator may skip it explicitly. That skip is itself a log entry.
 
 `Activate` commits when the last stage has met its ack rule, or when an identity with role `operator` forces it. Activation publishes the version as desired. Nodes that have not acked still receive it (subject to their window) and still serve last-good until they apply.
+
+A proposal moves through these states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> STAGED: Propose, once the leader validated it
+    STAGED --> StageOpen: Stage binds the ordered selectors
+    StageOpen --> StageOpen: Advance, the open stage has enough Acks
+    StageOpen --> DESIRED: Activate, the last stage met its ack rule<br/>or an operator forces it
+    DESIRED --> [*]
+    note right of StageOpen
+        only nodes in the open
+        stage receive the version
+    end note
+    note left of DESIRED
+        Rollback appends a new,
+        higher version with an
+        older activated content
+        and rolls it out the
+        same way
+    end note
+```
 
 `Rollback { toVersion }` appends a new version whose `canonicalHash` and canonical YAML equal the retained activated snapshot `toVersion`. The new version is higher than any current version, so anti-replay still moves forward. The rollout of a rollback uses the same stage list unless the operator selects a single stage of all nodes. Nodes that never installed the bad version treat the rollback as a no-op if their installed hash already matches, and ack it.
 
@@ -521,6 +565,23 @@ The data node checks the pinned CA fingerprint **before** it sends the token. Ro
 Role, labels, and capabilities come from the token record. The leader writes them into the node certificate (SAN and a role extension). The projection is derived from that certificate. `Register` cannot raise them. A `Register` that claims a different role is rejected.
 
 `ConsumeToken` and `Register` are one Raft entry. The leader appends that entry and waits until it commits, and only then returns the certificate. A leadership change does not mint a second join for the same token and the same identity: the consume is already in the log and the re-presentation returns it, or it is not committed and the certificate was not sent. A different identity does not reuse that entry. Failed presentations are rate-limited and audited per source address. The token is checked before any CSR is signed, so an unauthenticated joiner does not cost a signature. `NodeEnrollment.tokenConsumed()` runs only after that commit (§6.1).
+
+The join, in order:
+
+```mermaid
+sequenceDiagram
+    participant N as Data node
+    participant L as Control leader
+    participant R as cp-config log
+
+    Note over N: check the pinned CA fingerprint<br/>before sending the token
+    N->>L: join token and CSR
+    Note over L: check the token before<br/>any CSR is signed
+    L->>R: ConsumeToken and Register,<br/>one entry
+    R-->>L: committed
+    L-->>N: node certificate
+    Note over N: tokenConsumed(): write node.id,<br/>then delete the token file
+```
 
 Voter bootstrap tokens follow the same TTL, hash, and per-identity idempotency rules, and an enrolled `admin` must approve them. The one-voter lab configuration is not a production deployment. Production failure tests use 3 voters. The operator retires the one-voter group before data nodes join.
 

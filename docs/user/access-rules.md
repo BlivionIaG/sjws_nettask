@@ -15,14 +15,15 @@ resolved, so a link cannot reach a refused path under another name:
 
 ```mermaid
 flowchart TD
-    d{"--deny pattern matches?"} -->|yes| r403["403"]
-    d -->|no| rl{"First matching<br/>--access-rule"}
-    rl -->|"allow:"| ok["Allowed"]
+    d{"A deny pattern matches?<br/>--deny, then YAML access.deny"} -->|yes| r403["403"]
+    d -->|no| rl{"First matching rule<br/>--access-rule, then<br/>YAML access.rules"}
+    rl -->|"allow:"| ok["Allowed by name"]
     rl -->|"deny:"| r403
     rl -->|"hide:"| r404["404"]
-    rl -->|"none matches"| dot{"Dot component and<br/>--allow-dotfiles off?"}
+    rl -->|"none matches"| dot{"Dot component and<br/>dotfiles not allowed?"}
     dot -->|yes| r404
     dot -->|no| ok
+    ok --> rp["The same check on the real path, then<br/>the owner and world-readable checks<br/>when they are set: 403"]
 ```
 
 Patterns are `/`-separated globs: `*` matches within one component, `?` one character, `**` any number of

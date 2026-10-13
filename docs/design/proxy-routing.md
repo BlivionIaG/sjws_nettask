@@ -24,9 +24,12 @@ Non-goals (for now)
 ```mermaid
 flowchart TB
     t["transport"] --> rq["core.Request"]
-    rq --> fl["filters<br/>logging, rights,<br/>security headers, ..."]
-    fl --> r{{"Router"}}
-    r --> p["ProxyHandler<br/>upstream A"]
+    rq --> fl["filters, only when enabled<br/>access log, metrics, /healthz,<br/>or ones an embedder registers"]
+    fl --> ac["ACME challenge handler<br/>only with ACME on the main listener"]
+    ac --> r{{"Router<br/>only with routing.enabled"}}
+    r --> p["ProxyHandler<br/>one pool per upstream"]
+    r --> w["WeightedHandler<br/>a route with backends"]
+    w --> p
     r --> rd["RedirectHandler"]
     r --> sf["StaticFileHandler<br/>fallback"]
 ```
@@ -52,7 +55,7 @@ responses are relayed unchanged:
 
 ```mermaid
 flowchart TD
-    dd{"A path segment is ..?<br/>in any encoded spelling"} -->|yes| e400["400, before any route is tried"]
+    dd{"A path segment is ..?<br/>%2e counts as a dot, and<br/>/ \ %2f %5c ; split segments"} -->|yes| e400["400, before any route is tried"]
     dd -->|no| m{"A route matches?"}
     m -->|no| fb["Fallback: the<br/>static file handler"]
     m -->|yes| rw{"Route has a rewrite?"}
@@ -76,6 +79,18 @@ flowchart TD
   fully shadows.
 - **Scale.** Matching is a linear scan, which suits the expected tens of routes. If there are more, phase 3 groups routes
   in a host→routes map, then sorts each group by prefix length (longest first). Order stays the user-visible contract.
+
+A route with `backends` instead of `proxy` goes through `WeightedHandler`, which picks the upstream
+before the proxy runs:
+
+```mermaid
+flowchart TD
+    r["Route with backends"] --> p{"A backend's pin matches?<br/>header or cookie,<br/>checked in order"}
+    p -->|yes| pb["That backend,<br/>whatever the weights"]
+    p -->|no| s{"sticky is set and the client<br/>sent that header or cookie?"}
+    s -->|yes| sb["Hash its value, then pick by weight:<br/>the same client keeps its backend"]
+    s -->|no| rb["Pick at random by weight<br/>from a precomputed alias table"]
+```
 
 ## 4. Redirect
 
@@ -128,21 +143,49 @@ The client's own deadlines also stay in force, such as the write timeout via `Co
 
 Errors are logged once per upstream per interval, rate-limited so log volume stays flat when an upstream is down.
 
-The order in which the phase-1 `ProxyHandler` decides. A request has a body when it carries
-`Transfer-Encoding`, or a `Content-Length` other than 0:
+The order in which `ProxyHandler` decides. Each of the first five steps answers with the status shown
+when its condition holds, and otherwise passes the request on:
 
 ```mermaid
 flowchart TD
-    b{"Request has a body?"} -->|yes| e501["501, until phase 2"]
-    b -->|no| c{"Origin-form target<br/>and a usable method?"}
-    c -->|no| e400["400"]
-    c -->|yes| s["Send with the<br/>shared HttpClient<br/>HTTP/1.1, no redirects,<br/>X-Forwarded-* and<br/>Forwarded added"]
-    s --> r{"Outcome"}
-    r -->|"timeout"| e504["504"]
-    r -->|"refused, reset,<br/>DNS or I/O error"| e502a["502"]
-    r -->|"response head<br/>received"| bd{"Body over<br/>max_body?"}
-    bd -->|yes| e502b["502"]
-    bd -->|no| ok["Relay the status, headers<br/>and the buffered body"]
+    c1["1. Any Transfer-Encoding header: 501"] --> c2["2. A body of unknown length, or one the<br/>transport did not attach: 501"]
+    c2 --> c3["3. Body over max_body: 413"]
+    c3 --> c4["4. Target not origin-form, bad method<br/>or bad header value: 400"]
+    c4 --> c5["5. Circuit open: 503 with Retry-After,<br/>the upstream is not contacted"]
+    c5 --> x["Send over a pooled keep-alive connection,<br/>or open one. The body goes upstream<br/>in 64 KiB chunks"]
+    x --> o{"Outcome"}
+    o -->|"connect, write or<br/>head timeout"| e504["504"]
+    o -->|"refused, reset, I/O error<br/>or a malformed response"| e502["502"]
+    o -->|"response head<br/>received"| ok["Relay the status, headers and the streamed body<br/>After the head, a failure aborts the<br/>client connection or stream"]
+```
+
+A pooled connection that fails before the response head is tried once more on a fresh connection when
+the request has no body. With `retry` or `circuit` configured, which is per upstream and optional, a
+failed attempt goes through this decision:
+
+```mermaid
+flowchart TD
+    f["An attempt failed: a connect, timeout<br/>or reset error, or a 502, 503<br/>or 504 response"] --> a{"Kind is in retry.on, the method is idempotent,<br/>the request has no body, and fewer than<br/>retry.attempts retries were made?"}
+    a -->|no| v["Stop: relay the last result<br/>an upstream 5xx unchanged,<br/>an error as 502 or 504"]
+    a -->|yes| b{"The retry budget<br/>has a token?"}
+    b -->|no| v
+    b -->|yes| n["Discard the failed response<br/>and try again"]
+    v --> c["The circuit breaker records one<br/>verdict for the request,<br/>after its retries"]
+```
+
+The circuit breaker is a small state machine per upstream:
+
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED
+    CLOSED --> OPEN: the configured number<br/>of consecutive failures
+    OPEN --> HALF_OPEN: eject_for elapsed
+    HALF_OPEN --> CLOSED: the probe succeeds
+    HALF_OPEN --> OPEN: the probe fails,<br/>open twice as long
+    note right of OPEN
+        503 with Retry-After,
+        the upstream is not contacted
+    end note
 ```
 
 ## 6. Config schema (sent to Config & ACME)

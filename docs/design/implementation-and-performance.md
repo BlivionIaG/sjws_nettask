@@ -29,12 +29,12 @@ only for accepting, timing, event loops and background work:
 flowchart TB
     subgraph tcp["HTTP/1.1: blocking NIO"]
         direction TB
-        acc["accept-loop<br/>platform thread"]
-        rp["http1-reaper<br/>platform daemon thread<br/>sweeps every 50 ms"]
+        acc["accept-loop<br/>platform thread,<br/>one virtual thread<br/>per connection"]
+        rp["http1-reaper<br/>platform daemon thread,<br/>every 50 ms expires<br/>overdue deadlines"]
         vt1["virtual thread<br/>per connection"]
         acc ~~~ rp
-        acc -->|"each connection"| vt1
-        rp -.->|"expires deadlines"| vt1
+        acc --> vt1
+        rp -.-> vt1
     end
 
     subgraph h2["HTTP/2: Netty"]
@@ -55,10 +55,16 @@ flowchart TB
     vt1 --> hh
     vt2 --> hh
     vt3 --> hh
+
+    up["upstream-io-N<br/>shared Netty event loops<br/>platform daemon threads<br/>max(2, CPUs / 2)"]
+    hh -->|"proxy route"| up
 ```
 
-Two more daemon threads exist only when their feature is on: `access-log` drains the bounded log
-queue, and `acme-renew` issues and renews certificates.
+More daemon threads exist only when their feature is on: `access-log` drains the bounded log queue,
+`acme-renew` issues and renews certificates, and `acme-http-01` accepts on the dedicated HTTP-01 port.
+The `upstream-io-N` event loops belong to the reverse proxy (`routing.enabled` with a proxy route).
+One group serves every upstream pool in the process: the first pool creates it and the last one
+closing shuts it down. The upstream socket I/O runs there while the request's virtual thread waits.
 
 **Measured** (loopback, 8 cores: server pinned to 4, `wrk -t4` to the other 4; 8 s per point, fresh JVM
 with G1 and a 1 GB heap, 3 repetitions, medians; requests/s, or GB/s for 50 MB with a 30 s wrk timeout).

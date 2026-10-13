@@ -54,17 +54,18 @@ the file through `ReloadHook` (see docs/user/config-file.md, including the Confi
 ACME HTTP-01 issuance uses the staging CA unless you select production.
 `--status` uses 0 = running, 1 = pid file is stale, 3 = not running.
 
-What happens at startup, and where each exit code comes from:
+What happens at startup, and where each exit code comes from. `--daemon` and `--restart` run the
+parent's steps first, then the detached child repeats everything below the decision:
 
 ```mermaid
 flowchart TD
-    s(["java -jar<br/>sjws_nettask.jar<br/>[options]"]) --> a["-h or --help<br/>print usage, exit 0"]
-    a --> b["--stop or --status<br/>act on the pid file and exit<br/>exit codes as listed above"]
-    b --> c["Load the configuration<br/>invalid: exit 64"]
+    s(["java -jar sjws_nettask.jar [options]"]) --> a["-h or --help: print usage, exit 0<br/>--stop or --status: act on the pid file and exit<br/>exit codes as listed above"]
+    a --> c["Load the configuration, resolve the role<br/>invalid, or a role without --bootstrap,<br/>or standalone with it: exit 64"]
     c --> d{"--daemon or --restart?"}
-    d -->|yes| e["Start a detached<br/>child JVM that<br/>repeats the steps<br/>below, and wait<br/>until it is listening"]
-    d -->|no| f["Document root must<br/>be a directory<br/>otherwise: exit 2"]
-    f --> g["Pid file must not<br/>name a live server<br/>otherwise: exit 1,<br/>already running"]
-    g --> h["Bind the TCP port<br/>otherwise: exit 1,<br/>cannot listen"]
-    h --> i["Serve until SIGTERM or SIGINT<br/>then exit 0"]
+    d -->|yes| e["--restart stops the old server first<br/>Start a detached child JVM that repeats the steps<br/>below, and wait until the pid file names it<br/>20 s at most"]
+    d -->|no| bs["--bootstrap needs --pid-file and a valid<br/>bootstrap file, otherwise: exit 64"]
+    bs --> f["Document root must be a directory<br/>otherwise: exit 2"]
+    f --> g["Pid file must not name a live server<br/>otherwise: exit 1, already running"]
+    g --> h["Bind the TCP port (off by default for control)<br/>otherwise: exit 1, cannot listen"]
+    h --> i["Serve until SIGTERM or SIGINT, drain,<br/>then the JVM exits 143 or 130"]
 ```

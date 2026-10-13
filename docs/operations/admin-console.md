@@ -25,5 +25,5 @@ flowchart TD
     ok -->|yes| st["Stop the running<br/>server, gracefully,<br/>then start one with the<br/>new configuration"]
     st --> f{"Did it start?"}
     f -->|yes| done["Running with the<br/>new configuration<br/>log: reloaded"]
-    f -->|no| rb["Start the previous<br/>configuration again<br/>and show the error<br/>log: reload failed,<br/>restoring previous<br/>configuration"]
+    f -->|no| rb["If a server was running,<br/>start its previous<br/>configuration again<br/>log: reload failed,<br/>restoring previous<br/>configuration. The error<br/>is shown. If that start<br/>fails too, the server<br/>stays down"]
 ```

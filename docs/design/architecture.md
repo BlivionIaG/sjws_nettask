@@ -74,40 +74,46 @@ sequenceDiagram
 
     Note over S: compile the config snapshot<br/>StaticFileHandler and FileCache<br/>Router if routing.enabled<br/>ACME wrapper on the main listener
     Note over S: build the observer slot,<br/>FilterChain and HaRuntime
-    opt HTTP/3 enabled
-        S->>H3: start on UDP
-        Note over S,H3: with the stored ACME certificate if still valid,<br/>then advertise Alt-Svc if enabled.<br/>Failure: WARN, continue without HTTP/3
-    end
-    opt HTTP/2 enabled
-        S->>H2: start the TLS port,<br/>and the h2c port if set
-        Note over S,H2: Failure: WARN, continue without HTTP/2
-    end
-    S->>CM: bind the TCP port
-    Note over S,CM: runs the accept loop on its own thread.<br/>Bind failure: close everything started, exit code 1
-    opt ACME with its own HTTP-01 port
-        Note over S: open the dedicated HTTP-01 listener
+    alt content port bound (default, except on a control node)
+        opt HTTP/3 enabled
+            S->>H3: start on UDP
+            Note over S,H3: with the stored ACME certificate if still valid,<br/>then advertise Alt-Svc if enabled.<br/>Failure: WARN, continue without HTTP/3
+        end
+        opt HTTP/2 enabled
+            S->>H2: start the TLS port,<br/>and the h2c port if set
+            Note over S,H2: Failure: WARN, continue without HTTP/2
+        end
+        S->>CM: bind the TCP port
+        Note over S,CM: runs the accept loop on its own thread.<br/>Bind failure: close everything started, exit code 1
+        opt ACME with its own HTTP-01 port
+            Note over S: open the dedicated HTTP-01 listener
+        end
+    else content port not bound
+        Note over S: park a service-idle thread<br/>until close()
     end
     Note over S: create the control-plane leadership<br/>(none on a data node)
     Note over S: register the reload hook
     opt ACME enabled, and not a data node
         Note over S: start the AcmeService,<br/>it issues once it is leader-ready
     end
-    Note over S: write the last-good config
+    opt data node
+        Note over S: write the last-good config
+    end
 ```
 
 ## Handler composition
 
 What a transport calls is decided once, in `SjwsServer`. Each box below is a `Handler` that wraps the
-one inside it, and each exists only when its feature is on. With none of them, the transports call
-`StaticFileHandler` directly, and HTTP/1.1 and HTTP/3 read the live config snapshot, so a reload is
-visible on the next request.
+one inside it, and each exists only when its feature is on. With none of them, every transport calls
+the live config snapshot's handler (the `StaticFileHandler` itself unless routing or ACME wrap it),
+so a reload is visible on the next request.
 
 ```mermaid
 flowchart TB
     t["Transport<br/>HTTP/1.1 · HTTP/2 · HTTP/3"] --> ha
 
     subgraph ha["HaHandler: only when HaSettings is attached"]
-        subgraph fc["FilterChain: only when observability is on or filters are registered"]
+        subgraph fc["FilterChain: only when observability is on or filters are set"]
             subgraph ac["AcmeChallengeHandler: only when ACME answers on the main listener"]
                 subgraph rt["Router: only when routing.enabled"]
                     px["ProxyHandler"]
@@ -123,15 +129,17 @@ flowchart TB
 | Layer | What it does |
 |---|---|
 | `HaHandler` | answers `/healthz` and `/readyz` from `HealthBoard`; everything else goes to the published generation, or to the config handler until one is published |
-| `FilterChain` | `ObserveRequestFilter` at order 0, then the other filters by order ([filters](../development/filters.md)) |
+| `FilterChain` | `ObserveRequestFilter` at order 0, then the other filters by order, registered at startup or compiled from a `FilterDocument` that `ChainControl` applies ([filters](../development/filters.md)) |
 | `AcmeChallengeHandler` | answers `/.well-known/acme-challenge/` before anything else, including the file handler's dotfile check |
 | `Router` | first matching route wins: `ProxyHandler`, `RedirectHandler`, or the static handler; a route with `errors: problem` wraps its handler in `ProblemErrorHandler` ([routing](proxy-routing.md)) |
 | `StaticFileHandler` | every status decision for a file ([access rules](../user/access-rules.md), [caching](../user/caching-and-ranges.md)) |
 
-HTTP/2 is the exception today. `Http2Server` is handed one handler when it starts: the chain, terminal or
-`HaHandler` if there is one, otherwise the startup snapshot's `StaticFileHandler`. Nothing swaps it on
-reload, so config-driven routing and reloaded settings reach HTTP/2 only through a chain (the
-observe filter reads the live snapshot, whether it was installed at startup or armed later).
+On the command line the handler every transport calls reads the live snapshot, so a reload (document
+root, access rules, routes) reaches HTTP/1.1, HTTP/2 and HTTP/3 on the next request. Filters or a
+replacement terminal that an embedder passes to `SjwsServer.start` are compiled around the startup
+`StaticFileHandler` and keep it across reloads. `SjwsServer.chainControl` opens the slot a control
+plane uses: each `FilterDocument` it applies is compiled and published to every transport with one
+volatile write per transport ([filters](../development/filters.md)).
 
 ## Current gaps
 
@@ -166,7 +174,10 @@ sequenceDiagram
     Admin->>S: metricsSnapshot()
     S->>Slot: arm()
     Note over S,Slot: replaces NONE with a recording observer
-    alt the filter was not compiled at startup
+    alt not compiled at startup, and a ChainControl snapshot is live
+        S->>T: pin the observe filter outermost
+        Note over S,T: the snapshot is recompiled at the same<br/>version and published to every transport
+    else not compiled at startup
         S->>T: publish the observe chain
         Note over S,T: HTTP/1.1 reads it from the shared HandlerRef,<br/>HTTP/2 and HTTP/3 get armHandler(chain)
     end

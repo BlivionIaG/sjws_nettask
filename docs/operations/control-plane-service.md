@@ -73,6 +73,18 @@ bind it unless that flag or key turns it off. The sample control file sets
 builds the content snapshot even when it does not listen. The admin listener is not
 in this slice.
 
+In order, the process settles its role, checks it against `--bootstrap`, and then decides on the
+content port:
+
+```mermaid
+flowchart TD
+    s1["1. --role, when set, is the role.<br/>WARN when it overrides<br/>WEB_SERVER_ROLE or node.mode"] --> s2["2. Else WEB_SERVER_ROLE, when set.<br/>WARN when it overrides node.mode"]
+    s2 --> s3["3. Else node.mode, when a config file<br/>was named. A file without it is<br/>standalone"]
+    s3 --> s4["4. Else the role in the bootstrap file,<br/>or standalone without one"]
+    s4 --> s5["5. control or data without --bootstrap,<br/>or standalone with it: exit 64"]
+    s5 --> s6["6. Content port: WEB_SERVER_BIND_CONTENT,<br/>then --bind-content, then<br/>server.bind_content, then the role:<br/>off for control, on for the others"]
+```
+
 ## Bootstrap
 
 `--bootstrap=PATH` (`WEB_SERVER_BOOTSTRAP`) is a mode `0600` or `0640` file. The role that

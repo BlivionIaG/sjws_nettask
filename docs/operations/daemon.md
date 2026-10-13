@@ -28,12 +28,12 @@ sequenceDiagram
     Note over P,F: refuse if the pid file names a live server,<br/>or the log file is not writable
     P->>C: start a second JVM
     Note over P,C: in a new session when setsid exists,<br/>SJWS_DAEMON_CHILD=1,<br/>output appended to the log file
-    Note over C: ignore SIGHUP, load the configuration,<br/>bind the listeners
+    Note over C: load the configuration, make SIGHUP<br/>a reload, start the server
     C->>F: write the pid file
-    Note over C,F: only once listening
+    Note over C,F: once the server is up
     P->>F: poll for the child's pid
     P-->>U: Started sjws_nettask (pid N), exit 0
-    Note over P,C: If the child exits first, or 20 s pass<br/>without a pid file, the parent prints the<br/>last log lines and exits non-zero
+    Note over P,C: If the child exits first, or 20 s pass<br/>without a pid file (the child is then<br/>stopped), the parent prints the last<br/>log lines and exits non-zero
 ```
 
 `--stop` sends SIGTERM and waits for the drain budget (default 30 seconds, or `drain-ms` from the
@@ -60,14 +60,15 @@ logging to the console.
 
 ```mermaid
 flowchart TD
-    sig["SIGTERM or SIGINT<br/>--stop sends SIGTERM"] --> a["The shutdown hook runs<br/>SjwsServer.close()<br/>stop the ACME renew<br/>thread and the HTTP-01<br/>listener, withdraw<br/>Alt-Svc"]
-    a --> b["Stop accepting on<br/>every listener<br/>HTTP/2 and HTTP/3 send<br/>GOAWAY, the TCP listen<br/>socket closes<br/>idle and half-read<br/>HTTP/1.1 connections<br/>are dropped at once"]
+    sig["SIGTERM or SIGINT<br/>--stop sends SIGTERM"] --> h["The shutdown hook calls<br/>SjwsServer.drain()<br/>with HA attached it first<br/>runs Lifecycle.drain():<br/>not-ready, deregistration<br/>delay, Connection: close"]
+    h --> a["close(): stop the ACME<br/>renew thread and the<br/>HTTP-01 listener,<br/>withdraw Alt-Svc"]
+    a --> b["Stop accepting on<br/>every listener<br/>HTTP/2 sends GOAWAY,<br/>HTTP/3 refuses new<br/>connections, the TCP listen<br/>socket closes<br/>idle and half-read<br/>HTTP/1.1 connections<br/>are dropped at once"]
     b --> d{"Responses in progress<br/>finished in time?"}
     d -->|"yes, within --shutdown-timeout, default 10 s"| e["Listeners and<br/>threads are<br/>released"]
     d -->|no| f["Whatever is still<br/>open is closed"]
-    e --> g["Pid file removed,<br/>process exits"]
+    e --> g["The proxy's upstream pools<br/>are closed. A control or data<br/>process removes its status<br/>file. The pid file goes and<br/>the JVM exits 143 (SIGTERM)<br/>or 130 (SIGINT)"]
     f --> g
-    b -.-> par["HTTP/2 and HTTP/3<br/>drain in parallel<br/>HTTP/2 up to<br/>--shutdown-timeout, HTTP/3<br/>up to 2 s"]
+    b -.-> par["HTTP/2 and HTTP/3<br/>drain in parallel<br/>HTTP/2 up to<br/>--shutdown-timeout, HTTP/3<br/>sends GOAWAY, then up to 2 s"]
 ```
 
 `contrib/sjws` is a small start/stop/status/restart wrapper (`SJWS_JAR`, `SJWS_PID_FILE`,

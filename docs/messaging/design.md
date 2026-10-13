@@ -28,7 +28,8 @@ stateDiagram-v2
     [*] --> ENQUEUED: produce
     ENQUEUED --> IN_FLIGHT: poll leases it to a consumer
     IN_FLIGHT --> ACKED: ack
-    IN_FLIGHT --> ENQUEUED: nack, or the lease expires
+    IN_FLIGHT --> ENQUEUED: nack
+    IN_FLIGHT --> IN_FLIGHT: expired lease, redelivered by poll
     IN_FLIGHT --> DEAD_LETTERED: reject, or nack or expiry after maxAttempts deliveries
     ACKED --> [*]
     DEAD_LETTERED --> [*]
@@ -91,15 +92,16 @@ sequenceDiagram
     participant S as ledger-syncer<br/>thread
 
     P->>W: append(batch)
-    Note over P,W: queued on a bounded queue of 65,536 entries,<br/>the producer blocks while it is full
+    Note over P,W: bounded queue, 65,536 entries:<br/>the producer blocks while it is full
     W->>L: write the drained group
     alt NONE or ASYNC, the default
         W-->>P: ack after the write
     else GROUP or EACH
         W-->>P: ack once an fsync covers it
+        Note over W,S: W fsyncs inline if its default is GROUP<br/>or EACH. Otherwise S does it
     end
     S->>L: force(false)
-    Note left of S: ASYNC and per-append GROUP only,<br/>off the ack path. Then durableOffset<br/>advances and a LedgerSnapshot<br/>is published
+    Note left of S: ASYNC writers, and appends that<br/>wait for a fsync. Then durableOffset<br/>advances and a LedgerSnapshot<br/>is published
 ```
 
 ### 2.3 In-memory state machine
@@ -180,11 +182,11 @@ flowchart TB
     adm["Admin endpoint<br/>for the inspector"]
     br["Broker<br/>topics, partitions,<br/>consumer groups"]
     insp["delivery.LedgerInspector<br/>counts and paged listings"]
-    part["delivery.Partition<br/>produce, subscribe, poll,<br/>ack, nack, reject"]
-    ds["delivery.DeliveryState<br/>cursor, leases, retries,<br/>dead letters, de-duplication"]
+    part["delivery.Partition<br/>produce, subscribe, poll,<br/>ack, nack, reject,<br/>snapshots, maintain"]
+    ds["delivery.DeliveryState<br/>cursor, leases, retries,<br/>dead letters, dedup,<br/>snapshot encoding"]
     dlq["Partition for topic.dlq<br/>dead-lettered copies"]
     lw["ledger.LedgerWriter<br/>writer thread, bounded queue,<br/>group commit, syncer"]
-    sl["ledger.SegmentedLog<br/>segments, CRC batches,<br/>torn-tail recovery"]
+    sl["ledger.SegmentedLog<br/>segments, CRC batches,<br/>recovery, scans,<br/>readahead, compaction"]
     rep["Replication through<br/>the cluster layer"]
 
     bind -.-> br
@@ -193,6 +195,7 @@ flowchart TB
     insp --> part
     part --> ds
     part --> lw
+    part --> sl
     part --> dlq
     lw --> sl
     rep -.-> lw
