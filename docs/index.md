@@ -29,6 +29,7 @@ Back to the [README](../README.md) (quick start).
 - [Messaging core (draft)](messaging/design.md)
 - [Messaging metrics (proposal)](design/messaging-metrics.md)
 - [Messaging config and broker apply (draft)](messaging/config.md)
+- [High availability, as implemented](design/high-availability.md)
 - [High availability (draft)](ha/design.md)
 - [Control plane / API gateway mode (draft)](design/control-plane.md)
 - [Agent swarm layer (optional, draft)](design/agent-swarm.md)
