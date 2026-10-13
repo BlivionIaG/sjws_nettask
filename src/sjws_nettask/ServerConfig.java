@@ -392,9 +392,11 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 The file is strict (a bad value is an error). Invalid values of the server
                 flags above still warn and fall back. The key password is never accepted
                 on the command line (it would be visible in the process list) or in the file.
-                The HA cluster key is never accepted as an argument. Set ha.cluster_key in the
-                config file or WEB_SERVER_HA_CLUSTER_KEY. WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS is
-                the previous key during rotation. HA enabled without a key refuses to start.
+                The HA cluster key is never accepted as an argument. Set ha.cluster_key_file
+                (mode 0600) or ha.cluster_key in the config file, or WEB_SERVER_HA_CLUSTER_KEY.
+                WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS is the previous key during rotation. The
+                daemon child does not inherit those variables. HA enabled without a key refuses
+                to start.
                 """;
     }
 
