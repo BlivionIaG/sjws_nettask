@@ -106,6 +106,29 @@ class CpServerTlsTest {
         }
     }
 
+    /** A CONTROL host on Security's listener TLS: mTLS listeners, and SIGHUP reloads each listener's material. */
+    @Test
+    void controlHostServesMtlsAndReloadsListenerTls() throws Exception {
+        var tls = CpTls.serverContext(material(false));
+        var deps = new CpTestDeps() {
+            @Override
+            public CpServerTls serverTls(String listener) {
+                return tls;
+            }
+        };
+        var y = new java.util.HashMap<String, Object>(java.util.Map.of("nodeId", "cp-1", "stateDir",
+                dir.resolve("s").toString(), "keyDir", dir.resolve("k").toString(), "rootPub",
+                dir.resolve("r.pub").toString(), "watch", java.util.Map.of("listen", "127.0.0.1:0"), "admin",
+                java.util.Map.of("listen", "127.0.0.1:0")));
+        var config = CpConfig.parse(k -> null, java.util.Map.of(), y, null);
+        try (var host = (CpHost) CpLaunch.start(config, deps, new java.io.PrintStream(java.io.OutputStream.nullOutputStream()))) {
+            long before = tls.generation();
+            assertNull(host.reload());
+            assertEquals(before + 2, tls.generation(), "watch and admin listener TLS both reloaded");
+            assertEquals(java.util.List.of("keys", "store", "watch", "admin", "ready", "reloaded"), host.events());
+        }
+    }
+
     private static void handshakeWithoutClientCert(int port) throws Exception {
         var trustAll = new javax.net.ssl.X509TrustManager() {
             @Override

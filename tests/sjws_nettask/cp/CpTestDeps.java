@@ -22,7 +22,7 @@ import sjws_nettask.cluster.ClusterTransport;
 import sjws_nettask.cluster.SimTransport;
 
 /** Loopback listeners, {@link KeyRing#generate} and one shared in-process transport. */
-final class CpTestDeps implements CpHostDeps {
+class CpTestDeps implements CpHostDeps {
 
     final ClusterTransport net;
     final AtomicInteger keyLoads = new AtomicInteger();
@@ -65,7 +65,7 @@ final class CpTestDeps implements CpHostDeps {
 
     /** Plain loopback listeners. */
     @Override
-    public CpServerTls serverTls(String listener) {
+    public CpServerTls serverTls(String listener) throws CpKeyException {
         return null;
     }
 
