@@ -31,6 +31,7 @@ Back to the [README](../README.md) (quick start).
 - [Control plane / API gateway mode (draft)](design/control-plane.md)
 - [Agent swarm layer (optional, draft)](design/agent-swarm.md)
 - [Agent graphs (swarm addendum, draft)](design/agent-graphs.md)
+- [Swarm research mode (draft)](design/swarm-research-mode.md)
 
 ## Security
 - [Security policy and vulnerability reporting](../SECURITY.md)
