@@ -133,4 +133,38 @@ class LogRetentionTest {
             m.close();
         }
     }
+
+    @Test
+    void fetchesShareTheReadLockWhileRetentionWaitsForThem() throws Exception {
+        try (var topics = new LogTopics(dir, Durability.ASYNC, SEG, new LogRetention(2 * SEG, 0), System::currentTimeMillis)) {
+            var h = new MessagingHttp(topics);
+            fill(h, "t", 60);
+            var reads = topics.get("t", false).reads();
+            var held = new java.util.concurrent.CountDownLatch(1);
+            var release = new java.util.concurrent.CountDownLatch(1);
+            var reader = Thread.ofPlatform().start(() -> {
+                reads.readLock().lock();
+                try { held.countDown(); release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                finally { reads.readLock().unlock(); }
+            });
+            held.await();
+            // another fetch proceeds while a fetch is in flight (an exclusive lock would block it forever)
+            var r = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(java.time.Duration.ofSeconds(10),
+                    () -> h.handle(new Request("GET", "/messaging/v1/topics/t/records?offset=0")));
+            assertEquals(200, r.status());
+            MessagingHttpTest.bytes(r);
+            // retention must wait for in-flight fetches before deleting segments
+            var deleted = new java.util.concurrent.CompletableFuture<Integer>();
+            var gc = Thread.ofPlatform().start(() -> {
+                try { deleted.complete(topics.enforceRetention()); } catch (Throwable e) { deleted.completeExceptionally(e); }
+            });
+            while (!reads.hasQueuedThreads()) Thread.onSpinWait();
+            assertFalse(deleted.isDone());
+            assertEquals(1, reads.getReadLockCount());
+            release.countDown();
+            assertTrue(deleted.get(10, java.util.concurrent.TimeUnit.SECONDS) > 0);
+            reader.join();
+            gc.join();
+        }
+    }
 }
