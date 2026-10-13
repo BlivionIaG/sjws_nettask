@@ -37,26 +37,28 @@ public final class LocalCluster implements ClusterNode {
     }
 
     public static LocalCluster start(NodeId self, List<Member> members, PacketLink link, Clock clock,
-            Duration interval) {
-        return start(self, members, link, clock, interval, Duration.ofSeconds(5), ClusterEvents.NONE);
+            Duration interval, ClusterKey key) {
+        return start(self, members, link, clock, interval, Duration.ofSeconds(5), ClusterEvents.NONE, key);
     }
 
     public static LocalCluster start(NodeId self, List<Member> members, PacketLink link, Clock clock,
-            Duration interval, Duration deadAfter, ClusterEvents events) {
+            Duration interval, Duration deadAfter, ClusterEvents events, ClusterKey key) {
         Objects.requireNonNull(deadAfter, "deadAfter");
+        Objects.requireNonNull(key, "cluster key");
         long now = clock.nanoTime();
         var membership = new Membership(self, members, interval.toNanos(), deadAfter.toNanos(), now, events);
-        var heartbeats = new HeartbeatService(membership, link, clock, interval, events);
+        var heartbeats = new HeartbeatService(membership, link, clock, interval, events, key);
         heartbeats.start();
         return new LocalCluster(membership, heartbeats);
     }
 
     /** One detector step without the background thread. Tests drive a fake clock through this. */
     public static LocalCluster open(NodeId self, List<Member> members, PacketLink link, Clock clock,
-            Duration interval, Duration deadAfter, ClusterEvents events) {
+            Duration interval, Duration deadAfter, ClusterEvents events, ClusterKey key) {
+        Objects.requireNonNull(key, "cluster key");
         long now = clock.nanoTime();
         var membership = new Membership(self, members, interval.toNanos(), deadAfter.toNanos(), now, events);
-        var heartbeats = new HeartbeatService(membership, link, clock, interval, events);
+        var heartbeats = new HeartbeatService(membership, link, clock, interval, events, key);
         return new LocalCluster(membership, heartbeats);
     }
 
@@ -74,6 +76,10 @@ public final class LocalCluster implements ClusterNode {
 
     public int sendFailures() {
         return heartbeats.sendFailures();
+    }
+
+    public int rejected() {
+        return heartbeats.rejected();
     }
 
     public Membership detector() {

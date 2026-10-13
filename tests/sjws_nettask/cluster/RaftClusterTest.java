@@ -336,7 +336,8 @@ class RaftClusterTest {
         var net = new SimNetwork();
         var link = net.link(new InetSocketAddress("127.0.0.1", 9));
         var local = LocalCluster.open(member(1, false).id(), List.of(member(1, false)), link, Clock.SYSTEM,
-                Duration.ofMillis(50), Duration.ofSeconds(5), ClusterEvents.NONE);
+                Duration.ofMillis(50), Duration.ofSeconds(5), ClusterEvents.NONE,
+                ClusterKey.of("0123456789abcdef".getBytes(java.nio.charset.StandardCharsets.UTF_8), null));
         assertThrows(UnsupportedOperationException.class, () -> local.openGroup(GROUP, options(Durability.STRICT, 1), null));
         assertThrows(UnsupportedOperationException.class, () -> local.append(GROUP, List.of()));
         assertThrows(UnsupportedOperationException.class, () -> local.onLeaderChange(GROUP, (t, l) -> {

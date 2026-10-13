@@ -35,10 +35,17 @@ wiring that should drain instead belongs to daemon mode, which can call `Lifecyc
    at accept time, and only when a passive gate is installed — active/active installs none.
    The request path adds one `volatile` snapshot read inside `HaHandler` (the `Handler` seam),
    not in the parser or the cache. Target: ≤1% throughput loss, ≤2% p99 delta vs single-node.
-2. **Cheap heartbeats.** Fixed-size UDP datagrams (64 B, default 500 ms, jittered), one
-   dedicated virtual thread, no allocation per beat beyond a reused buffer and a reused
-   `DatagramPacket`. Monotonic clocks are not comparable across hosts: the packet carries
-   `leaseRemainingMs`, and the receiver sets its own expiry from `System.nanoTime()`.
+2. **Cheap heartbeats.** Fixed-size UDP datagrams (64-byte membership body plus an 8-byte
+   timestamp, an 8-byte sequence, and a 32-byte HMAC-SHA256; 112 B on the wire, default
+   500 ms, jittered), one dedicated virtual thread, no allocation per beat beyond a reused
+   buffer and a reused `DatagramPacket`. The tag covers the body, the timestamp, and the
+   sequence. The receiver accepts the current cluster key and the previous key during
+   rotation, drops a sequence that is not strictly newer for that sender, and drops a
+   timestamp outside ±5 seconds. Each drop increments `rejected()`. A missing key with HA
+   enabled refuses to start. Monotonic
+   clocks are not comparable across hosts: the packet carries `leaseRemainingMs`, and the
+   receiver sets its own expiry from `System.nanoTime()`. The authentication timestamp is
+   wall-clock milliseconds and is only a replay window.
 3. **Sync off the hot path.** Content/config/cert sync runs in background threads and is
    applied by atomic swap (new snapshot → single reference publish); readers never block.
    `HaHandler` loads the `Snapshot` once at the start of `handle`, so an in-flight call keeps
