@@ -333,6 +333,7 @@ public final class BufferPool {
                     this.settings.debug() ? new Throwable("buffer acquired here") : null);
             this.live.put(tracker, Boolean.TRUE);
         }
+        buf.clear(); // every lease starts with position 0, limit = capacity
         var h = new PooledBuffer(buf, slot, budget, charged, tracker);
         if (tracker != null) {
             tracker.cleanable = CLEANER.register(h, tracker);
@@ -441,6 +442,7 @@ public final class BufferPool {
     }
 
     private static void poison(ByteBuffer buf) {
+        buf.clear(); // absolute puts are bounded by the limit the owner left, not by the capacity
         for (int i = 0, n = buf.capacity(); i < n; i++) {
             buf.put(i, POISON);
         }

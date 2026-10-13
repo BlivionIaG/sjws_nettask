@@ -41,7 +41,7 @@ import sjws_nettask.core.RoutePattern;
 public final class ConfigLoader {
 
     private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
-            "routing", "middleware", "access", "messaging", "swarm");
+            "routing", "middleware", "access", "messaging", "swarm", "buffers");
     private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
@@ -162,6 +162,7 @@ public final class ConfigLoader {
             access = accessSection(root, warnings);
             messaging = MessagingSettings.parse(root);
             yamlSwarm = swarmSection(root);
+            buffersSection(root);
         }
         var parsed = baseline == null
                 ? ServerConfig.parse(args, env, passwords)
@@ -1108,6 +1109,27 @@ public final class ConfigLoader {
         YamlValues.knownKeys(map, List.of("enabled"), "swarm");
         return map.containsKey("enabled") ? bool(map.get("enabled"), "swarm.enabled") : null;
     }
+
+    /**
+     * {@code buffers.pool} (default false): the shared direct-buffer pool ({@code docs/design/buffer-pool.md}).
+     * Node-local and read once at startup: it maps to the {@code sjws.buf.pool} system property, which wins when
+     * set on the command line. A reload does not switch the pool on or off.
+     */
+    private static void buffersSection(Map<String, Object> root) {
+        if (!(root.get("buffers") instanceof Object buffers)) {
+            return;
+        }
+        var map = YamlValues.mapping(buffers, "buffers");
+        YamlValues.knownKeys(map, List.of("pool"), "buffers");
+        if (map.containsKey("pool")) {
+            boolean on = bool(map.get("pool"), "buffers.pool");
+            if (System.getProperty(POOL_PROPERTY) == null) {
+                System.setProperty(POOL_PROPERTY, on ? "on" : "off");
+            }
+        }
+    }
+
+    static final String POOL_PROPERTY = "sjws.buf.pool";
 
     private static AccessSettings accessSection(Map<String, Object> root, List<String> warnings) {
         if (!(root.get("access") instanceof Object access)) {

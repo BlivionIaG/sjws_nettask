@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** Accept-loop failure paths, driven by fake channels around a real loopback listener. */
+@org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class ClientManagerFaultTest {
 
     @TempDir
