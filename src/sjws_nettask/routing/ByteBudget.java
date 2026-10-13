@@ -23,11 +23,23 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Every proxy exchange counts the bytes it read from an upstream and has not yet handed to
  * the client writer. Each exchange is already bounded by its read-ahead window
- * ({@link UpstreamPool#READ_AHEAD}). On top of that, while {@link #exhausted()} is true, event
- * loops stop reading ahead: autoRead is off and they do not call {@code read()}. An exchange then
- * reads again only once its own queue is empty. So the total stays near {@link #limit()}: it can
- * exceed it by at most about one socket read per active exchange, and never by a whole response.
- * Slow clients therefore wait (TCP backpressure to the upstream) instead of growing the heap.
+ * ({@link UpstreamPool#READ_AHEAD}, 256 KiB). On top of that, while {@link #exhausted()} is true,
+ * event loops stop reading ahead: autoRead is off and they do not call {@code read()}. An
+ * exchange then reads again only once its own queue is empty, so slow clients wait (TCP
+ * backpressure to the upstream) instead of growing the heap.
+ *
+ * <p><b>Worst-case overshoot</b> (the budget is soft). A {@code read()} is one socket read
+ * ({@code maxMessagesPerRead = 1}) of at most {@link UpstreamPool#MAX_READ} (128 KiB), or
+ * {@link UpstreamPool#SMALL_READ} (16 KiB) once the budget is {@link #pressured()} (at least 3/4
+ * used). Steady state under pressure is therefore at most {@code limit + active × 16 KiB}. The
+ * transient bound, for reads already issued when pressure began, is
+ * {@code limit + active × 128 KiB}. "Active" means proxied responses being streamed: HTTP/1
+ * connections plus h2/h3 streams. At 2048 of them, that is 64 MiB + 32 MiB steady and
+ * 64 MiB + 256 MiB transient.
+ *
+ * <p>A streamed body that is dropped without being written is closed by the filter chain
+ * ({@link sjws_nettask.core.Body#discard}). As a backstop, the idle timer abandons a paused
+ * exchange whose consumer has not taken a chunk for twice {@code idle_read_timeout}.
  *
  * <p>The default is 64 MiB, or {@code -Dsjws.proxy.maxInflightBytes=<bytes>}. One instance is
  * shared by all upstream pools in the process ({@link #shared()}). Tests make their own.
@@ -56,6 +68,11 @@ public final class ByteBudget {
     /** Bytes read from upstreams and not yet taken by a client writer (the F5 regression-test hook). */
     public long inFlight() {
         return this.inFlight.get();
+    }
+
+    /** At least three quarters used: upstream reads shrink to {@link UpstreamPool#SMALL_READ}. */
+    boolean pressured() {
+        return this.inFlight.get() >= this.limit - (this.limit >> 2);
     }
 
     boolean exhausted() {
