@@ -96,6 +96,7 @@ public final class Router implements Handler, AutoCloseable {
 
     private final Route[] routes;
     private final Handler fallback;
+    private final List<AutoCloseable> resources;
     /** Null when the table is small enough to scan. */
     private final CompiledRoutes compiled;
 
@@ -105,19 +106,41 @@ public final class Router implements Handler, AutoCloseable {
     }
 
     Router(List<Route> routes, Handler fallback, boolean compile) {
+        this(routes, fallback, compile, List.of());
+    }
+
+    /**
+     * @param resources closed by {@link #close} besides the route handlers: pools held behind a
+     *        wrapper (weighted backends, filters, error pages) that is not itself closeable
+     */
+    public Router(List<Route> routes, Handler fallback, List<? extends AutoCloseable> resources) {
+        this(routes, fallback, routes.size() > LINEAR_MAX, resources);
+    }
+
+    private Router(List<Route> routes, Handler fallback, boolean compile, List<? extends AutoCloseable> resources) {
         this.routes = routes.toArray(Route[]::new);
         this.fallback = fallback;
         this.compiled = compile ? new CompiledRoutes(this.routes) : null;
+        this.resources = List.copyOf(resources);
     }
 
     public List<Route> routes() {
         return List.of(this.routes);
     }
 
-    /** Closes every route handler that holds resources (proxy connection pools), once each. */
+    /** Closes the resources and every route handler that holds some (proxy connection pools), once each. */
     @Override
     public void close() {
         var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
+        for (var c : this.resources) {
+            if (seen.add(c)) {
+                try {
+                    c.close();
+                } catch (Exception e) {
+                    System.err.println("WARN: closing routing resource: " + e);
+                }
+            }
+        }
         for (var r : this.routes) {
             if (r.handler() instanceof AutoCloseable c && seen.add(c)) {
                 try {

@@ -176,7 +176,7 @@ class RateLimitFilterTest {
         assertEquals(1L, new Limit(By.PEER, null, 1_000_000_000L, 's', 1, 1).intervalNanos());
         assertEquals("5/m", new Limit(By.PEER, null, 5, 'm', 1, 1).rate());
         assertNotNull(new RateLimitFilter(new Limit(By.PEER, null, 1, 'h', 1_000_000, 1)));
-        assertNotEquals(0, RateLimitFilter.Mix.mix(1));
+        assertNotEquals(0, AliasTable.mix(1));
     }
 
     @Test

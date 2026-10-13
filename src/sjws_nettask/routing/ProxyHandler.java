@@ -185,6 +185,11 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         this.pool.close();
     }
 
+    /** See {@link UpstreamPool#retire()}. */
+    void retire() {
+        this.pool.retire();
+    }
+
     @Override
     public Response handle(Request request) {
         boolean head = request.headOnly();
@@ -217,18 +222,44 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         return resilient(request, out, length, head);
     }
 
-    private static int status(IOException e) {
+    /**
+     * One exchange for {@link EndpointBalancer}, without this handler's own retry or breaker:
+     * a request this handler rejects comes back as its error response, a failed exchange as the
+     * exception (classify it with {@link #kind(IOException)}, answer it with {@link #status}).
+     */
+    Response attempt(Request request) throws IOException, InterruptedException {
+        boolean head = request.headOnly();
+        if (!request.headers().values("transfer-encoding").isEmpty()) {
+            return StaticFileHandler.error(501, head);
+        }
+        long length = request.body().length();
+        if (length < 0 || request.body() == sjws_nettask.core.RequestBody.EMPTY && hasDeclaredBody(request)) {
+            return StaticFileHandler.error(501, head);
+        }
+        if (length > this.settings.maxBody()) {
+            return StaticFileHandler.error(413, head);
+        }
+        HttpRequest out;
+        try {
+            out = buildRequest(request, length);
+        } catch (IllegalArgumentException e) {
+            return StaticFileHandler.error(400, head);
+        }
+        return exchange(request, out, length, true);
+    }
+
+    static int status(IOException e) {
         return e instanceof UpstreamPool.ConnectTimeout || e instanceof ResponseTimeout ? 504 : 502;
     }
 
-    private static Resilience.On kind(IOException e) {
+    static Resilience.On kind(IOException e) {
         if (e instanceof UpstreamPool.ConnectTimeout || e instanceof UpstreamPool.ConnectFailed) {
             return Resilience.On.CONNECT;
         }
         return e instanceof ResponseTimeout ? Resilience.On.TIMEOUT : Resilience.On.RESET;
     }
 
-    private static Resilience.On kind(int status) {
+    static Resilience.On kind(int status) {
         return switch (status) {
             case 502 -> Resilience.On.STATUS_502;
             case 503 -> Resilience.On.STATUS_503;
@@ -238,7 +269,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     }
 
     /** Methods a retry cannot duplicate the effect of (RFC 9110 §9.2.2). */
-    private static boolean idempotent(String method) {
+    static boolean idempotent(String method) {
         return switch (method) {
             case "GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE" -> true;
             default -> false;

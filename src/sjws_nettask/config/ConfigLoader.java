@@ -581,11 +581,18 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host", "retry", "circuit"), "routing.upstreams." + name);
-            if (!body.containsKey("url")) {
-                throw new ConfigException("routing.upstreams." + name + ".url is required");
+                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb"), "routing.upstreams." + name);
+            boolean multi = body.containsKey("endpoints");
+            if (multi == body.containsKey("url")) {
+                throw new ConfigException("routing.upstreams." + name + ": exactly one of url or endpoints is required");
             }
-            var url = upstreamUrl(text(body.get("url"), "routing.upstreams." + name + ".url"), name);
+            if (body.containsKey("lb") && !multi) {
+                throw new ConfigException("routing.upstreams." + name + ".lb is only valid with endpoints");
+            }
+            var endpointUrls = new ArrayList<URI>();
+            var endpoints = multi ? endpoints(body.get("endpoints"), name, endpointUrls) : null;
+            var url = multi ? endpointUrls.get(0)
+                    : upstreamUrl(text(body.get("url"), "routing.upstreams." + name + ".url"), name);
             var connect = body.containsKey("connect_timeout")
                     ? timeout(text(body.get("connect_timeout"), "routing.upstreams." + name + ".connect_timeout"),
                             "routing.upstreams." + name + ".connect_timeout")
@@ -604,12 +611,150 @@ public final class ConfigLoader {
             boolean preserve = body.containsKey("preserve_host")
                     && bool(body.get("preserve_host"), "routing.upstreams." + name + ".preserve_host");
             var retry = body.containsKey("retry") ? retry(body.get("retry"), "routing.upstreams." + name + ".retry") : null;
-            var circuit = body.containsKey("circuit")
-                    ? circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit") : null;
+            Upstream.Discovery discovery = null;
+            sjws_nettask.routing.Resilience.Circuit circuit = null;
+            if (multi) {
+                var lb = sjws_nettask.routing.discovery.LbPolicy.WEIGHTED_RANDOM;
+                if (body.containsKey("lb")) {
+                    lb = sjws_nettask.routing.discovery.LbPolicy.parse(text(body.get("lb"), "routing.upstreams." + name + ".lb"));
+                    if (lb == null) {
+                        throw new ConfigException("routing.upstreams." + name
+                                + ".lb: expected weighted_random, round_robin or least_request");
+                    }
+                }
+                var outlier = body.containsKey("circuit")
+                        ? outlier(body.get("circuit"), "routing.upstreams." + name + ".circuit")
+                        : sjws_nettask.routing.EndpointBalancer.Outlier.DEFAULT;
+                discovery = new Upstream.Discovery(endpoints, lb, outlier);
+            } else if (body.containsKey("circuit")) {
+                circuit = circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit");
+            }
             var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience));
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery));
         }
         return Map.copyOf(out);
+    }
+
+    /**
+     * {@code endpoints: ["http://h:p", {url, weight, zone, id, labels}]}: 1 to 1024 endpoints sharing
+     * one scheme and path, no query or fragment.
+     */
+    private static List<sjws_nettask.routing.discovery.Endpoint> endpoints(Object value, String name, List<URI> urls) {
+        var path = "routing.upstreams." + name + ".endpoints";
+        var list = YamlValues.sequence(value, path);
+        if (list.isEmpty() || list.size() > 1024) {
+            throw new ConfigException(path + ": expected 1 to 1024 endpoints");
+        }
+        var out = new ArrayList<sjws_nettask.routing.discovery.Endpoint>(list.size());
+        var seen = new java.util.HashSet<String>();
+        for (int i = 0; i < list.size(); i++) {
+            var at = path + "[" + i + "]";
+            var item = list.get(i);
+            String urlText;
+            int weight = 1;
+            String zone = null;
+            String id = null;
+            Map<String, String> labels = Map.of();
+            if (item instanceof Map<?, ?>) {
+                var m = YamlValues.mapping(item, at);
+                YamlValues.knownKeys(m, List.of("url", "weight", "zone", "id", "labels"), at);
+                if (!m.containsKey("url")) {
+                    throw new ConfigException(at + ".url is required");
+                }
+                urlText = text(m.get("url"), at + ".url");
+                weight = m.containsKey("weight") ? integer(m.get("weight"), at + ".weight", 0, 1_000_000) : 1;
+                zone = m.containsKey("zone") ? text(m.get("zone"), at + ".zone") : null;
+                id = m.containsKey("id") ? text(m.get("id"), at + ".id") : null;
+                if (m.containsKey("labels")) {
+                    var raw = YamlValues.mapping(m.get("labels"), at + ".labels");
+                    var copy = new java.util.TreeMap<String, String>();
+                    raw.forEach((k, v) -> copy.put(k, String.valueOf(v)));
+                    labels = copy;
+                }
+            } else {
+                urlText = text(item, at);
+            }
+            URI uri;
+            try {
+                uri = URI.create(urlText.trim());
+            } catch (IllegalArgumentException e) {
+                throw new ConfigException(at + ": " + e.getMessage());
+            }
+            var scheme = uri.getScheme();
+            if (uri.getHost() == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+                throw new ConfigException(at + ": expected an absolute http(s) URL");
+            }
+            if (uri.getRawQuery() != null || uri.getRawFragment() != null || uri.getRawUserInfo() != null) {
+                throw new ConfigException(at + ": no user info, query or fragment");
+            }
+            if (!urls.isEmpty()) {
+                var first = urls.get(0);
+                if (!first.getScheme().equalsIgnoreCase(scheme) || !java.util.Objects.equals(first.getRawPath(),
+                        uri.getRawPath())) {
+                    throw new ConfigException(at + ": every endpoint must use the scheme and path of the first");
+                }
+            }
+            int port = uri.getPort() > 0 ? uri.getPort() : "https".equalsIgnoreCase(scheme) ? 443 : 80;
+            var host = uri.getHost();
+            if (host.startsWith("[") && host.endsWith("]")) {
+                host = host.substring(1, host.length() - 1);
+            }
+            var endpoint = new sjws_nettask.routing.discovery.Endpoint(id, host, port, weight, labels, sjws_nettask.routing.discovery.Endpoint.Health.READY, zone);
+            if (!seen.add(endpoint.authority())) {
+                throw new ConfigException(at + ": duplicate endpoint " + endpoint.authority());
+            }
+            if (weight == 0 && list.size() == 1) {
+                throw new ConfigException(at + ".weight: the only endpoint cannot have weight 0");
+            }
+            urls.add(uri);
+            out.add(endpoint);
+        }
+        return out;
+    }
+
+    /**
+     * {@code circuit:} on a multi-endpoint upstream: passive ejection per endpoint,
+     * {@code {failures: 5, eject_for: 10s, error_rate: 50%, min_requests: 20, window: 10s, max_ejection: 50%}}.
+     */
+    private static sjws_nettask.routing.EndpointBalancer.Outlier outlier(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("failures", "eject_for", "error_rate", "min_requests", "window",
+                "max_ejection"), path);
+        var d = sjws_nettask.routing.EndpointBalancer.Outlier.DEFAULT;
+        int failures = map.containsKey("failures") ? integer(map.get("failures"), path + ".failures", 1, 1000)
+                : d.consecutive();
+        var ejectFor = map.containsKey("eject_for")
+                ? timeout(text(map.get("eject_for"), path + ".eject_for"), path + ".eject_for") : d.ejectFor();
+        int rate = map.containsKey("error_rate") ? percent(map.get("error_rate"), path + ".error_rate", 1)
+                : d.errorRatePercent();
+        int min = map.containsKey("min_requests")
+                ? integer(map.get("min_requests"), path + ".min_requests", 1, 1_000_000) : d.minRequests();
+        var window = map.containsKey("window")
+                ? timeout(text(map.get("window"), path + ".window"), path + ".window") : d.window();
+        if (window.toMillis() < 2) {
+            throw new ConfigException(path + ".window: must be at least 2ms");
+        }
+        int max = map.containsKey("max_ejection") ? percent(map.get("max_ejection"), path + ".max_ejection", 0)
+                : d.maxEjectionPercent();
+        return new sjws_nettask.routing.EndpointBalancer.Outlier(failures, rate, min, window, ejectFor, max);
+    }
+
+    /** {@code 50%} or {@code 50}: an integer percentage, {@code min}..100. */
+    private static int percent(Object value, String path, int min) {
+        var text = String.valueOf(value).trim();
+        if (text.endsWith("%")) {
+            text = text.substring(0, text.length() - 1).trim();
+        }
+        int n;
+        try {
+            n = Integer.parseInt(text);
+        } catch (NumberFormatException e) {
+            throw new ConfigException(path + ": expected a percentage such as 50%");
+        }
+        if (n < min || n > 100) {
+            throw new ConfigException(path + ": must be " + min + "%..100%");
+        }
+        return n;
     }
 
     /** {@code retry: {attempts: 2, on: [connect, reset, 502, 503, 504], budget: 20%}} */
