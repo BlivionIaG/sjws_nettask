@@ -15,6 +15,7 @@ Back to the [README](../README.md) (quick start).
 ## Operations
 - [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API, control heartbeat report
 - [Running in the background (daemon)](operations/daemon.md)
+- [Docker image](deployment/docker.md): multi-stage build, non-root runtime, health check
 - [Control-plane and data-node service](operations/control-plane-service.md): systemd units, join bootstrap, status, drain
 - [Admin console (TUI)](operations/admin-console.md)
 - [Control-plane console (mockup)](operations/cp-console.md)
