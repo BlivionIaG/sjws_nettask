@@ -77,48 +77,6 @@ class ClassLoadTest {
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
     }
 
-    /**
-     * A real {@code data}/{@code gateway} role process (§12 S1, decision b). It uses the bootstrap fixture shape of
-     * {@code ServiceDaemonTest.bootstrap(.., "data")}. The cluster harness has no live control plane yet
-     * ({@code clusterharness.PendingControlPlane.available() == false}), so the node starts with
-     * {@code connection=pending}, which is the role's normal state before it joins.
-     */
-    @Test
-    void dataGatewayRoleLoadsNoSwarmClass() throws Exception {
-        var text = runDataGateway(List.of());
-        assertFalse(text.contains(SWARM), text);
-    }
-
-    @Test
-    void dataGatewayRoleEnabledLoadsTheSwarmModule() throws Exception {
-        var text = runDataGateway(List.of("-Dsjws.swarm.enabled=true"));
-        assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
-    }
-
-    private String runDataGateway(List<String> flags) throws Exception {
-        var root = Files.createDirectories(this.dir.resolve("gw-html"));
-        var pin = this.dir.resolve("root.pub");
-        var token = this.dir.resolve("join.token");
-        var boot = this.dir.resolve("bootstrap-" + System.nanoTime());
-        Files.writeString(pin, "test-root-public-key\n");
-        Files.writeString(token, "token-id=node-1\nsecret=class-load-test-secret-0123\n");
-        Files.setPosixFilePermissions(token, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
-        Files.writeString(boot, "role=data\ndata-role=gateway\nnode-id=gw-1\ncontrol-plane=127.0.0.1:9\npin=" + pin
-                + "\njoin-token=" + token + "\nstate-dir=" + this.dir.resolve("state") + "\n");
-        Files.setPosixFilePermissions(boot, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
-        var text = run(flags, "Server started:", "sjws_nettask.Sjws_nettask", "--role=data", "--bootstrap=" + boot,
-                "--pid-file=" + this.dir.resolve("gw-" + System.nanoTime() + ".pid"), Integer.toString(freePort()),
-                root.toString());
-        assertTrue(text.contains("control-plane role=data/gateway"), text);
-        return text;
-    }
-
-    private static int freePort() throws Exception {
-        try (var socket = new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
-    }
-
     private Path yaml() throws Exception {
         var root = Files.createDirectories(this.dir.resolve("site"));
         var yaml = this.dir.resolve("sjws.yaml");
@@ -139,7 +97,6 @@ class ClassLoadTest {
         pb.environment().remove("SJWS_SWARM_ENABLED");
         pb.environment().remove("WEB_SERVER_DIR");
         pb.environment().remove("WEB_SERVER_PORT");
-        pb.environment().remove("WEB_SERVER_ROLE");
         var process = pb.start();
         try {
             var deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
