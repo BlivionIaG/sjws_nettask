@@ -23,6 +23,8 @@ The swarm layer lets many *agents* (LLM-backed workers, tools and orchestrators)
 
 How this is enforced is in §3.3.
 
+**Addendum:** agent graphs (DAGs with bounded loops, fan-out/fan-in, subgraphs, durable runs) are designed in [agent-graphs.md](agent-graphs.md).
+
 ## 2. Non-goals
 - **An agent runtime or LLM framework.** No prompt templating, no planning, no tool-calling logic in the server. Agents are external processes using the SDK (§11).
 - **Hosting models.** sjws proxies to LLM backends (§10). It never runs inference.
