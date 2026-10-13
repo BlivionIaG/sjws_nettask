@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "sdk" / "python"))
 
 from sjws_swarm import Client, DeadlineExceeded, LeaseLost  # noqa: E402
 
-JAR = os.environ.get("SJWS_JAR")
+JAR = os.path.abspath(os.environ["SJWS_JAR"]) if os.environ.get("SJWS_JAR") else None
 
 
 def free_port() -> int:
