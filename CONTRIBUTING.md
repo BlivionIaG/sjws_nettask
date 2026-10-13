@@ -1,5 +1,7 @@
 # Contributing to sjws_nettask
 
+Coding agents: read [AGENTS.md](AGENTS.md) first (rules for authors, PRs, perf numbers, security).
+
 ## Setup
 
 Java 25+ and Maven. Sources are in `src/` (NetBeans layout), tests in `tests/`.
