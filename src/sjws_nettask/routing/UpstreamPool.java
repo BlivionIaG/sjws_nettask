@@ -108,7 +108,7 @@ final class UpstreamPool implements AutoCloseable {
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 // start at 16 KiB and grow to 128 KiB: big bodies move in few large chunks (fewer hand-offs and writes)
-                .option(ChannelOption.RCVBUF_ALLOCATOR, new io.netty.channel.AdaptiveRecvByteBufAllocator(4096, 16384, 128 * 1024))
+                .option(ChannelOption.RCVBUF_ALLOCATOR, new ReadSizes())
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) Math.min(Integer.MAX_VALUE, connectTimeout.toMillis()))
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
@@ -218,6 +218,50 @@ final class UpstreamPool implements AutoCloseable {
     /** End-of-response and failure markers in an exchange's queue. */
     private static final Object END = new Object();
 
+    /** Largest single socket read: also the per-exchange overshoot of the budget (see {@link ByteBudget}). */
+    static final int MAX_READ = 128 * 1024;
+    /** Read size while the budget is under pressure (at least 3/4 used). */
+    static final int SMALL_READ = 16 * 1024;
+
+    /**
+     * Adaptive reads of up to {@link #MAX_READ}, one socket read per {@code read()} call, shrunk to
+     * {@link #SMALL_READ} while {@link Reads#small} is set (Netty caches the handle per channel, so
+     * the size is switched on the handle, not by replacing the allocator).
+     */
+    static final class ReadSizes implements io.netty.channel.RecvByteBufAllocator {
+        private final io.netty.channel.AdaptiveRecvByteBufAllocator adaptive;
+
+        ReadSizes() {
+            this.adaptive = new io.netty.channel.AdaptiveRecvByteBufAllocator(4096, 16384, MAX_READ);
+            this.adaptive.maxMessagesPerRead(1);
+        }
+
+        @Override
+        public Handle newHandle() {
+            return new Reads(this.adaptive.newHandle());
+        }
+    }
+
+    static final class Reads extends io.netty.channel.RecvByteBufAllocator.DelegatingHandle {
+        /** Event loop only. */
+        boolean small;
+
+        Reads(io.netty.channel.RecvByteBufAllocator.Handle delegate) {
+            super(delegate);
+        }
+
+        @Override
+        public int guess() {
+            int g = delegate().guess();
+            return this.small ? Math.min(g, SMALL_READ) : g;
+        }
+
+        @Override
+        public io.netty.buffer.ByteBuf allocate(io.netty.buffer.ByteBufAllocator alloc) {
+            return alloc.ioBuffer(guess());
+        }
+    }
+
     /** Body bytes the event loop may queue ahead of the request thread before it stops reading. */
     static final int READ_AHEAD = 256 * 1024;
 
@@ -245,6 +289,8 @@ final class UpstreamPool implements AutoCloseable {
         private final long idleNanos;
         /** Last time body bytes arrived, for the idle timer. */
         volatile long lastRead;
+        /** Last time the consumer took a chunk; a paused exchange nobody takes from is abandoned. */
+        volatile long lastTake;
         /** Event loop only: the pending head or idle timer. */
         private io.netty.util.concurrent.Future<?> timer;
 
@@ -300,6 +346,7 @@ final class UpstreamPool implements AutoCloseable {
         void headArrived() {
             cancelTimer();
             this.lastRead = System.nanoTime();
+            this.lastTake = this.lastRead;
             if (!this.complete) {
                 this.timer = this.channel.eventLoop().schedule(this::idleCheck, this.idleNanos, TimeUnit.NANOSECONDS);
             }
@@ -311,6 +358,14 @@ final class UpstreamPool implements AutoCloseable {
             }
             long now = System.nanoTime();
             if (this.paused) { // the client is the slow side; its write timeout applies, not ours
+                if (now - this.lastTake >= 2 * this.idleNanos) {
+                    // backstop: the response was dropped without being written or closed (or the writer
+                    // stalled for twice the idle read timeout). Release the budget and the connection.
+                    Relay.fail(this, new IOException("streamed body not consumed for " + Duration.ofNanos(2 * this.idleNanos)));
+                    drain();
+                    this.channel.close();
+                    return;
+                }
                 this.lastRead = now;
             }
             long quiet = now - this.lastRead;
@@ -332,6 +387,7 @@ final class UpstreamPool implements AutoCloseable {
 
         /** Next content chunk, or {@link #END}; throws on failure (including the idle timer firing). */
         Object take() throws IOException, InterruptedException {
+            this.lastTake = System.nanoTime();
             var next = this.queue.take();
             if (next instanceof ByteBuf buf) {
                 int n = buf.readableBytes();
@@ -368,6 +424,9 @@ final class UpstreamPool implements AutoCloseable {
 
     /** Event-loop side: hands decoded messages to the channel's current exchange. */
     static final class Relay extends ChannelInboundHandlerAdapter {
+        /** Event loop only: this channel currently reads {@link #SMALL_READ} at a time. */
+        private boolean small;
+
         static final io.netty.util.AttributeKey<Exchange> CURRENT = io.netty.util.AttributeKey.valueOf("sjws.exchange");
 
         @Override
@@ -419,6 +478,12 @@ final class UpstreamPool implements AutoCloseable {
             var ex = ctx.channel().attr(CURRENT).get();
             if (ex == null || ex.abandoned || ex.complete) {
                 return;
+            }
+            boolean pressure = ex.budget.pressured();
+            if (pressure != this.small // shrink reads under budget pressure: bounds the overshoot
+                    && ctx.channel().unsafe().recvBufAllocHandle() instanceof Reads reads) {
+                this.small = pressure;
+                reads.small = pressure;
             }
             long q = ex.queued.get();
             boolean full = q >= READ_AHEAD || q > 0 && ex.budget.exhausted(); // window, or the global F5 budget

@@ -135,12 +135,13 @@ final class Http3Writer {
     }
 
     private Outcome send(Response response) throws IOException, InterruptedException {
-        var head = headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now());
         if (response.body() instanceof Body.Stream stream) {
-            try (var source = stream.source()) {
-                return sendStream(head, response, stream, source);
+            try (var source = stream.source()) { // closed even if the head cannot be built
+                return sendStream(headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now()), response, stream,
+                        source);
             }
         }
+        var head = headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now());
         boolean sendBody = response.sendsBody() && response.contentLength() > 0;
         if (sendBody && response.body() instanceof Body.FileBody file) {
             long deadline = System.nanoTime() + this.limits.slotWait().toNanos();

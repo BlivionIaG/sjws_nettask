@@ -266,6 +266,85 @@ class ProxyEdgeTest {
         }
     }
 
+    /** Security review finding 1: a filter that replaces a proxied response must not leak budget or the connection. */
+    @Test
+    void aReplacedProxiedResponseReleasesItsBudget() throws Exception {
+        int size = 8 << 20;
+        try (var s = script("HTTP/1.1 200 OK\r\nContent-Length: " + size + "\r\n\r\n" + "z".repeat(size))) {
+            var budget = new ByteBudget(16 << 20);
+            var d = Duration.ofSeconds(30); // the idle backstop must not be what releases it
+            try (var p = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://127.0.0.1:" + s.getLocalPort()), d, d, d,
+                    1 << 20, null, List.of(), false, 4), budget)) {
+                var chain = sjws_nettask.core.RequestFilters.create().add((q, next) -> {
+                    next.proceed(q);
+                    return sjws_nettask.core.StaticFileHandler.error(403, false);
+                }).build(p);
+                assertEquals(403, chain.handle(new Request("GET", "/big")).status());
+                for (int i = 0; i < 200 && budget.inFlight() != 0; i++) {
+                    Thread.sleep(10);
+                }
+                assertEquals(0, budget.inFlight());
+                assertEquals(0, p.idleConnections());
+            }
+        }
+    }
+
+    /** Backstop: a paused exchange whose body nobody takes is abandoned after twice the idle read timeout. */
+    @Test
+    void anUnreadPausedStreamIsAbandonedByTheBackstop() throws Exception {
+        int size = 8 << 20;
+        try (var s = script("HTTP/1.1 200 OK\r\nContent-Length: " + size + "\r\n\r\n" + "w".repeat(size))) {
+            var budget = new ByteBudget(16 << 20);
+            var idle = Duration.ofMillis(200);
+            try (var p = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://127.0.0.1:" + s.getLocalPort()),
+                    Duration.ofSeconds(5), Duration.ofSeconds(5), idle, 1 << 20, null, List.of(), false, 4), budget)) {
+                var dropped = p.handle(new Request("GET", "/big")); // never written, never closed (a bug elsewhere)
+                assertInstanceOf(Body.Stream.class, dropped.body());
+                for (int i = 0; i < 100 && budget.inFlight() == 0; i++) {
+                    Thread.sleep(10);
+                }
+                assertTrue(budget.inFlight() > 0);
+                for (int i = 0; i < 300 && budget.inFlight() != 0; i++) {
+                    Thread.sleep(10);
+                }
+                assertEquals(0, budget.inFlight(), "the backstop released the window");
+                var src = ((Body.Stream) dropped.body()).source();
+                assertThrows(IOException.class, () -> {
+                    while (src.next() != null) {
+                        // a late reader sees the failure, not a truncated body
+                    }
+                });
+                src.close();
+            }
+        }
+    }
+
+    /** Under budget pressure reads shrink to 16 KiB, so the overshoot per exchange is small. */
+    @Test
+    void readsShrinkUnderBudgetPressure() throws Exception {
+        int size = 4 << 20;
+        try (var s = script("HTTP/1.1 200 OK\r\nContent-Length: " + size + "\r\n\r\n" + "v".repeat(size))) {
+            var budget = new ByteBudget(64 * 1024);
+            var d = Duration.ofSeconds(5);
+            try (var p = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://127.0.0.1:" + s.getLocalPort()), d, d, d,
+                    1 << 20, null, List.of(), false, 4), budget)) {
+                var src = ((Body.Stream) p.handle(new Request("GET", "/big")).body()).source();
+                long total = 0;
+                int largeAfterWarmup = 0;
+                for (var b = src.next(); b != null; b = src.next()) {
+                    if (total > 1 << 20 && b.remaining() > UpstreamPool.SMALL_READ) {
+                        largeAfterWarmup++;
+                    }
+                    total += b.remaining();
+                    Thread.sleep(1); // a slow client keeps the budget under pressure
+                }
+                src.close();
+                assertEquals(size, total);
+                assertTrue(largeAfterWarmup <= 2, "reads above 16 KiB under pressure: " + largeAfterWarmup);
+            }
+        }
+    }
+
     @Test
     void routerClosesEachHandlerOnceAndSurvivesAFailingClose() {
         var closes = new AtomicInteger();

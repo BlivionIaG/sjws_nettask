@@ -26,6 +26,21 @@ import java.util.Objects;
 public sealed interface Body permits Body.Empty, Body.Bytes, Body.FileBody, Body.Stream {
 
     /**
+     * Releases a body that will never be written, for example a response a filter replaced or
+     * dropped. For a {@link Stream}, this closes its source, which returns the proxy's budget and
+     * closes its upstream connection. Other bodies hold nothing. Never throws.
+     */
+    static void discard(Body body) {
+        if (body instanceof Stream stream) {
+            try {
+                stream.source().close();
+            } catch (RuntimeException e) {
+                System.err.println("WARN: discarding a streamed body: " + e);
+            }
+        }
+    }
+
+    /**
      * @return number of bytes the body has (also for HEAD responses, which don't send them), or -1
      *         for a {@link Stream} of unknown length
      */
