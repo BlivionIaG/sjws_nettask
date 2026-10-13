@@ -190,6 +190,19 @@ public final class ConfigCodec {
                 switch (route.action()) {
                     case RouteSpec.Action.Proxy proxy ->
                         out.append("      proxy: ").append(quote(proxy.upstream().name())).append('\n');
+                    case RouteSpec.Action.Weighted weighted -> {
+                        out.append("      backends:\n");
+                        for (var b : weighted.backends()) {
+                            out.append("        - upstream: ").append(quote(b.upstream().name())).append('\n');
+                            out.append("          weight: ").append(b.weight()).append('\n');
+                            if (b.pin() != null) {
+                                out.append("          pin: ").append(match(b.pin())).append('\n');
+                            }
+                        }
+                        if (weighted.sticky() != null) {
+                            out.append("      sticky: ").append(match(weighted.sticky())).append('\n');
+                        }
+                    }
                     case RouteSpec.Action.Redirect redirect -> {
                         out.append("      redirect:\n");
                         out.append("        status: ").append(redirect.status()).append('\n');
@@ -200,6 +213,11 @@ public final class ConfigCodec {
                 }
             }
         }
+    }
+
+    private static String match(sjws_nettask.routing.WeightedHandler.Match m) {
+        return "{ " + (m.cookie() ? "cookie" : "header") + ": " + quote(m.name())
+                + (m.value() == null ? "" : ", value: " + quote(m.value())) + " }";
     }
 
     private static void middleware(StringBuilder out, List<MiddlewareSpec> middleware) {

@@ -670,8 +670,8 @@ public final class ConfigLoader {
         for (int i = 0; i < list.size(); i++) {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
-            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static",
-                    "listing", "errors", "problem_type"), path);
+            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "backends", "sticky", "redirect",
+                    "static", "listing", "errors", "problem_type"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -690,12 +690,17 @@ public final class ConfigLoader {
                 rewrite = prefix(text(map.get("rewrite"), path + ".rewrite"), path + ".rewrite");
             }
             int actions = (map.containsKey("proxy") ? 1 : 0) + (map.containsKey("redirect") ? 1 : 0)
-                    + (map.containsKey("static") ? 1 : 0);
+                    + (map.containsKey("static") ? 1 : 0) + (map.containsKey("backends") ? 1 : 0);
             if (actions != 1) {
-                throw new ConfigException(path + ": exactly one of proxy, redirect or static is required");
+                throw new ConfigException(path + ": exactly one of proxy, backends, redirect or static is required");
+            }
+            if (map.containsKey("sticky") && !map.containsKey("backends")) {
+                throw new ConfigException(path + ".sticky is only valid with backends");
             }
             RouteSpec.Action action;
-            if (map.containsKey("proxy")) {
+            if (map.containsKey("backends")) {
+                action = weighted(map, upstreams, path);
+            } else if (map.containsKey("proxy")) {
                 var name = text(map.get("proxy"), path + ".proxy");
                 var upstream = upstreams.get(name);
                 if (upstream == null) {
@@ -716,6 +721,58 @@ public final class ConfigLoader {
             out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path)));
         }
         return List.copyOf(out);
+    }
+
+    /** {@code backends: [{upstream, weight (default 1), pin}]} and {@code sticky}. */
+    private static RouteSpec.Action.Weighted weighted(Map<String, Object> route, Map<String, Upstream> upstreams,
+            String path) {
+        var list = YamlValues.sequence(route.get("backends"), path + ".backends");
+        if (list.isEmpty() || list.size() > 64) {
+            throw new ConfigException(path + ".backends: expected 1 to 64 backends");
+        }
+        var out = new ArrayList<RouteSpec.Action.Backend>(list.size());
+        long total = 0;
+        for (int i = 0; i < list.size(); i++) {
+            var at = path + ".backends[" + i + "]";
+            var b = YamlValues.mapping(list.get(i), at);
+            YamlValues.knownKeys(b, List.of("upstream", "weight", "pin"), at);
+            if (!b.containsKey("upstream")) {
+                throw new ConfigException(at + ".upstream is required");
+            }
+            var name = text(b.get("upstream"), at + ".upstream");
+            var upstream = upstreams.get(name);
+            if (upstream == null) {
+                throw new ConfigException(at + ".upstream: unknown upstream '" + name + "'");
+            }
+            int weight = b.containsKey("weight") ? integer(b.get("weight"), at + ".weight", 0, 1_000_000) : 1;
+            var pin = b.containsKey("pin") ? match(b.get("pin"), at + ".pin", true) : null;
+            if (weight == 0 && pin == null) {
+                throw new ConfigException(at + ": weight 0 needs a pin (it would never be chosen)");
+            }
+            total += weight;
+            out.add(new RouteSpec.Action.Backend(upstream, weight, pin));
+        }
+        if (total == 0) {
+            throw new ConfigException(path + ".backends: total weight must be > 0");
+        }
+        var sticky = route.containsKey("sticky") ? match(route.get("sticky"), path + ".sticky", false) : null;
+        return new RouteSpec.Action.Weighted(out, sticky);
+    }
+
+    /** {@code {header: name}} or {@code {cookie: name}}, with {@code value} when {@code withValue}. */
+    private static sjws_nettask.routing.WeightedHandler.Match match(Object value, String path, boolean withValue) {
+        var m = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(m, withValue ? List.of("header", "cookie", "value") : List.of("header", "cookie"), path);
+        if (m.containsKey("header") == m.containsKey("cookie")) {
+            throw new ConfigException(path + ": expected exactly one of header or cookie");
+        }
+        boolean cookie = m.containsKey("cookie");
+        var name = text(m.get(cookie ? "cookie" : "header"), path + (cookie ? ".cookie" : ".header")).trim();
+        if (name.isEmpty() || !name.chars().allMatch(c -> c > 32 && c < 127 && "()<>@,;:\\\"/[]?={}".indexOf(c) < 0)) {
+            throw new ConfigException(path + ": invalid name '" + name + "'");
+        }
+        String v = m.containsKey("value") ? String.valueOf(m.get("value")) : null;
+        return new sjws_nettask.routing.WeightedHandler.Match(cookie, name, v);
     }
 
     /** {@code errors: html | problem} (default html) and the optional {@code problem_type} URI base. */
