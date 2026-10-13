@@ -62,6 +62,8 @@ public final class CpStore implements AutoCloseable {
     private static final byte ADVANCE = 8;
     /** Wraps a mutation so a retried Idempotency-Key is not applied twice after replay. */
     private static final byte IDEM = 9;
+    private static final byte JOIN_ISSUE = 10;
+    private static final byte JOIN_CONSUME = 11;
     private static final int HISTORY = 8;
 
     private final ReplicatedNode node;
@@ -71,7 +73,7 @@ public final class CpStore implements AutoCloseable {
     private final Map<String, sjws_nettask.controlplane.Role> policy = new LinkedHashMap<>();
     private sjws_nettask.controlplane.Rbac rights;
     private sjws_nettask.controlplane.AuditLog audit;
-    private final List<String> revoked = new ArrayList<>();
+    private final List<String> revoked = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final List<String> selectors = new ArrayList<>();
     private final List<SignedSnapshot> history = new ArrayList<>();
     private final List<ConfigDocument> documents = new ArrayList<>();
@@ -81,6 +83,12 @@ public final class CpStore implements AutoCloseable {
     private java.nio.file.Path auditFile;
     private Staged staged;
     private int stage;
+
+    /** Newest activated envelope, for watch threads; written only where {@code history} grows. */
+    private volatile SignedSnapshot latest;
+    /** Guards the watch wait and the state watch threads touch: {@code reported} and {@code joins}. */
+    private final java.util.concurrent.locks.ReentrantLock watchLock = new java.util.concurrent.locks.ReentrantLock();
+    private final java.util.concurrent.locks.Condition activatedChanged = watchLock.newCondition();
 
     private CpStore(ReplicatedNode node, KeyRing keys) {
         this.node = node;
@@ -148,9 +156,139 @@ public final class CpStore implements AutoCloseable {
         return NodeLifecycle.dataPlane(controlPlaneUp, hasLastGood, pastMaxStaleness);
     }
 
-    /** Same node identity and token within the TTL returns the join already recorded. */
+    /**
+     * Issues a one-shot join token (replicated). Only the SHA-256 of {@code secret} is stored.
+     */
+    public Outcome issueJoinToken(String tokenId, byte[] secret, long nowMillis, long ttlMillis) {
+        var bad = JoinTokens.checkIssue(tokenId, secret, ttlMillis);
+        if (bad != null) {
+            return Outcome.error(400, bad);
+        }
+        if (!leadership.leaderReady()) {
+            return Outcome.error(503, "leader not ready");
+        }
+        long expires = nowMillis + ttlMillis;
+        try {
+            append(joinEntry(JOIN_ISSUE, tokenId, JoinTokens.sha256(secret), expires, nowMillis));
+        } catch (ExecutionException e) {
+            return Outcome.error(503, "log");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Outcome.error(503, "log");
+        }
+        return Outcome.ok("{\"token\":" + LastGoodFiles.jsonString(tokenId) + ",\"expiresAtMillis\":" + expires + "}", 0);
+    }
+
+    /**
+     * Presents a join token. The first successful use burns it through a replicated consume entry
+     * (atomic: of two concurrent first uses one wins, the other is "used"). A retry from the node that
+     * joined, with the same token, returns the recorded join ({@code replay}) without consuming again.
+     */
     public JoinTokens.Result presentJoin(String nodeId, String tokenId, byte[] secret, long nowMillis) {
-        return joins.present(nodeId, tokenId, secret, nowMillis, JoinTokens.DEFAULT_TTL_MILLIS);
+        var hash = secret == null || secret.length < 16 ? null : JoinTokens.sha256(secret);
+        var decision = joins.evaluate(nodeId, tokenId, hash, nowMillis);
+        if (!decision.accepted() || decision.replay()) {
+            return decision;
+        }
+        if (!leadership.leaderReady()) {
+            return new JoinTokens.Result(null, false, "leader not ready");
+        }
+        try {
+            append(joinEntry(JOIN_CONSUME, nodeId, tokenId, hash, nowMillis));
+        } catch (ExecutionException e) {
+            return new JoinTokens.Result(null, false, "log");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new JoinTokens.Result(null, false, "log");
+        }
+        var join = joins.joined(nodeId);
+        if (join != null && join.tokenId().equals(tokenId)) {
+            return new JoinTokens.Result(join, false, null);
+        }
+        return new JoinTokens.Result(null, false, "used");
+    }
+
+    private static ByteBuffer joinEntry(byte type, String a, String b, long n1, long n2) {
+        var ra = a.getBytes(StandardCharsets.UTF_8);
+        var rb = b.getBytes(StandardCharsets.UTF_8);
+        var buffer = ByteBuffer.allocate(1 + 4 + ra.length + 4 + rb.length + 16);
+        buffer.put(type);
+        put(buffer, ra);
+        put(buffer, rb);
+        buffer.putLong(n1);
+        buffer.putLong(n2);
+        buffer.flip();
+        return buffer;
+    }
+
+    private static ByteBuffer joinEntry(byte type, String nodeId, String tokenId, String hash, long now) {
+        var rn = nodeId.getBytes(StandardCharsets.UTF_8);
+        var rt = tokenId.getBytes(StandardCharsets.UTF_8);
+        var rh = hash.getBytes(StandardCharsets.UTF_8);
+        var buffer = ByteBuffer.allocate(1 + 12 + rn.length + rt.length + rh.length + 8);
+        buffer.put(type);
+        put(buffer, rn);
+        put(buffer, rt);
+        put(buffer, rh);
+        buffer.putLong(now);
+        buffer.flip();
+        return buffer;
+    }
+
+    /**
+     * Watch credential. A node that has joined keeps authenticating with the same token id and secret
+     * until it is revoked (the one-shot rule applies to joining, not to every long poll); any other
+     * presentation goes through {@link #presentJoin}, which consumes an issued token once.
+     */
+    public JoinTokens.Result authenticateWatch(String nodeId, String tokenId, byte[] secret, long nowMillis) {
+        var join = nodeId == null ? null : joins.joined(nodeId);
+        if (join != null && secret != null && secret.length >= 16 && join.tokenId().equals(tokenId)
+                && java.security.MessageDigest.isEqual(join.secretHash().getBytes(StandardCharsets.US_ASCII),
+                        JoinTokens.sha256(secret).getBytes(StandardCharsets.US_ASCII))) {
+            return new JoinTokens.Result(join, true, null);
+        }
+        return presentJoin(nodeId, tokenId, secret, nowMillis);
+    }
+
+    /**
+     * The activated envelope once its version is above {@code afterVersion}, waiting up to
+     * {@code waitMillis}; null on timeout or interrupt (interrupt flag kept). Watch threads only.
+     */
+    public SignedSnapshot awaitActivated(long afterVersion, long waitMillis) {
+        long left = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(0L, waitMillis));
+        watchLock.lock();
+        try {
+            while (true) {
+                var now = latest;
+                if (now != null && now.version() > afterVersion) {
+                    return now;
+                }
+                if (left <= 0L) {
+                    return null;
+                }
+                left = activatedChanged.awaitNanos(left);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } finally {
+            watchLock.unlock();
+        }
+    }
+
+    /** True when {@code nodeId} is on the revoke denylist. */
+    public boolean isRevoked(String nodeId) {
+        return revoked.contains(nodeId);
+    }
+
+    private void publishLatest(SignedSnapshot snapshot) {
+        watchLock.lock();
+        try {
+            latest = snapshot;
+            activatedChanged.signalAll();
+        } finally {
+            watchLock.unlock();
+        }
     }
 
     public void publishBinding(sjws_nettask.service.NodeEnrollment enrollment) throws java.io.IOException {
@@ -444,7 +582,12 @@ public final class CpStore implements AutoCloseable {
             default -> "SUSPECT";
         };
         long applied = Math.max(0L, appliedVersion);
-        reported.put(id, new Reported(id, labels == null ? Map.of() : Map.copyOf(labels), known, applied));
+        watchLock.lock();
+        try {
+            reported.put(id, new Reported(id, labels == null ? Map.of() : Map.copyOf(labels), known, applied));
+        } finally {
+            watchLock.unlock();
+        }
     }
 
     public String nodesJson() {
@@ -453,7 +596,14 @@ public final class CpStore implements AutoCloseable {
         var json = new StringBuilder();
         json.append("{\"nodes\":[");
         nodeJson(json, "cp-1", leader, Map.of("role", "control"), "READY", desired, 0L, revoked.contains("cp-1"));
-        for (var node : reported.values()) {
+        List<Reported> nodes;
+        watchLock.lock();
+        try {
+            nodes = List.copyOf(reported.values());
+        } finally {
+            watchLock.unlock();
+        }
+        for (var node : nodes) {
             json.append(',');
             nodeJson(json, node.id, "data", node.labels, node.health, node.applied,
                     Math.max(0L, desired - node.applied), revoked.contains(node.id));
@@ -675,6 +825,7 @@ public final class CpStore implements AutoCloseable {
                     history.remove(0);
                     documents.remove(0);
                 }
+                publishLatest(snapshot);
                 staged = null;
             }
             case RBAC -> {
@@ -689,6 +840,19 @@ public final class CpStore implements AutoCloseable {
                 }
             }
             case REVOKE -> revoked.add(readString(body));
+            case JOIN_ISSUE -> {
+                var tokenId = readString(body);
+                var hash = readString(body);
+                long expires = body.getLong();
+                long now = body.getLong();
+                joins.issue(tokenId, hash, expires, now);
+            }
+            case JOIN_CONSUME -> {
+                var nodeId = readString(body);
+                var tokenId = readString(body);
+                var hash = readString(body);
+                joins.consume(nodeId, tokenId, hash, body.getLong());
+            }
             case ROLLOUT -> {
                 selectors.clear();
                 int count = body.getInt();

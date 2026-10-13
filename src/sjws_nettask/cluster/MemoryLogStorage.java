@@ -27,6 +27,7 @@ public final class MemoryLogStorage implements LogStorage {
 
     private final Map<GroupId, NavigableMap<Long, Rec>> logs = new ConcurrentHashMap<>();
     private final Map<GroupId, AtomicInteger> forceCounts = new ConcurrentHashMap<>();
+    private final Map<GroupId, WitnessCursor> cursors = new ConcurrentHashMap<>();
 
     private NavigableMap<Long, Rec> log(GroupId group) {
         var existing = logs.get(group);
@@ -81,7 +82,35 @@ public final class MemoryLogStorage implements LogStorage {
 
     @Override
     public void force(GroupId group) {
+        cursor(group).publish();
         forces(group, true);
+    }
+
+    @Override
+    public long witnessIndex(GroupId group) {
+        var cursor = cursors.get(group);
+        return cursor == null ? 0L : cursor.index();
+    }
+
+    @Override
+    public long witnessTerm(GroupId group) {
+        var cursor = cursors.get(group);
+        return cursor == null ? 0L : cursor.term();
+    }
+
+    @Override
+    public void noteWitness(GroupId group, long index, long term) {
+        cursor(group).note(index, term);
+    }
+
+    private WitnessCursor cursor(GroupId group) {
+        var existing = cursors.get(group);
+        if (existing != null) {
+            return existing;
+        }
+        var created = new WitnessCursor();
+        var raced = cursors.putIfAbsent(group, created);
+        return raced == null ? created : raced;
     }
 
     @Override

@@ -27,6 +27,7 @@ Back to the [README](../README.md) (quick start).
 - [Request routing and reverse proxy (proposal)](design/proxy-routing.md)
 - [Control plane: distributable access policy, operator RBAC and audit](design/control-plane-security.md)
 - [Messaging core (draft)](messaging/design.md)
+- [Messaging metrics (proposal)](design/messaging-metrics.md)
 - [Messaging config and broker apply (draft)](messaging/config.md)
 - [High availability (draft)](ha/design.md)
 - [Control plane / API gateway mode (draft)](design/control-plane.md)

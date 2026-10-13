@@ -80,9 +80,8 @@ class CpCoverageTest {
             assertEquals(503, store.revoke("n1").status());
             assertEquals(503, store.rollout(List.of("edge")).status());
             assertEquals(503, store.advance().status());
-            var joined = store.presentJoin("edge-1", "tok", new byte[16], NOW);
-            assertTrue(joined.accepted());
-            assertTrue(store.presentJoin("edge-1", "tok", new byte[16], NOW).replay());
+            assertEquals(503, store.issueJoinToken("tok", new byte[16], NOW, TTL).status());
+            assertEquals("token", store.presentJoin("edge-1", "tok", new byte[16], NOW).error(), "never issued");
 
             elect(store, clock);
             assertTrue(store.ready(true));

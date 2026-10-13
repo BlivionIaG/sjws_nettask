@@ -363,4 +363,29 @@ class BufferPoolTest {
         t.join();
         assertEquals(0, p.budget(BufferPool.MESSAGING).usedBytes());
     }
+
+    @Test
+    void creditParkedByOtherThreadsIsReclaimedSoTheLimitIsExact() throws Exception {
+        var p = BufferPool.create(new BufferPool.Settings(true, 4 << 20, Map.of(BufferPool.MESSAGING, 0.5), false, 0, 0));
+        var http = p.budget(BufferPool.HTTP);
+        int n = (int) (http.limitBytes() / 65536);
+        var workers = new ArrayList<Thread>();
+        for (int t = 0; t < 8; t++) { // each leaves credit in its own stripe
+            workers.add(Thread.ofPlatform().start(() -> http.acquire(65536).release()));
+        }
+        for (var w : workers) {
+            w.join();
+        }
+        assertEquals(0, http.usedBytes(), "parked credit is not reported as used");
+        var held = new ArrayList<PooledBuffer>();
+        for (int i = 0; i < n; i++) {
+            var b = http.tryAcquire(65536);
+            assertNotNull(b, "buffer " + i + " of " + n);
+            held.add(b);
+        }
+        assertNull(http.tryAcquire(65536), "limit reached");
+        assertEquals(http.limitBytes(), http.usedBytes());
+        held.forEach(PooledBuffer::release);
+        assertEquals(0, http.usedBytes());
+    }
 }

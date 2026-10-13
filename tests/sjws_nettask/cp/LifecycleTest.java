@@ -65,35 +65,61 @@ class LifecycleTest {
     }
 
     @Test
-    void joinTokenIsIdempotentPerIdentity() {
+    void joinTokenIsOneShot() {
         var secret = new byte[16];
         Arrays.fill(secret, (byte) 7);
+        var hash = JoinTokens.sha256(secret);
         var tokens = new JoinTokens();
-        var created = tokens.present("edge-1", "tok", secret, 1_000, JoinTokens.DEFAULT_TTL_MILLIS);
+        assertEquals("token", tokens.consume("edge-1", "tok", hash, 1_000).error(), "not issued");
+        assertTrue(tokens.issue("tok", hash, 1_000 + JoinTokens.DEFAULT_TTL_MILLIS, 1_000));
+        assertFalse(tokens.issue("tok", "other", 9_999_999, 1_000), "an id is issued once");
+        assertTrue(tokens.evaluate("edge-1", "tok", hash, 1_000).accepted());
+        assertNull(tokens.evaluate("edge-1", "tok", hash, 1_000).join(), "evaluate does not consume");
+
+        var created = tokens.consume("edge-1", "tok", hash, 2_000);
         assertTrue(created.accepted());
         assertFalse(created.replay());
-        var again = tokens.present("edge-1", "tok", secret, 1_000, JoinTokens.DEFAULT_TTL_MILLIS);
+        assertEquals("edge-1", tokens.joined("edge-1").nodeId());
+
+        // burned: another node can never use it
+        assertEquals("used", tokens.consume("edge-2", "tok", hash, 2_001).error());
+        assertNull(tokens.joined("edge-2"));
+        // a lost-response retry from the same node gets its recorded join back, without a second consume
+        var again = tokens.consume("edge-1", "tok", hash, 3_000);
         assertTrue(again.replay());
         assertEquals(created.join(), again.join());
-        assertEquals("identity", tokens.present("other", "tok", secret, 1_000, 1_000).error());
-        assertEquals("identity", tokens.present(null, "tok", secret, 1_000, 1_000).error());
-        assertEquals("token", tokens.present("edge-2", null, secret, 1_000, 1_000).error());
-        assertEquals("token", tokens.present("edge-2", "tok2", null, 1_000, 1_000).error());
-        assertFalse(tokens.present("edge-2", null, secret, 1_000, 1_000).accepted());
-        assertEquals("identity", tokens.present("bad id", "tok", secret, 1_000, 1_000).error());
-        assertEquals("token", tokens.present("edge-2", " ", secret, 1_000, 1_000).error());
-        assertEquals("token", tokens.present("edge-2", "tok2", new byte[8], 1_000, 1_000).error());
-        assertEquals("ttl", tokens.present("edge-2", "tok2", secret, 1_000, 0).error());
-        assertEquals("ttl", tokens.present("edge-2", "tok2", secret, 1_000, JoinTokens.MAX_TTL_MILLIS + 1).error());
-        assertEquals("expired", tokens.present("edge-1", "tok", secret, created.join().expiresAtMillis() + 1,
-                1_000).error());
+        // ... only within the grace window, even though the token's own TTL has not run out
+        assertEquals("used", tokens.evaluate("edge-1", "tok", hash, 2_000 + JoinTokens.REPLAY_GRACE_MILLIS + 1).error());
+        // and only with the same secret
         var other = secret.clone();
         other[0] = 1;
-        var fresh = new JoinTokens();
-        fresh.present("edge-1", "tok", secret, 1_000, 1_000);
-        assertEquals("identity", fresh.present("edge-1", "other-token", secret, 1_000, 1_000).error());
-        assertEquals("identity", fresh.present("edge-1", "tok", other, 1_000, 1_000).error());
-        assertEquals("ttl", fresh.present("edge-3", "tok3", secret, Long.MAX_VALUE, 1_000).error());
+        assertEquals("token", tokens.evaluate("edge-1", "tok", JoinTokens.sha256(other), 3_000).error());
+
+        // expiry, identity and input checks
+        tokens.issue("tok2", hash, 5_000, 1_000);
+        assertEquals("expired", tokens.consume("edge-3", "tok2", hash, 5_001).error());
+        assertEquals("identity", tokens.consume("edge-1", "tok2", hash, 4_000).error(), "already joined");
+        assertEquals("identity", tokens.evaluate("bad id", "tok2", hash, 1_000).error());
+        assertEquals("identity", tokens.evaluate(null, "tok2", hash, 1_000).error());
+        assertEquals("token", tokens.evaluate("edge-3", null, hash, 1_000).error());
+        assertEquals("token", tokens.evaluate("edge-3", "tok2", null, 1_000).error());
+        assertNull(JoinTokens.checkIssue("tok3", secret, 1_000));
+        assertEquals("token", JoinTokens.checkIssue("bad id", secret, 1_000));
+        assertEquals("token", JoinTokens.checkIssue(null, secret, 1_000));
+        assertEquals("secret", JoinTokens.checkIssue("tok3", new byte[8], 1_000));
+        assertEquals("secret", JoinTokens.checkIssue("tok3", null, 1_000));
+        assertEquals("ttl", JoinTokens.checkIssue("tok3", secret, 0));
+        assertEquals("ttl", JoinTokens.checkIssue("tok3", secret, JoinTokens.MAX_TTL_MILLIS + 1));
+    }
+
+    @Test
+    void issuedTokensAreBounded() {
+        var tokens = new JoinTokens();
+        for (int i = 0; i < JoinTokens.MAX_TOKENS; i++) {
+            assertTrue(tokens.issue("t" + i, "h", 10, 0));
+        }
+        assertFalse(tokens.issue("live", "h", 100, 5), "full of unexpired tokens");
+        assertTrue(tokens.issue("after", "h", 100, 11), "expired unused tokens are pruned");
     }
 
     @Test
