@@ -38,8 +38,8 @@ sequenceDiagram
     Note over M: parse the flags and the config,<br/>resolve the role: a bad combination<br/>exits 64. A control process binds no<br/>content port by default
     M->>L: onListening, once the server has started
     Note over L: write the status file. Without a cp: block,<br/>sjws.cp.nodeId or SJWS_CP_NODE_ID:<br/>a WARN, and nothing is hosted
-    Note over L: CpConfig: system property, then the<br/>environment, then the YAML cp: block.<br/>An unknown key, or a missing nodeId,<br/>stateDir, keyDir, rootPub, watch.listen<br/>or admin.listen: error
-    Note over L: CpTiming.check: 80 ms x 1.01 + 10 ms<br/>= 90.8 ms must stay below the 100 ms<br/>election timeout
+    Note over L: CpConfig: system property, then the<br/>environment, then the YAML cp: block.<br/>peers, minBundleSerial and four more keys<br/>are YAML only. An unknown key, or a missing<br/>nodeId, stateDir, keyDir, rootPub,<br/>watch.listen or admin.listen: error
+    Note over L: CpTiming.check, at the default drift ratio<br/>and margin: 80 ms x 1.01 + 10 ms = 90.8 ms<br/>must stay below the 100 ms election timeout
     L->>C: open, or CpWitnessHost on a witness
     Note over C: KeyRing.load, then CpStore.open and<br/>start, then the mTLS WatchServer and<br/>the mTLS AdminServer. Both need cp.tls.<br/>cp.peers is refused: no voter network<br/>transport is wired yet
     C-->>M: hosted. Any error closes what was<br/>opened, prints ERROR and exits 1, not 64
@@ -50,10 +50,10 @@ What a control process hosts once it is up. Activate and rollback are signed wit
 ```mermaid
 flowchart TB
     ops["Operators<br/>mTLS client certificate"] -->|"/cp/v1/*"| adm["AdminServer and CpAdmin"]
-    nodes["Data nodes<br/>mTLS client certificate"] -->|"GET watch,<br/>POST ack"| wat["WatchServer"]
+    nodes["Data nodes<br/>mTLS client certificate<br/>and the join token"] -->|"GET watch,<br/>POST ack"| wat["WatchServer"]
     adm --> store["CpStore<br/>group cp-config, history<br/>of 8, staged proposal"]
     store -->|"authorize"| rbac["Rbac, AuditLog"]
-    store --> raft["ReplicatedNode,<br/>RaftGroup"]
+    store --> raft["ReplicatedNode,<br/>ReplicationGroup"]
     store -->|"sign"| keys["KeyRing"]
     store -->|"publishLatest"| wat
 ```
@@ -170,12 +170,12 @@ sequenceDiagram
     participant K as KeyRing.load
 
     H->>K: cp.keyDir, cp.stateDir, root.pub
-    Note over K: directories: keyDir is real, owned by this process,<br/>mode 0700, under secure parents. stateDir is real,<br/>under secure parents
+    Note over K: directories: keyDir is resolved, owned by this process<br/>with no group or other access, under secure parents.<br/>stateDir is resolved, under secure parents
     Note over K: root.pub is an Ed25519 key whose SHA-256<br/>fingerprint equals cp.rootPubSha256 when that is set
-    Note over K: trust.bundle: strict parse, a valid root signature,<br/>not expired, not issued in the future,<br/>valid for at most 90 days
-    Note over K: anti-rollback: the higher floor of trust.state in<br/>stateDir and in keyDir, or cp.minBundleSerial to<br/>seed it, never trust on first use. The bundle may not<br/>be below the floor, and one serial is one bundle
+    Note over K: trust.bundle: strict parse, a valid root signature,<br/>not expired, not issued more than 5 min ahead,<br/>valid for at most 90 days
+    Note over K: anti-rollback: the floor is the highest of trust.state in<br/>stateDir and in keyDir and cp.minBundleSerial, on every<br/>load. With no trust.state, cp.minBundleSerial must seed<br/>it: never trust on first use. The bundle may not be<br/>below the floor, and a recorded serial is one bundle
     Note over K: online.key (mode 0600 or 0400): an Ed25519 key that<br/>signs a challenge for a bundle key that is unexpired<br/>and valid at most 90 days from the issue
-    Note over K: both trust.state copies advance:<br/>temp file, fsync, atomic move
+    Note over K: the trust.state copy that differs is rewritten:<br/>temp file, fsync, atomic move
     K-->>H: the ring, or CpKeyException: any failed step<br/>refuses to start
 ```
 

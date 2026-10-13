@@ -24,33 +24,35 @@ config file format and ACME (`ConfigSource`, `CertProvider`), reverse proxy, the
 backend (`MetricsSink`), daemon/service mode (signals, PID), and the CI workflow. `HaSettings`
 is attached in code (`SjwsServer.start(config, ha)`). This workstream does not add flags to
 `ServerConfig` — that parser, `--help`, and the docs option tables stay with the config
-workstream. The process shutdown hook calls `SjwsServer.drain()`, which is `close()` unless HA
-is attached, and then `Lifecycle.drain()`.
+workstream. The process shutdown hook calls `SjwsServer.drain()`, which is `close()` when HA
+is detached, and otherwise `Lifecycle.drain()` followed by `close()`.
 
-What the code has today. Solid boxes run in a shipped process (`java -jar`). Dotted boxes are built, but only
-tests, an embedder or the HA bench reach them, because `HaSettings` is attached only there. The YAML `ha:` section is
+What the code has today. Solid boxes run in a shipped process (`java -jar`). Dotted boxes are built, but a shipped
+process never reaches them. `HaSettings` is attached only by tests, embedders and the HA bench, and
+`GenerationSync`, `VipFence` and `TcpTransport` have no caller in `src` at all. The YAML `ha:` section is
 validated and starts nothing yet. The dashed box lists what is still only designed:
 
 ```mermaid
 flowchart LR
-        hh["HaHandler: probes, then<br/>the published generation"]
+        hh["HaHandler: probes,<br/>then the published<br/>generation, else the<br/>config snapshot"]
         hb["HealthBoard: precomputed<br/>probes. Nothing sets<br/>quorumOk yet"]
         sh["SnapshotHolder: atomic<br/>publish. Nothing<br/>publishes yet"]
         lc["Lifecycle.drain() and<br/>ClientManager hooks"]
-        gs["GenerationSync: STAGE and<br/>ACTIVATE over Raft"]
-        vip["VipHook, VipFence,<br/>FailoverPolicy"]
+        gs["GenerationSync: STAGE<br/>and ACTIVATE over Raft"]
+        vip["VipHook, VipFence,<br/>FailoverPolicy: fed the<br/>leader and its lease<br/>by a caller"]
         hh --> hb
         hh --> sh
         lc --> hb
-        raft["RaftGroup and<br/>ReplicatedNode: pre-vote,<br/>lease, witness, RELAXED<br/>and STRICT"]
+        raft["RaftGroup and<br/>ReplicatedNode. Shipped:<br/>one voter, RELAXED.<br/>Tests: more voters,<br/>pre-vote, lease,<br/>witness, STRICT"]
         pol["QuorumPolicy and VoterSet"]
         tcp["TcpTransport"]
-        mem["Membership and<br/>HeartbeatService:<br/>authenticated UDP<br/>heartbeats, not connected<br/>to Raft"]
+        sim["SimTransport:<br/>in process"]
+        mem["Membership detector and<br/>HeartbeatService:<br/>authenticated UDP<br/>heartbeats, not connected<br/>to Raft"]
         raft --> pol
         raft --> tcp
-    cp["cp.CpStore, the one<br/>shipped user: group<br/>cp-config, one voter on<br/>an in-process transport"]
+        raft --> sim
+    cp["cp.CpStore, the shipped<br/>user: group cp-config,<br/>one voter on an<br/>in-process transport"]
     gs --> raft
-    vip --> raft
     cp --> raft
 
     classDef lib stroke-dasharray: 2 4
@@ -166,12 +168,13 @@ The two-node choice (witness versus async primary/standby), the failure matrix, 
   The accept loop's one volatile role read (passive mode only) feeds that hook and the
   `ha_role` gauge; it does not run per request.
 
-Two data nodes and a witness. The Raft side is built in `cluster` and runs only in tests: no shipped process
-runs an `ha-control` voter beside the content listener (dotted boxes, as above):
+Two data nodes and a witness. The Raft side of this topology, an `ha-control` group of two data nodes and a
+witness, is built in `cluster` and runs only in tests: no shipped process runs an `ha-control` voter beside the
+content listener (dotted boxes, as above):
 
 ```mermaid
 flowchart TB
-    lb["Load balancer or DNS<br/>probes /healthz and /readyz"]
+    lb["Load balancer or DNS<br/>probes /healthz<br/>and /readyz"]
 
     subgraph a["Node A"]
         sa["Static files<br/>served locally"]
@@ -183,7 +186,7 @@ flowchart TB
         rb["ha-control voter"]
     end
 
-    w["Witness<br/>votes and acks, never leads,<br/>keeps a cursor, not the log"]
+    w["Witness<br/>votes and acks,<br/>never leads, keeps a<br/>cursor, not the log"]
 
     lb --> sa
     lb --> sb
@@ -215,10 +218,10 @@ flowchart TB
       r["Request, with HA attached"] --> p1{"Path is /healthz?"}
       p1 -->|yes| h["200 ok while the accept<br/>loop is alive, else 503<br/>precomputed, no allocation"]
       p1 -->|no| p2{"Path is /readyz?"}
-      p2 -->|yes| rd["200 only when a<br/>snapshot is loaded, the<br/>node is not draining,<br/>and quorum is ok if the<br/>policy requires it, else 503"]
+      p2 -->|yes| rd["200 only when a snapshot<br/>is loaded, the node is<br/>not draining, and quorum<br/>is ok if the policy<br/>requires it, else 503"]
       p2 -->|no| g{"A generation has<br/>been published?"}
-      g -->|yes| gh["Its handler, loaded once at<br/>the start of the call"]
-      g -->|no| ch["The config snapshot handler"]
+      g -->|yes| gh["Its handler, loaded once<br/>at the start of the call"]
+      g -->|no| ch["The config snapshot<br/>handler"]
   ```
 
 - Peer failure detection: UDP heartbeat plus an indirect probe (k=2 via other members when
@@ -237,14 +240,12 @@ flowchart TB
       DEAD --> ALIVE: a heartbeat
       note right of SUSPECT
           deadAfter counts from the
-          last heartbeat heard, 5 s
+          last time it was heard, 5 s
           by default. A heartbeat
           counts when its incarnation
-          is the same or higher
-      end note
-      note left of ALIVE
-          also probed indirectly
-          through up to 2 other
+          is the same or higher.
+          A suspect is also probed
+          through up to 2 other alive
           members, when 3 or more
           are listed
       end note
@@ -329,13 +330,13 @@ in-process map, heartbeats do not announce generations, and nothing publishes a 
 sequenceDiagram
     participant P as publishFrom caller
     participant R as ha-control group
-    participant N as Every node
+    participant N as Every data node,<br/>in log order
 
     Note over P: load config, certificate and key<br/>from ConfigSource and CertProvider.<br/>Store the payload in HmacBundles,<br/>an in-process map
     P->>R: append STAGE, generation and SHA-256
     Note over R: a follower's append fails<br/>with NotLeaderException
     R-->>N: STAGE committed
-    Note over N: pull the payload from HmacBundles,<br/>check the HMAC and the hash, rewrite<br/>the key file (mode 0600, ATOMIC_MOVE)
+    Note over N: pull the payload from HmacBundles,<br/>check its HMAC, rewrite the key file<br/>(mode 0600, ATOMIC_MOVE). The hash in<br/>the entry is not compared
     R-->>P: the STAGE future completes
     P->>R: append ACTIVATE at once
     R-->>N: ACTIVATE committed

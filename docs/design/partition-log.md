@@ -40,9 +40,11 @@ returns sub-batch slices.
 - Errors are RFC 9457 problems, like `SwarmHttp`.
 - Access goes through the existing rights or filters chain; no new auth.
 
-As built (`MessagingHttp`, `LogTopics`), it differs from the plan above in three places. There are no `Producer-Id`
+As built (`MessagingHttp`, `LogTopics`), it differs from the plan above in four places. There are no `Producer-Id`
 or `Producer-Seq` headers. `Durability` takes `none`, `async` or `group` and is never weaker than the topic's writer
-default. Fetch decodes the batches and re-encodes them into a pooled buffer instead of using `transferTo`. Produce:
+default. Fetch decodes the batches and re-encodes them into a pooled buffer instead of using `transferTo`. The
+responses carry more: produce answers `{baseOffset, count}` with a `Durability-Effective` header, and fetch adds
+`Next-Offset` and `Log-End-Offset`. Produce:
 
 ```mermaid
 sequenceDiagram
@@ -51,8 +53,9 @@ sequenceDiagram
     participant W as LedgerWriter
 
     C->>H: POST /messaging/v1/topics/t/records
-    Note over H: topic: 1 to 128 letters, digits, dots, dashes<br/>or underscores, else 400. Body: 8 MiB at most,<br/>else 400. A known length is staged in one<br/>messaging buffer
-    Note over H: Durability header none, async or group,<br/>never weaker than the topic's writer default
+    Note over H: topic: 1 to 128 letters, digits, dots, dashes<br/>or underscores, not . or .., else 400
+    Note over H: Durability header none, async or group, else 400,<br/>never weaker than the topic's writer default
+    Note over H: body: 8 MiB at most, else 400. Up to 4 MiB it is<br/>staged in one messaging buffer, above that or with<br/>no length in a growing heap buffer
     H->>W: append(records, durability)<br/>on the topic's log, opened on first produce
     W-->>H: base offset, once the durability holds
     Note over H: waits 30 s at most, then 503
@@ -68,12 +71,16 @@ sequenceDiagram
     participant B as BufferPool
 
     C->>H: GET /messaging/v1/topics/t/records<br/>with offset and maxBytes
-    Note over H: unknown topic: 404. Offset before the log<br/>start: 416. maxBytes defaults to 1 MiB,<br/>16 MiB at most
+    Note over H: a bad offset, or maxBytes outside 1 byte to 16 MiB<br/>(1 MiB by default): 400. Unknown topic: 404.<br/>Offset before the log start: 416
     Note over H: read batches from the SegmentedLog, from<br/>offset to the committed offset, under the topic's<br/>read lock, up to maxBytes (the first always comes)
-    H->>B: tryAcquire one chunk, messaging budget
-    Note over B: null when the budget is exhausted: 503 with<br/>Retry-After 1. With the pool off it is a<br/>heap buffer and never null
-    H-->>C: 200 application/vnd.sjws.batch<br/>with Next-Offset and Log-End-Offset
-    Note over H: the body streams the batches, re-encoded<br/>into that chunk. A bigger frame is its own buffer
+    alt no batch qualifies
+        H-->>C: 200, an empty body, with Next-Offset<br/>and Log-End-Offset. No buffer is taken
+    else batches were read
+        H->>B: tryAcquire one chunk, messaging budget
+        Note over B: null when the budget is exhausted: 503 with<br/>Retry-After 1. With the pool off it is a<br/>heap buffer and never null
+        H-->>C: 200 application/vnd.sjws.batch<br/>with Next-Offset and Log-End-Offset
+        Note over H: the body streams the batches, re-encoded<br/>into that chunk. A bigger frame is its own buffer
+    end
 ```
 
 ### 2.3 Retention (G2)
@@ -87,11 +94,11 @@ What exists today, for the two kinds of topic:
 ```mermaid
 flowchart TB
     subgraph plain["Plain log topics: scheduled when a limit is set"]
-        t1["Timer<br/>messaging-retention,<br/>every 10 s by default"] --> t2["Per topic, under its<br/>write lock: delete the<br/>oldest sealed segments<br/>while over maxBytes or<br/>older than maxAgeMs.<br/>Never the active one"]
+        t1["Timer<br/>messaging-retention,<br/>every 10 s by default"] --> t2["Per topic opened since<br/>the start, under its<br/>write lock: delete the<br/>oldest sealed segments<br/>while over maxBytes or<br/>older than maxAgeMs.<br/>Never the active one"]
         t2 --> t3["A fetch below the new<br/>start gets 416"]
     end
     subgraph deliv["Delivery topics: maintain exists, nothing schedules it"]
-        d1["Low watermark: the min of<br/>the oldest retained<br/>snapshot, the oldest<br/>message a group still<br/>needs, and the lowest<br/>retain-from pin"] --> d2["Delete sealed segments<br/>wholly below it, oldest<br/>first, once they are<br/>older than keepResolvedMs"]
+        d1["Low watermark: the min of<br/>the oldest retained<br/>snapshot, the oldest<br/>message not yet resolved<br/>(a dead letter counts),<br/>and the lowest<br/>retain-from pin"] --> d2["Delete sealed segments<br/>wholly below it, oldest<br/>first, once they are<br/>older than keepResolvedMs"]
         d2 --> d3["Compact sealed segments<br/>below the snapshot and<br/>pin floor when their live<br/>bytes are under<br/>compactLiveRatio"]
         d3 --> d4["Then the same for<br/>topic.dlq"]
     end

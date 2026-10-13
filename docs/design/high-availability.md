@@ -118,8 +118,8 @@ refuses the pre-vote, so the term does not move and the leader that holds the wi
 stays leader. `onTimeoutNow` (leadership transfer) still starts a real election; it does
 not go through the pre-vote.
 
-One election, from the first deadline to the lease. The Raft side runs in tests and in a control process
-(group `cp-config`, one voter), not yet in an HA pair:
+One election, from the first deadline to the lease, as three voters run it in tests. The Raft side runs in tests
+and in a control process (group `cp-config`, one voter, which sends no `PRE_VOTE` or `VOTE`), not yet in an HA pair:
 
 ```mermaid
 sequenceDiagram
@@ -233,9 +233,10 @@ flowchart TB
     c2["2. Time: within 5 s of<br/>now either way, and not<br/>before this process<br/>booted (else TIME)"]
     c3["3. Body and address:<br/>the body decodes (else<br/>BODY) and is addressed<br/>to this node (else<br/>DEST)"]
     c4["4. Epoch: the boot<br/>epoch is not later than<br/>the packet timestamp by<br/>more than 5 s (else<br/>EPOCH)"]
-    c5["5. Replay state: the<br/>sender is a member<br/>(else MEMBER) and the<br/>sequence is above 0<br/>(else SEQ). A new<br/>sender, a newer boot<br/>epoch, or a lower one<br/>after silence resets<br/>the sequence. Otherwise<br/>a lower epoch is EPOCH<br/>and a sequence not<br/>above the last is SEQ"]
+    c5["5. Replay state, first<br/>checks: the destination<br/>field names this node<br/>(else DEST), the sender<br/>is a member (else<br/>MEMBER), the sequence<br/>is above 0 (else SEQ),<br/>and the boot epoch is<br/>not later than now by<br/>more than 5 s (else<br/>EPOCH)"]
+    c6["6. The sender's mark: a<br/>new sender, a newer boot<br/>epoch, or a lower one<br/>after silence resets the<br/>sequence. Otherwise a<br/>lower epoch is EPOCH<br/>and a sequence not above<br/>the last is SEQ"]
     ok["Accepted:<br/>Membership.onHeartbeat.<br/>Every drop is counted<br/>under its reason"]
-    c1 --> c2 --> c3 --> c4 --> c5 --> ok
+    c1 --> c2 --> c3 --> c4 --> c5 --> c6 --> ok
 ```
 
 Rotation is the previous key. Put the new secret in `ha.cluster_key` or

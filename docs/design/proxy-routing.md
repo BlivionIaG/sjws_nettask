@@ -24,18 +24,18 @@ Non-goals (for now)
 ```mermaid
 flowchart TB
     t["transport"] --> rq["core.Request"]
-    rq --> fl["filters, only when enabled:<br/>access log, metrics, /healthz,<br/>or ones an embedder registers"]
+    rq --> fl["filters, only when<br/>enabled: access log,<br/>metrics, /healthz, or<br/>ones an embedder<br/>registers or a<br/>ChainControl applies"]
     fl --> pm["prefix mounts, only when<br/>a module mounts one"]
     pm -->|"/messaging/v1, /swarm/v1"| mod["module handler<br/>MessagingHttp, SwarmHttp"]
     pm --> ac["ACME challenge handler<br/>only with ACME on the<br/>main listener"]
-    ac --> gl["global routing.rate_limit<br/>only when set: 429 before<br/>any route"]
+    ac --> gl["global routing.rate_limit<br/>only when set, and with<br/>routing.enabled: 429<br/>before any route"]
     gl --> r{{"Router<br/>only with routing.enabled"}}
-    r --> rw["per route, only when set:<br/>errors: problem wrapper,<br/>then the route's rate_limit"]
-    rw --> p["ProxyHandler: one pool<br/>per upstream url, or an<br/>EndpointBalancer with one<br/>pool per endpoint"]
+    r --> rw["per route, only when<br/>set: errors: problem<br/>wrapper, then the<br/>route's rate_limit"]
+    rw --> p["One handler per<br/>upstream, shared by<br/>every route that names<br/>it: a ProxyHandler for a<br/>url, an EndpointBalancer<br/>for endpoints (a pool<br/>each)"]
     rw --> w["WeightedHandler<br/>a route with backends"]
     w --> p
     rw --> rd["RedirectHandler"]
-    rw --> sf["StaticFileHandler<br/>static routes and the fallback"]
+    rw --> sf["StaticFileHandler<br/>static routes and<br/>the fallback"]
     r --> sf
 ```
 
@@ -60,7 +60,7 @@ responses are relayed unchanged:
 
 ```mermaid
 flowchart TD
-    dd{"A path segment is ..? %2e<br/>counts as a dot, / \ %2f<br/>%5c split segments, and ;<br/>ends one"} -->|yes| e400["400, before any route is tried"]
+    dd{"A path segment is ..? %2e<br/>counts as a dot, / \ %2f<br/>%5c split segments, and ;<br/>ends one"} -->|yes| e400["400, before any<br/>route is tried"]
     dd -->|no| m{"A route matches?"}
     m -->|no| fb["Fallback: the<br/>static file handler"]
     m -->|yes| rw{"Route has a rewrite?"}
@@ -92,9 +92,9 @@ before the proxy runs:
 flowchart TD
     r["Route with backends"] --> p{"A backend's pin matches?<br/>header or cookie,<br/>checked in order"}
     p -->|yes| pb["That backend,<br/>whatever the weights"]
-    p -->|no| s{"sticky is set and the client<br/>sent that header or cookie?"}
+    p -->|no| s{"sticky is set and the<br/>client sent that header<br/>or cookie?"}
     s -->|yes| sb["Hash its value, then pick<br/>by weight: the same<br/>client keeps its backend"]
-    s -->|no| rb["Pick at random by weight<br/>from a precomputed alias table"]
+    s -->|no| rb["Pick at random by<br/>weight from a<br/>precomputed alias table"]
 ```
 
 ## 4. Redirect
@@ -174,11 +174,11 @@ failed attempt goes through this decision:
 ```mermaid
 flowchart TD
     f["An attempt failed: a<br/>connect, timeout or reset<br/>error, or a 502, 503 or<br/>504 response"] --> a{"Kind is in retry.on, the<br/>method is idempotent, the<br/>request has no body, and<br/>fewer than retry.attempts<br/>retries were made?"}
-    a -->|no| v["Stop: relay the last result<br/>an upstream 5xx unchanged,<br/>an error as 502 or 504"]
+    a -->|no| v["Stop: relay the last<br/>result an upstream 5xx<br/>unchanged, an error as<br/>502 or 504"]
     a -->|yes| b{"The retry budget<br/>has a token?"}
     b -->|no| v
-    b -->|yes| n["Discard the failed<br/>response and try again:<br/>an endpoints upstream<br/>picks an endpoint not<br/>tried yet, if one is left"]
-    v --> c["url upstream: the circuit<br/>breaker records one<br/>verdict for the request,<br/>after its retries"]
+    b -->|yes| n["Discard the failed<br/>response and try again:<br/>an endpoints upstream<br/>picks an endpoint that is<br/>not tried yet and not<br/>ejected, if one is left"]
+    v --> c["url upstream with circuit:<br/>the breaker records one<br/>verdict for the request,<br/>after its retries"]
     v --> ce["endpoints upstream: each<br/>attempt was recorded on<br/>the endpoint it hit"]
 ```
 

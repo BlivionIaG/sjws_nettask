@@ -80,10 +80,10 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 
   ```mermaid
   flowchart TD
-      a["New QUIC connection<br/>source address not<br/>yet validated"] --> b["Fewer than 256<br/>half-open handshakes<br/>otherwise: dropped silently"]
-      b --> c["Handshake completes within 5 s<br/>otherwise: dropped"]
+      a["New QUIC connection<br/>source address not<br/>yet validated"] --> b["Fewer than 256<br/>half-open handshakes<br/>otherwise:<br/>dropped silently"]
+      b --> c["Handshake completes<br/>within 5 s<br/>otherwise: dropped"]
       c --> d["Under the connection caps<br/>otherwise: closed with<br/>H3_EXCESSIVE_LOAD"]
-      d --> e["A request stream is admitted<br/>otherwise: refused with<br/>H3_REQUEST_REJECTED"]
+      d --> e["A request stream is<br/>admitted<br/>otherwise: refused with<br/>H3_REQUEST_REJECTED"]
       e --> f["The handler runs on<br/>a virtual thread<br/>a file response waits<br/>for a file slot<br/>and is refused if<br/>none frees up"]
   ```
 

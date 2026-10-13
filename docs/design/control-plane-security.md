@@ -46,11 +46,11 @@ In order, `apply` does this:
 flowchart TD
     a["LivePolicy.apply(document)"] --> s{"The scope matches<br/>this node's labels?"}
     s -->|no| nf["NOT_FOR_THIS_NODE<br/>nothing is compiled"]
-    s -->|yes| c["Compile the rules<br/>a bad pattern or owner throws,<br/>the active policy stays"]
+    s -->|yes| c["Compile the rules<br/>a bad pattern or owner<br/>throws, the active<br/>policy stays"]
     c --> v{"Version above<br/>the active one?"}
     v -->|no| st["STALE"]
     v -->|yes| p["Publish version and rules<br/>together with a<br/>compare-and-set"]
-    p --> ap["APPLIED<br/>the next policy call reads it"]
+    p --> ap["APPLIED<br/>the next policy call<br/>reads it"]
 ```
 
 To install it, build the handler with `new StaticFileHandler(root, …, livePolicy)` in place of
@@ -84,7 +84,7 @@ audit write then sits on every path, and an allowed decision whose line cannot b
 
 ```mermaid
 flowchart TD
-    a["Rbac.authorize(certificate,<br/>permission, target, version)"] --> c1["1. No known, enabled<br/>operator for the<br/>certificate subject: the<br/>decision is denied,<br/>unauthenticated"]
+    a["Rbac.authorize(certificate,<br/>permission, target,<br/>version)"] --> c1["1. No known, enabled<br/>operator for the<br/>certificate subject: the<br/>decision is denied,<br/>unauthenticated"]
     c1 --> c2["2. The operator's role<br/>does not allow the<br/>permission: the decision<br/>is denied"]
     c2 --> c3["3. Otherwise the decision<br/>is allowed"]
     c3 --> c4["4. The decision,<br/>whichever it is, is<br/>appended to the audit<br/>log. If the append fails,<br/>it becomes denied: audit<br/>unavailable"]

@@ -57,11 +57,13 @@ sequenceDiagram
 
     Note over C: a SELECTOR. Parse it first: a bad one sends<br/>nothing. Nothing edited: "nothing to apply"
     C->>K: validate the draft
-    Note over K: sections but access.rules are read-only,<br/>an edit there fails here
+    K->>S: GET /cp/v1/config
+    Note over K: sections but access.rules are read-only,<br/>an edit there is an error and nothing is posted
     K->>S: POST /cp/v1/config:validate
     S-->>K: errors, if any
+    Note over C: any error: "validation failed",<br/>nothing is staged
     C->>K: stage on the base version
-    K->>S: GET /cp/v1/config
+    K->>S: GET /cp/v1/config, twice
     Note over K: head is not the base version: CONFLICT,<br/>the draft is kept
     K->>S: POST /cp/v1/config, Idempotency-Key
     Note over S: 503 if the leader is not ready,<br/>409 if a proposal is already staged

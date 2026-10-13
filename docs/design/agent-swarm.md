@@ -67,13 +67,14 @@ How this is enforced is in §3.3.
 4. **Off-mode wrk gate** (§13, item 3). It is the backstop, not the proof. wrk cannot resolve a single extra volatile read; tests 1–3 can.
 
 As built in S1, from the gate to the mount. `swarm` itself imports only `core`, `messaging.delivery`, `messaging.ledger`,
-`swarm.wire` and `config.SecureKeyFile`, and the guard tests above keep every other package from naming it:
+`swarm.wire`, `config.SecureKeyFile` and the root `OptionalModule` interface, and the guard tests above keep every file
+except `OptionalModules` from naming it:
 
 ```mermaid
 flowchart TB
-    g["Gate, first one set wins:<br/>-Dsjws.swarm.enabled,<br/>then SJWS_SWARM_ENABLED,<br/>then the YAML key<br/>swarm.enabled. Only the<br/>text true enables"]
-    g -->|"off, the default"| off["OptionalModules.start<br/>returns at once: no swarm<br/>class is loaded, no<br/>thread, no dispatcher.<br/>/swarm/v1 is a<br/>static-file miss (404)"]
-    g -->|on| ld["Class.forName by name:<br/>sjws_nettask.swarm.SwarmModule.<br/>A load failure is a WARN<br/>and the module is skipped"]
+    g["Gate, first one set wins:<br/>-Dsjws.swarm.enabled,<br/>then SJWS_SWARM_ENABLED<br/>(true, any case), then the<br/>YAML key swarm.enabled<br/>(true, yes, on or 1; any<br/>other word fails the load)"]
+    g -->|"off, the default"| off["No swarm class is loaded<br/>and no thread starts.<br/>With messaging off too,<br/>OptionalModules.start<br/>returns at once and<br/>there is no dispatcher.<br/>/swarm/v1 is a<br/>static-file miss: GET<br/>404, POST 405"]
+    g -->|on| ld["Class.forName by name:<br/>sjws_nettask.swarm.SwarmModule.<br/>A load failure is a WARN<br/>and the module is<br/>skipped"]
     ld --> m["SwarmModule opens the<br/>Swarm (partitions and the<br/>reply poller start on<br/>first use) and reads the<br/>agent tokens. None, or a<br/>bad file: a deny-all<br/>gate, every request is<br/>401"]
     m --> mt["Before the listener<br/>accepts, contribute()<br/>mounts SwarmHttp at<br/>/swarm/v1, in front of<br/>the request handler"]
     mt --> rq["Each request: SwarmHttp,<br/>then TaskService and<br/>ReplyRouter over<br/>delivery.Partition"]
@@ -177,8 +178,8 @@ sequenceDiagram
 
     C->>S: a caller: POST /swarm/v1/tasks/POOL:call<br/>TASK frame, optional deadlineMs
     Note over S: token (else 401), size (413), POST only (405),<br/>pool allowed (403)
+    Note over S: the first call, or the first after 10 idle<br/>minutes, opens reply.NODE and starts its<br/>poller thread before it produces
     S->>M: produce on tasks.POOL, replyTo reply.NODE
-    Note over S: the first call opens reply.NODE<br/>and starts its poller thread
     C->>S: a worker: POST .../tasks/POOL:claim
     S->>M: poll group workers
     M-->>S: tasks leased, attempt n

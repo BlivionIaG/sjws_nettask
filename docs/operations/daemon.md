@@ -32,7 +32,7 @@ sequenceDiagram
     Note over C: load the configuration, make SIGHUP a<br/>reload, start the server: optional modules,<br/>HTTP/3, HTTP/2, the TCP port
     C->>F: write the pid file
     Note over C,F: once the server is listening
-    Note over C: with --bootstrap the role hooks run after that.<br/>A failure there is reported only in the log
+    Note over C: with --bootstrap the role hooks run after that.<br/>A failure there is normally only<br/>reported in the log
     P->>F: poll for the child's pid
     P-->>U: Started sjws_nettask (pid N), exit 0
     Note over P,C: If the child exits first, or 20 s pass<br/>without a pid file (the child is then<br/>stopped), the parent prints the last<br/>log lines and exits non-zero

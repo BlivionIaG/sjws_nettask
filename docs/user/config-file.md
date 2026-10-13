@@ -17,7 +17,7 @@ Defaults, then the file, then arguments, then environment variables.
 
 ```mermaid
 flowchart TB
-    d["Built-in defaults"] -->|"overridden by"| f["YAML file<br/>--config, or WEB_SERVER_CONFIG"]
+    d["Built-in defaults"] -->|"overridden by"| f["YAML file<br/>--config, or<br/>WEB_SERVER_CONFIG"]
     f -->|"overridden by"| a["Command-line arguments"]
     a -->|"overridden by"| e["Environment variables<br/>WEB_SERVER_*"]
     e --> doc["ConfigDocument,<br/>parsed strictly"]
@@ -213,8 +213,9 @@ stream limits are fixed at start.
 
 No config file means reload reports `no config file` and changes nothing.
 
-`reload()` re-reads the file with the original arguments and environment; `applyRemote` takes a
-document that a control plane pushed instead. *Valid* means it parses, `ConfigValidator` accepts it
+`reload()` re-reads the file with the original arguments and environment (`SIGHUP` reaches it in the daemon child;
+the admin console's `r` restarts the server instead, see [admin console](../operations/admin-console.md));
+`applyRemote` takes a document that a control plane pushed instead. *Valid* means it parses, `ConfigValidator` accepts it
 (schema version, document root is a directory, certificate and key files, no `tls.cert` together with
 ACME, node labels), the certificate loads, and a new HTTP-01 port can be opened. A pushed document is
 also refused when its non-zero `version` is lower than the running one. The steps, in order, with
@@ -222,12 +223,12 @@ every rejection leaving the previous snapshot in place:
 
 ```mermaid
 flowchart TD
-    r["reload(): SIGHUP, or r in<br/>the admin console. A data<br/>node that took a push<br/>keeps it and re-reads<br/>only its bootstrap<br/>settings. Otherwise the<br/>file is re-read (none or<br/>invalid: rejected)"]
-    p["applyRemote(SignedSnapshot),<br/>a push. DataApply.decide<br/>checks the signature and<br/>every envelope rule<br/>(refused: rejected). The<br/>same envelope is a no-op.<br/>Then the YAML is parsed"]
+    r["reload(): SIGHUP to the<br/>daemon child, through<br/>ReloadHook. A data node<br/>that took a push keeps it<br/>and re-reads only its<br/>bootstrap settings.<br/>Otherwise the file is<br/>re-read (none or<br/>invalid: rejected)"]
+    p["applyRemote(SignedSnapshot),<br/>a push. DataApply.decide<br/>checks the signature and<br/>every envelope rule<br/>(refused: rejected). The<br/>same envelope is a<br/>no-op. Then the YAML is<br/>parsed"]
     r --> s1
     p --> s1
     s1["1. Valid (schema,<br/>validator, messaging<br/>shape, files) and not an<br/>older bundle version,<br/>else rejected"]
-    s1 --> s2["2. A destructive<br/>messaging change without<br/>allow_destructive:<br/>rejected"]
+    s1 --> s2["2. A destructive<br/>messaging change without<br/>allow_destructive:<br/>rejected. A partition<br/>decrease is rejected<br/>even with it"]
     s2 --> s3["3. Same canonical hash as<br/>the running snapshot: a<br/>no-op, nothing is swapped"]
     s3 --> s4["4. Bind-time settings and<br/>node.mode keep their old<br/>value (needsRestart), the<br/>certificate loads, the<br/>next snapshot compiles"]
     s4 --> s5["5. reload() on a data<br/>node: a changed routing,<br/>middleware, access, acme<br/>or topics section is<br/>rejected, it needs a push"]

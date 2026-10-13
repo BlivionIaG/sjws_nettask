@@ -27,7 +27,7 @@ stateDiagram-v2
     HEAD --> PROCESSING: head received
     PROCESSING --> WRITING: response ready, or the handler waits for body bytes
     WRITING --> PROCESSING: request body bytes arrived
-    WRITING --> HEAD: 100 Continue written, the body is bounded by the header timeout again
+    WRITING --> HEAD: 100 Continue written for a discarded<br/>GET or HEAD body, the header timeout bounds it again
     WRITING --> IDLE: keep-alive
     IDLE --> CLOSED: idle timeout
     HEAD --> CLOSED: header timeout, 408
@@ -50,9 +50,9 @@ accept queue (`--backlog`); the per-address cap is applied after it.
 ```mermaid
 flowchart TD
     q["Client connects<br/>kernel accept queue,<br/>--backlog default 1024"] --> cap{"Under --max-connections?"}
-    cap -->|no| wait["Stays in the accept queue<br/>until a connection finishes"]
-    cap -->|yes| ip{"Under --max-connections-per-ip<br/>for this address?"}
-    ip -->|no| drop["Closed at once, no response"]
+    cap -->|no| wait["Stays in the accept<br/>queue until a connection<br/>finishes"]
+    cap -->|yes| ip{"Under<br/>--max-connections-per-ip<br/>for this address?"}
+    ip -->|no| drop["Closed at once, no<br/>response"]
     ip -->|yes| run["A virtual thread<br/>runs the connection<br/>under the IDLE, HEAD<br/>and WRITING deadlines"]
 ```
 

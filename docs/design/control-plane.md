@@ -59,7 +59,7 @@ flowchart TD
     st --> sw
     b --> sw
     e --> sw
-    sw --> live["LiveConfig / ConfigSnapshot"]
+    sw --> live["LiveConfig /<br/>ConfigSnapshot"]
     live --> use["HTTP, filters, router"]
     live -.-> bl["broker loop"]
 
@@ -67,9 +67,11 @@ flowchart TD
     class mv,pj,bl design
 ```
 
-Dashed boxes and arrows are not in the tree yet. The solid ones exist. A control process hosts one voter on an
-in-process transport: voter sets of 3, 5 or 2 + witness run only in tests, because the shipped dependencies refuse
-`cp.peers`. Every data role runs the same watch client against the whole document, with no per-role projection. See
+Solid boxes and arrows run in a shipped process. Dashed ones do not: the role projection and the broker loop are
+not written, and the voter network exists in the tree (`cluster.TcpTransport`, a multi-voter `CpStore.open`) but
+nothing wires it up. A control process hosts one voter on an in-process transport: voter sets of 3, 5 or 2 +
+witness run only in tests, because the shipped dependencies refuse `cp.peers`. Every data role runs the same watch
+client against the whole document, with no per-role projection. See
 [Control-plane and data-node service](../operations/control-plane-service.md) and
 [Control-plane process hosting](control-plane-hosting.md).
 
@@ -418,19 +420,21 @@ sequenceDiagram
     D-->>L: heartbeat, every 1 s
 ```
 
-As built, the watch is a long poll, not a stream. `DataWatch` asks any control voter for the newest activated
-version, and `WatchServer` answers from that voter's applied state, so a follower serves it too. There is no
-`Register`, no heartbeat, no freshness frame and no window of unacked versions, and a node that is behind gets only
-the newest envelope. A rejected envelope is logged and skipped, and it is not acked:
+As built, the watch is a long poll, not a stream. `DataWatch` asks the one control address it was started with
+(there is no voter list and no failover) for the newest activated version, and `WatchServer` answers from that
+voter's applied state, so a follower can serve it too. A node's first presentation of its token needs the leader:
+a follower answers 401. `N` is the highest version the node applied or skipped, and its first poll does not wait.
+There is no `Register`, no heartbeat, no freshness frame and no window of unacked versions, and a node that is
+behind gets only the newest envelope. A rejected envelope is logged and skipped, and it is not acked:
 
 ```mermaid
 sequenceDiagram
     participant D as Data node, DataWatch
-    participant V as Any control voter, WatchServer
+    participant V as Control voter, WatchServer
 
     loop until the node stops
         D->>V: GET /cp/v1/watch?after=N&waitMs=25000
-        Note over V: TLS 1.3 with a client certificate. The node id<br/>is in X-Sjws-Node-Id, with the join token if<br/>there is one. The request is held for 30 s at most
+        Note over V: TLS 1.3 with a client certificate: the handshake<br/>checks it, the listener does not tie it to the node.<br/>X-Sjws-Node-Id, X-Sjws-Token-Id and X-Sjws-Join-Secret<br/>are required. The request is held for 30 s at most
         alt nothing newer than N
             V-->>D: 204
         else a newer activated version
@@ -502,22 +506,20 @@ activated version:
 ```mermaid
 stateDiagram-v2
     [*] --> STAGED: propose
-    STAGED --> STAGED: rollout, advance
     STAGED --> DESIRED: activate
     DESIRED --> [*]
     note right of STAGED
         one staged proposal
         at a time, a second
         propose is 409.
-        rollout and advance
-        only record selectors
-        and a stage counter.
         Acks are not consulted
     end note
     note left of DESIRED
         signed, kept in a
-        history of 8, served
-        to every watcher.
+        history of 8. Watchers
+        get the newest, the
+        older ones serve
+        /config/{v} and rollback.
         Rollback is a new
         higher version with the
         old content, immediate,
@@ -525,6 +527,9 @@ stateDiagram-v2
         proposal
     end note
 ```
+
+`rollout` and `advance` are not transitions. They are accepted in any state and only record the selectors and a
+stage counter, which `GET /cp/v1/rollout` reports. An activate or a rollback does not clear them.
 
 `Rollback { toVersion }` appends a new version whose `canonicalHash` and canonical YAML equal the retained activated snapshot `toVersion`. The new version is higher than any current version, so anti-replay still moves forward. The rollout of a rollback uses the same stage list unless the operator selects a single stage of all nodes. Nodes that never installed the bad version treat the rollback as a no-op if their installed hash already matches, and ack it.
 
@@ -624,8 +629,9 @@ Role, labels, and capabilities come from the token record. The leader writes the
 
 `ConsumeToken` and `Register` are one Raft entry. The leader appends that entry and waits until it commits, and only then returns the certificate. A leadership change does not mint a second join for the same token and the same identity: the consume is already in the log and the re-presentation returns it, or it is not committed and the certificate was not sent. A different identity does not reuse that entry. Failed presentations are rate-limited and audited per source address. The token is checked before any CSR is signed, so an unauthenticated joiner does not cost a signature. `NodeEnrollment.tokenConsumed()` runs only after that commit (§6.1).
 
-The join, in order, as designed. As built, a node presents its token, or its certificate, in headers on the watch,
-the leader commits one `JOIN_CONSUME` entry for a token, and there is no `Register`, no CSR and no node certificate
+The join, in order, as designed. As built, a node sends its node id and join token in `X-Sjws-*` headers on the
+watch (the hosted listener also requires a TLS client certificate, which it does not tie to the node id), the
+leader commits one `JOIN_CONSUME` entry for the token, and there is no `Register`, no CSR and no node certificate
 issued. No admin route issues join tokens yet:
 
 ```mermaid

@@ -28,7 +28,7 @@ knows which protocol carried the request.
 
 ```mermaid
 flowchart TB
-    p1["HTTP/1.1<br/>ClientManager, Http1Connection<br/>Http1Parser, Http1Requests"]
+    p1["HTTP/1.1<br/>ClientManager,<br/>Http1Connection,<br/>Http1Parser,<br/>Http1Requests"]
     p2["HTTP/2<br/>Http2Server<br/>Http2StreamHandler"]
     p3["HTTP/3<br/>Http3Server<br/>Http3RequestHandler"]
 
@@ -62,9 +62,9 @@ flowchart TB
 
 `SjwsServer` is the composition root. `SjwsServer.start` builds the pieces in this order. HTTP/3 and
 HTTP/2 are optional: if one cannot start (port busy, QUIC natives missing, bad certificate) the server
-logs a `WARN:` line and keeps serving the others. Only a failure to bind the TCP port, or to open the
-dedicated HTTP-01 listener, stops it, and it then closes everything it had already started. Two
-overlapping prefix mounts also stop it, before any bind.
+logs a `WARN:` line and keeps serving the others. Two things stop the server: two overlapping prefix mounts,
+which fail before any bind, and a failure to bind the TCP port or to open the dedicated HTTP-01 listener,
+after which it closes everything it had already started.
 
 ```mermaid
 sequenceDiagram
@@ -116,9 +116,9 @@ flowchart TB
     subgraph ha["HaHandler: only when HaSettings is attached"]
         subgraph fc["FilterChain: only when observability is on or filters are set"]
             subgraph pm["Prefix mounts: only when a module mounts one"]
-                mod["Module handlers:<br/>/messaging/v1 and /swarm/v1,<br/>a match stops here"]
+                mod["Module handlers:<br/>/messaging/v1 and<br/>/swarm/v1, a match<br/>stops here"]
                 subgraph ac["AcmeChallengeHandler: only with ACME on the main listener"]
-                    subgraph rl["Global rate limit: only with routing.rate_limit"]
+                    subgraph rl["Global rate limit: only with<br/>routing.enabled and rate_limit"]
                         subgraph rt["Router: only when routing.enabled"]
                             px["ProxyHandler or<br/>EndpointBalancer"]
                             rd["RedirectHandler"]
@@ -137,10 +137,10 @@ flowchart TB
 |---|---|
 | `HaHandler` | answers `/healthz` and `/readyz` from `HealthBoard`; everything else goes to the published generation, or to the config handler until one is published |
 | `FilterChain` | `ObserveRequestFilter` at order 0, then the other filters by order, registered at startup or compiled from a `FilterDocument` that `ChainControl` applies ([filters](../development/filters.md)) |
-| Prefix mounts | `HandlerMounts`: a dispatcher built at startup in front of the live snapshot's handler. A request under a mounted prefix goes to that optional module's handler, everything else falls through. The filters wrap it, so they see both. Not built when nothing mounts. Two modules mount, both off by default: messaging at `/messaging/v1` (`sjws.messaging.enabled`) and the swarm at `/swarm/v1` (`sjws.swarm.enabled`) |
+| Prefix mounts | `HandlerMounts`: a dispatcher built at startup in front of the live snapshot's handler (or of the replacement terminal an embedder passes to `SjwsServer.start`). A request under a mounted prefix goes to that optional module's handler, everything else falls through. The filters wrap it, so they see both. Not built when nothing mounts. Two modules mount, both off by default: messaging at `/messaging/v1` (`sjws.messaging.enabled`) and the swarm at `/swarm/v1` (`sjws.swarm.enabled`) |
 | `AcmeChallengeHandler` | answers `/.well-known/acme-challenge/` before anything else, including the file handler's dotfile check |
-| Global rate limit | `routing.rate_limit`: one limiter in front of the Router, so a refused request (429) never reaches a route ([routing](proxy-routing.md)) |
-| `Router` | first matching route wins: `ProxyHandler` (an `EndpointBalancer` for an upstream with endpoints), weighted backends, `RedirectHandler`, or the static handler; a route with `errors: problem` wraps its handler in `ProblemErrorHandler`, and a route `rate_limit` sits inside that wrapper ([routing](proxy-routing.md)) |
+| Global rate limit | `routing.rate_limit`: one limiter in front of the Router, so a refused request (429) never reaches a route. It exists only with `routing.enabled` ([routing](proxy-routing.md)) |
+| `Router` | first matching route wins: `ProxyHandler` (an `EndpointBalancer` for an upstream with endpoints), weighted backends, `RedirectHandler`, or the static handler (also the fallback when no route matches, so behind the global limit too); a route with `errors: problem` wraps its handler in `ProblemErrorHandler`, and a route `rate_limit` sits inside that wrapper ([routing](proxy-routing.md)) |
 | `StaticFileHandler` | every status decision for a file ([access rules](../user/access-rules.md), [caching](../user/caching-and-ranges.md)) |
 
 The file-handler leaf reads the live snapshot, on the command line and under filters an embedder

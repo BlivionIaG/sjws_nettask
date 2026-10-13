@@ -92,7 +92,7 @@ stateDiagram-v2
     note right of Held
         a leak is only seen
         for tracked handles:
-        about 1 in 64, or
+        1 in 64 by default, or
         all in debug mode
     end note
 ```
@@ -111,7 +111,9 @@ stateDiagram-v2
 - **Neither method blocks.** Blocking would add latency and could deadlock under backpressure.
 - **Trimming:** a slab whose chunks are all free for longer than `pool.idle_trim` (default 60 s) is freed. Direct memory is released through the JDK `Cleaner`, plus an explicit unmap where possible. This is checked from `ConnectionReaper`'s timer thread; no new thread is added.
 
-One `acquire` as built (`BufferBudget.acquire` into `BufferPool.take`). `acquireLarge` (128 KiB to 4 MiB) skips the slabs: it reuses one of at most four cached buffers of its size, or allocates a direct buffer, under the same budget and cap:
+One `acquire` as built (`BufferBudget.acquire` into `BufferPool.take`). `acquireLarge` (above 64 KiB up to 4 MiB,
+rounded up to a power of two) skips the slabs: it reuses one of at most four cached buffers of its size, or
+allocates a direct buffer, under the same budget and cap:
 
 ```mermaid
 flowchart TB
@@ -121,7 +123,7 @@ flowchart TB
     s2["2. Round up to a size<br/>class: 256 B ... 64 KiB"]
     s3["3. Charge the class size<br/>to the tenant budget"]
     s4["4. Take a free chunk:<br/>the thread's magazine<br/>(platform threads only),<br/>then the shared stacks,<br/>then a new 1 MiB slab"]
-    s5["5. Hand it out with one<br/>reference. About 1 in 64<br/>is tracked for leaks"]
+    s5["5. Hand it out with one<br/>reference. By default 1<br/>in 64 is tracked for leaks"]
     no["Refused: over the budget<br/>or the global cap is hit.<br/>acquire: unpooled heap<br/>buffer, counted fallback.<br/>tryAcquire: null, counted<br/>denied"]
     s1 --> s2 --> s3 --> s4 --> s5
     s3 -->|"over budget"| no

@@ -161,8 +161,8 @@ The rest of the suite:
 
   `mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test`
 
-- The cluster harness (tag `cluster`) runs the same way. Its cases start several data
-  nodes and 3 or 5 real `CpStore` voters on an in-process transport, fault scenarios included:
+- The cluster harness (tag `cluster`) runs the same way. Its cases start data nodes, and the
+  control-plane ones add 3 or 5 real `CpStore` voters on an in-process transport, fault scenarios included:
 
   `mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test`
 
@@ -185,7 +185,7 @@ flowchart TB
 
     subgraph verify["Job verify: Temurin 25"]
         direction TB
-        v0["Linux only: install<br/>Prometheus 3.15.0, which<br/>PrometheusScrapeTest<br/>requires on Linux CI"] --> v1["mvn -B verify<br/>tests, jar tests,<br/>JaCoCo gate"] --> v1b["HTTP/1 tests again with<br/>the buffer pool on<br/>(-Dsjws.buf.pool=on,<br/>debug mode)"] --> v1c["Python SDK tests against<br/>the jar that verify built"] --> v2["mvn -B -Dgroups=e2e test<br/>fails if no e2e test matched"] --> v3["mvn -B -Dgroups=cluster<br/>test: live multi-node<br/>scenarios"] --> v4["Linux only: install wrk, then<br/>tools/gateway-bench.sh<br/>standalone vs gateway-off"] --> v5["Upload target/site/jacoco/"]
+        v0["Linux only: install<br/>Prometheus 3.15.0, which<br/>PrometheusScrapeTest<br/>requires on Linux CI"] --> v1["mvn -B verify<br/>tests, jar tests,<br/>JaCoCo gate"] --> v1b["HTTP/1 tests again with<br/>the buffer pool on<br/>(-Dsjws.buf.pool=on,<br/>debug mode)"] --> v1c["Python SDK tests against<br/>the jar that verify built"] --> v2["mvn -B -Dgroups=e2e test<br/>fails if no e2e test<br/>matched"] --> v3["mvn -B -Dgroups=cluster<br/>test: live multi-node<br/>scenarios"] --> v4["Linux only: install wrk,<br/>then<br/>tools/gateway-bench.sh<br/>standalone vs<br/>gateway-off"] --> v5["Upload target/site/jacoco/"]
     end
 
     subgraph mut["Job mutation: ubuntu-latest"]

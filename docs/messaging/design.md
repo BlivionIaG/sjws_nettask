@@ -34,12 +34,13 @@ stateDiagram-v2
     ACKED --> [*]
     DEAD_LETTERED --> [*]
 
-    note right of ENQUEUED: redelivered after its backoff, attempt + 1
+    note right of ENQUEUED: redelivered after its backoff,<br/>or the nack's delay if longer,<br/>attempt + 1
     note right of DEAD_LETTERED: copied to the topic.dlq partition first, if the topic has one
 ```
 
 This is what `messaging.delivery.Partition` implements today. A settle (ack, nack, reject, extend) carries
-the attempt it was leased under, and an older attempt is refused as `STALE_ATTEMPT`. `extend` keeps the
+the attempt it was leased under, and an older attempt is refused as `STALE_ATTEMPT` (`NOT_IN_FLIGHT` once the
+message is no longer in flight). `extend` keeps the
 attempt and moves the lease deadline. A lease expires lazily: nothing fires at the deadline, and the next
 poll of the group redelivers it as attempt + 1 once the deadline plus the backoff has passed, or
 dead-letters it when it has used `maxAttempts`.
@@ -105,7 +106,7 @@ sequenceDiagram
         Note over W,S: W fsyncs inline if its default is GROUP<br/>or EACH. Otherwise S does it
     end
     S->>L: force(false)
-    Note left of S: S runs when an ASYNC writer<br/>is dirty or an append waits for<br/>an fsync. W wakes it after every<br/>write. Then durableOffset advances<br/>and a LedgerSnapshot is published
+    Note left of S: S runs when an ASYNC writer<br/>is dirty or an append waits for<br/>an fsync. W wakes it after every<br/>write, except on an EACH writer.<br/>Then durableOffset advances and<br/>a LedgerSnapshot is published
 ```
 
 ### 2.3 In-memory state machine
@@ -196,12 +197,12 @@ and the swarm (`sjws.swarm.enabled`), the only production user of `Partition`:
 
 ```mermaid
 flowchart LR
-    mh["messaging.http:<br/>MessagingModule and<br/>MessagingHttp at<br/>/messaging/v1"]
+    mh["messaging.http:<br/>MessagingModule, with the<br/>retention timer, and<br/>MessagingHttp at<br/>/messaging/v1"]
     sh["swarm: SwarmHttp,<br/>TaskService and Topics<br/>at /swarm/v1"]
     br["Broker and native binary<br/>protocol"]
-    tools["delivery.LedgerInspector<br/>and messaging.stats:<br/>only tests call them"]
+    tools["delivery.LedgerInspector<br/>and messaging.stats:<br/>only tests and a bench<br/>call them"]
     rep["Replication through the<br/>cluster layer"]
-    lt["messaging.http.LogTopics:<br/>one log and writer per<br/>topic, retention timer"]
+    lt["messaging.http.LogTopics:<br/>one log and writer per<br/>topic, enforceRetention"]
     part["delivery.Partition:<br/>produce, poll, extend,<br/>ack, nack, reject,<br/>snapshots, maintain<br/>(nothing schedules it)"]
     ds["delivery.DeliveryState:<br/>cursor, leases, retries,<br/>dead letters, dedup"]
     dlq["Partition for topic.dlq:<br/>dead-lettered copies"]

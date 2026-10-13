@@ -15,7 +15,7 @@ resolved, so a link cannot reach a refused path under another name:
 
 ```mermaid
 flowchart TD
-    d{"A deny pattern matches?<br/>--deny, then YAML access.deny"} -->|yes| r403["403"]
+    d{"A deny pattern matches?<br/>--deny, then YAML<br/>access.deny"} -->|yes| r403["403"]
     d -->|no| rl{"First matching rule<br/>--access-rule, then<br/>YAML access.rules"}
     rl -->|"allow:"| ok["Allowed by name"]
     rl -->|"deny:"| r403
