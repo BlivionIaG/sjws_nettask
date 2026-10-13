@@ -28,6 +28,8 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.SjwsServer;
+import sjws_nettask.observe.ClusterBoard;
+import sjws_nettask.observe.ClusterStatus;
 
 /**
  * Runs an {@link SjwsServer} in this JVM. {@code reload} re-evaluates the config supplier (e.g.
@@ -51,6 +53,7 @@ public final class EmbeddedServerControl implements ServerControl {
     private volatile ServerConfig config;
     private volatile Instant startedAt;
     private volatile String lastError;
+    private volatile ClusterBoard cluster;
 
     public EmbeddedServerControl(Supplier<ServerConfig> configSource, LogBuffer log) {
         this(configSource, SjwsServer::start, log, Clock.systemUTC());
@@ -84,6 +87,17 @@ public final class EmbeddedServerControl implements ServerControl {
         return new ServerStatus(ServerStatus.State.RUNNING, s.tcpPort(), s.udpPort(),
                 manager == null ? -1 : manager.activeConnections(),
                 Duration.between(this.startedAt, this.clock.instant()), summary, view);
+    }
+
+    /** Attaches the control-plane aggregate the TUI reads. Null detaches it. */
+    public void attachCluster(ClusterBoard board) {
+        this.cluster = board;
+    }
+
+    @Override
+    public ClusterStatus clusterStatus() {
+        var board = this.cluster;
+        return board == null ? null : board.status();
     }
 
     @Override

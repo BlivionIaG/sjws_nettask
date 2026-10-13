@@ -11,4 +11,6 @@ Enter): `s` start, `x` stop, `r` reload (re-reads arguments and environment; an 
 leaves the server running, a config that fails to bind restores the previous one), `v`/`c`/`l`
 status/config/logs views, Enter refresh, `h` help, `q` quit (stops the server). The console talks to
 the server only through `sjws_nettask.admin.ServerControl`, so another implementation (e.g. one
-controlling a daemon) can be plugged in.
+controlling a daemon) can be plugged in. `clusterStatus()` is null until a control plane attaches
+a `ClusterBoard`; the status view then shows cluster requests per second, p99, errors, drifted
+nodes, and per-route totals.

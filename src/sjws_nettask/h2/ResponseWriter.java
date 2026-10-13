@@ -130,24 +130,48 @@ final class ResponseWriter {
         }
         boolean sendBody = response.sendsBody() && response.contentLength() > 0;
         if (sendBody && response.body() instanceof Body.FileBody file) {
-            long deadline = System.nanoTime() + this.fileWait.toNanos();
-            if (this.connectionFiles != null && !this.connectionFiles.tryAcquire(this.fileWait.toNanos(),
-                    TimeUnit.NANOSECONDS)) {
+            // A file that fits in one DATA frame holds a server-wide slot only while it is read, so it
+            // can't pin anything and skips the connection's budget (which large files share).
+            boolean small = file.length() <= CHUNK;
+            if (!acquireFileSlots(!small)) {
                 return Outcome.REJECTED;
             }
-            try {
-                if (!this.files.tryAcquire(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
-                    return Outcome.REJECTED;
-                }
+            if (small) {
+                ByteBuf body = null;
+                IOException openFailure = null;
                 try {
-                    return sendFile(response, file);
+                    FileChannel fc = null;
+                    try {
+                        fc = SafeOpen.open(file);
+                    } catch (IOException e) {
+                        openFailure = e;
+                    }
+                    if (fc != null) {
+                        body = readAll(fc, file);
+                    }
                 } finally {
-                    this.files.release();
+                    releaseFileSlots(false);
                 }
+                if (openFailure != null) { // nothing sent yet: answer with the matching error
+                    var outcome = send(StaticFileHandler.error(SafeOpen.status(openFailure), response.headOnly()));
+                    this.answered = outcome == Outcome.COMPLETE;
+                    return Outcome.SWAPPED;
+                }
+                if (body == null) {
+                    return Outcome.SHRANK;
+                }
+                if (!this.sink.active()) {
+                    body.release();
+                    return Outcome.CLOSED;
+                }
+                this.sink.head(response, false);
+                this.previous = this.sink.data(body, true);
+                return awaitLast();
+            }
+            try {
+                return sendFile(response, file);
             } finally {
-                if (this.connectionFiles != null) {
-                    this.connectionFiles.release();
-                }
+                releaseFileSlots(true);
             }
         }
         if (sendBody && response.body() instanceof Body.Bytes bytes) {
@@ -156,6 +180,51 @@ final class ResponseWriter {
         }
         this.previous = this.sink.head(response, true);
         return awaitLast();
+    }
+
+    /** The connection's file budget (if {@code budget}), then a server-wide slot, together within {@code fileWait}. */
+    private boolean acquireFileSlots(boolean budget) throws InterruptedException {
+        boolean perConnection = budget && this.connectionFiles != null;
+        long deadline = System.nanoTime() + this.fileWait.toNanos();
+        if (perConnection
+                && !this.connectionFiles.tryAcquire(this.fileWait.toNanos(), TimeUnit.NANOSECONDS)) {
+            return false;
+        }
+        if (!this.files.tryAcquire(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+            if (perConnection) {
+                this.connectionFiles.release();
+            }
+            return false;
+        }
+        return true;
+    }
+
+    private void releaseFileSlots(boolean budget) {
+        this.files.release();
+        if (budget && this.connectionFiles != null) {
+            this.connectionFiles.release();
+        }
+    }
+
+    /** Reads a whole (small) open file and closes it; null when it shrank meanwhile. */
+    private ByteBuf readAll(FileChannel fc, Body.FileBody file) throws IOException {
+        try (fc) {
+            int n = (int) file.length();
+            ByteBuf buf = this.sink.alloc().ioBuffer(n);
+            try {
+                while (buf.readableBytes() < n) {
+                    int read = buf.writeBytes(fc, file.offset() + buf.readableBytes(), n - buf.readableBytes());
+                    if (read <= 0) {
+                        buf.release();
+                        return null;
+                    }
+                }
+            } catch (IOException | RuntimeException e) {
+                buf.release();
+                throw e;
+            }
+            return buf;
+        }
     }
 
     private Outcome sendFile(Response response, Body.FileBody file) throws IOException, InterruptedException {

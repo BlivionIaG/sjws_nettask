@@ -161,6 +161,16 @@ The rest of the suite:
 
   `mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test`
 
+- The cluster harness (tag `cluster`) runs the same way. Live cases start several
+  data nodes. The fault scenarios are `@Disabled` and do not fail this step:
+
+  `mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test`
+
+- `tools/gateway-bench.sh` then runs a short wrk comparison (warm-up 1 s, measure 3 s)
+  of standalone vs gateway-off on Linux, after `apt-get install wrk`. It fails if either mode
+  reports request errors or zero throughput. The 30 s comparison is local; see
+  `bench/README.md`. macOS CI (manual dispatch only) skips that step.
+
 - Job `mutation` (cron or `workflow_dispatch` only): `ubuntu-latest`, timeout
   120 minutes, PIT via `mvn -B -P pitest test-compile org.pitest:pitest-maven:mutationCoverage`.
   Not part of a pull request.
@@ -173,8 +183,46 @@ Local equivalents, with Java 25:
 mvn test
 mvn verify
 mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test
+mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
 mvn test -DexcludedGroups=h3
 ```
+
+## Cluster harness
+
+`tests/sjws_nettask/clusterharness/` starts M data nodes the same way
+`FileServingEndToEndTest` does: `SjwsServer.start` with `port(0)`, a `@TempDir`
+document root, and `java.net.http.HttpClient` forced to HTTP/1.1 with no proxy.
+`start` returns only after the accept loop is bound, so the live tests do not sleep.
+
+Control nodes go through `ControlPlane`. The design is
+[PR #38](https://github.com/BlivionIaG/sjws_nettask/pull/38)
+(`docs/design/control-plane.md`). `sjws_nettask.cp` is not in this tree.
+`PendingControlPlane` throws `ControlPlanePendingException` on every operation.
+It does not elect a leader or apply a snapshot. `ClusterHarness.open` with 3 or 5
+control nodes, or with data role `DATA`, throws that exception before it binds.
+
+Live (tag `cluster`, run by `mvn verify` and by the CI group step):
+
+- Three gateway-off data nodes on distinct ephemeral ports serve `hello.txt`
+  (200, body, `text/plain`) and a missing path (404). Applied version is 0.
+  No thread name starts with `cp-`.
+- Gateway-off and standalone return the same status, body, and content headers
+  for that file. Neither attaches `HaSettings`.
+- A control-node count other than 0, 3, or 5 is rejected.
+- `PendingControlPlane.available()` is false and the exception text links PR #38.
+
+Pending (`@Disabled`, the message starts with `TODO` and the PR URL):
+
+| Scenario | What it will assert once `sjws_nettask.cp` exists |
+|---|---|
+| Network partition | Push converges with no content errors. Isolating data nodes from every voter leaves them on that version and hash, still serving the file. After heal, a later push converges. |
+| Control-plane leader kill | In-process kill, then one election-timeout advance on `ClusterClock.Manual`. A different voter is `leaderReady` on its own ephemeral admin port. A following push converges, and content stays 200. |
+| Slow node | A one-way watch delay on one data node. Content stays 200 during the push. Advancing the manual clock releases the delay and every node, including the slow one, reports the new version. |
+| Config rollback | Rollback returns a higher version whose content hash is the earlier version. Every data node converges on that version and hash. Content stays 200 during the rollback. |
+
+Enable a scenario by removing `@Disabled` only when `ControlPlane.available()` is true.
+Point `ClusterHarness.newControlPlane()` at the real factory. Leaving the stub in
+place makes the scenario fail, which is the point.
 
 ## Roadmap
 

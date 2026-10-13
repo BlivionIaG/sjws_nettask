@@ -3,3 +3,4 @@ build/
 test/
 nbproject/private/
 target/
+bench/controlplane/results/

@@ -22,15 +22,12 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Pattern;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.RoutePattern;
@@ -43,8 +40,9 @@ import sjws_nettask.core.RoutePattern;
  */
 public final class ConfigLoader {
 
-    private static final List<String> TOP = List.of("server", "http3", "tls", "acme", "routing", "middleware", "access");
-    private static final Pattern HOST = Pattern.compile(
+    private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
+            "routing", "middleware", "access");
+    private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
 
@@ -101,27 +99,56 @@ public final class ConfigLoader {
         List<MiddlewareSpec> middleware = List.of();
         AccessSettings access = AccessSettings.DEFAULT;
         Path configFile = null;
-        String contentHash = null;
         Path yamlPassword = null;
+        NodeSettings node = NodeSettings.STANDALONE;
+        int schemaVersion = ConfigDocument.SCHEMA;
+        long bundleVersion = 0;
+        byte[] bootSignature = null;
+        String recoveredHash = null;
+        Path yamlState = null;
+        String text;
+        Path readFrom = null;
         if (configured != null) {
-            configFile = Path.of(configured);
-            if (!Files.isRegularFile(configFile)) {
-                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath());
+            var requested = Path.of(configured);
+            configFile = requested;
+            if (!Files.isRegularFile(requested)) {
+                var state = stateDir(args, env, null, requested.toAbsolutePath().getParent());
+                var json = LastGoodStore.file(state);
+                var recovered = LastGoodStore.dataPlaneYaml(json);
+                var source = json;
+                if (recovered == null) {
+                    var legacy = LastGoodStore.beside(requested);
+                    recovered = LastGoodStore.dataPlaneYaml(legacy);
+                    source = legacy;
+                }
+                if (recovered == null) {
+                    throw new ConfigException("Cannot read config file " + requested.toAbsolutePath());
+                }
+                warnings.add("config file " + requested.toAbsolutePath()
+                        + " is missing; booted from last good config " + source.toAbsolutePath());
+                text = recovered;
+                readFrom = source;
+                bootSignature = LastGoodStore.signature(source);
+                recoveredHash = ConfigCodec.sha256(recovered);
+            } else {
+                try {
+                    text = Files.readString(requested);
+                } catch (IOException e) {
+                    throw new ConfigException("Cannot read config file " + requested.toAbsolutePath() + ": "
+                            + e.getMessage());
+                }
+                readFrom = requested;
             }
-            byte[] bytes;
-            try {
-                bytes = Files.readAllBytes(configFile);
-            } catch (IOException e) {
-                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath() + ": "
-                        + e.getMessage());
+            if (text.getBytes(StandardCharsets.UTF_8).length > 1_000_000) {
+                throw new ConfigException("Config file " + readFrom.toAbsolutePath() + " is larger than 1MB");
             }
-            if (bytes.length > 1_000_000) {
-                throw new ConfigException("Config file " + configFile.toAbsolutePath() + " is larger than 1MB");
-            }
-            contentHash = sha256(bytes);
-            var root = YamlValues.parse(new String(bytes, StandardCharsets.UTF_8), configFile.toString());
+            var root = YamlValues.parse(text, readFrom.toString());
             YamlValues.knownKeys(root, TOP, "config");
+            schemaVersion = schemaOf(root);
+            bundleVersion = versionOf(root);
+            node = nodeSection(root);
             var base = configFile.toAbsolutePath().getParent();
+            yamlState = stateDirKey(root, base);
             baseline = serverSection(root, base);
             yamlPassword = tlsPassword(root, base);
             acme = acmeSection(root, base);
@@ -144,8 +171,120 @@ public final class ConfigLoader {
         if (acme.enabled()) {
             access = access.withAcmeChallenge();
         }
-        var document = new ConfigDocument(server, acme, routing, middleware, access, configFile, contentHash);
+        var base = configFile == null ? null : configFile.toAbsolutePath().getParent();
+        var document = ConfigDocument.of(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion,
+                configFile).withStateDir(stateDir(args, env, yamlState, base));
+        if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
+            document = document.withSignature(bootSignature);
+        }
         return new Loaded(document, warnings, List.of(), false, args, env, passwords);
+    }
+
+    private static int schemaOf(Map<String, Object> root) {
+        if (!root.containsKey("schema")) {
+            return ConfigDocument.SCHEMA;
+        }
+        int schema = integer(root.get("schema"), "schema", 1, Integer.MAX_VALUE);
+        if (schema != ConfigDocument.SCHEMA) {
+            throw new ConfigException("schema: unsupported schema version " + schema);
+        }
+        return schema;
+    }
+
+    private static long versionOf(Map<String, Object> root) {
+        if (!root.containsKey("version")) {
+            return 0;
+        }
+        var value = root.get("version");
+        long version;
+        if (value instanceof Integer || value instanceof Long) {
+            version = ((Number) value).longValue();
+        } else if (value instanceof String text && text.trim().matches("[0-9]{1,18}")) {
+            version = Long.parseLong(text.trim());
+        } else {
+            throw new ConfigException("version: expected an integer >= 0");
+        }
+        if (version < 0) {
+            throw new ConfigException("version: expected an integer >= 0");
+        }
+        return version;
+    }
+
+    private static NodeSettings nodeSection(Map<String, Object> root) {
+        if (!(root.get("node") instanceof Object node)) {
+            return NodeSettings.STANDALONE;
+        }
+        var map = YamlValues.mapping(node, "node");
+        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir"), "node");
+        var mode = map.containsKey("mode")
+                ? NodeSettings.Mode.parse(text(map.get("mode"), "node.mode"))
+                : NodeSettings.Mode.STANDALONE;
+        var labels = map.containsKey("labels") ? labels(map.get("labels")) : Map.<String, String>of();
+        return new NodeSettings(mode, labels);
+    }
+
+    private static Path stateDirKey(Map<String, Object> root, Path base) {
+        if (!(root.get("node") instanceof Object node)) {
+            return null;
+        }
+        var map = YamlValues.mapping(node, "node");
+        if (!map.containsKey("state_dir")) {
+            return null;
+        }
+        var path = Path.of(text(map.get("state_dir"), "node.state_dir"));
+        if (!path.isAbsolute() && base != null) {
+            path = base.resolve(path);
+        }
+        return path;
+    }
+
+    /**
+     * Environment, then {@code --state-dir}, then {@code node.state_dir}, then {@link LastGoodStore#defaultStateDir()}.
+     * Paths from the file are already resolved against the file. Flag and environment paths stay relative
+     * to the working directory.
+     */
+    private static Path stateDir(String[] args, Map<String, String> env, Path fromYaml, Path base) {
+        var envDir = env.get("WEB_SERVER_STATE_DIR");
+        if (envDir != null && !envDir.isBlank()) {
+            return Path.of(envDir.trim()).toAbsolutePath().normalize();
+        }
+        String fromArgs = null;
+        for (var arg : args) {
+            if (!arg.startsWith("--") || !optionName(arg).equals("--state-dir")) {
+                continue;
+            }
+            var value = optionValue(arg);
+            if (value == null || value.isBlank()) {
+                throw new ConfigException("Missing value for --state-dir (use --state-dir=PATH)");
+            }
+            fromArgs = value.trim();
+        }
+        if (fromArgs != null) {
+            return Path.of(fromArgs).toAbsolutePath().normalize();
+        }
+        if (fromYaml != null) {
+            var path = fromYaml.isAbsolute() || base == null ? fromYaml : base.resolve(fromYaml);
+            return path.toAbsolutePath().normalize();
+        }
+        return LastGoodStore.defaultStateDir();
+    }
+
+    private static Map<String, String> labels(Object value) {
+        var map = YamlValues.mapping(value, "node.labels");
+        if (map.size() > NodeSettings.MAX_LABELS) {
+            throw new ConfigException("node.labels: at most " + NodeSettings.MAX_LABELS + " entries");
+        }
+        var out = new LinkedHashMap<String, String>();
+        for (var entry : map.entrySet()) {
+            if (!NodeSettings.LABEL.matcher(entry.getKey()).matches()) {
+                throw new ConfigException("node.labels: invalid key");
+            }
+            if (!(entry.getValue() instanceof String text) || !NodeSettings.LABEL.matcher(text).matches()) {
+                throw new ConfigException("node.labels." + entry.getKey() + ": invalid value");
+            }
+            out.put(entry.getKey(), text);
+        }
+        return Map.copyOf(out);
     }
 
     private static ServerConfig applyYamlPassword(ServerConfig server, Path yamlPassword, String[] args,
@@ -466,7 +605,8 @@ public final class ConfigLoader {
         for (int i = 0; i < list.size(); i++) {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
-            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static"), path);
+            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static",
+                    "listing", "errors", "problem_type"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -502,11 +642,44 @@ public final class ConfigLoader {
             } else if (!bool(map.get("static"), path + ".static")) {
                 throw new ConfigException(path + ".static must be true");
             } else {
-                action = new RouteSpec.Action.Static();
+                action = new RouteSpec.Action.Static(
+                        !map.containsKey("listing") || bool(map.get("listing"), path + ".listing"));
             }
-            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action));
+            if (map.containsKey("listing") && !(action instanceof RouteSpec.Action.Static)) {
+                throw new ConfigException(path + ".listing is only valid on a static route");
+            }
+            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path)));
         }
         return List.copyOf(out);
+    }
+
+    /** {@code errors: html | problem} (default html) and the optional {@code problem_type} URI base. */
+    private static RouteSpec.Errors errors(Map<String, Object> map, String path) {
+        boolean problem = false;
+        if (map.containsKey("errors")) {
+            var format = text(map.get("errors"), path + ".errors");
+            problem = switch (format) {
+                case "html" -> false;
+                case "problem" -> true;
+                default -> throw new ConfigException(path + ".errors: expected html or problem");
+            };
+        }
+        String type = null;
+        if (map.containsKey("problem_type")) {
+            if (!problem) {
+                throw new ConfigException(path + ".problem_type requires errors: problem");
+            }
+            type = text(map.get("problem_type"), path + ".problem_type");
+            try {
+                var uri = new java.net.URI(type);
+                if (!uri.isAbsolute()) {
+                    throw new ConfigException(path + ".problem_type: expected an absolute URI");
+                }
+            } catch (java.net.URISyntaxException e) {
+                throw new ConfigException(path + ".problem_type: not a URI");
+            }
+        }
+        return problem ? new RouteSpec.Errors(true, type) : RouteSpec.Errors.HTML;
     }
 
     private static RouteSpec.Action.Redirect redirect(Object value, String path) {
@@ -601,9 +774,6 @@ public final class ConfigLoader {
         boolean world = map.containsKey("require_world_readable")
                 && bool(map.get("require_world_readable"), "access.require_world_readable");
         var settings = new AccessSettings(deny, rules, dotfiles, owner, world);
-        if (!settings.isDefault()) {
-            warnings.add("access is stored but not enforced");
-        }
         return settings;
     }
 
@@ -650,20 +820,6 @@ public final class ConfigLoader {
             throw new ConfigException(path + ": pattern is required");
         }
         return action + ":" + pattern;
-    }
-
-    private static String sha256(byte[] bytes) {
-        try {
-            var digest = MessageDigest.getInstance("SHA-256").digest(bytes);
-            var hex = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                hex.append(Character.forDigit((b >> 4) & 0xf, 16));
-                hex.append(Character.forDigit(b & 0xf, 16));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
     }
 
     private static String directory(String value, String path) {
