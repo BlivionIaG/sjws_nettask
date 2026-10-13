@@ -35,13 +35,37 @@ import sjws_nettask.core.StaticFileHandler;
  * @param handler what a request runs: {@code files} or a router over it, possibly behind the ACME challenge wrapper
  * @param generation increases by one on every successful reload
  * @param epoch control-plane epoch, {@code 0} for a local snapshot
+ * @param resources what {@link #close()} releases (the router's upstream pools), or null
  */
 public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, Handler handler, int generation,
-        long epoch) implements AppliedConfig {
+        long epoch, AutoCloseable resources) implements AppliedConfig {
 
     public ConfigSnapshot {
         if (epoch < 0) {
             throw new IllegalArgumentException("epoch");
+        }
+    }
+
+    public ConfigSnapshot(ConfigDocument document, StaticFileHandler files, Handler handler, int generation) {
+        this(document, files, handler, generation, 0L, null);
+    }
+
+    public ConfigSnapshot(ConfigDocument document, StaticFileHandler files, Handler handler, int generation,
+            long epoch) {
+        this(document, files, handler, generation, epoch, null);
+    }
+
+    /**
+     * Releases upstream connection pools after this snapshot was replaced (reload) or the server
+     * stopped. Requests still running on it finish; their connections are then closed. Idempotent.
+     */
+    public void close() {
+        if (this.resources != null) {
+            try {
+                this.resources.close();
+            } catch (Exception e) {
+                System.err.println("WARN: closing routing resources: " + e);
+            }
         }
     }
 
@@ -54,14 +78,17 @@ public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, H
         var files = new StaticFileHandler(server.root(), server.allowUnlistableDirs(),
                 new FileCache(server.cacheBytes()), effectiveAccess(server.access(), document.access()));
         Handler handler = files;
+        AutoCloseable resources = null;
         if (document.routing().enabled()) {
-            handler = RoutingCompiler.compile(document.routing(), files);
+            var router = RoutingCompiler.compile(document.routing(), files);
+            handler = router;
+            resources = router;
         }
         var acme = document.acme();
         if (acme.enabled() && acme.onMainListener(server.port())) {
             handler = new AcmeChallengeHandler(board, handler); // challenges are answered before any route
         }
-        return new ConfigSnapshot(document, files, handler, generation, epoch);
+        return new ConfigSnapshot(document, files, handler, generation, epoch, resources);
     }
 
     /** Cluster version. {@code 0} when the document has no {@code version} key. */
@@ -77,7 +104,7 @@ public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, H
     }
 
     public ConfigSnapshot withEpoch(long epoch) {
-        return new ConfigSnapshot(document, files, handler, generation, epoch);
+        return new ConfigSnapshot(document, files, handler, generation, epoch, resources);
     }
 
     /**

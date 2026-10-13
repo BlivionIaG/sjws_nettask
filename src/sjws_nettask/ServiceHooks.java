@@ -38,4 +38,12 @@ public interface ServiceHooks {
 
     /** One startup log line that contains no secrets, or null. */
     String startupLine();
+
+    /**
+     * Wire name of the role this bootstrap selected ({@code control} or {@code data}), or null when
+     * this hook does not name one. The request path does not call this.
+     */
+    default String nodeMode() {
+        return null;
+    }
 }

@@ -32,7 +32,7 @@ import sjws_nettask.http1.Http1Writer;
  * progress pushes the connection's write deadline forward. Large files go through
  * {@link FileChannel#transferTo} (sendfile).
  */
-final class ChannelOutput extends OutputStream implements Http1Writer.FileSink {
+final class ChannelOutput extends OutputStream implements Http1Writer.FileSink, Http1Writer.BufferSink {
 
     static final int WRITE_CHUNK = 64 * 1024;
 
@@ -66,7 +66,12 @@ final class ChannelOutput extends OutputStream implements Http1Writer.FileSink {
 
     @Override
     public void write(byte[] b, int off, int len) throws IOException {
-        var buf = ByteBuffer.wrap(b, off, len);
+        write(ByteBuffer.wrap(b, off, len));
+    }
+
+    /** Sends {@code buf} (heap or direct) without copying, under the write deadline. */
+    @Override
+    public void write(ByteBuffer buf) throws IOException {
         while (buf.hasRemaining()) {
             this.timer.writing();
             int limit = buf.limit();

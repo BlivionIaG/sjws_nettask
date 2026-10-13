@@ -70,6 +70,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `h3/QuicNativesReportTest` | prints whether the QUIC natives loaded (untagged, always runs) |
 | `MainTest` | entry point: `--help`/`-h` (exit 0), usage errors (64), bad root (2), busy port (1), warnings, startup/shutdown messages |
 | `DaemonTest` | `--daemon`/`--stop`/`--status`/`--restart`, pid-file lock and stale/reused pids, log file, graceful drain on close |
+| `ServiceDaemonTest`, `RoleSampleTest`, `service/BootstrapTest` | control/data bootstrap and join token (mode, symlink, no secret on the command line or in status), `--status` role/connection/config-version, HA drain on the shutdown hook, systemd unit checks, role precedence (`--role`, then `WEB_SERVER_ROLE`, then `node.mode`), SIGHUP reload, drain budget, contrib role samples against schema 1, standalone does not load `sjws_nettask.service` |
 | `ClientManagerFaultTest`, `Http1EdgeTest` | accept-loop faults (back-off, reset before registration, setOption failure), EOF/CR/body-drain edge cases, failure log |
 | `http1/LegacyApiTest`, `core/CoreApiTest` | legacy wrappers (HTML/Page/Header/CONSTANTS) and small core APIs (ResponseHeaders, Mime, Response, FileCache bounds) |
 
@@ -92,7 +93,7 @@ Every user-visible behaviour and the test that asserts it.
 | Behaviour | Asserted by |
 |---|---|
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and the docs option tables in sync |
-| `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
+| `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown, `--role`, `--bootstrap`, join token, control/data status, `node.mode` precedence, contrib role samples | `DaemonTest`, `ServiceDaemonTest`, `RoleSampleTest`, `service/BootstrapTest` |
 | access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed; the observe filter is order 0 and is absent while off | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test`; HTTP/2 recording in `h2/H2ConfigAndWiringTest` |
 | control heartbeat report (cumulative snapshot, 5 s cache, histogram merge by index) | `observe/NodeReporterTest` |
 | cluster requests/s, merged p99, errors by node and route, config drift, shown on the admin status view when a board is attached | `observe/ClusterBoardTest`, `admin/AdminTuiTest` |

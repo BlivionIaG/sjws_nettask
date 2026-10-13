@@ -57,11 +57,16 @@ public final class FilterChain implements Handler {
     public Response handle(Request request) {
         var guard = GUARDS.get();
         int depth = ++guard.depth;
+        int streams = guard.streams.size();
         try {
             return this.head.proceed(request);
         } finally {
             release(guard, this.head, depth);
             guard.depth = depth - 1;
+            // the returned stream now belongs to the caller (the transport, or an outer chain node)
+            while (guard.streams.size() > streams) {
+                guard.streams.remove(guard.streams.size() - 1);
+            }
         }
     }
 
@@ -84,7 +89,29 @@ public final class FilterChain implements Handler {
         }
     }
 
+    /**
+     * Called with the response a node returns, or null if it failed. Closes every streamed body
+     * produced below the node since {@code mark} that this response does not carry: a filter
+     * that replaced or dropped a proxied response must not leak its upstream connection or byte
+     * budget. The carried stream, if there is one, is recorded for the nodes above.
+     */
+    private static Response settle(Guard guard, int mark, Response response) {
+        var keep = response == null ? null : response.body();
+        for (int i = guard.streams.size() - 1; i >= mark; i--) {
+            var dropped = guard.streams.remove(i);
+            if (dropped != keep) {
+                Body.discard(dropped);
+            }
+        }
+        if (keep instanceof Body.Stream stream) {
+            guard.streams.add(stream);
+        }
+        return response;
+    }
+
     private static final class Guard {
+        /** Streamed bodies produced inside the chain on this thread and not yet handed out. Reused. */
+        private final java.util.ArrayList<Body.Stream> streams = new java.util.ArrayList<>(4);
         private final IdentityHashMap<RequestFilter.Chain, Integer> open = new IdentityHashMap<>(8);
         private int depth;
     }
@@ -133,18 +160,22 @@ public final class FilterChain implements Handler {
         @Override
         public Response proceed(Request request) {
             enter(this);
+            var guard = GUARDS.get();
+            int mark = guard.streams.size();
             Response response;
             try {
                 response = this.filter.filter(request, this.next);
             } catch (RuntimeException e) {
                 System.err.println("Filter " + this.name + " failed: " + e);
+                settle(guard, mark, null);
                 return failure(request);
             }
             if (response == null) {
                 System.err.println("Filter " + this.name + " returned no response");
+                settle(guard, mark, null);
                 return failure(request);
             }
-            return response;
+            return settle(guard, mark, response);
         }
     }
 
@@ -183,6 +214,8 @@ public final class FilterChain implements Handler {
         @Override
         public Response proceed(Request request) {
             enter(this);
+            var guard = GUARDS.get();
+            int mark = guard.streams.size();
             Response response;
             try {
                 response = this.terminal.handle(request);
@@ -194,7 +227,7 @@ public final class FilterChain implements Handler {
                 System.err.println("Request handler returned no response");
                 return failure(request);
             }
-            return response;
+            return settle(guard, mark, response);
         }
     }
 

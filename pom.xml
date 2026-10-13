@@ -290,8 +290,8 @@
                 <element>PACKAGE</element>
                 <includes><include>sjws_nettask.service</include></includes>
                 <limits>
-                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
-                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.75</minimum></limit>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
                 </limits>
               </rule>
               <rule>

@@ -45,6 +45,15 @@ node:
 `version` that is lower than the one already running. `node.mode` is kept until
 restart; `labels` apply on the next successful apply.
 
+There is no `node.role` key. `--role` and `WEB_SERVER_ROLE` are the command-line
+form of `node.mode`. Precedence is `--role`, then `WEB_SERVER_ROLE`, then
+`node.mode`. A difference is logged at startup
+(`WARN: --role=<flag> overrides node.mode=<file>`, or the same with
+`WEB_SERVER_ROLE` when the flag was absent). With no flag, no variable, and no
+config file, `--bootstrap` may still name the role. `control` or `data` still
+requires `--bootstrap`. Sample files: `contrib/sjws_nettask-standalone.yaml`,
+`contrib/sjws_nettask-control.yaml`, `contrib/sjws_nettask-data.yaml`.
+
 A data-plane process whose config file is missing boots from
 `<stateDir>/config/last-good.json` when that file exists, the hash in the envelope
 matches the embedded document, and `node.mode` is `data`. `stateDir` is
@@ -78,6 +87,7 @@ server:
   cache_bytes: 64m          # up to 16g; 0 disables the cache
   allow_unlistable_dirs: false
   access_log: off           # opened at startup; a reload does not reopen the writer
+  bind_content: true        # startup only; control defaults to false. Not in the canonical document
 
 http3:
   enabled: false
@@ -141,9 +151,11 @@ No config file means reload reports `no config file` and changes nothing.
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
 the JDK does not expose `sun.misc.Signal`, and when this process already ignores
 `SIGHUP`. An ignored `SIGHUP` stays ignored: the VM does not install a Java
-handler over it. `main` does not call it: a foreground process must still die on
-`SIGHUP`. The daemon child ignores `SIGHUP` and has no reload hook; its handler
-should call `ReloadHook.run()` instead of ignoring the signal.
+handler over it. `main` calls it only for the daemon child. A foreground process
+must still die on `SIGHUP`. The child is also detached with `setsid` when that
+binary exists, so a terminal hangup is not delivered. On a data node that has
+accepted a pushed config, the hook reloads bootstrap local settings and leaves
+the pushed document in place. Control and standalone re-read the local file.
 
 ## ACME
 
@@ -207,10 +219,16 @@ document root, and a path with a `..` segment is 400. ACME challenges are
 answered before any route. With `enabled: false` (the default) no router is built
 and the request path is unchanged. The records map onto `Route(host, prefix, rewrite,
 handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
-maxBody, proto, trustedProxies)`. Phase 1 proxies requests without a body
-(501 otherwise); see `docs/design/proxy-routing.md`. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
-TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) and `preserve_host`
-(default false) are parsed but not applied yet (phase 2).
+idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
+HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
+response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
+streamed upstream (over `max_body` is 413). A chunked request body, or a body on HTTP/2 or
+HTTP/3, is 501 for now; see `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
+bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
+and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
+growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
+closes the replaced pools.
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml

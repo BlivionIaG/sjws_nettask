@@ -117,6 +117,12 @@ public final class SjwsServer implements AutoCloseable {
     private ServerSocketChannel tcp;
     private ClientManager manager;
     private Thread acceptThread;
+    /** Released by {@link #close()} so a control process with no content port can leave {@link #awaitTermination()}. */
+    private final CountDownLatch contentless = new CountDownLatch(1);
+    /** Set after a data node accepts a control-plane document. SIGHUP then keeps that document. */
+    private final AtomicBoolean remoteApplied = new AtomicBoolean();
+    /** Re-reads bootstrap local settings. Null until the service hook attaches one. */
+    private volatile Runnable localReload;
     private AutoCloseable reloadHook;
     private AcmeService acme;
     /** Null on a data node. Not read by the request path. */
@@ -329,11 +335,17 @@ public final class SjwsServer implements AutoCloseable {
      *        for standalone and tests. A null verifier uses {@link SnapshotVerifier#forMode}.
      */
     public static SjwsServer start(ConfigLoader.Loaded loaded, SnapshotVerifier verifier) throws IOException {
-        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier);
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier, true);
     }
 
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory) throws IOException {
-        return start(loaded, h3Factory, H2_FACTORY, null, null);
+        return start(loaded, h3Factory, true);
+    }
+
+    /** {@code bindContent} false leaves the content port unbound. The process still stays up until {@link #close()}. */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent)
+            throws IOException {
+        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent);
     }
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
@@ -345,12 +357,12 @@ public final class SjwsServer implements AutoCloseable {
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
             HaSettings ha) throws IOException {
-        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null);
+        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null, true);
     }
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
-            HaSettings ha, SnapshotVerifier verifier) throws IOException {
+            HaSettings ha, SnapshotVerifier verifier, boolean bindContent) throws IOException {
         var board = new ChallengeBoard();
         var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
         if (ha != null && ha.handler() instanceof StaticFileHandler injected) {
@@ -358,40 +370,51 @@ public final class SjwsServer implements AutoCloseable {
             // instead of compiling a second one beside it.
             Handler visible = snapshot.handler() == snapshot.files() ? injected : snapshot.handler();
             snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation(),
-                    snapshot.epoch());
+                    snapshot.epoch(), snapshot.resources());
         }
         var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha, verifier);
-        if (snapshot.document().server().h3Enabled()) {
-            server.startH3(h3Factory, storedCertificate(snapshot));
-        }
-        if (snapshot.document().server().h2Enabled()) {
-            server.startH2(h2Factory);
-        }
-        try {
-            server.tcp = bind(snapshot.document().server().port(), snapshot.document().server().backlog());
-        } catch (IOException e) {
-            server.close();
-            throw e;
-        }
-        Supplier<Handler> handlers = server.override != null ? () -> server.override : server.live::handler;
-        server.manager = new ClientManager(server.tcp, snapshot.document().server(), handlers, server.altSvc,
-                null, server.armed);
-        server.attachGauges(server.slot.get().metrics());
-        if (server.ha != null) {
-            server.manager.setDrainSignal(server.ha.lifecycle()::closeAfterResponse);
-            server.manager.onAcceptLoopExit(() -> server.ha.health().setAlive(false));
-            IntSupplier pause = server.ha.settings().acceptPause();
-            if (pause != null) {
-                server.manager.setAcceptPause(pause);
+        if (bindContent) {
+            if (snapshot.document().server().h3Enabled()) {
+                server.startH3(h3Factory, storedCertificate(snapshot));
             }
-        }
-        server.acceptThread = new Thread(server.manager, "accept-loop");
-        server.acceptThread.start();
-        try {
-            server.openChallenge(snapshot);
-        } catch (IOException e) {
-            server.close();
-            throw e;
+            if (snapshot.document().server().h2Enabled()) {
+                server.startH2(h2Factory);
+            }
+            try {
+                server.tcp = bind(snapshot.document().server().port(), snapshot.document().server().backlog());
+            } catch (IOException e) {
+                server.close();
+                throw e;
+            }
+            Supplier<Handler> handlers = server.override != null ? () -> server.override : server.live::handler;
+            server.manager = new ClientManager(server.tcp, snapshot.document().server(), handlers, server.altSvc,
+                    null, server.armed);
+            server.attachGauges(server.slot.get().metrics());
+            if (server.ha != null) {
+                server.manager.setDrainSignal(server.ha.lifecycle()::closeAfterResponse);
+                server.manager.onAcceptLoopExit(() -> server.ha.health().setAlive(false));
+                IntSupplier pause = server.ha.settings().acceptPause();
+                if (pause != null) {
+                    server.manager.setAcceptPause(pause);
+                }
+            }
+            server.acceptThread = new Thread(server.manager, "accept-loop");
+            server.acceptThread.start();
+            try {
+                server.openChallenge(snapshot);
+            } catch (IOException e) {
+                server.close();
+                throw e;
+            }
+        } else {
+            server.acceptThread = new Thread(() -> {
+                try {
+                    server.contentless.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "service-idle");
+            server.acceptThread.start();
         }
         server.leadership = leadershipFor(snapshot);
         server.reloadHook = ReloadHook.register(server::onReload);
@@ -566,20 +589,28 @@ public final class SjwsServer implements AutoCloseable {
         try {
             var previous = this.live.get();
             try {
-                if (incoming != null) {
-                    this.verifier.verify(incoming);
-                }
-                var prepared = incoming == null
-                        ? this.reloader.reload(previous, this.h3 != null, this.board)
-                        : this.reloader.apply(previous, incoming, this.h3 != null, this.board, true);
-                if (incoming == null && prepared.applied()
-                        && previous.document().node().mode() == NodeSettings.Mode.DATA
-                        && controlPlaneSectionsChanged(previous.document(), prepared.snapshot().document())) {
-                    result = ReloadResult.rejected(previous, java.util.List.of(
-                            "SIGHUP cannot change control-plane sections on a data node: "
-                                    + controlPlaneDetail(previous.document(), prepared.snapshot().document())));
+                if (incoming == null && this.remoteApplied.get()) {
+                    result = reloadLocalOnly();
                 } else {
-                    result = prepared.applied() && prepared.snapshot() == previous ? prepared : publish(prepared);
+                    if (incoming != null) {
+                        this.verifier.verify(incoming);
+                    }
+                    var prepared = incoming == null
+                            ? this.reloader.reload(previous, this.h3 != null, this.board)
+                            : this.reloader.apply(previous, incoming, this.h3 != null, this.board, true);
+                    if (incoming == null && prepared.applied()
+                            && previous.document().node().mode() == NodeSettings.Mode.DATA
+                            && controlPlaneSectionsChanged(previous.document(), prepared.snapshot().document())) {
+                        result = ReloadResult.rejected(previous, java.util.List.of(
+                                "SIGHUP cannot change control-plane sections on a data node: "
+                                        + controlPlaneDetail(previous.document(), prepared.snapshot().document())));
+                    } else {
+                        result = prepared.applied() && prepared.snapshot() == previous ? prepared : publish(prepared);
+                    }
+                    if (incoming != null && result.applied()
+                            && this.live.get().document().node().mode() == NodeSettings.Mode.DATA) {
+                        this.remoteApplied.set(true);
+                    }
                 }
             } catch (ConfigException e) {
                 var message = e.getMessage() == null ? "configuration rejected" : e.getMessage();
@@ -692,6 +723,33 @@ public final class SjwsServer implements AutoCloseable {
                 && left.routes().routes().equals(right.routes().routes());
     }
 
+    /** Re-read bootstrap local settings on SIGHUP after a pushed config. The request path does not call this. */
+    public void setLocalReload(Runnable action) {
+        this.localReload = action;
+    }
+
+    /**
+     * Data node that already accepted a control-plane document. The snapshot stays. Bootstrap
+     * listen, peers, labels, and contact are refreshed when a hook is attached.
+     */
+    private ReloadResult reloadLocalOnly() {
+        var warnings = new java.util.ArrayList<String>();
+        var local = this.localReload;
+        if (local == null) {
+            warnings.add("kept the control-plane config; no local bootstrap reload is attached");
+        } else {
+            try {
+                local.run();
+                warnings.add("kept the control-plane config; reloaded local bootstrap settings");
+            } catch (RuntimeException e) {
+                warnings.add("kept the control-plane config; local bootstrap reload failed");
+            }
+        }
+        var current = this.live.get();
+        return new ReloadResult(false, current.generation(), warnings, java.util.List.of(), java.util.List.of(),
+                current, null);
+    }
+
     private ReloadResult publish(ReloadResult result) {
         if (!result.applied()) {
             return result;
@@ -714,9 +772,14 @@ public final class SjwsServer implements AutoCloseable {
             if (opened != null) {
                 opened.close();
             }
+            result.snapshot().close(); // never published: release its upstream pools
             return ReloadResult.rejected(this.live.get(), java.util.List.of("HTTP-01 listener: " + e.getMessage()));
         }
+        var replaced = this.live.get();
         this.live.set(result.snapshot());
+        if (replaced != result.snapshot()) {
+            replaced.close(); // old upstream pools: idle connections now, in-flight ones when they finish
+        }
         var server = result.snapshot().document().server();
         if (this.manager != null && this.manager.reaper() != null) {
             this.manager.reaper().update(server.idleTimeout(), server.headerTimeout(), server.writeTimeout());
@@ -978,6 +1041,9 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     public int tcpPort() {
+        if (this.tcp == null) {
+            return -1;
+        }
         try {
             return ((InetSocketAddress) this.tcp.getLocalAddress()).getPort();
         } catch (IOException e) { // closed
@@ -1024,7 +1090,9 @@ public final class SjwsServer implements AutoCloseable {
             throw new IllegalArgumentException("shutdown timeout out of range");
         }
         this.shutdownTimeout = timeout;
-        this.manager.shutdownTimeout(timeout);
+        if (this.manager != null) {
+            this.manager.shutdownTimeout(timeout);
+        }
         if (this.h2 != null) {
             this.h2.shutdownTimeout(timeout);
         }
@@ -1032,6 +1100,9 @@ public final class SjwsServer implements AutoCloseable {
 
     /** One-line summary for the startup log (never contains secrets). */
     public String describe() {
+        if (this.tcp == null) {
+            return "content port not bound";
+        }
         var sb = new StringBuilder("HTTP/1.1 on tcp/").append(tcpPort());
         if (this.h3 != null) {
             sb.append(", HTTP/3 on udp/").append(udpPort()).append(" (")
@@ -1083,6 +1154,7 @@ public final class SjwsServer implements AutoCloseable {
             }
             return;
         }
+        this.contentless.countDown();
         try {
             if (this.reloadHook != null) {
                 try {
@@ -1150,6 +1222,7 @@ public final class SjwsServer implements AutoCloseable {
                     Thread.currentThread().interrupt();
                 }
             }
+            this.live.get().close(); // upstream pools, after the listeners drained
         } finally {
             this.shutdownDone.countDown();
         }
