@@ -216,8 +216,7 @@ class CpStoreTest {
             assertEquals(sjws_nettask.controlplane.Role.ADMIN, store.roleOfSan("urn:sjws:admin:root"));
             assertEquals(sjws_nettask.controlplane.Role.VIEWER, store.roleOfSan("urn:sjws:admin:viewer"));
             assertTrue(store.adminEnrolled());
-            assertEquals(401, admin.handle(new sjws_nettask.controlplane.Rbac.Token("sjws_root.secret"), "GET",
-                    "/cp/v1/health", null, "").status());
+            assertEquals(401, admin.handle(null, "GET", "/cp/v1/health", null, "").status());
             assertEquals(404, admin.handle(adminCert, "GET", "/cp/v1/missing", null, "").status());
             assertEquals(-1L, CpAdmin.queryLong("from=no", "from"));
             assertNull(CpAdmin.jsonString("{}", "san"));

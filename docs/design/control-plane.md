@@ -38,7 +38,7 @@ The content request path reads the snapshot that is already installed. It does n
 2. **Zero cost when the control plane is off.** With `standalone`, the accept loop and `Http1Connection` do not read a role, a lease, a generation from Raft, or a control-plane flag. Evidence for every PR, including this one, is a `wrk` / `wrk2` before/after on the same host. The gate is the same shape as HA: report req/s and p50/p90/p99/p99.9.
 3. **Lock-free hot path.** A request performs one volatile read of an immutable snapshot (`LiveConfig.get` / `handler()`), then runs that snapshot's `Handler`. Publish is an atomic swap (`AtomicReference.set`) of the whole snapshot. The handler chain, the HA generation leaf, and the HTTP/3 handler supplier all read that snapshot. They do not keep a leaf captured at startup (§5.6). Readers take no lock. An in-flight request keeps the handler it already loaded.
 4. **Raft I/O on dedicated threads.** Append, fsync, election, and `GroupListener.onCommitted` run on the cluster group's threads (PR #29: one apply thread per group, index order). Those threads are distinct from the accept loop and from request virtual threads.
-5. **The control plane bootstraps without the broker.** `sjws_nettask.cp` does not import `sjws_nettask.messaging`. Messaging does not import `sjws_nettask.cp`. Topic *desired state* lives in the config document. The broker opens partitions from the applied document on its own threads.
+5. **The control plane bootstraps without the broker.** `sjws_nettask.cp` does not import `sjws_nettask.messaging`. Messaging does not import `sjws_nettask.cp`. Topic and group desired state is a neutral schema in `sjws_nettask.config` (§13.5). The control plane names those records and does not name broker runtime types. The broker opens partitions from the applied document on its reconcile thread.
 6. **Fail static.** A data-plane node that cannot reach a leader keeps the last successfully applied snapshot, including across a restart from the persisted last-good file. A minority of control nodes cannot publish.
 7. **Config & ACME own the model.** The control plane stores, versions, signs, and ships the document that workstream already validates. It does not invent a second schema.
 
@@ -72,11 +72,11 @@ The content request path reads the snapshot that is already installed. It does n
 | Package | Role |
 |---|---|
 | `sjws_nettask.cp` | Raft state machine, signing, rollout, admin API, watch, registration. Depends on `sjws_nettask.cluster`, the config model, and `sjws_nettask.controlplane` for admin RBAC. Owns `SignedSnapshot`. Does not apply patches. |
-| `sjws_nettask.config` | Owns `ConfigDocument`, `ConfigCodec`, `canonicalHash`, `contentHash`, `ConfigValidator`, `ConfigDiff.between`, `ConfigSnapshot.compile`, `ConfigReloader.apply`, `LiveConfig`. It does not mention a `cp` type. Signature checks are not here; they are inside `SjwsServer.applyRemote` (§5.5). |
+| `sjws_nettask.config` | Owns `ConfigDocument`, `ConfigCodec`, `canonicalHash`, `contentHash`, `ConfigValidator`, `ConfigDiff.between`, `ConfigSnapshot.compile`, `ConfigReloader.apply`, `LiveConfig`, and the neutral messaging records (`MessagingSettings`, `TopicSpec`, `GroupSpec`, `PartitionAssignment`). It does not mention a `cp` type and does not name broker runtime types. Signature checks are not here; they are inside `SjwsServer.applyRemote` (§5.5). |
 | `sjws_nettask.cluster` | Per-group Raft from PR #29. Unchanged by this workstream. It imports neither `sjws_nettask.cp` nor `sjws_nettask.messaging`. |
 | Data plane (`http1`, `h2`, `h3`, `routing`, `core`, `messaging`, `acme` on a data node) | Sees a `Handler` or, for the broker and the composition root only, `AppliedConfig` (§3.2). Does not depend on `sjws_nettask.cp`. |
 
-`sjws_nettask.cp` does not import `sjws_nettask.messaging`, `sjws_nettask.routing`, `sjws_nettask.http1`, `sjws_nettask.h2`, or `sjws_nettask.h3`. A control process can open `cp-config` and serve the admin API with no broker class initialized. `cp-config` has its own log directory and its own segments. It does not share the messaging ledger's segments, so compaction or truncation of one cannot affect the other.
+`sjws_nettask.cp` does not import `sjws_nettask.messaging`, `sjws_nettask.routing`, `sjws_nettask.http1`, `sjws_nettask.h2`, or `sjws_nettask.h3`. The only messaging shape it is allowed to name is the neutral records in `sjws_nettask.config` (`MessagingSettings`, `TopicSpec`, `GroupSpec`, `PartitionAssignment`). It does not name `Partition`, `LedgerWriter`, `MessagingStats`, or any other broker type. A control process boots, elects, and reaches `leaderReady` with no messaging class loaded (§15). `cp-config` has its own log directory and its own segments. It does not share the messaging ledger's segments, so compaction or truncation of one cannot affect the other. A broker is not a `cp-config` voter by default. Co-location is allowed and couples the two failure domains; production placement keeps them apart.
 
 The composition root is `Sjws_nettask` / `SjwsServer`. It is the only place that may mention both a data-plane server and `sjws_nettask.cp`, and only through `sjws_nettask.cp.CpBootstrap`, reached from the `control` or `data` branch. `standalone` does not name that class, so the verifier does not load `sjws_nettask.cp` or `sjws_nettask.cluster` (§16).
 
@@ -103,7 +103,7 @@ public interface AppliedConfig {
 
 `ConfigSnapshot` implements `AppliedConfig`. `version()` is `ConfigDocument.bundleVersion()` (0 when unset). `canonicalHash()` is `ConfigDocument.canonicalHash()`. `epoch` is one extra `long` on the snapshot (0 when local). That field is the only new hot-path cost. `LiveConfig` remains the `AtomicReference` holder. The harness method `DataNode.contentHash()` returns this `canonicalHash`.
 
-Transports do not import `AppliedConfig`. They already depend on `Supplier<Handler>` and `HandlerRef`, which is the narrower seam, and that stays. HTTP/1, HTTP/2, and HTTP/3 read the supplier the publish step installs (§5.6). `AppliedConfig` is for the broker and the composition root. The messaging broker, when it is running, reads `document()` on its partition-writer thread to learn the desired topic set. That read is not on the HTTP request path and is not a call to the control plane.
+Transports do not import `AppliedConfig`. They already depend on `Supplier<Handler>` and `HandlerRef`, which is the narrower seam, and that stays. HTTP/1, HTTP/2, and HTTP/3 read the supplier the publish step installs (§5.6). `AppliedConfig` is for the broker's reconcile thread and the composition root. That thread reads `document()` to learn the desired topic set and opens or closes partitions. It is not a partition writer: each partition keeps its own writer thread. The read is not on the HTTP request path and is not a call to the control plane.
 
 ### 3.3 Roles in the one binary
 
@@ -226,7 +226,9 @@ Canonical YAML is `ConfigCodec.text` of the document:
 
 ### 5.4 Diffs
 
-`ConfigDiff.between(before, after, http3Running)` is a per-section report. Each `Change` names a section (`schema`, `version`, `node`, `server`, `http3`, `tls`, `acme`, `routing`, `middleware`, `access`, `startup`), an effect (`LIVE` or `RESTART`), and a comma-separated list of field names. It does not return bytes. There is no `ConfigDiff.apply`. A `Change` list is not turned back into a `ConfigDocument`.
+`ConfigDiff.between(before, after, http3Running)` is a per-section report. Each `Change` names a section (`schema`, `version`, `node`, `server`, `http3`, `tls`, `acme`, `routing`, `middleware`, `access`, `startup`, plus one row per topic or group), an effect (`LIVE` or `RESTART`), and a comma-separated list of field names. Topic rows are `topics/<name>`. A group-only change is `topics/<name>/groups/<group>`. The topics section is not one whole-section replace. It does not return bytes. There is no `ConfigDiff.apply`. A `Change` list is not turned back into a `ConfigDocument`.
+
+Partition increase, retry, DLQ, and retention are `LIVE`. A replication-factor change is `LIVE` only as the start of a make-before-break rebalance (§13.5), and the detail says so. A durability change applies to new appends and is `LIVE` with that detail. Partition decrease, topic deletion, and group deletion appear in the report only after the guards in §13.5 accept them. A rejected proposal is not appended, so it has no diff.
 
 The report is what `GET /cp/v1/config/diff` returns. Field names never include a password, a PEM body, or file bytes.
 
@@ -371,7 +373,7 @@ A data node connects to a control node over the watch (§8). The first message a
 
 The leader appends one Raft entry that is both `ConsumeToken` and `Register`, and only then returns the certificate (§12.4). Followers learn the registration through Raft. A follower that receives a watch redirects the node to the leader (the hint is the same idea as `NotLeaderException`: leader id and address). The data node retries against the hint.
 
-Liveness heartbeats are records on that same stream, default interval 1 s, carrying the applied version and a monotonic send time. The leader appends a coalesced `Heartbeat` (at most one committed entry per node per interval; intermediate beats update an in-memory freshness table on the leader and are included in the next entry). A node with no beat for 5 s is `SUSPECT`. A node with no beat for 15 s is `DEAD` for rollout accounting. Neither state changes what the data node is serving. Dead nodes are skipped by the current stage and do not block a stage whose policy allows a configured minimum of acks; a policy of "all targeted nodes" waits.
+Liveness heartbeats are records on that same stream, default interval 1 s, carrying the applied version and a monotonic send time. A broker heartbeat also carries a bounded aggregate for the topics that node hosts: per-topic lag, in-flight count, and DLQ depth. The record is plain numbers. It is not a broker stats type, and it never carries per-message data. `GET /cp/v1/nodes` returns the last aggregate (§14). There is no second stats path. The leader appends a coalesced `Heartbeat` (at most one committed entry per node per interval; intermediate beats update an in-memory freshness table on the leader and are included in the next entry). A node with no beat for 5 s is `SUSPECT`. A node with no beat for 15 s is `DEAD` for rollout accounting. Neither state changes what the data node is serving, and neither state moves a partition. Dead nodes are skipped by the current stage and do not block a stage whose policy allows a configured minimum of acks; a policy of "all targeted nodes" waits. Reassignment waits for an operator action or for `node_dead_after` (default 10 minutes) with no heartbeat (§13.5).
 
 Separately, the leader pushes a signed **freshness** frame at least every 30 s, including when the desired version has not changed (§12.3). That frame is how a data node distinguishes "nothing new" from "a newer version is being withheld". It is not the liveness heartbeat above.
 
@@ -390,7 +392,17 @@ The client speaks first:
 
 The server then sends, in version order, a full `SignedSnapshot` for every version above `fromVersion`. A client that already holds the parent still receives the full document. Patches are not a frame type.
 
-After the client is caught up, the server sends each newly activated version the same way. The client replies `Ack { version }` after `applyRemote` has swapped the live snapshot, the side effects in §5.6 have run, and `floor.json`, `trust.json`, and `last-good.json` are durable.
+After the client is caught up, the server sends each newly activated version the same way. The client replies after `applyRemote` has swapped the live snapshot, the side effects in §5.6 have run, and `floor.json`, `trust.json`, and `last-good.json` are durable. Swapping the snapshot is not the whole ack when the node hosts partitions. Opening a partition can take seconds, so a broker ack names each partition:
+
+```
+Ack {
+  version,
+  status: applied | partial | failed,
+  details: [ { topic, partition, state: opening | serving | catching_up | failed, error } ]
+}
+```
+
+`applied` means every partition assigned to this node is `serving`. `partial` means at least one is still `opening` or `catching_up`. `failed` means at least one is `failed`; the previous assignments stay in service. A gateway or static node has an empty `details` list and uses `applied` once the snapshot swap is durable. The broker applier runs on the reconcile thread and sends the ack when that thread reports. The control plane stores the report. It does not open the partition.
 
 Backpressure: the server window is one unacked version by default (`maxInFlight`, configurable, minimum 1). It does not send version N+1 before `Ack` of N. The applicator queue on the client is bounded to that window. A slow apply stalls the stream. It does not buffer an unbounded log on the data node, and it does not stall Raft apply on the leader: the leader's push task reads the committed snapshot from memory and blocks on that one node's window only. Other nodes have their own windows.
 
@@ -408,7 +420,7 @@ An operator proposes canonical YAML through the admin API. The leader validates 
 
 The leader pushes the staged version only to nodes in the open stage. Other nodes keep their installed version. A node that does not match any selector is untouched.
 
-`Advance` opens the next stage after the open stage has enough `Ack`s. The default requirement is every targeted node that is `ALIVE`. The operator can set a minimum count. A node that is `DEAD` is reported and, under the default policy, blocks advance; the operator may skip it explicitly. That skip is itself a log entry.
+`Advance` opens the next stage after the open stage has enough `Ack`s. The default requirement is every targeted node that is `ALIVE`. A stage that targets brokers advances when those brokers report `serving` for the partitions that stage opened, not when they have only swapped the snapshot (§13.5). The operator can set a minimum count. A node that is `DEAD` is reported and, under the default policy, blocks advance; the operator may skip it explicitly. That skip is itself a log entry.
 
 `Activate` commits when the last stage has met its ack rule, or when an identity with role `operator` forces it. Activation publishes the version as desired. Nodes that have not acked still receive it (subject to their window) and still serve last-good until they apply.
 
@@ -522,7 +534,7 @@ The leader pushes a **projection**, not the full document. The projection is the
 |---|---|
 | `gateway` | routing, middleware, access, TLS references for the names it terminates |
 | `static` | server file settings, access, TLS references |
-| `broker` | topics section |
+| `broker` | this node's partition assignments and the specs of those topics, not the whole topics section |
 | `edge` | the gateway projection plus the topics it is labeled to ingress |
 
 `projectionId` is the node id from the certificate. The signature covers that id, so one node's envelope does not verify on another node. Secrets in the projection use the envelope encryption in §12.6, wrapped to that node's sealing key.
@@ -608,13 +620,98 @@ Each consumer keeps its own runtime objects. The control plane's job ends when `
 
 Local reload remains `ReloadHook` → `ConfigReloader.reload`. A remote apply is `SjwsServer.applyRemote`: signature and rollback checks, then `ConfigReloader.apply`, then the same swap, all under `reloadLock` (§5.5, §5.6). It does not call `ReloadHook.run()`. On role `data`, SIGHUP does not replace CP-owned sections. ACME issuance is leader-only and waits on `leaderReady(term, appliedIndex)` (§5.7, §6). Certificate bytes stay out of canonical YAML. Heartbeats carry `canonicalHash` and `version`, not PEM, passwords, or the process-local generation. Rotation accepts the previous CA and the new CA for one activated version, then drops the previous CA. Challenge responses on a data node still use the in-memory `ChallengeBoard` that `ConfigSnapshot.compile` already wraps in front of the handler when HTTP-01 is on the main listener. Tokens are placed by the leader's publish of the challenge reference inside the snapshot the data node applies, before the leader tells the ACME directory to validate. That ordering is the same as today's local ACME flow (token on the board before `trigger`), moved to the leader and the watch.
 
-### 13.5 Messaging topics
+### 13.5 Messaging topics and groups
 
-The document gains a `topics:` list: name, partition count, a local ledger mode, and a cluster ack. Local modes are the names `LedgerWriter` already uses: `async` (the default), `group`, `each`, and `none`. The cluster ack uses the HA vocabulary from [high availability](../ha/design.md): `relaxed` is the default and means majority in memory (`Durability.RELAXED`); `strict` is opt-in and means quorum commit plus fsync (`Durability.STRICT`). The control plane stores that list inside the canonical YAML and projects it to `broker` and labeled `edge` nodes. `cp-config` itself is opened with the same default: majority in memory, quorum-plus-fsync only when the group options say so.
+The snapshot carries messaging as neutral records owned by `sjws_nettask.config`: `MessagingSettings`, `TopicSpec`, `GroupSpec`, and `PartitionAssignment`. They are names, counts, durations, label matchers, and node ids. `sjws_nettask.cp` names those records and nothing from the broker. It does not name `Partition`, `LedgerWriter`, `MessagingStats`, or any other messaging runtime type, and it does not call into the broker to distribute config, to notify a change, or to write the audit stream. The watch stays the direct mTLS stream in §8. The broker maps the records onto its own classes after apply. The control plane never does that mapping.
 
-The broker reads the list from `AppliedConfig.document()` after apply and opens or closes `Partition`s on its writer threads. `sjws_nettask.cp` does not call `Partition.open`, does not touch the ledger, and does not append to a partition group. `sjws_nettask.messaging` does not call `ControlLeadership` or the watch. A control-role process starts with no partition directory.
+`topics` is a map keyed by topic name. `groups` is a map on that topic. A consumer group exists only when the snapshot declares it, so it can be audited and deleted through the same document. The control plane does not create a group because a consumer showed up.
 
-Desired topic state and the message log are different Raft groups. Losing the control plane does not truncate a partition log. The broker keeps the partitions it already opened from last-good.
+```yaml
+messaging:
+  enabled: true
+  defaults:
+    partitions: 3
+    replication: 3
+    durability: replicated          # replicated | async | group | strict
+    durability_opt_in: [strict]     # none and each only when listed here
+    retry: { max_attempts: 5, backoff_base: 100ms, backoff_max: 30s }
+    visibility_timeout: 30s
+    retention: { max_age: 7d, max_bytes: 10g, keep_resolved: false, compact_live_ratio: 0.5 }
+    segment_bytes: 1g
+  placement:
+    broker_selector: { role: broker }   # same label matchers as a rollout selector
+    spread_by: zone
+  topics:
+    orders:
+      partitions: 6
+      replication: 3
+      durability: replicated
+      durability_opt_in: [strict]
+      retry: { max_attempts: 8, backoff_base: 100ms, backoff_max: 30s }
+      dlq: { enabled: true, suffix: .dlq, retention: { max_age: 30d } }
+      placement: { broker_selector: { role: broker, tier: ssd }, spread_by: zone }
+      groups:
+        billing:  { start: earliest }     # earliest | latest | offset:<n>, creation only
+        shipping: { start: latest, visibility_timeout: 2m, retry: { max_attempts: 3 } }
+      allow_destructive: false
+  assignment:                          # written by the control plane, never by the operator
+    "orders/0": [n1, n3, n5]           # first id is the preferred leader
+```
+
+Validation runs before the leader appends `Propose`, and again inside `applyRemote` before publish:
+
+- Topic and group names match `[a-z0-9][a-z0-9._-]{0,127}` and must not end in `.dlq`.
+- `partitions ≥ 1`. `1 ≤ replication ≤` the number of registered nodes whose labels match that topic's `broker_selector`.
+- Topic `durability` is `replicated` (the default), `strict`, `async`, or `group`. `replicated` means majority in memory, the same default `cp-config` uses. `strict` means quorum commit plus fsync. `async` and `group` are local-only and require `replication: 1`. `none` and `each` are not topic defaults. They are accepted only inside an explicit `durability_opt_in` list. The document default list is `[strict]` and does not include them.
+- `max_attempts ≥ 1` and `backoff_max ≥ backoff_base`.
+- `dlq.enabled` defaults to true. The dead-letter name is `<topic><suffix>`, and the suffix defaults to `.dlq`.
+- `start` is `earliest`, `latest`, or `offset:<n>`, and is used only when the group is created.
+- An operator proposal that already contains `assignment` is rejected. Placement is computed below.
+
+`cp-config` itself stays on majority in memory, with quorum-plus-fsync only when its group options say so. That is the control log's durability, not a topic's.
+
+#### Destructive changes
+
+| Change | Guard |
+|---|---|
+| Topic deletion | Validation error unless that topic sets `allow_destructive: true`. The commit records a tombstone. Broker data is removed only after `grace` (default 10 minutes) and only after the removal is committed in the partition group. A rollback that restores the topic cancels the tombstone. The rollback does not delete data. |
+| Group deletion | The same flag on the topic, the same tombstone, and the same grace. Offsets stay until grace expires. |
+| Partition-count decrease | Requires `allow_destructive: true` as the explicit confirmation, and is still rejected at schema version 1. Schema 1 has no migration that preserves records when the partition count shrinks. A later schema that defines that migration is the version gate that may accept the decrease. |
+| Replication-factor change | Requires `allow_destructive: true`. It is not an in-place shrink of the log. The control plane schedules the make-before-break rebalance below. Raising or lowering the factor without the flag is a validation error. |
+
+#### Placement, computed by the control plane
+
+`placement.broker_selector` uses the same label-matcher conjunction as a rollout selector (§9). `spread_by` names a label key, for example `zone`. The leader computes `partition → ordered replica node ids` from that spec and the live registration table, and commits it in `cp-config` as `assignment` before it signs the envelope. The first id is the preferred leader. Candidates are registered nodes whose labels match the selector. Replicas spread by the `spread_by` label first, then by fewest hosted partitions, and ties break by a stable hash of `topic/partition`. Brokers do not run this computation. Two brokers that apply the same version see the same replica lists.
+
+A broker projection carries only that node's assignments and the specs of the topics those assignments name. An edge projection is the gateway projection plus the topics that node is labeled to ingress.
+
+Rebalance is add-before-remove. Each step is its own control-plane version, and the next step waits for the broker ack of the previous one:
+
+1. Add the new replica as a learner on that partition's group.
+2. Wait until the learner's lag is at most `catch_up_entries`.
+3. Promote the learner to voter.
+4. Remove the old replica.
+5. After that removal is committed, the old node deletes local data only after `grace`.
+
+The control plane does not remove a replica before the added replica has caught up and been promoted. A node marked `DEAD` (§7) does not by itself move a partition. Reassignment happens on an operator action, or after `node_dead_after` (default 10 minutes) with no heartbeat.
+
+Partition-group membership changes are driven by these versions and executed by messaging, on its own groups, through `changeMembership`. The control plane never appends to a partition group. Messaging never appends to `cp-config`. `changeMembership` and `transferLeadership` are the cluster API from the HA stack (PR #29), which the implementation PRs merge. This design does not reimplement them. Preferred leader is a hint. Partition-group leadership belongs to that group's Raft. A broker does not stop leading because the control plane is unreachable, and a control-plane outage does not close a partition or move that group's leadership.
+
+Partition increase adds empty partitions. Keyed producers observe a new key-to-partition mapping from the next version. That reordering is part of the change. No existing records move. Partition decrease stays behind the schema-1 gate above.
+
+#### Apply, on the broker's reconcile thread
+
+The broker reads `AppliedConfig.document()` on one reconcile thread. That thread opens and closes partitions. It is not a partition writer. Each partition keeps its own writer thread. The applier is idempotent: a version at or below the applied version is ignored, validation failure keeps the previous state, and the ack then reports `failed` with the object path. The reconcile thread reports when each assigned partition is `opening`, `serving`, `catching_up`, or `failed`, and the watch sends that as the `Ack` in §8.
+
+Bind-time versus live matches the port report `applyRemote` already returns. Partition increase, retry, DLQ, and retention are live. A replication-factor change is a rebalance, not a field swap. A durability change applies to new appends only.
+
+#### Bootstrap, with either plane down
+
+1. Control voters form a quorum and activate version 1 with no dependency on brokers.
+2. Brokers start from last-good, or from empty, open the partitions they already own locally, and serve.
+3. They then connect to the watch and reconcile.
+
+A broker restarts and serves those partitions while the control plane is down. A control process starts with no partition directory. Desired topic state and the message log are different Raft groups. Losing the control plane does not truncate a partition log.
 
 ## 14. Admin API and the TUI
 
@@ -629,7 +726,7 @@ The control role binds a dedicated admin address and does not bind the content p
 | `POST` | `/cp/v1/rollout` | `operator` | `ROLLOUT` | ordered selectors |
 | `POST` | `/cp/v1/rollout/advance` | `operator` | `ROLLOUT` | open the next stage, or force |
 | `POST` | `/cp/v1/rollback` | `operator` | `ROLLBACK` | `{ "toVersion": <long> }` |
-| `GET` | `/cp/v1/nodes` | `viewer` | `READ` | id, role, labels, version, freshness |
+| `GET` | `/cp/v1/nodes` | `viewer` | `READ` | id, role, labels, version, freshness, and the last heartbeat aggregate (per-topic lag, in-flight, DLQ depth). Not a second stats path. |
 | `POST` | `/cp/v1/nodes/{id}/revoke` | `admin` | `MANAGE_OPERATORS` | denylist |
 
 Every route authenticates with the client certificate. There is no `Authorization` bearer. A missing or unmapped certificate is 401. A mapped certificate whose role lacks the permission is 403.
@@ -689,13 +786,18 @@ While the watch is down, the oracle is the data node, not the admin API. `DataNo
 | Readiness | systemd `active` is not consulted. A control node is ready only when `/readyz` is 200 and `leaderReady()` is true. |
 | Content port | Role `control` does not bind the content port unless a content listener was set. |
 | Role precedence | `--role` wins over `WEB_SERVER_ROLE`, which wins over YAML. |
-| Projection | A `broker` envelope fails verification on a `gateway` node id and contains no sealed blob for the gateway key. |
+| Projection | A `broker` envelope fails verification on a `gateway` node id and contains no sealed blob for the gateway key. The broker projection is that node's assignments and those topic specs, not the whole topics section. |
+| Destructive messaging | Deleting a topic or group, or changing `replication`, without `allow_destructive: true` is a validation error and is not appended. A partition-count decrease is rejected at schema 1 even with the flag. A rollback that restores a tombstoned topic does not delete partition data. |
+| Placement | The committed assignment is a function of the topic spec and the registration table. An operator `assignment` block is rejected. A rebalance version adds the new replica and does not remove the old one until the add has acked `serving`. |
+| Partition ack | `Ack` names `applied`, `partial`, or `failed`, and a per-partition state of `opening`, `serving`, `catching_up`, or `failed`. A broker canary does not advance on `opening`. |
+| Control class load | A control process boots, elects, and reaches `leaderReady` with no `sjws_nettask.messaging` class loaded. |
+| Broker without CP | A broker restarts from last-good and serves the partitions it already owns while the control plane is down. The outage does not close a partition and does not move that partition group's leadership. |
 | Join token | A second presentation from the same identity within the TTL is the same join. A different identity fails. A presentation past TTL fails. The CSR is not signed before the token check. |
 | Revoke | The node receives no version committed after `Revoke`. Secrets wrapped to it are rotated. |
 | Chain swap | With HA and caller filters enabled, a pushed routing change is observed on HTTP/1, HTTP/2, and HTTP/3. The accept loop stays open. No non-2xx and no connection failure on the content port during `publish`. |
 | One publisher | A remote apply and a SIGHUP overlap. One generation is assigned. Both run the ACME listener, reaper timeout, and `replaceTls` side effects. Role `data` rejects a SIGHUP that changes a CP-owned section. |
 | Class load | `standalone` under `-Xlog:class+load` (or a `jdk.ClassLoad` JFR event) loads no `sjws_nettask.cp.*` and no `sjws_nettask.cluster.*` class. No admin port, no `stateDir`, no crypto provider init for the control plane. |
-| Dependency cut | `cp` class files have no constant-pool reference to `sjws_nettask/messaging`. `config` sources do not reference `cp`. `SjwsServer.applyRemote` is the one composition-root method that names `SignedSnapshot`, because the checks run inside it; `standalone` does not call it. `cluster` sources reference neither `cp` nor `messaging`. |
+| Dependency cut | `cp` class files have no constant-pool reference to `sjws_nettask/messaging`. They may name `MessagingSettings`, `TopicSpec`, `GroupSpec`, and `PartitionAssignment` in `sjws_nettask.config`, and they do not name `Partition`, `LedgerWriter`, or `MessagingStats`. `config` sources do not reference `cp`. `SjwsServer.applyRemote` is the one composition-root method that names `SignedSnapshot`, because the checks run inside it; `standalone` does not call it. `cluster` sources reference neither `cp` nor `messaging`. |
 | Limits | A frame over the cap, and a YAML alias bomb, are rejected before compile. |
 | Redaction | A scan of logs, metrics, and admin JSON finds no token or sealed-blob bytes. `toString` of a `Secret` is `***`. |
 | Standalone hot path | No `cp-` thread. With no filters, the handler is the static file handler. |
@@ -725,7 +827,7 @@ This design PR changes no `.java` file. Its before/after pair is noise on identi
 Each PR is based on current master (this document's base or newer), merges the HA stack when it needs `ClusterNode`, keeps `mvn verify` green, does not lower the 0.96 root branch floor, and does not merge itself.
 
 1. **Design.** This document.
-2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, and `ConfigDiff.between` as a report. `SjwsServer.applyRemote` verifies the signature and the rollback inside the lock and fails closed, then uses `ConfigReloader.apply`. The handler chain reads the live snapshot. Last-good is `<stateDir>/config/last-good.json`. Admin routes in §14 authorize through `sjws_nettask.controlplane.Rbac` with `Role.VIEWER`, `Role.OPERATOR`, and `Role.ADMIN`. The client certificate is the only admin credential. RBAC stays out of `Propose`. Expose `sjws_nettask.service.ControlPlaneBinding` and `NodeEnrollment` with the signatures in §6.1. SIGHUP stays a local reload. Drain stays inside the 30 s `drain-ms` budget. Readiness is `/readyz` plus `leaderReady()` on a control node. Join tokens are one-shot and idempotent per node identity. The control role does not bind the content port by default. Role precedence is CLI, then environment, then YAML. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
-3. **Registration and distribution.** Watch client and server, projection, ack window, full snapshots only, `<stateDir>/config/last-good.json`, staged rollout and rollback, label selection. Data role calls `applyRemote`. Implement `ControlPlane` so the four harness scenarios can drop `@Disabled`. Tests for resume, backpressure, canary, partition, and revoke. Benchmark as §16.
+2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, and `ConfigDiff.between` as a report. `SjwsServer.applyRemote` verifies the signature and the rollback inside the lock and fails closed, then uses `ConfigReloader.apply`. The handler chain reads the live snapshot. Last-good is `<stateDir>/config/last-good.json`. Admin routes in §14 authorize through `sjws_nettask.controlplane.Rbac` with `Role.VIEWER`, `Role.OPERATOR`, and `Role.ADMIN`. The client certificate is the only admin credential. RBAC stays out of `Propose`. Expose `sjws_nettask.service.ControlPlaneBinding` and `NodeEnrollment` with the signatures in §6.1. SIGHUP stays a local reload. Drain stays inside the 30 s `drain-ms` budget. Readiness is `/readyz` plus `leaderReady()` on a control node. Join tokens are one-shot and idempotent per node identity. The control role does not bind the content port by default. Role precedence is CLI, then environment, then YAML. This PR does not import `sjws_nettask.messaging`, does not compute partition placement, and does not open a partition. The topic schema, the destructive-change guards, CP-computed placement, and per-partition acks are the contract in §13.5. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
+3. **Registration and distribution.** Watch client and server, projection, ack window, full snapshots only, `<stateDir>/config/last-good.json`, staged rollout and rollback, label selection. Data role calls `applyRemote`. The broker projection is that node's assignments plus those topic specs, and `Ack` carries the per-partition states in §8. Placement is computed on the control leader and committed in `cp-config`. Implement `ControlPlane` so the four harness scenarios can drop `@Disabled`. Tests for resume, backpressure, canary, partition, revoke, destructive messaging changes, add-before-remove rebalance, and the broker serving from last-good while the control plane is down. Benchmark as §16.
 
 The request path in both implementation PRs stays a volatile read of the immutable snapshot.

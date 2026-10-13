@@ -89,7 +89,7 @@ class ControlPlaneSecurityTest {
         var cfg = sjws_nettask.config.ConfigDocument.of(server, sjws_nettask.config.ConfigDocument.defaults(server).acme(),
                 sjws_nettask.config.ConfigDocument.defaults(server).routing(), List.of(), access,
                 new sjws_nettask.config.NodeSettings(sjws_nettask.config.NodeSettings.Mode.DATA, Map.of("zone", "eu:1")),
-                1, 12, null, "");
+                1, 12, null);
         var d = AccessPolicyDocument.fromConfig(cfg, Scope.label("zone", "eu:1"));
         assertEquals(12, d.version());
         var live = LivePolicy.forNode(cfg.node(), AccessRules.DEFAULT);
@@ -144,68 +144,57 @@ class ControlPlaneSecurityTest {
         return new Rbac(ops, new AuditLog(log, CLOCK, true));
     }
 
+    static Rbac.ClientCert cert(String s) {
+        return new Rbac.ClientCert(s);
+    }
+
     @Test
     void rolesAndDenyByDefault() throws IOException {
-        var adminTok = Rbac.newToken("root");
-        var viewTok = Rbac.newToken("view");
-        var opTok = Rbac.newToken("ops");
         var log = tmp.resolve("audit.jsonl");
-        var r = rbac(log, List.of(new Operator("root", Role.ADMIN, null, Rbac.hashToken(adminTok), true),
-                new Operator("view", Role.VIEWER, null, Rbac.hashToken(viewTok), true),
-                new Operator("ops", Role.OPERATOR, "CN=Ops Bot, O=Sjws", Rbac.hashToken(opTok), true),
-                new Operator("gone", Role.ADMIN, "CN=gone", null, false),
-                new Operator("san", Role.VIEWER, "urn:sjws:admin:san", null, true)));
-        assertTrue(r.authorize(new Rbac.ClientCert("urn:sjws:admin:san"), Permission.READ, "s", 0).allowed());
-        assertFalse(r.authorize(new Rbac.ClientCert("urn:sjws:admin:SAN"), Permission.READ, "s", 0).allowed());
-        assertFalse(r.authorize(new Rbac.ClientCert("urn:bad san"), Permission.READ, "s", 0).allowed());
-        var admin = new Rbac.Token(adminTok);
-        var viewer = new Rbac.Token(viewTok);
-        assertTrue(r.authorize(viewer, Permission.READ, "status", 0).allowed());
+        var r = rbac(log, List.of(new Operator("root", Role.ADMIN, "urn:sjws:admin:root", true),
+                new Operator("view", Role.VIEWER, "CN=Viewer,O=Sjws", true),
+                new Operator("ops", Role.OPERATOR, "CN=Ops Bot, O=Sjws", true),
+                new Operator("gone", Role.ADMIN, "CN=gone", false)));
+        var admin = cert("urn:sjws:admin:root");
+        var viewer = cert("cn=viewer, o=sjws");
+        assertTrue(r.authorize(viewer, Permission.READ, "status", 0).allowed(), "DN match is canonical");
         for (var p : List.of(Permission.EDIT_ROUTES, Permission.ROLLOUT, Permission.ROLLBACK, Permission.NODE_DRAIN, Permission.MANAGE_OPERATORS)) {
             assertFalse(r.authorize(viewer, p, "x", 0).allowed(), p.name());
         }
-        var cert = new Rbac.ClientCert("cn=Ops Bot,o=Sjws");
-        assertTrue(r.authorize(cert, Permission.ROLLOUT, "v5", 5).allowed());
-        assertFalse(r.authorize(cert, Permission.MANAGE_OPERATORS, "x", 0).allowed());
+        var ops = cert("cn=Ops Bot,o=Sjws");
+        assertTrue(r.authorize(ops, Permission.ROLLOUT, "v5", 5).allowed());
+        assertFalse(r.authorize(ops, Permission.MANAGE_OPERATORS, "x", 0).allowed());
         assertTrue(r.authorize(admin, Permission.MANAGE_OPERATORS, "x", 0).allowed());
-        // unauthenticated paths
-        for (Rbac.Credential c : List.of(new Rbac.Token(adminTok + "x"), new Rbac.Token(null), new Rbac.Token("Bearer x"),
-                new Rbac.Token("sjws_nodot"), new Rbac.Token("sjws_nobody.abc"), new Rbac.Token(viewTok.replace("view", "root")),
-                new Rbac.ClientCert("CN=gone"), new Rbac.ClientCert("not a dn ==="), new Rbac.ClientCert(null),
-                new Rbac.ClientCert("CN=stranger"), new Rbac.Token(Rbac.newToken("ops").replace("ops", "gone")))) {
+        // unauthenticated paths: unknown, disabled, malformed, case-changed SAN, null
+        for (var c : List.of(cert("CN=gone"), cert("not a dn ==="), cert(null), cert("CN=stranger"),
+                cert("urn:sjws:admin:ROOT"), cert("urn:bad san"), cert("urn:sjws:admin:root2"), cert(""))) {
             var d = r.authorize(c, Permission.READ, "status", 0);
-            assertFalse(d.allowed(), c.toString());
+            assertFalse(d.allowed(), String.valueOf(c));
             assertEquals("unauthenticated", d.reason());
         }
-        assertEquals("Token[redacted]", admin.toString());
-        assertFalse(r.operators().toString().contains(Rbac.hashToken(adminTok)));
         var audit = Files.readString(log);
-        assertFalse(audit.contains(adminTok), "audit never holds secrets");
         assertTrue(audit.contains("\"actor\":\"view\",\"action\":\"ROLLOUT\",\"target\":\"x\",\"outcome\":\"denied: role VIEWER lacks ROLLOUT\""));
         assertTrue(audit.contains("\"actor\":\"ops\",\"action\":\"ROLLOUT\",\"target\":\"v5\",\"outcome\":\"allowed\",\"version\":5"));
+        assertTrue(audit.contains("\"actor\":\"unknown-cert:CN=stranger\""));
         assertTrue(AuditLog.verify(log).ok());
     }
 
     @Test
     void operatorManagementKeepsAnAdminAndIsAudited() throws IOException {
-        var adminTok = Rbac.newToken("root");
-        var opTok = Rbac.newToken("ops");
         var log = tmp.resolve("a.jsonl");
-        var r = rbac(log, List.of(new Operator("root", Role.ADMIN, null, Rbac.hashToken(adminTok), true),
-                new Operator("ops", Role.OPERATOR, null, Rbac.hashToken(opTok), true)));
-        var admin = new Rbac.Token(adminTok);
-        var ops = new Rbac.Token(opTok);
-        assertFalse(r.putOperator(ops, new Operator("ops", Role.ADMIN, null, Rbac.hashToken(opTok), true)).allowed(),
-                "no self-promotion");
-        var newTok = Rbac.newToken("eve");
-        assertTrue(r.putOperator(admin, new Operator("eve", Role.VIEWER, null, Rbac.hashToken(newTok), true)).allowed());
-        assertTrue(r.authorize(new Rbac.Token(newTok), Permission.READ, "s", 0).allowed());
+        var r = rbac(log, List.of(new Operator("root", Role.ADMIN, "CN=root", true),
+                new Operator("ops", Role.OPERATOR, "CN=ops", true)));
+        var admin = cert("CN=root");
+        var ops = cert("CN=ops");
+        assertFalse(r.putOperator(ops, new Operator("ops", Role.ADMIN, "CN=ops", true)).allowed(), "no self-promotion");
+        assertTrue(r.putOperator(admin, new Operator("eve", Role.VIEWER, "urn:sjws:admin:eve", true)).allowed());
+        assertTrue(r.authorize(cert("urn:sjws:admin:eve"), Permission.READ, "s", 0).allowed());
         var last = r.removeOperator(admin, "root");
         assertFalse(last.allowed());
         assertEquals("would leave no enabled admin", last.reason());
-        assertFalse(r.putOperator(admin, new Operator("root", Role.ADMIN, null, Rbac.hashToken(adminTok), false)).allowed());
+        assertFalse(r.putOperator(admin, new Operator("root", Role.ADMIN, "CN=root", false)).allowed());
         assertTrue(r.removeOperator(admin, "eve").allowed());
-        assertFalse(r.authorize(new Rbac.Token(newTok), Permission.READ, "s", 0).allowed(), "revoked at once");
+        assertFalse(r.authorize(cert("urn:sjws:admin:eve"), Permission.READ, "s", 0).allowed(), "revoked at once");
         assertFalse(r.removeOperator(ops, "root").allowed());
         var d = r.authorize(ops, Permission.ROLLBACK, "v3", 3);
         r.complete(d, true, 6, "re-issued v3 as v6");
@@ -213,29 +202,29 @@ class ControlPlaneSecurityTest {
         assertTrue(Files.readString(log).contains("\"outcome\":\"ok: re-issued v3 as v6\",\"version\":6"));
         assertTrue(AuditLog.verify(log).ok());
         assertThrows(IllegalArgumentException.class, () -> new Rbac(List.of(
-                new Operator("a", Role.ADMIN, "CN=a", null, true), new Operator("a", Role.ADMIN, "CN=b", null, true)),
+                new Operator("a", Role.ADMIN, "CN=a", true), new Operator("a", Role.ADMIN, "CN=b", true)),
                 new AuditLog(tmp.resolve("dup"), CLOCK, false)));
     }
 
     @Test
     void operatorValidation() {
-        assertThrows(IllegalArgumentException.class, () -> new Operator("Bad Id", Role.ADMIN, "CN=a", null, true));
-        assertThrows(IllegalArgumentException.class, () -> new Operator(null, Role.ADMIN, "CN=a", null, true));
-        assertThrows(IllegalArgumentException.class, () -> new Operator("a", Role.ADMIN, null, null, true));
-        assertThrows(IllegalArgumentException.class, () -> new Operator("a", Role.ADMIN, null, "abc", true));
-        assertThrows(IllegalArgumentException.class, () -> new Operator("a", Role.ADMIN, "===", null, true));
-        assertThrows(IllegalArgumentException.class, () -> new Operator("a.b", Role.ADMIN, "CN=a", null, true));
-        assertTrue(new Operator("a", Role.ADMIN, "CN=a", null, false).toString().contains("disabled"));
+        assertThrows(IllegalArgumentException.class, () -> new Operator("Bad Id", Role.ADMIN, "CN=a", true));
+        assertThrows(IllegalArgumentException.class, () -> new Operator(null, Role.ADMIN, "CN=a", true));
+        assertThrows(IllegalArgumentException.class, () -> new Operator("a", Role.ADMIN, null, true), "mTLS identity required");
+        assertThrows(IllegalArgumentException.class, () -> new Operator("a", Role.ADMIN, "===", true));
+        assertThrows(IllegalArgumentException.class, () -> new Operator("a", Role.ADMIN, "urn:bad san", true));
+        assertThrows(IllegalArgumentException.class, () -> new Operator("a.b", Role.ADMIN, "CN=a", true));
+        assertThrows(NullPointerException.class, () -> new Operator("a", null, "CN=a", true));
+        assertTrue(new Operator("a", Role.ADMIN, "CN=a", false).toString().contains("disabled"));
         assertEquals(Permission.values().length, Role.ADMIN.permissions().size());
     }
 
     @Test
     void deniedWhenAuditCannotBeWritten() throws IOException {
-        var tok = Rbac.newToken("root");
         var audit = new AuditLog(tmp.resolve("c.jsonl"), CLOCK, false);
-        var r = new Rbac(List.of(new Operator("root", Role.ADMIN, null, Rbac.hashToken(tok), true)), audit);
+        var r = new Rbac(List.of(new Operator("root", Role.ADMIN, "CN=root", true)), audit);
         audit.close();
-        var d = r.authorize(new Rbac.Token(tok), Permission.READ, "s", 0);
+        var d = r.authorize(cert("CN=root"), Permission.READ, "s", 0);
         assertFalse(d.allowed());
         assertEquals("audit unavailable", d.reason());
     }

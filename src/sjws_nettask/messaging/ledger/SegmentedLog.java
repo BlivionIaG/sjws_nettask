@@ -5,13 +5,15 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.List;
 import java.util.regex.Pattern;
 
 /**
- * Append-only segmented log for one partition. Not thread-safe: owned by a single writer
- * ({@link LedgerWriter}); reads from other threads must go through the writer's published snapshot
- * bounds (never past {@link LedgerSnapshot#nextOffset}).
+ * Append-only segmented log for one partition. One writer ({@link LedgerWriter}) appends; reads
+ * ({@link #read}, {@link #scanFrom}) are safe from other threads concurrently and only see fully written batches.
+ * Maintenance ({@link #deleteSegment}, compaction) touches sealed segments only and must not race with
+ * readers of the same segment (callers serialize it with their reads).
  */
 public final class SegmentedLog implements AutoCloseable {
 
@@ -20,7 +22,8 @@ public final class SegmentedLog implements AutoCloseable {
 
     private final Path dir;
     private final long segmentBytes;
-    private final List<Segment> segments = new ArrayList<>();
+    /** Copy-on-write: the writer rolls, maintenance deletes/compacts sealed segments, readers iterate without locks. */
+    private final List<Segment> segments = new CopyOnWriteArrayList<>();
     private final long recoveredTruncatedBytes;
     /** Active segment, readable by a background syncer thread while the writer appends. */
     private volatile Segment active;
@@ -116,13 +119,66 @@ public final class SegmentedLog implements AutoCloseable {
     /** Reads every committed batch in order (recovery, tests, tools). */
     public List<RecordBatch> readAll() throws IOException {
         var out = new ArrayList<RecordBatch>();
-        long o = startOffset();
-        while (o < nextOffset()) {
-            var b = read(o);
-            out.add(b);
-            o = b.nextOffset();
-        }
+        scanFrom(Long.MIN_VALUE, out::add);
         return out;
+    }
+
+    /** Calls {@code sink} for every batch whose offsets reach {@code fromOffset} or later, in order. */
+    public void scanFrom(long fromOffset, java.util.function.Consumer<RecordBatch> sink) throws IOException {
+        for (var seg : segments) {
+            if (seg.nextOffset() <= fromOffset) continue;
+            seg.scan(fromOffset, sink);
+        }
+    }
+
+    /** Immutable description of one segment file. */
+    public record SegmentInfo(long baseOffset, long nextOffset, long bytes, boolean active, boolean compacted, long lastModifiedMs) { }
+
+    public List<SegmentInfo> segments() throws IOException {
+        var out = new ArrayList<SegmentInfo>();
+        var act = active;
+        for (var seg : segments) out.add(new SegmentInfo(seg.baseOffset, seg.nextOffset(), seg.size(), seg == act, seg.compacted(), seg.lastModifiedMs()));
+        return out;
+    }
+
+    public long totalBytes() { long n = 0; for (var seg : segments) n += seg.size(); return n; }
+
+    private Segment sealedSegment(long base) {
+        for (var seg : segments) if (seg.baseOffset == base) {
+            if (seg == active) throw new IllegalArgumentException("active segment " + base);
+            return seg;
+        }
+        throw new IllegalArgumentException("no segment " + base);
+    }
+
+    /** Deletes the oldest sealed segment (retention). Only the first segment may be deleted, so offsets stay a prefix cut. */
+    public void deleteSegment(long base) throws IOException {
+        var seg = sealedSegment(base);
+        if (segments.getFirst() != seg) throw new IllegalArgumentException("only the oldest segment can be deleted");
+        segments.remove(seg);
+        seg.close();
+        seg.deleteFiles();
+    }
+
+    /**
+     * Phase 1 of compaction (no lock needed, readers may continue): writes a copy of sealed segment {@code base} keeping only
+     * batches whose base offset {@code keep} accepts, fsynced, plus its marker. Returns the new size in bytes.
+     */
+    public long prepareCompaction(long base, java.util.function.LongPredicate keep) throws IOException {
+        return sealedSegment(base).writeCompacted(keep);
+    }
+
+    /** Phase 2 (callers exclude readers of this segment): swaps in the compacted file and persists its index. */
+    public void commitCompaction(long base) throws IOException {
+        var old = sealedSegment(base);
+        int i = segments.indexOf(old);
+        old.close();
+        var cmp = dir.resolve(Segment.name(base, ".cmp"));
+        java.nio.file.Files.move(cmp, old.logPath, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        java.nio.file.Files.deleteIfExists(old.indexPath);
+        var seg = Segment.open(dir, base, true, new long[1]);
+        seg.seal();
+        segments.set(i, seg);
     }
 
     @Override public void close() throws IOException {

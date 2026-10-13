@@ -97,7 +97,7 @@ final class YamlValues {
 
     private static Object copyValue(Object value, String path) {
         if (value == null || value instanceof String || value instanceof Boolean || value instanceof Integer
-                || value instanceof Long) {
+                || value instanceof Long || value instanceof Double || value instanceof Float) {
             return value;
         }
         if (value instanceof Map<?, ?> map) {

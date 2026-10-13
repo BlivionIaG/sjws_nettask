@@ -92,6 +92,44 @@ class RoutingCompilerTest {
     }
 
     @Test
+    void bracketedIpv6RouteHosts() throws IOException {
+        var loaded = load("""
+                routing:
+                  enabled: true
+                  routes:
+                    - { host: "[::1]", prefix: /, redirect: { status: 308, location: /v6 } }
+                    - { host: "[2001:DB8::1]", prefix: /, static: true }
+                """);
+        var specs = loaded.document().routing().routes().routes();
+        assertEquals("::1", specs.get(0).host());
+        assertEquals("[::1]", specs.get(0).routerHost());
+        assertEquals("2001:db8::1", specs.get(1).host());
+        var router = assertInstanceOf(Router.class,
+                ConfigSnapshot.compile(loaded.document(), new sjws_nettask.acme.ChallengeBoard(), 1).handler());
+        assertEquals("[::1]", router.routes().get(0).host());
+        assertEquals("[2001:db8::1]", router.routes().get(1).host());
+        var hit = new Request("GET", "/", new RequestHeaders(null, null, null, null, null, "[::1]:8080"));
+        assertEquals(308, router.handle(hit).status());
+        var other = new Request("GET", "/", new RequestHeaders(null, null, null, null, null, "[::2]:8080"));
+        assertEquals(200, router.handle(other).status()); // no route: static fallback
+        var upper = new Request("GET", "/", new RequestHeaders(null, null, null, null, null, "[2001:DB8::1]"));
+        assertEquals(200, router.handle(upper).status());
+    }
+
+    @Test
+    void rejectsBadIpv6RouteHosts() throws IOException {
+        for (var host : new String[] {"::1", "[::1]:80", "::1:80", "example.com:80", "[::1", "::1]", "[]",
+                "[127.0.0.1]", "[fe80::1%eth0]", "[::g]", "[[::1]]", "[::1]x", "[localhost]"}) {
+            var file = this.root.resolve("bad.yaml");
+            Files.writeString(file, "server:\n  port: 0\nrouting:\n  enabled: true\n  routes:\n    - { host: \""
+                    + host + "\", prefix: /, static: true }\n");
+            var loaded = ConfigLoader.load(new String[] {"--config=" + file, "--no-h3"}, Map.of());
+            assertFalse(loaded.ok(), host);
+            assertTrue(loaded.errors().toString().contains(".host"), host + ": " + loaded.errors());
+        }
+    }
+
+    @Test
     void cidr() {
         var v4 = Cidr.parse("10.1.0.0/16");
         assertTrue(v4.contains(new InetSocketAddress("10.1.200.3", 1)));
@@ -132,7 +170,7 @@ class RoutingCompilerTest {
                     - { prefix: /old, rewrite: /, redirect: { status: 308, location: /new/, keep_path: true } }
                     - { prefix: /files, rewrite: /, static: true }
                 """.formatted(up.getAddress().getPort()));
-        try (var server = SjwsServer.start(loaded, null)) {
+        try (var server = SjwsServer.start(loaded)) {
             var client = HttpClient.newHttpClient();
             var base = "http://127.0.0.1:" + server.tcpPort();
             var api = get(client, base + "/api/x?q=1");

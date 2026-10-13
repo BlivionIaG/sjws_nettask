@@ -13,7 +13,7 @@ Back to the [README](../README.md) (quick start).
 - [Platform notes](user/platform-notes.md)
 
 ## Operations
-- [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API
+- [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API, control heartbeat report
 - [Running in the background (daemon)](operations/daemon.md)
 - [Admin console (TUI)](operations/admin-console.md)
 - [Releasing](operations/releasing.md)

@@ -22,6 +22,7 @@ import java.io.PrintStream;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Locale;
+import sjws_nettask.observe.ClusterStatus;
 
 /**
  * Line-oriented admin console: each command (a letter + Enter) redraws the screen. Plain ANSI
@@ -146,8 +147,53 @@ public final class AdminTui {
         if (root != null) {
             sb.append("  Document root     : ").append(root).append('\n');
         }
+        var cluster = this.control.clusterStatus();
+        if (cluster != null) {
+            renderCluster(sb, cluster);
+        }
         sb.append("Recent events:\n");
         this.log.tail(5).forEach(l -> sb.append("  ").append(l).append('\n'));
+    }
+
+    private void renderCluster(StringBuilder sb, ClusterStatus cluster) {
+        sb.append(String.format(Locale.ROOT, "Cluster desired %d: %.1f req/s  p99 %s  errors %d  drifted %d%n",
+                cluster.desiredVersion(), cluster.requestsPerSecond(), latency(cluster.p99Nanos()), cluster.errors(),
+                cluster.driftedNodes()));
+        for (var node : cluster.nodes()) {
+            sb.append("  node ").append(node.nodeId()).append(" applied ").append(node.appliedVersion());
+            if (node.drifted()) {
+                sb.append(" DRIFT");
+            }
+            if (!node.alive()) {
+                sb.append(" down");
+            }
+            if (node.draining()) {
+                sb.append(" draining");
+            }
+            if (!node.ready()) {
+                sb.append(" not-ready");
+            }
+            sb.append(String.format(Locale.ROOT, "  %.1f req/s  errors %d  p99 %s%n", node.requestsPerSecond(),
+                    node.errors(), latency(node.p99Nanos())));
+        }
+        for (var route : cluster.routes()) {
+            sb.append(String.format(Locale.ROOT, "  route %s  requests %d  errors %d  p99 %s%n", route.name(),
+                    route.requests(), route.errors(), latency(route.p99Nanos())));
+        }
+        for (var key : cluster.apiKeys()) {
+            sb.append(String.format(Locale.ROOT, "  api-key %s  requests %d  errors %d  p99 %s%n", key.name(),
+                    key.requests(), key.errors(), latency(key.p99Nanos())));
+        }
+    }
+
+    private static String latency(long nanos) {
+        if (nanos <= 0) {
+            return "-";
+        }
+        if (nanos == Long.MAX_VALUE) {
+            return "+Inf";
+        }
+        return String.format(Locale.ROOT, "%.3f s", nanos / 1_000_000_000.0);
     }
 
     private void renderLogs(StringBuilder sb) {

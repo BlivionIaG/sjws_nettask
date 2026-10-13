@@ -124,9 +124,11 @@ class AcmeLeadershipTest {
         var root = Files.createDirectory(dir.resolve("html"));
         var storage = dir.resolve("acme");
         var yaml = dir.resolve("sjws.yaml");
+        var state = dir.resolve("state");
         Files.writeString(yaml, """
                 node:
                   mode: data
+                  state_dir: %s
                 server:
                   port: 0
                   root: %s
@@ -137,7 +139,7 @@ class AcmeLeadershipTest {
                   domains: [example.com]
                   storage: %s
                   accept_terms: true
-                """.formatted(root.toAbsolutePath(), storage.toAbsolutePath()));
+                """.formatted(state.toAbsolutePath(), root.toAbsolutePath(), storage.toAbsolutePath()));
         var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
         assertTrue(loaded.ok(), loaded.errors().toString());
         assertEquals(NodeSettings.Mode.DATA, loaded.document().node().mode());

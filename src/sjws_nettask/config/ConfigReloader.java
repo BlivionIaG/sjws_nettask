@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.acme.ChallengeBoard;
 import sjws_nettask.tls.TlsMaterial;
@@ -62,7 +63,7 @@ public final class ConfigReloader {
      * failure the returned snapshot is {@code current}.
      *
      * @param keepLocalFile when true, the compiled document keeps {@code current}'s config path
-     *        so a pushed bundle does not retarget the last-good file
+     *        so a pushed bundle does not replace the user's YAML path
      */
     public ReloadResult apply(ConfigSnapshot current, ConfigDocument incoming, boolean http3Running,
             ChallengeBoard board, boolean keepLocalFile) {
@@ -79,6 +80,15 @@ public final class ConfigReloader {
         if (incoming.bundleVersion() > 0 && currentVersion > incoming.bundleVersion()) {
             return ReloadResult.rejected(current, List.of("bundle version " + incoming.bundleVersion()
                     + " is older than " + currentVersion));
+        }
+        var destructive = MessagingSettings.destructiveErrors(current.document().messaging(), incoming.messaging());
+        if (!destructive.isEmpty()) {
+            return ReloadResult.rejected(current, destructive);
+        }
+        if (!incoming.canonicalHash().isEmpty()
+                && incoming.canonicalHash().equals(current.document().canonicalHash())
+                && Objects.equals(incoming.server().tlsKeyPassword(), current.document().server().tlsKeyPassword())) {
+            return new ReloadResult(true, current.generation(), warnings, List.of(), List.of(), current, null);
         }
         var restart = new ArrayList<String>();
         var clamped = clamp(current.document().server(), incoming.server(), http3Running, restart);
@@ -101,10 +111,20 @@ public final class ConfigReloader {
         Path configFile = keepLocalFile || incoming.configFile() == null
                 ? current.document().configFile()
                 : incoming.configFile();
+        Path stateDir = incoming.stateDir() != null ? incoming.stateDir() : current.document().stateDir();
         try {
-            var document = ConfigDocument.of(clamped, incoming.acme(), incoming.routing(), incoming.middleware(),
-                    incoming.access(), node, incoming.schemaVersion(), incoming.bundleVersion(), configFile,
-                    incoming.contentHash());
+            boolean unchanged = clamped.equals(incoming.server()) && node.equals(incoming.node())
+                    && incoming.canonicalText() != null;
+            var document = unchanged
+                    ? incoming.withConfigFile(configFile).withStateDir(stateDir)
+                    : ConfigDocument.of(clamped, incoming.acme(), incoming.routing(), incoming.middleware(),
+                            incoming.access(), node, incoming.schemaVersion(), incoming.bundleVersion(), configFile,
+                            incoming.messaging())
+                            .withStateDir(stateDir);
+            if (incoming.signature() != null && document.signature() == null
+                    && document.canonicalHash().equals(incoming.canonicalHash())) {
+                document = document.withSignature(incoming.signature());
+            }
             var next = ConfigSnapshot.compile(document, board, current.generation() + 1);
             return new ReloadResult(true, next.generation(), warnings, List.of(), restart, next, tls);
         } catch (RuntimeException e) {

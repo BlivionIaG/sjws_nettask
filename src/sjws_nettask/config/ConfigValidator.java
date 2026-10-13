@@ -64,6 +64,7 @@ public final class ConfigValidator {
                 break;
             }
         }
+        errors.addAll(document.messaging().shapeErrors());
         return List.copyOf(errors);
     }
 }
