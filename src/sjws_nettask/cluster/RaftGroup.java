@@ -283,7 +283,7 @@ final class RaftGroup {
         role = Role.PRE_CANDIDATE;
         votes.clear();
         votes.add(self);
-        electionDeadline = now + options.electionTimeout().toNanos();
+        electionDeadline = now + retryTimeout();
         if (isQuorum(votes)) {
             startElection(now, after);
             return;
@@ -298,11 +298,20 @@ final class RaftGroup {
         leader = null;
         votes.clear();
         votes.add(self);
-        electionDeadline = now + options.electionTimeout().toNanos();
+        electionDeadline = now + retryTimeout();
         send(VOTE, voteBody(term));
         if (isQuorum(votes)) {
             becomeLeader(now, after);
         }
+    }
+
+    /**
+     * The election timeout plus a per-node stagger, the same one the first deadline uses. Without
+     * it, two candidates that time out together keep splitting the vote on a real clock.
+     */
+    private long retryTimeout() {
+        long election = options.electionTimeout().toNanos();
+        return election + (self.wire() - 1L) * (election / 5);
     }
 
     private byte[] voteBody(long voteTerm) {
@@ -391,7 +400,10 @@ final class RaftGroup {
         long candidateTerm = body.getLong();
         var candidate = byWire.apply(candidateWire);
         boolean grant = false;
-        boolean leaderFresh = role == Role.LEADER || (leader != null && now < electionDeadline);
+        // A pre-candidate has already timed out on its leader, and its own pre-vote moved
+        // electionDeadline, so that deadline no longer says the leader is fresh.
+        boolean leaderFresh = role == Role.LEADER
+                || (role == Role.FOLLOWER && leader != null && now < electionDeadline);
         if (theirTerm >= term && candidate != null && !leaderFresh && (!witness || witnessForced())) {
             long ourLast = witness ? witnessCursorIndex() : lastIndex();
             long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);

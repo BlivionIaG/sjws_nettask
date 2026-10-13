@@ -52,6 +52,7 @@ class ClassLoadTest {
             assertTrue(text.contains("bench port="), text);
             assertFalse(text.contains("sjws_nettask.cp."), text);
             assertFalse(text.contains("sjws_nettask.cluster."), text);
+            assertFalse(text.contains("sjws_nettask.cluster.TcpTransport"), text);
             assertFalse(text.contains("sjws_nettask.service."), text);
         } finally {
             process.destroy();
