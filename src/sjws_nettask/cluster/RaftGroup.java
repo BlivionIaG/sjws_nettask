@@ -30,6 +30,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
@@ -120,11 +121,10 @@ final class RaftGroup {
         this.clock = clock;
         this.listener = listener;
         this.voters.addAll(voters);
-        long election = options.electionTimeout().toNanos();
         if (options.preferred()) {
-            this.electionDeadline = Math.max(1L, election / 5);
+            this.electionDeadline = Math.max(1L, options.electionTimeout().toNanos() / 5);
         } else {
-            this.electionDeadline = election + (self.wire() - 1L) * (election / 5);
+            this.electionDeadline = staggeredTimeout();
         }
     }
 
@@ -306,12 +306,25 @@ final class RaftGroup {
     }
 
     /**
-     * The election timeout plus a per-node stagger, the same one the first deadline uses. Without
-     * it, two candidates that time out together keep splitting the vote on a real clock.
+     * The election timeout plus a fresh per-node jitter in {@code [0, election)}. Redrawn on
+     * every retry so two candidates that share a first-deadline slot (sparse wire ids such as
+     * 1 and 7 with three voters) cannot split the vote forever. The wait stays under
+     * {@code 2 * election}, unlike the old {@code (wire - 1) * (election / 5)} growth.
      */
     private long retryTimeout() {
         long election = options.electionTimeout().toNanos();
-        return election + (self.wire() - 1L) * (election / 5);
+        long jitter = election == 0 ? 0 : ThreadLocalRandom.current().nextLong(election);
+        return election + jitter;
+    }
+
+    /**
+     * First-deadline stagger: {@code ((wire - 1) mod voterCount) * (election / voterCount)}.
+     * Contiguous ids {@code 1..n} keep node 1 first; sparse ids stay inside one election period.
+     */
+    private long staggeredTimeout() {
+        long election = options.electionTimeout().toNanos();
+        int count = Math.max(1, voters.size());
+        return election + (long) Math.floorMod(self.wire() - 1, count) * (election / count);
     }
 
     private byte[] voteBody(long voteTerm) {

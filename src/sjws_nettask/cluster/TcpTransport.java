@@ -27,7 +27,6 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -73,7 +72,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     public static final int MAX_FRAME_BYTES = 16 << 20;
     public static final int MAC_LENGTH = 32;
     /** A lower boot epoch is accepted only after the sender was silent this long. */
-    public static final long EPOCH_SILENCE_MILLIS = HeartbeatAuthenticator.WINDOW_MILLIS;
+    public static final long EPOCH_SILENCE_MILLIS = AuthReplay.WINDOW_MILLIS;
     private static final int HEADER_BYTES = 1 + 1 + 2 + 2 + 8 + 8 + 4 + 2;
     private static final byte[] LABEL = "sjws-raft-frame\0".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] HKDF_INFO = "sjws-raft-frame-v1".getBytes(StandardCharsets.US_ASCII);
@@ -131,7 +130,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private final AtomicLong inboundDrops = new AtomicLong();
     private final AtomicInteger[] rejected = new AtomicInteger[Reason.values().length];
     private final ReentrantLock replayLock = new ReentrantLock();
-    private final Map<Integer, long[]> replay = new HashMap<>();
+    private final AuthReplay replay = new AuthReplay();
     private final ServerSocket server;
     private final Thread acceptor;
     private volatile BiConsumer<NodeId, SimTransport.Frame> handler;
@@ -311,11 +310,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         var buf = ByteBuffer.wrap(bytes);
         int version = buf.get();
         int keyId = buf.get();
-        if (version != VERSION || (keyId != HeartbeatAuthenticator.KEY_CURRENT
-                && keyId != HeartbeatAuthenticator.KEY_PREVIOUS)) {
+        if (version != VERSION || !AuthReplay.keyIdOk(keyId)) {
             return drop(Reason.MALFORMED);
         }
-        var mac = keyId == HeartbeatAuthenticator.KEY_CURRENT ? current : previous;
+        var mac = keyId == AuthReplay.KEY_CURRENT ? current : previous;
         if (mac == null || !tagMatches(mac, bytes)) {
             return drop(Reason.TAG);
         }
@@ -329,32 +327,26 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         if (groupLength == 0 || bodyLength < 0) {
             return drop(Reason.MALFORMED);
         }
-        if (dest != self.wire()) {
-            return drop(Reason.DEST);
-        }
         var sender = byWire.get(from);
-        if (sender == null || sender.equals(self)) {
-            return drop(Reason.MEMBER);
-        }
-        if (seq <= 0 || epoch > nowMillis + HeartbeatAuthenticator.WINDOW_MILLIS) {
-            return drop(seq <= 0 ? Reason.SEQ : Reason.EPOCH);
-        }
+        AuthReplay.Decision decision;
         replayLock.lock();
         try {
-            var state = replay.get(from);
-            if (state == null || epoch > state[0]
-                    || (epoch < state[0] && nowMillis - state[2] >= EPOCH_SILENCE_MILLIS)) {
-                replay.put(from, new long[] {epoch, seq, nowMillis});
-            } else if (epoch < state[0]) {
-                return drop(Reason.EPOCH);
-            } else if (seq <= state[1]) {
-                return drop(Reason.SEQ);
-            } else {
-                state[1] = seq;
-                state[2] = nowMillis;
-            }
+            decision = replay.accept(from, dest, self.wire(), epoch, seq, nowMillis, EPOCH_SILENCE_MILLIS,
+                    wire -> {
+                        var id = byWire.get(wire);
+                        return id != null && !id.equals(self);
+                    });
         } finally {
             replayLock.unlock();
+        }
+        if (decision != AuthReplay.Decision.OK) {
+            return drop(switch (decision) {
+                case DEST -> Reason.DEST;
+                case MEMBER -> Reason.MEMBER;
+                case EPOCH -> Reason.EPOCH;
+                case SEQ -> Reason.SEQ;
+                case OK -> throw new IllegalStateException();
+            });
         }
         var group = new String(bytes, HEADER_BYTES, groupLength, StandardCharsets.UTF_8);
         var body = new byte[bodyLength];
@@ -394,7 +386,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         mac.update(LABEL);
         mac.update(bytes, 0, bytes.length - MAC_LENGTH);
         var tag = mac.doFinal();
-        return MessageDigest.isEqual(tag, java.util.Arrays.copyOfRange(bytes, bytes.length - MAC_LENGTH,
+        return AuthReplay.tagEquals(tag, java.util.Arrays.copyOfRange(bytes, bytes.length - MAC_LENGTH,
                 bytes.length));
     }
 
