@@ -56,7 +56,12 @@ How this is enforced is in §3.3.
    - no file under `src/sjws_nettask/{core,http1,h2,h3,routing,messaging,cp,controlplane,cluster,observe,config}` contains `sjws_nettask.swarm`;
    - `swarm.wire` imports only `core`.
 2. **Class-load test**, cloned from `tests/sjws_nettask/cp/ClassLoadTest.java:1-45`. That test starts `sjws_nettask.ha.BenchServer --mode=single` under `-Xlog:class+load=info` and asserts that no `sjws_nettask.cp.`, `cluster.` or `service.` class was loaded. The swarm test adds `assertFalse(text.contains("sjws_nettask.swarm."))`, in standalone mode and in `data`/`gateway` mode without `swarm.enabled`.
-3. **Single entry point.** The composition root (`SjwsServer` / `service.Bootstrap`) references the swarm only through `ServiceLoader.load(OptionalModule.class)`, or one reflective `Class.forName("sjws_nettask.swarm.SwarmModule")`, and only when `swarm.enabled` is true. That keeps the swarm out of the verifier's reach when off. `service.Bootstrap` already gates `messaging` the same way, by name (`src/sjws_nettask/service/Bootstrap.java:43`).
+3. **Single entry point** (shipped in #90). `sjws_nettask.OptionalModules` is the only code outside `swarm` that names the swarm, and it does so only as the string constant `SWARM_CLASS = "sjws_nettask.swarm.SwarmModule"` (`src/sjws_nettask/OptionalModules.java:33-35`).
+   - When the JVM property `-Dsjws.swarm.enabled=true` is set, or the environment variable `SJWS_SWARM_ENABLED=true` (the property wins), it loads `SwarmModule` by reflection, `Class.forName(...).asSubclass(OptionalModule.class)` (`OptionalModules.java:52-65`).
+   - Otherwise it returns a shared no-op `OptionalModules.NONE`, so no swarm class is loaded or verified.
+   - Both startup paths call it once, after the server starts and outside any request path: `try (var modules = OptionalModules.start(err))` in `Sjws_nettask.serve` (`src/sjws_nettask/Sjws_nettask.java:95,127`).
+   - The YAML key `swarm.enabled` replaces the property/env gate in S1 (§12).
+   - No existing package used this pattern before #90: `service/Bootstrap.java:43` is only the `"messaging"` capability string, not a gate.
 4. **Off-mode wrk gate** (§13, item 3). It is the backstop, not the proof. wrk cannot resolve a single extra volatile read; tests 1–3 can.
 
 ## 4. Task model on messaging (Co-author: Messaging Core; their notes integrated 2026-10-13, pending their review of this text)
@@ -73,30 +78,33 @@ This section is grounded in what is merged: #21 ledger, #33 delivery, #69 snapsh
 | Swarm concept | Existing primitive (master) |
 |---|---|
 | Task queue for a service | Topic `tasks.<pool>` (the pool is the service name from §7). The worker pool is a consumer group; a worker is the `consumer` id in `poll`. Competing consumers are built in: each message is leased to one consumer of the group. |
-| Submit | `Partition.produce(producerId, seq, payload[, durability])` (`Partition.java:183,190`). Dedup on `(producerId, seq)` with a window of 4096 per producer (`DeliveryState.java:40`), durable across restarts via snapshots. |
-| Claim + lease | `Partition.poll(group, consumer, max, visibilityMs)` (`Partition.java:225`). It records `LedgerEntry.Deliver(group, offset, consumer, deadlineMs, attempt)` (`LedgerEntry.java:27`). On expiry the message is redelivered on the next poll with `attempt + 1`. |
-| Complete | `Partition.ack(group, offset[, durability])` (`Partition.java:262,265`) |
-| Transient failure (rate limit, tool timeout) | `Partition.nack(group, offset, retryAfterMs)` (`Partition.java:279`): `notBefore = now + max(delay, backoff)`. Backoff is `RetryPolicy.backoffMs`, `base << (attempt-1)` capped at `backoffMaxMs`. The default is `RetryPolicy(5, 100, 30_000)` (`RetryPolicy.java:7-20`). |
-| Deterministic failure (bad input) | `Partition.reject(group, offset, reason)` (`Partition.java:298`) sends the message straight to the DLQ. |
+| Submit | `Partition.produce(producerId, seq, payload[, durability])` . Dedup on `(producerId, seq)` with a window of 4096 per producer (`DeliveryState.java:40`), durable across restarts via snapshots. |
+| Claim + lease | `Partition.poll(group, consumer, max, visibilityMs)` . It records `LedgerEntry.Deliver(group, offset, consumer, deadlineMs, attempt)` (`LedgerEntry.java:27`). On expiry the message is redelivered on the next poll with `attempt + 1`. |
+| Complete | `Partition.ack(group, offset[, durability])`  |
+| Transient failure (rate limit, tool timeout) | `Partition.nack(group, offset, retryAfterMs)` : `notBefore = now + max(delay, backoff)`. Backoff is `RetryPolicy.backoffMs`, `base << (attempt-1)` capped at `backoffMaxMs`. The default is `RetryPolicy(5, 100, 30_000)` (`RetryPolicy.java:7-20`). |
+| Deterministic failure (bad input) | `Partition.reject(group, offset, reason)`  sends the message straight to the DLQ. |
 | Worker crash | Lease expiry, which counts as an attempt. |
-| Exhausted | At `maxAttempts` the message moves to `<topic>.dlq` (`Partition.deadLetterQueue()`, `Partition.java:179`) with origin group, offset, attempts and reason, e.g. `lease-expired:max-attempts` / `nacked:max-attempts` (`Partition.java:238,286`). |
+| Exhausted | At `maxAttempts` the message moves to `<topic>.dlq` (`Partition.deadLetterQueue()`, `Partition`) with origin group, offset, attempts and reason, e.g. `lease-expired:max-attempts` / `nacked:max-attempts` . |
 | State | `MessageState { ENQUEUED, IN_FLIGHT, ACKED, DEAD_LETTERED }` (`MessageState.java:4`) |
 
 The retry policy is set per topic through the `retry:` block of the #39 schema (`docs/messaging/config.md`). That schema is not parsed by code yet (**GAP**).
 
-### 4.2 Heartbeat = lease extension (**GAP**, Messaging Core proposal)
-- `extend(group, offset, attempt, visibilityMs) → boolean` appends a new `LedgerEntry.Extend(group, offset, attempt, newDeadlineMs)` record; replay sets the lease deadline. It is rejected if the message is not in flight or the attempt doesn't match.
-- Batched form: `extend(group, List<offset>)` writes one record batch per worker.
-- Cost: one small append per heartbeat. Recommended: heartbeat at ≤ visibility/3, batched per worker. The swarm's `LeaseKeeper` does the batching.
-- Until `extend` exists, phase S1 uses fixed leases only.
+### 4.2 Heartbeat = lease extension (Messaging Core, #91 in review)
+- `extend(group, offset, attempt, visibilityMs) → LeaseResult`.
+- Batched form: `extend(group, long[] offsets, int[] attempts, visibilityMs) → List<LeaseResult>`. The attempts travel with the offsets, because a bare list of offsets cannot be fenced.
+- Ledger record: `Extend(group, deadlineMs, offsets[], attempts[])`, **record type 7**. One record is written per call and covers the accepted leases only; replay sets the lease deadlines. A build older than #91 refuses a log that contains it.
+- `LeaseResult` is `{OK, NOT_IN_FLIGHT, STALE_ATTEMPT}`, the same result the fenced settles return (§4.3).
+- Cost: one small append per heartbeat call. Heartbeat at ≤ visibility/3. The #91 bench shows batched heartbeats cost −1.4 % (within noise) and unbatched about −9 %, so **`LeaseKeeper` must use the batched form**.
+- Until #91 merges, the swarm uses fixed leases only.
 
-### 4.3 Fencing (**GAP**, Messaging Core proposal; priority 1)
-`ack`/`nack`/`reject` take `(group, offset)` only (`Partition.java:262,279,298`; `LedgerEntry.Ack` at `LedgerEntry.java:30`). A stale worker whose lease expired and was re-leased can therefore ack the *new* attempt.
-
-The proposal: `ack`/`nack`/`reject`/`extend` carry the `attempt` from `Delivery` as a lease token, and a mismatch is rejected. The old signatures stay as "any attempt" for compatibility. This ships as Messaging Core PR **#87**. **The swarm uses only the fenced forms.** The SDK passes the attempt automatically.
+### 4.3 Fencing (Messaging Core, **#87 merged**)
+- Before #87, `ack`/`nack`/`reject` took `(group, offset)` only, so a stale worker whose lease had expired and been re-leased could settle the *new* attempt.
+- #87 adds fenced forms that carry the `attempt` from `Delivery` as a lease token and return `LeaseResult {OK, NOT_IN_FLIGHT, STALE_ATTEMPT}`.
+- The old unfenced overloads still match any attempt. They are **deprecated now** (`@Deprecated(forRemoval = true)`, pointing at the fenced forms, in a small Messaging Core follow-up) and are **removed after one release**.
+- **The swarm SDK and wire protocol expose only fenced settles.** The SDK passes the attempt automatically.
 
 ### 4.4 Results, idempotency, exactly-once
-- **Order:** the reply is made durable first, then the task is acked. A crash in between redelivers the task.
+- **Order:** the worker writes the reply with `Durability.ASYNC` via `produce(…, durability)` and **acks the task only when the reply's durability future completes**. A crash before that redelivers the task, and the caller deduplicates by `taskId`. Results are not lossy. Once partitions replicate, the reply uses the decided majority in-memory ack (`strict` per topic is available), and the task ack follows the reply's replicated ack.
 - **Producer side** (implemented): `(producerId, seq)` dedup. Agents persist `producerId` and a monotonic `seq`, or derive `seq` deterministically (e.g. the step number in a plan), so a publish retried after a crash is dropped.
 - **Consumer side** (application): delivery is at-least-once, so side effects are keyed by `taskId` (plus `attempt` for fencing). Tools that call external APIs pass `taskId` as their idempotency key (also §10.2).
 - Exactly-once consume-transform-produce would need a cross-partition transaction (**GAP**). It is not proposed for v1.
@@ -118,25 +126,29 @@ When headers land (**GAP 3** in §4.8), the metadata fields move to headers and 
 - **GAP:** per-consumer counters (in-flight per worker, extends, last heartbeat age) in `DeliveryCounts`, plus fixed-bucket latency histograms (enqueue→first delivery, delivery→ack) updated on the partition thread.
 
 ### 4.8 Gap order (Messaging Core)
-1. Attempt-fenced ack/nack/reject (PR #87, in review).
-2. `extend`, with the `Extend` record and the batched form.
+1. Attempt-fenced ack/nack/reject (PR #87, **merged**); deprecate the unfenced forms now and remove them after one release.
+2. `extend`, with the `Extend` record (type 7) and the fenced batched form (PR #91, in review).
 3. Message headers in `Enqueue`.
 4. Broker-side TTL / `expireAt`.
 5. Multi-partition topics with key hashing; max in-flight per key.
 6. DLQ redrive; deterministic jitter.
 7. Producer backpressure signal; per-consumer stats and latency histograms.
-8. Network protocol and replication (per #17 / HA). These are required before agents run on more than one node.
+8. Producer-id expiry (needed before long-lived agents churn producer ids).
+9. Network protocol and replication (per #17 / HA). These are required before agents run on more than one node.
 
 ## 5. Request/reply and token streaming (Co-author: Messaging Core; their notes integrated, pending their review of this text)
 
 ### 5.1 Request/reply
-- Reply topics are **one per requester**, `reply.<agentId>`. Each has a single consumer, so there is no group contention, and the requester correlates in memory (`correlationId → future`). This replaces the earlier per-session inbox idea.
+- Reply topics are **one per requesting node or process**: `reply.<nodeId|processId>`, demultiplexed in memory by `correlationId` (`correlationId → future`). Each `Partition` owns writer, syncer and snapshotter threads, doubled with its `.dlq`, so a topic per agent would not scale.
+- Reply topics are created **without a DLQ**.
+- They are **closed after 10 minutes idle** (configurable; idle means lag 0 and no polls). The files are kept, the topic reopens on demand, and it is deleted after retention plus a grace period.
+- A Messaging follow-up adds shared writer/syncer executors.
 - **Deadlines:**
   - A worker rejects a request whose `deadlineMs` passed before it started (`reject("deadline")`, visible in the DLQ).
   - The worker sets `visibilityMs ≤ deadlineMs − now`.
   - The requester times out locally and answers the HTTP caller with a 504-class error. A late reply is acked and discarded.
   - Broker-side TTL is §4.6.
-- **Durability:** replies use `Durability.NONE`/`ASYNC` (`messaging/ledger/Durability.java:9-17`). The request is the durable record of intent.
+- **Durability:** replies are written with `Durability.ASYNC` (`messaging/ledger/Durability.java`), and the task is acked only after the reply is durable (§4.4). `NONE` is not used for replies: a crash after the ack would lose both the reply and the task.
 
 ### 5.2 Token streaming
 There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP leg is Architecture's.
@@ -144,10 +156,11 @@ There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP l
 - **Ledger leg (Messaging Core).**
   - One stream maps to one partition key, `streamId`, and all chunks of a stream land on one partition, so they are ordered by offset. Until multi-partition topics exist, a stream topic is sharded as one `Partition` per shard.
   - **Chunk framing** in the payload envelope: `streamId`, `chunkSeq` (u32, starting at 0), `flags` (`FIRST`, `LAST`, `ERROR`, `CANCELLED`) and `bytes`.
-  - The producer uses `producerId = hash(streamId)` and `seq = chunkSeq`, so the existing dedup drops retransmitted chunks.
+  - Chunks are produced with the **agent's own `producerId`/`seq`**, not a per-stream producer id. Producer dedup state (≤ 4096 seqs per producerId) is never evicted, so per-stream ids would leak forever; producer-id expiry is recorded as a messaging gap (§4.8). **Consumers drop duplicates by `(streamId, chunkSeq)`**, which they already track in order to reorder.
+  - **Payload size:** at most 1 MiB inline per message by default, configurable per topic. The hard limit is 64 MiB (`RecordBatch.MAX_FRAME_BYTES`). Larger bodies go by reference to a **blob store owned by the swarm** (or a storage module), not by messaging, which stays opaque bytes plus ordering and retention.
   - **Coalescing:** a chunk closes at 1–4 KiB or 20 ms, whichever comes first. Per-token messages would cost about one append per token.
   - **Consumer:** one consumer per stream, reordering by `chunkSeq`. Gaps after a lease expiry are filled by redelivery. Max in-flight per key = 1 is the later alternative (§4.6).
-  - **Durability:** chunks use `NONE`/`ASYNC`. The final `LAST` chunk may use `GROUP` when the caller needs it durable. Per-append durability already exists (`Partition.java:190`).
+  - **Durability:** chunks use `NONE`/`ASYNC`. The final `LAST` chunk may use `GROUP` when the caller needs it durable. Per-append durability already exists .
 - **HTTP leg (Architecture).**
   - The gateway node that holds the caller's session consumes the stream and writes it as HTTP/1.1 chunked (`http1/Http1Writer.java:236-251`), as `text/event-stream` ([WHATWG HTML, Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)), or as h2/h3 DATA frames.
   - The body is a `core.Body.Stream`, which already pulls one chunk at a time (`routing/ProxyHandler.java:55-58`).
@@ -162,9 +175,12 @@ There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP l
 
 **DECIDED (2026-10-13, inceptor): streaming path.**
 - The **ledger is the default** for tasks and results.
-- The **direct path** (agent → HTTP gateway over h2/h3: no ledger write, no resume, no replay) is allowed **only for ephemeral token streams to HTTP-gateway clients**. It is **opt-in per request** (`stream: direct` in the request; the SDK's `stream(..., direct=True)`).
-- Even on the direct path, the **final result is always written to the ledger**, as a `LAST` result message on `reply.<agentId>`, followed by the fenced task ack (§4.3/§4.4). Only intermediate tokens skip the ledger.
-- A direct stream that breaks is not resumable. The caller falls back to the ledger result.
+- The **direct path** (agent → HTTP gateway over h2/h3: no ledger write, no resume, no replay) is allowed **only for ephemeral token streams to HTTP-gateway clients** (HTTP LLM-gateway responses). It is **opt-in per request or per route** (`stream: direct` in the request; the SDK's `stream(..., direct=True)`). Messaging Core accepts it under these conditions (sign-off on #90):
+  - It is documented as **lossy and non-resumable**: a failure ends the stream with an `ERROR` chunk, and there is no replay.
+  - It uses the same chunk framing (`streamId`, `chunkSeq`, `flags`, `bytes`) and the same `TOKEN`/`CANCEL`/`CREDIT` frames as §11.2, so clients have one decoder.
+  - It lives outside `sjws_nettask.messaging`, so the §3.3 guards hold.
+- Even on the direct path, the **final result is always written to the ledger**, as a `LAST` result message on `reply.<nodeId|processId>`, followed by the fenced task ack (§4.3/§4.4). Only intermediate tokens skip the ledger.
+- A direct stream that breaks ends with an `ERROR` chunk and is not resumable. The caller falls back to the ledger result.
 
 ## 6. Agent identity and RBAC
 - **Identity. DECIDED (2026-10-13, inceptor):** agent certificates come from a **separate intermediate CA** under the CP trust root (`cp/KeyRing.java`, `cp/TrustKey.java`), not from the node enrollment CA (`service/NodeEnrollment.java`, `service/JoinMaterial.java`). Agent certificates are short-lived and numerous, and they are revoked separately from node certificates. Revoking an agent never touches node trust, and a compromised agent CA can be rotated without re-enrolling nodes. Every agent connection is mTLS. The agent id is the certificate subject, which `controlplane.Rbac.ClientCert(subject)` already models (`controlplane/Rbac.java:50`).
@@ -270,8 +286,8 @@ The transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existing liste
 ## 12. Phases and exit criteria
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
-| S0 | This design, plus the guard tests from §3.3 (dependency and class-load), merged before any swarm code | Tests green on master; Messaging Core sign-off on §4–§5 |
-| S1 | Uses the Messaging Core fencing PR **#87** ("fence ack/nack/reject with the delivery attempt (lease token)"), which ships separately. `swarm` package: submit, claim with fixed lease, fenced ack/nack/reject, DLQ, request/reply via `reply.<agentId>`; `swarm.wire` codec; Python SDK unary | #87 merged; §3.3 tests green; off-mode gate (§13) within band; task-dispatch and request/reply targets (§13) met or recorded |
+| S0 | **Done (#90).** This design, plus the guard tests from §3.3 (dependency and class-load) and the single entry point, merged before any swarm code | Tests green on master ✅; Messaging Core sign-off on §4–§5 ✅, received on #90 (https://github.com/BlivionIaG/sjws_nettask/pull/90#pullrequestreview-5500560114) with three doc fixes, all applied here. **S0 exit criteria met.** |
+| S1 | Uses the Messaging Core fencing PR **#87** ("fence ack/nack/reject with the delivery attempt (lease token)"), which ships separately. `swarm` package: submit, claim with fixed lease, fenced ack/nack/reject, DLQ, request/reply via `reply.<nodeId|processId>`; `swarm.wire` codec; Python SDK unary. **Decided (2026-10-13, inceptor):** (a) the YAML key `swarm.enabled` is added in S1 together with Config & ACME, which owns `ConfigLoader`; the `-Dsjws.swarm.enabled` / `SJWS_SWARM_ENABLED` gate stays in use until then. (b) S1 adds a class-load test that starts a real `data`/`gateway` role process, using a CP fixture from Integration Tests, and asserts that no `sjws_nettask.swarm.` class is loaded with the swarm off | #87 merged; `swarm.enabled` YAML key parsed (off by default); data/gateway role class-load test green; §3.3 tests green; off-mode gate (§13) within band; task-dispatch and request/reply targets (§13) met or recorded |
 | S2 | Messaging gap 2 (`extend` + `Extend` record) and `LeaseKeeper`; ledger token streaming (`chunkSeq` framing + HTTP leg), the default; cancellation; W3C trace propagation; `AgentPolicy` document and the agent intermediate CA; GCRA quotas; `BudgetLedger` with the **soft global cap** (§8) | Stale-worker fencing and lease-expiry redelivery tests; heartbeat and streaming targets (§13); trace spans across 3 hops; mTLS-only agent auth with agent-CA revocation tests; 429 + `Retry-After` tests; a budget test asserting that the overshoot stays within the §8 bound |
 | S3 | **Hard per-node budget sub-allocation by the CP**; `AgentDirectory` discovery for push-style agents | Sub-allocation tests (no node exceeds its grant; re-grant on node loss) |
 | S4 | `LlmGateway` (weighted routing, circuit breaking, retries only with `Idempotency-Key`, usage accounting); the opt-in **direct** token path for HTTP-gateway clients, with the final result still in the ledger (§5.2); OTLP exporter | Fault-injection tests (backend down, mid-stream abort); a test that a direct stream always produces a ledger result; wrk2 latency through the gateway |
@@ -318,11 +334,11 @@ These are the reference points for the targets below. Neither this PR nor the ta
 | Token-per-message ledger write amplification | Chunks coalesced to 1–4 KiB or 20 ms (§5.2); opt-in direct path for ephemeral HTTP token streams only (decided, §5.2) |
 | Direct-path stream lost on gateway failure | Not resumable by design; the final result is always in the ledger (§5.2) |
 | Stale worker acks a re-leased attempt | Attempt-fenced ack/nack/reject (#87) and extend (§4.3), used exclusively by the swarm |
-| Multi-node agents blocked on messaging network protocol and replication | Single-node scope until gap 8 (§4.8); phases S1–S3 run on one broker node |
+| Multi-node agents blocked on messaging network protocol and replication | Single-node scope until gap 9 (§4.8); phases S1–S3 run on one broker node |
 | Budget overspend across nodes (S0–S2) | Soft global cap with a stated bound, `Σ F_n·ε_max + Σ D_n(T_sync)` (§8); `ε_max = 0` when the estimate is enforced as a per-call cap; hard per-node sub-allocation in S3 |
 | Retrying non-idempotent LLM POSTs duplicates cost | Retry a POST only with `Idempotency-Key` (decided, §10.2) |
 | An agent cert compromise | Separate agent intermediate CA with short-lived certs, revoked independently of nodes (§6); `AuditLog`; per-agent GCRA caps the blast radius |
-| Large prompts and results bloating the ledger | Inline size limit, plus storage by reference (§16 Q1) |
+| Large prompts and results bloating the ledger | Inline size limit, plus storage by reference (1 MiB inline default, swarm-owned blob store, §5.2) |
 
 ## 15. Decisions (2026-10-13, inceptor)
 1. **Streaming:** the ledger is the default; the direct path is opt-in per request for ephemeral HTTP-gateway token streams only; the final result is always in the ledger (§5.2).
@@ -334,12 +350,13 @@ These are the reference points for the targets below. Neither this PR nor the ta
 
 No Architecture/CP questions remain open.
 
-## 16. Open questions for Messaging Core
+## 16. Messaging Core questions: resolved
 
-Resolved questions were removed; they are answered in §4–§5 and §15. Still open:
+Messaging Core answered every remaining question in its sign-off (https://github.com/BlivionIaG/sjws_nettask/pull/90#pullrequestreview-5500560114). No messaging questions remain open.
 
-1. **Large payloads.** What is the maximum inline payload in the ledger, and does a by-reference blob store belong to messaging or to the swarm?
-2. **Replicated results.** Once partitions replicate (gap 8), should swarm results default to the decided majority in-memory ack (`docs/design/architecture.md` §A, Decided)?
-3. **Network protocol ownership.** Messaging has no broker network protocol yet (gap 8). Should the swarm wire protocol (§11.2) be the first network binding of `Partition` operations, or should it wait for and wrap Messaging Core's own protocol (#17 §10.1)?
-4. **Reply topic lifecycle.** With one `reply.<agentId>` topic per requester, how are idle reply topics closed and reclaimed, given per-partition threads and segment preallocation (`docs/messaging/design.md` §2.1)?
-5. **Unfenced forms.** #87 keeps the old `ack/nack/reject(group, offset)` overloads matching any attempt. Should they be deprecated once the swarm and all other callers use the fenced forms?
+1. **Default streaming path:** the ledger for everything routed through the swarm. The direct path is an opt-in for HTTP LLM-gateway responses only, lossy and with shared framing (§5.2).
+2. **Inline payload:** 1 MiB maximum by default, configurable per topic, with a 64 MiB hard limit (`RecordBatch.MAX_FRAME_BYTES`). Above that, use a by-reference blob store **owned by the swarm**, not messaging (§5.2).
+3. **Replicated results:** the decided majority in-memory ack, with `strict` per topic; the task ack follows the reply's replicated ack (§4.4).
+4. **Network protocol:** the swarm wire protocol (§11.2) is the **first network binding of `Partition`**. Its frames are defined generically (produce, poll, ack, nack, reject, extend, with lease tokens) and referenced from `docs/messaging/design.md` §10, rather than building a parallel broker protocol.
+5. **Reply topics:** one per node or process, `reply.<nodeId|processId>`, demultiplexed by `correlationId`. No DLQ; closed after 10 minutes idle, reopened on demand, deleted after retention plus a grace period (§5.1).
+6. **Unfenced settles:** deprecated now (#87 is merged) and removed after one release. The swarm exposes only fenced settles (§4.3).

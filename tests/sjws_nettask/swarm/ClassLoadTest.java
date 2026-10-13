@@ -77,10 +77,26 @@ class ClassLoadTest {
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
     }
 
+    @Test
+    void yamlKeyFalseLoadsNoSwarmClass() throws Exception {
+        var text = run(List.of(), "Server started:", "sjws_nettask.Sjws_nettask", "--config=" + yaml("swarm:\n  enabled: false\n"));
+        assertFalse(text.contains(SWARM), text);
+    }
+
+    @Test
+    void yamlKeyTrueLoadsTheSwarmModule() throws Exception {
+        var text = run(List.of(), "Server started:", "sjws_nettask.Sjws_nettask", "--config=" + yaml("swarm:\n  enabled: true\n"));
+        assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
+    }
+
     private Path yaml() throws Exception {
+        return yaml("");
+    }
+
+    private Path yaml(String extra) throws Exception {
         var root = Files.createDirectories(this.dir.resolve("site"));
-        var yaml = this.dir.resolve("sjws.yaml");
-        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n");
+        var yaml = this.dir.resolve("sjws-" + System.nanoTime() + ".yaml");
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n" + extra);
         return yaml;
     }
 

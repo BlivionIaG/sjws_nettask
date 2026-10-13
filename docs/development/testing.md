@@ -19,6 +19,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `ReloadHookTest` | reload hook registry |
 | `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance (linux/amd64), hot cert swap |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
+| `admin/cp/CpConsoleTest` | control-plane console: label selectors, diff, validation, stage/rollout/rollback on the fake CP, failover client, rendering, zero-cost guard |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
 | `observe/NodeReporterTest` | control heartbeat: 5 s cadence reuses the report, sequence advances only on a fresh take, cumulative 4xx/5xx, health and config generation suppliers, log2 histogram merge and p99 bucket bound |
 | `observe/ClusterBoardTest` | cluster aggregate: per-node rate from cumulative snapshots, restart zeroes the interval, merged p99, errors by node and route, config drift, label-name cap |
