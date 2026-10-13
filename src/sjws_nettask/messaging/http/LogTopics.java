@@ -33,8 +33,12 @@ final class LogTopics implements AutoCloseable {
 
     static final Pattern NAME = Pattern.compile("[A-Za-z0-9._-]{1,128}");
 
-    /** {@code reads} serializes fetches: segment readers keep a sequential-read hint and chunk cache. */
-    record Log(SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantLock reads) { }
+    /**
+     * {@code reads} guards segment deletion against fetches: fetches share the read lock (segment readers publish their
+     * chunk cache and sequential hint as immutable volatile records, so concurrent readers are safe and at worst lose a
+     * hint); retention takes the write lock.
+     */
+    record Log(SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantReadWriteLock reads) { }
 
     private final Path dir;
     private final Durability durability;
@@ -102,7 +106,7 @@ final class LogTopics implements AutoCloseable {
 
     /**
      * Applies {@link LogRetention} to every open topic; returns the number of segments deleted. Deletion holds the
-     * topic's {@code reads} lock, so a concurrent fetch never reads a segment being removed. The writer only touches
+     * topic's {@code reads} write lock, so a concurrent fetch never reads a segment being removed. The writer only touches
      * the active segment, which is never deleted.
      */
     int enforceRetention() throws IOException {
@@ -110,7 +114,7 @@ final class LogTopics implements AutoCloseable {
         int deleted = 0;
         long now = this.clockMs.getAsLong();
         for (var l : this.logs.values()) {
-            l.reads().lock();
+            l.reads().writeLock().lock();
             try {
                 long total = l.log().totalBytes();
                 for (var seg : l.log().segments()) {
@@ -120,7 +124,7 @@ final class LogTopics implements AutoCloseable {
                     deleted++;
                 }
             } finally {
-                l.reads().unlock();
+                l.reads().writeLock().unlock();
             }
         }
         return deleted;
@@ -141,7 +145,7 @@ final class LogTopics implements AutoCloseable {
             l = this.logs.get(topic);
             if (l == null) {
                 var log = SegmentedLog.open(this.dir.resolve(topic), this.segmentBytes);
-                l = new Log(log, new LedgerWriter(log, durability(topic)), new java.util.concurrent.locks.ReentrantLock());
+                l = new Log(log, new LedgerWriter(log, durability(topic)), new java.util.concurrent.locks.ReentrantReadWriteLock());
                 this.logs.put(topic, l);
             }
             return l;
