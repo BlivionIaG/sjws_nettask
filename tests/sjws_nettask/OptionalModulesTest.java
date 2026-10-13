@@ -69,7 +69,7 @@ class OptionalModulesTest {
 
     @Test
     void enabledLoadsTheSwarmByName() {
-        var module = OptionalModules.start(k -> "true", Map.of(), System.err);
+        var module = OptionalModules.start(k -> k.equals(OptionalModules.SWARM_PROPERTY) ? "true" : null, Map.of(), System.err);
         var swarm = assertInstanceOf(SwarmModule.class, module);
         assertEquals(List.of(module), OptionalModules.contributors(module));
         module.close();
@@ -97,5 +97,27 @@ class OptionalModulesTest {
     @Test
     void theSwarmIsReferencedOnlyByName() {
         assertTrue(OptionalModules.SWARM_CLASS.equals(SwarmModule.class.getName()));
+    }
+
+    @Test
+    void messagingOffByDefaultAndLoadsByName() throws Exception {
+        assertFalse(OptionalModules.messagingEnabled(NO_PROPS, Map.of()));
+        assertFalse(OptionalModules.messagingEnabled(NO_PROPS, Map.of(OptionalModules.MESSAGING_ENV, "yes")));
+        var dir = java.nio.file.Files.createTempDirectory("msgmod");
+        System.setProperty("sjws.messaging.dir", dir.toString());
+        try {
+            var only = OptionalModules.start(k -> k.equals(OptionalModules.MESSAGING_PROPERTY) ? "true" : null, Map.of(), System.err);
+            assertInstanceOf(sjws_nettask.messaging.http.MessagingModule.class, only);
+            assertEquals(List.of(only), OptionalModules.contributors(only));
+            only.close();
+            var both = OptionalModules.start(k -> "true", Map.of(), System.err);
+            var pair = assertInstanceOf(OptionalModules.Both.class, both);
+            assertInstanceOf(SwarmModule.class, pair.first());
+            assertEquals(2, OptionalModules.contributors(both).size());
+            both.close();
+            assertTrue(((SwarmModule) pair.first()).closed());
+        } finally {
+            System.clearProperty("sjws.messaging.dir");
+        }
     }
 }

@@ -38,6 +38,10 @@ final class OptionalModules {
     static final String SWARM_ENV = "SJWS_SWARM_ENABLED";
     static final String SWARM_CLASS = "sjws_nettask.swarm.SwarmModule";
 
+    static final String MESSAGING_PROPERTY = "sjws.messaging.enabled";
+    static final String MESSAGING_ENV = "SJWS_MESSAGING_ENABLED";
+    static final String MESSAGING_CLASS = "sjws_nettask.messaging.http.MessagingModule";
+
     /** What starts when nothing is enabled: no allocation per call, nothing to close. */
     static final OptionalModule NONE = () -> { };
 
@@ -67,10 +71,18 @@ final class OptionalModules {
 
     static OptionalModule start(Function<String, String> properties, Map<String, String> env, Boolean yaml,
             PrintStream err) {
-        if (!swarmEnabled(properties, env, yaml)) {
+        boolean swarm = swarmEnabled(properties, env, yaml);
+        boolean messaging = messagingEnabled(properties, env);
+        if (!swarm && !messaging) {
             return NONE;
         }
-        return load(SWARM_CLASS, err);
+        if (!messaging) {
+            return load(SWARM_CLASS, err);
+        }
+        if (!swarm) {
+            return load(MESSAGING_CLASS, err);
+        }
+        return new Both(load(SWARM_CLASS, err), load(MESSAGING_CLASS, err));
     }
 
     static OptionalModule start(PrintStream err) {
@@ -86,10 +98,34 @@ final class OptionalModules {
      * providers; the server does that while it compiles the terminal.
      */
     static List<HandlerContributor> contributors(OptionalModule module) {
+        if (module instanceof Both both) {
+            var out = new java.util.ArrayList<HandlerContributor>(2);
+            out.addAll(contributors(both.first()));
+            out.addAll(contributors(both.second()));
+            return List.copyOf(out);
+        }
         if (module instanceof HandlerContributor contributor) {
             return List.of(contributor);
         }
         return List.of();
+    }
+
+    /** {@code sjws.messaging.enabled} (property, then environment); off by default. No YAML key yet. */
+    static boolean messagingEnabled(Function<String, String> properties, Map<String, String> env) {
+        String value = properties.apply(MESSAGING_PROPERTY);
+        if (value == null) {
+            value = env.get(MESSAGING_ENV);
+        }
+        return value != null && "true".equalsIgnoreCase(value.trim());
+    }
+
+    /** Two enabled modules; closes the second first. */
+    record Both(OptionalModule first, OptionalModule second) implements OptionalModule {
+        @Override
+        public void close() {
+            this.second.close();
+            this.first.close();
+        }
     }
 
     static OptionalModule load(String className, PrintStream err) {
