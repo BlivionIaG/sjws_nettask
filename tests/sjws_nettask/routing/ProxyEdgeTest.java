@@ -319,10 +319,14 @@ class ProxyEdgeTest {
         }
     }
 
-    /** Under budget pressure reads shrink to 16 KiB, so the overshoot per exchange is small. */
+    /**
+     * A small budget still delivers the body and returns every byte. Chunk sizes on a live socket
+     * depend on how far the consumer gets ahead of the event loop, so the 16 KiB cap itself is
+     * checked on the allocator in {@link #pressuredReadsStayAtMost16KiB()}.
+     */
     @Test
-    void readsShrinkUnderBudgetPressure() throws Exception {
-        int size = 4 << 20;
+    void smallBudgetDeliversTheBodyAndReleasesIt() throws Exception {
+        int size = 1 << 20;
         try (var s = script("HTTP/1.1 200 OK\r\nContent-Length: " + size + "\r\n\r\n" + "v".repeat(size))) {
             var budget = new ByteBudget(64 * 1024);
             var d = Duration.ofSeconds(5);
@@ -330,18 +334,35 @@ class ProxyEdgeTest {
                     1 << 20, null, List.of(), false, 4), budget)) {
                 var src = ((Body.Stream) p.handle(new Request("GET", "/big")).body()).source();
                 long total = 0;
-                int largeAfterWarmup = 0;
+                long peak = 0;
                 for (var b = src.next(); b != null; b = src.next()) {
-                    if (total > 1 << 20 && b.remaining() > UpstreamPool.SMALL_READ) {
-                        largeAfterWarmup++;
-                    }
                     total += b.remaining();
-                    Thread.sleep(1); // a slow client keeps the budget under pressure
+                    peak = Math.max(peak, budget.inFlight());
                 }
                 src.close();
                 assertEquals(size, total);
-                assertTrue(largeAfterWarmup <= 2, "reads above 16 KiB under pressure: " + largeAfterWarmup);
+                assertEquals(0, budget.inFlight());
+                assertTrue(peak <= budget.limit() + UpstreamPool.MAX_READ, "peak " + peak);
             }
+        }
+    }
+
+    /** Once the budget is pressured, the allocator must not hand out a buffer above 16 KiB. */
+    @Test
+    void pressuredReadsStayAtMost16KiB() {
+        var handle = (UpstreamPool.Reads) new UpstreamPool.ReadSizes().newHandle();
+        for (int i = 0; i < 12; i++) {
+            int guess = handle.guess();
+            handle.lastBytesRead(guess);
+            handle.readComplete();
+        }
+        assertTrue(handle.guess() > UpstreamPool.SMALL_READ, "adaptive guess should have grown");
+        handle.small = true;
+        for (int i = 0; i < 8; i++) {
+            int guess = handle.guess();
+            assertTrue(guess <= UpstreamPool.SMALL_READ, "pressured guess " + guess);
+            handle.lastBytesRead(guess);
+            handle.readComplete();
         }
     }
 

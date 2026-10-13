@@ -20,9 +20,9 @@ import java.net.InetSocketAddress;
 import java.util.Objects;
 
 /**
- * Protocol-neutral request. Immutable. A filter that changes the method or target passes a
- * {@link #withMethod} / {@link #withTarget} copy into {@code proceed}; those copies keep
- * {@link #peer}, {@link #secure} and {@link #headers}.
+ * Protocol-neutral request. Immutable. A filter that changes the method, target or headers passes a
+ * {@link #withMethod} / {@link #withTarget} / {@link #withHeaders} copy into {@code proceed}.
+ * Those copies keep {@link #peer}, {@link #secure} and {@link #body}.
  * <p>
  * {@link #body} is a pull-style request body ({@link RequestBody#EMPTY} unless the transport
  * attached one). Do not buffer it into a {@code byte[]}.
@@ -88,5 +88,10 @@ public record Request(String method, String target, RequestHeaders headers, Inet
     /** Same request with {@code body}. */
     public Request withBody(RequestBody body) {
         return new Request(this.method, this.target, this.headers, this.peer, this.secure, this.protocol, body);
+    }
+
+    /** Same request, different headers. Keeps method, target, peer, secure, protocol and body. */
+    public Request withHeaders(RequestHeaders headers) {
+        return new Request(this.method, this.target, headers, this.peer, this.secure, this.protocol, this.body);
     }
 }
