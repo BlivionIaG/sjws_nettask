@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.nio.file.Files;
 import java.time.Duration;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -30,6 +31,23 @@ class ClusterBenchTest {
             }
             assertTrue(cluster.heartbeats() > 0);
             assertEquals("cluster", cluster.mode());
+            var side = ClusterSide.start();
+            try {
+                var voters = side.voters();
+                assertEquals(3, voters.voters().size());
+                var ids = voters.members();
+                var a = ids.get(0).id();
+                var b = ids.get(1).id();
+                var w = ids.get(2).id();
+                assertTrue(ids.get(2).witness());
+                assertFalse(ids.get(0).witness());
+                assertTrue(voters.policy().hasQuorum(voters.voters(), Set.of(a, b)));
+                assertTrue(voters.policy().hasQuorum(voters.voters(), Set.of(a, w)));
+                assertFalse(voters.policy().hasQuorum(voters.voters(), Set.of(a)));
+                assertFalse(voters.policy().hasQuorum(voters.voters(), Set.of(w)));
+            } finally {
+                side.close();
+            }
         } finally {
             cluster.close();
         }
