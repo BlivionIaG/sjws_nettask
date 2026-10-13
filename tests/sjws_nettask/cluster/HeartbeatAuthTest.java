@@ -264,6 +264,34 @@ class HeartbeatAuthTest {
     }
 
     @Test
+    void aLowerEpochWaitsForAtLeastFiveSeconds() {
+        long now = 40_000L;
+        long floor = HeartbeatAuthenticator.WINDOW_MILLIS;
+        var shortDead = new HeartbeatAuthenticator(ClusterKey.of(CURRENT, null), new FakeClock(0), 1_000L);
+        var high = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now, 2, 30_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, high);
+        assertNotNull(open(shortDead, high, now));
+        var low = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now + 1_000L, 1, 20_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, low);
+        assertNull(open(shortDead, low, now + 1_000L), "deadAfter below 5s does not reset the epoch yet");
+        var almost = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now + floor - 1, 1, 20_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, almost);
+        assertNull(open(shortDead, almost, now + floor - 1));
+        var ready = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now + floor, 1, 20_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, ready);
+        assertNotNull(open(shortDead, ready, now + floor), "5s of silence allows the earlier boot");
+
+        var longDead = new HeartbeatAuthenticator(ClusterKey.of(CURRENT, null), new FakeClock(0), 8_000L);
+        assertNotNull(open(longDead, high, now));
+        var atFloor = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now + floor, 1, 20_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, atFloor);
+        assertNull(open(longDead, atFloor, now + floor), "a longer dead interval still has to elapse");
+        var afterDead = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now + 8_000L, 1, 20_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, afterDead);
+        assertNotNull(open(longDead, afterDead, now + 8_000L));
+    }
+
+    @Test
     void aRestartedSenderIsAcceptedAndAPreBootCaptureIsNot() {
         var clock = new FakeClock(0L);
         clock.setWallMillis(5_000L);
