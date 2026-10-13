@@ -20,7 +20,17 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
+import sjws_nettask.SjwsServer;
+import sjws_nettask.cluster.FakeClock;
+import sjws_nettask.config.ConfigLoader;
+import sjws_nettask.cp.CpStore;
+import sjws_nettask.cp.KeyRing;
+import sjws_nettask.cp.LastGoodFiles;
+import sjws_nettask.cp.WatchServer;
+import sjws_nettask.service.ServiceLaunch;
 
 /**
  * Bootstrap files for a control or data process, under a caller-supplied temp directory.
@@ -51,17 +61,13 @@ import java.util.Objects;
  * {@code bootstrap} again. {@code ServiceDaemonTest} uses the same call.
  *
  * <p><b>Connected data node</b> ({@link ClusterHarness.DataRole#DATA}).
- * {@link #connected(Path)} is the variant that starts one data-role node against a live
- * in-process control plane on ephemeral ports, then lets the test push a config version.
- * It throws {@link ControlPlanePendingException} today. {@code sjws_nettask.cp.CpStore} is a
- * single voter and {@code AdminServer} can bind an ephemeral admin port, but there is no
- * data-node watch client: {@code ServiceLaunch} does not dial the control plane, so enrollment
- * stays {@code connection=pending} and a pushed {@code SignedSnapshot} is not applied.
- * {@link PendingControlPlane#available()} is false, so {@link ClusterHarness#open} still refuses
- * {@link ClusterHarness.DataRole#DATA} and the four fault scenarios in {@code ClusterScenariosTest}
- * stay {@code @Disabled}. Do not attach a {@code ControlPlaneBinding} to pretend the node connected.
- * {@code ConnectedDataNodeTest} is {@code @Disabled} with {@link #CONNECTED_PENDING} until a watch
- * client reports {@code connection=connected} and applies the pushed version.
+ * {@link #connected(Path)} starts an in-process single-voter {@code CpStore}, its loopback
+ * {@code WatchServer} on an ephemeral port, and one data-role {@code SjwsServer} whose
+ * {@code ServiceLaunch} hooks open the real data-node watch. The node reports
+ * {@code connection=connected} and applies each pushed {@code SignedSnapshot} on its own; nothing
+ * here attaches a {@code ControlPlaneBinding}. The multi-voter {@link ControlPlane} the four fault
+ * scenarios in {@code ClusterScenariosTest} need is still {@link PendingControlPlane}, so
+ * {@link ClusterHarness#open} still refuses {@link ClusterHarness.DataRole#DATA} there.
  */
 public final class NodeFixtures {
 
@@ -72,15 +78,12 @@ public final class NodeFixtures {
     public static final String JOIN_SECRET = "0123456789abcdef";
 
     /**
-     * Why {@link #connected(Path)} refuses, and why {@code ConnectedDataNodeTest} is disabled.
-     * The message starts with {@code TODO} and names the missing watch client.
+     * Why {@link ControlPlane} scenarios stay disabled: {@code CpStore} is a single voter, so
+     * {@code start(3|5)}, {@code killLeader}, and partitions have no real implementation yet.
      */
-    public static final String CONNECTED_PENDING = "TODO https://github.com/BlivionIaG/sjws_nettask/pull/38"
-            + " — data-node watch client is missing. CpStore is a single voter and AdminServer can bind"
-            + " an ephemeral port, but ServiceLaunch does not dial the control plane, so a data node stays"
-            + " connection=pending and does not apply a pushed SignedSnapshot."
-            + " Do not attach a ControlPlaneBinding to fake connection=connected."
-            + " PendingControlPlane.available() is false.";
+    public static final String VOTERS_PENDING = "TODO https://github.com/BlivionIaG/sjws_nettask/pull/38"
+            + " — CpStore is a single voter; multi-voter cp-config (start 3/5, killLeader, partition, delay)"
+            + " is still missing, so PendingControlPlane.available() is false.";
 
     private NodeFixtures() {
     }
@@ -124,25 +127,67 @@ public final class NodeFixtures {
     }
 
     /**
-     * A {@link ClusterHarness.DataRole#DATA} node joined to a live control plane.
-     * Throws until {@link #dataRoleCanJoin()} is true. Does not start a server and does not
-     * attach a binding.
+     * A {@link ClusterHarness.DataRole#DATA} node joined to a live in-process control plane over the
+     * real watch. Returns once the node reports {@code connection=connected} (version 0). The data
+     * node's {@code NodeEnrollment} is this process's only one, so one connected node at a time.
      */
     public static ConnectedDataNode connected(Path root) throws IOException {
         Objects.requireNonNull(root, "root");
-        if (!dataRoleCanJoin()) {
-            throw new ControlPlanePendingException(CONNECTED_PENDING);
+        var directory = root.toAbsolutePath();
+        Files.createDirectories(directory);
+        long now = System.currentTimeMillis();
+        var keys = KeyRing.generate("online-1", now + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var clock = new FakeClock(0);
+        var store = CpStore.open(directory.resolve("cp"), keys, clock);
+        WatchServer watch = null;
+        SjwsServer server = null;
+        sjws_nettask.ServiceHooks hooks = null;
+        try {
+            clock.advance(Duration.ofMillis(100));
+            store.drive();
+            if (!store.leadership().leaderReady()) {
+                throw new IOException("single voter did not become leaderReady");
+            }
+            watch = WatchServer.start(store, 0, System::currentTimeMillis);
+            var pin = directory.resolve("root.pub");
+            LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+            var token = directory.resolve("join.token");
+            Files.writeString(token, "token-id=node-1\nsecret=" + JOIN_SECRET + "\n");
+            Files.setPosixFilePermissions(token, PosixFilePermissions.fromString("rw-------"));
+            var boot = directory.resolve("bootstrap");
+            Files.writeString(boot, "role=data\ndata-role=gateway\nnode-id=gw-1\ncontrol-plane=127.0.0.1:"
+                    + watch.port() + "\npin=" + pin + "\njoin-token=" + token + "\nstate-dir="
+                    + directory.resolve("state") + "\n");
+            Files.setPosixFilePermissions(boot, PosixFilePermissions.fromString("rw-------"));
+            var html = Files.createDirectories(directory.resolve("html"));
+            Files.writeString(html.resolve("index.html"), "connected");
+            var yaml = directory.resolve("sjws.yaml");
+            Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + directory.resolve("config-state")
+                    + "\nserver:\n  port: 0\n  root: " + html + "\n");
+            server = SjwsServer.start(ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of()));
+            hooks = ServiceLaunch.prepare(boot, "data");
+            hooks.onListening(server, directory.resolve("node.pid"), Duration.ofSeconds(5));
+            var node = new ConnectedDataNode(store, watch, server, hooks, html);
+            node.awaitConnected(Duration.ofSeconds(20));
+            return node;
+        } catch (IOException | RuntimeException e) {
+            if (hooks != null) {
+                hooks.onShutdown();
+            }
+            if (server != null) {
+                server.close();
+            }
+            if (watch != null) {
+                watch.close();
+            }
+            store.close();
+            throw e;
         }
-        return new ConnectedDataNode();
     }
 
-    /**
-     * True only when a data process can dial an in-process control plane, report
-     * {@code connection=connected}, and apply a pushed snapshot on its own.
-     * {@code sjws_nettask.cp} can sign and serve admin HTTP. It does not do this.
-     */
+    /** True: a data process dials the in-process control plane and applies pushed snapshots itself. */
     public static boolean dataRoleCanJoin() {
-        return false;
+        return true;
     }
 
     /**

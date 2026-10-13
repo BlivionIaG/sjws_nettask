@@ -71,7 +71,7 @@ public final class CpStore implements AutoCloseable {
     private final Map<String, sjws_nettask.controlplane.Role> policy = new LinkedHashMap<>();
     private sjws_nettask.controlplane.Rbac rights;
     private sjws_nettask.controlplane.AuditLog audit;
-    private final List<String> revoked = new ArrayList<>();
+    private final List<String> revoked = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final List<String> selectors = new ArrayList<>();
     private final List<SignedSnapshot> history = new ArrayList<>();
     private final List<ConfigDocument> documents = new ArrayList<>();
@@ -81,6 +81,12 @@ public final class CpStore implements AutoCloseable {
     private java.nio.file.Path auditFile;
     private Staged staged;
     private int stage;
+
+    /** Newest activated envelope, for watch threads; written only where {@code history} grows. */
+    private volatile SignedSnapshot latest;
+    /** Guards the watch wait and the state watch threads touch: {@code reported} and {@code joins}. */
+    private final java.util.concurrent.locks.ReentrantLock watchLock = new java.util.concurrent.locks.ReentrantLock();
+    private final java.util.concurrent.locks.Condition activatedChanged = watchLock.newCondition();
 
     private CpStore(ReplicatedNode node, KeyRing keys) {
         this.node = node;
@@ -150,7 +156,53 @@ public final class CpStore implements AutoCloseable {
 
     /** Same node identity and token within the TTL returns the join already recorded. */
     public JoinTokens.Result presentJoin(String nodeId, String tokenId, byte[] secret, long nowMillis) {
-        return joins.present(nodeId, tokenId, secret, nowMillis, JoinTokens.DEFAULT_TTL_MILLIS);
+        watchLock.lock();
+        try {
+            return joins.present(nodeId, tokenId, secret, nowMillis, JoinTokens.DEFAULT_TTL_MILLIS);
+        } finally {
+            watchLock.unlock();
+        }
+    }
+
+    /**
+     * The activated envelope once its version is above {@code afterVersion}, waiting up to
+     * {@code waitMillis}; null on timeout or interrupt (interrupt flag kept). Watch threads only.
+     */
+    public SignedSnapshot awaitActivated(long afterVersion, long waitMillis) {
+        long left = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(0L, waitMillis));
+        watchLock.lock();
+        try {
+            while (true) {
+                var now = latest;
+                if (now != null && now.version() > afterVersion) {
+                    return now;
+                }
+                if (left <= 0L) {
+                    return null;
+                }
+                left = activatedChanged.awaitNanos(left);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } finally {
+            watchLock.unlock();
+        }
+    }
+
+    /** True when {@code nodeId} is on the revoke denylist. */
+    public boolean isRevoked(String nodeId) {
+        return revoked.contains(nodeId);
+    }
+
+    private void publishLatest(SignedSnapshot snapshot) {
+        watchLock.lock();
+        try {
+            latest = snapshot;
+            activatedChanged.signalAll();
+        } finally {
+            watchLock.unlock();
+        }
     }
 
     public void publishBinding(sjws_nettask.service.NodeEnrollment enrollment) throws java.io.IOException {
@@ -444,7 +496,12 @@ public final class CpStore implements AutoCloseable {
             default -> "SUSPECT";
         };
         long applied = Math.max(0L, appliedVersion);
-        reported.put(id, new Reported(id, labels == null ? Map.of() : Map.copyOf(labels), known, applied));
+        watchLock.lock();
+        try {
+            reported.put(id, new Reported(id, labels == null ? Map.of() : Map.copyOf(labels), known, applied));
+        } finally {
+            watchLock.unlock();
+        }
     }
 
     public String nodesJson() {
@@ -453,7 +510,14 @@ public final class CpStore implements AutoCloseable {
         var json = new StringBuilder();
         json.append("{\"nodes\":[");
         nodeJson(json, "cp-1", leader, Map.of("role", "control"), "READY", desired, 0L, revoked.contains("cp-1"));
-        for (var node : reported.values()) {
+        List<Reported> nodes;
+        watchLock.lock();
+        try {
+            nodes = List.copyOf(reported.values());
+        } finally {
+            watchLock.unlock();
+        }
+        for (var node : nodes) {
             json.append(',');
             nodeJson(json, node.id, "data", node.labels, node.health, node.applied,
                     Math.max(0L, desired - node.applied), revoked.contains(node.id));
@@ -675,6 +739,7 @@ public final class CpStore implements AutoCloseable {
                     history.remove(0);
                     documents.remove(0);
                 }
+                publishLatest(snapshot);
                 staged = null;
             }
             case RBAC -> {
