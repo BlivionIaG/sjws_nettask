@@ -25,6 +25,7 @@ import sjws_nettask.routing.ProblemErrorHandler;
 import sjws_nettask.routing.ProxyHandler;
 import sjws_nettask.routing.RedirectHandler;
 import sjws_nettask.routing.Router;
+import sjws_nettask.routing.WeightedHandler;
 
 /**
  * Builds the request-path handler for an enabled {@code routing:} section. Called once per
@@ -48,13 +49,14 @@ final class RoutingCompiler {
         var routes = new ArrayList<Router.Route>();
         for (var spec : routing.routes().routes()) {
             Handler handler = switch (spec.action()) {
-                case RouteSpec.Action.Proxy p -> {
-                    var shared = proxies.get(p.upstream().name());
-                    if (shared == null) {
-                        shared = proxy(p.upstream(), proto, cidrs);
-                        proxies.put(p.upstream().name(), shared);
+                case RouteSpec.Action.Proxy p -> shared(proxies, p.upstream(), proto, cidrs);
+                case RouteSpec.Action.Weighted w -> {
+                    var backends = new ArrayList<WeightedHandler.Backend>(w.backends().size());
+                    for (var b : w.backends()) {
+                        backends.add(new WeightedHandler.Backend(shared(proxies, b.upstream(), proto, cidrs),
+                                b.weight(), b.pin()));
                     }
-                    yield shared;
+                    yield new WeightedHandler(backends, w.sticky());
                 }
                 case RouteSpec.Action.Redirect r -> new RedirectHandler(r.status(), r.location(), r.keepPath());
                 case RouteSpec.Action.Static s -> files.withListings(s.listing());
@@ -70,9 +72,21 @@ final class RoutingCompiler {
         return new Router(routes, files);
     }
 
+    /** One pool per upstream, shared by every route and backend that names it. */
+    private static ProxyHandler shared(java.util.Map<String, ProxyHandler> proxies, Upstream u, String proto,
+            java.util.List<Cidr> cidrs) {
+        var shared = proxies.get(u.name());
+        if (shared == null) {
+            shared = proxy(u, proto, cidrs);
+            proxies.put(u.name(), shared);
+        }
+        return shared;
+    }
+
     private static ProxyHandler proxy(Upstream u, String proto, java.util.List<Cidr> cidrs) {
         return new ProxyHandler(new ProxyHandler.Settings(u.url(), u.connectTimeout(), u.responseTimeout(),
-                u.idleReadTimeout(), u.maxBody(), proto, cidrs, u.preserveHost(), 256));
+                u.idleReadTimeout(), u.maxBody(), proto, cidrs, u.preserveHost(), 256),
+                sjws_nettask.routing.ByteBudget.shared(), u.resilience());
     }
 
 }

@@ -580,7 +580,7 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host"), "routing.upstreams." + name);
+                    "max_body", "preserve_host", "retry", "circuit"), "routing.upstreams." + name);
             if (!body.containsKey("url")) {
                 throw new ConfigException("routing.upstreams." + name + ".url is required");
             }
@@ -602,9 +602,68 @@ public final class ConfigLoader {
                     : 16 << 20;
             boolean preserve = body.containsKey("preserve_host")
                     && bool(body.get("preserve_host"), "routing.upstreams." + name + ".preserve_host");
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve));
+            var retry = body.containsKey("retry") ? retry(body.get("retry"), "routing.upstreams." + name + ".retry") : null;
+            var circuit = body.containsKey("circuit")
+                    ? circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit") : null;
+            var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience));
         }
         return Map.copyOf(out);
+    }
+
+    /** {@code retry: {attempts: 2, on: [connect, reset, 502, 503, 504], budget: 20%}} */
+    private static sjws_nettask.routing.Resilience.Retry retry(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("attempts", "on", "budget"), path);
+        int attempts = map.containsKey("attempts") ? integer(map.get("attempts"), path + ".attempts", 1, 5) : 2;
+        var on = java.util.EnumSet.noneOf(sjws_nettask.routing.Resilience.On.class);
+        if (map.containsKey("on")) {
+            if (!(map.get("on") instanceof List<?> list)) {
+                throw new ConfigException(path + ".on: expected a list");
+            }
+            for (var item : list) {
+                on.add(switch (String.valueOf(item).trim().toLowerCase(java.util.Locale.ROOT)) {
+                    case "connect" -> sjws_nettask.routing.Resilience.On.CONNECT;
+                    case "timeout" -> sjws_nettask.routing.Resilience.On.TIMEOUT;
+                    case "reset" -> sjws_nettask.routing.Resilience.On.RESET;
+                    case "502" -> sjws_nettask.routing.Resilience.On.STATUS_502;
+                    case "503" -> sjws_nettask.routing.Resilience.On.STATUS_503;
+                    case "504" -> sjws_nettask.routing.Resilience.On.STATUS_504;
+                    default -> throw new ConfigException(path + ".on: unknown '" + item
+                            + "' (connect, timeout, reset, 502, 503, 504)");
+                });
+            }
+        } else {
+            on.add(sjws_nettask.routing.Resilience.On.CONNECT);
+            on.add(sjws_nettask.routing.Resilience.On.RESET);
+            on.add(sjws_nettask.routing.Resilience.On.STATUS_503);
+        }
+        int budget = 20;
+        if (map.containsKey("budget")) {
+            var text = String.valueOf(map.get("budget")).trim();
+            if (text.endsWith("%")) {
+                text = text.substring(0, text.length() - 1).trim();
+            }
+            try {
+                budget = Integer.parseInt(text);
+            } catch (NumberFormatException e) {
+                throw new ConfigException(path + ".budget: expected a percentage such as 20%");
+            }
+            if (budget < 1 || budget > 100) {
+                throw new ConfigException(path + ".budget: must be 1%..100%");
+            }
+        }
+        return new sjws_nettask.routing.Resilience.Retry(attempts, on, budget);
+    }
+
+    /** {@code circuit: {failures: 5, eject_for: 10s}} */
+    private static sjws_nettask.routing.Resilience.Circuit circuit(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("failures", "eject_for"), path);
+        int failures = map.containsKey("failures") ? integer(map.get("failures"), path + ".failures", 1, 1000) : 5;
+        var openFor = map.containsKey("eject_for")
+                ? timeout(text(map.get("eject_for"), path + ".eject_for"), path + ".eject_for") : Duration.ofSeconds(10);
+        return new sjws_nettask.routing.Resilience.Circuit(failures, openFor);
     }
 
     private static List<RouteSpec> routes(Object value, Map<String, Upstream> upstreams) {
@@ -613,8 +672,8 @@ public final class ConfigLoader {
         for (int i = 0; i < list.size(); i++) {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
-            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static",
-                    "listing", "errors", "problem_type"), path);
+            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "backends", "sticky", "redirect",
+                    "static", "listing", "errors", "problem_type"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -633,12 +692,17 @@ public final class ConfigLoader {
                 rewrite = prefix(text(map.get("rewrite"), path + ".rewrite"), path + ".rewrite");
             }
             int actions = (map.containsKey("proxy") ? 1 : 0) + (map.containsKey("redirect") ? 1 : 0)
-                    + (map.containsKey("static") ? 1 : 0);
+                    + (map.containsKey("static") ? 1 : 0) + (map.containsKey("backends") ? 1 : 0);
             if (actions != 1) {
-                throw new ConfigException(path + ": exactly one of proxy, redirect or static is required");
+                throw new ConfigException(path + ": exactly one of proxy, backends, redirect or static is required");
+            }
+            if (map.containsKey("sticky") && !map.containsKey("backends")) {
+                throw new ConfigException(path + ".sticky is only valid with backends");
             }
             RouteSpec.Action action;
-            if (map.containsKey("proxy")) {
+            if (map.containsKey("backends")) {
+                action = weighted(map, upstreams, path);
+            } else if (map.containsKey("proxy")) {
                 var name = text(map.get("proxy"), path + ".proxy");
                 var upstream = upstreams.get(name);
                 if (upstream == null) {
@@ -659,6 +723,58 @@ public final class ConfigLoader {
             out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path)));
         }
         return List.copyOf(out);
+    }
+
+    /** {@code backends: [{upstream, weight (default 1), pin}]} and {@code sticky}. */
+    private static RouteSpec.Action.Weighted weighted(Map<String, Object> route, Map<String, Upstream> upstreams,
+            String path) {
+        var list = YamlValues.sequence(route.get("backends"), path + ".backends");
+        if (list.isEmpty() || list.size() > 64) {
+            throw new ConfigException(path + ".backends: expected 1 to 64 backends");
+        }
+        var out = new ArrayList<RouteSpec.Action.Backend>(list.size());
+        long total = 0;
+        for (int i = 0; i < list.size(); i++) {
+            var at = path + ".backends[" + i + "]";
+            var b = YamlValues.mapping(list.get(i), at);
+            YamlValues.knownKeys(b, List.of("upstream", "weight", "pin"), at);
+            if (!b.containsKey("upstream")) {
+                throw new ConfigException(at + ".upstream is required");
+            }
+            var name = text(b.get("upstream"), at + ".upstream");
+            var upstream = upstreams.get(name);
+            if (upstream == null) {
+                throw new ConfigException(at + ".upstream: unknown upstream '" + name + "'");
+            }
+            int weight = b.containsKey("weight") ? integer(b.get("weight"), at + ".weight", 0, 1_000_000) : 1;
+            var pin = b.containsKey("pin") ? match(b.get("pin"), at + ".pin", true) : null;
+            if (weight == 0 && pin == null) {
+                throw new ConfigException(at + ": weight 0 needs a pin (it would never be chosen)");
+            }
+            total += weight;
+            out.add(new RouteSpec.Action.Backend(upstream, weight, pin));
+        }
+        if (total == 0) {
+            throw new ConfigException(path + ".backends: total weight must be > 0");
+        }
+        var sticky = route.containsKey("sticky") ? match(route.get("sticky"), path + ".sticky", false) : null;
+        return new RouteSpec.Action.Weighted(out, sticky);
+    }
+
+    /** {@code {header: name}} or {@code {cookie: name}}, with {@code value} when {@code withValue}. */
+    private static sjws_nettask.routing.WeightedHandler.Match match(Object value, String path, boolean withValue) {
+        var m = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(m, withValue ? List.of("header", "cookie", "value") : List.of("header", "cookie"), path);
+        if (m.containsKey("header") == m.containsKey("cookie")) {
+            throw new ConfigException(path + ": expected exactly one of header or cookie");
+        }
+        boolean cookie = m.containsKey("cookie");
+        var name = text(m.get(cookie ? "cookie" : "header"), path + (cookie ? ".cookie" : ".header")).trim();
+        if (name.isEmpty() || !name.chars().allMatch(c -> c > 32 && c < 127 && "()<>@,;:\\\"/[]?={}".indexOf(c) < 0)) {
+            throw new ConfigException(path + ": invalid name '" + name + "'");
+        }
+        String v = m.containsKey("value") ? String.valueOf(m.get("value")) : null;
+        return new sjws_nettask.routing.WeightedHandler.Match(cookie, name, v);
     }
 
     /** {@code errors: html | problem} (default html) and the optional {@code problem_type} URI base. */

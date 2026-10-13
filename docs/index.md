@@ -36,6 +36,7 @@ Back to the [README](../README.md) (quick start).
 - [Test suite catalog](development/testing.md)
 - [Integration and end-to-end tests](development/integration-tests.md)
 - [Request filters](development/filters.md)
+- [API gateway filters](development/gateway.md)
 - [Perf-regression gate (CI)](development/perf-gate.md)
 
 ## Benchmarks

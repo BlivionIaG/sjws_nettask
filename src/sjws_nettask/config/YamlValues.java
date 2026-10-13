@@ -87,7 +87,11 @@ final class YamlValues {
     private static Map<String, Object> copyMap(Map<?, ?> map, String path) {
         var out = new LinkedHashMap<String, Object>();
         for (var entry : map.entrySet()) {
-            if (!(entry.getKey() instanceof String key)) {
+            var raw = entry.getKey();
+            if (Boolean.TRUE.equals(raw) && path.endsWith(".retry")) {
+                raw = "on"; // YAML 1.1 reads the bare `retry.on` key as true
+            }
+            if (!(raw instanceof String key)) {
                 throw new ConfigException(path + ": keys must be strings");
             }
             out.put(key, copyValue(entry.getValue(), path + "." + key));

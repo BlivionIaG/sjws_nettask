@@ -229,6 +229,51 @@ bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read
 and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
 growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
 closes the replaced pools.
+
+Weighted and canary routes list `backends` instead of `proxy` (a plain `proxy:` route is unchanged):
+
+```yaml
+routes:
+  - prefix: /api
+    backends:
+      - { upstream: stable, weight: 95 }
+      - { upstream: canary, weight: 5, pin: { header: X-Canary, value: "1" } }
+      - { upstream: canary, weight: 0, pin: { cookie: beta } }   # pinned clients only
+    sticky: { cookie: session }                                  # optional
+```
+
+`weight` (default 1, 0 needs a `pin`) is a relative share, picked through a precomputed alias table:
+O(1) per request, no allocation, exact to the configured ratio. A `pin` (`header` or `cookie`, with an
+optional exact `value`; without one, presence is enough) sends a matching request to that backend
+whatever the weights; pins are checked in order. `sticky` hashes that header or cookie value so a
+client keeps its backend while the weights are unchanged; requests without it are picked at random.
+Each upstream keeps one pool and its own `retry` and `circuit`, however many routes or backends name it.
+Up to 64 backends per route.
+
+Retries and circuit breaking are per upstream and off unless configured (no cost when absent):
+
+```yaml
+upstreams:
+  api:
+    url: "http://127.0.0.1:9000"
+    retry: { attempts: 2, on: [connect, reset, 503], budget: 20% }   # defaults shown
+    circuit: { failures: 5, eject_for: 10s }                         # defaults shown
+```
+
+`retry.attempts` (1..5) is the number of extra tries. `on` picks the failures that are retried:
+`connect` (refused or connect timeout), `timeout` (response timeout), `reset` (the upstream closed
+before a response head), `502`, `503`, `504`. Only idempotent methods (GET, HEAD, OPTIONS, TRACE,
+PUT, DELETE) without a request body are retried, and only before anything reached the client (a
+retried 5xx body is discarded). `budget` caps retries at that share of requests: a token bucket per
+upstream earns `budget` of a token per request, holds at most 10, and each retry spends one.
+`circuit` opens after `failures` consecutive failures (connect, timeout, reset, 502/503/504) and
+then answers 503 with `Retry-After` without contacting the upstream. After `eject_for` one probe
+request is let through: success closes the circuit, failure opens it again for twice as long (up
+to 32×). Each request gives one verdict, after its retries, so a retry that recovers counts as a
+success. An upstream is a single endpoint, so an open circuit is an outage of that upstream: it suits
+a dead or overloaded upstream, not a flaky one. At 20% random 503s and 5000 req/s, `failures: 5`
+trips about once a second (see `bench/proxy-routing/resilience.sh`). Pair it with `retry`, or raise
+`failures`, when the upstream has a steady error rate.
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml
@@ -240,7 +285,7 @@ routing:
     - host: "example.com"  # optional; exact, "*.suffix" or "[ipv6]"
       prefix: "/api"       # required, segment-boundary match
       rewrite: "/"         # optional
-      proxy: api           # exactly one of proxy | redirect | static
+      proxy: api           # exactly one of proxy | backends | redirect | static
     - prefix: "/old"
       redirect: { status: 301, location: "https://example.com/new/", keep_path: true }
     - prefix: "/"
