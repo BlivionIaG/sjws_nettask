@@ -43,15 +43,15 @@ public final class LastGoodFiles {
     }
 
     public static void write(Path stateDir, long maxVersion, long maxEpoch, String keyId, List<TrustKey> keys,
-            long versionFloor, byte[] trustSignature, SignedSnapshot snapshot) throws IOException {
+            long versionFloor, byte[] trustBundle, SignedSnapshot snapshot) throws IOException {
         var dir = configDir(stateDir);
         Files.createDirectories(dir);
         var floor = "{\"maxVersion\":" + maxVersion + ",\"maxEpoch\":" + maxEpoch + ",\"keyId\":"
                 + jsonString(keyId) + "}";
         atomic(dir.resolve("floor.json"), floor);
         var trust = new StringBuilder();
-        trust.append("{\"versionFloor\":").append(versionFloor).append(",\"signature\":")
-                .append(jsonString(Base64.getEncoder().encodeToString(trustSignature))).append(",\"keys\":[");
+        trust.append("{\"versionFloor\":").append(versionFloor).append(",\"bundle\":")
+                .append(jsonString(Base64.getEncoder().encodeToString(trustBundle))).append(",\"keys\":[");
         for (int i = 0; i < keys.size(); i++) {
             if (i > 0) {
                 trust.append(',');
@@ -64,6 +64,12 @@ public final class LastGoodFiles {
         }
         trust.append("]}");
         atomic(dir.resolve("trust.json"), trust.toString());
+        atomic(dir.resolve("last-good.json"), snapshotJson(snapshot));
+        fsyncDir(dir);
+    }
+
+    /** The signed envelope as the JSON object stored in {@code last-good.json} and sent on the watch. */
+    static String snapshotJson(SignedSnapshot snapshot) {
         var last = new StringBuilder();
         last.append("{\"schema\":").append(snapshot.schema()).append(",\"version\":").append(snapshot.version())
                 .append(",\"raftIndex\":").append(snapshot.raftIndex()).append(",\"canonicalHash\":")
@@ -77,8 +83,7 @@ public final class LastGoodFiles {
                 .append(jsonString(Base64.getEncoder().encodeToString(snapshot.signature()))).append(",\"rollbackOf\":")
                 .append(snapshot.rollbackOf()).append(",\"canonicalYaml\":").append(jsonString(snapshot.canonicalYaml()))
                 .append('}');
-        atomic(dir.resolve("last-good.json"), last.toString());
-        fsyncDir(dir);
+        return last.toString();
     }
 
     public static void writePin(Path pin, byte[] rootPublic, long versionFloor) throws IOException {

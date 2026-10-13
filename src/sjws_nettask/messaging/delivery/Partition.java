@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ConcurrentHashMap;
@@ -88,6 +89,10 @@ public final class Partition implements AutoCloseable {
     private CompletableFuture<Long> lastSnapshot = CompletableFuture.completedFuture(-1L);
     private final long recoveredFromSnapshot;
     private final long replayedEntries;
+    /** Retain-from pins by owner (agent-graphs.md §4.3): retention never deletes at or above the lowest. */
+    private volatile Map<String, Long> pins = Map.of();
+    private final java.util.concurrent.locks.ReentrantLock pinLock = new java.util.concurrent.locks.ReentrantLock();
+    static final String PINS_FILE = "retain-from.pins";
 
     private Partition(String topic, SegmentedLog log, LedgerWriter writer, DeliveryState state, Partition dlq, LongSupplier clockMs,
             Path logDir, java.util.Collection<Long> snaps, long recoveredFromSnapshot, long replayedEntries) {
@@ -176,7 +181,9 @@ public final class Partition implements AutoCloseable {
             if (fromSnap >= 0 && so <= fromSnap && so >= log.startOffset()) keep.add(so);
             else Files.deleteIfExists(logDir.resolve(snapName(so)));
         }
+        var pinned = readPins(logDir); // before any thread starts: a corrupt pin file fails the open cleanly
         var p = new Partition(topic, log, new LedgerWriter(log, durability), st, dlq, clockMs, logDir, keep, fromSnap, replayed[0]);
+        p.pins = pinned;
         p.publish();
         return p;
     }
@@ -855,7 +862,7 @@ public final class Partition implements AutoCloseable {
         long oldestSnap = snapshots.isEmpty() ? 0 : snapshots.first(); // no durable snapshot yet: the whole log is needed
         lock.lock();
         try {
-            lw = Math.min(oldestSnap, state.oldestNeededMessageOffset());
+            lw = Math.min(Math.min(oldestSnap, state.oldestNeededMessageOffset()), retainFloor());
             for (var seg : log.segments()) {
                 if (seg.active() || seg.nextOffset() > lw
                         || (pol.keepResolvedMs() > 0 && now - seg.lastModifiedMs() < pol.keepResolvedMs())) break;
@@ -868,7 +875,7 @@ public final class Partition implements AutoCloseable {
         }
         if (pol.compactLiveRatio() > 0) {
             for (var seg : log.segments()) {
-                if (seg.active() || seg.nextOffset() > oldestSnap) break;
+                if (seg.active() || seg.nextOffset() > Math.min(oldestSnap, retainFloor())) break; // never rewrite pinned history
                 java.util.Set<Long> keep;
                 long liveBytes = 0;
                 lock.lock();
@@ -889,6 +896,77 @@ public final class Partition implements AutoCloseable {
         long pinned = 0;
         for (var seg : log.segments()) if (!seg.active()) pinned += seg.bytes();
         return new MaintenanceReport(lw, deleted, compacted, reclaimed, pinned, dlq == null ? null : dlq.maintain());
+    }
+
+    // ---- retain-from pins (agent-graphs.md §4.3 / §11.3) ----
+
+    /**
+     * Pins this partition's history from {@code offset} for {@code owner} (for example a graph runner's checkpoint
+     * floor): {@link #maintain()} never deletes or compacts at or above the lowest pin, whatever the delivery state or
+     * the {@link RetentionPolicy} says. Setting the same owner again moves its pin (forward or back). Pins are durable:
+     * written to {@value #PINS_FILE} (temp file, fsync, atomic rename) before this returns, and reloaded on open, so a
+     * restart cannot free history the owner has not re-pinned yet. Below the pins the normal low-watermark rules apply.
+     *
+     * @throws IllegalArgumentException for a blank owner or a negative offset
+     */
+    public void retainFrom(String owner, long offset) throws IOException {
+        if (owner == null || owner.isBlank() || owner.indexOf('\n') >= 0 || owner.indexOf('=') >= 0) throw new IllegalArgumentException("pin owner");
+        if (offset < 0) throw new IllegalArgumentException("pin offset < 0");
+        updatePins(m -> m.put(owner, offset));
+    }
+
+    /** Drops {@code owner}'s pin, if any. Durable like {@link #retainFrom}. */
+    public void releaseRetain(String owner) throws IOException {
+        updatePins(m -> m.remove(owner));
+    }
+
+    /** The lowest pin, or {@link Long#MAX_VALUE} without pins. */
+    public long retainFloor() {
+        long f = Long.MAX_VALUE;
+        for (long v : this.pins.values()) f = Math.min(f, v);
+        return f;
+    }
+
+    /** Current pins by owner (immutable). */
+    public Map<String, Long> retainPins() {
+        return this.pins;
+    }
+
+    private void updatePins(java.util.function.Consumer<java.util.Map<String, Long>> change) throws IOException {
+        this.pinLock.lock();
+        try {
+            var next = new java.util.TreeMap<String, Long>(this.pins);
+            change.accept(next);
+            if (next.equals(this.pins)) return;
+            var text = new StringBuilder();
+            for (var e : next.entrySet()) text.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+            var tmp = this.logDir.resolve(PINS_FILE + ".tmp");
+            try (var ch = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                ch.write(java.nio.ByteBuffer.wrap(text.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                ch.force(true);
+            }
+            Files.move(tmp, this.logDir.resolve(PINS_FILE), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            this.pins = Map.copyOf(next); // published only once durable
+        } finally {
+            this.pinLock.unlock();
+        }
+    }
+
+    static Map<String, Long> readPins(Path logDir) throws IOException {
+        var f = logDir.resolve(PINS_FILE);
+        if (!Files.exists(f)) return Map.of();
+        var out = new java.util.HashMap<String, Long>();
+        for (var line : Files.readAllLines(f, java.nio.charset.StandardCharsets.UTF_8)) {
+            int eq = line.lastIndexOf('=');
+            if (line.isBlank()) continue;
+            if (eq <= 0) throw new IOException("corrupt " + f + ": " + line);
+            try {
+                out.put(line.substring(0, eq), Long.parseLong(line.substring(eq + 1)));
+            } catch (NumberFormatException e) {
+                throw new IOException("corrupt " + f + ": " + line, e);
+            }
+        }
+        return Map.copyOf(out);
     }
 
     /** Bytes currently on disk for this partition's log (excluding the DLQ). */

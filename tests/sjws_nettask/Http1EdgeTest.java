@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** HTTP/1.1 connection edge cases end to end: early EOF, bodies to discard, failure logging. */
+@org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class Http1EdgeTest {
 
     @TempDir

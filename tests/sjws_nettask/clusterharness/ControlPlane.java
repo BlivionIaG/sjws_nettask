@@ -30,12 +30,12 @@ import java.util.Optional;
  * {@link ControlNode#adminPort()}. Fault methods are in-process: they do not send
  * {@code kill -9} and they do not require an mTLS admin certificate.
  *
- * <p>{@link PendingControlPlane} is the only implementation in this tree. It refuses every
- * call. Scenarios that need a real answer are {@code @Disabled}.
+ * <p>{@link CpStoreControlPlane} runs real {@code CpStore} voters. {@link PendingControlPlane}
+ * refuses every call; the harness uses it only when no control plane was asked for.
  */
 public interface ControlPlane extends AutoCloseable {
 
-    /** False until 3 or 5 in-process {@code cp-config} voters can run. */
+    /** True when 3 or 5 in-process {@code cp-config} voters can run. */
     boolean available();
 
     /**

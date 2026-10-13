@@ -281,6 +281,15 @@ class DaemonTest {
         Daemon.applyServerEnv(env, configured);
         assertEquals("/www", env.get("WEB_SERVER_ROOT"));
         assertFalse(env.containsKey("WEB_SERVER_PORT"));
+        var secret = "daemon-cluster-key-should-not-pass";
+        env.put("WEB_SERVER_HA_CLUSTER_KEY", secret);
+        env.put("WEB_SERVER_PORT", "9");
+        Daemon.applyServerEnv(env, Map.of("WEB_SERVER_HA_CLUSTER_KEY", secret, "WEB_SERVER_PORT", "9",
+                "WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS", "daemon-previous-key-no-pass"));
+        assertEquals("9", env.get("WEB_SERVER_PORT"));
+        assertFalse(env.containsKey("WEB_SERVER_HA_CLUSTER_KEY"));
+        assertFalse(env.containsKey("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS"));
+        assertFalse(env.values().toString().contains(secret));
 
         var yes = Daemon.parse(new String[] {"--daemon=yes"}, Map.of());
         assertEquals(Daemon.Action.DAEMON, yes.action());
