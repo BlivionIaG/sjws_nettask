@@ -33,6 +33,14 @@ jobs:
           distribution: temurin
           java-version: '25'
           cache: maven
+      - name: Install Prometheus
+        if: runner.os == 'Linux'
+        run: |
+          ver=3.15.0
+          curl -fsSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz"
+          tar -C /tmp -xzf /tmp/prometheus.tar.gz
+          echo "PROMTOOL=/tmp/prometheus-${ver}.linux-amd64/promtool" >> "$GITHUB_ENV"
+          echo "PROMETHEUS=/tmp/prometheus-${ver}.linux-amd64/prometheus" >> "$GITHUB_ENV"
       - name: Unit and integration tests, package, coverage gate
         run: mvn -B verify
       - name: Python SDK conformance and end-to-end (golden frames; Java server + Python unary client)
