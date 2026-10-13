@@ -64,6 +64,10 @@ class RootBranchCoverageTest {
         var fromEnv = Daemon.parse(new String[] {"--bind-content=false"}, Map.of("WEB_SERVER_BIND_CONTENT", "true"));
         assertEquals(Boolean.TRUE, fromEnv.bindContent());
         assertTrue(fromEnv.bindFromEnv());
+        var envOnly = Daemon.parse(new String[] {}, Map.of("WEB_SERVER_BIND_CONTENT", "yes"));
+        assertEquals(Boolean.TRUE, envOnly.bindContent());
+        var envAfterOn = Daemon.parse(new String[] {"--bind-content=true"}, Map.of("WEB_SERVER_BIND_CONTENT", "1"));
+        assertEquals(Boolean.TRUE, envAfterOn.bindContent());
     }
 
     @Test
@@ -114,6 +118,22 @@ class RootBranchCoverageTest {
             assertTrue(detail.contains("access"), detail);
             assertTrue(detail.contains("acme"), detail);
             assertTrue(detail.contains("topics"), detail);
+            var head = """
+                    schema: 1
+                    version: 2
+                    node:
+                      mode: data
+                      state_dir: %s
+                    server:
+                      port: 0
+                      root: %s
+                    """.formatted(state.toAbsolutePath(), root.toAbsolutePath());
+            Files.writeString(yaml, head + "routing:\n  enabled: true\n");
+            assertFalse(server.reload().applied());
+            Files.writeString(yaml, head + "routing:\n  forwarded_proto: https\n");
+            assertFalse(server.reload().applied());
+            Files.writeString(yaml, head + "routing:\n  trusted_proxies: [\"127.0.0.1\"]\n");
+            assertFalse(server.reload().applied());
         }
     }
 
@@ -169,6 +189,42 @@ class RootBranchCoverageTest {
             assertEquals(Sjws_nettask.EXIT_OK, code);
             assertFalse(out.toString().contains("  \n"));
         }
+        try (var server = SjwsServer.start(ServerConfig.builder(html).port(0).build())) {
+            int code = await(server, new PrintStream(new java.io.ByteArrayOutputStream()), error,
+                    this.dir.resolve("quiet.pid"), new ServiceHooks() {
+                        @Override
+                        public void onListening(SjwsServer started, Path pidFile, Duration shutdownTimeout) {
+                        }
+
+                        @Override
+                        public void onShutdown() {
+                        }
+
+                        @Override
+                        public String startupLine() {
+                            return null;
+                        }
+                    });
+            assertEquals(Sjws_nettask.EXIT_OK, code);
+        }
+        var occupied = this.dir.resolve("occupied.pid");
+        var owner = PidFile.claim(occupied);
+        assertTrue(owner.acquired());
+        try {
+            Files.writeString(occupied, "0\n");
+            var denied = PidFile.claim(occupied);
+            assertFalse(denied.acquired());
+            assertTrue(denied.snapshot().pid() <= 0);
+            try (var server = SjwsServer.start(ServerConfig.builder(html).port(0).build())) {
+                var messages = new java.io.ByteArrayOutputStream();
+                int code = await(server, new PrintStream(new java.io.ByteArrayOutputStream()), new PrintStream(messages),
+                        occupied, null);
+                assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, code);
+                assertTrue(messages.toString().contains("pid ?"), messages.toString());
+            }
+        } finally {
+            owner.file().close();
+        }
     }
 
     @Test
@@ -179,6 +235,14 @@ class RootBranchCoverageTest {
             var described = server.describe();
             assertTrue(described.contains("HTTP/2 on tcp/"), described);
             assertFalse(described.contains("h2c"), described);
+            long me = ProcessHandle.current().pid();
+            long started = ProcessHandle.current().info().startInstant().map(java.time.Instant::toEpochMilli).orElse(-1L);
+            var pid = this.dir.resolve("self.pid");
+            Files.writeString(pid, PidFile.text(me, started));
+            var out = new java.io.ByteArrayOutputStream();
+            assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(pid, Duration.ofMillis(200), -1, new PrintStream(out),
+                    new PrintStream(new java.io.ByteArrayOutputStream()), id -> java.util.Optional.empty()));
+            assertTrue(out.toString().contains("stale"));
             var first = server.chainControl(RequestFilters.create(), Set.of());
             assertSame(first, server.chainControl(RequestFilters.create(), Set.of()));
         }
