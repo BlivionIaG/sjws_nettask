@@ -1,6 +1,6 @@
 # Control-plane process hosting
 
-Status: draft for Security review. Docs only. Anything not already in master is marked **proposed**.
+Status: revised after Security review (B1, B2, N1-N7). Docs only. Anything not already in master is marked **proposed**.
 Builds on `docs/design/control-plane.md`, `docs/design/control-plane-security.md` and the #38 review.
 
 ## 1. Starting a control-role process
@@ -38,36 +38,116 @@ Peers come from config; membership changes are out of scope for v1.
 Ed25519 root and online key; the root signs `SnapshotCrypto.trustInput(versionFloor, keys)`. There is no load path.
 That is what blocks Security.
 
-**Proposed layout** under `cp.keyDir` (dir 0700, owned by the service user):
+**Proposed layout:**
 
-| File | Content | Mode |
-|---|---|---|
-| `online.key` | PKCS#8 DER Ed25519 private key of the current online key | 0600 |
-| `trust.bundle` | canonical bundle: `versionFloor`, list of `TrustKey(keyId, spki, notAfter, versionMin, versionMax)`, root signature, encoded per `SnapshotCrypto` (big-endian ints, length-prefixed strings) | 0644 or tighter |
-| `root.pub` | pinned root SPKI; kept **outside** `stateDir` as `KeyRing`'s javadoc requires | 0644 or tighter |
+| File | Where | Content | Owner / mode |
+|---|---|---|---|
+| `root.pub` | outside `stateDir` and `keyDir`; prefer a root-owned path the service user cannot write (e.g. `/etc/sjws/cp/root.pub`) | pinned root SPKI | root or service uid, no group/other write (0644 ok) |
+| `trust.bundle` | `cp.keyDir` | signed binary bundle (section 2.1) | root or service uid, no group/other write |
+| `online.key` | `cp.keyDir` | PKCS#8 DER Ed25519 private key of **this voter's** online key | service uid, 0600 (0400 accepted) |
+| `keyDir` itself | | | service uid, 0700 |
+| `trust.state` | `cp.stateDir` (not a replaceable file) | anti-rollback floor `(maxBundleSerial, maxVersionFloor)` (section 2.2) | service uid, 0600, fsynced |
 
-The root private key is **never** on a CP host.
+The root private key is **never** on a CP host. The CP process needs no write access to `root.pub`.
 
-**Loading (proposed), fail closed:** a new `KeyRing.load(keyDir, rootPub)` that
-1. refuses symlinks and loose modes (reuse the `PosixMode` checks used for token files);
-2. parses `root.pub` and `trust.bundle`, verifies the root signature over `trustInput`;
-3. parses `online.key` and checks its public half equals a `TrustKey` in the bundle that is not past `notAfter`;
-4. any parse, signature, expiry or mismatch error throws and the process exits. No fallback, no auto-generate in
-   production (`generate` stays for tests and the ceremony tool).
+### 2.1 Bundle format (answers former open question 2)
 
-## 3. Online key vs offline root (proposed)
+A versioned, domain-separated canonical **binary** wrapper, not YAML/JSON. Big-endian, length-prefixed, reusing the
+`SnapshotCrypto` encoders but with its own label, so a bundle signature never verifies as a snapshot signature and
+vice versa:
 
-- **Online key**: on every voter, signs snapshots (`KeyRing.sign`). Short-lived (`notAfter`), bounded
-  `versionMin..versionMax`.
-- **Offline root**: on an air-gapped machine; signs only trust bundles.
-- **Rotation ceremony:** (1) on a voter or the offline box, generate a new online pair; (2) carry the public SPKI to
-  the offline box; (3) the root signs a new `trust.bundle` containing old + new key, a raised `versionFloor` if a key is
-  being retired; (4) copy the bundle and the new `online.key` to every voter; (5) SIGHUP or restart; (6) after all data
-  nodes acknowledge the new bundle, issue a bundle without the old key. A CLI (`sjws-cp keys ...`) produces the
-  artifacts; format as in section 2.
-- **Permissions:** key dir 0700, `online.key` 0600 (0400 accepted), owner must equal the process uid; group/other
-  bits on secret files or a writable bundle -> refuse to start. Same rule as `PosixMode.requireOwnerOnly`.
-  On non-POSIX filesystems: refuse unless an explicit override is set (open question).
+```
+"sjws-cp-trust-bundle\0" || u8 formatVersion || u8 purpose(=trust-bundle)
+ || u64 bundleSerial || u64 issuedAt || u64 notAfter || u64 versionFloor
+ || u16 n || n x ( lp keyId || lp SPKI || u64 notAfter || u64 versionMin || u64 versionMax
+                  || u8 purpose(=snapshot-signing) )
+ || lp rootKeyId
+ || root signature over all bytes above
+```
+
+Strict parsing: known `formatVersion` and `purpose` only, no trailing bytes, keyIds sorted and unique, size caps on
+`n`, keyIds and SPKIs. `bundleSerial` is strictly increasing across every bundle the root ever signs. A text form exists
+only for display (`sjws-cp keys show`).
+
+### 2.2 Anti-rollback (B1)
+
+Every voter and data node persists `(maxBundleSerial, maxVersionFloor)` in `trust.state`, outside the replaceable key
+files (write temp, fsync, rename, fsync dir; 0600). A bundle is refused if `bundleSerial < maxBundleSerial` or
+`versionFloor < maxVersionFloor`, or if it is past its own `notAfter`. The check runs:
+- at load (startup);
+- on SIGHUP (section 2.4);
+- when a bundle arrives over the watch. Data nodes take new bundles only from snapshots, verified against the pinned
+  `root.pub`, never against an online key.
+
+On acceptance of a higher serial, `trust.state` is advanced (and fsynced) **before** the new ring is used. An equal
+serial is accepted only if the bytes are identical. A missing `trust.state` on a node that has run before is an error;
+first start initialises it from the loaded bundle and logs that it did.
+
+**Planned test (`KeyRingRollbackTest`):** load bundle N, then present bundle N-1 (validly root-signed) at load, on
+SIGHUP and over the watch: each is refused, the old ring stays in use, an audit event is logged. Also: lower floor with
+higher serial refused; a bundle signature fed to snapshot verification (and the reverse) fails.
+
+### 2.3 Loading, fail closed (B2 included)
+
+A new `KeyRing.load(keyDir, rootPub, stateDir)`:
+1. **Permission checks (StrictModes-style, consistent with #145):** open with `NOFOLLOW_LINKS`; check type (regular
+   file / directory), owner and mode on the opened descriptor. `root.pub`, `trust.bundle`, `keyDir` and **every parent
+   directory up to `/`** must be owned by root or the service uid and not group- or world-writable. `online.key` must be
+   owned by the process uid with 0600/0400; `keyDir` 0700. Fix #145's `/proc/self/fd` comparison so a symlinked
+   *parent* does not cause a false refusal: compare the inode via `fileKey()` (or `toRealPath()` on the parent).
+2. **Root pin:** parse `root.pub`. If `cp.rootPubSha256` is set (install time, config file), refuse on mismatch.
+   Log the root fingerprint (SHA-256 of the SPKI) at startup; never log key bytes.
+3. Parse `trust.bundle` strictly (2.1), verify the root signature and `rootKeyId`, apply the anti-rollback check (2.2).
+4. Parse `online.key` (read into a `byte[]`, `Arrays.fill` right after `KeyFactory`); its public half must equal an
+   unexpired `TrustKey` in the bundle whose keyId belongs to this node.
+5. Any error throws and the process exits. No fallback, no auto-generate in production (`generate` stays for tests and
+   the ceremony tool).
+
+`cp.tls.key` (Security) gets the same owner/mode checks; inline PEM is never accepted through YAML, env or property.
+
+**Non-POSIX filesystems (answers former open question 3):** refuse by default. The only override is
+`cp.insecureSkipPermissionChecks: true` **in the config file** (never env or CLI). It logs a loud WARN at startup and
+every hour, sets a flag on `/cp/v1/health`, and still checks for symlinks and regular files. Dev only.
+
+### 2.4 SIGHUP (answers former open question 1)
+
+One atomic step: build a new `KeyRing` plus TLS material (`cp.tls.*`) from disk, with all checks above (permissions,
+root signature, serial/floor per 2.2, online key matches an unexpired `TrustKey`), then swap a single reference. On
+any failure the old material stays, the error is logged and counted. A half-loaded ring is never installed. SIGHUP
+cannot introduce a key the root has not signed; it only picks up the ceremony's output. `root.pub` is **not** reloaded
+on SIGHUP, only on restart.
+
+Shutdown "zeroing" is best effort: Java cannot zero a `PrivateKey` (`destroy()` is not implemented for EdDSA and the
+provider copies bytes). We fill our own buffers and disable heap and core dumps for the control role.
+
+## 3. Online keys vs offline root (proposed)
+
+- **Online keys, one per voter (#38 F1b):** keyId = `nodeId` + serial. Each signs snapshots (`KeyRing.sign`), is
+  short-lived (`notAfter`) and bounded to `versionMin..versionMax`. All voters' keys sit in the same bundle, so
+  retiring a compromised voter is one bundle without its key.
+- **Offline root:** on an air-gapped machine; signs only trust bundles.
+- **Rotation ceremony:** (1) each voter generates its new online pair **on the voter** (`sjws-cp keys gen`); private
+  bytes never leave it; (2) only the SPKI is carried to the offline box; (3) the root signs a new `trust.bundle` with a
+  higher `bundleSerial`, fresh `issuedAt`, old + new keys; (4) copy the bundle to every voter; (5) SIGHUP or restart;
+  (6) once all data nodes report the new serial, sign another bundle (higher serial) without the old keys.
+- **Expiry alarm:** warn (log, metric, health) when an online key has less than 25% of its lifetime left.
+
+### 3.1 Compromise runbook
+
+1. **Detect** (alert, audit anomaly, host compromise). Isolate the voter.
+2. **Re-sign:** on the offline box, the root signs a bundle with a higher `bundleSerial` that drops the bad key and
+   sets `versionFloor` above the highest version the bad key could have signed (its `versionMax`).
+3. **Push:** copy to the remaining voters, SIGHUP; data nodes receive it via snapshot and verify it against `root.pub`.
+4. **Enforce:** every node advances `trust.state`; anything below the new serial or floor is refused, including a
+   restored older bundle.
+5. **Audit** which versions the bad key signed; rebuild the voter with a newly generated key in a later bundle.
+
+Root compromise is out of scope here: it needs a new `root.pub` on every node (restart), pinned via `cp.rootPubSha256`.
+
+### 3.2 Audit (#38 F10)
+
+Audit events for: bundle loads (serial, floor, keyIds, root fingerprint), SIGHUP outcomes, and every refusal
+(rollback, signature, permission, pin mismatch).
 
 ## 4. Config keys (proposed)
 
@@ -78,7 +158,10 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | `sjws.role` (existing resolution via `NodeLifecycle.role`) | `SJWS_ROLE` | `role` | `control` / `data` |
 | `sjws.cp.stateDir` | `SJWS_CP_STATE_DIR` | `cp.stateDir` | Raft log + snapshots |
 | `sjws.cp.keyDir` | `SJWS_CP_KEY_DIR` | `cp.keyDir` | section 2 |
-| `sjws.cp.rootPub` | `SJWS_CP_ROOT_PUB` | `cp.rootPub` | pinned root key |
+| `sjws.cp.rootPub` | `SJWS_CP_ROOT_PUB` | `cp.rootPub` | pinned root key path (must pass 2.3 checks) |
+| — | — | `cp.rootPubSha256` | optional install-time pin of the root SPKI |
+| — | — | `cp.insecureSkipPermissionChecks` | dev-only override (2.3), config file only |
+| — | — | `cp.maxClockDrift` | proposed, default 500 ms; startup refuses unless lease < electionTimeout − drift |
 | `sjws.cp.nodeId` | `SJWS_CP_NODE_ID` | `cp.nodeId` | this voter |
 | — | — | `cp.peers[]` (`id`, `address`, `witness: bool`) | voter set |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
@@ -92,7 +175,7 @@ Exact names of the role key must match the existing `NodeLifecycle.role` inputs;
 Existing guards: `tests/.../cp/ClassLoadTest`, `CpCoverageTest`, `SourceGuardTest`; `ServiceLaunch` already names
 no cp type except behind the role branch (`DataWatch` is typed loosely). Proposed: the control branch is reached by
 reflection; extend `cp/ClassLoadTest` to assert a data-role and a no-role start load no `CpStore`, `WatchServer`,
-`AdminServer` or `KeyRing`, and `SourceGuardTest` to forbid those names outside `cp/` and the reflective entry.
+`AdminServer` or `KeyRing`, a witness host loads no `KeyRing`, and `SourceGuardTest` to forbid those names outside `cp/` and the reflective entry.
 Benchmark: wrk A/B, CP off, 5 alternating pinned runs.
 
 ## 6. Voters and witnesses (HA input)
@@ -111,7 +194,7 @@ Source: HA, #118, `docs/design/high-availability.md` (HA's doc), #133, #142, #14
    Defaults in master: CP group `electionTimeout = Duration.ofMillis(100)`, `heartbeat = Duration.ofMillis(40)`
    (CpStore.java:114); `GroupOptions.leaseNanos()` = `heartbeat * 2` = 80 ms; `LocalCluster.start` default
    `deadAfter = Duration.ofSeconds(5)`; `HeartbeatAuthenticator.WINDOW_MILLIS = 5_000L`. Max clock drift has no
-   config value in master (open question).
+   config value in master; proposed `cp.maxClockDrift` (section 8).
 
 ## 7. Split of work
 
@@ -121,12 +204,14 @@ Source: HA, #118, `docs/design/high-availability.md` (HA's doc), #133, #142, #14
   `CpStore` with witness support, class-load/SourceGuard tests.
 - **HA:** witness voter semantics and timing review.
 
-## 8. Open questions
+## 8. Resolved questions (Security review of #151)
 
-1. Does SIGHUP also reload `trust.bundle`/`online.key`, or only TLS?
-2. Bundle encoding: reuse the `SnapshotCrypto` binary input as-is, or a canonical YAML/JSON wrapper?
-3. Non-POSIX filesystems: refuse, or allow with an explicit override?
-4. Max clock drift: new config key, or a fixed bound from HA?
-5. Do all voters host `AdminServer`, or only redirect writes to the leader?
-6. Is static peer config enough for v1, or is joint-consensus membership change needed?
-7. Witness: inside `CpStore` or a separate small class to keep witness hosts lean?
+1. SIGHUP reloads TLS + `trust.bundle` + `online.key` atomically; `root.pub` only on restart (2.4).
+2. Bundle encoding: versioned, domain-separated binary wrapper, strictly parsed (2.1).
+3. Non-POSIX: refuse; config-file-only override with recurring WARN and health flag (2.3).
+4. Max clock drift: config key `cp.maxClockDrift`, conservative default (500 ms proposed), validated at startup;
+   HA to confirm given the 40/80/100 ms margins.
+5. All voters host `AdminServer`; followers return the leader address for writes (control-plane.md §14); every voter
+   enforces RBAC and the denylist.
+6. Static peers for v1; future membership changes are an `admin`-only, audited operation.
+7. Witness is a separate small class; witness hosts never load `KeyRing` (asserted in `ClassLoadTest`).
