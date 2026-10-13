@@ -706,7 +706,8 @@ class ServiceDaemonTest {
                                 .document();
                         var pushed = sjws_nettask.config.ConfigDocument.of(
                                 base.server().toBuilder().root(three).build(), base.acme(), base.routing(),
-                                base.middleware(), base.access(), base.node(), 1, 3, null);
+                                base.middleware(), base.access(), base.node(), 1, 3, null)
+                                .withStateDir(base.stateDir());
                         var applied = server.applyRemote(pushed);
                         assertTrue(applied.applied(), applied.errors().toString());
                         assertEquals(three.toAbsolutePath(), server.config().root());
@@ -744,7 +745,8 @@ class ServiceDaemonTest {
         try (var server = SjwsServer.start(direct, SnapshotVerifier.noop())) {
             var doc = direct.document();
             var pushed = sjws_nettask.config.ConfigDocument.of(doc.server().toBuilder().root(three).build(), doc.acme(),
-                    doc.routing(), doc.middleware(), doc.access(), doc.node(), 1, 5, null);
+                    doc.routing(), doc.middleware(), doc.access(), doc.node(), 1, 5, null)
+                    .withStateDir(doc.stateDir());
             assertTrue(server.applyRemote(pushed).applied());
             var kept = server.reload();
             assertTrue(kept.warnings().toString().contains("no local bootstrap"), kept.warnings().toString());
