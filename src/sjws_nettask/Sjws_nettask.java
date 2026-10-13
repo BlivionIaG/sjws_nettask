@@ -92,7 +92,9 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true);
+        try (var modules = OptionalModules.start(err)) {
+            return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true);
+        }
     }
 
     /** Same lifecycle as {@link #serve}, starting from a loaded config file so reload can re-read it. */
@@ -122,8 +124,10 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
-                bindContent);
+        try (var modules = OptionalModules.start(err)) {
+            return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
+                    bindContent);
+        }
     }
 
     private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,
