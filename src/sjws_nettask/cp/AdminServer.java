@@ -43,48 +43,46 @@ import sjws_nettask.tls.TlsMaterial;
  * Loopback admin listener. Outside tests it starts only with mTLS: a server certificate, its key,
  * and a trust bundle limited to the admin CA. Client authentication is required. Identity is the
  * verified client certificate, mapped by {@link Rbac}. {@code Authorization} is ignored. A
- * connection without a certificate is unauthorized. Plain HTTP is {@link #startPlainForTests}.
+ * connection without a certificate is unauthorized. Certificates, key, CA bundle and an optional
+ * revocation list reload without a restart ({@link AdminTls}). Plain HTTP is {@link #startPlainForTests}.
  */
 public final class AdminServer implements AutoCloseable {
 
     private final HttpServer server;
     private final CpAdmin admin;
+    private final AdminTls tls;
+    private volatile Thread watcher;
 
-    private AdminServer(HttpServer server, CpAdmin admin) {
+    private AdminServer(HttpServer server, CpAdmin admin, AdminTls tls) {
         this.server = server;
         this.admin = admin;
+        this.tls = tls;
     }
 
     /**
      * mTLS admin listener. Refuses to bind when the certificate, the key, or the admin-CA trust
-     * bundle is missing or empty. Trust managers are built only from {@code trustBundle}.
+     * bundle is missing or empty. Trust managers are built only from {@code trustBundle}. No
+     * revocation list and no file watch; {@link #reloadTls()} still works.
      */
     public static AdminServer start(CpStore store, long nowMillis, long ttlMillis, Path certPem, Path keyPem,
             String keyPassword, Path trustBundle) throws IOException {
-        if (certPem == null || keyPem == null || trustBundle == null) {
-            throw new IOException("admin listener requires a server certificate, a key, and an admin CA trust bundle");
-        }
-        var material = TlsMaterial.fromPem(certPem, keyPem, keyPassword);
-        var trusted = trustCertificates(trustBundle);
-        if (trusted.length == 0) {
-            throw new IOException("admin CA trust bundle " + trustBundle + " contains no certificates");
-        }
-        SSLContext tls;
-        try {
-            var storeKeys = KeyStore.getInstance("PKCS12");
-            storeKeys.load(null, null);
-            for (int i = 0; i < trusted.length; i++) {
-                storeKeys.setCertificateEntry("ca" + i, trusted[i]);
-            }
-            var tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-            tmf.init(storeKeys);
-            tls = SSLContext.getInstance("TLSv1.3");
-            tls.init(material.keyManagerFactory().getKeyManagers(), tmf.getTrustManagers(), null);
-        } catch (GeneralSecurityException e) {
-            throw new IOException("admin mTLS material rejected: " + e.getMessage(), e);
-        }
+        return start(store, nowMillis, ttlMillis, certPem, keyPem, keyPassword, trustBundle, null, 0);
+    }
+
+    /**
+     * mTLS admin listener with optional revocation and rotation. See {@link AdminTls} for the
+     * revocation file format. Revoked client certificates are refused at the handshake and each
+     * refusal is written to the CP audit log.
+     *
+     * @param revocations CRL or denylist file, or null for none
+     * @param watchMillis when positive, check the files this often and reload when they change;
+     *        0 disables the watch ({@link #reloadTls()} remains available)
+     */
+    public static AdminServer start(CpStore store, long nowMillis, long ttlMillis, Path certPem, Path keyPem,
+            String keyPassword, Path trustBundle, Path revocations, long watchMillis) throws IOException {
+        var tls = AdminTls.open(certPem, keyPem, keyPassword, trustBundle, revocations, store::recordSecurityEvent);
         var https = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        https.setHttpsConfigurator(new HttpsConfigurator(tls) {
+        https.setHttpsConfigurator(new HttpsConfigurator(tls.context()) {
             @Override
             public void configure(HttpsParameters params) {
                 params.setNeedClientAuth(true);
@@ -94,37 +92,41 @@ public final class AdminServer implements AutoCloseable {
                 params.setSSLParameters(ssl);
             }
         });
-        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis));
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls);
         https.createContext("/", bound::handle);
         https.start();
+        if (watchMillis > 0) {
+            bound.watcher = Thread.ofVirtual().name("admin-tls-watch").start(() -> {
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        Thread.sleep(watchMillis);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    tls.reloadIfChanged();
+                }
+            });
+        }
         return bound;
+    }
+
+    /**
+     * Re-reads the certificate, key, CA bundle and revocation list (for an operator trigger such
+     * as SIGHUP). New handshakes use the new material; on failure the old material stays.
+     *
+     * @return null on success, otherwise the reason
+     */
+    public String reloadTls() {
+        return tls == null ? "plain listener has no TLS material" : tls.reload();
     }
 
     /** Plain HTTP, for tests that exercise routes without a certificate. Production code uses {@link #start}. */
     public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis) throws IOException {
         var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis));
+        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis), null);
         http.createContext("/", bound::handle);
         http.start();
         return bound;
-    }
-
-    private static X509Certificate[] trustCertificates(Path trustBundle) throws IOException {
-        if (!Files.isRegularFile(trustBundle)) {
-            throw new IOException("admin CA trust bundle is missing: " + trustBundle);
-        }
-        try (var in = Files.newInputStream(trustBundle)) {
-            var parsed = CertificateFactory.getInstance("X.509").generateCertificates(in);
-            var certs = new ArrayList<X509Certificate>();
-            for (var cert : parsed) {
-                if (cert instanceof X509Certificate x509) {
-                    certs.add(x509);
-                }
-            }
-            return certs.toArray(X509Certificate[]::new);
-        } catch (CertificateException e) {
-            throw new IOException("admin CA trust bundle rejected: " + e.getMessage(), e);
-        }
     }
 
     public int port() {
@@ -174,6 +176,10 @@ public final class AdminServer implements AutoCloseable {
 
     @Override
     public void close() {
+        var w = watcher;
+        if (w != null) {
+            w.interrupt();
+        }
         server.stop(0);
     }
 }
