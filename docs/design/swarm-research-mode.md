@@ -225,3 +225,16 @@ Methodology as swarm §13 (machine and commit reported, ≥ 5 alternating runs, 
 6. **Should P1–P3 be general graph features** (proposed), or research-only?
 7. **Artifact retention:** keep every candidate forever, or only lineage ancestors of the top-k plus a time window?
 8. **First target use case:** sjws's own performance tuning through the `bench/` harness, or an external workload?
+
+### 14.1 Decisions (2026-10-13, Blivion via inceptor)
+1. **Default accept rule:** greedy with elitism (§3.3). Annealing and tournament stay opt-in.
+2. **Noise test:** `min_effect` plus repeats by default; Welch's t-test is opt-in (`test: welch_t(alpha)`, §3.2).
+3. **Human review gate:** **required** before any result is promoted (§7.3 item 4); the gate timeout still defaults to stop, not approve.
+4. **Evaluator sandbox:** Linux namespaces + seccomp are the reference (base) sandbox; gVisor is optional (§7.1).
+5. **Evaluator network:** none. Evaluators get no network and no allow-list; retrieval (e.g. literature fetches in autoresearch) is done by a separate research agent with its own identity (§7.1, §4.1).
+6. **P1–P3** (loop-carried state, select step, dynamic counts) become **general graph features** in `swarm.graph` (§5.2); [agent-graphs.md](agent-graphs.md) is to be amended accordingly (events, checkpoint contents, phase).
+7. **Artifact retention:** keep the lineage ancestors of the top-k plus a time window; other candidates may be reclaimed (§4.2, §13).
+8. **First use case:** sjws's own performance tuning through the [`bench/`](../../bench/README.md) harness (§7.2).
+
+No Blivion questions remain open.
+

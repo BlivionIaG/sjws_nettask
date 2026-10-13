@@ -51,8 +51,26 @@ class SwarmHttpTest {
     void open() {
         this.swarm = Swarm.open(this.dir, "http-test", 3, new sjws_nettask.messaging.delivery.RetryPolicy(5, 0, 0),
                 System::currentTimeMillis, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
-        this.http = new SwarmHttp(this.swarm, 4);
+        this.http = new SwarmHttp(this.swarm, 4, ALLOW_ALL);
     }
+
+    /** Lets every request through: these tests cover the endpoints; SwarmGateTest covers admission. */
+    static final SwarmGate ALLOW_ALL = new SwarmGate() {
+        @Override
+        public Agent authenticate(Request request) {
+            return new Agent("test");
+        }
+
+        @Override
+        public boolean allows(Agent agent, String pool) {
+            return true;
+        }
+
+        @Override
+        public long maxRequestBytes() {
+            return SwarmHttp.MAX_REQUEST;
+        }
+    };
 
     @AfterEach
     void close() {
@@ -218,7 +236,7 @@ class SwarmHttpTest {
         assertEquals(400, post("/swarm/v1/leases/a~1~1:reply", task("x")).status(), "reply needs RESULT");
         assertEquals(400, post("/swarm/v1/tasks/bad%2Fpool", task("x")).status(), "invalid topic name");
         var big = new byte[SwarmHttp.MAX_REQUEST + 1];
-        assertEquals(400, post("/swarm/v1/tasks/a", big).status());
+        assertEquals(413, post("/swarm/v1/tasks/a", big).status());
         var unknownLength = new RequestBody() {
             int left = SwarmHttp.MAX_REQUEST + 10;
 

@@ -53,10 +53,12 @@ class SwarmModuleTest {
         };
         var module = new SwarmModule();
         var handler = HandlerMounts.install(List.of(module), fallback);
-        assertEquals(405, handler.handle(new Request("GET", "/swarm/v1")).status());
-        assertEquals(405, handler.handle(new Request("GET", "/swarm/v1/tasks?x=1")).status());
-        assertEquals(405, handler.handle(new Request("HEAD", "/swarm/v1/leases/1:ack")).status());
-        assertEquals(404, handler.handle(new Request("POST", "/swarm/v1")).status());
+        // no tokens configured in the test JVM: the gate denies everything (fail closed)
+        assertEquals(SwarmGate.DENY_ALL, module.gate());
+        assertEquals(401, handler.handle(new Request("GET", "/swarm/v1")).status());
+        assertEquals(401, handler.handle(new Request("GET", "/swarm/v1/tasks?x=1")).status());
+        assertEquals(401, handler.handle(new Request("HEAD", "/swarm/v1/leases/1:ack")).status());
+        assertEquals(401, handler.handle(new Request("POST", "/swarm/v1")).status());
         module.close();
         var miss = handler.handle(new Request("GET", "/swarm/v2"));
         assertEquals(404, miss.status());

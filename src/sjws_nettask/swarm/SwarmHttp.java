@@ -68,13 +68,31 @@ final class SwarmHttp implements Handler {
      */
     private final java.util.concurrent.ConcurrentHashMap<String, Task> claimed = new java.util.concurrent.ConcurrentHashMap<>();
 
-    SwarmHttp(Swarm swarm, long workerProducerId) {
+    private final SwarmGate gate;
+
+    SwarmHttp(Swarm swarm, long workerProducerId, SwarmGate gate) {
         this.swarm = swarm;
         this.workerProducerId = workerProducerId;
+        this.gate = java.util.Objects.requireNonNull(gate);
     }
 
     @Override
     public Response handle(Request request) {
+        // deny by default: authenticate before anything else, so an unauthenticated caller learns nothing
+        var agent = this.gate.authenticate(request);
+        if (agent == null) {
+            var r = problem(401, "unauthorized", "agent credential required").response();
+            r.headers().set("www-authenticate", "Bearer realm=\"sjws-swarm\"");
+            return r;
+        }
+        long len = request.body().length();
+        if (len > this.gate.maxRequestBytes()) {
+            return problem(413, "content too large", "request body larger than " + this.gate.maxRequestBytes())
+                    .response();
+        }
+        if (len < 0) {
+            request = request.withBody(capped(request.body(), this.gate.maxRequestBytes()));
+        }
         if (!"POST".equals(request.method())) {
             return problem(405, "method not allowed", "use POST").withAllow();
         }
@@ -92,6 +110,9 @@ final class SwarmHttp implements Handler {
         try {
             if (noun.startsWith("tasks/")) {
                 var pool = decode(noun.substring("tasks/".length()));
+                if (!this.gate.allows(agent, pool)) {
+                    return forbidden(pool);
+                }
                 return switch (verb) {
                     case "" -> submit(pool, request, query);
                     case "call" -> call(pool, request, query);
@@ -100,6 +121,10 @@ final class SwarmHttp implements Handler {
                 };
             }
             if (noun.startsWith("leases/")) {
+                var leaseId = decode(noun.substring("leases/".length()));
+                if (!this.gate.allows(agent, parseLease(leaseId).pool())) {
+                    return forbidden(parseLease(leaseId).pool());
+                }
                 return lease(decode(noun.substring("leases/".length())), verb, request, query);
             }
             return problem(404, "not found", path).response();
@@ -338,6 +363,31 @@ final class SwarmHttp implements Handler {
             r.headers().set("allow", "POST");
             return r;
         }
+    }
+
+    /** A body of unknown length that fails once it passes {@code max} bytes. */
+    static sjws_nettask.core.RequestBody capped(sjws_nettask.core.RequestBody body, long max) {
+        return new sjws_nettask.core.RequestBody() {
+            private long read;
+
+            @Override
+            public long length() {
+                return -1;
+            }
+
+            @Override
+            public int read(byte[] into, int off, int len) throws IOException {
+                int n = body.read(into, off, len);
+                if (n > 0 && (this.read += n) > max) {
+                    throw new IOException("larger than " + max);
+                }
+                return n;
+            }
+        };
+    }
+
+    private static Response forbidden(String pool) {
+        return problem(403, "forbidden", "agent may not use pool " + pool).response();
     }
 
     static Problem problem(int status, String title, String detail) {

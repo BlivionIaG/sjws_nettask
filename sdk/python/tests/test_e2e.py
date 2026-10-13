@@ -38,11 +38,15 @@ class EndToEndTest(unittest.TestCase):
         site.mkdir()
         (site / "hello.txt").write_text("hello")
         cls.port = free_port()
+        token = "e2e-token-0123456789abcdef"
+        tokens = pathlib.Path(cls.tmp, "tokens")
+        tokens.write_text(f"e2e {token} *\n")
+        tokens.chmod(0o600)
         java = os.path.join(os.environ.get("JAVA_HOME", ""), "bin", "java") if os.environ.get("JAVA_HOME") else "java"
         cls.log = open(pathlib.Path(cls.tmp, "server.log"), "w")
         cls.proc = subprocess.Popen(
             [java, "-Dsjws.swarm.enabled=true", "-Dsjws.swarm.dir=" + str(pathlib.Path(cls.tmp, "swarm")),
-             "-Dsjws.swarm.node=e2e", "-jar", JAR, str(cls.port), str(site)],
+             "-Dsjws.swarm.node=e2e", "-Dsjws.swarm.tokens.file=" + str(tokens), "-jar", JAR, str(cls.port), str(site)],
             stdout=cls.log, stderr=subprocess.STDOUT, cwd=cls.tmp)
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -54,7 +58,7 @@ class EndToEndTest(unittest.TestCase):
                 time.sleep(0.1)
         else:
             raise RuntimeError("server did not start: " + pathlib.Path(cls.tmp, "server.log").read_text())
-        cls.client = Client(f"http://127.0.0.1:{cls.port}")
+        cls.client = Client(f"http://127.0.0.1:{cls.port}", token=token)
 
     @classmethod
     def tearDownClass(cls):
