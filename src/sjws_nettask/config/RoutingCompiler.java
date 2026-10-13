@@ -72,7 +72,8 @@ final class RoutingCompiler {
 
     private static ProxyHandler proxy(Upstream u, String proto, java.util.List<Cidr> cidrs) {
         return new ProxyHandler(new ProxyHandler.Settings(u.url(), u.connectTimeout(), u.responseTimeout(),
-                u.idleReadTimeout(), u.maxBody(), proto, cidrs, u.preserveHost(), 256));
+                u.idleReadTimeout(), u.maxBody(), proto, cidrs, u.preserveHost(), 256),
+                sjws_nettask.routing.ByteBudget.shared(), u.resilience());
     }
 
 }

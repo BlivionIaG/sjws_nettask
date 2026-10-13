@@ -229,6 +229,27 @@ bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read
 and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
 growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
 closes the replaced pools.
+
+Retries and circuit breaking are per upstream and off unless configured (no cost when absent):
+
+```yaml
+upstreams:
+  api:
+    url: "http://127.0.0.1:9000"
+    retry: { attempts: 2, on: [connect, reset, 503], budget: 20% }   # defaults shown
+    circuit: { failures: 5, eject_for: 10s }                         # defaults shown
+```
+
+`retry.attempts` (1..5) is the number of extra tries. `on` picks the failures that are retried:
+`connect` (refused or connect timeout), `timeout` (response timeout), `reset` (the upstream closed
+before a response head), `502`, `503`, `504`. Only idempotent methods (GET, HEAD, OPTIONS, TRACE,
+PUT, DELETE) without a request body are retried, and only before anything reached the client (a
+retried 5xx body is discarded). `budget` caps retries at that share of requests: a token bucket per
+upstream earns `budget` of a token per request, holds at most 10, and each retry spends one.
+`circuit` opens after `failures` consecutive failures (connect, timeout, reset, 502/503/504) and
+then answers 503 with `Retry-After` without contacting the upstream. After `eject_for` one probe
+request is let through: success closes the circuit, failure opens it again for twice as long (up
+to 32×).
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml

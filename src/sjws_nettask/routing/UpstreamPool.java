@@ -59,7 +59,6 @@ import javax.net.ssl.SSLException;
  */
 final class UpstreamPool implements AutoCloseable {
 
-    /** Connect timeouts surface as this (mapped to 504); other connect failures are plain IOExceptions (502). */
     /** No response head within the response timeout (a 504, never retried). */
     static final class HeadTimeout extends IOException {
         HeadTimeout() {
@@ -67,6 +66,14 @@ final class UpstreamPool implements AutoCloseable {
         }
     }
 
+    /** The connection could not be opened (refused, unreachable, TLS failure): a 502. */
+    static final class ConnectFailed extends IOException {
+        ConnectFailed(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /** Connect timeouts surface as this (mapped to 504). */
     static final class ConnectTimeout extends IOException {
         ConnectTimeout(String message) {
             super(message);
@@ -174,7 +181,7 @@ final class UpstreamPool implements AutoCloseable {
             if (cause instanceof io.netty.channel.ConnectTimeoutException) {
                 throw new ConnectTimeout(cause.getMessage());
             }
-            throw new IOException("connect to " + this.host + ":" + this.port + ": " + cause, cause);
+            throw new ConnectFailed("connect to " + this.host + ":" + this.port + ": " + cause, cause);
         }
     }
 

@@ -29,5 +29,11 @@ import java.time.Duration;
  * @param maxBody request body cap, bytes (fits in a positive {@code int})
  */
 public record Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout,
-        Duration idleReadTimeout, int maxBody, boolean preserveHost) {
+        Duration idleReadTimeout, int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience) {
+
+    /** Without retries or circuit breaking. */
+    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
+            int maxBody, boolean preserveHost) {
+        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, null);
+    }
 }
