@@ -5,9 +5,11 @@ The repository's `Dockerfile` builds a two-stage image:
 * **build**: `maven:3.9-eclipse-temurin-25`. `pom.xml` is copied and dependencies are fetched first
   (BuildKit cache mount on `~/.m2`), then `src/` is compiled and packaged with `-DskipTests`
   (tests run in CI, not in the image build).
-* **runtime**: `eclipse-temurin:25-jre` with `/opt/sjws/sjws_nettask.jar` and `/opt/sjws/lib/`
-  (Netty and the QUIC natives, on the manifest Class-Path). Runs as the non-root user `sjws`
-  (uid/gid 10001). The sample document root `HTML/` is at `/srv/www`.
+* **runtime**: `gcr.io/distroless/cc-debian12` (glibc and libstdc++ for the QUIC natives, no shell)
+  with a `jlink` runtime in `/opt/java` (modules from `jdeps`, see the Dockerfile; debug info,
+  man pages and headers stripped, zip-compressed), and `/opt/sjws/sjws_nettask.jar` and `/opt/sjws/lib/`
+  (Netty and the Linux QUIC natives, on the manifest Class-Path; the macOS/Windows native jars are dropped). Runs as the non-root
+  uid/gid 10001 (numeric, no passwd entry). The sample document root `HTML/` is at `/srv/www`.
 
 Build and run:
 
