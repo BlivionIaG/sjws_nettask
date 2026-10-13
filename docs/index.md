@@ -29,6 +29,7 @@ Back to the [README](../README.md) (quick start).
 - [Messaging config and broker apply (draft)](messaging/config.md)
 - [High availability (draft)](ha/design.md)
 - [Control plane / API gateway mode (draft)](design/control-plane.md)
+- [Agent swarm layer (optional, draft)](design/agent-swarm.md)
 
 ## Security
 - [Security audit (2026-10-13)](security/audit.md)

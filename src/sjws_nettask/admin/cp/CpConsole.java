@@ -326,7 +326,7 @@ public final class CpConsole {
         for (var n : c.nodes()) {
             var labels = new java.util.TreeMap<>(n.labels()).toString();
             var cell = String.format("%-6s", n.health());
-            var health = n.health().equals("UP") ? color(GREEN, cell) : n.health().equals("?") ? cell : color(RED, cell);
+            var health = n.health().equals("UP") || n.health().equals("READY") ? color(GREEN, cell) : n.health().equals("?") ? cell : color(RED, cell);
             sb.append(String.format("  %-8s %-9s ", n.id(), n.role())).append(health)
                     .append(String.format(" %-5s %-4s %s%n", n.appliedVersion() < 0 ? "?" : n.appliedVersion(),
                             n.lag() < 0 ? "?" : n.lag() == 0 ? "0" : color(YELLOW, Long.toString(n.lag())), labels));
@@ -377,7 +377,7 @@ public final class CpConsole {
     }
 
     private void renderAudit(StringBuilder sb) throws CpException {
-        var all = this.client.audit(0, Integer.MAX_VALUE);
+        var all = this.client.audit(0, 100);
         sb.append("audit log (last ").append(AUDIT_LINES).append(")\n");
         for (var a : all.subList(Math.max(0, all.size() - AUDIT_LINES), all.size())) {
             sb.append(String.format("  %4d %s %-8s %-12s %s%n", a.seq(), a.time(), a.actor(), a.action(), a.detail()));

@@ -45,6 +45,7 @@ import sjws_nettask.cluster.FakeClock;
 import sjws_nettask.cp.AdminServer;
 import sjws_nettask.cp.CpStore;
 import sjws_nettask.cp.KeyRing;
+import sjws_nettask.controlplane.Role;
 
 /** The console's live client against a real in-process control plane over mTLS. */
 class HttpCpClientTest {
@@ -54,47 +55,93 @@ class HttpCpClientTest {
 
     static Path dir;
     static Path root;
+    static Path caPem;
     static Pem server;
     static Pem admin;
+    static Pem operator;
     static Pem viewer;
     static Pem stranger;
     static SSLContext adminTls;
 
-    /** A keytool-made identity, exported as PEM files. */
-    record Pem(Path cert, Path key, X509Certificate certificate, PrivateKey privateKey) {
+    /** An identity as PEM files: certificate (issued by the admin CA unless self-signed) and key. */
+    record Pem(Path cert, Path key) {
     }
 
-    static Pem identity(String name, String san) throws Exception {
-        var store = dir.resolve(name + ".p12");
-        var keytool = Path.of(System.getProperty("java.home"), "bin", "keytool").toString();
-        var p = new ProcessBuilder(keytool, "-genkeypair", "-alias", "a", "-keyalg", "EC", "-dname", "CN=" + name,
-                "-ext", "san=" + san, "-validity", "2", "-storetype", "PKCS12", "-keystore", store.toString(),
-                "-storepass", "changeit", "-keypass", "changeit").redirectErrorStream(true).start();
-        p.getInputStream().readAllBytes();
-        assertEquals(0, p.waitFor());
+    static void keytool(String... args) throws Exception {
+        var cmd = new ArrayList<String>();
+        cmd.add(Path.of(System.getProperty("java.home"), "bin", "keytool").toString());
+        cmd.addAll(List.of(args));
+        var p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        var out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(0, p.waitFor(), out);
+    }
+
+    static Path keystore(String name) {
+        return dir.resolve(name + ".p12");
+    }
+
+    static void keypair(String name, String san, boolean ca) throws Exception {
+        var args = new ArrayList<>(List.of("-genkeypair", "-alias", "a", "-keyalg", "EC", "-dname", "CN=" + name,
+                "-validity", "2", "-storetype", "PKCS12", "-keystore", keystore(name).toString(), "-storepass",
+                "changeit", "-keypass", "changeit"));
+        if (ca) {
+            args.addAll(List.of("-ext", "bc:c"));
+        } else if (san != null) {
+            args.addAll(List.of("-ext", "san=" + san));
+        }
+        keytool(args.toArray(String[]::new));
+    }
+
+    static Path keyPem(String name) throws Exception {
         var ks = KeyStore.getInstance("PKCS12");
-        try (var in = Files.newInputStream(store)) {
+        try (var in = Files.newInputStream(keystore(name))) {
             ks.load(in, "changeit".toCharArray());
         }
         var key = (PrivateKey) ks.getKey("a", "changeit".toCharArray());
-        var cert = (X509Certificate) ks.getCertificate("a");
         var enc = Base64.getMimeEncoder(64, "\n".getBytes(StandardCharsets.US_ASCII));
-        var certFile = Files.writeString(dir.resolve(name + ".pem"),
-                "-----BEGIN CERTIFICATE-----\n" + enc.encodeToString(cert.getEncoded()) + "\n-----END CERTIFICATE-----\n");
-        var keyFile = Files.writeString(dir.resolve(name + "-key.pem"),
+        return Files.writeString(dir.resolve(name + "-key.pem"),
                 "-----BEGIN PRIVATE KEY-----\n" + enc.encodeToString(key.getEncoded()) + "\n-----END PRIVATE KEY-----\n");
-        return new Pem(certFile, keyFile, cert, key);
     }
+
+    /** A leaf signed by the admin CA. */
+    static Pem issued(String name, String san) throws Exception {
+        keypair(name, null, false);
+        var csr = dir.resolve(name + ".csr");
+        keytool("-certreq", "-alias", "a", "-keystore", keystore(name).toString(), "-storepass", "changeit",
+                "-file", csr.toString());
+        var cert = dir.resolve(name + ".pem");
+        keytool("-gencert", "-alias", "a", "-keystore", keystore("ca").toString(), "-storepass", "changeit",
+                "-infile", csr.toString(), "-outfile", cert.toString(), "-rfc", "-validity", "2", "-ext", "san=" + san);
+        return new Pem(cert, keyPem(name));
+    }
+
+    /** Self-signed: not issued by the admin CA. */
+    static Pem selfSigned(String name, String san) throws Exception {
+        keypair(name, san, false);
+        var cert = dir.resolve(name + ".pem");
+        keytool("-exportcert", "-alias", "a", "-keystore", keystore(name).toString(), "-storepass", "changeit",
+                "-rfc", "-file", cert.toString());
+        return new Pem(cert, keyPem(name));
+    }
+
+    static final String ADMIN_SAN = "urn:sjws:admin:root";
+    static final String OPERATOR_SAN = "urn:sjws:operator:ops";
+    static final String VIEWER_SAN = "urn:sjws:viewer:watch";
 
     @BeforeAll
     static void identities() throws Exception {
         dir = Files.createTempDirectory("cp-console");
         root = Files.createDirectory(dir.resolve("html"));
-        server = identity("server", "ip:127.0.0.1,dns:localhost");
-        admin = identity("admin", "uri:urn:sjws:admin:root");
-        viewer = identity("viewer", "uri:urn:sjws:viewer:nobody");
-        stranger = identity("stranger", "ip:127.0.0.1");
-        adminTls = HttpCpClient.tls(admin.cert(), admin.key(), null, server.cert());
+        keypair("ca", null, true);
+        caPem = dir.resolve("ca.pem");
+        keytool("-exportcert", "-alias", "a", "-keystore", keystore("ca").toString(), "-storepass", "changeit",
+                "-rfc", "-file", caPem.toString());
+        server = issued("server", "ip:127.0.0.1,dns:localhost");
+        admin = issued("admin", "uri:" + ADMIN_SAN);
+        operator = issued("operator", "uri:" + OPERATOR_SAN);
+        viewer = issued("viewer", "uri:" + VIEWER_SAN);
+        stranger = selfSigned("stranger", "uri:" + ADMIN_SAN); // claims the admin SAN, not issued by the CA
+        adminTls = HttpCpClient.tls(admin.cert(), admin.key(), null, caPem);
     }
 
     @AfterAll
@@ -104,25 +151,7 @@ class HttpCpClientTest {
         }
     }
 
-    /** Server side: its own key, trusting the operator certificates (pinned, self-signed). */
-    static SSLContext serverTls() throws Exception {
-        var ks = KeyStore.getInstance("PKCS12");
-        ks.load(null, null);
-        ks.setKeyEntry("s", server.privateKey(), "x".toCharArray(), new X509Certificate[] {server.certificate()});
-        var kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-        kmf.init(ks, "x".toCharArray());
-        var trust = KeyStore.getInstance("PKCS12");
-        trust.load(null, null);
-        trust.setCertificateEntry("admin", admin.certificate());
-        trust.setCertificateEntry("viewer", viewer.certificate());
-        var tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-        tmf.init(trust);
-        var ctx = SSLContext.getInstance("TLSv1.3");
-        ctx.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
-        return ctx;
-    }
-
-    /** A running control plane with one activated version, and its admin listener. */
+    /** A control plane with one activated version, behind #89's fail-closed mTLS listener. */
     static final class Cp implements AutoCloseable {
         final CpStore store;
         final AdminServer http;
@@ -130,15 +159,17 @@ class HttpCpClientTest {
         Cp(Path stateDir, boolean elect) throws Exception {
             var clock = new FakeClock(0);
             this.store = CpStore.open(stateDir, KeyRing.generate("online-1", NOW + 86_400_000L, 0, Long.MAX_VALUE / 2),
-                    clock);
+                    clock, ADMIN_SAN);
             if (elect) {
                 clock.advance(Duration.ofMillis(100));
                 this.store.drive();
                 assertTrue(this.store.leadership().leaderReady());
+                assertEquals(200, this.store.grant(OPERATOR_SAN, Role.OPERATOR).status());
+                assertEquals(200, this.store.grant(VIEWER_SAN, Role.VIEWER).status());
                 assertEquals(200, this.store.propose("server:\n  port: 0\n  root: " + root + "\n").status());
                 assertEquals(200, this.store.activate(NOW, TTL).status());
             }
-            this.http = AdminServer.startTls(this.store, NOW, TTL, serverTls());
+            this.http = AdminServer.start(this.store, NOW, TTL, server.cert(), server.key(), null, caPem);
         }
 
         String endpoint() {
@@ -171,13 +202,22 @@ class HttpCpClientTest {
             var n = cluster.nodes().get(0);
             assertEquals("cp-1", n.id());
             assertEquals("LEADER", n.role());
-            assertEquals("?", n.health());
-            assertEquals(-1, n.lag());
+            assertEquals("READY", n.health());
+            assertEquals(1, n.appliedVersion());
+            assertEquals(0, n.lag());
+            assertEquals(Map.of("role", "control"), n.labels());
+            cp.store.reportNode("edge-1", Map.of("track", "canary"), "SUSPECT", 0);
+            var edge = c.cluster().nodes().get(1);
+            assertEquals("DATA", edge.role());
+            assertEquals("SUSPECT", edge.health());
+            assertEquals(1, edge.lag());
+            assertEquals(Map.of("track", "canary"), edge.labels());
             var bundle = c.config(1);
             assertEquals(1, bundle.version());
             assertEquals(List.of(), bundle.entries(Section.ACCESS));
             assertEquals(CpException.Kind.NOT_FOUND, assertThrows(CpException.class, () -> c.config(7)).kind());
-            assertEquals(CpException.Kind.NOT_FOUND, assertThrows(CpException.class, () -> c.audit(0, 10)).kind());
+            assertFalse(c.audit(0, 10).isEmpty(), "propose and activate are audited");
+            assertEquals(List.of(), c.audit(Long.MAX_VALUE / 2, 10));
             assertEquals(CpException.Kind.NOT_FOUND, assertThrows(CpException.class, () -> c.rolloutStatus("x")).kind());
         }
     }
@@ -193,12 +233,14 @@ class HttpCpClientTest {
             con.add(Section.ACCESS, "deny:/secret");
             var v = con.validate();
             assertTrue(v.ok(), v.errors().toString());
-            assertTrue(v.warnings().get(v.warnings().size() - 1).startsWith("checked locally"));
             var canary = con.apply("track=canary");
             assertEquals(Rollout_RUNNING, canary.state());
             assertEquals(2, canary.version());
             assertEquals(List.of("track=canary"), cp.store.selectors());
-            assertEquals(canary, f.rolloutStatus(canary.id()));
+            var status = f.rolloutStatus(canary.id());
+            assertEquals(List.of("track=canary"), status.targets());
+            assertEquals("track=canary", status.selector());
+            assertEquals(CpClient.Rollout.State.RUNNING, status.state());
             assertEquals(1, f.head(), "staged, not activated yet");
             var done = con.promote("*");
             assertEquals(CpClient.Rollout.State.DONE, done.state());
@@ -225,8 +267,11 @@ class HttpCpClientTest {
             var e = assertThrows(CpException.class, () -> c.stage(readOnly, 1, null));
             assertEquals(CpException.Kind.INVALID, e.kind());
             assertTrue(e.getMessage().contains("topics: read-only"), e.getMessage());
-            var v = c.validate(readOnly.with(Section.ACCESS, List.of("bogus")));
-            assertEquals(2, v.errors().size(), v.errors().toString());
+            assertEquals(1, c.validate(readOnly).errors().size(), "read-only change: not sent to the CP");
+            var v = c.validate(head.with(Section.ACCESS, List.of("bogus")));
+            assertFalse(v.ok(), "the CP's dry run rejects the rule");
+            assertTrue(c.validate(head.with(Section.ACCESS, List.of("deny:/x", "deny:/x"))).warnings().get(0)
+                    .contains("duplicate"));
             // stage does not pre-validate: the CP's strict loader rejects the rule (400)
             var serverSide = assertThrows(CpException.class,
                     () -> c.stage(head.with(Section.ACCESS, List.of("bogus")), 1, null));
@@ -242,21 +287,117 @@ class HttpCpClientTest {
         }
     }
 
+    static HttpCpClient as(Cp cp, Pem who) throws Exception {
+        return new HttpCpClient(cp.endpoint(), HttpCpClient.tls(who.cert(), who.key(), null, caPem));
+    }
+
+    /** Raw HTTPS request with an optional client identity and Authorization header. */
+    static int raw(Cp cp, Pem who, String method, String path, String body, String authorization) throws Exception {
+        SSLContext ctx;
+        if (who == null) {
+            var trust = KeyStore.getInstance("PKCS12");
+            trust.load(null, null);
+            try (var in = Files.newInputStream(caPem)) {
+                trust.setCertificateEntry("ca", java.security.cert.CertificateFactory.getInstance("X.509")
+                        .generateCertificate(in));
+            }
+            var tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init(trust);
+            ctx = SSLContext.getInstance("TLSv1.3");
+            ctx.init(null, tmf.getTrustManagers(), null); // no key managers: no client certificate
+        } else {
+            ctx = HttpCpClient.tls(who.cert(), who.key(), null, caPem);
+        }
+        var b = java.net.http.HttpRequest.newBuilder(java.net.URI.create("https://" + cp.endpoint() + path))
+                .timeout(Duration.ofSeconds(3))
+                .method(method, body == null ? java.net.http.HttpRequest.BodyPublishers.noBody()
+                        : java.net.http.HttpRequest.BodyPublishers.ofString(body));
+        if (authorization != null) {
+            b.header("Authorization", authorization);
+        }
+        return java.net.http.HttpClient.newBuilder().sslContext(ctx).build()
+                .send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString()).statusCode();
+    }
+
     @Test
-    void authenticationAndAvailability() throws Exception {
-        try (var cp = new Cp(dir.resolve("auth"), true); var notReady = new Cp(dir.resolve("unelected"), false)) {
-            var viewerTls = HttpCpClient.tls(viewer.cert(), viewer.key(), null, server.cert());
-            var asViewer = new HttpCpClient(cp.endpoint(), viewerTls);
-            assertEquals(CpException.Kind.FORBIDDEN, assertThrows(CpException.class, asViewer::head).kind());
-            // a certificate the CP does not trust: the handshake fails
-            var strangerTls = HttpCpClient.tls(stranger.cert(), stranger.key(), null, server.cert());
-            assertEquals(CpException.Kind.UNAVAILABLE,
-                    assertThrows(CpException.class, () -> new HttpCpClient(cp.endpoint(), strangerTls).head()).kind());
-            // a CP certificate the console does not trust
-            var wrongTrust = HttpCpClient.tls(admin.cert(), admin.key(), null, admin.cert());
+    void missingOrForeignClientCertificateIsRefusedAtTheHandshake() throws Exception {
+        try (var cp = new Cp(dir.resolve("needauth"), true)) {
+            // need-client-auth: no certificate, no TLS session, no HTTP status at all
+            assertThrows(java.io.IOException.class, () -> raw(cp, null, "GET", "/cp/v1/health", null, null));
+            assertThrows(java.io.IOException.class,
+                    () -> raw(cp, null, "GET", "/cp/v1/health", null, "Bearer sjws_root.secret"));
+            // a self-signed certificate claiming the admin SAN: not issued by the admin CA
+            assertThrows(java.io.IOException.class, () -> raw(cp, stranger, "GET", "/cp/v1/health", null, null));
+            assertEquals(CpException.Kind.UNAVAILABLE, assertThrows(CpException.class, () -> as(cp, stranger).head()).kind());
+            // the console refuses a CP certificate outside its trust file
+            var wrongTrust = HttpCpClient.tls(admin.cert(), admin.key(), null, stranger.cert());
             assertEquals(CpException.Kind.UNAVAILABLE,
                     assertThrows(CpException.class, () -> new HttpCpClient(cp.endpoint(), wrongTrust).head()).kind());
-            // leader not ready: 503 is retryable
+        }
+    }
+
+    @Test
+    void certificatesMapToViewerOperatorAndAdmin() throws Exception {
+        try (var cp = new Cp(dir.resolve("roles"), true)) {
+            assertEquals(Role.ADMIN, cp.store.roleOfSan(ADMIN_SAN));
+            assertEquals(Role.OPERATOR, cp.store.roleOfSan(OPERATOR_SAN));
+            assertEquals(Role.VIEWER, cp.store.roleOfSan(VIEWER_SAN));
+            var yaml = "server:\n  port: 0\n  root: " + root + "\n";
+            var grant = "{\"san\":\"urn:sjws:viewer:other\",\"role\":\"viewer\"}";
+            // viewer: READ only
+            assertEquals(200, raw(cp, viewer, "GET", "/cp/v1/nodes", null, null));
+            assertEquals(200, raw(cp, viewer, "GET", "/cp/v1/audit", null, null));
+            assertEquals(403, raw(cp, viewer, "POST", "/cp/v1/config:validate", yaml, null));
+            assertEquals(403, raw(cp, viewer, "POST", "/cp/v1/rollback", "{\"toVersion\":1}", null));
+            assertEquals(CpException.Kind.FORBIDDEN, assertThrows(CpException.class,
+                    () -> as(cp, viewer).rollback(1, null)).kind());
+            assertEquals(1, as(cp, viewer).head());
+            // operator: edit, rollout, rollback; no operator management
+            assertEquals(200, raw(cp, operator, "POST", "/cp/v1/config:validate", yaml, null));
+            assertEquals(403, raw(cp, operator, "POST", "/cp/v1/rbac", grant, null));
+            assertEquals(2, as(cp, operator).rollback(1, "op-rollback"));
+            // admin: everything, including operator management
+            assertEquals(200, raw(cp, admin, "POST", "/cp/v1/rbac", grant, null));
+            assertEquals(Role.VIEWER, cp.store.roleOfSan("urn:sjws:viewer:other"));
+            // the audit log names the certificate identity of each mutation
+            var actions = as(cp, admin).audit(0, 100);
+            assertTrue(actions.stream().anyMatch(e -> e.action().equals("ROLLBACK") && e.actor().equals("ops")), actions.toString());
+        }
+    }
+
+    @Test
+    void bearerTokenIsIgnored() throws Exception {
+        try (var cp = new Cp(dir.resolve("bearer"), true)) {
+            var yaml = "server:\n  port: 0\n  root: " + root + "\n";
+            // a viewer certificate plus a bearer header is still a viewer
+            assertEquals(403, raw(cp, viewer, "POST", "/cp/v1/config", yaml, "Bearer sjws_root.secret"));
+            assertEquals(403, raw(cp, viewer, "POST", "/cp/v1/rollback", "{\"toVersion\":1}", "Bearer anything"));
+            assertEquals(200, raw(cp, viewer, "GET", "/cp/v1/health", null, "Bearer garbage"));
+            // without TLS (the test-only listener) there is no certificate: a bearer header gets 401
+            try (var plain = AdminServer.startPlainForTests(cp.store, NOW, TTL)) {
+                var reply = java.net.http.HttpClient.newHttpClient().send(java.net.http.HttpRequest.newBuilder(
+                        java.net.URI.create("http://127.0.0.1:" + plain.port() + "/cp/v1/health"))
+                        .header("Authorization", "Bearer sjws_root.secret").GET().build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString());
+                assertEquals(401, reply.statusCode());
+            }
+        }
+    }
+
+    @Test
+    void listenerRefusesToStartWithoutItsMaterial() throws Exception {
+        try (var store = CpStore.open(dir.resolve("nomaterial"), KeyRing.generate("k", NOW + 86_400_000L, 0, 9),
+                new FakeClock(0))) {
+            assertThrows(java.io.IOException.class,
+                    () -> AdminServer.start(store, NOW, TTL, server.cert(), server.key(), null, null));
+            assertThrows(java.io.IOException.class,
+                    () -> AdminServer.start(store, NOW, TTL, server.cert(), server.key(), null, dir.resolve("none")));
+        }
+    }
+
+    @Test
+    void leaderNotReadyIsRetryable() throws Exception {
+        try (var notReady = new Cp(dir.resolve("unelected"), false)) {
             var waiting = new HttpCpClient(notReady.endpoint(), adminTls);
             assertEquals(0, waiting.head());
             assertEquals(CpException.Kind.UNAVAILABLE, assertThrows(CpException.class, () -> waiting.rollback(1, null)).kind());
@@ -267,7 +408,7 @@ class HttpCpClientTest {
     @Test
     void nonJsonReplyIsUnavailable() throws Exception {
         var https = com.sun.net.httpserver.HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        https.setHttpsConfigurator(new com.sun.net.httpserver.HttpsConfigurator(serverTls()));
+        https.setHttpsConfigurator(new com.sun.net.httpserver.HttpsConfigurator(HttpCpClient.tls(server.cert(), server.key(), null, caPem)));
         https.createContext("/", ex -> {
             var body = "oops".getBytes(StandardCharsets.UTF_8);
             ex.sendResponseHeaders(502, body.length);
@@ -302,7 +443,7 @@ class HttpCpClientTest {
         assertThrows(java.security.GeneralSecurityException.class,
                 () -> HttpCpClient.tls(admin.cert(), admin.key(), null, empty));
         assertThrows(java.io.IOException.class,
-                () -> HttpCpClient.tls(admin.cert(), dir.resolve("missing.pem"), null, server.cert()));
+                () -> HttpCpClient.tls(admin.cert(), dir.resolve("missing.pem"), null, caPem));
     }
 
     // ---------- live main ----------
@@ -318,15 +459,15 @@ class HttpCpClientTest {
     void liveMainConnectsWithPemFiles() throws Exception {
         try (var cp = new Cp(dir.resolve("main"), true)) {
             var out = main("--endpoints=" + cp.endpoint(), "--cert=" + admin.cert(), "--key=" + admin.key(),
-                    "--trust=" + server.cert(), "--no-color");
+                    "--trust=" + caPem, "--no-color");
             assertTrue(out.startsWith("0|sjws control plane  via " + cp.endpoint()), out);
-            assertTrue(out.contains("cp-1     LEADER    ?      ?     ?"), out);
+            assertTrue(out.contains("cp-1     LEADER    READY  1     0"), out);
             var pw = Files.writeString(dir.resolve("pw"), "unused\n");
             var withPassword = main("--endpoints=" + cp.endpoint(), "--cert=" + admin.cert(), "--key=" + admin.key(),
-                    "--trust=" + server.cert(), "--key-password-file=" + pw, "--no-color");
+                    "--trust=" + caPem, "--key-password-file=" + pw, "--no-color");
             assertTrue(withPassword.startsWith("0|") || withPassword.startsWith("64|ERROR: cannot load"), withPassword);
         }
-        assertTrue(main("--endpoints=a:1", "--cert=x", "--key=y", "--trust=" + server.cert())
+        assertTrue(main("--endpoints=a:1", "--cert=x", "--key=y", "--trust=" + caPem)
                 .startsWith("64|ERROR: cannot load the TLS material"));
         assertTrue(main("--endpoints=a:1", "--cert=" + admin.cert(), "--key=" + admin.key(), "--trust=t",
                 "--key-password-file=" + dir.resolve("nope")).startsWith("64|ERROR: cannot load"));
@@ -415,7 +556,7 @@ class HttpCpClientTest {
         assertEquals("x\\", CanonicalYaml.unquote("\"x\\\""), "dangling backslash kept");
         assertEquals(List.of("v: 1"), CanonicalYaml.block("k: inline\n  v: 1\n", "k"));
         assertEquals("\"\\u0001\\\"\"", HttpCpClient.jsonString("\u0001\""));
-        assertEquals(7, HttpCpClient.MISSING.size());
+        assertEquals(2, HttpCpClient.MISSING.size());
     }
 
     @Test

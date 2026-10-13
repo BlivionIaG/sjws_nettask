@@ -258,15 +258,47 @@ public final class Partition implements AutoCloseable {
                 m.originOffset(), m.originAttempts(), m.originReason());
     }
 
-    /** IN_FLIGHT → ACKED. Returns false if {@code offset} is not in flight for {@code group} (late or duplicate ack). */
-    public boolean ack(String group, long offset) { return ack(group, offset, null) != null; }
+    /** Matches any attempt: the unfenced overloads (kept for compatibility) settle whichever lease is current. */
+    static final int ANY_ATTEMPT = -1;
 
-    /** As {@link #ack(String, long)}, returning the record's durability future, or null when rejected. */
+    /** Lock held. Null when the caller holds the current lease, else why not. */
+    private LeaseResult fence(DeliveryState.Lease l, int attempt) {
+        if (l == null) return LeaseResult.NOT_IN_FLIGHT;
+        if (attempt != ANY_ATTEMPT && attempt != l.attempt()) return LeaseResult.STALE_ATTEMPT;
+        return null;
+    }
+
+    /**
+     * IN_FLIGHT → ACKED. Returns false if {@code offset} is not in flight for {@code group} (late or duplicate ack).
+     * Unfenced: prefer {@link #ack(String, long, int)} with the delivery's attempt.
+     */
+    public boolean ack(String group, long offset) { return ack(group, offset, ANY_ATTEMPT).ok(); }
+
+    /** As {@link #ack(String, long)}, returning the record's durability future, or null when rejected. Unfenced. */
     public CompletableFuture<Long> ack(String group, long offset, Durability durability) {
+        return ack(group, offset, ANY_ATTEMPT, durability).durable();
+    }
+
+    /** Fenced ack: applied only if {@code attempt} is the current lease ({@link Delivery#attempt()}). */
+    public LeaseResult ack(String group, long offset, int attempt) {
+        lock.lock();
+        try { // no result allocation on the common path
+            var r = fence(state.group(group).inFlight.get(offset), attempt);
+            if (r != null) return r;
+            append(new LedgerEntry.Ack(group, offset), null);
+            return LeaseResult.OK;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Fenced ack with a per-record durability override. */
+    public AckResult ack(String group, long offset, int attempt, Durability durability) {
         lock.lock();
         try {
-            if (!state.group(group).inFlight.containsKey(offset)) return null;
-            return append(new LedgerEntry.Ack(group, offset), durability);
+            var r = fence(state.group(group).inFlight.get(offset), attempt);
+            if (r != null) return new AckResult(r, null);
+            return new AckResult(LeaseResult.OK, append(new LedgerEntry.Ack(group, offset), durability));
         } finally {
             lock.unlock();
         }
@@ -274,34 +306,85 @@ public final class Partition implements AutoCloseable {
 
     /**
      * IN_FLIGHT → ENQUEUED, redeliverable after max(delayMs, backoff(attempt)); dead-lettered instead once the
-     * message has used {@code maxAttempts}. Returns false if not in flight.
+     * message has used {@code maxAttempts}. Returns false if not in flight. Unfenced.
      */
-    public boolean nack(String group, long offset, long delayMs) {
+    public boolean nack(String group, long offset, long delayMs) { return nack(group, offset, ANY_ATTEMPT, delayMs).ok(); }
+
+    /** Fenced nack: applied only if {@code attempt} is the current lease. */
+    public LeaseResult nack(String group, long offset, int attempt, long delayMs) {
         lock.lock();
         try {
             var g = state.group(group);
             var l = g.inFlight.get(offset);
-            if (l == null) return false;
+            var r = fence(l, attempt);
+            if (r != null) return r;
             if (l.attempt() >= state.policy().maxAttempts()) {
                 deadLetter(group, offset, l.attempt(), "nacked:max-attempts");
-                return true;
+                return LeaseResult.OK;
             }
             long notBefore = clockMs.getAsLong() + Math.max(Math.max(0, delayMs), state.policy().backoffMs(l.attempt()));
             append(new LedgerEntry.Nack(group, offset, notBefore), null);
-            return true;
+            return LeaseResult.OK;
         } finally {
             lock.unlock();
         }
     }
 
-    /** Dead-letters an in-flight message immediately (poison message). Returns false if not in flight. */
-    public boolean reject(String group, long offset, String reason) {
+    /** Dead-letters an in-flight message immediately (poison message). Returns false if not in flight. Unfenced. */
+    public boolean reject(String group, long offset, String reason) { return reject(group, offset, ANY_ATTEMPT, reason).ok(); }
+
+    /** Fenced reject: applied only if {@code attempt} is the current lease. */
+    public LeaseResult reject(String group, long offset, int attempt, String reason) {
         lock.lock();
         try {
             var l = state.group(group).inFlight.get(offset);
-            if (l == null) return false;
+            var r = fence(l, attempt);
+            if (r != null) return r;
             deadLetter(group, offset, l.attempt(), "rejected:" + reason);
-            return true;
+            return LeaseResult.OK;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Heartbeat: moves the lease of {@code offset} (held under {@code attempt}) to {@code now + visibilityMs}.
+     * Appends one EXTEND record. The new deadline may be earlier than the current one (shortening is allowed).
+     */
+    public LeaseResult extend(String group, long offset, int attempt, long visibilityMs) {
+        if (visibilityMs < 1) throw new IllegalArgumentException("visibility");
+        lock.lock();
+        try {
+            var r = fence(state.group(group).inFlight.get(offset), attempt);
+            if (r != null) return r;
+            append(new LedgerEntry.Extend(group, clockMs.getAsLong() + visibilityMs, new long[] {offset}, new int[] {attempt}), null);
+            return LeaseResult.OK;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Batched heartbeat (one worker, many leases): every lease that is still held gets {@code now + visibilityMs},
+     * in a single EXTEND record. Returns one result per input, in order; refused leases are not written.
+     */
+    public List<LeaseResult> extend(String group, long[] offsets, int[] attempts, long visibilityMs) {
+        if (visibilityMs < 1 || offsets.length != attempts.length) throw new IllegalArgumentException("extend");
+        var out = new ArrayList<LeaseResult>(offsets.length);
+        lock.lock();
+        try {
+            var g = state.group(group);
+            var okOff = new long[offsets.length];
+            var okAtt = new int[offsets.length];
+            int n = 0;
+            for (int i = 0; i < offsets.length; i++) { // a duplicate offset is written twice; applying it is idempotent
+                var r = fence(g.inFlight.get(offsets[i]), attempts[i]);
+                if (r == null) { okOff[n] = offsets[i]; okAtt[n] = attempts[i]; n++; r = LeaseResult.OK; }
+                out.add(r);
+            }
+            if (n > 0) append(new LedgerEntry.Extend(group, clockMs.getAsLong() + visibilityMs,
+                    java.util.Arrays.copyOf(okOff, n), java.util.Arrays.copyOf(okAtt, n)), null);
+            return out;
         } finally {
             lock.unlock();
         }

@@ -14,16 +14,21 @@ certificate the control node must present. `--demo` runs the same screens agains
 control plane (`FakeCpClient`).
 
 ### Live mode: what is wired and what is not
-Wired: `GET /cp/v1/health`, `GET /cp/v1/nodes`, `GET /cp/v1/config`, `POST /cp/v1/config`
-(propose), `POST /cp/v1/rollout` (selector other than `*`), `POST /cp/v1/activate` (selector `*`),
-`POST /cp/v1/rollback`. HTTP 503 (leader not ready) and connection failures move to the next
-endpoint.
+Wired: `GET /cp/v1/health`, `GET /cp/v1/nodes` (labels, health, applied version, lag),
+`GET /cp/v1/config`, `GET /cp/v1/config/{version}` (history), `POST /cp/v1/config:validate`
+(server dry run), `POST /cp/v1/config` (propose), `POST /cp/v1/rollout` (selector other than `*`),
+`POST /cp/v1/activate` (selector `*`), `GET /cp/v1/rollout`, `POST /cp/v1/rollback`, and
+`GET /cp/v1/audit`. Every mutation carries an `Idempotency-Key`. HTTP 503 (leader not ready) and
+connection failures move to the next endpoint.
 
-Not on the server yet, so handled in the console: version history (only the activated version
-is readable), dry-run validate (checked locally; the CP validates on propose), rollout status (the
-last rollout sent is shown), audit (the view says the endpoint is missing), idempotency keys,
-structured edits other than `access.rules` (other sections are read-only), and per-node labels,
-health, applied version and lag (shown as `?`).
+Authentication is the client certificate only (#89): the CP requires one (`needClientAuth`), trusts
+exactly the admin CA bundle, and maps the certificate's `urn:` SAN to viewer, operator or admin. An
+`Authorization` header is ignored. The console's `--cert/--key` must be issued by that CA and
+`--trust` must hold the CA that issued the CP's certificate.
+
+Still not on the server, so handled in the console: structured edits other than `access.rules`
+(the API takes a whole document; other sections are read-only), and per-node rollout acks
+(`GET /cp/v1/rollout` gives the stage, not which nodes applied it).
 
 It is a separate entry point: the server never loads `sjws_nettask.admin.cp` (a test enforces
 this), so the console costs nothing when it is not used.

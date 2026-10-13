@@ -43,22 +43,17 @@ import sjws_nettask.tls.TlsMaterial;
  * authenticated by the operator's client certificate (mTLS). Wrap several in
  * {@link FailoverCpClient} for CP failover.
  * <p>
- * Wired: {@code GET /health}, {@code GET /nodes}, {@code GET /config}, {@code POST /config},
- * {@code POST /rollout}, {@code POST /activate}, {@code POST /rollback}. Not available on the
- * server yet, answered locally (see {@link #MISSING}): version history, dry-run validate,
- * rollout status, audit, idempotency keys, structured edits of sections other than access rules.
+ * Every call the console makes has a server route (#76, #96). Mutations carry the caller's
+ * {@code Idempotency-Key}, which the CP replays, so a write retried on another endpoint after a
+ * failover is applied once. What the API still lacks is listed in {@link #MISSING}.
  */
 public final class HttpCpClient implements CpClient {
 
     /** Endpoints the console needs that the admin API does not have yet. */
     public static final List<String> MISSING = List.of(
-            "GET /cp/v1/config/{version} (history: only the activated version is readable)",
-            "POST /cp/v1/config:validate (dry run: validated locally, the CP validates on propose)",
-            "GET /cp/v1/rollout (status: the console shows what it last sent)",
-            "GET /cp/v1/audit",
-            "Idempotency-Key on mutations (a write retried after failover may apply twice)",
-            "structured edits of routes/filters/certs/topics (only access.rules is editable)",
-            "per-node labels, health, applied version and lag in GET /cp/v1/nodes");
+            "structured edits of routes/filters/certs/topics (the API takes a whole document; only access.rules is"
+                    + " editable)",
+            "per-node rollout acks and failures in GET /cp/v1/rollout (it reports the stage index and selectors)");
 
     static final Duration TIMEOUT = Duration.ofSeconds(3);
 
@@ -108,8 +103,15 @@ public final class HttpCpClient implements CpClient {
     }
 
     Map<String, Object> send(String method, String path, String body) throws CpException {
+        return send(method, path, body, null);
+    }
+
+    Map<String, Object> send(String method, String path, String body, String idempotencyKey) throws CpException {
         var builder = HttpRequest.newBuilder(this.base.resolve(path)).timeout(TIMEOUT)
                 .header("Accept", "application/json");
+        if (idempotencyKey != null) {
+            builder = builder.header("Idempotency-Key", idempotencyKey);
+        }
         builder = body == null ? builder.method(method, HttpRequest.BodyPublishers.noBody())
                 : builder.method(method, HttpRequest.BodyPublishers.ofString(body));
         HttpResponse<String> response;
@@ -156,8 +158,14 @@ public final class HttpCpClient implements CpClient {
             for (var item : list) {
                 if (item instanceof Map<?, ?> n) {
                     var role = String.valueOf(n.get("role")).toUpperCase(java.util.Locale.ROOT);
-                    var health1 = Boolean.TRUE.equals(n.get("revoked")) ? "REVOKED" : "?";
-                    views.add(new NodeView(String.valueOf(n.get("id")), role, Map.of(), health1, -1, -1));
+                    var labels = new java.util.LinkedHashMap<String, String>();
+                    if (n.get("labels") instanceof Map<?, ?> l) {
+                        l.forEach((k, v) -> labels.put(String.valueOf(k), String.valueOf(v)));
+                    }
+                    var health1 = Boolean.TRUE.equals(n.get("revoked")) ? "REVOKED"
+                            : n.get("health") == null ? "?" : String.valueOf(n.get("health"));
+                    views.add(new NodeView(String.valueOf(n.get("id")), role, labels, health1,
+                            number(n.get("appliedVersion")), number(n.get("lag"))));
                 }
             }
         }
@@ -185,12 +193,8 @@ public final class HttpCpClient implements CpClient {
 
     @Override
     public ConfigBundle config(long version) throws CpException {
-        long head = head();
-        if (version != head) {
-            throw new CpException(CpException.Kind.NOT_FOUND, "version " + version
-                    + ": only the activated version " + head + " is readable (no history endpoint yet)");
-        }
-        return CanonicalYaml.sections(head, yaml());
+        var reply = send("GET", "/cp/v1/config/" + version, null);
+        return CanonicalYaml.sections(number(reply.get("version")), String.valueOf(reply.get("yaml")));
     }
 
     private String yaml() {
@@ -202,20 +206,30 @@ public final class HttpCpClient implements CpClient {
         }
     }
 
-    /** Local checks only: the admin API has no dry-run endpoint, the CP validates again on propose. */
+    /**
+     * Read-only sections are checked here (the edit could not be sent); the document itself goes to
+     * {@code POST /cp/v1/config:validate}, the CP's dry run of propose.
+     */
     @Override
     public Validation validate(ConfigBundle draft) throws CpException {
         var errors = new ArrayList<String>(readOnlyChanges(draft));
-        var access = FakeCpClient.check(new ConfigBundle(0, Map.of(Section.ACCESS, draft.entries(Section.ACCESS),
+        var warnings = new ArrayList<String>();
+        if (errors.isEmpty()) {
+            var reply = send("POST", "/cp/v1/config:validate",
+                    CanonicalYaml.withRules(yaml(), draft.entries(Section.ACCESS)));
+            if (reply.get("errors") instanceof List<?> list) {
+                list.forEach(e -> errors.add(String.valueOf(e)));
+            }
+        }
+        var dup = FakeCpClient.check(new ConfigBundle(0, Map.of(Section.ACCESS, draft.entries(Section.ACCESS),
                 Section.ROUTES, List.of("x -> y"))));
-        errors.addAll(access.errors());
-        var warnings = new ArrayList<>(access.warnings());
-        warnings.add("checked locally: the control plane validates the whole document on propose");
+        warnings.addAll(dup.warnings());
         return new Validation(errors, warnings);
     }
 
     private List<String> readOnlyChanges(ConfigBundle draft) throws CpException {
-        var current = config(head());
+        head();
+        var current = CanonicalYaml.sections(this.headVersion, yaml());
         var out = new ArrayList<String>();
         for (var s : Section.values()) {
             if (s != CanonicalYaml.EDITABLE && !current.entries(s).equals(draft.entries(s))) {
@@ -236,7 +250,8 @@ public final class HttpCpClient implements CpClient {
         if (!readOnly.isEmpty()) {
             throw new CpException(CpException.Kind.INVALID, String.join("; ", readOnly));
         }
-        var reply = send("POST", "/cp/v1/config", CanonicalYaml.withRules(yaml(), draft.entries(Section.ACCESS)));
+        var reply = send("POST", "/cp/v1/config", CanonicalYaml.withRules(yaml(), draft.entries(Section.ACCESS)),
+                idempotencyKey);
         return number(reply.get("version"));
     }
 
@@ -254,11 +269,11 @@ public final class HttpCpClient implements CpClient {
         }
         Rollout r;
         if (sel.terms().isEmpty()) {
-            var reply = send("POST", "/cp/v1/activate", null);
+            var reply = send("POST", "/cp/v1/activate", null, idempotencyKey);
             r = new Rollout("v" + number(reply.get("version")), number(reply.get("version")), "*",
                     Rollout.State.DONE, List.of(), List.of());
         } else {
-            send("POST", "/cp/v1/rollout", "{\"stages\":[" + jsonString(sel.toString()) + "]}");
+            send("POST", "/cp/v1/rollout", "{\"stages\":[" + jsonString(sel.toString()) + "]}", idempotencyKey);
             r = new Rollout("v" + version + "@" + sel, version, sel.toString(), Rollout.State.RUNNING, List.of(),
                     List.of());
         }
@@ -271,29 +286,63 @@ public final class HttpCpClient implements CpClient {
         return r;
     }
 
-    /** No status endpoint yet: the last rollout this client sent, if {@code id} matches. */
+    /**
+     * {@code GET /cp/v1/rollout}: the stage index and selectors. A rollout this client activated is
+     * DONE; otherwise the stages up to the open one are reported as reached.
+     */
     @Override
     public Rollout rolloutStatus(String id) throws CpException {
+        var reply = send("GET", "/cp/v1/rollout", null);
+        Rollout last;
         this.lock.lock();
         try {
-            if (this.lastRollout != null && this.lastRollout.id().equals(id)) {
-                return this.lastRollout;
-            }
+            last = this.lastRollout;
         } finally {
             this.lock.unlock();
         }
-        throw new CpException(CpException.Kind.NOT_FOUND, "rollout " + id + " (no rollout status endpoint yet)");
+        if (last != null && last.id().equals(id) && last.state() == Rollout.State.DONE) {
+            return last;
+        }
+        var selectors = new ArrayList<String>();
+        if (reply.get("selectors") instanceof List<?> list) {
+            list.forEach(x -> selectors.add(String.valueOf(x)));
+        }
+        if (selectors.isEmpty()) {
+            throw new CpException(CpException.Kind.NOT_FOUND, "no rollout is open");
+        }
+        int reached = (int) Math.min(selectors.size(), Math.max(0, number(reply.get("stage"))) + 1);
+        return new Rollout(id, last == null ? 0 : last.version(), selectors.get(reached - 1), Rollout.State.RUNNING,
+                selectors, selectors.subList(0, reached));
     }
 
     @Override
     public long rollback(long toVersion, String idempotencyKey) throws CpException {
-        var reply = send("POST", "/cp/v1/rollback", "{\"toVersion\":" + toVersion + "}");
+        var reply = send("POST", "/cp/v1/rollback", "{\"toVersion\":" + toVersion + "}", idempotencyKey);
         return number(reply.get("version"));
     }
 
     @Override
     public List<AuditEntry> audit(long afterSeq, int limit) throws CpException {
-        throw new CpException(CpException.Kind.NOT_FOUND, "the admin API has no audit endpoint yet");
+        var reply = send("GET", "/cp/v1/audit?after=" + Math.max(0, afterSeq) + "&limit=" + Math.max(1, Math.min(100,
+                limit)), null);
+        var out = new ArrayList<AuditEntry>();
+        if (reply.get("entries") instanceof List<?> list) {
+            for (var item : list) {
+                if (item instanceof Map<?, ?> e) {
+                    java.time.Instant time;
+                    try {
+                        time = java.time.Instant.parse(String.valueOf(e.get("ts")));
+                    } catch (java.time.format.DateTimeParseException ex) {
+                        time = java.time.Instant.EPOCH;
+                    }
+                    var detail = e.get("target") + " " + e.get("outcome")
+                            + (e.get("version") instanceof Long v && v > 0 ? " v" + v : "");
+                    out.add(new AuditEntry(number(e.get("seq")), time, String.valueOf(e.get("actor")),
+                            String.valueOf(e.get("action")), detail));
+                }
+            }
+        }
+        return out;
     }
 
     static String jsonString(String s) {

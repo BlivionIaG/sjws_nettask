@@ -67,4 +67,35 @@ class SourceGuardTest {
         assertFalse(cluster.contains("sjws_nettask.http1"), "cluster must not import HTTP/1");
         assertFalse(cluster.contains("io.netty"), "cluster must not import Netty");
     }
+
+    /** docs/design/agent-swarm.md §3.3, item 1: the swarm is a leaf; only the entry point names it, as a string. */
+    @Test
+    void nothingOutsideTheSwarmDependsOnIt() throws IOException {
+        var offenders = new ArrayList<String>();
+        try (var walk = Files.walk(Path.of("src"))) {
+            for (var p : (Iterable<Path>) walk::iterator) {
+                var name = p.toString().replace('\\', '/');
+                if (!name.endsWith(".java") || name.startsWith("src/sjws_nettask/swarm/")) {
+                    continue;
+                }
+                var text = Files.readString(p);
+                if (name.equals("src/sjws_nettask/OptionalModules.java")) {
+                    if (text.contains("import sjws_nettask.swarm") || text.split("sjws_nettask\\.swarm", -1).length - 1 != 2) {
+                        offenders.add(name + " (must name the swarm only in the SWARM_CLASS constant and its javadoc)");
+                    }
+                } else if (text.contains("sjws_nettask.swarm")) {
+                    offenders.add(name);
+                }
+            }
+        }
+        assertTrue(offenders.isEmpty(), "outside the swarm package, only OptionalModules may name it: " + offenders);
+        var wire = Path.of("src/sjws_nettask/swarm/wire");
+        if (Files.isDirectory(wire)) {
+            var imports = java.util.regex.Pattern.compile("import (static )?sjws_nettask\\.([\\w]+)").matcher(all(wire));
+            while (imports.find()) {
+                var pkg = imports.group(2);
+                assertTrue(pkg.equals("core"), "swarm.wire may import only core: " + imports.group());
+            }
+        }
+    }
 }
