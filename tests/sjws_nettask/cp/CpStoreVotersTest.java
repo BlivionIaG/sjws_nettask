@@ -117,7 +117,9 @@ class CpStoreVotersTest {
                 MemberState.ALIVE, true);
         var withWitness = VoterSet.dataAndWitness(members.get(0), members.get(1), w);
         assertThrows(IllegalArgumentException.class, () -> CpStore.open(dir.resolve("y"), keys, new FakeClock(0),
-                "urn:sjws:admin:root", members.get(0).id(), withWitness, new SimTransport()));
+                "urn:sjws:admin:root", w.id(), withWitness, new SimTransport()), "a witness is CpWitness, not CpStore");
+        CpStore.open(dir.resolve("z"), keys, new FakeClock(0), "urn:sjws:admin:root", members.get(0).id(), withWitness,
+                new SimTransport()).close();
         var five = members(5);
         var clock = new FakeClock(0);
         var net = new SimTransport();

@@ -39,7 +39,8 @@ public final class DataApply {
     private final byte[] rootPublic;
     private final long pinFloor;
     private final List<TrustKey> keys;
-    private final byte[] trustSignature;
+    /** Exact root-signed {@link TrustBundle} bytes. */
+    private final byte[] trustBundle;
     private final long trustFloor;
     private final Path stateDir;
     private final LongSupplier nowMillis;
@@ -48,12 +49,12 @@ public final class DataApply {
     private long appliedVersion;
     private long appliedEpoch;
 
-    private DataApply(byte[] rootPublic, long pinFloor, List<TrustKey> keys, byte[] trustSignature, long trustFloor,
+    private DataApply(byte[] rootPublic, long pinFloor, List<TrustKey> keys, byte[] trustBundle, long trustFloor,
             Path stateDir, LongSupplier nowMillis) {
         this.rootPublic = rootPublic;
         this.pinFloor = pinFloor;
         this.keys = List.copyOf(keys);
-        this.trustSignature = trustSignature;
+        this.trustBundle = trustBundle.clone();
         this.trustFloor = trustFloor;
         this.stateDir = stateDir;
         this.nowMillis = nowMillis;
@@ -62,8 +63,8 @@ public final class DataApply {
     public static DataApply open(KeyRing keys, Path pin, Path stateDir, LongSupplier nowMillis) throws IOException {
         LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
         var read = LastGoodFiles.readPin(pin);
-        return new DataApply(read.rootPublic(), read.versionFloor(), keys.keys(), keys.trustSignature(),
-                keys.versionFloor(), stateDir, nowMillis);
+        return new DataApply(read.rootPublic(), read.versionFloor(), keys.bundle().keys(), keys.bundle().encoded(),
+                keys.bundle().versionFloor(), stateDir, nowMillis);
     }
 
     /**
@@ -74,13 +75,20 @@ public final class DataApply {
     public static DataApply trusted(Path pin, WatchWire.Message bundle, Path stateDir, LongSupplier nowMillis)
             throws IOException {
         var read = LastGoodFiles.readPin(pin);
-        var root = SnapshotCrypto.publicKey(read.rootPublic());
-        if (root == null || bundle.trustFloor() < read.versionFloor() || !SnapshotCrypto.verify(root,
-                SnapshotCrypto.trustInput(bundle.trustFloor(), bundle.keys()), bundle.trustSignature())) {
-            throw new IOException("trust bundle does not verify under the pinned root");
+        TrustBundle parsed;
+        try {
+            parsed = TrustBundle.parse(bundle.bundle(), read.rootPublic());
+        } catch (CpKeyException e) {
+            throw new IOException("trust bundle does not verify under the pinned root: " + e.getMessage(), e);
         }
-        return new DataApply(read.rootPublic(), read.versionFloor(), bundle.keys(), bundle.trustSignature(),
-                bundle.trustFloor(), stateDir, nowMillis);
+        if (parsed.versionFloor() < read.versionFloor()) {
+            throw new IOException("trust bundle floor is below the pinned floor");
+        }
+        if (nowMillis.getAsLong() > parsed.notAfterMillis()) {
+            throw new IOException("trust bundle has expired");
+        }
+        return new DataApply(read.rootPublic(), read.versionFloor(), parsed.keys(), parsed.encoded(),
+                parsed.versionFloor(), stateDir, nowMillis);
     }
 
     public record Decision(String error, boolean noop, String yaml) {
@@ -122,8 +130,9 @@ public final class DataApply {
         if (key == null) {
             return Decision.reject("keyId");
         }
-        var root = SnapshotCrypto.publicKey(rootPublic);
-        if (root == null || !SnapshotCrypto.verify(root, SnapshotCrypto.trustInput(trustFloor, keys), trustSignature)) {
+        try {
+            TrustBundle.parse(trustBundle, rootPublic);
+        } catch (CpKeyException e) {
             return Decision.reject("trust");
         }
         var onlineKey = SnapshotCrypto.publicKey(key.publicKey());
@@ -197,7 +206,7 @@ public final class DataApply {
     /** Records the applied envelope (floor, epoch, retained hash) and persists last-good. */
     public void remember(SignedSnapshot snapshot) throws IOException {
         record(snapshot);
-        LastGoodFiles.write(stateDir, appliedVersion, appliedEpoch, snapshot.keyId(), keys, trustFloor, trustSignature,
+        LastGoodFiles.write(stateDir, appliedVersion, appliedEpoch, snapshot.keyId(), keys, trustFloor, trustBundle,
                 snapshot);
     }
 

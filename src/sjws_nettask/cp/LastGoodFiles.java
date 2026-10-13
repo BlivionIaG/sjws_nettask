@@ -43,15 +43,15 @@ public final class LastGoodFiles {
     }
 
     public static void write(Path stateDir, long maxVersion, long maxEpoch, String keyId, List<TrustKey> keys,
-            long versionFloor, byte[] trustSignature, SignedSnapshot snapshot) throws IOException {
+            long versionFloor, byte[] trustBundle, SignedSnapshot snapshot) throws IOException {
         var dir = configDir(stateDir);
         Files.createDirectories(dir);
         var floor = "{\"maxVersion\":" + maxVersion + ",\"maxEpoch\":" + maxEpoch + ",\"keyId\":"
                 + jsonString(keyId) + "}";
         atomic(dir.resolve("floor.json"), floor);
         var trust = new StringBuilder();
-        trust.append("{\"versionFloor\":").append(versionFloor).append(",\"signature\":")
-                .append(jsonString(Base64.getEncoder().encodeToString(trustSignature))).append(",\"keys\":[");
+        trust.append("{\"versionFloor\":").append(versionFloor).append(",\"bundle\":")
+                .append(jsonString(Base64.getEncoder().encodeToString(trustBundle))).append(",\"keys\":[");
         for (int i = 0; i < keys.size(); i++) {
             if (i > 0) {
                 trust.append(',');

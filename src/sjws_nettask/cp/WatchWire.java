@@ -22,64 +22,55 @@ import java.util.Base64;
 import java.util.List;
 
 /**
- * Body of one {@code GET /cp/v1/watch} answer: the root-signed trust bundle, then the activated
+ * Body of one {@code GET /cp/v1/watch} answer: the root-signed trust bundle ({@link TrustBundle} bytes), then the activated
  * {@link SignedSnapshot} in its {@code last-good.json} form. Nothing here is trusted on decode:
  * {@link DataApply#trusted} checks the bundle against the pin and {@link DataApply#decide} checks
  * the snapshot, both fail closed.
  */
 public final class WatchWire {
 
-    /** At most this many online keys in one bundle. */
-    static final int MAX_KEYS = 16;
-
     private WatchWire() {
     }
 
-    public record Message(long trustFloor, byte[] trustSignature, List<TrustKey> keys, SignedSnapshot snapshot) {
+    /**
+     * @param bundle the exact root-signed {@link TrustBundle} bytes ({@code KeyRing.bundle().encoded()}); not
+     *        trusted until {@link DataApply#trusted} parses it against the pinned root
+     */
+    public record Message(byte[] bundle, SignedSnapshot snapshot) {
+        public Message {
+            bundle = bundle.clone();
+        }
+
+        @Override
+        public byte[] bundle() {
+            return bundle.clone();
+        }
     }
 
     public static String encode(KeyRing keys, SignedSnapshot snapshot) {
-        var b64 = Base64.getEncoder();
-        var out = new StringBuilder(512 + snapshot.canonicalYaml().length());
-        out.append("{\"versionFloor\":").append(keys.versionFloor()).append(",\"trustSignature\":")
-                .append(LastGoodFiles.jsonString(b64.encodeToString(keys.trustSignature())))
-                .append(",\"keyCount\":").append(keys.keys().size());
-        for (int i = 0; i < keys.keys().size(); i++) {
-            var k = keys.keys().get(i);
-            out.append(",\"k").append(i).append(".keyId\":").append(LastGoodFiles.jsonString(k.keyId()))
-                    .append(",\"k").append(i).append(".publicKey\":")
-                    .append(LastGoodFiles.jsonString(b64.encodeToString(k.publicKey())))
-                    .append(",\"k").append(i).append(".notAfter\":").append(k.notAfterMillis())
-                    .append(",\"k").append(i).append(".versionMin\":").append(k.versionMin())
-                    .append(",\"k").append(i).append(".versionMax\":").append(k.versionMax());
+        var bundle = keys.bundle();
+        if (bundle == null) {
+            throw new IllegalStateException("key ring has no trust bundle");
         }
-        out.append(",\"snapshot\":").append(LastGoodFiles.snapshotJson(snapshot)).append('}');
+        var out = new StringBuilder(512 + snapshot.canonicalYaml().length());
+        out.append("{\"bundle\":").append(LastGoodFiles.jsonString(Base64.getEncoder().encodeToString(bundle.encoded())))
+                .append(",\"snapshot\":").append(LastGoodFiles.snapshotJson(snapshot)).append('}');
         return out.toString();
     }
 
     public static Message decode(String json) throws IOException {
         try {
-            var b64 = Base64.getDecoder();
-            long floor = LastGoodFiles.readLong(json, "versionFloor");
-            var signature = b64.decode(LastGoodFiles.readString(json, "trustSignature"));
-            long count = LastGoodFiles.readLong(json, "keyCount");
-            if (count < 1 || count > MAX_KEYS) {
-                throw new IOException("keyCount");
+            var text = LastGoodFiles.readString(json, "bundle");
+            // Base64 of MAX_BYTES; checked before decoding so an oversized field allocates nothing large.
+            if (text.length() > (TrustBundle.MAX_BYTES + 2) / 3 * 4) {
+                throw new IOException("bundle size");
             }
-            var keys = new ArrayList<TrustKey>();
-            for (long i = 0; i < count; i++) {
-                keys.add(new TrustKey(LastGoodFiles.readString(json, "k" + i + ".keyId"),
-                        b64.decode(LastGoodFiles.readString(json, "k" + i + ".publicKey")),
-                        LastGoodFiles.readLong(json, "k" + i + ".notAfter"),
-                        LastGoodFiles.readLong(json, "k" + i + ".versionMin"),
-                        LastGoodFiles.readLong(json, "k" + i + ".versionMax")));
-            }
+            var bundle = Base64.getDecoder().decode(text);
             int at = json.indexOf("\"snapshot\":");
             if (at < 0) {
                 throw new IOException("missing snapshot");
             }
-            return new Message(floor, signature, List.copyOf(keys),
-                    DataApply.parseSnapshot(json.substring(at + "\"snapshot\":".length())));
+            return new Message(bundle, DataApply.parseSnapshot(json.substring(at + "\"snapshot\":".length())));
         } catch (IllegalArgumentException e) {
             throw new IOException("watch message: " + e.getMessage(), e);
         }

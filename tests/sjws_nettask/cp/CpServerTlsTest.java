@@ -90,6 +90,70 @@ class CpServerTlsTest {
         assertNull(new CpKeyConfig(dir, dir, dir, " ", false, 0).rootPubSha256());
     }
 
+    /** CONTROL hosting: both listeners use CpServerTls.context() and parameters() (client cert required). */
+    @Test
+    void watchAndAdminListenersRequireClientCertificates() throws Exception {
+        var cfg = material(false);
+        var tls = CpTls.serverContext(cfg);
+        var keys = KeyRing.generate("online-1", Long.MAX_VALUE, 0, Long.MAX_VALUE);
+        try (var store = CpStore.open(dir.resolve("state"), keys, sjws_nettask.cluster.Clock.SYSTEM);
+                var watch = WatchServer.startMtls(store, new java.net.InetSocketAddress("127.0.0.1", 0),
+                        System::currentTimeMillis, tls);
+                var admin = AdminServer.startMtls(store, new java.net.InetSocketAddress("127.0.0.1", 0),
+                        System.currentTimeMillis(), 60_000L, tls)) {
+            for (int port : new int[] {watch.port(), admin.port()}) {
+                assertThrows(java.io.IOException.class, () -> handshakeWithoutClientCert(port, cfg.caPem()), "port " + port);
+            }
+        }
+    }
+
+    /** A CONTROL host on Security's listener TLS: mTLS listeners, and SIGHUP reloads each listener's material. */
+    @Test
+    void controlHostServesMtlsAndReloadsListenerTls() throws Exception {
+        var tls = CpTls.serverContext(material(false));
+        var deps = new CpTestDeps() {
+            @Override
+            public CpServerTls serverTls(String listener) {
+                return tls;
+            }
+        };
+        var y = new java.util.HashMap<String, Object>(java.util.Map.of("nodeId", "cp-1", "stateDir",
+                dir.resolve("s").toString(), "keyDir", dir.resolve("k").toString(), "rootPub",
+                dir.resolve("r.pub").toString(), "watch", java.util.Map.of("listen", "127.0.0.1:0"), "admin",
+                java.util.Map.of("listen", "127.0.0.1:0")));
+        var config = CpConfig.parse(k -> null, java.util.Map.of(), y, null);
+        try (var host = (CpHost) CpLaunch.start(config, deps, new java.io.PrintStream(java.io.OutputStream.nullOutputStream()))) {
+            long before = tls.generation();
+            assertNull(host.reload());
+            assertEquals(before + 2, tls.generation(), "watch and admin listener TLS both reloaded");
+            assertEquals(java.util.List.of("keys", "store", "watch", "admin", "ready", "reloaded"), host.events());
+        }
+    }
+
+    /** Trusts only the test CA (the server is authenticated); offers no client certificate. */
+    private static void handshakeWithoutClientCert(int port, Path caPem) throws Exception {
+        var store = java.security.KeyStore.getInstance("PKCS12");
+        store.load(null, null);
+        try (var in = Files.newInputStream(caPem)) {
+            store.setCertificateEntry("ca",
+                    java.security.cert.CertificateFactory.getInstance("X.509").generateCertificate(in));
+        }
+        var tmf = javax.net.ssl.TrustManagerFactory.getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(store);
+        var ctx = javax.net.ssl.SSLContext.getInstance("TLSv1.3");
+        ctx.init(null, tmf.getTrustManagers(), null);
+        try (var socket = (javax.net.ssl.SSLSocket) ctx.getSocketFactory().createSocket("127.0.0.1", port)) {
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            var out = socket.getOutputStream();
+            out.write("GET /cp/v1/health HTTP/1.1\r\nHost: x\r\n\r\n".getBytes());
+            out.flush();
+            if (socket.getInputStream().read() < 0) {
+                throw new java.io.EOFException("closed without a client certificate");
+            }
+        }
+    }
+
     private CpListenerConfig material(boolean insecure) throws Exception {
         var caKeys = ec();
         var caName = new X500Name("CN=cp-ca");
