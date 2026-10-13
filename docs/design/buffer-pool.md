@@ -80,6 +80,23 @@ public sealed interface PooledBuffer extends AutoCloseable permits Slab.Chunk, U
   - A JUnit extension (`@ExtendWith(NoBufferLeaks.class)`) on transport and messaging suites.
   - Fault tests: client reset mid-request, shrinking file, TLS handshake failure, segment read error. All must end with 0 outstanding.
 
+The life of one pooled chunk as built (`PooledBuffer`, `BufferPool.recycle`). A large buffer is allocated on its own and parks in a cache of at most four per size, and a heap fallback is never pooled. Only a tracked handle can be recovered by the `Cleaner`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Free: slab carved
+    Free --> Held: acquire (charged)
+    Held --> Held: retain (+1 ref)
+    Held --> Free: last release (refunded)
+    Held --> Free: leak seen by the Cleaner
+    note right of Held
+        a leak is only seen
+        for tracked handles:
+        about 1 in 64, or
+        all in debug mode
+    end note
+```
+
 ## 6. Cap, sub-budgets and exhaustion
 - **One shared cap with named sub-budgets (approved).** `pool.max_bytes` is the global cap. `pool.budgets.<tenant>` gives each tenant a fraction or byte limit:
   - default `messaging: 50%`;
@@ -93,6 +110,23 @@ public sealed interface PooledBuffer extends AutoCloseable permits Slab.Chunk, U
 - **Cap:** `pool.max_bytes`, default **64 MiB** (open: should it scale with max connections?), with a per-class soft share so that no single class takes more than 50% of the cap.
 - **Neither method blocks.** Blocking would add latency and could deadlock under backpressure.
 - **Trimming:** a slab whose chunks are all free for longer than `pool.idle_trim` (default 60 s) is freed. Direct memory is released through the JDK `Cleaner`, plus an explicit unmap where possible. This is checked from `ConnectionReaper`'s timer thread; no new thread is added.
+
+One `acquire` as built (`BufferBudget.acquire` into `BufferPool.take`). `acquireLarge` (128 KiB to 4 MiB) skips the slabs: it reuses one of at most four cached buffers of its size, or allocates a direct buffer, under the same budget and cap:
+
+```mermaid
+flowchart TB
+    c1["HTTP/1 transport<br/>budget http: acquire<br/>(pool on only)"] --> s1
+    c2["Messaging HTTP<br/>budget messaging:<br/>produce acquires,<br/>fetch tryAcquires"] --> s1
+    s1["1. Pool off (the default):<br/>plain heap buffer, no<br/>accounting. Else go on"]
+    s2["2. Round up to a size<br/>class: 256 B ... 64 KiB"]
+    s3["3. Charge the class size<br/>to the tenant budget"]
+    s4["4. Take a free chunk:<br/>the thread's magazine<br/>(platform threads only),<br/>then the shared stacks,<br/>then a new 1 MiB slab"]
+    s5["5. Hand it out with one<br/>reference. About 1 in 64<br/>is tracked for leaks"]
+    no["Refused: over the budget<br/>or the global cap is hit.<br/>acquire: unpooled heap<br/>buffer, counted fallback.<br/>tryAcquire: null, counted<br/>denied"]
+    s1 --> s2 --> s3 --> s4 --> s5
+    s3 -->|"over budget"| no
+    s4 -->|"cap reached,<br/>refunded"| no
+```
 
 ## 7. Config: zero cost when off
 - `buffers.pool: off|on` in the YAML config (`--buffer-pool`), default **off** for the first release, then on after benches.

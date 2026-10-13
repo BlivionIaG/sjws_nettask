@@ -150,8 +150,8 @@ The rest of the suite:
   cancel in progress on pull requests.
 - Job `verify` (not on the cron): Temurin 25, `ubuntu-latest`. `macos-latest` is
   added only for `workflow_dispatch`. Timeout 45 minutes. Steps: checkout,
-  `actions/setup-java@v4` with the Maven cache, `mvn -B verify`, then the
-  end-to-end step below, then upload `target/site/jacoco/`.
+  `actions/setup-java` with the Maven cache, then the steps in the diagram below, then
+  upload `target/site/jacoco/`.
 - `mvn -B verify` is the unit and integration suite, the `jar` tests (Surefire
   execution `jar-tests` on the `integration-test` phase, without the JaCoCo
   agent), and the coverage gate. `FileServingEndToEndTest` is part of that
@@ -161,8 +161,8 @@ The rest of the suite:
 
   `mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test`
 
-- The cluster harness (tag `cluster`) runs the same way. Live cases start several
-  data nodes. The fault scenarios are `@Disabled` and do not fail this step:
+- The cluster harness (tag `cluster`) runs the same way. Its cases start several data
+  nodes and 3 or 5 real `CpStore` voters on an in-process transport, fault scenarios included:
 
   `mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test`
 
@@ -179,13 +179,13 @@ The rest of the suite:
 flowchart TB
     push["push to master"] --> verify
     pr["pull request"] --> verify
-    wd["workflow_dispatch"] --> verify
+    wd["workflow_dispatch"] -->|"also on macos-latest"| verify
     wd --> mut
     cron["weekly cron<br/>Monday 03:00 UTC"] --> mut
 
     subgraph verify["Job verify: Temurin 25"]
         direction TB
-        v1["mvn -B verify<br/>tests, jar tests, JaCoCo gate<br/>on ubuntu-latest, and<br/>on macos-latest<br/>too for workflow_dispatch"] --> v2["mvn -B -Dgroups=e2e test<br/>fails if no e2e test matched"] --> v3["mvn -B -Dgroups=cluster test<br/>live multi-node scenarios"] --> v4["Linux only: install wrk, then<br/>tools/gateway-bench.sh<br/>standalone vs gateway-off"] --> v5["Upload target/site/jacoco/"]
+        v0["Linux only: install<br/>Prometheus 3.15.0, which<br/>PrometheusScrapeTest<br/>requires on Linux CI"] --> v1["mvn -B verify<br/>tests, jar tests,<br/>JaCoCo gate"] --> v1b["HTTP/1 tests again with<br/>the buffer pool on<br/>(-Dsjws.buf.pool=on,<br/>debug mode)"] --> v1c["Python SDK tests against<br/>the jar that verify built"] --> v2["mvn -B -Dgroups=e2e test<br/>fails if no e2e test matched"] --> v3["mvn -B -Dgroups=cluster<br/>test: live multi-node<br/>scenarios"] --> v4["Linux only: install wrk, then<br/>tools/gateway-bench.sh<br/>standalone vs gateway-off"] --> v5["Upload target/site/jacoco/"]
     end
 
     subgraph mut["Job mutation: ubuntu-latest"]

@@ -81,6 +81,7 @@ flowchart TD
     h --> f["Request filters,<br/>only when enabled<br/>access log ·<br/>metrics · /healthz"]
     f --> s["StaticFileHandler<br/>path rules · cache ·<br/>validators · ranges"]
     s --> d[("Document root<br/>./HTML")]
+    f -.-> o["Opt-in, off by default<br/>routing and proxy<br/>messaging /messaging/v1<br/>swarm /swarm/v1"]
 ```
 
 The layers, the request flow and the design notes are in

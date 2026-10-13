@@ -27,6 +27,7 @@ stateDiagram-v2
     HEAD --> PROCESSING: head received
     PROCESSING --> WRITING: response ready, or the handler waits for body bytes
     WRITING --> PROCESSING: request body bytes arrived
+    WRITING --> HEAD: 100 Continue written, the body is bounded by the header timeout again
     WRITING --> IDLE: keep-alive
     IDLE --> CLOSED: idle timeout
     HEAD --> CLOSED: header timeout, 408

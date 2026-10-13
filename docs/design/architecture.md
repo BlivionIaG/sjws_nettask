@@ -63,7 +63,8 @@ flowchart TB
 `SjwsServer` is the composition root. `SjwsServer.start` builds the pieces in this order. HTTP/3 and
 HTTP/2 are optional: if one cannot start (port busy, QUIC natives missing, bad certificate) the server
 logs a `WARN:` line and keeps serving the others. Only a failure to bind the TCP port, or to open the
-dedicated HTTP-01 listener, stops it, and it then closes everything it had already started.
+dedicated HTTP-01 listener, stops it, and it then closes everything it had already started. Two
+overlapping prefix mounts also stop it, before any bind.
 
 ```mermaid
 sequenceDiagram
@@ -73,7 +74,7 @@ sequenceDiagram
     participant CM as ClientManager
 
     Note over S: compile the config snapshot<br/>StaticFileHandler and FileCache<br/>Router if routing.enabled<br/>ACME wrapper on the main listener
-    Note over S: build the observer slot,<br/>FilterChain and HaRuntime
+    Note over S: build the observer slot, the prefix-mount<br/>dispatcher, the FilterChain and HaRuntime
     alt content port bound (default, except on a control node)
         opt HTTP/3 enabled
             S->>H3: start on UDP
@@ -110,17 +111,23 @@ so a reload is visible on the next request.
 
 ```mermaid
 flowchart TB
-    t["Transport<br/>HTTP/1.1 · HTTP/2 · HTTP/3"] --> ha
+    t["Transport<br/>HTTP/1.1, HTTP/2,<br/>HTTP/3"] --> ha
 
     subgraph ha["HaHandler: only when HaSettings is attached"]
         subgraph fc["FilterChain: only when observability is on or filters are set"]
-            subgraph ac["AcmeChallengeHandler: only when ACME answers on the main listener"]
-                subgraph rt["Router: only when routing.enabled"]
-                    px["ProxyHandler"]
-                    rd["RedirectHandler"]
+            subgraph pm["Prefix mounts: only when a module mounts one"]
+                mod["Module handlers:<br/>/messaging/v1 and /swarm/v1,<br/>a match stops here"]
+                subgraph ac["AcmeChallengeHandler: only with ACME on the main listener"]
+                    subgraph rl["Global rate limit: only with routing.rate_limit"]
+                        subgraph rt["Router: only when routing.enabled"]
+                            px["ProxyHandler or<br/>EndpointBalancer"]
+                            rd["RedirectHandler"]
+                        end
+                    end
+                    sf["StaticFileHandler:<br/>always present"]
+                    rt -->|"static route, or no route matches"| sf
                 end
-                sf["StaticFileHandler:<br/>always present"]
-                rt -->|"static route, or no route matches"| sf
+                mod ~~~ px
             end
         end
     end
@@ -130,16 +137,18 @@ flowchart TB
 |---|---|
 | `HaHandler` | answers `/healthz` and `/readyz` from `HealthBoard`; everything else goes to the published generation, or to the config handler until one is published |
 | `FilterChain` | `ObserveRequestFilter` at order 0, then the other filters by order, registered at startup or compiled from a `FilterDocument` that `ChainControl` applies ([filters](../development/filters.md)) |
+| Prefix mounts | `HandlerMounts`: a dispatcher built at startup in front of the live snapshot's handler. A request under a mounted prefix goes to that optional module's handler, everything else falls through. The filters wrap it, so they see both. Not built when nothing mounts. Two modules mount, both off by default: messaging at `/messaging/v1` (`sjws.messaging.enabled`) and the swarm at `/swarm/v1` (`sjws.swarm.enabled`) |
 | `AcmeChallengeHandler` | answers `/.well-known/acme-challenge/` before anything else, including the file handler's dotfile check |
-| `Router` | first matching route wins: `ProxyHandler`, `RedirectHandler`, or the static handler; a route with `errors: problem` wraps its handler in `ProblemErrorHandler` ([routing](proxy-routing.md)) |
+| Global rate limit | `routing.rate_limit`: one limiter in front of the Router, so a refused request (429) never reaches a route ([routing](proxy-routing.md)) |
+| `Router` | first matching route wins: `ProxyHandler` (an `EndpointBalancer` for an upstream with endpoints), weighted backends, `RedirectHandler`, or the static handler; a route with `errors: problem` wraps its handler in `ProblemErrorHandler`, and a route `rate_limit` sits inside that wrapper ([routing](proxy-routing.md)) |
 | `StaticFileHandler` | every status decision for a file ([access rules](../user/access-rules.md), [caching](../user/caching-and-ranges.md)) |
 
-On the command line the handler every transport calls reads the live snapshot, so a reload (document
-root, access rules, routes) reaches HTTP/1.1, HTTP/2 and HTTP/3 on the next request. Filters or a
-replacement terminal that an embedder passes to `SjwsServer.start` are compiled around the startup
-`StaticFileHandler` and keep it across reloads. `SjwsServer.chainControl` opens the slot a control
-plane uses: each `FilterDocument` it applies is compiled and published to every transport with one
-volatile write per transport ([filters](../development/filters.md)).
+The file-handler leaf reads the live snapshot, on the command line and under filters an embedder
+registers, so a reload (document root, access rules, routes) reaches HTTP/1.1, HTTP/2 and HTTP/3 on
+the next request. Only a replacement terminal that an embedder passes to `SjwsServer.start` keeps the
+leaf it was compiled around. `SjwsServer.chainControl` opens the slot a control plane uses: each
+`FilterDocument` it applies is compiled and published to every transport with one volatile write per
+transport ([filters](../development/filters.md)).
 
 ## Current gaps
 
@@ -243,30 +252,31 @@ Prototype: `bench/LogBench.java` (bench code only, not server code).
 
 ## T5. How the existing code fits
 Dashed boxes are not built yet. The ledger and delivery code in `sjws_nettask.messaging` covers part of
-`PartitionLog` and of the partition logic, and is not wired into the server.
+`PartitionLog` and of the partition logic. Two opt-in modules, messaging and the swarm, reach it through
+prefix mounts in the handler chain. Both are off by default.
 
 ```mermaid
 flowchart TB
-    subgraph shared["Shared core: listeners, virtual threads, ConnectionReaper, buffer pool"]
-        tcp["TCP :80 / :443<br/>Http1Connection"]
-        quic["UDP, QUIC<br/>h3 on Netty"]
-        msg["TCP :msg<br/>MsgConnection"]
-    end
+    t1["HTTP/1.1<br/>TCP, Http1Connection"] --> req
+    t2["HTTP/2<br/>TLS or h2c, Netty"] --> req
+    t3["HTTP/3<br/>UDP, Netty QUIC"] --> req
+    msg["TCP :msg<br/>MsgConnection"]
 
-    tcp --> req["core.Request"]
-    quic --> req
-    req --> chain["Handler chain"]
-    chain --> static["StaticFileHandler"]
-    chain --> mh["MessagingHttpHandler"]
+    req["core.Request"] --> chain["Handler chain:<br/>filters, prefix mounts"]
+    chain --> static["Router and<br/>StaticFileHandler"]
+    chain --> mh["MessagingHttp<br/>/messaging/v1, opt-in"]
+    chain --> sh["SwarmHttp<br/>/swarm/v1, opt-in"]
 
-    mh -->|"produce / fetch"| broker["Broker"]
-    msg -->|"produce / fetch"| broker
-    broker --> plog[("PartitionLog<br/>segments")]
-    broker <--> repl["Replicator"]
-    repl <--> raft["Raft metadata"]
+    mh -->|"produce / fetch"| plog[("PartitionLog:<br/>SegmentedLog +<br/>LedgerWriter")]
+    sh --> part["delivery.Partition<br/>leases, DLQ"]
+    part --> plog
+    msg -.->|"produce / fetch"| broker["Broker"]
+    broker -.-> plog
+    broker <-.-> repl["Replicator"]
+    repl <-.-> raft["Raft metadata for<br/>messaging (cluster hosts<br/>only the control plane)"]
 
     classDef design stroke-dasharray: 5 5
-    class msg,mh,broker,plog,repl,raft design
+    class msg,broker,repl,raft design
 ```
 * `core.Handler` (PR #4) stays the HTTP seam. Messaging over HTTP is just another `Handler` in the chain, so it needs no transport change.
 * `Transport` (today the HTTP/3 lifecycle) becomes the generic listener interface. A messaging TCP listener is a new `Transport`.

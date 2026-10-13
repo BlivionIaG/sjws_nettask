@@ -274,7 +274,7 @@ when there is one and `handler` otherwise, so the empty path stays a direct call
 
 ```mermaid
 flowchart TD
-    a{"A handler was published<br/>through armHandler?"} -->|"yes: a metrics arm,<br/>a ChainControl snapshot,<br/>or the live snapshot"| ar["Call that handler"]
+    a{"A handler was published<br/>through armHandler?"} -->|"yes: a metrics arm,<br/>a ChainControl snapshot,<br/>or HTTP/2's live snapshot"| ar["Call that handler"]
     a -->|no| s["The startup choice:<br/>FilterChain.dispatch(files,<br/>terminal, chain)"]
     s --> c{"chain is not null?"}
     c -->|yes| ch["Call chain.handle<br/>the chain already<br/>closes over its<br/>terminal"]
@@ -282,6 +282,12 @@ flowchart TD
     t -->|yes| fl["Call files.handle directly<br/>no chain object on<br/>the request path"]
     t -->|no| tm["Call terminal.handle<br/>for example a router"]
 ```
+That is the rule of `FilterChain.dispatch`, which `Http3Server` applies when it is built and a custom
+transport can apply. On a `SjwsServer` the transports then follow the request handler: HTTP/1.1 reads
+`override` (the chain, the prefix mounts, a replacement terminal or the HA handler) or, when there is none,
+the live snapshot handler. HTTP/3 is switched to the same `requestHandler()` at start. HTTP/2 takes
+`terminal` when there is one, and otherwise follows the live snapshot.
+
 `Transport.armHandler` is how a listener learns about a filter published by a later
 `metricsSnapshot()`. The default ignores it. HTTP/2 and HTTP/3 install that handler for the next
 request.
