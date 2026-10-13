@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.Timeout;
 class HeartbeatServiceTest {
 
     private static final SiteId SITE = new SiteId("local");
+    private static final ClusterKey KEY = ClusterKey.of("0123456789abcdef".getBytes(StandardCharsets.UTF_8), null);
 
     private static InetSocketAddress at(int port) {
         return new InetSocketAddress("127.0.0.1", port);
@@ -43,9 +45,10 @@ class HeartbeatServiceTest {
         };
         var members = List.of(member(1, "a", 1), member(2, "b", 2));
         var interval = Duration.ofMillis(100);
-        var a = LocalCluster.open(new NodeId(1, "a"), members, aLink, clock, interval, Duration.ofSeconds(5), events);
+        var a = LocalCluster.open(new NodeId(1, "a"), members, aLink, clock, interval, Duration.ofSeconds(5), events,
+                KEY);
         var b = LocalCluster.open(new NodeId(2, "b"), members, bLink, clock, interval, Duration.ofSeconds(5),
-                ClusterEvents.NONE);
+                ClusterEvents.NONE, KEY);
         a.announce(3L, 9L, 11L, 1_000);
         a.cycle();
         b.cycle();
@@ -77,8 +80,10 @@ class HeartbeatServiceTest {
         var bad = new byte[HeartbeatCodec.BYTES];
         junk.send(at(1), bad, 0, bad.length);
         int before = a.received();
+        int rejected = a.rejected();
         a.cycle();
         assertEquals(before, a.received());
+        assertEquals(rejected + 2, a.rejected());
 
         while (bLink.poll() != null) {
             // leave the queue empty so the next drop is observable
@@ -106,11 +111,13 @@ class HeartbeatServiceTest {
         var interval = Duration.ofMillis(20);
         var membership = new Membership(new NodeId(1, "a"), members, interval.toNanos(), Duration.ofSeconds(5).toNanos(),
                 0L, ClusterEvents.NONE);
-        var service = new HeartbeatService(membership, boom, clock, interval, ClusterEvents.NONE);
+        var service = new HeartbeatService(membership, boom, clock, interval, ClusterEvents.NONE, KEY);
+        assertThrows(NullPointerException.class,
+                () -> new HeartbeatService(membership, boom, clock, interval, ClusterEvents.NONE, null));
         assertThrows(IllegalArgumentException.class,
-                () -> new HeartbeatService(membership, boom, clock, Duration.ZERO, ClusterEvents.NONE));
+                () -> new HeartbeatService(membership, boom, clock, Duration.ZERO, ClusterEvents.NONE, KEY));
         assertThrows(IllegalArgumentException.class,
-                () -> new HeartbeatService(membership, boom, clock, null, ClusterEvents.NONE));
+                () -> new HeartbeatService(membership, boom, clock, null, ClusterEvents.NONE, KEY));
         service.cycle();
         assertTrue(service.sendFailures() > 0);
         boom.failSend = false;
@@ -135,9 +142,9 @@ class HeartbeatServiceTest {
             }
         };
         var left = LocalCluster.start(new NodeId(1, "a"), members, link, Clock.SYSTEM, interval, Duration.ofSeconds(5),
-                events);
-        var right = LocalCluster.start(new NodeId(2, "b"), members, peer, Clock.SYSTEM, interval, Duration.ofSeconds(5),
-                ClusterEvents.NONE);
+                events, KEY);
+        var right = LocalCluster.start(new NodeId(2, "b"), members, peer, Clock.SYSTEM, interval,
+                Duration.ofSeconds(5), ClusterEvents.NONE, KEY);
         long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
         while (left.sendFailures() == 0 && System.nanoTime() < deadline) {
             Thread.sleep(10);
@@ -148,7 +155,7 @@ class HeartbeatServiceTest {
         assertTrue(peer.localAddress().getPort() == 2);
 
         var alone = LocalCluster.open(new NodeId(1, "a"), List.of(member(1, "a", 1)), net.link(at(8)), clock,
-                interval, Duration.ofSeconds(5), ClusterEvents.NONE);
+                interval, Duration.ofSeconds(5), ClusterEvents.NONE, KEY);
         alone.cycle();
         assertEquals(0, alone.received());
         alone.close();
@@ -167,8 +174,8 @@ class HeartbeatServiceTest {
                     new Member(a, site, leftLink.localAddress(), 1L, MemberState.ALIVE, false),
                     new Member(b, site, rightLink.localAddress(), 1L, MemberState.ALIVE, false));
             var interval = Duration.ofMillis(15);
-            var left = LocalCluster.start(a, members, leftLink, Clock.SYSTEM, interval);
-            var right = LocalCluster.start(b, members, rightLink, Clock.SYSTEM, interval);
+            var left = LocalCluster.start(a, members, leftLink, Clock.SYSTEM, interval, KEY);
+            var right = LocalCluster.start(b, members, rightLink, Clock.SYSTEM, interval, KEY);
             long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
             while ((left.received() == 0 || right.received() == 0) && System.nanoTime() < deadline) {
                 Thread.sleep(15);

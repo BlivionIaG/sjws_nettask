@@ -25,8 +25,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * One virtual thread, one reused 64-byte buffer. {@link #cycle()} is the same step the thread
- * runs, exposed so tests can advance a fake clock without sleeping.
+ * One virtual thread, one reused authenticated datagram. {@link #cycle()} is the same step the
+ * thread runs, exposed so tests can advance a fake clock without sleeping. Every datagram is
+ * HMAC-SHA256; a missing cluster key is refused.
  */
 public final class HeartbeatService implements AutoCloseable {
 
@@ -35,8 +36,10 @@ public final class HeartbeatService implements AutoCloseable {
     private final Clock clock;
     private final Duration interval;
     private final ClusterEvents events;
+    private final HeartbeatAuthenticator auth;
     private final ReentrantLock lock = new ReentrantLock();
-    private final byte[] buffer = new byte[HeartbeatCodec.BYTES];
+    private final byte[] body = new byte[HeartbeatCodec.BYTES];
+    private final byte[] packet = new byte[HeartbeatAuthenticator.PACKET_BYTES];
     private final Map<NodeId, Long> lastSendNanos = new HashMap<>();
     private final AtomicInteger received = new AtomicInteger();
     private final AtomicInteger sendFailures = new AtomicInteger();
@@ -48,11 +51,12 @@ public final class HeartbeatService implements AutoCloseable {
     private int leaseRemainingMs;
 
     public HeartbeatService(Membership membership, PacketLink link, Clock clock, Duration interval,
-            ClusterEvents events) {
+            ClusterEvents events, ClusterKey key) {
         this.membership = Objects.requireNonNull(membership, "membership");
         this.link = Objects.requireNonNull(link, "link");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.events = Objects.requireNonNull(events, "events");
+        this.auth = new HeartbeatAuthenticator(Objects.requireNonNull(key, "cluster key"));
         if (interval == null || interval.isZero() || interval.isNegative()) {
             throw new IllegalArgumentException("interval");
         }
@@ -77,6 +81,11 @@ public final class HeartbeatService implements AutoCloseable {
 
     public int sendFailures() {
         return sendFailures.get();
+    }
+
+    /** Authenticated datagrams that were dropped (bad tag, replay, stale, or a bad body). */
+    public int rejected() {
+        return this.auth.rejected();
     }
 
     public void start() {
@@ -130,10 +139,11 @@ public final class HeartbeatService implements AutoCloseable {
         }
         for (var peer : membership.view().others()) {
             var beat = membership.outbound(peer.id(), termNow, generationNow, hashNow, leaseNow);
-            HeartbeatCodec.encode(beat, buffer);
+            HeartbeatCodec.encode(beat, this.body);
+            this.auth.seal(this.body, this.packet, System.currentTimeMillis());
             lastSendNanos.put(peer.id(), now);
             try {
-                link.send(peer.address(), buffer, 0, HeartbeatCodec.BYTES);
+                link.send(peer.address(), this.packet, 0, HeartbeatAuthenticator.PACKET_BYTES);
             } catch (IOException failed) {
                 sendFailures.incrementAndGet();
             }
@@ -155,10 +165,7 @@ public final class HeartbeatService implements AutoCloseable {
     }
 
     private void accept(PacketLink.Packet packet, long now) {
-        if (packet.data().length != HeartbeatCodec.BYTES) {
-            return;
-        }
-        var beat = HeartbeatCodec.decode(packet.data());
+        var beat = this.auth.open(packet.data(), System.currentTimeMillis());
         if (beat == null) {
             return;
         }
@@ -174,9 +181,10 @@ public final class HeartbeatService implements AutoCloseable {
         if (reply.isEmpty()) {
             return;
         }
-        HeartbeatCodec.encode(reply.get(), buffer);
+        HeartbeatCodec.encode(reply.get(), this.body);
+        this.auth.seal(this.body, this.packet, System.currentTimeMillis());
         try {
-            link.send(packet.from(), buffer, 0, HeartbeatCodec.BYTES);
+            link.send(packet.from(), this.packet, 0, HeartbeatAuthenticator.PACKET_BYTES);
         } catch (IOException failed) {
             sendFailures.incrementAndGet();
         }
