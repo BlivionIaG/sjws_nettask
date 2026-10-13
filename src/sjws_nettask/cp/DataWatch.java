@@ -19,6 +19,11 @@ package sjws_nettask.cp;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
+import java.net.Socket;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -54,6 +59,8 @@ public final class DataWatch implements AutoCloseable {
     private final SjwsServer server;
     private final NodeEnrollment enrollment;
     private final LongSupplier nowMillis;
+    private final CpTls cpTls;
+    private SSLContext clientTls;
     private final Thread thread;
     private volatile boolean running = true;
     private volatile HttpURLConnection open;
@@ -64,12 +71,16 @@ public final class DataWatch implements AutoCloseable {
     private long reportedVersion;
 
     private DataWatch(URI base, String nodeId, String tokenId, byte[] secret, Path pin, Path stateDir,
-            SjwsServer server, NodeEnrollment enrollment, LongSupplier nowMillis) {
+            SjwsServer server, NodeEnrollment enrollment, LongSupplier nowMillis, CpTls cpTls, SSLContext clientTls) {
         this.base = base;
         this.nodeId = nodeId;
         this.tokenId = tokenId;
-        this.secret = Base64.getEncoder().encodeToString(secret);
-        Arrays.fill(secret, (byte) 0);
+        this.secret = secret == null ? null : Base64.getEncoder().encodeToString(secret);
+        if (secret != null) {
+            Arrays.fill(secret, (byte) 0);
+        }
+        this.cpTls = cpTls;
+        this.clientTls = clientTls;
         this.pin = pin;
         this.stateDir = stateDir;
         this.server = server;
@@ -84,30 +95,51 @@ public final class DataWatch implements AutoCloseable {
      */
     public static DataWatch open(String controlPlane, String nodeId, String tokenId, byte[] secret, Path pin,
             Path stateDir, SjwsServer server, NodeEnrollment enrollment, LongSupplier nowMillis) throws IOException {
-        var watch = new DataWatch(endpoint(controlPlane), nodeId, tokenId, secret, pin, stateDir, server, enrollment,
-                nowMillis);
+        return open(controlPlane, nodeId, tokenId, secret, pin, stateDir, server, enrollment, nowMillis, null);
+    }
+
+    /**
+     * Starts the watch over mutual TLS when {@code cpTls} is set: any host, {@code https}, the CP
+     * certificate checked against the pinned CA and {@link CpTls#peerName()}. The join token may be
+     * null once this node has joined, because its certificate is then the credential. With
+     * {@code cpTls} null this is the plain loopback watch.
+     */
+    public static DataWatch open(String controlPlane, String nodeId, String tokenId, byte[] secret, Path pin,
+            Path stateDir, SjwsServer server, NodeEnrollment enrollment, LongSupplier nowMillis, CpTls cpTls)
+            throws IOException {
+        if (cpTls == null && (tokenId == null || secret == null)) {
+            throw new IOException("plain control-plane watch needs the join token");
+        }
+        var clientTls = cpTls == null ? null : cpTls.client();
+        var watch = new DataWatch(endpoint(controlPlane, cpTls != null), nodeId, tokenId, secret, pin, stateDir,
+                server, enrollment, nowMillis, cpTls, clientTls);
         watch.thread.start();
         return watch;
     }
 
     static URI endpoint(String controlPlane) throws IOException {
+        return endpoint(controlPlane, false);
+    }
+
+    static URI endpoint(String controlPlane, boolean tls) throws IOException {
         if (controlPlane == null || controlPlane.isBlank()) {
             throw new IOException("no control-plane address");
         }
-        var text = controlPlane.contains("://") ? controlPlane : "http://" + controlPlane;
+        var scheme = tls ? "https" : "http";
+        var text = controlPlane.contains("://") ? controlPlane : scheme + "://" + controlPlane;
         URI uri;
         try {
             uri = URI.create(text);
         } catch (IllegalArgumentException e) {
             throw new IOException("control-plane address: " + e.getMessage());
         }
-        if (!"http".equals(uri.getScheme()) || uri.getHost() == null || uri.getPort() < 1) {
-            throw new IOException("control-plane address must be host:port");
+        if (!scheme.equals(uri.getScheme()) || uri.getHost() == null || uri.getPort() < 1) {
+            throw new IOException("control-plane address must be host:port" + (tls ? " (https with cpTls)" : ""));
         }
-        if (!InetAddress.getByName(uri.getHost()).isLoopbackAddress()) {
-            throw new IOException("control-plane watch is loopback-only until the mTLS watch lands");
+        if (!tls && !InetAddress.getByName(uri.getHost()).isLoopbackAddress()) {
+            throw new IOException("plain control-plane watch is loopback-only; configure cpTls for a remote CP");
         }
-        return URI.create("http://" + uri.getHost() + ":" + uri.getPort());
+        return URI.create(scheme + "://" + uri.getHost() + ":" + uri.getPort());
     }
 
     /** Highest version applied through this watch; 0 before the first apply. */
@@ -182,13 +214,15 @@ public final class DataWatch implements AutoCloseable {
     }
 
     private HttpURLConnection request(String method, String pathAndQuery) throws IOException {
-        var conn = openSocket(this.base.resolve(pathAndQuery));
+        var conn = openSocket(this.base.resolve(pathAndQuery), clientTls());
         conn.setRequestMethod(method);
         conn.setConnectTimeout(5_000);
         conn.setReadTimeout((int) (WAIT_MS + 10_000L));
         conn.setRequestProperty(WatchServer.NODE, this.nodeId);
-        conn.setRequestProperty(WatchServer.TOKEN_ID, this.tokenId);
-        conn.setRequestProperty(WatchServer.SECRET, this.secret);
+        if (this.tokenId != null && this.secret != null) {
+            conn.setRequestProperty(WatchServer.TOKEN_ID, this.tokenId);
+            conn.setRequestProperty(WatchServer.SECRET, this.secret);
+        }
         if ("POST".equals(method)) {
             conn.setDoOutput(true);
             conn.getOutputStream().close();
@@ -198,11 +232,113 @@ public final class DataWatch implements AutoCloseable {
     }
 
     /**
-     * The one place a connection to the control plane is created. Plain HTTP today; the opt-in mTLS
-     * of the node-to-CP channel returns an {@code HttpsURLConnection} with its SSL context here.
+     * The client context, rebuilt when the cpTls files change (so a rotated node certificate or CA
+     * is picked up on the next poll). A failed rebuild keeps the previous context.
      */
-    static HttpURLConnection openSocket(URI target) throws IOException {
-        return (HttpURLConnection) target.toURL().openConnection();
+    private SSLContext clientTls() {
+        if (this.cpTls == null) {
+            return null;
+        }
+        var stamp = stamp(this.cpTls);
+        if (!stamp.equals(this.clientStamp)) {
+            try {
+                this.clientTls = this.cpTls.client();
+                this.clientStamp = stamp;
+            } catch (IOException e) {
+                System.err.println("WARN: cpTls reload failed, keeping the previous material: " + e.getMessage());
+                this.clientStamp = stamp;
+            }
+        }
+        return this.clientTls;
+    }
+
+    private String clientStamp = "";
+
+    private static String stamp(CpTls t) {
+        var out = new StringBuilder();
+        for (var p : new Path[] {t.certPem(), t.keyPem(), t.caPem()}) {
+            try {
+                out.append(java.nio.file.Files.getLastModifiedTime(p).toMillis()).append(':')
+                        .append(java.nio.file.Files.size(p)).append(';');
+            } catch (IOException e) {
+                out.append("absent;");
+            }
+        }
+        return out.toString();
+    }
+
+    /**
+     * The one place a connection to the control plane is created: plain HTTP when {@code tls} is
+     * null, otherwise an {@code HttpsURLConnection} over TLS 1.3 with this node's certificate,
+     * trusting only the pinned CA ({@link CpTls#client()} also checks the CP identity).
+     */
+    static HttpURLConnection openSocket(URI target, SSLContext tls) throws IOException {
+        var conn = (HttpURLConnection) target.toURL().openConnection();
+        if (tls == null) {
+            return conn;
+        }
+        if (!(conn instanceof HttpsURLConnection https)) {
+            throw new IOException("cpTls needs an https control-plane address");
+        }
+        https.setSSLSocketFactory(new Tls13Only(tls.getSocketFactory()));
+        return conn;
+    }
+
+    /** Restricts every socket to TLS 1.3. */
+    private static final class Tls13Only extends SSLSocketFactory {
+        private final SSLSocketFactory delegate;
+
+        Tls13Only(SSLSocketFactory delegate) {
+            this.delegate = delegate;
+        }
+
+        private Socket only13(Socket s) {
+            if (s instanceof SSLSocket ssl) {
+                ssl.setEnabledProtocols(new String[] {"TLSv1.3"});
+            }
+            return s;
+        }
+
+        @Override
+        public String[] getDefaultCipherSuites() {
+            return delegate.getDefaultCipherSuites();
+        }
+
+        @Override
+        public String[] getSupportedCipherSuites() {
+            return delegate.getSupportedCipherSuites();
+        }
+
+        @Override
+        public Socket createSocket(Socket s, String host, int port, boolean autoClose) throws IOException {
+            return only13(delegate.createSocket(s, host, port, autoClose));
+        }
+
+        @Override
+        public Socket createSocket() throws IOException {
+            return only13(delegate.createSocket());
+        }
+
+        @Override
+        public Socket createSocket(String host, int port) throws IOException {
+            return only13(delegate.createSocket(host, port));
+        }
+
+        @Override
+        public Socket createSocket(String host, int port, InetAddress local, int localPort) throws IOException {
+            return only13(delegate.createSocket(host, port, local, localPort));
+        }
+
+        @Override
+        public Socket createSocket(InetAddress host, int port) throws IOException {
+            return only13(delegate.createSocket(host, port));
+        }
+
+        @Override
+        public Socket createSocket(InetAddress address, int port, InetAddress local, int localPort)
+                throws IOException {
+            return only13(delegate.createSocket(address, port, local, localPort));
+        }
     }
 
     /** Rewrites the status file only on a change. {@code down} maps to disconnected or pending. */

@@ -107,13 +107,15 @@ public final class AdminTls {
     private final Path trustBundle;
     private final Path revocations;
     private final Audit audit;
+    private final String label;
     private final SSLContext context;
     private final AtomicLong generation = new AtomicLong();
     private volatile Material current;
     private volatile Material previous;
 
-    private AdminTls(Path certPem, Path keyPem, String keyPassword, Path trustBundle, Path revocations, Audit audit)
-            throws IOException {
+    private AdminTls(String label, Path certPem, Path keyPem, String keyPassword, Path trustBundle, Path revocations,
+            Audit audit) throws IOException {
+        this.label = label;
         this.certPem = certPem;
         this.keyPem = keyPem;
         this.keyPassword = keyPassword;
@@ -141,11 +143,32 @@ public final class AdminTls {
         if (certPem == null || keyPem == null || trustBundle == null) {
             throw new IOException("admin listener requires a server certificate, a key, and an admin CA trust bundle");
         }
-        return new AdminTls(certPem, keyPem, keyPassword, trustBundle, revocations, audit);
+        return new AdminTls("admin-tls", certPem, keyPem, keyPassword, trustBundle, revocations, audit);
+    }
+
+    /**
+     * Same reloadable, revocation-checked server context for another mTLS listener (the CP watch
+     * channel). {@code label} prefixes audit actions, e.g. {@code cp-tls.handshake}.
+     */
+    static AdminTls openListener(String label, Path certPem, Path keyPem, String keyPassword, Path trustBundle,
+            Path revocations, Audit audit) throws IOException {
+        if (certPem == null || keyPem == null || trustBundle == null) {
+            throw new IOException(label + " requires a certificate, a key, and a CA trust bundle");
+        }
+        return new AdminTls(label, certPem, keyPem, keyPassword, trustBundle, revocations, audit);
     }
 
     public SSLContext context() {
         return context;
+    }
+
+    /** The delegating managers installed in {@link #context()}; for tests. */
+    X509ExtendedTrustManager trustManager() {
+        return new Trust();
+    }
+
+    X509ExtendedKeyManager keyManager() {
+        return new Keys();
     }
 
     /** Number of successful loads, starting at 1. */
@@ -166,11 +189,11 @@ public final class AdminTls {
             current = next;
             generation.set(next.gen());
             invalidateSessions(context.getServerSessionContext());
-            audit.record("system", "admin-tls.reload", String.valueOf(trustBundle), "ok");
+            audit.record("system", label + ".reload", String.valueOf(trustBundle), "ok");
             return null;
         } catch (IOException | RuntimeException e) {
             var why = String.valueOf(e.getMessage());
-            audit.record("system", "admin-tls.reload", String.valueOf(trustBundle), "failed: " + why);
+            audit.record("system", label + ".reload", String.valueOf(trustBundle), "failed: " + why);
             return why;
         }
     }
@@ -351,10 +374,10 @@ public final class AdminTls {
             var why = m.revokedBy(cert);
             if (why != null) {
                 var actor = cert == chain[0] ? subject(chain[0]) : subject(chain[0]) + " via " + subject(cert);
-                audit.record(actor, "admin-tls.handshake",
+                audit.record(actor, label + ".handshake",
                         "serial:" + cert.getSerialNumber().toString(16) + " sha256:" + fingerprint(cert),
                         "denied: revoked (" + why + ")");
-                throw new CertificateException("admin client certificate is revoked");
+                throw new CertificateException("client certificate is revoked");
             }
         }
     }

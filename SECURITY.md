@@ -103,6 +103,21 @@ What the code enforces today:
   revoked certificate is refused, and each refusal is written to the audit log. A revocation file
   that is configured but missing or invalid fails closed. Reloading invalidates cached TLS
   sessions. Connections that are already open stay open until they close.
+- **Node-to-control-plane watch channel**: the default is plain HTTP, and only on loopback. Both
+  ends refuse a non-loopback address unless `cpTls` is configured. In bootstrap that is
+  `cp-tls-cert`, `cp-tls-key`, `cp-tls-ca` and optionally `cp-tls-peer`; on the CP side it is a
+  `CpTls` value passed to `WatchServer`. With `cpTls` on, the channel is mutual TLS 1.3 only:
+  - The CP requires a client certificate from the configured CA. The node trusts only its pinned CA
+    and checks that the CP certificate carries `cp-tls-peer`.
+  - The client certificate must name the node id (URI SAN `urn:sjws:node:<id>`, DNS SAN or CN). A
+    mismatch is refused and audited.
+  - The certificate is then the only credential: issuing a node certificate is the enrollment, and
+    the join-token path is not used.
+  - The CP side reuses the admin listener's reload and revocation machinery (CRL or denylist, with
+    refusals audited).
+
+  With `cpTls` off, the interim credential is the join token, and the CP keeps only its SHA-256
+  hash, compared in constant time.
 - **Join tokens** are one-shot, and this is enforced. The control plane stores only a SHA-256
   hash of each token. A token must be issued before it can be used, and it expires after a TTL
   (default 1 hour, at most 24 hours). It is burned atomically, through the Raft-replicated CP log,
@@ -121,9 +136,8 @@ What the code enforces today:
 
 Recommendations:
 
-- **Keep cluster and control-plane traffic on a private, trusted network.** The HA heartbeat is plain
-  UDP, and the node-to-control-plane channel (an mTLS watch in the design) is not yet authenticated
-  in code. Snapshots are signed, but the transport is not encrypted.
+- **Keep cluster traffic on a private, trusted network.** The HA heartbeat is plain UDP. Enable
+  `cpTls` (below) whenever the node-to-control-plane watch leaves loopback.
 - Deliver each join token through a file readable only by the service user, use the shortest
   practical TTL, and never put tokens in arguments, logs or the repository.
 - The swarm (`/swarm/v1`) endpoints have no built-in authentication. Enable them only behind the
