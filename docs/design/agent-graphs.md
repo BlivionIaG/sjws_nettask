@@ -17,6 +17,8 @@ A *graph* is a versioned definition of steps (agent calls) and edges. A *run* is
 - With graphs off (the default), no `sjws_nettask.swarm.graph.` class is loaded, no runner thread is started, no graph topic is opened, and no graph document is parsed or held. With the swarm off, nothing in `swarm.*` loads at all (swarm §3.3).
 - Core hot paths (`http1`, `h2`, `h3`, `core`, `routing.ProxyHandler`, `messaging.delivery.Partition`) are not modified. The graph layer uses public APIs of `swarm` and `messaging` only.
 
+**Built on graphs:** [swarm research mode](swarm-research-mode.md) (hill-climb and autoresearch loops).
+
 ## 2. Non-goals
 - **An agent framework or planner.** sjws does not decide *what* agents do. It executes a graph someone defined. Prompting, tool selection and LLM-driven planning stay in agents (swarm §2).
 - **Turing-complete workflows in the server.** Conditions are a small, side-effect-free expression language over step outputs (§3.4). No user code runs in the server.

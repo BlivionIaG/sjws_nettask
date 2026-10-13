@@ -22,6 +22,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -29,6 +30,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import sjws_nettask.ServerConfig;
+import sjws_nettask.cluster.ClusterKey;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.RoutePattern;
 
@@ -41,7 +43,7 @@ import sjws_nettask.core.RoutePattern;
 public final class ConfigLoader {
 
     private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
-            "routing", "middleware", "access", "messaging", "swarm");
+            "routing", "middleware", "access", "messaging", "swarm", "ha", "buffers", "cp");
     private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
@@ -106,9 +108,13 @@ public final class ConfigLoader {
         long bundleVersion = 0;
         Boolean yamlBind = null;
         Boolean yamlSwarm = null;
+        boolean haEnabled = false;
+        byte[] haKey = null;
+        byte[] haPrevious = null;
         byte[] bootSignature = null;
         String recoveredHash = null;
         Path yamlState = null;
+        Map<String, Object> yamlCp = null;
         String text;
         Path readFrom = null;
         if (configured != null) {
@@ -162,6 +168,12 @@ public final class ConfigLoader {
             access = accessSection(root, warnings);
             messaging = MessagingSettings.parse(root);
             yamlSwarm = swarmSection(root);
+            yamlCp = cpSection(root);
+            buffersSection(root);
+            var ha = haSection(root, env, base, readFrom, warnings);
+            haEnabled = ha.enabled();
+            haKey = ha.current();
+            haPrevious = ha.previous();
         }
         var parsed = baseline == null
                 ? ServerConfig.parse(args, env, passwords)
@@ -184,7 +196,20 @@ public final class ConfigLoader {
         if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
             document = document.withSignature(bootSignature);
         }
-        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm);
+        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm, haEnabled,
+                haKey, haPrevious, yamlCp, base);
+    }
+
+    /**
+     * The raw {@code cp:} block (control-plane-hosting.md §4), or null when the file has none. Kept untyped
+     * so a standalone or data process names no {@code sjws_nettask.cp} class; only the CONTROL role parses it
+     * (the cp package parses it).
+     */
+    private static Map<String, Object> cpSection(Map<String, Object> root) {
+        if (!(root.get("cp") instanceof Object cp)) {
+            return null;
+        }
+        return java.util.Collections.unmodifiableMap(YamlValues.mapping(cp, "cp"));
     }
 
     private static int schemaOf(Map<String, Object> root) {
@@ -1096,6 +1121,108 @@ public final class ConfigLoader {
     }
 
     /**
+     * HA heartbeat key. Not part of the canonical document, so a last-good copy never stores it.
+     * When {@code ha.enabled} is false the key bytes are discarded and {@link ClusterKey} is not
+     * resolved. A missing key with HA enabled is an error. The environment overrides the file.
+     * Values are never copied into the message. An inline secret in a group- or world-readable
+     * file is a warning. {@code ha.cluster_key_file} must be mode 0600 or 0400 and owned by this
+     * process. The leaf is not followed. Every parent must be owned by root or this process.
+     * A group- or world-writable parent is refused unless it is sticky and owned by root or
+     * this process.
+     */
+    private static HaMaterial haSection(Map<String, Object> root, Map<String, String> env, Path base, Path configFile,
+            List<String> warnings) {
+        boolean enabled = false;
+        String fileKey = null;
+        String filePrevious = null;
+        String keyFile = null;
+        String previousFile = null;
+        if (root.get("ha") instanceof Object ha) {
+            var map = YamlValues.mapping(ha, "ha");
+            YamlValues.knownKeys(map, List.of("enabled", "cluster_key", "cluster_key_previous", "cluster_key_file",
+                    "cluster_key_previous_file"), "ha");
+            if (map.containsKey("enabled")) {
+                enabled = bool(map.get("enabled"), "ha.enabled");
+            }
+            if (map.containsKey("cluster_key")) {
+                fileKey = secret(map.get("cluster_key"), "ha.cluster_key");
+            }
+            if (map.containsKey("cluster_key_previous")) {
+                filePrevious = secret(map.get("cluster_key_previous"), "ha.cluster_key_previous");
+            }
+            if (map.containsKey("cluster_key_file")) {
+                keyFile = text(map.get("cluster_key_file"), "ha.cluster_key_file");
+            }
+            if (map.containsKey("cluster_key_previous_file")) {
+                previousFile = text(map.get("cluster_key_previous_file"), "ha.cluster_key_previous_file");
+            }
+        }
+        if (fileKey != null && keyFile != null) {
+            throw new ConfigException("ha.cluster_key and ha.cluster_key_file cannot both be set");
+        }
+        if (filePrevious != null && previousFile != null) {
+            throw new ConfigException("ha.cluster_key_previous and ha.cluster_key_previous_file cannot both be set");
+        }
+        if (fileKey != null || filePrevious != null) {
+            warnIfGroupReadable(configFile, warnings);
+        }
+        if (!enabled) {
+            return HaMaterial.OFF;
+        }
+        String current = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY") ? env.get("WEB_SERVER_HA_CLUSTER_KEY")
+                : keyFile != null ? readKeyFile(resolve(base, keyFile, "ha.cluster_key_file"), "ha.cluster_key_file")
+                        : fileKey;
+        String previous = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")
+                ? env.get("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")
+                : previousFile != null
+                        ? readKeyFile(resolve(base, previousFile, "ha.cluster_key_previous_file"),
+                                "ha.cluster_key_previous_file")
+                        : filePrevious;
+        if (current == null || current.isBlank()) {
+            throw new ConfigException(
+                    "HA is enabled but no cluster key is set; set ha.cluster_key or WEB_SERVER_HA_CLUSTER_KEY");
+        }
+        if (previous != null && previous.isBlank()) {
+            throw new ConfigException("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS is empty");
+        }
+        return HaMaterial.enabled(current, previous);
+    }
+
+    /** Inline key material sits in this file. Group or world read is a warning, not a refusal. */
+    private static void warnIfGroupReadable(Path configFile, List<String> warnings) {
+        if (configFile == null) {
+            return;
+        }
+        try {
+            var perms = Files.getPosixFilePermissions(configFile);
+            if (perms.contains(PosixFilePermission.GROUP_READ) || perms.contains(PosixFilePermission.OTHERS_READ)) {
+                warnings.add("config file " + configFile + " is readable by group/others and contains ha.cluster_key; "
+                        + "chmod 600 it, or use ha.cluster_key_file");
+            }
+        } catch (UnsupportedOperationException | IOException ignored) {
+            // no POSIX permissions to check
+        }
+    }
+
+    /**
+     * Key file via {@link SecureKeyFile}: only the parent is resolved, the leaf is opened once
+     * with {@code NOFOLLOW_LINKS}, and a group- or world-writable parent is refused. At most
+     * 4 KiB. The bytes are not part of the error text. Java keeps the characters in a
+     * {@code String}; they are not wiped.
+     */
+    private static String readKeyFile(Path path, String name) {
+        return new String(SecureKeyFile.read(path, name, 4096), StandardCharsets.UTF_8);
+    }
+
+    /** UTF-8 secret. Blank is refused. The value is not included in the error. */
+    private static String secret(Object value, String path) {
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw new ConfigException(path + ": expected a string");
+        }
+        return text;
+    }
+
+    /**
      * {@code swarm.enabled} (docs/design/agent-swarm.md §3.3, §12 S1), or null when the file has no {@code swarm}
      * section. Node-local like {@code server.bind_content}: not part of the canonical document, so a config
      * recovered from last-good boots with the swarm off unless the property or environment gate is set.
@@ -1108,6 +1235,27 @@ public final class ConfigLoader {
         YamlValues.knownKeys(map, List.of("enabled"), "swarm");
         return map.containsKey("enabled") ? bool(map.get("enabled"), "swarm.enabled") : null;
     }
+
+    /**
+     * {@code buffers.pool} (default false): the shared direct-buffer pool ({@code docs/design/buffer-pool.md}).
+     * Node-local and read once at startup: it maps to the {@code sjws.buf.pool} system property, which wins when
+     * set on the command line. A reload does not switch the pool on or off.
+     */
+    private static void buffersSection(Map<String, Object> root) {
+        if (!(root.get("buffers") instanceof Object buffers)) {
+            return;
+        }
+        var map = YamlValues.mapping(buffers, "buffers");
+        YamlValues.knownKeys(map, List.of("pool"), "buffers");
+        if (map.containsKey("pool")) {
+            boolean on = bool(map.get("pool"), "buffers.pool");
+            if (System.getProperty(POOL_PROPERTY) == null) {
+                System.setProperty(POOL_PROPERTY, on ? "on" : "off");
+            }
+        }
+    }
+
+    static final String POOL_PROPERTY = "sjws.buf.pool";
 
     private static AccessSettings accessSection(Map<String, Object> root, List<String> warnings) {
         if (!(root.get("access") instanceof Object access)) {
@@ -1491,6 +1639,42 @@ public final class ConfigLoader {
         return value.trim();
     }
 
+    /** Key bytes kept only while HA is enabled. {@link #toString()} redacts them. */
+    private static final class HaMaterial {
+        private static final HaMaterial OFF = new HaMaterial(false, null, null);
+
+        private final boolean enabled;
+        private final byte[] current;
+        private final byte[] previous;
+
+        private HaMaterial(boolean enabled, byte[] current, byte[] previous) {
+            this.enabled = enabled;
+            this.current = current;
+            this.previous = previous;
+        }
+
+        static HaMaterial enabled(String current, String previous) {
+            try {
+                byte[] prev = previous == null ? null : ClusterKey.parse(previous);
+                return new HaMaterial(true, ClusterKey.parse(current), prev);
+            } catch (IllegalArgumentException failed) {
+                throw new ConfigException(failed.getMessage());
+            }
+        }
+
+        boolean enabled() {
+            return this.enabled;
+        }
+
+        byte[] current() {
+            return this.current;
+        }
+
+        byte[] previous() {
+            return this.previous;
+        }
+    }
+
     /** Arguments and environment captured at startup so a reload reapplies them (the process env does not change). */
     public static final class Loaded {
         private final ConfigDocument document;
@@ -1504,16 +1688,45 @@ public final class ConfigLoader {
         private final Boolean yamlBindContent;
         /** {@code swarm.enabled} from the file, or null when the key was omitted. */
         private final Boolean yamlSwarmEnabled;
+        /** True when {@code ha.enabled} is true. The key bytes are null unless this is true. */
+        private final boolean haEnabled;
+        /** Current HMAC key, or null when HA is off. Not part of {@link #toString()}. */
+        private final byte[] haClusterKey;
+        /** Previous HMAC key during rotation, or null. Not part of {@link #toString()}. */
+        private final byte[] haClusterKeyPrevious;
+        /** Raw {@code cp:} block, or null. Parsed only by the CONTROL role. */
+        private final Map<String, Object> yamlCp;
+        /** Directory of the config file, for relative {@code cp:} paths; null without a file. */
+        private final Path configBase;
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
                 Boolean yamlBindContent) {
-            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, null);
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, null, false, null,
+                    null);
         }
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
                 Boolean yamlBindContent, Boolean yamlSwarmEnabled) {
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, yamlSwarmEnabled,
+                    false, null, null);
+        }
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
+                byte[] haClusterKeyPrevious) {
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, yamlSwarmEnabled,
+                    haEnabled, haClusterKey, haClusterKeyPrevious, null, null);
+        }
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
+                byte[] haClusterKeyPrevious, Map<String, Object> yamlCp, Path configBase) {
+            this.yamlCp = yamlCp;
+            this.configBase = configBase;
             this.document = document;
             this.warnings = List.copyOf(warnings);
             this.errors = List.copyOf(errors);
@@ -1523,12 +1736,48 @@ public final class ConfigLoader {
             this.passwords = passwords;
             this.yamlBindContent = yamlBindContent;
             this.yamlSwarmEnabled = yamlSwarmEnabled;
+            this.haEnabled = haEnabled;
+            this.haClusterKey = haClusterKey == null ? null : haClusterKey.clone();
+            this.haClusterKeyPrevious = haClusterKeyPrevious == null ? null : haClusterKeyPrevious.clone();
         }
 
-        /** Same load, with the document replaced. The file's {@code bind_content} and {@code swarm.enabled} are kept. */
+        /** Same load, with the document replaced. The file's {@code bind_content}, swarm flag, and HA key are kept. */
         public Loaded withDocument(ConfigDocument document) {
             return new Loaded(document, this.warnings, this.errors, this.helpRequested, this.args, this.env,
-                    this.passwords, this.yamlBindContent, this.yamlSwarmEnabled);
+                    this.passwords, this.yamlBindContent, this.yamlSwarmEnabled, this.haEnabled, this.haClusterKey,
+                    this.haClusterKeyPrevious, this.yamlCp, this.configBase);
+        }
+
+        /** The raw {@code cp:} block from the file, or null when it has none. */
+        public Map<String, Object> yamlCp() {
+            return this.yamlCp;
+        }
+
+        /** Directory of the config file, or null when there is none. */
+        public Path configBase() {
+            return this.configBase;
+        }
+
+        /** {@code ha.enabled}. False when the file omits it. */
+        public boolean haEnabled() {
+            return this.haEnabled;
+        }
+
+        /** @return a copy of the current cluster key, or null when HA is off. Do not log the bytes. */
+        public byte[] haClusterKey() {
+            return this.haClusterKey == null ? null : this.haClusterKey.clone();
+        }
+
+        /** @return a copy of the previous cluster key, or null. Do not log the bytes. */
+        public byte[] haClusterKeyPrevious() {
+            return this.haClusterKeyPrevious == null ? null : this.haClusterKeyPrevious.clone();
+        }
+
+        @Override
+        public String toString() {
+            return "Loaded{ok=" + ok() + ", haEnabled=" + this.haEnabled + ", clusterKey="
+                    + (this.haClusterKey == null ? "none" : "****") + ", clusterKeyPrevious="
+                    + (this.haClusterKeyPrevious == null ? "none" : "****") + "}";
         }
 
         /** {@code swarm.enabled}, or null when the file did not set it. Not part of the canonical document. */

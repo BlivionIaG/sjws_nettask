@@ -17,6 +17,7 @@
 package sjws_nettask.observe;
 
 import java.nio.charset.StandardCharsets;
+import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.ServerConfig.MetricsExposure;
 import sjws_nettask.core.Body;
@@ -46,6 +47,9 @@ public final class RequestObserver implements AutoCloseable {
     public static final int PROTOCOL_COUNT = 5;
     public static final String[] PROTOCOL_NAMES = {"HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3", "other"};
 
+    /** Prometheus text exposition 0.0.4. Scrapes reject any other version token. */
+    public static final String METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
+
     /**
      * Observability off. The filter is not installed, so a request does not read the clock, does not
      * update a counter, and does not check {@code /healthz} or {@code /metrics}. A document-root file
@@ -69,6 +73,10 @@ public final class RequestObserver implements AutoCloseable {
     private final MetricsExposure exposure;
     private final boolean recording;
     private final boolean healthz;
+    /** Read only while rendering {@code /metrics}. Null omits the cluster families. */
+    private volatile Supplier<ClusterStatus> cluster;
+    /** Read only while rendering {@code /metrics}. Null or {@link LabelSource#NONE} omits gateway families. */
+    private volatile LabelSource labels;
 
     private RequestObserver(ServerMetrics metrics, AccessLog log, MetricsExposure exposure, boolean recording,
             boolean healthz) {
@@ -193,9 +201,43 @@ public final class RequestObserver implements AutoCloseable {
         }
     }
 
+    /**
+     * Cluster gauges for the next scrape. Null clears them. Not read on the request path.
+     * {@link #NONE} ignores this so the off switch stays a constant.
+     */
+    void attachCluster(Supplier<ClusterStatus> cluster) {
+        if (this != NONE) {
+            this.cluster = cluster;
+        }
+    }
+
+    /**
+     * Per-route and per-API-key series for the next scrape. Null clears them.
+     * Not read on the request path. {@link #NONE} ignores this.
+     */
+    void attachLabels(LabelSource labels) {
+        if (this != NONE) {
+            this.labels = labels;
+        }
+    }
+
+    /** Process counters, plus cluster and gateway families when those sources are attached. */
+    String exposition() {
+        var sb = new StringBuilder(this.metrics.prometheus());
+        var cluster = this.cluster;
+        if (cluster != null) {
+            MetricsText.appendCluster(sb, cluster.get());
+        }
+        var labels = this.labels;
+        if (labels != null && labels != LabelSource.NONE) {
+            MetricsText.appendGateway(sb, labels);
+        }
+        return sb.toString();
+    }
+
     private Response metricsResponse(boolean head) {
-        byte[] text = this.metrics.prometheus().getBytes(StandardCharsets.UTF_8);
-        var headers = ResponseHeaders.of().add("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        byte[] text = exposition().getBytes(StandardCharsets.UTF_8);
+        var headers = ResponseHeaders.of().add("content-type", METRICS_CONTENT_TYPE)
                 .add("cache-control", "no-store").add("x-content-type-options", "nosniff");
         return new Response(200, headers, Body.Bytes.of(text), head);
     }

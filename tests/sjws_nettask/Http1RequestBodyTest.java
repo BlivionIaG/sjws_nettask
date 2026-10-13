@@ -34,6 +34,7 @@ import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 
 /** {@link Http1Connection}'s streamed request body and {@link Body.Stream} framing. */
+@org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class Http1RequestBodyTest {
 
     private static String exchange(Handler handler, String raw, boolean halfClose) throws Exception {

@@ -21,7 +21,7 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * Stand-in for {@code sjws_nettask.cp}. Every operation throws
+ * Null object for scenarios that ask for no control plane. Every operation throws
  * {@link ControlPlanePendingException}. It does not elect a leader, push config, or
  * answer health. {@link #available()} is false.
  */

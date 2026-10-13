@@ -77,6 +77,11 @@ public final class Membership {
         }
     }
 
+    /** Silence after which a member is dead. Heartbeat replay uses this to allow an earlier boot epoch. */
+    public long deadAfterNanos() {
+        return this.deadAfterNanos;
+    }
+
     public NodeId self() {
         return self;
     }

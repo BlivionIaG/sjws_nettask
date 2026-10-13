@@ -43,7 +43,7 @@ class RoleClassLoadTest {
     /**
      * A real {@code data}/{@code gateway} role process (§12 S1, decision b). Bootstrap files come from
      * {@link NodeFixtures#pending(Path, String)} (role {@code data}), the shared pending fixture.
-     * {@code PendingControlPlane.available()} is false and there is no data-node watch, so the node starts with
+     * The fixture names no live control plane, so the node starts with
      * {@code connection=pending}, which is the role's normal state before it joins.
      */
     @Test

@@ -53,6 +53,9 @@ jobs:
           cp "target/$name.jar" "dist/$name/"
           cp -r target/lib "dist/$name/lib"
           cp LICENSE README.md "dist/$name/"
+          # systemd units, the role sample configs and the same-host drop-in
+          mkdir -p "dist/$name/contrib"
+          cp contrib/*.service contrib/*.yaml contrib/*.conf contrib/sjws "dist/$name/contrib/"
           (cd dist && tar czf "$name.tar.gz" "$name" && zip -qr "$name.zip" "$name")
           cp "target/$name.jar" dist/
           (cd dist && sha256sum "$name.tar.gz" "$name.zip" "$name.jar" > SHA256SUMS)

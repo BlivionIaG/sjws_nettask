@@ -17,12 +17,15 @@
 package sjws_nettask.ha;
 
 import java.nio.file.Path;
+import java.util.Objects;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.SjwsServer;
+import sjws_nettask.cluster.ClusterKey;
 
 /**
  * Process entry for {@code tools/ha-bench.sh}. Single-node leaves HA detached. Cluster mode
- * attaches {@link HaSettings} and runs a second node with UDP heartbeats. Blocks until killed.
+ * attaches {@link HaSettings} and runs two data nodes plus a witness with UDP heartbeats.
+ * Blocks until killed.
  */
 public final class BenchServer {
 
@@ -30,7 +33,22 @@ public final class BenchServer {
     }
 
     public static void main(String[] args) throws Exception {
-        var running = launch(Options.parse(args));
+        Options options;
+        try {
+            options = Options.parse(args);
+        } catch (RuntimeException rejected) {
+            System.err.println("ERROR: " + rejected.getMessage());
+            System.exit(64);
+            return;
+        }
+        Running running;
+        try {
+            running = options.cluster() ? startCluster(options) : launch(options);
+        } catch (IllegalArgumentException rejected) {
+            System.err.println("ERROR: " + rejected.getMessage());
+            System.exit(64);
+            return;
+        }
         System.out.println("bench port=" + running.tcpPort() + " mode=" + running.mode());
         System.out.flush();
         try {
@@ -40,11 +58,31 @@ public final class BenchServer {
         }
     }
 
-    /** Starts the server (and, in cluster mode, the heartbeat peer). Caller closes it. */
+    /** Cluster mode only. Resolves {@link ClusterKey} so a single-node launch does not load it. */
+    private static Running startCluster(Options options) throws Exception {
+        return launch(options, ClusterKey.fromEnvironment(System.getenv()));
+    }
+
+    /** Starts the server. Cluster mode without a key is refused. Caller closes it. */
     public static Running launch(Options options) throws Exception {
+        if (options.cluster()) {
+            throw new IllegalArgumentException(
+                    "HA is enabled but no cluster key is set; set ha.cluster_key or WEB_SERVER_HA_CLUSTER_KEY");
+        }
+        return start(options, null, null);
+    }
+
+    /** Cluster mode with a key that did not come from the command line. Not public, so a single-node launch does not resolve it. */
+    static Running launch(Options options, ClusterKey key) throws Exception {
+        if (!options.cluster()) {
+            throw new IllegalArgumentException("cluster key is only used when HA is enabled");
+        }
+        Objects.requireNonNull(key, "cluster key");
+        return start(options, ClusterSide.start(key), HaSettings.defaults());
+    }
+
+    private static Running start(Options options, ClusterSide side, HaSettings ha) throws Exception {
         var config = ServerConfig.defaults(Path.of(options.root())).withPort(options.port());
-        ClusterSide side = options.cluster() ? ClusterSide.start() : null;
-        HaSettings ha = options.cluster() ? HaSettings.defaults() : null;
         try {
             var server = SjwsServer.start(config, ha);
             return new Running(server, side, options.mode());
@@ -104,6 +142,9 @@ public final class BenchServer {
                     port = Integer.parseInt(arg.substring("--port=".length()));
                 } else if (arg.startsWith("--root=")) {
                     root = arg.substring("--root=".length());
+                } else if (arg.startsWith("--cluster-key") || arg.startsWith("--ha-cluster-key")) {
+                    throw new IllegalArgumentException(
+                            "cluster key is not accepted on the command line; set WEB_SERVER_HA_CLUSTER_KEY");
                 } else {
                     throw new IllegalArgumentException("unknown argument: " + arg);
                 }

@@ -23,6 +23,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
 | `observe/NodeReporterTest` | control heartbeat: 5 s cadence reuses the report, sequence advances only on a fresh take, cumulative 4xx/5xx, health and config generation suppliers, log2 histogram merge and p99 bucket bound |
 | `observe/ClusterBoardTest` | cluster aggregate: per-node rate from cumulative snapshots, restart zeroes the interval, merged p99, errors by node and route, config drift, label-name cap |
+| `observe/PrometheusScrapeTest` | `/metrics` text 0.0.4 (HELP/TYPE, histogram buckets, `_sum`, `_count`, escaped labels), cluster and gateway series only when attached, `promtool check metrics` and a live Prometheus scrape when those binaries are set (`PROMTOOL`, `PROMETHEUS`; required on Linux CI), Grafana JSON and PromQL under `contrib/grafana/` |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/HandlerMountTest`, `HandlerMountServerTest`, `h3/HandlerMountHttp3Test` | startup prefix mounts: none (same handler), one, several, overlap rejected before bind, router and global filters on HTTP/1.1, the same table on HTTP/3 |
@@ -51,10 +52,11 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
 | `ha/SnapshotHolderTest`, `ha/HealthBoardTest`, `ha/HaLifecycleTest` | atomic snapshot publish, precomputed `/healthz` and `/readyz`, drain (delay, in-flight, `Connection: close`), accept pause |
-| `cluster/QuorumPolicyTest`, `cluster/HeartbeatCodecTest`, `cluster/MembershipTest`, `cluster/HeartbeatServiceTest` | majority and witness quorums, 64-byte heartbeat codec, failure detector (suspect, dead, incarnation refute, indirect probe), simulated loss and UDP heartbeats |
+| `cluster/QuorumPolicyTest`, `cluster/HeartbeatCodecTest`, `cluster/MembershipTest`, `cluster/HeartbeatServiceTest`, `cluster/HeartbeatAuthTest` | majority and witness quorums, 64-byte heartbeat codec, HMAC-SHA256 datagrams (spoof, replay, stale, rotation, wrong key, sender restart, receiver restart, cross-peer replay, non-member), failure detector (suspect, dead, incarnation refute, indirect probe), simulated loss and UDP heartbeats |
 | `cluster/RaftClusterTest`, `ha/GenerationSyncTest` | per-group Raft (election, batch commit, strict vs relaxed fsync, witness, minority, joint membership, transfer, snapshot compact, preferred campaign, failback), HMAC generation publish and key mode 0600 |
 | `ha/FailoverTest` | VIP claim and release-before-expiry, active/active claims nothing, `/readyz` rolling restart, `SO_REUSEPORT` hand-over and the unavailable path |
 | `ha/ClusterBenchTest` | cluster-mode bench process runs a second node and the heartbeat thread |
+| `ha/HeartbeatAuthClassLoadTest` | HA off does not load `HeartbeatAuthenticator` or `ClusterKey`; cluster mode without a key exits 64 |
 | `SingleNodeHotPathTest` | clustering off: file handler, no role supplier, no drain supplier, no heartbeat or raft thread |
 | `clusterharness/ClusterScenariosTest` (`@Tag("cluster")`) | N control + M data nodes on the file-serving harness (ephemeral port, temp root, HTTP/1.1 client). Live: gateway-off and standalone serve the same file with no `cp-` thread. Partition, leader kill, slow node, and rollback stay `@Disabled`: `CpStore` is one voter and does not implement `ControlPlane`. `NodeFixtures.pending` starts a node at `connection=pending`. `ConnectedDataNodeTest` stays `@Disabled` until a data-node watch exists |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
@@ -98,7 +100,7 @@ Every user-visible behaviour and the test that asserts it.
 |---|---|
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and the docs option tables in sync |
 | `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown, `--role`, `--bootstrap`, join token, control/data status, `node.mode` precedence, contrib role samples | `DaemonTest`, `ServiceDaemonTest`, `RoleSampleTest`, `service/BootstrapTest` |
-| access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed; the observe filter is order 0 and is absent while off | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test`; HTTP/2 recording in `h2/H2ConfigAndWiringTest` |
+| access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed; the observe filter is order 0 and is absent while off; attaching cluster or gateway series does not install that filter | `observe/ObservabilityTest`, `observe/PrometheusScrapeTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test`; HTTP/2 recording in `h2/H2ConfigAndWiringTest` |
 | control heartbeat report (cumulative snapshot, 5 s cache, histogram merge by index) | `observe/NodeReporterTest` |
 | cluster requests/s, merged p99, errors by node and route, config drift, shown on the admin status view when a board is attached | `observe/ClusterBoardTest`, `admin/AdminTuiTest` |
 | gateway mode off matches standalone file serving (ephemeral ports, no `cp-` thread, applied version 0) | `clusterharness/ClusterScenariosTest` |

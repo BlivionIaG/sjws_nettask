@@ -155,7 +155,9 @@ class SnapshotRetentionTest {
             var held = p.poll("g", "slow", 1, 1_000_000).getFirst(); // stays in flight
             assertEquals(pinned, held.offset());
             for (int i = 0; i < 400; i++) {
-                p.produce(0, 0, b("m" + i + "y".repeat(100)));
+                // Wait for each append: the writer rolls segments only between write groups, so without this a slow
+                // writer could drain the whole loop as one group into one oversized segment and nothing is sealed.
+                p.produce(0, 0, b("m" + i + "y".repeat(100))).durable().get();
                 for (var d : p.poll("g", "c", 1, 1000)) assertTrue(p.ack("g", d.offset()));
             }
             var r0 = p.maintain();
