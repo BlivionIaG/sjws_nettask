@@ -120,7 +120,7 @@ public class SwarmBench {
         var body = new byte[1024];
         var seq = new AtomicLong();
         // Prefilled backlog, no concurrent producer: the measurement is claim (poll) + fenced ack only.
-        long backlog = (long) ((secs + 2) * 120_000);
+        long backlog = (long) ((secs + 2) * Long.getLong("bench.rate", 120_000));
         for (long i = 0; i < backlog; i++) t.submit("p", 1, seq.incrementAndGet(), env(body));
         long warmEnd = System.nanoTime() + 2_000_000_000L, end = warmEnd + (long) (secs * 1e9);
         var counts = new long[workers];
