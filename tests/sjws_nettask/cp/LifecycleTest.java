@@ -115,11 +115,12 @@ class LifecycleTest {
     @Test
     void issuedTokensAreBounded() {
         var tokens = new JoinTokens();
+        var h = JoinTokens.sha256(new byte[16]);
         for (int i = 0; i < JoinTokens.MAX_TOKENS; i++) {
-            assertTrue(tokens.issue("t" + i, "h", 10, 0));
+            assertTrue(tokens.issue("t" + i, h, 10, 0));
         }
-        assertFalse(tokens.issue("live", "h", 100, 5), "full of unexpired tokens");
-        assertTrue(tokens.issue("after", "h", 100, 11), "expired unused tokens are pruned");
+        assertFalse(tokens.issue("live", h, 100, 5), "full of unexpired tokens");
+        assertTrue(tokens.issue("after", h, 100, 11), "expired unused tokens are pruned");
     }
 
     @Test
