@@ -35,6 +35,16 @@ public final class TaskService {
 
     private final Topics topics;
 
+    /**
+     * Runs the post-durability acks of {@link #reply}/{@link #replyAll}. Without it the ack (which takes the
+     * pool partition's lock) ran on the reply topic's ledger-writer thread, stalling that writer behind the lock.
+     */
+    private static final java.util.concurrent.Executor ACKER = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+        var th = new Thread(r, "sjws-reply-ack");
+        th.setDaemon(true);
+        return th;
+    });
+
     public TaskService(Topics topics) {
         this.topics = topics;
     }
@@ -190,7 +200,7 @@ public final class TaskService {
         }
         // Different reply topics are different logs, so wait for each topic's futures (normally one topic).
         return CompletableFuture.allOf(durable.toArray(CompletableFuture[]::new))
-                .thenApply(x -> partition(pool).ack(WORKERS, offs, atts, null).results());
+                .thenApplyAsync(x -> partition(pool).ack(WORKERS, offs, atts, null).results(), ACKER);
     }
 
     public CompletableFuture<LeaseResult> reply(Task t, long producerId, long seq, String contentType, byte[] body) {
@@ -200,6 +210,6 @@ public final class TaskService {
         }
         var reply = t.envelope().reply(contentType, body);
         var r = this.topics.partition(to).produce(producerId, seq, reply.encode(), Durability.ASYNC);
-        return r.durable().thenApply(off -> ack(t));
+        return r.durable().thenApplyAsync(off -> ack(t), ACKER);
     }
 }
