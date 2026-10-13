@@ -43,20 +43,24 @@ import sjws_nettask.clusterharness.ClusterHarness.DataRole;
  * ephemeral ports, a temporary document root, {@code java.net.http.HttpClient}.
  *
  * <p>Live cases are the data plane with the control plane off (standalone and gateway-off).
- * Partition, leader kill, slow node, and rollback need {@code sjws_nettask.cp}. They are
- * disabled and point at {@link ControlPlaneDesign#PR}. Enabling them against
- * {@link PendingControlPlane} fails the test; that class does not invent a passing cluster.
+ * Partition, leader kill, slow node, and rollback need a {@link ControlPlane} implementation.
+ * {@code sjws_nettask.cp.CpStore} does not provide one (one voter, no partition, no leader kill,
+ * no {@link ClusterClock} delay, no data-node watch), so those four stay {@code @Disabled}.
+ * Enabling them against {@link PendingControlPlane} fails the test; that class does not invent
+ * a passing cluster.
  */
 @Tag("cluster")
 @Timeout(20)
 class ClusterScenariosTest {
 
     /**
-     * Disabled on purpose. The control plane is the design PR, not this tree.
+     * Disabled on purpose. {@code CpStore} does not implement {@link ControlPlane}.
      * Do not delete this annotation to "make CI green" against {@link PendingControlPlane}.
      */
     private static final String PENDING = "TODO https://github.com/BlivionIaG/sjws_nettask/pull/38"
-            + " — enable when sjws_nettask.cp implements ControlPlane."
+            + " — CpStore is one voter and does not implement ControlPlane"
+            + " (no 3/5 voters on ClusterClock, no partition, no leader kill, no per-node delay,"
+            + " no data-node watch to converge applied versions)."
             + " PendingControlPlane must not satisfy this scenario.";
 
     private static final String BODY = "hello from the temp docroot\n";

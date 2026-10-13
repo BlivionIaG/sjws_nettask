@@ -26,7 +26,9 @@ import java.util.Objects;
  * The task and reply envelope carried in the message payload until messaging has headers
  * (docs/design/agent-swarm.md §4.5). Layout, version 1, big-endian:
  * {@code [version:u8][taskId:16][correlationId:16][deadlineMs:i64][replyTo][traceparent][tracestate][budgetRef]
- * [contentType][bodyLen:i32][body]}, where each text field is {@code [len:u16][UTF-8]}.
+ * [contentType][bodyLen:i32][body]}, where each text field is {@code [len:u16][bytes]} in <b>standard</b> UTF-8
+ * (RFC 3629), not Java's modified UTF-8 ({@code DataOutput.writeUTF}): NUL is the one byte {@code 00} and a
+ * supplementary character is four bytes, never a surrogate pair. {@code len} counts bytes (at most 65535).
  * <p>
  * Immutable. The public constructor and accessors copy arrays; the codec and the swarm's own hot path
  * (encode, decode, reply) do not, so a request/reply round trip copies a body only where messaging does.

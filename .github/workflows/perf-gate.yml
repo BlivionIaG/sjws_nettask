@@ -11,6 +11,7 @@ on:
       - 'src/**'
       - 'pom.xml'
       - 'tools/perf-gate/**'
+      - 'contrib/sjws_nettask-standalone.yaml'
       - '.github/workflows/perf-gate.yml'
 
 permissions:
@@ -50,26 +51,35 @@ jobs:
             jar="$(ls "$side"/target/sjws_nettask-*.jar | grep -v -e sources -e tests | head -n1)"
             echo "${side^^}_JAR=$GITHUB_WORKSPACE/$jar" >> "$GITHUB_ENV"
           done
-      - name: Benchmark (interleaved, warmup, median of runs)
+      - name: Benchmark and compare
         env:
           RUNS: '5'
           DURATION: 10s
           WARMUP: 5s
-        # Scripts come from the PR head; the base build is only executed as a server.
-        run: head/tools/perf-gate/bench.sh "$BASE_JAR" "$HEAD_JAR" perf-out
-      - name: Compare
-        env:
           THRESHOLD: ${{ vars.PERF_THRESHOLD || '10' }}
           P99_THRESHOLD: ${{ vars.PERF_P99_THRESHOLD || '' }}
+        # Scripts and the sample config come from the PR head; the base build only runs as a server.
+        # Pass 1: default CLI (standalone). Pass 2: explicit --role=standalone with the packaged
+        # standalone config and the swarm forced off (control plane detached on both sides).
         run: |
           args=(--threshold "$THRESHOLD")
           [[ -n "$P99_THRESHOLD" ]] && args+=(--p99-threshold "$P99_THRESHOLD")
-          set +e
-          python3 head/tools/perf-gate/compare.py perf-out/base.jsonl perf-out/head.jsonl "${args[@]}" > perf-out/summary.md
-          rc=$?
-          set -e
-          cat perf-out/summary.md >> "$GITHUB_STEP_SUMMARY"
-          cat perf-out/summary.md
+          rc=0
+          run_pass() { # dir title
+            head/tools/perf-gate/bench.sh "$BASE_JAR" "$HEAD_JAR" "perf-out/$1"
+            set +e
+            python3 head/tools/perf-gate/compare.py "perf-out/$1/base.jsonl" "perf-out/$1/head.jsonl" \
+              --title "$2" "${args[@]}" > "perf-out/$1/summary.md"
+            local r=$?
+            set -e
+            cat "perf-out/$1/summary.md" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            [[ $r -eq 0 ]] || rc=1
+          }
+          run_pass default "Perf gate: default CLI"
+          SERVER_ARGS="--role=standalone --config=$GITHUB_WORKSPACE/head/contrib/sjws_nettask-standalone.yaml" \
+          JAVA_OPTS="-Dsjws.swarm.enabled=false" \
+            run_pass role-standalone "Perf gate: --role=standalone, sample config, swarm off"
           exit $rc
       - uses: actions/upload-artifact@v7
         if: always()

@@ -24,7 +24,24 @@ class FramesTest(unittest.TestCase):
             self.assertEqual(f, got, name)
             self.assertEqual(len(frame) // 2, used)
             n += 1
-        self.assertGreaterEqual(n, 9)
+        self.assertGreaterEqual(n, 11)
+
+    def test_golden_envelopes_are_standard_utf8(self):
+        want = {"task-env-nul": "reply.nul\0x", "task-env-emoji": "reply.\U0001F600"}
+        seen = 0
+        for line in GOLDEN.read_text().splitlines():
+            name, _, _, payload, _ = (line.split(" ") + [""] * 5)[:5]
+            if name not in want:
+                continue
+            p = bytes.fromhex(payload)
+            n = int.from_bytes(p[41:43], "big")
+            reply_to = p[43:43 + n]
+            self.assertEqual(want[name].encode("utf-8"), reply_to, name)
+            self.assertEqual(want[name], reply_to.decode("utf-8", errors="strict"), name)
+            self.assertNotIn(b"\xc0\x80", reply_to, name)   # modified-UTF-8 NUL
+            self.assertNotIn(b"\xed", reply_to, name)        # CESU-8 surrogate half
+            seen += 1
+        self.assertEqual(2, seen)
 
     def test_partial_and_errors(self):
         whole = Frame(FrameType.TOKEN, LAST, b"abc").encode()

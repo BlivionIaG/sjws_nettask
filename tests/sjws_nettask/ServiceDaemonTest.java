@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
+import sjws_nettask.clusterharness.NodeFixtures;
 import sjws_nettask.config.SnapshotVerifier;
 import sjws_nettask.ha.HaEvents;
 import sjws_nettask.ha.HaSettings;
@@ -37,7 +38,7 @@ import sjws_nettask.service.ServiceStatus;
 @Timeout(60)
 class ServiceDaemonTest {
 
-    private static final String SECRET = "0123456789abcdef";
+    private static final String SECRET = NodeFixtures.JOIN_SECRET;
     private static final Transport.Factory NO_H3 = (c, h) -> {
         throw new AssertionError("HTTP/3 must not be created");
     };
@@ -860,22 +861,9 @@ class ServiceDaemonTest {
         return String.join("\n", lines.subList(from, lines.size()));
     }
 
+    /** Pending bootstrap ({@code connection=pending}). State dir is {@code root/state}. */
     private static Path bootstrap(Path root, String role) throws Exception {
-        var pin = root.resolve("root.pub");
-        var token = root.resolve("join.token");
-        var state = root.resolve("state");
-        var boot = root.resolve("bootstrap");
-        Files.writeString(pin, "test-root-public-key\n");
-        Files.writeString(token, "token-id=node-1\nsecret=" + SECRET + "\n");
-        Files.setPosixFilePermissions(token, PosixFilePermissions.fromString("rw-------"));
-        String body = role.equals("control")
-                ? "role=control\nnode-id=cp-1\npin=" + pin + "\njoin-token=" + token + "\nstate-dir=" + state
-                        + "\nlisten=127.0.0.1:9443\n"
-                : "role=data\ndata-role=gateway\nnode-id=gw-1\ncontrol-plane=127.0.0.1:9443\npin=" + pin
-                        + "\njoin-token=" + token + "\nstate-dir=" + state + "\n";
-        Files.writeString(boot, body);
-        Files.setPosixFilePermissions(boot, PosixFilePermissions.fromString("rw-------"));
-        return boot;
+        return NodeFixtures.pending(root, role).bootstrap();
     }
 
     private static int freePort() throws Exception {

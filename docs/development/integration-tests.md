@@ -196,10 +196,21 @@ document root, and `java.net.http.HttpClient` forced to HTTP/1.1 with no proxy.
 
 Control nodes go through `ControlPlane`. The design is
 [PR #38](https://github.com/BlivionIaG/sjws_nettask/pull/38)
-(`docs/design/control-plane.md`). `sjws_nettask.cp` is not in this tree.
-`PendingControlPlane` throws `ControlPlanePendingException` on every operation.
-It does not elect a leader or apply a snapshot. `ClusterHarness.open` with 3 or 5
-control nodes, or with data role `DATA`, throws that exception before it binds.
+(`docs/design/control-plane.md`). `sjws_nettask.cp.CpStore` is a single voter and
+`AdminServer` can bind an ephemeral port. Neither implements `ControlPlane`
+(3 or 5 voters, partition, leader kill, `ClusterClock` delay, or a push that data
+nodes apply). `PendingControlPlane` throws `ControlPlanePendingException` on every
+operation. It does not elect a leader or apply a snapshot. `ClusterHarness.open`
+with 3 or 5 control nodes, or with data role `DATA`, throws that exception before it binds.
+
+`NodeFixtures.pending(dir, "data")` writes the bootstrap files under that temp directory
+(`state` is `dir/state`, not the working directory). A process started from that file
+reports `connection=pending`. That replaces the copy
+[PR #95](https://github.com/BlivionIaG/sjws_nettask/pull/95) inlined in
+`RoleClassLoadTest`. `NodeFixtures.connected(dir)` is the data-role variant against a
+live control plane. It throws, and `ConnectedDataNodeTest` is `@Disabled`, until a
+data-node watch client reports `connection=connected` and applies a pushed version.
+Attaching a `ControlPlaneBinding` in the test is not that client.
 
 Live (tag `cluster`, run by `mvn verify` and by the CI group step):
 
@@ -213,7 +224,7 @@ Live (tag `cluster`, run by `mvn verify` and by the CI group step):
 
 Pending (`@Disabled`, the message starts with `TODO` and the PR URL):
 
-| Scenario | What it will assert once `sjws_nettask.cp` exists |
+| Scenario | What it will assert once `ControlPlane.available()` is true |
 |---|---|
 | Network partition | Push converges with no content errors. Isolating data nodes from every voter leaves them on that version and hash, still serving the file. After heal, a later push converges. |
 | Control-plane leader kill | In-process kill, then one election-timeout advance on `ClusterClock.Manual`. A different voter is `leaderReady` on its own ephemeral admin port. A following push converges, and content stays 200. |

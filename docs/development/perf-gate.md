@@ -25,3 +25,11 @@ the server CLI, so the A/B gate compares standalone builds. Standalone vs gatewa
 build is `tools/gateway-bench.sh`, run briefly in CI and at full length by
 `.github/workflows/cluster-tests.yml` (nightly, `workflow_dispatch`, or the `cluster-tests` PR label),
 together with the cluster harness (`mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test`).
+
+## Second pass: explicit role
+
+The gate runs the A/B twice. The second pass starts both builds with
+`--role=standalone --config=contrib/sjws_nettask-standalone.yaml` and `-Dsjws.swarm.enabled=false`
+(positional port and root still win over the file), so the role/config path is gated as well.
+`--role=data` and `--role=control` are not benchmarked: both require `--bootstrap` with a control-plane
+contact, pin and join token, which a single cheap runner pass cannot provide.

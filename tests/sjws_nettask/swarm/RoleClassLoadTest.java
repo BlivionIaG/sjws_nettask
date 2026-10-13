@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.clusterharness.NodeFixtures;
 
 /**
  * Zero cost when off for a real {@code data}/{@code gateway} role process (docs/design/agent-swarm.md §12 S1,
@@ -40,9 +41,9 @@ class RoleClassLoadTest {
     Path dir;
 
     /**
-     * A real {@code data}/{@code gateway} role process (§12 S1, decision b). It uses the bootstrap fixture shape of
-     * {@code ServiceDaemonTest.bootstrap(.., "data")}. The cluster harness has no live control plane yet
-     * ({@code clusterharness.PendingControlPlane.available() == false}), so the node starts with
+     * A real {@code data}/{@code gateway} role process (§12 S1, decision b). Bootstrap files come from
+     * {@link NodeFixtures#pending(Path, String)} (role {@code data}), the shared pending fixture.
+     * {@code PendingControlPlane.available()} is false and there is no data-node watch, so the node starts with
      * {@code connection=pending}, which is the role's normal state before it joins.
      */
     @Test
@@ -59,15 +60,7 @@ class RoleClassLoadTest {
 
     private String runDataGateway(List<String> flags) throws Exception {
         var root = Files.createDirectories(this.dir.resolve("gw-html"));
-        var pin = this.dir.resolve("root.pub");
-        var token = this.dir.resolve("join.token");
-        var boot = this.dir.resolve("bootstrap-" + System.nanoTime());
-        Files.writeString(pin, "test-root-public-key\n");
-        Files.writeString(token, "token-id=node-1\nsecret=class-load-test-secret-0123\n");
-        Files.setPosixFilePermissions(token, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
-        Files.writeString(boot, "role=data\ndata-role=gateway\nnode-id=gw-1\ncontrol-plane=127.0.0.1:9\npin=" + pin
-                + "\njoin-token=" + token + "\nstate-dir=" + this.dir.resolve("state") + "\n");
-        Files.setPosixFilePermissions(boot, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        var boot = NodeFixtures.pending(this.dir, "data").bootstrap();
         var text = run(flags, "Server started:", "sjws_nettask.Sjws_nettask", "--role=data", "--bootstrap=" + boot,
                 "--pid-file=" + this.dir.resolve("gw-" + System.nanoTime() + ".pid"),
                 "--state-dir=" + this.dir.resolve("config-state"), Integer.toString(freePort()), root.toString());

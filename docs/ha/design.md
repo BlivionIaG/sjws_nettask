@@ -82,6 +82,8 @@ the partition leader; that redirect is not part of the static path.
 
 ### 4.1 Two nodes
 
+The two-node choice (witness versus async primary/standby), the failure matrix, and what the current classes still lack are in [two-node HA](../design/two-node-ha-decision.md). This section is the serving-mode sketch; that document is the decision.
+
 - **Active/active (recommended):** both serve; upstream LB/DNS uses `/healthz` / `/readyz`.
   No split-brain risk for serving because content is read-only; the only contested action is
   publishing a new generation, which requires a lease from the leader and a witness ack.

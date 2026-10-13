@@ -19,6 +19,7 @@ package sjws_nettask.observe;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
 
 /**
@@ -39,6 +40,10 @@ public final class ObserverSlot {
     }
 
     private volatile RequestObserver current;
+    /** Copied onto the recording observer. Not read by {@link #get()}. */
+    private volatile Supplier<ClusterStatus> cluster;
+    /** Copied onto the recording observer. Not read by {@link #get()}. */
+    private volatile LabelSource labels;
 
     public ObserverSlot(RequestObserver initial) {
         this.current = initial == null ? RequestObserver.NONE : initial;
@@ -49,9 +54,43 @@ public final class ObserverSlot {
         return this.current;
     }
 
+    /**
+     * Cluster gauges rendered into {@code /metrics}. Null omits them. Does not install a filter
+     * and is not read by {@link #get()}, so a server that is not scraping pays nothing.
+     */
+    public void attachCluster(Supplier<ClusterStatus> cluster) {
+        this.cluster = cluster;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.attachCluster(cluster);
+        }
+    }
+
+    /**
+     * Per-route and per-API-key series rendered into {@code /metrics}. Null omits them.
+     * Not read by {@link #get()}.
+     */
+    public void attachLabels(LabelSource labels) {
+        this.labels = labels;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.attachLabels(labels);
+        }
+    }
+
     /** Replaces the observer. Used before the listeners accept. */
     public void set(RequestObserver observer) {
-        this.current = observer == null ? RequestObserver.NONE : observer;
+        var next = observer == null ? RequestObserver.NONE : observer;
+        copySources(next);
+        this.current = next;
+    }
+
+    private void copySources(RequestObserver observer) {
+        if (observer == null || observer == RequestObserver.NONE) {
+            return;
+        }
+        observer.attachCluster(this.cluster);
+        observer.attachLabels(this.labels);
     }
 
     /**
@@ -72,7 +111,9 @@ public final class ObserverSlot {
      * {@code opened} and keeps the observer that won.
      */
     RequestObserver replace(RequestObserver opened) {
+        copySources(opened);
         if (CURRENT.compareAndSet(this, RequestObserver.NONE, opened)) {
+            copySources(opened);
             return opened;
         }
         opened.close();

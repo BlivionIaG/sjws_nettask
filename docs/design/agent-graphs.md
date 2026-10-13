@@ -17,6 +17,8 @@ A *graph* is a versioned definition of steps (agent calls) and edges. A *run* is
 - With graphs off (the default), no `sjws_nettask.swarm.graph.` class is loaded, no runner thread is started, no graph topic is opened, and no graph document is parsed or held. With the swarm off, nothing in `swarm.*` loads at all (swarm §3.3).
 - Core hot paths (`http1`, `h2`, `h3`, `core`, `routing.ProxyHandler`, `messaging.delivery.Partition`) are not modified. The graph layer uses public APIs of `swarm` and `messaging` only.
 
+**Built on graphs:** [swarm research mode](swarm-research-mode.md) (hill-climb and autoresearch loops).
+
 ## 2. Non-goals
 - **An agent framework or planner.** sjws does not decide *what* agents do. It executes a graph someone defined. Prompting, tool selection and LLM-driven planning stay in agents (swarm §2).
 - **Turing-complete workflows in the server.** Conditions are a small, side-effect-free expression language over step outputs (§3.4). No user code runs in the server.
@@ -79,11 +81,11 @@ A join records **which** predecessor results it consumed in the `StepReady` even
 | Graph concept | Swarm / messaging primitive |
 |---|---|
 | Step instance dispatch | A normal swarm task on `tasks.<service>` via `TaskService.submit(pool, producerId, seq, envelope)` (`src/sjws_nettask/swarm/TaskService.java:77`). Workers do not know they are in a graph. |
-| Step result | The worker's normal fenced reply-then-ack, `TaskService.reply(...)` (`TaskService.java:206`), whose `replyTo` is the run's **shard topic** instead of a reply topic. The envelope already carries `replyTo` (`TaskEnvelope.java:93`). |
+| Step result | The worker's normal fenced reply-then-ack, `TaskService.reply(...)` (`TaskService.java:206`), whose `replyTo` is the run's **shard topic** instead of a reply topic. Workers write results **directly** into the shard topic, with no runner copy (decided §11.3). The envelope already carries `replyTo` (`TaskEnvelope.java:93`). |
 | Run event log | Topic `graph.runs.<shard>`, `shard = hash(runId) mod S`. One shard = one `Partition` (`messaging/delivery/Partition.java:52`) opened through `swarm.Topics.partition` (`swarm/Topics.java:52`). Multi-partition topics are a messaging GAP (swarm §4.8 gap 5), so sharding is by topic name until they exist. |
 | Step identity | `stepInstanceId = stepId[#iteration][/mapIndex]`, deterministic from the graph and the recorded run state. |
 | Idempotency key | `(runId, stepInstanceId, stepAttempt)` in the envelope `taskId` field (16 B: a hash of the triple) and, for LLM calls, in the `Idempotency-Key` header (swarm §10.2). |
-| Producer dedup | The runner produces with its own `producerId` and `seq = runner-local monotonic counter persisted in the checkpoint` (swarm §4.4; `DeliveryState` window of 4096 per producer). |
+| Producer dedup | The runner produces with a **stable per-shard `producerId`** and `seq = runner-local monotonic counter persisted in the checkpoint` (swarm §4.4; `DeliveryState` window of 4096 per producer). Workers writing results are also producers on the shard partition with their own ids (§11.3). |
 
 `stepAttempt` is the **graph-level** retry counter (re-dispatch of a step after a failed result or timeout). The messaging delivery `attempt` (lease token, `Task.attempt`, `swarm/Task.java:23`) is separate and handles worker crashes inside one step attempt.
 
@@ -93,6 +95,7 @@ Each shard topic is the **source of truth**. Events, all keyed by `runId`:
 `RunStarted{graph@version, input-ref, deadline, budget, traceparent}` · `StepReady{stepInstanceId, consumedResults[]}` · `StepDispatched{stepInstanceId, stepAttempt, taskId, pool, offset}` · `StepResult{stepInstanceId, stepAttempt, status, output-ref, usage}` · `EdgeDecided{from, to, taken}` · `Spawned{stepInstanceId, n}` · `StepCancelled` · `RunCheckpoint{...}` · `RunFinished{status, output-ref}`.
 
 - Payloads above the 1 MiB inline limit go by reference to the swarm-owned blob store (swarm §5.2, §16 item 2).
+- **One topic per shard, one total order** (decided §11.3): decisions and results share the shard partition, so replay picks the same accepted result (§4.4 point 2), with one snapshot, one retention low watermark and one `poll` loop. If result volume starves the runner (visible as runner group lag in `MessagingStats`), the fix is more shards, not more topics per shard. Workers that are not trusted to write run history are excluded through `AgentPolicy` rights, not by adding a reply topic.
 - **Single writer per shard:** one `GraphRunner` owns a shard and is the only producer of decisions (`StepReady`, `StepDispatched`, `EdgeDecided`, …). `StepResult` events are appended by workers (via `replyTo`), and the runner consumes the shard topic as one consumer group, so it sees results and its own decisions in one total order. No lock is shared between shards.
 - Prior art: event-sourced workflow history in [Temporal](https://docs.temporal.io/workflow-execution/event); the difference (§2) is that we record decisions too, so no workflow code is replayed.
 
@@ -100,7 +103,12 @@ Each shard topic is the **source of truth**. Events, all keyed by `runId`:
 - The runner keeps an in-memory table `runId → RunState` for runs in its shard. Every `K` events or `T` ms (operator-tuned; no values fixed here) it writes a `RunCheckpoint` containing the compact state of all active runs in the shard plus the shard offset it covers, and the runner's producer `seq`.
 - This is a per-shard snapshot of an event-sourced log, similar in spirit to [Flink's checkpoints](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/#checkpointing) (state + source offset), but trivially consistent because one thread owns the shard. Messaging's own snapshots (#69) keep the partition recovery bounded underneath.
 - **Resume after failure** (process crash, node restart): open shard, read the last `RunCheckpoint`, replay events after its offset, rebuild `RunState`. Then reconcile in-flight steps: a `StepDispatched` without `StepResult` is still a live task in `tasks.<pool>` (it survives in its own partition), so the runner just waits, with the step timeout (§6.2) as the backstop. Nothing is re-dispatched merely because the runner restarted.
-- Retention: a shard's events before the oldest active run's `RunStarted` and before the last checkpoint may be reclaimed by messaging retention (#69). Finished-run history is kept for a configurable window for the TUI and tracing (§6.3).
+- **Retention** (decided §11.3). History below a checkpoint can be freed while runs are active, under these rules:
+  - Shard floor = `min(latest durable RunCheckpoint offset, RunStarted offset of the oldest active run not fully contained in that checkpoint)`. Because checkpoints hold all active runs' state, this is in practice the checkpoint offset.
+  - The runner exposes the floor to messaging as an **explicit "retain from" pin**, not via consumer-group commit timing. The runner group's committed offset already pins the delivery low watermark (`RetentionPolicy`), so unconsumed results are never lost.
+  - Order: partition snapshot (#69) at or above the checkpoint offset, then the checkpoint, then retention. Retention never deletes at or above the newest snapshot, so recovery cannot replay into a gap.
+  - Finished-run history for the TUI and tracing (§6.3) is a time floor (`keepResolvedMs`), applied only below the checkpoint floor.
+  - The retain-from pin is a messaging API addition (Messaging Core); it does not exist on master.
 
 ### 4.4 Exactly-once step results (and what it does not mean)
 Guarantee: **for each `(runId, stepInstanceId)`, the run state records exactly one accepted result, and downstream steps see only that result.**
@@ -114,7 +122,7 @@ How:
 **Honest caveats.**
 - External effects (an email sent, a ticket created, LLM tokens spent) can happen more than once, because delivery is at-least-once (swarm §2, §4.4). Only tools that honour the idempotency key avoid duplicates. LLM spend on a duplicated call is real and is charged to the budget.
 - Task submit to `tasks.<pool>` and the `StepDispatched` event live in different partitions; there is no cross-partition transaction (swarm §4.4, GAP). Point 4 makes the duplicate harmless, it does not make it impossible.
-- Item 4 relies on producer-dedup state surviving restarts (it does, via snapshots) and on producer ids not expiring mid-run (producer-id expiry is gap 8 in swarm §4.8; its TTL must exceed the maximum run duration).
+- Item 4 relies on producer-dedup state surviving restarts (it does, via snapshots) and on producer ids not expiring mid-run. Producer-id expiry (swarm §4.8 gap 8) is **on idle time, not age**: a producer expires only after `max_run_duration + max step timeout + clock-skew margin` without an append, evaluated from ledger timestamps so replay expires the same producers (decided §11.3). Runner producer ids are stable per shard and never idle while the shard lives; worker producer ids are the ones that expire.
 
 ## 5. Scale
 
@@ -134,7 +142,7 @@ How:
 Bounded at every level, and admission refuses rather than queues unboundedly:
 1. **Run admission:** `POST /swarm/v1/graphs/{name}/runs` is refused with `429` + `Retry-After` (RFC 9457 problem, as swarm §8) when the shard's active runs exceed `max_active_runs_per_shard`, or the graph's GCRA rate is exceeded (§5.4).
 2. **Per-run concurrency:** `max_inflight_steps` per run and `concurrency` per map step (§3.6).
-3. **Per-pool lag:** before dispatching, the runner reads the pool's group lag from `MessagingStats` (swarm §4.7) and defers dispatch above a threshold. The producer-side backpressure signal is messaging gap 7; until then lag is read pull-based, at most once per runner loop.
+3. **Per-pool lag:** before dispatching, the runner reads the pool group's `lagMessages` from the **published `MessagingStats` snapshot** (lock-free; about 2.6 µs per read as measured by Messaging Core), never `counts()`, which can take the partition lock to rebuild. The read is rate-limited to about once per ms or once per poll batch, so a hot runner loop cannot hammer it (decided §11.3). Above a threshold, dispatch is deferred. The producer-side backpressure signal is messaging gap 7.
 4. The runner's own input is pull-based (`poll(max)`), so a flood of results cannot overrun it.
 
 ### 5.4 Budgets: per graph, per run, per agent
@@ -252,7 +260,8 @@ Added to the swarm handler mounted through `HandlerContributor` (PR #101; `Swarm
 | Shard log grows with long runs | Checkpoints + retention (§4.3); outputs by reference |
 | Duplicate external effects | Idempotency key per step attempt; stated caveat (§4.4) |
 | Runaway cost from loops/spawns | Mandatory `max_iterations`, `max_items`, `max_spawn`, `max_steps_per_run`; static worst case shown at publish (§5.4) |
-| Producer-id expiry breaks runner dedup | Expiry TTL > max run duration (§4.4); messaging gap 8 |
+| Producer-id expiry breaks runner dedup | Idle-time TTL > max run duration + max step timeout + skew margin; stable runner ids (§4.4, §11.3); messaging gap 8 |
+| Workers and runner contend on the shard partition lock | Small at today's rates per Messaging Core; watch runner group lag; add shards |
 | Graph layer leaks into swarm or core | §8 guards fail the build |
 | Fixed shard count limits growth | Decided for now (§11.1); size `S` for expected peak; resharding deferred |
 
@@ -267,12 +276,15 @@ Added to the swarm handler mounted through `HandlerContributor` (PR #101; `Swarm
 No inceptor/Blivion questions remain open.
 
 ### 11.2 Open
-**For Messaging Core**
-1. Is a worker writing its `StepResult` directly into `graph.runs.<shard>` (via `replyTo`) acceptable, or should results land on a reply topic and the runner copy them (one extra append, but a single producer per shard)?
-2. Can the runner consume its shard and produce into it with the existing single-partition API without a self-feedback cost, or should decisions and results be two topics per shard?
-3. Producer-id expiry (gap 8): can the TTL be configured per producer, so runner ids outlive the longest run?
-4. Lag read for backpressure (§5.3): is polling `MessagingStats` once per runner loop cheap enough until gap 7?
-5. Retention API to reclaim per-shard history below a checkpoint offset while some runs are still active.
+
+None. Messaging Core answered every question (Messaging Core, [#111 review](https://github.com/BlivionIaG/sjws_nettask/pull/111#pullrequestreview-5503546631)); see §11.3.
+
+### 11.3 Decided (2026-10-13, Messaging Core)
+1. **Results:** workers write results directly into the run's shard topic; the fenced reply-then-ack path (`TaskService.reply`) works unchanged with `replyTo` set to the shard topic. This saves one append and one runner copy per step. Untrusted workers are excluded through rights, not topology (§4.1, §4.2).
+2. **Topics:** one topic per shard for decisions and results, giving a single total order; split only if runner group lag shows starvation, and then add shards (§4.2).
+3. **Producer-id expiry:** on idle time, `> max_run_duration + max step timeout + clock-skew margin`, evaluated from ledger timestamps; runner producer ids are stable per shard (§4.1, §4.4).
+4. **Lag polling:** cheap (about 2.6 µs, measured by Messaging Core); read `lagMessages` from the published snapshot, not `counts()`, rate-limited to about once per ms or per poll batch (§5.3).
+5. **Retention:** history below a checkpoint can be freed while runs are active if the runner exposes its floor as an explicit retain-from pin, with snapshot → checkpoint → retention ordering (§4.3).
 
 ## 12. Benchmark plan
 All runs follow swarm §13 methodology: machine and commit reported, ≥ 5 alternating runs, mean ± stddev, load generator and server pinned to disjoint CPUs.
