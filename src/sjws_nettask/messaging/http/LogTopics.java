@@ -38,6 +38,8 @@ final class LogTopics implements AutoCloseable {
 
     private final Path dir;
     private final Durability durability;
+    /** Per-topic writer default overriding {@link #durability} (docs/design/partition-log.md R8, gap G3). */
+    private final java.util.Map<String, Durability> topicDurability;
     private final long segmentBytes;
     private final LogRetention retention;
     private final java.util.function.LongSupplier clockMs;
@@ -50,11 +52,48 @@ final class LogTopics implements AutoCloseable {
     }
 
     LogTopics(Path dir, Durability durability, long segmentBytes, LogRetention retention, java.util.function.LongSupplier clockMs) {
+        this(dir, durability, java.util.Map.of(), segmentBytes, retention, clockMs);
+    }
+
+    LogTopics(Path dir, Durability durability, java.util.Map<String, Durability> topicDurability, long segmentBytes,
+            LogRetention retention, java.util.function.LongSupplier clockMs) {
         this.dir = dir;
-        this.durability = durability;
+        this.durability = java.util.Objects.requireNonNull(durability);
+        this.topicDurability = java.util.Map.copyOf(topicDurability);
         this.segmentBytes = segmentBytes;
         this.retention = java.util.Objects.requireNonNull(retention);
         this.clockMs = clockMs;
+    }
+
+    /** The writer default for {@code topic}: its override, else the module default. */
+    Durability durability(String topic) {
+        return this.topicDurability.getOrDefault(topic, this.durability);
+    }
+
+    /**
+     * Parses {@code none|async|group|each} (case-insensitive), and {@code topic:mode,topic:mode} lists for the
+     * per-topic overrides. Throws {@link IllegalArgumentException} naming the bad entry.
+     */
+    static Durability parseDurability(String v) {
+        return switch (v.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "none" -> Durability.NONE;
+            case "async" -> Durability.ASYNC;
+            case "group" -> Durability.GROUP;
+            case "each" -> Durability.EACH;
+            default -> throw new IllegalArgumentException("durability must be none, async, group or each: " + v);
+        };
+    }
+
+    static java.util.Map<String, Durability> parseTopicDurability(String list) {
+        var out = new java.util.HashMap<String, Durability>();
+        for (var part : list.split(",")) {
+            if (part.isBlank()) continue;
+            int c = part.lastIndexOf(':');
+            var topic = c < 0 ? "" : part.substring(0, c).trim();
+            if (!validName(topic)) throw new IllegalArgumentException("bad topic in durability override: " + part.trim());
+            out.put(topic, parseDurability(part.substring(c + 1)));
+        }
+        return out;
     }
 
     LogRetention retention() {
@@ -102,7 +141,7 @@ final class LogTopics implements AutoCloseable {
             l = this.logs.get(topic);
             if (l == null) {
                 var log = SegmentedLog.open(this.dir.resolve(topic), this.segmentBytes);
-                l = new Log(log, new LedgerWriter(log, this.durability), new java.util.concurrent.locks.ReentrantLock());
+                l = new Log(log, new LedgerWriter(log, durability(topic)), new java.util.concurrent.locks.ReentrantLock());
                 this.logs.put(topic, l);
             }
             return l;

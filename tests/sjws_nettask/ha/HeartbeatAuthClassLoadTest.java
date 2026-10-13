@@ -20,6 +20,8 @@ class HeartbeatAuthClassLoadTest {
 
     private static final String AUTH = "sjws_nettask.cluster.HeartbeatAuthenticator";
     private static final String KEY = "sjws_nettask.cluster.ClusterKey";
+    private static final String MAC = "javax.crypto.Mac";
+    private static final String KDF = "javax.crypto.KDF";
     private static final String SECRET = "classload-cluster-key-0123456789";
 
     @TempDir
@@ -30,8 +32,10 @@ class HeartbeatAuthClassLoadTest {
         var root = Files.createDirectory(this.dir.resolve("html"));
         var text = run(List.of(), "bench port=", 0, "sjws_nettask.ha.BenchServer", "--mode=single", "--port=0",
                 "--root=" + root);
-        assertFalse(text.contains(AUTH), text);
-        assertFalse(text.contains(KEY), text);
+        assertNotLoaded(text, AUTH);
+        assertNotLoaded(text, KEY);
+        assertNotLoaded(text, MAC);
+        assertNotLoaded(text, KDF);
         assertFalse(text.contains(SECRET), text);
     }
 
@@ -58,15 +62,19 @@ class HeartbeatAuthClassLoadTest {
         var root = Files.createDirectory(this.dir.resolve("html-on"));
         var text = run(List.of(SECRET), "bench port=", 0, "sjws_nettask.ha.BenchServer", "--mode=cluster", "--port=0",
                 "--root=" + root);
-        assertTrue(text.contains(AUTH), text);
+        assertLoaded(text, AUTH);
+        assertLoaded(text, MAC);
+        assertLoaded(text, KDF);
         assertFalse(text.contains(SECRET), text);
     }
 
     @Test
     void configFileWithHaOffLoadsNoAuthenticator() throws Exception {
         var text = run(List.of(SECRET), "Server started:", 0, "sjws_nettask.Sjws_nettask", "--config=" + yaml(false, true));
-        assertFalse(text.contains(AUTH), text);
-        assertFalse(text.contains(KEY), text);
+        assertNotLoaded(text, AUTH);
+        assertNotLoaded(text, KEY);
+        assertNotLoaded(text, MAC);
+        assertNotLoaded(text, KDF);
         assertFalse(text.contains(SECRET), text);
     }
 
@@ -134,6 +142,15 @@ class HeartbeatAuthClassLoadTest {
             process.waitFor(5, TimeUnit.SECONDS);
             process.destroyForcibly();
         }
+    }
+
+    /** Class-load log line, so {@code javax.crypto.KDF} does not match {@code KDFParameters}. */
+    private static void assertNotLoaded(String text, String className) {
+        assertFalse(text.contains("] " + className + " source:"), className);
+    }
+
+    private static void assertLoaded(String text, String className) {
+        assertTrue(text.contains("] " + className + " source:"), className);
     }
 
     private static void assertEqualsExit(int expected, int actual, String text) {

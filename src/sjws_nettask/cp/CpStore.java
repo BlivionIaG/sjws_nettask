@@ -238,11 +238,16 @@ public final class CpStore implements AutoCloseable {
     /**
      * Watch credential. A node that has joined keeps authenticating with the same token id and secret
      * until it is revoked (the one-shot rule applies to joining, not to every long poll); any other
-     * presentation goes through {@link #presentJoin}, which consumes an issued token once.
+     * presentation goes through {@link #presentJoin}, which consumes an issued token once. Only the
+     * secret's SHA-256 is held; a revoked node is refused before any comparison. Interim until the
+     * node-to-CP mTLS replaces this credential.
      */
     public JoinTokens.Result authenticateWatch(String nodeId, String tokenId, byte[] secret, long nowMillis) {
+        if (nodeId != null && isRevoked(nodeId)) {
+            return new JoinTokens.Result(null, false, "revoked");
+        }
         var join = nodeId == null ? null : joins.joined(nodeId);
-        if (join != null && secret != null && secret.length >= 16 && join.tokenId().equals(tokenId)
+        if (join != null && JoinTokens.isHash(join.secretHash()) && secret != null && secret.length >= 16 && join.tokenId().equals(tokenId)
                 && java.security.MessageDigest.isEqual(join.secretHash().getBytes(StandardCharsets.US_ASCII),
                         JoinTokens.sha256(secret).getBytes(StandardCharsets.US_ASCII))) {
             return new JoinTokens.Result(join, true, null);
@@ -676,6 +681,23 @@ public final class CpStore implements AutoCloseable {
         }
         json.append("]}");
         return Outcome.ok(json.toString(), 0);
+    }
+
+    /**
+     * Local security event (for example a refused admin handshake), written to this node's audit
+     * log. Not replicated: it records what this listener saw. Never throws.
+     */
+    public void recordSecurityEvent(String actor, String action, String target, String outcome) {
+        var log = audit;
+        if (log == null) {
+            return;
+        }
+        try {
+            log.append(actor, action, target, outcome, 0);
+        } catch (java.io.IOException | RuntimeException e) {
+            System.getLogger(CpStore.class.getName()).log(System.Logger.Level.WARNING,
+                    "audit write failed for " + action + ": " + e.getMessage());
+        }
     }
 
     /** Audit lines with {@code seq} greater than {@code afterSeq}, capped at {@code limit}. */

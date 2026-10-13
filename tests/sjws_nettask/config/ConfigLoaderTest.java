@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Base64;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.List;
@@ -651,6 +653,47 @@ class ConfigLoaderTest {
         assertFalse(refused.ok());
         assertTrue(refused.errors().stream().noneMatch(e -> e.contains(cli)), refused.errors().toString());
         assertTrue(refused.errors().stream().noneMatch(e -> e.contains(fileKey)), refused.errors().toString());
+    }
+
+    @Test
+    void haClusterKeyFileMustBeOwnerOnlyAndInlineKeysWarnWhenTheConfigIsReadable() throws Exception {
+        var secret = new byte[32];
+        java.util.Arrays.fill(secret, (byte) 0x3c);
+        var keyFile = dir.resolve("cluster.key");
+        Files.writeString(keyFile, "base64:" + Base64.getEncoder().encodeToString(secret) + "\n");
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        var yaml = dir.resolve("ha-file.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key_file: cluster.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        assertArrayEquals(secret, loaded.haClusterKey());
+        assertFalse(loaded.toString().contains("base64:"), loaded.toString());
+        assertTrue(loaded.warnings().stream().noneMatch(w -> w.contains("cluster_key")));
+
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-r-----"));
+        var open = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(open.ok());
+        assertTrue(open.errors().get(0).contains("0600"), open.errors().toString());
+        assertFalse(open.errors().get(0).contains("base64:"), open.errors().toString());
+
+        var both = error("ha:\n  enabled: true\n  cluster_key: \"0123456789abcdef\"\n  cluster_key_file: cluster.key\n");
+        assertTrue(both.contains("cannot both"));
+        assertFalse(both.contains("0123456789abcdef"));
+
+        var inline = dir.resolve("ha-inline.yaml");
+        var inlineKey = "inline-cluster-key-0123456789";
+        Files.writeString(inline, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key: \""
+                + inlineKey + "\"\n");
+        Files.setPosixFilePermissions(inline, PosixFilePermissions.fromString("rw-r--r--"));
+        var warned = ConfigLoader.load(new String[] {"--config=" + inline}, Map.of());
+        assertTrue(warned.ok(), warned.errors().toString());
+        assertTrue(warned.warnings().stream().anyMatch(w -> w.contains("chmod 600")), warned.warnings().toString());
+        assertFalse(warned.warnings().toString().contains(inlineKey), warned.warnings().toString());
+        Files.setPosixFilePermissions(inline, PosixFilePermissions.fromString("rw-------"));
+        var quiet = ConfigLoader.load(new String[] {"--config=" + inline}, Map.of());
+        assertTrue(quiet.warnings().stream().noneMatch(w -> w.contains("chmod 600")), quiet.warnings().toString());
     }
 
     private String error(String yaml) throws Exception {

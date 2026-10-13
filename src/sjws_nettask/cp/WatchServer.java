@@ -99,6 +99,10 @@ public final class WatchServer implements AutoCloseable {
                     return;
                 }
                 var snapshot = this.store.awaitActivated(after, wait);
+                if (this.store.isRevoked(node)) {
+                    send(exchange, 403, "{\"error\":\"revoked\"}");
+                    return;
+                }
                 if (snapshot == null) {
                     exchange.sendResponseHeaders(204, -1);
                     return;

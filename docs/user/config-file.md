@@ -77,21 +77,36 @@ In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
 ## HA
 
 Omitted, HA heartbeats stay off and the authenticator is not loaded. `ha.enabled: true`
-without a key refuses to start (exit 64). The key is at least 16 bytes. It is not part of
-the canonical document, so a last-good copy does not store it and startup logs do not print it.
+without a key refuses to start (exit 64). The key is at least 16 bytes; 32 random bytes is the
+useful size (`openssl rand -base64 32`). It is not part of the canonical document, so a last-good
+copy does not store it and startup logs do not print it. Java keeps the characters in a
+`String` and inside `Mac`; the process cannot wipe them.
 
 ```yaml
 ha:
   enabled: true
-  cluster_key: "replace-with-a-long-random-secret"
-  cluster_key_previous: "previous-secret-during-rotation"  # optional
+  cluster_key_file: /etc/sjws/cluster.key   # preferred; mode 0600 or 0400, not a symlink
+  # cluster_key: "base64:...."              # inline alternative; not together with the file
+  # cluster_key_previous_file: /etc/sjws/cluster.key.prev
 ```
 
-`WEB_SERVER_HA_CLUSTER_KEY` overrides `ha.cluster_key`.
-`WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS` overrides `ha.cluster_key_previous`.
-An empty variable is an error when HA is enabled; it does not fall back to the file.
-Packets are HMAC-SHA256. The receiver accepts the current key and, during rotation, the
-previous key. A monotonic per-sender sequence and a ±5 second timestamp window drop replays.
+A value is trimmed. `base64:` and `hex:` select those encodings; anything else is the UTF-8 of
+the trimmed text. A trailing newline from a file is not part of the key.
+
+`WEB_SERVER_HA_CLUSTER_KEY` overrides `ha.cluster_key` and `ha.cluster_key_file`.
+`WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS` overrides the previous key. An empty variable is an error
+when HA is enabled; it does not fall back to the file. The daemon child does not inherit either
+variable (`/proc/pid/environ`); use the key file there. A config file that contains an inline
+key and is readable by group or others produces a warning.
+
+Packets are HMAC-SHA256 under a key derived with HKDF-SHA256 (`info` `sjws-ha-heartbeat-v1`),
+so the same secret is not a tag for any other protocol. The MAC covers a domain label, a
+version, a key id, the 64-byte body, the timestamp, the sequence, a boot epoch, and the
+destination wire id. Key id 0 is the current key and key id 1 is the previous key; a packet is
+checked against that one key. Each sender's sequence starts over when its boot epoch is newer
+than the last one accepted, which is how a restarted node stays reachable. A timestamp older
+than the receiver's own boot is dropped. Clocks must stay within ±5 seconds (NTP). A larger
+step drops heartbeats until they agree, and a rate-limited warning names the skew.
 
 ## Server
 
