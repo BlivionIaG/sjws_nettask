@@ -728,7 +728,11 @@ public final class SjwsServer implements AutoCloseable {
                         result.needsRestart(), snap, result.tls());
             }
             var published = result.applied() && result.snapshot() == this.live.get() ? result : publish(result);
-            if (published.applied()) {
+            // Last-good (signed envelope, floor, trust, and the config sibling) is written only in DATA mode.
+            if (published.applied() && this.live.get().document().node().mode() != NodeSettings.Mode.DATA) {
+                apply.record(snapshot);
+            } else if (published.applied()) {
+                this.remoteApplied.set(true);
                 try {
                     apply.remember(snapshot);
                 } catch (IOException e) {
