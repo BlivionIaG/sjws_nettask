@@ -21,6 +21,7 @@ import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.List;
 import sjws_nettask.cluster.Clock;
+import sjws_nettask.cluster.ClusterKey;
 import sjws_nettask.cluster.LocalCluster;
 import sjws_nettask.cluster.Member;
 import sjws_nettask.cluster.MemberState;
@@ -47,11 +48,12 @@ final class ClusterSide implements AutoCloseable {
         this.rightLink = rightLink;
     }
 
-    static ClusterSide start() throws IOException {
-        return start(Duration.ofMillis(200));
+    static ClusterSide start(ClusterKey key) throws IOException {
+        return start(Duration.ofMillis(200), key);
     }
 
-    static ClusterSide start(Duration interval) throws IOException {
+    static ClusterSide start(Duration interval, ClusterKey key) throws IOException {
+        java.util.Objects.requireNonNull(key, "cluster key");
         UdpPacketLink leftLink = null;
         UdpPacketLink rightLink = null;
         LocalCluster left = null;
@@ -65,8 +67,8 @@ final class ClusterSide implements AutoCloseable {
             var members = List.of(
                     new Member(a, site, leftLink.localAddress(), 1L, MemberState.ALIVE, false),
                     new Member(b, site, rightLink.localAddress(), 1L, MemberState.ALIVE, false));
-            left = LocalCluster.start(a, members, leftLink, Clock.SYSTEM, interval);
-            right = LocalCluster.start(b, members, rightLink, Clock.SYSTEM, interval);
+            left = LocalCluster.start(a, members, leftLink, Clock.SYSTEM, interval, key);
+            right = LocalCluster.start(b, members, rightLink, Clock.SYSTEM, interval, key);
             return new ClusterSide(left, right, leftLink, rightLink);
         } catch (RuntimeException | IOException failed) {
             if (left != null) {
