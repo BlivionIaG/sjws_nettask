@@ -93,7 +93,7 @@ The retry policy is set per topic through the `retry:` block of the #39 schema (
 ### 4.3 Fencing (**GAP**, Messaging Core proposal; priority 1)
 `ack`/`nack`/`reject` take `(group, offset)` only (`Partition.java:262,279,298`; `LedgerEntry.Ack` at `LedgerEntry.java:30`). A stale worker whose lease expired and was re-leased can therefore ack the *new* attempt.
 
-The proposal: `ack`/`nack`/`reject`/`extend` carry the `attempt` from `Delivery` as a lease token, and a mismatch is rejected. The old signatures stay as "any attempt" for compatibility. **The swarm uses only the fenced forms.** The SDK passes the attempt automatically.
+The proposal: `ack`/`nack`/`reject`/`extend` carry the `attempt` from `Delivery` as a lease token, and a mismatch is rejected. The old signatures stay as "any attempt" for compatibility. This ships as Messaging Core PR **#87**. **The swarm uses only the fenced forms.** The SDK passes the attempt automatically.
 
 ### 4.4 Results, idempotency, exactly-once
 - **Order:** the reply is made durable first, then the task is acked. A crash in between redelivers the task.
@@ -118,7 +118,7 @@ When headers land (**GAP 3** in §4.8), the metadata fields move to headers and 
 - **GAP:** per-consumer counters (in-flight per worker, extends, last heartbeat age) in `DeliveryCounts`, plus fixed-bucket latency histograms (enqueue→first delivery, delivery→ack) updated on the partition thread.
 
 ### 4.8 Gap order (Messaging Core)
-1. Attempt-fenced ack/nack/reject.
+1. Attempt-fenced ack/nack/reject (PR #87, in review).
 2. `extend`, with the `Extend` record and the batched form.
 3. Message headers in `Enqueue`.
 4. Broker-side TTL / `expireAt`.
@@ -160,15 +160,20 @@ There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP l
   - The producer stops and emits a `LAST|CANCELLED` chunk.
   - Consumers ack the pending chunks of a cancelled stream without processing them, and retention (#69) reclaims them once acked.
 
-**Disagreement (open, see §16).** The earlier draft made the live path the default: tokens pushed agent → gateway with no ledger write, durable chunks opt-in. Messaging Core's notes route every stream through the ledger. I adopted Messaging Core's ledger design for any stream that goes through messaging. I still propose an **optional direct path** (agent → gateway over h2/h3, no ledger, no resume) for agents that run behind the LLM gateway and stream an HTTP response straight back (§10). That path never touches messaging. Which path is the default is §16 Q1.
+**DECIDED (2026-10-13, inceptor): streaming path.**
+- The **ledger is the default** for tasks and results.
+- The **direct path** (agent → HTTP gateway over h2/h3: no ledger write, no resume, no replay) is allowed **only for ephemeral token streams to HTTP-gateway clients**. It is **opt-in per request** (`stream: direct` in the request; the SDK's `stream(..., direct=True)`).
+- Even on the direct path, the **final result is always written to the ledger**, as a `LAST` result message on `reply.<agentId>`, followed by the fenced task ack (§4.3/§4.4). Only intermediate tokens skip the ledger.
+- A direct stream that breaks is not resumable. The caller falls back to the ledger result.
 
 ## 6. Agent identity and RBAC
-- **Identity.** Every agent connection is mTLS, with a client certificate issued under the CP trust root (`cp/KeyRing.java`, `cp/TrustKey.java`; enrollment in `service/NodeEnrollment.java`, `service/JoinMaterial.java`). The agent id is the certificate subject, which `controlplane.Rbac.ClientCert(subject)` already models (`controlplane/Rbac.java:50`).
+- **Identity. DECIDED (2026-10-13, inceptor):** agent certificates come from a **separate intermediate CA** under the CP trust root (`cp/KeyRing.java`, `cp/TrustKey.java`), not from the node enrollment CA (`service/NodeEnrollment.java`, `service/JoinMaterial.java`). Agent certificates are short-lived and numerous, and they are revoked separately from node certificates. Revoking an agent never touches node trust, and a compromised agent CA can be rotated without re-enrolling nodes. Every agent connection is mTLS. The agent id is the certificate subject, which `controlplane.Rbac.ClientCert(subject)` already models (`controlplane/Rbac.java:50`).
 - **Authorization.** `Rbac.authenticate(Credential)` and `Rbac.authorize(credential, permission, target, version)` (`Rbac.java:91,118`) are reused unchanged. Today's `Permission` set is operator-oriented (`READ, EDIT_ROUTES, ROLLOUT, ROLLBACK, NODE_DRAIN, …`, `controlplane/Permission.java:22-30`), and `Role` is `VIEWER/OPERATOR/ADMIN` (`Role.java:24-27`).
 
-  The swarm needs agent permissions: `TASK_SUBMIT(service)`, `TASK_CLAIM(service)`, `LLM_CALL(backend)`. Two options:
-  - (a) a separate `swarm.AgentPolicy` document, distributed through the CP like `controlplane.AccessPolicyDocument`. **Recommended**: `controlplane` does not change.
-  - (b) extend `Permission`. This touches a CP enum that other code switches on.
+  **DECIDED (2026-10-13, inceptor):** agent permissions (`TASK_SUBMIT(service)`, `TASK_CLAIM(service)`, `LLM_CALL(backend)`) live in a **separate `swarm.AgentPolicy` CP document**, distributed like `controlplane.AccessPolicyDocument`.
+  - **Core RBAC is untouched:** `Permission`, `Role` and `Rbac` don't change.
+  - **It costs nothing when the swarm is off:** no `AgentPolicy` is parsed or held, and no `swarm` class is loaded (§3.3).
+  - The swarm evaluates `AgentPolicy` itself. It may reuse `Rbac.authenticate` for the certificate subject, but never adds permissions to it.
 - **Placement.** The node role is the existing `DataPlaneRole { GATEWAY, STATIC, BROKER, EDGE }` (`service/DataPlaneRole.java`). The swarm adds no role; it uses **labels** (`swarm=agent-host`, `swarm=llm-gateway`) from the node's enrollment (`service/NodeEnrollment.java:79`). Task partitions live on `BROKER` nodes, and LLM gateway routes on `GATEWAY`/`EDGE` nodes.
 - **Audit.** Agent mutations (submit, claim, cancel, budget changes) go to the hash-chained `controlplane.AuditLog` that `Rbac.complete` already writes (`Rbac.java:139`).
 
@@ -188,7 +193,24 @@ Agents register under a **service name**, e.g. `summarize.v1`. The swarm reuses 
   One table per (service, dimension) is keyed by an agent-id hash. It is fixed-size and striped, so it adds no allocation per check. A refusal maps to `429` with `Retry-After`, in the same shape as `gateway.Quota.retryAfterSeconds` (`gateway/Quota.java:27-45`).
 - **Budgets (tokens or cost per window)** are *not* a rate. `BudgetLedger` keeps per-agent counters that are debited from the LLM response's usage. It debits an estimate up front and settles the actual on completion. Counters are node-local `LongAdder`s, reconciled to the CP through the node report (`observe/NodeReport.java`, `observe/NodeReporter.java`).
 
-  The CP enforces a global cap only as a soft limit, because a hard global budget needs consensus per debit, which is not acceptable. Hard per-node sub-budgets are allocated by the CP; whether to have them is open question §15.1.
+  **DECIDED (2026-10-13, inceptor): soft global cap for S0–S2.** Hard per-node sub-allocation by the CP comes later (phase S3+, §12).
+
+  **Maximum overshoot of the soft cap.** Each node admits a call when its last-known global remaining budget covers the call's *estimate*. It debits the estimate locally, settles to the actual on completion, and reconciles with the CP every `T_sync`. Over one budget window, with nodes `n = 1..N`:
+
+  ```
+  Overshoot ≤ Σ_n [ F_n · ε_max ]  +  Σ_n [ D_n(T_sync) ]
+  ```
+  - `F_n` is the maximum number of in-flight (admitted, unsettled) budgeted calls on node `n`, bounded by the node's concurrency limit.
+  - `ε_max` is the maximum per-call estimate error, `max(actual − estimate, 0)`.
+  - `D_n(T_sync)` is the most node `n` can debit, in estimates, between two reconciliations: at most `r_n · T_sync · e_max`, where `r_n` is the node's GCRA admit rate for budgeted calls (plus its burst) and `e_max` is the maximum per-call estimate. This is the staleness term: other nodes' debits are invisible for up to `T_sync`.
+
+  With uniform limits this reduces to `Overshoot ≤ N · (F · ε_max + r · T_sync · e_max)`.
+
+  Two consequences:
+  - When the gateway enforces the estimate as a hard per-call cap (e.g. the request's `max_tokens`), `ε_max = 0` and only the staleness term remains.
+  - The overshoot shrinks linearly with `T_sync`.
+
+  The doc fixes no values. Operators set `F`, `r`, `T_sync` and the estimate policy, and the admin API reports the computed bound for the current configuration.
 - Quotas and budgets are checked at **submit** and at **LLM call**, never on the static-content path.
 
 ## 9. Tracing across a chain of agents
@@ -212,7 +234,11 @@ An LLM backend is a route whose upstreams are model servers, for example OpenAI-
 ### 10.2 The retry gap, without changing proxy defaults
 Today the proxy retries **only idempotent, bodyless methods** (`ProxyHandler.java:272-287`; `Resilience.java:39`; `docs/user/config-file.md:289-291`). LLM calls are `POST` with a body, so they are never retried, which is correct for a generic proxy.
 
-The swarm's `LlmGateway` wraps `ProxyHandler` and adds one swarm-only rule. It retries a `POST` **only when the failure provably happened before the request was sent** (`connect`), or when the backend honours an idempotency key (`Idempotency-Key`, [IETF draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)). It still spends the same `RetryBudget`. `ProxyHandler`'s behavior and defaults stay unchanged; if a hook is needed, it is an additive constructor parameter, reviewed with the routing owner. A failure after the response head has started aborts the stream, as in `ProxyHandler` today (`:69-70`).
+**DECIDED (2026-10-13, inceptor).** The swarm's `LlmGateway` wraps `ProxyHandler` and retries a `POST` **only when the request carries an `Idempotency-Key`** ([IETF draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)). The SDK sets it to `taskId:attempt` (§4.4).
+- The earlier "failed before send" clause is dropped. A connect failure is only provably pre-send at the transport level, and the policy is simpler without that exception.
+- Retries still spend the same `RetryBudget`.
+- `ProxyHandler`'s behavior and defaults stay unchanged. If a hook is needed, it is an additive constructor parameter, reviewed with the routing owner.
+- A failure after the response head has started aborts the stream, as in `ProxyHandler` today (`:69-70`).
 
 ### 10.3 Usage accounting
 The swarm parses the backend usage report (the final SSE event, or the JSON `usage` field), only on swarm routes, to settle `BudgetLedger` (§8).
@@ -245,11 +271,11 @@ The transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existing liste
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
 | S0 | This design, plus the guard tests from §3.3 (dependency and class-load), merged before any swarm code | Tests green on master; Messaging Core sign-off on §4–§5 |
-| S1 | Messaging gap 1 (attempt-fenced ack/nack/reject). `swarm` package: submit, claim with fixed lease, fenced ack/nack/reject, DLQ, request/reply via `reply.<agentId>`; `swarm.wire` codec; Python SDK unary | §3.3 tests green; off-mode gate (§13) within band; task-dispatch and request/reply targets (§13) met or recorded |
-| S2 | Messaging gap 2 (`extend` + `Extend` record) and `LeaseKeeper`; token streaming (ledger leg with `chunkSeq` framing, plus the HTTP leg); cancellation; W3C trace propagation | Stale-worker fencing and lease-expiry redelivery tests; heartbeat and streaming targets (§13); trace spans across 3 hops in an integration test |
-| S3 | Agent identity + `AgentPolicy` RBAC via CP; `AgentDirectory` discovery; GCRA quotas; `BudgetLedger` | mTLS-only agent auth tests; 429 + `Retry-After` tests; budget settle tests |
-| S4 | `LlmGateway` (weighted, circuit, pre-send retry, usage accounting); OTLP exporter | Fault-injection tests (backend down, mid-stream abort); wrk2 latency through the gateway |
-| S5 | Durable token chunks + resume; other SDKs | Resume-from-offset test; SDK conformance suite green |
+| S1 | Uses the Messaging Core fencing PR **#87** ("fence ack/nack/reject with the delivery attempt (lease token)"), which ships separately. `swarm` package: submit, claim with fixed lease, fenced ack/nack/reject, DLQ, request/reply via `reply.<agentId>`; `swarm.wire` codec; Python SDK unary | #87 merged; §3.3 tests green; off-mode gate (§13) within band; task-dispatch and request/reply targets (§13) met or recorded |
+| S2 | Messaging gap 2 (`extend` + `Extend` record) and `LeaseKeeper`; ledger token streaming (`chunkSeq` framing + HTTP leg), the default; cancellation; W3C trace propagation; `AgentPolicy` document and the agent intermediate CA; GCRA quotas; `BudgetLedger` with the **soft global cap** (§8) | Stale-worker fencing and lease-expiry redelivery tests; heartbeat and streaming targets (§13); trace spans across 3 hops; mTLS-only agent auth with agent-CA revocation tests; 429 + `Retry-After` tests; a budget test asserting that the overshoot stays within the §8 bound |
+| S3 | **Hard per-node budget sub-allocation by the CP**; `AgentDirectory` discovery for push-style agents | Sub-allocation tests (no node exceeds its grant; re-grant on node loss) |
+| S4 | `LlmGateway` (weighted routing, circuit breaking, retries only with `Idempotency-Key`, usage accounting); the opt-in **direct** token path for HTTP-gateway clients, with the final result still in the ledger (§5.2); OTLP exporter | Fault-injection tests (backend down, mid-stream abort); a test that a direct stream always produces a ledger result; wrk2 latency through the gateway |
+| S5 | Other SDKs | SDK conformance suite green |
 
 ## 13. Benchmark plan
 All runs report the machine (CPU model, vCPU count, RAM, disk, kernel, JDK) and the commit. Every A/B comparison uses **≥ 5 alternating runs** (master, branch, master, …), reported as mean ± stddev, as Messaging Core did for #69. The load generator and the server are pinned to disjoint CPUs with `taskset`.
@@ -289,34 +315,31 @@ These are the reference points for the targets below. Neither this PR nor the ta
 |---|---|
 | The swarm leaks into core paths over time | §3.3 tests fail the build; reviewer checklist |
 | Missing lease extension forces long leases, so failure detection is slow | S2 depends on `Partition.extend`; S1 documents the fixed-lease limit |
-| Token-per-message ledger write amplification | Chunks coalesced to 1–4 KiB or 20 ms (§5.2); optional direct path (§16 Q1) |
-| Stale worker acks a re-leased attempt | Attempt-fenced ack/nack/reject/extend (§4.3), used exclusively by the swarm |
+| Token-per-message ledger write amplification | Chunks coalesced to 1–4 KiB or 20 ms (§5.2); opt-in direct path for ephemeral HTTP token streams only (decided, §5.2) |
+| Direct-path stream lost on gateway failure | Not resumable by design; the final result is always in the ledger (§5.2) |
+| Stale worker acks a re-leased attempt | Attempt-fenced ack/nack/reject (#87) and extend (§4.3), used exclusively by the swarm |
 | Multi-node agents blocked on messaging network protocol and replication | Single-node scope until gap 8 (§4.8); phases S1–S3 run on one broker node |
-| Budget overspend across nodes | Up-front estimate debit; soft global cap; CP-allocated per-node sub-budgets (§15.1) |
-| Retrying non-idempotent LLM POSTs duplicates cost | Retry only pre-send failures or with `Idempotency-Key` (§10.2) |
-| An agent cert compromise | CP revocation + `AuditLog`; short-lived agent certs; per-agent GCRA caps blast radius |
-| Large prompts and results bloating the ledger | Inline size limit, plus storage by reference (§16 Q2) |
+| Budget overspend across nodes (S0–S2) | Soft global cap with a stated bound, `Σ F_n·ε_max + Σ D_n(T_sync)` (§8); `ε_max = 0` when the estimate is enforced as a per-call cap; hard per-node sub-allocation in S3 |
+| Retrying non-idempotent LLM POSTs duplicates cost | Retry a POST only with `Idempotency-Key` (decided, §10.2) |
+| An agent cert compromise | Separate agent intermediate CA with short-lived certs, revoked independently of nodes (§6); `AuditLog`; per-agent GCRA caps the blast radius |
+| Large prompts and results bloating the ledger | Inline size limit, plus storage by reference (§16 Q1) |
 
-## 15. Open questions for Architecture / CP
-1. Hard per-node budget sub-allocation by the CP, or soft global only for v1?
-2. `AgentPolicy` as a separate CP-distributed document (recommended), or new `Permission` values?
-3. Should agent certificates be issued by the same CP enrollment flow as nodes, or by a separate intermediate CA?
+## 15. Decisions (2026-10-13, inceptor)
+1. **Streaming:** the ledger is the default; the direct path is opt-in per request for ephemeral HTTP-gateway token streams only; the final result is always in the ledger (§5.2).
+2. **Budget:** soft global cap for S0–S2 with the overshoot bound in §8; hard per-node sub-allocation by the CP in S3.
+3. **RBAC:** `AgentPolicy` is a separate CP document; core RBAC is untouched and costs nothing when the swarm is off (§6).
+4. **Agent certificates:** a separate intermediate CA; short-lived, numerous, revoked separately from nodes (§6).
+5. **Fencing** ships first, as Messaging Core PR #87; S1 references it (§12).
+6. **LLM retries:** a POST is retried only with an `Idempotency-Key` (§10.2).
+
+No Architecture/CP questions remain open.
 
 ## 16. Open questions for Messaging Core
 
-**Resolved by the Messaging Core notes (2026-10-13):**
-- ~~Lease extension~~: `extend(group, offset, attempt, visibilityMs)` with a new `Extend` record and a batched form; `attempt` is unchanged (§4.2).
-- ~~Consumer liveness in stats~~: per-consumer counters (in-flight, extends, last heartbeat age) are planned in `DeliveryCounts` (§4.7).
-- ~~Headers~~: payload envelope until headers land in `Enqueue` (gap 3) (§4.5).
-- ~~Reply inboxes~~: one topic per requester, `reply.<agentId>`, rather than per session or shared (§5.1).
-- ~~Mixed durability~~: chunks `NONE`/`ASYNC`, the final `LAST` chunk `GROUP` when needed (§5.2).
-- ~~Ordering~~: offset order per partition. Strict per-key order needs max in-flight per key = 1 (gap 5); until then the consumer reorders by `chunkSeq` (§4.6, §5.2).
-- ~~Cancellation~~: a `cancel(correlationId)` control message, then a `LAST|CANCELLED` chunk, then the remaining chunks are acked unprocessed (§5.2).
+Resolved questions were removed; they are answered in §4–§5 and §15. Still open:
 
-**Still open:**
-1. **Streaming default (disagreement).** Should every token stream go through the ledger (the notes), or should the direct agent → gateway path be the default for HTTP-only streams, with the ledger reserved for messaging-routed or resumable streams (Architecture)? The cost of the ledger path is coalesced appends per chunk plus one consumer per stream. Its benefit is resume and replay.
-2. **Large payloads.** What is the maximum inline payload in the ledger, and does a by-reference blob store belong to messaging or to the swarm? The notes don't cover it.
-3. **Replicated results.** Once partitions replicate (gap 8), should swarm results default to the decided majority in-memory ack (`docs/design/architecture.md` §A, Decided)?
-4. **Network protocol ownership.** Messaging has no broker network protocol yet (gap 8). Should the swarm wire protocol (§11.2) be the first network binding of `Partition` operations, or should it wait for and wrap Messaging Core's own protocol (#17 §10.1, "custom binary plus HTTP bindings")?
-5. **Reply topic lifecycle.** With one `reply.<agentId>` topic per requester, how are idle reply topics closed and reclaimed, given per-partition threads and segment preallocation (`docs/messaging/design.md` §2.1)?
-6. **Fencing compatibility.** Should the unfenced `ack(group, offset)` forms be deprecated once fenced forms exist, given that the swarm uses only fenced calls?
+1. **Large payloads.** What is the maximum inline payload in the ledger, and does a by-reference blob store belong to messaging or to the swarm?
+2. **Replicated results.** Once partitions replicate (gap 8), should swarm results default to the decided majority in-memory ack (`docs/design/architecture.md` §A, Decided)?
+3. **Network protocol ownership.** Messaging has no broker network protocol yet (gap 8). Should the swarm wire protocol (§11.2) be the first network binding of `Partition` operations, or should it wait for and wrap Messaging Core's own protocol (#17 §10.1)?
+4. **Reply topic lifecycle.** With one `reply.<agentId>` topic per requester, how are idle reply topics closed and reclaimed, given per-partition threads and segment preallocation (`docs/messaging/design.md` §2.1)?
+5. **Unfenced forms.** #87 keeps the old `ack/nack/reject(group, offset)` overloads matching any attempt. Should they be deprecated once the swarm and all other callers use the fenced forms?
