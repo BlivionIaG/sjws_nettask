@@ -186,7 +186,8 @@ class CpStoreTest {
             elect(store, clock);
             var client = HttpClient.newHttpClient();
             var bearer = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()
-                    + "/cp/v1/health")).header("Authorization", "Bearer sjws_root.secret").GET().build(),
+                    + "/cp/v1/health")).header("Authorization", "Bearer sjws_root.secret")
+                    .header("Idempotency-Key", "retry-1").GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(401, bearer.statusCode(), bearer.body());
             var denied = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()

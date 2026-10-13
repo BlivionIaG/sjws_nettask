@@ -134,7 +134,8 @@ public final class AdminServer implements AutoCloseable {
     private void handle(HttpExchange exchange) throws IOException {
         var outcome = admin.handle(credential(exchange), exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
                 exchange.getRequestURI().getRawQuery(),
-                new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+                new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
+                exchange.getRequestHeaders().getFirst("Idempotency-Key"));
         var bytes = outcome.body().getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
         exchange.sendResponseHeaders(outcome.status(), bytes.length);
