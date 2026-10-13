@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import sjws_nettask.OptionalModule;
 import sjws_nettask.core.HandlerContributor;
 import sjws_nettask.core.HandlerMounts;
+import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LedgerWriter;
 import sjws_nettask.messaging.ledger.SegmentedLog;
 
@@ -42,6 +43,11 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String RETENTION_CHECK_MS_PROPERTY = "sjws.messaging.retention.check.ms";
     static final String RETENTION_CHECK_MS_ENV = "SJWS_MESSAGING_RETENTION_CHECK_MS";
 
+    static final String DURABILITY_PROPERTY = "sjws.messaging.durability";
+    static final String DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY";
+    static final String TOPIC_DURABILITY_PROPERTY = "sjws.messaging.durability.topics";
+    static final String TOPIC_DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY_TOPICS";
+
     private final LogTopics topics;
     /** Null unless a retention limit is set: no thread when retention is off. */
     private final java.util.concurrent.ScheduledExecutorService retentionTimer;
@@ -51,7 +57,30 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
                 number(setting(SEGMENT_BYTES_PROPERTY, SEGMENT_BYTES_ENV, ""), SegmentedLog.DEFAULT_SEGMENT_BYTES),
                 new LogRetention(number(setting(RETENTION_BYTES_PROPERTY, RETENTION_BYTES_ENV, ""), 0),
                         number(setting(RETENTION_MS_PROPERTY, RETENTION_MS_ENV, ""), 0)),
-                number(setting(RETENTION_CHECK_MS_PROPERTY, RETENTION_CHECK_MS_ENV, ""), 10_000));
+                number(setting(RETENTION_CHECK_MS_PROPERTY, RETENTION_CHECK_MS_ENV, ""), 10_000),
+                durability(setting(DURABILITY_PROPERTY, DURABILITY_ENV, "")),
+                topicDurability(setting(TOPIC_DURABILITY_PROPERTY, TOPIC_DURABILITY_ENV, "")));
+    }
+
+    /** The module default; a bad value is logged and falls back to the writer default (ASYNC). */
+    static Durability durability(String v) {
+        if (v.isEmpty()) return LedgerWriter.DEFAULT_DURABILITY;
+        try {
+            return LogTopics.parseDurability(v);
+        } catch (IllegalArgumentException e) {
+            System.err.println("WARN: " + e.getMessage());
+            return LedgerWriter.DEFAULT_DURABILITY;
+        }
+    }
+
+    /** Per-topic overrides; a bad list is logged and ignored as a whole. */
+    static java.util.Map<String, Durability> topicDurability(String v) {
+        try {
+            return LogTopics.parseTopicDurability(v);
+        } catch (IllegalArgumentException e) {
+            System.err.println("WARN: " + e.getMessage());
+            return java.util.Map.of();
+        }
     }
 
     MessagingModule(Path dir) {
@@ -59,7 +88,12 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     }
 
     MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs) {
-        this.topics = new LogTopics(dir, LedgerWriter.DEFAULT_DURABILITY, segmentBytes, retention, System::currentTimeMillis);
+        this(dir, segmentBytes, retention, checkMs, LedgerWriter.DEFAULT_DURABILITY, java.util.Map.of());
+    }
+
+    MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
+            java.util.Map<String, Durability> topicDurability) {
+        this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, System::currentTimeMillis);
         if (retention.unlimited()) {
             this.retentionTimer = null;
         } else {
@@ -75,6 +109,10 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         } catch (java.io.IOException | RuntimeException e) {
             System.err.println("WARN: messaging retention: " + e);
         }
+    }
+
+    LogTopics topics() {
+        return this.topics;
     }
 
     boolean retentionScheduled() {
