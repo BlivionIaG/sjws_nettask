@@ -122,12 +122,14 @@ final class MessagingHttp implements Handler {
         // TODO(buffer pool, §2.4): sendfile / pooled view instead of re-encoding the decoded batch (same bytes).
         log.reads().lock();
         try {
-        while (next < committed && out.size() < maxBytes) {
+        long written = 0; // long: compared with the long maxBytes without int overflow
+        while (next < committed && written < maxBytes) {
             var b = log.log().read(next);
             if (b == null || b.nextOffset() > committed) break;
             var frame = b.encode();
-            if (out.size() > 0 && out.size() + frame.remaining() > maxBytes) break;
+            if (!fits(written, frame.remaining(), maxBytes)) break;
             out.write(frame.array(), frame.arrayOffset() + frame.position(), frame.remaining());
+            written += frame.remaining();
             next = b.nextOffset();
         }
         } finally {
@@ -136,6 +138,11 @@ final class MessagingHttp implements Handler {
         var h = ResponseHeaders.of().set("content-type", BATCH_TYPE).set("next-offset", Long.toString(next))
                 .set("log-end-offset", Long.toString(committed));
         return new Response(200, h, Body.Bytes.of(out.toByteArray()));
+    }
+
+    /** Whether a frame of {@code frameBytes} may follow {@code written} bytes: the first frame always fits. */
+    static boolean fits(long written, long frameBytes, long maxBytes) {
+        return written == 0 || written + frameBytes <= maxBytes;
     }
 
     static Durability durability(List<String> values) throws BadRequest {

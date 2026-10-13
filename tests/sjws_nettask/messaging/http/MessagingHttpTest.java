@@ -129,6 +129,24 @@ class MessagingHttpTest {
     }
 
     @Test
+    void fetchBoundsNearIntMax() throws Exception {
+        long max = Integer.MAX_VALUE;
+        assertTrue(MessagingHttp.fits(0, max + 10, 1));             // the first frame always goes out
+        assertTrue(MessagingHttp.fits(max - 1, 1, max));             // exactly at the limit
+        assertTrue(!MessagingHttp.fits(max, 1, max));                // one past Integer.MAX_VALUE, no overflow to negative
+        assertTrue(MessagingHttp.fits(max, 1, max + 1));
+        assertTrue(!MessagingHttp.fits(max + 1, max, 2 * max));
+        try (var topics = new LogTopics(dir, Durability.ASYNC)) {
+            var h = new MessagingHttp(topics);
+            post(h, "t", recs("a"), "group");
+            assertEquals(400, h.handle(new Request("GET", "/messaging/v1/topics/t/records?maxBytes=2147483647")).status());
+            assertEquals(400, h.handle(new Request("GET", "/messaging/v1/topics/t/records?maxBytes=2147483648")).status());
+            assertEquals(200, h.handle(new Request("GET", "/messaging/v1/topics/t/records?maxBytes=" + MessagingHttp.MAX_FETCH_BYTES)).status());
+            assertEquals(400, h.handle(new Request("GET", "/messaging/v1/topics/t/records?offset=9223372036854775808")).status());
+        }
+    }
+
+    @Test
     void survivesReopen() throws Exception {
         try (var topics = new LogTopics(dir, Durability.ASYNC)) {
             post(new MessagingHttp(topics), "t", recs("keep"), "group");
