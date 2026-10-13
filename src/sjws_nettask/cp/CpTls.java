@@ -68,6 +68,19 @@ public record CpTls(Path certPem, Path keyPem, Path caPem, Path revocations, Str
         }
     }
 
+    /**
+     * Server TLS for a CP listener (admin, watch, Raft transport): TLS 1.3 only, client
+     * certificate required, key file owner/mode checked. Refusals are audited as
+     * {@code <name>.handshake}; {@link CpServerTls#reloadTls()} keeps the old material on failure.
+     */
+    public static CpServerTls serverContext(CpListenerConfig config) throws CpKeyException {
+        return serverContext(config, (actor, action, target, outcome) -> { });
+    }
+
+    public static CpServerTls serverContext(CpListenerConfig config, AdminTls.Audit audit) throws CpKeyException {
+        return CpServerTls.open(config, audit);
+    }
+
     /** Reloadable, revocation-checked server context; refusals are audited as {@code cp-tls.handshake}. */
     AdminTls server(AdminTls.Audit audit) throws IOException {
         return AdminTls.openListener("cp-tls", certPem, keyPem, null, caPem, revocations, audit);

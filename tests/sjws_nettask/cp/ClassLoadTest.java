@@ -51,6 +51,10 @@ class ClassLoadTest {
             }
             assertTrue(text.contains("bench port="), text);
             assertFalse(text.contains("sjws_nettask.cp."), text);
+            for (var cp : new String[] {"KeyRing", "KeyRingLoader", "TrustBundle", "TrustState", "CpKeyConfig",
+                    "CpListenerConfig", "CpServerTls", "CpTls"}) {
+                assertFalse(text.contains("sjws_nettask.cp." + cp + " "), cp);
+            }
             assertFalse(text.contains("sjws_nettask.cluster."), text);
             assertFalse(text.contains("sjws_nettask.service."), text);
         } finally {
