@@ -333,7 +333,6 @@ public final class BufferPool {
                     this.settings.debug() ? new Throwable("buffer acquired here") : null);
             this.live.put(tracker, Boolean.TRUE);
         }
-        buf.clear(); // every lease starts with position 0, limit = capacity
         var h = new PooledBuffer(buf, slot, budget, charged, tracker);
         if (tracker != null) {
             tracker.cleanable = CLEANER.register(h, tracker);
