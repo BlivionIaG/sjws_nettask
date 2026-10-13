@@ -160,7 +160,8 @@ class CpStoreTest {
         }
         var yaml = dir.resolve("data.yaml");
         Files.writeString(yaml, "node:\n  mode: data\nserver:\n  port: 0\n  root: " + first.toAbsolutePath() + "\n");
-        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, java.util.Map.of());
+        var loaded = ConfigLoader.load(
+                new String[] {"--config=" + yaml, "--state-dir=" + dir.resolve("data-state")}, java.util.Map.of());
         try (var server = SjwsServer.start(loaded)) {
             Files.writeString(yaml, "node:\n  mode: data\nserver:\n  port: 0\n  root: " + second.toAbsolutePath()
                     + "\nrouting:\n  enabled: true\n");

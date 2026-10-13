@@ -2,8 +2,10 @@ package sjws_nettask;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.PrintStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -13,7 +15,9 @@ import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -371,12 +375,14 @@ class HardeningIntegrationTest {
     }
 
     @Test
-    void helpPrintsUsageAndExitsZero() throws Exception {
-        Process p = launch("--help");
-        assertTrue(p.waitFor(10, TimeUnit.SECONDS));
-        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertEquals(0, p.exitValue(), out);
-        assertTrue(out.contains("Usage:") && out.contains("--h3-port"), out);
+    void helpPrintsUsageAndExitsZero() {
+        var bytes = new ByteArrayOutputStream();
+        var out = new PrintStream(bytes, true, StandardCharsets.UTF_8);
+        var code = new AtomicInteger(-1);
+        Sjws_nettask.main(new String[] {"--help"}, Map.of(), out, out, code::set);
+        String text = bytes.toString(StandardCharsets.UTF_8);
+        assertEquals(0, code.get(), text);
+        assertTrue(text.contains("Usage:") && text.contains("--h3-port"), text);
     }
 
     @Test

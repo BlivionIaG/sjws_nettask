@@ -69,8 +69,8 @@ class RoleClassLoadTest {
                 + "\njoin-token=" + token + "\nstate-dir=" + this.dir.resolve("state") + "\n");
         Files.setPosixFilePermissions(boot, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
         var text = run(flags, "Server started:", "sjws_nettask.Sjws_nettask", "--role=data", "--bootstrap=" + boot,
-                "--pid-file=" + this.dir.resolve("gw-" + System.nanoTime() + ".pid"), Integer.toString(freePort()),
-                root.toString());
+                "--pid-file=" + this.dir.resolve("gw-" + System.nanoTime() + ".pid"),
+                "--state-dir=" + this.dir.resolve("config-state"), Integer.toString(freePort()), root.toString());
         assertTrue(text.contains("control-plane role=data/gateway"), text);
         return text;
     }
