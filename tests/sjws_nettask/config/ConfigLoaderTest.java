@@ -575,6 +575,84 @@ class ConfigLoaderTest {
         assertTrue(error(up("      circuit: { eject_for: never }\n")).contains("eject_for"));
     }
 
+    @Test
+    void haClusterKeyComesFromTheFileOrEnvAndIsNeverLogged() throws Exception {
+        var fileKey = "file-cluster-key-0123456789";
+        var previous = "file-previous-key-0123456";
+        var envKey = "env-cluster-key-0123456789";
+        var root = dir.toAbsolutePath();
+        var bare = dir.resolve("bare.yaml");
+        Files.writeString(bare, "server:\n  port: 0\n  root: " + root + "\n");
+        var withHa = dir.resolve("ha.yaml");
+        Files.writeString(withHa, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key: \""
+                + fileKey + "\"\n  cluster_key_previous: \"" + previous + "\"\n");
+        var off = ConfigLoader.load(new String[] {"--config=" + bare}, Map.of("WEB_SERVER_HA_CLUSTER_KEY", envKey));
+        assertTrue(off.ok(), off.errors().toString());
+        assertFalse(off.haEnabled());
+        assertNull(off.haClusterKey());
+        assertFalse(off.toString().contains(envKey), off.toString());
+        assertTrue(off.toString().contains("clusterKey=none"));
+
+        var on = ConfigLoader.load(new String[] {"--config=" + withHa}, Map.of());
+        assertTrue(on.ok(), on.errors().toString());
+        assertTrue(on.haEnabled());
+        assertArrayEquals(fileKey.getBytes(java.nio.charset.StandardCharsets.UTF_8), on.haClusterKey());
+        assertArrayEquals(previous.getBytes(java.nio.charset.StandardCharsets.UTF_8), on.haClusterKeyPrevious());
+        assertEquals(off.document().canonicalHash(), on.document().canonicalHash());
+        assertFalse(on.document().canonicalText().contains(fileKey));
+        assertFalse(on.document().canonicalText().contains("cluster_key"));
+        assertFalse(on.toString().contains(fileKey), on.toString());
+        assertFalse(on.toString().contains(previous), on.toString());
+        assertTrue(on.toString().contains("****"));
+        assertArrayEquals(on.haClusterKey(), on.withDocument(on.document()).haClusterKey());
+
+        var overridden = ConfigLoader.load(new String[] {"--config=" + withHa},
+                Map.of("WEB_SERVER_HA_CLUSTER_KEY", envKey, "WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS", "env-previous-key-012345"));
+        assertArrayEquals(envKey.getBytes(java.nio.charset.StandardCharsets.UTF_8), overridden.haClusterKey());
+        assertFalse(overridden.toString().contains(envKey), overridden.toString());
+        assertFalse(overridden.toString().contains(fileKey), overridden.toString());
+
+        var disabled = dir.resolve("ha-off.yaml");
+        Files.writeString(disabled, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: false\n  cluster_key: \""
+                + fileKey + "\"\n");
+        var keptOff = ConfigLoader.load(new String[] {"--config=" + disabled}, Map.of());
+        assertTrue(keptOff.ok(), keptOff.errors().toString());
+        assertFalse(keptOff.haEnabled());
+        assertNull(keptOff.haClusterKey());
+        assertFalse(keptOff.toString().contains(fileKey));
+
+        var missing = error("ha:\n  enabled: true\n  cluster_key_previous: \"" + previous + "\"\n");
+        assertTrue(missing.contains("no cluster key"));
+        assertFalse(missing.contains(previous), missing);
+        var emptyEnv = ConfigLoader.load(new String[] {"--config=" + withHa}, Map.of("WEB_SERVER_HA_CLUSTER_KEY", ""));
+        assertFalse(emptyEnv.ok());
+        assertFalse(emptyEnv.errors().get(0).contains(fileKey), emptyEnv.errors().toString());
+        var blankEnv = ConfigLoader.load(new String[] {"--config=" + withHa},
+                Map.of("WEB_SERVER_HA_CLUSTER_KEY", "   ", "WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS", "   "));
+        assertFalse(blankEnv.ok());
+        assertFalse(blankEnv.errors().get(0).contains(fileKey), blankEnv.errors().toString());
+        var shortPrevious = "short-prev-zz";
+        var previousTooShort = error("ha:\n  enabled: true\n  cluster_key: \"" + fileKey
+                + "\"\n  cluster_key_previous: \"" + shortPrevious + "\"\n");
+        assertTrue(previousTooShort.contains("at least"));
+        assertFalse(previousTooShort.contains(shortPrevious), previousTooShort);
+        assertFalse(previousTooShort.contains(fileKey), previousTooShort);
+        var shortKey = "uniq-short-zz";
+        var tooShort = error("ha:\n  enabled: true\n  cluster_key: \"" + shortKey + "\"\n");
+        assertTrue(tooShort.contains("at least"));
+        assertFalse(tooShort.contains(shortKey), tooShort);
+        assertTrue(error("ha:\n  enabled: true\n  cluster_key: 1\n").contains("expected a string"));
+        assertTrue(error("ha:\n  enabled: true\n  cluster_key: \"   \"\n").contains("expected a string"));
+        assertTrue(error("ha:\n  enabled: maybe\n").contains("true or false"));
+        assertTrue(error("ha:\n  password: " + fileKey + "\n").contains("Unknown key"));
+        assertFalse(error("ha:\n  password: " + fileKey + "\n").contains(fileKey));
+        var cli = "cli-cluster-key-should-not-appear";
+        var refused = ConfigLoader.load(new String[] {"--config=" + withHa, "--cluster-key=" + cli}, Map.of());
+        assertFalse(refused.ok());
+        assertTrue(refused.errors().stream().noneMatch(e -> e.contains(cli)), refused.errors().toString());
+        assertTrue(refused.errors().stream().noneMatch(e -> e.contains(fileKey)), refused.errors().toString());
+    }
+
     private String error(String yaml) throws Exception {
         var loaded = ConfigLoader.load(new String[] {"--config=" + write(yaml)}, Map.of());
         assertFalse(loaded.ok(), yaml);

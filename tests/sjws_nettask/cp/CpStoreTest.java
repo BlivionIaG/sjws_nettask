@@ -86,7 +86,8 @@ class CpStoreTest {
             assertEquals("canonicalHash", yamlFlip.error());
 
             var loaded = ConfigLoader.load(new String[] {"--config=" + write(dir.resolve("sjws.yaml"),
-                    "server:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n")}, java.util.Map.of());
+                    "node:\n  mode: data\nserver:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n")},
+                    java.util.Map.of());
             try (var server = SjwsServer.start(loaded)) {
                 assertEquals("one", HttpTestSupport.get(server.tcpPort(), "/", 2000).bodyText());
                 server.attachControlPlane(apply);
