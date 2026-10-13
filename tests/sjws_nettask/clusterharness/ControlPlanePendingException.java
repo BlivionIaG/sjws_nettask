@@ -16,12 +16,21 @@
  */
 package sjws_nettask.clusterharness;
 
-/** Thrown when a scenario needs {@code sjws_nettask.cp} and this tree does not have it. */
+/**
+ * Thrown when a scenario needs a live control plane the harness can drive.
+ * {@code sjws_nettask.cp} is in this tree as a single-voter store. It does not implement
+ * {@link ControlPlane}, and a data node still has no watch client.
+ */
 public final class ControlPlanePendingException extends IllegalStateException {
 
     public ControlPlanePendingException() {
         super("sjws_nettask.cp is pending. See " + ControlPlaneDesign.PR
                 + " (docs/design/control-plane.md). PendingControlPlane does not simulate Raft, "
                 + "rollout, or last-good apply.");
+    }
+
+    /** A refusal that names the missing piece. {@code detail} should start with {@code TODO}. */
+    public ControlPlanePendingException(String detail) {
+        super(detail);
     }
 }
