@@ -165,6 +165,11 @@ public record CpTls(Path certPem, Path keyPem, Path caPem, Path revocations, Str
         }
     }
 
+    /** The node-side trust manager: pinned-CA validation plus the {@code peerName} check. */
+    static X509ExtendedTrustManager peerCheck(X509ExtendedTrustManager pinned, String peerName) {
+        return new PeerCheck(pinned, peerName);
+    }
+
     /** TLS 1.3 only, with or without required client authentication. */
     static SSLParameters parameters(SSLContext tls, boolean needClientAuth) {
         var ssl = tls.getDefaultSSLParameters();

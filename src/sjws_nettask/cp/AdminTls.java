@@ -162,6 +162,15 @@ public final class AdminTls {
         return context;
     }
 
+    /** The delegating managers installed in {@link #context()}; for tests. */
+    X509ExtendedTrustManager trustManager() {
+        return new Trust();
+    }
+
+    X509ExtendedKeyManager keyManager() {
+        return new Keys();
+    }
+
     /** Number of successful loads, starting at 1. */
     public long generation() {
         return generation.get();
