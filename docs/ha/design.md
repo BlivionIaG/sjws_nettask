@@ -58,9 +58,12 @@ wiring that should drain instead belongs to daemon mode, which can call `Lifecyc
    previous key (`ha.cluster_key` / `ha.cluster_key_file` and `ha.cluster_key_previous` /
    `ha.cluster_key_previous_file`), then remove the previous key once every node is sending
    with the new one. The key file must be mode 0600 or 0400 and owned by this process.
-   Parent-directory symlinks are resolved with `toRealPath` and those checks apply to the
-   resolved path, which is then read through one `NOFOLLOW_LINKS` channel. Nodes need
-   NTP: the authentication window is ±5 seconds of wall-clock time. Monotonic
+   Only the parent directory is resolved with `toRealPath`. The leaf is opened with
+   `NOFOLLOW_LINKS` and is never followed, so a symlink in that name is refused.
+   Owner and mode are taken from that opened file. Any resolved parent that is group-
+   or world-writable is refused, unless it is sticky and owned by root or this process
+   (`/tmp`). Control-plane key files use the same helper, `sjws_nettask.config.SecureKeyFile`.
+   Nodes need NTP: the authentication window is ±5 seconds of wall-clock time. Monotonic
    clocks are not comparable across hosts: the packet carries `leaseRemainingMs`, and the
    receiver sets its own expiry from `System.nanoTime()`. The authentication timestamp is
    wall-clock milliseconds and is only a replay window.

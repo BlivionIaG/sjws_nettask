@@ -19,14 +19,9 @@ package sjws_nettask.config;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.nio.file.attribute.PosixFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -1115,7 +1110,9 @@ public final class ConfigLoader {
      * When {@code ha.enabled} is false the key bytes are discarded and {@link ClusterKey} is not
      * resolved. A missing key with HA enabled is an error. The environment overrides the file.
      * Values are never copied into the message. An inline secret in a group- or world-readable
-     * file is a warning. {@code ha.cluster_key_file} must be mode 0600 or 0400 and owned by this process.
+     * file is a warning. {@code ha.cluster_key_file} must be mode 0600 or 0400 and owned by this
+     * process. The leaf is not followed. A group- or world-writable parent is refused unless it
+     * is sticky and owned by root or this process.
      */
     private static HaMaterial haSection(Map<String, Object> root, Map<String, String> env, Path base, Path configFile,
             List<String> warnings) {
@@ -1192,131 +1189,13 @@ public final class ConfigLoader {
     }
 
     /**
-     * Key file: parent-directory symlinks are resolved with {@link Path#toRealPath()}, then the
-     * resolved path is opened once with {@link LinkOption#NOFOLLOW_LINKS}. The file itself must
-     * not be a symlink. It is at most 4 KiB, mode 0600 or 0400, and owned by this process.
-     * Mode and owner come from that same file descriptor on Linux ({@code /proc/self/fd}), so a
-     * replace between the check and the read cannot change which inode was accepted. The bytes
-     * are not part of the error text. Java keeps the characters in a {@code String}; they are
-     * not wiped.
+     * Key file via {@link SecureKeyFile}: only the parent is resolved, the leaf is opened once
+     * with {@code NOFOLLOW_LINKS}, and a group- or world-writable parent is refused. At most
+     * 4 KiB. The bytes are not part of the error text. Java keeps the characters in a
+     * {@code String}; they are not wiped.
      */
     private static String readKeyFile(Path path, String name) {
-        if (!path.getFileSystem().supportedFileAttributeViews().contains("posix")) {
-            throw new ConfigException(name + " cannot be checked (filesystem has no POSIX permissions)");
-        }
-        if (Files.isSymbolicLink(path)) {
-            throw new ConfigException(name + " is a symlink");
-        }
-        final Path opened;
-        try {
-            opened = path.toRealPath();
-        } catch (IOException e) {
-            throw new ConfigException("Cannot read " + name);
-        }
-        try (var channel = FileChannel.open(opened, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
-            checkedKey(channel, opened, name);
-            if (channel.size() > 4096) {
-                throw new ConfigException(name + " is too large");
-            }
-            var buf = ByteBuffer.allocate((int) channel.size());
-            while (buf.hasRemaining()) {
-                if (channel.read(buf) < 0) {
-                    break;
-                }
-            }
-            buf.flip();
-            return StandardCharsets.UTF_8.decode(buf).toString();
-        } catch (UnsupportedOperationException e) {
-            throw new ConfigException(name + " cannot be checked (filesystem has no POSIX permissions)");
-        } catch (IOException e) {
-            if (Files.isSymbolicLink(path) || Files.isSymbolicLink(opened)) {
-                throw new ConfigException(name + " is a symlink");
-            }
-            throw new ConfigException("Cannot read " + name);
-        }
-    }
-
-    /**
-     * Attributes of the inode {@code channel} already has open. On Linux this is {@code fstat}
-     * of that descriptor. Elsewhere it is a {@code NOFOLLOW} stat of the path while the channel
-     * is still open.
-     */
-    private static void checkedKey(FileChannel channel, Path opened, String name) throws IOException {
-        if (!channel.isOpen()) {
-            throw new IOException(name);
-        }
-        PosixFileAttributes attrs;
-        int owner;
-        var procFd = linuxFd(opened, name);
-        if (procFd != null) {
-            attrs = Files.readAttributes(procFd, PosixFileAttributes.class);
-            owner = ((Integer) Files.getAttribute(procFd, "unix:uid")).intValue();
-        } else {
-            attrs = Files.readAttributes(opened, PosixFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            owner = ((Integer) Files.getAttribute(opened, "unix:uid", LinkOption.NOFOLLOW_LINKS)).intValue();
-        }
-        if (!attrs.isRegularFile()) {
-            throw new ConfigException(name + " is not a file");
-        }
-        if (!ownedByThisProcess(opened, owner, attrs)) {
-            throw new ConfigException(name + " must be owned by this process");
-        }
-        var perms = attrs.permissions();
-        boolean ownerRead = perms.contains(PosixFilePermission.OWNER_READ);
-        boolean secret = perms.contains(PosixFilePermission.GROUP_READ)
-                || perms.contains(PosixFilePermission.GROUP_WRITE)
-                || perms.contains(PosixFilePermission.GROUP_EXECUTE)
-                || perms.contains(PosixFilePermission.OTHERS_READ)
-                || perms.contains(PosixFilePermission.OTHERS_WRITE)
-                || perms.contains(PosixFilePermission.OTHERS_EXECUTE);
-        if (!ownerRead || secret || perms.contains(PosixFilePermission.OWNER_EXECUTE)) {
-            throw new ConfigException(name + " must be mode 0600 or 0400");
-        }
-    }
-
-    /** This process's uid when {@code /proc/self} exists; otherwise the same owner name. */
-    private static boolean ownedByThisProcess(Path opened, int ownerUid, PosixFileAttributes attrs) throws IOException {
-        var self = Path.of("/proc/self");
-        if (Files.exists(self)) {
-            int uid = ((Integer) Files.getAttribute(self, "unix:uid")).intValue();
-            return ownerUid == uid;
-        }
-        var me = opened.getFileSystem().getUserPrincipalLookupService()
-                .lookupPrincipalByName(System.getProperty("user.name"));
-        return me.equals(attrs.owner());
-    }
-
-    /**
-     * {@code /proc/self/fd/N} for the single descriptor whose target is {@code opened}, or null
-     * when this system has no proc fd directory. More than one match fails closed.
-     */
-    private static Path linuxFd(Path opened, String name) throws IOException {
-        var dir = Path.of("/proc/self/fd");
-        if (!Files.isDirectory(dir)) {
-            return null;
-        }
-        String want = opened.toString();
-        int found = -1;
-        int matches = 0;
-        try (var stream = Files.newDirectoryStream(dir)) {
-            for (var entry : stream) {
-                Path link;
-                try {
-                    link = Files.readSymbolicLink(entry);
-                } catch (IOException ignored) {
-                    continue;
-                }
-                if (!link.toString().equals(want)) {
-                    continue;
-                }
-                matches++;
-                found = Integer.parseInt(entry.getFileName().toString());
-            }
-        }
-        if (matches != 1) {
-            throw new ConfigException(name + " cannot be checked");
-        }
-        return dir.resolve(Integer.toString(found));
+        return new String(SecureKeyFile.read(path, name, 4096), StandardCharsets.UTF_8);
     }
 
     /** UTF-8 secret. Blank is refused. The value is not included in the error. */

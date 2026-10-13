@@ -114,9 +114,12 @@ step drops heartbeats until they agree, and a rate-limited warning names the ske
 Key rotation: put the new secret in `ha.cluster_key` or `ha.cluster_key_file` and the key
 that is still in use in `ha.cluster_key_previous` or `ha.cluster_key_previous_file`. Roll
 that config to every node, wait until heartbeats are using the new key, then remove the
-previous key. Parent-directory symlinks in the key-file path are resolved with `toRealPath`,
-and the owner and mode checks apply to that resolved path. It is then opened with
-`NOFOLLOW_LINKS`, must be mode 0600 or 0400, and must be owned by the server's uid.
+previous key. Only the parent directory of a key file is resolved with `toRealPath`.
+The leaf is opened with `NOFOLLOW_LINKS` and is never followed. Owner and mode (0600 or
+0400, owned by this process) are checked on that opened file. A resolved parent that is
+group- or world-writable is refused, unless it is sticky and owned by root or this
+process, as `/tmp` is. Control-plane key files use the same helper
+(`sjws_nettask.config.SecureKeyFile`).
 
 ## Server
 

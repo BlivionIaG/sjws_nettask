@@ -744,6 +744,101 @@ class ConfigLoaderTest {
         assertFalse(open.errors().get(0).contains(secret), open.errors().toString());
     }
 
+    /**
+     * A leaf symlink that already exists is refused by the old pre-check too, so it cannot tell
+     * the two versions apart. This swap runs after that pre-check would have passed and before
+     * the open. The target is a valid 0600 file owned by this process: code that follows the
+     * leaf accepts it.
+     */
+    @Test
+    void haClusterKeyFileRefusesALeafSwappedForASymlinkToAValidKey() throws Exception {
+        var secret = "leaf-swap-secret-0123456789abcd";
+        var other = "other-valid-secret-0123456789ab";
+        var keyFile = dir.resolve("swap.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        var target = dir.resolve("valid-target.key");
+        Files.writeString(target, other);
+        Files.setPosixFilePermissions(target, PosixFilePermissions.fromString("rw-------"));
+        var yaml = dir.resolve("ha-swap.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: swap.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        assertNull(SecureKeyFile.beforeOpen);
+        SecureKeyFile.beforeOpen = opened -> {
+            try {
+                Files.delete(opened);
+                Files.createSymbolicLink(opened, target);
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
+        try {
+            var swapped = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+            assertFalse(swapped.ok(), swapped.errors().toString());
+            assertTrue(swapped.errors().get(0).contains("symlink"), swapped.errors().toString());
+            assertFalse(swapped.errors().get(0).contains(secret), swapped.errors().toString());
+            assertFalse(swapped.errors().get(0).contains(other), swapped.errors().toString());
+        } finally {
+            SecureKeyFile.beforeOpen = null;
+        }
+    }
+
+    @Test
+    void haClusterKeyFileRefusesAGroupOrWorldWritableParentUnlessSticky() throws Exception {
+        var secret = "loose-parent-secret-0123456789ab";
+        var loose = Files.createDirectories(dir.resolve("loose"));
+        var inner = Files.createDirectories(loose.resolve("inner"));
+        Files.setPosixFilePermissions(inner, PosixFilePermissions.fromString("rwx------"));
+        var keyFile = inner.resolve("cluster.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        Files.setPosixFilePermissions(loose, PosixFilePermissions.fromString("rwxrwxr-x"));
+        var yaml = dir.resolve("ha-loose.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: loose/inner/cluster.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        var group = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(group.ok());
+        assertTrue(group.errors().get(0).contains("writable parent"), group.errors().toString());
+        assertFalse(group.errors().get(0).contains(secret), group.errors().toString());
+
+        Files.setPosixFilePermissions(loose, PosixFilePermissions.fromString("rwx---rwx"));
+        var other = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(other.ok());
+        assertTrue(other.errors().get(0).contains("writable parent"), other.errors().toString());
+        assertFalse(other.errors().get(0).contains(secret), other.errors().toString());
+
+        var sticky = Files.createDirectories(dir.resolve("sticky"));
+        var stickyKey = sticky.resolve("cluster.key");
+        Files.writeString(stickyKey, secret);
+        Files.setPosixFilePermissions(stickyKey, PosixFilePermissions.fromString("rw-------"));
+        Files.setAttribute(sticky, "unix:mode", 01777);
+        int mode = ((Integer) Files.getAttribute(sticky, "unix:mode")).intValue();
+        assertTrue((mode & 01000) != 0, Integer.toOctalString(mode));
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: sticky/cluster.key\n");
+        var allowed = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(allowed.ok(), allowed.errors().toString());
+        assertArrayEquals(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), allowed.haClusterKey());
+        assertFalse(allowed.toString().contains(secret), allowed.toString());
+
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: no-such-dir/cluster.key\n");
+        var missingDir = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(missingDir.ok());
+        assertTrue(missingDir.errors().get(0).contains("Cannot read"), missingDir.errors().toString());
+
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: absent.key\n");
+        var missingFile = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(missingFile.ok());
+        assertTrue(missingFile.errors().get(0).contains("Cannot read"), missingFile.errors().toString());
+        assertFalse(missingFile.errors().get(0).contains("symlink"), missingFile.errors().toString());
+    }
+
     private String error(String yaml) throws Exception {
         var loaded = ConfigLoader.load(new String[] {"--config=" + write(yaml)}, Map.of());
         assertFalse(loaded.ok(), yaml);
