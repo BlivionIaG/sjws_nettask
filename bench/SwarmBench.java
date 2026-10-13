@@ -21,8 +21,8 @@ import sjws_nettask.swarm.TaskEnvelope;
  *   heartbeat <off|keeper> <secs>  one dispatch worker (claim+ack, 1 KiB) while 10 000 leases in pool "hold" are kept
  *                               by LeaseKeeper.start(5 s), spread: one batched extend of 100 every 50 ms. Prints
  *                               dispatch tasks/s and tick latency. Target: < 2 % loss vs off.
- *   reqreply <rate> <secs>      ReplyRouter.call at <rate>/s open loop; one worker claims and replies (reply ASYNC,
- *                               then ack). Prints round-trip p50/p99. Target at 10k/s: p50 < 50 us, p99 < 500 us.
+ *   reqreply <rate> <secs>      ReplyRouter.call at <rate>/s open loop; one worker claims (blocking, 50 ms) up to 64
+ *                               and replies (ASYNC) with one batched fenced ack after the replies are durable. Prints round-trip p50/p99. Target at 10k/s: p50 < 50 us, p99 < 500 us.
  *
  *   java -cp target/classes bench/SwarmBench.java <dir> <mode> <arg> <secs>
  */
@@ -129,15 +129,19 @@ public class SwarmBench {
         var worker = Thread.ofPlatform().name("worker").start(() -> {
             long seq = 0;
             while (!stop.get()) {
-                var got = t.claim("echo", "w", 64, 30_000);
-                if (got.isEmpty()) { Thread.onSpinWait(); continue; }
-                for (Task task : got) t.reply(task, 2, ++seq, "", task.envelope().body());
+                // blocking claim (#99, 50 ms), then one reply per task and one batched fenced ack (#100)
+                var got = t.claim("echo", "w", 64, 30_000, 50_000_000L);
+                if (got.isEmpty()) continue;
+                var bodies = new ArrayList<byte[]>(got.size());
+                for (Task task : got) bodies.add(task.envelope().body());
+                t.replyAll(got, 2, seq + 1, "", bodies);
+                seq += got.size();
             }
         });
         long gap = 1_000_000_000L / rate;
         long warm = (long) (2e9 / gap), total = warm + (long) (secs * 1e9 / gap);
         var lat = new long[(int) (total - warm)];
-        var futures = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+        var done = new AtomicLong();
         long start = System.nanoTime();
         var body = new byte[256];
         for (long i = 0; i < total; i++) {
@@ -145,9 +149,10 @@ public class SwarmBench {
             while (System.nanoTime() < due) Thread.onSpinWait();
             long idx = i - warm;
             var f = s.replies().call("echo", "", body, System.currentTimeMillis() + 10_000, "");
-            futures.add(f.thenAccept(r -> { if (idx >= 0) lat[(int) idx] = System.nanoTime() - due; }));
+            f.whenComplete((r, e) -> { if (e == null && idx >= 0) lat[(int) idx] = System.nanoTime() - due; done.incrementAndGet(); });
         }
-        for (var f : futures) f.get(30, TimeUnit.SECONDS);
+        long until = System.nanoTime() + 30_000_000_000L;
+        while (done.get() < total && System.nanoTime() < until) Thread.sleep(1);
         stop.set(true);
         worker.join();
         System.out.printf("reqreply rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d%n", rate,

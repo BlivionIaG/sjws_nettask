@@ -149,6 +149,42 @@ public final class TaskService {
      * the reply is durable (§4.4): a crash before that redelivers the task, and the caller dedups by taskId.
      * The future holds the ack's result. {@code (producerId, seq)} dedups a reply retried after a crash.
      */
+    /**
+     * Replies to every task in {@code tasks} ({@code bodies[i]} for {@code tasks.get(i)}, all from one pool), each
+     * with {@code (producerId, firstSeq + i)}, then acks them with <b>one batched fenced ack</b> (#100) once the last
+     * reply is durable. Takes ownership of the {@code bodies} arrays (no copy).
+     */
+    public CompletableFuture<List<LeaseResult>> replyAll(List<Task> tasks, long producerId, long firstSeq,
+            String contentType, List<byte[]> bodies) {
+        if (tasks.size() != bodies.size()) {
+            throw new IllegalArgumentException("one body per task");
+        }
+        if (tasks.isEmpty()) {
+            return CompletableFuture.completedFuture(List.of());
+        }
+        var pool = tasks.get(0).pool();
+        var offs = new long[tasks.size()];
+        var atts = new int[tasks.size()];
+        var durable = new java.util.ArrayList<CompletableFuture<Long>>(tasks.size());
+        for (int i = 0; i < tasks.size(); i++) {
+            var t = tasks.get(i);
+            if (!t.pool().equals(pool)) {
+                throw new IllegalArgumentException("tasks from one pool");
+            }
+            var to = t.envelope().replyTo();
+            if (to.isEmpty()) {
+                throw new IllegalArgumentException("task has no replyTo");
+            }
+            offs[i] = t.offset();
+            atts[i] = t.attempt();
+            durable.add(this.topics.partition(to).produce(producerId, firstSeq + i,
+                    t.envelope().replyOwned(contentType, bodies.get(i)).encode(), Durability.ASYNC).durable());
+        }
+        // Different reply topics are different logs, so wait for each topic's futures (normally one topic).
+        return CompletableFuture.allOf(durable.toArray(CompletableFuture[]::new))
+                .thenApply(x -> partition(pool).ack(WORKERS, offs, atts, null).results());
+    }
+
     public CompletableFuture<LeaseResult> reply(Task t, long producerId, long seq, String contentType, byte[] body) {
         var to = t.envelope().replyTo();
         if (to.isEmpty()) {
