@@ -81,6 +81,8 @@ no counter: see how observability is wired). Docs, test, CI and dependency-only 
 
 ## Security
 
+- Vulnerability reports and disclosure follow [SECURITY.md](SECURITY.md). Never describe an unfixed
+  exploitable issue in a public issue, PR title or commit message.
 - The control-plane admin listener is **mTLS only** (`cp.AdminServer`: client certificate required,
   identity from the certificate, `Authorization` ignored; it refuses to bind without the material).
   See [control-plane security](docs/design/control-plane-security.md) and the [audit](docs/security/audit.md).

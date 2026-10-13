@@ -37,3 +37,7 @@ server:
 Start at **[docs/index.md](docs/index.md)**: installation, command line and config file, HTTP/1.x,
 HTTP/2, HTTP/3, access rules, caching, observability, daemon mode, admin console, architecture and
 design notes, testing. See also [CONTRIBUTING.md](CONTRIBUTING.md) and [LICENSE](LICENSE).
+
+## Security
+
+Report vulnerabilities privately, never in a public issue: see [SECURITY.md](SECURITY.md).

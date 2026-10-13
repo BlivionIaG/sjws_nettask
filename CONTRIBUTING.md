@@ -2,6 +2,9 @@
 
 Coding agents: read [AGENTS.md](AGENTS.md) first (rules for authors, PRs, perf numbers, security).
 
+Security issues: do not open a public issue or PR. Report them privately as described in
+[SECURITY.md](SECURITY.md).
+
 ## Setup
 
 Java 25+ and Maven. Sources are in `src/` (NetBeans layout), tests in `tests/`.
