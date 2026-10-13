@@ -230,6 +230,14 @@ class ResilienceTest {
     }
 
     @Test
+    void aRecoveredRetryIsASuccessForTheBreaker() {
+        this.failFirst = 1;
+        var p = proxy(this.base, new Resilience(retry(1, 20), new Resilience.Circuit(1, Duration.ofSeconds(30))));
+        assertEquals(200, p.handle(new Request("GET", "/")).status());
+        assertEquals("CLOSED", p.circuitState());
+    }
+
+    @Test
     void offIsThePlainPath() {
         assertEquals("CLOSED", new ProxyHandler(new ProxyHandler.Settings(this.base)).circuitState());
     }

@@ -246,7 +246,8 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     }
 
     /**
-     * Circuit check, then up to {@code 1 + attempts} tries. A failed attempt is retried only when it
+     * Circuit check (once per request), then up to {@code 1 + attempts} tries; the breaker records
+     * the request's final outcome. A failed attempt is retried only when it
      * is listed in {@code on}, the request is idempotent and bodyless, and the retry budget has a
      * token; nothing has reached the client before a retry (a retried 5xx body is discarded).
      */
@@ -256,13 +257,13 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         if (retry != null) {
             this.retryBudget.deposit();
         }
+        if (this.breaker != null && !this.breaker.allow()) {
+            var open = StaticFileHandler.error(503, head);
+            open.headers().add("retry-after", Long.toString(this.breaker.retryAfterSeconds()));
+            return open;
+        }
         int tries = 0;
         while (true) {
-            if (this.breaker != null && !this.breaker.allow()) {
-                var open = StaticFileHandler.error(503, head);
-                open.headers().add("retry-after", Long.toString(this.breaker.retryAfterSeconds()));
-                return open;
-            }
             Resilience.On failed;
             Response response = null;
             int errorStatus = 0;
@@ -279,19 +280,20 @@ public final class ProxyHandler implements Handler, AutoCloseable {
                 }
                 return StaticFileHandler.error(502, head);
             }
-            if (this.breaker != null) {
-                if (failed == null) {
-                    this.breaker.success();
-                } else {
-                    this.breaker.failure();
-                }
-            }
-            if (failed == null) {
-                return response;
-            }
-            boolean again = mayRetry && tries < retry.attempts() && retry.on().contains(failed)
+            boolean again = failed != null && mayRetry && tries < retry.attempts() && retry.on().contains(failed)
                     && this.retryBudget.withdraw();
             if (!again) {
+                // one verdict per request, after its retries: a retry that recovers is a success
+                if (this.breaker != null) {
+                    if (failed == null) {
+                        this.breaker.success();
+                    } else {
+                        this.breaker.failure();
+                    }
+                }
+                if (failed == null) {
+                    return response;
+                }
                 return response != null ? response : StaticFileHandler.error(errorStatus, head);
             }
             if (response != null) {
