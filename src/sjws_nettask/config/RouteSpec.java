@@ -60,11 +60,27 @@ public record RouteSpec(String host, boolean wildcard, String hostSuffix, String
         public static final Errors HTML = new Errors(false, null);
     }
 
-    /** Exactly one of proxy, redirect or static. */
-    public sealed interface Action permits Action.Proxy, Action.Redirect, Action.Static {
+    /** Exactly one of proxy, backends, redirect or static. */
+    public sealed interface Action permits Action.Proxy, Action.Weighted, Action.Redirect, Action.Static {
 
         /** {@code proxy: <upstream name>} resolved to the upstream record. */
         record Proxy(Upstream upstream) implements Action {
+        }
+
+        /**
+         * {@code backends: [{upstream, weight, pin}]} with an optional {@code sticky} key.
+         *
+         * @param sticky header or cookie whose value is hashed to pick a backend; null picks at random
+         */
+        record Weighted(java.util.List<Backend> backends, sjws_nettask.routing.WeightedHandler.Match sticky)
+                implements Action {
+            public Weighted {
+                backends = java.util.List.copyOf(backends);
+            }
+        }
+
+        /** @param pin header or cookie test that sends a request here regardless of weight; may be null */
+        record Backend(Upstream upstream, int weight, sjws_nettask.routing.WeightedHandler.Match pin) {
         }
 
         /**
