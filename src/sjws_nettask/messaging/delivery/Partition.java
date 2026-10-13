@@ -218,7 +218,7 @@ public final class Partition implements AutoCloseable {
             var f = append(new LedgerEntry.Enqueue(producerId, seq, clockMs.getAsLong(), "", -1, 0, "", payload), durability);
             return new ProduceResult(o, false, f);
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -238,7 +238,7 @@ public final class Partition implements AutoCloseable {
             subscribed.add(group);
             return true;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -254,7 +254,7 @@ public final class Partition implements AutoCloseable {
         try {
             got = pollLocked(group, consumer, max, visibilityMs);
         } finally {
-            lock.unlock();
+            unlock();
         }
         return toDeliveries(got);
     }
@@ -301,7 +301,7 @@ public final class Partition implements AutoCloseable {
                 }
             }
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -430,7 +430,7 @@ public final class Partition implements AutoCloseable {
             append(new LedgerEntry.Ack(group, offset), null);
             return LeaseResult.OK;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -442,7 +442,7 @@ public final class Partition implements AutoCloseable {
             if (r != null) return new AckResult(r, null);
             return new AckResult(LeaseResult.OK, append(new LedgerEntry.Ack(group, offset), durability));
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -468,7 +468,7 @@ public final class Partition implements AutoCloseable {
             append(new LedgerEntry.Nack(group, offset, notBefore), null);
             return LeaseResult.OK;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -485,7 +485,7 @@ public final class Partition implements AutoCloseable {
             deadLetter(group, offset, l.attempt(), "rejected:" + reason);
             return LeaseResult.OK;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -502,7 +502,7 @@ public final class Partition implements AutoCloseable {
             append(new LedgerEntry.Extend(group, clockMs.getAsLong() + visibilityMs, new long[] {offset}, new int[] {attempt}), null);
             return LeaseResult.OK;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -528,7 +528,7 @@ public final class Partition implements AutoCloseable {
                     java.util.Arrays.copyOf(okOff, n), java.util.Arrays.copyOf(okAtt, n)), null);
             return out;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -561,7 +561,7 @@ public final class Partition implements AutoCloseable {
             }
             return new BatchAckResult(List.of(out), entries.isEmpty() ? null : appendAll(entries, durability));
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -594,7 +594,7 @@ public final class Partition implements AutoCloseable {
             return append(new LedgerEntry.Enqueue(0, 0, m.timestampMs(), group, offset, attempts, reason,
                     payload), null);
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -609,19 +609,15 @@ public final class Partition implements AutoCloseable {
     /** As {@link #append}, for several entries written as one batch; the future yields the first offset. */
     private CompletableFuture<Long> appendAll(List<LedgerEntry> es, Durability durability) {
         long offset = state.nextOffset;
-        CompletableFuture<Long> f;
-        try {
-            List<byte[]> enc;
-            if (es.size() == 1) enc = List.of(LedgerEntry.encode(es.get(0)));
-            else { enc = new ArrayList<>(es.size()); for (var e : es) enc.add(LedgerEntry.encode(e)); }
-            f = writer.append(enc, durability);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted", ie);
-        }
-        if (f.isCompletedExceptionally()) {
-            f.join(); // rethrows: the writer is fenced; nothing was applied
-        }
+        List<byte[]> enc;
+        if (es.size() == 1) enc = List.of(LedgerEntry.encode(es.get(0)));
+        else { enc = new ArrayList<>(es.size()); for (var e : es) enc.add(LedgerEntry.encode(e)); }
+        RecordBatch.encodedSize(enc); // validate eagerly, before anything is applied
+        if (writerFailed != null) throw writerFailed; // fenced: nothing is applied
+        // Staged in apply order (we hold the lock); handed to the writer by flush() right after the lock is
+        // released, so the ledger order still matches the apply order but the writer handoff is off-lock.
+        var f = new CompletableFuture<Long>();
+        staged.add(new Staged(enc, durability, offset, f));
         for (int i = 0; i < es.size(); i++) {
             var e = es.get(i);
             if (e instanceof LedgerEntry.Enqueue x) cachePayload(offset + i, x.payloadRef());
@@ -629,9 +625,65 @@ public final class Partition implements AutoCloseable {
             if (!waiters.isEmpty()) wake(e);
         }
         if (!deferPublish) afterApply();
-        return f.thenApply(base -> {
-            if (base != offset) throw new IllegalStateException("ledger offset drift " + base + " != " + offset);
-            return base;
+        return f;
+    }
+
+    /** One applied-but-not-yet-handed-off append: its records, durability, expected base offset and future. */
+    private record Staged(List<byte[]> records, Durability durability, long offset, CompletableFuture<Long> done) { }
+
+    /** Applied appends awaiting their writer handoff, in apply (= offset) order; added only under {@link #lock}. */
+    private final java.util.concurrent.ConcurrentLinkedQueue<Staged> staged = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /** Serializes handoffs so staged batches reach the writer in offset order. Taken after (never inside) {@link #lock}, or inside it. */
+    private final ReentrantLock flushLock = new ReentrantLock();
+    /** Set once a handoff failed (writer fenced/closed): later appends fail fast, as the writer would. */
+    private volatile IllegalStateException writerFailed;
+
+    /** Releases the partition lock; the outermost release hands staged appends to the writer (off-lock). */
+    private void unlock() {
+        boolean outer = lock.getHoldCount() == 1;
+        lock.unlock();
+        if (outer && !staged.isEmpty()) flush();
+    }
+
+    /**
+     * Hands every staged append to the writer, in order. Combining: if another thread is flushing, it re-checks the
+     * queue after releasing {@link #flushLock}, so an entry staged meanwhile is never stranded (the entry's add
+     * precedes our failed tryLock, which precedes the flusher's unlock and re-check).
+     */
+    void flush() {
+        while (!staged.isEmpty() && flushLock.tryLock()) {
+            try {
+                Staged s;
+                while ((s = staged.poll()) != null) handOff(s);
+            } finally {
+                flushLock.unlock();
+            }
+        }
+    }
+
+    private void handOff(Staged s) {
+        boolean interrupted = false;
+        CompletableFuture<Long> f;
+        while (true) {
+            try {
+                f = writer.append(s.records(), s.durability());
+                break;
+            } catch (InterruptedException ie) {
+                interrupted = true; // the entry is already applied: it must reach the writer, in order
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+        long expect = s.offset();
+        var done = s.done();
+        f.whenComplete((base, t) -> {
+            if (t != null) {
+                if (writerFailed == null) writerFailed = new IllegalStateException("ledger writer failed", t);
+                done.completeExceptionally(t);
+            } else if (base != expect) {
+                done.completeExceptionally(new IllegalStateException("ledger offset drift " + base + " != " + expect));
+            } else {
+                done.complete(base);
+            }
         });
     }
 
@@ -743,7 +795,7 @@ public final class Partition implements AutoCloseable {
     /** Serializes the state now (under the lock) and writes it in the background; completes with its offset once durable. */
     public CompletableFuture<Long> snapshotNow() {
         lock.lock();
-        try { return snapshotLocked(); } finally { lock.unlock(); }
+        try { return snapshotLocked(); } finally { unlock(); }
     }
 
     private CompletableFuture<Long> snapshotLocked() {
@@ -871,7 +923,7 @@ public final class Partition implements AutoCloseable {
                 reclaimed += seg.bytes();
             }
         } finally {
-            lock.unlock();
+            unlock();
         }
         if (pol.compactLiveRatio() > 0) {
             for (var seg : log.segments()) {
@@ -883,12 +935,12 @@ public final class Partition implements AutoCloseable {
                     keep = new java.util.HashSet<>(state.messages.subMap(seg.baseOffset(), true, seg.nextOffset(), false).keySet());
                     for (long k : keep) liveBytes += state.messages.get(k).size() + RecordBatch.HEADER_BYTES + 12 + 4;
                 } finally {
-                    lock.unlock();
+                    unlock();
                 }
                 if (liveBytes >= seg.bytes() * pol.compactLiveRatio()) continue;
                 long newSize = log.prepareCompaction(seg.baseOffset(), keep::contains);
                 lock.lock();
-                try { log.commitCompaction(seg.baseOffset()); } finally { lock.unlock(); }
+                try { log.commitCompaction(seg.baseOffset()); } finally { unlock(); }
                 compacted++;
                 reclaimed += seg.bytes() - newSize;
             }
@@ -988,7 +1040,7 @@ public final class Partition implements AutoCloseable {
             if (c == null) { c = state.counts(); counts.set(c); }
             return c;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1001,7 +1053,7 @@ public final class Partition implements AutoCloseable {
         if (s.version() == state.version) return s;
         long age = System.nanoTime() - lastRebuildNanos;
         if (age >= minRebuildNanos && lock.tryLock()) {
-            try { return rebuild(); } finally { lock.unlock(); }
+            try { return rebuild(); } finally { unlock(); }
         }
         if (age >= maxStaleNanos) return freshSnapshot();
         return s;
@@ -1010,7 +1062,7 @@ public final class Partition implements AutoCloseable {
     /** Rebuilds under the lock and returns a view that includes every entry applied so far. */
     public DeliverySnapshot freshSnapshot() {
         lock.lock();
-        try { return rebuild(); } finally { lock.unlock(); }
+        try { return rebuild(); } finally { unlock(); }
     }
 
     /** Tuning: rebuild rate limit, staleness bound and per-list cap of {@link #snapshot()} (also applied to the DLQ). */
@@ -1025,7 +1077,7 @@ public final class Partition implements AutoCloseable {
     private boolean eager;
 
     /** When true, the paged view is rebuilt after every operation (tests, low-rate topics). Default: rate-limited. */
-    public void eagerSnapshots(boolean on) { lock.lock(); try { eager = on; publish(); } finally { lock.unlock(); } }
+    public void eagerSnapshots(boolean on) { lock.lock(); try { eager = on; publish(); } finally { unlock(); } }
 
     /** Groups known to exist (lock-free hint for {@link #subscribe}); only ever grows, like the groups themselves. */
     private final java.util.Set<String> subscribed = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -1057,7 +1109,7 @@ public final class Partition implements AutoCloseable {
     }
 
     /** Canonical state dump (tests). */
-    String canonicalState() { lock.lock(); try { return state.canonical(); } finally { lock.unlock(); } }
+    String canonicalState() { lock.lock(); try { return state.canonical(); } finally { unlock(); } }
 
     @Override public void close() throws IOException {
         lock.lock();
@@ -1065,7 +1117,7 @@ public final class Partition implements AutoCloseable {
             closed = true;
             for (var w : waiters.values()) w.cond.signalAll();
         } finally {
-            lock.unlock();
+            unlock();
         }
         try {
             writer.close();

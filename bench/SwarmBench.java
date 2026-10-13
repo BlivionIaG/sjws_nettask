@@ -126,10 +126,12 @@ public class SwarmBench {
         var counts = new long[workers];
         var lat = new long[workers][];
         var ns = new int[workers];
+        var alat = new long[workers][];
         var threads = new ArrayList<Thread>();
         for (int w = 0; w < workers; w++) {
             int id = w;
-            lat[w] = new long[4_000_000];
+            lat[w] = new long[1_000_000];
+            alat[w] = new long[1_000_000];
             threads.add(Thread.ofPlatform().start(() -> {
                 String me = "w" + id;
                 while (true) {
@@ -138,9 +140,10 @@ public class SwarmBench {
                     var got = t.claim("p", me, 1, 30_000);
                     long t1 = System.nanoTime();
                     for (Task task : got) t.ack(task);
+                    long t2 = System.nanoTime();
                     if (t0 >= warmEnd && !got.isEmpty()) {
                         counts[id]++;
-                        if (ns[id] < lat[id].length) lat[id][ns[id]++] = t1 - t0;
+                        if (ns[id] < lat[id].length) { alat[id][ns[id]] = t2 - t1; lat[id][ns[id]++] = t1 - t0; }
                     }
                 }
             }));
@@ -150,9 +153,14 @@ public class SwarmBench {
         int n = Arrays.stream(ns).sum();
         var all = new long[n];
         int k = 0;
-        for (int w = 0; w < workers; w++) { System.arraycopy(lat[w], 0, all, k, ns[w]); k += ns[w]; }
-        System.out.printf("dispatch workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / secs,
-                pct(all, n, 0.50) / 1e3, pct(all, n, 0.99) / 1e3);
+        var acks = new long[n];
+        for (int w = 0; w < workers; w++) {
+            System.arraycopy(lat[w], 0, all, k, ns[w]);
+            System.arraycopy(alat[w], 0, acks, k, ns[w]);
+            k += ns[w];
+        }
+        System.out.printf("dispatch workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f ack_p50_us=%.2f ack_p99_us=%.2f%n",
+                workers, total / secs, pct(all, n, 0.50) / 1e3, pct(all, n, 0.99) / 1e3, pct(acks, n, 0.50) / 1e3, pct(acks, n, 0.99) / 1e3);
     }
 
     static void heartbeat(Swarm s, String mode, double secs) throws Exception {
