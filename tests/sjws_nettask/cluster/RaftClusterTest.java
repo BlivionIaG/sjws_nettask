@@ -505,4 +505,68 @@ class RaftClusterTest {
     private record Cluster(FakeClock clock, SimTransport net, List<ReplicatedNode> nodes, List<MemoryLogStorage> logs,
             GroupOptions options) {
     }
+
+    @Test
+    void callbackThatAppendsDoesNotOverlapOrReorder() throws Exception {
+        var cluster = cluster(1, false, Durability.RELAXED, 1_000_000);
+        elect(cluster);
+        var node = cluster.nodes.get(0);
+        var inFlight = new java.util.concurrent.atomic.AtomicInteger();
+        var overlaps = new java.util.concurrent.atomic.AtomicInteger();
+        var indexes = java.util.Collections.synchronizedList(new ArrayList<Long>());
+        var texts = java.util.Collections.synchronizedList(new ArrayList<String>());
+        node.openGroup(GROUP, cluster.options, entry -> {
+            if (inFlight.incrementAndGet() != 1) {
+                overlaps.incrementAndGet();
+            }
+            try {
+                var text = text(entry.entry());
+                indexes.add(entry.index());
+                texts.add(text);
+                if (text.startsWith("p")) {
+                    node.append(GROUP, List.of(bytes("c" + text.substring(1)))); // re-enters deliver()
+                }
+                if (text.equals("boom")) {
+                    throw new IllegalStateException("test");
+                }
+            } finally {
+                inFlight.decrementAndGet();
+            }
+        });
+        int threads = 8;
+        int perThread = 50;
+        var start = new java.util.concurrent.CountDownLatch(1);
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            var futures = new ArrayList<java.util.concurrent.Future<?>>();
+            for (int t = 0; t < threads; t++) {
+                int id = t;
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < perThread; i++) {
+                        node.append(GROUP, List.of(bytes(i == 7 && id == 0 ? "boom" : "p" + id + "-" + i)))
+                                .get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (var f : futures) {
+                f.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        var last = node.append(GROUP, List.of(bytes("end"))).get(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals(0, overlaps.get(), "callbacks overlapped");
+        var seen = List.copyOf(indexes);
+        for (int i = 1; i < seen.size(); i++) {
+            assertTrue(seen.get(i) > seen.get(i - 1), "out of order at " + i + ": " + seen);
+        }
+        assertEquals(last.index(), seen.get(seen.size() - 1));
+        long nested = texts.stream().filter(x -> x.startsWith("c")).count();
+        long parents = texts.stream().filter(x -> x.startsWith("p")).count();
+        assertEquals(threads * perThread - 1, parents);
+        assertEquals(parents, nested, "an append made inside a callback was stranded");
+    }
 }

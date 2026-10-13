@@ -1011,9 +1011,22 @@ final class RaftGroup {
         deliver();
     }
 
-    /** Runs queued commit callbacks in log order, one thread at a time; returns once the queue is empty. */
+    /**
+     * Runs queued commit callbacks in log order, one thread at a time; returns once the queue is empty.
+     * A callback that appends re-enters here on the draining thread: that nested call returns at once
+     * and the outer loop below delivers whatever it queued, so callbacks never overlap or reorder and
+     * nothing is stranded. A callback that throws is skipped so the rest of the queue still drains.
+     */
     private void deliver() {
-        deliveryLock.lock();
+        if (deliveryLock.isHeldByCurrentThread()) {
+            return;
+        }
+        try {
+            deliveryLock.lockInterruptibly();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return; // the current drainer, or the next run(), delivers what is queued
+        }
         try {
             while (true) {
                 Runnable next;
@@ -1026,7 +1039,12 @@ final class RaftGroup {
                 if (next == null) {
                     return;
                 }
-                next.run();
+                try {
+                    next.run();
+                } catch (RuntimeException e) {
+                    System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                            "commit callback failed in group " + groupId, e);
+                }
             }
         } finally {
             deliveryLock.unlock();
