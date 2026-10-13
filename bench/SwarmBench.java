@@ -24,6 +24,11 @@ import sjws_nettask.swarm.TaskEnvelope;
  *   reqreply <rate> <secs>      ReplyRouter.call at <rate>/s open loop; one worker claims (blocking, 50 ms) up to 64
  *                               and replies (ASYNC) with one batched fenced ack after the replies are durable. Prints round-trip p50/p99. Target at 10k/s: p50 < 50 us, p99 < 500 us.
  *
+ *   http <token|-> <secs>        /swarm/v1 in process through SwarmModule's mounted handler: submit (1 KiB TASK
+ *                               frame) + claim + ack per round, one thread. Sends "Authorization: Bearer <token>"
+ *                               unless "-". Run with -Dsjws.swarm.tokens.file=... for gate on; against a master
+ *                               build (no gate) for gate off. Prints rounds/s and per-call p50/p99.
+ *
  *   java -cp target/classes bench/SwarmBench.java <dir> <mode> <arg> <secs>
  */
 public class SwarmBench {
@@ -47,9 +52,67 @@ public class SwarmBench {
                 case "dispatch" -> dispatch(s, Integer.parseInt(a[2]), secs);
                 case "heartbeat" -> heartbeat(s, a[2], secs);
                 case "reqreply" -> reqreply(s, Integer.parseInt(a[2]), secs);
+                case "http" -> http(dir, a[2], secs);
                 default -> throw new IllegalArgumentException(mode);
             }
         }
+    }
+
+    static sjws_nettask.core.RequestBody body(byte[] data) {
+        return new sjws_nettask.core.RequestBody() {
+            int pos;
+
+            public long length() { return data.length; }
+
+            public int read(byte[] into, int off, int len) {
+                if (pos >= data.length) return -1;
+                int n = Math.min(len, data.length - pos);
+                System.arraycopy(data, pos, into, off, n);
+                pos += n;
+                return n;
+            }
+        };
+    }
+
+    static void http(Path dir, String token, double secs) throws Exception {
+        System.setProperty("sjws.swarm.dir", dir.resolve("http").toString());
+        var module = new sjws_nettask.swarm.SwarmModule();
+        sjws_nettask.core.Handler fallback = r -> sjws_nettask.core.StaticFileHandler.error(404, false);
+        var h = sjws_nettask.core.HandlerMounts.install(java.util.List.of(module), fallback);
+        var fields = new java.util.HashMap<String, java.util.List<String>>();
+        if (!token.equals("-")) fields.put("authorization", java.util.List.of("Bearer " + token));
+        var headers = sjws_nettask.core.RequestHeaders.of(fields);
+        var task = new sjws_nettask.swarm.wire.Frame(sjws_nettask.swarm.wire.Frame.Type.TASK, 0, new byte[1024]).encode();
+        var lat = new long[12_000_000];
+        int n = 0;
+        long rounds = 0;
+        long warmEnd = System.nanoTime() + 2_000_000_000L, end = warmEnd + (long) (secs * 1e9);
+        while (true) {
+            long t0 = System.nanoTime();
+            if (t0 > end) break;
+            var r1 = h.handle(new sjws_nettask.core.Request("POST", "/swarm/v1/tasks/p", headers, null, false, null, body(task)));
+            long t1 = System.nanoTime();
+            var r2 = h.handle(new sjws_nettask.core.Request("POST", "/swarm/v1/tasks/p:claim", headers, null, false, null, body(new byte[0])));
+            long t2 = System.nanoTime();
+            if (r1.status() != 202 || r2.status() != 200) throw new IllegalStateException("status " + r1.status() + "/" + r2.status());
+            var b = ((sjws_nettask.core.Body.Bytes) r2.body()).data().duplicate();
+            var f = sjws_nettask.swarm.wire.Frame.decode(b);
+            var p = java.nio.ByteBuffer.wrap(f.payload());
+            var id = new byte[p.getShort()];
+            p.get(id);
+            var lease = java.net.URLEncoder.encode(new String(id, java.nio.charset.StandardCharsets.UTF_8), java.nio.charset.StandardCharsets.UTF_8);
+            long t3 = System.nanoTime();
+            var r3 = h.handle(new sjws_nettask.core.Request("POST", "/swarm/v1/leases/" + lease + ":ack", headers, null, false, null, body(new byte[0])));
+            long t4 = System.nanoTime();
+            if (r3.status() != 204) throw new IllegalStateException("ack " + r3.status());
+            if (t0 >= warmEnd && n + 3 <= lat.length) {
+                lat[n++] = t1 - t0; lat[n++] = t2 - t1; lat[n++] = t4 - t3;
+                rounds++;
+            }
+        }
+        module.close();
+        System.out.printf("http rounds/s=%.0f call_p50_us=%.2f call_p99_us=%.2f%n", rounds / secs, pct(lat, n, 0.50) / 1e3,
+                pct(lat, n, 0.99) / 1e3);
     }
 
     static void dispatch(Swarm s, int workers, double secs) throws Exception {

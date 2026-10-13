@@ -39,15 +39,22 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
     static final String NODE_ENV = "SJWS_SWARM_NODE";
 
     private final Swarm swarm;
+    private final SwarmGate gate;
     private volatile boolean closed;
 
     public SwarmModule() {
         this(Swarm.open(Path.of(setting(DIR_PROPERTY, DIR_ENV, "swarm-data")),
-                setting(NODE_PROPERTY, NODE_ENV, "swarm-" + ProcessHandle.current().pid()), new SecureRandom().nextLong()));
+                setting(NODE_PROPERTY, NODE_ENV, "swarm-" + ProcessHandle.current().pid()), new SecureRandom().nextLong()),
+                TokenGate.configured(System::getProperty, System.getenv(), System.err));
     }
 
-    SwarmModule(Swarm swarm) {
+    SwarmModule(Swarm swarm, SwarmGate gate) {
         this.swarm = swarm;
+        this.gate = gate;
+    }
+
+    SwarmGate gate() {
+        return this.gate;
     }
 
     static String setting(String property, String env, String dflt) {
@@ -64,7 +71,7 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
 
     @Override
     public void contribute(HandlerMounts mounts) {
-        mounts.mount("/swarm/v1", new SwarmHttp(this.swarm, new SecureRandom().nextLong()));
+        mounts.mount("/swarm/v1", new SwarmHttp(this.swarm, new SecureRandom().nextLong(), this.gate));
     }
 
     public boolean closed() {
