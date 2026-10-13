@@ -85,8 +85,8 @@ class HandlerMountServerTest {
         assertNull(this.server.filterChain());
         int port = this.server.tcpPort();
         var hit = HttpTestSupport.get(port, "/swarm/v1/tasks", 4000);
-        assertEquals(501, hit.statusCode());
-        assertTrue(hit.bodyText().contains("501"), hit.bodyText());
+        assertEquals(405, hit.statusCode());
+        assertTrue(hit.bodyText().contains("405"), hit.bodyText());
         assertEquals("hello", HttpTestSupport.get(port, "/hello.txt", 4000).bodyText());
         assertEquals(404, HttpTestSupport.get(port, "/swarm/v2", 4000).statusCode());
         module.close();
