@@ -797,7 +797,8 @@ public final class CpStore implements AutoCloseable {
             try {
                 ownedStorage.close();
             } catch (IOException e) {
-                // Closing read/append channels; the log on disk is already durable as configured.
+                System.getLogger(CpStore.class.getName()).log(System.Logger.Level.WARNING,
+                        "cp log close failed: " + e.getMessage());
             }
         }
     }
