@@ -22,15 +22,12 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Pattern;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.RoutePattern;
@@ -43,8 +40,9 @@ import sjws_nettask.core.RoutePattern;
  */
 public final class ConfigLoader {
 
-    private static final List<String> TOP = List.of("server", "http3", "tls", "acme", "routing", "middleware", "access");
-    private static final Pattern HOST = Pattern.compile(
+    private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
+            "routing", "middleware", "access", "messaging");
+    private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
 
@@ -58,7 +56,7 @@ public final class ConfigLoader {
     /** A server started from a {@link ServerConfig} alone (no file, so reload has nothing to read). */
     public static Loaded standalone(ServerConfig config) {
         return new Loaded(ConfigDocument.defaults(config), List.of(), List.of(), false, new String[0], Map.of(),
-                ServerConfig::readPasswordFile);
+                ServerConfig::readPasswordFile, null);
     }
 
     public static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
@@ -66,13 +64,13 @@ public final class ConfigLoader {
         var environment = Map.copyOf(env);
         for (var arg : arguments) {
             if (arg.equals("-h") || arg.equals("--help")) {
-                return new Loaded(null, List.of(), List.of(), true, arguments, environment, passwords);
+                return new Loaded(null, List.of(), List.of(), true, arguments, environment, passwords, null);
             }
         }
         try {
             return loadFile(arguments, environment, passwords);
         } catch (ConfigException e) {
-            return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords);
+            return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords, null);
         }
     }
 
@@ -100,41 +98,75 @@ public final class ConfigLoader {
         Routing routing = Routing.disabled();
         List<MiddlewareSpec> middleware = List.of();
         AccessSettings access = AccessSettings.DEFAULT;
+        MessagingSettings messaging = MessagingSettings.disabled();
         Path configFile = null;
-        String contentHash = null;
         Path yamlPassword = null;
+        NodeSettings node = NodeSettings.STANDALONE;
+        int schemaVersion = ConfigDocument.SCHEMA;
+        long bundleVersion = 0;
+        Boolean yamlBind = null;
+        byte[] bootSignature = null;
+        String recoveredHash = null;
+        Path yamlState = null;
+        String text;
+        Path readFrom = null;
         if (configured != null) {
-            configFile = Path.of(configured);
-            if (!Files.isRegularFile(configFile)) {
-                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath());
+            var requested = Path.of(configured);
+            configFile = requested;
+            if (!Files.isRegularFile(requested)) {
+                var state = stateDir(args, env, null, requested.toAbsolutePath().getParent());
+                var json = LastGoodStore.file(state);
+                var recovered = LastGoodStore.dataPlaneYaml(json);
+                var source = json;
+                if (recovered == null) {
+                    var legacy = LastGoodStore.beside(requested);
+                    recovered = LastGoodStore.dataPlaneYaml(legacy);
+                    source = legacy;
+                }
+                if (recovered == null) {
+                    throw new ConfigException("Cannot read config file " + requested.toAbsolutePath());
+                }
+                warnings.add("config file " + requested.toAbsolutePath()
+                        + " is missing; booted from last good config " + source.toAbsolutePath());
+                text = recovered;
+                readFrom = source;
+                bootSignature = LastGoodStore.signature(source);
+                recoveredHash = ConfigCodec.sha256(recovered);
+            } else {
+                try {
+                    text = Files.readString(requested);
+                } catch (IOException e) {
+                    throw new ConfigException("Cannot read config file " + requested.toAbsolutePath() + ": "
+                            + e.getMessage());
+                }
+                readFrom = requested;
             }
-            byte[] bytes;
-            try {
-                bytes = Files.readAllBytes(configFile);
-            } catch (IOException e) {
-                throw new ConfigException("Cannot read config file " + configFile.toAbsolutePath() + ": "
-                        + e.getMessage());
+            if (text.getBytes(StandardCharsets.UTF_8).length > 1_000_000) {
+                throw new ConfigException("Config file " + readFrom.toAbsolutePath() + " is larger than 1MB");
             }
-            if (bytes.length > 1_000_000) {
-                throw new ConfigException("Config file " + configFile.toAbsolutePath() + " is larger than 1MB");
-            }
-            contentHash = sha256(bytes);
-            var root = YamlValues.parse(new String(bytes, StandardCharsets.UTF_8), configFile.toString());
+            var root = YamlValues.parse(text, readFrom.toString());
             YamlValues.knownKeys(root, TOP, "config");
+            schemaVersion = schemaOf(root);
+            bundleVersion = versionOf(root);
+            node = nodeSection(root);
             var base = configFile.toAbsolutePath().getParent();
-            baseline = serverSection(root, base);
+            var bindHolder = new Boolean[1];
+            yamlState = stateDirKey(root, base);
+            baseline = serverSection(root, base, bindHolder);
+            yamlBind = bindHolder[0];
             yamlPassword = tlsPassword(root, base);
             acme = acmeSection(root, base);
             routing = routingSection(root, warnings);
             middleware = middlewareSection(root, warnings);
             access = accessSection(root, warnings);
+            messaging = MessagingSettings.parse(root);
         }
         var parsed = baseline == null
                 ? ServerConfig.parse(args, env, passwords)
                 : ServerConfig.parse(args, env, baseline, passwords);
         warnings.addAll(parsed.warnings());
         if (!parsed.ok()) {
-            return new Loaded(null, warnings, parsed.errors(), parsed.helpRequested(), args, env, passwords);
+            return new Loaded(null, warnings, parsed.errors(), parsed.helpRequested(), args, env, passwords, null);
         }
         var server = applyYamlPassword(parsed.config(), yamlPassword, args, env, passwords, warnings);
         acme = overlayAcme(acme, args, env, configFile);
@@ -144,8 +176,120 @@ public final class ConfigLoader {
         if (acme.enabled()) {
             access = access.withAcmeChallenge();
         }
-        var document = new ConfigDocument(server, acme, routing, middleware, access, configFile, contentHash);
-        return new Loaded(document, warnings, List.of(), false, args, env, passwords);
+        var base = configFile == null ? null : configFile.toAbsolutePath().getParent();
+        var document = ConfigDocument.of(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion,
+                configFile, messaging).withStateDir(stateDir(args, env, yamlState, base));
+        if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
+            document = document.withSignature(bootSignature);
+        }
+        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind);
+    }
+
+    private static int schemaOf(Map<String, Object> root) {
+        if (!root.containsKey("schema")) {
+            return ConfigDocument.SCHEMA;
+        }
+        int schema = integer(root.get("schema"), "schema", 1, Integer.MAX_VALUE);
+        if (schema != ConfigDocument.SCHEMA) {
+            throw new ConfigException("schema: unsupported schema version " + schema);
+        }
+        return schema;
+    }
+
+    private static long versionOf(Map<String, Object> root) {
+        if (!root.containsKey("version")) {
+            return 0;
+        }
+        var value = root.get("version");
+        long version;
+        if (value instanceof Integer || value instanceof Long) {
+            version = ((Number) value).longValue();
+        } else if (value instanceof String text && text.trim().matches("[0-9]{1,18}")) {
+            version = Long.parseLong(text.trim());
+        } else {
+            throw new ConfigException("version: expected an integer >= 0");
+        }
+        if (version < 0) {
+            throw new ConfigException("version: expected an integer >= 0");
+        }
+        return version;
+    }
+
+    private static NodeSettings nodeSection(Map<String, Object> root) {
+        if (!(root.get("node") instanceof Object node)) {
+            return NodeSettings.STANDALONE;
+        }
+        var map = YamlValues.mapping(node, "node");
+        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir"), "node");
+        var mode = map.containsKey("mode")
+                ? NodeSettings.Mode.parse(text(map.get("mode"), "node.mode"))
+                : NodeSettings.Mode.STANDALONE;
+        var labels = map.containsKey("labels") ? labels(map.get("labels")) : Map.<String, String>of();
+        return new NodeSettings(mode, labels);
+    }
+
+    private static Path stateDirKey(Map<String, Object> root, Path base) {
+        if (!(root.get("node") instanceof Object node)) {
+            return null;
+        }
+        var map = YamlValues.mapping(node, "node");
+        if (!map.containsKey("state_dir")) {
+            return null;
+        }
+        var path = Path.of(text(map.get("state_dir"), "node.state_dir"));
+        if (!path.isAbsolute() && base != null) {
+            path = base.resolve(path);
+        }
+        return path;
+    }
+
+    /**
+     * Environment, then {@code --state-dir}, then {@code node.state_dir}, then {@link LastGoodStore#defaultStateDir()}.
+     * Paths from the file are already resolved against the file. Flag and environment paths stay relative
+     * to the working directory.
+     */
+    private static Path stateDir(String[] args, Map<String, String> env, Path fromYaml, Path base) {
+        var envDir = env.get("WEB_SERVER_STATE_DIR");
+        if (envDir != null && !envDir.isBlank()) {
+            return Path.of(envDir.trim()).toAbsolutePath().normalize();
+        }
+        String fromArgs = null;
+        for (var arg : args) {
+            if (!arg.startsWith("--") || !optionName(arg).equals("--state-dir")) {
+                continue;
+            }
+            var value = optionValue(arg);
+            if (value == null || value.isBlank()) {
+                throw new ConfigException("Missing value for --state-dir (use --state-dir=PATH)");
+            }
+            fromArgs = value.trim();
+        }
+        if (fromArgs != null) {
+            return Path.of(fromArgs).toAbsolutePath().normalize();
+        }
+        if (fromYaml != null) {
+            var path = fromYaml.isAbsolute() || base == null ? fromYaml : base.resolve(fromYaml);
+            return path.toAbsolutePath().normalize();
+        }
+        return LastGoodStore.defaultStateDir();
+    }
+
+    private static Map<String, String> labels(Object value) {
+        var map = YamlValues.mapping(value, "node.labels");
+        if (map.size() > NodeSettings.MAX_LABELS) {
+            throw new ConfigException("node.labels: at most " + NodeSettings.MAX_LABELS + " entries");
+        }
+        var out = new LinkedHashMap<String, String>();
+        for (var entry : map.entrySet()) {
+            if (!NodeSettings.LABEL.matcher(entry.getKey()).matches()) {
+                throw new ConfigException("node.labels: invalid key");
+            }
+            if (!(entry.getValue() instanceof String text) || !NodeSettings.LABEL.matcher(text).matches()) {
+                throw new ConfigException("node.labels." + entry.getKey() + ": invalid value");
+            }
+            out.put(entry.getKey(), text);
+        }
+        return Map.copyOf(out);
     }
 
     private static ServerConfig applyYamlPassword(ServerConfig server, Path yamlPassword, String[] args,
@@ -168,13 +312,16 @@ public final class ConfigLoader {
         }
     }
 
-    private static ServerConfig serverSection(Map<String, Object> root, Path base) {
+    private static ServerConfig serverSection(Map<String, Object> root, Path base, Boolean[] bindContent) {
         var builder = ServerConfig.builder(Path.of(sjws_nettask.CONSTANTS.DEFAULT_HTML_PATH));
         if (root.get("server") instanceof Object server) {
             var map = YamlValues.mapping(server, "server");
             YamlValues.knownKeys(map, List.of("port", "root", "max_connections", "max_connections_per_ip", "backlog",
                     "idle_timeout", "header_timeout", "write_timeout", "cache_bytes", "allow_unlistable_dirs",
-                    "access_log"), "server");
+                    "access_log", "bind_content"), "server");
+            if (map.containsKey("bind_content")) {
+                bindContent[0] = bool(map.get("bind_content"), "server.bind_content");
+            }
             if (map.containsKey("port")) {
                 builder.port(integer(map.get("port"), "server.port", 0, 65535));
             }
@@ -407,8 +554,8 @@ public final class ConfigLoader {
             return Routing.disabled();
         }
         var map = YamlValues.mapping(routing, "routing");
-        YamlValues.knownKeys(map, List.of("enabled", "upstreams", "routes", "forwarded_proto", "trusted_proxies"),
-                "routing");
+        YamlValues.knownKeys(map, List.of("enabled", "upstreams", "routes", "forwarded_proto", "trusted_proxies",
+                "rate_limit"), "routing");
         boolean enabled = map.containsKey("enabled") && bool(map.get("enabled"), "routing.enabled");
         var proto = map.containsKey("forwarded_proto")
                 ? forwarded(text(map.get("forwarded_proto"), "routing.forwarded_proto"))
@@ -420,7 +567,8 @@ public final class ConfigLoader {
         var routes = map.containsKey("routes") ? routes(map.get("routes"), upstreams) : List.<RouteSpec>of();
         var table = new RouteTable(routes);
         warnings.addAll(table.shadows());
-        return new Routing(enabled, proto, proxies, upstreams, table);
+        var limit = map.containsKey("rate_limit") ? rateLimit(map.get("rate_limit"), "routing.rate_limit", false) : null;
+        return new Routing(enabled, proto, proxies, upstreams, table, limit);
     }
 
     private static Map<String, Upstream> upstreams(Object value) {
@@ -433,11 +581,18 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host"), "routing.upstreams." + name);
-            if (!body.containsKey("url")) {
-                throw new ConfigException("routing.upstreams." + name + ".url is required");
+                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb"), "routing.upstreams." + name);
+            boolean multi = body.containsKey("endpoints");
+            if (multi == body.containsKey("url")) {
+                throw new ConfigException("routing.upstreams." + name + ": exactly one of url or endpoints is required");
             }
-            var url = upstreamUrl(text(body.get("url"), "routing.upstreams." + name + ".url"), name);
+            if (body.containsKey("lb") && !multi) {
+                throw new ConfigException("routing.upstreams." + name + ".lb is only valid with endpoints");
+            }
+            var endpointUrls = new ArrayList<URI>();
+            var endpoints = multi ? endpoints(body.get("endpoints"), name, endpointUrls) : null;
+            var url = multi ? endpointUrls.get(0)
+                    : upstreamUrl(text(body.get("url"), "routing.upstreams." + name + ".url"), name);
             var connect = body.containsKey("connect_timeout")
                     ? timeout(text(body.get("connect_timeout"), "routing.upstreams." + name + ".connect_timeout"),
                             "routing.upstreams." + name + ".connect_timeout")
@@ -455,9 +610,206 @@ public final class ConfigLoader {
                     : 16 << 20;
             boolean preserve = body.containsKey("preserve_host")
                     && bool(body.get("preserve_host"), "routing.upstreams." + name + ".preserve_host");
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve));
+            var retry = body.containsKey("retry") ? retry(body.get("retry"), "routing.upstreams." + name + ".retry") : null;
+            Upstream.Discovery discovery = null;
+            sjws_nettask.routing.Resilience.Circuit circuit = null;
+            if (multi) {
+                var lb = sjws_nettask.routing.discovery.LbPolicy.WEIGHTED_RANDOM;
+                if (body.containsKey("lb")) {
+                    lb = sjws_nettask.routing.discovery.LbPolicy.parse(text(body.get("lb"), "routing.upstreams." + name + ".lb"));
+                    if (lb == null) {
+                        throw new ConfigException("routing.upstreams." + name
+                                + ".lb: expected weighted_random, round_robin or least_request");
+                    }
+                }
+                var outlier = body.containsKey("circuit")
+                        ? outlier(body.get("circuit"), "routing.upstreams." + name + ".circuit")
+                        : sjws_nettask.routing.EndpointBalancer.Outlier.DEFAULT;
+                discovery = new Upstream.Discovery(endpoints, lb, outlier);
+            } else if (body.containsKey("circuit")) {
+                circuit = circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit");
+            }
+            var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery));
         }
         return Map.copyOf(out);
+    }
+
+    /**
+     * {@code endpoints: ["http://h:p", {url, weight, zone, id, labels}]}: 1 to 1024 endpoints sharing
+     * one scheme and path, no query or fragment.
+     */
+    private static List<sjws_nettask.routing.discovery.Endpoint> endpoints(Object value, String name, List<URI> urls) {
+        var path = "routing.upstreams." + name + ".endpoints";
+        var list = YamlValues.sequence(value, path);
+        if (list.isEmpty() || list.size() > 1024) {
+            throw new ConfigException(path + ": expected 1 to 1024 endpoints");
+        }
+        var out = new ArrayList<sjws_nettask.routing.discovery.Endpoint>(list.size());
+        var seen = new java.util.HashSet<String>();
+        for (int i = 0; i < list.size(); i++) {
+            var at = path + "[" + i + "]";
+            var item = list.get(i);
+            String urlText;
+            int weight = 1;
+            String zone = null;
+            String id = null;
+            Map<String, String> labels = Map.of();
+            if (item instanceof Map<?, ?>) {
+                var m = YamlValues.mapping(item, at);
+                YamlValues.knownKeys(m, List.of("url", "weight", "zone", "id", "labels"), at);
+                if (!m.containsKey("url")) {
+                    throw new ConfigException(at + ".url is required");
+                }
+                urlText = text(m.get("url"), at + ".url");
+                weight = m.containsKey("weight") ? integer(m.get("weight"), at + ".weight", 0, 1_000_000) : 1;
+                zone = m.containsKey("zone") ? text(m.get("zone"), at + ".zone") : null;
+                id = m.containsKey("id") ? text(m.get("id"), at + ".id") : null;
+                if (m.containsKey("labels")) {
+                    var raw = YamlValues.mapping(m.get("labels"), at + ".labels");
+                    var copy = new java.util.TreeMap<String, String>();
+                    raw.forEach((k, v) -> copy.put(k, String.valueOf(v)));
+                    labels = copy;
+                }
+            } else {
+                urlText = text(item, at);
+            }
+            URI uri;
+            try {
+                uri = URI.create(urlText.trim());
+            } catch (IllegalArgumentException e) {
+                throw new ConfigException(at + ": " + e.getMessage());
+            }
+            var scheme = uri.getScheme();
+            if (uri.getHost() == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+                throw new ConfigException(at + ": expected an absolute http(s) URL");
+            }
+            if (uri.getRawQuery() != null || uri.getRawFragment() != null || uri.getRawUserInfo() != null) {
+                throw new ConfigException(at + ": no user info, query or fragment");
+            }
+            if (!urls.isEmpty()) {
+                var first = urls.get(0);
+                if (!first.getScheme().equalsIgnoreCase(scheme) || !java.util.Objects.equals(first.getRawPath(),
+                        uri.getRawPath())) {
+                    throw new ConfigException(at + ": every endpoint must use the scheme and path of the first");
+                }
+            }
+            int port = uri.getPort() > 0 ? uri.getPort() : "https".equalsIgnoreCase(scheme) ? 443 : 80;
+            var host = uri.getHost();
+            if (host.startsWith("[") && host.endsWith("]")) {
+                host = host.substring(1, host.length() - 1);
+            }
+            var endpoint = new sjws_nettask.routing.discovery.Endpoint(id, host, port, weight, labels, sjws_nettask.routing.discovery.Endpoint.Health.READY, zone);
+            if (!seen.add(endpoint.authority())) {
+                throw new ConfigException(at + ": duplicate endpoint " + endpoint.authority());
+            }
+            if (weight == 0 && list.size() == 1) {
+                throw new ConfigException(at + ".weight: the only endpoint cannot have weight 0");
+            }
+            urls.add(uri);
+            out.add(endpoint);
+        }
+        return out;
+    }
+
+    /**
+     * {@code circuit:} on a multi-endpoint upstream: passive ejection per endpoint,
+     * {@code {failures: 5, eject_for: 10s, error_rate: 50%, min_requests: 20, window: 10s, max_ejection: 50%}}.
+     */
+    private static sjws_nettask.routing.EndpointBalancer.Outlier outlier(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("failures", "eject_for", "error_rate", "min_requests", "window",
+                "max_ejection"), path);
+        var d = sjws_nettask.routing.EndpointBalancer.Outlier.DEFAULT;
+        int failures = map.containsKey("failures") ? integer(map.get("failures"), path + ".failures", 1, 1000)
+                : d.consecutive();
+        var ejectFor = map.containsKey("eject_for")
+                ? timeout(text(map.get("eject_for"), path + ".eject_for"), path + ".eject_for") : d.ejectFor();
+        int rate = map.containsKey("error_rate") ? percent(map.get("error_rate"), path + ".error_rate", 1)
+                : d.errorRatePercent();
+        int min = map.containsKey("min_requests")
+                ? integer(map.get("min_requests"), path + ".min_requests", 1, 1_000_000) : d.minRequests();
+        var window = map.containsKey("window")
+                ? timeout(text(map.get("window"), path + ".window"), path + ".window") : d.window();
+        if (window.toMillis() < 2) {
+            throw new ConfigException(path + ".window: must be at least 2ms");
+        }
+        int max = map.containsKey("max_ejection") ? percent(map.get("max_ejection"), path + ".max_ejection", 0)
+                : d.maxEjectionPercent();
+        return new sjws_nettask.routing.EndpointBalancer.Outlier(failures, rate, min, window, ejectFor, max);
+    }
+
+    /** {@code 50%} or {@code 50}: an integer percentage, {@code min}..100. */
+    private static int percent(Object value, String path, int min) {
+        var text = String.valueOf(value).trim();
+        if (text.endsWith("%")) {
+            text = text.substring(0, text.length() - 1).trim();
+        }
+        int n;
+        try {
+            n = Integer.parseInt(text);
+        } catch (NumberFormatException e) {
+            throw new ConfigException(path + ": expected a percentage such as 50%");
+        }
+        if (n < min || n > 100) {
+            throw new ConfigException(path + ": must be " + min + "%..100%");
+        }
+        return n;
+    }
+
+    /** {@code retry: {attempts: 2, on: [connect, reset, 502, 503, 504], budget: 20%}} */
+    private static sjws_nettask.routing.Resilience.Retry retry(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("attempts", "on", "budget"), path);
+        int attempts = map.containsKey("attempts") ? integer(map.get("attempts"), path + ".attempts", 1, 5) : 2;
+        var on = java.util.EnumSet.noneOf(sjws_nettask.routing.Resilience.On.class);
+        if (map.containsKey("on")) {
+            if (!(map.get("on") instanceof List<?> list)) {
+                throw new ConfigException(path + ".on: expected a list");
+            }
+            for (var item : list) {
+                on.add(switch (String.valueOf(item).trim().toLowerCase(java.util.Locale.ROOT)) {
+                    case "connect" -> sjws_nettask.routing.Resilience.On.CONNECT;
+                    case "timeout" -> sjws_nettask.routing.Resilience.On.TIMEOUT;
+                    case "reset" -> sjws_nettask.routing.Resilience.On.RESET;
+                    case "502" -> sjws_nettask.routing.Resilience.On.STATUS_502;
+                    case "503" -> sjws_nettask.routing.Resilience.On.STATUS_503;
+                    case "504" -> sjws_nettask.routing.Resilience.On.STATUS_504;
+                    default -> throw new ConfigException(path + ".on: unknown '" + item
+                            + "' (connect, timeout, reset, 502, 503, 504)");
+                });
+            }
+        } else {
+            on.add(sjws_nettask.routing.Resilience.On.CONNECT);
+            on.add(sjws_nettask.routing.Resilience.On.RESET);
+            on.add(sjws_nettask.routing.Resilience.On.STATUS_503);
+        }
+        int budget = 20;
+        if (map.containsKey("budget")) {
+            var text = String.valueOf(map.get("budget")).trim();
+            if (text.endsWith("%")) {
+                text = text.substring(0, text.length() - 1).trim();
+            }
+            try {
+                budget = Integer.parseInt(text);
+            } catch (NumberFormatException e) {
+                throw new ConfigException(path + ".budget: expected a percentage such as 20%");
+            }
+            if (budget < 1 || budget > 100) {
+                throw new ConfigException(path + ".budget: must be 1%..100%");
+            }
+        }
+        return new sjws_nettask.routing.Resilience.Retry(attempts, on, budget);
+    }
+
+    /** {@code circuit: {failures: 5, eject_for: 10s}} */
+    private static sjws_nettask.routing.Resilience.Circuit circuit(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("failures", "eject_for"), path);
+        int failures = map.containsKey("failures") ? integer(map.get("failures"), path + ".failures", 1, 1000) : 5;
+        var openFor = map.containsKey("eject_for")
+                ? timeout(text(map.get("eject_for"), path + ".eject_for"), path + ".eject_for") : Duration.ofSeconds(10);
+        return new sjws_nettask.routing.Resilience.Circuit(failures, openFor);
     }
 
     private static List<RouteSpec> routes(Object value, Map<String, Upstream> upstreams) {
@@ -466,7 +818,8 @@ public final class ConfigLoader {
         for (int i = 0; i < list.size(); i++) {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
-            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "redirect", "static"), path);
+            YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "backends", "sticky", "redirect",
+                    "static", "listing", "errors", "problem_type", "rate_limit"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -485,12 +838,17 @@ public final class ConfigLoader {
                 rewrite = prefix(text(map.get("rewrite"), path + ".rewrite"), path + ".rewrite");
             }
             int actions = (map.containsKey("proxy") ? 1 : 0) + (map.containsKey("redirect") ? 1 : 0)
-                    + (map.containsKey("static") ? 1 : 0);
+                    + (map.containsKey("static") ? 1 : 0) + (map.containsKey("backends") ? 1 : 0);
             if (actions != 1) {
-                throw new ConfigException(path + ": exactly one of proxy, redirect or static is required");
+                throw new ConfigException(path + ": exactly one of proxy, backends, redirect or static is required");
+            }
+            if (map.containsKey("sticky") && !map.containsKey("backends")) {
+                throw new ConfigException(path + ".sticky is only valid with backends");
             }
             RouteSpec.Action action;
-            if (map.containsKey("proxy")) {
+            if (map.containsKey("backends")) {
+                action = weighted(map, upstreams, path);
+            } else if (map.containsKey("proxy")) {
                 var name = text(map.get("proxy"), path + ".proxy");
                 var upstream = upstreams.get(name);
                 if (upstream == null) {
@@ -502,11 +860,162 @@ public final class ConfigLoader {
             } else if (!bool(map.get("static"), path + ".static")) {
                 throw new ConfigException(path + ".static must be true");
             } else {
-                action = new RouteSpec.Action.Static();
+                action = new RouteSpec.Action.Static(
+                        !map.containsKey("listing") || bool(map.get("listing"), path + ".listing"));
             }
-            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action));
+            if (map.containsKey("listing") && !(action instanceof RouteSpec.Action.Static)) {
+                throw new ConfigException(path + ".listing is only valid on a static route");
+            }
+            var limit = map.containsKey("rate_limit") ? rateLimit(map.get("rate_limit"), path + ".rate_limit", true) : null;
+            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path), limit));
         }
         return List.copyOf(out);
+    }
+
+    /**
+     * {@code rate_limit: {by: peer|header|route, header, rate: 100/s, burst, buckets}}. {@code by: route}
+     * (one bucket for the route) is only valid on a route.
+     */
+    private static sjws_nettask.routing.RateLimitFilter.Limit rateLimit(Object value, String path, boolean onRoute) {
+        var m = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(m, List.of("by", "header", "rate", "burst", "buckets"), path);
+        var byText = m.containsKey("by") ? text(m.get("by"), path + ".by").trim().toLowerCase(Locale.ROOT) : "peer";
+        var by = switch (byText) {
+            case "peer" -> sjws_nettask.routing.RateLimitFilter.By.PEER;
+            case "header" -> sjws_nettask.routing.RateLimitFilter.By.HEADER;
+            case "route" -> {
+                if (!onRoute) {
+                    throw new ConfigException(path + ".by: route is only valid on a route (use peer or header here)");
+                }
+                yield sjws_nettask.routing.RateLimitFilter.By.ROUTE;
+            }
+            default -> throw new ConfigException(path + ".by: expected peer, header or route");
+        };
+        String header = null;
+        if (by == sjws_nettask.routing.RateLimitFilter.By.HEADER) {
+            if (!m.containsKey("header")) {
+                throw new ConfigException(path + ".header is required with by: header");
+            }
+            header = text(m.get("header"), path + ".header").trim();
+            if (header.isEmpty() || !header.chars().allMatch(c -> c > 32 && c < 127 && TSPECIALS.indexOf(c) < 0)) {
+                throw new ConfigException(path + ".header: invalid name '" + header + "'");
+            }
+        } else if (m.containsKey("header")) {
+            throw new ConfigException(path + ".header is only valid with by: header");
+        }
+        if (!m.containsKey("rate")) {
+            throw new ConfigException(path + ".rate is required (for example 100/s, 600/m, 1000/h)");
+        }
+        var rate = String.valueOf(m.get("rate")).trim();
+        long count;
+        char unit = 's';
+        int slash = rate.indexOf('/');
+        try {
+            if (slash >= 0) {
+                var u = rate.substring(slash + 1).trim();
+                if (u.length() != 1 || "smh".indexOf(u.charAt(0)) < 0) {
+                    throw new NumberFormatException();
+                }
+                unit = u.charAt(0);
+                rate = rate.substring(0, slash).trim();
+            }
+            count = Long.parseLong(rate);
+        } catch (NumberFormatException e) {
+            throw new ConfigException(path + ".rate: expected N/s, N/m or N/h");
+        }
+        if (count < 1 || count > 1_000_000_000L) {
+            throw new ConfigException(path + ".rate: must be 1..1000000000 per unit");
+        }
+        int burst = m.containsKey("burst") ? integer(m.get("burst"), path + ".burst", 1, 1_000_000)
+                : (int) Math.min(1_000_000, unit == 's' ? count : 1);
+        int buckets = m.containsKey("buckets") ? integer(m.get("buckets"), path + ".buckets", 1, 1 << 20) : 4096;
+        if (Integer.bitCount(buckets) != 1) {
+            throw new ConfigException(path + ".buckets: must be a power of two");
+        }
+        return new sjws_nettask.routing.RateLimitFilter.Limit(by, header, count, unit, burst, buckets);
+    }
+
+    private static final String TSPECIALS = "()<>@,;:\\\"/[]?={}";
+
+    /** {@code backends: [{upstream, weight (default 1), pin}]} and {@code sticky}. */
+    private static RouteSpec.Action.Weighted weighted(Map<String, Object> route, Map<String, Upstream> upstreams,
+            String path) {
+        var list = YamlValues.sequence(route.get("backends"), path + ".backends");
+        if (list.isEmpty() || list.size() > 64) {
+            throw new ConfigException(path + ".backends: expected 1 to 64 backends");
+        }
+        var out = new ArrayList<RouteSpec.Action.Backend>(list.size());
+        long total = 0;
+        for (int i = 0; i < list.size(); i++) {
+            var at = path + ".backends[" + i + "]";
+            var b = YamlValues.mapping(list.get(i), at);
+            YamlValues.knownKeys(b, List.of("upstream", "weight", "pin"), at);
+            if (!b.containsKey("upstream")) {
+                throw new ConfigException(at + ".upstream is required");
+            }
+            var name = text(b.get("upstream"), at + ".upstream");
+            var upstream = upstreams.get(name);
+            if (upstream == null) {
+                throw new ConfigException(at + ".upstream: unknown upstream '" + name + "'");
+            }
+            int weight = b.containsKey("weight") ? integer(b.get("weight"), at + ".weight", 0, 1_000_000) : 1;
+            var pin = b.containsKey("pin") ? match(b.get("pin"), at + ".pin", true) : null;
+            if (weight == 0 && pin == null) {
+                throw new ConfigException(at + ": weight 0 needs a pin (it would never be chosen)");
+            }
+            total += weight;
+            out.add(new RouteSpec.Action.Backend(upstream, weight, pin));
+        }
+        if (total == 0) {
+            throw new ConfigException(path + ".backends: total weight must be > 0");
+        }
+        var sticky = route.containsKey("sticky") ? match(route.get("sticky"), path + ".sticky", false) : null;
+        return new RouteSpec.Action.Weighted(out, sticky);
+    }
+
+    /** {@code {header: name}} or {@code {cookie: name}}, with {@code value} when {@code withValue}. */
+    private static sjws_nettask.routing.WeightedHandler.Match match(Object value, String path, boolean withValue) {
+        var m = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(m, withValue ? List.of("header", "cookie", "value") : List.of("header", "cookie"), path);
+        if (m.containsKey("header") == m.containsKey("cookie")) {
+            throw new ConfigException(path + ": expected exactly one of header or cookie");
+        }
+        boolean cookie = m.containsKey("cookie");
+        var name = text(m.get(cookie ? "cookie" : "header"), path + (cookie ? ".cookie" : ".header")).trim();
+        if (name.isEmpty() || !name.chars().allMatch(c -> c > 32 && c < 127 && "()<>@,;:\\\"/[]?={}".indexOf(c) < 0)) {
+            throw new ConfigException(path + ": invalid name '" + name + "'");
+        }
+        String v = m.containsKey("value") ? String.valueOf(m.get("value")) : null;
+        return new sjws_nettask.routing.WeightedHandler.Match(cookie, name, v);
+    }
+
+    /** {@code errors: html | problem} (default html) and the optional {@code problem_type} URI base. */
+    private static RouteSpec.Errors errors(Map<String, Object> map, String path) {
+        boolean problem = false;
+        if (map.containsKey("errors")) {
+            var format = text(map.get("errors"), path + ".errors");
+            problem = switch (format) {
+                case "html" -> false;
+                case "problem" -> true;
+                default -> throw new ConfigException(path + ".errors: expected html or problem");
+            };
+        }
+        String type = null;
+        if (map.containsKey("problem_type")) {
+            if (!problem) {
+                throw new ConfigException(path + ".problem_type requires errors: problem");
+            }
+            type = text(map.get("problem_type"), path + ".problem_type");
+            try {
+                var uri = new java.net.URI(type);
+                if (!uri.isAbsolute()) {
+                    throw new ConfigException(path + ".problem_type: expected an absolute URI");
+                }
+            } catch (java.net.URISyntaxException e) {
+                throw new ConfigException(path + ".problem_type: not a URI");
+            }
+        }
+        return problem ? new RouteSpec.Errors(true, type) : RouteSpec.Errors.HTML;
     }
 
     private static RouteSpec.Action.Redirect redirect(Object value, String path) {
@@ -601,9 +1110,6 @@ public final class ConfigLoader {
         boolean world = map.containsKey("require_world_readable")
                 && bool(map.get("require_world_readable"), "access.require_world_readable");
         var settings = new AccessSettings(deny, rules, dotfiles, owner, world);
-        if (!settings.isDefault()) {
-            warnings.add("access is stored but not enforced");
-        }
         return settings;
     }
 
@@ -650,20 +1156,6 @@ public final class ConfigLoader {
             throw new ConfigException(path + ": pattern is required");
         }
         return action + ":" + pattern;
-    }
-
-    private static String sha256(byte[] bytes) {
-        try {
-            var digest = MessageDigest.getInstance("SHA-256").digest(bytes);
-            var hex = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                hex.append(Character.forDigit((b >> 4) & 0xf, 16));
-                hex.append(Character.forDigit(b & 0xf, 16));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
     }
 
     private static String directory(String value, String path) {
@@ -807,6 +1299,30 @@ public final class ConfigLoader {
     private record HostPattern(String host, boolean wildcard, String suffix) {
     }
 
+    /**
+     * {@code [v6]} route host: a real IPv6 literal (parsed without DNS, no zone id, no port),
+     * returned lower-case without brackets; {@link RouteSpec#routerHost()} brackets it again
+     * as {@code [::1]}, the form a Host header carries.
+     */
+    private static String ipv6Literal(String text, String path) {
+        var bad = new ConfigException(path + ": expected a bracketed IPv6 literal such as [::1] (no port)");
+        if (text.length() < 3 || text.indexOf(']') != text.length() - 1) {
+            throw bad;
+        }
+        var inner = text.substring(1, text.length() - 1);
+        if (inner.indexOf(':') < 0 || inner.indexOf('%') >= 0 || inner.indexOf('[') >= 0) {
+            throw bad;
+        }
+        try {
+            if (!(InetAddress.ofLiteral(inner) instanceof java.net.Inet6Address)) {
+                throw bad;
+            }
+        } catch (IllegalArgumentException e) {
+            throw bad;
+        }
+        return inner;
+    }
+
     private static HostPattern host(String value, String path) {
         var text = value.trim().toLowerCase(Locale.ROOT);
         if (text.startsWith("*.")) {
@@ -816,8 +1332,11 @@ public final class ConfigLoader {
             }
             return new HostPattern(text, true, "." + rest);
         }
+        if (text.startsWith("[")) {
+            return new HostPattern(ipv6Literal(text, path), false, null);
+        }
         if (text.indexOf('*') >= 0 || text.indexOf(':') >= 0) {
-            throw new ConfigException(path + ": expected a name or *.suffix");
+            throw new ConfigException(path + ": expected a name, *.suffix or [ipv6]");
         }
         try {
             InetAddress.ofLiteral(text);
@@ -965,9 +1484,12 @@ public final class ConfigLoader {
         private final String[] args;
         private final Map<String, String> env;
         private final ServerConfig.PasswordFileReader passwords;
+        /** {@code server.bind_content} from the file, or null when the key was omitted. */
+        private final Boolean yamlBindContent;
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
-                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent) {
             this.document = document;
             this.warnings = List.copyOf(warnings);
             this.errors = List.copyOf(errors);
@@ -975,6 +1497,18 @@ public final class ConfigLoader {
             this.args = args.clone();
             this.env = Map.copyOf(env);
             this.passwords = passwords;
+            this.yamlBindContent = yamlBindContent;
+        }
+
+        /** Same load, with the document replaced. The file's {@code bind_content} is kept. */
+        public Loaded withDocument(ConfigDocument document) {
+            return new Loaded(document, this.warnings, this.errors, this.helpRequested, this.args, this.env,
+                    this.passwords, this.yamlBindContent);
+        }
+
+        /** {@code server.bind_content}, or null when the file did not set it. Not part of the canonical document. */
+        public Boolean yamlBindContent() {
+            return this.yamlBindContent;
         }
 
         public boolean ok() {

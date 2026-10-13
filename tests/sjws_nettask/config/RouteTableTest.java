@@ -46,6 +46,13 @@ class RouteTableTest {
         var v6 = new RouteSpec("::1", false, null, "/", null, new RouteSpec.Action.Static());
         assertTrue(v6.matchesHost("[::1]:8080"));
         assertFalse(v6.matchesHost("[::2]"));
+        assertFalse(v6.matchesHost("[::1"));
+        assertEquals("[::1]", v6.routerHost());
+        assertTrue(route("example.com", false, null, "/").matchesHost("EXAMPLE.com.:80"));
+        assertFalse(route("k.test", false, null, "/").matchesHost("\u212a.test"));
+        // the request-path rule: a prefix ending in '/' matches whatever follows it
+        assertTrue(route(null, false, null, "/a/").matchesPath("/a/x"));
+        assertTrue(RouteTable.prefixCovers("/a/", "/a/x"));
     }
 
     @Test

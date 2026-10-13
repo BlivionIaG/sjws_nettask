@@ -29,5 +29,33 @@ import java.time.Duration;
  * @param maxBody request body cap, bytes (fits in a positive {@code int})
  */
 public record Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout,
-        Duration idleReadTimeout, int maxBody, boolean preserveHost) {
+        Duration idleReadTimeout, int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
+        Upstream.Discovery discovery) {
+
+    /**
+     * {@code endpoints:} instead of one {@code url}: the static endpoint set (the default
+     * {@link sjws_nettask.routing.discovery.UpstreamSource}), the policy and passive ejection.
+     * {@link Upstream#url()} is then the first endpoint's URL; every endpoint shares its scheme
+     * and path.
+     */
+    public record Discovery(java.util.List<sjws_nettask.routing.discovery.Endpoint> endpoints,
+            sjws_nettask.routing.discovery.LbPolicy lb, sjws_nettask.routing.EndpointBalancer.Outlier outlier) {
+        public Discovery {
+            endpoints = java.util.List.copyOf(endpoints);
+            java.util.Objects.requireNonNull(lb, "lb");
+            java.util.Objects.requireNonNull(outlier, "outlier");
+        }
+    }
+
+    /** A single URL. */
+    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
+            int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience) {
+        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, resilience, null);
+    }
+
+    /** Without retries or circuit breaking. */
+    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
+            int maxBody, boolean preserveHost) {
+        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, null);
+    }
 }

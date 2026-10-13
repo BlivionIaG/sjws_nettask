@@ -60,7 +60,7 @@ class ConfigLoaderTest {
 
     @Test
     void missingFileIsAnError() {
-        var loaded = ConfigLoader.load(new String[] {"--config=/no/such/sjws.yaml"}, Map.of());
+        var loaded = ConfigLoader.load(new String[] {"--config=/no/such/sjws.yaml", "--state-dir=" + dir}, Map.of());
         assertFalse(loaded.ok());
         assertTrue(loaded.errors().get(0).contains("Cannot read config file"));
     }
@@ -271,8 +271,10 @@ class ConfigLoaderTest {
         assertFalse(access.allowDotfiles());
         assertEquals("www-data", access.requireOwner());
         assertTrue(access.requireWorldReadable());
-        assertEquals(sha256(bytes), loaded.document().contentHash());
-        assertTrue(loaded.warnings().stream().anyMatch(w -> w.contains("not enforced")));
+        assertEquals(sjws_nettask.config.ConfigCodec.sha256(loaded.document().canonicalText()),
+                loaded.document().canonicalHash());
+        assertNotEquals(sha256(bytes), loaded.document().canonicalHash());
+        assertTrue(loaded.warnings().stream().noneMatch(w -> w.contains("not enforced")));
         var injected = ConfigLoader.load(new String[] {"--config=" + write("""
                 acme:
                   enabled: true
@@ -283,7 +285,8 @@ class ConfigLoaderTest {
         assertEquals(List.of(AccessSettings.ACME_CHALLENGE_RULE), injected.document().access().rules());
         assertTrue(injected.warnings().stream().noneMatch(w -> w.contains("not enforced")));
         assertTrue(error("access:\n  rules: [permit:/x]\n").contains("allow:"));
-        assertNull(ConfigLoader.standalone(ServerConfig.defaults(dir)).document().contentHash());
+        assertTrue(ConfigLoader.standalone(ServerConfig.defaults(dir)).document().canonicalHash()
+                .matches("[0-9a-f]{64}"));
     }
 
     @Test
@@ -465,6 +468,58 @@ class ConfigLoaderTest {
             hex.append(Character.forDigit(b & 0xf, 16));
         }
         return hex.toString();
+    }
+
+    private static sjws_nettask.routing.Resilience resilience(ConfigLoader.Loaded loaded) {
+        var proxy = (RouteSpec.Action.Proxy) loaded.document().routing().routes().routes().get(0).action();
+        return proxy.upstream().resilience();
+    }
+
+    private static String up(String extra) {
+        return "routing:\n  upstreams:\n    api:\n      url: \"http://127.0.0.1:9\"\n" + extra
+                + "  routes:\n    - prefix: /\n      proxy: api\n";
+    }
+
+    @Test
+    void retryAndCircuitParse() throws Exception {
+        var off = ConfigLoader.load(new String[] {"--config=" + write(up(""))}, Map.of());
+        assertTrue(off.ok(), off.errors().toString());
+        assertNull(resilience(off));
+        var on = ConfigLoader.load(new String[] {"--config=" + write(up("""
+                      retry: { attempts: 3, on: [connect, timeout, reset, 502, 503, 504], budget: 10% }
+                      circuit: { failures: 4, eject_for: 2s }
+                """))}, Map.of());
+        assertTrue(on.ok(), on.errors().toString());
+        var r = resilience(on);
+        assertEquals(3, r.retry().attempts());
+        assertEquals(6, r.retry().on().size());
+        assertEquals(10, r.retry().budgetPercent());
+        assertEquals(4, r.circuit().failures());
+        assertEquals(Duration.ofSeconds(2), r.circuit().openFor());
+        var defaults = ConfigLoader.load(new String[] {"--config=" + write(up("      retry: {}\n"))}, Map.of());
+        assertTrue(defaults.ok(), defaults.errors().toString());
+        assertEquals(2, resilience(defaults).retry().attempts());
+        assertEquals(20, resilience(defaults).retry().budgetPercent());
+        assertEquals(3, resilience(defaults).retry().on().size());
+        assertNull(resilience(defaults).circuit());
+        var circuitOnly = ConfigLoader.load(new String[] {"--config=" + write(up("      circuit: {}\n"))}, Map.of());
+        assertTrue(circuitOnly.ok(), circuitOnly.errors().toString());
+        assertEquals(5, resilience(circuitOnly).circuit().failures());
+        assertNull(resilience(circuitOnly).retry());
+        var bare = ConfigLoader.load(new String[] {"--config=" + write(up("      retry: { budget: 30 }\n"))}, Map.of());
+        assertEquals(30, resilience(bare).retry().budgetPercent());
+    }
+
+    @Test
+    void retryAndCircuitErrors() throws Exception {
+        assertTrue(error(up("      retry: { attempts: 9 }\n")).contains("attempts"));
+        assertTrue(error(up("      retry: { on: [teapot] }\n")).contains("teapot"));
+        assertTrue(error(up("      retry: { on: connect }\n")).contains("list"));
+        assertTrue(error(up("      retry: { budget: lots }\n")).contains("budget"));
+        assertTrue(error(up("      retry: { budget: 0% }\n")).contains("budget"));
+        assertTrue(error(up("      retry: { tries: 1 }\n")).contains("tries"));
+        assertTrue(error(up("      circuit: { failures: 0 }\n")).contains("failures"));
+        assertTrue(error(up("      circuit: { eject_for: never }\n")).contains("eject_for"));
     }
 
     private String error(String yaml) throws Exception {

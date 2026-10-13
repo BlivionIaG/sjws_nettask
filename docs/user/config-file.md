@@ -26,7 +26,47 @@ line and in the environment stay relative to the working directory.
 `--help` wins before a missing file is an error. A missing document root is exit
 code 2, including when the root comes from the file.
 
-`routing`, `middleware` and `access` are file-only. They do not add command-line flags.
+`routing`, `middleware`, `access` and `node` are file-only. They do not add command-line flags.
+
+## Node
+
+Omitted, the process is `standalone`. The request path does not read the mode.
+
+```yaml
+schema: 1
+version: 0          # control-plane bundle version; 0 means unset
+node:
+  mode: standalone  # standalone (default), control, or data
+  labels: {}        # up to 64 keys; each key and value is 1..63 of [A-Za-z0-9_.:-]
+  state_dir: /var/lib/sjws_nettask   # optional; local, not part of the canonical hash
+```
+
+`schema` must be 1 when it is present. A reload or a remote apply rejects a non-zero
+`version` that is lower than the one already running. `node.mode` is kept until
+restart; `labels` apply on the next successful apply.
+
+There is no `node.role` key. `--role` and `WEB_SERVER_ROLE` are the command-line
+form of `node.mode`. Precedence is `--role`, then `WEB_SERVER_ROLE`, then
+`node.mode`. A difference is logged at startup
+(`WARN: --role=<flag> overrides node.mode=<file>`, or the same with
+`WEB_SERVER_ROLE` when the flag was absent). With no flag, no variable, and no
+config file, `--bootstrap` may still name the role. `control` or `data` still
+requires `--bootstrap`. Sample files: `contrib/sjws_nettask-standalone.yaml`,
+`contrib/sjws_nettask-control.yaml`, `contrib/sjws_nettask-data.yaml`.
+
+A data-plane process whose config file is missing boots from
+`<stateDir>/config/last-good.json` when that file exists, the hash in the envelope
+matches the embedded document, and `node.mode` is `data`. `stateDir` is
+`node.state_dir`, or `--state-dir` / `WEB_SERVER_STATE_DIR` (those win over the
+file), and otherwise the daemon's data directory: the working directory, where the
+default pid and log files are written. The `config` directory is mode `0700` and
+the file is mode `0600`. The bytes are a JSON envelope around the canonical
+document, so they do not contain a key password. The temp file and its directory
+are fsynced before the atomic rename, and the write runs after the reload lock is
+released. Standalone and control do not write this file and do not boot from it.
+A file left by an older build at `<file>.last-good` is still read once when the
+JSON file is absent. A failed apply leaves both the running config and this file
+as they were.
 
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
 `h`, `d`). In a size, a bare integer is bytes and `1m` is one mebibyte (`k`, `m`,
@@ -47,6 +87,7 @@ server:
   cache_bytes: 64m          # up to 16g; 0 disables the cache
   allow_unlistable_dirs: false
   access_log: off           # opened at startup; a reload does not reopen the writer
+  bind_content: true        # startup only; control defaults to false. Not in the canonical document
 
 http3:
   enabled: false
@@ -78,6 +119,17 @@ start of `close`. The hook re-reads the file, reapplies the original arguments
 and the environment captured at startup, and on success compiles a new immutable
 snapshot and publishes it with one `AtomicReference` write. A validation error,
 a missing root, or an unreadable certificate keeps the previous snapshot.
+`SjwsServer.applyRemote` checks the injected signature verifier, then validates and
+publishes a pushed document through that same swap. A data or control process
+that was not given a verifier rejects the push. Standalone uses a no-op verifier.
+A bad signature, a canonical hash that is not the SHA-256 of the canonical
+document, or a lower non-zero `version` is rejected before the swap. An incoming
+canonical hash equal to the running snapshot's is a no-op: the file cache and
+upstream pools are left in place. It does not re-read the file and it does not
+replace the file: the user's YAML stays put. A data node writes last-good only
+after the swap, and only after the reload lock is released. HTTP/1 and HTTP/3
+can observe the new snapshot a moment apart: the publish updates the live
+reference, then the HTTP/3 handler and certificate.
 
 The request path is that one volatile read and then the handler that was built
 with the snapshot. It does not parse YAML, match routes, or take the reload lock.
@@ -99,9 +151,11 @@ No config file means reload reports `no config file` and changes nothing.
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
 the JDK does not expose `sun.misc.Signal`, and when this process already ignores
 `SIGHUP`. An ignored `SIGHUP` stays ignored: the VM does not install a Java
-handler over it. `main` does not call it: a foreground process must still die on
-`SIGHUP`. The daemon child ignores `SIGHUP` and has no reload hook; its handler
-should call `ReloadHook.run()` instead of ignoring the signal.
+handler over it. `main` calls it only for the daemon child. A foreground process
+must still die on `SIGHUP`. The child is also detached with `setsid` when that
+binary exists, so a terminal hangup is not delivered. On a data node that has
+accepted a pushed config, the hook reloads bootstrap local settings and leaves
+the pushed document in place. Control and standalone re-read the local file.
 
 ## ACME
 
@@ -122,6 +176,12 @@ acme:
 ```
 
 When enabled, email, at least one domain and `accept_terms: true` are required.
+A standalone process issues as before. A control node issues only after
+`ControlLeadership.leaderReady(term, appliedIndex)`, which fires once that term's
+election NOOP is applied, and stops issuing when the term changes.
+`isLeader()` alone does not start an order. A data node does not start ACME;
+its certificate arrives with the pushed config. Logs drop a message that contains
+a private key or a certificate PEM.
 The same checks on shape (directory, domain spelling, durations) run when it is
 off, so a typo is still an error. CLI and environment overrides use `--acme`,
 `--no-acme`, `--acme-directory`, `--acme-email`, `--acme-domain` (repeatable),
@@ -159,10 +219,115 @@ document root, and a path with a `..` segment is 400. ACME challenges are
 answered before any route. With `enabled: false` (the default) no router is built
 and the request path is unchanged. The records map onto `Route(host, prefix, rewrite,
 handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
-maxBody, proto, trustedProxies)`. Phase 1 proxies requests without a body
-(501 otherwise); see `docs/design/proxy-routing.md`. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
-TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) and `preserve_host`
-(default false) are parsed but not applied yet (phase 2).
+idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
+HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
+response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
+streamed upstream (over `max_body` is 413). A chunked request body, or a body on HTTP/2 or
+HTTP/3, is 501 for now; see `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
+bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
+and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
+growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
+closes the replaced pools.
+
+Rate limits are local to this server and off unless configured. A route takes `rate_limit:`, and
+`routing.rate_limit:` is a global limit checked before any route:
+
+```yaml
+routing:
+  rate_limit: { by: peer, rate: 1000/s, burst: 2000 }            # global, optional
+  routes:
+    - prefix: /api
+      proxy: api
+      rate_limit: { by: header, header: X-Api-Key, rate: 600/m, burst: 20, buckets: 4096 }
+    - prefix: /login
+      static: true
+      rate_limit: { by: route, rate: 50/s }                       # one bucket for the whole route
+```
+
+`by` is `peer` (client address, the default), `header` (that header's first value) or `route`
+(route-level only). `rate` is `N/s`, `N/m` or `N/h` (a bare number is per second). `burst` is the
+number of requests a full bucket admits at once; the default is one second's worth for `/s` and 1
+for `/m` and `/h`. Requests over the limit get 429 with `Retry-After` (seconds until the next
+token), rendered like the route's other errors. Buckets live in a fixed table of `buckets` stripes
+(a power of two, default 4096; `by: route` uses one). Memory never grows with the number of
+clients. Two clients that hash to the same stripe share its budget, which is stricter, never looser.
+A request without the key (no address, or no header) shares one extra bucket. The control-plane
+`rate-limit` filter type uses this same table. Its `capacity` is the burst and
+`refill-per-second` is the steady rate; `max-keys` only sizes the table.
+
+Weighted and canary routes list `backends` instead of `proxy` (a plain `proxy:` route is unchanged):
+
+```yaml
+routes:
+  - prefix: /api
+    backends:
+      - { upstream: stable, weight: 95 }
+      - { upstream: canary, weight: 5, pin: { header: X-Canary, value: "1" } }
+      - { upstream: canary, weight: 0, pin: { cookie: beta } }   # pinned clients only
+    sticky: { cookie: session }                                  # optional
+```
+
+`weight` (default 1, 0 needs a `pin`) is a relative share, picked through a precomputed alias table:
+O(1) per request, no allocation, exact to the configured ratio. A `pin` (`header` or `cookie`, with an
+optional exact `value`; without one, presence is enough) sends a matching request to that backend
+whatever the weights; pins are checked in order. `sticky` hashes that header or cookie value so a
+client keeps its backend while the weights are unchanged; requests without it are picked at random.
+Each upstream keeps one pool and its own `retry` and `circuit`, however many routes or backends name it.
+Up to 64 backends per route.
+
+Retries and circuit breaking are per upstream and off unless configured (no cost when absent):
+
+```yaml
+upstreams:
+  api:
+    url: "http://127.0.0.1:9000"
+    retry: { attempts: 2, on: [connect, reset, 503], budget: 20% }   # defaults shown
+    circuit: { failures: 5, eject_for: 10s }                         # defaults shown
+```
+
+`retry.attempts` (1..5) is the number of extra tries. `on` picks the failures that are retried:
+`connect` (refused or connect timeout), `timeout` (response timeout), `reset` (the upstream closed
+before a response head), `502`, `503`, `504`. Only idempotent methods (GET, HEAD, OPTIONS, TRACE,
+PUT, DELETE) without a request body are retried, and only before anything reached the client (a
+retried 5xx body is discarded). `budget` caps retries at that share of requests: a token bucket per
+upstream earns `budget` of a token per request, holds at most 10, and each retry spends one.
+`circuit` opens after `failures` consecutive failures (connect, timeout, reset, 502/503/504) and
+then answers 503 with `Retry-After` without contacting the upstream. After `eject_for` one probe
+request is let through: success closes the circuit, failure opens it again for twice as long (up
+to 32×). Each request gives one verdict, after its retries, so a retry that recovers counts as a
+success. An upstream is a single endpoint, so an open circuit is an outage of that upstream: it suits
+a dead or overloaded upstream, not a flaky one. At 20% random 503s and 5000 req/s, `failures: 5`
+trips about once a second (see `bench/proxy-routing/resilience.sh`). Pair it with `retry`, or raise
+`failures`, when the upstream has a steady error rate.
+
+An upstream can list several endpoints instead of one `url` (exactly one of the two). It then
+balances over them, with one pool per endpoint and a circuit per endpoint:
+
+```yaml
+upstreams:
+  api:
+    endpoints:
+      - "http://10.0.0.1:9000"
+      - { url: "http://10.0.0.2:9000", weight: 3, zone: b, id: api-2, labels: { tier: canary } }
+    lb: weighted_random            # default; round_robin | least_request
+    retry: { attempts: 2 }         # a retry goes to a different endpoint
+    circuit: { failures: 5, eject_for: 10s, error_rate: 50%, min_requests: 20, window: 10s, max_ejection: 50% }  # defaults
+```
+
+All endpoints share one scheme and path (no query, fragment or userinfo); up to 1024, default
+weight 1 (0..1000000, 0 = only used when nothing weighted is left). `weighted_random` draws from an
+alias table (O(1)); `round_robin` cycles; `least_request` takes the less busy of two random
+endpoints (requests waiting for response headers). On a multi-endpoint upstream the circuit is
+always on with the defaults above, per endpoint, per attempt: an endpoint is ejected after
+`failures` consecutive failures, or when at least `min_requests` in the last `window` fail at
+`error_rate` or more. It comes back after `eject_for` through one probe, doubling on each repeat
+(up to 32×). If more than `max_ejection` of the endpoints are ejected, the balancer ignores ejection
+("panic") and spreads over all of them. When every endpoint is ejected or tried, the request still
+goes somewhere rather than failing fast. The endpoint list can be replaced at run time by the
+control plane (see `docs/ha/discovery.md`); a reload keeps a list the control plane has set.
+A plain `url` upstream is unchanged and pays nothing for this.
+
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml
@@ -171,10 +336,10 @@ routing:
   upstreams:
     api: { url: "http://127.0.0.1:9000", connect_timeout: 5s, response_timeout: 30s, max_body: 16m }
   routes:   # ordered, first match wins
-    - host: "example.com"  # optional; exact or "*.suffix"
+    - host: "example.com"  # optional; exact, "*.suffix" or "[ipv6]"
       prefix: "/api"       # required, segment-boundary match
       rewrite: "/"         # optional
-      proxy: api           # exactly one of proxy | redirect | static
+      proxy: api           # exactly one of proxy | backends | redirect | static
     - prefix: "/old"
       redirect: { status: 301, location: "https://example.com/new/", keep_path: true }
     - prefix: "/"
@@ -185,8 +350,41 @@ routing:
 `prefix` matches on a segment boundary (`/api` matches `/api`, `/api/…` and
 `/api?…`, not `/apix`) against the raw percent-encoded target. `host` is
 case-insensitive; a port in the request's Host header is ignored; `*.example.com`
-matches a subdomain and not the apex. A route that an earlier route completely
+matches a subdomain and not the apex. An IPv6 address is written bracketed, as in a
+Host header (`host: "[::1]"` or `"[2001:db8::1]"`); it must be a real IPv6 literal (no
+zone id, checked without DNS) and is compared lower-case. A bare `::1` or a `host:port`
+is rejected. A route that an earlier route completely
 covers is a warning. The sample above does not shadow itself.
+
+### Per-route error format and listings
+
+These settings are part of the route records (`RouteSpec`), so they travel with the
+rest of the routing section to every node that loads it. Defaults keep today's behaviour.
+
+```yaml
+  routes:
+    - prefix: "/api"
+      proxy: api
+      errors: problem                               # html (default) | problem
+      problem_type: "https://errors.example.com/"   # optional, absolute URI; needs errors: problem
+    - prefix: "/files"
+      static: true
+      listing: false                                # static routes only; default true
+```
+
+`errors: problem` renders the error pages this server generates for the route as
+RFC 9457 `application/problem+json` with `type`, `title`, `status`, `detail` and
+`instance`, for 400, 401, 403, 404, 405, 408, 413, 429, 500, 501, 502, 503 and
+504. Other statuses keep the HTML page. A response relayed from an upstream (for
+example the upstream's own 503) is never rewritten. `type` is `about:blank`, or
+`problem_type` followed by the status code (`https://errors.example.com/503`).
+`instance` is the request path as the client sent it (before `rewrite`, without
+the query). The body carries `Cache-Control: no-store`, and semantic fields of the
+page such as `Allow`, `Content-Range` or `Retry-After` are kept. Routes without
+`errors: problem` get no wrapper and run exactly as before.
+
+`listing: false` answers a directory without `index.html` with 404, as if it did
+not exist. The route still shares the document root, access policy and file cache.
 
 ## Middleware
 
@@ -219,9 +417,11 @@ with `/`). Any other `*` is an error.
 
 ## Access
 
-Stored for the rights-management flags and not enforced here. Dotfiles are already
-hidden by the file handler. A non-default section warns. The fields map onto
-`AccessRules` once that class is present, without this server depending on it:
+Enforced by the file handler over HTTP/1.1, HTTP/2 and HTTP/3, and re-applied
+on every reload (add a rule and reload: it is enforced on the next request; remove
+it and reload: it is lifted). A malformed rule or an unknown `require_owner` is an
+error, and a reload that fails keeps the previous rules. Each field has a flag and
+an environment variable:
 
 | YAML | Flag | Environment |
 |---|---|---|
@@ -242,6 +442,22 @@ access:
   require_world_readable: false
 ```
 
+### Precedence with the command line
+
+The YAML section and the flags / environment are **merged**, never one replacing
+the other, so nothing configured in either place is silently dropped:
+
+| Field | Effective value |
+|---|---|
+| `deny` | union: flag/environment patterns, then YAML patterns (all answer 403, before any rule) |
+| `rules` | flag/environment rules first, then YAML rules; first match wins, so a flag rule overrides a YAML rule for the same path |
+| `allow_dotfiles` | on if either source turns it on (each is an explicit opt-in) |
+| `require_world_readable` | on if either source turns it on |
+| `require_owner` | the flag/environment value when set, otherwise the YAML value |
+
+With no `access:` section (or a default one) the flag policy is used as is, with
+no extra cost per request.
+
 `/.well-known/acme-challenge/` is answered by the ACME handler before the file
 handler, including its dotfile check, whenever ACME is on the main listener. An
 unknown token is 404 and is not a file. When ACME is enabled the stored rules
@@ -252,18 +468,27 @@ access-rule list needs. A dedicated HTTP-01 port never consults the file handler
 ## Request path
 
 `LiveConfig` holds an `AtomicReference` of `ConfigSnapshot`. The snapshot carries
-the static-file handler (and, only when ACME challenges are on the main listener,
+the static-file handler with the merged access rules (and, only when ACME challenges are on the main listener,
 the challenge handler in front of it), the route table, the middleware list and
 the access settings. Building that snapshot is the only time the file is parsed.
 
 ## ConfigStore rollout
 
-The bundle is this YAML file. Its version is the lowercase SHA-256 of the file
-bytes (`ConfigDocument.contentHash()`). A process that was started without a file
-has no hash. Each successful reload also bumps a generation counter on the
-snapshot; that counter is how many times this process has swapped, not the bundle
-version. The hash is of the file, not of the file after arguments and environment
-variables have been applied.
+The bundle is this YAML file. `canonicalHash()` is the lowercase SHA-256 of the
+canonical YAML of the effective document (fixed key order, sorted maps, no key
+password, and not the hash itself). Reordering keys in the file leaves it
+unchanged. A signature covers that hash, the bundle `version`, and `schema`:
+the bytes are `schema`, a newline, `version`, a newline, and the hex hash.
+Distribution sends the full signed document. `ConfigDiff` reports which keys
+were added, removed, or changed in each section. It is not a patch and it cannot
+rebuild a document. `version` (`bundleVersion()`) is the control-plane bundle
+version. Each apply that actually changes the snapshot bumps a generation counter;
+that counter is how many times this process has swapped, not the bundle version.
+A repeated push of the same canonical hash does not bump it. Bind-time fields
+that are clamped back to the running value are reflected in the canonical hash of
+the snapshot that was published, so that hash can differ from the hash of the
+bundle that was pushed. The canonical text is rendered once for that hash and
+reused for the last-good envelope.
 
 Applied live, on the next request, with no drain: document root, cache budget,
 unlistable directories, HTTP/1 timeouts when HTTP/3 is not running, the stored

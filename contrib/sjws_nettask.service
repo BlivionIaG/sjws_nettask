@@ -1,9 +1,17 @@
 # systemd unit for sjws_nettask (Type=forking: --daemon writes PIDFile, then the parent exits).
 # Install the jar and its target/lib/ directory together (the manifest Class-Path is lib/).
 # Adjust the document root and the port, and add User= if the service should not run as root.
-# TimeoutStopSec is longer than the default --shutdown-timeout (10s) plus the 5s --stop margin.
+#
+# Active means the main process is up. It does not mean the content port is accepting, and this
+# unit does not call sd_notify. Readiness is /readyz (when high availability serves it) and
+# --status. ExecReload sends SIGHUP, which the daemon child handles as ReloadHook.
+#
+# TimeoutStopSec covers the default drain budget (30s) plus the 5s SIGKILL margin plus about
+# 10s for the ExecStop JVM. Raising --drain-budget requires raising TimeoutStopSec by the same
+# amount. --shutdown-timeout is only the in-process close of responses already in flight.
 #
 #   install -D -m 0644 contrib/sjws_nettask.service /etc/systemd/system/sjws_nettask.service
+#   install -D -m 0644 contrib/sjws_nettask-standalone.yaml /etc/sjws_nettask/sjws_nettask-standalone.yaml
 #   systemctl daemon-reload && systemctl enable --now sjws_nettask
 
 [Unit]
@@ -13,11 +21,11 @@ After=network.target
 [Service]
 Type=forking
 PIDFile=/run/sjws_nettask.pid
-ExecStart=/usr/bin/java -jar /usr/share/sjws_nettask/sjws_nettask.jar --daemon --pid-file=/run/sjws_nettask.pid --log-file=/var/log/sjws_nettask.log --shutdown-timeout=10 8080 /var/www/html
+ExecStart=/usr/bin/java -jar /usr/share/sjws_nettask/sjws_nettask.jar --daemon --config=/etc/sjws_nettask/sjws_nettask-standalone.yaml --pid-file=/run/sjws_nettask.pid --log-file=/var/log/sjws_nettask.log --shutdown-timeout=10 8080 /var/www/html
 ExecStop=/usr/bin/java -jar /usr/share/sjws_nettask/sjws_nettask.jar --stop --pid-file=/run/sjws_nettask.pid --shutdown-timeout=10
-ExecReload=/usr/bin/java -jar /usr/share/sjws_nettask/sjws_nettask.jar --restart --pid-file=/run/sjws_nettask.pid --log-file=/var/log/sjws_nettask.log --shutdown-timeout=10 8080 /var/www/html
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
-TimeoutStopSec=30
+TimeoutStopSec=45
 WorkingDirectory=/var/www/html
 
 [Install]

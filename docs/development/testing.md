@@ -21,9 +21,16 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `admin/cp/CpConsoleTest` | control-plane console: label selectors, diff, validation, stage/rollout/rollback on the fake CP, failover client, rendering, zero-cost guard |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
+| `observe/NodeReporterTest` | control heartbeat: 5 s cadence reuses the report, sequence advances only on a fresh take, cumulative 4xx/5xx, health and config generation suppliers, log2 histogram merge and p99 bucket bound |
+| `observe/ClusterBoardTest` | cluster aggregate: per-node rate from cumulative snapshots, restart zeroes the interval, merged p99, errors by node and route, config drift, label-name cap |
 | `Http1GoldenTest`, `http1/Http1WriterTest` | byte-exact HTTP/1.1 responses; writer edge cases |
 | `core/ContractTest`, `core/StaticFileHandlerTest` | protocol-neutral request/response records and handler |
 | `core/FilterChainTest` | filter order, short-circuit, 500 on filter/handler failure, route patterns, `MiddlewareSpec` registration |
+| `core/FilterDocumentTest` | declarative document: JSON round trip, scope, label selectors, rejected wire forms |
+| `core/ChainControlTest` | atomic snapshot swap, stale and invalid documents keep the live chain, in-flight requests finish on the old chain |
+| `ChainControlServerTest` | publishing a document onto a live server leaves the direct file path in place until the first apply |
+| `gateway/ApiKeyFilterTest`, `gateway/JwtFilterTest`, `gateway/RateLimitFilterTest`, `gateway/CorsFilterTest`, `gateway/RequestSizeFilterTest`, `gateway/HeaderRewriteFilterTest`, `gateway/MiniJsonTest` | gateway filters: API key, JWT (HS/RS/ES, exp/nbf/iss/aud), striped GCRA rate limit, CORS preflight, size limits, header rewrite |
+| `GatewayServerTest` | a declarative document of those filters on a live HTTP/1.1 server; a bad entry keeps the previous snapshot |
 | `FilterIntegrationTest` | real HTTP/1.1 server: no chain by default, header/short-circuit filters, client address and raw headers, a replacement terminal handler, 500 then the next request on the same connection |
 | `h3/FilterHttp3Test` | default HTTP/3 factory runs the same chain; a filter failure is a 500 on that stream |
 | `core/PlatformEdgeCaseTest` | case/Unicode/`%2F` behaviour per file system |
@@ -39,9 +46,14 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/SecurityHeadersTest` | `X-Content-Type-Options: nosniff` on every file and generated page; script-free, frame-free `Content-Security-Policy` on listings, errors and redirects |
 | `core/RenderingTest` | reason phrases for every registered status (empty for unregistered codes), error page titles, HEAD error heads, MIME/charset of the added static-file types |
 | `core/AccessRulesTest` | access rules: glob table (anchored/unanchored, `*`/`?`/`**`, "everything below"), deny list > rules > dotfile default, allow wildcards never expose dotfiles but literals can (`.well-known/acme-challenge`), linear matching with many `**` on deep paths, malformed rules, handler wiring with and without the cache (403/404, normalized and decoded paths, listings filtered, denied index falls back to listing), symlinks to denied/dot paths refused, owner/world-readable policy (re-checked on cache hits, fails closed without POSIX attributes), custom `AccessPolicy` seam. `AccessRulesBench` (not a test) prints the per-request cost |
+| `config/RouteErrorsTest` | per-route `errors: problem` (RFC 9457) and `listing:`: YAML parsing and rejections, no wrapper when off, static 404/403/405 and HEAD as problem+json with the client's path and kept fields, proxy 502/504 converted while an upstream's own 503 body is relayed, 401/403/429/502/503/504 from any inner handler, JSON escaping, `listing: false` 404 sharing the cache |
 | `core/PerIpLimitTest` | per-address connection counter, IPv6 counted per /64 |
 | `SjwsServerTest`, `AltSvcTest` | HTTP/1.1 + optional transport wiring (fake transport), Alt-Svc opt-in/withdrawal, shutdown order, `--backlog` reaches listen(2) (checked with `ss`) |
 | `ha/SnapshotHolderTest`, `ha/HealthBoardTest`, `ha/HaLifecycleTest` | atomic snapshot publish, precomputed `/healthz` and `/readyz`, drain (delay, in-flight, `Connection: close`), accept pause |
+| `cluster/QuorumPolicyTest`, `cluster/HeartbeatCodecTest`, `cluster/MembershipTest`, `cluster/HeartbeatServiceTest` | majority and witness quorums, 64-byte heartbeat codec, failure detector (suspect, dead, incarnation refute, indirect probe), simulated loss and UDP heartbeats |
+| `cluster/RaftClusterTest`, `ha/GenerationSyncTest` | per-group Raft (election, batch commit, strict vs relaxed fsync, witness, minority, joint membership, transfer, snapshot compact, preferred campaign, failback), HMAC generation publish and key mode 0600 |
+| `ha/FailoverTest` | VIP claim and release-before-expiry, active/active claims nothing, `/readyz` rolling restart, `SO_REUSEPORT` hand-over and the unavailable path |
+| `ha/ClusterBenchTest` | cluster-mode bench process runs a second node and the heartbeat thread |
 | `SingleNodeHotPathTest` | clustering off: file handler, no role supplier, no drain supplier, no heartbeat or raft thread |
 | `clusterharness/ClusterScenariosTest` (`@Tag("cluster")`) | N control + M data nodes on the file-serving harness (ephemeral port, temp root, HTTP/1.1 client). Live: gateway-off and standalone serve the same file with no `cp-` thread. Partition, leader kill, slow node, and rollback are `@Disabled` until `sjws_nettask.cp` (design PR #38); `PendingControlPlane` refuses those calls |
 | `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
@@ -61,6 +73,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `h3/QuicNativesReportTest` | prints whether the QUIC natives loaded (untagged, always runs) |
 | `MainTest` | entry point: `--help`/`-h` (exit 0), usage errors (64), bad root (2), busy port (1), warnings, startup/shutdown messages |
 | `DaemonTest` | `--daemon`/`--stop`/`--status`/`--restart`, pid-file lock and stale/reused pids, log file, graceful drain on close |
+| `ServiceDaemonTest`, `RoleSampleTest`, `service/BootstrapTest` | control/data bootstrap and join token (mode, symlink, no secret on the command line or in status), `--status` role/connection/config-version, HA drain on the shutdown hook, systemd unit checks, role precedence (`--role`, then `WEB_SERVER_ROLE`, then `node.mode`), SIGHUP reload, drain budget, contrib role samples against schema 1, standalone does not load `sjws_nettask.service` |
 | `ClientManagerFaultTest`, `Http1EdgeTest` | accept-loop faults (back-off, reset before registration, setOption failure), EOF/CR/body-drain edge cases, failure log |
 | `http1/LegacyApiTest`, `core/CoreApiTest` | legacy wrappers (HTML/Page/Header/CONSTANTS) and small core APIs (ResponseHeaders, Mime, Response, FileCache bounds) |
 
@@ -83,8 +96,10 @@ Every user-visible behaviour and the test that asserts it.
 | Behaviour | Asserted by |
 |---|---|
 | every `--flag` and `WEB_SERVER_*` variable (value, default, invalid value, env over argument) | `ServerConfigTest`, `DaemonTest`; `DocsConsistencyTest` keeps `--help` and the docs option tables in sync |
-| `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown | `DaemonTest` |
+| `--daemon`, `--stop`, `--status`, `--restart`, pid file, log file, graceful shutdown, `--role`, `--bootstrap`, join token, control/data status, `node.mode` precedence, contrib role samples | `DaemonTest`, `ServiceDaemonTest`, `RoleSampleTest`, `service/BootstrapTest` |
 | access log (common, combined, JSON), `/healthz` opt-in (a document-root file is served when it is off), `/metrics` off / localhost / on, counters stay off until armed; the observe filter is order 0 and is absent while off | `observe/ObservabilityTest`; HTTP/3 recording in `h3/ObservabilityHttp3Test`; HTTP/2 recording in `h2/H2ConfigAndWiringTest` |
+| control heartbeat report (cumulative snapshot, 5 s cache, histogram merge by index) | `observe/NodeReporterTest` |
+| cluster requests/s, merged p99, errors by node and route, config drift, shown on the admin status view when a board is attached | `observe/ClusterBoardTest`, `admin/AdminTuiTest` |
 | gateway mode off matches standalone file serving (ephemeral ports, no `cp-` thread, applied version 0) | `clusterharness/ClusterScenariosTest` |
 | `--help` / `-h` text, exit 0 | `MainTest` |
 | exit codes 0 / 1 (cannot listen) / 2 (bad root) / 64 (usage) | `MainTest` |

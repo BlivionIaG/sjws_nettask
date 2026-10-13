@@ -31,9 +31,10 @@ public final class AccessLog implements RequestFilter {
 ```
 
 `Request` is an immutable record. `Response` is a record too; its `headers()` are a mutable
-map, and the chain does not copy them. Pass `request.withMethod` / `request.withTarget` into
-`proceed` to change what the rest of the chain sees; those copies keep the peer address,
-`secure`, and headers. Return a new `Response` to change the status or body, or mutate
+map, and the chain does not copy them. Pass `request.withMethod`, `request.withTarget` or `request.withHeaders` into
+`proceed` to change what the rest of the chain sees. `withMethod` and `withTarget` keep the
+peer address, `secure`, headers and body. `withHeaders` keeps the method, target, peer,
+`secure`, protocol and body. Return a new `Response` to change the status or body, or mutate
 `response.headers()` in place. Skip `proceed` to short-circuit; later filters and the terminal
 handler do not run.
 
@@ -88,8 +89,12 @@ when `proceed` returns, before the socket write. Parse errors, 408, HTTP/2 refus
 refusals do not enter the chain, so they are not logged or counted.
 
 `RoutePattern` is `*` (or omitted) for every request, `/exact`, or `/prefix/*` (the path equals
-`/prefix` or starts with `/prefix/`). The query and fragment are ignored. The path is not
-percent-decoded.
+`/prefix` or starts with `/prefix/`). The query and fragment are ignored. The path is matched
+after percent-decoding and dot-segment normalisation, so `/%61dmin`, `//admin` and `/x/../admin`
+all match `/admin/*`. Spellings that different readers resolve differently (`%2f`, `%5c`, `\`,
+`;` path parameters, a `%` left after decoding, malformed escapes, `..` above the root) match
+every route, so a scoped filter fails closed instead of being skipped. Plain paths are matched in
+place without allocating.
 
 ## Configuration hook
 
@@ -158,6 +163,23 @@ Handler proxied = RequestFilters.create()
     .wrapping(proxyHandler);
 ```
 
+## Streamed bodies: two contracts
+
+`FilterChain` closes proxied response streams that no longer reach the client (see `settle`). Two
+rules follow:
+
+* **Rewrapping counts as dropping.** The chain compares bodies by identity. If a filter wraps the
+  same source in a new `Body.Stream`, the original stream counts as dropped and the chain closes its
+  source, so the new wrapper then reads from a closed source. Pass the response through unchanged,
+  or read the source yourself and return a new body that does not share it.
+* **A terminal that throws closes its own stream.** If the terminal handler fails after it opened
+  a stream but before it returned it, the chain never saw that stream and cannot close it. The
+  handler must close it (`Body.discard`) before throwing. Otherwise the upstream connection and its
+  byte budget leak.
+
+A filter that answers on its own (for example a 429 from `RateLimitFilter`) without calling
+`next` has nothing to close.
+
 ## Request body
 
 This record has no body. Do not add a buffered `byte[]`: a proxy that relays a body needs a
@@ -195,3 +217,61 @@ path stays a direct call on the concrete handler.
 `Transport.armHandler` is how a listener learns about a filter published by a later
 `metricsSnapshot()`. The default ignores it. HTTP/2 and HTTP/3 install that handler for the next
 request.
+
+## Declarative chain
+
+A control plane distributes the chain as data. `FilterDocument` is that data: a wire `format`,
+a config `version`, and a list of entries. Each entry has a `type` (the factory name), an
+`order`, a string `params` map, and a `scope`. The scope is a route pattern
+(`RoutePattern`), a node-label selector, or both (the node must match and the request must
+match the route). Label selectors are compiled out when the document is applied: the request
+path does not look at node labels. An entry that does not match this node's labels is still
+constructed, so a bad param fails the whole document, and then left out of the snapshot.
+
+`FilterDocument.toJson()` / `fromJson` is the stable UTF-8 JSON encoding (format 1). The writer
+emits one canonical form (no insignificant whitespace, keys in a fixed order, param keys sorted).
+`fromJson` of that text equals the document. Numbers and booleans are rejected inside `params`;
+use strings. Unknown fields, duplicate keys, and a document larger than 1 MiB are rejected.
+The schema:
+
+```json
+{
+  "format": 1,
+  "version": 7,
+  "filters": [
+    {
+      "type": "api-key",
+      "order": 10,
+      "params": { "header": "x-api-key", "keys": "a,b" },
+      "scope": { "route": "/api/*", "labels": "edge,!internal" }
+    }
+  ]
+}
+```
+
+`labels` is comma-separated. `!name` means the node must not carry that label. `*` or omitting
+the selector matches every node. Omitting `scope` matches every request on every node.
+
+`SjwsServer.chainControl(registry, nodeLabels)` opens a slot and does not change the request
+path. The first successful `apply` compiles the snapshot and installs that handler into the
+volatile slot each transport already reads (the same slot a metrics arm uses). Until then a
+server with no filters still calls `StaticFileHandler.handle` directly, and a server that
+already has filters keeps that chain. `apply` validates and compiles on the calling thread, then
+publishes with that one write. The request path does not enter `ChainControl`, so it does not
+take the publish lock, read the document, or load a second snapshot reference. A request that
+has already loaded a handler, including one blocked inside `proceed`, finishes on it. A document
+that fails to parse or compile throws, and the published handler stays. A version lower than the
+one being served is rejected the same way. An equal version is applied again, which is how a
+node picks up a label change without a new generation.
+
+An empty `filters` array is valid and calls the terminal handler directly. When that terminal
+is the static file handler, the call is still `StaticFileHandler.handle`. Opening the slot
+without applying a document does not install this read.
+
+When observability was on at startup, or counters are armed later, the observe filter is
+inserted at order 0 on the compiled snapshot (a negative order still runs further out). Arming
+counters after a document is live recompiles that document in place so the next request is
+counted. The observe filter is not installed when observability is off.
+
+The gateway filters (`api-key`, `jwt`, `rate-limit`, `cors`, `request-size`, `header-rewrite`)
+are factories on this same document. See [API gateway filters](gateway.md).

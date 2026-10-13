@@ -295,11 +295,22 @@ final class Http1Connection implements Runnable {
 
         var core = Http1Requests.toCore(request, this.peer);
         if (!core.headOnly() && !"GET".equals(core.method())) {
-            // OPTIONS (200) or a known but unsupported method (405). Never read (possibly huge)
-            // bodies just to reject them: keep the connection only if there is no body.
+            // OPTIONS, a proxied method, or one the file handler rejects (405). A Content-Length
+            // body is offered to the handler as a pull-style RequestBody and never read just to
+            // reject it: the connection is kept only if the handler consumed the body whole.
             boolean keepAlive = keep(request.keepAlive() && !request.hasBody());
+            BodyReader body = null;
+            if (!request.chunked() && request.contentLength() > 0) {
+                body = new BodyReader(request.contentLength(), request.expectContinue(), out, timer);
+                core = core.withBody(body);
+            }
             timer.processing();
-            send(out, apply(core), keepAlive);
+            var response = apply(core);
+            if (body != null) {
+                keepAlive = keep(request.keepAlive() && body.complete());
+            }
+            keepAlive = framing(response, request, keepAlive);
+            send(out, response, keepAlive);
             return keepAlive;
         }
 
@@ -338,8 +349,75 @@ final class Http1Connection implements Runnable {
         }
         timer.processing();
 
-        send(out, apply(core), keepAlive);
+        var response = apply(core);
+        keepAlive = framing(response, request, keepAlive);
+        send(out, response, keepAlive);
         return keepAlive;
+    }
+
+    /** A stream of unknown length can't be chunked to an HTTP/1.0 client: the close ends it. */
+    private static boolean framing(sjws_nettask.core.Response response, Http1Parser.Head request, boolean keepAlive) {
+        return keepAlive && !(response.body() instanceof sjws_nettask.core.Body.Stream stream && stream.length() < 0
+                && "HTTP/1.0".equals(request.version()));
+    }
+
+    /**
+     * The request body (Content-Length framing) read on demand by the handler, from the bytes
+     * already buffered and then the socket. Each read that waits is bounded by the write timeout
+     * (the reaper's per-progress deadline); 100 Continue is sent before the first read.
+     */
+    private final class BodyReader implements sjws_nettask.core.RequestBody {
+        private final long length;
+        private final ChannelOutput out;
+        private final ConnectionReaper.Timer timer;
+        private boolean continueDue;
+        private long remaining;
+
+        BodyReader(long length, boolean expectContinue, ChannelOutput out, ConnectionReaper.Timer timer) {
+            this.length = length;
+            this.remaining = length;
+            this.continueDue = expectContinue;
+            this.out = out;
+            this.timer = timer;
+        }
+
+        boolean complete() {
+            return this.remaining == 0;
+        }
+
+        @Override
+        public long length() {
+            return this.length;
+        }
+
+        @Override
+        public int read(byte[] into, int off, int len) throws IOException {
+            if (this.remaining == 0) {
+                return -1;
+            }
+            if (len == 0) {
+                return 0;
+            }
+            if (this.continueDue) {
+                this.continueDue = false;
+                this.out.write(CONTINUE);
+            }
+            if (!hasInput()) {
+                this.timer.writing(); // per-read progress deadline while the handler waits for the client
+                try {
+                    if (fill() < 0) {
+                        throw new IOException("client closed the connection after "
+                                + (this.length - this.remaining) + " of " + this.length + " body bytes");
+                    }
+                } finally {
+                    this.timer.processing();
+                }
+            }
+            int n = (int) Math.min(Math.min(len, this.remaining), Http1Connection.this.in.remaining());
+            Http1Connection.this.in.get(into, off, n);
+            this.remaining -= n;
+            return n;
+        }
     }
 
     /**

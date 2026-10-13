@@ -63,15 +63,15 @@ has a small text body and honours HEAD.
 
 ## 5. Reverse proxy
 
-**Client choice.** The plan is `java.net.http.HttpClient` (JDK, no new dependency), one instance per upstream,
-created at config load. It is built with HTTP/1.1, `Redirect.NEVER`, and an executor of virtual threads.
-- *Alternative:* Netty's HTTP client (already on the classpath for HTTP/3) gives true zero-copy `ByteBuf`
-  relay, but it would bring Netty into `routing` and the HTTP/1 path. We revisit this only if the phase-2
-  benchmarks show that HttpClient is the bottleneck.
+**Client choice.** Phase 1 used `java.net.http.HttpClient`. Phase 1's benchmarks (§9) put the proxy at
+6–7× below direct, so phase 2 replaces it with a Netty HTTP/1.1 client (`routing.UpstreamPool`, see §12).
+Netty is already a dependency (h2, h3); it stays inside `routing`, and `core` and `http1` still do not import it
+(`SourceGuardTest`).
 
-**Connection pooling.** HttpClient keeps a keep-alive pool per (scheme, host, port). The pool is
-tuned with `jdk.httpclient.connectionPoolSize` and `jdk.httpclient.keepalive.timeout` (documented, and settable
-in config). Sharing one client per upstream avoids handshakes on each request.
+**Connection pooling.** There is one `UpstreamPool` per upstream, holding idle keep-alive channels in a LIFO deque capped at
+256 per upstream. All pools share one daemon event-loop group (`upstream-io-*`, max(2, cores/2) threads), which is
+reference-counted: it is created with the first pool and shut down when the last pool closes. With routing off,
+nothing is created.
 
 **Timeouts.** There are three:
 - `connect_timeout`, default 5 s;
@@ -150,9 +150,10 @@ unchanged.
 - **Proxy:**
   - Pooled connections avoid handshakes.
   - Phase 1 buffers up to `max_body`, which is bounded but costs a copy.
-  - Phase 2 streams: the upstream `Flow.Publisher<List<ByteBuffer>>` is handed to the writer as a streaming body,
-    with backpressure, so a request never holds more than one or two chunk buffers. True zero-copy (kernel splice) is out of
-    reach with HttpClient. The goal is "no extra full-body copy".
+  - Phase 2 streams: the upstream body is a `Body.Stream` pulled by the writer. The event loop reads ahead at most
+    256 KiB per exchange, then stops reading until the writer has drained half of it, so a request never holds more than
+    that window. HTTP/1.1 writes each Netty buffer to the client socket without copying it; h2 and h3 copy each chunk
+    into a frame. There is no full-body copy.
 - **No per-request client, executor, or header-name normalisation tables.** Static sets are used for the hop-by-hop headers.
 
 ## 8. Core contract gaps and proposed changes
@@ -237,4 +238,52 @@ upstream client in phase 2.
    HTTP-01 challenges (`/.well-known/acme-challenge/`) bypass routing? The proposal is that they are matched before the Router, always.
 4. Should Host default to the upstream host or be preserved? The proposal is upstream host plus `X-Forwarded-Host`, with `preserve_host` to opt in.
 5. HTTP/3 clients being proxied to HTTP/1.1 upstreams: should `Alt-Svc` from upstreams always be stripped? The proposal is yes.
-6. Should we keep HttpClient or move to the Netty client? We decide after the phase-2 benchmarks.
+6. Should we keep HttpClient or move to the Netty client? **Decided: Netty** (§12). It is 1.5–5× faster than phase 1 depending on size.
+
+## 12. Phase 2: Netty upstream client and streaming (implemented)
+
+**Core additions.** These are additive, and every existing constructor is kept.
+- `Body.Stream(long length /* -1 unknown */, Source)` is a pull source. `next()` returns a buffer that stays valid until the next call, or null at the end. The writer closes it exactly once. A known length is honoured exactly; on a mismatch the writer aborts rather than send a short response.
+- `RequestBody` (`length()`, `read(byte[],int,int)`, `EMPTY`) is carried by `Request.body()`; `Request.withBody` was added.
+- Writers:
+  - HTTP/1.1 uses Content-Length when the length is known. When it is unknown it uses chunked on keep-alive, otherwise close-delimited (always close-delimited for an HTTP/1.0 client). `ChannelOutput` takes the `ByteBuffer` directly through `Http1Writer.BufferSink`.
+  - h2 waits for writability before each chunk, and ends with an empty DATA frame carrying END_STREAM.
+  - h3 shuts down the stream output at the end.
+  - The h2 → HTTP/1.1 fallback sets chunked for an unknown length.
+- Request bodies: HTTP/1.1 requests with Content-Length are streamed through `Http1Connection.BodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. A chunked request body, or any body on h2/h3, is not attached yet; the proxy answers it with 501, as it did in phase 1.
+
+**Client (`routing.UpstreamPool` + `ProxyHandler`).**
+- The pipeline is `HttpClientCodec` + `Relay`, with autoRead off.
+- A bodyless request costs a single event-loop task: bind the exchange, write, `read()`, and arm the head timer. The request thread then parks on the head future.
+- Body chunks go into a per-exchange queue. The event loop keeps reading while fewer than 256 KiB are queued. After that it pauses, and the consumer resumes it once it has drained half. Interim 1xx responses are skipped.
+- Timeouts: `connect_timeout` is a Netty connect timeout (504). `response_timeout` is a timer on the event loop for the head (504), and also bounds each write of the request body. `idle_read_timeout` is a timer between body bytes that does not run while the window is paused (the client is the slow side). Mid-body it aborts the client response. Other errors give 502, as before.
+- **Memory bound (security finding F5).** In phase 1, responses up to `max_body` (16 MiB) were buffered per request. Now each exchange holds at most its 256 KiB read-ahead window. A slow client stops the writer, the writer stops taking chunks, and the upstream event loop stops reading, since autoRead is off and nothing calls `read()`. TCP then pushes back on the upstream. h2 also waits for stream writability before each chunk. As a global backstop, `routing.ByteBudget` counts the body bytes held by all exchanges. Its default is 64 MiB, set with `-Dsjws.proxy.maxInflightBytes`. While it is exhausted, no exchange reads ahead; an exchange reads again only when its own queue is empty. The overshoot is therefore at most one socket read per active exchange, and requests wait rather than get a 503. `ProxyHandler(Settings, ByteBudget)` and `budget().inFlight()` are the hooks for the Security workstream's slow-client heap-bound regression test.
+- A failed **reused** connection is retried once for a bodyless request (stale keep-alive). A request with a body is never retried.
+- `preserve_host` forwards the client's Host. Otherwise Host is the upstream authority, with the original in `X-Forwarded-Host`.
+- Lifecycle: `Router` and `ConfigSnapshot` are `AutoCloseable`.
+  - A reload closes the replaced snapshot after the swap. Idle connections close at once; leased ones close when their exchange ends.
+  - A rejected candidate is closed.
+  - `SjwsServer.close()` closes the live snapshot after the drain.
+  - The shared event-loop group stops when the last pool closes.
+
+**Results** (this box, a shared 8-vCPU VM with load from other agents, so numbers are noisy). The upstream is master's static server; the proxy and the upstream share CPUs 0-3, and wrk runs on 4-7. Interleaved A/B (`bench/proxy-routing/ab.sh`, 2 × 5 s each) against master `d592aaf` (phase 1, HttpClient):
+
+| wrk -t4 -c64, req/s | direct | phase 1 proxied | phase 2 proxied | phase 2 vs phase 1 |
+|---|---|---|---|---|
+| 1 KiB | 82,741 / 128,220 | 11,239 / 17,265 | 36,543 / 27,177 | 1.6–3.3× |
+| 64 KiB | 36,089 / 26,223 | 7,851 / 6,372 | 11,853 / 11,886 | 1.5–1.9× |
+| 4 MiB | 1,754 / 1,956 | 140 / 138 | 715 / 656 | ~5× |
+
+The full `run.sh` output (wrk and wrk2, routing disabled vs master) is in the PR description.
+
+## 13. Gateway features
+
+These build on the control-plane review on PR #38 (`UpstreamSet` snapshots swapped by reference). Each one is zero cost when it is not configured: `RoutingCompiler` simply does not wrap the handler.
+
+| Feature | Data-plane design | Needs from the control plane | Needs from Middleware Chain |
+|---|---|---|---|
+| **Discovery** (implemented in B.4: `routing.discovery` types, `routing.EndpointBalancer`, static `endpoints` lists; the CP watch client feeds `UpstreamRegistry.lookup(service).update(set)`, see `docs/ha/discovery.md`. Differences: an empty update keeps the last non-empty set, a never-populated source gives 503; upstreams are named, not `{service, selector}`) | Routes target `upstream: {service, selector}`. An `UpstreamSource.current()` volatile read gives an immutable `UpstreamSet{endpointsVersion, Endpoint[]}`. There is one `UpstreamPool` per endpoint, reference-counted across sets, so a membership change does not drop warm connections. An empty set gives 503. | An `Endpoints` watch frame per service (signed, its own monotonic `endpointsVersion`, debounced), and `Register` carrying the services. Persisted beside last-good. | Nothing. This lives below the filter chain, in `ProxyHandler`. |
+| **Weighted / canary routes** (implemented in B.2: `backends` with `pin` for the match and route-level `sticky`; retry/circuit stay per upstream) | `route.backends: [{upstream, weight}]`, plus optional `match: {header, cookie}` to pin canaries. Selection uses a precomputed alias table (O(1), no allocation); the sticky choice uses a hash of a header or cookie. Weights are part of the compiled snapshot, so a change is a config version. | Shipping the weights as config. A staged rollout (§9 of #38) can push weight steps as versions. | A per-route filter list (open question 1) to run the canary-only filters. |
+| **Retries** (implemented in B.1, per upstream: see `docs/user/config-file.md`; per-endpoint selection waits for discovery) | Per-route `retry: {attempts, on: [connect, 502, 503, reset], budget: 10%}`. Only idempotent methods, or bodyless requests, are retried, and only before any response byte has been relayed. The next attempt picks a different endpoint. A token-bucket retry budget per upstream prevents storms. Phase 2 already retries stale keep-alive connections. | Nothing beyond the endpoint sets. | A way for filters to see the attempt count (a request attribute), so that logging and metrics are per try. |
+| **Circuit breaking** (B.1: consecutive failures per upstream; B.4: per endpoint with error-rate window and panic mode on multi-endpoint upstreams; `max_pending` is not done) | Per endpoint, a lock-free consecutive-failure / error-rate window (an `AtomicLong` packed state). States are closed, open (eject for `eject_for` with exponential backoff), and half-open (one probe). Ejected endpoints are skipped by load balancing. If more than `max_ejection` would be ejected, fall back to "panic" (use all). A per-upstream `max_pending` / `max_connections` limit gives 503 quickly. | Coarse health only (SUSPECT/DEAD). Local outlier state stays local and is never pushed back. | Nothing. Optionally an observer hook for state changes. |
+| **Rate limits** (implemented in B.3: `routing.RateLimitFilter`, GCRA in a fixed `AtomicLongArray`, per route through `RequestFilters.wrapping` plus `routing.rate_limit`; local only) | A filter, not a router feature: `RateLimitFilter{key: peer|header|route, rate, burst}`. It uses a sharded token bucket (striped `AtomicLong`s keyed by a hash, with a fixed table size, so there is no `computeIfAbsent` growth) and answers 429 with `Retry-After`. Local limits only in v1. A global limit would split the quota per node, with the share received from the CP (rate / ready gateway count). | v2 only: the per-node quota share, recomputed when gateway membership changes. | The chain's ordering (run before auth/proxy), per-route attachment, and a short-circuit response API, which `RequestFilters` already has. |

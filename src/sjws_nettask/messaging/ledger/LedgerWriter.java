@@ -226,6 +226,11 @@ public final class LedgerWriter implements AutoCloseable {
     private void syncLoop() {
         long lastFsync = 0;
         while (true) {
+            // A waiter can be queued after the fsync that already covers it (writer checked durable just
+            // before this thread advanced it): complete those here, or they would wait forever.
+            long d0 = durableNow();
+            Waiter w0;
+            while ((w0 = fsyncWaiters.peek()) != null && w0.endOffset <= d0) { fsyncWaiters.poll(); w0.done.complete(w0.base); }
             long target = written;
             boolean dirty = target > durableNow();
             boolean wanted = dirty && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());

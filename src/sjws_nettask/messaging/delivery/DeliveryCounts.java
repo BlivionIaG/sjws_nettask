@@ -11,7 +11,11 @@ import java.util.Map;
  */
 public record DeliveryCounts(long version, long nextOffset, long enqueuedTotal, int liveMessages, Map<String, Group> groups) {
 
-    public record Group(long committedOffset, DeliverySnapshot.Counts counts) { }
+    /**
+     * @param committedOffset          first ledger offset not yet resolved (ACKED/DEAD_LETTERED) by the group
+     * @param oldestUnresolvedAtMs     enqueue time of the oldest message the group has not resolved (0 if none)
+     */
+    public record Group(long committedOffset, DeliverySnapshot.Counts counts, long oldestUnresolvedAtMs) { }
 
     public DeliveryCounts { groups = Collections.unmodifiableMap(new LinkedHashMap<>(groups)); }
 }

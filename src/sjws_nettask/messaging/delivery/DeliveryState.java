@@ -19,7 +19,8 @@ import java.util.TreeSet;
  */
 final class DeliveryState {
 
-    record Message(long offset, long producerId, long seq, long timestampMs, byte[] payload, String originGroup,
+    /** Message metadata only: the payload stays in the log segment at {@code offset} (step 3). */
+    record Message(long offset, long producerId, long seq, long timestampMs, int size, String originGroup,
             long originOffset, int originAttempts, String originReason) { }
 
     record Lease(String consumer, long deadlineMs, int attempt) { }
@@ -112,7 +113,7 @@ final class DeliveryState {
         if (offset != nextOffset) throw new IllegalStateException("gap: expected " + nextOffset + " got " + offset);
         switch (e) {
             case LedgerEntry.Enqueue x -> {
-                messages.put(offset, new Message(offset, x.producerId(), x.seq(), x.timestampMs(), x.payloadRef(),
+                messages.put(offset, new Message(offset, x.producerId(), x.seq(), x.timestampMs(), x.payloadRef().length,
                         x.originGroup(), x.originOffset(), x.originAttempts(), x.originReason()));
                 enqueued++;
                 for (var g : groups.values()) g.freshCount++;
@@ -195,7 +196,7 @@ final class DeliveryState {
         return g;
     }
 
-    /** Frees a message's payload once every group has resolved it (only when at least one group exists). */
+    /** Forgets a message once every group has resolved it (only when at least one group exists); its segment can then be reclaimed. */
     private void releaseIfDone(long offset) {
         for (var g : groups.values()) if (!g.resolved(offset) || g.dead.containsKey(offset)) return;
         messages.remove(offset);
@@ -220,7 +221,10 @@ final class DeliveryState {
 
     DeliveryCounts counts() {
         var gs = new LinkedHashMap<String, DeliveryCounts.Group>();
-        for (var g : groups.values()) gs.put(g.name, new DeliveryCounts.Group(g.committedOffset, countsOf(g)));
+        for (var g : groups.values()) {
+            var oldest = messages.ceilingEntry(g.committedOffset);
+            gs.put(g.name, new DeliveryCounts.Group(g.committedOffset, countsOf(g), oldest == null ? 0 : oldest.getValue().timestampMs()));
+        }
         return new DeliveryCounts(version, nextOffset, enqueued, messages.size(), gs);
     }
 
@@ -264,7 +268,7 @@ final class DeliveryState {
     private DeliverySnapshot.Item item(long offset, MessageState s, int attempts, String consumer, long timeMs, String reason) {
         var m = messages.get(offset);
         return new DeliverySnapshot.Item(offset, s, attempts, consumer, timeMs, m == null ? 0 : m.timestampMs,
-                m == null ? 0 : m.payload.length, reason);
+                m == null ? 0 : m.size, reason);
     }
 
     /** Canonical, comparable dump of the full state (tests: replay must reproduce it exactly). */
@@ -273,7 +277,7 @@ final class DeliveryState {
         sb.append("next=").append(nextOffset).append(" enq=").append(enqueued).append('\n');
         for (var m : messages.values())
             sb.append("m ").append(m.offset).append(' ').append(m.producerId).append(':').append(m.seq).append(' ')
-              .append(java.util.Arrays.hashCode(m.payload)).append(' ').append(m.originGroup).append('@').append(m.originOffset).append('\n');
+              .append(m.size).append(' ').append(m.originGroup).append('@').append(m.originOffset).append('\n');
         for (var g : groups.values()) {
             sb.append("g ").append(g.name).append(" start=").append(g.startOffset).append(" cur=").append(g.cursor)
               .append(" fresh=").append(g.freshCount).append(" commit=").append(g.committedOffset)
@@ -284,4 +288,100 @@ final class DeliveryState {
         sb.append("dedup=").append(new TreeMap<>(highestSeq)).append(" origins=").append(new TreeSet<>(origins));
         return sb.toString();
     }
+
+    // ---- on-disk snapshot (step 3) ----
+
+    static final int SNAP_MAGIC = 0x534a5353; // "SJSS"
+    static final int SNAP_VERSION = 1;
+
+    /** Serializes the full state (no payloads) as of {@link #nextOffset}, with a trailing CRC32C. */
+    byte[] serialize() {
+        try {
+            var bo = new java.io.ByteArrayOutputStream(64 + messages.size() * 48);
+            var o = new java.io.DataOutputStream(bo);
+            o.writeInt(SNAP_MAGIC); o.writeInt(SNAP_VERSION);
+            o.writeLong(nextOffset); o.writeLong(enqueued); o.writeLong(version);
+            o.writeInt(messages.size());
+            for (var m : messages.values()) {
+                o.writeLong(m.offset); o.writeLong(m.producerId); o.writeLong(m.seq); o.writeLong(m.timestampMs); o.writeInt(m.size);
+                o.writeUTF(m.originGroup); o.writeLong(m.originOffset); o.writeInt(m.originAttempts); o.writeUTF(m.originReason);
+            }
+            o.writeInt(groups.size());
+            for (var g : groups.values()) {
+                o.writeUTF(g.name); o.writeLong(g.startOffset); o.writeLong(g.cursor); o.writeLong(g.freshCount);
+                o.writeLong(g.committedOffset); o.writeLong(g.acked); o.writeLong(g.deadLettered); o.writeLong(g.redeliveries);
+                o.writeInt(g.inFlight.size());
+                for (var e : g.inFlight.entrySet()) { o.writeLong(e.getKey()); o.writeUTF(e.getValue().consumer()); o.writeLong(e.getValue().deadlineMs()); o.writeInt(e.getValue().attempt()); }
+                o.writeInt(g.retry.size());
+                for (var e : g.retry.entrySet()) { o.writeLong(e.getKey()); o.writeLong(e.getValue().notBeforeMs()); o.writeInt(e.getValue().attempts()); }
+                o.writeInt(g.dead.size());
+                for (var e : g.dead.entrySet()) { o.writeLong(e.getKey()); o.writeUTF(e.getValue().reason()); o.writeInt(e.getValue().attempts()); }
+                o.writeInt(g.resolvedAbove.size());
+                for (long x : g.resolvedAbove) o.writeLong(x);
+                o.writeInt(g.due.size());
+                for (var d : g.due) { o.writeLong(d.atMs()); o.writeLong(d.offset()); }
+            }
+            o.writeInt(dedup.size());
+            for (var e : new TreeMap<>(dedup).entrySet()) {
+                o.writeLong(e.getKey()); o.writeLong(highestSeq.get(e.getKey()));
+                o.writeInt(e.getValue().size());
+                for (var w : e.getValue().entrySet()) { o.writeLong(w.getKey()); o.writeLong(w.getValue()); }
+            }
+            o.writeInt(origins.size());
+            for (var x : new TreeSet<>(origins)) o.writeUTF(x);
+            o.flush();
+            var body = bo.toByteArray();
+            var c = new java.util.zip.CRC32C();
+            c.update(body);
+            return java.nio.ByteBuffer.allocate(body.length + 4).put(body).putInt((int) c.getValue()).array();
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e); // ByteArrayOutputStream does not throw
+        }
+    }
+
+    /** Inverse of {@link #serialize}; throws IllegalArgumentException on a bad CRC, magic or version. */
+    static DeliveryState deserialize(byte[] raw, RetryPolicy policy) {
+        if (raw.length < 12) throw new IllegalArgumentException("short snapshot");
+        var c = new java.util.zip.CRC32C();
+        c.update(raw, 0, raw.length - 4);
+        if ((int) c.getValue() != java.nio.ByteBuffer.wrap(raw, raw.length - 4, 4).getInt()) throw new IllegalArgumentException("snapshot crc");
+        try {
+            var in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(raw, 0, raw.length - 4));
+            if (in.readInt() != SNAP_MAGIC || in.readInt() != SNAP_VERSION) throw new IllegalArgumentException("snapshot format");
+            var st = new DeliveryState(policy);
+            st.nextOffset = in.readLong(); st.enqueued = in.readLong(); st.version = in.readLong();
+            for (int i = in.readInt(); i > 0; i--) {
+                var m = new Message(in.readLong(), in.readLong(), in.readLong(), in.readLong(), in.readInt(), in.readUTF(), in.readLong(), in.readInt(), in.readUTF());
+                st.messages.put(m.offset, m);
+            }
+            for (int i = in.readInt(); i > 0; i--) {
+                String name = in.readUTF();
+                long start = in.readLong();
+                var g = st.new Group(name, start);
+                g.cursor = in.readLong(); g.freshCount = in.readLong(); g.committedOffset = in.readLong();
+                g.acked = in.readLong(); g.deadLettered = in.readLong(); g.redeliveries = in.readLong();
+                for (int k = in.readInt(); k > 0; k--) g.inFlight.put(in.readLong(), new Lease(in.readUTF(), in.readLong(), in.readInt()));
+                for (int k = in.readInt(); k > 0; k--) g.retry.put(in.readLong(), new Retry(in.readLong(), in.readInt()));
+                for (int k = in.readInt(); k > 0; k--) g.dead.put(in.readLong(), new Dead(in.readUTF(), in.readInt()));
+                for (int k = in.readInt(); k > 0; k--) g.resolvedAbove.add(in.readLong());
+                for (int k = in.readInt(); k > 0; k--) g.due.add(new Due(in.readLong(), in.readLong()));
+                st.groups.put(name, g);
+            }
+            for (int i = in.readInt(); i > 0; i--) {
+                long pid = in.readLong();
+                st.highestSeq.put(pid, in.readLong());
+                var w = new LinkedHashMap<Long, Long>();
+                for (int k = in.readInt(); k > 0; k--) w.put(in.readLong(), in.readLong());
+                st.dedup.put(pid, w);
+            }
+            for (int i = in.readInt(); i > 0; i--) st.origins.add(in.readUTF());
+            if (in.available() != 0) throw new IllegalArgumentException("trailing snapshot bytes");
+            return st;
+        } catch (java.io.IOException e) {
+            throw new IllegalArgumentException("truncated snapshot", e);
+        }
+    }
+
+    /** Lowest ledger offset whose ENQUEUE record is still needed (oldest retained message), or {@link #nextOffset}. */
+    long oldestNeededMessageOffset() { return messages.isEmpty() ? nextOffset : messages.firstKey(); }
 }

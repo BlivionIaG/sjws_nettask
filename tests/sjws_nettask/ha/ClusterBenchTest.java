@@ -1,0 +1,38 @@
+package sjws_nettask.ha;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.nio.file.Files;
+import java.time.Duration;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+@Timeout(15)
+class ClusterBenchTest {
+
+    @Test
+    void clusterModeRunsASecondNodeAndSingleModeDoesNot() throws Exception {
+        var root = Files.createTempDirectory("ha-bench");
+        Files.writeString(root.resolve("index.html"), "x");
+        var single = BenchServer.launch(new BenchServer.Options("single", 0, root.toString()));
+        try {
+            assertTrue(single.tcpPort() > 0);
+            assertEquals(0, single.heartbeats());
+            assertEquals("single", single.mode());
+        } finally {
+            single.close();
+        }
+        var cluster = BenchServer.launch(new BenchServer.Options("cluster", 0, root.toString()));
+        try {
+            long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+            while (cluster.heartbeats() == 0 && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+            }
+            assertTrue(cluster.heartbeats() > 0);
+            assertEquals("cluster", cluster.mode());
+        } finally {
+            cluster.close();
+        }
+        assertThrows(IllegalArgumentException.class, () -> ClusterSide.start(Duration.ZERO));
+    }
+}
