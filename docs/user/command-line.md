@@ -56,17 +56,15 @@ ACME HTTP-01 issuance uses the staging CA unless you select production.
 `--status` uses 0 = running, 1 = pid file is stale, 3 = not running.
 
 What happens at startup, and where each exit code comes from. `--daemon` and `--restart` run the
-parent's steps first, then the detached child repeats everything below the decision:
+parent's steps first, then the detached child runs the whole sequence again, without the detach step:
 
 ```mermaid
 flowchart TD
-    s(["java -jar sjws_nettask.jar [options]"]) --> a["-h or --help: print usage, exit 0<br/>--stop or --status: act on the pid file and exit<br/>exit codes as listed above"]
-    a --> c["Load the configuration, resolve the role<br/>invalid, or a role without --bootstrap,<br/>or standalone with it: exit 64"]
-    c --> d{"--daemon or --restart?"}
-    d -->|yes| e["--restart stops the old server first<br/>Start a detached child JVM that repeats the steps<br/>below, and wait until the pid file names it<br/>20 s at most"]
-    d -->|no| bs["--bootstrap needs --pid-file and a valid<br/>bootstrap file, otherwise: exit 64"]
-    bs --> f["Document root must be a directory<br/>otherwise: exit 2"]
-    f --> g["Pid file must not name a live server<br/>otherwise: exit 1, already running"]
-    g --> h["Bind the TCP port (off by default for control)<br/>otherwise: exit 1, cannot listen"]
-    h --> i["Serve until SIGTERM or SIGINT, drain,<br/>then the JVM exits 143 or 130"]
+    s(["java -jar sjws_nettask.jar [options]"]) --> a["-h or --help: usage, exit<br/>0. --stop or --status: act<br/>on the pid file, then<br/>exit. Then load the config<br/>and resolve the role:<br/>invalid is exit 64"]
+    a --> d{"--daemon or --restart?"}
+    d -->|yes| e["A detached child JVM runs<br/>these steps again. The<br/>parent waits for its pid<br/>file, 20 s at most.<br/>--restart stops the old<br/>server first"]
+    d -->|no| bs["--bootstrap needs<br/>--pid-file and a valid<br/>bootstrap file: else exit<br/>64. The root must be a<br/>directory: else exit 2.<br/>The pid file must not name<br/>a live server: else exit 1"]
+    bs --> m["Start the enabled optional<br/>modules, then HTTP/3 and<br/>HTTP/2 (failure: WARN),<br/>then bind the TCP port.<br/>Failure: exit 1"]
+    m --> hk["Claim the pid file. With<br/>--bootstrap run the role<br/>hooks: status file, watch<br/>client or control-plane<br/>hosting. Failure: exit 1"]
+    hk --> i["Serve until SIGTERM or<br/>SIGINT, drain, the JVM<br/>exits 143 or 130"]
 ```

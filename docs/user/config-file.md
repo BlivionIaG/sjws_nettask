@@ -192,10 +192,9 @@ A bad signature, a canonical hash that is not the SHA-256 of the canonical
 document, or a lower non-zero `version` is rejected before the swap. An incoming
 canonical hash equal to the running snapshot's is a no-op: the file cache and
 upstream pools are left in place. It does not re-read the file and it does not
-replace the file: the user's YAML stays put. A data node writes last-good only
-after the swap, and only after the reload lock is released. HTTP/1 and HTTP/3
-can observe the new snapshot a moment apart: the publish updates the live
-reference, then the HTTP/3 handler and certificate.
+replace the file: the user's YAML stays put. A data node writes last-good after
+the swap. HTTP/1, HTTP/2 and HTTP/3 all read the live reference, so they see the
+new snapshot with the publish; the HTTP/3 certificate is replaced a moment later.
 
 The request path is that one volatile read and then the handler that was built
 with the snapshot. It does not parse YAML, match routes, or take the reload lock.
@@ -223,13 +222,17 @@ every rejection leaving the previous snapshot in place:
 
 ```mermaid
 flowchart TD
-    s1["1. reload() on a data node<br/>that already accepted a<br/>push: keep that config,<br/>re-read only the local<br/>bootstrap settings, stop"]
-    s1 --> s2["2. reload() re-reads the file<br/>(none or invalid: rejected)<br/>applyRemote first asks the<br/>signature verifier<br/>(refused: rejected)"]
-    s2 --> s3["3. Valid, and not an older<br/>bundle version, else rejected"]
-    s3 --> s4["4. Same canonical hash as the<br/>running snapshot: applied as<br/>a no-op, nothing is swapped"]
-    s4 --> s5["5. Bind-time settings and<br/>node.mode keep their old<br/>value (needsRestart), the<br/>certificate loads, the next<br/>snapshot compiles, a new<br/>HTTP-01 listener opens,<br/>else rejected"]
-    s5 --> s6["6. Publish with one<br/>AtomicReference write, close<br/>the old snapshot's pools, then<br/>the side effects: HTTP/3<br/>handler and certificate, the<br/>old HTTP-01 listener, ACME"]
-    s6 --> s7["7. After the lock is released,<br/>a data node writes last-good"]
+    r["reload(): SIGHUP, or r in<br/>the admin console. A data<br/>node that took a push<br/>keeps it and re-reads<br/>only its bootstrap<br/>settings. Otherwise the<br/>file is re-read (none or<br/>invalid: rejected)"]
+    p["applyRemote(SignedSnapshot),<br/>a push. DataApply.decide<br/>checks the signature and<br/>every envelope rule<br/>(refused: rejected). The<br/>same envelope is a no-op.<br/>Then the YAML is parsed"]
+    r --> s1
+    p --> s1
+    s1["1. Valid (schema,<br/>validator, messaging<br/>shape, files) and not an<br/>older bundle version,<br/>else rejected"]
+    s1 --> s2["2. A destructive<br/>messaging change without<br/>allow_destructive:<br/>rejected"]
+    s2 --> s3["3. Same canonical hash as<br/>the running snapshot: a<br/>no-op, nothing is swapped"]
+    s3 --> s4["4. Bind-time settings and<br/>node.mode keep their old<br/>value (needsRestart), the<br/>certificate loads, the<br/>next snapshot compiles"]
+    s4 --> s5["5. reload() on a data<br/>node: a changed routing,<br/>middleware, access, acme<br/>or topics section is<br/>rejected, it needs a push"]
+    s5 --> s6["6. A new HTTP-01 listener<br/>opens, then one<br/>AtomicReference write<br/>publishes. After it:<br/>close the old pools,<br/>update the reaper<br/>timeouts, replace the<br/>HTTP/3 certificate, close<br/>the old HTTP-01 listener,<br/>start or update ACME"]
+    s6 --> s7["7. A data node writes<br/>last-good: inside the<br/>lock for a push, after it<br/>for reload()"]
 ```
 
 HTTP/2 reads the live snapshot on every request, as HTTP/1.1 does, so a reload reaches it with

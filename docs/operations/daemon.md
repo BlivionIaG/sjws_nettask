@@ -24,13 +24,15 @@ sequenceDiagram
     participant F as Pid file<br/>and log file
 
     U->>P: java -jar ... --daemon
+    Note over P: load the configuration and resolve the role,<br/>invalid: exit 64
     P->>F: check the pid file and log file
-    Note over P,F: refuse if the pid file names a live server,<br/>or the log file is not writable
+    Note over P,F: refuse if the pid file names a live<br/>server, or the log file is not writable
     P->>C: start a second JVM
-    Note over P,C: in a new session when setsid exists,<br/>SJWS_DAEMON_CHILD=1,<br/>output appended to the log file
-    Note over C: load the configuration, make SIGHUP<br/>a reload, start the server
+    Note over P,C: new session when setsid exists,<br/>SJWS_DAEMON_CHILD=1, WEB_SERVER_* settings<br/>(not the two HA key variables),<br/>output appended to the log file
+    Note over C: load the configuration, make SIGHUP a<br/>reload, start the server: optional modules,<br/>HTTP/3, HTTP/2, the TCP port
     C->>F: write the pid file
-    Note over C,F: once the server is up
+    Note over C,F: once the server is listening
+    Note over C: with --bootstrap the role hooks run after that.<br/>A failure there is reported only in the log
     P->>F: poll for the child's pid
     P-->>U: Started sjws_nettask (pid N), exit 0
     Note over P,C: If the child exits first, or 20 s pass<br/>without a pid file (the child is then<br/>stopped), the parent prints the last<br/>log lines and exits non-zero
@@ -59,16 +61,21 @@ is present, then the same 5 second margin as before. A foreground process with
 logging to the console.
 
 ```mermaid
-flowchart TD
-    sig["SIGTERM or SIGINT<br/>--stop sends SIGTERM"] --> h["The shutdown hook calls<br/>SjwsServer.drain()<br/>with HA attached it first<br/>runs Lifecycle.drain():<br/>not-ready, deregistration<br/>delay, Connection: close"]
-    h --> a["close(): stop the ACME<br/>renew thread and the<br/>HTTP-01 listener,<br/>withdraw Alt-Svc"]
-    a --> b["Stop accepting on<br/>every listener<br/>HTTP/2 sends GOAWAY,<br/>HTTP/3 refuses new<br/>connections, the TCP listen<br/>socket closes<br/>idle and half-read<br/>HTTP/1.1 connections<br/>are dropped at once"]
-    b --> d{"Responses in progress<br/>finished in time?"}
-    d -->|"yes, within --shutdown-timeout, default 10 s"| e["Listeners and<br/>threads are<br/>released"]
-    d -->|no| f["Whatever is still<br/>open is closed"]
-    e --> g["The proxy's upstream pools<br/>are closed. A control or data<br/>process removes its status<br/>file. The pid file goes and<br/>the JVM exits 143 (SIGTERM)<br/>or 130 (SIGINT)"]
-    f --> g
-    b -.-> par["HTTP/2 and HTTP/3<br/>drain in parallel<br/>HTTP/2 up to<br/>--shutdown-timeout, HTTP/3<br/>sends GOAWAY, then up to 2 s"]
+sequenceDiagram
+    participant H as Shutdown hook
+    participant S as SjwsServer
+
+    Note over H: SIGTERM or SIGINT, --stop sends SIGTERM
+    H->>S: drain()
+    Note over S: with HA attached (embedders only),<br/>Lifecycle.drain runs first: not-ready,<br/>deregistration delay, Connection: close
+    Note over S: close() removes the SIGHUP hook, stops<br/>ACME renewal and the HTTP-01 listener,<br/>withdraws Alt-Svc
+    Note over S: stop accepting on every listener: HTTP/2<br/>GOAWAY, HTTP/3 refuses new connections, the<br/>TCP socket closes. Idle and half-read<br/>HTTP/1.1 connections are dropped at once
+    Note over S: responses in progress finish, up to<br/>--shutdown-timeout (default 10 s). HTTP/2 and<br/>HTTP/3 drain in parallel, HTTP/3 up to 2 s.<br/>Whatever is still open is closed
+    Note over S: close the proxy's upstream pools,<br/>then the access-log writer
+    S-->>H: drained
+    Note over H: wait up to 5 s for main to log<br/>Server Terminated properly !
+    Note over H: role hooks: a control process closes its<br/>control plane (admin, watch, store), a data<br/>process stops its watch client, and the<br/>status file is removed
+    Note over H: remove the pid file, then the JVM exits<br/>143 (SIGTERM) or 130 (SIGINT)
 ```
 
 `contrib/sjws` is a small start/stop/status/restart wrapper (`SJWS_JAR`, `SJWS_PID_FILE`,

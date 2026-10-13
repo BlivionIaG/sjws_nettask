@@ -44,7 +44,7 @@ flowchart TD
     probe --> rec
     h --> rec["Record when the<br/>response is built,<br/>before the socket<br/>write<br/>striped LongAdders:<br/>status, protocol,<br/>latency bucket, bytes"]
     rec --> lg{"Access log on?"}
-    lg -->|yes| q{"Room in the bounded<br/>lock-free queue?"}
+    lg -->|yes| q{"Room in the bounded<br/>lock-free queue, and<br/>the writer still running?"}
     q -->|yes| th["The access-log thread<br/>writes and flushes<br/>to stdout or the file"]
     q -->|no| dr["The line is<br/>dropped and<br/>counted<br/>accessLogDropped"]
 ```

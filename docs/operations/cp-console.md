@@ -45,3 +45,34 @@ this), so the console costs nothing when it is not used.
 - **Audit** (`l`): who did what, plus the endpoint switches of the failover client.
 - **Failover**: `FailoverCpClient` sticks to one endpoint, moves on when it is unreachable, follows
   `NOT_LEADER` hints, and retries writes safely because every write carries an idempotency key.
+
+Apply (`a <selector>`) as the live console runs it. Every call goes through `FailoverCpClient`: a 503 or a
+connection failure moves to the next endpoint, and a retried write keeps its `Idempotency-Key`:
+
+```mermaid
+sequenceDiagram
+    participant C as CpConsole
+    participant K as HttpCpClient
+    participant S as Control plane
+
+    Note over C: a SELECTOR. Parse it first: a bad one sends<br/>nothing. Nothing edited: "nothing to apply"
+    C->>K: validate the draft
+    Note over K: sections but access.rules are read-only,<br/>an edit there fails here
+    K->>S: POST /cp/v1/config:validate
+    S-->>K: errors, if any
+    C->>K: stage on the base version
+    K->>S: GET /cp/v1/config
+    Note over K: head is not the base version: CONFLICT,<br/>the draft is kept
+    K->>S: POST /cp/v1/config, Idempotency-Key
+    Note over S: 503 if the leader is not ready,<br/>409 if a proposal is already staged
+    alt the selector is *
+        C->>K: roll out
+        K->>S: POST /cp/v1/activate
+    else any other selector
+        C->>K: roll out
+        K->>S: POST /cp/v1/rollout, selector as stage
+    end
+    C->>K: reset the base
+    K->>S: GET /cp/v1/config, /config/{version}
+    Note over C: a rollout failure after staging keeps the version:<br/>"staged but not rolled out", then p selector
+```
