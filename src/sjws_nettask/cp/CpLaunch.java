@@ -66,7 +66,7 @@ public final class CpLaunch {
         if (config.selfIsWitness()) {
             return CpWitnessHost.start(config, deps);
         }
-        return CpHost.start(config, deps);
+        return CpHost.start(config, deps, err);
     }
 
     static NodeId nodeId(CpConfig.Peer peer) {
@@ -97,9 +97,13 @@ public final class CpLaunch {
         return VoterSet.majority(members, ids);
     }
 
-    /** The shipped dependencies. Key loading and listener TLS are Security's stubs today, so this fails closed. */
+    /**
+     * The shipped dependencies: {@link KeyRing#load} and {@link CpTls#serverContext} from Security (#160). The
+     * voter transport waits for TcpTransport (#158), so a configured {@code cp.peers} fails closed for now.
+     */
     static CpHostDeps production(Map<String, Object> yamlCp, Path configBase) {
-        var tls = CpListenerConfig.fromYaml(yamlCp == null ? null : yamlCp.get("tls"), configBase);
+        var tls = yamlCp == null ? null : yamlCp.get("tls");
+        boolean insecure = yamlCp != null && Boolean.TRUE.equals(yamlCp.get("insecureSkipPermissionChecks"));
         return new CpHostDeps() {
             @Override
             public Clock clock() {
@@ -118,31 +122,44 @@ public final class CpLaunch {
             }
 
             @Override
-            public Listeners listeners() {
-                return new Listeners() {
-                    @Override
-                    public Object prepareTls() throws java.security.GeneralSecurityException, IOException {
-                        return CpTls.serverContext(tls);
-                    }
-
-                    @Override
-                    public AutoCloseable openWatch(CpStore store, InetSocketAddress address, Object context)
-                            throws IOException {
-                        throw new IOException("mTLS watch listener is Security's (CpListenerConfig); not wired yet");
-                    }
-
-                    @Override
-                    public AutoCloseable openAdmin(CpStore store, InetSocketAddress address, Object context)
-                            throws IOException {
-                        throw new IOException("mTLS admin listener is Security's (CpListenerConfig); not wired yet");
-                    }
-
-                    @Override
-                    public void swapTls(Object context) {
-                        // Security's reloadTls() installs the context.
-                    }
-                };
+            public CpServerTls serverTls(String listener) throws CpKeyException {
+                return CpTls.serverContext(listenerConfig(tls, configBase, listener, insecure));
             }
         };
+    }
+
+    /**
+     * {@code cp.tls.{cert,key,ca,adminCa,revocations}}: the watch listener trusts {@code ca} (data nodes), the
+     * admin listener {@code adminCa}. Paths only.
+     */
+    static CpListenerConfig listenerConfig(Object tls, Path base, String listener, boolean insecure)
+            throws CpKeyException {
+        if (!(tls instanceof Map<?, ?> map)) {
+            throw new CpKeyException("cp.tls is required for " + listener);
+        }
+        for (var key : map.keySet()) {
+            if (!java.util.Set.of("cert", "key", "ca", "adminCa", "revocations").contains(key)) {
+                throw new CpKeyException("Unknown key cp.tls." + key);
+            }
+        }
+        var ca = "cp-admin".equals(listener) ? "adminCa" : "ca";
+        try {
+            return new CpListenerConfig(listener, path(map, "cert", base), path(map, "key", base),
+                    path(map, ca, base), path(map, "revocations", base), insecure);
+        } catch (IllegalArgumentException e) {
+            throw new CpKeyException("cp.tls: " + e.getMessage(), e);
+        }
+    }
+
+    private static Path path(Map<?, ?> map, String key, Path base) throws CpKeyException {
+        var raw = map.get(key);
+        if (raw == null) {
+            return null;
+        }
+        if (!(raw instanceof String s) || s.isBlank()) {
+            throw new CpKeyException("cp.tls." + key + " must be a path");
+        }
+        var p = Path.of(s);
+        return p.isAbsolute() || base == null ? p : base.resolve(p);
     }
 }

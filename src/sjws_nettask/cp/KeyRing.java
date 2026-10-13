@@ -76,8 +76,18 @@ public final class KeyRing {
         var key = new TrustKey(keyId, online.getPublic().getEncoded(), notAfterMillis, versionMin, versionMax);
         var input = SnapshotCrypto.trustInput(versionFloor, List.of(key));
         var signature = sign(root.getPrivate(), input);
-        return new KeyRing(root.getPrivate(), root.getPublic().getEncoded(), online.getPrivate(), key, versionFloor,
-                signature);
+        var spki = root.getPublic().getEncoded();
+        // A generated ring also carries a root-signed trust bundle (serial 1), so the watch wire is the same for
+        // generated (tests, ceremony) and loaded rings.
+        TrustBundle bundle;
+        try {
+            bundle = TrustBundle.parse(TrustBundle.sign(root.getPrivate(), spki, 1L, Math.min(0L, notAfterMillis - 1), notAfterMillis, versionFloor,
+                    List.of(key)), spki);
+        } catch (CpKeyException e) {
+            throw new IllegalStateException("generated trust bundle does not parse: " + e.getMessage(), e);
+        }
+        return new KeyRing(root.getPrivate(), spki, online.getPrivate(), key, versionFloor, signature, bundle,
+                TrustBundle.fingerprint(spki), false);
     }
 
     /**
@@ -104,12 +114,12 @@ public final class KeyRing {
                 fingerprint, insecure);
     }
 
-    /** The loaded {@code trust.bundle}; null for a {@link #generate generated} ring. */
+    /** The root-signed trust bundle: the loaded {@code trust.bundle}, or serial 1 for a {@link #generate generated} ring. */
     public TrustBundle bundle() {
         return bundle;
     }
 
-    /** Hex SHA-256 of the root SPKI; null for a generated ring. */
+    /** Hex SHA-256 of the root SPKI. */
     public String rootFingerprint() {
         return rootFingerprint;
     }

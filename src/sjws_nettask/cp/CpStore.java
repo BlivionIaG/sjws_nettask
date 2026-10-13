@@ -625,7 +625,7 @@ public final class CpStore implements AutoCloseable {
     public String healthJson() {
         var leader = leadership.leaderId().map(LastGoodFiles::jsonString).orElse("null");
         return "{\"leader\":" + leader + ",\"term\":" + leadership.term() + ",\"leaderReady\":"
-                + leadership.leaderReady() + ",\"voters\":1}";
+                + leadership.leaderReady() + ",\"voters\":1,\"insecurePermissions\":" + keys.insecurePermissions() + "}";
     }
 
     /**

@@ -120,6 +120,26 @@ public final class AdminServer implements AutoCloseable {
         return tls == null ? "plain listener has no TLS material" : tls.reload();
     }
 
+    /**
+     * mTLS admin listener on {@code address} with Security's listener TLS: {@link CpServerTls#context()} and
+     * {@link CpServerTls#parameters()} on every connection. Reload goes through {@link CpServerTls#reloadTls()}.
+     */
+    public static AdminServer startMtls(CpStore store, InetSocketAddress address, long nowMillis, long ttlMillis,
+            CpServerTls serverTls) throws IOException {
+        java.util.Objects.requireNonNull(serverTls, "serverTls");
+        var https = HttpsServer.create(address, 0);
+        https.setHttpsConfigurator(new HttpsConfigurator(serverTls.context()) {
+            @Override
+            public void configure(HttpsParameters params) {
+                params.setSSLParameters(serverTls.parameters());
+            }
+        });
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), null);
+        https.createContext("/", bound::handle);
+        https.start();
+        return bound;
+    }
+
     /** Plain HTTP, for tests that exercise routes without a certificate. Production code uses {@link #start}. */
     public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis) throws IOException {
         var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);

@@ -105,6 +105,29 @@ public final class WatchServer implements AutoCloseable {
     }
 
     /**
+     * Binds {@code address} with Security's listener TLS ({@link CpTls#serverContext}): the stable
+     * {@link CpServerTls#context()} and its {@link CpServerTls#parameters()} on every accepted connection.
+     * Reload is {@link CpServerTls#reloadTls()} (the CONTROL host's SIGHUP hook); this server only reads it.
+     */
+    public static WatchServer startMtls(CpStore store, InetSocketAddress address, LongSupplier nowMillis,
+            CpServerTls serverTls) throws IOException {
+        java.util.Objects.requireNonNull(serverTls, "serverTls");
+        var https = HttpsServer.create(address, 0);
+        https.setHttpsConfigurator(new HttpsConfigurator(serverTls.context()) {
+            @Override
+            public void configure(HttpsParameters params) {
+                params.setSSLParameters(serverTls.parameters());
+            }
+        });
+        var executor = Executors.newVirtualThreadPerTaskExecutor();
+        https.setExecutor(executor);
+        var watch = new WatchServer(https, executor, store, nowMillis, null);
+        https.createContext("/cp/v1/watch", watch::handle);
+        https.start();
+        return watch;
+    }
+
+    /**
      * The one place the listening socket is created: plain {@code HttpServer} when {@code tls} is
      * null, otherwise an {@code HttpsServer} requiring TLS 1.3 client authentication.
      */

@@ -118,7 +118,7 @@ class WatchTest {
             assertEquals(200, got.statusCode());
             var message = WatchWire.decode(got.body());
             assertEquals(store.activated(), message.snapshot());
-            assertEquals(keys.keys().size(), message.keys().size());
+            assertEquals(keys.keys().size(), TrustBundle.parse(message.bundle(), keys.rootPublic()).keys().size());
             assertEquals(204, call(p, "GET", "/cp/v1/watch?after=1&waitMs=0", "gw-1", "t", ok).statusCode());
             assertEquals(204, call(p, "POST", "/cp/v1/watch/ack?version=1", "gw-1", "t", ok).statusCode());
             assertTrue(store.nodesJson().contains("\"gw-1\""), store.nodesJson());
@@ -130,33 +130,21 @@ class WatchTest {
         }
     }
 
-    /** keyCount is a long on the wire: bounds at MAX_KEYS, and int-overflow sizes fail closed. */
+    /** The wire carries the exact TrustBundle bytes; an oversized or non-base64 bundle fails closed. */
     @Test
-    void keyCountBoundaries() throws Exception {
+    void bundleBytesOnTheWire() throws Exception {
         var keys = keys();
         try (var store = elected(this.dir.resolve("cp"), keys)) {
             assertEquals(200, store.propose("server:\n  port: 0\n  root: " + root() + "\n").status());
             assertEquals(200, store.activate(System.currentTimeMillis(), 60_000L).status());
             var text = WatchWire.encode(keys, store.activated());
-            int from = text.indexOf(",\"k0.keyId\":");
-            int to = text.indexOf(",\"snapshot\":");
-            var k0 = text.substring(from, to);
-            for (int n : new int[] {1, WatchWire.MAX_KEYS - 1, WatchWire.MAX_KEYS}) {
-                var extra = new StringBuilder();
-                for (int i = 1; i < n; i++) {
-                    extra.append(k0.replace("\"k0.", "\"k" + i + "."));
-                }
-                var padded = text.substring(0, to).replace("\"keyCount\":1", "\"keyCount\":" + n) + extra
-                        + text.substring(to);
-                assertEquals(n, WatchWire.decode(padded).keys().size(), "keyCount " + n);
-            }
-            long[] bad = {0L, -1L, WatchWire.MAX_KEYS + 1L, Integer.MAX_VALUE, Integer.MAX_VALUE + 1L,
-                    1L << 32, (1L << 32) + 1L, Long.MAX_VALUE, Long.MIN_VALUE};
-            for (long n : bad) {
-                var e = assertThrows(IOException.class,
-                        () -> WatchWire.decode(text.replace("\"keyCount\":1", "\"keyCount\":" + n)), "keyCount " + n);
-                assertEquals("keyCount", e.getMessage(), "keyCount " + n);
-            }
+            assertArrayEquals(keys.bundle().encoded(), WatchWire.decode(text).bundle());
+            var b64 = java.util.Base64.getEncoder().encodeToString(keys.bundle().encoded());
+            var huge = "A".repeat((TrustBundle.MAX_BYTES + 2) / 3 * 4 + 4);
+            assertEquals("bundle size",
+                    assertThrows(IOException.class, () -> WatchWire.decode(text.replace(b64, huge))).getMessage());
+            assertThrows(IOException.class, () -> WatchWire.decode(text.replace(b64, "!!")));
+            assertThrows(IOException.class, () -> WatchWire.decode(text.replace("\"bundle\":", "\"b\":")));
         }
     }
 
@@ -179,10 +167,17 @@ class WatchTest {
             LastGoodFiles.writePin(high, keys.rootPublic(), 5);
             assertThrows(IOException.class,
                     () -> DataApply.trusted(high, message, this.dir.resolve("s"), System::currentTimeMillis));
-            assertThrows(IOException.class, () -> WatchWire.decode(text.replace("\"keyCount\":1", "\"keyCount\":0")));
             assertThrows(IOException.class, () -> WatchWire.decode(text.replace("\"snapshot\":", "\"snap\":")));
-            assertThrows(IOException.class, () -> WatchWire.decode(text.replace("\"k0.keyId\":\"online-1\"",
-                    "\"k0.keyId\":\"\"")));
+            // A tampered bundle (one byte flipped) does not verify under the pinned root.
+            var bytes = message.bundle();
+            bytes[TrustBundle.DOMAIN.length + 4] ^= 1;
+            var tampered = new WatchWire.Message(bytes, message.snapshot());
+            assertThrows(IOException.class,
+                    () -> DataApply.trusted(pin, tampered, this.dir.resolve("s"), System::currentTimeMillis));
+            // The legacy trustInput signature is not a bundle.
+            var legacy = new WatchWire.Message(keys.trustSignature(), message.snapshot());
+            assertThrows(IOException.class,
+                    () -> DataApply.trusted(pin, legacy, this.dir.resolve("s"), System::currentTimeMillis));
         }
     }
 

@@ -17,14 +17,13 @@
 package sjws_nettask.cp;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.security.GeneralSecurityException;
 import sjws_nettask.cluster.Clock;
 import sjws_nettask.cluster.ClusterTransport;
 
 /**
  * What a CONTROL-role host needs from outside (control-plane-hosting.md §1). {@link CpLaunch#production} is the
- * shipped set; tests pass loopback listeners, {@link KeyRing#generate} and a shared in-process transport.
+ * shipped set: {@link KeyRing#load} and {@link CpTls#serverContext} (Security, #160). Tests pass
+ * {@link KeyRing#generate}, plain loopback listeners and a shared in-process transport.
  */
 public interface CpHostDeps {
 
@@ -36,19 +35,9 @@ public interface CpHostDeps {
     /** Full voters only; a witness never calls this. */
     KeyRing loadKeys(CpKeyConfig config) throws CpKeyException;
 
-    Listeners listeners();
-
-    /** WatchServer and AdminServer binding. TLS material is Security's ({@link CpTls#serverContext}). */
-    interface Listeners {
-
-        /** Builds (but does not install) the listener TLS material. */
-        Object prepareTls() throws GeneralSecurityException, IOException;
-
-        AutoCloseable openWatch(CpStore store, InetSocketAddress address, Object tls) throws IOException;
-
-        AutoCloseable openAdmin(CpStore store, InetSocketAddress address, Object tls) throws IOException;
-
-        /** Installs material from {@link #prepareTls()} for new handshakes. Must not fail. */
-        void swapTls(Object tls);
-    }
+    /**
+     * Server TLS for one listener ({@code cp-watch}, {@code cp-admin}). Null means a plain listener, which
+     * {@link CpHost} accepts only on a loopback address (tests and local development).
+     */
+    CpServerTls serverTls(String listener) throws CpKeyException;
 }

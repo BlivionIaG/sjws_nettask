@@ -16,10 +16,7 @@
  */
 package sjws_nettask.cp;
 
-import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import sjws_nettask.cluster.Clock;
 import sjws_nettask.cluster.ClusterTransport;
 import sjws_nettask.cluster.SimTransport;
@@ -29,11 +26,8 @@ final class CpTestDeps implements CpHostDeps {
 
     final ClusterTransport net;
     final AtomicInteger keyLoads = new AtomicInteger();
-    final AtomicReference<Object> tlsInstalled = new AtomicReference<>("tls-0");
-    final AtomicInteger tlsBuilt = new AtomicInteger();
-    volatile boolean failTls;
     volatile boolean failKeys;
-    volatile boolean failAdmin;
+    volatile boolean insecure;
 
     CpTestDeps(ClusterTransport net) {
         this.net = net;
@@ -59,38 +53,31 @@ final class CpTestDeps implements CpHostDeps {
             throw new CpKeyException("test: bad bundle");
         }
         keyLoads.incrementAndGet();
+        if (insecure) {
+            try {
+                return insecureRing();
+            } catch (Exception e) {
+                throw new CpKeyException("test", e);
+            }
+        }
         return KeyRing.generate("online-" + keyLoads.get(), Long.MAX_VALUE, 0, Long.MAX_VALUE);
     }
 
+    /** Plain loopback listeners. */
     @Override
-    public Listeners listeners() {
-        return new Listeners() {
-            @Override
-            public Object prepareTls() throws java.security.GeneralSecurityException {
-                if (failTls) {
-                    throw new java.security.GeneralSecurityException("test: bad cert");
-                }
-                return "tls-" + tlsBuilt.incrementAndGet();
-            }
+    public CpServerTls serverTls(String listener) {
+        return null;
+    }
 
-            @Override
-            public AutoCloseable openWatch(CpStore store, InetSocketAddress address, Object tls) throws IOException {
-                return WatchServer.start(store, new InetSocketAddress("127.0.0.1", 0), System::currentTimeMillis,
-                        null);
-            }
-
-            @Override
-            public AutoCloseable openAdmin(CpStore store, InetSocketAddress address, Object tls) throws IOException {
-                if (failAdmin) {
-                    throw new IOException("test: admin bind failed");
-                }
-                return AdminServer.startPlainForTests(store, System.currentTimeMillis(), 60_000L);
-            }
-
-            @Override
-            public void swapTls(Object tls) {
-                tlsInstalled.set(tls);
-            }
-        };
+    /** A ring as {@link KeyRing#load} would return it with {@code insecureSkipPermissionChecks}. */
+    static KeyRing insecureRing() throws Exception {
+        var gen = java.security.KeyPairGenerator.getInstance("Ed25519");
+        var root = gen.generateKeyPair();
+        var online = gen.generateKeyPair();
+        var spki = root.getPublic().getEncoded();
+        var key = new TrustKey("online-x", online.getPublic().getEncoded(), Long.MAX_VALUE, 0, Long.MAX_VALUE);
+        var bundle = TrustBundle.parse(TrustBundle.sign(root.getPrivate(), spki, 1, 0, Long.MAX_VALUE, 0,
+                java.util.List.of(key)), spki);
+        return KeyRing.loaded(spki, online.getPrivate(), key, bundle, TrustBundle.fingerprint(spki), true);
     }
 }

@@ -148,44 +148,67 @@ class CpHostTest {
     @Test
     void failureMidStartClosesInReverse() throws Exception {
         var deps = new CpTestDeps();
-        deps.failAdmin = true;
-        var e = assertThrows(IOException.class, () -> CpLaunch.start(config(yaml("cp-1", 0, 0)), deps, err));
-        assertTrue(e.getMessage().contains("admin bind failed"));
-        deps.failAdmin = false;
-        // The state dir is free again: a fresh start succeeds.
+        var y = yaml("cp-1", 0, 0);
+        y.put("admin", Map.of("listen", "10.255.255.1:7444")); // plain listener off loopback: refused
+        var e = assertThrows(IOException.class, () -> CpLaunch.start(config(y), deps, err));
+        assertTrue(e.getMessage().contains("must be loopback"), e.getMessage());
+        // The watch listener and the store were closed: the state dir is free and a fresh start succeeds.
         try (var host = CpLaunch.start(config(yaml("cp-1", 0, 0)), deps, err)) {
             assertNull(host.reload());
         }
     }
 
     @Test
-    void reloadSwapsTlsAndKeysTogetherOrNeither() throws Exception {
+    void reloadLoadsKeysThenTlsAndSwapsOnlyIfBothSucceed() throws Exception {
         var deps = new CpTestDeps();
         try (var host = (CpHost) CpLaunch.start(config(yaml("cp-1", 0, 0)), deps, err)) {
+            var tlsCalls = new java.util.concurrent.atomic.AtomicInteger();
+            var tlsFails = new java.util.concurrent.atomic.AtomicBoolean();
+            host.tlsReloads.add(() -> {
+                tlsCalls.incrementAndGet();
+                if (tlsFails.get()) {
+                    throw new CpKeyException("test: bad cert");
+                }
+            });
             var keys = host.store().keys();
             deps.failKeys = true;
             assertNotNull(host.reload());
             assertSame(keys, host.store().keys());
-            assertEquals("tls-0", deps.tlsInstalled.get(), "TLS not swapped when the key ring fails");
+            assertEquals(0, tlsCalls.get(), "TLS is not touched when KeyRing.load fails");
             deps.failKeys = false;
-            deps.failTls = true;
-            assertNotNull(host.reload());
-            assertSame(keys, host.store().keys(), "keys not swapped when TLS fails");
-            deps.failTls = false;
+            tlsFails.set(true);
+            assertTrue(host.reload().contains("TLS"));
+            assertSame(keys, host.store().keys(), "ring not swapped when a listener reload fails");
+            tlsFails.set(false);
             assertNull(host.reload());
             assertNotSame(keys, host.store().keys());
-            assertNotEquals("tls-0", deps.tlsInstalled.get());
+            assertEquals(2, tlsCalls.get());
         }
     }
 
     @Test
-    void productionStartFailsClosedOnTheKeyRingStub() {
+    void insecureRingWarnsRepeatedlyAndFlagsHealth() throws Exception {
+        var deps = new CpTestDeps();
+        deps.insecure = true;
+        var out = new ByteArrayOutputStream();
+        var print = new PrintStream(out, true);
+        try (var host = (CpHost) CpHost.start(config(yaml("cp-1", 0, 0)), deps, print,
+                java.time.Duration.ofMillis(20))) {
+            await(() -> out.toString().split(java.util.regex.Pattern.quote(CpHost.INSECURE_WARNING), -1).length > 3,
+                    "repeated insecure WARN");
+            assertTrue(host.insecurePermissions());
+            assertTrue(host.store().healthJson().contains("\"insecurePermissions\":true"), host.store().healthJson());
+        }
+        try (var host = (CpHost) CpLaunch.start(config(yaml("cp-1", 0, 0)), new CpTestDeps(), err)) {
+            assertTrue(host.store().healthJson().contains("\"insecurePermissions\":false"));
+        }
+    }
+
+    @Test
+    void productionStartFailsClosedWithoutKeyFiles() {
         var y = yaml("cp-1", 0, 0);
         var e = assertThrows(IOException.class, () -> CpLaunch.launch(y, null, err));
-        assertTrue(e.getMessage().contains("KeyRing.load is not implemented"), e.getMessage());
-        var peers = yaml("cp-1", 3, 0);
-        var t = assertThrows(IOException.class, () -> CpLaunch.launch(peers, null, err));
-        assertTrue(t.getMessage().contains("KeyRing.load") || t.getMessage().contains("TcpTransport"), t.getMessage());
+        assertTrue(e.getMessage().contains("key ring not loaded"), e.getMessage());
         assertThrows(IOException.class, () -> CpLaunch.launch(Map.of("nodeId", "x"), null, err));
     }
 

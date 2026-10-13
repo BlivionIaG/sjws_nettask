@@ -17,7 +17,9 @@
 package sjws_nettask.cp;
 
 import java.io.IOException;
+import java.io.PrintStream;
 import java.net.InetSocketAddress;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -31,22 +33,42 @@ import sjws_nettask.service.CpReloadable;
  */
 public final class CpHost implements CpReloadable {
 
+    /** One listener's in-place TLS reload ({@link CpServerTls#reloadTls()}). */
+    @FunctionalInterface
+    interface TlsReload {
+        void reloadTls() throws CpKeyException;
+    }
+
+    static final String INSECURE_WARNING = "WARN: control plane running with cp.insecureSkipPermissionChecks:"
+            + " key file owner/mode checks are OFF. Development only.";
+
     private final CpConfig config;
     private final CpHostDeps deps;
+    private final PrintStream err;
+    private final Duration warnEvery;
     private final List<String> events = new CopyOnWriteArrayList<>();
+    final List<TlsReload> tlsReloads = new CopyOnWriteArrayList<>();
     private CpStore store;
     private AutoCloseable watch;
     private AutoCloseable admin;
+    private Thread insecureWarner;
     private volatile boolean closed;
 
-    private CpHost(CpConfig config, CpHostDeps deps) {
+    private CpHost(CpConfig config, CpHostDeps deps, PrintStream err, Duration warnEvery) {
         this.config = config;
         this.deps = deps;
+        this.err = err;
+        this.warnEvery = warnEvery;
     }
 
     /** Declared as {@link CpReloadable} so callers link no cp type. */
-    public static CpReloadable start(CpConfig config, CpHostDeps deps) throws IOException {
-        var host = new CpHost(config, deps);
+    public static CpReloadable start(CpConfig config, CpHostDeps deps, PrintStream err) throws IOException {
+        return start(config, deps, err, Duration.ofHours(1));
+    }
+
+    static CpReloadable start(CpConfig config, CpHostDeps deps, PrintStream err, Duration warnEvery)
+            throws IOException {
+        var host = new CpHost(config, deps, err, warnEvery);
         try {
             host.open();
         } catch (IOException | RuntimeException e) {
@@ -73,17 +95,64 @@ public final class CpHost implements CpReloadable {
         }
         store.start();
         events.add("store");
-        Object tls;
-        try {
-            tls = deps.listeners().prepareTls();
-        } catch (java.security.GeneralSecurityException e) {
-            throw new IOException("control role: listener TLS not ready: " + e.getMessage(), e);
+        if (keys.insecurePermissions()) {
+            startInsecureWarner();
         }
-        watch = deps.listeners().openWatch(store, resolve(config.watchListen()), tls);
+        var watchTls = serverTls("cp-watch");
+        var watchAt = resolve(config.watchListen());
+        if (watchTls == null) {
+            watch = WatchServer.start(store, loopback(watchAt, "cp.watch.listen"), deps.clock()::currentTimeMillis,
+                    (CpTls) null);
+        } else {
+            watch = WatchServer.startMtls(store, watchAt, deps.clock()::currentTimeMillis, watchTls);
+            tlsReloads.add(watchTls::reloadTls);
+        }
         events.add("watch");
-        admin = deps.listeners().openAdmin(store, resolve(config.adminListen()), tls);
+        var adminTls = serverTls("cp-admin");
+        var adminAt = resolve(config.adminListen());
+        long now = deps.clock().currentTimeMillis();
+        if (adminTls == null) {
+            loopback(adminAt, "cp.admin.listen");
+            admin = AdminServer.startPlainForTests(store, now, 60_000L);
+        } else {
+            admin = AdminServer.startMtls(store, adminAt, now, 60_000L, adminTls);
+            tlsReloads.add(adminTls::reloadTls);
+        }
         events.add("admin");
         events.add("ready");
+    }
+
+    private CpServerTls serverTls(String name) throws IOException {
+        try {
+            return deps.serverTls(name);
+        } catch (CpKeyException e) {
+            throw new IOException("control role: " + name + " TLS refused: " + e.getMessage(), e);
+        }
+    }
+
+    /** Hourly WARN while a ring loaded with {@code insecureSkipPermissionChecks} is in use (§2.3). */
+    private void startInsecureWarner() {
+        err.println(INSECURE_WARNING);
+        insecureWarner = Thread.ofVirtual().name("cp-insecure-warn").start(() -> {
+            while (!closed) {
+                try {
+                    Thread.sleep(warnEvery);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                var s = store;
+                if (!closed && s != null && s.keys().insecurePermissions()) {
+                    err.println(INSECURE_WARNING);
+                }
+            }
+        });
+    }
+
+    private static InetSocketAddress loopback(InetSocketAddress address, String key) throws IOException {
+        if (address.getAddress() == null || !address.getAddress().isLoopbackAddress()) {
+            throw new IOException(key + ": a listener without TLS must be loopback, not " + address);
+        }
+        return address;
     }
 
     private static InetSocketAddress resolve(InetSocketAddress address) {
@@ -101,31 +170,41 @@ public final class CpHost implements CpReloadable {
         return !closed && s != null && s.ready(true);
     }
 
+    /** True when the ring in use was loaded with {@code insecureSkipPermissionChecks} (also on /cp/v1/health). */
+    public boolean insecurePermissions() {
+        var s = store;
+        return s != null && s.keys().insecurePermissions();
+    }
+
     /** Start and stop steps in order, for tests. */
     List<String> events() {
         return List.copyOf(events);
     }
 
+    /**
+     * SIGHUP: {@code KeyRing.load} first (no side effects), then {@code reloadTls()} on each listener (each keeps
+     * its old material on failure); the new ring is installed only if all of them succeeded.
+     */
     @Override
     public String reload() {
         if (closed || store == null) {
             return "control role not running";
-        }
-        Object tls;
-        try {
-            tls = deps.listeners().prepareTls();
-        } catch (java.security.GeneralSecurityException | IOException | RuntimeException e) {
-            events.add("reload-failed");
-            return "listener TLS reload failed: " + e.getMessage();
         }
         KeyRing keys;
         try {
             keys = deps.loadKeys(config.keys());
         } catch (CpKeyException | RuntimeException e) {
             events.add("reload-failed");
-            return "key ring reload failed: " + e.getMessage();
+            return "key ring reload failed, keeping the current ring and TLS: " + e.getMessage();
         }
-        deps.listeners().swapTls(tls);
+        for (var tls : tlsReloads) {
+            try {
+                tls.reloadTls();
+            } catch (CpKeyException | RuntimeException e) {
+                events.add("reload-failed");
+                return "listener TLS reload failed, keeping the current ring: " + e.getMessage();
+            }
+        }
         store.useKeys(keys);
         events.add("reloaded");
         return null;
@@ -137,6 +216,10 @@ public final class CpHost implements CpReloadable {
             return;
         }
         closed = true;
+        var warner = insecureWarner;
+        if (warner != null) {
+            warner.interrupt();
+        }
         var failures = new ArrayList<String>();
         quiet(admin, "admin", failures);
         quiet(watch, "watch", failures);
