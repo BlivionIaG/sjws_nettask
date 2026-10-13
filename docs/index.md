@@ -33,6 +33,7 @@ Back to the [README](../README.md) (quick start).
 - [Agent graphs (swarm addendum, draft)](design/agent-graphs.md)
 
 ## Security
+- [Security policy and vulnerability reporting](../SECURITY.md)
 - [Security audit (2026-10-13)](security/audit.md)
 
 ## Development
