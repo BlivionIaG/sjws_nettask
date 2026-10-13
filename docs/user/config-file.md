@@ -249,7 +249,11 @@ upstream earns `budget` of a token per request, holds at most 10, and each retry
 `circuit` opens after `failures` consecutive failures (connect, timeout, reset, 502/503/504) and
 then answers 503 with `Retry-After` without contacting the upstream. After `eject_for` one probe
 request is let through: success closes the circuit, failure opens it again for twice as long (up
-to 32×).
+to 32×). Each request gives one verdict, after its retries, so a retry that recovers counts as a
+success. An upstream is a single endpoint, so an open circuit is an outage of that upstream: it suits
+a dead or overloaded upstream, not a flaky one. At 20% random 503s and 5000 req/s, `failures: 5`
+trips about once a second (see `bench/proxy-routing/resilience.sh`). Pair it with `retry`, or raise
+`failures`, when the upstream has a steady error rate.
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml
