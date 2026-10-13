@@ -29,12 +29,19 @@ import sjws_nettask.routing.Router;
  * @param hostSuffix for a wildcard, the dotted suffix ({@code *.example.com} stores
  *        {@code .example.com}); null otherwise
  * @param errors how server-generated error pages of this route are rendered
+ * @param rateLimit {@code rate_limit:} of this route, or null
  */
 public record RouteSpec(String host, boolean wildcard, String hostSuffix, String prefix, String rewrite,
-        RouteSpec.Action action, RouteSpec.Errors errors) {
+        RouteSpec.Action action, RouteSpec.Errors errors, sjws_nettask.routing.RateLimitFilter.Limit rateLimit) {
 
     public RouteSpec {
         java.util.Objects.requireNonNull(errors, "errors");
+    }
+
+    /** No rate limit. */
+    public RouteSpec(String host, boolean wildcard, String hostSuffix, String prefix, String rewrite, Action action,
+            Errors errors) {
+        this(host, wildcard, hostSuffix, prefix, rewrite, action, errors, null);
     }
 
     /** HTML error pages (the default). */

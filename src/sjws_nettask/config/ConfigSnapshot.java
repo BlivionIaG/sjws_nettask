@@ -65,7 +65,8 @@ public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, H
         AutoCloseable resources = null;
         if (document.routing().enabled()) {
             var router = RoutingCompiler.compile(document.routing(), files);
-            handler = router;
+            var global = document.routing().rateLimit();
+            handler = global == null ? router : RoutingCompiler.limited(global, router); // before any route
             resources = router;
         }
         var acme = document.acme();
