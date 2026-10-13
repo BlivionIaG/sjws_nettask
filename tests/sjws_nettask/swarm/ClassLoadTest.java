@@ -16,15 +16,23 @@
  */
 package sjws_nettask.swarm;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -65,27 +73,29 @@ class ClassLoadTest {
 
     @Test
     void explicitlyDisabledLoadsNoSwarmClass() throws Exception {
-        var text = run(List.of("-Dsjws.swarm.enabled=false"), "Server started:", "sjws_nettask.Sjws_nettask",
+        var text = run(List.of("-Dsjws.swarm.enabled=false"), "Server started:", 404, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml());
         assertFalse(text.contains(SWARM), text);
     }
 
     @Test
     void enabledLoadsTheSwarmModule() throws Exception {
-        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", "sjws_nettask.Sjws_nettask",
+        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 501, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml());
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
     }
 
     @Test
     void yamlKeyFalseLoadsNoSwarmClass() throws Exception {
-        var text = run(List.of(), "Server started:", "sjws_nettask.Sjws_nettask", "--config=" + yaml("swarm:\n  enabled: false\n"));
+        var text = run(List.of(), "Server started:", 404, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml("swarm:\n  enabled: false\n"));
         assertFalse(text.contains(SWARM), text);
     }
 
     @Test
     void yamlKeyTrueLoadsTheSwarmModule() throws Exception {
-        var text = run(List.of(), "Server started:", "sjws_nettask.Sjws_nettask", "--config=" + yaml("swarm:\n  enabled: true\n"));
+        var text = run(List.of(), "Server started:", 501, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml("swarm:\n  enabled: true\n"));
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
     }
 
@@ -101,6 +111,11 @@ class ClassLoadTest {
     }
 
     private String run(List<String> jvmFlags, String ready, String... main) throws Exception {
+        return run(jvmFlags, ready, null, main);
+    }
+
+    /** {@code swarmStatus} is the HTTP status of {@code GET /swarm/v1/tasks}, checked while the process is up. */
+    private String run(List<String> jvmFlags, String ready, Integer swarmStatus, String... main) throws Exception {
         var log = this.dir.resolve("classes-" + System.nanoTime() + ".log");
         var cmd = new ArrayList<String>();
         cmd.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
@@ -128,11 +143,30 @@ class ClassLoadTest {
             Thread.sleep(300);
             text = Files.readString(log);
             assertTrue(text.contains(ready), text);
+            if (swarmStatus != null) {
+                assertEquals(swarmStatus.intValue(), swarmHttpStatus(text));
+            }
             return text;
         } finally {
             process.destroy();
             process.waitFor(5, TimeUnit.SECONDS);
             process.destroyForcibly();
+        }
+    }
+
+    private static int swarmHttpStatus(String log) throws Exception {
+        var matcher = Pattern.compile("HTTP/1.1 on tcp/(\\d+)").matcher(log);
+        assertTrue(matcher.find(), log);
+        int port = Integer.parseInt(matcher.group(1));
+        try (var socket = new Socket()) {
+            socket.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+            socket.setSoTimeout(2000);
+            socket.getOutputStream().write(("GET /swarm/v1/tasks HTTP/1.1\r\nHost: localhost\r\n"
+                    + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            var line = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
+                    .readLine();
+            assertNotNull(line, "no status line");
+            return Integer.parseInt(line.split(" ")[1]);
         }
     }
 }

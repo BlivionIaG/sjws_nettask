@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -306,10 +307,10 @@ class RootBranchCoverageTest {
         var method = SjwsServer.class.getDeclaredMethod("start", ConfigLoader.Loaded.class,
                 sjws_nettask.Transport.Factory.class, sjws_nettask.Transport.Factory.class, RequestFilters.class,
                 java.util.function.Function.class, sjws_nettask.ha.HaSettings.class,
-                sjws_nettask.config.SnapshotVerifier.class, boolean.class);
+                sjws_nettask.config.SnapshotVerifier.class, boolean.class, List.class);
         method.setAccessible(true);
         var routedServer = (SjwsServer) method.invoke(null, loaded, H3Transports.defaultFactory(), SjwsServer.H2_FACTORY,
-                null, null, ha, SnapshotVerifier.noop(), true);
+                null, null, ha, SnapshotVerifier.noop(), true, null);
         try (routedServer) {
             assertNotNull(routedServer.ha());
         }
@@ -407,10 +408,10 @@ class RootBranchCoverageTest {
             throws Exception {
         Method method = Sjws_nettask.class.getDeclaredMethod("awaitServing", SjwsServer.class, ServerConfig.class,
                 PrintStream.class, PrintStream.class, Consumer.class, Duration.class, Path.class, ServiceHooks.class,
-                long.class, boolean.class);
+                long.class, boolean.class, OptionalModule.class);
         method.setAccessible(true);
         Consumer<SjwsServer> started = SjwsServer::close;
         return (int) method.invoke(null, server, server.config(), out, err, started, Duration.ofSeconds(1), pid, hooks,
-                -1L, true);
+                -1L, true, OptionalModules.NONE);
     }
 }

@@ -16,10 +16,18 @@
  */
 package sjws_nettask.swarm;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import sjws_nettask.core.Handler;
+import sjws_nettask.core.HandlerMounts;
+import sjws_nettask.core.Request;
+import sjws_nettask.core.StaticFileHandler;
 
 class SwarmModuleTest {
 
@@ -33,5 +41,22 @@ class SwarmModuleTest {
         assertTrue(module.closed());
         module.close(); // idempotent
         assertTrue(module.closed());
+    }
+
+    @Test
+    void mountsSwarmV1AndLeavesOtherPathsAlone() {
+        var seen = new AtomicReference<String>();
+        Handler fallback = request -> {
+            seen.set(request.target());
+            return StaticFileHandler.error(404, request.headOnly());
+        };
+        var handler = HandlerMounts.install(List.of(new SwarmModule()), fallback);
+        assertEquals(501, handler.handle(new Request("GET", "/swarm/v1")).status());
+        assertEquals(501, handler.handle(new Request("GET", "/swarm/v1/tasks?x=1")).status());
+        assertEquals(501, handler.handle(new Request("HEAD", "/swarm/v1/leases/1:ack")).status());
+        var miss = handler.handle(new Request("GET", "/swarm/v2"));
+        assertEquals(404, miss.status());
+        assertEquals("/swarm/v2", seen.get());
+        assertSame(fallback, HandlerMounts.install(List.of(), fallback));
     }
 }

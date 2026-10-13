@@ -22,6 +22,7 @@ import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -52,6 +53,8 @@ import sjws_nettask.config.SnapshotVerifier;
 import sjws_nettask.core.ChainControl;
 import sjws_nettask.core.FilterChain;
 import sjws_nettask.core.Handler;
+import sjws_nettask.core.HandlerContributor;
+import sjws_nettask.core.HandlerMounts;
 import sjws_nettask.core.RequestFilter;
 import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.StaticFileHandler;
@@ -133,7 +136,7 @@ public final class SjwsServer implements AutoCloseable {
 
     private SjwsServer(ConfigSnapshot snapshot, ConfigReloader reloader, ChallengeBoard board,
             RequestFilters filters, Function<StaticFileHandler, Handler> terminal, HaSettings haSettings,
-            SnapshotVerifier verifier)
+            SnapshotVerifier verifier, List<HandlerContributor> contributors)
             throws IOException {
         this.verifier = verifier != null ? verifier : SnapshotVerifier.forMode(snapshot.document().node().mode());
         this.live = new LiveConfig(snapshot);
@@ -164,10 +167,20 @@ public final class SjwsServer implements AutoCloseable {
             // The file-handler leaf reads the live snapshot, including under caller filters,
             // so a pushed document root is observed without rebuilding the chain. A caller
             // replacement leaf stays the leaf it was compiled around. Chain control opens on
-            // this same leaf.
-            chainLeaf = leaf == files ? request -> this.live.handler().handle(request) : leaf;
+            // this same leaf. Prefix mounts, when any contributor added one, sit in front of
+            // that leaf and under the global filters. No contributor means this leaf is unchanged.
+            Handler fallback = leaf == files ? request -> this.live.handler().handle(request) : leaf;
+            var found = HandlerMounts.discover(contributors);
+            Handler mounted = found.isEmpty() ? fallback : HandlerMounts.install(found, fallback);
+            chainLeaf = mounted;
             built = registry == null ? null : registry.build(chainLeaf);
-            selected = built != null ? built : (leaf == files ? null : leaf);
+            if (built != null) {
+                selected = built;
+            } else if (mounted != fallback) {
+                selected = mounted;
+            } else {
+                selected = leaf == files ? null : leaf;
+            }
         } catch (RuntimeException e) {
             this.slot.close();
             throw e;
@@ -253,6 +266,19 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     /**
+     * As {@link #start(ServerConfig, RequestFilters, Function)}, and mounts {@code contributors}
+     * in front of the terminal before accepting. Null or empty, and contributors that mount
+     * nothing, leave the terminal as that overload does. Service providers of
+     * {@link HandlerContributor} are included. Overlapping mounts throw before the port is bound.
+     */
+    public static SjwsServer start(ServerConfig config, RequestFilters filters,
+            Function<StaticFileHandler, Handler> terminal, List<HandlerContributor> contributors)
+            throws IOException {
+        return start(ConfigLoader.standalone(config), H3Transports.defaultFactory(), H2_FACTORY, filters, terminal,
+                null, null, true, contributors);
+    }
+
+    /**
      * @param h3Factory used only when {@code config.h3Enabled()}
      * @param filters request filters, or null; compiled once here and passed to both transports
      * @throws IOException if the TCP port cannot be bound (nothing is left running)
@@ -331,11 +357,31 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     /**
+     * Config-file startup with prefix mounts. Routing, when enabled, stays the fallback behind
+     * the mounts. A null list still discovers {@link HandlerContributor} service providers.
+     */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, List<HandlerContributor> contributors)
+            throws IOException {
+        return start(loaded, H3Transports.defaultFactory(), true, contributors);
+    }
+
+    static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent,
+            List<HandlerContributor> contributors) throws IOException {
+        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, contributors);
+    }
+
+    static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, List<HandlerContributor> contributors)
+            throws IOException {
+        return start(ConfigLoader.standalone(config), h3Factory, H2_FACTORY, null, null, null, null, true,
+                contributors);
+    }
+
+    /**
      * @param verifier required for a data or control node. {@link SnapshotVerifier#noop()} is only
      *        for standalone and tests. A null verifier uses {@link SnapshotVerifier#forMode}.
      */
     public static SjwsServer start(ConfigLoader.Loaded loaded, SnapshotVerifier verifier) throws IOException {
-        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier, true);
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier, true, null);
     }
 
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory) throws IOException {
@@ -345,7 +391,7 @@ public final class SjwsServer implements AutoCloseable {
     /** {@code bindContent} false leaves the content port unbound. The process still stays up until {@link #close()}. */
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent)
             throws IOException {
-        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent);
+        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, null);
     }
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
@@ -357,12 +403,13 @@ public final class SjwsServer implements AutoCloseable {
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
             HaSettings ha) throws IOException {
-        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null, true);
+        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null, true, null);
     }
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
-            HaSettings ha, SnapshotVerifier verifier, boolean bindContent) throws IOException {
+            HaSettings ha, SnapshotVerifier verifier, boolean bindContent, List<HandlerContributor> contributors)
+            throws IOException {
         var board = new ChallengeBoard();
         var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
         if (ha != null && ha.handler() instanceof StaticFileHandler injected) {
@@ -372,7 +419,8 @@ public final class SjwsServer implements AutoCloseable {
             snapshot = new ConfigSnapshot(snapshot.document(), injected, visible, snapshot.generation(),
                     snapshot.epoch(), snapshot.resources());
         }
-        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha, verifier);
+        var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha, verifier,
+                contributors);
         if (bindContent) {
             if (snapshot.document().server().h3Enabled()) {
                 server.startH3(h3Factory, storedCertificate(snapshot));

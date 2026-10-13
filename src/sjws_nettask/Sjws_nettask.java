@@ -81,20 +81,21 @@ public class Sjws_nettask {
                 return EXIT_CANNOT_LISTEN;
             }
         }
+        var modules = OptionalModules.start(err);
         SjwsServer server;
         try {
-            server = SjwsServer.start(config, h3Factory);
+            server = SjwsServer.start(config, h3Factory, OptionalModules.contributors(modules));
         } catch (BindException e) {
+            modules.close();
             err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
                     + " (already in use or not permitted).");
             return EXIT_CANNOT_LISTEN;
         } catch (IOException | UncheckedIOException e) {
+            modules.close();
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        try (var modules = OptionalModules.start(err)) {
-            return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true);
-        }
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true, modules);
     }
 
     /** Same lifecycle as {@link #serve}, starting from a loaded config file so reload can re-read it. */
@@ -113,26 +114,27 @@ public class Sjws_nettask {
                 return EXIT_CANNOT_LISTEN;
             }
         }
+        var modules = OptionalModules.start(loaded.yamlSwarmEnabled(), err);
         SjwsServer server;
         try {
-            server = SjwsServer.start(loaded, h3Factory, bindContent);
+            server = SjwsServer.start(loaded, h3Factory, bindContent, OptionalModules.contributors(modules));
         } catch (BindException e) {
+            modules.close();
             err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
                     + " (already in use or not permitted).");
             return EXIT_CANNOT_LISTEN;
         } catch (IOException | UncheckedIOException e) {
+            modules.close();
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        try (var modules = OptionalModules.start(loaded.yamlSwarmEnabled(), err)) {
-            return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
-                    bindContent);
-        }
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
+                bindContent, modules);
     }
 
     private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,
             Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile, ServiceHooks hooks,
-            long drainBudgetMs, boolean bindContent) {
+            long drainBudgetMs, boolean bindContent, OptionalModule modules) {
         server.shutdownTimeout(shutdownTimeout);
         var pid = new AtomicReference<PidFile>();
         var task = new Shutdown(server, pid, out, err);
@@ -194,6 +196,7 @@ public class Sjws_nettask {
         } finally {
             task.run();
             removeHook(hook);
+            modules.close();
         }
     }
 

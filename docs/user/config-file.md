@@ -473,7 +473,9 @@ swarm:
 ```
 
 `swarm.enabled: true` starts the optional agent-swarm module (`docs/design/agent-swarm.md`)
-after the server is up. It is node-local, like `server.bind_content`: it is not part of the
+before the listener accepts. The module mounts `/swarm/v1/*`; those requests answer 501 until
+the task API lands, and every other path stays on the terminal the server already had. It is
+node-local, like `server.bind_content`: it is not part of the
 canonical document, so the control plane does not distribute it and a config recovered from
 last-good starts with the swarm off. The JVM property `-Dsjws.swarm.enabled` and then the
 environment variable `SJWS_SWARM_ENABLED` win over the key when set. With the swarm off no

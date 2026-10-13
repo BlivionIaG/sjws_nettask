@@ -17,7 +17,7 @@
 package sjws_nettask;
 
 /**
- * An optional module started by the composition root after the server is up and closed when the process
+ * An optional module started by the composition root before the server accepts and closed when the process
  * stops serving. Modules are loaded only through {@link OptionalModules}, by name, so a disabled module's
  * classes are never loaded (docs/design/agent-swarm.md §3.3).
  */

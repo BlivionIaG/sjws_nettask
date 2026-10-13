@@ -16,6 +16,7 @@
  */
 package sjws_nettask;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -24,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.swarm.SwarmModule;
@@ -36,6 +38,7 @@ class OptionalModulesTest {
     void offByDefault() {
         assertFalse(OptionalModules.swarmEnabled(NO_PROPS, Map.of()));
         assertSame(OptionalModules.NONE, OptionalModules.start(NO_PROPS, Map.of(), System.err));
+        assertTrue(OptionalModules.contributors(OptionalModules.NONE).isEmpty());
         OptionalModules.NONE.close();
     }
 
@@ -68,6 +71,7 @@ class OptionalModulesTest {
     void enabledLoadsTheSwarmByName() {
         var module = OptionalModules.start(k -> "true", Map.of(), System.err);
         var swarm = assertInstanceOf(SwarmModule.class, module);
+        assertEquals(List.of(module), OptionalModules.contributors(module));
         module.close();
         assertTrue(swarm.closed());
     }
