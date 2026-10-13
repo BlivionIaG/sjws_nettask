@@ -42,7 +42,7 @@ import sjws_nettask.core.MiddlewareSpec;
  */
 public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing routing, List<MiddlewareSpec> middleware,
         AccessSettings access, NodeSettings node, int schemaVersion, long bundleVersion, Path configFile,
-        Path stateDir, String canonicalHash, String canonicalText, byte[] signature) {
+        Path stateDir, String canonicalHash, String canonicalText, byte[] signature, MessagingSettings messaging) {
 
     /** The only schema this process accepts. */
     public static final int SCHEMA = 1;
@@ -67,6 +67,9 @@ public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing rou
         if (signature != null) {
             signature = signature.clone();
         }
+        if (messaging == null) {
+            messaging = MessagingSettings.disabled();
+        }
     }
 
     public static ConfigDocument defaults(ServerConfig server) {
@@ -81,16 +84,28 @@ public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing rou
     public static ConfigDocument of(ServerConfig server, AcmeSettings acme, Routing routing,
             List<MiddlewareSpec> middleware, AccessSettings access, NodeSettings node, int schemaVersion,
             long bundleVersion, Path configFile) {
+        return of(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion, configFile,
+                MessagingSettings.disabled());
+    }
+
+    /**
+     * Builds a document and sets {@link #canonicalHash()} from one rendering of the canonical YAML.
+     * {@code messaging} is the neutral topic schema. A disabled section with no topics is omitted
+     * from that text, so an older document keeps its hash.
+     */
+    public static ConfigDocument of(ServerConfig server, AcmeSettings acme, Routing routing,
+            List<MiddlewareSpec> middleware, AccessSettings access, NodeSettings node, int schemaVersion,
+            long bundleVersion, Path configFile, MessagingSettings messaging) {
         var draft = new ConfigDocument(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion,
-                configFile, null, "", null, null);
+                configFile, null, "", null, null, messaging);
         var text = ConfigCodec.text(draft);
         return new ConfigDocument(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion,
-                configFile, draft.stateDir(), ConfigCodec.sha256(text), text, null);
+                configFile, draft.stateDir(), ConfigCodec.sha256(text), text, null, messaging);
     }
 
     public ConfigDocument withServer(ServerConfig server) {
         var next = of(server, this.acme, this.routing, this.middleware, this.access, this.node, this.schemaVersion,
-                this.bundleVersion, this.configFile).withStateDir(this.stateDir);
+                this.bundleVersion, this.configFile, this.messaging).withStateDir(this.stateDir);
         if (next.canonicalHash.equals(this.canonicalHash)) {
             return next.withSignature(this.signature);
         }
@@ -99,7 +114,7 @@ public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing rou
 
     public ConfigDocument withNode(NodeSettings node) {
         var next = of(this.server, this.acme, this.routing, this.middleware, this.access, node, this.schemaVersion,
-                this.bundleVersion, this.configFile).withStateDir(this.stateDir);
+                this.bundleVersion, this.configFile, this.messaging).withStateDir(this.stateDir);
         if (next.canonicalHash.equals(this.canonicalHash)) {
             return next.withSignature(this.signature);
         }
@@ -114,7 +129,7 @@ public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing rou
         }
         return new ConfigDocument(this.server, this.acme, this.routing, this.middleware, this.access, this.node,
                 this.schemaVersion, this.bundleVersion, this.configFile, dir, this.canonicalHash, this.canonicalText,
-                this.signature);
+                this.signature, this.messaging);
     }
 
     /** Same canonical bytes. A pushed bundle keeps the path of the local file. */
@@ -124,7 +139,7 @@ public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing rou
         }
         return new ConfigDocument(this.server, this.acme, this.routing, this.middleware, this.access, this.node,
                 this.schemaVersion, this.bundleVersion, configFile, this.stateDir, this.canonicalHash,
-                this.canonicalText, this.signature);
+                this.canonicalText, this.signature, this.messaging);
     }
 
     /** The signature is not part of the canonical text, so the hash stays as it was. */
@@ -134,6 +149,16 @@ public record ConfigDocument(ServerConfig server, AcmeSettings acme, Routing rou
         }
         return new ConfigDocument(this.server, this.acme, this.routing, this.middleware, this.access, this.node,
                 this.schemaVersion, this.bundleVersion, this.configFile, this.stateDir, this.canonicalHash,
-                this.canonicalText, signature);
+                this.canonicalText, signature, this.messaging);
+    }
+
+    /** Same document with a different topic schema. The canonical hash is recomputed. */
+    public ConfigDocument withMessaging(MessagingSettings messaging) {
+        var next = of(this.server, this.acme, this.routing, this.middleware, this.access, this.node, this.schemaVersion,
+                this.bundleVersion, this.configFile, messaging).withStateDir(this.stateDir);
+        if (next.canonicalHash.equals(this.canonicalHash)) {
+            return next.withSignature(this.signature);
+        }
+        return next;
     }
 }

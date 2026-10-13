@@ -81,6 +81,10 @@ public final class ConfigReloader {
             return ReloadResult.rejected(current, List.of("bundle version " + incoming.bundleVersion()
                     + " is older than " + currentVersion));
         }
+        var destructive = MessagingSettings.destructiveErrors(current.document().messaging(), incoming.messaging());
+        if (!destructive.isEmpty()) {
+            return ReloadResult.rejected(current, destructive);
+        }
         if (!incoming.canonicalHash().isEmpty()
                 && incoming.canonicalHash().equals(current.document().canonicalHash())
                 && Objects.equals(incoming.server().tlsKeyPassword(), current.document().server().tlsKeyPassword())) {
@@ -114,7 +118,8 @@ public final class ConfigReloader {
             var document = unchanged
                     ? incoming.withConfigFile(configFile).withStateDir(stateDir)
                     : ConfigDocument.of(clamped, incoming.acme(), incoming.routing(), incoming.middleware(),
-                            incoming.access(), node, incoming.schemaVersion(), incoming.bundleVersion(), configFile)
+                            incoming.access(), node, incoming.schemaVersion(), incoming.bundleVersion(), configFile,
+                            incoming.messaging())
                             .withStateDir(stateDir);
             if (incoming.signature() != null && document.signature() == null
                     && document.canonicalHash().equals(incoming.canonicalHash())) {

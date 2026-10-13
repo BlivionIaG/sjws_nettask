@@ -49,6 +49,9 @@ public final class ConfigCodec {
         routing(out, document.routing());
         middleware(out, document.middleware());
         access(out, document.access());
+        if (!document.messaging().omittedFromCanonical()) {
+            document.messaging().appendCanonical(out);
+        }
         return out.toString();
     }
 
@@ -309,7 +312,7 @@ public final class ConfigCodec {
         }
     }
 
-    private static String duration(Duration duration) {
+    static String duration(Duration duration) {
         if (duration.toNanosPart() == 0 && duration.toSeconds() % 86_400 == 0 && duration.toSeconds() >= 86_400) {
             return (duration.toSeconds() / 86_400) + "d";
         }
