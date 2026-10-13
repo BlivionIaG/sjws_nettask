@@ -48,6 +48,23 @@ class OptionalModulesTest {
     }
 
     @Test
+    void yamlKeyAppliesOnlyWhenPropertyAndEnvironmentAreUnset() {
+        assertFalse(OptionalModules.swarmEnabled(NO_PROPS, Map.of(), null));
+        assertFalse(OptionalModules.swarmEnabled(NO_PROPS, Map.of(), false));
+        assertTrue(OptionalModules.swarmEnabled(NO_PROPS, Map.of(), true));
+        assertFalse(OptionalModules.swarmEnabled(k -> "false", Map.of(), true));
+        assertFalse(OptionalModules.swarmEnabled(NO_PROPS, Map.of(OptionalModules.SWARM_ENV, "false"), true));
+        assertTrue(OptionalModules.swarmEnabled(NO_PROPS, Map.of(OptionalModules.SWARM_ENV, "true"), false));
+        assertSame(OptionalModules.NONE, OptionalModules.start(NO_PROPS, Map.of(), false, System.err));
+        var module = OptionalModules.start(NO_PROPS, Map.of(), true, System.err);
+        assertInstanceOf(SwarmModule.class, module);
+        module.close();
+        if (System.getProperty(OptionalModules.SWARM_PROPERTY) == null && System.getenv(OptionalModules.SWARM_ENV) == null) {
+            assertSame(OptionalModules.NONE, OptionalModules.start((Boolean) null, System.err));
+        }
+    }
+
+    @Test
     void enabledLoadsTheSwarmByName() {
         var module = OptionalModules.start(k -> "true", Map.of(), System.err);
         var swarm = assertInstanceOf(SwarmModule.class, module);
