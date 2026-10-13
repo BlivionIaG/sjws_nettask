@@ -28,7 +28,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `core/FilterDocumentTest` | declarative document: JSON round trip, scope, label selectors, rejected wire forms |
 | `core/ChainControlTest` | atomic snapshot swap, stale and invalid documents keep the live chain, in-flight requests finish on the old chain |
 | `ChainControlServerTest` | publishing a document onto a live server leaves the direct file path in place until the first apply |
-| `gateway/ApiKeyFilterTest`, `gateway/JwtFilterTest`, `gateway/RateLimitFilterTest`, `gateway/CorsFilterTest`, `gateway/RequestSizeFilterTest`, `gateway/HeaderRewriteFilterTest`, `gateway/MiniJsonTest` | gateway filters: API key, JWT (HS/RS/ES, exp/nbf/iss/aud), local token bucket, CORS preflight, size limits, header rewrite |
+| `gateway/ApiKeyFilterTest`, `gateway/JwtFilterTest`, `gateway/RateLimitFilterTest`, `gateway/CorsFilterTest`, `gateway/RequestSizeFilterTest`, `gateway/HeaderRewriteFilterTest`, `gateway/MiniJsonTest` | gateway filters: API key, JWT (HS/RS/ES, exp/nbf/iss/aud), striped GCRA rate limit, CORS preflight, size limits, header rewrite |
 | `GatewayServerTest` | a declarative document of those filters on a live HTTP/1.1 server; a bad entry keeps the previous snapshot |
 | `FilterIntegrationTest` | real HTTP/1.1 server: no chain by default, header/short-circuit filters, client address and raw headers, a replacement terminal handler, 500 then the next request on the same connection |
 | `h3/FilterHttp3Test` | default HTTP/3 factory runs the same chain; a filter failure is a 500 on that stream |

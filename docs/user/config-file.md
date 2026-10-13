@@ -252,8 +252,9 @@ for `/m` and `/h`. Requests over the limit get 429 with `Retry-After` (seconds u
 token), rendered like the route's other errors. Buckets live in a fixed table of `buckets` stripes
 (a power of two, default 4096; `by: route` uses one). Memory never grows with the number of
 clients. Two clients that hash to the same stripe share its budget, which is stricter, never looser.
-A request without the key (no address, or no header) shares one extra bucket. This is separate from
-the control-plane `rate-limit` filter type, which keeps a bounded map of exact keys.
+A request without the key (no address, or no header) shares one extra bucket. The control-plane
+`rate-limit` filter type uses this same table. Its `capacity` is the burst and
+`refill-per-second` is the steady rate; `max-keys` only sizes the table.
 
 Weighted and canary routes list `backends` instead of `proxy` (a plain `proxy:` route is unchanged):
 

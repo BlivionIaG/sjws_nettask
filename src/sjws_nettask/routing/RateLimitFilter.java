@@ -18,7 +18,6 @@ package sjws_nettask.routing;
 
 import java.util.Locale;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.LongSupplier;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestFilter;
@@ -33,8 +32,9 @@ import sjws_nettask.core.StaticFileHandler;
  * GCRA theoretical arrival time, so admission is a single CAS with no lock and no allocation.
  * A refused request gets 429 with {@code Retry-After}; nothing reaches the next handler.
  * <p>
- * Not the control-plane {@code rate-limit} filter in {@code gateway} (capped maps, pluggable
- * cluster quota): this one is attached by {@code rate_limit:} in the routing section.
+ * The gateway {@code rate-limit} filter uses this same {@link GcraTable}. A cluster quota can
+ * still replace that filter's local table. This class is the one attached by {@code rate_limit:}
+ * in the routing section.
  */
 public final class RateLimitFilter implements RequestFilter {
 
@@ -89,12 +89,7 @@ public final class RateLimitFilter implements RequestFilter {
     }
 
     private final Limit limit;
-    private final AtomicLongArray tat; // last slot: requests without a key
-    private final int mask;
-    private final long interval;
-    private final long tolerance; // interval * burst
-    private final LongSupplier clock;
-    private final long origin;
+    private final GcraTable table;
 
     public RateLimitFilter(Limit limit) {
         this(limit, System::nanoTime);
@@ -102,13 +97,7 @@ public final class RateLimitFilter implements RequestFilter {
 
     RateLimitFilter(Limit limit, LongSupplier clock) {
         this.limit = Objects.requireNonNull(limit, "limit");
-        this.tat = new AtomicLongArray(limit.buckets() + 1);
-        this.mask = limit.buckets() - 1;
-        this.interval = limit.intervalNanos();
-        this.tolerance = Math.multiplyHigh(this.interval, limit.burst()) != 0 ? Long.MAX_VALUE / 4
-                : Math.min(Long.MAX_VALUE / 4, this.interval * limit.burst());
-        this.clock = clock;
-        this.origin = clock.getAsLong() - 1; // now >= 1, so a fresh bucket (0) starts full
+        this.table = new GcraTable(limit.intervalNanos(), limit.burst(), limit.buckets(), clock);
     }
 
     public Limit limit() {
@@ -128,38 +117,24 @@ public final class RateLimitFilter implements RequestFilter {
 
     /** @return 0 when admitted, else nanoseconds until one more request would be */
     long admit(int slot) {
-        long now = this.clock.getAsLong() - this.origin;
-        while (true) {
-            long t = this.tat.get(slot);
-            long next = Math.max(t, now) + this.interval;
-            long over = next - now - this.tolerance;
-            if (over > 0) {
-                return over;
-            }
-            if (this.tat.compareAndSet(slot, t, next)) {
-                return 0;
-            }
-        }
+        return this.table.admit(slot);
     }
 
     int slot(Request request) {
-        int keyless = this.mask + 1;
+        int keyless = this.table.keylessSlot();
         return switch (this.limit.by()) {
             case ROUTE -> 0;
             case PEER -> {
                 var peer = request.peer();
                 var address = peer == null ? null : peer.getAddress();
-                yield address == null ? keyless : stripe(address.hashCode());
+                yield address == null ? keyless : this.table.stripe(address.hashCode());
             }
             case HEADER -> {
                 var values = request.headers().values(this.limit.header());
-                yield values.isEmpty() || values.get(0).isEmpty() ? keyless : stripe(values.get(0).hashCode());
+                yield values.isEmpty() || values.get(0).isEmpty() ? keyless
+                        : this.table.stripe(values.get(0).hashCode());
             }
         };
-    }
-
-    private int stripe(int hash) {
-        return (int) Mix.mix(hash) & this.mask;
     }
 
     /** SplitMix64 finalizer: spreads adjacent addresses over the table. */
@@ -168,9 +143,7 @@ public final class RateLimitFilter implements RequestFilter {
         }
 
         static long mix(long z) {
-            z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
-            z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
-            return z ^ (z >>> 31);
+            return GcraTable.mix(z);
         }
     }
 }

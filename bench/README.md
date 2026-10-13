@@ -45,3 +45,8 @@ shared runner is too noisy for a tight band.
 
 When `sjws_nettask.cp` grows a startup role, `gateway-off` in `GatewayBench` must select
 standalone explicitly. The two wrk columns should stay in the same band.
+
+`--mode=rate-limit` is separate. It installs the gateway factories and applies one
+`rate-limit` document (`by=ip`, `buckets=4096`). `--capacity` (default `1000000`) and
+`--refill` (default `1000000000`) set that document. `standalone` and `gateway-off` do not
+call `chainControl`. Feature-off file serving is still `java -jar` with no chain.

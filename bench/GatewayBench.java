@@ -15,8 +15,11 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 import java.nio.file.Path;
+import java.util.Set;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.SjwsServer;
+import sjws_nettask.core.RequestFilters;
+import sjws_nettask.gateway.GatewayFilters;
 
 /**
  * Process entry for {@code tools/gateway-bench.sh}.
@@ -28,7 +31,12 @@ import sjws_nettask.SjwsServer;
  * nothing from {@code sjws_nettask.cp}. When that package grows a startup role,
  * {@code gateway-off} must select standalone explicitly and must still take this path.
  *
- * <p>Usage: {@code java -cp target/classes:target/lib/* bench/GatewayBench.java --mode=standalone|gateway-off --port=0 --root=DIR}
+ * <p>{@code rate-limit} is the only mode that opens chain control. It installs the gateway
+ * factories and applies one {@code rate-limit} document ({@code by=ip}, {@code buckets=4096}).
+ * {@code --capacity} and {@code --refill} set that document. {@code standalone} and
+ * {@code gateway-off} never call {@code chainControl}.
+ *
+ * <p>Usage: {@code java -cp target/classes:target/lib/* bench/GatewayBench.java --mode=standalone|gateway-off|rate-limit --port=0 --root=DIR}
  * Prints {@code bench port=<n> mode=<mode>} after the listener is bound. Port 0 is ephemeral.
  */
 public final class GatewayBench {
@@ -39,11 +47,18 @@ public final class GatewayBench {
     public static void main(String[] args) throws Exception {
         var options = Options.parse(args);
         var config = ServerConfig.builder(Path.of(options.root())).port(options.port()).h3Enabled(false).build();
-        // Both modes leave the control plane detached. gateway-off is not a second code path yet.
+        // standalone and gateway-off leave the control plane detached. gateway-off is not a second code path.
         var server = switch (options.mode()) {
-            case "standalone", "gateway-off" -> SjwsServer.start(config);
-            default -> throw new IllegalArgumentException("--mode=standalone|gateway-off");
+            case "standalone", "gateway-off", "rate-limit" -> SjwsServer.start(config);
+            default -> throw new IllegalArgumentException("--mode=standalone|gateway-off|rate-limit");
         };
+        if ("rate-limit".equals(options.mode())) {
+            var registry = GatewayFilters.install(RequestFilters.create());
+            var json = "{\"format\":1,\"version\":1,\"filters\":[{\"type\":\"rate-limit\",\"order\":0,"
+                    + "\"params\":{\"by\":\"ip\",\"capacity\":\"" + options.capacity()
+                    + "\",\"refill-per-second\":\"" + options.refill() + "\",\"buckets\":\"4096\"}}]}";
+            server.chainControl(registry, Set.of()).apply(json);
+        }
         System.out.println("bench port=" + server.tcpPort() + " mode=" + options.mode());
         System.out.flush();
         try {
@@ -53,11 +68,13 @@ public final class GatewayBench {
         }
     }
 
-    public record Options(String mode, int port, String root) {
+    public record Options(String mode, int port, String root, String capacity, String refill) {
         public static Options parse(String[] args) {
             String mode = "";
             int port = 0;
             String root = "";
+            String capacity = "1000000";
+            String refill = "1000000000";
             for (var arg : args) {
                 if (arg.startsWith("--mode=")) {
                     mode = arg.substring("--mode=".length());
@@ -65,12 +82,16 @@ public final class GatewayBench {
                     port = Integer.parseInt(arg.substring("--port=".length()));
                 } else if (arg.startsWith("--root=")) {
                     root = arg.substring("--root=".length());
+                } else if (arg.startsWith("--capacity=")) {
+                    capacity = arg.substring("--capacity=".length());
+                } else if (arg.startsWith("--refill=")) {
+                    refill = arg.substring("--refill=".length());
                 } else {
                     throw new IllegalArgumentException("unknown argument: " + arg);
                 }
             }
-            if (!"standalone".equals(mode) && !"gateway-off".equals(mode)) {
-                throw new IllegalArgumentException("--mode=standalone|gateway-off");
+            if (!"standalone".equals(mode) && !"gateway-off".equals(mode) && !"rate-limit".equals(mode)) {
+                throw new IllegalArgumentException("--mode=standalone|gateway-off|rate-limit");
             }
             if (port < 0 || port > 65535) {
                 throw new IllegalArgumentException("--port out of range");
@@ -78,7 +99,11 @@ public final class GatewayBench {
             if (root.isBlank()) {
                 throw new IllegalArgumentException("--root is required");
             }
-            return new Options(mode, port, root);
+            if (!capacity.chars().allMatch(Character::isDigit) || capacity.isEmpty()
+                    || !refill.chars().allMatch(Character::isDigit) || refill.isEmpty()) {
+                throw new IllegalArgumentException("--capacity and --refill must be digits");
+            }
+            return new Options(mode, port, root, capacity, refill);
         }
     }
 }
