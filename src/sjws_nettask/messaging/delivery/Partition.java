@@ -655,6 +655,23 @@ public final class Partition implements AutoCloseable {
         }
     }
 
+    /** Lock held. Evicts cached payloads below every group's committed offset (only written ones, as above). */
+    private void evictSettled() {
+        long below = state.minCommitted();
+        int mask = ringOff.length - 1;
+        while (ringCount > 0 && ringOff[ringHead] < below) {
+            long ho = ringOff[ringHead];
+            if (ho >= writtenHint) {
+                writtenHint = writer.snapshot().nextOffset();
+                if (ho >= writtenHint) return;
+            }
+            recentBytes -= ringVal[ringHead].length;
+            ringVal[ringHead] = null;
+            ringHead = (ringHead + 1) & mask;
+            ringCount--;
+        }
+    }
+
     private void growRing() {
         int n = ringOff.length, mask = n - 1;
         var o = new long[n * 2];
@@ -940,6 +957,9 @@ public final class Partition implements AutoCloseable {
 
     /** Lock held: after one apply (or a deferred batch of them). */
     private void afterApply() {
+        // Payloads every group has settled are dropped from the cache at once instead of aging out of the 64 MiB
+        // ring: in request/reply they would otherwise all survive young GCs and be copied into the old generation.
+        if (ringCount > 0 && ringOff[ringHead] < state.minCommitted()) evictSettled();
         publish();
         // Amortized O(1) per entry: a snapshot costs O(live state), so wait at least twice that many entries.
         long since = state.nextOffset - lastSnapshotTrigger;
