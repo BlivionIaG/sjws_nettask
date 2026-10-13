@@ -4,3 +4,5 @@ test/
 nbproject/private/
 target/
 bench/controlplane/results/
+__pycache__/
+*.pyc
