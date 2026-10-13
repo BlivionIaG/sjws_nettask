@@ -41,7 +41,8 @@ import sjws_nettask.messaging.ledger.RecordBatch;
  * Produce / fetch on plain log topics (docs/design/partition-log.md §2.2), mounted at {@code /messaging/v1}.
  * <ul>
  *   <li>{@code POST /messaging/v1/topics/{t}/records}: body = one or more {@code [len:int][bytes]} records, written as
- *       one batch. Optional {@code Durability: none|async|group}. 200 {@code {"baseOffset":n,"count":c}} once it holds.</li>
+ *       one batch. Optional {@code Durability: none|async|group}, never weaker than the topic policy; the response's
+ *       {@code Durability-Effective} names the mode that applied. 200 {@code {"baseOffset":n,"count":c}} once it holds.</li>
  *   <li>{@code GET /messaging/v1/topics/{t}/records?offset=&maxBytes=}: body = raw {@link RecordBatch} frames, byte-identical
  *       to the on-disk format, from the batch containing {@code offset}; at least one batch if any, then up to
  *       {@code maxBytes}. {@code Next-Offset} gives the offset to fetch next. Only committed batches are returned.</li>
@@ -98,7 +99,9 @@ final class MessagingHttp implements Handler {
         try {
             long base = log.writer().append(records, durability).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             var json = "{\"baseOffset\":" + base + ",\"count\":" + records.size() + "}";
-            var h = ResponseHeaders.of().set("content-type", "application/json");
+            var effective = durability != null ? durability : this.topics.durability(topic);
+            var h = ResponseHeaders.of().set("content-type", "application/json")
+                    .set("durability-effective", effective.name().toLowerCase(java.util.Locale.ROOT));
             return new Response(200, h, Body.Bytes.of(json.getBytes(StandardCharsets.US_ASCII)));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

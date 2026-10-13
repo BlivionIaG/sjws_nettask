@@ -88,10 +88,27 @@ class TopicDurabilityTest {
             var h = new MessagingHttp(m.topics());
             for (int i = 0; i < 20; i++) {
                 // "none" is not rejected, it is clamped: the ack still waits for the fsync of the GROUP topic
-                assertEquals(200, MessagingHttpTest.post(h, "safe", MessagingHttpTest.recs("v" + i), "none").status());
+                var r = MessagingHttpTest.post(h, "safe", MessagingHttpTest.recs("v" + i), "none");
+                assertEquals(200, r.status());
+                assertEquals("group", r.headers().get("durability-effective")); // the client can see the clamp
                 var snap = m.topics().get("safe", false).writer().snapshot();
                 assertEquals(snap.nextOffset(), snap.durableOffset());
             }
+        } finally {
+            m.close();
+        }
+    }
+
+    @Test
+    void effectiveDurabilityHeaderNamesTheModeThatApplied() throws Exception {
+        var m = new MessagingModule(dir, 1 << 20, LogRetention.NONE, 10_000, Durability.ASYNC, Map.of("safe", Durability.GROUP));
+        try {
+            var h = new MessagingHttp(m.topics());
+            assertEquals("async", MessagingHttpTest.post(h, "plain", MessagingHttpTest.recs("a"), null).headers().get("durability-effective"));
+            assertEquals("async", MessagingHttpTest.post(h, "plain", MessagingHttpTest.recs("b"), "none").headers().get("durability-effective")); // clamped up to the async default
+            assertEquals("group", MessagingHttpTest.post(h, "plain", MessagingHttpTest.recs("c"), "group").headers().get("durability-effective"));
+            assertEquals("group", MessagingHttpTest.post(h, "safe", MessagingHttpTest.recs("d"), null).headers().get("durability-effective"));
+            assertEquals("group", MessagingHttpTest.post(h, "safe", MessagingHttpTest.recs("e"), "async").headers().get("durability-effective"));
         } finally {
             m.close();
         }
