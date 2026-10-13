@@ -94,6 +94,13 @@ public final class ReplicatedNode implements ClusterNode {
         return new ReplicatedNode(self, members, voters, quorum, clock, storage, transport, null);
     }
 
+    /** Opens with {@link VoterSet#policy()}, which is a majority and has already rejected a bare pair. */
+    public static ReplicatedNode open(NodeId self, VoterSet voters, Clock clock, LogStorage storage,
+            SimTransport transport) {
+        Objects.requireNonNull(voters, "voters");
+        return open(self, voters.members(), voters.voters(), voters.policy(), clock, storage, transport);
+    }
+
     /** Tick and deliver on a virtual thread. Groups should already be open. */
     public void begin(Duration interval) {
         if (interval == null || interval.isZero() || interval.isNegative()) {
