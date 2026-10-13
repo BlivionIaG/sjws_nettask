@@ -391,4 +391,29 @@ class BufferPoolTest {
         held.forEach(PooledBuffer::release);
         assertEquals(0, http.usedBytes());
     }
+
+    @Test
+    void debugPoisonIgnoresLimitAndPosition() {
+        var p = pool(8 << 20, 0, true, 1, 0);
+        var b = p.budget(BufferPool.HTTP);
+        for (int size : new int[] {300, 16 << 10, 200 << 10}) {
+            var h = size > BufferPool.MAX_CLASS ? b.acquireLarge(size) : b.acquire(size);
+            var buf = h.buffer();
+            var raw = buf.duplicate();
+            buf.put(new byte[] {1, 2, 3, 4, 5}).flip(); // limit 5 < capacity
+            buf.get(); // position 1
+            h.release(); // threw IndexOutOfBoundsException before the fix
+            for (int i = 0; i < raw.capacity(); i++) {
+                assertEquals((byte) 0xDE, raw.get(i), "byte " + i + " of " + size);
+            }
+        }
+        // read-only view left behind by the caller: the pool poisons its own writable chunk
+        var h = b.acquire(1024);
+        var ro = h.buffer().asReadOnlyBuffer();
+        h.buffer().limit(10).position(3);
+        h.release();
+        assertEquals((byte) 0xDE, ro.get(0));
+        assertEquals((byte) 0xDE, ro.get(1023));
+        assertEquals(0, b.usedBytes());
+    }
 }

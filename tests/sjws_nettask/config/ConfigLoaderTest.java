@@ -696,6 +696,59 @@ class ConfigLoaderTest {
         assertTrue(quiet.warnings().stream().noneMatch(w -> w.contains("chmod 600")), quiet.warnings().toString());
     }
 
+    @Test
+    void haClusterKeyFileChecksOwnerThroughTheOpenChannel() throws Exception {
+        var secret = "owner-channel-key-0123456789abcd";
+        var keyFile = dir.resolve("owned.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("r--------"));
+        var yaml = dir.resolve("ha-owned.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key_file: owned.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        var readOnly = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(readOnly.ok(), readOnly.errors().toString());
+        assertArrayEquals(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), readOnly.haClusterKey());
+
+        var link = dir.resolve("owned.link");
+        Files.createSymbolicLink(link, keyFile);
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: owned.link\n");
+        var linked = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(linked.ok());
+        assertTrue(linked.errors().get(0).contains("symlink"), linked.errors().toString());
+        assertFalse(linked.errors().get(0).contains(secret), linked.errors().toString());
+
+        var huge = dir.resolve("huge.key");
+        Files.writeString(huge, "h".repeat(4097));
+        Files.setPosixFilePermissions(huge, PosixFilePermissions.fromString("rw-------"));
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key_file: huge.key\n");
+        var big = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(big.ok());
+        assertTrue(big.errors().get(0).contains("too large"), big.errors().toString());
+        assertFalse(big.errors().get(0).contains("hhhh"), big.errors().toString());
+
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key_file: " + root + "\n");
+        var directory = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(directory.ok());
+        assertTrue(directory.errors().get(0).contains("not a file") || directory.errors().get(0).contains("Cannot read"),
+                directory.errors().toString());
+
+        var passwd = Path.of("/etc/passwd");
+        if (Files.isReadable(passwd) && Files.exists(Path.of("/proc/self"))) {
+            int self = ((Integer) Files.getAttribute(Path.of("/proc/self"), "unix:uid")).intValue();
+            int owner = ((Integer) Files.getAttribute(passwd, "unix:uid")).intValue();
+            if (self != owner) {
+                Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                        + "\nha:\n  enabled: true\n  cluster_key_file: /etc/passwd\n");
+                var foreign = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+                assertFalse(foreign.ok());
+                assertTrue(foreign.errors().get(0).contains("owned by"), foreign.errors().toString());
+                assertFalse(foreign.errors().get(0).contains("root:"), foreign.errors().toString());
+            }
+        }
+    }
+
     private String error(String yaml) throws Exception {
         var loaded = ConfigLoader.load(new String[] {"--config=" + write(yaml)}, Map.of());
         assertFalse(loaded.ok(), yaml);

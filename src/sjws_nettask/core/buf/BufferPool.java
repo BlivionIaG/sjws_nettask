@@ -441,10 +441,20 @@ public final class BufferPool {
         }
     }
 
-    private static void poison(ByteBuffer buf) {
-        buf.clear(); // absolute puts are bounded by the limit the owner left, not by the capacity
-        for (int i = 0, n = buf.capacity(); i < n; i++) {
-            buf.put(i, POISON);
+    private static final byte[] POISON_BLOCK = new byte[4096];
+
+    static {
+        Arrays.fill(POISON_BLOCK, POISON);
+    }
+
+    /**
+     * Fills the whole chunk with {@link #POISON}. Goes through {@code duplicate().clear()}: absolute puts are checked
+     * against the limit, and a caller may release after {@code flip()} (limit &lt; capacity) or with any position.
+     */
+    static void poison(ByteBuffer buf) {
+        var all = buf.duplicate().clear();
+        for (int i = 0, n = all.capacity(); i < n; i += POISON_BLOCK.length) {
+            all.put(i, POISON_BLOCK, 0, Math.min(POISON_BLOCK.length, n - i));
         }
     }
 

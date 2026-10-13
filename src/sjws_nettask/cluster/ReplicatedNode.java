@@ -19,6 +19,7 @@ package sjws_nettask.cluster;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -94,6 +95,13 @@ public final class ReplicatedNode implements ClusterNode {
         return new ReplicatedNode(self, members, voters, quorum, clock, storage, transport, null);
     }
 
+    /** Opens with {@link VoterSet#policy()}, which is a majority and has already rejected a bare pair. */
+    public static ReplicatedNode open(NodeId self, VoterSet voters, Clock clock, LogStorage storage,
+            SimTransport transport) {
+        Objects.requireNonNull(voters, "voters");
+        return open(self, voters.members(), voters.voters(), voters.policy(), clock, storage, transport);
+    }
+
     /** Tick and deliver on a virtual thread. Groups should already be open. */
     public void begin(Duration interval) {
         if (interval == null || interval.isZero() || interval.isNegative()) {
@@ -132,6 +140,10 @@ public final class ReplicatedNode implements ClusterNode {
 
     boolean ackedFromMemory(GroupId groupId) {
         return group(groupId).ackedFromMemory();
+    }
+
+    boolean campaigning(GroupId groupId) {
+        return group(groupId).campaigning();
     }
 
     Set<NodeId> voters(GroupId groupId) {
@@ -194,13 +206,17 @@ public final class ReplicatedNode implements ClusterNode {
             return existing.facade();
         }
         var peers = new ArrayList<NodeId>();
+        var witnesses = new HashSet<NodeId>();
         for (var member : members) {
+            if (member.witness()) {
+                witnesses.add(member.id());
+            }
             if (!member.id().equals(self)) {
                 peers.add(member.id());
             }
         }
-        var group = new RaftGroup(groupId, self, witness, voters, peers, byWire::get, quorum, options, storage, rpc,
-                clock, listener);
+        var group = new RaftGroup(groupId, self, witness, witnesses, voters, peers, byWire::get, quorum, options,
+                storage, rpc, clock, listener);
         groups.put(groupId, group);
         return group.facade();
     }

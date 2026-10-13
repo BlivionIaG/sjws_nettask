@@ -159,10 +159,13 @@ class RaftClusterTest {
         cluster.net.cut(leader.self(), cluster.nodes.get(1).self());
         var committed = leader.append(GROUP, List.of(bytes("kept")));
         ReplicatedNode.driveAll(cluster.nodes);
-        assertTrue(committed.isDone());
+        assertFalse(committed.isDone());
         assertEquals(0L, cluster.logs.get(2).lastIndex(GROUP));
-        assertTrue(cluster.logs.get(2).witnessIndex(GROUP) >= committed.get().index());
+        assertTrue(cluster.logs.get(2).witnessIndex(GROUP) > 0L);
         cluster.net.heal(leader.self(), cluster.nodes.get(1).self());
+        cluster.clock.advance(Duration.ofMillis(40));
+        ReplicatedNode.driveAll(cluster.nodes);
+        assertTrue(committed.isDone());
 
         var majority = cluster(3, false, Durability.STRICT, 1_000_000);
         elect(majority);
@@ -268,9 +271,12 @@ class RaftClusterTest {
         ReplicatedNode.driveAll(nodes);
         assertEquals(term, leader.term());
         assertFalse(leader.isLeader());
+        assertFalse(nodes.get(2).campaigning(GROUP));
         clock.advance(Duration.ofSeconds(1));
         ReplicatedNode.driveAll(nodes);
-        assertTrue(leader.term() > term);
+        assertEquals(term, leader.term());
+        assertFalse(leader.isLeader());
+        assertTrue(nodes.get(2).campaigning(GROUP));
     }
 
     @Test
