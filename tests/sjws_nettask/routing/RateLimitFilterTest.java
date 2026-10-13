@@ -178,4 +178,17 @@ class RateLimitFilterTest {
         assertNotNull(new RateLimitFilter(new Limit(By.PEER, null, 1, 'h', 1_000_000, 1)));
         assertNotEquals(0, AliasTable.mix(1));
     }
+
+    @Test
+    void tableRejectsABadShapeAndReportsDelayWithoutTaking() {
+        assertThrows(IllegalArgumentException.class, () -> new GcraTable(0, 1, 1, () -> 1L));
+        assertThrows(IllegalArgumentException.class, () -> new GcraTable(1, 0, 1, () -> 1L));
+        assertThrows(IllegalArgumentException.class, () -> new GcraTable(1, 1, 3, () -> 1L));
+        var table = new GcraTable(1_000_000_000L, 1, 4, () -> 1_000_000_000L);
+        assertEquals(0, table.delay(0));
+        assertEquals(0, table.admit(table.stripe(1)));
+        assertTrue(table.delay(table.stripe(1)) > 0);
+        assertEquals(4, table.buckets());
+        assertEquals(4, table.keylessSlot());
+    }
 }

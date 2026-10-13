@@ -43,7 +43,7 @@ public interface Quota {
 
     /**
      * Admission for a client address. The default encodes the address and calls {@link #tryAcquire}.
-     * A local token bucket overrides this so a known address does not allocate a string.
+     * The striped table overrides this so an address is hashed without copying it to a string.
      */
     default boolean tryAcquireAddress(InetAddress address) {
         return tryAcquire(address == null ? null : address.getHostAddress());
@@ -54,7 +54,7 @@ public interface Quota {
         return retryAfterSeconds(address == null ? null : address.getHostAddress());
     }
 
-    /** Builds the quota for one filter entry. The local token bucket is the default. */
+    /** Builds the quota for one filter entry. The striped GCRA table is the default. */
     @FunctionalInterface
     interface Factory {
 
