@@ -137,6 +137,10 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     private final UpstreamPool pool;
     private final String basePath;
     private final String authority;
+    /** Both null unless configured: the plain path then makes one attempt, as before. */
+    private final Resilience.Retry retry;
+    private final Resilience.RetryBudget retryBudget;
+    private final Resilience.CircuitBreaker breaker;
 
     public ProxyHandler(Settings settings) {
         this(settings, ByteBudget.shared());
@@ -144,7 +148,16 @@ public final class ProxyHandler implements Handler, AutoCloseable {
 
     /** @param budget the global in-flight body-byte budget (F5); tests pass their own */
     public ProxyHandler(Settings settings, ByteBudget budget) {
+        this(settings, budget, null);
+    }
+
+    /** @param resilience retries and circuit breaking, or null for neither */
+    public ProxyHandler(Settings settings, ByteBudget budget, Resilience resilience) {
         this.settings = settings;
+        this.retry = resilience == null ? null : resilience.retry();
+        this.retryBudget = this.retry == null ? null : new Resilience.RetryBudget(this.retry.budgetPercent());
+        this.breaker = resilience == null || resilience.circuit() == null ? null
+                : new Resilience.CircuitBreaker(resilience.circuit());
         this.pool = new UpstreamPool(settings.upstream(), settings.connectTimeout(), settings.maxIdle(), budget);
         var path = settings.upstream().getRawPath();
         this.basePath = path == null || path.isEmpty() || path.equals("/") ? ""
@@ -191,16 +204,108 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         } catch (IllegalArgumentException e) {
             return StaticFileHandler.error(400, head);
         }
-        try {
-            return exchange(request, out, length, true);
-        } catch (UpstreamPool.ConnectTimeout | ResponseTimeout e) {
-            return StaticFileHandler.error(504, head);
-        } catch (IOException e) {
-            return StaticFileHandler.error(502, head);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return StaticFileHandler.error(502, head);
+        if (this.retry == null && this.breaker == null) {
+            try {
+                return exchange(request, out, length, true);
+            } catch (IOException e) {
+                return StaticFileHandler.error(status(e), head);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return StaticFileHandler.error(502, head);
+            }
         }
+        return resilient(request, out, length, head);
+    }
+
+    private static int status(IOException e) {
+        return e instanceof UpstreamPool.ConnectTimeout || e instanceof ResponseTimeout ? 504 : 502;
+    }
+
+    private static Resilience.On kind(IOException e) {
+        if (e instanceof UpstreamPool.ConnectTimeout || e instanceof UpstreamPool.ConnectFailed) {
+            return Resilience.On.CONNECT;
+        }
+        return e instanceof ResponseTimeout ? Resilience.On.TIMEOUT : Resilience.On.RESET;
+    }
+
+    private static Resilience.On kind(int status) {
+        return switch (status) {
+            case 502 -> Resilience.On.STATUS_502;
+            case 503 -> Resilience.On.STATUS_503;
+            case 504 -> Resilience.On.STATUS_504;
+            default -> null;
+        };
+    }
+
+    /** Methods a retry cannot duplicate the effect of (RFC 9110 §9.2.2). */
+    private static boolean idempotent(String method) {
+        return switch (method) {
+            case "GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE" -> true;
+            default -> false;
+        };
+    }
+
+    /**
+     * Circuit check (once per request), then up to {@code 1 + attempts} tries; the breaker records
+     * the request's final outcome. A failed attempt is retried only when it
+     * is listed in {@code on}, the request is idempotent and bodyless, and the retry budget has a
+     * token; nothing has reached the client before a retry (a retried 5xx body is discarded).
+     */
+    private Response resilient(Request request, HttpRequest out, long length, boolean head) {
+        var retry = this.retry;
+        boolean mayRetry = retry != null && length == 0 && idempotent(request.method());
+        if (retry != null) {
+            this.retryBudget.deposit();
+        }
+        if (this.breaker != null && !this.breaker.allow()) {
+            var open = StaticFileHandler.error(503, head);
+            open.headers().add("retry-after", Long.toString(this.breaker.retryAfterSeconds()));
+            return open;
+        }
+        int tries = 0;
+        while (true) {
+            Resilience.On failed;
+            Response response = null;
+            int errorStatus = 0;
+            try {
+                response = exchange(request, tries == 0 ? out : rebuild(out), length, true);
+                failed = kind(response.status());
+            } catch (IOException e) {
+                failed = kind(e);
+                errorStatus = status(e);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                if (this.breaker != null) {
+                    this.breaker.release(); // the client went away: no verdict on the upstream
+                }
+                return StaticFileHandler.error(502, head);
+            }
+            boolean again = failed != null && mayRetry && tries < retry.attempts() && retry.on().contains(failed)
+                    && this.retryBudget.withdraw();
+            if (!again) {
+                // one verdict per request, after its retries: a retry that recovers is a success
+                if (this.breaker != null) {
+                    if (failed == null) {
+                        this.breaker.success();
+                    } else {
+                        this.breaker.failure();
+                    }
+                }
+                if (failed == null) {
+                    return response;
+                }
+                return response != null ? response : StaticFileHandler.error(errorStatus, head);
+            }
+            if (response != null) {
+                Body.discard(response.body()); // the 5xx is replaced by the next attempt
+            }
+            tries++;
+        }
+    }
+
+    /** Circuit state, for tests and metrics; CLOSED when no breaker is configured. */
+    String circuitState() {
+        return this.breaker == null ? "CLOSED" : this.breaker.state().name();
     }
 
     private static final class ResponseTimeout extends IOException {

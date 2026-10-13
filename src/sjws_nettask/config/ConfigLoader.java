@@ -578,7 +578,7 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host"), "routing.upstreams." + name);
+                    "max_body", "preserve_host", "retry", "circuit"), "routing.upstreams." + name);
             if (!body.containsKey("url")) {
                 throw new ConfigException("routing.upstreams." + name + ".url is required");
             }
@@ -600,9 +600,68 @@ public final class ConfigLoader {
                     : 16 << 20;
             boolean preserve = body.containsKey("preserve_host")
                     && bool(body.get("preserve_host"), "routing.upstreams." + name + ".preserve_host");
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve));
+            var retry = body.containsKey("retry") ? retry(body.get("retry"), "routing.upstreams." + name + ".retry") : null;
+            var circuit = body.containsKey("circuit")
+                    ? circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit") : null;
+            var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience));
         }
         return Map.copyOf(out);
+    }
+
+    /** {@code retry: {attempts: 2, on: [connect, reset, 502, 503, 504], budget: 20%}} */
+    private static sjws_nettask.routing.Resilience.Retry retry(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("attempts", "on", "budget"), path);
+        int attempts = map.containsKey("attempts") ? integer(map.get("attempts"), path + ".attempts", 1, 5) : 2;
+        var on = java.util.EnumSet.noneOf(sjws_nettask.routing.Resilience.On.class);
+        if (map.containsKey("on")) {
+            if (!(map.get("on") instanceof List<?> list)) {
+                throw new ConfigException(path + ".on: expected a list");
+            }
+            for (var item : list) {
+                on.add(switch (String.valueOf(item).trim().toLowerCase(java.util.Locale.ROOT)) {
+                    case "connect" -> sjws_nettask.routing.Resilience.On.CONNECT;
+                    case "timeout" -> sjws_nettask.routing.Resilience.On.TIMEOUT;
+                    case "reset" -> sjws_nettask.routing.Resilience.On.RESET;
+                    case "502" -> sjws_nettask.routing.Resilience.On.STATUS_502;
+                    case "503" -> sjws_nettask.routing.Resilience.On.STATUS_503;
+                    case "504" -> sjws_nettask.routing.Resilience.On.STATUS_504;
+                    default -> throw new ConfigException(path + ".on: unknown '" + item
+                            + "' (connect, timeout, reset, 502, 503, 504)");
+                });
+            }
+        } else {
+            on.add(sjws_nettask.routing.Resilience.On.CONNECT);
+            on.add(sjws_nettask.routing.Resilience.On.RESET);
+            on.add(sjws_nettask.routing.Resilience.On.STATUS_503);
+        }
+        int budget = 20;
+        if (map.containsKey("budget")) {
+            var text = String.valueOf(map.get("budget")).trim();
+            if (text.endsWith("%")) {
+                text = text.substring(0, text.length() - 1).trim();
+            }
+            try {
+                budget = Integer.parseInt(text);
+            } catch (NumberFormatException e) {
+                throw new ConfigException(path + ".budget: expected a percentage such as 20%");
+            }
+            if (budget < 1 || budget > 100) {
+                throw new ConfigException(path + ".budget: must be 1%..100%");
+            }
+        }
+        return new sjws_nettask.routing.Resilience.Retry(attempts, on, budget);
+    }
+
+    /** {@code circuit: {failures: 5, eject_for: 10s}} */
+    private static sjws_nettask.routing.Resilience.Circuit circuit(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("failures", "eject_for"), path);
+        int failures = map.containsKey("failures") ? integer(map.get("failures"), path + ".failures", 1, 1000) : 5;
+        var openFor = map.containsKey("eject_for")
+                ? timeout(text(map.get("eject_for"), path + ".eject_for"), path + ".eject_for") : Duration.ofSeconds(10);
+        return new sjws_nettask.routing.Resilience.Circuit(failures, openFor);
     }
 
     private static List<RouteSpec> routes(Object value, Map<String, Upstream> upstreams) {
