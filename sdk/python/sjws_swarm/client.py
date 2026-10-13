@@ -13,6 +13,7 @@ come later; this client is synchronous.
 from __future__ import annotations
 
 import json
+import os
 import struct
 import urllib.error
 import urllib.parse
@@ -65,9 +66,14 @@ class Lease:
 
 
 class Client:
-    def __init__(self, base_url: str, timeout: float = 60.0):
+    def __init__(self, base_url: str, timeout: float = 60.0, token: str | None = None):
+        """``token`` is the agent's bearer token; defaults to the SJWS_SWARM_TOKEN environment variable."""
         self.base = base_url.rstrip("/") + "/swarm/v1/"
         self.timeout = timeout
+        self._token = token if token is not None else os.environ.get("SJWS_SWARM_TOKEN")
+
+    def __repr__(self) -> str:
+        return f"Client({self.base!r})"  # never shows the token
 
     def submit(self, service: str, body: bytes, deadline: float | None = None) -> bytes:
         """Submits a task without waiting; returns its 16-byte task id."""
@@ -105,9 +111,15 @@ class Client:
     def _settle(self, lease_id: str, verb: str, query: dict | None = None, body: bytes = b"") -> None:
         self._post("leases/" + _seg(lease_id) + ":" + verb, query or {}, body)
 
+    def _headers(self) -> dict:
+        h = {"Content-Type": CONTENT_TYPE}
+        if self._token:
+            h["Authorization"] = "Bearer " + self._token
+        return h
+
     def _post(self, path: str, query: dict, body: bytes, timeout: float | None = None) -> tuple[int, bytes]:
         url = self.base + path + ("?" + urllib.parse.urlencode(query) if query else "")
-        req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": CONTENT_TYPE})
+        req = urllib.request.Request(url, data=body, method="POST", headers=self._headers())
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
                 return r.status, r.read()

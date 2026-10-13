@@ -80,7 +80,7 @@ class ClassLoadTest {
 
     @Test
     void enabledLoadsTheSwarmModule() throws Exception {
-        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 405, "sjws_nettask.Sjws_nettask",
+        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml());
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
     }
@@ -94,9 +94,35 @@ class ClassLoadTest {
 
     @Test
     void yamlKeyTrueLoadsTheSwarmModule() throws Exception {
-        var text = run(List.of(), "Server started:", 405, "sjws_nettask.Sjws_nettask",
+        var text = run(List.of(), "Server started:", 401, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml("swarm:\n  enabled: true\n"));
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
+    }
+
+    @Test
+    void tokensConfiguredButSwarmOffLoadsNoSwarmOrGateClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.tokens.file=" + tokens()), "Server started:", 404,
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertFalse(text.contains(SWARM), text);
+        assertFalse(text.contains("SwarmGate") || text.contains("TokenGate"), text);
+        assertFalse(text.contains(SECRET), "the token never reaches the output");
+    }
+
+    @Test
+    void enabledWithTokensStillRefusesAnonymousRequestsAndNeverLogsTheToken() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.tokens.file=" + tokens()), "Server started:",
+                401, "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.TokenGate"), text);
+        assertTrue(text.contains("swarm: token gate with 1 agent(s)"), text);
+        assertFalse(text.contains(SECRET), "the token never reaches the output");
+    }
+
+    static final String SECRET = "s3cret-token-for-classload-test";
+
+    private Path tokens() throws Exception {
+        var f = this.dir.resolve("tokens-" + System.nanoTime());
+        Files.writeString(f, "agent-1 " + SECRET + " *\n");
+        return f;
     }
 
     private Path yaml() throws Exception {
