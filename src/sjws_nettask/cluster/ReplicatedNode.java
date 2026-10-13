@@ -19,6 +19,7 @@ package sjws_nettask.cluster;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,7 +31,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
- * One process speaking the cluster API. Groups share {@link SimTransport}; frames carry
+ * One process speaking the cluster API. Groups share one {@link ClusterTransport}; frames carry
  * {@link GroupId}. {@link #open} does not start a thread — tests call {@link #drive}.
  * {@link #start} ticks on a virtual thread.
  */
@@ -45,7 +46,7 @@ public final class ReplicatedNode implements ClusterNode {
     private final Clock clock;
     private final LogStorage storage;
     private final ClusterRpc rpc;
-    private final SimTransport transport;
+    private final ClusterTransport transport;
     private final Map<Integer, NodeId> byWire = new LinkedHashMap<>();
     private final Map<GroupId, RaftGroup> groups = new LinkedHashMap<>();
     private volatile Duration tick;
@@ -53,7 +54,7 @@ public final class ReplicatedNode implements ClusterNode {
     private Thread thread;
 
     private ReplicatedNode(NodeId self, List<Member> members, Set<NodeId> voters, QuorumPolicy quorum, Clock clock,
-            LogStorage storage, SimTransport transport, Duration tick) {
+            LogStorage storage, ClusterTransport transport, Duration tick) {
         this.self = Objects.requireNonNull(self, "self");
         this.members = List.copyOf(members);
         this.voters = Set.copyOf(voters);
@@ -90,8 +91,15 @@ public final class ReplicatedNode implements ClusterNode {
 
     /** Membership and replication without a background thread. */
     public static ReplicatedNode open(NodeId self, List<Member> members, Set<NodeId> voters, QuorumPolicy quorum,
-            Clock clock, LogStorage storage, SimTransport transport) {
+            Clock clock, LogStorage storage, ClusterTransport transport) {
         return new ReplicatedNode(self, members, voters, quorum, clock, storage, transport, null);
+    }
+
+    /** Opens with {@link VoterSet#policy()}, which is a majority and has already rejected a bare pair. */
+    public static ReplicatedNode open(NodeId self, VoterSet voters, Clock clock, LogStorage storage,
+            ClusterTransport transport) {
+        Objects.requireNonNull(voters, "voters");
+        return open(self, voters.members(), voters.voters(), voters.policy(), clock, storage, transport);
     }
 
     /** Tick and deliver on a virtual thread. Groups should already be open. */
@@ -132,6 +140,10 @@ public final class ReplicatedNode implements ClusterNode {
 
     boolean ackedFromMemory(GroupId groupId) {
         return group(groupId).ackedFromMemory();
+    }
+
+    boolean campaigning(GroupId groupId) {
+        return group(groupId).campaigning();
     }
 
     Set<NodeId> voters(GroupId groupId) {
@@ -194,13 +206,17 @@ public final class ReplicatedNode implements ClusterNode {
             return existing.facade();
         }
         var peers = new ArrayList<NodeId>();
+        var witnesses = new HashSet<NodeId>();
         for (var member : members) {
+            if (member.witness()) {
+                witnesses.add(member.id());
+            }
             if (!member.id().equals(self)) {
                 peers.add(member.id());
             }
         }
-        var group = new RaftGroup(groupId, self, witness, voters, peers, byWire::get, quorum, options, storage, rpc,
-                clock, listener);
+        var group = new RaftGroup(groupId, self, witness, witnesses, voters, peers, byWire::get, quorum, options,
+                storage, rpc, clock, listener);
         groups.put(groupId, group);
         return group.facade();
     }
@@ -242,5 +258,6 @@ public final class ReplicatedNode implements ClusterNode {
                 Thread.currentThread().interrupt();
             }
         }
+        transport.detach(self);
     }
 }

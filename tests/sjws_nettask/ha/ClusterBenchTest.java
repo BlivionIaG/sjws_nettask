@@ -2,13 +2,19 @@ package sjws_nettask.ha;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Duration;
+import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import sjws_nettask.cluster.ClusterKey;
 
 @Timeout(15)
 class ClusterBenchTest {
+
+    private static final ClusterKey KEY = ClusterKey.of("0123456789abcdef".getBytes(StandardCharsets.UTF_8), null);
 
     @Test
     void clusterModeRunsASecondNodeAndSingleModeDoesNot() throws Exception {
@@ -22,7 +28,9 @@ class ClusterBenchTest {
         } finally {
             single.close();
         }
-        var cluster = BenchServer.launch(new BenchServer.Options("cluster", 0, root.toString()));
+        var clusterOptions = new BenchServer.Options("cluster", 0, root.toString());
+        assertThrows(IllegalArgumentException.class, () -> BenchServer.launch(clusterOptions));
+        var cluster = BenchServer.launch(clusterOptions, KEY);
         try {
             long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
             while (cluster.heartbeats() == 0 && System.nanoTime() < deadline) {
@@ -30,9 +38,38 @@ class ClusterBenchTest {
             }
             assertTrue(cluster.heartbeats() > 0);
             assertEquals("cluster", cluster.mode());
+            var side = ClusterSide.start(KEY);
+            try {
+                var voters = side.voters();
+                assertEquals(3, voters.voters().size());
+                var ids = voters.members();
+                var a = ids.get(0).id();
+                var b = ids.get(1).id();
+                var w = ids.get(2).id();
+                assertTrue(ids.get(2).witness());
+                assertFalse(ids.get(0).witness());
+                assertTrue(voters.policy().hasQuorum(voters.voters(), Set.of(a, b)));
+                assertTrue(voters.policy().hasQuorum(voters.voters(), Set.of(a, w)));
+                assertFalse(voters.policy().hasQuorum(voters.voters(), Set.of(a)));
+                assertFalse(voters.policy().hasQuorum(voters.voters(), Set.of(w)));
+            } finally {
+                side.close();
+            }
         } finally {
             cluster.close();
         }
-        assertThrows(IllegalArgumentException.class, () -> ClusterSide.start(Duration.ZERO));
+        assertThrows(IllegalArgumentException.class, () -> ClusterSide.start(Duration.ZERO, KEY));
+        assertThrows(NullPointerException.class, () -> ClusterSide.start(Duration.ofMillis(20), null));
+        var secret = "cli-secret-value-not-logged-99";
+        var refused = assertThrows(IllegalArgumentException.class,
+                () -> BenchServer.Options.parse(new String[] {"--cluster-key=" + secret}));
+        assertFalse(refused.getMessage().contains(secret));
+        var alias = assertThrows(IllegalArgumentException.class,
+                () -> BenchServer.Options.parse(new String[] {"--ha-cluster-key=" + secret}));
+        assertFalse(alias.getMessage().contains(secret));
+        assertThrows(IllegalArgumentException.class,
+                () -> BenchServer.launch(new BenchServer.Options("single", 0, root.toString()), KEY));
+        var fromEnv = ClusterKey.fromEnvironment(Map.of(ClusterKey.ENV_CURRENT, "env-cluster-key-0123"));
+        assertFalse(fromEnv.toString().contains("env-cluster-key-0123"));
     }
 }

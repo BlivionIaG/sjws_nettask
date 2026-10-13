@@ -190,6 +190,23 @@ Questions 3, 5, 6 and 7 in §13 are answered. Still open: 1 (decoded record view
 - Stripes are short `synchronized` sections over array stacks, not CAS. This avoids ABA and allocation.
 - The fallback when a budget is exhausted is a heap buffer (`pooled() == false`), not unpooled direct.
 - Stats are per tenant (budget), not per size class.
-- Config comes from system properties for now: `sjws.buf.pool` (default false), `sjws.buf.maxBytes`, `sjws.buf.budgets`, `sjws.buf.debug`, `sjws.buf.leakSample`, `sjws.buf.magazine`. The YAML key comes with PR (b).
+- Config comes from system properties for now: `sjws.buf.pool` (default false), `sjws.buf.maxBytes`, `sjws.buf.budgets`, `sjws.buf.debug`, `sjws.buf.leakSample`, `sjws.buf.magazine`. PR (b) added the YAML key `buffers.pool` (sets `sjws.buf.pool` unless it is already set) and wired HTTP/1: pooled direct input buffers in `Http1Connection` (the 256-byte one held while idle, the 2 KiB one only during a request), head + body sent with one gathering write from a pooled head buffer, small files read into a pooled buffer, and a pooled transfer buffer for pooled sinks without sendfile. Leases start cleared; debug poisoning clears the limit first.
 - Leak tracking is sampled, 1 in `leakSample`. An unsampled leaked handle keeps its chunk and its budget charge forever. Debug mode tracks every acquire.
 - Default `leakSample=64`, chosen from the measured Cleaner cost (bench/BufferPoolBench.java, see the PR description). Single thread, 2 KiB, ReentrantLock build: sample 0 = 114.9 ns/op, 1/64 = 126.0 ns/op (about 1.9 B/op), 1/1 = 252.8 ns/op (160 B/op). These were measured on a shared, heavily loaded box (load 9–84 on 8 cores), so treat them as indicative. Known follow-up: with 8 platform threads hammering one class, the pool on was slower than heap allocation (about 1.4 µs vs 0.8 µs per op), so stripe and magazine contention needs work before callers land.
+
+## 16. Contention fix (follow-up to PR (a))
+
+Profiling by ablation (8 platform threads, one 2 KiB class, magazines on): the shared state touched on every operation was what hurt, not the stripes:
+
+| variant | ns/op per thread |
+|---|---|
+| as merged | 1213.4 |
+| without the budget CAS | 682.7 |
+| without the per-slab free counter and `lastFreeNanos` write | 1092.4 |
+| without both | 135.2 |
+
+The magazines already served almost every acquire, so stripe selection and the stripe locks were not on the hot path.
+
+Fix:
+- **Budgets** keep per-stripe credit in padded cells (128 B apart, indexed by thread id). A charge or refund is a CAS on the thread's own cell. The shared `used` counter is touched only to lease a batch (at most min(256 KiB, limit / 4·cells)) or to return the excess above 2 batches. When a lease would exceed the limit, the budget first takes back every cell's parked credit, so a denial is still exact. `usedBytes()` excludes parked credit.
+- **Slabs** no longer keep a shared free counter. Each slot records when it was last freed (written by the releasing thread). `trim` checks idleness and membership under the stripe locks.

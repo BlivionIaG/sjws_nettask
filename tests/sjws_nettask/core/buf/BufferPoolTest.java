@@ -292,7 +292,10 @@ class BufferPoolTest {
                     var rnd = ThreadLocalRandom.current();
                     for (int i = 0; i < 2000; i++) {
                         var budget = p.budget(rnd.nextBoolean() ? BufferPool.HTTP : BufferPool.MESSAGING);
-                        var b = rnd.nextInt(4) == 0 ? budget.tryAcquire(1 + rnd.nextInt(65536)) : budget.acquire(1 + rnd.nextInt(65536));
+                        // >= 8 bytes: over budget, acquire() falls back to a heap buffer of exactly the
+                        // requested size, and the putLong(0) below needs 8 (flaked with sizes 1..7)
+                        int size = Long.BYTES + rnd.nextInt(65536 - Long.BYTES + 1);
+                        var b = rnd.nextInt(4) == 0 ? budget.tryAcquire(size) : budget.acquire(size);
                         if (b == null) {
                             continue;
                         }
@@ -362,5 +365,55 @@ class BufferPoolTest {
         var t = Thread.ofPlatform().start(b::release);
         t.join();
         assertEquals(0, p.budget(BufferPool.MESSAGING).usedBytes());
+    }
+
+    @Test
+    void creditParkedByOtherThreadsIsReclaimedSoTheLimitIsExact() throws Exception {
+        var p = BufferPool.create(new BufferPool.Settings(true, 4 << 20, Map.of(BufferPool.MESSAGING, 0.5), false, 0, 0));
+        var http = p.budget(BufferPool.HTTP);
+        int n = (int) (http.limitBytes() / 65536);
+        var workers = new ArrayList<Thread>();
+        for (int t = 0; t < 8; t++) { // each leaves credit in its own stripe
+            workers.add(Thread.ofPlatform().start(() -> http.acquire(65536).release()));
+        }
+        for (var w : workers) {
+            w.join();
+        }
+        assertEquals(0, http.usedBytes(), "parked credit is not reported as used");
+        var held = new ArrayList<PooledBuffer>();
+        for (int i = 0; i < n; i++) {
+            var b = http.tryAcquire(65536);
+            assertNotNull(b, "buffer " + i + " of " + n);
+            held.add(b);
+        }
+        assertNull(http.tryAcquire(65536), "limit reached");
+        assertEquals(http.limitBytes(), http.usedBytes());
+        held.forEach(PooledBuffer::release);
+        assertEquals(0, http.usedBytes());
+    }
+
+    @Test
+    void debugPoisonIgnoresLimitAndPosition() {
+        var p = pool(8 << 20, 0, true, 1, 0);
+        var b = p.budget(BufferPool.HTTP);
+        for (int size : new int[] {300, 16 << 10, 200 << 10}) {
+            var h = size > BufferPool.MAX_CLASS ? b.acquireLarge(size) : b.acquire(size);
+            var buf = h.buffer();
+            var raw = buf.duplicate();
+            buf.put(new byte[] {1, 2, 3, 4, 5}).flip(); // limit 5 < capacity
+            buf.get(); // position 1
+            h.release(); // threw IndexOutOfBoundsException before the fix
+            for (int i = 0; i < raw.capacity(); i++) {
+                assertEquals((byte) 0xDE, raw.get(i), "byte " + i + " of " + size);
+            }
+        }
+        // read-only view left behind by the caller: the pool poisons its own writable chunk
+        var h = b.acquire(1024);
+        var ro = h.buffer().asReadOnlyBuffer();
+        h.buffer().limit(10).position(3);
+        h.release();
+        assertEquals((byte) 0xDE, ro.get(0));
+        assertEquals((byte) 0xDE, ro.get(1023));
+        assertEquals(0, b.usedBytes());
     }
 }

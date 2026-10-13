@@ -19,6 +19,8 @@ The file is strict: an unknown key or a bad value is an error and the process ex
 64. The existing server flags stay lenient (a bad number warns and falls back).
 There is no `--key-password` and no `key_password` key; a password lives in
 `tls.key_password_file` or `WEB_SERVER_TLS_KEY_PASSWORD`.
+The HA cluster key is the same kind of secret: `ha.cluster_key` or
+`WEB_SERVER_HA_CLUSTER_KEY`, never a command-line flag.
 
 Paths in the file are resolved against the file's directory. Paths on the command
 line and in the environment stay relative to the working directory.
@@ -71,6 +73,56 @@ as they were.
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
 `h`, `d`). In a size, a bare integer is bytes and `1m` is one mebibyte (`k`, `m`,
 `g`, 1024-based). Server timeouts are whole seconds, 1..86400, matching the flags.
+
+## HA
+
+Omitted, HA heartbeats stay off and the authenticator is not loaded. `ha.enabled: true`
+without a key refuses to start (exit 64). The key is at least 16 bytes; 32 random bytes is the
+useful size (`openssl rand -base64 32`). It is not part of the canonical document, so a last-good
+copy does not store it and startup logs do not print it. Java keeps the characters in a
+`String` and inside `Mac`; the process cannot wipe them.
+
+```yaml
+ha:
+  enabled: true
+  cluster_key_file: /etc/sjws/cluster.key   # preferred; mode 0600 or 0400, owned by this process, not a symlink
+  # cluster_key: "base64:...."              # inline alternative; not together with the file
+  # cluster_key_previous_file: /etc/sjws/cluster.key.prev
+```
+
+A value is trimmed. `base64:` and `hex:` select those encodings; anything else is the UTF-8 of
+the trimmed text. A trailing newline from a file is not part of the key.
+
+`WEB_SERVER_HA_CLUSTER_KEY` overrides `ha.cluster_key` and `ha.cluster_key_file`.
+`WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS` overrides the previous key. An empty variable is an error
+when HA is enabled; it does not fall back to the file. The daemon child does not inherit either
+variable (`/proc/pid/environ`); use the key file there. A config file that contains an inline
+key and is readable by group or others produces a warning.
+
+Packets are HMAC-SHA256 under a key derived with HKDF-SHA256 (`info` `sjws-ha-heartbeat-v1`),
+so the same secret is not a tag for any other protocol. The MAC covers a domain label, a
+version, a key id, the 64-byte body, the timestamp, the sequence, a boot epoch, and the
+destination wire id. Key id 0 is the current key and key id 1 is the previous key; a packet is
+checked against that one key. Each sender's sequence starts over when its boot epoch is newer
+than the last one accepted, which is how a restarted node stays reachable. The epoch must not
+lead the packet timestamp, or the receiver's clock, by more than the ±5 second window; a
+later epoch is dropped and does not stick. A lower epoch is accepted only after that sender
+has been silent for at least `max(deadAfter, 5s)`. A timestamp older
+than the receiver's own boot is dropped. Clocks must stay within ±5 seconds (NTP). A larger
+step drops heartbeats until they agree, and a rate-limited warning names the skew.
+
+Key rotation: put the new secret in `ha.cluster_key` or `ha.cluster_key_file` and the key
+that is still in use in `ha.cluster_key_previous` or `ha.cluster_key_previous_file`. Roll
+that config to every node, wait until heartbeats are using the new key, then remove the
+previous key. Only the parent directory of a key file is resolved with `toRealPath`.
+The leaf is opened with `NOFOLLOW_LINKS` and is never followed. Owner and mode (0600 or
+0400, owned by this process) are checked on that opened file. Every resolved parent up
+to `/` must be owned by root or this process. A group- or world-writable parent is
+refused, unless it is sticky and owned by root or this process, as `/tmp` is. On Linux
+the descriptor in `/proc/self/fd` is used only when its device and inode match that
+file. Without `/proc`, the check is an `lstat` of the path while the channel is open,
+and the owner name is compared with `root` or `user.name`. Control-plane key files use
+the same helper (`sjws_nettask.config.SecureKeyFile`).
 
 ## Server
 
@@ -481,6 +533,21 @@ last-good starts with the swarm off. The JVM property `-Dsjws.swarm.enabled` and
 environment variable `SJWS_SWARM_ENABLED` win over the key when set. With the swarm off no
 `sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet.
 The key is read once, at startup: changing it takes effect on restart, not on reload.
+
+## Buffers
+
+```yaml
+buffers:
+  pool: false   # default
+```
+
+`buffers.pool: true` turns on the shared pool of direct buffers (`docs/design/buffer-pool.md`). HTTP/1
+then reads requests into pooled buffers (an idle connection keeps only a 256-byte one) and sends
+in-memory bodies and files up to 64 KiB with one gathering write instead of copying them into a new
+array; larger files still go through sendfile. The key sets the JVM property `sjws.buf.pool`; a
+`-Dsjws.buf.pool=on|off` given on the command line wins. Node-local like `swarm.enabled`, and read
+once, at startup: changing it takes effect on restart, not on reload. The other pool settings
+(`sjws.buf.maxBytes`, `sjws.buf.budgets`) are JVM properties only.
 
 ## Request path
 

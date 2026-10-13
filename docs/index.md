@@ -27,12 +27,15 @@ Back to the [README](../README.md) (quick start).
 - [Request routing and reverse proxy (proposal)](design/proxy-routing.md)
 - [Control plane: distributable access policy, operator RBAC and audit](design/control-plane-security.md)
 - [Messaging core (draft)](messaging/design.md)
+- [Messaging metrics (proposal)](design/messaging-metrics.md)
 - [Messaging config and broker apply (draft)](messaging/config.md)
+- [High availability, as implemented](design/high-availability.md)
 - [High availability (draft)](ha/design.md)
 - [Control plane / API gateway mode (draft)](design/control-plane.md)
 - [Agent swarm layer (optional, draft)](design/agent-swarm.md)
 - [Agent graphs (swarm addendum, draft)](design/agent-graphs.md)
 - [Swarm research mode (draft)](design/swarm-research-mode.md)
+- [Shared buffer pool and zero-copy (draft)](design/buffer-pool.md)
 
 ## Security
 - [Security policy and vulnerability reporting](../SECURITY.md)

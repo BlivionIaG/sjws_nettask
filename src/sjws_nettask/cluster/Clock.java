@@ -23,6 +23,14 @@ public interface Clock {
 
     long nanoTime();
 
+    /**
+     * Wall-clock millis for heartbeat authentication. The monotonic clock is not comparable
+     * across hosts; this value is. Production uses {@link System#currentTimeMillis()}.
+     */
+    default long currentTimeMillis() {
+        return System.currentTimeMillis();
+    }
+
     void sleep(Duration duration) throws InterruptedException;
 
     Clock SYSTEM = new Clock() {

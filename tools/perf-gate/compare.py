@@ -23,6 +23,7 @@ def stats(rows, key):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("base"); ap.add_argument("head")
+    ap.add_argument("--title", default="Perf gate")
     ap.add_argument("--threshold", type=float, default=10.0, help="allowed throughput regression in percent")
     ap.add_argument("--p99-threshold", type=float, default=None,
                     help="allowed p99 regression in percent (default: 2x --threshold; tails are noisier)")
@@ -31,7 +32,7 @@ def main(argv=None):
     limits = {"rps": a.threshold, "p99_us": a.p99_threshold if a.p99_threshold is not None else 2 * a.threshold}
     metrics = [("Requests/s", "rps", +1, lambda v: f"{v:,.0f}"),
                ("p99 latency", "p99_us", -1, lambda v: f"{v/1000:.2f} ms")]
-    out = [f"### Perf gate (median of {len(base)}/{len(head)} runs, thresholds rps {limits['rps']:g}% / p99 {limits['p99_us']:g}%)", "",
+    out = [f"### {a.title} (median of {len(base)}/{len(head)} runs, thresholds rps {limits['rps']:g}% / p99 {limits['p99_us']:g}%)", "",
            "| Metric | master | PR | Change | Allowed | Result |", "|---|---|---|---|---|---|"]
     failed = False
     for label, key, good, fmt in metrics:

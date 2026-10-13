@@ -51,12 +51,40 @@ class ClassLoadTest {
             }
             assertTrue(text.contains("bench port="), text);
             assertFalse(text.contains("sjws_nettask.cp."), text);
+            for (var cp : new String[] {"KeyRing", "KeyRingLoader", "TrustBundle", "TrustState", "CpKeyConfig",
+                    "CpListenerConfig", "CpServerTls", "CpTls"}) {
+                assertFalse(text.contains("sjws_nettask.cp." + cp + " "), cp);
+            }
             assertFalse(text.contains("sjws_nettask.cluster."), text);
+            assertFalse(text.contains("sjws_nettask.cluster.TcpTransport"), text);
             assertFalse(text.contains("sjws_nettask.service."), text);
         } finally {
             process.destroy();
             process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
             process.destroyForcibly();
+        }
+    }
+
+    /** control-plane-hosting.md §5, §8.7: a witness host loads no key ring, store or listener. */
+    @Test
+    void witnessHostLoadsNoKeyRingStoreOrListeners() throws Exception {
+        var javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        var log = dir.resolve("witness-classes.log");
+        var process = new ProcessBuilder(javaBin, "-Xlog:class+load=info", "-cp", System.getProperty("java.class.path"),
+                "sjws_nettask.cp.CpWitnessLoadMain").redirectErrorStream(true).redirectOutput(log.toFile()).start();
+        String text;
+        try {
+            boolean done = process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS);
+            text = Files.readString(log);
+            assertTrue(done, "witness subprocess hung: " + text.lines().filter(l -> !l.contains("class,load"))
+                    .reduce("", (a, b) -> a + "\n" + b));
+        } finally {
+            process.destroyForcibly();
+        }
+        assertTrue(text.contains("witness up"), text);
+        assertTrue(text.contains("sjws_nettask.cp.CpWitness "), "sanity: the witness itself is loaded");
+        for (var name : java.util.List.of("KeyRing", "CpStore", "WatchServer", "AdminServer", "CpHost ")) {
+            assertFalse(text.contains("sjws_nettask.cp." + name), name + " loaded by a witness host");
         }
     }
 }

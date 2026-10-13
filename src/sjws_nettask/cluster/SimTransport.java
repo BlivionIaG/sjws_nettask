@@ -31,7 +31,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link GroupId}. {@link #cut} drops both directions; delivery is explicit so tests can
  * interleave groups without sleeping.
  */
-public final class SimTransport {
+public final class SimTransport implements ClusterTransport {
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Map<NodeId, BiConsumer<NodeId, Frame>> handlers = new HashMap<>();
@@ -39,6 +39,7 @@ public final class SimTransport {
     private final Set<Directed> blocked = new HashSet<>();
     private final List<GroupId> delivered = new ArrayList<>();
 
+    @Override
     public ClusterRpc attach(NodeId self, BiConsumer<NodeId, Frame> handler) {
         lock.lock();
         try {
@@ -47,6 +48,18 @@ public final class SimTransport {
             }
             handlers.put(self, handler);
             return new Endpoint(self);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Drops {@code self}'s handler and its queued frames, so a restarted node can attach again. */
+    @Override
+    public void detach(NodeId self) {
+        lock.lock();
+        try {
+            handlers.remove(self);
+            queue.removeIf(envelope -> envelope.to.equals(self) || envelope.from.equals(self));
         } finally {
             lock.unlock();
         }
@@ -73,6 +86,7 @@ public final class SimTransport {
     }
 
     /** Deliver up to {@code max} queued frames. Returns how many handlers ran. */
+    @Override
     public int deliver(int max) {
         int deliveredNow = 0;
         while (deliveredNow < max) {
