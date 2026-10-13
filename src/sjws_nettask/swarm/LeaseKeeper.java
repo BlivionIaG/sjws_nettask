@@ -50,6 +50,9 @@ public final class LeaseKeeper implements AutoCloseable {
     private volatile Thread thread;
     private volatile boolean closed;
     private long batches;
+    private int cursor;
+    /** Leases per extend when the keeper's thread spreads a round over the period (the #91 bench shape). */
+    public static final int SLICE = 100;
 
     public LeaseKeeper(TaskService tasks, long visibilityMs, BiConsumer<Task, LeaseResult> lost) {
         if (visibilityMs < 1) {
@@ -104,13 +107,34 @@ public final class LeaseKeeper implements AutoCloseable {
 
     /** One heartbeat round: one batched extend per pool. */
     public void tick() {
+        tick(Integer.MAX_VALUE);
+    }
+
+    /**
+     * One slice of a heartbeat round: extends the next {@code max} held leases (rotating through all of them
+     * across calls), one batched extend per pool in the slice.
+     */
+    public void tick(int max) {
+        if (max < 1) {
+            throw new IllegalArgumentException("max");
+        }
         long now = this.tasks.clock().getAsLong();
         var byPool = new LinkedHashMap<String, List<Task>>();
         var expiring = new ArrayList<Task>();
         this.lock.lock();
         try {
+            int size = this.held.size();
+            int from = size == 0 || max >= size ? 0 : this.cursor % size;
+            int take = Math.min(max, size);
+            this.cursor = from + take;
+            int i = -1;
             for (var it = this.held.values().iterator(); it.hasNext();) {
                 var t = it.next();
+                i++;
+                boolean in = from + take <= size ? i >= from && i < from + take : i >= from || i < from + take - size;
+                if (!in) {
+                    continue;
+                }
                 if (t.envelope().deadlineMs() - now < this.visibilityMs) {
                     it.remove();
                     expiring.add(t);
@@ -153,7 +177,10 @@ public final class LeaseKeeper implements AutoCloseable {
         }
     }
 
-    /** Starts a daemon thread that calls {@link #tick()} every {@code periodMs}. */
+    /**
+     * Starts a daemon thread that renews every lease once per {@code periodMs}, spread over the period: it wakes
+     * every {@code periodMs / ceil(n / SLICE)} and extends the next {@value #SLICE} leases in one batched call.
+     */
     public LeaseKeeper start(long periodMs) {
         if (periodMs < 1 || periodMs > this.visibilityMs) {
             throw new IllegalArgumentException("period");
@@ -161,10 +188,11 @@ public final class LeaseKeeper implements AutoCloseable {
         this.thread = Thread.ofPlatform().daemon().name("swarm-lease-keeper").start(() -> {
             long next = System.nanoTime();
             while (!this.closed) {
-                next += periodMs * 1_000_000L;
+                int slices = Math.max(1, (size() + SLICE - 1) / SLICE);
+                next += periodMs * 1_000_000L / slices;
                 LockSupport.parkNanos(next - System.nanoTime());
                 if (!this.closed) {
-                    tick();
+                    tick(SLICE);
                 }
             }
         });

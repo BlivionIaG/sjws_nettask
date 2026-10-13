@@ -202,6 +202,26 @@ class TaskServiceTest {
     }
 
     @Test
+    void slicedTicksRotateThroughEveryLease() {
+        for (int i = 0; i < 5; i++) {
+            this.tasks.submit("s", 1, i + 1, env("s" + i, "", TaskEnvelope.NO_DEADLINE));
+        }
+        var held = this.tasks.claim("s", "w", 5, 1_000);
+        var keeper = new LeaseKeeper(this.tasks, 1_000, (t, r) -> { throw new AssertionError(r); });
+        held.forEach(keeper::hold);
+        // 3 slices of 2 cover all 5 leases (the third wraps), each within the 1 s lease.
+        for (int i = 0; i < 3; i++) {
+            this.now.addAndGet(300);
+            keeper.tick(2);
+        }
+        assertEquals(3, keeper.batches());
+        this.now.addAndGet(300); // 1.2 s after claim: every lease got at least one extend
+        assertTrue(this.tasks.claim("s", "w2", 5, 1_000).isEmpty());
+        assertThrows(IllegalArgumentException.class, () -> keeper.tick(0));
+        new LeaseKeeper(this.tasks, 1_000, (t, r) -> { }).tick(1); // empty keeper
+    }
+
+    @Test
     void leaseKeeperThreadHeartbeatsUntilClosed() throws Exception {
         var real = new Topics(this.dir.resolve("real"), RetryPolicy.DEFAULT, System::currentTimeMillis);
         try (real) {

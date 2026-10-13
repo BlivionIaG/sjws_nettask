@@ -19,7 +19,7 @@ import sjws_nettask.swarm.TaskEnvelope;
  *   dispatch <workers> <secs>   pool "p" is prefilled with 1 KiB tasks; each worker claims 1 and acks it (fenced).
  *                               Prints tasks/s and claim() latency p50/p99. Target: >= 50k tasks/s, claim p99 < 100 us.
  *   heartbeat <off|keeper> <secs>  one dispatch worker (claim+ack, 1 KiB) while 10 000 leases in pool "hold" are kept
- *                               by a LeaseKeeper ticking every 5 s (one batched extend of 10 000 per tick). Prints
+ *                               by LeaseKeeper.start(5 s), spread: one batched extend of 100 every 50 ms. Prints
  *                               dispatch tasks/s and tick latency. Target: < 2 % loss vs off.
  *   reqreply <rate> <secs>      ReplyRouter.call at <rate>/s open loop; one worker claims and replies (reply ASYNC,
  *                               then ack). Prints round-trip p50/p99. Target at 10k/s: p50 < 50 us, p99 < 500 us.
@@ -97,25 +97,12 @@ public class SwarmBench {
         int leases = 10_000;
         for (int i = 0; i < leases; i++) t.submit("hold", 1, i + 1, env(new byte[1024]));
         var held = t.claim("hold", "holder", leases, 3_600_000);
-        var ticks = new ArrayList<Long>();
         LeaseKeeper keeper = null;
-        Thread ticker = null;
         var stop = new AtomicBoolean();
         if (mode.equals("keeper")) {
             keeper = s.leaseKeeper(15_000, (x, r) -> { throw new AssertionError("lost lease " + r); });
             held.forEach(keeper::hold);
-            var k = keeper;
-            ticker = Thread.ofPlatform().name("ticker").start(() -> {
-                long next = System.nanoTime();
-                while (!stop.get()) {
-                    next += 5_000_000_000L;
-                    while (!stop.get() && System.nanoTime() < next) LockSupport.parkNanos(10_000_000L);
-                    if (stop.get()) break;
-                    long t0 = System.nanoTime();
-                    k.tick();
-                    synchronized (ticks) { ticks.add(System.nanoTime() - t0); }
-                }
-            });
+            keeper.start(5_000); // spread: one batched extend of LeaseKeeper.SLICE leases every 50 ms
         }
         var body = new byte[1024];
         long warmEnd = System.nanoTime() + 2_000_000_000L, end = warmEnd + (long) (secs * 1e9);
@@ -128,14 +115,10 @@ public class SwarmBench {
             if (now >= warmEnd) done++;
         }
         stop.set(true);
-        if (ticker != null) ticker.join();
         String tick = "";
-        synchronized (ticks) {
-            if (!ticks.isEmpty()) {
-                tick = String.format(" ticks=%d tick_mean_ms=%.2f tick_max_ms=%.2f batches=%d", ticks.size(),
-                        ticks.stream().mapToLong(x -> x).average().orElse(0) / 1e6,
-                        ticks.stream().mapToLong(x -> x).max().orElse(0) / 1e6, keeper.batches());
-            }
+        if (keeper != null) {
+            keeper.close();
+            tick = " batches=" + keeper.batches();
         }
         System.out.printf("heartbeat mode=%s dispatch_tasks/s=%.0f%s%n", mode, done / secs, tick);
     }
