@@ -94,6 +94,15 @@ What the code enforces today:
   bind without its certificate, key and admin-CA bundle. Authorization is deny-by-default RBAC
   (`viewer`, `operator`, `admin`), and every decision is written to the audit log before it is
   returned.
+- **Admin certificate rotation and revocation**: the admin listener reloads its certificate, key
+  and admin-CA bundle without a restart, either on an explicit reload (`AdminServer.reloadTls()`,
+  for example from a SIGHUP handler) or through an optional file watch. A reload that fails keeps
+  the previous material and is audited. An optional revocation file is checked at every handshake,
+  against every certificate in the client chain. It holds either PEM CRLs, each of which must be
+  signed by the admin CA, or a denylist of `sha256:<fingerprint>` and `serial:<hex>` entries. A
+  revoked certificate is refused, and each refusal is written to the audit log. A revocation file
+  that is configured but missing or invalid fails closed. Reloading invalidates cached TLS
+  sessions. Connections that are already open stay open until they close.
 - **Join tokens** are one-shot, and this is enforced. The control plane stores only a SHA-256
   hash of each token. A token must be issued before it can be used, and it expires after a TTL
   (default 1 hour, at most 24 hours). It is burned atomically, through the Raft-replicated CP log,
@@ -119,8 +128,9 @@ Recommendations:
   practical TTL, and never put tokens in arguments, logs or the repository.
 - The swarm (`/swarm/v1`) endpoints have no built-in authentication. Enable them only behind the
   gateway's API-key or JWT filters, or on a private listener.
-- Issue admin client certificates from a dedicated admin CA, and rotate and revoke them through your
-  PKI.
+- Issue admin client certificates from a dedicated admin CA. When a key is lost or a person
+  leaves, add the certificate to the admin revocation list. Rotate the CA and server certificate by
+  replacing the files and reloading.
 - Run the server as an unprivileged user that can read the document root and not write to it.
 
 See also [control-plane security](docs/design/control-plane-security.md),
