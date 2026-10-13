@@ -45,6 +45,7 @@ import sjws_nettask.config.ConfigDiff;
 import sjws_nettask.config.ConfigDocument;
 import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.config.ConfigValidator;
+import sjws_nettask.config.MessagingSettings;
 
 /**
  * Single-voter {@code cp-config} log, the signed snapshot history, and the admin operations.
@@ -208,6 +209,15 @@ public final class CpStore implements AutoCloseable {
         var errors = ConfigValidator.validate(loaded.document());
         if (!errors.isEmpty()) {
             return Outcome.error(400, errors.get(0));
+        }
+        if (!loaded.document().messaging().assignment().isEmpty()) {
+            return Outcome.error(400, "assignment is computed by the control plane");
+        }
+        var previous = documents.isEmpty() ? MessagingSettings.disabled()
+                : documents.get(documents.size() - 1).messaging();
+        var destructive = MessagingSettings.destructiveErrors(previous, loaded.document().messaging());
+        if (!destructive.isEmpty()) {
+            return Outcome.error(400, destructive.get(0));
         }
         long version = (history.isEmpty() ? 0 : history.get(history.size() - 1).version()) + 1;
         var canonical = ConfigCodec.text(copyVersion(loaded.document(), version));
@@ -503,7 +513,7 @@ public final class CpStore implements AutoCloseable {
     private static ConfigDocument copyVersion(ConfigDocument document, long version) {
         return ConfigDocument.of(document.server(), document.acme(), document.routing(), document.middleware(),
                 document.access(), document.node(), document.schemaVersion(), version, document.configFile(),
-                document.contentHash());
+                document.messaging()).withStateDir(document.stateDir());
     }
 
     private static ConfigLoader.Loaded parse(String yaml) throws IOException {
@@ -590,13 +600,13 @@ public final class CpStore implements AutoCloseable {
         var ops = new ArrayList<sjws_nettask.controlplane.Operator>();
         for (var entry : policy.entrySet()) {
             ops.add(new sjws_nettask.controlplane.Operator(operatorId(entry.getKey(), used), entry.getValue(),
-                    entry.getKey(), null, true));
+                    entry.getKey(), true));
         }
         this.rights = new sjws_nettask.controlplane.Rbac(ops, audit);
     }
 
     private static String canonicalSan(String san) {
-        return new sjws_nettask.controlplane.Operator("n", sjws_nettask.controlplane.Role.VIEWER, san, null, false)
+        return new sjws_nettask.controlplane.Operator("n", sjws_nettask.controlplane.Role.VIEWER, san, false)
                 .certSubject();
     }
 
