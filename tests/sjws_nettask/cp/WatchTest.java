@@ -56,6 +56,11 @@ class WatchTest {
         return store;
     }
 
+    private static void issue(CpStore store, String tokenId) {
+        assertEquals(200, store.issueJoinToken(tokenId, SECRET.getBytes(StandardCharsets.UTF_8),
+                System.currentTimeMillis(), JoinTokens.DEFAULT_TTL_MILLIS).status());
+    }
+
     private static KeyRing keys() {
         return KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
     }
@@ -92,7 +97,13 @@ class WatchTest {
             assertEquals(401, call(p, "GET", "/cp/v1/watch", null, null, null).statusCode());
             assertEquals(401, call(p, "GET", "/cp/v1/watch", "gw-1", "t", "%%%").statusCode());
             assertEquals(401, call(p, "GET", "/cp/v1/watch", "gw-1", "t", "c2hvcnQ=").statusCode());
+            assertEquals(401, call(p, "GET", "/cp/v1/watch?waitMs=0", "gw-1", "t", ok).statusCode(), "not issued");
+            issue(store, "t");
             assertEquals(204, call(p, "GET", "/cp/v1/watch?waitMs=0", "gw-1", "t", ok).statusCode());
+            assertEquals(204, call(p, "GET", "/cp/v1/watch?waitMs=0", "gw-1", "t", ok).statusCode(), "joined node polls again");
+            assertEquals(401, call(p, "GET", "/cp/v1/watch?waitMs=0", "gw-1", "t",
+                    Base64.getEncoder().encodeToString("fedcba9876543210".getBytes(StandardCharsets.UTF_8)))
+                    .statusCode(), "wrong secret");
             assertEquals(401, call(p, "GET", "/cp/v1/watch", "gw-2", "t", ok).statusCode(), "token bound to gw-1");
             assertEquals(400, call(p, "GET", "/cp/v1/watch?after=x", "gw-1", "t", ok).statusCode());
             assertEquals(404, call(p, "GET", "/cp/v1/other", "gw-1", "t", ok).statusCode());
@@ -116,6 +127,36 @@ class WatchTest {
             Thread.currentThread().interrupt();
             assertNull(store.awaitActivated(5, 1_000));
             assertTrue(Thread.interrupted());
+        }
+    }
+
+    /** keyCount is a long on the wire: bounds at MAX_KEYS, and int-overflow sizes fail closed. */
+    @Test
+    void keyCountBoundaries() throws Exception {
+        var keys = keys();
+        try (var store = elected(this.dir.resolve("cp"), keys)) {
+            assertEquals(200, store.propose("server:\n  port: 0\n  root: " + root() + "\n").status());
+            assertEquals(200, store.activate(System.currentTimeMillis(), 60_000L).status());
+            var text = WatchWire.encode(keys, store.activated());
+            int from = text.indexOf(",\"k0.keyId\":");
+            int to = text.indexOf(",\"snapshot\":");
+            var k0 = text.substring(from, to);
+            for (int n : new int[] {1, WatchWire.MAX_KEYS - 1, WatchWire.MAX_KEYS}) {
+                var extra = new StringBuilder();
+                for (int i = 1; i < n; i++) {
+                    extra.append(k0.replace("\"k0.", "\"k" + i + "."));
+                }
+                var padded = text.substring(0, to).replace("\"keyCount\":1", "\"keyCount\":" + n) + extra
+                        + text.substring(to);
+                assertEquals(n, WatchWire.decode(padded).keys().size(), "keyCount " + n);
+            }
+            long[] bad = {0L, -1L, WatchWire.MAX_KEYS + 1L, Integer.MAX_VALUE, Integer.MAX_VALUE + 1L,
+                    1L << 32, (1L << 32) + 1L, Long.MAX_VALUE, Long.MIN_VALUE};
+            for (long n : bad) {
+                var e = assertThrows(IOException.class,
+                        () -> WatchWire.decode(text.replace("\"keyCount\":1", "\"keyCount\":" + n)), "keyCount " + n);
+                assertEquals("keyCount", e.getMessage(), "keyCount " + n);
+            }
         }
     }
 
@@ -162,6 +203,7 @@ class WatchTest {
     void dataWatchSkipsUntrustedSnapshotsAndReportsOutage() throws Exception {
         var keys = keys();
         var store = elected(this.dir.resolve("cp"), keys);
+        issue(store, "node-1");
         var watch = WatchServer.start(store, 0, System::currentTimeMillis);
         var pin = this.dir.resolve("root.pub");
         LastGoodFiles.writePin(pin, keys().rootPublic(), 0); // not this control plane's root

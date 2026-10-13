@@ -134,7 +134,12 @@ Read-only, served from in-memory state and segments, with no locks on the hot pa
 - `get(topic, partition, offset)`: the message and its full state history.
 - Audited admin mutations, written to the ledger: requeue from the DLQ, purge, reset offset.
 Exposed as Java `messaging.Inspector` and as JSON at `/_admin/messaging/...` behind the
-rights decorator; metrics go to the observability `MetricsSink`.
+rights decorator; metrics go to the observability `MetricsSink`. Proposed series names
+(produce and fetch latency, log-end / durable / unsynced / high-watermark gauges, replication
+status) and the cardinality caps are in
+[docs/design/messaging-metrics.md](../design/messaging-metrics.md). Those names are not stable.
+sjws Messaging Core's offset, path, and label notes are folded into that proposal.
+The lag gauges already rendered by `PartitionStatsRegistry` are listed there as shipped.
 
 ## 5. Package layout
 `sjws_nettask.messaging`: `Broker`, `Partition`, `Ledger`, `Segment`, `SegmentIndex`,

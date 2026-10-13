@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -40,6 +41,7 @@ public final class FileLogStorage implements LogStorage {
     private final Map<GroupId, NavigableMap<Long, Rec>> logs = new ConcurrentHashMap<>();
     private final Map<GroupId, FileChannel> channels = new ConcurrentHashMap<>();
     private final Map<GroupId, AtomicInteger> forceCounts = new ConcurrentHashMap<>();
+    private final Map<GroupId, WitnessCursor> cursors = new ConcurrentHashMap<>();
 
     public FileLogStorage(Path root) throws IOException {
         this.root = root;
@@ -185,6 +187,11 @@ public final class FileLogStorage implements LogStorage {
         lock.lock();
         try {
             channels.get(group).force(true);
+            var cursor = cursors.get(group);
+            if (cursor != null && cursor.dirty()) {
+                writeCursor(group, cursor.stagedIndex(), cursor.stagedTerm());
+                cursor.publish();
+            }
             var count = forceCounts.get(group);
             if (count == null) {
                 var created = new AtomicInteger();
@@ -195,6 +202,85 @@ public final class FileLogStorage implements LogStorage {
         } finally {
             lock.unlock();
         }
+    }
+
+    @Override
+    public long witnessIndex(GroupId group) throws IOException {
+        lock.lock();
+        try {
+            return cursorLocked(group).index();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public long witnessTerm(GroupId group) throws IOException {
+        lock.lock();
+        try {
+            return cursorLocked(group).term();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public void noteWitness(GroupId group, long index, long term) throws IOException {
+        lock.lock();
+        try {
+            cursorLocked(group).note(index, term);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private WitnessCursor cursorLocked(GroupId group) throws IOException {
+        var existing = cursors.get(group);
+        if (existing != null) {
+            return existing;
+        }
+        var created = new WitnessCursor();
+        var loaded = readCursor(group);
+        created.load(loaded.index, loaded.term);
+        cursors.put(group, created);
+        return created;
+    }
+
+    private CursorFile readCursor(GroupId group) throws IOException {
+        var path = witnessPath(group);
+        if (!Files.isRegularFile(path) || Files.size(path) < 16) {
+            return new CursorFile(0, 0);
+        }
+        var buf = ByteBuffer.wrap(Files.readAllBytes(path));
+        return new CursorFile(buf.getLong(), buf.getLong());
+    }
+
+    private void writeCursor(GroupId group, long index, long term) throws IOException {
+        var target = witnessPath(group);
+        var tmp = root.resolve(target.getFileName().toString() + ".tmp");
+        try (var channel = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            var buf = ByteBuffer.allocate(16);
+            buf.putLong(index);
+            buf.putLong(term);
+            buf.flip();
+            while (buf.hasRemaining()) {
+                channel.write(buf);
+            }
+            channel.force(true);
+        }
+        Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
+            dir.force(true);
+        }
+    }
+
+    private Path witnessPath(GroupId group) {
+        var safe = group.value().replaceAll("[^A-Za-z0-9._-]", "_");
+        return root.resolve(safe + ".witness");
+    }
+
+    private record CursorFile(long index, long term) {
     }
 
     @Override

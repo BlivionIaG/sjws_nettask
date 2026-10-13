@@ -148,6 +148,11 @@ public final class NodeFixtures {
             if (!store.leadership().leaderReady()) {
                 throw new IOException("single voter did not become leaderReady");
             }
+            var issued = store.issueJoinToken("node-1", JOIN_SECRET.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                    System.currentTimeMillis(), sjws_nettask.cp.JoinTokens.DEFAULT_TTL_MILLIS);
+            if (issued.status() != 200) {
+                throw new IOException("join token not issued: " + issued.status());
+            }
             watch = WatchServer.start(store, 0, System::currentTimeMillis);
             var pin = directory.resolve("root.pub");
             LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());

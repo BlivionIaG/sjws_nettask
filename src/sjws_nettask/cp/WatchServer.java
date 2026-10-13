@@ -131,7 +131,7 @@ public final class WatchServer implements AutoCloseable {
             return "token";
         }
         try {
-            var result = this.store.presentJoin(node, tokenId, raw, this.nowMillis.getAsLong());
+            var result = this.store.authenticateWatch(node, tokenId, raw, this.nowMillis.getAsLong());
             if (!result.accepted()) {
                 return result.error();
             }
