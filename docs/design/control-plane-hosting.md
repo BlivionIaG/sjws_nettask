@@ -24,8 +24,8 @@ the swarm so data-only builds load no CP class):
 5. Report ready only when `CpStore.ready(...)` is true.
 
 **Implemented** in `sjws_nettask.cp.CpLaunch` / `CpHost` / `CpWitnessHost`. Hosting starts only when `cp` settings
-exist (a `cp:` block, `sjws.cp.nodeId` or `SJWS_CP_NODE_ID`); a control bootstrap without them keeps today's
-behaviour and logs a WARN. Once configured, every error is fatal.
+exist (a `cp:` block, `sjws.cp.nodeId` or `SJWS_CP_NODE_ID`); a control bootstrap without them fails closed
+(exit 64, before any listener; inceptor's decision after #161). Once configured, every error is fatal.
 
 **Proposed shutdown order** (reverse): stop accepting admin writes (close `AdminServer`) -> close `WatchServer`
 (watchers fail over to another voter) -> `CpStore.close()` (Raft node, log) -> zero private key bytes held in memory.
@@ -190,7 +190,18 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
 | `sjws.cp.admin.listen` | `SJWS_CP_ADMIN_LISTEN` | `cp.admin.listen` | AdminServer |
-| — | — | `cp.tls.{cert,key,ca,adminCa}` | owned by Security |
+| — | — | `cp.tls.{cert,key,ca,adminCa,peerCa,revocations}` | owned by Security; `peerCa` (voter links) defaults to `ca` |
+| — | `WEB_SERVER_HA_CLUSTER_KEY` (`_PREVIOUS` during rotation) | — | voter frame HMAC key, same on every voter; required with `cp.peers` |
+
+**Voter links (`cp.peers`).** Each voter (and the witness) opens one `cluster.TcpTransport` on its own
+`cp.peers` address. Every socket comes from `cp.CpPeerSockets`, a `TcpTransport.SocketFactory` over the
+`cp-peer` `CpServerTls.context()` with `parameters()` applied (TLS 1.3, client certificate required on both
+ends, chain checked against `peerCa` or `ca` and the revocation list). Frames stay HMAC-authenticated on top
+(HKDF of the cluster key, not the heartbeat key). SIGHUP reloads the `cp-peer` material with the other
+listeners. Without TLS material the start fails closed; only the test seam (`CpHostDeps.serverTls` returning
+null) allows plain links, and only when every peer is loopback. A CONTROL role with no `cp` settings at all
+refuses to start (exit 64, before any listener). Gap: peer certificates are not yet bound to the `cp.peers`
+id (any certificate from the peer CA is accepted on the TLS layer; the HMAC key still binds the sender).
 
 The role key is the existing `--role` / `WEB_SERVER_ROLE` / `node.mode` (`NodeLifecycle.role`); there is no `sjws.cp.role`.
 Implemented in `sjws_nettask.cp.CpConfig` and `CpKeyConfig`; `ConfigLoader` keeps the `cp:` block raw so a

@@ -92,8 +92,21 @@ class CpHostingEdgesTest {
         y.put("insecureSkipPermissionChecks", true);
         var deps = CpLaunch.production(y, dir);
         assertSame(Clock.SYSTEM, deps.clock());
-        var t = assertThrows(IOException.class, () -> deps.transport(parse(base())));
-        assertTrue(t.getMessage().contains("#158"), t.getMessage());
+        // cp.peers without the voter frame key refuses (the env var name is reported, never a value).
+        var noKey = assertThrows(IOException.class, () -> CpLaunch.peerKey(Map.of()));
+        assertTrue(noKey.getMessage().contains(sjws_nettask.cluster.ClusterKey.ENV_CURRENT), noKey.getMessage());
+        assertThrows(IOException.class, () -> CpLaunch.peerKey(Map.of(sjws_nettask.cluster.ClusterKey.ENV_CURRENT, " ")));
+        var shortKey = assertThrows(IOException.class,
+                () -> CpLaunch.peerKey(Map.of(sjws_nettask.cluster.ClusterKey.ENV_CURRENT, "short")));
+        assertFalse(shortKey.getMessage().contains("short"), shortKey.getMessage());
+        assertNotNull(CpLaunch.peerKey(Map.of(sjws_nettask.cluster.ClusterKey.ENV_CURRENT, "0123456789abcdef0123")));
+        if (System.getenv(sjws_nettask.cluster.ClusterKey.ENV_CURRENT) == null) {
+            var peered = base();
+            peered.put("peers", java.util.List.of(Map.of("id", "cp-1", "address", "127.0.0.1:1"),
+                    Map.of("id", "cp-2", "address", "127.0.0.1:2"), Map.of("id", "cp-3", "address", "127.0.0.1:3")));
+            peered.put("nodeId", "cp-1");
+            assertThrows(IOException.class, () -> deps.transport(parse(peered), null));
+        }
         assertThrows(CpKeyException.class, () -> deps.serverTls("cp-watch"));
         assertThrows(CpKeyException.class, () -> deps.loadKeys(parse(base()).keys()));
         var none = CpLaunch.production(null, null);
