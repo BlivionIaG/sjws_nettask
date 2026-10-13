@@ -43,7 +43,7 @@ import sjws_nettask.core.RoutePattern;
 public final class ConfigLoader {
 
     private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
-            "routing", "middleware", "access", "messaging", "swarm", "ha", "buffers");
+            "routing", "middleware", "access", "messaging", "swarm", "ha", "buffers", "cp");
     private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
@@ -114,6 +114,7 @@ public final class ConfigLoader {
         byte[] bootSignature = null;
         String recoveredHash = null;
         Path yamlState = null;
+        Map<String, Object> yamlCp = null;
         String text;
         Path readFrom = null;
         if (configured != null) {
@@ -167,6 +168,7 @@ public final class ConfigLoader {
             access = accessSection(root, warnings);
             messaging = MessagingSettings.parse(root);
             yamlSwarm = swarmSection(root);
+            yamlCp = cpSection(root);
             buffersSection(root);
             var ha = haSection(root, env, base, readFrom, warnings);
             haEnabled = ha.enabled();
@@ -195,7 +197,19 @@ public final class ConfigLoader {
             document = document.withSignature(bootSignature);
         }
         return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm, haEnabled,
-                haKey, haPrevious);
+                haKey, haPrevious, yamlCp, base);
+    }
+
+    /**
+     * The raw {@code cp:} block (control-plane-hosting.md §4), or null when the file has none. Kept untyped
+     * so a standalone or data process names no {@code sjws_nettask.cp} class; only the CONTROL role parses it
+     * ({@code sjws_nettask.cp.CpConfig}).
+     */
+    private static Map<String, Object> cpSection(Map<String, Object> root) {
+        if (!(root.get("cp") instanceof Object cp)) {
+            return null;
+        }
+        return java.util.Collections.unmodifiableMap(YamlValues.mapping(cp, "cp"));
     }
 
     private static int schemaOf(Map<String, Object> root) {
@@ -1680,6 +1694,10 @@ public final class ConfigLoader {
         private final byte[] haClusterKey;
         /** Previous HMAC key during rotation, or null. Not part of {@link #toString()}. */
         private final byte[] haClusterKeyPrevious;
+        /** Raw {@code cp:} block, or null. Parsed only by the CONTROL role. */
+        private final Map<String, Object> yamlCp;
+        /** Directory of the config file, for relative {@code cp:} paths; null without a file. */
+        private final Path configBase;
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
@@ -1699,6 +1717,16 @@ public final class ConfigLoader {
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
                 Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
                 byte[] haClusterKeyPrevious) {
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, yamlSwarmEnabled,
+                    haEnabled, haClusterKey, haClusterKeyPrevious, null, null);
+        }
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
+                byte[] haClusterKeyPrevious, Map<String, Object> yamlCp, Path configBase) {
+            this.yamlCp = yamlCp;
+            this.configBase = configBase;
             this.document = document;
             this.warnings = List.copyOf(warnings);
             this.errors = List.copyOf(errors);
@@ -1717,7 +1745,17 @@ public final class ConfigLoader {
         public Loaded withDocument(ConfigDocument document) {
             return new Loaded(document, this.warnings, this.errors, this.helpRequested, this.args, this.env,
                     this.passwords, this.yamlBindContent, this.yamlSwarmEnabled, this.haEnabled, this.haClusterKey,
-                    this.haClusterKeyPrevious);
+                    this.haClusterKeyPrevious, this.yamlCp, this.configBase);
+        }
+
+        /** The raw {@code cp:} block from the file, or null when it has none. */
+        public Map<String, Object> yamlCp() {
+            return this.yamlCp;
+        }
+
+        /** Directory of the config file, or null when there is none. */
+        public Path configBase() {
+            return this.configBase;
         }
 
         /** {@code ha.enabled}. False when the file omits it. */

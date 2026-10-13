@@ -143,8 +143,7 @@ public final class CpStore implements AutoCloseable {
 
     private static CpStore attach(ReplicatedNode node, NodeId id, java.nio.file.Path stateDir, KeyRing keys,
             String adminSan) throws IOException {
-        var options = new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40),
-                10_000);
+        var options = groupOptions();
         var store = new CpStore(node, keys);
         store.auditFile = stateDir.resolve("audit.jsonl");
         store.audit = new sjws_nettask.controlplane.AuditLog(store.auditFile, java.time.Clock.systemUTC(), false);
@@ -153,6 +152,11 @@ public final class CpStore implements AutoCloseable {
         store.group = node.openGroup(GROUP, options, entry -> store.onCommitted(entry.entry()));
         store.leadership = ControlLeadership.attach(node, GROUP, store.group, id);
         return store;
+    }
+
+    /** The {@code cp-config} group timings; the CONTROL start checks them with {@link CpTiming#check}. */
+    public static GroupOptions groupOptions() {
+        return new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40), 10_000);
     }
 
     public ControlLeadership leadership() {
