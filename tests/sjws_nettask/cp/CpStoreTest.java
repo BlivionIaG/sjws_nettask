@@ -181,7 +181,8 @@ class CpStoreTest {
         var root = Files.createDirectory(dir.resolve("html"));
         var keys = KeyRing.generate("online-1", NOW + 86_400_000L, 0, Long.MAX_VALUE / 2);
         var clock = new FakeClock(0);
-        try (var store = CpStore.open(dir.resolve("cp"), keys, clock); var http = AdminServer.start(store, NOW, TTL)) {
+        try (var store = CpStore.open(dir.resolve("cp"), keys, clock);
+                var http = AdminServer.startPlainForTests(store, NOW, TTL)) {
             elect(store, clock);
             var client = HttpClient.newHttpClient();
             var bearer = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.port()
