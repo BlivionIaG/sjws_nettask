@@ -153,7 +153,7 @@ Bounded at every level, and admission refuses rather than queues unboundedly:
 - A result arriving after cancellation is recorded as `late` and ignored; its spend is still settled.
 
 ### 6.2 Timeouts and deadline inheritance
-- Every run has an absolute deadline. Each step's effective deadline is `min(run deadline, now + step timeout)`, and a child run's deadline is `min(parent step deadline, child default)`. The value lands in `TaskEnvelope.deadlineMs` (`TaskEnvelope.java:97`), which workers already honour (expired tasks are rejected, `TaskEnvelope.expiredAt`, `:136`; swarm §5.1).
+- Every run has an absolute deadline. Each step's effective deadline is `min(run deadline, now + step timeout)`, and a child run's deadline is `min(parent step deadline, child default)`. The value lands in `TaskEnvelope.deadlineMs` (`TaskEnvelope.java:97`), which workers already honour (expired tasks are rejected on claim, `swarm/TaskService.java:116`, using `TaskEnvelope.expiredAt`, `TaskEnvelope.java:136`; swarm §5.1).
 - The worker's lease visibility is already bounded by the deadline (swarm §5.1).
 - The runner enforces step timeouts itself with a per-shard timer wheel (one thread, no per-step thread), so a lost task cannot stall a run: on timeout it bumps `stepAttempt` and redispatches (if retries remain) or fails the step. This mirrors Temporal's [start-to-close and schedule-to-close timeouts](https://docs.temporal.io/encyclopedia/detecting-activity-failures).
 
