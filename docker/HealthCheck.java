@@ -4,9 +4,26 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 
-/** Container HEALTHCHECK: exit 0 when GET of the URL (default local /healthz) answers 200. */
+/**
+ * Container HEALTHCHECK: exit 0 when GET of the URL (default local /healthz) answers 200.
+ * {@code --quic} instead exits 0 when Netty's QUIC natives load (needs lib/ on the class path).
+ */
 public final class HealthCheck {
     public static void main(String[] args) {
+        if (args.length > 0 && args[0].equals("--quic")) {
+            try {
+                Class<?> quic = Class.forName("io.netty.handler.codec.quic.Quic");
+                boolean ok = (Boolean) quic.getMethod("isAvailable").invoke(null);
+                if (!ok) {
+                    System.err.println("quic: " + quic.getMethod("unavailabilityCause").invoke(null));
+                }
+                System.out.println("quic natives available: " + ok);
+                System.exit(ok ? 0 : 1);
+            } catch (ReflectiveOperationException e) {
+                System.err.println("quic: " + e);
+                System.exit(1);
+            }
+        }
         String url = args.length > 0 ? args[0] : "http://127.0.0.1:8080/healthz";
         try {
             HttpClient client = HttpClient.newBuilder()

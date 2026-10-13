@@ -44,7 +44,14 @@ jobs:
       - name: Image size
         run: |
           docker image ls "$IMAGE"
-          echo "Image size: $(docker image inspect "$IMAGE" --format '{{.Size}}' | numfmt --to=iec)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Image size: $(docker image inspect "$IMAGE" --format '{{.Size}}' | numfmt --to=iec)"
+            echo
+            echo '| Layer size | Created by |'
+            echo '|---|---|'
+            docker history --no-trunc --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE" \
+              | awk -F'\t' '$1 != "0B" { c = substr($2, 1, 90); gsub(/\|/, "\\|", c); printf "| %s | `%s` |\n", $1, c }'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Run and wait for healthy
         run: |
           docker run -d --name "$NAME" -p 8080:8080 "$IMAGE"
@@ -61,11 +68,16 @@ jobs:
           set -x
           [ "$(curl -fsS http://127.0.0.1:8080/healthz)" = ok ]
           curl -fsS -o /dev/null -w '%{http_code} %{content_type}\n' http://127.0.0.1:8080/index.html
-          uid="$(docker exec "$NAME" id -u)"
-          [ "$uid" != 0 ]
+          # distroless has no `id`: check the configured user and the live process instead.
+          user="$(docker inspect -f '{{.Config.User}}' "$IMAGE")"
+          echo "image user: $user"
+          [ -n "$user" ] && [ "${user%%:*}" != 0 ] && [ "${user%%:*}" != root ]
           pid_uid="$(docker top "$NAME" -eo pid,uid,comm | awk '$3=="java"{print $2; exit}')"
           echo "java runs as uid $pid_uid"
           [ -n "$pid_uid" ] && [ "$pid_uid" != 0 ] && [ "$pid_uid" != root ]
+          # QUIC (HTTP/3) natives must load on the image's glibc.
+          docker exec "$NAME" java --enable-native-access=ALL-UNNAMED \
+            -cp '/opt/sjws/healthcheck:/opt/sjws/lib/*' HealthCheck --quic
       - name: Logs
         if: always()
         run: docker logs "$NAME" 2>&1 | tail -n 100 || true

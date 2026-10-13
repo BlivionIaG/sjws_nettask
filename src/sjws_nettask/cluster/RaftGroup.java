@@ -34,8 +34,10 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
 /**
- * One Raft group. A witness votes and acks without storing entries. User bytes are not the
- * on-disk record: a leading marker separates user data, configuration, and the leader's no-op.
+ * One Raft group. A witness votes and acks without storing entries. Before that ack, and again
+ * before a vote grant, it forces the last acked {@code (index, term)} and refuses a candidate
+ * whose log is behind that mark. User bytes are not the on-disk record: a leading marker
+ * separates user data, configuration, and the leader's no-op.
  */
 final class RaftGroup {
 
@@ -305,9 +307,9 @@ final class RaftGroup {
         }
         var candidate = byWire.apply(candidateWire);
         boolean grant = false;
-        if (theirTerm >= term && candidate != null) {
-            long ourLast = lastIndex();
-            long ourTerm = termAt(ourLast);
+        if (theirTerm >= term && candidate != null && (!witness || witnessForced())) {
+            long ourLast = witness ? witnessCursorIndex() : lastIndex();
+            long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);
             boolean upToDate = lastTerm > ourTerm || (lastTerm == ourTerm && lastIndex >= ourLast);
             if (upToDate && (votedFor == null || votedFor.equals(candidate))) {
                 votedFor = candidate;
@@ -377,7 +379,11 @@ final class RaftGroup {
         electionDeadline = now + options.leaseNanos() + options.electionTimeout().toNanos();
         leaseExpires = now + options.leaseNanos();
         if (witness) {
-            ack(from, true, prevIndex + entries.size());
+            long ackIndex = prevIndex + entries.size();
+            long ackTerm = entries.isEmpty() ? prevTerm : entries.get(entries.size() - 1).term;
+            if (witnessRemember(ackIndex, ackTerm)) {
+                ack(from, true, ackIndex);
+            }
             return;
         }
         if (!matches(prevIndex, prevTerm)) {
@@ -705,6 +711,43 @@ final class RaftGroup {
     private void force() {
         try {
             storage.force(groupId);
+        } catch (IOException failed) {
+            throw new UncheckedIOException(failed);
+        }
+    }
+
+    /** Force the staged witness cursor. A disk error refuses the vote and does not set votedFor. */
+    private boolean witnessForced() {
+        try {
+            force();
+            return true;
+        } catch (UncheckedIOException failed) {
+            return false;
+        }
+    }
+
+    /** Stage and force before the ack is sent. A disk error sends no ack. */
+    private boolean witnessRemember(long index, long term) {
+        try {
+            storage.noteWitness(groupId, index, term);
+            force();
+            return true;
+        } catch (IOException | UncheckedIOException failed) {
+            return false;
+        }
+    }
+
+    private long witnessCursorIndex() {
+        try {
+            return storage.witnessIndex(groupId);
+        } catch (IOException failed) {
+            throw new UncheckedIOException(failed);
+        }
+    }
+
+    private long witnessCursorTerm() {
+        try {
+            return storage.witnessTerm(groupId);
         } catch (IOException failed) {
             throw new UncheckedIOException(failed);
         }
