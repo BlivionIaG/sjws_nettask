@@ -177,7 +177,42 @@ public final class ConfigCodec {
             for (var name : sorted(routing.upstreams())) {
                 var upstream = routing.upstreams().get(name);
                 out.append("    ").append(yamlKey(name)).append(":\n");
-                out.append("      url: ").append(quote(upstream.url().toString())).append('\n');
+                var discovery = upstream.discovery();
+                if (discovery == null) {
+                    out.append("      url: ").append(quote(upstream.url().toString())).append('\n');
+                } else {
+                    var scheme = upstream.url().getScheme();
+                    var path = upstream.url().getRawPath() == null ? "" : upstream.url().getRawPath();
+                    out.append("      lb: ").append(discovery.lb().wireName()).append('\n');
+                    out.append("      endpoints:\n");
+                    for (var e : discovery.endpoints()) {
+                        out.append("        - { url: ").append(quote(scheme + "://" + e.authority() + path))
+                                .append(", weight: ").append(e.weight());
+                        if (!e.id().equals(e.authority())) {
+                            out.append(", id: ").append(quote(e.id()));
+                        }
+                        if (e.zone() != null) {
+                            out.append(", zone: ").append(quote(e.zone()));
+                        }
+                        if (!e.labels().isEmpty()) {
+                            out.append(", labels: {");
+                            var first = true;
+                            for (var k : new java.util.TreeSet<>(e.labels().keySet())) {
+                                out.append(first ? " " : ", ").append(quote(k)).append(": ").append(quote(e.labels().get(k)));
+                                first = false;
+                            }
+                            out.append(" }");
+                        }
+                        out.append(" }\n");
+                    }
+                    var o = discovery.outlier();
+                    out.append("      circuit: { failures: ").append(o.consecutive())
+                            .append(", eject_for: ").append(quote(duration(o.ejectFor())))
+                            .append(", error_rate: ").append(o.errorRatePercent())
+                            .append(", min_requests: ").append(o.minRequests())
+                            .append(", window: ").append(quote(duration(o.window())))
+                            .append(", max_ejection: ").append(o.maxEjectionPercent()).append(" }\n");
+                }
                 out.append("      connect_timeout: ").append(quote(duration(upstream.connectTimeout()))).append('\n');
                 out.append("      response_timeout: ").append(quote(duration(upstream.responseTimeout())))
                         .append('\n');
