@@ -55,7 +55,7 @@ jobs:
             [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" = true ] || break
             sleep 2
           done
-          docker logs "$NAME"; exit 1
+          docker inspect -f '{{json .State.Health}}' "$NAME"; docker logs "$NAME"; exit 1
       - name: Smoke test
         run: |
           set -x

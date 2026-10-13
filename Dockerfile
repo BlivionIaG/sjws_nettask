@@ -14,6 +14,11 @@ RUN --mount=type=cache,target=/root/.m2 \
  && cp -r target/lib /out/lib
 
 FROM eclipse-temurin:25-jre
+# curl for HEALTHCHECK (not guaranteed in the base image).
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system --gid 10001 sjws \
  && useradd --system --uid 10001 --gid sjws --home-dir /opt/sjws --shell /usr/sbin/nologin sjws
 WORKDIR /opt/sjws
