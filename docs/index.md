@@ -40,6 +40,7 @@ Back to the [README](../README.md) (quick start).
 
 ## Development
 - [Contributing](../CONTRIBUTING.md) · [AGENTS.md](../AGENTS.md) (guide for coding agents)
+- [Ownership: who owns what](development/ownership.md)
 - [Test suite catalog](development/testing.md)
 - [Integration and end-to-end tests](development/integration-tests.md)
 - [Request filters](development/filters.md)
