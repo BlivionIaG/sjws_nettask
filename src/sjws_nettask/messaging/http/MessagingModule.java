@@ -43,6 +43,7 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String RETENTION_CHECK_MS_ENV = "SJWS_MESSAGING_RETENTION_CHECK_MS";
 
     private final LogTopics topics;
+    private volatile MessagingHooks hooks = MessagingHooks.NONE;
     /** Null unless a retention limit is set: no thread when retention is off. */
     private final java.util.concurrent.ScheduledExecutorService retentionTimer;
 
@@ -98,9 +99,16 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         return v == null || v.isBlank() ? dflt : v.trim();
     }
 
+    /** Installs the metrics hooks (see {@link MessagingHooks}); call before the server mounts the module. */
+    public void hooks(MessagingHooks h) {
+        this.hooks = java.util.Objects.requireNonNull(h);
+    }
+
     @Override
     public void contribute(HandlerMounts mounts) {
-        mounts.mount("/messaging/v1", new MessagingHttp(this.topics));
+        var h = new MessagingHttp(this.topics);
+        h.hooks(this.hooks);
+        mounts.mount("/messaging/v1", h);
     }
 
     @Override

@@ -34,6 +34,9 @@ import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.core.buf.BufferBudget;
+import sjws_nettask.core.buf.BufferPool;
+import sjws_nettask.core.buf.PooledBuffer;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.RecordBatch;
 
@@ -57,10 +60,24 @@ final class MessagingHttp implements Handler {
     static final long MAX_FETCH_BYTES = 16 << 20;
     static final long ACK_TIMEOUT_MS = 30_000;
 
+    /** Retry-After for a fetch shed because the messaging buffer budget is exhausted. */
+    static final String RETRY_AFTER_SECONDS = "1";
+
     private final LogTopics topics;
+    private final BufferBudget budget;
+    private volatile MessagingHooks hooks = MessagingHooks.NONE;
 
     MessagingHttp(LogTopics topics) {
+        this(topics, BufferPool.shared().budget(BufferPool.MESSAGING));
+    }
+
+    MessagingHttp(LogTopics topics, BufferBudget budget) {
         this.topics = topics;
+        this.budget = budget;
+    }
+
+    void hooks(MessagingHooks h) {
+        this.hooks = java.util.Objects.requireNonNull(h);
     }
 
     @Override
@@ -73,8 +90,18 @@ final class MessagingHttp implements Handler {
         if (!LogTopics.validName(topic)) return problem(400, "bad request", "topic name must match " + LogTopics.NAME);
         try {
             return switch (request.method()) {
-                case "POST" -> produce(topic, request);
-                case "GET" -> fetch(topic, query(q < 0 ? "" : target.substring(q + 1)));
+                case "POST" -> {
+                    long t0 = System.nanoTime();
+                    var r = produce(topic, request);
+                    this.hooks.produced(topic, r.status(), Math.max(0, request.body().length()), System.nanoTime() - t0);
+                    yield r;
+                }
+                case "GET" -> {
+                    long t0 = System.nanoTime();
+                    var r = fetch(topic, query(q < 0 ? "" : target.substring(q + 1)));
+                    this.hooks.fetched(topic, r.status(), Math.max(0, r.contentLength()), System.nanoTime() - t0);
+                    yield r;
+                }
                 default -> {
                     var r = problem(405, "method not allowed", "use GET or POST");
                     r.headers().set("allow", "GET, POST");
@@ -117,27 +144,74 @@ final class MessagingHttp implements Handler {
         long committed = log.writer().snapshot().nextOffset();
         long start = log.log().startOffset();
         if (offset < start) return problem(416, "offset out of range", "log starts at " + start);
-        var out = new ByteArrayOutputStream();
         long next = offset;
-        // TODO(buffer pool, §2.4): sendfile / pooled view instead of re-encoding the decoded batch (same bytes).
+        var batches = new ArrayList<RecordBatch>();
+        long total = 0; // long: compared with the long maxBytes without int overflow
         log.reads().lock();
         try {
-        long written = 0; // long: compared with the long maxBytes without int overflow
-        while (next < committed && written < maxBytes) {
-            var b = log.log().read(next);
-            if (b == null || b.nextOffset() > committed) break;
-            var frame = b.encode();
-            if (!fits(written, frame.remaining(), maxBytes)) break;
-            out.write(frame.array(), frame.arrayOffset() + frame.position(), frame.remaining());
-            written += frame.remaining();
-            next = b.nextOffset();
-        }
+            while (next < committed && total < maxBytes) {
+                var b = log.log().read(next);
+                if (b == null || b.nextOffset() > committed) break;
+                int size = RecordBatch.encodedSize(b.records());
+                if (!fits(total, size, maxBytes)) break;
+                batches.add(b);
+                total += size;
+                next = b.nextOffset();
+            }
         } finally {
             log.reads().unlock();
         }
         var h = ResponseHeaders.of().set("content-type", BATCH_TYPE).set("next-offset", Long.toString(next))
                 .set("log-end-offset", Long.toString(committed));
-        return new Response(200, h, Body.Bytes.of(out.toByteArray()));
+        if (batches.isEmpty()) return new Response(200, h, Body.Bytes.of(new byte[0]));
+        // Frames are encoded off-lock into one pooled buffer of the messaging budget, reused chunk by chunk; under
+        // budget pressure the fetch is shed (503 + Retry-After) instead of allocating (partition-log.md §2.4).
+        var buf = this.budget.tryAcquire((int) Math.min(total, BufferPool.MAX_CLASS));
+        if (buf == null) {
+            var r = problem(503, "busy", "messaging buffer budget exhausted");
+            r.headers().set("retry-after", RETRY_AFTER_SECONDS);
+            return r;
+        }
+        return new Response(200, h, new Body.Stream(total, new FrameSource(batches, buf)));
+    }
+
+    /** Streams whole frames; a frame larger than the pooled buffer goes out as its own heap buffer. */
+    static final class FrameSource implements Body.Stream.Source {
+        private final List<RecordBatch> batches;
+        private PooledBuffer buf;
+        private int i;
+
+        FrameSource(List<RecordBatch> batches, PooledBuffer buf) {
+            this.batches = batches;
+            this.buf = buf;
+        }
+
+        @Override
+        public ByteBuffer next() {
+            if (this.i >= this.batches.size() || this.buf == null) return null;
+            var b = this.batches.get(this.i);
+            var out = this.buf.buffer().clear();
+            if (RecordBatch.encodedSize(b.records()) > out.capacity()) {
+                this.i++;
+                return b.encode();
+            }
+            while (this.i < this.batches.size()) {
+                b = this.batches.get(this.i);
+                if (RecordBatch.encodedSize(b.records()) > out.remaining()) break;
+                RecordBatch.encode(b.baseOffset(), b.timestampMs(), b.records(), out);
+                this.i++;
+            }
+            return out.flip();
+        }
+
+        @Override
+        public void close() {
+            if (this.buf != null) {
+                this.buf.buffer().clear(); // limit = capacity on release (see records())
+                this.buf.release();
+                this.buf = null;
+            }
+        }
     }
 
     /** Whether a frame of {@code frameBytes} may follow {@code written} bytes: the first frame always fits. */
@@ -155,9 +229,33 @@ final class MessagingHttp implements Handler {
         };
     }
 
-    static List<byte[]> records(Request request) throws BadRequest {
+    /**
+     * The request's records. A body of known length up to {@link BufferPool#MAX_LARGE} is read into one buffer of
+     * the messaging budget (released before return); an unknown length falls back to a growing heap buffer.
+     */
+    List<byte[]> records(Request request) throws BadRequest {
         var body = request.body();
-        if (body.length() > MAX_REQUEST) throw new BadRequest("request body larger than " + MAX_REQUEST);
+        long len = body.length();
+        if (len > MAX_REQUEST) throw new BadRequest("request body larger than " + MAX_REQUEST);
+        if (len >= 0 && len <= BufferPool.MAX_LARGE) {
+            if (len == 0) throw new BadRequest("no records");
+            var pb = len <= BufferPool.MAX_CLASS ? this.budget.acquire((int) len) : this.budget.acquireLarge((int) len);
+            try {
+                var b = pb.buffer().clear().limit((int) len);
+                var chunk = new byte[(int) Math.min(len, 8192)];
+                try {
+                    int n;
+                    while (b.hasRemaining() && (n = body.read(chunk, 0, Math.min(chunk.length, b.remaining()))) >= 0) b.put(chunk, 0, n);
+                    if (b.hasRemaining() || body.read(chunk, 0, 1) >= 0) throw new BadRequest("request body does not match its length");
+                } catch (IOException e) {
+                    throw new BadRequest("request body: " + e.getMessage());
+                }
+                return parse(b.flip());
+            } finally {
+                pb.buffer().clear(); // the pool's debug poison writes up to capacity: hand it back with limit = capacity
+                pb.release();
+            }
+        }
         var buf = new ByteArrayOutputStream();
         var chunk = new byte[8192];
         try {
@@ -169,7 +267,10 @@ final class MessagingHttp implements Handler {
         } catch (IOException e) {
             throw new BadRequest("request body: " + e.getMessage());
         }
-        var in = ByteBuffer.wrap(buf.toByteArray());
+        return parse(ByteBuffer.wrap(buf.toByteArray()));
+    }
+
+    static List<byte[]> parse(ByteBuffer in) throws BadRequest {
         var out = new ArrayList<byte[]>();
         while (in.hasRemaining()) {
             if (in.remaining() < 4) throw new BadRequest("truncated record length");
