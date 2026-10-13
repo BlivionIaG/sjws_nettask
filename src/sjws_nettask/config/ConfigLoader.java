@@ -41,7 +41,7 @@ import sjws_nettask.core.RoutePattern;
 public final class ConfigLoader {
 
     private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
-            "routing", "middleware", "access", "messaging", "swarm");
+            "routing", "middleware", "access", "messaging", "swarm", "ha");
     private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
@@ -106,6 +106,9 @@ public final class ConfigLoader {
         long bundleVersion = 0;
         Boolean yamlBind = null;
         Boolean yamlSwarm = null;
+        boolean haEnabled = false;
+        byte[] haKey = null;
+        byte[] haPrevious = null;
         byte[] bootSignature = null;
         String recoveredHash = null;
         Path yamlState = null;
@@ -162,6 +165,10 @@ public final class ConfigLoader {
             access = accessSection(root, warnings);
             messaging = MessagingSettings.parse(root);
             yamlSwarm = swarmSection(root);
+            var ha = haSection(root, env);
+            haEnabled = ha.enabled();
+            haKey = ha.current();
+            haPrevious = ha.previous();
         }
         var parsed = baseline == null
                 ? ServerConfig.parse(args, env, passwords)
@@ -184,7 +191,8 @@ public final class ConfigLoader {
         if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
             document = document.withSignature(bootSignature);
         }
-        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm);
+        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm, haEnabled,
+                haKey, haPrevious);
     }
 
     private static int schemaOf(Map<String, Object> root) {
@@ -1096,6 +1104,53 @@ public final class ConfigLoader {
     }
 
     /**
+     * HA heartbeat key. Not part of the canonical document, so a last-good copy never stores it.
+     * When {@code ha.enabled} is false the key bytes are discarded. A missing key with HA enabled
+     * is an error. The environment overrides the file. Values are never copied into the message.
+     */
+    private static HaMaterial haSection(Map<String, Object> root, Map<String, String> env) {
+        boolean enabled = false;
+        String fileKey = null;
+        String filePrevious = null;
+        if (root.get("ha") instanceof Object ha) {
+            var map = YamlValues.mapping(ha, "ha");
+            YamlValues.knownKeys(map, List.of("enabled", "cluster_key", "cluster_key_previous"), "ha");
+            if (map.containsKey("enabled")) {
+                enabled = bool(map.get("enabled"), "ha.enabled");
+            }
+            if (map.containsKey("cluster_key")) {
+                fileKey = secret(map.get("cluster_key"), "ha.cluster_key");
+            }
+            if (map.containsKey("cluster_key_previous")) {
+                filePrevious = secret(map.get("cluster_key_previous"), "ha.cluster_key_previous");
+            }
+        }
+        if (!enabled) {
+            return HaMaterial.OFF;
+        }
+        String current = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY") ? env.get("WEB_SERVER_HA_CLUSTER_KEY") : fileKey;
+        String previous = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")
+                ? env.get("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")
+                : filePrevious;
+        if (current == null || current.isBlank()) {
+            throw new ConfigException(
+                    "HA is enabled but no cluster key is set; set ha.cluster_key or WEB_SERVER_HA_CLUSTER_KEY");
+        }
+        if (previous != null && previous.isBlank()) {
+            throw new ConfigException("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS is empty");
+        }
+        return HaMaterial.enabled(current, previous);
+    }
+
+    /** UTF-8 secret. Blank is refused. The value is not included in the error. */
+    private static String secret(Object value, String path) {
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw new ConfigException(path + ": expected a string");
+        }
+        return text;
+    }
+
+    /**
      * {@code swarm.enabled} (docs/design/agent-swarm.md §3.3, §12 S1), or null when the file has no {@code swarm}
      * section. Node-local like {@code server.bind_content}: not part of the canonical document, so a config
      * recovered from last-good boots with the swarm off unless the property or environment gate is set.
@@ -1491,6 +1546,49 @@ public final class ConfigLoader {
         return value.trim();
     }
 
+    /** Key bytes kept only while HA is enabled. {@link #toString()} redacts them. */
+    private static final class HaMaterial {
+        private static final HaMaterial OFF = new HaMaterial(false, null, null);
+        private static final int MIN_BYTES = 16;
+
+        private final boolean enabled;
+        private final byte[] current;
+        private final byte[] previous;
+
+        private HaMaterial(boolean enabled, byte[] current, byte[] previous) {
+            this.enabled = enabled;
+            this.current = current;
+            this.previous = previous;
+        }
+
+        static HaMaterial enabled(String current, String previous) {
+            var cur = current.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            if (cur.length < MIN_BYTES) {
+                throw new ConfigException("ha.cluster_key must be at least " + MIN_BYTES + " bytes");
+            }
+            byte[] prev = null;
+            if (previous != null) {
+                prev = previous.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                if (prev.length < MIN_BYTES) {
+                    throw new ConfigException("ha.cluster_key_previous must be at least " + MIN_BYTES + " bytes");
+                }
+            }
+            return new HaMaterial(true, cur, prev);
+        }
+
+        boolean enabled() {
+            return this.enabled;
+        }
+
+        byte[] current() {
+            return this.current;
+        }
+
+        byte[] previous() {
+            return this.previous;
+        }
+    }
+
     /** Arguments and environment captured at startup so a reload reapplies them (the process env does not change). */
     public static final class Loaded {
         private final ConfigDocument document;
@@ -1504,16 +1602,31 @@ public final class ConfigLoader {
         private final Boolean yamlBindContent;
         /** {@code swarm.enabled} from the file, or null when the key was omitted. */
         private final Boolean yamlSwarmEnabled;
+        /** True when {@code ha.enabled} is true. The key bytes are null unless this is true. */
+        private final boolean haEnabled;
+        /** Current HMAC key, or null when HA is off. Not part of {@link #toString()}. */
+        private final byte[] haClusterKey;
+        /** Previous HMAC key during rotation, or null. Not part of {@link #toString()}. */
+        private final byte[] haClusterKeyPrevious;
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
                 Boolean yamlBindContent) {
-            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, null);
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, null, false, null,
+                    null);
         }
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
                 Boolean yamlBindContent, Boolean yamlSwarmEnabled) {
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, yamlSwarmEnabled,
+                    false, null, null);
+        }
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
+                byte[] haClusterKeyPrevious) {
             this.document = document;
             this.warnings = List.copyOf(warnings);
             this.errors = List.copyOf(errors);
@@ -1523,12 +1636,38 @@ public final class ConfigLoader {
             this.passwords = passwords;
             this.yamlBindContent = yamlBindContent;
             this.yamlSwarmEnabled = yamlSwarmEnabled;
+            this.haEnabled = haEnabled;
+            this.haClusterKey = haClusterKey == null ? null : haClusterKey.clone();
+            this.haClusterKeyPrevious = haClusterKeyPrevious == null ? null : haClusterKeyPrevious.clone();
         }
 
-        /** Same load, with the document replaced. The file's {@code bind_content} and {@code swarm.enabled} are kept. */
+        /** Same load, with the document replaced. The file's {@code bind_content}, swarm flag, and HA key are kept. */
         public Loaded withDocument(ConfigDocument document) {
             return new Loaded(document, this.warnings, this.errors, this.helpRequested, this.args, this.env,
-                    this.passwords, this.yamlBindContent, this.yamlSwarmEnabled);
+                    this.passwords, this.yamlBindContent, this.yamlSwarmEnabled, this.haEnabled, this.haClusterKey,
+                    this.haClusterKeyPrevious);
+        }
+
+        /** {@code ha.enabled}. False when the file omits it. */
+        public boolean haEnabled() {
+            return this.haEnabled;
+        }
+
+        /** @return a copy of the current cluster key, or null when HA is off. Do not log the bytes. */
+        public byte[] haClusterKey() {
+            return this.haClusterKey == null ? null : this.haClusterKey.clone();
+        }
+
+        /** @return a copy of the previous cluster key, or null. Do not log the bytes. */
+        public byte[] haClusterKeyPrevious() {
+            return this.haClusterKeyPrevious == null ? null : this.haClusterKeyPrevious.clone();
+        }
+
+        @Override
+        public String toString() {
+            return "Loaded{ok=" + ok() + ", haEnabled=" + this.haEnabled + ", clusterKey="
+                    + (this.haClusterKey == null ? "none" : "****") + ", clusterKeyPrevious="
+                    + (this.haClusterKeyPrevious == null ? "none" : "****") + "}";
         }
 
         /** {@code swarm.enabled}, or null when the file did not set it. Not part of the canonical document. */
