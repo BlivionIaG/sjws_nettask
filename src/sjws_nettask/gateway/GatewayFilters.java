@@ -29,14 +29,14 @@ public final class GatewayFilters {
     private GatewayFilters() {
     }
 
-    /** Local token bucket for {@code rate-limit}. */
+    /** Striped GCRA table for {@code rate-limit}. */
     public static RequestFilters install(RequestFilters registry) {
-        return install(registry, RateLimitFilter.TokenBucket::create);
+        return install(registry, spec -> RateLimitFilter.local(spec, System::nanoTime));
     }
 
     /**
-     * @param quotas builds the quota for each {@code rate-limit} entry. The request path calls
-     *        {@link Quota#tryAcquire} only.
+     * @param quotas builds the quota for each {@code rate-limit} entry. The default is the shared
+     *        striped table. The request path calls {@link Quota#tryAcquire} only.
      */
     public static RequestFilters install(RequestFilters registry, Quota.Factory quotas) {
         Objects.requireNonNull(registry, "registry");
