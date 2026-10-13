@@ -63,7 +63,7 @@ jobs:
           curl -fsS -o /dev/null -w '%{http_code} %{content_type}\n' http://127.0.0.1:8080/index.html
           uid="$(docker exec "$NAME" id -u)"
           [ "$uid" != 0 ]
-          pid_uid="$(docker top "$NAME" -eo uid,comm | awk '$2=="java"{print $1}')"
+          pid_uid="$(docker top "$NAME" -eo pid,uid,comm | awk '$3=="java"{print $2; exit}')"
           echo "java runs as uid $pid_uid"
           [ -n "$pid_uid" ] && [ "$pid_uid" != 0 ] && [ "$pid_uid" != root ]
       - name: Logs
