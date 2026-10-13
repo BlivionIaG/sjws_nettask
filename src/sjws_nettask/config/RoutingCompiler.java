@@ -61,6 +61,9 @@ final class RoutingCompiler {
                 case RouteSpec.Action.Redirect r -> new RedirectHandler(r.status(), r.location(), r.keepPath());
                 case RouteSpec.Action.Static s -> files.withListings(s.listing());
             };
+            if (spec.rateLimit() != null) { // inside the problem wrapper, so a 429 renders like the route's other errors
+                handler = limited(spec.rateLimit(), handler);
+            }
             var errors = spec.errors();
             if (errors.problem()) { // opt-in wrapper; it applies the rewrite so "instance" is the client's path
                 handler = new ProblemErrorHandler(handler, spec.prefix(), spec.rewrite(), errors.typeBase());
@@ -70,6 +73,13 @@ final class RoutingCompiler {
             }
         }
         return new Router(routes, files);
+    }
+
+    /** The route's handler behind its own {@link sjws_nettask.routing.RateLimitFilter}. */
+    static Handler limited(sjws_nettask.routing.RateLimitFilter.Limit limit, Handler handler) {
+        return sjws_nettask.core.RequestFilters.create()
+                .add(new sjws_nettask.routing.RateLimitFilter(limit))
+                .wrapping(handler);
     }
 
     /** One pool per upstream, shared by every route and backend that names it. */
