@@ -21,12 +21,14 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Process-wide reload hooks. {@link #run()} rebuilds each registered server's immutable
- * configuration snapshot and swaps it in. Daemon mode ignores {@code SIGHUP} and does not expose a
- * hook of its own; its handler should call {@link #run()} instead of ignoring the signal.
+ * configuration snapshot and swaps it in. The daemon child calls {@link #installSighup()} so
+ * {@code SIGHUP} is reload. A foreground process does not: it must still die on {@code SIGHUP}.
+ * The child is also started with {@code setsid} when that binary exists, so closing the terminal
+ * does not deliver {@code SIGHUP} at all.
  * <p>
- * {@link #installSighup()} is optional and is not called from {@code main}: a foreground process
- * must still die on {@code SIGHUP}. The registry itself is the interface. A {@code SIGHUP} the
- * process already ignores stays ignored, and {@link #installSighup()} then returns false.
+ * A {@code SIGHUP} the process already ignores stays ignored, and {@link #installSighup()} then
+ * returns false. On a data node that has accepted a pushed config, the server's hook reloads
+ * bootstrap settings only and leaves that config in place.
  */
 public final class ReloadHook {
 
@@ -61,7 +63,7 @@ public final class ReloadHook {
      * Points {@code SIGHUP} at {@link #run()}. Returns false when the JDK does not expose
      * {@code sun.misc.Signal}, or when this process already ignores {@code SIGHUP} (inherited from
      * the parent, or set earlier in this VM). In that case the call changes nothing: the VM will
-     * not replace an ignored {@code SIGHUP}. Not used by {@code main}.
+     * not replace an ignored {@code SIGHUP}. {@code main} calls this only for the daemon child.
      */
     public static boolean installSighup() {
         try {

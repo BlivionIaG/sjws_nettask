@@ -1006,6 +1006,7 @@ class DaemonTest {
         try {
             long start = startMillis(sleep);
             Files.writeString(sleepPid, PidFile.text(sleep.pid(), start));
+            sjws_nettask.service.ServiceStatus.writeStandaloneDrain(sleepPid, sleep.pid(), start, 0);
             reset();
             assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(sleepPid, Duration.ofSeconds(-6), out, err, pid -> {
                 assertEquals(sleep.pid(), pid);
@@ -1108,12 +1109,14 @@ class DaemonTest {
             assertEquals(sleep.pid(), PidFile.read(pid).pid(), "release must not delete a file now naming someone else");
 
             Files.writeString(pid, sleep.pid() + "\n");
+            sjws_nettask.service.ServiceStatus.writeStandaloneDrain(pid, sleep.pid(), -1, 0);
             reset();
             assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(pid, Duration.ofSeconds(-6), out, err,
                     p -> Optional.of(new FakeHandle(-1, true))));
             assertTrue(sleep.isAlive());
 
             Files.writeString(pid, PidFile.text(sleep.pid(), start));
+            sjws_nettask.service.ServiceStatus.writeStandaloneDrain(pid, sleep.pid(), start, 0);
             reset();
             assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(pid, Duration.ofSeconds(-6), out, err,
                     p -> Optional.of(new FakeHandle(-1, true))));

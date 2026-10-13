@@ -1,0 +1,17 @@
+# Sample control-plane node. Schema 1. Role is node.mode.
+# Packaged path: contrib/sjws_nettask-control.yaml
+# Installed path used by contrib/sjws_nettask-control@.service:
+#   install -D -m 0640 contrib/sjws_nettask-control.yaml /etc/sjws_nettask/control-1/sjws_nettask-control.yaml
+# listen address, peers, pin, and the join token stay in the bootstrap file.
+# The content port stays unbound unless bind_content is true or --bind-content is set.
+# The admin listener is not part of this file.
+schema: 1
+version: 0
+node:
+  mode: control
+  labels:
+    plane: control
+server:
+  port: 8080
+  root: /var/www/html
+  bind_content: false

@@ -1,0 +1,54 @@
+# systemd template for a sjws_nettask control-plane node.
+#   systemctl enable --now sjws_nettask-control@1
+#
+# Create the account and the bootstrap before the first start:
+#   useradd --system --home /var/lib/sjws_nettask --shell /usr/sbin/nologin sjws
+#   install -d -m 0750 -o root -g sjws /etc/sjws_nettask/control-1
+# Bootstrap layout, file modes, and the lifecycle notes:
+#   docs/operations/control-plane-service.md
+#
+# The join token and the pin live in files named by the bootstrap. They are not arguments.
+# Type=forking matches the standalone unit: --daemon writes PIDFile, then the parent exits.
+# Active means the main process is up, not that the content port is bound and not leaderReady.
+# This unit does not call sd_notify. Readiness is /readyz and --status.
+# A control process does not bind the content port unless --bind-content or server.bind_content
+# is set. The admin listener is not started here.
+# Do not Requires= a data unit. Stopping this node must not stop data nodes.
+# ExecReload sends SIGHUP. The daemon child runs ReloadHook. It does not re-read the join token.
+#
+# TimeoutStopSec covers the default drain budget (30s) plus the 5s SIGKILL margin plus about
+# 10s for the ExecStop JVM. Raising --drain-budget requires raising TimeoutStopSec to match.
+#
+#   install -D -m 0644 contrib/sjws_nettask-control@.service /etc/systemd/system/sjws_nettask-control@.service
+#   install -D -m 0640 contrib/sjws_nettask-control.yaml /etc/sjws_nettask/control-1/sjws_nettask-control.yaml
+#   systemctl daemon-reload
+
+[Unit]
+Description=sjws_nettask control plane node %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=sjws
+Group=sjws
+UMask=0077
+PIDFile=/run/sjws_nettask/control-%i.pid
+RuntimeDirectory=sjws_nettask
+StateDirectory=sjws_nettask
+LogsDirectory=sjws_nettask
+WorkingDirectory=/var/lib/sjws_nettask
+ExecStart=/usr/bin/java -XX:-HeapDumpOnOutOfMemoryError -jar /usr/share/sjws_nettask/sjws_nettask.jar --daemon --role=control --config=/etc/sjws_nettask/control-%i/sjws_nettask-control.yaml --bootstrap=/etc/sjws_nettask/control-%i/bootstrap --pid-file=/run/sjws_nettask/control-%i.pid --log-file=/var/log/sjws_nettask/control-%i.log --shutdown-timeout=10
+ExecStop=/usr/bin/java -jar /usr/share/sjws_nettask/sjws_nettask.jar --stop --pid-file=/run/sjws_nettask/control-%i.pid --shutdown-timeout=10
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

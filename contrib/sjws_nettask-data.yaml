@@ -1,0 +1,14 @@
+# Sample data-plane node. Schema 1. Role is node.mode.
+# Packaged path: contrib/sjws_nettask-data.yaml
+# Installed path used by contrib/sjws_nettask-data@.service:
+#   install -D -m 0640 contrib/sjws_nettask-data.yaml /etc/sjws_nettask/data-edge1/sjws_nettask-data.yaml
+# data-role, control-plane contact, pin, and the join token stay in the bootstrap file.
+schema: 1
+version: 0
+node:
+  mode: data
+  labels:
+    plane: data
+server:
+  port: 8080
+  root: /var/www/html

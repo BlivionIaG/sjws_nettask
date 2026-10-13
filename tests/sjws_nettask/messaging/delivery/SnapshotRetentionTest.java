@@ -200,6 +200,7 @@ class SnapshotRetentionTest {
             assertEquals(0, r.deletedSegments(), "younger than keepResolvedMs");
             assertEquals(0, r.compactedSegments(), "compaction off");
             p.retention(RetentionPolicy.DEFAULT);
+            seal(p);
             var mr = p.maintain();
             assertTrue(mr.deletedSegments() > 0, mr + " segs=" + segs(dir.resolve("t")));
         }
@@ -209,12 +210,23 @@ class SnapshotRetentionTest {
 
     static String segs(Path d) throws IOException { try (var l = SegmentedLog.open(d, SEG)) { return l.segments().toString(); } }
 
+    /**
+     * One more append after a burst. The writer may coalesce the burst into a single batch larger
+     * than the segment, which stays active; the follow-up append seals it so retention can delete it.
+     */
+    private void seal(Partition p) throws Exception {
+        p.produce(0, 0, new byte[1]);
+        for (var d : p.poll("g", "c", 1, 1000)) p.ack("g", d.offset());
+        p.snapshotNow().get();
+    }
+
     @Test
     void missingSnapshotAfterRetentionFailsLoudly() throws Exception {
         try (var p = open()) {
             p.subscribe("g", true);
             for (int i = 0; i < 200; i++) { p.produce(0, 0, new byte[100]); for (var d : p.poll("g", "c", 1, 1000)) p.ack("g", d.offset()); }
             p.snapshotNow().get();
+            seal(p);
             var mr = p.maintain();
             assertTrue(mr.deletedSegments() > 0, mr + " segs=" + segs(dir.resolve("t")));
         }
