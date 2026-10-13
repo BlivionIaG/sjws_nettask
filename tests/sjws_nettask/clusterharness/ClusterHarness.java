@@ -42,7 +42,10 @@ import sjws_nettask.SjwsServer;
  * {@link DataRole#STANDALONE} and {@link DataRole#GATEWAY_OFF} construct no control-plane
  * object: that is the zero-cost path. {@link DataRole#DATA} and a non-zero control-node
  * count need {@link ControlPlane#available()}. Until then {@link #open} throws
- * {@link ControlPlanePendingException} before it binds.
+ * {@link ControlPlanePendingException} before it binds. A data process that has not joined
+ * is {@link NodeFixtures#pending(java.nio.file.Path, String)}, which reports
+ * {@code connection=pending}. {@link NodeFixtures#connected(java.nio.file.Path)} is the
+ * live-control-plane variant and refuses until a data-node watch exists.
  */
 public final class ClusterHarness implements AutoCloseable {
 
@@ -131,9 +134,11 @@ public final class ClusterHarness implements AutoCloseable {
     }
 
     /**
-     * The control-plane factory. Returns {@link PendingControlPlane} because
-     * {@code sjws_nettask.cp} is not in this tree. Replace this body when the design lands
-     * in code; do not make {@link PendingControlPlane} pretend to commit.
+     * The control-plane factory. Returns {@link PendingControlPlane}.
+     * {@code sjws_nettask.cp.CpStore} is a single voter with a fixed member address. It does not
+     * implement {@link ControlPlane}: no 3 or 5 voters, no {@link ClusterClock}, no partition,
+     * no leader kill, no per-node delay, and no push onto a data node. Replace this body when
+     * that factory exists. Do not make {@link PendingControlPlane} pretend to commit.
      */
     static ControlPlane newControlPlane() {
         return new PendingControlPlane();
