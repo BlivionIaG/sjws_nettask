@@ -27,7 +27,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -362,7 +361,6 @@ public final class BufferPool {
         if (mag != null) {
             var s = mag.pop(c);
             if (s != null) {
-                s.slab.free.decrementAndGet();
                 return s;
             }
         }
@@ -370,7 +368,6 @@ public final class BufferPool {
         for (int i = 0; i <= this.stripeMask; i++) {
             var s = cls.stripes[(home + i) & this.stripeMask].pop();
             if (s != null) {
-                s.slab.free.decrementAndGet();
                 return s;
             }
         }
@@ -384,7 +381,6 @@ public final class BufferPool {
             // another thread may have grown meanwhile
             var again = cls.stripes[home].pop();
             if (again != null) {
-                again.slab.free.decrementAndGet();
                 return again;
             }
             if (!reserve(SLAB_BYTES)) {
@@ -399,7 +395,6 @@ public final class BufferPool {
             }
             slab.slots = slots;
             cls.slabs.add(slab);
-            slab.free.set(n - 1);
             cls.stripes[home].pushAll(slots, 1, n);
             return slots[0];
         } finally {
@@ -431,8 +426,7 @@ public final class BufferPool {
             }
             return;
         }
-        slot.slab.lastFreeNanos = System.nanoTime();
-        slot.slab.free.incrementAndGet();
+        slot.freedAt = System.nanoTime(); // the releasing thread owns the slot: no shared write
         var mag = wasLeak ? null : magazine(true); // a leak is recycled on the Cleaner thread: no magazine there
         if (mag != null && mag.push(slot)) {
             return;
@@ -504,12 +498,9 @@ public final class BufferPool {
         long now = System.nanoTime();
         for (var cls : this.classes) {
             for (var slab : cls.slabs) {
-                if (slab.free.get() != slab.slots.length || now - slab.lastFreeNanos < idleNanos) {
-                    continue;
-                }
                 cls.lock.lock();
         try {
-                    if (removeIfAllInStripes(cls, slab)) {
+                    if (removeIfIdle(cls, slab, now - idleNanos)) {
                         cls.slabs.remove(slab);
                         this.reserved.addAndGet(-SLAB_BYTES);
                         this.trimmed.increment();
@@ -529,9 +520,14 @@ public final class BufferPool {
         return freed;
     }
 
-    private boolean removeIfAllInStripes(SizeClass cls, Slab slab) {
-        // lock every stripe (fixed order), count, then remove; a slot held in a magazine keeps the slab
+    private boolean removeIfIdle(SizeClass cls, Slab slab, long freedBefore) {
+        // lock every stripe (fixed order), check, then remove; a slot held in a magazine keeps the slab
         return lockAll(cls.stripes, 0, () -> {
+            for (var s : slab.slots) {
+                if (s.freedAt - freedBefore > 0) {
+                    return false; // used too recently (or still out)
+                }
+            }
             int found = 0;
             for (var st : cls.stripes) {
                 found += st.count(slab);
@@ -565,6 +561,8 @@ public final class BufferPool {
         final ByteBuffer buf;
         final int cls;
         final Slab slab;
+        /** When it was last released (or created); written by the releasing thread, read by trim under the stripe locks. */
+        long freedAt = System.nanoTime();
 
         Slot(ByteBuffer buf, int cls, Slab slab) {
             this.buf = buf;
@@ -575,9 +573,6 @@ public final class BufferPool {
 
     static final class Slab {
         Slot[] slots;
-        final AtomicInteger free = new AtomicInteger();
-        volatile long lastFreeNanos = System.nanoTime();
-
     }
 
     static final class SizeClass {
