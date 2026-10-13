@@ -347,6 +347,49 @@ public final class Partition implements AutoCloseable {
         }
     }
 
+    /**
+     * Heartbeat: moves the lease of {@code offset} (held under {@code attempt}) to {@code now + visibilityMs}.
+     * Appends one EXTEND record. The new deadline may be earlier than the current one (shortening is allowed).
+     */
+    public LeaseResult extend(String group, long offset, int attempt, long visibilityMs) {
+        if (visibilityMs < 1) throw new IllegalArgumentException("visibility");
+        lock.lock();
+        try {
+            var r = fence(state.group(group).inFlight.get(offset), attempt);
+            if (r != null) return r;
+            append(new LedgerEntry.Extend(group, clockMs.getAsLong() + visibilityMs, new long[] {offset}, new int[] {attempt}), null);
+            return LeaseResult.OK;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Batched heartbeat (one worker, many leases): every lease that is still held gets {@code now + visibilityMs},
+     * in a single EXTEND record. Returns one result per input, in order; refused leases are not written.
+     */
+    public List<LeaseResult> extend(String group, long[] offsets, int[] attempts, long visibilityMs) {
+        if (visibilityMs < 1 || offsets.length != attempts.length) throw new IllegalArgumentException("extend");
+        var out = new ArrayList<LeaseResult>(offsets.length);
+        lock.lock();
+        try {
+            var g = state.group(group);
+            var okOff = new long[offsets.length];
+            var okAtt = new int[offsets.length];
+            int n = 0;
+            for (int i = 0; i < offsets.length; i++) { // a duplicate offset is written twice; applying it is idempotent
+                var r = fence(g.inFlight.get(offsets[i]), attempts[i]);
+                if (r == null) { okOff[n] = offsets[i]; okAtt[n] = attempts[i]; n++; r = LeaseResult.OK; }
+                out.add(r);
+            }
+            if (n > 0) append(new LedgerEntry.Extend(group, clockMs.getAsLong() + visibilityMs,
+                    java.util.Arrays.copyOf(okOff, n), java.util.Arrays.copyOf(okAtt, n)), null);
+            return out;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void deadLetter(String group, long offset, int attempts, String reason) {
         var m = state.messages.get(offset);
         if (dlq != null) {

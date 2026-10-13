@@ -10,7 +10,7 @@ import java.nio.charset.StandardCharsets;
  */
 public sealed interface LedgerEntry {
 
-    byte ENQUEUE_T = 1, SUBSCRIBE_T = 2, DELIVER_T = 3, ACK_T = 4, NACK_T = 5, DLQ_T = 6;
+    byte ENQUEUE_T = 1, SUBSCRIBE_T = 2, DELIVER_T = 3, ACK_T = 4, NACK_T = 5, DLQ_T = 6, EXTEND_T = 7;
 
     /** A message. {@code producerId == 0} disables dedup. {@code originGroup} is non-empty only in a DLQ topic. */
     record Enqueue(long producerId, long seq, long timestampMs, String originGroup, long originOffset, int originAttempts,
@@ -35,6 +35,22 @@ public sealed interface LedgerEntry {
     /** → DEAD_LETTERED (already copied to {@code <topic>.dlq}). */
     record DeadLetter(String group, long offset, String reason) implements LedgerEntry { }
 
+    /**
+     * Lease extension (heartbeat): each {@code offsets[i]} in flight under {@code attempts[i]} gets the new absolute
+     * {@code deadlineMs}. One record for a single or a batched extend; only accepted leases are written.
+     * Type 7 is new: a build without it rejects a log that contains one (unknown type), it never misreads it.
+     */
+    record Extend(String group, long deadlineMs, long[] offsets, int[] attempts) implements LedgerEntry {
+        public Extend {
+            if (offsets.length != attempts.length || offsets.length == 0) throw new IllegalArgumentException("extend batch");
+        }
+        @Override public boolean equals(Object o) {
+            return o instanceof Extend e && e.group.equals(group) && e.deadlineMs == deadlineMs
+                    && java.util.Arrays.equals(e.offsets, offsets) && java.util.Arrays.equals(e.attempts, attempts);
+        }
+        @Override public int hashCode() { return java.util.Objects.hash(group, deadlineMs, java.util.Arrays.hashCode(offsets)); }
+    }
+
     static byte[] encode(LedgerEntry e) {
         var b = ByteBuffer.allocate(size(e));
         switch (e) {
@@ -53,6 +69,10 @@ public sealed interface LedgerEntry {
             case Ack x -> { b.put(ACK_T); str(b, x.group); b.putLong(x.offset); }
             case Nack x -> { b.put(NACK_T); str(b, x.group); b.putLong(x.offset).putLong(x.notBeforeMs); }
             case DeadLetter x -> { b.put(DLQ_T); str(b, x.group); b.putLong(x.offset); str(b, x.reason); }
+            case Extend x -> {
+                b.put(EXTEND_T); str(b, x.group); b.putLong(x.deadlineMs).putInt(x.offsets.length);
+                for (int i = 0; i < x.offsets.length; i++) b.putLong(x.offsets[i]).putInt(x.attempts[i]);
+            }
         }
         return b.array();
     }
@@ -65,6 +85,7 @@ public sealed interface LedgerEntry {
             case Ack x -> ss(x.group) + 8;
             case Nack x -> ss(x.group) + 16;
             case DeadLetter x -> ss(x.group) + 8 + ss(x.reason);
+            case Extend x -> ss(x.group) + 8 + 4 + 12 * x.offsets.length;
         };
     }
 
@@ -87,6 +108,16 @@ public sealed interface LedgerEntry {
                 case ACK_T -> new Ack(str(b), b.getLong());
                 case NACK_T -> new Nack(str(b), b.getLong(), b.getLong());
                 case DLQ_T -> new DeadLetter(str(b), b.getLong(), str(b));
+                case EXTEND_T -> {
+                    String g = str(b);
+                    long deadline = b.getLong();
+                    int n = b.getInt();
+                    if (n < 1 || n > b.remaining() / 12) throw new IllegalArgumentException("extend count " + n);
+                    var offs = new long[n];
+                    var atts = new int[n];
+                    for (int i = 0; i < n; i++) { offs[i] = b.getLong(); atts[i] = b.getInt(); }
+                    yield new Extend(g, deadline, offs, atts);
+                }
                 default -> throw new IllegalArgumentException("unknown ledger entry type");
             };
             if (b.hasRemaining()) throw new IllegalArgumentException("trailing bytes in ledger entry");

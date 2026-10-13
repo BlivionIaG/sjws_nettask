@@ -151,6 +151,18 @@ final class DeliveryState {
                 g.inFlight.put(o, lease);
                 g.due.add(g.leaseDue(o, lease));
             }
+            case LedgerEntry.Extend x -> {
+                var g = group(x.group());
+                for (int i = 0; i < x.offsets().length; i++) {
+                    long o = x.offsets()[i];
+                    var l = Objects.requireNonNull(g.inFlight.get(o), "extend: not in flight");
+                    if (l.attempt != x.attempts()[i]) throw new IllegalStateException("extend: stale attempt at " + o);
+                    g.due.remove(g.leaseDue(o, l));
+                    var nl = new Lease(l.consumer, x.deadlineMs(), l.attempt);
+                    g.inFlight.put(o, nl);
+                    g.due.add(g.leaseDue(o, nl));
+                }
+            }
             case LedgerEntry.Ack x -> {
                 var g = group(x.group());
                 var l = Objects.requireNonNull(g.inFlight.remove(x.offset()), "not in flight");
