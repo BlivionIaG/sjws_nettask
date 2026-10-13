@@ -38,13 +38,53 @@ final class LogTopics implements AutoCloseable {
 
     private final Path dir;
     private final Durability durability;
+    private final long segmentBytes;
+    private final LogRetention retention;
+    private final java.util.function.LongSupplier clockMs;
     private final ConcurrentHashMap<String, Log> logs = new ConcurrentHashMap<>();
     private final java.util.concurrent.locks.ReentrantLock opening = new java.util.concurrent.locks.ReentrantLock();
     private volatile boolean closed;
 
     LogTopics(Path dir, Durability durability) {
+        this(dir, durability, SegmentedLog.DEFAULT_SEGMENT_BYTES, LogRetention.NONE, System::currentTimeMillis);
+    }
+
+    LogTopics(Path dir, Durability durability, long segmentBytes, LogRetention retention, java.util.function.LongSupplier clockMs) {
         this.dir = dir;
         this.durability = durability;
+        this.segmentBytes = segmentBytes;
+        this.retention = java.util.Objects.requireNonNull(retention);
+        this.clockMs = clockMs;
+    }
+
+    LogRetention retention() {
+        return this.retention;
+    }
+
+    /**
+     * Applies {@link LogRetention} to every open topic; returns the number of segments deleted. Deletion holds the
+     * topic's {@code reads} lock, so a concurrent fetch never reads a segment being removed. The writer only touches
+     * the active segment, which is never deleted.
+     */
+    int enforceRetention() throws IOException {
+        if (this.retention.unlimited()) return 0;
+        int deleted = 0;
+        long now = this.clockMs.getAsLong();
+        for (var l : this.logs.values()) {
+            l.reads().lock();
+            try {
+                long total = l.log().totalBytes();
+                for (var seg : l.log().segments()) {
+                    if (seg.active() || !this.retention.expired(total, seg.lastModifiedMs(), now)) break;
+                    l.log().deleteSegment(seg.baseOffset());
+                    total -= seg.bytes();
+                    deleted++;
+                }
+            } finally {
+                l.reads().unlock();
+            }
+        }
+        return deleted;
     }
 
     static boolean validName(String topic) {
@@ -61,7 +101,7 @@ final class LogTopics implements AutoCloseable {
             if (this.closed) throw new IllegalStateException("closed");
             l = this.logs.get(topic);
             if (l == null) {
-                var log = SegmentedLog.open(this.dir.resolve(topic));
+                var log = SegmentedLog.open(this.dir.resolve(topic), this.segmentBytes);
                 l = new Log(log, new LedgerWriter(log, this.durability), new java.util.concurrent.locks.ReentrantLock());
                 this.logs.put(topic, l);
             }
