@@ -56,8 +56,9 @@ import javax.crypto.spec.SecretKeySpec;
  * packet timestamp, or later than the receiver's now, by more than {@link #WINDOW_MILLIS} is
  * dropped and does not update that state: a boot time cannot sit in the future, so one forged
  * epoch cannot lock a member out. A lower epoch is accepted only after the sender has been
- * silent for at least the membership dead interval, which is a clock step backwards across a
- * restart of a member the receiver already treats as dead. A timestamp older than this
+ * silent for at least {@code max(deadAfter, 5s)}. That floor is the skew window, so a captured
+ * packet has left it before the epoch can move backwards. It covers a clock step backwards
+ * across a restart of a member the receiver already treats as dead. A timestamp older than this
  * process's boot is dropped, so a capture from before this process started is not replayed.
  * A destination other than this node is dropped. A sender that is not in the membership list
  * is dropped and is not inserted into the map. The map is then bounded by the membership list.
@@ -114,8 +115,8 @@ public final class HeartbeatAuthenticator {
     }
 
     /**
-     * @param deadAfterMillis silence after which a lower boot epoch is accepted. Zero never
-     *        accepts a lower epoch. This is the membership dead interval.
+     * @param deadAfterMillis membership dead interval. Zero never accepts a lower epoch.
+     *        Otherwise a lower epoch waits for {@code max(deadAfterMillis, WINDOW_MILLIS)}.
      */
     public HeartbeatAuthenticator(ClusterKey key, Clock clock, long deadAfterMillis) {
         Objects.requireNonNull(key, "cluster key");
@@ -280,14 +281,16 @@ public final class HeartbeatAuthenticator {
     }
 
     /**
-     * A member that has already been silent for the dead interval may come back with an earlier
-     * boot epoch. Its clock stepped backwards across the restart. A live member is not reset.
+     * A member silent for {@code max(deadAfter, 5s)} may come back with an earlier boot epoch.
+     * Its clock stepped backwards across the restart. A live member is not reset, and a dead
+     * interval shorter than the skew window does not open that window to a captured packet.
      */
     private boolean lowerEpochAfterSilence(Sender sender, long epoch, long nowMillis) {
         if (this.deadAfterMillis <= 0 || epoch >= sender.epoch) {
             return false;
         }
-        return nowMillis - sender.seenMillis >= this.deadAfterMillis;
+        long required = Math.max(this.deadAfterMillis, WINDOW_MILLIS);
+        return nowMillis - sender.seenMillis >= required;
     }
 
     private Heartbeat drop(Reason reason) {

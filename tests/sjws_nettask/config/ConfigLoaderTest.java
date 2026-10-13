@@ -718,6 +718,32 @@ class ConfigLoaderTest {
         }
     }
 
+    @Test
+    void haClusterKeyFileResolvesParentSymlinksBeforeTheChecks() throws Exception {
+        var secret = "parent-symlink-key-0123456789ab";
+        var realDir = Files.createDirectories(dir.resolve("real-keys"));
+        var keyFile = realDir.resolve("cluster.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        var linkDir = dir.resolve("via-link");
+        Files.createSymbolicLink(linkDir, realDir);
+        var yaml = dir.resolve("ha-parent-link.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: via-link/cluster.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        assertArrayEquals(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), loaded.haClusterKey());
+        assertFalse(loaded.toString().contains(secret), loaded.toString());
+
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-r-----"));
+        var open = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(open.ok());
+        assertTrue(open.errors().get(0).contains("0600"), open.errors().toString());
+        assertFalse(open.errors().get(0).contains(secret), open.errors().toString());
+    }
+
     private String error(String yaml) throws Exception {
         var loaded = ConfigLoader.load(new String[] {"--config=" + write(yaml)}, Map.of());
         assertFalse(loaded.ok(), yaml);

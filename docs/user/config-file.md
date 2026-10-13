@@ -107,15 +107,16 @@ checked against that one key. Each sender's sequence starts over when its boot e
 than the last one accepted, which is how a restarted node stays reachable. The epoch must not
 lead the packet timestamp, or the receiver's clock, by more than the ±5 second window; a
 later epoch is dropped and does not stick. A lower epoch is accepted only after that sender
-has been silent for the dead interval. A timestamp older
+has been silent for at least `max(deadAfter, 5s)`. A timestamp older
 than the receiver's own boot is dropped. Clocks must stay within ±5 seconds (NTP). A larger
 step drops heartbeats until they agree, and a rate-limited warning names the skew.
 
 Key rotation: put the new secret in `ha.cluster_key` or `ha.cluster_key_file` and the key
 that is still in use in `ha.cluster_key_previous` or `ha.cluster_key_previous_file`. Roll
 that config to every node, wait until heartbeats are using the new key, then remove the
-previous key. The key file is opened with `NOFOLLOW_LINKS`, must be mode 0600 or 0400, and
-must be owned by the server's uid.
+previous key. Parent-directory symlinks in the key-file path are resolved with `toRealPath`,
+and the owner and mode checks apply to that resolved path. It is then opened with
+`NOFOLLOW_LINKS`, must be mode 0600 or 0400, and must be owned by the server's uid.
 
 ## Server
 

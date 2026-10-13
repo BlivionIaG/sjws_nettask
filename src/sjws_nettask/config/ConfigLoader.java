@@ -1192,17 +1192,27 @@ public final class ConfigLoader {
     }
 
     /**
-     * Key file: opened once with {@link LinkOption#NOFOLLOW_LINKS}, at most 4 KiB, mode 0600 or
-     * 0400, and owned by this process. Mode and owner come from that same file descriptor on
-     * Linux ({@code /proc/self/fd}), so a replace between the check and the read cannot change
-     * which inode was accepted. The bytes are not part of the error text. Java keeps the
-     * characters in a {@code String}; they are not wiped.
+     * Key file: parent-directory symlinks are resolved with {@link Path#toRealPath()}, then the
+     * resolved path is opened once with {@link LinkOption#NOFOLLOW_LINKS}. The file itself must
+     * not be a symlink. It is at most 4 KiB, mode 0600 or 0400, and owned by this process.
+     * Mode and owner come from that same file descriptor on Linux ({@code /proc/self/fd}), so a
+     * replace between the check and the read cannot change which inode was accepted. The bytes
+     * are not part of the error text. Java keeps the characters in a {@code String}; they are
+     * not wiped.
      */
     private static String readKeyFile(Path path, String name) {
         if (!path.getFileSystem().supportedFileAttributeViews().contains("posix")) {
             throw new ConfigException(name + " cannot be checked (filesystem has no POSIX permissions)");
         }
-        var opened = path.toAbsolutePath();
+        if (Files.isSymbolicLink(path)) {
+            throw new ConfigException(name + " is a symlink");
+        }
+        final Path opened;
+        try {
+            opened = path.toRealPath();
+        } catch (IOException e) {
+            throw new ConfigException("Cannot read " + name);
+        }
         try (var channel = FileChannel.open(opened, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
             checkedKey(channel, opened, name);
             if (channel.size() > 4096) {
@@ -1219,7 +1229,7 @@ public final class ConfigLoader {
         } catch (UnsupportedOperationException e) {
             throw new ConfigException(name + " cannot be checked (filesystem has no POSIX permissions)");
         } catch (IOException e) {
-            if (Files.isSymbolicLink(path)) {
+            if (Files.isSymbolicLink(path) || Files.isSymbolicLink(opened)) {
                 throw new ConfigException(name + " is a symlink");
             }
             throw new ConfigException("Cannot read " + name);

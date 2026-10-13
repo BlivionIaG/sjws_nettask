@@ -48,16 +48,18 @@ wiring that should drain instead belongs to daemon mode, which can call `Lifecyc
    later than the receiver's now, beyond the same ±5 second skew window. A later epoch is
    dropped and does not change replay state, so a forged far-future epoch cannot lock the
    real member out after the attacker stops. A lower epoch is accepted only when that sender
-   has been silent for at least the dead interval (the receiver already treats the member as
-   dead). That is a clock step backwards across a restart, not a live rewind.
+   has been silent for at least {@code max(deadAfter, 5s)} (the receiver already treats the
+   member as dead, and a captured packet has left the skew window). That is a clock step
+   backwards across a restart, not a live rewind.
    A timestamp older than the receiver's boot is dropped. A destination other than this node,
    and a sender that is not a member, are dropped; the replay map only holds members.
    Drops are counted by reason. A missing key with HA enabled refuses to start. Rotation is
    two steps: deploy the new secret as the current key and the key still in use as the
    previous key (`ha.cluster_key` / `ha.cluster_key_file` and `ha.cluster_key_previous` /
    `ha.cluster_key_previous_file`), then remove the previous key once every node is sending
-   with the new one. The key file must be mode 0600 or 0400, owned by this process, and is
-   read through one `NOFOLLOW_LINKS` channel. Nodes need
+   with the new one. The key file must be mode 0600 or 0400 and owned by this process.
+   Parent-directory symlinks are resolved with `toRealPath` and those checks apply to the
+   resolved path, which is then read through one `NOFOLLOW_LINKS` channel. Nodes need
    NTP: the authentication window is ±5 seconds of wall-clock time. Monotonic
    clocks are not comparable across hosts: the packet carries `leaseRemainingMs`, and the
    receiver sets its own expiry from `System.nanoTime()`. The authentication timestamp is
