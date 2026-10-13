@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * The default {@link UpstreamSource}: holds the set from the config file (or whatever the control
@@ -27,6 +28,8 @@ import java.util.function.Consumer;
  * volatile load.
  */
 public final class StaticUpstreamSource implements UpstreamSource {
+
+    private final ReentrantLock lock = new ReentrantLock();
 
     private final String service;
     private final List<Consumer<UpstreamSet>> listeners = new CopyOnWriteArrayList<>();
@@ -74,24 +77,32 @@ public final class StaticUpstreamSource implements UpstreamSource {
     public boolean reloadFromConfig(UpstreamSet set) {
         Objects.requireNonNull(set, "set");
         UpstreamSet applied;
-        synchronized (this) {
-            if (this.fed || !set.service().equals(this.service)) {
-                return false;
-            }
-            var live = set.withoutDead();
-            if (live.size() == 0 || live.equals(this.current)) {
-                return false;
-            }
-            this.current = live;
-            applied = live;
+        this.lock.lock();
+        try {
+                if (this.fed || !set.service().equals(this.service)) {
+                    return false;
+                }
+                var live = set.withoutDead();
+                if (live.size() == 0 || live.equals(this.current)) {
+                    return false;
+                }
+                this.current = live;
+                applied = live;
+        } finally {
+            this.lock.unlock();
         }
         publish(applied);
         return true;
     }
 
     /** True once a control-plane update has been applied. */
-    public synchronized boolean controlPlaneFed() {
-        return this.fed;
+    public boolean controlPlaneFed() {
+        this.lock.lock();
+        try {
+            return this.fed;
+        } finally {
+            this.lock.unlock();
+        }
     }
 
     private boolean apply(UpstreamSet set, boolean fromControlPlane) {
@@ -100,18 +111,21 @@ public final class StaticUpstreamSource implements UpstreamSource {
             throw new IllegalArgumentException("set for '" + set.service() + "' offered to '" + this.service + "'");
         }
         UpstreamSet applied;
-        synchronized (this) {
-            if (set.version() <= this.seen) {
-                return false;
-            }
-            this.seen = set.version();
-            var live = set.withoutDead();
-            if (live.size() == 0) {
-                return false; // keep the last non-empty set (or none, which answers 503)
-            }
-            this.current = live;
-            this.fed |= fromControlPlane;
-            applied = live;
+        this.lock.lock();
+        try {
+                if (set.version() <= this.seen) {
+                    return false;
+                }
+                this.seen = set.version();
+                var live = set.withoutDead();
+                if (live.size() == 0) {
+                    return false; // keep the last non-empty set (or none, which answers 503)
+                }
+                this.current = live;
+                this.fed |= fromControlPlane;
+                applied = live;
+        } finally {
+            this.lock.unlock();
         }
         publish(applied);
         return true;

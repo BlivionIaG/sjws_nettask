@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.LongSupplier;
+import java.util.concurrent.locks.ReentrantLock;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
@@ -53,6 +54,9 @@ import sjws_nettask.routing.discovery.UpstreamSource;
  * different endpoint when one is available. Never-populated sources answer 503.
  */
 public final class EndpointBalancer implements Handler, AutoCloseable {
+
+    private static final ReentrantLock CLOSER_LOCK = new ReentrantLock();
+    private final ReentrantLock lock = new ReentrantLock();
 
     /**
      * Passive ejection. An endpoint is ejected after {@code consecutive} failures in a row, or
@@ -177,48 +181,56 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         }
     }
 
-    private synchronized void swap(UpstreamSet set) {
-        if (this.closed) {
-            return;
-        }
-        var next = new Pool[set.size()];
-        for (int i = 0; i < next.length; i++) {
-            var endpoint = set.endpointAt(i);
-            var key = endpoint.authority();
-            var pool = this.pools.get(key);
-            if (pool == null) {
-                pool = new Pool(key, this.factory.create(endpoint), new Health(this.outlier, this.ejected));
-                this.pools.put(key, pool);
+    private void swap(UpstreamSet set) {
+        this.lock.lock();
+        try {
+            if (this.closed) {
+                return;
             }
-            pool.refs++;
-            next[i] = pool;
-        }
-        var old = this.view;
-        this.view = new View(set, next);
-        if (old != null) {
-            for (var pool : old.pools) {
-                if (--pool.refs == 0) {
-                    this.pools.remove(pool.key);
-                    pool.health.forget();
-                    closeLater(pool.proxy);
+            var next = new Pool[set.size()];
+            for (int i = 0; i < next.length; i++) {
+                var endpoint = set.endpointAt(i);
+                var key = endpoint.authority();
+                var pool = this.pools.get(key);
+                if (pool == null) {
+                    pool = new Pool(key, this.factory.create(endpoint), new Health(this.outlier, this.ejected));
+                    this.pools.put(key, pool);
+                }
+                pool.refs++;
+                next[i] = pool;
+            }
+            var old = this.view;
+            this.view = new View(set, next);
+            if (old != null) {
+                for (var pool : old.pools) {
+                    if (--pool.refs == 0) {
+                        this.pools.remove(pool.key);
+                        pool.health.forget();
+                        closeLater(pool.proxy);
+                    }
                 }
             }
+        } finally {
+            this.lock.unlock();
         }
     }
 
     private void closeLater(ProxyHandler proxy) {
         var c = closer;
         if (c == null) {
-            synchronized (EndpointBalancer.class) {
-                c = closer;
-                if (c == null) {
-                    c = Executors.newSingleThreadScheduledExecutor(r -> {
-                        var t = new Thread(r, "sjws-endpoint-pool-closer");
-                        t.setDaemon(true);
-                        return t;
-                    });
-                    closer = c;
-                }
+            CLOSER_LOCK.lock();
+            try {
+                    c = closer;
+                    if (c == null) {
+                        c = Executors.newSingleThreadScheduledExecutor(r -> {
+                            var t = new Thread(r, "sjws-endpoint-pool-closer");
+                            t.setDaemon(true);
+                            return t;
+                        });
+                        closer = c;
+                    }
+            } finally {
+                CLOSER_LOCK.unlock();
             }
         }
         // requests that picked this endpoint just before the swap still get a connection
@@ -226,21 +238,26 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     }
 
     @Override
-    public synchronized void close() {
-        if (this.closed) {
-            return;
-        }
-        this.closed = true;
+    public void close() {
+        this.lock.lock();
         try {
-            this.subscription.close();
-        } catch (Exception e) {
-            System.err.println("WARN: unsubscribing from upstream source: " + e);
+            if (this.closed) {
+                return;
+            }
+            this.closed = true;
+            try {
+                this.subscription.close();
+            } catch (Exception e) {
+                System.err.println("WARN: unsubscribing from upstream source: " + e);
+            }
+            for (var pool : this.pools.values()) {
+                pool.proxy.close();
+            }
+            this.pools.clear();
+            this.view = null;
+        } finally {
+            this.lock.unlock();
         }
-        for (var pool : this.pools.values()) {
-            pool.proxy.close();
-        }
-        this.pools.clear();
-        this.view = null;
     }
 
     @Override
@@ -361,8 +378,13 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         return this.ejected.get();
     }
 
-    synchronized int poolCount() {
-        return this.pools.size();
+    int poolCount() {
+        this.lock.lock();
+        try {
+            return this.pools.size();
+        } finally {
+            this.lock.unlock();
+        }
     }
 
     /** Pool of an endpoint in the current view, for tests. */
@@ -383,6 +405,8 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
      * bucket one {@code AtomicLong}: 24-bit epoch, 20-bit total, 20-bit failures), and the circuit.
      */
     static final class Health {
+
+        private final ReentrantLock lock = new ReentrantLock();
         private static final long COUNT = 1L << 20;
         private static final long MASK = COUNT - 1;
 
@@ -424,14 +448,17 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         void success(long now) {
             this.consecutive.set(0);
             if (this.ejectedUntil != 0) {
-                synchronized (this) {
-                    if (this.ejectedUntil != 0) {
-                        this.ejectedUntil = 0;
-                        this.trips = 0;
-                        this.buckets.set(0, 0);
-                        this.buckets.set(1, 0);
-                        this.ejectedCounter.decrementAndGet();
-                    }
+                this.lock.lock();
+                try {
+                        if (this.ejectedUntil != 0) {
+                            this.ejectedUntil = 0;
+                            this.trips = 0;
+                            this.buckets.set(0, 0);
+                            this.buckets.set(1, 0);
+                            this.ejectedCounter.decrementAndGet();
+                        }
+                } finally {
+                    this.lock.unlock();
                 }
                 this.probing.set(false);
                 return;
@@ -442,32 +469,43 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         void failure(long now) {
             int run = this.consecutive.incrementAndGet();
             if (this.ejectedUntil != 0) { // a failed probe (or a straggler): eject again, longer
-                synchronized (this) {
-                    if (this.ejectedUntil != 0) {
-                        int t = Math.min(this.trips + 1, 5);
-                        this.trips = t;
-                        this.ejectedUntil = nonZero(now + (this.policy.ejectFor().toNanos() << t));
-                    }
+                this.lock.lock();
+                try {
+                        if (this.ejectedUntil != 0) {
+                            int t = Math.min(this.trips + 1, 5);
+                            this.trips = t;
+                            this.ejectedUntil = nonZero(now + (this.policy.ejectFor().toNanos() << t));
+                        }
+                } finally {
+                    this.lock.unlock();
                 }
                 this.probing.set(false);
                 return;
             }
             boolean rate = record(now, true);
             if (run >= this.policy.consecutive() || rate) {
-                synchronized (this) {
-                    if (this.ejectedUntil == 0) {
-                        this.ejectedUntil = nonZero(now + this.policy.ejectFor().toNanos());
-                        this.ejectedCounter.incrementAndGet();
-                    }
+                this.lock.lock();
+                try {
+                        if (this.ejectedUntil == 0) {
+                            this.ejectedUntil = nonZero(now + this.policy.ejectFor().toNanos());
+                            this.ejectedCounter.incrementAndGet();
+                        }
+                } finally {
+                    this.lock.unlock();
                 }
             }
         }
 
         /** The pool left every set: its ejection no longer counts toward panic. */
-        synchronized void forget() {
-            if (this.ejectedUntil != 0) {
-                this.ejectedUntil = 0;
-                this.ejectedCounter.decrementAndGet();
+        void forget() {
+            this.lock.lock();
+            try {
+                if (this.ejectedUntil != 0) {
+                    this.ejectedUntil = 0;
+                    this.ejectedCounter.decrementAndGet();
+                }
+            } finally {
+                this.lock.unlock();
             }
         }
 
