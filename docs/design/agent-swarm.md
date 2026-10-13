@@ -112,6 +112,8 @@ The retry policy is set per topic through the `retry:` block of the #39 schema (
 ### 4.5 Task envelope (in the payload until headers exist)
 `{version:u8, taskId:16B (idempotency key), correlationId:16B, replyTo:topic, deadlineMs:absolute (caller clock), traceparent, tracestate?, budgetRef, schema/contentType, body}`.
 
+Wire layout v1 (big-endian): `[version:u8][taskId:16][correlationId:16][deadlineMs:i64][replyTo][traceparent][tracestate][budgetRef][contentType][bodyLen:i32][body]`, each text field `[len:u16][bytes]`. **Text fields are standard UTF-8** (RFC 3629), not Java's modified UTF-8 (`DataOutput.writeUTF`): NUL is the single byte `00`, a supplementary character such as U+1F600 is four bytes (`f09f9880`), and `len` counts bytes, at most 65535 (decided 2026-10-13, inceptor; pinned by `TaskEnvelopeUtf8Test` and the `task-env-*` golden frames).
+
 When headers land (**GAP 3** in §4.8), the metadata fields move to headers and the `version` byte selects the layout.
 
 ### 4.6 Further gaps the swarm relies on
@@ -282,6 +284,7 @@ The transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existing liste
   - `CREDIT` grants per-stream send credit, on top of h2/h3 flow control, for application-level backpressure.
 - **Errors** use RFC 9457 problem+json ([RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)), which the routing layer already emits (`routing/ProblemErrorHandler.java`).
 - A conformance suite (golden frames under `tests/.../swarm/wire`) is shared by the Java codec and the Python SDK.
+- All text on the wire (envelope text fields, §4.5) is **standard UTF-8**, never modified UTF-8. The golden set includes envelopes with NUL and a supplementary character that both codecs must reproduce byte for byte.
 
 ## 12. Phases and exit criteria
 | Phase | Deliverable | Exit criteria |

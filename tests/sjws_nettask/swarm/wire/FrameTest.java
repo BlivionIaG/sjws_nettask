@@ -48,7 +48,7 @@ class FrameTest {
             assertEquals(frame, Frame.decode(ByteBuffer.wrap(hex.parseHex(f[4]))), f[0]);
             n++;
         }
-        assertTrue(n >= 9, "golden frames: " + n);
+        assertTrue(n >= 11, "golden frames: " + n);
     }
 
     @Test
