@@ -5,6 +5,7 @@ Skipped when SJWS_JAR is unset.
 """
 import os
 import pathlib
+import secrets
 import shutil
 import socket
 import subprocess
@@ -38,7 +39,7 @@ class EndToEndTest(unittest.TestCase):
         site.mkdir()
         (site / "hello.txt").write_text("hello")
         cls.port = free_port()
-        token = "e2e-token-0123456789abcdef"
+        token = "e2e-token-" + secrets.token_urlsafe(32)
         tokens = pathlib.Path(cls.tmp, "tokens")
         tokens.write_text(f"e2e {token} *\n")
         tokens.chmod(0o600)

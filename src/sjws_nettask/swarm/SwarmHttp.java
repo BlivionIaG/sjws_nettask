@@ -69,6 +69,12 @@ final class SwarmHttp implements Handler {
     private final java.util.concurrent.ConcurrentHashMap<String, Task> claimed = new java.util.concurrent.ConcurrentHashMap<>();
 
     private final SwarmGate gate;
+    /** Requests refused with 401 (no or invalid credential); read by tests and, later, metrics. */
+    private final java.util.concurrent.atomic.LongAdder failedAuth = new java.util.concurrent.atomic.LongAdder();
+
+    long failedAuth() {
+        return this.failedAuth.sum();
+    }
 
     SwarmHttp(Swarm swarm, long workerProducerId, SwarmGate gate) {
         this.swarm = swarm;
@@ -81,8 +87,11 @@ final class SwarmHttp implements Handler {
         // deny by default: authenticate before anything else, so an unauthenticated caller learns nothing
         var agent = this.gate.authenticate(request);
         if (agent == null) {
+            this.failedAuth.increment();
+            boolean presented = !request.headers().values("authorization").isEmpty();
             var r = problem(401, "unauthorized", "agent credential required").response();
-            r.headers().set("www-authenticate", "Bearer realm=\"sjws-swarm\"");
+            r.headers().set("www-authenticate",
+                    presented ? "Bearer realm=\"sjws-swarm\", error=\"invalid_token\"" : "Bearer realm=\"sjws-swarm\"");
             return r;
         }
         long len = request.body().length();
@@ -122,12 +131,15 @@ final class SwarmHttp implements Handler {
             }
             if (noun.startsWith("leases/")) {
                 var leaseId = decode(noun.substring("leases/".length()));
-                if (!this.gate.allows(agent, parseLease(leaseId).pool())) {
-                    return forbidden(parseLease(leaseId).pool());
+                var task = parseLease(leaseId);
+                if (!this.gate.allows(agent, task.pool())) {
+                    return forbidden(task.pool());
                 }
-                return lease(decode(noun.substring("leases/".length())), verb, request, query);
+                return lease(leaseId, task, verb, request, query);
             }
             return problem(404, "not found", path).response();
+        } catch (TooLarge e) {
+            return problem(413, "content too large", e.getMessage()).response();
         } catch (BadRequest e) {
             return problem(400, "bad request", e.getMessage()).response();
         } catch (IllegalArgumentException e) {
@@ -188,8 +200,8 @@ final class SwarmHttp implements Handler {
         return bytes(200, out.toByteArray());
     }
 
-    private Response lease(String id, String verb, Request request, Map<String, String> query) throws BadRequest {
-        var t = parseLease(id);
+    private Response lease(String id, Task t, String verb, Request request, Map<String, String> query)
+            throws BadRequest {
         var held = this.claimed.get(id);
         LeaseResult r;
         switch (verb) {
@@ -279,7 +291,7 @@ final class SwarmHttp implements Handler {
     static Frame readFrame(Request request) throws BadRequest {
         var body = request.body();
         if (body.length() > MAX_REQUEST) {
-            throw new BadRequest("request body larger than " + MAX_REQUEST);
+            throw new TooLarge("request body larger than " + MAX_REQUEST);
         }
         var buf = new java.io.ByteArrayOutputStream();
         var chunk = new byte[8192];
@@ -288,9 +300,11 @@ final class SwarmHttp implements Handler {
             while ((n = body.read(chunk, 0, chunk.length)) >= 0) {
                 buf.write(chunk, 0, n);
                 if (buf.size() > MAX_REQUEST) {
-                    throw new BadRequest("request body larger than " + MAX_REQUEST);
+                    throw new TooLarge("request body larger than " + MAX_REQUEST);
                 }
             }
+        } catch (BodyTooLarge e) {
+            throw new TooLarge("request body " + e.getMessage());
         } catch (IOException e) {
             throw new BadRequest("request body: " + e.getMessage());
         }
@@ -379,7 +393,7 @@ final class SwarmHttp implements Handler {
             public int read(byte[] into, int off, int len) throws IOException {
                 int n = body.read(into, off, len);
                 if (n > 0 && (this.read += n) > max) {
-                    throw new IOException("larger than " + max);
+                    throw new BodyTooLarge("larger than " + max);
                 }
                 return n;
             }
@@ -413,8 +427,22 @@ final class SwarmHttp implements Handler {
         return b.append('"').toString();
     }
 
-    static final class BadRequest extends Exception {
+    static class BadRequest extends Exception {
         BadRequest(String message) {
+            super(message);
+        }
+    }
+
+    /** Answered with 413, for both declared and unknown-length (chunked) bodies. */
+    static final class TooLarge extends BadRequest {
+        TooLarge(String message) {
+            super(message);
+        }
+    }
+
+    /** Thrown by {@link #capped} when an unknown-length body passes the gate's limit. */
+    static final class BodyTooLarge extends IOException {
+        BodyTooLarge(String message) {
             super(message);
         }
     }

@@ -16,10 +16,8 @@
  */
 package sjws_nettask.swarm;
 
-import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -28,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import sjws_nettask.config.SecureKeyFile;
 import sjws_nettask.core.Request;
 
 /**
@@ -46,7 +45,10 @@ public final class TokenGate implements SwarmGate {
     static final String MAX_PROPERTY = "sjws.swarm.maxRequestBytes";
     static final String MAX_ENV = "SJWS_SWARM_MAX_REQUEST_BYTES";
     static final long DEFAULT_MAX = SwarmHttp.MAX_REQUEST;
-    static final int MIN_TOKEN_CHARS = 16;
+    /** 32 random bytes in base64url without padding ({@code openssl rand -base64 32} gives 44 characters). */
+    static final int MIN_TOKEN_CHARS = 43;
+    /** Size cap of the tokens file. */
+    static final int MAX_FILE_BYTES = 1 << 20;
 
     private record Entry(byte[] digest, Agent agent, Set<String> pools) { }
 
@@ -100,8 +102,20 @@ public final class TokenGate implements SwarmGate {
             var inline = env.get(TOKENS_ENV);
             List<String> lines;
             if (file != null) {
-                lines = Files.readAllLines(Path.of(file), StandardCharsets.UTF_8);
+                byte[] bytes;
+                try {
+                    // NOFOLLOW leaf, owner = this process, mode 0600/0400, secure parents, size cap (#152)
+                    bytes = SecureKeyFile.read(Path.of(file), "swarm tokens file", MAX_FILE_BYTES);
+                } catch (RuntimeException e) {
+                    err.println("WARN: swarm: tokens file " + file + " refused (must be a regular file owned by this"
+                            + " process, mode 0600 or 0400, in secure directories, at most " + MAX_FILE_BYTES
+                            + " bytes); /swarm/v1 rejects every request");
+                    return DENY_ALL;
+                }
+                lines = List.of(new String(bytes, StandardCharsets.UTF_8).split("\\R"));
             } else if (inline != null && !inline.isBlank()) {
+                err.println("WARN: swarm: tokens from " + TOKENS_ENV + " are visible in /proc/<pid>/environ and"
+                        + " inherited by child processes; prefer " + FILE_ENV + " (a 0600 file)");
                 lines = List.of(inline.split("[;\\n]"));
             } else {
                 err.println("WARN: swarm: no agent tokens configured (" + FILE_ENV + " or " + TOKENS_ENV
@@ -112,10 +126,10 @@ public final class TokenGate implements SwarmGate {
             var gate = new TokenGate(lines, max == null ? DEFAULT_MAX : Long.parseLong(max));
             err.println("swarm: token gate with " + gate.entries.length + " agent(s)");
             return gate;
-        } catch (IOException | RuntimeException e) {
+        } catch (RuntimeException e) {
             // the message never contains a token (see the constructor); the exception class is enough
             err.println("WARN: swarm: agent tokens rejected (" + e.getClass().getSimpleName() + ": "
-                    + (e instanceof IOException ? "cannot read the tokens file" : e.getMessage())
+                    + e.getMessage()
                     + "); /swarm/v1 rejects every request");
             return DENY_ALL;
         }
