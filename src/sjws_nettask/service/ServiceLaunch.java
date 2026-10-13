@@ -52,6 +52,15 @@ public final class ServiceLaunch {
         return new Hooks(Bootstrap.load(bootstrapFile, expectedRole), drainBudgetMs, yamlCp, configBase);
     }
 
+    /**
+     * Hosting starts only when the operator configured it, so a control bootstrap without {@code cp} settings
+     * keeps today's behaviour. Once configured, any error is fatal (fail closed).
+     */
+    static boolean controlConfigured(Map<String, Object> yamlCp, java.util.function.Function<String, String> props,
+            Map<String, String> env) {
+        return yamlCp != null || props.apply("sjws.cp.nodeId") != null || env.get("SJWS_CP_NODE_ID") != null;
+    }
+
     /** The CONTROL-role entry point, named only as a string (control-plane-hosting.md §1, §5). */
     static final String CONTROL_CLASS = "sjws_nettask.cp.CpLaunch";
 
@@ -110,7 +119,12 @@ public final class ServiceLaunch {
                 this.watch = openWatch(server);
             }
             if (this.bootstrap.role() == NodeRole.CONTROL) {
-                this.control = launchControl(this.yamlCp, this.configBase);
+                if (controlConfigured(this.yamlCp, System::getProperty, System.getenv())) {
+                    this.control = launchControl(this.yamlCp, this.configBase);
+                } else {
+                    System.err.println("WARN: control role without cp settings (no cp: block, sjws.cp.nodeId or"
+                            + " SJWS_CP_NODE_ID): control-plane services are not hosted");
+                }
             }
         }
 

@@ -23,6 +23,10 @@ the swarm so data-only builds load no CP class):
 4. Bind `WatchServer` (mTLS), then `AdminServer` (mTLS).
 5. Report ready only when `CpStore.ready(...)` is true.
 
+**Implemented** in `sjws_nettask.cp.CpLaunch` / `CpHost` / `CpWitnessHost`. Hosting starts only when `cp` settings
+exist (a `cp:` block, `sjws.cp.nodeId` or `SJWS_CP_NODE_ID`); a control bootstrap without them keeps today's
+behaviour and logs a WARN. Once configured, every error is fatal.
+
 **Proposed shutdown order** (reverse): stop accepting admin writes (close `AdminServer`) -> close `WatchServer`
 (watchers fail over to another voter) -> `CpStore.close()` (Raft node, log) -> zero private key bytes held in memory.
 Shutdown stays within the existing drain budget (`Sjws_nettask.drainBudgetMillis`).
