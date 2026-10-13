@@ -24,14 +24,19 @@ Non-goals (for now)
 ```mermaid
 flowchart TB
     t["transport"] --> rq["core.Request"]
-    rq --> fl["filters, only when enabled<br/>access log, metrics, /healthz,<br/>or ones an embedder registers"]
-    fl --> ac["ACME challenge handler<br/>only with ACME on the main listener"]
-    ac --> r{{"Router<br/>only with routing.enabled"}}
-    r --> p["ProxyHandler<br/>one pool per upstream"]
-    r --> w["WeightedHandler<br/>a route with backends"]
+    rq --> fl["filters, only when enabled:<br/>access log, metrics, /healthz,<br/>or ones an embedder registers"]
+    fl --> pm["prefix mounts, only when<br/>a module mounts one"]
+    pm -->|"/messaging/v1, /swarm/v1"| mod["module handler<br/>MessagingHttp, SwarmHttp"]
+    pm --> ac["ACME challenge handler<br/>only with ACME on the main listener"]
+    ac --> gl["global routing.rate_limit<br/>only when set: 429 before any route"]
+    gl --> r{{"Router<br/>only with routing.enabled"}}
+    r --> rw["per route, only when set:<br/>errors: problem wrapper,<br/>then the route's rate_limit"]
+    rw --> p["ProxyHandler: one pool per<br/>upstream url, or an EndpointBalancer<br/>with one pool per endpoint"]
+    rw --> w["WeightedHandler<br/>a route with backends"]
     w --> p
-    r --> rd["RedirectHandler"]
-    r --> sf["StaticFileHandler<br/>fallback"]
+    rw --> rd["RedirectHandler"]
+    rw --> sf["StaticFileHandler<br/>static routes and the fallback"]
+    r --> sf
 ```
 
 - `Router`, `RedirectHandler` and `ProxyHandler` are leaf `core.Handler`s. They are not filters.
@@ -55,7 +60,7 @@ responses are relayed unchanged:
 
 ```mermaid
 flowchart TD
-    dd{"A path segment is ..?<br/>%2e counts as a dot, and<br/>/ \ %2f %5c ; split segments"} -->|yes| e400["400, before any route is tried"]
+    dd{"A path segment is ..?<br/>%2e counts as a dot, / \ %2f %5c<br/>split segments, and ; ends one"} -->|yes| e400["400, before any route is tried"]
     dd -->|no| m{"A route matches?"}
     m -->|no| fb["Fallback: the<br/>static file handler"]
     m -->|yes| rw{"Route has a rewrite?"}
@@ -144,14 +149,17 @@ The client's own deadlines also stay in force, such as the write timeout via `Co
 Errors are logged once per upstream per interval, rate-limited so log volume stays flat when an upstream is down.
 
 The order in which `ProxyHandler` decides. Each of the first five steps answers with the status shown
-when its condition holds, and otherwise passes the request on:
+when its condition holds, and otherwise passes the request on. Step 5 exists only when `circuit` is set
+on the upstream. An upstream with `endpoints` goes through an `EndpointBalancer` first, which picks an
+endpoint and then runs steps 1 to 4 on that endpoint's pool, with no step 5 (it skips ejected endpoints
+instead, see [endpoint discovery](../ha/discovery.md)):
 
 ```mermaid
 flowchart TD
     c1["1. Any Transfer-Encoding header: 501"] --> c2["2. A body of unknown length, or one the<br/>transport did not attach: 501"]
     c2 --> c3["3. Body over max_body: 413"]
     c3 --> c4["4. Target not origin-form, bad method<br/>or bad header value: 400"]
-    c4 --> c5["5. Circuit open: 503 with Retry-After,<br/>the upstream is not contacted"]
+    c4 --> c5["5. Circuit open, only with circuit set:<br/>503 with Retry-After, the upstream<br/>is not contacted"]
     c5 --> x["Send over a pooled keep-alive connection,<br/>or open one. The body goes upstream<br/>in 64 KiB chunks"]
     x --> o{"Outcome"}
     o -->|"connect, write or<br/>head timeout"| e504["504"]
@@ -169,11 +177,14 @@ flowchart TD
     a -->|no| v["Stop: relay the last result<br/>an upstream 5xx unchanged,<br/>an error as 502 or 504"]
     a -->|yes| b{"The retry budget<br/>has a token?"}
     b -->|no| v
-    b -->|yes| n["Discard the failed response<br/>and try again"]
-    v --> c["The circuit breaker records one<br/>verdict for the request,<br/>after its retries"]
+    b -->|yes| n["Discard the failed response and<br/>try again: an endpoints upstream picks<br/>an endpoint not tried yet, if one is left"]
+    v --> c["url upstream: the circuit breaker<br/>records one verdict for the request,<br/>after its retries"]
+    v --> ce["endpoints upstream: each attempt was<br/>recorded on the endpoint it hit"]
 ```
 
-The circuit breaker is a small state machine per upstream:
+The circuit breaker of an upstream with a `url` is a small state machine per upstream. An upstream with
+`endpoints` keeps the health of each endpoint instead, with an error-rate trip and a panic mode
+([endpoint discovery](../ha/discovery.md)):
 
 ```mermaid
 stateDiagram-v2

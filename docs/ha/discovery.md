@@ -48,3 +48,49 @@ Rules:
 - Per-endpoint circuit: consecutive failures and an error-rate window, ejection with doubling
   backoff and one probe, panic mode above `max_ejection` (see `docs/user/config-file.md`).
 - An upstream with a single `url` does not go through any of this.
+
+One request through an upstream with `endpoints` (`routing.EndpointBalancer`). An endpoint upstream never
+runs the `ProxyHandler`'s own retry or circuit breaker: the balancer owns both, per endpoint.
+
+```mermaid
+flowchart TD
+    s1["1. No set was ever published:<br/>503 without Retry-After"] --> s2["2. Pick an endpoint<br/>(next diagram)"]
+    s2 --> s3["3. Send on its pool: the<br/>ProxyHandler checks 501,<br/>413 and 400, then exchanges"]
+    s3 --> s4{"4. Failed? connect, timeout,<br/>reset, 502, 503 or 504"}
+    s4 -->|no| ok["Record a success on the<br/>endpoint, relay the response"]
+    s4 -->|yes| s5["5. Record a failure on the<br/>endpoint. Retry gate open?<br/>kind in retry.on, idempotent<br/>method, no body, attempts<br/>left, budget token"]
+    s5 -->|"yes: discard the body,<br/>mark the endpoint tried"| s2
+    s5 -->|no| last["Relay the last result: the<br/>upstream response unchanged,<br/>or 504 or 502"]
+```
+
+How an endpoint is picked. An endpoint is available when it is in rotation, or is the one request that wins
+the half-open probe after `eject_for`. `SUSPECT` endpoints have weight 0, so the weighted pass leaves them for last:
+
+```mermaid
+flowchart TD
+    p0["Panic mode when more than<br/>max_ejection percent of the<br/>endpoints are ejected: ejection<br/>is then ignored"]
+    p1["1. Up to 4 draws by the lb policy:<br/>weighted_random, round_robin or<br/>least_request. Take a draw that is<br/>untried and available"]
+    p2["2. Else scan from a random start,<br/>weighted endpoints first, then weight 0.<br/>Take one that is untried and available"]
+    p3["3. Else any available endpoint,<br/>even one already tried"]
+    p4["4. Else a policy draw regardless:<br/>everything is ejected, still answer"]
+    p0 --> p1 --> p2 --> p3 --> p4
+```
+
+Passive health of one endpoint. It is ejected after `failures` consecutive failures (default 5), or when the
+error rate over `window` (default 10 s, in two buckets) reaches `error_rate` (default 50 %) with at least
+`min_requests` (default 20) requests. It stays out for `eject_for` (default 10 s). Only connect, timeout, reset
+and 502, 503 or 504 count as failures:
+
+```mermaid
+stateDiagram-v2
+    [*] --> IN_ROTATION
+    IN_ROTATION --> EJECTED: consecutive failures,<br/>or the error rate
+    EJECTED --> HALF_OPEN: eject_for elapsed,<br/>one request wins the probe
+    HALF_OPEN --> IN_ROTATION: a success
+    HALF_OPEN --> EJECTED: a failure, ejected twice<br/>as long, up to 32 times
+    EJECTED --> IN_ROTATION: a success from<br/>a straggling request
+    note right of EJECTED
+        selection skips it. In panic
+        mode ejection is ignored
+    end note
+```
