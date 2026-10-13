@@ -105,11 +105,12 @@ class NodeFixturesTest {
     }
 
     @Test
-    void controlPlaneScenariosStayPendingWithoutVoters() {
+    void pendingControlPlaneIsOnlyTheNullObject() throws Exception {
         assertFalse(new PendingControlPlane().available());
+        try (var live = ClusterHarness.newControlPlane()) {
+            assertTrue(live.available());
+        }
         assertTrue(NodeFixtures.dataRoleCanJoin());
-        assertTrue(NodeFixtures.VOTERS_PENDING.startsWith("TODO"));
-        assertTrue(NodeFixtures.VOTERS_PENDING.contains(ControlPlaneDesign.PR));
         assertNull(NodeEnrollment.current());
         assertThrows(IllegalArgumentException.class, () -> NodeFixtures.pending(root, "standalone"));
     }

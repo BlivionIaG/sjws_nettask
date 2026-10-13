@@ -40,6 +40,7 @@ import sjws_nettask.cluster.ReplicatedNode;
 import sjws_nettask.cluster.ReplicationGroup;
 import sjws_nettask.cluster.SimTransport;
 import sjws_nettask.cluster.SiteId;
+import sjws_nettask.cluster.VoterSet;
 import sjws_nettask.config.ConfigCodec;
 import sjws_nettask.config.ConfigDiff;
 import sjws_nettask.config.ConfigDocument;
@@ -48,7 +49,7 @@ import sjws_nettask.config.ConfigValidator;
 import sjws_nettask.config.MessagingSettings;
 
 /**
- * Single-voter {@code cp-config} log, the signed snapshot history, and the admin operations.
+ * The {@code cp-config} log (one voter, or one of 3 or 5), the signed snapshot history, and the admin operations.
  * The log directory is {@code <stateDir>/cp-config} and is not a messaging ledger.
  */
 public final class CpStore implements AutoCloseable {
@@ -111,6 +112,33 @@ public final class CpStore implements AutoCloseable {
         var storage = new FileLogStorage(stateDir.resolve("cp-config"));
         var node = ReplicatedNode.open(id, List.of(member), Set.of(id), QuorumPolicy.majority(), clock, storage,
                 new SimTransport());
+        return attach(node, id, stateDir, keys, adminSan);
+    }
+
+    /**
+     * One voter of a static {@code cp-config} voter set (control-plane-hosting.md §1 and §6): 3 or 5
+     * full voters, majority over all of them, every voter on the same {@code transport}. Each voter
+     * applies the committed log, so a follower answers watches from its applied state; writes still
+     * need {@link ControlLeadership#leaderReady()}. Witness voters are not accepted here yet.
+     */
+    public static CpStore open(java.nio.file.Path stateDir, KeyRing keys, Clock clock, String adminSan, NodeId self,
+            VoterSet voters, SimTransport transport) throws IOException {
+        int count = voters.voters().size();
+        if (count != 3 && count != 5) {
+            throw new IllegalArgumentException("cp-config needs 3 or 5 voters, not " + count);
+        }
+        for (var member : voters.members()) {
+            if (member.witness()) {
+                throw new IllegalArgumentException("cp-config witness voters are not supported yet: " + member.id());
+            }
+        }
+        var storage = new FileLogStorage(stateDir.resolve("cp-config"));
+        var node = ReplicatedNode.open(self, voters, clock, storage, transport);
+        return attach(node, self, stateDir, keys, adminSan);
+    }
+
+    private static CpStore attach(ReplicatedNode node, NodeId id, java.nio.file.Path stateDir, KeyRing keys,
+            String adminSan) throws IOException {
         var options = new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40),
                 10_000);
         var store = new CpStore(node, keys);
