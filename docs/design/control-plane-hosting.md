@@ -161,7 +161,8 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | `sjws.cp.rootPub` | `SJWS_CP_ROOT_PUB` | `cp.rootPub` | pinned root key path (must pass 2.3 checks) |
 | — | — | `cp.rootPubSha256` | optional install-time pin of the root SPKI |
 | — | — | `cp.insecureSkipPermissionChecks` | dev-only override (2.3), config file only |
-| — | — | `cp.maxClockDrift` | proposed, default 500 ms; startup refuses unless lease < electionTimeout − drift |
+| — | — | `cp.maxClockDriftRatio` | proposed, default 0.01 (1%); rate error over one lease (HA) |
+| — | — | `cp.leaseSafetyMargin` | proposed, default 10 ms; fixed margin in the startup check (HA) |
 | `sjws.cp.nodeId` | `SJWS_CP_NODE_ID` | `cp.nodeId` | this voter |
 | — | — | `cp.peers[]` (`id`, `address`, `witness: bool`) | voter set |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
@@ -189,12 +190,17 @@ Source: HA, #118, `docs/design/high-availability.md` (HA's doc), #133, #142, #14
 3. **Voter counts:** 2 data + 1 witness (option A) or an odd number of full voters (3/5). A bare 2-voter config is
    rejected at startup (`QuorumPolicy`, #142). Majority is always over all voters. STRICT needs both data nodes
    durable (a witness ack is not a disk copy); RELAXED needs any 2 of 3.
-4. **Timing:** lease < election timeout − max clock drift. Pre-vote mandatory. Heartbeats are HMAC-authenticated
-   with a boot epoch (#134/#144/#145); the dead interval drives both failover and lower-epoch acceptance.
-   Defaults in master: CP group `electionTimeout = Duration.ofMillis(100)`, `heartbeat = Duration.ofMillis(40)`
-   (CpStore.java:114); `GroupOptions.leaseNanos()` = `heartbeat * 2` = 80 ms; `LocalCluster.start` default
-   `deadAfter = Duration.ofSeconds(5)`; `HeartbeatAuthenticator.WINDOW_MILLIS = 5_000L`. Max clock drift has no
-   config value in master; proposed `cp.maxClockDrift` (section 8).
+4. **Timing (HA):** leases are measured on each node's monotonic clock, so wall-clock offset does not matter;
+   only the clock *rate* error over one lease does. Startup check (fail closed):
+   `lease * (1 + cp.maxClockDriftRatio) + cp.leaseSafetyMargin < electionTimeout`. Defaults:
+   `cp.maxClockDriftRatio = 0.01`, `cp.leaseSafetyMargin = 10 ms`. With master's current CP timings
+   (`electionTimeout = 100 ms`, `heartbeat = 40 ms`, `GroupOptions.leaseNanos()` = `heartbeat * 2` = 80 ms;
+   CpStore.java:114) that is `80 * 1.01 + 10 = 90.8 < 100`, so the check passes and the default timings do not
+   change. Pre-vote is mandatory. Heartbeats are HMAC-authenticated with a boot epoch (#134/#144/#145); the dead
+   interval drives both failover and lower-epoch acceptance. Other master defaults: `LocalCluster.start`
+   `deadAfter = Duration.ofSeconds(5)`; `HeartbeatAuthenticator.WINDOW_MILLIS = 5_000L`.
+   **Note:** the 100 ms election timeout is aggressive given JVM GC pauses and can trigger spurious elections.
+   It is tunable; raising it is a follow-up that needs failover-time measurements (HA), not a change in this doc.
 
 ## 7. Split of work
 
@@ -209,8 +215,11 @@ Source: HA, #118, `docs/design/high-availability.md` (HA's doc), #133, #142, #14
 1. SIGHUP reloads TLS + `trust.bundle` + `online.key` atomically; `root.pub` only on restart (2.4).
 2. Bundle encoding: versioned, domain-separated binary wrapper, strictly parsed (2.1).
 3. Non-POSIX: refuse; config-file-only override with recurring WARN and health flag (2.3).
-4. Max clock drift: config key `cp.maxClockDrift`, conservative default (500 ms proposed), validated at startup;
-   HA to confirm given the 40/80/100 ms margins.
+4. Max clock drift (**resolved, sjws High Availability**): not an absolute ms value. Use
+   `cp.maxClockDriftRatio` (default 0.01) and `cp.leaseSafetyMargin` (default 10 ms); startup refuses unless
+   `lease * (1 + driftRatio) + margin < electionTimeout`. With current 80/100 ms timings the check passes
+   (`90.8 < 100`); defaults stay. The 100 ms election timeout is flagged as aggressive for JVM GC and left
+   tunable for a later HA follow-up with failover-time measurements.
 5. All voters host `AdminServer`; followers return the leader address for writes (control-plane.md §14); every voter
    enforces RBAC and the denylist.
 6. Static peers for v1; future membership changes are an `admin`-only, audited operation.
