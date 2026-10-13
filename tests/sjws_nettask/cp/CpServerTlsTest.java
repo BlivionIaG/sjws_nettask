@@ -93,7 +93,8 @@ class CpServerTlsTest {
     /** CONTROL hosting: both listeners use CpServerTls.context() and parameters() (client cert required). */
     @Test
     void watchAndAdminListenersRequireClientCertificates() throws Exception {
-        var tls = CpTls.serverContext(material(false));
+        var cfg = material(false);
+        var tls = CpTls.serverContext(cfg);
         var keys = KeyRing.generate("online-1", Long.MAX_VALUE, 0, Long.MAX_VALUE);
         try (var store = CpStore.open(dir.resolve("state"), keys, sjws_nettask.cluster.Clock.SYSTEM);
                 var watch = WatchServer.startMtls(store, new java.net.InetSocketAddress("127.0.0.1", 0),
@@ -101,7 +102,7 @@ class CpServerTlsTest {
                 var admin = AdminServer.startMtls(store, new java.net.InetSocketAddress("127.0.0.1", 0),
                         System.currentTimeMillis(), 60_000L, tls)) {
             for (int port : new int[] {watch.port(), admin.port()}) {
-                assertThrows(java.io.IOException.class, () -> handshakeWithoutClientCert(port), "port " + port);
+                assertThrows(java.io.IOException.class, () -> handshakeWithoutClientCert(port, cfg.caPem()), "port " + port);
             }
         }
     }
@@ -129,23 +130,18 @@ class CpServerTlsTest {
         }
     }
 
-    private static void handshakeWithoutClientCert(int port) throws Exception {
-        var trustAll = new javax.net.ssl.X509TrustManager() {
-            @Override
-            public void checkClientTrusted(X509Certificate[] c, String a) {
-            }
-
-            @Override
-            public void checkServerTrusted(X509Certificate[] c, String a) {
-            }
-
-            @Override
-            public X509Certificate[] getAcceptedIssuers() {
-                return new X509Certificate[0];
-            }
-        };
+    /** Trusts only the test CA (the server is authenticated); offers no client certificate. */
+    private static void handshakeWithoutClientCert(int port, Path caPem) throws Exception {
+        var store = java.security.KeyStore.getInstance("PKCS12");
+        store.load(null, null);
+        try (var in = Files.newInputStream(caPem)) {
+            store.setCertificateEntry("ca",
+                    java.security.cert.CertificateFactory.getInstance("X.509").generateCertificate(in));
+        }
+        var tmf = javax.net.ssl.TrustManagerFactory.getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(store);
         var ctx = javax.net.ssl.SSLContext.getInstance("TLSv1.3");
-        ctx.init(null, new javax.net.ssl.TrustManager[] {trustAll}, null);
+        ctx.init(null, tmf.getTrustManagers(), null);
         try (var socket = (javax.net.ssl.SSLSocket) ctx.getSocketFactory().createSocket("127.0.0.1", port)) {
             socket.setSoTimeout(5_000);
             socket.startHandshake();
