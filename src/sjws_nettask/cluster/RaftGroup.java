@@ -57,6 +57,13 @@ final class RaftGroup {
     static final int PRE_VOTE_RESP = 7;
 
     private final ReentrantLock lock = new ReentrantLock();
+    /**
+     * Committed-entry callbacks and their append futures, queued under {@link #lock} in log order and
+     * run outside it by one thread at a time ({@link #deliveryLock}), so a listener sees entries
+     * strictly in index order and never concurrently, whichever thread drove the commit.
+     */
+    private final java.util.ArrayDeque<Runnable> deliveries = new java.util.ArrayDeque<>();
+    private final ReentrantLock deliveryLock = new ReentrantLock();
     private final GroupId groupId;
     private final NodeId self;
     private final boolean witness;
@@ -644,7 +651,7 @@ final class RaftGroup {
                     var payload = new byte[data.length - 1];
                     System.arraycopy(data, 1, payload, 0, payload.length);
                     long entryTerm = termAt(index);
-                    after.add(() -> {
+                    deliveries.add(() -> {
                         if (listener != null) {
                             listener.onCommitted(new CommittedEntry(groupId, entryTerm, index,
                                     ByteBuffer.wrap(payload)));
@@ -657,7 +664,7 @@ final class RaftGroup {
                     long entryTerm = termAt(index);
                     long applied = index;
                     var copy = List.copyOf(noopListeners);
-                    after.add(() -> {
+                    deliveries.add(() -> {
                         for (var listener : copy) {
                             listener.accept(entryTerm, applied);
                         }
@@ -678,7 +685,7 @@ final class RaftGroup {
             pending.remove(entry.getKey());
             long index = entry.getKey();
             long entryTerm = termAt(index);
-            after.add(() -> entry.getValue().complete(new CommittedIndex(groupId, entryTerm, index)));
+            deliveries.add(() -> entry.getValue().complete(new CommittedIndex(groupId, entryTerm, index)));
         }
     }
 
@@ -997,9 +1004,32 @@ final class RaftGroup {
         return ids;
     }
 
-    private static void run(List<Runnable> tasks) {
+    private void run(List<Runnable> tasks) {
         for (var task : tasks) {
             task.run();
+        }
+        deliver();
+    }
+
+    /** Runs queued commit callbacks in log order, one thread at a time; returns once the queue is empty. */
+    private void deliver() {
+        deliveryLock.lock();
+        try {
+            while (true) {
+                Runnable next;
+                lock.lock();
+                try {
+                    next = deliveries.poll();
+                } finally {
+                    lock.unlock();
+                }
+                if (next == null) {
+                    return;
+                }
+                next.run();
+            }
+        } finally {
+            deliveryLock.unlock();
         }
     }
 
