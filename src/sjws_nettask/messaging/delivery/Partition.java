@@ -205,12 +205,16 @@ public final class Partition implements AutoCloseable {
 
     /** Creates {@code group} if absent: from the oldest retained message, or from the next new one. Idempotent. */
     public boolean subscribe(String group, boolean fromStart) {
+        // Groups are never removed, so a group seen once stays subscribed: callers that re-subscribe before every
+        // claim/ack (TaskService) skip the partition lock entirely.
+        if (subscribed.contains(group)) return false;
         lock.lock();
         try {
-            if (state.groups.containsKey(group)) return false;
+            if (state.groups.containsKey(group)) { subscribed.add(group); return false; }
             long from = fromStart ? (state.messages.isEmpty() ? state.nextOffset : Math.min(state.messages.firstKey(), state.nextOffset))
                     : state.nextOffset;
             append(new LedgerEntry.Subscribe(group, from), null);
+            subscribed.add(group);
             return true;
         } finally {
             lock.unlock();
@@ -224,12 +228,14 @@ public final class Partition implements AutoCloseable {
      */
     public List<Delivery> poll(String group, String consumer, int max, long visibilityMs) {
         if (max < 1 || visibilityMs < 1) throw new IllegalArgumentException("max/visibility");
+        List<Leased> got;
         lock.lock();
         try {
-            return pollLocked(group, consumer, max, visibilityMs);
+            got = pollLocked(group, consumer, max, visibilityMs);
         } finally {
             lock.unlock();
         }
+        return toDeliveries(got);
     }
 
     /**
@@ -240,6 +246,10 @@ public final class Partition implements AutoCloseable {
      * caller is waiting.
      */
     public List<Delivery> poll(String group, String consumer, int max, long visibilityMs, long waitNanos) {
+        return toDeliveries(pollWaiting(group, consumer, max, visibilityMs, waitNanos));
+    }
+
+    private List<Leased> pollWaiting(String group, String consumer, int max, long visibilityMs, long waitNanos) {
         if (max < 1 || visibilityMs < 1 || waitNanos < 0) throw new IllegalArgumentException("max/visibility/wait");
         long deadline = System.nanoTime() + waitNanos;
         lock.lock();
@@ -306,38 +316,64 @@ public final class Partition implements AutoCloseable {
         }
     }
 
-    private List<Delivery> pollLocked(String group, String consumer, int max, long visibilityMs) {
-        var g = state.group(group);
-        long now = clockMs.getAsLong();
-        var out = new ArrayList<Delivery>();
-        var policy = state.policy();
-        // Due redeliveries in due order. Each step removes the head (redelivered or dead-lettered), so this reads
-        // only what it uses instead of materialising every due entry per poll.
-        while (out.size() < max && !g.due.isEmpty()) {
-            var d = g.due.first();
-            if (d.atMs() > now) break;
-            long o = d.offset();
-            var lease = g.inFlight.get(o);
-            int attempts = lease != null ? lease.attempt() : g.retry.get(o).attempts();
-            if (attempts >= policy.maxAttempts()) {
-                deadLetter(g.name, o, attempts, lease != null ? "lease-expired:max-attempts" : "nacked:max-attempts");
-                continue;
-            }
-            out.add(deliver(group, o, consumer, now + visibilityMs, attempts + 1));
-        }
-        while (out.size() < max) {
-            Long o = state.messages.ceilingKey(g.cursor);
-            if (o == null) break;
-            out.add(deliver(group, o, consumer, now + visibilityMs, 1));
+    /**
+     * A lease taken under the lock; the {@link Delivery} (and its payload copy) is built after unlocking. The
+     * payload array is the cached or decoded one, never mutated, so reading it off-lock is safe.
+     */
+    private record Leased(long offset, int attempt, long deadline, DeliveryState.Message m, byte[] payload) { }
+
+    private static List<Delivery> toDeliveries(List<Leased> got) {
+        if (got.isEmpty()) return List.of();
+        var out = new ArrayList<Delivery>(got.size());
+        for (var l : got) {
+            var m = l.m();
+            out.add(new Delivery(l.offset(), l.attempt(), l.deadline(), m.producerId(), m.seq(), m.timestampMs(),
+                    l.payload(), m.originGroup(), m.originOffset(), m.originAttempts(), m.originReason()));
         }
         return out;
     }
 
-    private Delivery deliver(String group, long o, String consumer, long deadline, int attempt) {
+    /**
+     * Lock held. Counts/snapshot publication runs once at the end of the poll instead of once per lease
+     * ({@link #deferPublish}), which is what bounds the lock hold time of a multi-message claim.
+     */
+    private List<Leased> pollLocked(String group, String consumer, int max, long visibilityMs) {
+        var g = state.group(group);
+        long now = clockMs.getAsLong();
+        var out = new ArrayList<Leased>(Math.min(max, 16));
+        var policy = state.policy();
+        long before = state.nextOffset;
+        deferPublish = true;
+        try {
+            // Due redeliveries in due order. Each step removes the head (redelivered or dead-lettered), so this
+            // reads only what it uses instead of materialising every due entry per poll.
+            while (out.size() < max && !g.due.isEmpty()) {
+                var d = g.due.first();
+                if (d.atMs() > now) break;
+                long o = d.offset();
+                var lease = g.inFlight.get(o);
+                int attempts = lease != null ? lease.attempt() : g.retry.get(o).attempts();
+                if (attempts >= policy.maxAttempts()) {
+                    deadLetter(g.name, o, attempts, lease != null ? "lease-expired:max-attempts" : "nacked:max-attempts");
+                    continue;
+                }
+                out.add(deliver(group, o, consumer, now + visibilityMs, attempts + 1));
+            }
+            while (out.size() < max) {
+                Long o = state.messages.ceilingKey(g.cursor);
+                if (o == null) break;
+                out.add(deliver(group, o, consumer, now + visibilityMs, 1));
+            }
+        } finally {
+            deferPublish = false;
+            if (state.nextOffset != before) afterApply();
+        }
+        return out;
+    }
+
+    private Leased deliver(String group, long o, String consumer, long deadline, int attempt) {
         append(new LedgerEntry.Deliver(group, o, consumer, deadline, attempt), null);
-        var m = state.messages.get(o);
-        return new Delivery(o, attempt, deadline, m.producerId(), m.seq(), m.timestampMs(), payloadOf(o), m.originGroup(),
-                m.originOffset(), m.originAttempts(), m.originReason());
+        return new Leased(o, attempt, deadline, state.messages.get(o), payloadOf(o));
     }
 
     /** Matches any attempt: the unfenced overloads (kept for compatibility) settle whichever lease is current. */
@@ -568,10 +604,7 @@ public final class Partition implements AutoCloseable {
             state.apply(offset + i, e);
             if (!waiters.isEmpty()) wake(e);
         }
-        publish();
-        // Amortized O(1) per entry: a snapshot costs O(live state), so wait at least twice that many entries.
-        long since = state.nextOffset - lastSnapshotTrigger;
-        if (since >= snapshotEveryEntries && since >= 2L * state.messages.size()) snapshotLocked();
+        if (!deferPublish) afterApply();
         return f.thenApply(base -> {
             if (base != offset) throw new IllegalStateException("ledger offset drift " + base + " != " + offset);
             return base;
@@ -844,6 +877,20 @@ public final class Partition implements AutoCloseable {
 
     /** When true, the paged view is rebuilt after every operation (tests, low-rate topics). Default: rate-limited. */
     public void eagerSnapshots(boolean on) { lock.lock(); try { eager = on; publish(); } finally { lock.unlock(); } }
+
+    /** Groups known to exist (lock-free hint for {@link #subscribe}); only ever grows, like the groups themselves. */
+    private final java.util.Set<String> subscribed = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Lock held. Set while a poll appends several DELIVER records; it publishes once at the end. */
+    private boolean deferPublish;
+
+    /** Lock held: after one apply (or a deferred batch of them). */
+    private void afterApply() {
+        publish();
+        // Amortized O(1) per entry: a snapshot costs O(live state), so wait at least twice that many entries.
+        long since = state.nextOffset - lastSnapshotTrigger;
+        if (since >= snapshotEveryEntries && since >= 2L * state.messages.size()) snapshotLocked();
+    }
 
     private void publish() {
         counts.set(state.counts());
