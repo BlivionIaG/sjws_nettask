@@ -60,6 +60,8 @@ public final class CpStore implements AutoCloseable {
     private static final byte REVOKE = 6;
     private static final byte ROLLOUT = 7;
     private static final byte ADVANCE = 8;
+    /** Wraps a mutation so a retried Idempotency-Key is not applied twice after replay. */
+    private static final byte IDEM = 9;
     private static final int HISTORY = 8;
 
     private final ReplicatedNode node;
@@ -73,7 +75,10 @@ public final class CpStore implements AutoCloseable {
     private final List<String> selectors = new ArrayList<>();
     private final List<SignedSnapshot> history = new ArrayList<>();
     private final List<ConfigDocument> documents = new ArrayList<>();
+    private final Map<String, Cached> replay = new LinkedHashMap<>();
+    private final Map<String, Reported> reported = new LinkedHashMap<>();
     private final JoinTokens joins = new JoinTokens();
+    private java.nio.file.Path auditFile;
     private Staged staged;
     private int stage;
 
@@ -101,8 +106,8 @@ public final class CpStore implements AutoCloseable {
         var options = new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40),
                 10_000);
         var store = new CpStore(node, keys);
-        store.audit = new sjws_nettask.controlplane.AuditLog(stateDir.resolve("audit.jsonl"),
-                java.time.Clock.systemUTC(), false);
+        store.auditFile = stateDir.resolve("audit.jsonl");
+        store.audit = new sjws_nettask.controlplane.AuditLog(store.auditFile, java.time.Clock.systemUTC(), false);
         store.policy.put(canonicalSan(adminSan), sjws_nettask.controlplane.Role.ADMIN);
         store.rebuildRights();
         store.group = node.openGroup(GROUP, options, entry -> store.onCommitted(entry.entry()));
@@ -187,6 +192,16 @@ public final class CpStore implements AutoCloseable {
     }
 
     public Outcome propose(String yaml) {
+        return propose(yaml, null);
+    }
+
+    /** {@code key} is the Idempotency-Key. A repeat of the same request returns the first outcome. */
+    public Outcome propose(String yaml, String key) {
+        var fp = fingerprint("POST", "/cp/v1/config", yaml);
+        var hit = replayed(key, fp);
+        if (hit != null) {
+            return hit;
+        }
         if (!leadership.leaderReady()) {
             return Outcome.error(503, "leader not ready");
         }
@@ -221,8 +236,9 @@ public final class CpStore implements AutoCloseable {
         }
         long version = (history.isEmpty() ? 0 : history.get(history.size() - 1).version()) + 1;
         var canonical = ConfigCodec.text(copyVersion(loaded.document(), version));
+        var outcome = Outcome.ok("{\"version\":" + version + ",\"staged\":true}", version);
         try {
-            append(proposeEntry(version, canonical));
+            append(proposeEntry(version, canonical), key, outcome, fp);
         } catch (ExecutionException e) {
             return Outcome.error(503, "log");
         } catch (InterruptedException e) {
@@ -232,10 +248,19 @@ public final class CpStore implements AutoCloseable {
         if (staged == null || staged.version != version) {
             return Outcome.error(503, "propose did not commit");
         }
-        return Outcome.ok("{\"version\":" + version + ",\"staged\":true}", version);
+        return outcome;
     }
 
     public Outcome activate(long nowMillis, long ttlMillis) {
+        return activate(nowMillis, ttlMillis, null);
+    }
+
+    public Outcome activate(long nowMillis, long ttlMillis, String key) {
+        var fp = fingerprint("POST", "/cp/v1/activate", "");
+        var hit = replayed(key, fp);
+        if (hit != null) {
+            return hit;
+        }
         if (!leadership.leaderReady()) {
             return Outcome.error(503, "leader not ready");
         }
@@ -243,10 +268,19 @@ public final class CpStore implements AutoCloseable {
         if (pending == null) {
             return Outcome.error(409, "nothing staged");
         }
-        return commitSigned(pending.document, 0L, nowMillis, ttlMillis);
+        return commitSigned(pending.document, 0L, nowMillis, ttlMillis, key, fp);
     }
 
     public Outcome rollback(long toVersion, long nowMillis, long ttlMillis) {
+        return rollback(toVersion, nowMillis, ttlMillis, null);
+    }
+
+    public Outcome rollback(long toVersion, long nowMillis, long ttlMillis, String key) {
+        var fp = fingerprint("POST", "/cp/v1/rollback", Long.toString(toVersion));
+        var hit = replayed(key, fp);
+        if (hit != null) {
+            return hit;
+        }
         if (!leadership.leaderReady()) {
             return Outcome.error(503, "leader not ready");
         }
@@ -259,7 +293,7 @@ public final class CpStore implements AutoCloseable {
         if (document == null) {
             return Outcome.error(404, "version");
         }
-        return commitSigned(document, toVersion, nowMillis, ttlMillis);
+        return commitSigned(document, toVersion, nowMillis, ttlMillis, key, fp);
     }
 
     public Outcome diff(long from, long to, boolean http3Running) {
@@ -285,6 +319,15 @@ public final class CpStore implements AutoCloseable {
     }
 
     public Outcome grant(String san, sjws_nettask.controlplane.Role role) {
+        return grant(san, role, null);
+    }
+
+    public Outcome grant(String san, sjws_nettask.controlplane.Role role, String key) {
+        var fp = fingerprint("POST", "/cp/v1/rbac", (san == null ? "" : san) + "\n" + (role == null ? "" : role.name()));
+        var hit = replayed(key, fp);
+        if (hit != null) {
+            return hit;
+        }
         if (!leadership.leaderReady()) {
             return Outcome.error(503, "leader not ready");
         }
@@ -293,61 +336,93 @@ public final class CpStore implements AutoCloseable {
         } catch (IllegalArgumentException e) {
             return Outcome.error(400, "san");
         }
+        var outcome = Outcome.ok("{\"san\":" + LastGoodFiles.jsonString(san) + ",\"role\":\"" + role.name().toLowerCase()
+                + "\"}", 0);
         try {
-            append(rbacEntry(san, role));
+            append(rbacEntry(san, role), key, outcome, fp);
         } catch (ExecutionException e) {
             return Outcome.error(503, "log");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return Outcome.ok("{\"san\":" + LastGoodFiles.jsonString(san) + ",\"role\":\"" + role.name().toLowerCase()
-                + "\"}", 0);
+        return outcome;
     }
 
     public Outcome revoke(String nodeId) {
+        return revoke(nodeId, null);
+    }
+
+    public Outcome revoke(String nodeId, String key) {
+        var fp = fingerprint("POST", "/cp/v1/nodes/" + nodeId + "/revoke", "");
+        var hit = replayed(key, fp);
+        if (hit != null) {
+            return hit;
+        }
         if (!leadership.leaderReady()) {
             return Outcome.error(503, "leader not ready");
         }
+        var outcome = Outcome.ok("{\"revoked\":" + LastGoodFiles.jsonString(nodeId) + "}", 0);
         try {
-            append(bytes(REVOKE, nodeId));
+            append(bytes(REVOKE, nodeId), key, outcome, fp);
         } catch (ExecutionException e) {
             return Outcome.error(503, "log");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return Outcome.ok("{\"revoked\":" + LastGoodFiles.jsonString(nodeId) + "}", 0);
+        return outcome;
     }
 
     public Outcome rollout(List<String> stages) {
+        return rollout(stages, null);
+    }
+
+    public Outcome rollout(List<String> stages, String key) {
+        var fp = fingerprint("POST", "/cp/v1/rollout", stages == null ? "" : String.join("\n", stages));
+        var hit = replayed(key, fp);
+        if (hit != null) {
+            return hit;
+        }
         if (!leadership.leaderReady()) {
             return Outcome.error(503, "leader not ready");
         }
+        var outcome = Outcome.ok("{\"stages\":" + stages.size() + "}", 0);
         try {
-            append(rolloutEntry(stages));
+            append(rolloutEntry(stages), key, outcome, fp);
         } catch (ExecutionException e) {
             return Outcome.error(503, "log");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return Outcome.ok("{\"stages\":" + selectors.size() + "}", 0);
+        return outcome;
     }
 
     public Outcome advance() {
+        return advance(null);
+    }
+
+    public Outcome advance(String key) {
+        var fp = fingerprint("POST", "/cp/v1/rollout/advance", "");
+        var hit = replayed(key, fp);
+        if (hit != null) {
+            return hit;
+        }
         if (!leadership.leaderReady()) {
             return Outcome.error(503, "leader not ready");
         }
+        int next = stage < selectors.size() ? stage + 1 : stage;
+        var outcome = Outcome.ok("{\"stage\":" + next + "}", 0);
         try {
-            append(ByteBuffer.wrap(new byte[] {ADVANCE}));
+            append(ByteBuffer.wrap(new byte[] {ADVANCE}), key, outcome, fp);
         } catch (ExecutionException e) {
             return Outcome.error(503, "log");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return Outcome.ok("{\"stage\":" + stage + "}", 0);
+        return outcome;
     }
 
     public String healthJson() {
@@ -356,10 +431,131 @@ public final class CpStore implements AutoCloseable {
                 + leadership.leaderReady() + ",\"voters\":1}";
     }
 
+    /**
+     * A data node's last heartbeat. {@code health} is {@code READY}, {@code SUSPECT}, or {@code DEAD}.
+     * Lag is the activated version minus the applied version.
+     */
+    public void reportNode(String id, Map<String, String> labels, String health, long appliedVersion) {
+        if (id == null || id.isBlank() || "cp-1".equals(id)) {
+            return;
+        }
+        var known = switch (health == null ? "" : health) {
+            case "READY", "SUSPECT", "DEAD" -> health;
+            default -> "SUSPECT";
+        };
+        long applied = Math.max(0L, appliedVersion);
+        reported.put(id, new Reported(id, labels == null ? Map.of() : Map.copyOf(labels), known, applied));
+    }
+
     public String nodesJson() {
         var leader = leadership.isLeader() ? "leader" : "follower";
-        return "{\"nodes\":[{\"id\":\"cp-1\",\"role\":\"" + leader + "\",\"revoked\":"
-                + revoked.contains("cp-1") + "}]}";
+        long desired = activated() == null ? 0L : activated().version();
+        var json = new StringBuilder();
+        json.append("{\"nodes\":[");
+        nodeJson(json, "cp-1", leader, Map.of("role", "control"), "READY", desired, 0L, revoked.contains("cp-1"));
+        for (var node : reported.values()) {
+            json.append(',');
+            nodeJson(json, node.id, "data", node.labels, node.health, node.applied,
+                    Math.max(0L, desired - node.applied), revoked.contains(node.id));
+        }
+        json.append("]}");
+        return json.toString();
+    }
+
+    public String rolloutJson() {
+        var json = new StringBuilder();
+        json.append("{\"stage\":").append(stage).append(",\"selectors\":[");
+        for (int i = 0; i < selectors.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append(LastGoodFiles.jsonString(selectors.get(i)));
+        }
+        json.append("]}");
+        return json.toString();
+    }
+
+    /** A retained snapshot. History keeps the last {@code HISTORY} activated versions. */
+    public Outcome configVersion(long version) {
+        for (var snapshot : history) {
+            if (snapshot.version() == version) {
+                return Outcome.ok(configBody(snapshot), version);
+            }
+        }
+        return Outcome.error(404, "version");
+    }
+
+    /**
+     * The same checks as {@link #propose(String)} and no log entry. {@code ok} is false when the
+     * document would be rejected.
+     */
+    public Outcome validate(String yaml) {
+        var errors = new ArrayList<String>();
+        if (yaml != null && forbidden(yaml)) {
+            errors.add("rbac and trust are not part of a proposal");
+        }
+        ConfigLoader.Loaded loaded = null;
+        if (errors.isEmpty()) {
+            try {
+                loaded = parse(yaml == null ? "" : yaml);
+            } catch (IOException e) {
+                errors.add("config");
+            }
+        }
+        if (errors.isEmpty() && (loaded == null || !loaded.ok() || loaded.document() == null)) {
+            errors.add(loaded == null || loaded.errors().isEmpty() ? "configuration rejected" : loaded.errors().get(0));
+        }
+        if (errors.isEmpty()) {
+            errors.addAll(ConfigValidator.validate(loaded.document()));
+        }
+        if (errors.isEmpty() && !loaded.document().messaging().assignment().isEmpty()) {
+            errors.add("assignment is computed by the control plane");
+        }
+        if (errors.isEmpty()) {
+            var previous = documents.isEmpty() ? MessagingSettings.disabled()
+                    : documents.get(documents.size() - 1).messaging();
+            errors.addAll(MessagingSettings.destructiveErrors(previous, loaded.document().messaging()));
+        }
+        var json = new StringBuilder();
+        json.append("{\"ok\":").append(errors.isEmpty()).append(",\"errors\":[");
+        for (int i = 0; i < errors.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append(LastGoodFiles.jsonString(errors.get(i)));
+        }
+        json.append("]}");
+        return Outcome.ok(json.toString(), 0);
+    }
+
+    /** Audit lines with {@code seq} greater than {@code afterSeq}, capped at {@code limit}. */
+    public String auditJson(long afterSeq, int limit) throws java.io.IOException {
+        int cap = limit <= 0 || limit > 100 ? 100 : limit;
+        var kept = new ArrayList<String>();
+        if (auditFile != null && java.nio.file.Files.isRegularFile(auditFile)) {
+            for (var line : java.nio.file.Files.readAllLines(auditFile)) {
+                if (line.isBlank()) {
+                    continue;
+                }
+                if (seqOf(line) <= afterSeq) {
+                    continue;
+                }
+                kept.add(line);
+            }
+        }
+        if (kept.size() > cap) {
+            kept = new ArrayList<>(kept.subList(kept.size() - cap, kept.size()));
+        }
+        var json = new StringBuilder();
+        json.append("{\"entries\":[");
+        for (int i = 0; i < kept.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append(kept.get(i));
+        }
+        json.append("]}");
+        return json.toString();
     }
 
     public String configJson() {
@@ -367,9 +563,7 @@ public final class CpStore implements AutoCloseable {
         if (current == null) {
             return "{\"activated\":null}";
         }
-        return "{\"version\":" + current.version() + ",\"canonicalHash\":"
-                + LastGoodFiles.jsonString(current.canonicalHashHex()) + ",\"yaml\":"
-                + LastGoodFiles.jsonString(current.canonicalYaml()) + "}";
+        return configBody(current);
     }
 
     public sjws_nettask.controlplane.Role roleOfSan(String san) {
@@ -397,14 +591,17 @@ public final class CpStore implements AutoCloseable {
         node.close();
     }
 
-    private Outcome commitSigned(ConfigDocument source, long rollbackOf, long nowMillis, long ttlMillis) {
+    private Outcome commitSigned(ConfigDocument source, long rollbackOf, long nowMillis, long ttlMillis, String key,
+            String fingerprint) {
         long version = (history.isEmpty() ? 0 : history.get(history.size() - 1).version()) + 1;
         var signedDocument = rollbackOf > 0 ? source : copyVersion(source, version);
         long raftIndex = group.lastApplied() + 1;
         var signed = keys.sign(signedDocument, version, leadership.term(), raftIndex, nowMillis, nowMillis + ttlMillis,
                 rollbackOf);
+        var outcome = Outcome.ok("{\"version\":" + version + ",\"raftIndex\":" + raftIndex + ",\"canonicalHash\":"
+                + LastGoodFiles.jsonString(signed.canonicalHashHex()) + "}", version);
         try {
-            var committed = append(signedEntry(signed));
+            var committed = append(signedEntry(signed), key, outcome, fingerprint);
             if (committed != raftIndex) {
                 return Outcome.error(503, "raft index");
             }
@@ -419,8 +616,7 @@ public final class CpStore implements AutoCloseable {
         if (current == null || current.version() != version) {
             return Outcome.error(503, "activate did not commit");
         }
-        return Outcome.ok("{\"version\":" + version + ",\"raftIndex\":" + raftIndex + ",\"canonicalHash\":"
-                + LastGoodFiles.jsonString(current.canonicalHashHex()) + "}", version);
+        return outcome;
     }
 
     private void onCommitted(ByteBuffer entry) {
@@ -430,6 +626,21 @@ public final class CpStore implements AutoCloseable {
             return;
         }
         byte type = body.get();
+        if (type == IDEM) {
+            try {
+                var idemKey = readString(body);
+                int status = body.getInt();
+                var response = readString(body);
+                var fp = readString(body);
+                replay.put(idemKey, new Cached(fp, new Outcome(status, response, 0)));
+            } catch (java.nio.BufferUnderflowException e) {
+                return; // a truncated marker must not stall apply
+            }
+            if (!body.hasRemaining()) {
+                return;
+            }
+            type = body.get();
+        }
         switch (type) {
             case PROPOSE -> {
                 long version = body.getLong();
@@ -497,8 +708,39 @@ public final class CpStore implements AutoCloseable {
         }
     }
 
+    private static String configBody(SignedSnapshot snapshot) {
+        return "{\"version\":" + snapshot.version() + ",\"canonicalHash\":"
+                + LastGoodFiles.jsonString(snapshot.canonicalHashHex()) + ",\"yaml\":"
+                + LastGoodFiles.jsonString(snapshot.canonicalYaml()) + "}";
+    }
+
+    private static void nodeJson(StringBuilder json, String id, String role, Map<String, String> labels, String health,
+            long applied, long lag, boolean revoked) {
+        json.append("{\"id\":").append(LastGoodFiles.jsonString(id)).append(",\"role\":")
+                .append(LastGoodFiles.jsonString(role)).append(",\"labels\":{");
+        var first = true;
+        for (var label : labels.entrySet()) {
+            if (!first) {
+                json.append(',');
+            }
+            first = false;
+            json.append(LastGoodFiles.jsonString(label.getKey())).append(':')
+                    .append(LastGoodFiles.jsonString(label.getValue()));
+        }
+        json.append("},\"health\":").append(LastGoodFiles.jsonString(health)).append(",\"appliedVersion\":")
+                .append(applied).append(",\"lag\":").append(lag).append(",\"revoked\":").append(revoked).append('}');
+    }
+
     private long append(ByteBuffer entry) throws InterruptedException, ExecutionException {
         return node.append(GROUP, List.of(entry)).get().index();
+    }
+
+    private long append(ByteBuffer entry, String key, Outcome success, String fp)
+            throws InterruptedException, ExecutionException {
+        if (key == null || key.isBlank() || success == null) {
+            return append(entry);
+        }
+        return append(wrap(entry, key, success.status(), success.body(), fp));
     }
 
     private ConfigDocument document(long version) {
@@ -685,7 +927,71 @@ public final class CpStore implements AutoCloseable {
         return new String(readBytes(body), StandardCharsets.UTF_8);
     }
 
+    private Outcome replayed(String key, String fp) {
+        if (key == null || key.isBlank()) {
+            return null;
+        }
+        if (key.length() > 128 || key.indexOf('\n') >= 0 || key.indexOf('\r') >= 0) {
+            return Outcome.error(400, "idempotency key");
+        }
+        var cached = replay.get(key);
+        if (cached == null) {
+            return null;
+        }
+        if (!cached.fingerprint.equals(fp)) {
+            return Outcome.error(409, "idempotency key reused");
+        }
+        return cached.outcome;
+    }
+
+    private static String fingerprint(String method, String path, String body) {
+        return method + "\n" + path + "\n" + (body == null ? "" : body);
+    }
+
+    private static long seqOf(String line) {
+        int at = line.indexOf("\"seq\":");
+        if (at < 0) {
+            return 0L;
+        }
+        int i = at + "\"seq\":".length();
+        int end = i;
+        while (end < line.length() && Character.isDigit(line.charAt(end))) {
+            end++;
+        }
+        if (end == i) {
+            return 0L;
+        }
+        return Long.parseLong(line.substring(i, end));
+    }
+
+    private static ByteBuffer wrap(ByteBuffer entry, String key, int status, String response, String fp) {
+        var payload = new byte[entry.remaining()];
+        entry.duplicate().get(payload);
+        var keyRaw = key.getBytes(StandardCharsets.UTF_8);
+        var responseRaw = response.getBytes(StandardCharsets.UTF_8);
+        var fpRaw = fp.getBytes(StandardCharsets.UTF_8);
+        var buffer = ByteBuffer.allocate(1 + 4 + keyRaw.length + 4 + 4 + responseRaw.length + 4 + fpRaw.length
+                + payload.length);
+        buffer.put(IDEM);
+        buffer.putInt(keyRaw.length);
+        buffer.put(keyRaw);
+        buffer.putInt(status);
+        buffer.putInt(responseRaw.length);
+        buffer.put(responseRaw);
+        buffer.putInt(fpRaw.length);
+        buffer.put(fpRaw);
+        buffer.put(payload);
+        buffer.flip();
+        return buffer;
+    }
+
     private record Staged(long version, ConfigDocument document) {
+    }
+
+    private record Cached(String fingerprint, Outcome outcome) {
+    }
+
+    private record Reported(String id, Map<String, String> labels, String health, long applied) {
     }
 
     public record Outcome(int status, String body, long version) {
