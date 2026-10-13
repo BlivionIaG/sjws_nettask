@@ -19,6 +19,8 @@ The file is strict: an unknown key or a bad value is an error and the process ex
 64. The existing server flags stay lenient (a bad number warns and falls back).
 There is no `--key-password` and no `key_password` key; a password lives in
 `tls.key_password_file` or `WEB_SERVER_TLS_KEY_PASSWORD`.
+The HA cluster key is the same kind of secret: `ha.cluster_key` or
+`WEB_SERVER_HA_CLUSTER_KEY`, never a command-line flag.
 
 Paths in the file are resolved against the file's directory. Paths on the command
 line and in the environment stay relative to the working directory.
@@ -71,6 +73,25 @@ as they were.
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
 `h`, `d`). In a size, a bare integer is bytes and `1m` is one mebibyte (`k`, `m`,
 `g`, 1024-based). Server timeouts are whole seconds, 1..86400, matching the flags.
+
+## HA
+
+Omitted, HA heartbeats stay off and the authenticator is not loaded. `ha.enabled: true`
+without a key refuses to start (exit 64). The key is at least 16 bytes. It is not part of
+the canonical document, so a last-good copy does not store it and startup logs do not print it.
+
+```yaml
+ha:
+  enabled: true
+  cluster_key: "replace-with-a-long-random-secret"
+  cluster_key_previous: "previous-secret-during-rotation"  # optional
+```
+
+`WEB_SERVER_HA_CLUSTER_KEY` overrides `ha.cluster_key`.
+`WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS` overrides `ha.cluster_key_previous`.
+An empty variable is an error when HA is enabled; it does not fall back to the file.
+Packets are HMAC-SHA256. The receiver accepts the current key and, during rotation, the
+previous key. A monotonic per-sender sequence and a ±5 second timestamp window drop replays.
 
 ## Server
 

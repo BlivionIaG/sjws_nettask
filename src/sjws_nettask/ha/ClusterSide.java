@@ -19,7 +19,9 @@ package sjws_nettask.ha;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.ArrayList;
 import sjws_nettask.cluster.Clock;
+import sjws_nettask.cluster.ClusterKey;
 import sjws_nettask.cluster.LocalCluster;
 import sjws_nettask.cluster.Member;
 import sjws_nettask.cluster.MemberState;
@@ -55,17 +57,16 @@ final class ClusterSide implements AutoCloseable {
         this.voters = voters;
     }
 
-    static ClusterSide start() throws IOException {
-        return start(Duration.ofMillis(200));
+    static ClusterSide start(ClusterKey key) throws IOException {
+        return start(Duration.ofMillis(200), key);
     }
 
-    static ClusterSide start(Duration interval) throws IOException {
+    static ClusterSide start(Duration interval, ClusterKey key) throws IOException {
+        java.util.Objects.requireNonNull(key, "cluster key");
         UdpPacketLink leftLink = null;
         UdpPacketLink rightLink = null;
         UdpPacketLink witnessLink = null;
-        LocalCluster left = null;
-        LocalCluster right = null;
-        LocalCluster witness = null;
+        var started = new ArrayList<LocalCluster>();
         try {
             leftLink = new UdpPacketLink(new InetSocketAddress("127.0.0.1", 0));
             rightLink = new UdpPacketLink(new InetSocketAddress("127.0.0.1", 0));
@@ -79,19 +80,16 @@ final class ClusterSide implements AutoCloseable {
                     new Member(b, site, rightLink.localAddress(), 1L, MemberState.ALIVE, false),
                     new Member(w, site, witnessLink.localAddress(), 1L, MemberState.ALIVE, true));
             var members = voters.members();
-            left = LocalCluster.start(a, members, leftLink, Clock.SYSTEM, interval);
-            right = LocalCluster.start(b, members, rightLink, Clock.SYSTEM, interval);
-            witness = LocalCluster.start(w, members, witnessLink, Clock.SYSTEM, interval);
+            var left = LocalCluster.start(a, members, leftLink, Clock.SYSTEM, interval, key);
+            started.add(left);
+            var right = LocalCluster.start(b, members, rightLink, Clock.SYSTEM, interval, key);
+            started.add(right);
+            var witness = LocalCluster.start(w, members, witnessLink, Clock.SYSTEM, interval, key);
+            started.add(witness);
             return new ClusterSide(left, right, witness, leftLink, rightLink, witnessLink, voters);
         } catch (RuntimeException | IOException failed) {
-            if (left != null) {
-                left.close();
-            }
-            if (right != null) {
-                right.close();
-            }
-            if (witness != null) {
-                witness.close();
+            for (var node : started) {
+                node.close();
             }
             closeQuiet(leftLink);
             closeQuiet(rightLink);
