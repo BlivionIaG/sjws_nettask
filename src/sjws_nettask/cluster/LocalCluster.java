@@ -82,6 +82,10 @@ public final class LocalCluster implements ClusterNode {
         return heartbeats.rejected();
     }
 
+    public int rejected(HeartbeatAuthenticator.Reason reason) {
+        return heartbeats.rejected(reason);
+    }
+
     public Membership detector() {
         return membership;
     }

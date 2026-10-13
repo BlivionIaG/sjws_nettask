@@ -683,6 +683,23 @@ public final class CpStore implements AutoCloseable {
         return Outcome.ok(json.toString(), 0);
     }
 
+    /**
+     * Local security event (for example a refused admin handshake), written to this node's audit
+     * log. Not replicated: it records what this listener saw. Never throws.
+     */
+    public void recordSecurityEvent(String actor, String action, String target, String outcome) {
+        var log = audit;
+        if (log == null) {
+            return;
+        }
+        try {
+            log.append(actor, action, target, outcome, 0);
+        } catch (java.io.IOException | RuntimeException e) {
+            System.getLogger(CpStore.class.getName()).log(System.Logger.Level.WARNING,
+                    "audit write failed for " + action + ": " + e.getMessage());
+        }
+    }
+
     /** Audit lines with {@code seq} greater than {@code afterSeq}, capped at {@code limit}. */
     public String auditJson(long afterSeq, int limit) throws java.io.IOException {
         int cap = limit <= 0 || limit > 100 ? 100 : limit;

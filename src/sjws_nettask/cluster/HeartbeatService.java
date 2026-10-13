@@ -40,6 +40,7 @@ public final class HeartbeatService implements AutoCloseable {
     private final ReentrantLock lock = new ReentrantLock();
     private final byte[] body = new byte[HeartbeatCodec.BYTES];
     private final byte[] packet = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+    private int[] memberWires = new int[4];
     private final Map<NodeId, Long> lastSendNanos = new HashMap<>();
     private final AtomicInteger received = new AtomicInteger();
     private final AtomicInteger sendFailures = new AtomicInteger();
@@ -56,7 +57,7 @@ public final class HeartbeatService implements AutoCloseable {
         this.link = Objects.requireNonNull(link, "link");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.events = Objects.requireNonNull(events, "events");
-        this.auth = new HeartbeatAuthenticator(Objects.requireNonNull(key, "cluster key"));
+        this.auth = new HeartbeatAuthenticator(Objects.requireNonNull(key, "cluster key"), this.clock);
         if (interval == null || interval.isZero() || interval.isNegative()) {
             throw new IllegalArgumentException("interval");
         }
@@ -83,9 +84,13 @@ public final class HeartbeatService implements AutoCloseable {
         return sendFailures.get();
     }
 
-    /** Authenticated datagrams that were dropped (bad tag, replay, stale, or a bad body). */
+    /** Authenticated datagrams that were dropped, for any reason. */
     public int rejected() {
         return this.auth.rejected();
+    }
+
+    public int rejected(HeartbeatAuthenticator.Reason reason) {
+        return this.auth.rejected(reason);
     }
 
     public void start() {
@@ -137,10 +142,13 @@ public final class HeartbeatService implements AutoCloseable {
         } finally {
             lock.unlock();
         }
-        for (var peer : membership.view().others()) {
+        var view = membership.view();
+        int members = memberWires(view);
+        this.auth.retainMembers(this.memberWires, members);
+        for (var peer : view.others()) {
             var beat = membership.outbound(peer.id(), termNow, generationNow, hashNow, leaseNow);
             HeartbeatCodec.encode(beat, this.body);
-            this.auth.seal(this.body, this.packet, System.currentTimeMillis());
+            this.auth.seal(this.body, this.packet, this.clock.currentTimeMillis());
             lastSendNanos.put(peer.id(), now);
             try {
                 link.send(peer.address(), this.packet, 0, HeartbeatAuthenticator.PACKET_BYTES);
@@ -165,7 +173,10 @@ public final class HeartbeatService implements AutoCloseable {
     }
 
     private void accept(PacketLink.Packet packet, long now) {
-        var beat = this.auth.open(packet.data(), System.currentTimeMillis());
+        var view = membership.view();
+        int members = memberWires(view);
+        var beat = this.auth.open(packet.data(), this.clock.currentTimeMillis(), view.self().wire(), this.memberWires,
+                members);
         if (beat == null) {
             return;
         }
@@ -182,12 +193,24 @@ public final class HeartbeatService implements AutoCloseable {
             return;
         }
         HeartbeatCodec.encode(reply.get(), this.body);
-        this.auth.seal(this.body, this.packet, System.currentTimeMillis());
+        this.auth.seal(this.body, this.packet, this.clock.currentTimeMillis());
         try {
             link.send(packet.from(), this.packet, 0, HeartbeatAuthenticator.PACKET_BYTES);
         } catch (IOException failed) {
             sendFailures.incrementAndGet();
         }
+    }
+
+    private int memberWires(MembershipView view) {
+        var members = view.members();
+        if (this.memberWires.length < members.size()) {
+            this.memberWires = new int[members.size()];
+        }
+        int n = 0;
+        for (var member : members) {
+            this.memberWires[n++] = member.id().wire();
+        }
+        return n;
     }
 
     @Override
