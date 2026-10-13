@@ -79,13 +79,17 @@ public final class ServiceLaunch {
         private AutoCloseable openWatch(SjwsServer server) {
             var join = this.bootstrap.join();
             var contact = this.bootstrap.controlPlane();
-            if (join == null || contact == null || contact.isBlank()) {
+            var files = this.bootstrap.cpTls();
+            if ((join == null && files == null) || contact == null || contact.isBlank()) {
                 return null;
             }
             try {
-                return sjws_nettask.cp.DataWatch.open(contact, this.bootstrap.nodeId(), join.tokenId(),
-                        join.copySecret(), this.bootstrap.pinFile(), this.bootstrap.stateDir(), server,
-                        this.enrollment, System::currentTimeMillis);
+                var tls = files == null ? null
+                        : new sjws_nettask.cp.CpTls(files.cert(), files.key(), files.ca(), null, files.peer(), 0);
+                return sjws_nettask.cp.DataWatch.open(contact, this.bootstrap.nodeId(),
+                        join == null ? null : join.tokenId(), join == null ? null : join.copySecret(),
+                        this.bootstrap.pinFile(), this.bootstrap.stateDir(), server, this.enrollment,
+                        System::currentTimeMillis, tls);
             } catch (IOException e) {
                 System.err.println("WARN: control-plane watch not started: " + e.getMessage());
                 return null;
