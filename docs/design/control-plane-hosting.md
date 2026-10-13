@@ -113,6 +113,20 @@ A new `KeyRing.load(keyDir, rootPub, stateDir)`:
 `cp.insecureSkipPermissionChecks: true` **in the config file** (never env or CLI). It logs a loud WARN at startup and
 every hour, sets a flag on `/cp/v1/health`, and still checks for symlinks and regular files. Dev only.
 
+### 2.3.1 Implementation notes (`KeyRing.load`)
+
+- `trust.state` is kept in **both** `cp.stateDir` and `cp.keyDir` (same format, 0600); load uses the higher floor,
+  logs a WARN when the copies differ, and rewrites both before the ring is used. Wiping or restoring `stateDir` alone
+  cannot lower the floor.
+- First start is explicit: with no `trust.state` in either place, load refuses unless `cp.minBundleSerial` is set,
+  and then seeds from it (audit `cp.trust.init`). `cp.minBundleSerial` is also enforced on every load.
+- An equal `bundleSerial` is accepted only when the bundle's SHA-256 equals the one recorded in `trust.state`.
+- Bundle validity (`notAfter - issuedAt`) and the online key's `notAfter - issuedAt` are capped at 90 days.
+- `root.pub` and `trust.bundle` are read with `SecureKeyFile.readPublic` (root or service uid, no group/other write);
+  `online.key` and `cp.tls.key` with `SecureKeyFile.read` (owner-only 0600/0400); `keyDir` must be 0700.
+- CP listeners: `CpTls.serverContext(CpListenerConfig)` (TLS 1.3, client cert required);
+  `CpServerTls.reloadTls()` builds new material first and keeps the old on failure.
+
 ### 2.4 SIGHUP (answers former open question 1)
 
 One atomic step: build a new `KeyRing` plus TLS material (`cp.tls.*`) from disk, with all checks above (permissions,

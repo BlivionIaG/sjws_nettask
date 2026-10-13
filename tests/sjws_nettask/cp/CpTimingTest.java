@@ -53,7 +53,7 @@ class CpTimingTest {
     }
 
     @Test
-    void keyRingLoadStubFailsClosed() {
+    void keyRingLoadFailsClosedOnMissingFiles() {
         var cfg = new CpKeyConfig(java.nio.file.Path.of("k"), java.nio.file.Path.of("r"), java.nio.file.Path.of("s"),
                 null, false, 0L);
         assertThrows(CpKeyException.class, () -> KeyRing.load(cfg));

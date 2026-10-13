@@ -76,6 +76,19 @@ public final class SecureKeyFile {
      * (for example {@code ha.cluster_key_file}); it is not a path and must not be the secret.
      */
     public static byte[] read(Path path, String name, int maxBytes) {
+        return read(path, name, maxBytes, true);
+    }
+
+    /**
+     * A non-secret trust file ({@code root.pub}, {@code trust.bundle}): same parent and leaf
+     * checks as {@link #read}, but the file may be owned by root or this process and readable
+     * by others. It must not be group- or world-writable.
+     */
+    public static byte[] readPublic(Path path, String name, int maxBytes) {
+        return read(path, name, maxBytes, false);
+    }
+
+    private static byte[] read(Path path, String name, int maxBytes, boolean secret) {
         if (!path.getFileSystem().supportedFileAttributeViews().contains("posix")) {
             throw new ConfigException(name + " cannot be checked (filesystem has no POSIX permissions)");
         }
@@ -98,7 +111,7 @@ public final class SecureKeyFile {
             hook.accept(opened);
         }
         try (var channel = FileChannel.open(opened, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
-            checkedKey(channel, opened, name);
+            checkedKey(channel, opened, name, secret);
             if (channel.size() > maxBytes) {
                 throw new ConfigException(name + " is too large");
             }
@@ -153,7 +166,8 @@ public final class SecureKeyFile {
     }
 
     /** Attributes of the inode {@code channel} already has open. */
-    private static void checkedKey(FileChannel channel, Path opened, String name) throws IOException {
+    private static void checkedKey(FileChannel channel, Path opened, String name, boolean secret)
+            throws IOException {
         if (!channel.isOpen()) {
             throw new IOException(name);
         }
@@ -176,18 +190,28 @@ public final class SecureKeyFile {
         if (!attrs.isRegularFile()) {
             throw new ConfigException(name + " is not a file");
         }
+        if (!secret) {
+            if (!ownedByRootOrUs(opened, owner, selfUid())) {
+                throw new ConfigException(name + " must be owned by root or this process");
+            }
+            var p = attrs.permissions();
+            if (p.contains(PosixFilePermission.GROUP_WRITE) || p.contains(PosixFilePermission.OTHERS_WRITE)) {
+                throw new ConfigException(name + " must not be group- or world-writable");
+            }
+            return;
+        }
         if (!ownedByThisProcess(opened, owner, attrs)) {
             throw new ConfigException(name + " must be owned by this process");
         }
         var perms = attrs.permissions();
         boolean ownerRead = perms.contains(PosixFilePermission.OWNER_READ);
-        boolean secret = perms.contains(PosixFilePermission.GROUP_READ)
+        boolean loose = perms.contains(PosixFilePermission.GROUP_READ)
                 || perms.contains(PosixFilePermission.GROUP_WRITE)
                 || perms.contains(PosixFilePermission.GROUP_EXECUTE)
                 || perms.contains(PosixFilePermission.OTHERS_READ)
                 || perms.contains(PosixFilePermission.OTHERS_WRITE)
                 || perms.contains(PosixFilePermission.OTHERS_EXECUTE);
-        if (!ownerRead || secret || perms.contains(PosixFilePermission.OWNER_EXECUTE)) {
+        if (!ownerRead || loose || perms.contains(PosixFilePermission.OWNER_EXECUTE)) {
             throw new ConfigException(name + " must be mode 0600 or 0400");
         }
     }

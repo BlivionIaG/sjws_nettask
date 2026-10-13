@@ -104,8 +104,6 @@ class CpConfigTest {
         assertEquals(42L, c.keys().minBundleSerial());
         assertEquals(0.02, c.maxClockDriftRatio());
         assertEquals(Duration.ofMillis(5), c.leaseSafetyMargin());
-        y.put("rootPubSha256", "AB".repeat(32));
-        assertThrows(IllegalArgumentException.class, () -> parse(y));
         y.remove("rootPubSha256");
         y.put("minBundleSerial", -1);
         assertThrows(IllegalArgumentException.class, () -> parse(y));

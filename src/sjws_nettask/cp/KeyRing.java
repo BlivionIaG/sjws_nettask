@@ -43,9 +43,20 @@ public final class KeyRing {
     private final long versionFloor;
     private final byte[] trustSignature;
     private final SecureRandom random = new SecureRandom();
+    private final TrustBundle bundle;
+    private final String rootFingerprint;
+    private final boolean insecure;
 
     private KeyRing(PrivateKey rootPrivate, byte[] rootPublic, PrivateKey onlinePrivate, TrustKey online,
             long versionFloor, byte[] trustSignature) {
+        this(rootPrivate, rootPublic, onlinePrivate, online, versionFloor, trustSignature, null, null, false);
+    }
+
+    private KeyRing(PrivateKey rootPrivate, byte[] rootPublic, PrivateKey onlinePrivate, TrustKey online,
+            long versionFloor, byte[] trustSignature, TrustBundle bundle, String rootFingerprint, boolean insecure) {
+        this.bundle = bundle;
+        this.rootFingerprint = rootFingerprint;
+        this.insecure = insecure;
         this.rootPrivate = rootPrivate;
         this.rootPublic = rootPublic;
         this.onlinePrivate = onlinePrivate;
@@ -69,15 +80,44 @@ public final class KeyRing {
                 signature);
     }
 
-    // ---- Security-owned seam (control-plane-hosting.md §2.3). Security's KeyRing.load PR replaces only this method.
     /**
-     * Loads the ring from disk, fail closed. <b>Stub until Security's PR lands:</b> always throws, so a CONTROL
-     * start refuses to run rather than run without verified keys. Tests use {@link #generate}.
+     * Loads this voter's ring from disk, fail closed (control-plane-hosting.md 2.2/2.3): StrictModes
+     * permission checks via {@code SecureKeyFile}, {@code root.pub} pin, strict root-signed
+     * {@code trust.bundle}, anti-rollback against {@code trust.state} in both {@code stateDir} and
+     * {@code keyDir} (the higher wins) and {@code cp.minBundleSerial}, 90-day validity cap, and
+     * {@code online.key} matching an unexpired bundle key. Both floors are advanced before return.
+     * Nothing is generated. Also the SIGHUP path: build a new ring with this, then swap.
      */
     public static KeyRing load(CpKeyConfig config) throws CpKeyException {
-        throw new CpKeyException("KeyRing.load is not implemented yet (Security); refusing to start the control role");
+        return KeyRingLoader.load(config, System.currentTimeMillis());
     }
-    // ---- end Security-owned seam
+
+    static KeyRing load(CpKeyConfig config, long nowMillis) throws CpKeyException {
+        return KeyRingLoader.load(config, nowMillis);
+    }
+
+    static KeyRing loaded(byte[] rootSpki, PrivateKey online, TrustKey key, TrustBundle bundle, String fingerprint,
+            boolean insecure) {
+        var sig = bundle.encoded();
+        return new KeyRing(null, rootSpki.clone(), online, key, bundle.versionFloor(),
+                java.util.Arrays.copyOfRange(sig, sig.length - TrustBundle.SIGNATURE_BYTES, sig.length), bundle,
+                fingerprint, insecure);
+    }
+
+    /** The loaded {@code trust.bundle}; null for a {@link #generate generated} ring. */
+    public TrustBundle bundle() {
+        return bundle;
+    }
+
+    /** Hex SHA-256 of the root SPKI; null for a generated ring. */
+    public String rootFingerprint() {
+        return rootFingerprint;
+    }
+
+    /** True when loaded with {@code cp.insecureSkipPermissionChecks}; surface on {@code /cp/v1/health}. */
+    public boolean insecurePermissions() {
+        return insecure;
+    }
 
     public byte[] rootPublic() {
         return rootPublic.clone();
@@ -96,7 +136,7 @@ public final class KeyRing {
     }
 
     public List<TrustKey> keys() {
-        return List.of(online);
+        return bundle == null ? List.of(online) : bundle.keys();
     }
 
     /**
