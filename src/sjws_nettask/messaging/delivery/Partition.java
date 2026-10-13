@@ -308,6 +308,9 @@ public final class Partition implements AutoCloseable {
 
     private List<Delivery> pollLocked(String group, String consumer, int max, long visibilityMs) {
         var g = state.group(group);
+        // Empty poll (a spinning or woken consumer finding nothing): no allocation at all.
+        if ((g.due.isEmpty() || g.due.first().atMs() > clockMs.getAsLong())
+                && (state.messages.isEmpty() || state.messages.lastKey() < g.cursor)) return List.of();
         long now = clockMs.getAsLong();
         var out = new ArrayList<Delivery>();
         var policy = state.policy();
@@ -808,7 +811,22 @@ public final class Partition implements AutoCloseable {
     // ---- inspection ----
 
     /** Exact counts as of the last applied entry. Lock-free, never stale. */
-    public DeliveryCounts counts() { return counts.get(); }
+    /**
+     * Exact counts as of the last applied entry. Computed on first read after a change (an append only marks them
+     * stale, so the hot path allocates nothing for them); a stale read takes the lock briefly.
+     */
+    public DeliveryCounts counts() {
+        var c = counts.get();
+        if (c != null) return c;
+        lock.lock();
+        try {
+            c = counts.get();
+            if (c == null) { c = state.counts(); counts.set(c); }
+            return c;
+        } finally {
+            lock.unlock();
+        }
+    }
 
     /**
      * Paged view. Lock-free unless the view is older than {@code maxStaleNanos} while the partition stays busy, in
@@ -846,7 +864,7 @@ public final class Partition implements AutoCloseable {
     public void eagerSnapshots(boolean on) { lock.lock(); try { eager = on; publish(); } finally { lock.unlock(); } }
 
     private void publish() {
-        counts.set(state.counts());
+        counts.setRelease(null); // stale: rebuilt lazily by counts()
         if (eager || snapshot.get() == null) rebuild();
     }
 

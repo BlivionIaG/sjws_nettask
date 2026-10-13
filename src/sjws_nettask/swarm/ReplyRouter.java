@@ -150,6 +150,7 @@ public final class ReplyRouter implements AutoCloseable {
     int pollOnce() {
         var p = this.topics.partition(this.topic);
         var got = p.poll(GROUP, "router", 256, 30_000);
+        if (got.isEmpty()) return 0; // idle spin: no iterator allocation
         for (var d : got) {
             TaskEnvelope env = null;
             try {

@@ -84,6 +84,8 @@ public record TaskEnvelope(byte[] taskId, byte[] correlationId, String replyTo, 
     }
 
     public byte[] encode() {
+        var fast = encodeAscii();
+        if (fast != null) return fast;
         var buf = new ByteArrayOutputStream(64 + this.body.length);
         try (var out = new DataOutputStream(buf)) {
             out.writeByte(VERSION);
@@ -103,6 +105,8 @@ public record TaskEnvelope(byte[] taskId, byte[] correlationId, String replyTo, 
 
     /** Decodes {@link #encode()}; a wrong version or a truncated payload is an {@link IllegalArgumentException}. */
     public static TaskEnvelope decode(byte[] payload) {
+        var fast = decodeAscii(payload);
+        if (fast != null) return fast;
         try (var in = new DataInputStream(new ByteArrayInputStream(payload))) {
             int version = in.readUnsignedByte();
             if (version != VERSION) {
@@ -145,5 +149,61 @@ public record TaskEnvelope(byte[] taskId, byte[] correlationId, String replyTo, 
     @Override
     public String toString() {
         return "TaskEnvelope[replyTo=" + this.replyTo + ", body=" + this.body.length + "B]";
+    }
+
+    // Exact-size fast paths for the common case: every text field is 1..0x7F ASCII, where modified UTF-8
+    // (DataOutput.writeUTF) is the bytes themselves. Same wire format; anything else takes the stream path.
+
+    private static boolean ascii(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == 0 || c > 0x7F) return false;
+        }
+        return s.length() <= 0xFFFF;
+    }
+
+    private byte[] encodeAscii() {
+        if (!ascii(this.replyTo) || !ascii(this.traceparent) || !ascii(this.tracestate) || !ascii(this.budgetRef)
+                || !ascii(this.contentType)) return null;
+        int n = 1 + 16 + 16 + 8 + 10 + this.replyTo.length() + this.traceparent.length() + this.tracestate.length()
+                + this.budgetRef.length() + this.contentType.length() + 4 + this.body.length;
+        var out = new byte[n];
+        var b = java.nio.ByteBuffer.wrap(out);
+        b.put((byte) VERSION).put(this.taskId).put(this.correlationId).putLong(this.deadlineMs);
+        putAscii(b, this.replyTo);
+        putAscii(b, this.traceparent);
+        putAscii(b, this.tracestate);
+        putAscii(b, this.budgetRef);
+        putAscii(b, this.contentType);
+        b.putInt(this.body.length).put(this.body);
+        return out;
+    }
+
+    private static void putAscii(java.nio.ByteBuffer b, String s) {
+        b.putShort((short) s.length());
+        for (int i = 0; i < s.length(); i++) b.put((byte) s.charAt(i));
+    }
+
+    /** Null when the payload is not a well-formed all-ASCII v1 envelope (the stream path then decides). */
+    private static TaskEnvelope decodeAscii(byte[] p) {
+        if (p.length < 1 + 32 + 8 + 10 + 4 || (p[0] & 0xFF) != VERSION) return null;
+        int pos = 41;
+        var strs = new String[5];
+        for (int k = 0; k < 5; k++) {
+            if (pos + 2 > p.length) return null;
+            int len = ((p[pos] & 0xFF) << 8) | (p[pos + 1] & 0xFF);
+            pos += 2;
+            if (pos + len > p.length) return null;
+            for (int i = pos; i < pos + len; i++) if (p[i] <= 0) return null; // 0 or >= 0x80: not plain ASCII
+            strs[k] = len == 0 ? "" : new String(p, pos, len, java.nio.charset.StandardCharsets.ISO_8859_1);
+            pos += len;
+        }
+        if (pos + 4 > p.length) return null;
+        var b = java.nio.ByteBuffer.wrap(p);
+        int len = b.getInt(pos);
+        pos += 4;
+        if (len < 0 || len > p.length - pos) return null;
+        return new TaskEnvelope(Arrays.copyOfRange(p, 1, 17), Arrays.copyOfRange(p, 17, 33), strs[0], b.getLong(33),
+                strs[1], strs[2], strs[3], strs[4], Arrays.copyOfRange(p, pos, pos + len));
     }
 }

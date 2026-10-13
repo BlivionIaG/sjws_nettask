@@ -40,8 +40,16 @@ public final class TaskService {
     }
 
     public static String topic(String pool) {
-        return TOPIC_PREFIX + pool;
+        var t = TOPIC_NAMES.get(pool); // claim/submit hot path: no string concat per call
+        if (t == null) {
+            t = TOPIC_PREFIX + pool;
+            if (TOPIC_NAMES.size() < 4096) TOPIC_NAMES.putIfAbsent(pool, t);
+        }
+        return t;
     }
+
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> TOPIC_NAMES =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /** The pool's partition; the worker group reads from the oldest retained task. */
     Partition partition(String pool) {
