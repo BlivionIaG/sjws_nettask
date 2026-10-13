@@ -48,6 +48,28 @@ public final class AdminServer implements AutoCloseable {
         return bound;
     }
 
+    /**
+     * Same routes over TLS 1.3 with a required client certificate: the mTLS listener the admin
+     * console connects to. Loopback only, like {@link #start(CpStore, long, long)}.
+     */
+    public static AdminServer startTls(CpStore store, long nowMillis, long ttlMillis, javax.net.ssl.SSLContext tls)
+            throws IOException {
+        var https = com.sun.net.httpserver.HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        https.setHttpsConfigurator(new com.sun.net.httpserver.HttpsConfigurator(tls) {
+            @Override
+            public void configure(com.sun.net.httpserver.HttpsParameters params) {
+                var ssl = getSSLContext().getDefaultSSLParameters();
+                ssl.setNeedClientAuth(true);
+                ssl.setProtocols(new String[] {"TLSv1.3"});
+                params.setSSLParameters(ssl);
+            }
+        });
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis));
+        https.createContext("/", bound::handle);
+        https.start();
+        return bound;
+    }
+
     public int port() {
         return server.getAddress().getPort();
     }

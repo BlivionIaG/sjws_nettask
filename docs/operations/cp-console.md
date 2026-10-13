@@ -1,9 +1,29 @@
 # Control-plane console (mockup)
 
-Status: **mockup**. The console runs against an in-memory control plane
-(`FakeCpClient`) until HA ships the operator API it proposes (`sjws_nettask.admin.cp.CpClient`).
+The console talks to the control plane's mTLS admin API (`/cp/v1`, see
+[control-plane design](../design/control-plane.md)) through `HttpCpClient`, spread over several
+control nodes by `FailoverCpClient`:
 
-    java -cp "target/sjws_nettask-0.2-SNAPSHOT.jar:target/lib/*" sjws_nettask.admin.cp.CpConsoleMain --demo [--endpoints=cp-1:9443,cp-2:9443] [--no-color]
+    java -cp "target/sjws_nettask-0.2-SNAPSHOT.jar:target/lib/*" sjws_nettask.admin.cp.CpConsoleMain \
+        --endpoints=cp-1:9443,cp-2:9443 --cert=operator.pem --key=operator-key.pem --trust=cp-ca.pem \
+        [--key-password-file=FILE] [--no-color]
+
+`--cert`/`--key` are the operator's PEM certificate and key (its URI SAN, e.g.
+`urn:sjws:admin:root`, is the identity the CP maps to a role); `--trust` holds the CA or pinned
+certificate the control node must present. `--demo` runs the same screens against an in-memory
+control plane (`FakeCpClient`).
+
+### Live mode: what is wired and what is not
+Wired: `GET /cp/v1/health`, `GET /cp/v1/nodes`, `GET /cp/v1/config`, `POST /cp/v1/config`
+(propose), `POST /cp/v1/rollout` (selector other than `*`), `POST /cp/v1/activate` (selector `*`),
+`POST /cp/v1/rollback`. HTTP 503 (leader not ready) and connection failures move to the next
+endpoint.
+
+Not on the server yet, so handled in the console: version history (only the activated version
+is readable), dry-run validate (checked locally; the CP validates on propose), rollout status (the
+last rollout sent is shown), audit (the view says the endpoint is missing), idempotency keys,
+structured edits other than `access.rules` (other sections are read-only), and per-node labels,
+health, applied version and lag (shown as `?`).
 
 It is a separate entry point: the server never loads `sjws_nettask.admin.cp` (a test enforces
 this), so the console costs nothing when it is not used.

@@ -484,7 +484,7 @@ class CpConsoleTest {
         assertTrue(out.startsWith("0|sjws control plane  via e1"), out);
         assertTrue(out.contains("rollout r1 of version 2 to canary=true: DONE 1/1"), out);
         assertTrue(main("q\n", "--demo").startsWith("0|" + CpConsole.CLEAR));
-        assertTrue(main("").startsWith("64|Usage"));
+        assertTrue(main("").startsWith("64|ERROR: live mode needs"));
         assertTrue(main("", "--endpoints=").startsWith("64|ERROR: unknown argument --endpoints="));
         assertTrue(main("", "--nope").startsWith("64|ERROR"));
     }

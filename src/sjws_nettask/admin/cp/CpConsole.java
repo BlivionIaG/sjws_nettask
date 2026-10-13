@@ -325,11 +325,11 @@ public final class CpConsole {
         sb.append(String.format("  %-8s %-9s %-6s %-5s %-4s %s%n", "NODE", "ROLE", "HEALTH", "VER", "LAG", "LABELS"));
         for (var n : c.nodes()) {
             var labels = new java.util.TreeMap<>(n.labels()).toString();
-            var health = n.health().equals("UP") ? color(GREEN, String.format("%-6s", n.health()))
-                    : color(RED, String.format("%-6s", n.health()));
+            var cell = String.format("%-6s", n.health());
+            var health = n.health().equals("UP") ? color(GREEN, cell) : n.health().equals("?") ? cell : color(RED, cell);
             sb.append(String.format("  %-8s %-9s ", n.id(), n.role())).append(health)
-                    .append(String.format(" %-5d %-4s %s%n", n.appliedVersion(),
-                            n.lag() == 0 ? "0" : color(YELLOW, Long.toString(n.lag())), labels));
+                    .append(String.format(" %-5s %-4s %s%n", n.appliedVersion() < 0 ? "?" : n.appliedVersion(),
+                            n.lag() < 0 ? "?" : n.lag() == 0 ? "0" : color(YELLOW, Long.toString(n.lag())), labels));
         }
         if (this.lastRollout != null) {
             var r = this.lastRollout;
