@@ -6,9 +6,19 @@ import java.time.Duration;
 public final class FakeClock implements Clock {
 
     private long nanos;
+    private long wallMillis;
 
     public FakeClock(long nanos) {
         this.nanos = nanos;
+    }
+
+    public void setWallMillis(long wallMillis) {
+        this.wallMillis = wallMillis;
+    }
+
+    @Override
+    public long currentTimeMillis() {
+        return this.wallMillis;
     }
 
     @Override

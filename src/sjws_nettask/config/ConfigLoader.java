@@ -22,6 +22,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -29,6 +30,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import sjws_nettask.ServerConfig;
+import sjws_nettask.cluster.ClusterKey;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.RoutePattern;
 
@@ -165,7 +167,7 @@ public final class ConfigLoader {
             access = accessSection(root, warnings);
             messaging = MessagingSettings.parse(root);
             yamlSwarm = swarmSection(root);
-            var ha = haSection(root, env);
+            var ha = haSection(root, env, base, readFrom, warnings);
             haEnabled = ha.enabled();
             haKey = ha.current();
             haPrevious = ha.previous();
@@ -1105,16 +1107,22 @@ public final class ConfigLoader {
 
     /**
      * HA heartbeat key. Not part of the canonical document, so a last-good copy never stores it.
-     * When {@code ha.enabled} is false the key bytes are discarded. A missing key with HA enabled
-     * is an error. The environment overrides the file. Values are never copied into the message.
+     * When {@code ha.enabled} is false the key bytes are discarded and {@link ClusterKey} is not
+     * resolved. A missing key with HA enabled is an error. The environment overrides the file.
+     * Values are never copied into the message. An inline secret in a group- or world-readable
+     * file is a warning. {@code ha.cluster_key_file} must be mode 0600 or 0400.
      */
-    private static HaMaterial haSection(Map<String, Object> root, Map<String, String> env) {
+    private static HaMaterial haSection(Map<String, Object> root, Map<String, String> env, Path base, Path configFile,
+            List<String> warnings) {
         boolean enabled = false;
         String fileKey = null;
         String filePrevious = null;
+        String keyFile = null;
+        String previousFile = null;
         if (root.get("ha") instanceof Object ha) {
             var map = YamlValues.mapping(ha, "ha");
-            YamlValues.knownKeys(map, List.of("enabled", "cluster_key", "cluster_key_previous"), "ha");
+            YamlValues.knownKeys(map, List.of("enabled", "cluster_key", "cluster_key_previous", "cluster_key_file",
+                    "cluster_key_previous_file"), "ha");
             if (map.containsKey("enabled")) {
                 enabled = bool(map.get("enabled"), "ha.enabled");
             }
@@ -1124,14 +1132,34 @@ public final class ConfigLoader {
             if (map.containsKey("cluster_key_previous")) {
                 filePrevious = secret(map.get("cluster_key_previous"), "ha.cluster_key_previous");
             }
+            if (map.containsKey("cluster_key_file")) {
+                keyFile = text(map.get("cluster_key_file"), "ha.cluster_key_file");
+            }
+            if (map.containsKey("cluster_key_previous_file")) {
+                previousFile = text(map.get("cluster_key_previous_file"), "ha.cluster_key_previous_file");
+            }
+        }
+        if (fileKey != null && keyFile != null) {
+            throw new ConfigException("ha.cluster_key and ha.cluster_key_file cannot both be set");
+        }
+        if (filePrevious != null && previousFile != null) {
+            throw new ConfigException("ha.cluster_key_previous and ha.cluster_key_previous_file cannot both be set");
+        }
+        if (fileKey != null || filePrevious != null) {
+            warnIfGroupReadable(configFile, warnings);
         }
         if (!enabled) {
             return HaMaterial.OFF;
         }
-        String current = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY") ? env.get("WEB_SERVER_HA_CLUSTER_KEY") : fileKey;
+        String current = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY") ? env.get("WEB_SERVER_HA_CLUSTER_KEY")
+                : keyFile != null ? readKeyFile(resolve(base, keyFile, "ha.cluster_key_file"), "ha.cluster_key_file")
+                        : fileKey;
         String previous = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")
                 ? env.get("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")
-                : filePrevious;
+                : previousFile != null
+                        ? readKeyFile(resolve(base, previousFile, "ha.cluster_key_previous_file"),
+                                "ha.cluster_key_previous_file")
+                        : filePrevious;
         if (current == null || current.isBlank()) {
             throw new ConfigException(
                     "HA is enabled but no cluster key is set; set ha.cluster_key or WEB_SERVER_HA_CLUSTER_KEY");
@@ -1140,6 +1168,56 @@ public final class ConfigLoader {
             throw new ConfigException("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS is empty");
         }
         return HaMaterial.enabled(current, previous);
+    }
+
+    /** Inline key material sits in this file. Group or world read is a warning, not a refusal. */
+    private static void warnIfGroupReadable(Path configFile, List<String> warnings) {
+        if (configFile == null) {
+            return;
+        }
+        try {
+            var perms = Files.getPosixFilePermissions(configFile);
+            if (perms.contains(PosixFilePermission.GROUP_READ) || perms.contains(PosixFilePermission.OTHERS_READ)) {
+                warnings.add("config file " + configFile + " is readable by group/others and contains ha.cluster_key; "
+                        + "chmod 600 it, or use ha.cluster_key_file");
+            }
+        } catch (UnsupportedOperationException | IOException ignored) {
+            // no POSIX permissions to check
+        }
+    }
+
+    /**
+     * Key file: not a symlink, at most 4 KiB, mode 0600 or 0400. The bytes are not part of the
+     * error text. Java keeps the characters in a {@code String}; they are not wiped.
+     */
+    private static String readKeyFile(Path path, String name) {
+        try {
+            if (Files.isSymbolicLink(path)) {
+                throw new ConfigException(name + " is a symlink");
+            }
+            if (!Files.isRegularFile(path)) {
+                throw new ConfigException(name + " is not a file");
+            }
+            var perms = Files.getPosixFilePermissions(path);
+            boolean ownerRead = perms.contains(PosixFilePermission.OWNER_READ);
+            boolean secret = perms.contains(PosixFilePermission.GROUP_READ)
+                    || perms.contains(PosixFilePermission.GROUP_WRITE)
+                    || perms.contains(PosixFilePermission.GROUP_EXECUTE)
+                    || perms.contains(PosixFilePermission.OTHERS_READ)
+                    || perms.contains(PosixFilePermission.OTHERS_WRITE)
+                    || perms.contains(PosixFilePermission.OTHERS_EXECUTE);
+            if (!ownerRead || secret || perms.contains(PosixFilePermission.OWNER_EXECUTE)) {
+                throw new ConfigException(name + " must be mode 0600 or 0400");
+            }
+            if (Files.size(path) > 4096) {
+                throw new ConfigException(name + " is too large");
+            }
+            return Files.readString(path);
+        } catch (UnsupportedOperationException e) {
+            throw new ConfigException(name + " cannot be checked (filesystem has no POSIX permissions)");
+        } catch (IOException e) {
+            throw new ConfigException("Cannot read " + name);
+        }
     }
 
     /** UTF-8 secret. Blank is refused. The value is not included in the error. */
@@ -1549,7 +1627,6 @@ public final class ConfigLoader {
     /** Key bytes kept only while HA is enabled. {@link #toString()} redacts them. */
     private static final class HaMaterial {
         private static final HaMaterial OFF = new HaMaterial(false, null, null);
-        private static final int MIN_BYTES = 16;
 
         private final boolean enabled;
         private final byte[] current;
@@ -1562,18 +1639,12 @@ public final class ConfigLoader {
         }
 
         static HaMaterial enabled(String current, String previous) {
-            var cur = current.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            if (cur.length < MIN_BYTES) {
-                throw new ConfigException("ha.cluster_key must be at least " + MIN_BYTES + " bytes");
+            try {
+                byte[] prev = previous == null ? null : ClusterKey.parse(previous);
+                return new HaMaterial(true, ClusterKey.parse(current), prev);
+            } catch (IllegalArgumentException failed) {
+                throw new ConfigException(failed.getMessage());
             }
-            byte[] prev = null;
-            if (previous != null) {
-                prev = previous.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                if (prev.length < MIN_BYTES) {
-                    throw new ConfigException("ha.cluster_key_previous must be at least " + MIN_BYTES + " bytes");
-                }
-            }
-            return new HaMaterial(true, cur, prev);
         }
 
         boolean enabled() {

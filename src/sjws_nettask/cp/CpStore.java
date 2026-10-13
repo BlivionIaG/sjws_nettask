@@ -238,11 +238,16 @@ public final class CpStore implements AutoCloseable {
     /**
      * Watch credential. A node that has joined keeps authenticating with the same token id and secret
      * until it is revoked (the one-shot rule applies to joining, not to every long poll); any other
-     * presentation goes through {@link #presentJoin}, which consumes an issued token once.
+     * presentation goes through {@link #presentJoin}, which consumes an issued token once. Only the
+     * secret's SHA-256 is held; a revoked node is refused before any comparison. Interim until the
+     * node-to-CP mTLS replaces this credential.
      */
     public JoinTokens.Result authenticateWatch(String nodeId, String tokenId, byte[] secret, long nowMillis) {
+        if (nodeId != null && isRevoked(nodeId)) {
+            return new JoinTokens.Result(null, false, "revoked");
+        }
         var join = nodeId == null ? null : joins.joined(nodeId);
-        if (join != null && secret != null && secret.length >= 16 && join.tokenId().equals(tokenId)
+        if (join != null && JoinTokens.isHash(join.secretHash()) && secret != null && secret.length >= 16 && join.tokenId().equals(tokenId)
                 && java.security.MessageDigest.isEqual(join.secretHash().getBytes(StandardCharsets.US_ASCII),
                         JoinTokens.sha256(secret).getBytes(StandardCharsets.US_ASCII))) {
             return new JoinTokens.Result(join, true, null);

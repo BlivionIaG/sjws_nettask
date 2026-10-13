@@ -24,7 +24,8 @@ import sjws_nettask.cluster.ClusterKey;
 
 /**
  * Process entry for {@code tools/ha-bench.sh}. Single-node leaves HA detached. Cluster mode
- * attaches {@link HaSettings} and runs a second node with UDP heartbeats. Blocks until killed.
+ * attaches {@link HaSettings} and runs two data nodes plus a witness with UDP heartbeats.
+ * Blocks until killed.
  */
 public final class BenchServer {
 

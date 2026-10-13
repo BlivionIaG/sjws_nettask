@@ -71,7 +71,23 @@ class MessagingHttpTest {
         return h.handle(new Request("POST", "/messaging/v1/topics/" + topic + "/records", headers).withBody(body(data)));
     }
 
+    /** The body bytes; a streamed body is drained and its source closed (releasing pooled buffers). */
     static byte[] bytes(Response r) {
+        if (r.body() instanceof Body.Stream st) {
+            var out = new java.io.ByteArrayOutputStream();
+            try (var src = st.source()) {
+                ByteBuffer b;
+                while ((b = src.next()) != null) {
+                    var a = new byte[b.remaining()];
+                    b.get(a);
+                    out.writeBytes(a);
+                }
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+            assertEquals(st.length(), out.size(), "stream length");
+            return out.toByteArray();
+        }
         var d = ((Body.Bytes) r.body()).data().duplicate();
         var out = new byte[d.remaining()];
         d.get(out);

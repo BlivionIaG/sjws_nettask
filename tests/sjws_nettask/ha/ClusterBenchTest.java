@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import sjws_nettask.cluster.ClusterKey;
@@ -37,6 +38,23 @@ class ClusterBenchTest {
             }
             assertTrue(cluster.heartbeats() > 0);
             assertEquals("cluster", cluster.mode());
+            var side = ClusterSide.start(KEY);
+            try {
+                var voters = side.voters();
+                assertEquals(3, voters.voters().size());
+                var ids = voters.members();
+                var a = ids.get(0).id();
+                var b = ids.get(1).id();
+                var w = ids.get(2).id();
+                assertTrue(ids.get(2).witness());
+                assertFalse(ids.get(0).witness());
+                assertTrue(voters.policy().hasQuorum(voters.voters(), Set.of(a, b)));
+                assertTrue(voters.policy().hasQuorum(voters.voters(), Set.of(a, w)));
+                assertFalse(voters.policy().hasQuorum(voters.voters(), Set.of(a)));
+                assertFalse(voters.policy().hasQuorum(voters.voters(), Set.of(w)));
+            } finally {
+                side.close();
+            }
         } finally {
             cluster.close();
         }
@@ -46,6 +64,9 @@ class ClusterBenchTest {
         var refused = assertThrows(IllegalArgumentException.class,
                 () -> BenchServer.Options.parse(new String[] {"--cluster-key=" + secret}));
         assertFalse(refused.getMessage().contains(secret));
+        var alias = assertThrows(IllegalArgumentException.class,
+                () -> BenchServer.Options.parse(new String[] {"--ha-cluster-key=" + secret}));
+        assertFalse(alias.getMessage().contains(secret));
         assertThrows(IllegalArgumentException.class,
                 () -> BenchServer.launch(new BenchServer.Options("single", 0, root.toString()), KEY));
         var fromEnv = ClusterKey.fromEnvironment(Map.of(ClusterKey.ENV_CURRENT, "env-cluster-key-0123"));
