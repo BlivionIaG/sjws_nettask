@@ -334,7 +334,7 @@ These are the reference points for the targets below. Neither this PR nor the ta
 | Token-per-message ledger write amplification | Chunks coalesced to 1–4 KiB or 20 ms (§5.2); opt-in direct path for ephemeral HTTP token streams only (decided, §5.2) |
 | Direct-path stream lost on gateway failure | Not resumable by design; the final result is always in the ledger (§5.2) |
 | Stale worker acks a re-leased attempt | Attempt-fenced ack/nack/reject (#87) and extend (§4.3), used exclusively by the swarm |
-| Multi-node agents blocked on messaging network protocol and replication | Single-node scope until gap 8 (§4.8); phases S1–S3 run on one broker node |
+| Multi-node agents blocked on messaging network protocol and replication | Single-node scope until gap 9 (§4.8); phases S1–S3 run on one broker node |
 | Budget overspend across nodes (S0–S2) | Soft global cap with a stated bound, `Σ F_n·ε_max + Σ D_n(T_sync)` (§8); `ε_max = 0` when the estimate is enforced as a per-call cap; hard per-node sub-allocation in S3 |
 | Retrying non-idempotent LLM POSTs duplicates cost | Retry a POST only with `Idempotency-Key` (decided, §10.2) |
 | An agent cert compromise | Separate agent intermediate CA with short-lived certs, revoked independently of nodes (§6); `AuditLog`; per-agent GCRA caps the blast radius |
