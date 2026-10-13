@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
@@ -320,30 +321,79 @@ class ProxyEdgeTest {
     }
 
     /**
-     * A small budget still delivers the body and returns every byte. Chunk sizes on a live socket
-     * depend on how far the consumer gets ahead of the event loop, so the 16 KiB cap itself is
-     * checked on the allocator in {@link #pressuredReadsStayAtMost16KiB()}.
+     * Under budget pressure the event loop caps socket reads at 16 KiB. Other exchanges already
+     * hold the budget on the pressure line, and this client takes a chunk only once the budget is
+     * exhausted: the capped read is queued, and releasing it leaves the pressure line intact so
+     * the next refill stays capped.
      */
     @Test
-    void smallBudgetDeliversTheBodyAndReleasesIt() throws Exception {
+    @Timeout(15)
+    void readsShrinkUnderBudgetPressure() throws Exception {
         int size = 1 << 20;
+        var budget = new ByteBudget(64 * 1024);
+        long heldByOthers = budget.limit() - (budget.limit() >> 2);
+        budget.add(heldByOthers);
         try (var s = script("HTTP/1.1 200 OK\r\nContent-Length: " + size + "\r\n\r\n" + "v".repeat(size))) {
-            var budget = new ByteBudget(64 * 1024);
             var d = Duration.ofSeconds(5);
             try (var p = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://127.0.0.1:" + s.getLocalPort()), d, d, d,
                     1 << 20, null, List.of(), false, 4), budget)) {
                 var src = ((Body.Stream) p.handle(new Request("GET", "/big")).body()).source();
-                long total = 0;
-                long peak = 0;
-                for (var b = src.next(); b != null; b = src.next()) {
-                    total += b.remaining();
-                    peak = Math.max(peak, budget.inFlight());
+                try {
+                    long total = 0;
+                    int large = 0;
+                    int held = 0;
+                    var first = new StringBuilder();
+                    while (total < size) {
+                        long inFlight = awaitExhausted(budget, total, size, heldByOthers);
+                        var b = src.next();
+                        if (b == null) {
+                            break;
+                        }
+                        int n = b.remaining();
+                        if (first.length() < 64) {
+                            if (!first.isEmpty()) {
+                                first.append(',');
+                            }
+                            first.append(n);
+                        }
+                        if (n > UpstreamPool.SMALL_READ) {
+                            large++;
+                        }
+                        if (inFlight >= budget.limit()) {
+                            held++;
+                        }
+                        total += n;
+                    }
+                    assertEquals(size, total);
+                    assertEquals(heldByOthers, budget.inFlight());
+                    assertTrue(held > 8, "takes while exhausted: " + held + " first sizes " + first);
+                    assertEquals(0, large, "reads above 16 KiB under pressure, first sizes " + first);
+                } finally {
+                    src.close();
                 }
-                src.close();
-                assertEquals(size, total);
-                assertEquals(0, budget.inFlight());
-                assertTrue(peak <= budget.limit() + UpstreamPool.MAX_READ, "peak " + peak);
             }
+        } finally {
+            budget.release(heldByOthers);
+        }
+    }
+
+    /**
+     * Spins until the budget is exhausted, or this exchange's unread tail is already queued.
+     * Exhausted implies pressured, and with {@code heldByOthers} sitting on the pressure line a
+     * 16 KiB take cannot clear it.
+     */
+    private static long awaitExhausted(ByteBudget budget, long taken, long size, long heldByOthers) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (true) {
+            long inFlight = budget.inFlight();
+            long body = inFlight - heldByOthers;
+            if (inFlight >= budget.limit() || body > 0 && taken + body >= size) {
+                return inFlight;
+            }
+            if (System.nanoTime() >= deadline) {
+                fail("budget was not exhausted: inFlight=" + inFlight + " taken=" + taken + "/" + size);
+            }
+            Thread.onSpinWait();
         }
     }
 
