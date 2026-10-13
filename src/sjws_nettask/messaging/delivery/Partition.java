@@ -339,6 +339,9 @@ public final class Partition implements AutoCloseable {
      */
     private List<Leased> pollLocked(String group, String consumer, int max, long visibilityMs) {
         var g = state.group(group);
+        // Empty poll (a spinning or woken consumer finding nothing): no allocation at all.
+        if ((g.due.isEmpty() || g.due.first().atMs() > clockMs.getAsLong())
+                && (state.messages.isEmpty() || state.messages.lastKey() < g.cursor)) return List.of();
         long now = clockMs.getAsLong();
         var out = new ArrayList<Leased>(Math.min(max, 16));
         var policy = state.policy();
@@ -712,6 +715,17 @@ public final class Partition implements AutoCloseable {
         // Nothing is serialized under the lock: the snapshotter rebuilds the state at `off` from the newest
         // snapshot file plus the log tail (deterministic replay) and serializes that private copy.
         var prev = lastSnapshot;
+        // A small state (the common request/reply case: almost nothing live) is cheaper to serialize here than
+        // to rebuild by replaying the whole tail off-lock, which allocates about as much as the live appends did.
+        if (state.serializedEntries() <= INLINE_SNAPSHOT_ENTRIES) {
+            var data = state.serialize();
+            lastSnapshot = prev.handleAsync((v, t) -> {
+                awaitDurable(off);
+                writeSnapshot(off, data);
+                return off;
+            }, snapshotter);
+            return lastSnapshot;
+        }
         lastSnapshot = prev.handleAsync((v, t) -> {
             writeSnapshot(off, rebuildAt(off));
             return off;
@@ -723,15 +737,26 @@ public final class Partition implements AutoCloseable {
      * Snapshotter thread. State at {@code off}, rebuilt off-lock: newest snapshot file (or empty) + replay of
      * {@code [base, off)}. Only reads log at or above the newest snapshot, which retention/compaction never touch.
      */
-    private byte[] rebuildAt(long off) {
+    /** Snapshots of at most this many serialized entries are taken under the lock (bounded, ~100 µs). */
+    static final long INLINE_SNAPSHOT_ENTRIES = 16_384;
+
+    /** Snapshotter thread. A snapshot is only valid once the log is durable through {@code off}: wait for the writer, then fsync. */
+    private void awaitDurable(long off) {
         try {
-            // The snapshot is only valid if the log is durable through `off`: wait for the writer, then fsync.
             long deadline = System.nanoTime() + 30_000_000_000L;
             while (writer.snapshot().nextOffset() < off) {
                 if (System.nanoTime() > deadline) throw new IOException("log never reached snapshot offset " + off);
                 LockSupport.parkNanos(100_000);
             }
             log.force();
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
+    private byte[] rebuildAt(long off) {
+        try {
+            awaitDurable(off);
             var policy = state.policy();
             DeliveryState st = null;
             Long base = snapshots.floor(off);
@@ -841,7 +866,22 @@ public final class Partition implements AutoCloseable {
     // ---- inspection ----
 
     /** Exact counts as of the last applied entry. Lock-free, never stale. */
-    public DeliveryCounts counts() { return counts.get(); }
+    /**
+     * Exact counts as of the last applied entry. Computed on first read after a change (an append only marks them
+     * stale, so the hot path allocates nothing for them); a stale read takes the lock briefly.
+     */
+    public DeliveryCounts counts() {
+        var c = counts.get();
+        if (c != null) return c;
+        lock.lock();
+        try {
+            c = counts.get();
+            if (c == null) { c = state.counts(); counts.set(c); }
+            return c;
+        } finally {
+            lock.unlock();
+        }
+    }
 
     /**
      * Paged view. Lock-free unless the view is older than {@code maxStaleNanos} while the partition stays busy, in
@@ -893,7 +933,7 @@ public final class Partition implements AutoCloseable {
     }
 
     private void publish() {
-        counts.set(state.counts());
+        counts.setRelease(null); // stale: rebuilt lazily by counts()
         if (eager || snapshot.get() == null) rebuild();
     }
 
