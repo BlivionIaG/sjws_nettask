@@ -418,7 +418,10 @@ final class Daemon {
     static void applyServerEnv(Map<String, String> childEnv, Map<String, String> configured) {
         childEnv.keySet().removeIf(k -> k.startsWith("WEB_SERVER_"));
         configured.forEach((k, v) -> {
-            if (k.startsWith("WEB_SERVER_") && v != null) {
+            // The cluster key would be visible in the child's /proc/pid/environ. The child
+            // reads ha.cluster_key or ha.cluster_key_file instead.
+            if (k.startsWith("WEB_SERVER_") && v != null && !k.equals("WEB_SERVER_HA_CLUSTER_KEY")
+                    && !k.equals("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")) {
                 childEnv.put(k, v);
             }
         });
