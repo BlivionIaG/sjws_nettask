@@ -105,16 +105,12 @@ class NodeFixturesTest {
     }
 
     @Test
-    void connectedDataNodeIsRefusedRatherThanFaked() {
+    void controlPlaneScenariosStayPendingWithoutVoters() {
         assertFalse(new PendingControlPlane().available());
-        assertFalse(NodeFixtures.dataRoleCanJoin());
-        var thrown = assertThrows(ControlPlanePendingException.class, () -> NodeFixtures.connected(root));
-        assertTrue(thrown.getMessage().startsWith("TODO"), thrown.getMessage());
-        assertTrue(thrown.getMessage().contains("ServiceLaunch"), thrown.getMessage());
-        assertTrue(thrown.getMessage().contains("watch"), thrown.getMessage());
-        assertTrue(thrown.getMessage().contains(ControlPlaneDesign.PR), thrown.getMessage());
+        assertTrue(NodeFixtures.dataRoleCanJoin());
+        assertTrue(NodeFixtures.VOTERS_PENDING.startsWith("TODO"));
+        assertTrue(NodeFixtures.VOTERS_PENDING.contains(ControlPlaneDesign.PR));
         assertNull(NodeEnrollment.current());
         assertThrows(IllegalArgumentException.class, () -> NodeFixtures.pending(root, "standalone"));
-        assertThrows(ControlPlanePendingException.class, ConnectedDataNode::new);
     }
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Interleaved A/B wrk benchmark of two sjws_nettask builds on one host.
 # Usage: tools/perf-gate/bench.sh BASE_JAR HEAD_JAR OUT_DIR
-# Env: RUNS (5), DURATION (10s), WARMUP (5s), THREADS (2), CONNECTIONS (64), BODY_BYTES (1024)
+# Env: SERVER_ARGS (extra server options, e.g. "--role=standalone --config=FILE"),
+#      JAVA_OPTS (extra JVM options), RUNS (5), DURATION (10s), WARMUP (5s), THREADS (2), CONNECTIONS (64), BODY_BYTES (1024)
 # Each server runs in standalone mode (default; no cluster/gateway flags) with access logging off.
 # Rounds alternate base/head so host drift hits both equally. Writes OUT_DIR/{base,head}.jsonl.
 set -euo pipefail
@@ -18,7 +19,8 @@ trap cleanup EXIT
 head -c "$BODY_BYTES" /dev/zero > "$ROOT/index.html"
 
 start() { # name jar port
-  "$JAVA" -Xms256m -Xmx256m -jar "$2" "$3" "$ROOT" > "$OUT/$1-server.log" 2>&1 &
+  # shellcheck disable=SC2086
+  "$JAVA" -Xms256m -Xmx256m ${JAVA_OPTS:-} -jar "$2" "$3" "$ROOT" ${SERVER_ARGS:-} > "$OUT/$1-server.log" 2>&1 &
   PIDS+=($!)
   for _ in $(seq 100); do
     curl -sf -o /dev/null "http://127.0.0.1:$3/index.html" && return 0

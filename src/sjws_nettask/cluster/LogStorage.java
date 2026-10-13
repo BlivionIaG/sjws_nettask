@@ -39,4 +39,19 @@ public interface LogStorage {
     void force(GroupId group) throws IOException;
 
     int forces(GroupId group);
+
+    /**
+     * Last witness ack that {@link #force} has made durable, or 0. This is not {@link #lastIndex}:
+     * a witness records the cursor without storing entries.
+     */
+    long witnessIndex(GroupId group) throws IOException;
+
+    /** Term paired with {@link #witnessIndex}, or 0. */
+    long witnessTerm(GroupId group) throws IOException;
+
+    /**
+     * Stage a witness ack when {@code (term, index)} is strictly ahead of the cursor. A lower pair
+     * is ignored. The stage is durable only after {@link #force}.
+     */
+    void noteWitness(GroupId group, long index, long term) throws IOException;
 }

@@ -1,0 +1,57 @@
+name: Contrib
+
+# Validates the packaged samples: each role config through the real ConfigLoader
+# (tests/sjws_nettask/RoleSampleTest.java) and the systemd units with systemd-analyze verify.
+on:
+  push:
+    branches: [master]
+    paths: &paths
+      - 'contrib/**'
+      - 'src/sjws_nettask/config/**'
+      - 'tests/sjws_nettask/RoleSampleTest.java'
+      - '.github/workflows/contrib.yml'
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contrib-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  samples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Load each role sample with the real config loader
+        run: mvn -B -Dtest=RoleSampleTest -Dsurefire.failIfNoSpecifiedTests=true -Djacoco.skip=true test
+      - name: systemd-analyze verify
+        run: |
+          if ! command -v systemd-analyze > /dev/null; then
+            echo "::warning::systemd-analyze not available; skipping unit verification"
+            exit 0
+          fi
+          d="$(mktemp -d)"
+          cp contrib/*.service "$d/"
+          mkdir -p "$d/sjws_nettask-data@.service.d"
+          cp contrib/sjws_nettask-data-same-host.conf "$d/sjws_nettask-data@.service.d/same-host.conf"
+          # Units reference /usr/bin/java and User=sjws; make both resolvable on the runner.
+          [ -x /usr/bin/java ] || sudo ln -sf "$JAVA_HOME/bin/java" /usr/bin/java
+          id sjws > /dev/null 2>&1 || sudo useradd --system --no-create-home sjws
+          set -o pipefail
+          SYSTEMD_UNIT_PATH="$d:" systemd-analyze verify \
+            sjws_nettask.service \
+            sjws_nettask-control@1.service \
+            sjws_nettask-data@1.service 2>&1 | tee verify.log
+          if grep -v -e 'Failed to put bus name' -e 'Failed to connect to bus' verify.log | grep -q .; then
+            echo "::error::systemd-analyze reported problems"; exit 1
+          fi

@@ -103,9 +103,13 @@ What the code enforces today:
   revoked certificate is refused, and each refusal is written to the audit log. A revocation file
   that is configured but missing or invalid fails closed. Reloading invalidates cached TLS
   sessions. Connections that are already open stay open until they close.
-- **Join tokens** are stored as SHA-256 hashes and bound to the first node identity that presents
-  them. They expire after a TTL (default 1 hour, at most 24 hours), and a different identity is
-  rejected.
+- **Join tokens** are one-shot, and this is enforced. The control plane stores only a SHA-256
+  hash of each token. A token must be issued before it can be used, and it expires after a TTL
+  (default 1 hour, at most 24 hours). It is burned atomically, through the Raft-replicated CP log,
+  the first time it is used successfully, and the burn survives restarts and leader changes. A
+  second use from any node is refused. The one exception is a retry from the same node with the
+  same token within 10 minutes (for example after a lost response): it gets back the registration
+  that was already issued, and the token is not accepted again.
 - **Configuration snapshots** pushed to data nodes are Ed25519-signed and checked for signature,
   freshness and rollback (version floor) before they are applied.
 - **ACME** account and domain keys are written with mode `0600` in a `0700` directory.
@@ -120,8 +124,8 @@ Recommendations:
 - **Keep cluster and control-plane traffic on a private, trusted network.** The HA heartbeat is plain
   UDP, and the node-to-control-plane channel (an mTLS watch in the design) is not yet authenticated
   in code. Snapshots are signed, but the transport is not encrypted.
-- Treat join tokens as one-shot secrets: deliver each through a file readable only by the service
-  user, use the shortest practical TTL, and never put them in arguments, logs or the repository.
+- Deliver each join token through a file readable only by the service user, use the shortest
+  practical TTL, and never put tokens in arguments, logs or the repository.
 - The swarm (`/swarm/v1`) endpoints have no built-in authentication. Enable them only behind the
   gateway's API-key or JWT filters, or on a private listener.
 - Issue admin client certificates from a dedicated admin CA. When a key is lost or a person

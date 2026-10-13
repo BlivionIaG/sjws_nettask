@@ -46,6 +46,8 @@ public final class ServiceLaunch {
         private final Bootstrap bootstrap;
         private final long drainBudgetMs;
         private NodeEnrollment enrollment;
+        /** A {@code sjws_nettask.cp.DataWatch} on a data node; typed loosely so this class names no cp type. */
+        private AutoCloseable watch;
 
         private Hooks(Bootstrap bootstrap, long drainBudgetMs) {
             this.bootstrap = bootstrap;
@@ -65,6 +67,29 @@ public final class ServiceLaunch {
             if (server != null) {
                 server.setLocalReload(this::reloadLocal);
             }
+            if (server != null && this.bootstrap.role() == NodeRole.DATA) {
+                this.watch = openWatch(server);
+            }
+        }
+
+        /**
+         * Dials the control plane (design §8). An address the watch cannot use, or no join token,
+         * leaves the node {@code pending}: it keeps serving what it has and does not exit.
+         */
+        private AutoCloseable openWatch(SjwsServer server) {
+            var join = this.bootstrap.join();
+            var contact = this.bootstrap.controlPlane();
+            if (join == null || contact == null || contact.isBlank()) {
+                return null;
+            }
+            try {
+                return sjws_nettask.cp.DataWatch.open(contact, this.bootstrap.nodeId(), join.tokenId(),
+                        join.copySecret(), this.bootstrap.pinFile(), this.bootstrap.stateDir(), server,
+                        this.enrollment, System::currentTimeMillis);
+            } catch (IOException e) {
+                System.err.println("WARN: control-plane watch not started: " + e.getMessage());
+                return null;
+            }
         }
 
         @Override
@@ -83,6 +108,14 @@ public final class ServiceLaunch {
 
         @Override
         public void onShutdown() {
+            var running = this.watch;
+            if (running != null) {
+                try {
+                    running.close();
+                } catch (Exception e) {
+                    // Shutdown continues; the watch thread is a daemon.
+                }
+            }
             var open = this.enrollment;
             if (open != null) {
                 open.close();
