@@ -65,9 +65,8 @@ import sjws_nettask.service.ServiceLaunch;
  * {@code WatchServer} on an ephemeral port, and one data-role {@code SjwsServer} whose
  * {@code ServiceLaunch} hooks open the real data-node watch. The node reports
  * {@code connection=connected} and applies each pushed {@code SignedSnapshot} on its own; nothing
- * here attaches a {@code ControlPlaneBinding}. The multi-voter {@link ControlPlane} the four fault
- * scenarios in {@code ClusterScenariosTest} need is still {@link PendingControlPlane}, so
- * {@link ClusterHarness#open} still refuses {@link ClusterHarness.DataRole#DATA} there.
+ * here attaches a {@code ControlPlaneBinding}. The four fault scenarios in
+ * {@code ClusterScenariosTest} use the multi-voter {@link CpStoreControlPlane} instead.
  */
 public final class NodeFixtures {
 
@@ -76,14 +75,6 @@ public final class NodeFixtures {
      * command line, in {@code --status}, or in a log. It is not a production secret.
      */
     public static final String JOIN_SECRET = "0123456789abcdef";
-
-    /**
-     * Why {@link ControlPlane} scenarios stay disabled: {@code CpStore} is a single voter, so
-     * {@code start(3|5)}, {@code killLeader}, and partitions have no real implementation yet.
-     */
-    public static final String VOTERS_PENDING = "TODO https://github.com/BlivionIaG/sjws_nettask/pull/38"
-            + " — CpStore is a single voter; multi-voter cp-config (start 3/5, killLeader, partition, delay)"
-            + " is still missing, so PendingControlPlane.available() is false.";
 
     private NodeFixtures() {
     }

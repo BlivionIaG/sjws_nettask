@@ -66,6 +66,9 @@ public final class DataWatch implements AutoCloseable {
     private volatile HttpURLConnection open;
     private DataApply apply;
     private volatile long applied;
+    private volatile String appliedHash;
+    /** Status when no {@link NodeEnrollment} was given (several watches in one test process). */
+    private volatile ControlPlaneBinding own;
     private long skipped;
     private String state = "pending";
     private long reportedVersion;
@@ -102,7 +105,8 @@ public final class DataWatch implements AutoCloseable {
      * Starts the watch over mutual TLS when {@code cpTls} is set: any host, {@code https}, the CP
      * certificate checked against the pinned CA and {@link CpTls#peerName()}. The join token may be
      * null once this node has joined, because its certificate is then the credential. With
-     * {@code cpTls} null this is the plain loopback watch.
+     * {@code cpTls} null this is the plain loopback watch. {@code enrollment} may be null: the
+     * status then stays in {@link #binding()} only (several data nodes in one test process).
      */
     public static DataWatch open(String controlPlane, String nodeId, String tokenId, byte[] secret, Path pin,
             Path stateDir, SjwsServer server, NodeEnrollment enrollment, LongSupplier nowMillis, CpTls cpTls)
@@ -140,6 +144,11 @@ public final class DataWatch implements AutoCloseable {
             throw new IOException("plain control-plane watch is loopback-only; configure cpTls for a remote CP");
         }
         return URI.create(scheme + "://" + uri.getHost() + ":" + uri.getPort());
+    }
+
+    /** Canonical hash of the envelope last applied through this watch; null before the first apply. */
+    public String appliedHash() {
+        return this.appliedHash;
     }
 
     /** Highest version applied through this watch; 0 before the first apply. */
@@ -205,6 +214,7 @@ public final class DataWatch implements AutoCloseable {
             return;
         }
         this.applied = snapshot.version();
+        this.appliedHash = snapshot.canonicalHashHex();
         report("connected");
         var ack = request("POST", "/cp/v1/watch/ack?version=" + snapshot.version());
         int status = ack.getResponseCode();
@@ -351,6 +361,10 @@ public final class DataWatch implements AutoCloseable {
         }
         this.state = shown;
         this.reportedVersion = version;
+        if (this.enrollment == null) {
+            this.own = binding;
+            return;
+        }
         try {
             this.enrollment.attach(binding);
         } catch (IOException | IllegalStateException e) {
@@ -360,7 +374,7 @@ public final class DataWatch implements AutoCloseable {
 
     /** The binding last reported, for tests and {@code --status}. */
     public ControlPlaneBinding binding() {
-        return this.enrollment.binding();
+        return this.enrollment == null ? this.own : this.enrollment.binding();
     }
 
     @Override
