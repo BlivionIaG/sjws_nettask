@@ -110,6 +110,25 @@ class ResponseWriterTest {
     }
 
     @Test
+    void streamStopsWhenTheStreamIsGone() {
+        var stalled = new Recorder();
+        stalled.active = false;
+        stalled.stallAfter = 0; // the head write never completes and the stream is inactive
+        var src = new sjws_nettask.core.TestSource(false, new byte[2]);
+        assertEquals(ResponseWriter.Outcome.CLOSED, write(stalled, new Response(200, ResponseHeaders.of(), new Body.Stream(2, src))));
+        assertEquals(1, src.closes);
+    }
+
+    @Test
+    void zeroLengthStreamEndsWithTheHead() {
+        var r = new Recorder();
+        var src = new sjws_nettask.core.TestSource(false);
+        assertEquals(ResponseWriter.Outcome.COMPLETE, write(r, new Response(200, ResponseHeaders.of(), new Body.Stream(0, src))));
+        assertEquals(List.of(true), r.ends);
+        assertEquals(1, src.closes);
+    }
+
+    @Test
     void streamLengthMismatchHeadAndClosedSink() {
         var shortR = new Recorder();
         assertEquals(ResponseWriter.Outcome.SHRANK, write(shortR,

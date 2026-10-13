@@ -73,6 +73,19 @@ class RouteErrorsTest {
     }
 
     private static String body(Response r) {
+        if (r.body() instanceof Body.Stream st) { // proxied bodies stream (phase 2)
+            var out = new java.io.ByteArrayOutputStream();
+            try (var src = st.source()) {
+                for (var buf = src.next(); buf != null; buf = src.next()) {
+                    var c = new byte[buf.remaining()];
+                    buf.get(c);
+                    out.write(c, 0, c.length);
+                }
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+            return out.toString(StandardCharsets.UTF_8);
+        }
         var b = (Body.Bytes) r.body();
         var bytes = new byte[(int) b.length()];
         b.data().duplicate().get(bytes);
