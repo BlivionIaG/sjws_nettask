@@ -322,13 +322,15 @@ These are the reference points for the targets below. Neither this PR nor the ta
 **Targets** (Messaging Core, single node, same box as #69; these are pass thresholds, not results):
 | Workload | Target |
 |---|---|
-| Task dispatch (poll + ack, 1 KiB task, 16 workers) | ≥ 50k tasks/s, poll p99 < 100 µs |
+| Task dispatch (poll + ack, 1 KiB task, **workers = vCPU count**; 8 on the reference box) | ≥ 50k tasks/s, poll p99 < 100 µs |
 | Heartbeat/extend (10k leases, every 5 s) | ≤ 2k appends/s; < 2 % throughput loss vs no heartbeats |
 | Request/reply round trip (in-process) | p50 < 50 µs, p99 < 500 µs at 10k req/s |
 | Token streaming (1 KiB chunks, 1k concurrent streams) | ≥ 100 MiB/s aggregate, in order, chunk p99 < 1 ms producer→consumer |
 | Lease-expiry redelivery | within visibility + 10 ms |
 | Recovery with 1 M in-flight tasks | < 5 s |
 | Off | wrk within the noise band; no messaging threads |
+
+**S1c gate (decided 2026-10-14, inceptor).** The S1c latency gate is: claim p99 < 100 µs on the task-dispatch row, heartbeat loss < 2 %, and request/reply p99 < 500 µs. Dispatch is measured with **workers = the machine's vCPU count**, and every result states that core count. The reference box has 8 vCPU, so the gate is `SwarmBench dispatch 8`. The 16-worker run (16 on 8 vCPU) is reported as a **stress line, not the gate**: with more runnable workers than cores, a lock holder can be descheduled mid-section, so its p99 measures scheduling as much as code. The batched variant (`SwarmBench batched <W>x<B>`: claim up to `B` and settle with one batched fenced ack, `TaskService.ackAll`) is reported separately and is not the gate, because its claim latency is per batch, not per task. The §13 claim-1/ack-1 workload stays as it is.
 
 **Architecture additions:**
 1. **Streaming over HTTP:** time-to-first-token and inter-token latency added by sjws, agent emit → caller receive, on HTTP/1.1 chunked, SSE, h2 and h3. Ledger leg vs the optional direct path (§5.2).

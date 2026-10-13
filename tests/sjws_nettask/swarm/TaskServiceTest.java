@@ -345,4 +345,29 @@ class TaskServiceTest {
             new Topics(file, RetryPolicy.DEFAULT, this.now::get).partition("t");
         });
     }
+
+    @Test
+    void ackAllIsOneFencedBatchPerPool() {
+        for (int i = 0; i < 4; i++) {
+            this.tasks.submit("ba", 1, i + 1, env("t" + i, "", TaskEnvelope.NO_DEADLINE));
+        }
+        var got = this.tasks.claim("ba", "w", 4, 1_000);
+        assertEquals(4, got.size(), "claim with max > 1");
+        assertEquals(LeaseResult.OK, this.tasks.ack(got.get(1)));
+        // a stale attempt in the batch: re-lease task 2 after expiry, then ack with the old attempt
+        this.now.addAndGet(1_001);
+        var again = this.tasks.claim("ba", "w2", 4, 1_000);
+        assertEquals(3, again.size());
+        var results = this.tasks.ackAll(got);
+        assertEquals(List.of(LeaseResult.STALE_ATTEMPT, LeaseResult.NOT_IN_FLIGHT, LeaseResult.STALE_ATTEMPT,
+                LeaseResult.STALE_ATTEMPT), results);
+        assertEquals(List.of(LeaseResult.OK, LeaseResult.OK, LeaseResult.OK), this.tasks.ackAll(again));
+        assertTrue(this.tasks.claim("ba", "w3", 4, 1_000).isEmpty());
+        this.now.addAndGet(2_000);
+        assertTrue(this.tasks.claim("ba", "w3", 4, 1_000).isEmpty(), "acked, not redelivered");
+        assertEquals(List.of(), this.tasks.ackAll(List.of()));
+        this.tasks.submit("bb", 1, 1, env("x", "", TaskEnvelope.NO_DEADLINE));
+        var mixed = List.of(again.get(0), this.tasks.claim("bb", "w", 1, 1_000).get(0));
+        assertThrows(IllegalArgumentException.class, () -> this.tasks.ackAll(mixed));
+    }
 }
