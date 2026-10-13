@@ -193,6 +193,77 @@ class HeartbeatAuthTest {
     }
 
     @Test
+    void aForgedFutureEpochDoesNotLockOutTheRealSender() {
+        var auth = auth(ClusterKey.of(CURRENT, null));
+        long now = 50_000L;
+        long edge = now + HeartbeatAuthenticator.WINDOW_MILLIS;
+        var real = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now, 3, edge, 1, HeartbeatAuthenticator.KEY_CURRENT, real);
+        assertNotNull(open(auth, real, now), "an epoch at the skew window is a boot time");
+
+        var forged = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now, 1, Long.MAX_VALUE, 1, HeartbeatAuthenticator.KEY_CURRENT, forged);
+        assertNull(open(auth, forged, now), "a huge epoch is rejected");
+        assertEquals(1, auth.rejected(HeartbeatAuthenticator.Reason.EPOCH));
+        assertEquals(1, auth.trackedSenders());
+
+        var still = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now, 4, edge, 1, HeartbeatAuthenticator.KEY_CURRENT, still);
+        assertNotNull(open(auth, still, now), "the real sender is still accepted");
+        assertEquals(1, auth.rejected(HeartbeatAuthenticator.Reason.EPOCH));
+
+        var aheadOfNow = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(3, 1), edge, 1, edge + 1, 1, HeartbeatAuthenticator.KEY_CURRENT, aheadOfNow);
+        assertNull(open(auth, aheadOfNow, now), "an epoch past now plus the window is rejected");
+        assertEquals(2, auth.rejected(HeartbeatAuthenticator.Reason.EPOCH));
+        assertEquals(1, auth.trackedSenders());
+        assertThrows(IllegalArgumentException.class,
+                () -> new HeartbeatAuthenticator(ClusterKey.of(CURRENT, null), CLOCK, -1L));
+    }
+
+    @Test
+    void aLowerEpochIsAcceptedOnlyAfterTheDeadInterval() {
+        long dead = 5_000L;
+        long now = 30_000L;
+        var auth = new HeartbeatAuthenticator(ClusterKey.of(CURRENT, null), new FakeClock(0), dead);
+        var high = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now, 3, 20_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, high);
+        assertNotNull(open(auth, high, now));
+
+        var low = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now, 1, 10_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, low);
+        assertNull(open(auth, low, now), "a live sender keeps its epoch");
+        assertEquals(1, auth.rejected(HeartbeatAuthenticator.Reason.EPOCH));
+        var next = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now, 4, 20_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, next);
+        assertNotNull(open(auth, next, now), "the real sender is still accepted");
+
+        long early = now + dead - 1;
+        var tooSoon = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), early, 1, 10_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, tooSoon);
+        assertNull(open(auth, tooSoon, early));
+        assertEquals(2, auth.rejected(HeartbeatAuthenticator.Reason.EPOCH));
+
+        long later = now + dead;
+        var restarted = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), later, 1, 10_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, restarted);
+        assertNotNull(open(auth, restarted, later), "silence of the dead interval allows an earlier boot");
+        var follow = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), later, 2, 10_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, follow);
+        assertNotNull(open(auth, follow, later));
+        assertNull(open(auth, restarted, later));
+        assertEquals(1, auth.rejected(HeartbeatAuthenticator.Reason.SEQ));
+
+        var strict = auth(ClusterKey.of(CURRENT, null));
+        var first = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), now, 1, 20_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, first);
+        assertNotNull(open(strict, first, now));
+        var backward = new byte[HeartbeatAuthenticator.PACKET_BYTES];
+        seal(CURRENT, body(2, 1), later, 1, 10_000L, 1, HeartbeatAuthenticator.KEY_CURRENT, backward);
+        assertNull(open(strict, backward, later), "without a dead interval a lower epoch stays rejected");
+    }
+
+    @Test
     void aRestartedSenderIsAcceptedAndAPreBootCaptureIsNot() {
         var clock = new FakeClock(0L);
         clock.setWallMillis(5_000L);

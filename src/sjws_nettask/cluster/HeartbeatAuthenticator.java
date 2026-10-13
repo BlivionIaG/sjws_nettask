@@ -51,8 +51,13 @@ import javax.crypto.spec.SecretKeySpec;
  * tag is not a tag for any other use of the same secret. The key id selects one key; a packet is
  * not tried against both.
  *
- * <p>Replay state is {@code (sender, bootEpoch, sequence)}. A newer boot epoch resets that
- * sender's high-water mark, so a restarted node is accepted. A timestamp older than this
+ * <p>Replay state is {@code (sender, bootEpoch, sequence, lastAcceptedMillis)}. A newer boot epoch
+ * resets that sender's high-water mark, so a restarted node is accepted. An epoch later than the
+ * packet timestamp, or later than the receiver's now, by more than {@link #WINDOW_MILLIS} is
+ * dropped and does not update that state: a boot time cannot sit in the future, so one forged
+ * epoch cannot lock a member out. A lower epoch is accepted only after the sender has been
+ * silent for at least the membership dead interval, which is a clock step backwards across a
+ * restart of a member the receiver already treats as dead. A timestamp older than this
  * process's boot is dropped, so a capture from before this process started is not replayed.
  * A destination other than this node is dropped. A sender that is not in the membership list
  * is dropped and is not inserted into the map. The map is then bounded by the membership list.
@@ -95,6 +100,7 @@ public final class HeartbeatAuthenticator {
     private final Mac currentMac;
     private final Mac previousMac;
     private final long bootEpoch;
+    private final long deadAfterMillis;
     private final byte[] macBuf = new byte[MAC_LENGTH];
     private final byte[] tagBuf = new byte[MAC_LENGTH];
     private final byte[] body = new byte[BODY_BYTES];
@@ -104,8 +110,20 @@ public final class HeartbeatAuthenticator {
     private long lastTimeWarnMillis = Long.MIN_VALUE;
 
     public HeartbeatAuthenticator(ClusterKey key, Clock clock) {
+        this(key, clock, 0L);
+    }
+
+    /**
+     * @param deadAfterMillis silence after which a lower boot epoch is accepted. Zero never
+     *        accepts a lower epoch. This is the membership dead interval.
+     */
+    public HeartbeatAuthenticator(ClusterKey key, Clock clock, long deadAfterMillis) {
         Objects.requireNonNull(key, "cluster key");
         Objects.requireNonNull(clock, "clock");
+        if (deadAfterMillis < 0) {
+            throw new IllegalArgumentException("deadAfter");
+        }
+        this.deadAfterMillis = deadAfterMillis;
         this.bootEpoch = clock.currentTimeMillis();
         this.currentMac = mac(derive(key.current()));
         this.previousMac = key.hasPrevious() ? mac(derive(key.previous())) : null;
@@ -219,9 +237,14 @@ public final class HeartbeatAuthenticator {
             if (seq <= 0) {
                 return drop(Reason.SEQ);
             }
+            // A boot epoch is a time, so it cannot lead the packet or the receiver by more than
+            // the skew window. Reject before touching replay state.
+            if (epochAfter(epoch, timestamp) || epochAfter(epoch, nowMillis)) {
+                return drop(Reason.EPOCH);
+            }
             var sender = this.last.get(beat.fromWire());
-            if (sender == null || epoch > sender.epoch) {
-                this.last.put(beat.fromWire(), new Sender(epoch, seq));
+            if (sender == null || epoch > sender.epoch || lowerEpochAfterSilence(sender, epoch, nowMillis)) {
+                this.last.put(beat.fromWire(), new Sender(epoch, seq, nowMillis));
                 return beat;
             }
             if (epoch < sender.epoch) {
@@ -231,6 +254,7 @@ public final class HeartbeatAuthenticator {
                 return drop(Reason.SEQ);
             }
             sender.seq = seq;
+            sender.seenMillis = nowMillis;
             return beat;
         } finally {
             this.lock.unlock();
@@ -247,6 +271,23 @@ public final class HeartbeatAuthenticator {
         }
         write(dest, body, nowMillis, seq, bootEpoch, destWire, keyId);
         writeMac(mac(derive(key)), dest);
+    }
+
+    /** True when {@code epoch} is later than {@code time} by more than {@link #WINDOW_MILLIS}. */
+    private static boolean epochAfter(long epoch, long time) {
+        long limit = time > Long.MAX_VALUE - WINDOW_MILLIS ? Long.MAX_VALUE : time + WINDOW_MILLIS;
+        return epoch > limit;
+    }
+
+    /**
+     * A member that has already been silent for the dead interval may come back with an earlier
+     * boot epoch. Its clock stepped backwards across the restart. A live member is not reset.
+     */
+    private boolean lowerEpochAfterSilence(Sender sender, long epoch, long nowMillis) {
+        if (this.deadAfterMillis <= 0 || epoch >= sender.epoch) {
+            return false;
+        }
+        return nowMillis - sender.seenMillis >= this.deadAfterMillis;
     }
 
     private Heartbeat drop(Reason reason) {
@@ -356,10 +397,12 @@ public final class HeartbeatAuthenticator {
     private static final class Sender {
         private final long epoch;
         private long seq;
+        private long seenMillis;
 
-        private Sender(long epoch, long seq) {
+        private Sender(long epoch, long seq, long seenMillis) {
             this.epoch = epoch;
             this.seq = seq;
+            this.seenMillis = seenMillis;
         }
     }
 }
