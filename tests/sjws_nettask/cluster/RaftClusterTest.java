@@ -161,6 +161,7 @@ class RaftClusterTest {
         ReplicatedNode.driveAll(cluster.nodes);
         assertTrue(committed.isDone());
         assertEquals(0L, cluster.logs.get(2).lastIndex(GROUP));
+        assertTrue(cluster.logs.get(2).witnessIndex(GROUP) >= committed.get().index());
         cluster.net.heal(leader.self(), cluster.nodes.get(1).self());
 
         var majority = cluster(3, false, Durability.STRICT, 1_000_000);
