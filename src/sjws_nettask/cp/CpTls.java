@@ -68,6 +68,19 @@ public record CpTls(Path certPem, Path keyPem, Path caPem, Path revocations, Str
         }
     }
 
+    /**
+     * Server TLS for a CP listener (admin, watch, Raft transport): TLS 1.3 only, client
+     * certificate required, key file owner/mode checked. Refusals are audited as
+     * {@code <name>.handshake}; {@link CpServerTls#reloadTls()} keeps the old material on failure.
+     */
+    public static CpServerTls serverContext(CpListenerConfig config) throws CpKeyException {
+        return serverContext(config, (actor, action, target, outcome) -> { });
+    }
+
+    public static CpServerTls serverContext(CpListenerConfig config, AdminTls.Audit audit) throws CpKeyException {
+        return CpServerTls.open(config, audit);
+    }
+
     /** Reloadable, revocation-checked server context; refusals are audited as {@code cp-tls.handshake}. */
     AdminTls server(AdminTls.Audit audit) throws IOException {
         return AdminTls.openListener("cp-tls", certPem, keyPem, null, caPem, revocations, audit);
@@ -219,19 +232,4 @@ public record CpTls(Path certPem, Path keyPem, Path caPem, Path revocations, Str
         return identity != null && !identity.isEmpty() && names(cert).contains(identity);
     }
 
-    // ---- Security-owned seam (control-plane-hosting.md §2.4, §7). Security's listener PR replaces these stubs.
-    /**
-     * Builds the server TLS context for the CP listeners. <b>Stub until Security's PR lands:</b> always throws,
-     * so a CONTROL start (and a SIGHUP reload) fails closed.
-     */
-    public static javax.net.ssl.SSLContext serverContext(CpListenerConfig config)
-            throws java.security.GeneralSecurityException, java.io.IOException {
-        throw new java.security.GeneralSecurityException("CpTls.serverContext is not implemented yet (Security)");
-    }
-
-    /** Re-reads listener TLS material. <b>Stub until Security's PR lands:</b> always throws. */
-    public static void reloadTls() throws java.security.GeneralSecurityException, java.io.IOException {
-        throw new java.security.GeneralSecurityException("CpTls.reloadTls is not implemented yet (Security)");
-    }
-    // ---- end Security-owned seam
 }

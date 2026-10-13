@@ -19,26 +19,24 @@ package sjws_nettask.cp;
 import java.nio.file.Path;
 
 /**
- * <b>Security-owned placeholder.</b> Listener TLS settings for {@link WatchServer} and {@link AdminServer}
- * ({@code cp.tls.*}, control-plane-hosting.md §4/§7). Hosting only passes it through to
- * {@link CpTls#serverContext(CpListenerConfig)}; Security's listener-config PR replaces this whole file.
+ * One CP mTLS listener (admin, watch or Raft transport). Paths only; inline PEM is never accepted.
+ *
+ * @param name label used in audit actions, e.g. {@code cp-admin}
+ * @param certPem server certificate chain (PEM)
+ * @param keyPem server private key (PEM, unencrypted); owner-only 0600/0400 unless {@code insecureSkipPermissionChecks}
+ * @param caPem pinned CA bundle client certificates must chain to
+ * @param revocations CRL or denylist file as for {@link AdminTls}; null for none
+ * @param insecureSkipPermissionChecks dev only: skip the owner/mode check on {@code keyPem}
  */
-public record CpListenerConfig(Path cert, Path key, Path ca, Path adminCa) {
+public record CpListenerConfig(String name, Path certPem, Path keyPem, Path caPem, Path revocations,
+        boolean insecureSkipPermissionChecks) {
 
-    /** Minimal reading of the raw {@code cp.tls} block (paths only). Replaced by Security. */
-    static CpListenerConfig fromYaml(Object tls, Path base) {
-        if (!(tls instanceof java.util.Map<?, ?> map)) {
-            return new CpListenerConfig(null, null, null, null);
+    public CpListenerConfig {
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("cp listener requires a name");
         }
-        return new CpListenerConfig(path(map.get("cert"), base), path(map.get("key"), base), path(map.get("ca"), base),
-                path(map.get("adminCa"), base));
-    }
-
-    private static Path path(Object raw, Path base) {
-        if (!(raw instanceof String s) || s.isBlank()) {
-            return null;
+        if (certPem == null || keyPem == null || caPem == null) {
+            throw new IllegalArgumentException(name + " requires cert, key and ca");
         }
-        var p = Path.of(s);
-        return p.isAbsolute() || base == null ? p : base.resolve(p);
     }
 }

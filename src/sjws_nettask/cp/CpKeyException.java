@@ -16,8 +16,8 @@
  */
 package sjws_nettask.cp;
 
-/** Key material for the control role could not be loaded; the process must not start (hosting §2.3). */
-public class CpKeyException extends Exception {
+/** Control-plane key material refused. The message never carries key bytes. */
+public final class CpKeyException extends Exception {
 
     private static final long serialVersionUID = 1L;
 

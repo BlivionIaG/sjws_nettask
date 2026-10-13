@@ -17,32 +17,32 @@
 package sjws_nettask.cp;
 
 import java.nio.file.Path;
-import java.util.Objects;
 
 /**
- * Where {@link KeyRing#load(CpKeyConfig)} finds the control-plane key material (control-plane-hosting.md §2).
- * Agreed with Security: hosting owns this record and its parsing ({@link CpConfig}); Security owns
- * {@code KeyRing.load}.
+ * Where {@link KeyRing#load} finds the control-plane key material. Paths only: key bytes never
+ * come from config, env or properties.
  *
- * @param keyDir directory holding {@code trust.bundle} and {@code online.key}
- * @param rootPub pinned root public key, outside {@code stateDir} and {@code keyDir}
- * @param stateDir CP state directory; {@code trust.state} (anti-rollback floor) lives here
- * @param rootPubSha256 optional lowercase hex SHA-256 pin of the root SPKI, or null
- * @param insecureSkipPermissionChecks dev-only; true only when the config file says so explicitly
- * @param minBundleSerial lowest {@code bundleSerial} accepted even with no {@code trust.state} (default 0)
+ * @param keyDir {@code online.key}, {@code trust.bundle} and the second {@code trust.state} copy; mode 0700
+ * @param rootPub pinned root SPKI (DER or PEM), outside {@code keyDir} and {@code stateDir}
+ * @param stateDir node state; holds the primary {@code trust.state}
+ * @param rootPubSha256 optional install-time pin: hex SHA-256 of the root SPKI (colons ignored); null for none
+ * @param insecureSkipPermissionChecks dev only, config file only: skip owner/mode checks (symlink and
+ *        regular-file checks stay)
+ * @param minBundleSerial lowest acceptable {@code bundleSerial}; also the explicit first-start seed when
+ *        no {@code trust.state} exists. 0 means none
  */
 public record CpKeyConfig(Path keyDir, Path rootPub, Path stateDir, String rootPubSha256,
         boolean insecureSkipPermissionChecks, long minBundleSerial) {
 
     public CpKeyConfig {
-        Objects.requireNonNull(keyDir, "keyDir");
-        Objects.requireNonNull(rootPub, "rootPub");
-        Objects.requireNonNull(stateDir, "stateDir");
-        if (rootPubSha256 != null && !rootPubSha256.matches("[0-9a-f]{64}")) {
-            throw new IllegalArgumentException("cp.rootPubSha256 must be 64 lowercase hex characters");
+        if (keyDir == null || rootPub == null || stateDir == null) {
+            throw new IllegalArgumentException("cp keys require keyDir, rootPub and stateDir");
         }
         if (minBundleSerial < 0) {
-            throw new IllegalArgumentException("cp.minBundleSerial must not be negative");
+            throw new IllegalArgumentException("cp.minBundleSerial must be >= 0");
+        }
+        if (rootPubSha256 != null && rootPubSha256.isBlank()) {
+            rootPubSha256 = null;
         }
     }
 }
