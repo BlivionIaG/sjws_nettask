@@ -230,6 +230,31 @@ and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wai
 growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
 closes the replaced pools.
 
+Rate limits are local to this server and off unless configured. A route takes `rate_limit:`, and
+`routing.rate_limit:` is a global limit checked before any route:
+
+```yaml
+routing:
+  rate_limit: { by: peer, rate: 1000/s, burst: 2000 }            # global, optional
+  routes:
+    - prefix: /api
+      proxy: api
+      rate_limit: { by: header, header: X-Api-Key, rate: 600/m, burst: 20, buckets: 4096 }
+    - prefix: /login
+      static: true
+      rate_limit: { by: route, rate: 50/s }                       # one bucket for the whole route
+```
+
+`by` is `peer` (client address, the default), `header` (that header's first value) or `route`
+(route-level only). `rate` is `N/s`, `N/m` or `N/h` (a bare number is per second). `burst` is the
+number of requests a full bucket admits at once; the default is one second's worth for `/s` and 1
+for `/m` and `/h`. Requests over the limit get 429 with `Retry-After` (seconds until the next
+token), rendered like the route's other errors. Buckets live in a fixed table of `buckets` stripes
+(a power of two, default 4096; `by: route` uses one). Memory never grows with the number of
+clients. Two clients that hash to the same stripe share its budget, which is stricter, never looser.
+A request without the key (no address, or no header) shares one extra bucket. This is separate from
+the control-plane `rate-limit` filter type, which keeps a bounded map of exact keys.
+
 Retries and circuit breaking are per upstream and off unless configured (no cost when absent):
 
 ```yaml

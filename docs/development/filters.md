@@ -163,6 +163,23 @@ Handler proxied = RequestFilters.create()
     .wrapping(proxyHandler);
 ```
 
+## Streamed bodies: two contracts
+
+`FilterChain` closes proxied response streams that no longer reach the client (see `settle`). Two
+rules follow:
+
+* **Rewrapping counts as dropping.** The chain compares bodies by identity. If a filter wraps the
+  same source in a new `Body.Stream`, the original stream counts as dropped and the chain closes its
+  source, so the new wrapper then reads from a closed source. Pass the response through unchanged,
+  or read the source yourself and return a new body that does not share it.
+* **A terminal that throws closes its own stream.** If the terminal handler fails after it opened
+  a stream but before it returned it, the chain never saw that stream and cannot close it. The
+  handler must close it (`Body.discard`) before throwing. Otherwise the upstream connection and its
+  byte budget leak.
+
+A filter that answers on its own (for example a 429 from `RateLimitFilter`) without calling
+`next` has nothing to close.
+
 ## Request body
 
 This record has no body. Do not add a buffered `byte[]`: a proxy that relays a body needs a
