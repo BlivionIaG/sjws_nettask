@@ -64,6 +64,9 @@ class ClusterBenchTest {
         var refused = assertThrows(IllegalArgumentException.class,
                 () -> BenchServer.Options.parse(new String[] {"--cluster-key=" + secret}));
         assertFalse(refused.getMessage().contains(secret));
+        var alias = assertThrows(IllegalArgumentException.class,
+                () -> BenchServer.Options.parse(new String[] {"--ha-cluster-key=" + secret}));
+        assertFalse(alias.getMessage().contains(secret));
         assertThrows(IllegalArgumentException.class,
                 () -> BenchServer.launch(new BenchServer.Options("single", 0, root.toString()), KEY));
         var fromEnv = ClusterKey.fromEnvironment(Map.of(ClusterKey.ENV_CURRENT, "env-cluster-key-0123"));
