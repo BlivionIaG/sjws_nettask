@@ -35,7 +35,7 @@ Back to the [README](../README.md) (quick start).
 - [Security audit (2026-10-13)](security/audit.md)
 
 ## Development
-- [Contributing](../CONTRIBUTING.md)
+- [Contributing](../CONTRIBUTING.md) · [AGENTS.md](../AGENTS.md) (guide for coding agents)
 - [Test suite catalog](development/testing.md)
 - [Integration and end-to-end tests](development/integration-tests.md)
 - [Request filters](development/filters.md)
