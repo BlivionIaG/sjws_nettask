@@ -9,7 +9,7 @@ BR=$D/../../target/sjws_nettask-0.2-SNAPSHOT.jar; MJ=${MASTER_JAR:?master jar}; 
 T=$(mktemp -d); P=18101; U=http://127.0.0.1:$P/x; CB=18300
 start(){ taskset -c 0-3 "$@" >/dev/null 2>&1 & echo $! > $T/pid; sleep 3; }
 stop(){ kill $(cat $T/pid); wait $(cat $T/pid) 2>/dev/null; }
-w(){ taskset -c 4-7 wrk -t4 -c64 -d3s $1 >/dev/null; for i in 1 2 3; do taskset -c 4-7 wrk -t4 -c64 -d10s --latency ${2:-} $1 | awk '/Requests\/sec/{r=$2} / 99%/{p=$2} END{printf "%s/%s ", r, p}'; done; }
+w(){ local h=(); [ -n "${2:-}" ] && h=(-H "$2"); taskset -c 4-7 wrk -t4 -c64 -d3s "${h[@]}" $1 >/dev/null; for i in 1 2 3; do taskset -c 4-7 wrk -t4 -c64 -d10s --latency "${h[@]}" $1 | awk '/Requests\/sec/{r=$2} / 99%/{p=$2} END{printf "%s/%s ", r, p}'; done; }
 ups(){ printf '  upstreams:\n'; for ((i=0;i<10;i++)); do printf '    u%d: { url: "http://127.0.0.1:%d" }\n' $i $((CB+i)); done; }
 cfg(){ printf 'server:\n  port: %s\n  root: "%s"\nhttp3:\n  enabled: false\nrouting:\n  enabled: true\n%s\n  routes:\n%b' $P "$W" "$(ups)" "$1" > $T/c.yaml; echo $T/c.yaml; }
 counts(){ curl -s http://127.0.0.1:$CB/__counts; }
@@ -26,5 +26,5 @@ echo "== branch backends=1: $(start $J -jar $BR --config=$(cfg "$B1"); w $U; sto
 start $J -jar $BR --config=$(cfg "$B2"); reset; echo "== branch backends=2 (90/10): $(w $U) $(share 90,10)"; stop
 start $J -jar $BR --config=$(cfg "$B10"); reset; echo "== branch backends=10 (1..10): $(w $U) $(share 1,2,3,4,5,6,7,8,9,10)"; stop
 # sticky: one cookie per wrk connection would need a script; a fixed cookie must hit exactly one backend
-start $J -jar $BR --config=$(cfg "${B10}      sticky: { cookie: s }\n"); reset; echo "== branch backends=10 sticky (one cookie): $(w $U '-H Cookie:s=client42') $(counts)"; stop
+start $J -jar $BR --config=$(cfg "${B10}      sticky: { cookie: s }\n"); reset; echo "== branch backends=10 sticky (one cookie): $(w $U 'Cookie: s=client42') $(counts)"; stop
 kill $UP; rm -rf $T
