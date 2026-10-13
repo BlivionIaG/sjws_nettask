@@ -168,6 +168,23 @@ class EndpointBalancerTest {
     }
 
     @Test
+    void aRemovedEndpointDropsIdleConnectionsAtOnceButServesThroughTheGrace() throws Exception {
+        var src = new StaticUpstreamSource(set(1, null, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, null, null, Duration.ofSeconds(30));
+        var poolB = b.poolOf(ep(1, 1).authority());
+        assertEquals("b", body(poolB.proxy.handle(new Request("GET", "/")))); // read: the connection goes idle
+        for (int i = 0; i < 100 && poolB.proxy.idleConnections() == 0; i++) {
+            Thread.sleep(10);
+        }
+        assertEquals(1, poolB.proxy.idleConnections());
+        assertTrue(src.update(set(2, null, ep(0, 1))));
+        assertEquals(0, poolB.proxy.idleConnections()); // retired: idle sockets closed now
+        assertEquals("b", body(poolB.proxy.handle(new Request("GET", "/")))); // a late request still works
+        assertEquals(0, poolB.proxy.idleConnections()); // and its connection is not kept
+        b.close();
+    }
+
+    @Test
     void consecutiveFailuresEjectThenOneProbeReadmits() {
         var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
         var b = balancer(new StaticUpstreamSource(set(1, null, ep(0, 1), ep(1, 1))), null, o, Duration.ZERO);

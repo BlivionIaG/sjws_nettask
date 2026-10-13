@@ -233,7 +233,9 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 CLOSER_LOCK.unlock();
             }
         }
-        // requests that picked this endpoint just before the swap still get a connection
+        // requests that picked this endpoint just before the swap still get a connection, but idle
+        // sockets go now: an upstream that caps idle connections would otherwise close live ones
+        proxy.retire();
         c.schedule(proxy::close, this.grace.toMillis(), TimeUnit.MILLISECONDS);
     }
 

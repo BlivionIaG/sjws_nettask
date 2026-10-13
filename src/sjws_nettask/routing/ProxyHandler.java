@@ -185,6 +185,11 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         this.pool.close();
     }
 
+    /** See {@link UpstreamPool#retire()}. */
+    void retire() {
+        this.pool.retire();
+    }
+
     @Override
     public Response handle(Request request) {
         boolean head = request.headOnly();

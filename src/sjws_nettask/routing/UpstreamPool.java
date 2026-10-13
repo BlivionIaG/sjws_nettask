@@ -91,6 +91,7 @@ final class UpstreamPool implements AutoCloseable {
     private final ConcurrentLinkedDeque<Channel> idle = new ConcurrentLinkedDeque<>();
     private final Bootstrap bootstrap;
     private volatile boolean closed;
+    private volatile boolean retired;
 
     private final ByteBudget budget;
 
@@ -188,9 +189,9 @@ final class UpstreamPool implements AutoCloseable {
     /** Returns a channel whose exchange ended cleanly; anything else is closed. */
     void release(Channel ch, boolean reusable) {
         ch.attr(Relay.CURRENT).set(null);
-        if (reusable && !this.closed && ch.isActive() && this.idle.size() < this.maxIdle) {
+        if (reusable && !this.closed && !this.retired && ch.isActive() && this.idle.size() < this.maxIdle) {
             this.idle.offerFirst(ch);
-            if (this.closed && this.idle.remove(ch)) { // lost a race with close()
+            if ((this.closed || this.retired) && this.idle.remove(ch)) { // lost a race with close() or retire()
                 ch.close();
             }
         } else {
@@ -204,6 +205,18 @@ final class UpstreamPool implements AutoCloseable {
 
     int idleCount() {
         return this.idle.size();
+    }
+
+    /**
+     * Stops keeping connections: idle ones close now and each exchange in flight closes its own when
+     * it ends. New exchanges still connect. For an endpoint that left the set, so its idle sockets do
+     * not linger on the upstream until {@link #close()}. Idempotent.
+     */
+    void retire() {
+        this.retired = true;
+        for (var ch = this.idle.pollFirst(); ch != null; ch = this.idle.pollFirst()) {
+            ch.close();
+        }
     }
 
     /** Closes idle connections; exchanges in flight finish and then close theirs. Idempotent. */
