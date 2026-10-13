@@ -20,9 +20,9 @@ pass the port and root first, as on the command line ([command-line.md](../user/
 
     docker run --rm -p 8080:8080 -v "$PWD/site:/srv/www:ro" sjws_nettask 8080 /srv/www --healthz
 
-`HEALTHCHECK` curls `http://127.0.0.1:8080/healthz` every 10 s. It needs `--healthz` (see
+`HEALTHCHECK` runs `docker/HealthCheck.java` (compiled in the build stage, `java.net.http`, exit 0 on 200; no curl in the image) against `http://127.0.0.1:8080/healthz` every 10 s. It needs `--healthz` (see
 [observability.md](../operations/observability.md)) and port 8080; if you change either, override
-the check with `docker run --health-cmd ...` or `--no-healthcheck`. JVM heap is capped at 75 % of the
+the check with `docker run --health-cmd 'java -cp /opt/sjws/healthcheck HealthCheck http://127.0.0.1:PORT/healthz'` or `--no-healthcheck`. JVM heap is capped at 75 % of the
 container memory limit.
 
 Ports: `8080/tcp` is plain HTTP. `8443/tcp` and `8443/udp` are declared for TLS and HTTP/3; mount a
