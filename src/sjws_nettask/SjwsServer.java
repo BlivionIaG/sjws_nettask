@@ -59,6 +59,8 @@ import sjws_nettask.core.RequestFilter;
 import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.h3.Http3Server;
+import sjws_nettask.observe.ClusterStatus;
+import sjws_nettask.observe.LabelSource;
 import sjws_nettask.observe.ObserveRequestFilter;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
@@ -1022,6 +1024,23 @@ public final class SjwsServer implements AutoCloseable {
      */
     public ServerMetrics metrics() {
         return this.slot.get().metrics();
+    }
+
+    /**
+     * Appends {@link ClusterStatus} gauges to {@code /metrics}. Null omits them.
+     * The supplier is read only while a scrape is rendered. This does not install the observe
+     * filter, does not read the clock, and does not turn counters on.
+     */
+    public void attachClusterMetrics(Supplier<ClusterStatus> cluster) {
+        this.slot.attachCluster(cluster);
+    }
+
+    /**
+     * Appends per-route and per-API-key series to {@code /metrics}. Null omits them.
+     * The source is read only while a scrape is rendered. This does not install the observe filter.
+     */
+    public void attachGatewayMetrics(LabelSource labels) {
+        this.slot.attachLabels(labels);
     }
 
     /**
