@@ -205,12 +205,16 @@ public final class Partition implements AutoCloseable {
 
     /** Creates {@code group} if absent: from the oldest retained message, or from the next new one. Idempotent. */
     public boolean subscribe(String group, boolean fromStart) {
+        // Groups are never removed, so a group seen once stays subscribed: callers that re-subscribe before every
+        // claim/ack (TaskService) skip the partition lock entirely.
+        if (subscribed.contains(group)) return false;
         lock.lock();
         try {
-            if (state.groups.containsKey(group)) return false;
+            if (state.groups.containsKey(group)) { subscribed.add(group); return false; }
             long from = fromStart ? (state.messages.isEmpty() ? state.nextOffset : Math.min(state.messages.firstKey(), state.nextOffset))
                     : state.nextOffset;
             append(new LedgerEntry.Subscribe(group, from), null);
+            subscribed.add(group);
             return true;
         } finally {
             lock.unlock();
@@ -873,6 +877,9 @@ public final class Partition implements AutoCloseable {
 
     /** When true, the paged view is rebuilt after every operation (tests, low-rate topics). Default: rate-limited. */
     public void eagerSnapshots(boolean on) { lock.lock(); try { eager = on; publish(); } finally { lock.unlock(); } }
+
+    /** Groups known to exist (lock-free hint for {@link #subscribe}); only ever grows, like the groups themselves. */
+    private final java.util.Set<String> subscribed = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** Lock held. Set while a poll appends several DELIVER records; it publishes once at the end. */
     private boolean deferPublish;
