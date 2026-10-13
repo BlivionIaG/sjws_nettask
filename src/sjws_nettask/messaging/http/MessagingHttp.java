@@ -151,7 +151,7 @@ final class MessagingHttp implements Handler {
         long next = offset;
         var batches = new ArrayList<RecordBatch>();
         long total = 0; // long: compared with the long maxBytes without int overflow
-        log.reads().lock();
+        log.reads().readLock().lock();
         try {
             while (next < committed && total < maxBytes) {
                 var b = log.log().read(next);
@@ -163,7 +163,7 @@ final class MessagingHttp implements Handler {
                 next = b.nextOffset();
             }
         } finally {
-            log.reads().unlock();
+            log.reads().readLock().unlock();
         }
         var h = ResponseHeaders.of().set("content-type", BATCH_TYPE).set("next-offset", Long.toString(next))
                 .set("log-end-offset", Long.toString(committed));
