@@ -203,7 +203,7 @@ public final class ConfigLoader {
     /**
      * The raw {@code cp:} block (control-plane-hosting.md §4), or null when the file has none. Kept untyped
      * so a standalone or data process names no {@code sjws_nettask.cp} class; only the CONTROL role parses it
-     * ({@code sjws_nettask.cp.CpConfig}).
+     * (the cp package parses it).
      */
     private static Map<String, Object> cpSection(Map<String, Object> root) {
         if (!(root.get("cp") instanceof Object cp)) {

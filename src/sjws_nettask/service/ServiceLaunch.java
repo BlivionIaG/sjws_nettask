@@ -19,6 +19,7 @@ package sjws_nettask.service;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Map;
 
 import sjws_nettask.ServiceHooks;
 import sjws_nettask.SjwsServer;
@@ -39,19 +40,57 @@ public final class ServiceLaunch {
     }
 
     public static ServiceHooks prepare(Path bootstrapFile, String expectedRole, long drainBudgetMs) throws IOException {
-        return new Hooks(Bootstrap.load(bootstrapFile, expectedRole), drainBudgetMs);
+        return prepare(bootstrapFile, expectedRole, drainBudgetMs, null, null);
+    }
+
+    /**
+     * @param yamlCp raw {@code cp:} block of the config file (CONTROL role only), or null
+     * @param configBase directory of the config file, or null
+     */
+    public static ServiceHooks prepare(Path bootstrapFile, String expectedRole, long drainBudgetMs,
+            Map<String, Object> yamlCp, Path configBase) throws IOException {
+        return new Hooks(Bootstrap.load(bootstrapFile, expectedRole), drainBudgetMs, yamlCp, configBase);
+    }
+
+    /** The CONTROL-role entry point, named only as a string (control-plane-hosting.md §1, §5). */
+    static final String CONTROL_CLASS = "sjws_nettask.cp.CpLaunch";
+
+    /**
+     * Starts the CONTROL role by reflection: config, KeyRing.load, CpStore, WatchServer, AdminServer, ready.
+     * Any failure is an IOException, so the process exits non-zero (fail closed).
+     */
+    static CpReloadable launchControl(Map<String, Object> yamlCp, Path configBase) throws IOException {
+        try {
+            var launch = Class.forName(CONTROL_CLASS).getMethod("launch", Map.class, Path.class,
+                    java.io.PrintStream.class);
+            return (CpReloadable) launch.invoke(null, yamlCp, configBase, System.err);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            var cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            throw new IOException("control role failed to start: " + cause, cause);
+        } catch (ReflectiveOperationException | LinkageError e) {
+            throw new IOException("control role unavailable: " + e, e);
+        }
     }
 
     private static final class Hooks implements ServiceHooks {
         private final Bootstrap bootstrap;
         private final long drainBudgetMs;
+        private final Map<String, Object> yamlCp;
+        private final Path configBase;
         private NodeEnrollment enrollment;
+        /** The CONTROL-role host; null on a data node. Its reload is the single CP SIGHUP hook. */
+        private volatile CpReloadable control;
         /** A {@code sjws_nettask.cp.DataWatch} on a data node; typed loosely so this class names no cp type. */
         private AutoCloseable watch;
 
-        private Hooks(Bootstrap bootstrap, long drainBudgetMs) {
+        private Hooks(Bootstrap bootstrap, long drainBudgetMs, Map<String, Object> yamlCp, Path configBase) {
             this.bootstrap = bootstrap;
             this.drainBudgetMs = drainBudgetMs;
+            this.yamlCp = yamlCp;
+            this.configBase = configBase;
         }
 
         @Override
@@ -69,6 +108,9 @@ public final class ServiceLaunch {
             }
             if (server != null && this.bootstrap.role() == NodeRole.DATA) {
                 this.watch = openWatch(server);
+            }
+            if (this.bootstrap.role() == NodeRole.CONTROL) {
+                this.control = launchControl(this.yamlCp, this.configBase);
             }
         }
 
@@ -108,10 +150,22 @@ public final class ServiceLaunch {
             } catch (IOException e) {
                 throw new IllegalStateException("bootstrap reload failed");
             }
+            var host = this.control;
+            if (host != null) {
+                var failed = host.reload();
+                if (failed != null) {
+                    throw new IllegalStateException("control-plane reload failed, old material kept: " + failed);
+                }
+            }
         }
 
         @Override
         public void onShutdown() {
+            var host = this.control;
+            if (host != null) {
+                this.control = null;
+                host.close();
+            }
             var running = this.watch;
             if (running != null) {
                 try {

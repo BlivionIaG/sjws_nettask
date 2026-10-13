@@ -218,4 +218,20 @@ public record CpTls(Path certPem, Path keyPem, Path caPem, Path revocations, Str
     static boolean carries(X509Certificate cert, String identity) {
         return identity != null && !identity.isEmpty() && names(cert).contains(identity);
     }
+
+    // ---- Security-owned seam (control-plane-hosting.md §2.4, §7). Security's listener PR replaces these stubs.
+    /**
+     * Builds the server TLS context for the CP listeners. <b>Stub until Security's PR lands:</b> always throws,
+     * so a CONTROL start (and a SIGHUP reload) fails closed.
+     */
+    public static javax.net.ssl.SSLContext serverContext(CpListenerConfig config)
+            throws java.security.GeneralSecurityException, java.io.IOException {
+        throw new java.security.GeneralSecurityException("CpTls.serverContext is not implemented yet (Security)");
+    }
+
+    /** Re-reads listener TLS material. <b>Stub until Security's PR lands:</b> always throws. */
+    public static void reloadTls() throws java.security.GeneralSecurityException, java.io.IOException {
+        throw new java.security.GeneralSecurityException("CpTls.reloadTls is not implemented yet (Security)");
+    }
+    // ---- end Security-owned seam
 }

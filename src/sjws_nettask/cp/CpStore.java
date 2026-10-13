@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import sjws_nettask.cluster.Clock;
+import sjws_nettask.cluster.ClusterTransport;
 import sjws_nettask.cluster.Durability;
 import sjws_nettask.cluster.FileLogStorage;
 import sjws_nettask.cluster.GroupId;
@@ -54,7 +55,7 @@ import sjws_nettask.config.MessagingSettings;
  */
 public final class CpStore implements AutoCloseable {
 
-    public static final GroupId GROUP = new GroupId("cp-config");
+    public static final GroupId GROUP = CpGroup.GROUP;
     private static final byte PROPOSE = 1;
     private static final byte SIGNED = 5;
     private static final byte RBAC = 4;
@@ -72,7 +73,8 @@ public final class CpStore implements AutoCloseable {
     private FileLogStorage ownedStorage;
     private ReplicationGroup group;
     private ControlLeadership leadership;
-    private final KeyRing keys;
+    /** Swapped as a whole by {@link #useKeys} (SIGHUP, control-plane-hosting.md §2.4). */
+    private volatile KeyRing keys;
     private final Map<String, sjws_nettask.controlplane.Role> policy = new LinkedHashMap<>();
     private sjws_nettask.controlplane.Rbac rights;
     private sjws_nettask.controlplane.AuditLog audit;
@@ -118,21 +120,32 @@ public final class CpStore implements AutoCloseable {
     }
 
     /**
-     * One voter of a static {@code cp-config} voter set (control-plane-hosting.md §1 and §6): 3 or 5
-     * full voters, majority over all of them, every voter on the same {@code transport}. Each voter
-     * applies the committed log, so a follower answers watches from its applied state; writes still
-     * need {@link ControlLeadership#leaderReady()}. Witness voters are not accepted here yet.
+     * One full voter of a static {@code cp-config} voter set (control-plane-hosting.md §1 and §6): 3 or 5
+     * full voters, or 2 full voters plus a witness ({@link CpWitness}), majority over all of them, every voter
+     * on the same {@code transport}. Each full voter applies the committed log, so a follower answers watches
+     * from its applied state; writes still need {@link ControlLeadership#leaderReady()}.
      */
     public static CpStore open(java.nio.file.Path stateDir, KeyRing keys, Clock clock, String adminSan, NodeId self,
-            VoterSet voters, SimTransport transport) throws IOException {
-        int count = voters.voters().size();
-        if (count != 3 && count != 5) {
-            throw new IllegalArgumentException("cp-config needs 3 or 5 voters, not " + count);
-        }
+            VoterSet voters, ClusterTransport transport) throws IOException {
+        int full = 0;
+        int witnesses = 0;
         for (var member : voters.members()) {
-            if (member.witness()) {
-                throw new IllegalArgumentException("cp-config witness voters are not supported yet: " + member.id());
+            if (!voters.voters().contains(member.id())) {
+                continue;
             }
+            if (member.witness()) {
+                witnesses++;
+                if (member.id().equals(self)) {
+                    throw new IllegalArgumentException("a witness voter is hosted by CpWitness, not CpStore");
+                }
+            } else {
+                full++;
+            }
+        }
+        boolean ok = (witnesses == 0 && (full == 3 || full == 5)) || (witnesses == 1 && full == 2);
+        if (!ok) {
+            throw new IllegalArgumentException("cp-config needs 3 or 5 voters, or 2 voters plus 1 witness, not "
+                    + full + " + " + witnesses + " witness");
         }
         var storage = new FileLogStorage(stateDir.resolve("cp-config"));
         var node = ReplicatedNode.open(self, voters, clock, storage, transport);
@@ -156,7 +169,7 @@ public final class CpStore implements AutoCloseable {
 
     /** The {@code cp-config} group timings; the CONTROL start checks them with {@link CpTiming#check}. */
     public static GroupOptions groupOptions() {
-        return new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40), 10_000);
+        return CpGroup.options();
     }
 
     public ControlLeadership leadership() {
@@ -348,6 +361,11 @@ public final class CpStore implements AutoCloseable {
 
     public KeyRing keys() {
         return keys;
+    }
+
+    /** Installs a fully loaded ring; the caller has already verified it. Never a half-loaded ring. */
+    void useKeys(KeyRing fresh) {
+        this.keys = java.util.Objects.requireNonNull(fresh, "keys");
     }
 
     public void drive() {
