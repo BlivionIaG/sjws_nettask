@@ -1112,8 +1112,9 @@ public final class ConfigLoader {
      * resolved. A missing key with HA enabled is an error. The environment overrides the file.
      * Values are never copied into the message. An inline secret in a group- or world-readable
      * file is a warning. {@code ha.cluster_key_file} must be mode 0600 or 0400 and owned by this
-     * process. The leaf is not followed. A group- or world-writable parent is refused unless it
-     * is sticky and owned by root or this process.
+     * process. The leaf is not followed. Every parent must be owned by root or this process.
+     * A group- or world-writable parent is refused unless it is sticky and owned by root or
+     * this process.
      */
     private static HaMaterial haSection(Map<String, Object> root, Map<String, String> env, Path base, Path configFile,
             List<String> warnings) {

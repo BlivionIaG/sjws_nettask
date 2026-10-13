@@ -96,8 +96,9 @@ A new `KeyRing.load(keyDir, rootPub, stateDir)`:
    owned by root or the service uid may be group- or world-writable (`/tmp`). `online.key` must be
    owned by the process uid with 0600/0400; `keyDir` 0700. Resolve only the parent with `toRealPath()`, then open
    `parent.resolve(fileName)` with `NOFOLLOW_LINKS`, so a symlinked leaf is refused and a symlinked parent is not a
-   false refusal. `sjws_nettask.config.SecureKeyFile` is that shared open and writable-parent check.
-   `KeyRing.load` calls it, and still requires each non-sticky parent to be owned by root or the service uid.
+   false refusal. `sjws_nettask.config.SecureKeyFile` is that check: every resolved parent must be
+   owned by root or this process, and a group- or world-writable parent is refused unless it is
+   sticky and owned by root or this process. `KeyRing.load` calls it.
 2. **Root pin:** parse `root.pub`. If `cp.rootPubSha256` is set (install time, config file), refuse on mismatch.
    Log the root fingerprint (SHA-256 of the SPKI) at startup; never log key bytes.
 3. Parse `trust.bundle` strictly (2.1), verify the root signature and `rootKeyId`, apply the anti-rollback check (2.2).

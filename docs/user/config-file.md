@@ -116,10 +116,13 @@ that is still in use in `ha.cluster_key_previous` or `ha.cluster_key_previous_fi
 that config to every node, wait until heartbeats are using the new key, then remove the
 previous key. Only the parent directory of a key file is resolved with `toRealPath`.
 The leaf is opened with `NOFOLLOW_LINKS` and is never followed. Owner and mode (0600 or
-0400, owned by this process) are checked on that opened file. A resolved parent that is
-group- or world-writable is refused, unless it is sticky and owned by root or this
-process, as `/tmp` is. Control-plane key files use the same helper
-(`sjws_nettask.config.SecureKeyFile`).
+0400, owned by this process) are checked on that opened file. Every resolved parent up
+to `/` must be owned by root or this process. A group- or world-writable parent is
+refused, unless it is sticky and owned by root or this process, as `/tmp` is. On Linux
+the descriptor in `/proc/self/fd` is used only when its device and inode match that
+file. Without `/proc`, the check is an `lstat` of the path while the channel is open,
+and the owner name is compared with `root` or `user.name`. Control-plane key files use
+the same helper (`sjws_nettask.config.SecureKeyFile`).
 
 ## Server
 

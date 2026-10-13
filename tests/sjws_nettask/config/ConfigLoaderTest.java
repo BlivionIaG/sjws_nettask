@@ -2,8 +2,13 @@ package sjws_nettask.config;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Base64;
 import java.security.MessageDigest;
@@ -868,6 +873,112 @@ class ConfigLoaderTest {
         assertFalse(missingFile.ok());
         assertTrue(missingFile.errors().get(0).contains("Cannot read"), missingFile.errors().toString());
         assertFalse(missingFile.errors().get(0).contains("symlink"), missingFile.errors().toString());
+    }
+
+    @Test
+    void haClusterKeyFileRefusesAParentOwnedByAnotherUser() throws Exception {
+        var secret = "foreign-parent-secret-0123456789a";
+        var foreign = Files.createDirectories(dir.resolve("foreign-owner"));
+        var keyFile = foreign.resolve("cluster.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        Files.setPosixFilePermissions(foreign, PosixFilePermissions.fromString("rwxr-xr-x"));
+        var me = System.getProperty("user.name");
+        chown(foreign, "nobody");
+        try {
+            int uid = ((Integer) Files.getAttribute(foreign, "unix:uid")).intValue();
+            int self = ((Integer) Files.getAttribute(Path.of("/proc/self"), "unix:uid")).intValue();
+            assertNotEquals(self, uid);
+            assertNotEquals(0, uid);
+            var perms = Files.getPosixFilePermissions(foreign);
+            assertFalse(perms.contains(PosixFilePermission.GROUP_WRITE));
+            assertFalse(perms.contains(PosixFilePermission.OTHERS_WRITE));
+            var yaml = dir.resolve("ha-foreign-parent.yaml");
+            var root = dir.toAbsolutePath();
+            Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                    + "\nha:\n  enabled: true\n  cluster_key_file: foreign-owner/cluster.key\n");
+            Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+            var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+            assertFalse(loaded.ok(), loaded.errors().toString());
+            assertTrue(loaded.errors().get(0).contains("parent directory"), loaded.errors().toString());
+            assertFalse(loaded.errors().get(0).contains(secret), loaded.errors().toString());
+            assertFalse(loaded.errors().get(0).contains("nobody"), loaded.errors().toString());
+        } finally {
+            chown(foreign, me);
+        }
+    }
+
+    /**
+     * A second descriptor of the same inode must still load. Matching the path string and
+     * requiring a single hit refuses that case. A descriptor of a different file does not
+     * match {@code fileKey}.
+     */
+    @Test
+    void haClusterKeyFileTrustsTheDescriptorWhenTheInodeMatches() throws Exception {
+        var secret = "same-inode-secret-0123456789abcd";
+        var keyFile = dir.resolve("inode.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        var other = dir.resolve("other-inode.key");
+        Files.writeString(other, "different-inode-secret-012345678");
+        Files.setPosixFilePermissions(other, PosixFilePermissions.fromString("rw-------"));
+        var yaml = dir.resolve("ha-inode.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: inode.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        assertNull(SecureKeyFile.beforeOpen);
+        FileChannel[] extra = new FileChannel[1];
+        SecureKeyFile.beforeOpen = opened -> {
+            try {
+                extra[0] = FileChannel.open(opened, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
+        try (var otherChannel = FileChannel.open(other, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+            assertTrue(loaded.ok(), loaded.errors().toString());
+            assertArrayEquals(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), loaded.haClusterKey());
+            assertFalse(loaded.toString().contains(secret), loaded.toString());
+            Path keyFd = procFd(keyFile);
+            Path otherFd = procFd(other);
+            assertNotNull(keyFd);
+            assertNotNull(otherFd);
+            assertTrue(SecureKeyFile.sameFile(keyFile, keyFd));
+            assertFalse(SecureKeyFile.sameFile(keyFile, otherFd));
+            assertTrue(otherChannel.isOpen());
+        } finally {
+            SecureKeyFile.beforeOpen = null;
+            if (extra[0] != null) {
+                extra[0].close();
+            }
+        }
+    }
+
+    /** {@code /proc/self/fd} entry whose {@code fileKey} is {@code file}, while that file is open. */
+    private static Path procFd(Path file) throws Exception {
+        Object want = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey();
+        try (var stream = Files.newDirectoryStream(Path.of("/proc/self/fd"))) {
+            for (var entry : stream) {
+                Object key;
+                try {
+                    key = Files.readAttributes(entry, BasicFileAttributes.class).fileKey();
+                } catch (java.io.IOException ignored) {
+                    continue;
+                }
+                if (want != null && want.equals(key)) {
+                    return Path.of("/proc/self/fd").resolve(entry.getFileName().toString());
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void chown(Path path, String owner) throws Exception {
+        var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
+        String out = new String(proc.getInputStream().readAllBytes());
+        assertEquals(0, proc.waitFor(), out);
     }
 
     private String error(String yaml) throws Exception {

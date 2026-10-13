@@ -60,9 +60,15 @@ wiring that should drain instead belongs to daemon mode, which can call `Lifecyc
    with the new one. The key file must be mode 0600 or 0400 and owned by this process.
    Only the parent directory is resolved with `toRealPath`. The leaf is opened with
    `NOFOLLOW_LINKS` and is never followed, so a symlink in that name is refused.
-   Owner and mode are taken from that opened file. Any resolved parent that is group-
-   or world-writable is refused, unless it is sticky and owned by root or this process
-   (`/tmp`). Control-plane key files use the same helper, `sjws_nettask.config.SecureKeyFile`.
+   Owner and mode are taken from that opened file. Every resolved parent up to `/` must
+   be owned by root or this process. A group- or world-writable parent is refused unless
+   it is sticky and owned by root or this process (`/tmp`). On Linux those attributes are
+   `fstat` of `/proc/self/fd`, and that descriptor is used only when its device and inode
+   match the opened file. Without `/proc`, attributes are an `lstat` of the path with
+   `NOFOLLOW_LINKS` while the channel is open (a replace in that window can still change
+   the inode), and owner checks compare the owner name with `root` or `user.name`.
+   Whoever starts the JVM can set `user.name`; they already control the process.
+   Control-plane key files use the same helper, `sjws_nettask.config.SecureKeyFile`.
    Nodes need NTP: the authentication window is ±5 seconds of wall-clock time. Monotonic
    clocks are not comparable across hosts: the packet carries `leaseRemainingMs`, and the
    receiver sets its own expiry from `System.nanoTime()`. The authentication timestamp is
