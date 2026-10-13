@@ -298,6 +298,14 @@ final class DeliveryState {
     static final int SNAP_VERSION = 1;
 
     /** Serializes the full state (no payloads) as of {@link #nextOffset}, with a trailing CRC32C. */
+    /** Entries {@link #serialize} writes (messages, per-group lists, dedup windows, origins): its cost, O(groups + producers). */
+    long serializedEntries() {
+        long n = messages.size() + origins.size();
+        for (var g : groups.values()) n += g.inFlight.size() + g.retry.size() + g.dead.size() + g.resolvedAbove.size() + g.due.size();
+        for (var w : dedup.values()) n += w.size();
+        return n;
+    }
+
     byte[] serialize() {
         try {
             var bo = new java.io.ByteArrayOutputStream(64 + messages.size() * 48);

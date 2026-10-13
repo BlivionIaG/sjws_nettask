@@ -682,6 +682,17 @@ public final class Partition implements AutoCloseable {
         // Nothing is serialized under the lock: the snapshotter rebuilds the state at `off` from the newest
         // snapshot file plus the log tail (deterministic replay) and serializes that private copy.
         var prev = lastSnapshot;
+        // A small state (the common request/reply case: almost nothing live) is cheaper to serialize here than
+        // to rebuild by replaying the whole tail off-lock, which allocates about as much as the live appends did.
+        if (state.serializedEntries() <= INLINE_SNAPSHOT_ENTRIES) {
+            var data = state.serialize();
+            lastSnapshot = prev.handleAsync((v, t) -> {
+                awaitDurable(off);
+                writeSnapshot(off, data);
+                return off;
+            }, snapshotter);
+            return lastSnapshot;
+        }
         lastSnapshot = prev.handleAsync((v, t) -> {
             writeSnapshot(off, rebuildAt(off));
             return off;
@@ -693,15 +704,26 @@ public final class Partition implements AutoCloseable {
      * Snapshotter thread. State at {@code off}, rebuilt off-lock: newest snapshot file (or empty) + replay of
      * {@code [base, off)}. Only reads log at or above the newest snapshot, which retention/compaction never touch.
      */
-    private byte[] rebuildAt(long off) {
+    /** Snapshots of at most this many serialized entries are taken under the lock (bounded, ~100 µs). */
+    static final long INLINE_SNAPSHOT_ENTRIES = 16_384;
+
+    /** Snapshotter thread. A snapshot is only valid once the log is durable through {@code off}: wait for the writer, then fsync. */
+    private void awaitDurable(long off) {
         try {
-            // The snapshot is only valid if the log is durable through `off`: wait for the writer, then fsync.
             long deadline = System.nanoTime() + 30_000_000_000L;
             while (writer.snapshot().nextOffset() < off) {
                 if (System.nanoTime() > deadline) throw new IOException("log never reached snapshot offset " + off);
                 LockSupport.parkNanos(100_000);
             }
             log.force();
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
+    private byte[] rebuildAt(long off) {
+        try {
+            awaitDurable(off);
             var policy = state.policy();
             DeliveryState st = null;
             Long base = snapshots.floor(off);
