@@ -49,6 +49,9 @@ public final class ConfigCodec {
         routing(out, document.routing());
         middleware(out, document.middleware());
         access(out, document.access());
+        if (!document.messaging().omittedFromCanonical()) {
+            document.messaging().appendCanonical(out);
+        }
         return out.toString();
     }
 
@@ -143,8 +146,15 @@ public final class ConfigCodec {
         out.append("  renew_before: ").append(quote(duration(acme.renewBefore()))).append('\n');
     }
 
+    private static String limit(sjws_nettask.routing.RateLimitFilter.Limit l) {
+        return "{ by: " + l.by().name().toLowerCase(java.util.Locale.ROOT)
+                + (l.header() == null ? "" : ", header: " + quote(l.header()))
+                + ", rate: " + quote(l.rate()) + ", burst: " + l.burst() + ", buckets: " + l.buckets() + " }";
+    }
+
     private static void routing(StringBuilder out, Routing routing) {
-        if (!routing.enabled() && routing.trustedProxies().isEmpty() && routing.upstreams().isEmpty()
+        if (!routing.enabled() && routing.rateLimit() == null && routing.trustedProxies().isEmpty()
+                && routing.upstreams().isEmpty()
                 && routing.routes().routes().isEmpty() && routing.forwardedProto() == ForwardedProto.AUTO) {
             return;
         }
@@ -152,6 +162,9 @@ public final class ConfigCodec {
         out.append("  enabled: ").append(routing.enabled()).append('\n');
         out.append("  forwarded_proto: ").append(routing.forwardedProto().name().toLowerCase(java.util.Locale.ROOT))
                 .append('\n');
+        if (routing.rateLimit() != null) {
+            out.append("  rate_limit: ").append(limit(routing.rateLimit())).append('\n');
+        }
         if (!routing.trustedProxies().isEmpty()) {
             out.append("  trusted_proxies: [");
             for (int i = 0; i < routing.trustedProxies().size(); i++) {
@@ -167,7 +180,42 @@ public final class ConfigCodec {
             for (var name : sorted(routing.upstreams())) {
                 var upstream = routing.upstreams().get(name);
                 out.append("    ").append(yamlKey(name)).append(":\n");
-                out.append("      url: ").append(quote(upstream.url().toString())).append('\n');
+                var discovery = upstream.discovery();
+                if (discovery == null) {
+                    out.append("      url: ").append(quote(upstream.url().toString())).append('\n');
+                } else {
+                    var scheme = upstream.url().getScheme();
+                    var path = upstream.url().getRawPath() == null ? "" : upstream.url().getRawPath();
+                    out.append("      lb: ").append(discovery.lb().wireName()).append('\n');
+                    out.append("      endpoints:\n");
+                    for (var e : discovery.endpoints()) {
+                        out.append("        - { url: ").append(quote(scheme + "://" + e.authority() + path))
+                                .append(", weight: ").append(e.weight());
+                        if (!e.id().equals(e.authority())) {
+                            out.append(", id: ").append(quote(e.id()));
+                        }
+                        if (e.zone() != null) {
+                            out.append(", zone: ").append(quote(e.zone()));
+                        }
+                        if (!e.labels().isEmpty()) {
+                            out.append(", labels: {");
+                            var first = true;
+                            for (var k : new java.util.TreeSet<>(e.labels().keySet())) {
+                                out.append(first ? " " : ", ").append(quote(k)).append(": ").append(quote(e.labels().get(k)));
+                                first = false;
+                            }
+                            out.append(" }");
+                        }
+                        out.append(" }\n");
+                    }
+                    var o = discovery.outlier();
+                    out.append("      circuit: { failures: ").append(o.consecutive())
+                            .append(", eject_for: ").append(quote(duration(o.ejectFor())))
+                            .append(", error_rate: ").append(o.errorRatePercent())
+                            .append(", min_requests: ").append(o.minRequests())
+                            .append(", window: ").append(quote(duration(o.window())))
+                            .append(", max_ejection: ").append(o.maxEjectionPercent()).append(" }\n");
+                }
                 out.append("      connect_timeout: ").append(quote(duration(upstream.connectTimeout()))).append('\n');
                 out.append("      response_timeout: ").append(quote(duration(upstream.responseTimeout())))
                         .append('\n');
@@ -175,6 +223,29 @@ public final class ConfigCodec {
                         .append('\n');
                 out.append("      max_body: ").append(upstream.maxBody()).append('\n');
                 out.append("      preserve_host: ").append(upstream.preserveHost()).append('\n');
+                var resilience = upstream.resilience();
+                if (resilience != null && resilience.retry() != null) {
+                    var retry = resilience.retry();
+                    out.append("      retry: { attempts: ").append(retry.attempts()).append(", on: [");
+                    var on = new java.util.ArrayList<String>();
+                    for (var kind : sjws_nettask.routing.Resilience.On.values()) { // enum order: canonical
+                        if (retry.on().contains(kind)) {
+                            on.add(switch (kind) {
+                                case CONNECT -> "connect";
+                                case TIMEOUT -> "timeout";
+                                case RESET -> "reset";
+                                case STATUS_502 -> "502";
+                                case STATUS_503 -> "503";
+                                case STATUS_504 -> "504";
+                            });
+                        }
+                    }
+                    out.append(String.join(", ", on)).append("], budget: ").append(retry.budgetPercent()).append(" }\n");
+                }
+                if (resilience != null && resilience.circuit() != null) {
+                    out.append("      circuit: { failures: ").append(resilience.circuit().failures())
+                            .append(", eject_for: ").append(quote(duration(resilience.circuit().openFor()))).append(" }\n");
+                }
             }
         }
         if (!routing.routes().routes().isEmpty()) {
@@ -210,6 +281,9 @@ public final class ConfigCodec {
                         out.append("        keep_path: ").append(redirect.keepPath()).append('\n');
                     }
                     case RouteSpec.Action.Static ignored -> out.append("      static: true\n");
+                }
+                if (route.rateLimit() != null) {
+                    out.append("      rate_limit: ").append(limit(route.rateLimit())).append('\n');
                 }
             }
         }
@@ -273,7 +347,7 @@ public final class ConfigCodec {
         }
     }
 
-    private static String duration(Duration duration) {
+    static String duration(Duration duration) {
         if (duration.toNanosPart() == 0 && duration.toSeconds() % 86_400 == 0 && duration.toSeconds() >= 86_400) {
             return (duration.toSeconds() / 86_400) + "d";
         }

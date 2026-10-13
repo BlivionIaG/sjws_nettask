@@ -33,6 +33,8 @@ The file is strict: an unknown key or a bad value is an error and the process ex
 64. The existing server flags stay lenient (a bad number warns and falls back).
 There is no `--key-password` and no `key_password` key; a password lives in
 `tls.key_password_file` or `WEB_SERVER_TLS_KEY_PASSWORD`.
+The HA cluster key is the same kind of secret: `ha.cluster_key` or
+`WEB_SERVER_HA_CLUSTER_KEY`, never a command-line flag.
 
 Paths in the file are resolved against the file's directory. Paths on the command
 line and in the environment stay relative to the working directory.
@@ -85,6 +87,56 @@ as they were.
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
 `h`, `d`). In a size, a bare integer is bytes and `1m` is one mebibyte (`k`, `m`,
 `g`, 1024-based). Server timeouts are whole seconds, 1..86400, matching the flags.
+
+## HA
+
+Omitted, HA heartbeats stay off and the authenticator is not loaded. `ha.enabled: true`
+without a key refuses to start (exit 64). The key is at least 16 bytes; 32 random bytes is the
+useful size (`openssl rand -base64 32`). It is not part of the canonical document, so a last-good
+copy does not store it and startup logs do not print it. Java keeps the characters in a
+`String` and inside `Mac`; the process cannot wipe them.
+
+```yaml
+ha:
+  enabled: true
+  cluster_key_file: /etc/sjws/cluster.key   # preferred; mode 0600 or 0400, owned by this process, not a symlink
+  # cluster_key: "base64:...."              # inline alternative; not together with the file
+  # cluster_key_previous_file: /etc/sjws/cluster.key.prev
+```
+
+A value is trimmed. `base64:` and `hex:` select those encodings; anything else is the UTF-8 of
+the trimmed text. A trailing newline from a file is not part of the key.
+
+`WEB_SERVER_HA_CLUSTER_KEY` overrides `ha.cluster_key` and `ha.cluster_key_file`.
+`WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS` overrides the previous key. An empty variable is an error
+when HA is enabled; it does not fall back to the file. The daemon child does not inherit either
+variable (`/proc/pid/environ`); use the key file there. A config file that contains an inline
+key and is readable by group or others produces a warning.
+
+Packets are HMAC-SHA256 under a key derived with HKDF-SHA256 (`info` `sjws-ha-heartbeat-v1`),
+so the same secret is not a tag for any other protocol. The MAC covers a domain label, a
+version, a key id, the 64-byte body, the timestamp, the sequence, a boot epoch, and the
+destination wire id. Key id 0 is the current key and key id 1 is the previous key; a packet is
+checked against that one key. Each sender's sequence starts over when its boot epoch is newer
+than the last one accepted, which is how a restarted node stays reachable. The epoch must not
+lead the packet timestamp, or the receiver's clock, by more than the ±5 second window; a
+later epoch is dropped and does not stick. A lower epoch is accepted only after that sender
+has been silent for at least `max(deadAfter, 5s)`. A timestamp older
+than the receiver's own boot is dropped. Clocks must stay within ±5 seconds (NTP). A larger
+step drops heartbeats until they agree, and a rate-limited warning names the skew.
+
+Key rotation: put the new secret in `ha.cluster_key` or `ha.cluster_key_file` and the key
+that is still in use in `ha.cluster_key_previous` or `ha.cluster_key_previous_file`. Roll
+that config to every node, wait until heartbeats are using the new key, then remove the
+previous key. Only the parent directory of a key file is resolved with `toRealPath`.
+The leaf is opened with `NOFOLLOW_LINKS` and is never followed. Owner and mode (0600 or
+0400, owned by this process) are checked on that opened file. Every resolved parent up
+to `/` must be owned by root or this process. A group- or world-writable parent is
+refused, unless it is sticky and owned by root or this process, as `/tmp` is. On Linux
+the descriptor in `/proc/self/fd` is used only when its device and inode match that
+file. Without `/proc`, the check is an `lstat` of the path while the channel is open,
+and the owner name is compared with `root` or `user.name`. Control-plane key files use
+the same helper (`sjws_nettask.config.SecureKeyFile`).
 
 ## Server
 
@@ -298,6 +350,32 @@ and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wai
 growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
 closes the replaced pools.
 
+Rate limits are local to this server and off unless configured. A route takes `rate_limit:`, and
+`routing.rate_limit:` is a global limit checked before any route:
+
+```yaml
+routing:
+  rate_limit: { by: peer, rate: 1000/s, burst: 2000 }            # global, optional
+  routes:
+    - prefix: /api
+      proxy: api
+      rate_limit: { by: header, header: X-Api-Key, rate: 600/m, burst: 20, buckets: 4096 }
+    - prefix: /login
+      static: true
+      rate_limit: { by: route, rate: 50/s }                       # one bucket for the whole route
+```
+
+`by` is `peer` (client address, the default), `header` (that header's first value) or `route`
+(route-level only). `rate` is `N/s`, `N/m` or `N/h` (a bare number is per second). `burst` is the
+number of requests a full bucket admits at once; the default is one second's worth for `/s` and 1
+for `/m` and `/h`. Requests over the limit get 429 with `Retry-After` (seconds until the next
+token), rendered like the route's other errors. Buckets live in a fixed table of `buckets` stripes
+(a power of two, default 4096; `by: route` uses one). Memory never grows with the number of
+clients. Two clients that hash to the same stripe share its budget, which is stricter, never looser.
+A request without the key (no address, or no header) shares one extra bucket. The control-plane
+`rate-limit` filter type uses this same table. Its `capacity` is the burst and
+`refill-per-second` is the steady rate; `max-keys` only sizes the table.
+
 Weighted and canary routes list `backends` instead of `proxy` (a plain `proxy:` route is unchanged):
 
 ```yaml
@@ -342,6 +420,34 @@ success. An upstream is a single endpoint, so an open circuit is an outage of th
 a dead or overloaded upstream, not a flaky one. At 20% random 503s and 5000 req/s, `failures: 5`
 trips about once a second (see `bench/proxy-routing/resilience.sh`). Pair it with `retry`, or raise
 `failures`, when the upstream has a steady error rate.
+
+An upstream can list several endpoints instead of one `url` (exactly one of the two). It then
+balances over them, with one pool per endpoint and a circuit per endpoint:
+
+```yaml
+upstreams:
+  api:
+    endpoints:
+      - "http://10.0.0.1:9000"
+      - { url: "http://10.0.0.2:9000", weight: 3, zone: b, id: api-2, labels: { tier: canary } }
+    lb: weighted_random            # default; round_robin | least_request
+    retry: { attempts: 2 }         # a retry goes to a different endpoint
+    circuit: { failures: 5, eject_for: 10s, error_rate: 50%, min_requests: 20, window: 10s, max_ejection: 50% }  # defaults
+```
+
+All endpoints share one scheme and path (no query, fragment or userinfo); up to 1024, default
+weight 1 (0..1000000, 0 = only used when nothing weighted is left). `weighted_random` draws from an
+alias table (O(1)); `round_robin` cycles; `least_request` takes the less busy of two random
+endpoints (requests waiting for response headers). On a multi-endpoint upstream the circuit is
+always on with the defaults above, per endpoint, per attempt: an endpoint is ejected after
+`failures` consecutive failures, or when at least `min_requests` in the last `window` fail at
+`error_rate` or more. It comes back after `eject_for` through one probe, doubling on each repeat
+(up to 32×). If more than `max_ejection` of the endpoints are ejected, the balancer ignores ejection
+("panic") and spreads over all of them. When every endpoint is ejected or tried, the request still
+goes somewhere rather than failing fast. The endpoint list can be replaced at run time by the
+control plane (see `docs/ha/discovery.md`); a reload keeps a list the control plane has set.
+A plain `url` upstream is unchanged and pays nothing for this.
+
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
 ```yaml
@@ -478,6 +584,38 @@ unknown token is 404 and is not a file. When ACME is enabled the stored rules
 also gain `allow:/.well-known/acme-challenge` if it is not already there: a
 wildcard allow does not match a dot component, and that literal is the form the
 access-rule list needs. A dedicated HTTP-01 port never consults the file handler.
+
+## Swarm
+
+```yaml
+swarm:
+  enabled: false   # default
+```
+
+`swarm.enabled: true` starts the optional agent-swarm module (`docs/design/agent-swarm.md`)
+before the listener accepts. The module mounts `/swarm/v1/*`; those requests answer 501 until
+the task API lands, and every other path stays on the terminal the server already had. It is
+node-local, like `server.bind_content`: it is not part of the
+canonical document, so the control plane does not distribute it and a config recovered from
+last-good starts with the swarm off. The JVM property `-Dsjws.swarm.enabled` and then the
+environment variable `SJWS_SWARM_ENABLED` win over the key when set. With the swarm off no
+`sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet.
+The key is read once, at startup: changing it takes effect on restart, not on reload.
+
+## Buffers
+
+```yaml
+buffers:
+  pool: false   # default
+```
+
+`buffers.pool: true` turns on the shared pool of direct buffers (`docs/design/buffer-pool.md`). HTTP/1
+then reads requests into pooled buffers (an idle connection keeps only a 256-byte one) and sends
+in-memory bodies and files up to 64 KiB with one gathering write instead of copying them into a new
+array; larger files still go through sendfile. The key sets the JVM property `sjws.buf.pool`; a
+`-Dsjws.buf.pool=on|off` given on the command line wins. Node-local like `swarm.enabled`, and read
+once, at startup: changing it takes effect on restart, not on reload. The other pool settings
+(`sjws.buf.maxBytes`, `sjws.buf.budgets`) are JVM properties only.
 
 ## Request path
 

@@ -31,7 +31,6 @@ import java.time.Duration;
 import java.util.HashSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -42,29 +41,28 @@ import sjws_nettask.clusterharness.ClusterHarness.DataRole;
  * Multi-node cluster harness on top of the file-serving end-to-end test: real listeners,
  * ephemeral ports, a temporary document root, {@code java.net.http.HttpClient}.
  *
- * <p>Live cases are the data plane with the control plane off (standalone and gateway-off).
- * Partition, leader kill, slow node, and rollback need {@code sjws_nettask.cp}. They are
- * disabled and point at {@link ControlPlaneDesign#PR}. Enabling them against
- * {@link PendingControlPlane} fails the test; that class does not invent a passing cluster.
+ * <p>The data plane with the control plane off (standalone and gateway-off) constructs no
+ * control-plane object. Partition, leader kill, slow node, and rollback run against
+ * {@link CpStoreControlPlane}: 3 or 5 real {@code cp-config} voters on the manual
+ * {@link ClusterClock}, and data-mode servers joined through the real watch.
  */
 @Tag("cluster")
 @Timeout(20)
 class ClusterScenariosTest {
 
-    /**
-     * Disabled on purpose. The control plane is the design PR, not this tree.
-     * Do not delete this annotation to "make CI green" against {@link PendingControlPlane}.
-     */
-    private static final String PENDING = "TODO https://github.com/BlivionIaG/sjws_nettask/pull/38"
-            + " — enable when sjws_nettask.cp implements ControlPlane."
-            + " PendingControlPlane must not satisfy this scenario.";
-
     private static final String BODY = "hello from the temp docroot\n";
-    private static final String YAML_V1 = "server:\n  port: 0\n";
-    private static final String YAML_V2 = "server:\n  port: 0\n  healthz: true\n";
 
     @TempDir
     Path root;
+
+    /** A pushed document must name an existing root; data nodes reject it otherwise (fail closed). */
+    private String yamlV1() {
+        return "server:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n";
+    }
+
+    private String yamlV2() {
+        return "server:\n  port: 0\n  root: " + root.toAbsolutePath() + "\n  max_connections: 2048\n";
+    }
 
     @Test
     void dataNodesServeOnEphemeralPorts() throws Exception {
@@ -115,15 +113,31 @@ class ClusterScenariosTest {
     }
 
     @Test
-    void controlPlaneRefusesUntilTheDesignIsImplemented() {
+    void pendingControlPlaneStillRefuses() {
         var cp = new PendingControlPlane();
         assertFalse(cp.available());
-        var thrown = assertThrows(ControlPlanePendingException.class, () -> cp.push(YAML_V1));
+        var thrown = assertThrows(ControlPlanePendingException.class, () -> cp.push("server:\n  port: 0\n"));
         assertTrue(thrown.getMessage().contains(ControlPlaneDesign.PR), thrown.getMessage());
-        assertThrows(ControlPlanePendingException.class,
-                () -> ClusterHarness.open(3, 2, root, DataRole.DATA, ClusterClock.Manual.startingAtZero()));
-        assertThrows(ControlPlanePendingException.class,
-                () -> ClusterHarness.open(5, 1, root, DataRole.GATEWAY_OFF, ClusterClock.SYSTEM));
+        assertThrows(IllegalArgumentException.class,
+                () -> ClusterHarness.open(0, 1, root, DataRole.DATA, ClusterClock.SYSTEM));
+    }
+
+    @Test
+    void threeVotersElectOneReadyLeader() throws Exception {
+        try (var cluster = ClusterHarness.open(3, 1, root, DataRole.GATEWAY_OFF, ClusterClock.Manual.startingAtZero())) {
+            var cp = cluster.control();
+            assertTrue(cp.available());
+            assertEquals(3, cp.nodes().size());
+            var leader = cp.leader().orElseThrow();
+            assertTrue(leader.term() > 0L);
+            int ready = 0;
+            var ports = new HashSet<Integer>();
+            for (var node : cp.nodes()) {
+                ready += node.leaderReady() ? 1 : 0;
+                assertTrue(ports.add(node.adminPort()), node.id());
+            }
+            assertEquals(1, ready);
+        }
     }
 
     @Test
@@ -148,14 +162,13 @@ class ClusterScenariosTest {
     }
 
     @Test
-    @Disabled(PENDING)
     void networkPartitionKeepsLastGoodConfig() throws Exception {
         Files.writeString(root.resolve("hello.txt"), BODY, StandardCharsets.UTF_8);
         var clock = ClusterClock.Manual.startingAtZero();
         try (var cluster = ClusterHarness.open(3, 2, root, DataRole.DATA, clock)) {
             var cp = cluster.control();
             assertQuietDuring(cluster, () -> {
-                long version = cp.push(YAML_V1);
+                long version = cp.push(yamlV1());
                 cp.awaitConverged(version, Duration.ofSeconds(2));
             });
             long installed = cluster.dataNodes().get(0).version();
@@ -171,7 +184,7 @@ class ClusterScenariosTest {
             }
             cp.heal();
             assertQuietDuring(cluster, () -> {
-                long next = cp.push(YAML_V2);
+                long next = cp.push(yamlV2());
                 cp.awaitConverged(next, Duration.ofSeconds(2));
             });
             long converged = cluster.dataNodes().get(0).version();
@@ -182,13 +195,12 @@ class ClusterScenariosTest {
     }
 
     @Test
-    @Disabled(PENDING)
     void controlPlaneLeaderKillConvergesOnANewLeader() throws Exception {
         Files.writeString(root.resolve("hello.txt"), BODY, StandardCharsets.UTF_8);
         var clock = ClusterClock.Manual.startingAtZero();
         try (var cluster = ClusterHarness.open(5, 2, root, DataRole.DATA, clock)) {
             var cp = cluster.control();
-            long version = cp.push(YAML_V1);
+            long version = cp.push(yamlV1());
             cp.awaitConverged(version, Duration.ofSeconds(2));
             var leader = cp.leader().orElseThrow();
             assertTrue(leader.leaderReady());
@@ -202,7 +214,7 @@ class ClusterScenariosTest {
             assertTrue(next.adminPort() > 0);
             assertNotEquals(oldPort, next.adminPort());
             assertQuietDuring(cluster, () -> {
-                long pushed = cp.push(YAML_V2);
+                long pushed = cp.push(yamlV2());
                 cp.awaitConverged(pushed, Duration.ofSeconds(2));
             });
             long converged = cluster.dataNodes().get(0).version();
@@ -215,7 +227,6 @@ class ClusterScenariosTest {
     }
 
     @Test
-    @Disabled(PENDING)
     void slowNodeStillConvergesWithoutRequestErrors() throws Exception {
         Files.writeString(root.resolve("hello.txt"), BODY, StandardCharsets.UTF_8);
         var clock = ClusterClock.Manual.startingAtZero();
@@ -224,7 +235,8 @@ class ClusterScenariosTest {
             var slow = cluster.dataNodes().get(2);
             cp.delay(slow.id(), Duration.ofMillis(200));
             var pushed = new long[1];
-            assertQuietDuring(cluster, () -> pushed[0] = cp.push(YAML_V1));
+            assertQuietDuring(cluster, () -> pushed[0] = cp.push(yamlV1()));
+            assertEquals(0L, slow.version(), "the delayed node waits for the clock");
             clock.advance(Duration.ofMillis(200));
             cp.awaitConverged(pushed[0], Duration.ofSeconds(2));
             for (var node : cluster.dataNodes()) {
@@ -235,16 +247,15 @@ class ClusterScenariosTest {
     }
 
     @Test
-    @Disabled(PENDING)
     void configRollbackConvergesOnThePreviousHash() throws Exception {
         Files.writeString(root.resolve("hello.txt"), BODY, StandardCharsets.UTF_8);
         var clock = ClusterClock.Manual.startingAtZero();
         try (var cluster = ClusterHarness.open(3, 2, root, DataRole.DATA, clock)) {
             var cp = cluster.control();
-            long v1 = cp.push(YAML_V1);
+            long v1 = cp.push(yamlV1());
             cp.awaitConverged(v1, Duration.ofSeconds(2));
             String hash = cp.contentHash(v1);
-            long v2 = cp.push(YAML_V2);
+            long v2 = cp.push(yamlV2());
             cp.awaitConverged(v2, Duration.ofSeconds(2));
             assertTrue(v2 > v1);
             var rolled = new long[1];

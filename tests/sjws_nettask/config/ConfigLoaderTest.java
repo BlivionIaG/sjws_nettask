@@ -2,8 +2,15 @@ package sjws_nettask.config;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Base64;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.List;
@@ -63,6 +70,72 @@ class ConfigLoaderTest {
         var loaded = ConfigLoader.load(new String[] {"--config=/no/such/sjws.yaml", "--state-dir=" + dir}, Map.of());
         assertFalse(loaded.ok());
         assertTrue(loaded.errors().get(0).contains("Cannot read config file"));
+    }
+
+    @Test
+    void swarmEnabledIsNodeLocalAndOffByDefault() throws Exception {
+        var none = ConfigLoader.load(new String[] {"--config=" + write("# nothing\n")}, Map.of());
+        assertTrue(none.ok(), none.errors().toString());
+        assertNull(none.yamlSwarmEnabled());
+        var on = ConfigLoader.load(new String[] {"--config=" + write("swarm:\n  enabled: true\n")}, Map.of());
+        assertTrue(on.ok(), on.errors().toString());
+        assertEquals(Boolean.TRUE, on.yamlSwarmEnabled());
+        assertFalse(on.document().canonicalText().contains("swarm"), on.document().canonicalText());
+        assertEquals(Boolean.TRUE, on.withDocument(on.document()).yamlSwarmEnabled());
+        var off = ConfigLoader.load(new String[] {"--config=" + write("swarm:\n  enabled: false\n")}, Map.of());
+        assertEquals(Boolean.FALSE, off.yamlSwarmEnabled());
+        var empty = ConfigLoader.load(new String[] {"--config=" + write("swarm: {}\n")}, Map.of());
+        assertTrue(empty.ok(), empty.errors().toString());
+        assertNull(empty.yamlSwarmEnabled());
+        var unknown = ConfigLoader.load(new String[] {"--config=" + write("swarm:\n  pools: 3\n")}, Map.of());
+        assertFalse(unknown.ok());
+        var bad = ConfigLoader.load(new String[] {"--config=" + write("swarm:\n  enabled: maybe\n")}, Map.of());
+        assertFalse(bad.ok());
+        assertTrue(bad.errors().get(0).contains("swarm.enabled"), bad.errors().toString());
+    }
+
+    @Test
+    void cpBlockIsCarriedRawAndNotCanonical() throws Exception {
+        var loaded = ConfigLoader.load(new String[] {"--config=" + write("cp:\n  nodeId: cp-1\n  peers: []\n")},
+                Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        assertEquals("cp-1", loaded.yamlCp().get("nodeId"));
+        assertNotNull(loaded.configBase());
+        assertFalse(loaded.document().canonicalText().contains("cp-1"), loaded.document().canonicalText());
+        assertNull(ConfigLoader.load(new String[] {"--config=" + write("swarm: {}\n")}, Map.of()).yamlCp());
+        assertEquals("cp-1", loaded.withDocument(loaded.document()).yamlCp().get("nodeId"));
+        assertFalse(ConfigLoader.load(new String[] {"--config=" + write("cp: 3\n")}, Map.of()).ok());
+    }
+
+    @Test
+    void buffersPoolMapsToThePropertyUnlessSet() throws Exception {
+        var saved = System.getProperty("sjws.buf.pool");
+        try {
+            System.clearProperty("sjws.buf.pool");
+            var on = ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  pool: true\n")}, Map.of());
+            assertTrue(on.ok(), on.errors().toString());
+            assertEquals("on", System.getProperty("sjws.buf.pool"));
+            assertFalse(on.document().canonicalText().contains("buffers"), on.document().canonicalText());
+            var kept = ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  pool: false\n")}, Map.of());
+            assertTrue(kept.ok(), kept.errors().toString());
+            assertEquals("on", System.getProperty("sjws.buf.pool")); // a property already set wins
+            System.clearProperty("sjws.buf.pool");
+            assertTrue(ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  pool: false\n")}, Map.of()).ok());
+            assertEquals("off", System.getProperty("sjws.buf.pool"));
+            System.clearProperty("sjws.buf.pool");
+            assertTrue(ConfigLoader.load(new String[] {"--config=" + write("buffers: {}\n")}, Map.of()).ok());
+            assertNull(System.getProperty("sjws.buf.pool"));
+            assertFalse(ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  slabs: 3\n")}, Map.of()).ok());
+            var bad = ConfigLoader.load(new String[] {"--config=" + write("buffers:\n  pool: maybe\n")}, Map.of());
+            assertFalse(bad.ok());
+            assertTrue(bad.errors().get(0).contains("buffers.pool"), bad.errors().toString());
+        } finally {
+            if (saved == null) {
+                System.clearProperty("sjws.buf.pool");
+            } else {
+                System.setProperty("sjws.buf.pool", saved);
+            }
+        }
     }
 
     @Test
@@ -520,6 +593,405 @@ class ConfigLoaderTest {
         assertTrue(error(up("      retry: { tries: 1 }\n")).contains("tries"));
         assertTrue(error(up("      circuit: { failures: 0 }\n")).contains("failures"));
         assertTrue(error(up("      circuit: { eject_for: never }\n")).contains("eject_for"));
+    }
+
+    @Test
+    void haClusterKeyComesFromTheFileOrEnvAndIsNeverLogged() throws Exception {
+        var fileKey = "file-cluster-key-0123456789";
+        var previous = "file-previous-key-0123456";
+        var envKey = "env-cluster-key-0123456789";
+        var root = dir.toAbsolutePath();
+        var bare = dir.resolve("bare.yaml");
+        Files.writeString(bare, "server:\n  port: 0\n  root: " + root + "\n");
+        var withHa = dir.resolve("ha.yaml");
+        Files.writeString(withHa, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key: \""
+                + fileKey + "\"\n  cluster_key_previous: \"" + previous + "\"\n");
+        var off = ConfigLoader.load(new String[] {"--config=" + bare}, Map.of("WEB_SERVER_HA_CLUSTER_KEY", envKey));
+        assertTrue(off.ok(), off.errors().toString());
+        assertFalse(off.haEnabled());
+        assertNull(off.haClusterKey());
+        assertFalse(off.toString().contains(envKey), off.toString());
+        assertTrue(off.toString().contains("clusterKey=none"));
+
+        var on = ConfigLoader.load(new String[] {"--config=" + withHa}, Map.of());
+        assertTrue(on.ok(), on.errors().toString());
+        assertTrue(on.haEnabled());
+        assertArrayEquals(fileKey.getBytes(java.nio.charset.StandardCharsets.UTF_8), on.haClusterKey());
+        assertArrayEquals(previous.getBytes(java.nio.charset.StandardCharsets.UTF_8), on.haClusterKeyPrevious());
+        assertEquals(off.document().canonicalHash(), on.document().canonicalHash());
+        assertFalse(on.document().canonicalText().contains(fileKey));
+        assertFalse(on.document().canonicalText().contains("cluster_key"));
+        assertFalse(on.toString().contains(fileKey), on.toString());
+        assertFalse(on.toString().contains(previous), on.toString());
+        assertTrue(on.toString().contains("****"));
+        assertArrayEquals(on.haClusterKey(), on.withDocument(on.document()).haClusterKey());
+
+        var overridden = ConfigLoader.load(new String[] {"--config=" + withHa},
+                Map.of("WEB_SERVER_HA_CLUSTER_KEY", envKey, "WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS", "env-previous-key-012345"));
+        assertArrayEquals(envKey.getBytes(java.nio.charset.StandardCharsets.UTF_8), overridden.haClusterKey());
+        assertFalse(overridden.toString().contains(envKey), overridden.toString());
+        assertFalse(overridden.toString().contains(fileKey), overridden.toString());
+
+        var disabled = dir.resolve("ha-off.yaml");
+        Files.writeString(disabled, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: false\n  cluster_key: \""
+                + fileKey + "\"\n");
+        var keptOff = ConfigLoader.load(new String[] {"--config=" + disabled}, Map.of());
+        assertTrue(keptOff.ok(), keptOff.errors().toString());
+        assertFalse(keptOff.haEnabled());
+        assertNull(keptOff.haClusterKey());
+        assertFalse(keptOff.toString().contains(fileKey));
+
+        var missing = error("ha:\n  enabled: true\n  cluster_key_previous: \"" + previous + "\"\n");
+        assertTrue(missing.contains("no cluster key"));
+        assertFalse(missing.contains(previous), missing);
+        var emptyEnv = ConfigLoader.load(new String[] {"--config=" + withHa}, Map.of("WEB_SERVER_HA_CLUSTER_KEY", ""));
+        assertFalse(emptyEnv.ok());
+        assertFalse(emptyEnv.errors().get(0).contains(fileKey), emptyEnv.errors().toString());
+        var blankEnv = ConfigLoader.load(new String[] {"--config=" + withHa},
+                Map.of("WEB_SERVER_HA_CLUSTER_KEY", "   ", "WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS", "   "));
+        assertFalse(blankEnv.ok());
+        assertFalse(blankEnv.errors().get(0).contains(fileKey), blankEnv.errors().toString());
+        var shortPrevious = "short-prev-zz";
+        var previousTooShort = error("ha:\n  enabled: true\n  cluster_key: \"" + fileKey
+                + "\"\n  cluster_key_previous: \"" + shortPrevious + "\"\n");
+        assertTrue(previousTooShort.contains("at least"));
+        assertFalse(previousTooShort.contains(shortPrevious), previousTooShort);
+        assertFalse(previousTooShort.contains(fileKey), previousTooShort);
+        var shortKey = "uniq-short-zz";
+        var tooShort = error("ha:\n  enabled: true\n  cluster_key: \"" + shortKey + "\"\n");
+        assertTrue(tooShort.contains("at least"));
+        assertFalse(tooShort.contains(shortKey), tooShort);
+        assertTrue(error("ha:\n  enabled: true\n  cluster_key: 1\n").contains("expected a string"));
+        assertTrue(error("ha:\n  enabled: true\n  cluster_key: \"   \"\n").contains("expected a string"));
+        assertTrue(error("ha:\n  enabled: maybe\n").contains("true or false"));
+        assertTrue(error("ha:\n  password: " + fileKey + "\n").contains("Unknown key"));
+        assertFalse(error("ha:\n  password: " + fileKey + "\n").contains(fileKey));
+        var cli = "cli-cluster-key-should-not-appear";
+        var refused = ConfigLoader.load(new String[] {"--config=" + withHa, "--cluster-key=" + cli}, Map.of());
+        assertFalse(refused.ok());
+        assertTrue(refused.errors().stream().noneMatch(e -> e.contains(cli)), refused.errors().toString());
+        assertTrue(refused.errors().stream().noneMatch(e -> e.contains(fileKey)), refused.errors().toString());
+    }
+
+    @Test
+    void haClusterKeyFileMustBeOwnerOnlyAndInlineKeysWarnWhenTheConfigIsReadable() throws Exception {
+        var secret = new byte[32];
+        java.util.Arrays.fill(secret, (byte) 0x3c);
+        var keyFile = dir.resolve("cluster.key");
+        Files.writeString(keyFile, "base64:" + Base64.getEncoder().encodeToString(secret) + "\n");
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        var yaml = dir.resolve("ha-file.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key_file: cluster.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        assertArrayEquals(secret, loaded.haClusterKey());
+        assertFalse(loaded.toString().contains("base64:"), loaded.toString());
+        assertTrue(loaded.warnings().stream().noneMatch(w -> w.contains("cluster_key")));
+
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-r-----"));
+        var open = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(open.ok());
+        assertTrue(open.errors().get(0).contains("0600"), open.errors().toString());
+        assertFalse(open.errors().get(0).contains("base64:"), open.errors().toString());
+
+        var both = error("ha:\n  enabled: true\n  cluster_key: \"0123456789abcdef\"\n  cluster_key_file: cluster.key\n");
+        assertTrue(both.contains("cannot both"));
+        assertFalse(both.contains("0123456789abcdef"));
+
+        var inline = dir.resolve("ha-inline.yaml");
+        var inlineKey = "inline-cluster-key-0123456789";
+        Files.writeString(inline, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key: \""
+                + inlineKey + "\"\n");
+        Files.setPosixFilePermissions(inline, PosixFilePermissions.fromString("rw-r--r--"));
+        var warned = ConfigLoader.load(new String[] {"--config=" + inline}, Map.of());
+        assertTrue(warned.ok(), warned.errors().toString());
+        assertTrue(warned.warnings().stream().anyMatch(w -> w.contains("chmod 600")), warned.warnings().toString());
+        assertFalse(warned.warnings().toString().contains(inlineKey), warned.warnings().toString());
+        Files.setPosixFilePermissions(inline, PosixFilePermissions.fromString("rw-------"));
+        var quiet = ConfigLoader.load(new String[] {"--config=" + inline}, Map.of());
+        assertTrue(quiet.warnings().stream().noneMatch(w -> w.contains("chmod 600")), quiet.warnings().toString());
+    }
+
+    @Test
+    void haClusterKeyFileChecksOwnerThroughTheOpenChannel() throws Exception {
+        var secret = "owner-channel-key-0123456789abcd";
+        var keyFile = dir.resolve("owned.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("r--------"));
+        var yaml = dir.resolve("ha-owned.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key_file: owned.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        var readOnly = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(readOnly.ok(), readOnly.errors().toString());
+        assertArrayEquals(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), readOnly.haClusterKey());
+
+        var link = dir.resolve("owned.link");
+        Files.createSymbolicLink(link, keyFile);
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: owned.link\n");
+        var linked = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(linked.ok());
+        assertTrue(linked.errors().get(0).contains("symlink"), linked.errors().toString());
+        assertFalse(linked.errors().get(0).contains(secret), linked.errors().toString());
+
+        var huge = dir.resolve("huge.key");
+        Files.writeString(huge, "h".repeat(4097));
+        Files.setPosixFilePermissions(huge, PosixFilePermissions.fromString("rw-------"));
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key_file: huge.key\n");
+        var big = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(big.ok());
+        assertTrue(big.errors().get(0).contains("too large"), big.errors().toString());
+        assertFalse(big.errors().get(0).contains("hhhh"), big.errors().toString());
+
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root + "\nha:\n  enabled: true\n  cluster_key_file: " + root + "\n");
+        var directory = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(directory.ok());
+        assertTrue(directory.errors().get(0).contains("not a file") || directory.errors().get(0).contains("Cannot read"),
+                directory.errors().toString());
+
+        var passwd = Path.of("/etc/passwd");
+        if (Files.isReadable(passwd) && Files.exists(Path.of("/proc/self"))) {
+            int self = ((Integer) Files.getAttribute(Path.of("/proc/self"), "unix:uid")).intValue();
+            int owner = ((Integer) Files.getAttribute(passwd, "unix:uid")).intValue();
+            if (self != owner) {
+                Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                        + "\nha:\n  enabled: true\n  cluster_key_file: /etc/passwd\n");
+                var foreign = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+                assertFalse(foreign.ok());
+                assertTrue(foreign.errors().get(0).contains("owned by"), foreign.errors().toString());
+                assertFalse(foreign.errors().get(0).contains("root:"), foreign.errors().toString());
+            }
+        }
+    }
+
+    @Test
+    void haClusterKeyFileResolvesParentSymlinksBeforeTheChecks() throws Exception {
+        var secret = "parent-symlink-key-0123456789ab";
+        var realDir = Files.createDirectories(dir.resolve("real-keys"));
+        var keyFile = realDir.resolve("cluster.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        var linkDir = dir.resolve("via-link");
+        Files.createSymbolicLink(linkDir, realDir);
+        var yaml = dir.resolve("ha-parent-link.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: via-link/cluster.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        assertArrayEquals(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), loaded.haClusterKey());
+        assertFalse(loaded.toString().contains(secret), loaded.toString());
+
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-r-----"));
+        var open = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(open.ok());
+        assertTrue(open.errors().get(0).contains("0600"), open.errors().toString());
+        assertFalse(open.errors().get(0).contains(secret), open.errors().toString());
+    }
+
+    /**
+     * A leaf symlink that already exists is refused by the old pre-check too, so it cannot tell
+     * the two versions apart. This swap runs after that pre-check would have passed and before
+     * the open. The target is a valid 0600 file owned by this process: code that follows the
+     * leaf accepts it.
+     */
+    @Test
+    void haClusterKeyFileRefusesALeafSwappedForASymlinkToAValidKey() throws Exception {
+        var secret = "leaf-swap-secret-0123456789abcd";
+        var other = "other-valid-secret-0123456789ab";
+        var keyFile = dir.resolve("swap.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        var target = dir.resolve("valid-target.key");
+        Files.writeString(target, other);
+        Files.setPosixFilePermissions(target, PosixFilePermissions.fromString("rw-------"));
+        var yaml = dir.resolve("ha-swap.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: swap.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        assertNull(SecureKeyFile.beforeOpen);
+        SecureKeyFile.beforeOpen = opened -> {
+            try {
+                Files.delete(opened);
+                Files.createSymbolicLink(opened, target);
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
+        try {
+            var swapped = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+            assertFalse(swapped.ok(), swapped.errors().toString());
+            assertTrue(swapped.errors().get(0).contains("symlink"), swapped.errors().toString());
+            assertFalse(swapped.errors().get(0).contains(secret), swapped.errors().toString());
+            assertFalse(swapped.errors().get(0).contains(other), swapped.errors().toString());
+        } finally {
+            SecureKeyFile.beforeOpen = null;
+        }
+    }
+
+    @Test
+    void haClusterKeyFileRefusesAGroupOrWorldWritableParentUnlessSticky() throws Exception {
+        var secret = "loose-parent-secret-0123456789ab";
+        var loose = Files.createDirectories(dir.resolve("loose"));
+        var inner = Files.createDirectories(loose.resolve("inner"));
+        Files.setPosixFilePermissions(inner, PosixFilePermissions.fromString("rwx------"));
+        var keyFile = inner.resolve("cluster.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        Files.setPosixFilePermissions(loose, PosixFilePermissions.fromString("rwxrwxr-x"));
+        var yaml = dir.resolve("ha-loose.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: loose/inner/cluster.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        var group = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(group.ok());
+        assertTrue(group.errors().get(0).contains("writable parent"), group.errors().toString());
+        assertFalse(group.errors().get(0).contains(secret), group.errors().toString());
+
+        Files.setPosixFilePermissions(loose, PosixFilePermissions.fromString("rwx---rwx"));
+        var other = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(other.ok());
+        assertTrue(other.errors().get(0).contains("writable parent"), other.errors().toString());
+        assertFalse(other.errors().get(0).contains(secret), other.errors().toString());
+
+        var sticky = Files.createDirectories(dir.resolve("sticky"));
+        var stickyKey = sticky.resolve("cluster.key");
+        Files.writeString(stickyKey, secret);
+        Files.setPosixFilePermissions(stickyKey, PosixFilePermissions.fromString("rw-------"));
+        Files.setAttribute(sticky, "unix:mode", 01777);
+        int mode = ((Integer) Files.getAttribute(sticky, "unix:mode")).intValue();
+        assertTrue((mode & 01000) != 0, Integer.toOctalString(mode));
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: sticky/cluster.key\n");
+        var allowed = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(allowed.ok(), allowed.errors().toString());
+        assertArrayEquals(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), allowed.haClusterKey());
+        assertFalse(allowed.toString().contains(secret), allowed.toString());
+
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: no-such-dir/cluster.key\n");
+        var missingDir = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(missingDir.ok());
+        assertTrue(missingDir.errors().get(0).contains("Cannot read"), missingDir.errors().toString());
+
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: absent.key\n");
+        var missingFile = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertFalse(missingFile.ok());
+        assertTrue(missingFile.errors().get(0).contains("Cannot read"), missingFile.errors().toString());
+        assertFalse(missingFile.errors().get(0).contains("symlink"), missingFile.errors().toString());
+    }
+
+    @Test
+    void haClusterKeyFileRefusesAParentOwnedByAnotherUser() throws Exception {
+        var secret = "foreign-parent-secret-0123456789a";
+        var foreign = Files.createDirectories(dir.resolve("foreign-owner"));
+        var keyFile = foreign.resolve("cluster.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        Files.setPosixFilePermissions(foreign, PosixFilePermissions.fromString("rwxr-xr-x"));
+        var me = System.getProperty("user.name");
+        chown(foreign, "nobody");
+        try {
+            int uid = ((Integer) Files.getAttribute(foreign, "unix:uid")).intValue();
+            int self = ((Integer) Files.getAttribute(Path.of("/proc/self"), "unix:uid")).intValue();
+            assertNotEquals(self, uid);
+            assertNotEquals(0, uid);
+            var perms = Files.getPosixFilePermissions(foreign);
+            assertFalse(perms.contains(PosixFilePermission.GROUP_WRITE));
+            assertFalse(perms.contains(PosixFilePermission.OTHERS_WRITE));
+            var yaml = dir.resolve("ha-foreign-parent.yaml");
+            var root = dir.toAbsolutePath();
+            Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                    + "\nha:\n  enabled: true\n  cluster_key_file: foreign-owner/cluster.key\n");
+            Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+            var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+            assertFalse(loaded.ok(), loaded.errors().toString());
+            assertTrue(loaded.errors().get(0).contains("parent directory"), loaded.errors().toString());
+            assertFalse(loaded.errors().get(0).contains(secret), loaded.errors().toString());
+            assertFalse(loaded.errors().get(0).contains("nobody"), loaded.errors().toString());
+        } finally {
+            chown(foreign, me);
+        }
+    }
+
+    /**
+     * A second descriptor of the same inode must still load. Matching the path string and
+     * requiring a single hit refuses that case. A descriptor of a different file does not
+     * match {@code fileKey}.
+     */
+    @Test
+    void haClusterKeyFileTrustsTheDescriptorWhenTheInodeMatches() throws Exception {
+        var secret = "same-inode-secret-0123456789abcd";
+        var keyFile = dir.resolve("inode.key");
+        Files.writeString(keyFile, secret);
+        Files.setPosixFilePermissions(keyFile, PosixFilePermissions.fromString("rw-------"));
+        var other = dir.resolve("other-inode.key");
+        Files.writeString(other, "different-inode-secret-012345678");
+        Files.setPosixFilePermissions(other, PosixFilePermissions.fromString("rw-------"));
+        var yaml = dir.resolve("ha-inode.yaml");
+        var root = dir.toAbsolutePath();
+        Files.writeString(yaml, "server:\n  port: 0\n  root: " + root
+                + "\nha:\n  enabled: true\n  cluster_key_file: inode.key\n");
+        Files.setPosixFilePermissions(yaml, PosixFilePermissions.fromString("rw-------"));
+        assertNull(SecureKeyFile.beforeOpen);
+        FileChannel[] extra = new FileChannel[1];
+        SecureKeyFile.beforeOpen = opened -> {
+            try {
+                extra[0] = FileChannel.open(opened, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
+        try (var otherChannel = FileChannel.open(other, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+            assertTrue(loaded.ok(), loaded.errors().toString());
+            assertArrayEquals(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), loaded.haClusterKey());
+            assertFalse(loaded.toString().contains(secret), loaded.toString());
+            Path keyFd = procFd(keyFile);
+            Path otherFd = procFd(other);
+            assertNotNull(keyFd);
+            assertNotNull(otherFd);
+            assertTrue(SecureKeyFile.sameFile(keyFile, keyFd));
+            assertFalse(SecureKeyFile.sameFile(keyFile, otherFd));
+            assertTrue(otherChannel.isOpen());
+        } finally {
+            SecureKeyFile.beforeOpen = null;
+            if (extra[0] != null) {
+                extra[0].close();
+            }
+        }
+    }
+
+    /** {@code /proc/self/fd} entry whose {@code fileKey} is {@code file}, while that file is open. */
+    private static Path procFd(Path file) throws Exception {
+        Object want = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey();
+        try (var stream = Files.newDirectoryStream(Path.of("/proc/self/fd"))) {
+            for (var entry : stream) {
+                Object key;
+                try {
+                    key = Files.readAttributes(entry, BasicFileAttributes.class).fileKey();
+                } catch (java.io.IOException ignored) {
+                    continue;
+                }
+                if (want != null && want.equals(key)) {
+                    return Path.of("/proc/self/fd").resolve(entry.getFileName().toString());
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void chown(Path path, String owner) throws Exception {
+        var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
+        String out = new String(proc.getInputStream().readAllBytes());
+        assertEquals(0, proc.waitFor(), out);
     }
 
     private String error(String yaml) throws Exception {

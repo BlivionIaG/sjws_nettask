@@ -151,6 +151,18 @@ final class DeliveryState {
                 g.inFlight.put(o, lease);
                 g.due.add(g.leaseDue(o, lease));
             }
+            case LedgerEntry.Extend x -> {
+                var g = group(x.group());
+                for (int i = 0; i < x.offsets().length; i++) {
+                    long o = x.offsets()[i];
+                    var l = Objects.requireNonNull(g.inFlight.get(o), "extend: not in flight");
+                    if (l.attempt != x.attempts()[i]) throw new IllegalStateException("extend: stale attempt at " + o);
+                    g.due.remove(g.leaseDue(o, l));
+                    var nl = new Lease(l.consumer, x.deadlineMs(), l.attempt);
+                    g.inFlight.put(o, nl);
+                    g.due.add(g.leaseDue(o, nl));
+                }
+            }
             case LedgerEntry.Ack x -> {
                 var g = group(x.group());
                 var l = Objects.requireNonNull(g.inFlight.remove(x.offset()), "not in flight");
@@ -204,24 +216,26 @@ final class DeliveryState {
     }
 
     /** Candidates for delivery at {@code nowMs}: due redeliveries first (by due time), then fresh in offset order. */
-    List<Long> dueRedeliveries(Group g, long nowMs, int max) {
-        var out = new ArrayList<Long>();
-        for (var d : g.due) {
-            if (d.atMs > nowMs || out.size() >= max) break;
-            out.add(d.offset);
-        }
-        return out;
-    }
-
     // ---- snapshot ----
 
     DeliverySnapshot.Counts countsOf(Group g) {
         return new DeliverySnapshot.Counts(g.freshCount + g.retry.size(), g.inFlight.size(), g.acked, g.deadLettered, g.redeliveries);
     }
 
+    /** Lowest committed offset over all groups (everything below is settled for every group); MIN_VALUE without groups. */
+    long minCommitted() {
+        if (groups.isEmpty()) return Long.MIN_VALUE;
+        long m = Long.MAX_VALUE;
+        for (var g : groups.values()) m = Math.min(m, g.committedOffset);
+        return m;
+    }
+
     DeliveryCounts counts() {
         var gs = new LinkedHashMap<String, DeliveryCounts.Group>();
-        for (var g : groups.values()) gs.put(g.name, new DeliveryCounts.Group(g.committedOffset, countsOf(g)));
+        for (var g : groups.values()) {
+            var oldest = messages.ceilingEntry(g.committedOffset);
+            gs.put(g.name, new DeliveryCounts.Group(g.committedOffset, countsOf(g), oldest == null ? 0 : oldest.getValue().timestampMs()));
+        }
         return new DeliveryCounts(version, nextOffset, enqueued, messages.size(), gs);
     }
 
@@ -292,6 +306,14 @@ final class DeliveryState {
     static final int SNAP_VERSION = 1;
 
     /** Serializes the full state (no payloads) as of {@link #nextOffset}, with a trailing CRC32C. */
+    /** Entries {@link #serialize} writes (messages, per-group lists, dedup windows, origins): its cost, O(groups + producers). */
+    long serializedEntries() {
+        long n = messages.size() + origins.size();
+        for (var g : groups.values()) n += g.inFlight.size() + g.retry.size() + g.dead.size() + g.resolvedAbove.size() + g.due.size();
+        for (var w : dedup.values()) n += w.size();
+        return n;
+    }
+
     byte[] serialize() {
         try {
             var bo = new java.io.ByteArrayOutputStream(64 + messages.size() * 48);

@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ConcurrentHashMap;
@@ -88,6 +89,10 @@ public final class Partition implements AutoCloseable {
     private CompletableFuture<Long> lastSnapshot = CompletableFuture.completedFuture(-1L);
     private final long recoveredFromSnapshot;
     private final long replayedEntries;
+    /** Retain-from pins by owner (agent-graphs.md §4.3): retention never deletes at or above the lowest. */
+    private volatile Map<String, Long> pins = Map.of();
+    private final java.util.concurrent.locks.ReentrantLock pinLock = new java.util.concurrent.locks.ReentrantLock();
+    static final String PINS_FILE = "retain-from.pins";
 
     private Partition(String topic, SegmentedLog log, LedgerWriter writer, DeliveryState state, Partition dlq, LongSupplier clockMs,
             Path logDir, java.util.Collection<Long> snaps, long recoveredFromSnapshot, long replayedEntries) {
@@ -112,9 +117,23 @@ public final class Partition implements AutoCloseable {
 
     public static Partition open(Path dir, String topic, RetryPolicy policy, LongSupplier clockMs, Durability durability,
             long segmentBytes) throws IOException {
+        return open(dir, topic, policy, clockMs, durability, segmentBytes, true);
+    }
+
+    /**
+     * As {@link #open(Path, String, RetryPolicy, LongSupplier, Durability, long)}; {@code deadLetterQueue = false}
+     * opens the topic without a {@code <topic>.dlq} partition (no directory, no writer, syncer or snapshotter
+     * threads for it). A message that exhausts {@code maxAttempts}, or is rejected, is then dropped in place: its
+     * own log records DEAD_LETTERED with the reason (it is counted in {@code deadLettered}, listed by inspection,
+     * never delivered again, and its payload becomes reclaimable by retention), but no copy is kept anywhere.
+     * An existing {@code <topic>.dlq} directory is left untouched, so reopening with a DLQ later still sees it.
+     */
+    public static Partition open(Path dir, String topic, RetryPolicy policy, LongSupplier clockMs, Durability durability,
+            long segmentBytes, boolean deadLetterQueue) throws IOException {
         if (topic.isEmpty() || topic.contains("/") || topic.contains("\\")) throw new IllegalArgumentException("topic");
         boolean isDlq = topic.endsWith(DLQ_SUFFIX);
-        Partition dlq = isDlq ? null : open(dir, topic + DLQ_SUFFIX, RetryPolicy.NO_DLQ, clockMs, durability, segmentBytes);
+        Partition dlq = isDlq || !deadLetterQueue ? null
+                : open(dir, topic + DLQ_SUFFIX, RetryPolicy.NO_DLQ, clockMs, durability, segmentBytes, false);
         var logDir = dir.resolve(topic);
         var log = SegmentedLog.open(logDir, segmentBytes);
         var policyFor = isDlq ? RetryPolicy.NO_DLQ : policy;
@@ -162,7 +181,9 @@ public final class Partition implements AutoCloseable {
             if (fromSnap >= 0 && so <= fromSnap && so >= log.startOffset()) keep.add(so);
             else Files.deleteIfExists(logDir.resolve(snapName(so)));
         }
+        var pinned = readPins(logDir); // before any thread starts: a corrupt pin file fails the open cleanly
         var p = new Partition(topic, log, new LedgerWriter(log, durability), st, dlq, clockMs, logDir, keep, fromSnap, replayed[0]);
+        p.pins = pinned;
         p.publish();
         return p;
     }
@@ -175,7 +196,7 @@ public final class Partition implements AutoCloseable {
 
     public String topic() { return topic; }
 
-    /** The {@code <topic>.dlq} partition, or null for a DLQ topic itself. */
+    /** The {@code <topic>.dlq} partition, or null for a DLQ topic itself or a topic opened without one. */
     public Partition deadLetterQueue() { return dlq; }
 
     // ---- producer ----
@@ -205,12 +226,16 @@ public final class Partition implements AutoCloseable {
 
     /** Creates {@code group} if absent: from the oldest retained message, or from the next new one. Idempotent. */
     public boolean subscribe(String group, boolean fromStart) {
+        // Groups are never removed, so a group seen once stays subscribed: callers that re-subscribe before every
+        // claim/ack (TaskService) skip the partition lock entirely.
+        if (subscribed.contains(group)) return false;
         lock.lock();
         try {
-            if (state.groups.containsKey(group)) return false;
+            if (state.groups.containsKey(group)) { subscribed.add(group); return false; }
             long from = fromStart ? (state.messages.isEmpty() ? state.nextOffset : Math.min(state.messages.firstKey(), state.nextOffset))
                     : state.nextOffset;
             append(new LedgerEntry.Subscribe(group, from), null);
+            subscribed.add(group);
             return true;
         } finally {
             lock.unlock();
@@ -224,14 +249,132 @@ public final class Partition implements AutoCloseable {
      */
     public List<Delivery> poll(String group, String consumer, int max, long visibilityMs) {
         if (max < 1 || visibilityMs < 1) throw new IllegalArgumentException("max/visibility");
+        List<Leased> got;
         lock.lock();
         try {
-            var g = state.group(group);
-            long now = clockMs.getAsLong();
-            var out = new ArrayList<Delivery>();
-            var policy = state.policy();
-            for (long o : state.dueRedeliveries(g, now, Integer.MAX_VALUE)) {
-                if (out.size() >= max) break;
+            got = pollLocked(group, consumer, max, visibilityMs);
+        } finally {
+            lock.unlock();
+        }
+        return toDeliveries(got);
+    }
+
+    /**
+     * Blocking poll: as {@link #poll(String, String, int, long)}, but when nothing is deliverable it parks (no spin)
+     * for up to {@code waitNanos} until a message is appended, or until the group's earliest redelivery is due.
+     * Returns early with what it got; an empty list means the wait elapsed (or the partition closed / the thread
+     * was interrupted, with the interrupt flag kept). Wakeups come from the append path and cost nothing when no
+     * caller is waiting.
+     */
+    public List<Delivery> poll(String group, String consumer, int max, long visibilityMs, long waitNanos) {
+        return toDeliveries(pollWaiting(group, consumer, max, visibilityMs, waitNanos));
+    }
+
+    private List<Leased> pollWaiting(String group, String consumer, int max, long visibilityMs, long waitNanos) {
+        if (max < 1 || visibilityMs < 1 || waitNanos < 0) throw new IllegalArgumentException("max/visibility/wait");
+        long deadline = System.nanoTime() + waitNanos;
+        lock.lock();
+        try {
+            while (true) {
+                var out = pollLocked(group, consumer, max, visibilityMs);
+                if (!out.isEmpty() || closed) return out;
+                long left = deadline - System.nanoTime();
+                if (left <= 0) return out;
+                var g = state.group(group);
+                long firstDue = g.due.isEmpty() ? Long.MAX_VALUE : g.due.first().atMs();
+                long wait = left;
+                if (firstDue != Long.MAX_VALUE) {
+                    long ms = Math.max(1, firstDue - clockMs.getAsLong());
+                    wait = Math.min(wait, ms * 1_000_000L);
+                }
+                var w = waiters.get(group);
+                if (w == null) { w = new Waiters(lock.newCondition()); waiters.put(group, w); }
+                w.count++;
+                if (firstDue < w.sleepUntilDueMs) w.sleepUntilDueMs = firstDue;
+                try {
+                    w.cond.awaitNanos(wait);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return out;
+                } finally {
+                    if (--w.count == 0) waiters.remove(group);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Lock held. Waiters of one group: blocked in {@link #poll(String, String, int, long, long)}. */
+    private static final class Waiters {
+        final java.util.concurrent.locks.Condition cond;
+        int count;
+        /** Earliest redelivery due time any current waiter planned to wake at (MAX = none). */
+        long sleepUntilDueMs = Long.MAX_VALUE;
+        Waiters(java.util.concurrent.locks.Condition c) { cond = c; }
+    }
+
+    private final java.util.HashMap<String, Waiters> waiters = new java.util.HashMap<>();
+    private volatile boolean closed;
+
+    /** Lock held, after {@code e} was applied, only when someone waits. */
+    private void wake(LedgerEntry e) {
+        switch (e) {
+            case LedgerEntry.Enqueue x -> { for (var w : waiters.values()) w.cond.signal(); } // one waiter per group per message
+            case LedgerEntry.Deliver x -> dueChanged(x.group(), x.deadlineMs());
+            case LedgerEntry.Nack x -> dueChanged(x.group(), x.notBeforeMs());
+            case LedgerEntry.Extend x -> dueChanged(x.group(), x.deadlineMs());
+            default -> { }
+        }
+    }
+
+    /** A redelivery may now be due at or after {@code atMs}: wake the group's waiters if they sleep past it. */
+    private void dueChanged(String group, long atMs) {
+        var w = waiters.get(group);
+        if (w != null && atMs < w.sleepUntilDueMs) {
+            w.sleepUntilDueMs = atMs;
+            w.cond.signalAll();
+        }
+    }
+
+    /**
+     * A lease taken under the lock; the {@link Delivery} (and its payload copy) is built after unlocking. The
+     * payload array is the cached or decoded one, never mutated, so reading it off-lock is safe.
+     */
+    private record Leased(long offset, int attempt, long deadline, DeliveryState.Message m, byte[] payload) { }
+
+    private static List<Delivery> toDeliveries(List<Leased> got) {
+        if (got.isEmpty()) return List.of();
+        var out = new ArrayList<Delivery>(got.size());
+        for (var l : got) {
+            var m = l.m();
+            out.add(new Delivery(l.offset(), l.attempt(), l.deadline(), m.producerId(), m.seq(), m.timestampMs(),
+                    l.payload(), m.originGroup(), m.originOffset(), m.originAttempts(), m.originReason()));
+        }
+        return out;
+    }
+
+    /**
+     * Lock held. Counts/snapshot publication runs once at the end of the poll instead of once per lease
+     * ({@link #deferPublish}), which is what bounds the lock hold time of a multi-message claim.
+     */
+    private List<Leased> pollLocked(String group, String consumer, int max, long visibilityMs) {
+        var g = state.group(group);
+        // Empty poll (a spinning or woken consumer finding nothing): no allocation at all.
+        if ((g.due.isEmpty() || g.due.first().atMs() > clockMs.getAsLong())
+                && (state.messages.isEmpty() || state.messages.lastKey() < g.cursor)) return List.of();
+        long now = clockMs.getAsLong();
+        var out = new ArrayList<Leased>(Math.min(max, 16));
+        var policy = state.policy();
+        long before = state.nextOffset;
+        deferPublish = true;
+        try {
+            // Due redeliveries in due order. Each step removes the head (redelivered or dead-lettered), so this
+            // reads only what it uses instead of materialising every due entry per poll.
+            while (out.size() < max && !g.due.isEmpty()) {
+                var d = g.due.first();
+                if (d.atMs() > now) break;
+                long o = d.offset();
                 var lease = g.inFlight.get(o);
                 int attempts = lease != null ? lease.attempt() : g.retry.get(o).attempts();
                 if (attempts >= policy.maxAttempts()) {
@@ -245,28 +388,59 @@ public final class Partition implements AutoCloseable {
                 if (o == null) break;
                 out.add(deliver(group, o, consumer, now + visibilityMs, 1));
             }
-            return out;
+        } finally {
+            deferPublish = false;
+            if (state.nextOffset != before) afterApply();
+        }
+        return out;
+    }
+
+    private Leased deliver(String group, long o, String consumer, long deadline, int attempt) {
+        append(new LedgerEntry.Deliver(group, o, consumer, deadline, attempt), null);
+        return new Leased(o, attempt, deadline, state.messages.get(o), payloadOf(o));
+    }
+
+    /** Matches any attempt: the unfenced overloads (kept for compatibility) settle whichever lease is current. */
+    static final int ANY_ATTEMPT = -1;
+
+    /** Lock held. Null when the caller holds the current lease, else why not. */
+    private LeaseResult fence(DeliveryState.Lease l, int attempt) {
+        if (l == null) return LeaseResult.NOT_IN_FLIGHT;
+        if (attempt != ANY_ATTEMPT && attempt != l.attempt()) return LeaseResult.STALE_ATTEMPT;
+        return null;
+    }
+
+    /**
+     * IN_FLIGHT → ACKED. Returns false if {@code offset} is not in flight for {@code group} (late or duplicate ack).
+     * Unfenced: prefer {@link #ack(String, long, int)} with the delivery's attempt.
+     */
+    public boolean ack(String group, long offset) { return ack(group, offset, ANY_ATTEMPT).ok(); }
+
+    /** As {@link #ack(String, long)}, returning the record's durability future, or null when rejected. Unfenced. */
+    public CompletableFuture<Long> ack(String group, long offset, Durability durability) {
+        return ack(group, offset, ANY_ATTEMPT, durability).durable();
+    }
+
+    /** Fenced ack: applied only if {@code attempt} is the current lease ({@link Delivery#attempt()}). */
+    public LeaseResult ack(String group, long offset, int attempt) {
+        lock.lock();
+        try { // no result allocation on the common path
+            var r = fence(state.group(group).inFlight.get(offset), attempt);
+            if (r != null) return r;
+            append(new LedgerEntry.Ack(group, offset), null);
+            return LeaseResult.OK;
         } finally {
             lock.unlock();
         }
     }
 
-    private Delivery deliver(String group, long o, String consumer, long deadline, int attempt) {
-        append(new LedgerEntry.Deliver(group, o, consumer, deadline, attempt), null);
-        var m = state.messages.get(o);
-        return new Delivery(o, attempt, deadline, m.producerId(), m.seq(), m.timestampMs(), payloadOf(o), m.originGroup(),
-                m.originOffset(), m.originAttempts(), m.originReason());
-    }
-
-    /** IN_FLIGHT → ACKED. Returns false if {@code offset} is not in flight for {@code group} (late or duplicate ack). */
-    public boolean ack(String group, long offset) { return ack(group, offset, null) != null; }
-
-    /** As {@link #ack(String, long)}, returning the record's durability future, or null when rejected. */
-    public CompletableFuture<Long> ack(String group, long offset, Durability durability) {
+    /** Fenced ack with a per-record durability override. */
+    public AckResult ack(String group, long offset, int attempt, Durability durability) {
         lock.lock();
         try {
-            if (!state.group(group).inFlight.containsKey(offset)) return null;
-            return append(new LedgerEntry.Ack(group, offset), durability);
+            var r = fence(state.group(group).inFlight.get(offset), attempt);
+            if (r != null) return new AckResult(r, null);
+            return new AckResult(LeaseResult.OK, append(new LedgerEntry.Ack(group, offset), durability));
         } finally {
             lock.unlock();
         }
@@ -274,37 +448,126 @@ public final class Partition implements AutoCloseable {
 
     /**
      * IN_FLIGHT → ENQUEUED, redeliverable after max(delayMs, backoff(attempt)); dead-lettered instead once the
-     * message has used {@code maxAttempts}. Returns false if not in flight.
+     * message has used {@code maxAttempts}. Returns false if not in flight. Unfenced.
      */
-    public boolean nack(String group, long offset, long delayMs) {
+    public boolean nack(String group, long offset, long delayMs) { return nack(group, offset, ANY_ATTEMPT, delayMs).ok(); }
+
+    /** Fenced nack: applied only if {@code attempt} is the current lease. */
+    public LeaseResult nack(String group, long offset, int attempt, long delayMs) {
         lock.lock();
         try {
             var g = state.group(group);
             var l = g.inFlight.get(offset);
-            if (l == null) return false;
+            var r = fence(l, attempt);
+            if (r != null) return r;
             if (l.attempt() >= state.policy().maxAttempts()) {
                 deadLetter(group, offset, l.attempt(), "nacked:max-attempts");
-                return true;
+                return LeaseResult.OK;
             }
             long notBefore = clockMs.getAsLong() + Math.max(Math.max(0, delayMs), state.policy().backoffMs(l.attempt()));
             append(new LedgerEntry.Nack(group, offset, notBefore), null);
-            return true;
+            return LeaseResult.OK;
         } finally {
             lock.unlock();
         }
     }
 
-    /** Dead-letters an in-flight message immediately (poison message). Returns false if not in flight. */
-    public boolean reject(String group, long offset, String reason) {
+    /** Dead-letters an in-flight message immediately (poison message). Returns false if not in flight. Unfenced. */
+    public boolean reject(String group, long offset, String reason) { return reject(group, offset, ANY_ATTEMPT, reason).ok(); }
+
+    /** Fenced reject: applied only if {@code attempt} is the current lease. */
+    public LeaseResult reject(String group, long offset, int attempt, String reason) {
         lock.lock();
         try {
             var l = state.group(group).inFlight.get(offset);
-            if (l == null) return false;
+            var r = fence(l, attempt);
+            if (r != null) return r;
             deadLetter(group, offset, l.attempt(), "rejected:" + reason);
-            return true;
+            return LeaseResult.OK;
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Heartbeat: moves the lease of {@code offset} (held under {@code attempt}) to {@code now + visibilityMs}.
+     * Appends one EXTEND record. The new deadline may be earlier than the current one (shortening is allowed).
+     */
+    public LeaseResult extend(String group, long offset, int attempt, long visibilityMs) {
+        if (visibilityMs < 1) throw new IllegalArgumentException("visibility");
+        lock.lock();
+        try {
+            var r = fence(state.group(group).inFlight.get(offset), attempt);
+            if (r != null) return r;
+            append(new LedgerEntry.Extend(group, clockMs.getAsLong() + visibilityMs, new long[] {offset}, new int[] {attempt}), null);
+            return LeaseResult.OK;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Batched heartbeat (one worker, many leases): every lease that is still held gets {@code now + visibilityMs},
+     * in a single EXTEND record. Returns one result per input, in order; refused leases are not written.
+     */
+    public List<LeaseResult> extend(String group, long[] offsets, int[] attempts, long visibilityMs) {
+        if (visibilityMs < 1 || offsets.length != attempts.length) throw new IllegalArgumentException("extend");
+        var out = new ArrayList<LeaseResult>(offsets.length);
+        lock.lock();
+        try {
+            var g = state.group(group);
+            var okOff = new long[offsets.length];
+            var okAtt = new int[offsets.length];
+            int n = 0;
+            for (int i = 0; i < offsets.length; i++) { // a duplicate offset is written twice; applying it is idempotent
+                var r = fence(g.inFlight.get(offsets[i]), attempts[i]);
+                if (r == null) { okOff[n] = offsets[i]; okAtt[n] = attempts[i]; n++; r = LeaseResult.OK; }
+                out.add(r);
+            }
+            if (n > 0) append(new LedgerEntry.Extend(group, clockMs.getAsLong() + visibilityMs,
+                    java.util.Arrays.copyOf(okOff, n), java.util.Arrays.copyOf(okAtt, n)), null);
+            return out;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Batched fenced ack (one worker settling many leases): every lease still held under its attempt is acked,
+     * all in one ledger write (one writer hand-off, one durability wait). Returns one result per input, in order,
+     * and the batch's durability future (null when nothing was acked). A duplicate offset acks once; the
+     * second copy reports NOT_IN_FLIGHT, exactly as two single acks would.
+     */
+    public BatchAckResult ack(String group, long[] offsets, int[] attempts, Durability durability) {
+        if (offsets.length != attempts.length) throw new IllegalArgumentException("ack");
+        var out = new LeaseResult[offsets.length];
+        lock.lock();
+        try {
+            var g = state.group(group);
+            var entries = new ArrayList<LedgerEntry>(offsets.length);
+            var accepted = new long[offsets.length];
+            java.util.HashSet<Long> seen = offsets.length > 32 ? new java.util.HashSet<>() : null;
+            for (int i = 0; i < offsets.length; i++) {
+                var r = fence(g.inFlight.get(offsets[i]), attempts[i]);
+                if (r == null && (seen != null ? !seen.add(offsets[i]) : contains(accepted, entries.size(), offsets[i]))) {
+                    r = LeaseResult.NOT_IN_FLIGHT; // already acked earlier in this batch
+                }
+                if (r == null) {
+                    accepted[entries.size()] = offsets[i];
+                    entries.add(new LedgerEntry.Ack(group, offsets[i]));
+                    r = LeaseResult.OK;
+                }
+                out[i] = r;
+            }
+            return new BatchAckResult(List.of(out), entries.isEmpty() ? null : appendAll(entries, durability));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static boolean contains(long[] a, int n, long v) {
+        for (int j = 0; j < n; j++) if (a[j] == v) return true;
+        return false;
     }
 
     private void deadLetter(String group, long offset, int attempts, String reason) {
@@ -340,10 +603,18 @@ public final class Partition implements AutoCloseable {
      * order) matches apply order.
      */
     private CompletableFuture<Long> append(LedgerEntry e, Durability durability) {
+        return appendAll(List.of(e), durability);
+    }
+
+    /** As {@link #append}, for several entries written as one batch; the future yields the first offset. */
+    private CompletableFuture<Long> appendAll(List<LedgerEntry> es, Durability durability) {
         long offset = state.nextOffset;
         CompletableFuture<Long> f;
         try {
-            f = writer.append(List.of(LedgerEntry.encode(e)), durability);
+            List<byte[]> enc;
+            if (es.size() == 1) enc = List.of(LedgerEntry.encode(es.get(0)));
+            else { enc = new ArrayList<>(es.size()); for (var e : es) enc.add(LedgerEntry.encode(e)); }
+            f = writer.append(enc, durability);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("interrupted", ie);
@@ -351,12 +622,13 @@ public final class Partition implements AutoCloseable {
         if (f.isCompletedExceptionally()) {
             f.join(); // rethrows: the writer is fenced; nothing was applied
         }
-        if (e instanceof LedgerEntry.Enqueue x) cachePayload(offset, x.payloadRef());
-        state.apply(offset, e);
-        publish();
-        // Amortized O(1) per entry: a snapshot costs O(live state), so wait at least twice that many entries.
-        long since = state.nextOffset - lastSnapshotTrigger;
-        if (since >= snapshotEveryEntries && since >= 2L * state.messages.size()) snapshotLocked();
+        for (int i = 0; i < es.size(); i++) {
+            var e = es.get(i);
+            if (e instanceof LedgerEntry.Enqueue x) cachePayload(offset + i, x.payloadRef());
+            state.apply(offset + i, e);
+            if (!waiters.isEmpty()) wake(e);
+        }
+        if (!deferPublish) afterApply();
         return f.thenApply(base -> {
             if (base != offset) throw new IllegalStateException("ledger offset drift " + base + " != " + offset);
             return base;
@@ -382,6 +654,23 @@ public final class Partition implements AutoCloseable {
             if (ho >= writtenHint) {
                 writtenHint = writer.snapshot().nextOffset();
                 if (ho >= writtenHint) return; // not written yet: keep (temporarily over budget)
+            }
+            recentBytes -= ringVal[ringHead].length;
+            ringVal[ringHead] = null;
+            ringHead = (ringHead + 1) & mask;
+            ringCount--;
+        }
+    }
+
+    /** Lock held. Evicts cached payloads below every group's committed offset (only written ones, as above). */
+    private void evictSettled() {
+        long below = state.minCommitted();
+        int mask = ringOff.length - 1;
+        while (ringCount > 0 && ringOff[ringHead] < below) {
+            long ho = ringOff[ringHead];
+            if (ho >= writtenHint) {
+                writtenHint = writer.snapshot().nextOffset();
+                if (ho >= writtenHint) return;
             }
             recentBytes -= ringVal[ringHead].length;
             ringVal[ringHead] = null;
@@ -464,6 +753,17 @@ public final class Partition implements AutoCloseable {
         // Nothing is serialized under the lock: the snapshotter rebuilds the state at `off` from the newest
         // snapshot file plus the log tail (deterministic replay) and serializes that private copy.
         var prev = lastSnapshot;
+        // A small state (the common request/reply case: almost nothing live) is cheaper to serialize here than
+        // to rebuild by replaying the whole tail off-lock, which allocates about as much as the live appends did.
+        if (state.serializedEntries() <= INLINE_SNAPSHOT_ENTRIES) {
+            var data = state.serialize();
+            lastSnapshot = prev.handleAsync((v, t) -> {
+                awaitDurable(off);
+                writeSnapshot(off, data);
+                return off;
+            }, snapshotter);
+            return lastSnapshot;
+        }
         lastSnapshot = prev.handleAsync((v, t) -> {
             writeSnapshot(off, rebuildAt(off));
             return off;
@@ -475,15 +775,26 @@ public final class Partition implements AutoCloseable {
      * Snapshotter thread. State at {@code off}, rebuilt off-lock: newest snapshot file (or empty) + replay of
      * {@code [base, off)}. Only reads log at or above the newest snapshot, which retention/compaction never touch.
      */
-    private byte[] rebuildAt(long off) {
+    /** Snapshots of at most this many serialized entries are taken under the lock (bounded, ~100 µs). */
+    static final long INLINE_SNAPSHOT_ENTRIES = 16_384;
+
+    /** Snapshotter thread. A snapshot is only valid once the log is durable through {@code off}: wait for the writer, then fsync. */
+    private void awaitDurable(long off) {
         try {
-            // The snapshot is only valid if the log is durable through `off`: wait for the writer, then fsync.
             long deadline = System.nanoTime() + 30_000_000_000L;
             while (writer.snapshot().nextOffset() < off) {
                 if (System.nanoTime() > deadline) throw new IOException("log never reached snapshot offset " + off);
                 LockSupport.parkNanos(100_000);
             }
             log.force();
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
+    private byte[] rebuildAt(long off) {
+        try {
+            awaitDurable(off);
             var policy = state.policy();
             DeliveryState st = null;
             Long base = snapshots.floor(off);
@@ -551,7 +862,7 @@ public final class Partition implements AutoCloseable {
         long oldestSnap = snapshots.isEmpty() ? 0 : snapshots.first(); // no durable snapshot yet: the whole log is needed
         lock.lock();
         try {
-            lw = Math.min(oldestSnap, state.oldestNeededMessageOffset());
+            lw = Math.min(Math.min(oldestSnap, state.oldestNeededMessageOffset()), retainFloor());
             for (var seg : log.segments()) {
                 if (seg.active() || seg.nextOffset() > lw
                         || (pol.keepResolvedMs() > 0 && now - seg.lastModifiedMs() < pol.keepResolvedMs())) break;
@@ -564,7 +875,7 @@ public final class Partition implements AutoCloseable {
         }
         if (pol.compactLiveRatio() > 0) {
             for (var seg : log.segments()) {
-                if (seg.active() || seg.nextOffset() > oldestSnap) break;
+                if (seg.active() || seg.nextOffset() > Math.min(oldestSnap, retainFloor())) break; // never rewrite pinned history
                 java.util.Set<Long> keep;
                 long liveBytes = 0;
                 lock.lock();
@@ -587,13 +898,99 @@ public final class Partition implements AutoCloseable {
         return new MaintenanceReport(lw, deleted, compacted, reclaimed, pinned, dlq == null ? null : dlq.maintain());
     }
 
+    // ---- retain-from pins (agent-graphs.md §4.3 / §11.3) ----
+
+    /**
+     * Pins this partition's history from {@code offset} for {@code owner} (for example a graph runner's checkpoint
+     * floor): {@link #maintain()} never deletes or compacts at or above the lowest pin, whatever the delivery state or
+     * the {@link RetentionPolicy} says. Setting the same owner again moves its pin (forward or back). Pins are durable:
+     * written to {@value #PINS_FILE} (temp file, fsync, atomic rename) before this returns, and reloaded on open, so a
+     * restart cannot free history the owner has not re-pinned yet. Below the pins the normal low-watermark rules apply.
+     *
+     * @throws IllegalArgumentException for a blank owner or a negative offset
+     */
+    public void retainFrom(String owner, long offset) throws IOException {
+        if (owner == null || owner.isBlank() || owner.indexOf('\n') >= 0 || owner.indexOf('=') >= 0) throw new IllegalArgumentException("pin owner");
+        if (offset < 0) throw new IllegalArgumentException("pin offset < 0");
+        updatePins(m -> m.put(owner, offset));
+    }
+
+    /** Drops {@code owner}'s pin, if any. Durable like {@link #retainFrom}. */
+    public void releaseRetain(String owner) throws IOException {
+        updatePins(m -> m.remove(owner));
+    }
+
+    /** The lowest pin, or {@link Long#MAX_VALUE} without pins. */
+    public long retainFloor() {
+        long f = Long.MAX_VALUE;
+        for (long v : this.pins.values()) f = Math.min(f, v);
+        return f;
+    }
+
+    /** Current pins by owner (immutable). */
+    public Map<String, Long> retainPins() {
+        return this.pins;
+    }
+
+    private void updatePins(java.util.function.Consumer<java.util.Map<String, Long>> change) throws IOException {
+        this.pinLock.lock();
+        try {
+            var next = new java.util.TreeMap<String, Long>(this.pins);
+            change.accept(next);
+            if (next.equals(this.pins)) return;
+            var text = new StringBuilder();
+            for (var e : next.entrySet()) text.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+            var tmp = this.logDir.resolve(PINS_FILE + ".tmp");
+            try (var ch = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                ch.write(java.nio.ByteBuffer.wrap(text.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                ch.force(true);
+            }
+            Files.move(tmp, this.logDir.resolve(PINS_FILE), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            this.pins = Map.copyOf(next); // published only once durable
+        } finally {
+            this.pinLock.unlock();
+        }
+    }
+
+    static Map<String, Long> readPins(Path logDir) throws IOException {
+        var f = logDir.resolve(PINS_FILE);
+        if (!Files.exists(f)) return Map.of();
+        var out = new java.util.HashMap<String, Long>();
+        for (var line : Files.readAllLines(f, java.nio.charset.StandardCharsets.UTF_8)) {
+            int eq = line.lastIndexOf('=');
+            if (line.isBlank()) continue;
+            if (eq <= 0) throw new IOException("corrupt " + f + ": " + line);
+            try {
+                out.put(line.substring(0, eq), Long.parseLong(line.substring(eq + 1)));
+            } catch (NumberFormatException e) {
+                throw new IOException("corrupt " + f + ": " + line, e);
+            }
+        }
+        return Map.copyOf(out);
+    }
+
     /** Bytes currently on disk for this partition's log (excluding the DLQ). */
     public long logBytes() { return log.totalBytes(); }
 
     // ---- inspection ----
 
     /** Exact counts as of the last applied entry. Lock-free, never stale. */
-    public DeliveryCounts counts() { return counts.get(); }
+    /**
+     * Exact counts as of the last applied entry. Computed on first read after a change (an append only marks them
+     * stale, so the hot path allocates nothing for them); a stale read takes the lock briefly.
+     */
+    public DeliveryCounts counts() {
+        var c = counts.get();
+        if (c != null) return c;
+        lock.lock();
+        try {
+            c = counts.get();
+            if (c == null) { c = state.counts(); counts.set(c); }
+            return c;
+        } finally {
+            lock.unlock();
+        }
+    }
 
     /**
      * Paged view. Lock-free unless the view is older than {@code maxStaleNanos} while the partition stays busy, in
@@ -630,8 +1027,25 @@ public final class Partition implements AutoCloseable {
     /** When true, the paged view is rebuilt after every operation (tests, low-rate topics). Default: rate-limited. */
     public void eagerSnapshots(boolean on) { lock.lock(); try { eager = on; publish(); } finally { lock.unlock(); } }
 
+    /** Groups known to exist (lock-free hint for {@link #subscribe}); only ever grows, like the groups themselves. */
+    private final java.util.Set<String> subscribed = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Lock held. Set while a poll appends several DELIVER records; it publishes once at the end. */
+    private boolean deferPublish;
+
+    /** Lock held: after one apply (or a deferred batch of them). */
+    private void afterApply() {
+        // Payloads every group has settled are dropped from the cache at once instead of aging out of the 64 MiB
+        // ring: in request/reply they would otherwise all survive young GCs and be copied into the old generation.
+        if (ringCount > 0 && ringOff[ringHead] < state.minCommitted()) evictSettled();
+        publish();
+        // Amortized O(1) per entry: a snapshot costs O(live state), so wait at least twice that many entries.
+        long since = state.nextOffset - lastSnapshotTrigger;
+        if (since >= snapshotEveryEntries && since >= 2L * state.messages.size()) snapshotLocked();
+    }
+
     private void publish() {
-        counts.set(state.counts());
+        counts.setRelease(null); // stale: rebuilt lazily by counts()
         if (eager || snapshot.get() == null) rebuild();
     }
 
@@ -646,6 +1060,13 @@ public final class Partition implements AutoCloseable {
     String canonicalState() { lock.lock(); try { return state.canonical(); } finally { lock.unlock(); } }
 
     @Override public void close() throws IOException {
+        lock.lock();
+        try {
+            closed = true;
+            for (var w : waiters.values()) w.cond.signalAll();
+        } finally {
+            lock.unlock();
+        }
         try {
             writer.close();
             snapshotter.shutdown();

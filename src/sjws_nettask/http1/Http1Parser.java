@@ -203,34 +203,53 @@ public final class Http1Parser {
                 throw new IllegalStateException("head already complete; reset() first");
             }
             int end = off + len;
-            int i = off;
-            while (i < end) {
-                byte b = buf[i++];
-                if (this.pendingCr) {
-                    if (b != '\n') {
-                        throw new ParseError(400, "bare CR");
-                    }
-                    this.pendingCr = false;
-                    if (completeLine()) {
-                        return i - off;
-                    }
-                } else if (b == '\r') {
-                    this.pendingCr = true;
-                } else if (b == '\n') {
-                    if (completeLine()) {
-                        return i - off;
-                    }
-                } else {
-                    if (this.lineLength >= this.maxLineLength) {
-                        throw new ParseError(this.inHeaders ? 431 : 414, "line too long");
-                    }
-                    if (this.lineLength == this.line.length) {
-                        this.line = Arrays.copyOf(this.line, Math.min(this.maxLineLength, Math.max(INITIAL_LINE, 2 * this.line.length)));
-                    }
-                    this.line[this.lineLength++] = b;
+            for (int i = off; i < end;) {
+                if (step(buf[i++])) {
+                    return i - off;
                 }
             }
             return len;
+        }
+
+        /**
+         * As {@link #feed(byte[], int, int)}, reading {@code buf} (heap or direct) with absolute gets from
+         * {@code off}; the buffer's position and limit are not changed.
+         */
+        public int feed(java.nio.ByteBuffer buf, int off, int len) throws ParseError {
+            if (this.head != null) {
+                throw new IllegalStateException("head already complete; reset() first");
+            }
+            int end = off + len;
+            for (int i = off; i < end;) {
+                if (step(buf.get(i++))) {
+                    return i - off;
+                }
+            }
+            return len;
+        }
+
+        /** One input byte; true when it completed the head. */
+        private boolean step(byte b) throws ParseError {
+            if (this.pendingCr) {
+                if (b != '\n') {
+                    throw new ParseError(400, "bare CR");
+                }
+                this.pendingCr = false;
+                return completeLine();
+            } else if (b == '\r') {
+                this.pendingCr = true;
+            } else if (b == '\n') {
+                return completeLine();
+            } else {
+                if (this.lineLength >= this.maxLineLength) {
+                    throw new ParseError(this.inHeaders ? 431 : 414, "line too long");
+                }
+                if (this.lineLength == this.line.length) {
+                    this.line = Arrays.copyOf(this.line, Math.min(this.maxLineLength, Math.max(INITIAL_LINE, 2 * this.line.length)));
+                }
+                this.line[this.lineLength++] = b;
+            }
+            return false;
         }
 
         /**

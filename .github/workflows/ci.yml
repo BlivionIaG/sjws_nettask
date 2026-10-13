@@ -28,13 +28,25 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '25'
           cache: maven
+      - name: Install Prometheus
+        if: runner.os == 'Linux'
+        run: |
+          ver=3.15.0
+          curl -fsSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz"
+          tar -C /tmp -xzf /tmp/prometheus.tar.gz
+          echo "PROMTOOL=/tmp/prometheus-${ver}.linux-amd64/promtool" >> "$GITHUB_ENV"
+          echo "PROMETHEUS=/tmp/prometheus-${ver}.linux-amd64/prometheus" >> "$GITHUB_ENV"
       - name: Unit and integration tests, package, coverage gate
         run: mvn -B verify
+      - name: HTTP/1 tests with the buffer pool on (debug pool, NoBufferLeaks)
+        run: mvn -B -Djacoco.skip=true -DargLine="-Dsjws.buf.pool=on -Dsjws.buf.debug=true" -Dtest='ClientManagerFaultTest,Http1*Test,sjws_nettask.http1.*Test' -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Python SDK conformance and end-to-end (golden frames; Java server + Python unary client)
+        run: SJWS_JAR="$(ls target/sjws_nettask-*.jar | head -1)" python3 -B -m unittest discover -s sdk/python/tests -v
       - name: End-to-end file serving (real listener, temp docroot, HTTP client)
         run: mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test
       - name: Multi-node cluster harness (live scenarios)
@@ -58,7 +70,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '25'

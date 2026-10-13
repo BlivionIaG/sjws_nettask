@@ -42,7 +42,8 @@ public final class Bootstrap {
     private static final Set<String> CAPABILITIES = Set.of("http1", "http2", "http3", "proxy", "static",
             "messaging");
     private static final Set<String> KEYS = Set.of("role", "data-role", "node-id", "state-dir", "pin",
-            "control-plane", "listen", "peers", "capabilities", "join-token");
+            "control-plane", "listen", "peers", "capabilities", "join-token", "cp-tls-cert", "cp-tls-key", "cp-tls-ca",
+            "cp-tls-peer");
     private static final Set<String> IDENTITY_KEYS = Set.of("node-id", "role", "data-role");
 
     private final NodeRole role;
@@ -59,6 +60,14 @@ public final class Bootstrap {
     private final Path source;
     private final boolean joinedBefore;
     private JoinMaterial join;
+    private CpTlsFiles cpTls;
+
+    /**
+     * Opt-in mTLS for the watch channel: this node's certificate and key, the pinned CP CA, and the
+     * identity the CP certificate must carry (null: the dialled host name). Absolute paths.
+     */
+    public record CpTlsFiles(Path cert, Path key, Path ca, String peer) {
+    }
 
     private Bootstrap(NodeRole role, DataPlaneRole dataRole, String nodeId, String controlPlane, String listen,
             List<String> peers, List<String> capabilities, Map<String, String> labels, Path pinFile, byte[] pin,
@@ -168,7 +177,7 @@ public final class Bootstrap {
             }
             return new Bootstrap(this.role, this.dataRole, this.nodeId, fresh.controlPlane, fresh.listen, fresh.peers,
                     fresh.capabilities, fresh.labels, fresh.pinFile, fresh.pin.clone(), this.stateDir, this.source,
-                    this.joinedBefore, this.join);
+                    this.joinedBefore, this.join).withCpTls(fresh.cpTls);
         } finally {
             if (fresh.join != null) {
                 fresh.join.wipeMemory();
@@ -176,6 +185,16 @@ public final class Bootstrap {
             }
             Arrays.fill(fresh.pin, (byte) 0);
         }
+    }
+
+    private Bootstrap withCpTls(CpTlsFiles files) {
+        this.cpTls = files;
+        return this;
+    }
+
+    /** The cpTls block, or null when the watch channel is plain (the default). */
+    public CpTlsFiles cpTls() {
+        return this.cpTls;
     }
 
     void wipePin() {
@@ -349,11 +368,36 @@ public final class Bootstrap {
                 throw new BootstrapException(stateDir + " identity does not match this bootstrap");
             }
         }
-        var join = loadJoin(source, parsed.values.get("join-token"), pinFile, stateDir, joined);
+        var cpTls = cpTls(source, parsed.values, stateDir);
+        // Under cpTls the node certificate is the enrollment, so a first start needs no join token.
+        var join = loadJoin(source, parsed.values.get("join-token"), pinFile, stateDir, joined || cpTls != null);
         var pin = readPin(pinFile);
         ensurePrivateDir(stateDir);
         return new Bootstrap(role, dataRole, nodeId, controlPlane, listen, peers, capabilities,
-                Map.copyOf(parsed.labels), pinFile, pin, stateDir, source, joined, join);
+                Map.copyOf(parsed.labels), pinFile, pin, stateDir, source, joined, join)
+                .withCpTls(cpTls);
+    }
+
+    /** All of cp-tls-cert, cp-tls-key and cp-tls-ca, or none of them (cp-tls-peer is optional). */
+    private static CpTlsFiles cpTls(Path source, Map<String, String> values, Path stateDir) throws IOException {
+        var cert = values.get("cp-tls-cert");
+        var key = values.get("cp-tls-key");
+        var ca = values.get("cp-tls-ca");
+        var peer = values.get("cp-tls-peer");
+        if (cert == null && key == null && ca == null) {
+            if (peer != null) {
+                throw new BootstrapException(source + " cp-tls-peer needs cp-tls-cert, cp-tls-key and cp-tls-ca");
+            }
+            return null;
+        }
+        if (cert == null || key == null || ca == null) {
+            throw new BootstrapException(source + " cp-tls needs cp-tls-cert, cp-tls-key and cp-tls-ca together");
+        }
+        if (peer != null && !peer.matches("[A-Za-z0-9._:-]{1,253}")) {
+            throw new BootstrapException(source + " has an invalid cp-tls-peer");
+        }
+        return new CpTlsFiles(absolute(source, cert, "cp-tls-cert"), absolute(source, key, "cp-tls-key"),
+                absolute(source, ca, "cp-tls-ca"), peer);
     }
 
     private static JoinMaterial loadJoin(Path source, String tokenPath, Path pinFile, Path stateDir, boolean joined)

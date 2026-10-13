@@ -223,6 +223,9 @@ public final class LedgerWriter implements AutoCloseable {
     }
 
     /** Background fsync: ASYNC writers keep durableOffset close to nextOffset; any writer serves GROUP overrides. */
+    /** Backstop for the syncer's idle park; every real wake-up is an explicit unpark. */
+    static final long IDLE_PARK_NANOS = 100_000_000L;
+
     private void syncLoop() {
         long lastFsync = 0;
         while (true) {
@@ -236,7 +239,10 @@ public final class LedgerWriter implements AutoCloseable {
             boolean wanted = dirty && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
             if (!wanted) {
                 if (stopSyncer) return;
-                LockSupport.parkNanos(1_000_000);
+                // Event-driven: the writer unparks this thread after every write (and close() does too), and an
+                // unpark that comes first leaves a permit, so nothing is missed. An idle partition (a DLQ, say) no
+                // longer wakes 1000x/s; the long timeout is only a backstop.
+                LockSupport.parkNanos(this, IDLE_PARK_NANOS);
                 continue;
             }
             long wait = lastFsync + fsyncIntervalNanos - System.nanoTime();

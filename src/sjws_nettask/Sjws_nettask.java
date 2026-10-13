@@ -81,18 +81,21 @@ public class Sjws_nettask {
                 return EXIT_CANNOT_LISTEN;
             }
         }
+        var modules = OptionalModules.start(err);
         SjwsServer server;
         try {
-            server = SjwsServer.start(config, h3Factory);
+            server = SjwsServer.start(config, h3Factory, OptionalModules.contributors(modules));
         } catch (BindException e) {
+            modules.close();
             err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
                     + " (already in use or not permitted).");
             return EXIT_CANNOT_LISTEN;
         } catch (IOException | UncheckedIOException e) {
+            modules.close();
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true);
+        return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true, modules);
     }
 
     /** Same lifecycle as {@link #serve}, starting from a loaded config file so reload can re-read it. */
@@ -111,24 +114,27 @@ public class Sjws_nettask {
                 return EXIT_CANNOT_LISTEN;
             }
         }
+        var modules = OptionalModules.start(loaded.yamlSwarmEnabled(), err);
         SjwsServer server;
         try {
-            server = SjwsServer.start(loaded, h3Factory, bindContent);
+            server = SjwsServer.start(loaded, h3Factory, bindContent, OptionalModules.contributors(modules));
         } catch (BindException e) {
+            modules.close();
             err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
                     + " (already in use or not permitted).");
             return EXIT_CANNOT_LISTEN;
         } catch (IOException | UncheckedIOException e) {
+            modules.close();
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
-                bindContent);
+                bindContent, modules);
     }
 
     private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,
             Consumer<SjwsServer> started, Duration shutdownTimeout, Path pidFile, ServiceHooks hooks,
-            long drainBudgetMs, boolean bindContent) {
+            long drainBudgetMs, boolean bindContent, OptionalModule modules) {
         server.shutdownTimeout(shutdownTimeout);
         var pid = new AtomicReference<PidFile>();
         var task = new Shutdown(server, pid, out, err);
@@ -190,6 +196,7 @@ public class Sjws_nettask {
         } finally {
             task.run();
             removeHook(hook);
+            modules.close();
         }
     }
 
@@ -405,7 +412,7 @@ public class Sjws_nettask {
                 return EXIT_USAGE;
             }
             try {
-                hooks = loadServiceHooks(opt.bootstrap(), choice.expectedRole(), opt.drainBudgetMs());
+                hooks = loadServiceHooks(opt.bootstrap(), choice.expectedRole(), opt.drainBudgetMs(), loaded);
             } catch (IOException e) {
                 err.println("ERROR: " + safeMessage(e.getMessage()));
                 return EXIT_USAGE;
@@ -450,9 +457,10 @@ public class Sjws_nettask {
      * @param expectedRole {@code control} or {@code data} from {@code --role} or {@code node.mode},
      *        or null to take the role from the bootstrap file
      */
-    private static ServiceHooks loadServiceHooks(Path bootstrap, String expectedRole, long drainBudgetMs)
-            throws IOException {
-        return sjws_nettask.service.ServiceLaunch.prepare(bootstrap, expectedRole, drainBudgetMs);
+    private static ServiceHooks loadServiceHooks(Path bootstrap, String expectedRole, long drainBudgetMs,
+            sjws_nettask.config.ConfigLoader.Loaded loaded) throws IOException {
+        return sjws_nettask.service.ServiceLaunch.prepare(bootstrap, expectedRole, drainBudgetMs, loaded.yamlCp(),
+                loaded.configBase());
     }
 
     /**
@@ -589,10 +597,22 @@ public class Sjws_nettask {
      * @param args the command line arguments
      */
     public static void main(String[] args) {
-        int code = run(args, System.getenv(), System.out, System.err, H3Transports.defaultFactory(), s -> {
+        main(args, System.getenv(), System.out, System.err, code -> {
+            if (code != 0) {
+                System.exit(code);
+            }
         });
-        if (code != 0) {
-            System.exit(code);
-        }
+    }
+
+    /**
+     * The body of {@link #main(String[])} with streams and the exit hook supplied by the caller.
+     * A normal launch passes a hook that calls {@link System#exit(int)} only for a non-zero code.
+     * Tests pass a hook that records the code, so {@code --help} can be checked in this JVM.
+     */
+    static void main(String[] args, Map<String, String> env, PrintStream out, PrintStream err,
+            Consumer<Integer> exit) {
+        int code = run(args, env, out, err, H3Transports.defaultFactory(), server -> {
+        });
+        exit.accept(code);
     }
 }

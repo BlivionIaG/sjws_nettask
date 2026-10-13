@@ -41,12 +41,15 @@ import sjws_nettask.SjwsServer;
  * file-serving harness starts ({@code tests/sjws_nettask/e2e/FileServingEndToEndTest}).
  * {@link DataRole#STANDALONE} and {@link DataRole#GATEWAY_OFF} construct no control-plane
  * object: that is the zero-cost path. {@link DataRole#DATA} and a non-zero control-node
- * count need {@link ControlPlane#available()}. Until then {@link #open} throws
- * {@link ControlPlanePendingException} before it binds.
+ * count start {@link CpStoreControlPlane}: 3 or 5 real {@code cp-config} voters, and data
+ * nodes that join them through the real watch. A data process that has not joined
+ * is {@link NodeFixtures#pending(java.nio.file.Path, String)}, which reports
+ * {@code connection=pending}. {@link NodeFixtures#connected(java.nio.file.Path)} is the
+ * live-control-plane variant and refuses until a data-node watch exists.
  */
 public final class ClusterHarness implements AutoCloseable {
 
-    /** How a data node is started. {@code DATA} is the control-plane role and is pending. */
+    /** How a data node is started. {@code DATA} is the control-plane role. */
     public enum DataRole {
         /** Today's server. No control-plane object. */
         STANDALONE,
@@ -55,7 +58,7 @@ public final class ClusterHarness implements AutoCloseable {
          * {@code sjws_nettask.cp} has a startup role; that role must stay unconstructed.
          */
         GATEWAY_OFF,
-        /** Data-plane role that watches {@code cp-config}. Pending with the control plane. */
+        /** Data-plane role that watches {@code cp-config} through {@code DataWatch}. */
         DATA
     }
 
@@ -103,17 +106,25 @@ public final class ClusterHarness implements AutoCloseable {
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(role, "role");
         Objects.requireNonNull(clock, "clock");
-        ControlPlane control = newControlPlane();
-        if ((role == DataRole.DATA || controlNodes > 0) && !control.available()) {
+        if (role == DataRole.DATA && controlNodes == 0) {
+            throw new IllegalArgumentException("the data role needs 3 or 5 control nodes");
+        }
+        boolean live = role == DataRole.DATA || controlNodes > 0;
+        ControlPlane control = live ? newControlPlane() : new PendingControlPlane();
+        if (live && !control.available()) {
             throw new ControlPlanePendingException();
         }
         List<DataNode> nodes = new ArrayList<>(dataNodes);
         try {
-            for (int i = 0; i < dataNodes; i++) {
-                nodes.add(ServingNode.start("data-" + i, labelsFor(i), root));
-            }
             if (controlNodes > 0) {
                 control.start(controlNodes, clock);
+            }
+            for (int i = 0; i < dataNodes; i++) {
+                if (role == DataRole.DATA) {
+                    nodes.add(((CpStoreControlPlane) control).join("data-" + i, labelsFor(i), root));
+                } else {
+                    nodes.add(ServingNode.start("data-" + i, labelsFor(i), root));
+                }
             }
         } catch (RuntimeException | IOException e) {
             for (DataNode node : nodes) {
@@ -131,12 +142,12 @@ public final class ClusterHarness implements AutoCloseable {
     }
 
     /**
-     * The control-plane factory. Returns {@link PendingControlPlane} because
-     * {@code sjws_nettask.cp} is not in this tree. Replace this body when the design lands
-     * in code; do not make {@link PendingControlPlane} pretend to commit.
+     * The control-plane factory: {@link CpStoreControlPlane}, real {@code cp-config} voters in this
+     * process. Only called when a scenario asks for control nodes or the data role, so standalone
+     * and gateway-off construct no control-plane object.
      */
-    static ControlPlane newControlPlane() {
-        return new PendingControlPlane();
+    static ControlPlane newControlPlane() throws IOException {
+        return new CpStoreControlPlane(java.nio.file.Files.createTempDirectory("sjws-cp-harness"));
     }
 
     public DataRole role() {

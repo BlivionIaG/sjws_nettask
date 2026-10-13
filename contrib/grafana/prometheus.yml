@@ -1,0 +1,17 @@
+# Sample scrape for one sjws process.
+# /metrics is Prometheus text exposition 0.0.4
+# (Content-Type: text/plain; version=0.0.4; charset=utf-8).
+# --metrics=localhost answers only a loopback peer, so Prometheus runs on this host.
+# Use --metrics=on only on a network that is already private.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: sjws
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - "127.0.0.1:8080"

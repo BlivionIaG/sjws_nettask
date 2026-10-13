@@ -80,6 +80,7 @@ public final class ConfigDiff {
         routing(out, left.routing(), right.routing());
         middleware(out, left.middleware(), right.middleware());
         access(out, left.access(), right.access());
+        messaging(out, left.messaging(), right.messaging());
         startup(out, left.server(), right.server());
         return List.copyOf(out);
     }
@@ -259,6 +260,69 @@ public final class ConfigDiff {
             fields.add(changed("access"));
         }
         emit(out, "access", Effect.LIVE, fields);
+    }
+
+    private static void messaging(List<Change> out, MessagingSettings left, MessagingSettings right) {
+        if (left.equals(right)) {
+            return;
+        }
+        var names = new java.util.TreeSet<String>();
+        names.addAll(left.topics().keySet());
+        names.addAll(right.topics().keySet());
+        for (var name : names) {
+            var before = left.topics().get(name);
+            var after = right.topics().get(name);
+            if (before == null) {
+                emit(out, "topics/" + name, Effect.LIVE, List.of(new KeyChange(name, Kind.ADDED)));
+                continue;
+            }
+            if (after == null) {
+                emit(out, "topics/" + name, Effect.LIVE, List.of(new KeyChange(name, Kind.REMOVED)));
+                continue;
+            }
+            var fields = new ArrayList<KeyChange>();
+            if (before.partitions() != after.partitions()) {
+                fields.add(changed("partitions"));
+            }
+            if (before.replication() != after.replication()) {
+                fields.add(changed("replication"));
+            }
+            if (!before.durability().equals(after.durability())
+                    || !before.durabilityOptIn().equals(after.durabilityOptIn())) {
+                fields.add(changed("durability"));
+            }
+            if (before.maxAttempts() != after.maxAttempts() || !before.backoffBase().equals(after.backoffBase())
+                    || !before.backoffMax().equals(after.backoffMax())) {
+                fields.add(changed("retry"));
+            }
+            if (before.dlqEnabled() != after.dlqEnabled() || !before.dlqSuffix().equals(after.dlqSuffix())) {
+                fields.add(changed("dlq"));
+            }
+            if (before.keepResolved() != after.keepResolved()
+                    || before.compactLiveRatio() != after.compactLiveRatio()
+                    || !before.retentionMaxAge().equals(after.retentionMaxAge())
+                    || before.retentionMaxBytes() != after.retentionMaxBytes()) {
+                fields.add(changed("retention"));
+            }
+            var groups = new java.util.TreeSet<String>();
+            groups.addAll(before.groups().keySet());
+            groups.addAll(after.groups().keySet());
+            for (var group : groups) {
+                var leftGroup = before.groups().get(group);
+                var rightGroup = after.groups().get(group);
+                if (leftGroup == null) {
+                    emit(out, "topics/" + name + "/groups/" + group, Effect.LIVE,
+                            List.of(new KeyChange(group, Kind.ADDED)));
+                } else if (rightGroup == null) {
+                    emit(out, "topics/" + name + "/groups/" + group, Effect.LIVE,
+                            List.of(new KeyChange(group, Kind.REMOVED)));
+                } else if (!leftGroup.equals(rightGroup)) {
+                    emit(out, "topics/" + name + "/groups/" + group, Effect.LIVE,
+                            List.of(changed("start")));
+                }
+            }
+            emit(out, "topics/" + name, Effect.LIVE, fields);
+        }
     }
 
     private static void startup(List<Change> out, ServerConfig left, ServerConfig right) {

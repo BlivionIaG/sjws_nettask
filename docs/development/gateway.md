@@ -56,20 +56,26 @@ Publishing a new snapshot is the rotation: in-flight requests keep the previous 
 
 ## rate-limit
 
-Local token bucket. `capacity` is the number of tokens (required, at least 1).
-`refill-per-second` is a positive decimal with up to six fractional digits. `by` is `ip`
-(default), `header` or `route`. `header` names the field when `by` is `header`. The route key
-is the raw request target. A missing address or header shares one bucket, which does not count
-against `max-keys` (default 10000). New keys are inserted under one lock, so concurrent
-first sightings cannot grow the map past that cap. A known key does not allocate, and a known
-client address does not allocate a string. `status` defaults to 429 and must be 400..599. A
-refusal sets `Retry-After`.
+The same fixed GCRA table as routing `rate_limit` (`routing.GcraTable`). Memory is the stripe
+array, not a map of keys. `capacity` is the burst: how many requests a full stripe admits at
+once (required, 1..1000000). `refill-per-second` is the steady rate, a positive decimal with up
+to six fractional digits and at most 1000000000. `by` is `ip` (default), `header` or `route`.
+`header` names the field when `by` is `header`. The route key is the raw request target, hashed
+into the table (unlike routing `by: route`, which is one bucket for that route). A missing
+address or header shares one extra bucket.
+
+`buckets` is the stripe count, a power of two, default 4096, at most 1048576. `max-keys` is the
+old name for that size: it is rounded up to a power of two and does not refuse a new key. Two
+keys that land on one stripe share its budget, which is stricter, never looser. Set one of
+`buckets` or `max-keys`, not both. A known address is hashed without copying it to a string.
+`status` defaults to 429 and must be 400..599. A refusal sets `Retry-After` to the whole seconds
+until the stripe would admit another request.
 
 `Quota` is the extension point. The request path calls `tryAcquire` for a header or route key
 and `tryAcquireAddress` for an address, and neither may block or do I/O.
 `GatewayFilters.install(registry, factory)` uses that factory for
 each `rate-limit` entry, so a cluster remainder can refill a local balance on another thread
-and answer from it here. The default factory is the local bucket.
+and answer from it here. The default factory is the striped table.
 
 ## cors
 

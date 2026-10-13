@@ -45,3 +45,37 @@ shared runner is too noisy for a tight band.
 
 When `sjws_nettask.cp` grows a startup role, `gateway-off` in `GatewayBench` must select
 standalone explicitly. The two wrk columns should stay in the same band.
+
+`--mode=rate-limit` is separate. It installs the gateway factories and applies one
+`rate-limit` document (`by=ip`, `buckets=4096`). `--capacity` (default `1000000`) and
+`--refill` (default `1000000000`) set that document. `standalone` and `gateway-off` do not
+call `chainControl`. Feature-off file serving is still `java -jar` with no chain.
+
+## Swarm S1 (`SwarmBench`)
+
+`bench/SwarmBench.java` measures the swarm against the targets in `docs/design/agent-swarm.md` §13. Everything runs on a single node and in-process, with the ASYNC ledger:
+
+```sh
+mvn -B -q -DskipTests package
+java -cp target/classes bench/SwarmBench.java /tmp/sb dispatch 16 5          # claim(1)+fenced ack, 1 KiB, prefilled
+java -cp target/classes bench/SwarmBench.java /tmp/sb heartbeat off 20       # dispatch with no keeper
+java -cp target/classes bench/SwarmBench.java /tmp/sb heartbeat keeper 20    # + LeaseKeeper: 10k leases, batched tick every 5 s
+java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply 10000 10      # ReplyRouter.call, open loop at 10k/s
+```
+
+- **Comparisons.** Compare `heartbeat off` and `heartbeat keeper` with 5 alternating runs pinned with `taskset`.
+- **Request/reply latency.** It is measured from each call's scheduled send time, so a stall also counts against the calls queued behind it.
+- **Results.** The S1 PR body has the numbers measured on the dev box.
+
+## Partition log over `/messaging/v1` (`MessagingLogBench`, `messaging-http/run.sh`)
+
+These are the produce/fetch benches for plain log topics (docs/design/partition-log.md R11). `MessagingLogBench` drives the public handler in-process, without the network:
+
+```
+mvn -q compile
+java -cp target/classes bench/MessagingLogBench.java /tmp/mlb produce 1024 4 10          # writer default (async)
+java -cp target/classes bench/MessagingLogBench.java /tmp/mlb produce 1024 4 10 group    # fsync opt-in
+java -cp target/classes bench/MessagingLogBench.java /tmp/mlb fetch   1024 4 10
+```
+
+`messaging-http/run.sh <jar> [sizes]` runs the same operations end to end over HTTP with wrk (default sizes are 100 B, 1 KiB, 16 KiB and 256 KiB). Run every bench as `flock /tmp/sjws-bench.lock …`, only when the 1-minute load is under 4, and record that load next to the numbers.

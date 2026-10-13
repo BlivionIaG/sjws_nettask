@@ -22,6 +22,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -29,6 +30,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import sjws_nettask.ServerConfig;
+import sjws_nettask.cluster.ClusterKey;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.RoutePattern;
 
@@ -41,7 +43,7 @@ import sjws_nettask.core.RoutePattern;
 public final class ConfigLoader {
 
     private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
-            "routing", "middleware", "access");
+            "routing", "middleware", "access", "messaging", "swarm", "ha", "buffers", "cp");
     private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
@@ -98,15 +100,21 @@ public final class ConfigLoader {
         Routing routing = Routing.disabled();
         List<MiddlewareSpec> middleware = List.of();
         AccessSettings access = AccessSettings.DEFAULT;
+        MessagingSettings messaging = MessagingSettings.disabled();
         Path configFile = null;
         Path yamlPassword = null;
         NodeSettings node = NodeSettings.STANDALONE;
         int schemaVersion = ConfigDocument.SCHEMA;
         long bundleVersion = 0;
         Boolean yamlBind = null;
+        Boolean yamlSwarm = null;
+        boolean haEnabled = false;
+        byte[] haKey = null;
+        byte[] haPrevious = null;
         byte[] bootSignature = null;
         String recoveredHash = null;
         Path yamlState = null;
+        Map<String, Object> yamlCp = null;
         String text;
         Path readFrom = null;
         if (configured != null) {
@@ -158,6 +166,14 @@ public final class ConfigLoader {
             routing = routingSection(root, warnings);
             middleware = middlewareSection(root, warnings);
             access = accessSection(root, warnings);
+            messaging = MessagingSettings.parse(root);
+            yamlSwarm = swarmSection(root);
+            yamlCp = cpSection(root);
+            buffersSection(root);
+            var ha = haSection(root, env, base, readFrom, warnings);
+            haEnabled = ha.enabled();
+            haKey = ha.current();
+            haPrevious = ha.previous();
         }
         var parsed = baseline == null
                 ? ServerConfig.parse(args, env, passwords)
@@ -176,11 +192,24 @@ public final class ConfigLoader {
         }
         var base = configFile == null ? null : configFile.toAbsolutePath().getParent();
         var document = ConfigDocument.of(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion,
-                configFile).withStateDir(stateDir(args, env, yamlState, base));
+                configFile, messaging).withStateDir(stateDir(args, env, yamlState, base));
         if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
             document = document.withSignature(bootSignature);
         }
-        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind);
+        return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm, haEnabled,
+                haKey, haPrevious, yamlCp, base);
+    }
+
+    /**
+     * The raw {@code cp:} block (control-plane-hosting.md §4), or null when the file has none. Kept untyped
+     * so a standalone or data process names no {@code sjws_nettask.cp} class; only the CONTROL role parses it
+     * (the cp package parses it).
+     */
+    private static Map<String, Object> cpSection(Map<String, Object> root) {
+        if (!(root.get("cp") instanceof Object cp)) {
+            return null;
+        }
+        return java.util.Collections.unmodifiableMap(YamlValues.mapping(cp, "cp"));
     }
 
     private static int schemaOf(Map<String, Object> root) {
@@ -552,8 +581,8 @@ public final class ConfigLoader {
             return Routing.disabled();
         }
         var map = YamlValues.mapping(routing, "routing");
-        YamlValues.knownKeys(map, List.of("enabled", "upstreams", "routes", "forwarded_proto", "trusted_proxies"),
-                "routing");
+        YamlValues.knownKeys(map, List.of("enabled", "upstreams", "routes", "forwarded_proto", "trusted_proxies",
+                "rate_limit"), "routing");
         boolean enabled = map.containsKey("enabled") && bool(map.get("enabled"), "routing.enabled");
         var proto = map.containsKey("forwarded_proto")
                 ? forwarded(text(map.get("forwarded_proto"), "routing.forwarded_proto"))
@@ -565,7 +594,8 @@ public final class ConfigLoader {
         var routes = map.containsKey("routes") ? routes(map.get("routes"), upstreams) : List.<RouteSpec>of();
         var table = new RouteTable(routes);
         warnings.addAll(table.shadows());
-        return new Routing(enabled, proto, proxies, upstreams, table);
+        var limit = map.containsKey("rate_limit") ? rateLimit(map.get("rate_limit"), "routing.rate_limit", false) : null;
+        return new Routing(enabled, proto, proxies, upstreams, table, limit);
     }
 
     private static Map<String, Upstream> upstreams(Object value) {
@@ -578,11 +608,18 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host", "retry", "circuit"), "routing.upstreams." + name);
-            if (!body.containsKey("url")) {
-                throw new ConfigException("routing.upstreams." + name + ".url is required");
+                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb"), "routing.upstreams." + name);
+            boolean multi = body.containsKey("endpoints");
+            if (multi == body.containsKey("url")) {
+                throw new ConfigException("routing.upstreams." + name + ": exactly one of url or endpoints is required");
             }
-            var url = upstreamUrl(text(body.get("url"), "routing.upstreams." + name + ".url"), name);
+            if (body.containsKey("lb") && !multi) {
+                throw new ConfigException("routing.upstreams." + name + ".lb is only valid with endpoints");
+            }
+            var endpointUrls = new ArrayList<URI>();
+            var endpoints = multi ? endpoints(body.get("endpoints"), name, endpointUrls) : null;
+            var url = multi ? endpointUrls.get(0)
+                    : upstreamUrl(text(body.get("url"), "routing.upstreams." + name + ".url"), name);
             var connect = body.containsKey("connect_timeout")
                     ? timeout(text(body.get("connect_timeout"), "routing.upstreams." + name + ".connect_timeout"),
                             "routing.upstreams." + name + ".connect_timeout")
@@ -601,12 +638,150 @@ public final class ConfigLoader {
             boolean preserve = body.containsKey("preserve_host")
                     && bool(body.get("preserve_host"), "routing.upstreams." + name + ".preserve_host");
             var retry = body.containsKey("retry") ? retry(body.get("retry"), "routing.upstreams." + name + ".retry") : null;
-            var circuit = body.containsKey("circuit")
-                    ? circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit") : null;
+            Upstream.Discovery discovery = null;
+            sjws_nettask.routing.Resilience.Circuit circuit = null;
+            if (multi) {
+                var lb = sjws_nettask.routing.discovery.LbPolicy.WEIGHTED_RANDOM;
+                if (body.containsKey("lb")) {
+                    lb = sjws_nettask.routing.discovery.LbPolicy.parse(text(body.get("lb"), "routing.upstreams." + name + ".lb"));
+                    if (lb == null) {
+                        throw new ConfigException("routing.upstreams." + name
+                                + ".lb: expected weighted_random, round_robin or least_request");
+                    }
+                }
+                var outlier = body.containsKey("circuit")
+                        ? outlier(body.get("circuit"), "routing.upstreams." + name + ".circuit")
+                        : sjws_nettask.routing.EndpointBalancer.Outlier.DEFAULT;
+                discovery = new Upstream.Discovery(endpoints, lb, outlier);
+            } else if (body.containsKey("circuit")) {
+                circuit = circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit");
+            }
             var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience));
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery));
         }
         return Map.copyOf(out);
+    }
+
+    /**
+     * {@code endpoints: ["http://h:p", {url, weight, zone, id, labels}]}: 1 to 1024 endpoints sharing
+     * one scheme and path, no query or fragment.
+     */
+    private static List<sjws_nettask.routing.discovery.Endpoint> endpoints(Object value, String name, List<URI> urls) {
+        var path = "routing.upstreams." + name + ".endpoints";
+        var list = YamlValues.sequence(value, path);
+        if (list.isEmpty() || list.size() > 1024) {
+            throw new ConfigException(path + ": expected 1 to 1024 endpoints");
+        }
+        var out = new ArrayList<sjws_nettask.routing.discovery.Endpoint>(list.size());
+        var seen = new java.util.HashSet<String>();
+        for (int i = 0; i < list.size(); i++) {
+            var at = path + "[" + i + "]";
+            var item = list.get(i);
+            String urlText;
+            int weight = 1;
+            String zone = null;
+            String id = null;
+            Map<String, String> labels = Map.of();
+            if (item instanceof Map<?, ?>) {
+                var m = YamlValues.mapping(item, at);
+                YamlValues.knownKeys(m, List.of("url", "weight", "zone", "id", "labels"), at);
+                if (!m.containsKey("url")) {
+                    throw new ConfigException(at + ".url is required");
+                }
+                urlText = text(m.get("url"), at + ".url");
+                weight = m.containsKey("weight") ? integer(m.get("weight"), at + ".weight", 0, 1_000_000) : 1;
+                zone = m.containsKey("zone") ? text(m.get("zone"), at + ".zone") : null;
+                id = m.containsKey("id") ? text(m.get("id"), at + ".id") : null;
+                if (m.containsKey("labels")) {
+                    var raw = YamlValues.mapping(m.get("labels"), at + ".labels");
+                    var copy = new java.util.TreeMap<String, String>();
+                    raw.forEach((k, v) -> copy.put(k, String.valueOf(v)));
+                    labels = copy;
+                }
+            } else {
+                urlText = text(item, at);
+            }
+            URI uri;
+            try {
+                uri = URI.create(urlText.trim());
+            } catch (IllegalArgumentException e) {
+                throw new ConfigException(at + ": " + e.getMessage());
+            }
+            var scheme = uri.getScheme();
+            if (uri.getHost() == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+                throw new ConfigException(at + ": expected an absolute http(s) URL");
+            }
+            if (uri.getRawQuery() != null || uri.getRawFragment() != null || uri.getRawUserInfo() != null) {
+                throw new ConfigException(at + ": no user info, query or fragment");
+            }
+            if (!urls.isEmpty()) {
+                var first = urls.get(0);
+                if (!first.getScheme().equalsIgnoreCase(scheme) || !java.util.Objects.equals(first.getRawPath(),
+                        uri.getRawPath())) {
+                    throw new ConfigException(at + ": every endpoint must use the scheme and path of the first");
+                }
+            }
+            int port = uri.getPort() > 0 ? uri.getPort() : "https".equalsIgnoreCase(scheme) ? 443 : 80;
+            var host = uri.getHost();
+            if (host.startsWith("[") && host.endsWith("]")) {
+                host = host.substring(1, host.length() - 1);
+            }
+            var endpoint = new sjws_nettask.routing.discovery.Endpoint(id, host, port, weight, labels, sjws_nettask.routing.discovery.Endpoint.Health.READY, zone);
+            if (!seen.add(endpoint.authority())) {
+                throw new ConfigException(at + ": duplicate endpoint " + endpoint.authority());
+            }
+            if (weight == 0 && list.size() == 1) {
+                throw new ConfigException(at + ".weight: the only endpoint cannot have weight 0");
+            }
+            urls.add(uri);
+            out.add(endpoint);
+        }
+        return out;
+    }
+
+    /**
+     * {@code circuit:} on a multi-endpoint upstream: passive ejection per endpoint,
+     * {@code {failures: 5, eject_for: 10s, error_rate: 50%, min_requests: 20, window: 10s, max_ejection: 50%}}.
+     */
+    private static sjws_nettask.routing.EndpointBalancer.Outlier outlier(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("failures", "eject_for", "error_rate", "min_requests", "window",
+                "max_ejection"), path);
+        var d = sjws_nettask.routing.EndpointBalancer.Outlier.DEFAULT;
+        int failures = map.containsKey("failures") ? integer(map.get("failures"), path + ".failures", 1, 1000)
+                : d.consecutive();
+        var ejectFor = map.containsKey("eject_for")
+                ? timeout(text(map.get("eject_for"), path + ".eject_for"), path + ".eject_for") : d.ejectFor();
+        int rate = map.containsKey("error_rate") ? percent(map.get("error_rate"), path + ".error_rate", 1)
+                : d.errorRatePercent();
+        int min = map.containsKey("min_requests")
+                ? integer(map.get("min_requests"), path + ".min_requests", 1, 1_000_000) : d.minRequests();
+        var window = map.containsKey("window")
+                ? timeout(text(map.get("window"), path + ".window"), path + ".window") : d.window();
+        if (window.toMillis() < 2) {
+            throw new ConfigException(path + ".window: must be at least 2ms");
+        }
+        int max = map.containsKey("max_ejection") ? percent(map.get("max_ejection"), path + ".max_ejection", 0)
+                : d.maxEjectionPercent();
+        return new sjws_nettask.routing.EndpointBalancer.Outlier(failures, rate, min, window, ejectFor, max);
+    }
+
+    /** {@code 50%} or {@code 50}: an integer percentage, {@code min}..100. */
+    private static int percent(Object value, String path, int min) {
+        var text = String.valueOf(value).trim();
+        if (text.endsWith("%")) {
+            text = text.substring(0, text.length() - 1).trim();
+        }
+        int n;
+        try {
+            n = Integer.parseInt(text);
+        } catch (NumberFormatException e) {
+            throw new ConfigException(path + ": expected a percentage such as 50%");
+        }
+        if (n < min || n > 100) {
+            throw new ConfigException(path + ": must be " + min + "%..100%");
+        }
+        return n;
     }
 
     /** {@code retry: {attempts: 2, on: [connect, reset, 502, 503, 504], budget: 20%}} */
@@ -671,7 +846,7 @@ public final class ConfigLoader {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
             YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "backends", "sticky", "redirect",
-                    "static", "listing", "errors", "problem_type"), path);
+                    "static", "listing", "errors", "problem_type", "rate_limit"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -718,10 +893,76 @@ public final class ConfigLoader {
             if (map.containsKey("listing") && !(action instanceof RouteSpec.Action.Static)) {
                 throw new ConfigException(path + ".listing is only valid on a static route");
             }
-            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path)));
+            var limit = map.containsKey("rate_limit") ? rateLimit(map.get("rate_limit"), path + ".rate_limit", true) : null;
+            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path), limit));
         }
         return List.copyOf(out);
     }
+
+    /**
+     * {@code rate_limit: {by: peer|header|route, header, rate: 100/s, burst, buckets}}. {@code by: route}
+     * (one bucket for the route) is only valid on a route.
+     */
+    private static sjws_nettask.routing.RateLimitFilter.Limit rateLimit(Object value, String path, boolean onRoute) {
+        var m = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(m, List.of("by", "header", "rate", "burst", "buckets"), path);
+        var byText = m.containsKey("by") ? text(m.get("by"), path + ".by").trim().toLowerCase(Locale.ROOT) : "peer";
+        var by = switch (byText) {
+            case "peer" -> sjws_nettask.routing.RateLimitFilter.By.PEER;
+            case "header" -> sjws_nettask.routing.RateLimitFilter.By.HEADER;
+            case "route" -> {
+                if (!onRoute) {
+                    throw new ConfigException(path + ".by: route is only valid on a route (use peer or header here)");
+                }
+                yield sjws_nettask.routing.RateLimitFilter.By.ROUTE;
+            }
+            default -> throw new ConfigException(path + ".by: expected peer, header or route");
+        };
+        String header = null;
+        if (by == sjws_nettask.routing.RateLimitFilter.By.HEADER) {
+            if (!m.containsKey("header")) {
+                throw new ConfigException(path + ".header is required with by: header");
+            }
+            header = text(m.get("header"), path + ".header").trim();
+            if (header.isEmpty() || !header.chars().allMatch(c -> c > 32 && c < 127 && TSPECIALS.indexOf(c) < 0)) {
+                throw new ConfigException(path + ".header: invalid name '" + header + "'");
+            }
+        } else if (m.containsKey("header")) {
+            throw new ConfigException(path + ".header is only valid with by: header");
+        }
+        if (!m.containsKey("rate")) {
+            throw new ConfigException(path + ".rate is required (for example 100/s, 600/m, 1000/h)");
+        }
+        var rate = String.valueOf(m.get("rate")).trim();
+        long count;
+        char unit = 's';
+        int slash = rate.indexOf('/');
+        try {
+            if (slash >= 0) {
+                var u = rate.substring(slash + 1).trim();
+                if (u.length() != 1 || "smh".indexOf(u.charAt(0)) < 0) {
+                    throw new NumberFormatException();
+                }
+                unit = u.charAt(0);
+                rate = rate.substring(0, slash).trim();
+            }
+            count = Long.parseLong(rate);
+        } catch (NumberFormatException e) {
+            throw new ConfigException(path + ".rate: expected N/s, N/m or N/h");
+        }
+        if (count < 1 || count > 1_000_000_000L) {
+            throw new ConfigException(path + ".rate: must be 1..1000000000 per unit");
+        }
+        int burst = m.containsKey("burst") ? integer(m.get("burst"), path + ".burst", 1, 1_000_000)
+                : (int) Math.min(1_000_000, unit == 's' ? count : 1);
+        int buckets = m.containsKey("buckets") ? integer(m.get("buckets"), path + ".buckets", 1, 1 << 20) : 4096;
+        if (Integer.bitCount(buckets) != 1) {
+            throw new ConfigException(path + ".buckets: must be a power of two");
+        }
+        return new sjws_nettask.routing.RateLimitFilter.Limit(by, header, count, unit, burst, buckets);
+    }
+
+    private static final String TSPECIALS = "()<>@,;:\\\"/[]?={}";
 
     /** {@code backends: [{upstream, weight (default 1), pin}]} and {@code sticky}. */
     private static RouteSpec.Action.Weighted weighted(Map<String, Object> route, Map<String, Upstream> upstreams,
@@ -878,6 +1119,143 @@ public final class ConfigLoader {
         }
         return raw.trim();
     }
+
+    /**
+     * HA heartbeat key. Not part of the canonical document, so a last-good copy never stores it.
+     * When {@code ha.enabled} is false the key bytes are discarded and {@link ClusterKey} is not
+     * resolved. A missing key with HA enabled is an error. The environment overrides the file.
+     * Values are never copied into the message. An inline secret in a group- or world-readable
+     * file is a warning. {@code ha.cluster_key_file} must be mode 0600 or 0400 and owned by this
+     * process. The leaf is not followed. Every parent must be owned by root or this process.
+     * A group- or world-writable parent is refused unless it is sticky and owned by root or
+     * this process.
+     */
+    private static HaMaterial haSection(Map<String, Object> root, Map<String, String> env, Path base, Path configFile,
+            List<String> warnings) {
+        boolean enabled = false;
+        String fileKey = null;
+        String filePrevious = null;
+        String keyFile = null;
+        String previousFile = null;
+        if (root.get("ha") instanceof Object ha) {
+            var map = YamlValues.mapping(ha, "ha");
+            YamlValues.knownKeys(map, List.of("enabled", "cluster_key", "cluster_key_previous", "cluster_key_file",
+                    "cluster_key_previous_file"), "ha");
+            if (map.containsKey("enabled")) {
+                enabled = bool(map.get("enabled"), "ha.enabled");
+            }
+            if (map.containsKey("cluster_key")) {
+                fileKey = secret(map.get("cluster_key"), "ha.cluster_key");
+            }
+            if (map.containsKey("cluster_key_previous")) {
+                filePrevious = secret(map.get("cluster_key_previous"), "ha.cluster_key_previous");
+            }
+            if (map.containsKey("cluster_key_file")) {
+                keyFile = text(map.get("cluster_key_file"), "ha.cluster_key_file");
+            }
+            if (map.containsKey("cluster_key_previous_file")) {
+                previousFile = text(map.get("cluster_key_previous_file"), "ha.cluster_key_previous_file");
+            }
+        }
+        if (fileKey != null && keyFile != null) {
+            throw new ConfigException("ha.cluster_key and ha.cluster_key_file cannot both be set");
+        }
+        if (filePrevious != null && previousFile != null) {
+            throw new ConfigException("ha.cluster_key_previous and ha.cluster_key_previous_file cannot both be set");
+        }
+        if (fileKey != null || filePrevious != null) {
+            warnIfGroupReadable(configFile, warnings);
+        }
+        if (!enabled) {
+            return HaMaterial.OFF;
+        }
+        String current = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY") ? env.get("WEB_SERVER_HA_CLUSTER_KEY")
+                : keyFile != null ? readKeyFile(resolve(base, keyFile, "ha.cluster_key_file"), "ha.cluster_key_file")
+                        : fileKey;
+        String previous = env.containsKey("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")
+                ? env.get("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS")
+                : previousFile != null
+                        ? readKeyFile(resolve(base, previousFile, "ha.cluster_key_previous_file"),
+                                "ha.cluster_key_previous_file")
+                        : filePrevious;
+        if (current == null || current.isBlank()) {
+            throw new ConfigException(
+                    "HA is enabled but no cluster key is set; set ha.cluster_key or WEB_SERVER_HA_CLUSTER_KEY");
+        }
+        if (previous != null && previous.isBlank()) {
+            throw new ConfigException("WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS is empty");
+        }
+        return HaMaterial.enabled(current, previous);
+    }
+
+    /** Inline key material sits in this file. Group or world read is a warning, not a refusal. */
+    private static void warnIfGroupReadable(Path configFile, List<String> warnings) {
+        if (configFile == null) {
+            return;
+        }
+        try {
+            var perms = Files.getPosixFilePermissions(configFile);
+            if (perms.contains(PosixFilePermission.GROUP_READ) || perms.contains(PosixFilePermission.OTHERS_READ)) {
+                warnings.add("config file " + configFile + " is readable by group/others and contains ha.cluster_key; "
+                        + "chmod 600 it, or use ha.cluster_key_file");
+            }
+        } catch (UnsupportedOperationException | IOException ignored) {
+            // no POSIX permissions to check
+        }
+    }
+
+    /**
+     * Key file via {@link SecureKeyFile}: only the parent is resolved, the leaf is opened once
+     * with {@code NOFOLLOW_LINKS}, and a group- or world-writable parent is refused. At most
+     * 4 KiB. The bytes are not part of the error text. Java keeps the characters in a
+     * {@code String}; they are not wiped.
+     */
+    private static String readKeyFile(Path path, String name) {
+        return new String(SecureKeyFile.read(path, name, 4096), StandardCharsets.UTF_8);
+    }
+
+    /** UTF-8 secret. Blank is refused. The value is not included in the error. */
+    private static String secret(Object value, String path) {
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw new ConfigException(path + ": expected a string");
+        }
+        return text;
+    }
+
+    /**
+     * {@code swarm.enabled} (docs/design/agent-swarm.md §3.3, §12 S1), or null when the file has no {@code swarm}
+     * section. Node-local like {@code server.bind_content}: not part of the canonical document, so a config
+     * recovered from last-good boots with the swarm off unless the property or environment gate is set.
+     */
+    private static Boolean swarmSection(Map<String, Object> root) {
+        if (!(root.get("swarm") instanceof Object swarm)) {
+            return null;
+        }
+        var map = YamlValues.mapping(swarm, "swarm");
+        YamlValues.knownKeys(map, List.of("enabled"), "swarm");
+        return map.containsKey("enabled") ? bool(map.get("enabled"), "swarm.enabled") : null;
+    }
+
+    /**
+     * {@code buffers.pool} (default false): the shared direct-buffer pool ({@code docs/design/buffer-pool.md}).
+     * Node-local and read once at startup: it maps to the {@code sjws.buf.pool} system property, which wins when
+     * set on the command line. A reload does not switch the pool on or off.
+     */
+    private static void buffersSection(Map<String, Object> root) {
+        if (!(root.get("buffers") instanceof Object buffers)) {
+            return;
+        }
+        var map = YamlValues.mapping(buffers, "buffers");
+        YamlValues.knownKeys(map, List.of("pool"), "buffers");
+        if (map.containsKey("pool")) {
+            boolean on = bool(map.get("pool"), "buffers.pool");
+            if (System.getProperty(POOL_PROPERTY) == null) {
+                System.setProperty(POOL_PROPERTY, on ? "on" : "off");
+            }
+        }
+    }
+
+    static final String POOL_PROPERTY = "sjws.buf.pool";
 
     private static AccessSettings accessSection(Map<String, Object> root, List<String> warnings) {
         if (!(root.get("access") instanceof Object access)) {
@@ -1261,6 +1639,42 @@ public final class ConfigLoader {
         return value.trim();
     }
 
+    /** Key bytes kept only while HA is enabled. {@link #toString()} redacts them. */
+    private static final class HaMaterial {
+        private static final HaMaterial OFF = new HaMaterial(false, null, null);
+
+        private final boolean enabled;
+        private final byte[] current;
+        private final byte[] previous;
+
+        private HaMaterial(boolean enabled, byte[] current, byte[] previous) {
+            this.enabled = enabled;
+            this.current = current;
+            this.previous = previous;
+        }
+
+        static HaMaterial enabled(String current, String previous) {
+            try {
+                byte[] prev = previous == null ? null : ClusterKey.parse(previous);
+                return new HaMaterial(true, ClusterKey.parse(current), prev);
+            } catch (IllegalArgumentException failed) {
+                throw new ConfigException(failed.getMessage());
+            }
+        }
+
+        boolean enabled() {
+            return this.enabled;
+        }
+
+        byte[] current() {
+            return this.current;
+        }
+
+        byte[] previous() {
+            return this.previous;
+        }
+    }
+
     /** Arguments and environment captured at startup so a reload reapplies them (the process env does not change). */
     public static final class Loaded {
         private final ConfigDocument document;
@@ -1272,10 +1686,47 @@ public final class ConfigLoader {
         private final ServerConfig.PasswordFileReader passwords;
         /** {@code server.bind_content} from the file, or null when the key was omitted. */
         private final Boolean yamlBindContent;
+        /** {@code swarm.enabled} from the file, or null when the key was omitted. */
+        private final Boolean yamlSwarmEnabled;
+        /** True when {@code ha.enabled} is true. The key bytes are null unless this is true. */
+        private final boolean haEnabled;
+        /** Current HMAC key, or null when HA is off. Not part of {@link #toString()}. */
+        private final byte[] haClusterKey;
+        /** Previous HMAC key during rotation, or null. Not part of {@link #toString()}. */
+        private final byte[] haClusterKeyPrevious;
+        /** Raw {@code cp:} block, or null. Parsed only by the CONTROL role. */
+        private final Map<String, Object> yamlCp;
+        /** Directory of the config file, for relative {@code cp:} paths; null without a file. */
+        private final Path configBase;
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
                 Boolean yamlBindContent) {
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, null, false, null,
+                    null);
+        }
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent, Boolean yamlSwarmEnabled) {
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, yamlSwarmEnabled,
+                    false, null, null);
+        }
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
+                byte[] haClusterKeyPrevious) {
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, yamlSwarmEnabled,
+                    haEnabled, haClusterKey, haClusterKeyPrevious, null, null);
+        }
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
+                byte[] haClusterKeyPrevious, Map<String, Object> yamlCp, Path configBase) {
+            this.yamlCp = yamlCp;
+            this.configBase = configBase;
             this.document = document;
             this.warnings = List.copyOf(warnings);
             this.errors = List.copyOf(errors);
@@ -1284,12 +1735,54 @@ public final class ConfigLoader {
             this.env = Map.copyOf(env);
             this.passwords = passwords;
             this.yamlBindContent = yamlBindContent;
+            this.yamlSwarmEnabled = yamlSwarmEnabled;
+            this.haEnabled = haEnabled;
+            this.haClusterKey = haClusterKey == null ? null : haClusterKey.clone();
+            this.haClusterKeyPrevious = haClusterKeyPrevious == null ? null : haClusterKeyPrevious.clone();
         }
 
-        /** Same load, with the document replaced. The file's {@code bind_content} is kept. */
+        /** Same load, with the document replaced. The file's {@code bind_content}, swarm flag, and HA key are kept. */
         public Loaded withDocument(ConfigDocument document) {
             return new Loaded(document, this.warnings, this.errors, this.helpRequested, this.args, this.env,
-                    this.passwords, this.yamlBindContent);
+                    this.passwords, this.yamlBindContent, this.yamlSwarmEnabled, this.haEnabled, this.haClusterKey,
+                    this.haClusterKeyPrevious, this.yamlCp, this.configBase);
+        }
+
+        /** The raw {@code cp:} block from the file, or null when it has none. */
+        public Map<String, Object> yamlCp() {
+            return this.yamlCp;
+        }
+
+        /** Directory of the config file, or null when there is none. */
+        public Path configBase() {
+            return this.configBase;
+        }
+
+        /** {@code ha.enabled}. False when the file omits it. */
+        public boolean haEnabled() {
+            return this.haEnabled;
+        }
+
+        /** @return a copy of the current cluster key, or null when HA is off. Do not log the bytes. */
+        public byte[] haClusterKey() {
+            return this.haClusterKey == null ? null : this.haClusterKey.clone();
+        }
+
+        /** @return a copy of the previous cluster key, or null. Do not log the bytes. */
+        public byte[] haClusterKeyPrevious() {
+            return this.haClusterKeyPrevious == null ? null : this.haClusterKeyPrevious.clone();
+        }
+
+        @Override
+        public String toString() {
+            return "Loaded{ok=" + ok() + ", haEnabled=" + this.haEnabled + ", clusterKey="
+                    + (this.haClusterKey == null ? "none" : "****") + ", clusterKeyPrevious="
+                    + (this.haClusterKeyPrevious == null ? "none" : "****") + "}";
+        }
+
+        /** {@code swarm.enabled}, or null when the file did not set it. Not part of the canonical document. */
+        public Boolean yamlSwarmEnabled() {
+            return this.yamlSwarmEnabled;
         }
 
         /** {@code server.bind_content}, or null when the file did not set it. Not part of the canonical document. */

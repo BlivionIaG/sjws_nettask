@@ -359,6 +359,21 @@ class ServerConfigTest {
     }
 
     @Test
+    void clusterKeyOnCommandLineIsRefusedAndNeverEchoed() {
+        var secret = "cli-cluster-key-should-not-appear";
+        var previous = "cli-previous-key-should-not-appear";
+        var p = parse(Map.of(), "--cluster-key=" + secret, "--ha-cluster-key-previous=" + previous);
+        assertFalse(p.ok());
+        var text = p.errors().toString();
+        assertFalse(text.contains(secret), text);
+        assertFalse(text.contains(previous), text);
+        assertTrue(p.errors().stream().anyMatch(e -> e.contains("not accepted on the command line")));
+        assertTrue(parse(Map.of(), "--ha-cluster-key=" + secret).errors().stream()
+                .noneMatch(e -> e.contains(secret)));
+        assertTrue(parse(Map.of(), "--cluster-key-previous=" + previous).errors().stream()
+                .noneMatch(e -> e.contains(previous)));
+    }
+
     void passwordOnCommandLineIsRefusedAndNeverEchoed() {
         var p = parse(Map.of(), "--h3", "--cert=/c", "--key=/k", "--key-password=hunter2");
         assertNull(p.config().tlsKeyPassword());

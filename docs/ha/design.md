@@ -62,10 +62,44 @@ flowchart TB
    at accept time, and only when a passive gate is installed — active/active installs none.
    The request path adds one `volatile` snapshot read inside `HaHandler` (the `Handler` seam),
    not in the parser or the cache. Target: ≤1% throughput loss, ≤2% p99 delta vs single-node.
-2. **Cheap heartbeats.** Fixed-size UDP datagrams (64 B, default 500 ms, jittered), one
-   dedicated virtual thread, no allocation per beat beyond a reused buffer and a reused
-   `DatagramPacket`. Monotonic clocks are not comparable across hosts: the packet carries
-   `leaseRemainingMs`, and the receiver sets its own expiry from `System.nanoTime()`.
+2. **Cheap heartbeats.** Fixed-size UDP datagrams (64-byte membership body plus version,
+   key id, timestamp, sequence, boot epoch, destination wire id, and a 32-byte HMAC-SHA256;
+   124 B on the wire, default 500 ms, jittered), one dedicated virtual thread, no allocation
+   per beat beyond a reused buffer and a reused `DatagramPacket`. The MAC input is a domain
+   label (`sjws-ha-hb`), the version, the key id, the body, the timestamp, the sequence, the
+   boot epoch, and the destination. The HMAC key is HKDF-SHA256 of the cluster key
+   (`sjws-ha-heartbeat-v1`), not the raw secret. Key id 0 selects the current key and key id 1
+   the previous key; one packet is not checked against both. A newer boot epoch from a member
+   resets that sender's sequence high-water mark, so a restart is not a missed heartbeat.
+   The epoch is a boot time: it must be no later than the packet's own timestamp, and no
+   later than the receiver's now, beyond the same ±5 second skew window. A later epoch is
+   dropped and does not change replay state, so a forged far-future epoch cannot lock the
+   real member out after the attacker stops. A lower epoch is accepted only when that sender
+   has been silent for at least {@code max(deadAfter, 5s)} (the receiver already treats the
+   member as dead, and a captured packet has left the skew window). That is a clock step
+   backwards across a restart, not a live rewind.
+   A timestamp older than the receiver's boot is dropped. A destination other than this node,
+   and a sender that is not a member, are dropped; the replay map only holds members.
+   Drops are counted by reason. A missing key with HA enabled refuses to start. Rotation is
+   two steps: deploy the new secret as the current key and the key still in use as the
+   previous key (`ha.cluster_key` / `ha.cluster_key_file` and `ha.cluster_key_previous` /
+   `ha.cluster_key_previous_file`), then remove the previous key once every node is sending
+   with the new one. The key file must be mode 0600 or 0400 and owned by this process.
+   Only the parent directory is resolved with `toRealPath`. The leaf is opened with
+   `NOFOLLOW_LINKS` and is never followed, so a symlink in that name is refused.
+   Owner and mode are taken from that opened file. Every resolved parent up to `/` must
+   be owned by root or this process. A group- or world-writable parent is refused unless
+   it is sticky and owned by root or this process (`/tmp`). On Linux those attributes are
+   `fstat` of `/proc/self/fd`, and that descriptor is used only when its device and inode
+   match the opened file. Without `/proc`, attributes are an `lstat` of the path with
+   `NOFOLLOW_LINKS` while the channel is open (a replace in that window can still change
+   the inode), and owner checks compare the owner name with `root` or `user.name`.
+   Whoever starts the JVM can set `user.name`; they already control the process.
+   Control-plane key files use the same helper, `sjws_nettask.config.SecureKeyFile`.
+   Nodes need NTP: the authentication window is ±5 seconds of wall-clock time. Monotonic
+   clocks are not comparable across hosts: the packet carries `leaseRemainingMs`, and the
+   receiver sets its own expiry from `System.nanoTime()`. The authentication timestamp is
+   wall-clock milliseconds and is only a replay window.
 3. **Sync off the hot path.** Content/config/cert sync runs in background threads and is
    applied by atomic swap (new snapshot → single reference publish); readers never block.
    `HaHandler` loads the `Snapshot` once at the start of `handle`, so an in-flight call keeps
@@ -108,6 +142,8 @@ last generation (fail static). Messaging endpoints, when Messaging Core adds the
 the partition leader; that redirect is not part of the static path.
 
 ### 4.1 Two nodes
+
+The two-node choice (witness versus async primary/standby), the failure matrix, and what the current classes still lack are in [two-node HA](../design/two-node-ha-decision.md). This section is the serving-mode sketch; that document is the decision.
 
 - **Active/active (recommended):** both serve; upstream LB/DNS uses `/healthz` / `/readyz`.
   No split-brain risk for serving because content is read-only; the only contested action is

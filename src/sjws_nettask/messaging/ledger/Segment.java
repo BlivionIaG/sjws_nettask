@@ -246,7 +246,8 @@ final class Segment implements AutoCloseable {
             int i = Arrays.binarySearch(idxOff, 0, n, fromOffset);
             pos = i >= 0 ? idxPos[i] : (i == -1 ? 0 : idxPos[-i - 2]);
         }
-        var buf = ByteBuffer.allocate(4 << 20);
+        // Chunk sized to what is left to read (a snapshot rebuild scans a short tail), capped at 4 MiB.
+        var buf = ByteBuffer.allocate((int) Math.max(64, Math.min(4 << 20, end - pos)));
         long bufStart = pos;
         buf.limit(0);
         while (pos < end) {
