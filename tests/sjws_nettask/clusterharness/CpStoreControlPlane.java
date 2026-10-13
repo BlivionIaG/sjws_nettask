@@ -73,6 +73,9 @@ final class CpStoreControlPlane implements ControlPlane {
     private SimTransport transport;
     private ClusterClock clock;
     private KeyRing keys;
+    private VoterSet voterSet;
+    private Clock raftClock;
+    private long started;
     private Thread driver;
     private volatile boolean running;
 
@@ -105,15 +108,13 @@ final class CpStoreControlPlane implements ControlPlane {
                     MemberState.ALIVE, false));
             ids.add(id);
         }
-        var set = VoterSet.majority(members, ids);
-        Clock raft = new RaftClock(clusterClock);
+        this.voterSet = VoterSet.majority(members, ids);
+        this.raftClock = new RaftClock(clusterClock);
+        this.started = now;
         for (var member : members) {
-            var store = CpStore.open(this.dir.resolve(member.id().name()), this.keys, raft, "urn:sjws:admin:root",
-                    member.id(), set, this.transport);
-            var voter = new Voter(member.id(), store);
+            var voter = new Voter(member.id());
             this.voters.add(voter);
-            voter.watch = WatchServer.start(store, 0, System::currentTimeMillis);
-            voter.admin = AdminServer.startPlainForTests(store, now, TTL_MILLIS);
+            boot(voter);
         }
         this.running = true;
         this.driver = Thread.ofPlatform().daemon().name("harness-cp-driver").start(this::drive);
@@ -254,10 +255,37 @@ final class CpStoreControlPlane implements ControlPlane {
         }
     }
 
+    /** Opens (or reopens) {@code voter}'s store on its own log directory, then its watch and admin. */
+    private void boot(Voter voter) throws IOException {
+        voter.store = CpStore.open(this.dir.resolve(voter.id.name()), this.keys, this.raftClock,
+                "urn:sjws:admin:root", voter.id, this.voterSet, this.transport);
+        voter.watch = WatchServer.start(voter.store, 0, System::currentTimeMillis);
+        voter.admin = AdminServer.startPlainForTests(voter.store, this.started, TTL_MILLIS);
+        voter.dead = false;
+    }
+
+    /**
+     * Resumes the data-node relays, restarts every killed voter from its own log directory (it
+     * rejoins and catches up from the leader), then restores every voter-to-voter link.
+     */
     @Override
     public void heal() {
         for (var joined : this.data.values()) {
             joined.relay.resume();
+        }
+        this.driving.lock();
+        try {
+            for (var voter : this.voters) {
+                if (voter.dead) {
+                    try {
+                        boot(voter);
+                    } catch (IOException e) {
+                        throw new java.io.UncheckedIOException("restart " + voter.id.name(), e);
+                    }
+                }
+            }
+        } finally {
+            this.driving.unlock();
         }
         for (var a : this.voters) {
             for (var b : this.voters) {
@@ -351,6 +379,20 @@ final class CpStoreControlPlane implements ControlPlane {
         }
     }
 
+    /** Last config version applied by voter {@code id}'s store (0 when none, -1 when dead). */
+    long appliedVersion(String id) {
+        for (var voter : this.voters) {
+            if (voter.id.name().equals(id)) {
+                if (voter.dead) {
+                    return -1;
+                }
+                var history = voter.store.history();
+                return history.isEmpty() ? 0 : history.get(history.size() - 1).version();
+            }
+        }
+        throw new IllegalArgumentException("no voter " + id);
+    }
+
     private CpStore leaderStore() {
         return ((Voter) leader().orElseThrow(() -> new IllegalStateException("cp-config has no ready leader"))).store;
     }
@@ -430,14 +472,13 @@ final class CpStoreControlPlane implements ControlPlane {
 
     private static final class Voter implements ControlNode {
         private final NodeId id;
-        private final CpStore store;
-        private WatchServer watch;
-        private AdminServer admin;
+        private volatile CpStore store;
+        private volatile WatchServer watch;
+        private volatile AdminServer admin;
         private volatile boolean dead;
 
-        Voter(NodeId id, CpStore store) {
+        Voter(NodeId id) {
             this.id = id;
-            this.store = store;
         }
 
         @Override

@@ -258,5 +258,6 @@ public final class ReplicatedNode implements ClusterNode {
                 Thread.currentThread().interrupt();
             }
         }
+        transport.detach(self);
     }
 }

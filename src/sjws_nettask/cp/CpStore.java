@@ -68,6 +68,8 @@ public final class CpStore implements AutoCloseable {
     private static final int HISTORY = 8;
 
     private final ReplicatedNode node;
+    /** The voter's log, closed with the store so a restart can reopen the same directory. */
+    private FileLogStorage ownedStorage;
     private ReplicationGroup group;
     private ControlLeadership leadership;
     private final KeyRing keys;
@@ -134,7 +136,9 @@ public final class CpStore implements AutoCloseable {
         }
         var storage = new FileLogStorage(stateDir.resolve("cp-config"));
         var node = ReplicatedNode.open(self, voters, clock, storage, transport);
-        return attach(node, self, stateDir, keys, adminSan);
+        var store = attach(node, self, stateDir, keys, adminSan);
+        store.ownedStorage = storage;
+        return store;
     }
 
     private static CpStore attach(ReplicatedNode node, NodeId id, java.nio.file.Path stateDir, KeyRing keys,
@@ -789,6 +793,13 @@ public final class CpStore implements AutoCloseable {
     @Override
     public void close() {
         node.close();
+        if (ownedStorage != null) {
+            try {
+                ownedStorage.close();
+            } catch (IOException e) {
+                // Closing read/append channels; the log on disk is already durable as configured.
+            }
+        }
     }
 
     private Outcome commitSigned(ConfigDocument source, long rollbackOf, long nowMillis, long ttlMillis, String key,
