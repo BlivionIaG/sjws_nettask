@@ -41,7 +41,7 @@ import sjws_nettask.core.RoutePattern;
 public final class ConfigLoader {
 
     private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
-            "routing", "middleware", "access");
+            "routing", "middleware", "access", "messaging");
     private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
@@ -98,6 +98,7 @@ public final class ConfigLoader {
         Routing routing = Routing.disabled();
         List<MiddlewareSpec> middleware = List.of();
         AccessSettings access = AccessSettings.DEFAULT;
+        MessagingSettings messaging = MessagingSettings.disabled();
         Path configFile = null;
         Path yamlPassword = null;
         NodeSettings node = NodeSettings.STANDALONE;
@@ -158,6 +159,7 @@ public final class ConfigLoader {
             routing = routingSection(root, warnings);
             middleware = middlewareSection(root, warnings);
             access = accessSection(root, warnings);
+            messaging = MessagingSettings.parse(root);
         }
         var parsed = baseline == null
                 ? ServerConfig.parse(args, env, passwords)
@@ -176,7 +178,7 @@ public final class ConfigLoader {
         }
         var base = configFile == null ? null : configFile.toAbsolutePath().getParent();
         var document = ConfigDocument.of(server, acme, routing, middleware, access, node, schemaVersion, bundleVersion,
-                configFile).withStateDir(stateDir(args, env, yamlState, base));
+                configFile, messaging).withStateDir(stateDir(args, env, yamlState, base));
         if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
             document = document.withSignature(bootSignature);
         }

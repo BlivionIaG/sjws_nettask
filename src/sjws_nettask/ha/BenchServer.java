@@ -22,8 +22,7 @@ import sjws_nettask.SjwsServer;
 
 /**
  * Process entry for {@code tools/ha-bench.sh}. Single-node leaves HA detached. Cluster mode
- * attaches {@link HaSettings} so the request path pays for the snapshot read and the probes.
- * Blocks until the process is killed.
+ * attaches {@link HaSettings} and runs a second node with UDP heartbeats. Blocks until killed.
  */
 public final class BenchServer {
 
@@ -31,16 +30,61 @@ public final class BenchServer {
     }
 
     public static void main(String[] args) throws Exception {
-        var options = Options.parse(args);
-        var config = ServerConfig.defaults(Path.of(options.root())).withPort(options.port());
-        HaSettings ha = options.cluster() ? HaSettings.defaults() : null;
-        var server = SjwsServer.start(config, ha);
-        System.out.println("bench port=" + server.tcpPort() + " mode=" + options.mode());
+        var running = launch(Options.parse(args));
+        System.out.println("bench port=" + running.tcpPort() + " mode=" + running.mode());
         System.out.flush();
         try {
             Thread.currentThread().join();
         } finally {
+            running.close();
+        }
+    }
+
+    /** Starts the server (and, in cluster mode, the heartbeat peer). Caller closes it. */
+    public static Running launch(Options options) throws Exception {
+        var config = ServerConfig.defaults(Path.of(options.root())).withPort(options.port());
+        ClusterSide side = options.cluster() ? ClusterSide.start() : null;
+        HaSettings ha = options.cluster() ? HaSettings.defaults() : null;
+        try {
+            var server = SjwsServer.start(config, ha);
+            return new Running(server, side, options.mode());
+        } catch (RuntimeException | java.io.IOException failed) {
+            if (side != null) {
+                side.close();
+            }
+            throw failed;
+        }
+    }
+
+    public static final class Running implements AutoCloseable {
+        private final SjwsServer server;
+        private final ClusterSide side;
+        private final String mode;
+
+        private Running(SjwsServer server, ClusterSide side, String mode) {
+            this.server = server;
+            this.side = side;
+            this.mode = mode;
+        }
+
+        public int tcpPort() {
+            return server.tcpPort();
+        }
+
+        public String mode() {
+            return mode;
+        }
+
+        public int heartbeats() {
+            return side == null ? 0 : side.received();
+        }
+
+        @Override
+        public void close() {
             server.close();
+            if (side != null) {
+                side.close();
+            }
         }
     }
 

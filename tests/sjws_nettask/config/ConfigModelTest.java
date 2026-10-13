@@ -455,15 +455,16 @@ class ConfigModelTest {
         assertTrue(emptySig.getMessage().contains("signature"));
         var tampered = new ConfigDocument(base.server(), base.acme(), base.routing(), base.middleware(),
                 base.access(), base.node(), base.schemaVersion(), base.bundleVersion(), base.configFile(),
-                base.stateDir(), "ab", base.canonicalText(), new byte[] {1});
+                base.stateDir(), "ab", base.canonicalText(), new byte[] {1}, null);
         var hashMismatch = assertThrows(ConfigException.class, () -> verifier.verify(tampered));
         assertTrue(hashMismatch.getMessage().contains("canonical hash"));
         assertThrows(IllegalArgumentException.class, () -> new ConfigDocument(base.server(), base.acme(),
-                base.routing(), base.middleware(), base.access(), base.node(), -1, 0, null, null, null, null, null));
+                base.routing(), base.middleware(), base.access(), base.node(), -1, 0, null, null, null, null, null,
+                null));
         assertThrows(IllegalArgumentException.class, () -> new ConfigDocument(base.server(), base.acme(),
-                base.routing(), base.middleware(), base.access(), base.node(), 1, -1, null, null, "", null, null));
+                base.routing(), base.middleware(), base.access(), base.node(), 1, -1, null, null, "", null, null, null));
         var clearedHash = new ConfigDocument(base.server(), base.acme(), base.routing(), base.middleware(),
-                base.access(), base.node(), 1, 0, null, base.stateDir(), null, null, null);
+                base.access(), base.node(), 1, 0, null, base.stateDir(), null, null, null, null);
         assertEquals("", clearedHash.canonicalHash());
         var signed = base.withSignature(new byte[] {9});
         assertArrayEquals(new byte[] {9}, signed.withNode(signed.node()).signature());
@@ -489,7 +490,7 @@ class ConfigModelTest {
         assertTrue(specialJson.contains("\\r"), specialJson);
         var rendered = new ConfigDocument(data.server(), data.acme(), data.routing(), data.middleware(),
                 data.access(), data.node(), data.schemaVersion(), data.bundleVersion(), data.configFile(),
-                data.stateDir(), data.canonicalHash(), null, null);
+                data.stateDir(), data.canonicalHash(), null, null, null);
         var nullText = dir.resolve("null-text.json");
         LastGoodStore.write(nullText, rendered);
         assertEquals(data.canonicalText(), LastGoodStore.dataPlaneYaml(nullText));
@@ -534,7 +535,7 @@ class ConfigModelTest {
                 base.node(), base.schemaVersion(), 2, base.configFile());
         var bare = new ConfigDocument(shifted, base.acme(), base.routing(), base.middleware(), base.access(),
                 base.node(), hashed.schemaVersion(), hashed.bundleVersion(), hashed.configFile(), hashed.stateDir(),
-                hashed.canonicalHash(), null, new byte[] {7, 7});
+                hashed.canonicalHash(), null, new byte[] {7, 7}, null);
         var board = new ChallengeBoard();
         var current = ConfigSnapshot.compile(base, board, 1);
         var reloader = new ConfigReloader(loaded);
@@ -543,7 +544,7 @@ class ConfigModelTest {
         assertArrayEquals(new byte[] {7, 7}, copied.snapshot().document().signature());
         var empty = new ConfigDocument(base.server(), base.acme(), base.routing(), base.middleware(), base.access(),
                 base.node(), base.schemaVersion(), base.bundleVersion(), base.configFile(), base.stateDir(), "",
-                base.canonicalText(), null);
+                base.canonicalText(), null, null);
         assertTrue(reloader.apply(current, empty, false, board, false).applied());
     }
 

@@ -34,13 +34,25 @@ import sjws_nettask.core.StaticFileHandler;
  * @param files the static-file handler (also what {@code SjwsServer.handler()} returns)
  * @param handler what a request runs: {@code files} or a router over it, possibly behind the ACME challenge wrapper
  * @param generation increases by one on every successful reload
+ * @param epoch control-plane epoch, {@code 0} for a local snapshot
  * @param resources what {@link #close()} releases (the router's upstream pools), or null
  */
 public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, Handler handler, int generation,
-        AutoCloseable resources) {
+        long epoch, AutoCloseable resources) implements AppliedConfig {
+
+    public ConfigSnapshot {
+        if (epoch < 0) {
+            throw new IllegalArgumentException("epoch");
+        }
+    }
 
     public ConfigSnapshot(ConfigDocument document, StaticFileHandler files, Handler handler, int generation) {
-        this(document, files, handler, generation, null);
+        this(document, files, handler, generation, 0L, null);
+    }
+
+    public ConfigSnapshot(ConfigDocument document, StaticFileHandler files, Handler handler, int generation,
+            long epoch) {
+        this(document, files, handler, generation, epoch, null);
     }
 
     /**
@@ -58,6 +70,10 @@ public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, H
     }
 
     public static ConfigSnapshot compile(ConfigDocument document, ChallengeBoard board, int generation) {
+        return compile(document, board, generation, 0L);
+    }
+
+    public static ConfigSnapshot compile(ConfigDocument document, ChallengeBoard board, int generation, long epoch) {
         var server = document.server();
         var files = new StaticFileHandler(server.root(), server.allowUnlistableDirs(),
                 new FileCache(server.cacheBytes()), effectiveAccess(server.access(), document.access()));
@@ -73,7 +89,23 @@ public record ConfigSnapshot(ConfigDocument document, StaticFileHandler files, H
         if (acme.enabled() && acme.onMainListener(server.port())) {
             handler = new AcmeChallengeHandler(board, handler); // challenges are answered before any route
         }
-        return new ConfigSnapshot(document, files, handler, generation, resources);
+        return new ConfigSnapshot(document, files, handler, generation, epoch, resources);
+    }
+
+    /** Cluster version. {@code 0} when the document has no {@code version} key. */
+    @Override
+    public long version() {
+        return document.bundleVersion();
+    }
+
+    /** SHA-256 of {@link ConfigCodec#text}, not the raw file bytes. */
+    @Override
+    public String canonicalHash() {
+        return document.canonicalHash();
+    }
+
+    public ConfigSnapshot withEpoch(long epoch) {
+        return new ConfigSnapshot(document, files, handler, generation, epoch, resources);
     }
 
     /**

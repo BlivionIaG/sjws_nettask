@@ -54,9 +54,17 @@ public final class ServiceLaunch {
 
         @Override
         public void onListening(SjwsServer server, Path pidFile, Duration shutdownTimeout) throws IOException {
+            boolean ha = server != null && server.ha() != null;
+            if (ha) {
+                // Refuse a drain that cannot finish inside the daemon budget before the listener is published.
+                sjws_nettask.cp.NodeLifecycle.drainBudgetMillis(true, server.ha().settings().drainDelay().toMillis(),
+                        server.ha().settings().drainTimeout().toMillis());
+            }
             long budget = Sjws_nettask.drainBudgetMillis(this.drainBudgetMs);
             this.enrollment = NodeEnrollment.open(this.bootstrap, pidFile, budget);
-            server.setLocalReload(this::reloadLocal);
+            if (server != null) {
+                server.setLocalReload(this::reloadLocal);
+            }
         }
 
         @Override
