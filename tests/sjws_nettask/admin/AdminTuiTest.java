@@ -408,7 +408,12 @@ class AdminTuiTest {
     @Test
     void mainWithEmbeddedControlRunsARealServer() throws IOException {
         var bytes = new ByteArrayOutputStream();
-        int code = AdminMain.run(new String[] {"0", this.root.toString(), "--no-color", "--bogus-flag"}, Map::of,
+        int port; // "0" is not a valid port argument (falls back to 8080, which may be busy): pick a free one
+        try (var probe = new ServerSocket(0)) {
+            port = probe.getLocalPort();
+        }
+        int code = AdminMain.run(new String[] {Integer.toString(port), this.root.toString(), "--no-color",
+                "--bogus-flag"}, Map::of,
                 new ByteArrayInputStream("\nq\n".getBytes(StandardCharsets.UTF_8)),
                 new PrintStream(bytes, true, StandardCharsets.UTF_8),
                 EmbeddedServerControl::new);
