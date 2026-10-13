@@ -95,6 +95,19 @@ class ConfigLoaderTest {
     }
 
     @Test
+    void cpBlockIsCarriedRawAndNotCanonical() throws Exception {
+        var loaded = ConfigLoader.load(new String[] {"--config=" + write("cp:\n  nodeId: cp-1\n  peers: []\n")},
+                Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        assertEquals("cp-1", loaded.yamlCp().get("nodeId"));
+        assertNotNull(loaded.configBase());
+        assertFalse(loaded.document().canonicalText().contains("cp-1"), loaded.document().canonicalText());
+        assertNull(ConfigLoader.load(new String[] {"--config=" + write("swarm: {}\n")}, Map.of()).yamlCp());
+        assertEquals("cp-1", loaded.withDocument(loaded.document()).yamlCp().get("nodeId"));
+        assertFalse(ConfigLoader.load(new String[] {"--config=" + write("cp: 3\n")}, Map.of()).ok());
+    }
+
+    @Test
     void buffersPoolMapsToThePropertyUnlessSet() throws Exception {
         var saved = System.getProperty("sjws.buf.pool");
         try {

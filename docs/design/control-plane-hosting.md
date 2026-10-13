@@ -159,21 +159,24 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 
 | Property | Env | YAML | Meaning |
 |---|---|---|---|
-| `sjws.role` (existing resolution via `NodeLifecycle.role`) | `SJWS_ROLE` | `role` | `control` / `data` |
+| `--role` (existing resolution via `NodeLifecycle.role`) | `WEB_SERVER_ROLE` | `node.mode` | `control` / `data` |
 | `sjws.cp.stateDir` | `SJWS_CP_STATE_DIR` | `cp.stateDir` | Raft log + snapshots |
 | `sjws.cp.keyDir` | `SJWS_CP_KEY_DIR` | `cp.keyDir` | section 2 |
 | `sjws.cp.rootPub` | `SJWS_CP_ROOT_PUB` | `cp.rootPub` | pinned root key path (must pass 2.3 checks) |
 | — | — | `cp.rootPubSha256` | optional install-time pin of the root SPKI |
-| — | — | `cp.insecureSkipPermissionChecks` | dev-only override (2.3), config file only |
+| — | — | `cp.insecureSkipPermissionChecks` | dev-only override (2.3), config file only; a property/env setting is refused |
+| — | — | `cp.minBundleSerial` | lowest accepted `bundleSerial` (default 0; Security) |
 | — | — | `cp.maxClockDriftRatio` | proposed, default 0.01 (1%); rate error over one lease (HA) |
 | — | — | `cp.leaseSafetyMargin` | proposed, default 10 ms; fixed margin in the startup check (HA) |
 | `sjws.cp.nodeId` | `SJWS_CP_NODE_ID` | `cp.nodeId` | this voter |
-| — | — | `cp.peers[]` (`id`, `address`, `witness: bool`) | voter set |
+| — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
 | `sjws.cp.admin.listen` | `SJWS_CP_ADMIN_LISTEN` | `cp.admin.listen` | AdminServer |
 | — | — | `cp.tls.{cert,key,ca,adminCa}` | owned by Security |
 
-Exact names of the role key must match the existing `NodeLifecycle.role` inputs; check before implementing.
+The role key is the existing `--role` / `WEB_SERVER_ROLE` / `node.mode` (`NodeLifecycle.role`); there is no `sjws.cp.role`.
+Implemented in `sjws_nettask.cp.CpConfig` and `CpKeyConfig`; `ConfigLoader` keeps the `cp:` block raw so a
+non-control process names no cp class.
 
 ## 5. Zero cost when the CP role is off
 

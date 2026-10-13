@@ -69,6 +69,16 @@ public final class KeyRing {
                 signature);
     }
 
+    // ---- Security-owned seam (control-plane-hosting.md §2.3). Security's KeyRing.load PR replaces only this method.
+    /**
+     * Loads the ring from disk, fail closed. <b>Stub until Security's PR lands:</b> always throws, so a CONTROL
+     * start refuses to run rather than run without verified keys. Tests use {@link #generate}.
+     */
+    public static KeyRing load(CpKeyConfig config) throws CpKeyException {
+        throw new CpKeyException("KeyRing.load is not implemented yet (Security); refusing to start the control role");
+    }
+    // ---- end Security-owned seam
+
     public byte[] rootPublic() {
         return rootPublic.clone();
     }
