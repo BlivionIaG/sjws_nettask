@@ -68,6 +68,15 @@ class RootBranchCoverageTest {
         assertEquals(Boolean.TRUE, envOnly.bindContent());
         var envAfterOn = Daemon.parse(new String[] {"--bind-content=true"}, Map.of("WEB_SERVER_BIND_CONTENT", "1"));
         assertEquals(Boolean.TRUE, envAfterOn.bindContent());
+        var badBudget = Daemon.parse(new String[] {"--drain-budget=nope"}, Map.of());
+        assertTrue(badBudget.warnings().stream().anyMatch(w -> w.contains("default")));
+        var replacedBudget = Daemon.parse(new String[] {"--drain-budget=10", "--drain-budget=9999"}, Map.of());
+        assertEquals(10_000L, replacedBudget.drainBudgetMs());
+        assertTrue(replacedBudget.warnings().stream().anyMatch(w -> w.contains("10")));
+        var world = ServerConfig.parse(new String[] {"--require-world-readable"}, Map.of());
+        assertTrue(world.config().access().requireWorldReadable());
+        var worldOff = ServerConfig.parse(new String[] {"--require-world-readable=false"}, Map.of());
+        assertFalse(worldOff.config().access().requireWorldReadable());
     }
 
     @Test
@@ -225,6 +234,49 @@ class RootBranchCoverageTest {
         } finally {
             owner.file().close();
         }
+        var live = this.dir.resolve("live.pid");
+        var liveOwner = PidFile.claim(live);
+        assertTrue(liveOwner.acquired());
+        try {
+            var denied = PidFile.claim(live);
+            assertFalse(denied.acquired());
+            assertTrue(denied.snapshot().pid() > 0);
+            try (var server = SjwsServer.start(ServerConfig.builder(html).port(0).build())) {
+                var messages = new java.io.ByteArrayOutputStream();
+                int code = await(server, new PrintStream(new java.io.ByteArrayOutputStream()), new PrintStream(messages),
+                        live, null);
+                assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, code);
+                assertTrue(messages.toString().contains("pid " + denied.snapshot().pid()), messages.toString());
+            }
+        } finally {
+            liveOwner.file().close();
+        }
+    }
+
+    @Test
+    void haKeepsAnInjectedFileHandlerWithAndWithoutFilters() throws Exception {
+        var html = Files.createDirectory(this.dir.resolve("ha"));
+        var files = new sjws_nettask.core.StaticFileHandler(html);
+        var ha = new sjws_nettask.ha.HaSettings.Builder().drainDelay(Duration.ofMillis(1))
+                .drainTimeout(Duration.ofMillis(1)).handler(files).build();
+        var config = ServerConfig.builder(html).port(0).h3Enabled(false).build();
+        var filters = RequestFilters.create().add((request, next) -> next.proceed(request));
+        try (var server = SjwsServer.start(config, H3Transports.defaultFactory(), filters, null, ha)) {
+            assertNotNull(server.ha());
+        }
+        try (var server = SjwsServer.start(config, ha)) {
+            assertNotNull(server.ha());
+        }
+        long me = ProcessHandle.current().pid();
+        long started = ProcessHandle.current().info().startInstant().map(java.time.Instant::toEpochMilli).orElse(-1L);
+        var pid = this.dir.resolve("running.pid");
+        Files.writeString(pid, PidFile.text(me, started));
+        var snap = PidFile.read(pid);
+        assertTrue(snap.running(), snap.toString());
+        var out = new java.io.ByteArrayOutputStream();
+        assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(pid, Duration.ofMillis(200), -1L, new PrintStream(out),
+                new PrintStream(new java.io.ByteArrayOutputStream()), id -> java.util.Optional.empty()));
+        assertTrue(out.toString().contains("stale"), out.toString());
     }
 
     @Test
