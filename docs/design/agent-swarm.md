@@ -300,6 +300,10 @@ The transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existing liste
 
 **S2 security note (2026-10-13).** `/swarm/v1` (`src/sjws_nettask/swarm/SwarmHttp.java`) has **no built-in authentication or authorization** on master: any client that reaches the listener can submit, claim and settle tasks on any pool. Until S2d lands, enable the swarm only on a trusted network. S2d (`AgentPolicy` + agent intermediate CA, §6) must be **deny by default**: a request without a verified agent identity, or whose identity lacks the permission for the target pool, is refused, and missing policy or trust material refuses to mount (fail closed, AGENTS.md *Security*).
 
+**Deferred items (recorded 2026-10-13, not scheduled in a phase yet):**
+- **Deadline sweeper.** Expired HTTP claims are dropped by a linear scan of the claimed-lease cache on every claim (`SwarmHttp.sweep`, `src/sjws_nettask/swarm/SwarmHttp.java`), and expired tasks are only noticed when claimed (`TaskService.claim`). Replace this with a hashed timing wheel (one thread, O(1) insert/cancel per lease or deadline), shared with the graph runner's per-shard step timers (graphs §6.2).
+- **Reply-ack thread outlives `Swarm.close()`.** The durability-then-ack executor (`ACKER` in `src/sjws_nettask/swarm/TaskService.java`) is a static single-thread executor, so it is not shut down by `Swarm.close()` / `SwarmModule.close()` and survives module reloads. Make it owned by `Swarm` (closed with it, after pending acks drain) and add a test that no swarm thread remains after close.
+
 ## 13. Benchmark plan
 All runs report the machine (CPU model, vCPU count, RAM, disk, kernel, JDK) and the commit. Every A/B comparison uses **≥ 5 alternating runs** (master, branch, master, …), reported as mean ± stddev, as Messaging Core did for #69. The load generator and the server are pinned to disjoint CPUs with `taskset`.
 
