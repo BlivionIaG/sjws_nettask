@@ -180,6 +180,67 @@ class CpTlsWatchTest {
         }
     }
 
+    /** A data node through ServiceLaunch with cpTls and no join token: certificate-only enrollment, snapshot applied. */
+    @Test
+    void dataNodeEnrollsByCertificateAndAppliesSnapshots() throws Exception {
+        var ca = ca("CN=cp-ca");
+        var server = issued(ca, "CN=cp", new GeneralName(GeneralName.iPAddress, "127.0.0.1"), uri("urn:sjws:cp"));
+        var node = issued(ca, "CN=gw-1", uri("urn:sjws:node:gw-1"));
+        var cp = files("cp", server, ca, ca, null, null);
+        var gw = files("gw1", node, ca, ca, null, "urn:sjws:cp");
+        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var clock = new FakeClock(0);
+        var store = CpStore.open(dir.resolve("cp-state"), keys, clock);
+        clock.advance(Duration.ofMillis(100));
+        store.drive();
+        var watch = WatchServer.start(store, new InetSocketAddress("127.0.0.1", 0), System::currentTimeMillis, cp);
+        var pin = dir.resolve("root.pub");
+        LastGoodFiles.writePin(pin, keys.rootPublic(), 0);
+        var boot = dir.resolve("bootstrap");
+        Files.writeString(boot, "role=data\ndata-role=gateway\nnode-id=gw-1\ncontrol-plane=127.0.0.1:" + watch.port()
+                + "\npin=" + pin + "\nstate-dir=" + dir.resolve("state") + "\ncp-tls-cert=" + gw.certPem()
+                + "\ncp-tls-key=" + gw.keyPem() + "\ncp-tls-ca=" + gw.caPem() + "\ncp-tls-peer=urn:sjws:cp\n");
+        Files.setPosixFilePermissions(boot, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        var html = Files.createDirectories(dir.resolve("html"));
+        Files.writeString(html.resolve("index.html"), "x");
+        var yaml = dir.resolve("sjws.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + dir.resolve("cfg")
+                + "\nserver:\n  port: 0\n  root: " + html + "\n");
+        var http = sjws_nettask.SjwsServer.start(sjws_nettask.config.ConfigLoader.load(
+                new String[] {"--config=" + yaml}, java.util.Map.of()));
+        var hooks = sjws_nettask.service.ServiceLaunch.prepare(boot, "data");
+        try {
+            hooks.onListening(http, dir.resolve("node.pid"), Duration.ofSeconds(5));
+            assertEquals(200, store.propose("server:\n  port: 0\n  root: " + html + "\n").status());
+            assertEquals(200, store.activate(System.currentTimeMillis(), 60_000L).status());
+            long end = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+            while (version() < 1 && System.nanoTime() < end) {
+                Thread.sleep(20);
+            }
+            assertEquals(1L, version(), "snapshot applied over mTLS without a join token");
+            // rotate the node's files: the client context is rebuilt on the next poll
+            pem(gw.certPem(), issued(ca, "CN=gw-1", uri("urn:sjws:node:gw-1")).cert(), ca.cert());
+            Files.writeString(gw.keyPem(), "broken");
+            assertEquals(200, store.propose("server:\n  port: 0\n  root: " + html + "\n# v2\n").status());
+            assertEquals(200, store.activate(System.currentTimeMillis(), 60_000L).status());
+            end = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+            while (version() < 2 && System.nanoTime() < end) {
+                Thread.sleep(20);
+            }
+            assertEquals(2L, version(), "a broken reload keeps the previous client context");
+        } finally {
+            hooks.onShutdown();
+            http.close();
+            watch.close();
+            store.close();
+        }
+    }
+
+    private static long version() {
+        var e = sjws_nettask.service.NodeEnrollment.current();
+        return e == null || e.binding() == null ? 0L : e.binding().configVersion();
+    }
+
     @Test
     void offByDefaultStaysLoopbackPlainAndStoresOnlyAHash() throws Exception {
         assertThrows(IOException.class, () -> DataWatch.endpoint("10.0.0.1:9000"));

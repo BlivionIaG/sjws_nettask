@@ -368,12 +368,14 @@ public final class Bootstrap {
                 throw new BootstrapException(stateDir + " identity does not match this bootstrap");
             }
         }
-        var join = loadJoin(source, parsed.values.get("join-token"), pinFile, stateDir, joined);
+        var cpTls = cpTls(source, parsed.values, stateDir);
+        // Under cpTls the node certificate is the enrollment, so a first start needs no join token.
+        var join = loadJoin(source, parsed.values.get("join-token"), pinFile, stateDir, joined || cpTls != null);
         var pin = readPin(pinFile);
         ensurePrivateDir(stateDir);
         return new Bootstrap(role, dataRole, nodeId, controlPlane, listen, peers, capabilities,
                 Map.copyOf(parsed.labels), pinFile, pin, stateDir, source, joined, join)
-                .withCpTls(cpTls(source, parsed.values, stateDir));
+                .withCpTls(cpTls);
     }
 
     /** All of cp-tls-cert, cp-tls-key and cp-tls-ca, or none of them (cp-tls-peer is optional). */
