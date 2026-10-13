@@ -68,11 +68,11 @@ the half-open probe after `eject_for`. `SUSPECT` endpoints have weight 0, so the
 
 ```mermaid
 flowchart TD
-    p0["Panic mode when more than<br/>max_ejection percent of the<br/>endpoints are ejected: ejection<br/>is then ignored"]
-    p1["1. Up to 4 draws by the lb policy:<br/>weighted_random, round_robin or<br/>least_request. Take a draw that is<br/>untried and available"]
-    p2["2. Else scan from a random start,<br/>weighted endpoints first, then weight 0.<br/>Take one that is untried and available"]
-    p3["3. Else any available endpoint,<br/>even one already tried"]
-    p4["4. Else a policy draw regardless:<br/>everything is ejected, still answer"]
+    p0["Panic mode when more<br/>than max_ejection<br/>percent of the endpoints<br/>are ejected: ejection is<br/>then ignored"]
+    p1["1. Up to 4 draws by the<br/>lb policy:<br/>weighted_random,<br/>round_robin or<br/>least_request. Take a<br/>draw that is untried and<br/>available"]
+    p2["2. Else scan from a<br/>random start, weighted<br/>endpoints first, then<br/>weight 0. Take one that<br/>is untried and available"]
+    p3["3. Else any available<br/>endpoint, even one<br/>already tried"]
+    p4["4. Else a policy draw<br/>regardless: everything<br/>is ejected, still answer"]
     p0 --> p1 --> p2 --> p3 --> p4
 ```
 

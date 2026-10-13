@@ -229,11 +229,11 @@ The order in which `HeartbeatAuthenticator.open` checks a datagram, and the reas
 
 ```mermaid
 flowchart TB
-    c1["1. Shape and tag: 124<br/>bytes, version 1, key id 0<br/>or 1 (else MALFORMED),<br/>then the HMAC-SHA256 tag<br/>under that key (else TAG)"]
-    c2["2. Time: within 5 s of now<br/>either way, and not before<br/>this process booted (else<br/>TIME)"]
-    c3["3. Body and address: the<br/>body decodes (else BODY)<br/>and is addressed to this<br/>node (else DEST)"]
-    c4["4. Epoch: the boot epoch<br/>is not later than the<br/>packet timestamp by more<br/>than 5 s (else EPOCH)"]
-    c5["5. Replay state: the<br/>sender is a member (else<br/>MEMBER) and the sequence<br/>is above 0 (else SEQ). A<br/>new sender, a newer boot<br/>epoch, or a lower one<br/>after silence resets the<br/>sequence. Otherwise a<br/>lower epoch is EPOCH and a<br/>sequence not above the<br/>last is SEQ"]
+    c1["1. Shape and tag: 124<br/>bytes, version 1, key<br/>id 0 or 1 (else<br/>MALFORMED), then the<br/>HMAC-SHA256 tag under<br/>that key (else TAG)"]
+    c2["2. Time: within 5 s of<br/>now either way, and not<br/>before this process<br/>booted (else TIME)"]
+    c3["3. Body and address:<br/>the body decodes (else<br/>BODY) and is addressed<br/>to this node (else<br/>DEST)"]
+    c4["4. Epoch: the boot<br/>epoch is not later than<br/>the packet timestamp by<br/>more than 5 s (else<br/>EPOCH)"]
+    c5["5. Replay state: the<br/>sender is a member<br/>(else MEMBER) and the<br/>sequence is above 0<br/>(else SEQ). A new<br/>sender, a newer boot<br/>epoch, or a lower one<br/>after silence resets<br/>the sequence. Otherwise<br/>a lower epoch is EPOCH<br/>and a sequence not<br/>above the last is SEQ"]
     ok["Accepted:<br/>Membership.onHeartbeat.<br/>Every drop is counted<br/>under its reason"]
     c1 --> c2 --> c3 --> c4 --> c5 --> ok
 ```

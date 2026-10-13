@@ -23,7 +23,7 @@ flowchart TD
     rl -->|"none matches"| dot{"Dot component and<br/>dotfiles not allowed?"}
     dot -->|yes| r404
     dot -->|no| ok
-    ok --> rp["The same check on the real path, then<br/>the owner and world-readable checks<br/>when they are set: 403"]
+    ok --> rp["The same check on the<br/>real path, then the owner<br/>and world-readable checks<br/>when they are set: 403"]
 ```
 
 Patterns are `/`-separated globs: `*` matches within one component, `?` one character, `**` any number of

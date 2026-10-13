@@ -346,8 +346,8 @@ flowchart TD
     v -->|yes| rej["Rejected: the published<br/>handler stays"]
     v -->|no| c{"Does it compile?<br/>Every entry is built, so<br/>one bad param fails it all"}
     c -->|no| rej
-    c -->|yes| m["Leave out entries whose label<br/>selector misses this node, sort by order<br/>The observe filter goes first, order 0"]
-    m --> w["Publish the new FilterChain,<br/>or the terminal itself if nothing is left<br/>One volatile write per transport,<br/>replacing the startup chain"]
+    c -->|yes| m["Leave out entries whose<br/>label selector misses<br/>this node, sort by order<br/>The observe filter goes<br/>first, order 0"]
+    m --> w["Publish the new<br/>FilterChain, or the<br/>terminal itself if<br/>nothing is left One<br/>volatile write per<br/>transport, replacing the<br/>startup chain"]
 ```
 
 An empty `filters` array is valid and calls the terminal handler directly. When that terminal

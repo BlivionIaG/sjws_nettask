@@ -11,7 +11,7 @@ flowchart TD
     v -->|no| r["Resolve from scratch,<br/>dropping a stale entry<br/>containment, no-follow<br/>open, access rules on<br/>the real path"]
     r --> f{"Cacheable?"}
     f -->|yes| l["Read the file once<br/>into the cache<br/>concurrent misses of one<br/>file share that read"]
-    f -->|no| s["Serve from disk, not cached<br/>HTTP/1.1 uses sendfile above 64 KiB<br/>HTTP/2 and HTTP/3 read it in<br/>64 KiB chunks"]
+    f -->|no| s["Serve from disk, not<br/>cached HTTP/1.1 uses<br/>sendfile above 64 KiB<br/>HTTP/2 and HTTP/3 read it<br/>in 64 KiB chunks"]
 ```
 
 *Still valid* means a `stat` shows the same inode, mtime in ns, size and ctime, and (unless

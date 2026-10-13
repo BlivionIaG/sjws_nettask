@@ -60,7 +60,7 @@ parent's steps first, then the detached child runs the whole sequence again, wit
 
 ```mermaid
 flowchart TD
-    s(["java -jar sjws_nettask.jar [options]"]) --> a["-h or --help: usage, exit<br/>0. --stop or --status: act<br/>on the pid file, then<br/>exit. Then load the config<br/>and resolve the role:<br/>invalid is exit 64"]
+    s(["java -jar<br/>sjws_nettask.jar<br/>[options]"]) --> a["-h or --help: usage, exit<br/>0. --stop or --status: act<br/>on the pid file, then<br/>exit. Then load the config<br/>and resolve the role:<br/>invalid is exit 64"]
     a --> d{"--daemon or --restart?"}
     d -->|yes| e["A detached child JVM runs<br/>these steps again. The<br/>parent waits for its pid<br/>file, 20 s at most.<br/>--restart stops the old<br/>server first"]
     d -->|no| bs["--bootstrap needs<br/>--pid-file and a valid<br/>bootstrap file: else exit<br/>64. The root must be a<br/>directory: else exit 2.<br/>The pid file must not name<br/>a live server: else exit 1"]

@@ -27,11 +27,11 @@ flowchart TB
     rq --> fl["filters, only when enabled:<br/>access log, metrics, /healthz,<br/>or ones an embedder registers"]
     fl --> pm["prefix mounts, only when<br/>a module mounts one"]
     pm -->|"/messaging/v1, /swarm/v1"| mod["module handler<br/>MessagingHttp, SwarmHttp"]
-    pm --> ac["ACME challenge handler<br/>only with ACME on the main listener"]
-    ac --> gl["global routing.rate_limit<br/>only when set: 429 before any route"]
+    pm --> ac["ACME challenge handler<br/>only with ACME on the<br/>main listener"]
+    ac --> gl["global routing.rate_limit<br/>only when set: 429 before<br/>any route"]
     gl --> r{{"Router<br/>only with routing.enabled"}}
     r --> rw["per route, only when set:<br/>errors: problem wrapper,<br/>then the route's rate_limit"]
-    rw --> p["ProxyHandler: one pool per<br/>upstream url, or an EndpointBalancer<br/>with one pool per endpoint"]
+    rw --> p["ProxyHandler: one pool<br/>per upstream url, or an<br/>EndpointBalancer with one<br/>pool per endpoint"]
     rw --> w["WeightedHandler<br/>a route with backends"]
     w --> p
     rw --> rd["RedirectHandler"]
@@ -60,7 +60,7 @@ responses are relayed unchanged:
 
 ```mermaid
 flowchart TD
-    dd{"A path segment is ..?<br/>%2e counts as a dot, / \ %2f %5c<br/>split segments, and ; ends one"} -->|yes| e400["400, before any route is tried"]
+    dd{"A path segment is ..? %2e<br/>counts as a dot, / \ %2f<br/>%5c split segments, and ;<br/>ends one"} -->|yes| e400["400, before any route is tried"]
     dd -->|no| m{"A route matches?"}
     m -->|no| fb["Fallback: the<br/>static file handler"]
     m -->|yes| rw{"Route has a rewrite?"}
@@ -93,7 +93,7 @@ flowchart TD
     r["Route with backends"] --> p{"A backend's pin matches?<br/>header or cookie,<br/>checked in order"}
     p -->|yes| pb["That backend,<br/>whatever the weights"]
     p -->|no| s{"sticky is set and the client<br/>sent that header or cookie?"}
-    s -->|yes| sb["Hash its value, then pick by weight:<br/>the same client keeps its backend"]
+    s -->|yes| sb["Hash its value, then pick<br/>by weight: the same<br/>client keeps its backend"]
     s -->|no| rb["Pick at random by weight<br/>from a precomputed alias table"]
 ```
 
@@ -156,15 +156,15 @@ instead, see [endpoint discovery](../ha/discovery.md)):
 
 ```mermaid
 flowchart TD
-    c1["1. Any Transfer-Encoding header: 501"] --> c2["2. A body of unknown length, or one the<br/>transport did not attach: 501"]
+    c1["1. Any Transfer-Encoding<br/>header: 501"] --> c2["2. A body of unknown<br/>length, or one the<br/>transport did not attach:<br/>501"]
     c2 --> c3["3. Body over max_body: 413"]
-    c3 --> c4["4. Target not origin-form, bad method<br/>or bad header value: 400"]
-    c4 --> c5["5. Circuit open, only with circuit set:<br/>503 with Retry-After, the upstream<br/>is not contacted"]
-    c5 --> x["Send over a pooled keep-alive connection,<br/>or open one. The body goes upstream<br/>in 64 KiB chunks"]
+    c3 --> c4["4. Target not<br/>origin-form, bad method<br/>or bad header value: 400"]
+    c4 --> c5["5. Circuit open, only<br/>with circuit set: 503<br/>with Retry-After, the<br/>upstream is not contacted"]
+    c5 --> x["Send over a pooled<br/>keep-alive connection, or<br/>open one. The body goes<br/>upstream in 64 KiB chunks"]
     x --> o{"Outcome"}
     o -->|"connect, write or<br/>head timeout"| e504["504"]
     o -->|"refused, reset, I/O error<br/>or a malformed response"| e502["502"]
-    o -->|"response head<br/>received"| ok["Relay the status, headers and the streamed body<br/>After the head, a failure aborts the<br/>client connection or stream"]
+    o -->|"response head<br/>received"| ok["Relay the status, headers<br/>and the streamed body<br/>After the head, a failure<br/>aborts the client<br/>connection or stream"]
 ```
 
 A pooled connection that fails before the response head is tried once more on a fresh connection when
@@ -173,13 +173,13 @@ failed attempt goes through this decision:
 
 ```mermaid
 flowchart TD
-    f["An attempt failed: a connect, timeout<br/>or reset error, or a 502, 503<br/>or 504 response"] --> a{"Kind is in retry.on, the method is idempotent,<br/>the request has no body, and fewer than<br/>retry.attempts retries were made?"}
+    f["An attempt failed: a<br/>connect, timeout or reset<br/>error, or a 502, 503 or<br/>504 response"] --> a{"Kind is in retry.on, the<br/>method is idempotent, the<br/>request has no body, and<br/>fewer than retry.attempts<br/>retries were made?"}
     a -->|no| v["Stop: relay the last result<br/>an upstream 5xx unchanged,<br/>an error as 502 or 504"]
     a -->|yes| b{"The retry budget<br/>has a token?"}
     b -->|no| v
-    b -->|yes| n["Discard the failed response and<br/>try again: an endpoints upstream picks<br/>an endpoint not tried yet, if one is left"]
-    v --> c["url upstream: the circuit breaker<br/>records one verdict for the request,<br/>after its retries"]
-    v --> ce["endpoints upstream: each attempt was<br/>recorded on the endpoint it hit"]
+    b -->|yes| n["Discard the failed<br/>response and try again:<br/>an endpoints upstream<br/>picks an endpoint not<br/>tried yet, if one is left"]
+    v --> c["url upstream: the circuit<br/>breaker records one<br/>verdict for the request,<br/>after its retries"]
+    v --> ce["endpoints upstream: each<br/>attempt was recorded on<br/>the endpoint it hit"]
 ```
 
 The circuit breaker of an upstream with a `url` is a small state machine per upstream. An upstream with

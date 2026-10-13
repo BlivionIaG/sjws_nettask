@@ -78,11 +78,11 @@ content port:
 
 ```mermaid
 flowchart TD
-    s1["1. --role, when set, is the role.<br/>WARN when it overrides<br/>WEB_SERVER_ROLE or node.mode"] --> s2["2. Else WEB_SERVER_ROLE, when set.<br/>WARN when it overrides node.mode"]
-    s2 --> s3["3. Else node.mode, when a config file<br/>was named. A file without it is<br/>standalone"]
-    s3 --> s4["4. Else the role in the bootstrap file,<br/>or standalone without one"]
-    s4 --> s5["5. control or data without --bootstrap,<br/>or standalone with it: exit 64"]
-    s5 --> s6["6. Content port: WEB_SERVER_BIND_CONTENT,<br/>then --bind-content, then<br/>server.bind_content, then the role:<br/>off for control, on for the others"]
+    s1["1. --role, when set, is<br/>the role. WARN when it<br/>overrides WEB_SERVER_ROLE<br/>or node.mode"] --> s2["2. Else WEB_SERVER_ROLE,<br/>when set. WARN when it<br/>overrides node.mode"]
+    s2 --> s3["3. Else node.mode, when a<br/>config file was named. A<br/>file without it is<br/>standalone"]
+    s3 --> s4["4. Else the role in the<br/>bootstrap file, or<br/>standalone without one"]
+    s4 --> s5["5. control or data<br/>without --bootstrap, or<br/>standalone with it: exit<br/>64"]
+    s5 --> s6["6. Content port:<br/>WEB_SERVER_BIND_CONTENT,<br/>then --bind-content, then<br/>server.bind_content, then<br/>the role: off for<br/>control, on for the<br/>others"]
 ```
 
 ## Bootstrap
