@@ -54,6 +54,7 @@ final class LogTopics implements AutoCloseable {
     private volatile java.util.Set<String> compacted = java.util.Set.of();
     /** Serializes maintenance passes (retention and compaction) so a segment is never compacted and deleted at once. */
     private final java.util.concurrent.locks.ReentrantLock maintenance = new java.util.concurrent.locks.ReentrantLock();
+    private volatile ConsumerOffsets offsets = new ConsumerOffsets(this, ConsumerOffsets.DEFAULT_EXPIRY_MS, System::currentTimeMillis);
 
     LogTopics(Path dir, Durability durability) {
         this(dir, durability, SegmentedLog.DEFAULT_SEGMENT_BYTES, LogRetention.NONE, System::currentTimeMillis);
@@ -71,6 +72,17 @@ final class LogTopics implements AutoCloseable {
         this.segmentBytes = segmentBytes;
         this.retention = java.util.Objects.requireNonNull(retention);
         this.clockMs = clockMs;
+        this.offsets = new ConsumerOffsets(this, ConsumerOffsets.DEFAULT_EXPIRY_MS, clockMs);
+    }
+
+    ConsumerOffsets offsets() {
+        return this.offsets;
+    }
+
+    /** Sets how long a group's commit keeps pinning retention after it was made. */
+    void offsetsExpiryMs(long ms) {
+        if (ms < 1) throw new IllegalArgumentException("offsets expiry must be positive");
+        this.offsets = new ConsumerOffsets(this, ms, this.clockMs);
     }
 
     /** The writer default for {@code topic}: its override, else the module default. */
@@ -126,12 +138,14 @@ final class LogTopics implements AutoCloseable {
     private int enforceRetentionLocked() throws IOException {
         int deleted = 0;
         long now = this.clockMs.getAsLong();
-        for (var l : this.logs.values()) {
+        for (var e : this.logs.entrySet()) {
+            var l = e.getValue();
+            long floor = this.offsets.floor(e.getKey()); // a committed consumer still needs history from here
             l.reads().writeLock().lock();
             try {
                 long total = l.log().totalBytes();
                 for (var seg : l.log().segments()) {
-                    if (seg.active() || !this.retention.expired(total, seg.lastModifiedMs(), now)) break;
+                    if (seg.active() || seg.nextOffset() > floor || !this.retention.expired(total, seg.lastModifiedMs(), now)) break;
                     l.log().deleteSegment(seg.baseOffset());
                     total -= seg.bytes();
                     deleted++;
@@ -154,7 +168,7 @@ final class LogTopics implements AutoCloseable {
     }
 
     boolean compacted(String topic) {
-        return this.compacted.contains(topic);
+        return this.compacted.contains(topic) || ConsumerOffsets.TOPIC.equals(topic);
     }
 
     static java.util.Set<String> parseTopics(String list) {
@@ -181,13 +195,13 @@ final class LogTopics implements AutoCloseable {
      * The copy runs without locks; the swap takes the topic's {@code reads} write lock (in-flight fetches finish first).
      */
     CompactionReport compact() throws IOException {
-        if (this.compacted.isEmpty()) return new CompactionReport(0, 0);
+        if (this.compacted.isEmpty() && !this.logs.containsKey(ConsumerOffsets.TOPIC)) return new CompactionReport(0, 0);
         this.maintenance.lock();
         try {
             int segs = 0;
             long reclaimed = 0;
             for (var e : this.logs.entrySet()) {
-                if (!this.compacted.contains(e.getKey())) continue;
+                if (!compacted(e.getKey())) continue;
                 var l = e.getValue();
                 long end = l.writer().snapshot().nextOffset();
                 l.log().force(); // everything below `end` is now durable

@@ -48,6 +48,8 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String TOPIC_DURABILITY_PROPERTY = "sjws.messaging.durability.topics";
     /** Comma-separated keyed topics: records are {@code [keyLen:int][key][value]}; sealed segments keep each key's latest. */
     static final String COMPACTED_TOPICS_PROPERTY = "sjws.messaging.compacted.topics";
+    /** How long a group's committed offset pins retention of its topic (default 7 days). */
+    static final String OFFSETS_EXPIRY_PROPERTY = "sjws.messaging.offsets.expiry.ms";
     static final String TOPIC_DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY_TOPICS";
 
     private final LogTopics topics;
@@ -98,6 +100,7 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
             java.util.Map<String, Durability> topicDurability) {
         this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, System::currentTimeMillis);
         this.topics.compacted(LogTopics.parseTopics(System.getProperty(COMPACTED_TOPICS_PROPERTY, "")));
+        this.topics.offsetsExpiryMs(Long.getLong(OFFSETS_EXPIRY_PROPERTY, ConsumerOffsets.DEFAULT_EXPIRY_MS));
         if (retention.unlimited() && !this.topics.hasCompactedTopics()) {
             this.retentionTimer = null;
         } else {
