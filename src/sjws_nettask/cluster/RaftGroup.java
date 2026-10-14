@@ -1049,7 +1049,9 @@ final class RaftGroup {
                     deliveryLock.lockInterruptibly();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    return; // the current drainer, or the next run(), delivers what is queued
+                    // Entries stay queued: the current drainer, or the next tick or frame (at most about
+                    // one tick later), delivers them. See GroupListener.
+                    return;
                 }
             }
             try {

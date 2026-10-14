@@ -667,4 +667,81 @@ class RaftClusterTest {
             assertEquals(base + 1 + i, seen.get(i), "in order, no gaps or repeats");
         }
     }
+
+    /**
+     * Deterministic version of the slow-callback check, latched instead of timed: while a follower's
+     * commit callback is parked on another thread, that follower still handles a heartbeat and a vote
+     * request on the Raft path and replies to the vote.
+     */
+    @Test
+    void parkedCallbackDoesNotBlockHeartbeatOrVoteOnFollower() throws Exception {
+        var cluster = cluster(3, false, Durability.RELAXED, 1_000_000);
+        elect(cluster);
+        var leader = leader(cluster);
+        var follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
+        var other = cluster.nodes.stream().filter(n -> n != leader && n != follower).findFirst().orElseThrow();
+        long term = leader.openGroup(GROUP, cluster.options, null).term();
+        var parked = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var inCallback = new java.util.concurrent.atomic.AtomicBoolean();
+        follower.openGroup(GROUP, cluster.options, entry -> {
+            if (text(entry.entry()).equals("slow")) {
+                inCallback.set(true);
+                parked.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    inCallback.set(false);
+                }
+            }
+        });
+        var drainer = Thread.ofPlatform().start(() -> {
+            leader.append(GROUP, List.of(bytes("slow")));
+            ReplicatedNode.driveAll(cluster.nodes); // the leader commits "slow"
+            cluster.clock.advance(cluster.options.heartbeat());
+            ReplicatedNode.driveAll(cluster.nodes); // the next heartbeat carries the commit index: the
+                                                    // follower applies "slow" and parks on this thread
+        });
+        var voteReply = new java.util.concurrent.CompletableFuture<ByteBuffer>();
+        var raft = new java.util.concurrent.CompletableFuture<Void>();
+        try {
+            assertTrue(parked.await(10, java.util.concurrent.TimeUnit.SECONDS), "callback never parked");
+            Thread.ofPlatform().start(() -> {
+                try {
+                    // heartbeat: leader tick sends APPEND, the follower handles it on the Raft path
+                    cluster.clock.advance(cluster.options.heartbeat());
+                    leader.drive();
+                    follower.drive();
+                    leader.drive();
+                    // vote request from the third member at a higher term, with a log at least as new
+                    cluster.net.detach(other.self()); // a probe takes the third member's id
+                    var rpc = cluster.net.attach(other.self(), (from, frame) -> {
+                        if (frame.type() == RaftGroup.VOTE_RESP) {
+                            voteReply.complete(ByteBuffer.wrap(frame.body()));
+                        }
+                    });
+                    var vote = ByteBuffer.allocate(8 + 4 + 8 + 8).order(java.nio.ByteOrder.BIG_ENDIAN);
+                    vote.putLong(term + 1).putInt(other.self().wire()).putLong(Long.MAX_VALUE / 2)
+                            .putLong(Long.MAX_VALUE / 2);
+                    rpc.send(follower.self(), new SimTransport.Frame(GROUP, RaftGroup.VOTE, vote.array()));
+                    follower.drive();
+                    raft.complete(null);
+                } catch (Throwable t) {
+                    raft.completeExceptionally(t);
+                }
+            });
+            // Safety bound only: on blocking delivery this never completes while the callback is parked.
+            raft.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            var reply = voteReply.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            assertTrue(inCallback.get(), "the callback was still parked while the follower answered");
+            assertEquals(term + 1, reply.getLong(), "the follower handled the vote at the new term");
+            assertEquals(follower.self().wire(), reply.getInt());
+            assertEquals(1, reply.get(), "vote granted");
+        } finally {
+            release.countDown();
+            drainer.join(10_000);
+        }
+    }
 }
