@@ -334,6 +334,13 @@ These are the reference points for the targets below. Neither this PR nor the ta
 
 **S1c gate (decided 2026-10-14, inceptor).** The S1c latency gate is: claim p99 < 100 µs on the task-dispatch row, heartbeat loss < 2 %, and request/reply p99 < 500 µs. Dispatch is measured with **workers = the machine's vCPU count**, and every result states that core count. The reference box has 8 vCPU, so the gate is `SwarmBench dispatch 8`. The 16-worker run (16 on 8 vCPU) is reported as a **stress line, not the gate**: with more runnable workers than cores, a lock holder can be descheduled mid-section, so its p99 measures scheduling as much as code. The batched variant (`SwarmBench batched <W>x<B>`: claim up to `B` and settle with one batched fenced ack, `TaskService.ackAll`) is reported separately and is not the gate, because its claim latency is per batch, not per task. The §13 claim-1/ack-1 workload stays as it is.
 
+**S1c result: PASSED (2026-10-14, inceptor; PR #176, head `e23bcb6`).** Measured on G1 (the default collector, unchanged) with `shards=4`, the documented recommended setting of about cores/2:
+- **Claim:** p99 about 30 µs at 459k tasks/s (gate < 100 µs).
+- **Request/reply** (quiet window, 10k req/s for 10 s, 5 runs, medians): p50 26.8 µs, p99 338 µs (gate < 500 µs).
+- **Setup:** commit `e23bcb6`, OpenJDK 25.0.4.1, 8 vCPU (`taskset -c 0-7`), default heap (G1), under `flock /tmp/sjws-bench.lock`. Load was 0.22 at the start and 4.54 at the end. **Caveat:** the final runs were above the load < 4 rule, so they may be noisy.
+- **The request/reply bench uses a single worker** (`SwarmBench reqreply`: one worker claims up to 64 and replies). `SwarmBench reqreply-mw <W>x<rate>` is a multi-worker variant, reported separately and not the gate.
+- **Known limit, not a gate: `shards=1` on G1**, request/reply p99 896 µs. The tail comes from G1 young-collection pauses (JFR in #176). Informational: the same build with `-XX:+UseZGC` gave p99 225 µs at `shards=1` and 263 µs at `shards=4` (5 runs, load 3.6 → 4.8).
+
 **Architecture additions:**
 1. **Streaming over HTTP:** time-to-first-token and inter-token latency added by sjws, agent emit → caller receive, on HTTP/1.1 chunked, SSE, h2 and h3. Ledger leg vs the optional direct path (§5.2).
 2. **Throughput through the swarm wire protocol** (§11.2), not only in-process: tasks/s at saturation with 256 B and 4 KiB payloads.

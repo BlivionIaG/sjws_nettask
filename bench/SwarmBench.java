@@ -27,6 +27,9 @@ import sjws_nettask.swarm.TaskEnvelope;
  *   reqreply <rate> <secs>      ReplyRouter.call at <rate>/s open loop; one worker claims (blocking, 50 ms) up to 64
  *                               and replies (ASYNC) with one batched fenced ack after the replies are durable. Prints round-trip p50/p99. Target at 10k/s: p50 < 50 us, p99 < 500 us.
  *
+ *   reqreply-mw <W>x<rate> <secs>  as reqreply with W workers claiming from the same pool, each with its own
+ *                               reply producer. A variant, not the S1c gate (the gate's reqreply uses one worker).
+ *
  *   http <token|-> <secs>        /swarm/v1 in process through SwarmModule's mounted handler: submit (1 KiB TASK
  *                               frame) + claim + ack per round, one thread. Sends "Authorization: Bearer <token>"
  *                               unless "-". Run with -Dsjws.swarm.tokens.file=... for gate on; against a master
@@ -90,7 +93,11 @@ public class SwarmBench {
                     dispatch(s, Integer.parseInt(wb[0]), secs, Integer.parseInt(wb[1]));
                 }
                 case "heartbeat" -> heartbeat(s, a[2], secs);
-                case "reqreply" -> reqreply(s, Integer.parseInt(a[2]), secs);
+                case "reqreply" -> reqreply(s, Integer.parseInt(a[2]), secs, 1);
+                case "reqreply-mw" -> {
+                    var wr = a[2].split("x"); // <workers>x<rate>
+                    reqreply(s, Integer.parseInt(wr[1]), secs, Integer.parseInt(wr[0]));
+                }
                 case "http" -> http(dir, a[2], secs);
                 default -> throw new IllegalArgumentException(mode);
             }
@@ -241,21 +248,26 @@ public class SwarmBench {
         System.out.printf("heartbeat mode=%s dispatch_tasks/s=%.0f%s%n", mode, done / secs, tick);
     }
 
-    static void reqreply(Swarm s, int rate, double secs) throws Exception {
+    static void reqreply(Swarm s, int rate, double secs, int workers) throws Exception {
+        if (workers < 1) throw new IllegalArgumentException("workers >= 1: " + workers);
         var t = s.tasks();
         var stop = new AtomicBoolean();
-        var worker = Thread.ofPlatform().name("worker").start(() -> {
-            long seq = 0;
-            while (!stop.get()) {
-                // blocking claim (#99, 50 ms), then one reply per task and one batched fenced ack (#100)
-                var got = t.claim("echo", "w", 64, 30_000, 50_000_000L);
-                if (got.isEmpty()) continue;
-                var bodies = new ArrayList<byte[]>(got.size());
-                for (Task task : got) bodies.add(task.envelope().body());
-                t.replyAll(got, 2, seq + 1, "", bodies);
-                seq += got.size();
-            }
-        });
+        var pool = new ArrayList<Thread>(workers);
+        for (int w = 0; w < workers; w++) {
+            long producer = 2 + w; // one reply producer per worker, so dedup windows never collide
+            pool.add(Thread.ofPlatform().name("worker-" + w).start(() -> {
+                long seq = 0;
+                while (!stop.get()) {
+                    // blocking claim (#99, 50 ms), then one reply per task and one batched fenced ack (#100)
+                    var got = t.claim("echo", "w", 64, 30_000, 50_000_000L);
+                    if (got.isEmpty()) continue;
+                    var bodies = new ArrayList<byte[]>(got.size());
+                    for (Task task : got) bodies.add(task.envelope().body());
+                    t.replyAll(got, producer, seq + 1, "", bodies);
+                    seq += got.size();
+                }
+            }));
+        }
         long gap = 1_000_000_000L / rate;
         long warm = (long) (2e9 / gap), total = warm + (long) (secs * 1e9 / gap);
         var lat = new long[(int) (total - warm)];
@@ -272,8 +284,8 @@ public class SwarmBench {
         long until = System.nanoTime() + 30_000_000_000L;
         while (done.get() < total && System.nanoTime() < until) Thread.sleep(1);
         stop.set(true);
-        worker.join();
-        System.out.printf("reqreply rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d%n", rate,
+        for (var w : pool) w.join();
+        System.out.printf("reqreply workers=%d rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d%n", workers, rate,
                 pct(lat, lat.length, 0.50) / 1e3, pct(lat, lat.length, 0.99) / 1e3, pct(lat, lat.length, 1.0) / 1e3,
                 lat.length);
     }

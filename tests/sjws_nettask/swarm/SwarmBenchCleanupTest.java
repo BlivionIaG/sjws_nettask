@@ -62,6 +62,27 @@ class SwarmBenchCleanupTest {
     }
 
     @Test
+    void multiWorkerRequestReplyVariantRuns() throws Exception {
+        var p = start(List.of(), this.dir.toString(), "reqreply-mw", "3x500", "0.5");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(0, p.exitValue(), out);
+        var m = java.util.regex.Pattern.compile("reqreply workers=3 rate=500 .* n=(\\d+)").matcher(out);
+        assertTrue(m.find(), out);
+        assertEquals(250, Long.parseLong(m.group(1)), "every measured call completed: " + out);
+        assertEquals(0, benchDirs(), "no swarmbench* directory left: " + out);
+    }
+
+    @Test
+    void singleWorkerRequestReplyReportsOneWorker() throws Exception {
+        var p = start(List.of(), this.dir.toString(), "reqreply", "500", "0.5");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(0, p.exitValue(), out);
+        assertTrue(out.contains("reqreply workers=1 rate=500"), out);
+    }
+
+    @Test
     void theTempDirectoryIsDeletedWhenTheRunIsKilled() throws Exception {
         var p = start(List.of(), this.dir.toString(), "dispatch", "1", "600");
         long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);

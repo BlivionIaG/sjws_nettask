@@ -61,6 +61,7 @@ java -cp target/classes bench/SwarmBench.java /tmp/sb dispatch 16 5          # c
 java -cp target/classes bench/SwarmBench.java /tmp/sb heartbeat off 20       # dispatch with no keeper
 java -cp target/classes bench/SwarmBench.java /tmp/sb heartbeat keeper 20    # + LeaseKeeper: 10k leases, batched tick every 5 s
 java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply 10000 10      # ReplyRouter.call, open loop at 10k/s
+java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply-mw 4x10000 10 # same, 4 workers on the pool (variant, not the gate)
 ```
 
 - **Comparisons.** Compare `heartbeat off` and `heartbeat keeper` with 5 alternating runs pinned with `taskset`.
