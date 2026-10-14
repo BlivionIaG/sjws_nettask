@@ -112,10 +112,37 @@ public final class GenerationSync implements AutoCloseable {
         return done.await(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
-    /** Stops the worker after the markers already handed off. */
+    /** How long {@link #close()} waits for markers already handed off. */
+    static final java.time.Duration CLOSE_WAIT = java.time.Duration.ofSeconds(2);
+
+    /**
+     * Stops the worker after the markers already handed off, waiting up to {@link #CLOSE_WAIT}. A STAGE still
+     * running past that is safe: the key file is written to a temp file and renamed into place atomically, so it
+     * is either the old key or the new one, never partial.
+     */
     @Override
     public void close() {
+        closeWithin(CLOSE_WAIT);
+    }
+
+    /** {@link #close()} with an explicit wait; true when the worker finished in time. */
+    boolean closeWithin(java.time.Duration wait) {
         worker.shutdown();
+        try {
+            if (worker.awaitTermination(wait.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                return true;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        System.getLogger(GenerationSync.class.getName()).log(System.Logger.Level.WARNING,
+                "generation sync still applying after " + wait.toMillis() + " ms at close");
+        return false;
+    }
+
+    /** Runs {@code task} on the sync worker, after every marker handed off so far (tests). */
+    void onWorker(Runnable task) {
+        worker.execute(task);
     }
 
     void apply(byte[] copy) {

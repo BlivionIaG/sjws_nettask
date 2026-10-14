@@ -30,6 +30,10 @@ package sjws_nettask.cluster;
  * after this callback returns, so waiting for it deadlocks the group's deliveries. Appending is fine; chain on
  * the future instead of joining it.</li>
  * <li>A callback that throws is logged and skipped; the stream continues.</li>
+ * <li><b>State must be rebuildable by replaying the log.</b> {@code close()} drains for a bounded time, then may
+ * interrupt a running callback mid-way and drop the rest (one WARN with the count and index range; their append
+ * futures fail with {@link CommittedNotAppliedException}). Those entries are committed and are delivered again
+ * when the group reopens and replays.</li>
  * </ul>
  */
 @FunctionalInterface

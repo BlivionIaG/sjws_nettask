@@ -660,7 +660,7 @@ final class RaftGroup {
                             listener.onCommitted(new CommittedEntry(groupId, entryTerm, index,
                                     ByteBuffer.wrap(payload)));
                         }
-                    });
+                    }, index);
                 }
                 case JOINT -> applyJoint(data, after);
                 case NEW_CONFIG -> applyNew(data, after);
@@ -672,7 +672,7 @@ final class RaftGroup {
                         for (var listener : copy) {
                             listener.accept(entryTerm, applied);
                         }
-                    });
+                    }, applied);
                 }
                 default -> {
                     // Leave unknown markers applied so a bad record cannot stall the group.
@@ -690,7 +690,7 @@ final class RaftGroup {
             long index = entry.getKey();
             long entryTerm = termAt(index);
             var future = entry.getValue();
-            deliveries.submit(() -> future.complete(new CommittedIndex(groupId, entryTerm, index)), future);
+            deliveries.submit(() -> future.complete(new CommittedIndex(groupId, entryTerm, index)), future, index);
         }
     }
 
@@ -827,11 +827,16 @@ final class RaftGroup {
         long termNow = term;
         Optional<NodeId> who = Optional.ofNullable(leader);
         var copy = List.copyOf(leaderListeners);
-        after.add(() -> {
+        if (copy.isEmpty()) {
+            return;
+        }
+        // On the delivery thread, in order with commit callbacks and no-op listeners: a leader change is seen
+        // before the new term's no-op is applied (readiness), as before the executor split them apart.
+        deliveries.submit(() -> {
             for (var listener : copy) {
                 listener.accept(termNow, who);
             }
-        });
+        }, (java.util.concurrent.CompletableFuture<?>) null);
     }
 
     private long appendRaw(byte[] data) {
@@ -1025,6 +1030,14 @@ final class RaftGroup {
 
     long maxDeliveryLag() {
         return deliveries.maxLag();
+    }
+
+    long abandonedDeliveries() {
+        return deliveries.abandoned();
+    }
+
+    long deliveryLagWarnings() {
+        return deliveries.lagWarnings();
     }
 
     /** True on this group's delivery thread (inside a callback). */

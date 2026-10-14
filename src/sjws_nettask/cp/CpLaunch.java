@@ -255,7 +255,9 @@ public final class CpLaunch {
 
     /**
      * Same path, or the two bundles share a CA public key (re-encoded or re-issued PEMs of the same CA still
-     * match; byte comparison missed those). Unreadable or unparsable files are left to the TLS loader.
+     * match; byte comparison missed those). Unreadable or unparsable files are left to the TLS loader, which
+     * still fails closed: {@code AdminTls} refuses to start a listener whose CA bundle it cannot read or parse, so
+     * {@code false} here never lets an unchecked CA through.
      */
     static boolean sameCa(Path a, Path b) {
         if (a == null || b == null) {

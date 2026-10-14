@@ -35,10 +35,18 @@ final class DeliveryExecutor {
     /** Queued plus running deliveries at which {@code append()} starts refusing. */
     static final int DEFAULT_LAG_LIMIT = 4096;
 
-    private record Item(Runnable task, CompletableFuture<?> future) {
+    /** {@code index}: log index of the committed entry this delivers, or -1 (not a committed entry). */
+    private record Item(Runnable task, CompletableFuture<?> future, long index) {
     }
 
-    private static final Item STOP = new Item(() -> { }, null);
+    private static final Item STOP = new Item(() -> { }, null, -1);
+
+    /**
+     * Lag at which a WARN is logged once (re-armed when the queue empties). {@code append()} bounds leader-side
+     * growth at the lag limit, but follower commits are never refused, so a slow follower apply is unbounded;
+     * this makes it visible.
+     */
+    static final int LAG_WARN_FACTOR = 4;
 
     private final String name;
     private final int lagLimit;
@@ -46,6 +54,9 @@ final class DeliveryExecutor {
     private final AtomicLong lag = new AtomicLong();
     private final AtomicLong maxLag = new AtomicLong();
     private final AtomicLong delivered = new AtomicLong();
+    private final AtomicLong abandoned = new AtomicLong();
+    private final AtomicLong lagWarnings = new AtomicLong();
+    private boolean lagWarned;
     private final ReentrantLock state = new ReentrantLock();
     private final Condition idle = state.newCondition();
     private Thread thread;
@@ -59,24 +70,39 @@ final class DeliveryExecutor {
         this.lagLimit = lagLimit;
     }
 
-    /** A callback. */
-    void submit(Runnable task) {
-        submit(task, null);
+    /** A callback for the committed entry at {@code index}. */
+    void submit(Runnable task, long index) {
+        submit(task, null, index);
+    }
+
+    /** A delivery that is not tied to a committed entry (for example failing futures on step-down). */
+    void submit(Runnable task, CompletableFuture<?> future) {
+        submit(task, future, -1);
     }
 
     /**
      * A delivery; {@code future} (may be null) is the one {@code task} completes, failed instead if the
-     * executor closes before running it. Never blocks.
+     * executor closes before running it: with {@link CommittedNotAppliedException} when {@code index >= 0}
+     * (the entry is committed), else {@link IllegalStateException}. Never blocks.
      */
-    void submit(Runnable task, CompletableFuture<?> future) {
-        var item = new Item(task, future);
+    void submit(Runnable task, CompletableFuture<?> future, long index) {
+        var item = new Item(task, future, index);
         state.lock();
         try {
             if (closed) {
+                abandoned.incrementAndGet();
                 abandon(item);
                 return;
             }
-            maxLag.accumulateAndGet(lag.incrementAndGet(), Math::max);
+            long now = lag.incrementAndGet();
+            maxLag.accumulateAndGet(now, Math::max);
+            if (!lagWarned && now >= (long) lagLimit * LAG_WARN_FACTOR) {
+                lagWarned = true;
+                lagWarnings.incrementAndGet();
+                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                        "group " + name + ": apply lag " + now + " deliveries (warn at " + (long) lagLimit
+                                * LAG_WARN_FACTOR + "); callbacks are not keeping up");
+            }
             queue.add(item);
             if (thread == null) {
                 thread = Thread.ofVirtual().name("raft-deliver-" + name).start(this::loop);
@@ -104,6 +130,16 @@ final class DeliveryExecutor {
     /** Deliveries run so far. */
     long delivered() {
         return delivered.get();
+    }
+
+    /** Deliveries dropped by {@link #close} (or submitted after it) without running. */
+    long abandoned() {
+        return abandoned.get();
+    }
+
+    /** Times the lag crossed {@code LAG_WARN_FACTOR x lagLimit}. */
+    long lagWarnings() {
+        return lagWarnings.get();
     }
 
     int lagLimit() {
@@ -169,11 +205,31 @@ final class DeliveryExecutor {
         state.lock();
         try {
             closed = true;
+            long callbacks = 0;
+            long futures = 0;
+            long first = Long.MAX_VALUE;
+            long last = -1;
             for (Item item; (item = queue.poll()) != null;) {
                 if (item != STOP) {
                     lag.decrementAndGet();
+                    abandoned.incrementAndGet();
+                    if (item.future() == null) {
+                        callbacks++;
+                    } else {
+                        futures++;
+                    }
+                    if (item.index() >= 0) {
+                        first = Math.min(first, item.index());
+                        last = Math.max(last, item.index());
+                    }
                     abandon(item);
                 }
+            }
+            if (callbacks + futures > 0) {
+                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                        "group " + name + ": close abandoned " + callbacks + " commit callbacks and " + futures
+                                + " append futures" + (last >= 0 ? " for committed indexes " + first + ".." + last : "")
+                                + " after the drain budget; they are applied on reopen by log replay");
             }
             queue.add(STOP);
             idle.signalAll();
@@ -227,6 +283,7 @@ final class DeliveryExecutor {
                 if (lag.decrementAndGet() == 0) {
                     state.lock();
                     try {
+                        lagWarned = false;
                         idle.signalAll();
                     } finally {
                         state.unlock();
@@ -237,9 +294,10 @@ final class DeliveryExecutor {
         }
     }
 
-    private static void abandon(Item item) {
+    private void abandon(Item item) {
         if (item.future() != null) {
-            item.future().completeExceptionally(new IllegalStateException("group closed before delivery"));
+            item.future().completeExceptionally(item.index() >= 0 ? new CommittedNotAppliedException(name, item.index())
+                    : new IllegalStateException("group closed before delivery"));
         }
     }
 }
