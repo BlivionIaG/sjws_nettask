@@ -37,9 +37,12 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
     static final String DIR_ENV = "SJWS_SWARM_DIR";
     static final String NODE_PROPERTY = "sjws.swarm.node";
     static final String NODE_ENV = "SJWS_SWARM_NODE";
+    static final String TRACE_PROPERTY = "sjws.swarm.trace.enabled";
+    static final String TRACE_ENV = "SJWS_SWARM_TRACE_ENABLED";
 
     private final Swarm swarm;
     private final SwarmGate gate;
+    private final boolean trace;
     private volatile boolean closed;
 
     public SwarmModule() {
@@ -49,8 +52,21 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
     }
 
     SwarmModule(Swarm swarm, SwarmGate gate) {
+        this(swarm, gate, Boolean.parseBoolean(setting(TRACE_PROPERTY, TRACE_ENV, "false")));
+    }
+
+    SwarmModule(Swarm swarm, SwarmGate gate, boolean trace) {
         this.swarm = swarm;
         this.gate = gate;
+        this.trace = trace;
+        if (trace) {
+            // S2b, off by default: the only place the trace package is named outside SwarmHttp's guarded paths
+            System.err.println("swarm: " + sjws_nettask.swarm.trace.SwarmTrace.describe());
+        }
+    }
+
+    boolean trace() {
+        return this.trace;
     }
 
     SwarmGate gate() {
@@ -71,7 +87,7 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
 
     @Override
     public void contribute(HandlerMounts mounts) {
-        mounts.mount("/swarm/v1", new SwarmHttp(this.swarm, new SecureRandom().nextLong(), this.gate));
+        mounts.mount("/swarm/v1", new SwarmHttp(this.swarm, new SecureRandom().nextLong(), this.gate, this.trace));
     }
 
     public boolean closed() {

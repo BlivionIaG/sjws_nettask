@@ -76,10 +76,30 @@ final class SwarmHttp implements Handler {
         return this.failedAuth.sum();
     }
 
+    /**
+     * S2b trace propagation (swarm §9). When false, {@code sjws_nettask.swarm.trace} is never referenced, so it is
+     * not loaded and nothing is allocated for tracing.
+     */
+    private final boolean trace;
+
     SwarmHttp(Swarm swarm, long workerProducerId, SwarmGate gate) {
+        this(swarm, workerProducerId, gate, false);
+    }
+
+    SwarmHttp(Swarm swarm, long workerProducerId, SwarmGate gate, boolean trace) {
         this.swarm = swarm;
         this.workerProducerId = workerProducerId;
         this.gate = java.util.Objects.requireNonNull(gate);
+        this.trace = trace;
+    }
+
+    /** The validated ingress traceparent, or {@code ""} (always {@code ""} with tracing off). */
+    private String traceparent(Request request) {
+        if (!this.trace) {
+            return "";
+        }
+        var v = request.headers().values(sjws_nettask.swarm.trace.SwarmTrace.HEADER);
+        return v.isEmpty() ? "" : sjws_nettask.swarm.trace.SwarmTrace.parse(v.get(0));
     }
 
     @Override
@@ -151,7 +171,7 @@ final class SwarmHttp implements Handler {
         var body = taskBody(request);
         var id = ReplyRouter.newId();
         long deadline = deadline(query, TaskEnvelope.NO_DEADLINE);
-        var env = new TaskEnvelope(id, id, "", deadline, "", "", "", "", body);
+        var env = new TaskEnvelope(id, id, "", deadline, traceparent(request), "", "", "", body);
         // producerId 0: no dedup for anonymous HTTP submits (an Idempotency-Key binding is a follow-up)
         this.swarm.tasks().submit(pool, 0, 0, env);
         return frame(202, new Frame(Frame.Type.TASK, 0, id));
@@ -160,11 +180,15 @@ final class SwarmHttp implements Handler {
     private Response call(String pool, Request request, Map<String, String> query) throws BadRequest {
         var body = taskBody(request);
         long deadline = deadline(query, this.swarm.topics().clock().getAsLong() + DEFAULT_DEADLINE_MS);
-        var f = this.swarm.replies().call(pool, "", body, deadline, "");
+        var f = this.swarm.replies().call(pool, "", body, deadline, traceparent(request));
         try {
             var reply = f.get(Math.max(0, deadline - this.swarm.topics().clock().getAsLong()) + 1_000,
                     TimeUnit.MILLISECONDS);
-            return frame(200, new Frame(Frame.Type.RESULT, Frame.LAST, reply.body()));
+            var ok = frame(200, new Frame(Frame.Type.RESULT, Frame.LAST, reply.body()));
+            if (this.trace && !reply.traceparent().isEmpty()) {
+                ok.headers().set(sjws_nettask.swarm.trace.SwarmTrace.HEADER, reply.traceparent());
+            }
+            return ok;
         } catch (TimeoutException e) {
             return problem(504, "deadline exceeded", "no reply from " + pool).response();
         } catch (ExecutionException e) {
@@ -188,7 +212,17 @@ final class SwarmHttp implements Handler {
             return new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE);
         }
         var out = new java.io.ByteArrayOutputStream();
+        StringBuilder spans = this.trace ? new StringBuilder() : null;
         for (var t : got) {
+            if (spans != null) {
+                // a child span per claim; the cached envelope carries it, so :reply propagates it
+                var child = sjws_nettask.swarm.trace.SwarmTrace.child(t.envelope().traceparent());
+                if (!child.isEmpty()) {
+                    t = new Task(t.pool(), t.offset(), t.attempt(), t.leaseDeadlineMs(),
+                            t.envelope().withTraceparent(child), t.shard());
+                }
+                spans.append(spans.isEmpty() ? "" : ",").append(child.isEmpty() ? "-" : child);
+            }
             var key = leaseId(t);
             this.claimed.put(key, t);
             var id = key.getBytes(StandardCharsets.UTF_8);
@@ -197,7 +231,11 @@ final class SwarmHttp implements Handler {
                     .putLong(t.leaseDeadlineMs()).put(body).array();
             out.writeBytes(new Frame(Frame.Type.LEASE, 0, p).encode());
         }
-        return bytes(200, out.toByteArray());
+        var ok = bytes(200, out.toByteArray());
+        if (spans != null) {
+            ok.headers().set(sjws_nettask.swarm.trace.SwarmTrace.LEASE_HEADER, spans.toString());
+        }
+        return ok;
     }
 
     private Response lease(String id, Task t, String verb, Request request, Map<String, String> query)

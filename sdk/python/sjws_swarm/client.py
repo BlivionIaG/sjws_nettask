@@ -6,6 +6,11 @@
     for lease in s.claim("summarize.v1", wait=5):          # agent side
         lease.reply(b"result")                             # reply, then ack (§4.4)
 
+Tracing (S2b, swarm §9): pass ``traceparent=`` (a W3C Trace Context header value) to ``submit``/``call``.
+When the server runs with tracing on, each ``Lease.traceparent`` is the claim's child span; pass it on to
+downstream calls so the whole chain shares one trace. ``call_traced`` also returns the reply's traceparent.
+The client never invents trace ids; it only passes them through.
+
 Settles are always fenced: a lease id carries the delivery attempt, so a worker whose lease expired and
 was re-leased gets LeaseLost instead of settling the new attempt. The asyncio API of §11.1 and streaming
 come later; this client is synchronous.
@@ -23,6 +28,7 @@ from dataclasses import dataclass, field
 from .frames import Frame, FrameType, LAST, decode
 
 CONTENT_TYPE = "application/vnd.sjws.swarm.v1"
+LEASE_TRACE_HEADER = "sjws-lease-traceparent"
 
 
 class SwarmError(Exception):
@@ -48,6 +54,7 @@ class Lease:
     id: str
     deadline_ms: int
     body: bytes
+    traceparent: str | None = None
 
     def ack(self) -> None:
         self.client._settle(self.id, "ack")
@@ -75,22 +82,32 @@ class Client:
     def __repr__(self) -> str:
         return f"Client({self.base!r})"  # never shows the token
 
-    def submit(self, service: str, body: bytes, deadline: float | None = None) -> bytes:
+    def submit(self, service: str, body: bytes, deadline: float | None = None,
+               traceparent: str | None = None) -> bytes:
         """Submits a task without waiting; returns its 16-byte task id."""
         q = {} if deadline is None else {"deadlineMs": int(deadline * 1000)}
-        status, data = self._post("tasks/" + _seg(service), q, Frame(FrameType.TASK, 0, body).encode())
+        status, data, _ = self._post("tasks/" + _seg(service), q, Frame(FrameType.TASK, 0, body).encode(),
+                                     traceparent=traceparent)
         return _one(data, FrameType.TASK).payload
 
-    def call(self, service: str, body: bytes, deadline: float = 30.0) -> bytes:
+    def call(self, service: str, body: bytes, deadline: float = 30.0, traceparent: str | None = None) -> bytes:
         """Request/reply: returns the reply body, or raises DeadlineExceeded."""
+        return self.call_traced(service, body, deadline, traceparent)[0]
+
+    def call_traced(self, service: str, body: bytes, deadline: float = 30.0,
+                    traceparent: str | None = None) -> tuple[bytes, str | None]:
+        """As ``call``; also returns the reply's traceparent (the replying agent's claim span), or None."""
         q = {"deadlineMs": int(deadline * 1000)}
-        status, data = self._post("tasks/" + _seg(service) + ":call", q, Frame(FrameType.TASK, 0, body).encode(),
-                                  timeout=max(self.timeout, deadline + 5))
-        return _one(data, FrameType.RESULT).payload
+        status, data, headers = self._post("tasks/" + _seg(service) + ":call", q,
+                                           Frame(FrameType.TASK, 0, body).encode(),
+                                           timeout=max(self.timeout, deadline + 5), traceparent=traceparent)
+        return _one(data, FrameType.RESULT).payload, headers.get("traceparent")
 
     def claim(self, service: str, max: int = 1, visibility_ms: int = 30_000, wait: float = 0) -> list[Lease]:
         q = {"max": max, "visibilityMs": visibility_ms, "waitMs": int(wait * 1000)}
-        status, data = self._post("tasks/" + _seg(service) + ":claim", q, b"", timeout=max_(self.timeout, wait + 5))
+        status, data, headers = self._post("tasks/" + _seg(service) + ":claim", q, b"",
+                                           timeout=max_(self.timeout, wait + 5))
+        spans = (headers.get(LEASE_TRACE_HEADER) or "").split(",") if headers.get(LEASE_TRACE_HEADER) else []
         out = []
         view = memoryview(data)
         while view:
@@ -105,24 +122,28 @@ class Client:
             (n,) = struct.unpack_from(">H", p, 0)
             lease_id = p[2:2 + n].decode()
             (deadline,) = struct.unpack_from(">q", p, 2 + n)
-            out.append(Lease(self, lease_id, deadline, p[2 + n + 8:]))
+            span = spans[len(out)] if len(out) < len(spans) and spans[len(out)] != "-" else None
+            out.append(Lease(self, lease_id, deadline, p[2 + n + 8:], span))
         return out
 
     def _settle(self, lease_id: str, verb: str, query: dict | None = None, body: bytes = b"") -> None:
         self._post("leases/" + _seg(lease_id) + ":" + verb, query or {}, body)
 
-    def _headers(self) -> dict:
+    def _headers(self, traceparent: str | None = None) -> dict:
         h = {"Content-Type": CONTENT_TYPE}
         if self._token:
             h["Authorization"] = "Bearer " + self._token
+        if traceparent:
+            h["traceparent"] = traceparent
         return h
 
-    def _post(self, path: str, query: dict, body: bytes, timeout: float | None = None) -> tuple[int, bytes]:
+    def _post(self, path: str, query: dict, body: bytes, timeout: float | None = None,
+              traceparent: str | None = None) -> tuple[int, bytes, dict]:
         url = self.base + path + ("?" + urllib.parse.urlencode(query) if query else "")
-        req = urllib.request.Request(url, data=body, method="POST", headers=self._headers())
+        req = urllib.request.Request(url, data=body, method="POST", headers=self._headers(traceparent))
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
-                return r.status, r.read()
+                return r.status, r.read(), {k.lower(): v for k, v in r.headers.items()}
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
