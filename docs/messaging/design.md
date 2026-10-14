@@ -260,7 +260,7 @@ log and the ledger may share segments (log index == ledger position), so each en
 ## 7. Benchmark plan
 Plain Java harnesses in `bench/` (no JMH) plus a load generator, run on NVMe and on a cloud volume, with results kept as CSV.
 - Raw fsync cost (`force(false)`) for 4 KiB–1 MiB writes, preallocated vs not.
-- Group commit: throughput and p50/p99/p999 vs `maxBatchDelay` {0, 50, 200, 1000 µs} ×
+- Group commit: throughput and p50/p99/p999 vs `lingerNanos` {0, 50, 200, 1000 µs} ×
   producers {1, 8, 64} × size {100 B, 1 KiB, 16 KiB}.
 - End-to-end produce→consume→ack latency and redelivery overhead.
 - Recovery time vs log size and snapshot interval.

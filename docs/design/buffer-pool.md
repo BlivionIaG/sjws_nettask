@@ -202,12 +202,12 @@ Messaging Core implements these callers in PR (c). Every messaging call goes thr
 4. **Fetch path:** will the native protocol frame equal the on-disk `RecordBatch` bytes exactly (needed for transferTo)? Is TLS required for messaging v1, which would rule out sendfile?
 5. **Exhaustion policy for fetch:** use `tryAcquire` and answer "retry-after" under memory pressure, or fall back to an unpooled buffer like HTTP does?
 6. **Threading:** partition writers are platform threads. Are thread-local magazines OK for them, given one writer thread per partition so magazine count = partition count?
-7. **Who owns the cap:** one shared `pool.max_bytes`, or separate HTTP and messaging budgets so a fetch storm can't starve HTTP?
+7. **Who owns the cap:** one shared `sjws.buf.maxBytes`, or separate HTTP and messaging budgets so a fetch storm can't starve HTTP?
 
 ## 14. Decisions (Messaging Core, 2026-10-13)
 | # | Decision | Where |
 |---|---|---|
-| 7 | One shared `pool.max_bytes` plus named sub-budgets. `messaging` defaults to 50% so a fetch storm can't starve HTTP. Callers use a per-tenant `BufferBudget` view. | §2, §6 |
+| 7 | One shared `sjws.buf.maxBytes` plus named sub-budgets. `messaging` defaults to 50% so a fetch storm can't starve HTTP. Callers use a per-tenant `BufferBudget` view. | §2, §6 |
 | 5 | `tryAcquire` respects the sub-budget and returns null when it is exhausted. `acquire` still falls back to unpooled. | §2, §6 |
 | 6 | Optional per-thread magazines for platform threads (partition writers) stay in v1. | §4 |
 | 3 | The large class is for transient use (recovery, compaction, scan) with release afterwards. It is not a per-partition retained buffer. | §3, §10 |
