@@ -236,10 +236,15 @@ class ServiceDaemonTest {
         code = Sjws_nettask.run(new String[] {"--role=control", "--config=" + yaml, "--bootstrap=" + controlBoot,
                 "--pid-file=" + pid2, "--shutdown-timeout=2", Integer.toString(freePort()), html.toString()}, Map.of(),
                 out, err, NO_H3, SjwsServer::close);
-        assertEquals(Sjws_nettask.EXIT_OK, code, err() + out());
+        // The flag still wins over node.mode, and a CONTROL role without cp settings now fails closed (exit 64,
+        // before any listener) instead of running a node that hosts nothing.
+        assertEquals(Sjws_nettask.EXIT_USAGE, code, err() + out());
         assertTrue(err().contains("--role=control overrides node.mode=data"), err());
-        assertTrue(out().contains("role=control "), out());
+        assertTrue(err().contains("control role without cp settings"), err());
+        assertFalse(out().contains("role=control "), out());
         assertFalse(out().contains(SECRET), out());
+        assertFalse(err().contains(SECRET), err());
+        assertFalse(Files.exists(pid2), "no pid file: refused before listen");
     }
 
     @Test
@@ -646,9 +651,28 @@ class ServiceDaemonTest {
                 asData.document(), err);
         assertSame(asData, Sjws_nettask.applyProcessMode(asData, already, null));
 
+        // CONTROL without cp settings fails closed, with or without --bind-content.
+        for (var flags : java.util.List.of(new String[0], new String[] {"--bind-content"})) {
+            outBytes.reset();
+            errBytes.reset();
+            var args = new java.util.ArrayList<String>(java.util.List.of("--role=control"));
+            args.addAll(java.util.List.of(flags));
+            args.addAll(java.util.List.of("--bootstrap=" + controlBoot, "--pid-file=" + tmp.resolve("refused.pid"),
+                    "--shutdown-timeout=1", Integer.toString(freePort()), html.toString()));
+            int refused = Sjws_nettask.run(args.toArray(String[]::new), Map.of(), out, err, NO_H3, SjwsServer::close);
+            assertEquals(Sjws_nettask.EXIT_USAGE, refused, err() + out());
+            assertTrue(err().contains("control role without cp settings"), err());
+            assertTrue(err().contains("refusing to start"), err());
+        }
+
+        // The unbound content port, now reached through server.bind_content=false on a standalone node.
+        outBytes.reset();
+        errBytes.reset();
+        var noBind = tmp.resolve("standalone-nobind.yaml");
+        Files.writeString(noBind, "schema: 1\nserver:\n  port: 0\n  bind_content: false\n  root: " + html.toAbsolutePath() + "\n");
         var pid = tmp.resolve("nobind.pid");
-        int code = Sjws_nettask.run(new String[] {"--role=control", "--bootstrap=" + controlBoot, "--pid-file=" + pid,
-                "--shutdown-timeout=1", "9", html.toString()}, Map.of(), out, err, NO_H3, server -> {
+        int code = Sjws_nettask.run(new String[] {"--config=" + noBind, "--pid-file=" + pid,
+                "--shutdown-timeout=1"}, Map.of(), out, err, NO_H3, server -> {
                     assertEquals(-1, server.tcpPort());
                     assertEquals("content port not bound", server.describe());
                     server.shutdownTimeout(Duration.ofSeconds(1));
@@ -660,9 +684,8 @@ class ServiceDaemonTest {
         outBytes.reset();
         errBytes.reset();
         var pid2 = tmp.resolve("bind.pid");
-        code = Sjws_nettask.run(new String[] {"--role=control", "--bind-content", "--bootstrap=" + controlBoot,
-                "--pid-file=" + pid2, "--shutdown-timeout=1", Integer.toString(freePort()), html.toString()}, Map.of(),
-                out, err, NO_H3, server -> {
+        code = Sjws_nettask.run(new String[] {"--config=" + noBind, "--bind-content", "--pid-file=" + pid2,
+                "--shutdown-timeout=1"}, Map.of(), out, err, NO_H3, server -> {
                     assertTrue(server.tcpPort() > 0);
                     server.close();
                 });

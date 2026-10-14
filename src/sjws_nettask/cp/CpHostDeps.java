@@ -29,14 +29,18 @@ public interface CpHostDeps {
 
     Clock clock();
 
-    /** The voter transport for {@code cp.peers}. Called only when peers are configured. */
-    ClusterTransport transport(CpConfig config) throws IOException;
+    /**
+     * The voter transport for {@code cp.peers}. Called only when peers are configured. {@code peerTls} is what
+     * {@link #serverTls} returned for {@code cp-peer}; null means plain sockets, accepted only when every peer
+     * address is loopback. A transport that is {@link AutoCloseable} is owned and closed by the host.
+     */
+    ClusterTransport transport(CpConfig config, CpServerTls peerTls) throws IOException;
 
     /** Full voters only; a witness never calls this. */
     KeyRing loadKeys(CpKeyConfig config) throws CpKeyException;
 
     /**
-     * Server TLS for one listener ({@code cp-watch}, {@code cp-admin}). Null means a plain listener, which
+     * Server TLS for one listener ({@code cp-watch}, {@code cp-admin}, {@code cp-peer} for the voter links). Null means a plain listener, which
      * {@link CpHost} accepts only on a loopback address (tests and local development).
      */
     CpServerTls serverTls(String listener) throws CpKeyException;

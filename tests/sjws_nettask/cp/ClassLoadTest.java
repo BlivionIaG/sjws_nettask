@@ -87,4 +87,56 @@ class ClassLoadTest {
             assertFalse(text.contains("sjws_nettask.cp." + name), name + " loaded by a witness host");
         }
     }
+
+    /**
+     * A real data-role process (bootstrap {@code role=data}): CONTROL hosting stays unloaded, so the CP-off cost
+     * is zero there too. Only the data side of {@code cp} (watch client, lifecycle) may load.
+     */
+    @Test
+    void dataRoleStartLoadsNoControlHostingOrVoterTransport() throws Exception {
+        var root = Files.createDirectories(dir.resolve("data-html"));
+        var boot = sjws_nettask.clusterharness.NodeFixtures.pending(dir, "data").bootstrap();
+        var log = dir.resolve("data-classes.log");
+        int port;
+        try (var probe = new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+            port = probe.getLocalPort();
+        }
+        var javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        var pb = new ProcessBuilder(javaBin, "-Xlog:class+load=info", "-cp", System.getProperty("java.class.path"),
+                "sjws_nettask.Sjws_nettask", "--role=data", "--bootstrap=" + boot,
+                "--pid-file=" + dir.resolve("data.pid"), "--state-dir=" + dir.resolve("data-state"),
+                Integer.toString(port), root.toString()).redirectErrorStream(true).redirectOutput(log.toFile());
+        for (var env : new String[] {"WEB_SERVER_DIR", "WEB_SERVER_PORT", "WEB_SERVER_ROLE", "SJWS_CP_NODE_ID",
+                "SJWS_SWARM_ENABLED"}) {
+            pb.environment().remove(env);
+        }
+        var process = pb.start();
+        String text = "";
+        try {
+            var deadline = System.nanoTime() + java.time.Duration.ofSeconds(30).toNanos();
+            while (System.nanoTime() < deadline) {
+                text = Files.exists(log) ? Files.readString(log) : "";
+                if (text.contains("Server started:") || !process.isAlive()) {
+                    break;
+                }
+                Thread.sleep(50);
+            }
+            Thread.sleep(300); // let anything started right after the listener land in the log
+            text = Files.readString(log);
+        } finally {
+            process.destroy();
+            process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
+            process.destroyForcibly();
+        }
+        assertTrue(text.contains("Server started:"), text);
+        assertTrue(text.contains("control-plane role=data/gateway"), text);
+        for (var name : java.util.List.of("sjws_nettask.cp.CpLaunch ", "sjws_nettask.cp.CpHost ",
+                "sjws_nettask.cp.CpHostDeps ", "sjws_nettask.cp.CpWitness", "sjws_nettask.cp.CpStore ",
+                "sjws_nettask.cp.WatchServer ", "sjws_nettask.cp.AdminServer ", "sjws_nettask.cp.KeyRing ",
+                "sjws_nettask.cp.KeyRingLoader ", "sjws_nettask.cp.CpServerTls ", "sjws_nettask.cp.CpPeerSockets ",
+                "sjws_nettask.cp.CpConfig ", "sjws_nettask.cluster.TcpTransport ", "sjws_nettask.cluster.RaftGroup ",
+                "sjws_nettask.cluster.ReplicatedNode ")) {
+            assertFalse(text.contains(name), name.strip() + " loaded by a data-role start");
+        }
+    }
 }

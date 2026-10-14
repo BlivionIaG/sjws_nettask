@@ -43,7 +43,7 @@ public final class CpServerTls {
         checkKey(config);
         try {
             return new CpServerTls(config, AdminTls.openListener(config.name(), config.certPem(), config.keyPem(), null,
-                    config.caPem(), config.revocations(), audit));
+                    config.caPem(), config.revocations(), audit, CpPeerSockets.LISTENER.equals(config.name())));
         } catch (IOException | RuntimeException e) {
             throw new CpKeyException(config.name() + " TLS material refused: " + e.getMessage(), e);
         }
