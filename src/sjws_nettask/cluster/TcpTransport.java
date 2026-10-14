@@ -72,7 +72,8 @@ import javax.crypto.spec.SecretKeySpec;
  * that misses it is counted as {@link Reason#TIMEOUT}. A connection whose source address is not a member's
  * address is closed at accept and counted in {@link #strangersRefused}, with or without mTLS. An accepted socket
  * then completes {@link SocketFactory#handshake} within {@link #HANDSHAKE_TIMEOUT_MILLIS} in total before it
- * counts as an inbound slot, so a stalled handshake cannot hold one. At most {@code 2 x peers} inbound connections are open at once;
+ * counts as an inbound slot, so a stalled handshake cannot hold one; at most {@code 8 x peers} handshakes run at
+ * once, and an accept beyond that is closed and counted in {@link #handshakesRefused}. At most {@code 2 x peers} inbound connections are open at once;
  * extra ones are closed at accept and counted in {@link #inboundRefused}. A frame body is read into
  * a buffer that starts at {@link #PREAUTH_CHUNK_BYTES} and grows with the bytes actually received,
  * so a large length prefix alone does not allocate. An idle follower-to-follower link that the
@@ -177,6 +178,9 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private final AtomicLong inboundRefused = new AtomicLong();
     private final AtomicLong strangersRefused = new AtomicLong();
     private final AtomicLong handshakeFailures = new AtomicLong();
+    private final AtomicLong handshakesRefused = new AtomicLong();
+    private final AtomicInteger handshaking = new AtomicInteger();
+    private final int maxHandshakes;
     private final Set<java.net.InetAddress> memberHosts = new java.util.HashSet<>();
     private final AtomicLong oversizeDrops = new AtomicLong();
     private final AtomicLong peakReadBuffer = new AtomicLong();
@@ -258,6 +262,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             throw new IllegalArgumentException("self is not a member");
         }
         this.maxInbound = Math.max(2, 2 * peers.size());
+        this.maxHandshakes = Math.max(8, HANDSHAKES_PER_PEER * peers.size());
         this.server = sockets.listen(bind);
         this.acceptor = Thread.ofVirtual().name("raft-accept-" + self.name()).start(this::accept);
     }
@@ -324,6 +329,19 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         return strangersRefused.get();
     }
 
+    /** Accepted sockets closed at once because {@code 8 x peers} handshakes were already in flight. */
+    public long handshakesRefused() {
+        return handshakesRefused.get();
+    }
+
+    /** Concurrent in-flight inbound handshakes allowed per peer; each one costs a thread and a TLS engine. */
+    public static final int HANDSHAKES_PER_PEER = 8;
+
+    /** Inbound handshakes currently in flight. */
+    public int handshaking() {
+        return handshaking.get();
+    }
+
     /** Accepted sockets closed because {@link SocketFactory#handshake} failed or missed its deadline. */
     public long handshakeFailures() {
         return handshakeFailures.get();
@@ -387,8 +405,15 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 closeQuietly(socket);
                 continue;
             }
+            if (handshaking.incrementAndGet() > maxHandshakes) {
+                handshaking.decrementAndGet();
+                handshakesRefused.incrementAndGet();
+                closeQuietly(socket);
+                continue;
+            }
             inboundSockets.add(socket); // closed by close() even while its handshake runs
             if (!open) {
+                handshaking.decrementAndGet();
                 closeQuietly(socket);
                 inboundSockets.remove(socket);
                 return;
@@ -406,6 +431,8 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             closeQuietly(socket);
             inboundSockets.remove(socket);
             return;
+        } finally {
+            handshaking.decrementAndGet();
         }
         if (inboundCount.incrementAndGet() > maxInbound) {
             inboundCount.decrementAndGet();
