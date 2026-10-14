@@ -39,9 +39,10 @@ public final class SwarmTrace {
     private static final int LEN = 55; // "00-" + 32 + "-" + 16 + "-" + 2
 
     /**
-     * The normalized (lower-case) traceparent, or {@code ""} when {@code h} is absent or invalid. Invalid
-     * values are dropped, never forwarded (W3C Trace Context §3.2: restart the trace). Accepts future versions
-     * by their first 55 characters, as the spec requires, but always emits version {@code 00}.
+     * The traceparent, or {@code ""} when {@code h} is absent or invalid. Strict: every field is lower-case hex
+     * ({@code HEXDIGLC}, W3C Trace Context §3.2.2), so upper case is invalid, not normalized. Invalid values are
+     * dropped, never forwarded (restart the trace). Accepts future versions by their first 55 characters, as the
+     * spec requires, but always emits version {@code 00}. Surrounding blanks (header OWS) are ignored.
      */
     public static String parse(String h) {
         if (h == null) {
@@ -57,19 +58,24 @@ public final class SwarmTrace {
         if (!hex(s, 0, 2) || !hex(s, 3, 35) || !hex(s, 36, 52) || !hex(s, 53, 55)) {
             return "";
         }
-        var v = s.substring(0, 2).toLowerCase(java.util.Locale.ROOT);
+        var v = s.substring(0, 2);
         if ("ff".equals(v) || ("00".equals(v) && s.length() != LEN)) {
             return "";
         }
         if (zero(s, 3, 35) || zero(s, 36, 52)) {
             return "";
         }
-        return ("00" + s.substring(2, LEN)).toLowerCase(java.util.Locale.ROOT);
+        return "00" + s.substring(2, LEN);
     }
 
-    /** A child of {@code parent}: same trace id and flags, a fresh non-zero span id; {@code ""} if no parent. */
-    public static String child(String parent) {
-        if (parent == null || parent.length() != LEN) {
+    /**
+     * A child of {@code parent}: same trace id and flags, a fresh non-zero span id. {@code ""} when {@code parent}
+     * is absent or not a valid traceparent: stored values may come from in-process callers, never only from
+     * {@link #parse}, so they are re-validated before they can reach a response header.
+     */
+    public static String child(String stored) {
+        var parent = parse(stored);
+        if (parent.isEmpty()) {
             return "";
         }
         long span;
@@ -82,6 +88,15 @@ public final class SwarmTrace {
             sb.append('0');
         }
         return sb.append(id).append(parent, 52, LEN).toString();
+    }
+
+    /**
+     * The ingress traceparent from all values of the header: exactly one valid value, else {@code ""}. Several
+     * {@code traceparent} fields are invalid (dropped, the trace restarts), so an appended value can never be
+     * shadowed silently.
+     */
+    public static String ingress(java.util.List<String> values) {
+        return values.size() == 1 ? parse(values.get(0)) : "";
     }
 
     /** The 32-hex trace id of a valid traceparent. */
@@ -97,7 +112,7 @@ public final class SwarmTrace {
     private static boolean hex(String s, int from, int to) {
         for (int i = from; i < to; i++) {
             char c = s.charAt(i);
-            if (!(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F')) {
+            if (!(c >= '0' && c <= '9' || c >= 'a' && c <= 'f')) {
                 return false;
             }
         }

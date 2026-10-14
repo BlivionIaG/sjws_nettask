@@ -181,6 +181,94 @@ class SwarmTraceHttpTest {
         assertEquals("", t.get(0).envelope().traceparent(), "tracing off: the envelope carries nothing");
     }
 
+    static final String BAD = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7\r\n1"; // 55 chars, invalid
+
+    static TaskEnvelope env(String traceparent, String body) {
+        var id = ReplyRouter.newId();
+        return new TaskEnvelope(id, id, "", TaskEnvelope.NO_DEADLINE, traceparent, "", "", "",
+                body.getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void invalidStoredTraceparentNeverBreaksAClaim() {
+        var http = open(1, true);
+        assertEquals(55, BAD.length());
+        // in-process submit: bypasses HTTP ingress validation
+        this.swarm.tasks().submit("p", 0, 0, env(BAD, "bad"));
+        this.swarm.tasks().submit("p", 0, 0, env(TP.toUpperCase(), "upper"));
+        var r = post(http, "/swarm/v1/tasks/p:claim?max=2&waitMs=2000", null, new byte[0]);
+        assertEquals(200, r.status());
+        assertEquals(2, SwarmHttpTest.leases(r).size(), "every lease is delivered");
+        assertEquals("-,-", r.headers().get(SwarmTrace.LEASE_HEADER));
+    }
+
+    @Test
+    void invalidStoredReplyTraceparentIsNotEchoed() throws Exception {
+        var http = open(1, true);
+        var a = CompletableFuture.supplyAsync(() -> post(http, "/swarm/v1/tasks/a:call?deadlineMs=20000", null, task("q")));
+        var t = this.swarm.tasks().claim("a", "w", 1, 30_000, TimeUnit.SECONDS.toNanos(5)).get(0);
+        // an in-process worker replies with an envelope carrying an invalid traceparent
+        var forged = new Task(t.pool(), t.offset(), t.attempt(), t.leaseDeadlineMs(), t.envelope().withTraceparent(BAD),
+                t.shard());
+        assertTrue(this.swarm.tasks().reply(forged, 9, 1, "", "r".getBytes(StandardCharsets.UTF_8))
+                .get(10, TimeUnit.SECONDS).ok());
+        var ra = a.get(10, TimeUnit.SECONDS);
+        assertEquals(200, ra.status());
+        assertNull(ra.headers().get("traceparent"));
+    }
+
+    @Test
+    void reclaimAfterExpiryGetsASiblingSpan() throws Exception {
+        var http = open(1, true);
+        assertEquals(202, post(http, "/swarm/v1/tasks/p", TP, task("x")).status());
+        var first = post(http, "/swarm/v1/tasks/p:claim?visibilityMs=50&waitMs=2000", null, new byte[0]);
+        var c1 = first.headers().get(SwarmTrace.LEASE_HEADER);
+        Thread.sleep(200);
+        var second = post(http, "/swarm/v1/tasks/p:claim?visibilityMs=30000&waitMs=5000", null, new byte[0]);
+        assertEquals(200, second.status());
+        var c2 = second.headers().get(SwarmTrace.LEASE_HEADER);
+        assertEquals(SwarmTrace.traceId(TP), SwarmTrace.traceId(c1));
+        assertEquals(SwarmTrace.traceId(TP), SwarmTrace.traceId(c2));
+        assertNotEquals(SwarmTrace.spanId(c1), SwarmTrace.spanId(c2), "a fresh child per claim");
+        assertNotEquals(SwarmTrace.spanId(TP), SwarmTrace.spanId(c2));
+        // the ledger keeps the caller's parent, so the re-claim is a sibling, not a grandchild
+        var stored = this.swarm.tasks().claim("p", "w", 1, 1, 0);
+        assertTrue(stored.isEmpty());
+        assertEquals(TP.substring(52), c2.substring(52), "flags kept");
+    }
+
+    @Test
+    void multipleTraceparentHeadersAreDropped() {
+        var http = open(1, true);
+        var h = RequestHeaders.of(Map.of("traceparent", List.of(TP, "00-11111111111111111111111111111111-2222222222222222-01")));
+        assertEquals(202, http.handle(new Request("POST", "/swarm/v1/tasks/p", h, null, false, null,
+                SwarmHttpTest.body(task("x")))).status());
+        var r = post(http, "/swarm/v1/tasks/p:claim?waitMs=2000", null, new byte[0]);
+        assertEquals("-", r.headers().get(SwarmTrace.LEASE_HEADER), "several traceparent fields restart the trace");
+    }
+
+    @Test
+    void mixedBatchKeepsLeaseOrder() {
+        var http = open(1, true);
+        assertEquals(202, post(http, "/swarm/v1/tasks/p", TP, task("t0")).status());
+        assertEquals(202, post(http, "/swarm/v1/tasks/p", null, task("u1")).status());
+        assertEquals(202, post(http, "/swarm/v1/tasks/p", TP, task("t2")).status());
+        assertEquals(202, post(http, "/swarm/v1/tasks/p", null, task("u3")).status());
+        var r = post(http, "/swarm/v1/tasks/p:claim?max=4&waitMs=2000", null, new byte[0]);
+        var leases = SwarmHttpTest.leases(r);
+        var spans = r.headers().get(SwarmTrace.LEASE_HEADER).split(",");
+        assertEquals(4, leases.size());
+        assertEquals(4, spans.length);
+        for (int i = 0; i < 4; i++) {
+            var body = new String(leases.get(i).body(), StandardCharsets.UTF_8);
+            if (body.startsWith("t")) {
+                assertEquals(SwarmTrace.traceId(TP), SwarmTrace.traceId(spans[i]), body);
+            } else {
+                assertEquals("-", spans[i], body);
+            }
+        }
+    }
+
     @Test
     void moduleTraceFlag() {
         open(1, false);

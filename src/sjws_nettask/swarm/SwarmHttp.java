@@ -98,8 +98,8 @@ final class SwarmHttp implements Handler {
         if (!this.trace) {
             return "";
         }
-        var v = request.headers().values(sjws_nettask.swarm.trace.SwarmTrace.HEADER);
-        return v.isEmpty() ? "" : sjws_nettask.swarm.trace.SwarmTrace.parse(v.get(0));
+        return sjws_nettask.swarm.trace.SwarmTrace.ingress(
+                request.headers().values(sjws_nettask.swarm.trace.SwarmTrace.HEADER));
     }
 
     @Override
@@ -185,8 +185,12 @@ final class SwarmHttp implements Handler {
             var reply = f.get(Math.max(0, deadline - this.swarm.topics().clock().getAsLong()) + 1_000,
                     TimeUnit.MILLISECONDS);
             var ok = frame(200, new Frame(Frame.Type.RESULT, Frame.LAST, reply.body()));
-            if (this.trace && !reply.traceparent().isEmpty()) {
-                ok.headers().set(sjws_nettask.swarm.trace.SwarmTrace.HEADER, reply.traceparent());
+            if (this.trace) {
+                // the stored value may come from an in-process caller: re-validate before it becomes a header
+                var tp = sjws_nettask.swarm.trace.SwarmTrace.parse(reply.traceparent());
+                if (!tp.isEmpty()) {
+                    ok.headers().set(sjws_nettask.swarm.trace.SwarmTrace.HEADER, tp);
+                }
             }
             return ok;
         } catch (TimeoutException e) {

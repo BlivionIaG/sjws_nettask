@@ -29,7 +29,7 @@ class SwarmTraceTest {
     @Test
     void parsesValidAndNormalizes() {
         assertEquals(TP, SwarmTrace.parse(TP));
-        assertEquals(TP, SwarmTrace.parse("  " + TP.toUpperCase().replace("00-4BF", "00-4bf") + " "));
+        assertEquals(TP, SwarmTrace.parse("  " + TP + " "));
         // future version: first 55 chars, emitted as 00
         assertEquals(TP, SwarmTrace.parse("cc" + TP.substring(2) + "-what-ever"));
         assertEquals(TP, SwarmTrace.parse("cc" + TP.substring(2)));
@@ -41,7 +41,8 @@ class SwarmTraceTest {
             "ff" + TP.substring(2), TP.replace('-', '_'), "00_" + TP.substring(3), TP.substring(0, 35) + "_" + TP.substring(36),
             TP.substring(0, 52) + "_" + TP.substring(53), "0g" + TP.substring(2), TP.replace("4bf9", "4bz9"),
             TP.replace("00f0", "0zf0"), TP.substring(0, 53) + "0z", "00-" + "0".repeat(32) + TP.substring(35),
-            TP.substring(0, 36) + "0".repeat(16) + TP.substring(52)}) {
+            TP.substring(0, 36) + "0".repeat(16) + TP.substring(52), TP.toUpperCase(), TP.replace("4bf9", "4BF9"),
+            TP.replace("00f0", "00F0"), TP.substring(0, 53) + "0A", "CC" + TP.substring(2), TP + "," + TP}) {
             assertEquals("", SwarmTrace.parse(bad), String.valueOf(bad));
         }
     }
@@ -58,6 +59,18 @@ class SwarmTraceTest {
         }
         assertEquals("", SwarmTrace.child(""));
         assertEquals("", SwarmTrace.child(null));
+        // a stored value is re-validated: 55 chars but invalid (CR/LF, non-hex, upper case) has no child
+        assertEquals("", SwarmTrace.child("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7\r\n1"));
+        assertEquals("", SwarmTrace.child("z".repeat(55)));
+        assertEquals("", SwarmTrace.child(TP.toUpperCase()));
+    }
+
+    @Test
+    void ingressNeedsExactlyOneValidHeader() {
+        assertEquals("", SwarmTrace.ingress(java.util.List.of()));
+        assertEquals(TP, SwarmTrace.ingress(java.util.List.of(TP)));
+        assertEquals("", SwarmTrace.ingress(java.util.List.of(TP, TP)), "several fields: dropped, the trace restarts");
+        assertEquals("", SwarmTrace.ingress(java.util.List.of("bogus")));
         assertTrue(SwarmTrace.describe().contains(SwarmTrace.HEADER));
     }
 }
