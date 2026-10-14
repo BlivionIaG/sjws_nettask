@@ -80,6 +80,18 @@ delay the future.
 `Durability.STRICT` is opt-in. Followers that store the batch fsync it before they ack,
 and the leader fsyncs before replicating.
 
+### Per-append durability
+
+`ClusterNode.append(group, batch, durability)` overrides the group's mode for one batch
+(`null` uses `GroupOptions.durability()`). A STRICT batch in a RELAXED group is stored with the
+`USER_STRICT` marker (4) instead of `USER` (0); listeners and snapshots see the same payload.
+The leader fsyncs before replicating it, a follower that receives a batch containing one fsyncs
+before acking, and committing any index at or past it needs `dataCopiesRequired()` data acks,
+exactly as a STRICT group. Commits are a prefix, so RELAXED batches behind a pending STRICT one
+wait for it. A new leader rescans its uncommitted suffix for the marker. A RELAXED override in a
+STRICT group is still STRICT. The default interface method delegates `null` and fails anything
+else with `UnsupportedOperationException`.
+
 ### Restart safety and the exact RELAXED guarantee
 
 What a voter keeps across a crash:

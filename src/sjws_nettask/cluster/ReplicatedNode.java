@@ -250,13 +250,18 @@ public final class ReplicatedNode implements ClusterNode {
 
     @Override
     public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch) {
+        return append(groupId, batch, null);
+    }
+
+    @Override
+    public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability) {
         var group = groups.get(groupId);
         if (group == null) {
             var future = new CompletableFuture<CommittedIndex>();
             future.completeExceptionally(new IllegalStateException("no group " + groupId));
             return future;
         }
-        var future = group.append(batch);
+        var future = group.append(batch, durability);
         if (running && wake.availablePermits() == 0) {
             wake.release();
         }

@@ -47,6 +47,8 @@ final class RaftGroup {
     static final byte JOINT = 1;
     static final byte NEW_CONFIG = 2;
     static final byte NOOP = 3;
+    /** User data appended with a STRICT override: every data copy fsyncs it before it counts. */
+    static final byte USER_STRICT = 4;
 
     static final int VOTE = 1;
     static final int VOTE_RESP = 2;
@@ -114,6 +116,8 @@ final class RaftGroup {
      * it neither grants votes or pre-votes nor campaigns, unless it alone is a quorum.
      */
     private boolean recovering;
+    /** Uncommitted indexes (leader view) that carry {@link #USER_STRICT}. */
+    private final java.util.TreeSet<Long> strictPending = new java.util.TreeSet<>();
     private long recoveryUntil;
 
     private enum Role {
@@ -276,6 +280,13 @@ final class RaftGroup {
     }
 
     CompletableFuture<CommittedIndex> append(List<ByteBuffer> batch) {
+        return append(batch, null);
+    }
+
+    /** {@code durability} null uses {@link GroupOptions#durability()}. */
+    CompletableFuture<CommittedIndex> append(List<ByteBuffer> batch, Durability durability) {
+        boolean marked = durability == Durability.STRICT && options.durability() != Durability.STRICT;
+        boolean strict = marked || options.durability() == Durability.STRICT;
         if (batch == null || batch.isEmpty()) {
             throw new IllegalArgumentException("batch");
         }
@@ -306,10 +317,13 @@ final class RaftGroup {
             }
             long last = 0;
             for (var copy : copies) {
-                last = appendRaw(user(copy));
+                last = appendRaw(user(copy, marked ? USER_STRICT : USER));
+                if (marked) {
+                    strictPending.add(last);
+                }
             }
             pending.put(last, future);
-            if (options.durability() == Durability.STRICT) {
+            if (strict) {
                 force();
             } else {
                 relaxedDirty = true;
@@ -397,6 +411,13 @@ final class RaftGroup {
         for (var peer : peers) {
             nextIndex.put(peer, lastIndex() + 1);
             matchIndex.put(peer, 0L);
+        }
+        strictPending.clear();
+        for (long index = commitIndex + 1; index <= lastIndex(); index++) {
+            var data = read(index);
+            if (data != null && data.length > 0 && data[0] == USER_STRICT) {
+                strictPending.add(index);
+            }
         }
         appendRaw(new byte[] {NOOP});
         // Leadership is visible before the no-op callback, so leaderReady stays false in onLeaderChange.
@@ -558,8 +579,10 @@ final class RaftGroup {
             return;
         }
         long index = prevIndex;
+        boolean strictEntry = false;
         for (var entry : entries) {
             index++;
+            strictEntry |= entry.data.length > 0 && entry.data[0] == USER_STRICT;
             long existing = termAt(index);
             if (existing != entry.term) {
                 if (existing != 0) {
@@ -568,7 +591,7 @@ final class RaftGroup {
                 appendStored(index, entry.term, entry.data);
             }
         }
-        if (options.durability() == Durability.STRICT) {
+        if (options.durability() == Durability.STRICT || strictEntry) {
             force();
             forcedBeforeAck = true;
         } else {
@@ -685,6 +708,7 @@ final class RaftGroup {
             }
             if (quorumFor(index)) {
                 commitIndex = index;
+                strictPending.headSet(index, true).clear();
                 apply(after);
                 if (commitIndex - snapIndex >= options.snapshotEveryEntries()) {
                     snapshotThrough(commitIndex);
@@ -707,7 +731,7 @@ final class RaftGroup {
             }
             lastApplied = index;
             switch (data[0]) {
-                case USER -> {
+                case USER, USER_STRICT -> {
                     var payload = new byte[data.length - 1];
                     System.arraycopy(data, 1, payload, 0, payload.length);
                     long entryTerm = termAt(index);
@@ -818,7 +842,16 @@ final class RaftGroup {
         if (!isQuorum(acks)) {
             return false;
         }
-        return options.durability() != Durability.STRICT || dataAcks >= dataCopiesRequired();
+        return !strictUpTo(index) || dataAcks >= dataCopiesRequired();
+    }
+
+    /** Committing {@code index} commits a STRICT entry: a STRICT group, or a STRICT override in range. */
+    private boolean strictUpTo(long index) {
+        if (options.durability() == Durability.STRICT) {
+            return true;
+        }
+        var first = strictPending.ceiling(commitIndex + 1);
+        return first != null && first <= index;
     }
 
     /** STRICT needs two data disks when the group has two data voters and a witness. */
@@ -1049,7 +1082,7 @@ final class RaftGroup {
             out.write(snapData);
             for (long i = snapIndex + 1; i <= index; i++) {
                 var data = read(i);
-                if (data != null && data.length > 0 && data[0] == USER) {
+                if (data != null && data.length > 0 && (data[0] == USER || data[0] == USER_STRICT)) {
                     out.write(data, 1, data.length - 1);
                 }
             }
@@ -1061,9 +1094,9 @@ final class RaftGroup {
         }
     }
 
-    private static byte[] user(byte[] payload) {
+    private static byte[] user(byte[] payload, byte marker) {
         var out = new byte[payload.length + 1];
-        out[0] = USER;
+        out[0] = marker;
         System.arraycopy(payload, 0, out, 1, payload.length);
         return out;
     }
