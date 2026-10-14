@@ -87,8 +87,11 @@ final class MessagingHttp implements Handler {
         var target = request.target();
         int q = target.indexOf('?');
         var path = q < 0 ? target : target.substring(0, q);
-        if (path.startsWith(PREFIX) && path.indexOf("/offsets/", PREFIX.length()) > 0) return offsets(request, path);
-        if (!path.startsWith(PREFIX) || !path.endsWith("/records")) return problem(404, "not found", path);
+        if (!path.startsWith(PREFIX) || !path.endsWith("/records")) {
+            // Offsets are routed only off the records path, so produce/fetch pay no extra string scan.
+            if (path.startsWith(PREFIX) && path.indexOf("/offsets/", PREFIX.length()) > 0) return offsets(request, path);
+            return problem(404, "not found", path);
+        }
         var topic = URLDecoder.decode(path.substring(PREFIX.length(), path.length() - "/records".length()), StandardCharsets.UTF_8);
         if (!LogTopics.validName(topic)) return problem(400, "bad request", "topic name must match " + LogTopics.NAME);
         try {
