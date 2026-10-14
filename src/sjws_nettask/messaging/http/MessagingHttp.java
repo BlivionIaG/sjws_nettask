@@ -122,6 +122,9 @@ final class MessagingHttp implements Handler {
         // A request may only strengthen the topic's policy: a weaker Durability header is clamped up to it.
         var durability = atLeast(durability(request.headers().values("durability")), this.topics.durability(topic));
         var records = records(request);
+        if (this.topics.compacted(topic)) {
+            for (var r : records) if (LogTopics.key(r) == null) throw new BadRequest("keyed topic: each record is [keyLen:int][key][value]");
+        }
         var log = this.topics.get(topic, true);
         try {
             long base = log.writer().append(records, durability).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
@@ -155,7 +158,7 @@ final class MessagingHttp implements Handler {
         log.reads().readLock().lock();
         try {
             while (next < committed && total < maxBytes) {
-                var b = log.log().read(next);
+                var b = log.log().readCeiling(next); // steps over offsets a keyed topic compacted away
                 if (b == null || b.nextOffset() > committed) break;
                 int size = RecordBatch.encodedSize(b.records());
                 if (!fits(total, size, maxBytes)) break;

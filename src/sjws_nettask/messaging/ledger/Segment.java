@@ -186,7 +186,12 @@ final class Segment implements AutoCloseable {
      * Batch containing {@code offset}, or null (out of range, or a gap in a compacted segment). Reads go through a
      * {@link #READAHEAD_BYTES} window, so sequential consumers do one pread per window instead of two per frame.
      */
-    RecordBatch read(long offset) throws IOException {
+    RecordBatch read(long offset) throws IOException { return read(offset, false); }
+
+    /** The batch containing {@code offset}, else (a compacted gap) the first batch after it in this segment, or null. */
+    RecordBatch readCeiling(long offset) throws IOException { return read(offset, true); }
+
+    private RecordBatch read(long offset, boolean ceiling) throws IOException {
         long end = size;
         if (offset < baseOffset || offset >= nextOffset) return null;
         int n = idxLen;
@@ -211,7 +216,7 @@ final class Segment implements AutoCloseable {
                 var rb = RecordBatch.decode(c.buf.duplicate().position(rel).limit(rel + 4 + len).slice());
                 if (offset < rb.nextOffset()) {
                     hint = new Hint(rb.nextOffset(), pos + 4 + len);
-                    return rb.baseOffset() <= offset ? rb : null;
+                    return rb.baseOffset() <= offset || ceiling ? rb : null;
                 }
             } catch (RecordBatch.CorruptBatchException e) {
                 throw new IOException("corrupt committed batch at " + logPath + ":" + pos, e);

@@ -50,6 +50,10 @@ final class LogTopics implements AutoCloseable {
     private final ConcurrentHashMap<String, Log> logs = new ConcurrentHashMap<>();
     private final java.util.concurrent.locks.ReentrantLock opening = new java.util.concurrent.locks.ReentrantLock();
     private volatile boolean closed;
+    /** Keyed topics: records are {@code [keyLen:int][key][value]} and sealed segments keep only each key's latest record. */
+    private volatile java.util.Set<String> compacted = java.util.Set.of();
+    /** Serializes maintenance passes (retention and compaction) so a segment is never compacted and deleted at once. */
+    private final java.util.concurrent.locks.ReentrantLock maintenance = new java.util.concurrent.locks.ReentrantLock();
 
     LogTopics(Path dir, Durability durability) {
         this(dir, durability, SegmentedLog.DEFAULT_SEGMENT_BYTES, LogRetention.NONE, System::currentTimeMillis);
@@ -111,6 +115,15 @@ final class LogTopics implements AutoCloseable {
      */
     int enforceRetention() throws IOException {
         if (this.retention.unlimited()) return 0;
+        this.maintenance.lock();
+        try {
+            return enforceRetentionLocked();
+        } finally {
+            this.maintenance.unlock();
+        }
+    }
+
+    private int enforceRetentionLocked() throws IOException {
         int deleted = 0;
         long now = this.clockMs.getAsLong();
         for (var l : this.logs.values()) {
@@ -128,6 +141,95 @@ final class LogTopics implements AutoCloseable {
             }
         }
         return deleted;
+    }
+
+    /** Marks {@code topics} as keyed (compacted). */
+    void compacted(java.util.Set<String> topics) {
+        for (var t : topics) if (!validName(t)) throw new IllegalArgumentException("bad compacted topic: " + t);
+        this.compacted = java.util.Set.copyOf(topics);
+    }
+
+    boolean hasCompactedTopics() {
+        return !this.compacted.isEmpty();
+    }
+
+    boolean compacted(String topic) {
+        return this.compacted.contains(topic);
+    }
+
+    static java.util.Set<String> parseTopics(String list) {
+        var out = new java.util.HashSet<String>();
+        for (var t : list.split(",")) if (!t.isBlank()) out.add(t.trim());
+        return out;
+    }
+
+    /** The key of a keyed record ({@code [keyLen:int][key][value]}), or null if the record is not keyed. */
+    static java.nio.ByteBuffer key(byte[] record) {
+        if (record.length < 4) return null;
+        int len = ((record[0] & 0xff) << 24) | ((record[1] & 0xff) << 16) | ((record[2] & 0xff) << 8) | (record[3] & 0xff);
+        if (len < 0 || len > record.length - 4) return null;
+        return java.nio.ByteBuffer.wrap(record, 4, len).slice();
+    }
+
+    /** What one compaction pass did. */
+    record CompactionReport(int segments, long reclaimedBytes) { }
+
+    /**
+     * Compacts every open keyed topic: a sealed segment is rewritten keeping only the batches that hold the latest
+     * record of at least one key (batch granularity: a batch with any live record is kept whole). Only records the
+     * log has made durable count as "latest" (the log is forced first), so a crash can never lose a key's only value.
+     * The copy runs without locks; the swap takes the topic's {@code reads} write lock (in-flight fetches finish first).
+     */
+    CompactionReport compact() throws IOException {
+        if (this.compacted.isEmpty()) return new CompactionReport(0, 0);
+        this.maintenance.lock();
+        try {
+            int segs = 0;
+            long reclaimed = 0;
+            for (var e : this.logs.entrySet()) {
+                if (!this.compacted.contains(e.getKey())) continue;
+                var l = e.getValue();
+                long end = l.writer().snapshot().nextOffset();
+                l.log().force(); // everything below `end` is now durable
+                var latest = new java.util.HashMap<java.nio.ByteBuffer, Long>();
+                l.log().scanFrom(l.log().startOffset(), b -> {
+                    for (int i = 0; i < b.records().size(); i++) {
+                        long o = b.baseOffset() + i;
+                        if (o >= end) return;
+                        var k = key(b.records().get(i));
+                        if (k != null) latest.put(k, o);
+                    }
+                });
+                for (var seg : l.log().segments()) {
+                    if (seg.active() || seg.nextOffset() > end) break;
+                    var live = new java.util.HashSet<Long>(); // batch base offsets to keep
+                    boolean[] drop = {false};
+                    l.log().scanFrom(seg.baseOffset(), b -> {
+                        if (b.baseOffset() >= seg.nextOffset()) return;
+                        boolean keep = false;
+                        for (int i = 0; i < b.records().size() && !keep; i++) {
+                            var k = key(b.records().get(i));
+                            keep = k == null || latest.get(k) == b.baseOffset() + i;
+                        }
+                        if (keep) live.add(b.baseOffset());
+                        else drop[0] = true;
+                    });
+                    if (!drop[0]) continue;
+                    long bytes = l.log().prepareCompaction(seg.baseOffset(), live::contains);
+                    l.reads().writeLock().lock();
+                    try {
+                        l.log().commitCompaction(seg.baseOffset());
+                    } finally {
+                        l.reads().writeLock().unlock();
+                    }
+                    segs++;
+                    reclaimed += seg.bytes() - bytes;
+                }
+            }
+            return new CompactionReport(segs, reclaimed);
+        } finally {
+            this.maintenance.unlock();
+        }
     }
 
     static boolean validName(String topic) {

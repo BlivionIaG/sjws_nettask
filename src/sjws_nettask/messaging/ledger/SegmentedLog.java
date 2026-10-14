@@ -116,6 +116,22 @@ public final class SegmentedLog implements AutoCloseable {
         return null;
     }
 
+    /**
+     * The batch containing {@code offset}, or the first batch after it when {@code offset} falls in a compacted gap,
+     * or null past the end. Fetches use it so a consumer steps over compacted-away offsets.
+     */
+    public RecordBatch readCeiling(long offset) throws IOException {
+        var segs = segments;
+        int i = segs.size() - 1;
+        while (i > 0 && offset < segs.get(i).baseOffset) i--;
+        for (; i < segs.size(); i++) {
+            var s = segs.get(i);
+            var b = s.readCeiling(Math.max(offset, s.baseOffset));
+            if (b != null) return b;
+        }
+        return null;
+    }
+
     /** Reads every committed batch in order (recovery, tests, tools). */
     public List<RecordBatch> readAll() throws IOException {
         var out = new ArrayList<RecordBatch>();

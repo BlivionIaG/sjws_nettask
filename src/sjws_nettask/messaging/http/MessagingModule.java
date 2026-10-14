@@ -46,6 +46,8 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String DURABILITY_PROPERTY = "sjws.messaging.durability";
     static final String DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY";
     static final String TOPIC_DURABILITY_PROPERTY = "sjws.messaging.durability.topics";
+    /** Comma-separated keyed topics: records are {@code [keyLen:int][key][value]}; sealed segments keep each key's latest. */
+    static final String COMPACTED_TOPICS_PROPERTY = "sjws.messaging.compacted.topics";
     static final String TOPIC_DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY_TOPICS";
 
     private final LogTopics topics;
@@ -95,7 +97,8 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
             java.util.Map<String, Durability> topicDurability) {
         this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, System::currentTimeMillis);
-        if (retention.unlimited()) {
+        this.topics.compacted(LogTopics.parseTopics(System.getProperty(COMPACTED_TOPICS_PROPERTY, "")));
+        if (retention.unlimited() && !this.topics.hasCompactedTopics()) {
             this.retentionTimer = null;
         } else {
             this.retentionTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
@@ -107,6 +110,7 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     void retain() {
         try {
             this.topics.enforceRetention();
+            this.topics.compact();
         } catch (java.io.IOException | RuntimeException e) {
             System.err.println("WARN: messaging retention: " + e);
         }
