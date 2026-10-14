@@ -4,10 +4,10 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -32,6 +32,12 @@ public final class LedgerWriter implements AutoCloseable {
 
     public static final int DEFAULT_QUEUE = 65_536;
     public static final Durability DEFAULT_DURABILITY = Durability.ASYNC;
+    /**
+     * Default floor between background ASYNC fsyncs. 0 used to mean back to back, which on a busy topic is a
+     * continuous fsync loop (up to 13% system CPU in the S1c request/reply run) for no ack-latency benefit: ASYNC acks
+     * after write(2). 1 ms coalesces those into at most 1000 fsyncs/s and adds at most 1 ms to the power-loss window.
+     */
+    public static final long DEFAULT_FSYNC_INTERVAL_NANOS = 1_000_000L;
 
     private record Pending(List<byte[]> records, long timestampMs, Durability mode, CompletableFuture<Long> done) { }
 
@@ -45,6 +51,7 @@ public final class LedgerWriter implements AutoCloseable {
     private final long fsyncIntervalNanos;
     private final int maxGroupBytes;
     private final BlockingQueue<Pending> queue;
+    private final int capacity;
     private final AtomicReference<LedgerSnapshot> snapshot = new AtomicReference<>();
     private final ConcurrentLinkedQueue<Waiter> fsyncWaiters = new ConcurrentLinkedQueue<>();
     private final Thread thread;
@@ -62,15 +69,16 @@ public final class LedgerWriter implements AutoCloseable {
     /** ASYNC writer with defaults. */
     public LedgerWriter(SegmentedLog log) { this(log, DEFAULT_DURABILITY); }
 
-    public LedgerWriter(SegmentedLog log, Durability durability) { this(log, durability, 0, DEFAULT_QUEUE, 4 << 20, 0); }
+    public LedgerWriter(SegmentedLog log, Durability durability) { this(log, durability, 0, DEFAULT_QUEUE, 4 << 20, DEFAULT_FSYNC_INTERVAL_NANOS); }
 
     public LedgerWriter(SegmentedLog log, Durability durability, long lingerNanos, int queueCapacity, int maxGroupBytes) {
-        this(log, durability, lingerNanos, queueCapacity, maxGroupBytes, 0);
+        this(log, durability, lingerNanos, queueCapacity, maxGroupBytes, DEFAULT_FSYNC_INTERVAL_NANOS);
     }
 
     /**
      * @param lingerNanos        extra wait to grow a group after the first pending append (0 = none)
-     * @param queueCapacity      bounded hand-off queue (backpressure)
+     * @param queueCapacity      hand-off queue bound (backpressure in {@link #append} / {@link #awaitCapacity}; the
+     *                           queue itself is unbounded so {@link #appendNoWait} never blocks)
      * @param maxGroupBytes      soft cap on bytes written per group
      * @param fsyncIntervalNanos minimum spacing of background fsyncs in ASYNC mode (0 = back to back);
      *                           bounds the power-loss window together with one fsync duration
@@ -82,7 +90,9 @@ public final class LedgerWriter implements AutoCloseable {
         this.lingerNanos = lingerNanos;
         this.fsyncIntervalNanos = fsyncIntervalNanos;
         this.maxGroupBytes = maxGroupBytes;
-        this.queue = new ArrayBlockingQueue<>(queueCapacity);
+        if (queueCapacity < 1) throw new IllegalArgumentException("queueCapacity");
+        this.capacity = queueCapacity;
+        this.queue = new LinkedBlockingQueue<>();
         this.written = log.nextOffset();
         this.durable = log.nextOffset(); // recovered data is treated as durable (it survived a restart)
         publish();
@@ -103,14 +113,34 @@ public final class LedgerWriter implements AutoCloseable {
 
     /**
      * Enqueues one batch; completes with its base offset once durable per {@code mode} (null = writer
-     * default). Blocks while the queue is full.
+     * default). Blocks while the queue holds {@code queueCapacity} appends (see {@link #awaitCapacity}).
      */
     public CompletableFuture<Long> append(List<byte[]> recs, Durability mode) throws InterruptedException {
+        awaitCapacity();
+        return appendNoWait(recs, mode);
+    }
+
+    /**
+     * Blocks while the queue holds {@code queueCapacity} or more appends (writer behind). Callers that must append
+     * under their own lock (Partition) call this <em>before</em> taking it and then use {@link #appendNoWait}, so a
+     * slow writer throttles producers without ever stalling a lock holder. The bound is soft: it can be overshot by
+     * the appends of threads that passed this check concurrently.
+     */
+    public void awaitCapacity() throws InterruptedException {
+        if (queue.size() < capacity) return;
+        while (queue.size() >= capacity && !closed && failure == null) {
+            if (Thread.interrupted()) throw new InterruptedException();
+            LockSupport.parkNanos(this, 50_000);
+        }
+    }
+
+    /** As {@link #append} but never blocks: no capacity wait (see {@link #awaitCapacity}). Safe under a caller's lock. */
+    public CompletableFuture<Long> appendNoWait(List<byte[]> recs, Durability mode) {
         if (recs.isEmpty()) throw new IllegalArgumentException("empty batch");
         RecordBatch.encodedSize(recs); // validate size eagerly
         if (closed || failure != null) return CompletableFuture.failedFuture(failure != null ? failure : new IllegalStateException("closed"));
         var f = new CompletableFuture<Long>();
-        queue.put(new Pending(List.copyOf(recs), System.currentTimeMillis(), mode == null ? durability : mode, f));
+        queue.offer(new Pending(List.copyOf(recs), System.currentTimeMillis(), mode == null ? durability : mode, f));
         return f;
     }
 
@@ -179,7 +209,8 @@ public final class LedgerWriter implements AutoCloseable {
                 else fsyncWaiters.add(new Waiter(end, o, p.done));
                 o = end;
             }
-            LockSupport.unpark(syncer);
+            // NONE/GROUP/EACH writers only need the syncer for fsync waiters (GROUP overrides); ASYNC always.
+            if (durability == Durability.ASYNC || !fsyncWaiters.isEmpty()) LockSupport.unpark(syncer);
         } catch (IOException | RuntimeException e) {
             // The in-memory tail may disagree with disk: fence the writer; reopening recovers.
             failure = e;
