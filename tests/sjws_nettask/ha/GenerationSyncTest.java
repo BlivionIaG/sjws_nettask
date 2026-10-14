@@ -113,6 +113,19 @@ class GenerationSyncTest {
         leader.append(group, List.of(ByteBuffer.wrap(new byte[] {1})));
         ReplicatedNode.driveAll(nodes);
         assertThrows(java.io.IOException.class, () -> bundles.pull(7L, "nope".getBytes(StandardCharsets.UTF_8)));
+        // close() waits for the worker, but only up to its limit.
+        var busy = syncs.get(0);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        busy.onWorker(() -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        assertFalse(busy.closeWithin(java.time.Duration.ofMillis(50)), "bounded: returns while the worker is busy");
+        release.countDown();
+        assertTrue(busy.closeWithin(java.time.Duration.ofSeconds(5)));
         for (var sync : syncs) {
             sync.close();
             assertFalse(sync.awaitApplied(java.time.Duration.ofMillis(100)), "closed worker takes no more work");

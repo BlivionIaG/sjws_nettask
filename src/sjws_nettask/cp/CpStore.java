@@ -220,7 +220,7 @@ public final class CpStore implements AutoCloseable {
         try {
             append(joinEntry(JOIN_ISSUE, tokenId, JoinTokens.sha256(secret), expires, nowMillis));
         } catch (ExecutionException e) {
-            return Outcome.error(503, "log");
+            return Outcome.error(503, logFailure(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
@@ -245,7 +245,7 @@ public final class CpStore implements AutoCloseable {
         try {
             append(joinEntry(JOIN_CONSUME, nodeId, tokenId, hash, nowMillis));
         } catch (ExecutionException e) {
-            return new JoinTokens.Result(null, false, "log");
+            return new JoinTokens.Result(null, false, logFailure(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new JoinTokens.Result(null, false, "log");
@@ -437,7 +437,7 @@ public final class CpStore implements AutoCloseable {
         try {
             append(proposeEntry(version, canonical), key, outcome, fp);
         } catch (ExecutionException e) {
-            return Outcome.error(503, "log");
+            return Outcome.error(503, logFailure(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
@@ -538,7 +538,7 @@ public final class CpStore implements AutoCloseable {
         try {
             append(rbacEntry(san, role), key, outcome, fp);
         } catch (ExecutionException e) {
-            return Outcome.error(503, "log");
+            return Outcome.error(503, logFailure(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
@@ -563,7 +563,7 @@ public final class CpStore implements AutoCloseable {
         try {
             append(bytes(REVOKE, nodeId), key, outcome, fp);
         } catch (ExecutionException e) {
-            return Outcome.error(503, "log");
+            return Outcome.error(503, logFailure(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
@@ -588,7 +588,7 @@ public final class CpStore implements AutoCloseable {
         try {
             append(rolloutEntry(stages), key, outcome, fp);
         } catch (ExecutionException e) {
-            return Outcome.error(503, "log");
+            return Outcome.error(503, logFailure(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
@@ -614,7 +614,7 @@ public final class CpStore implements AutoCloseable {
         try {
             append(ByteBuffer.wrap(new byte[] {ADVANCE}), key, outcome, fp);
         } catch (ExecutionException e) {
-            return Outcome.error(503, "log");
+            return Outcome.error(503, logFailure(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
@@ -840,7 +840,7 @@ public final class CpStore implements AutoCloseable {
                 return Outcome.error(503, "raft index");
             }
         } catch (ExecutionException e) {
-            return Outcome.error(503, "log");
+            return Outcome.error(503, logFailure(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
@@ -977,6 +977,19 @@ public final class CpStore implements AutoCloseable {
         }
         json.append("},\"health\":").append(LastGoodFiles.jsonString(health)).append(",\"appliedVersion\":")
                 .append(applied).append(",\"lag\":").append(lag).append(",\"revoked\":").append(revoked).append('}');
+    }
+
+    /** Reason text when an append fails; a committed-but-unapplied entry is said so, not reported as lost. */
+    static final String COMMITTED_NOT_APPLIED = "committed, not applied (node closing): the write landed;"
+            + " do not retry without the same Idempotency-Key";
+
+    /**
+     * {@code "log"} for a write that did not land (not leader, apply lag, IO). For
+     * {@link sjws_nettask.cluster.CommittedNotAppliedException} the entry is in the log and will be applied on
+     * every replica, so the caller must not treat it as failed: for a join token it is consumed.
+     */
+    static String logFailure(ExecutionException e) {
+        return e.getCause() instanceof sjws_nettask.cluster.CommittedNotAppliedException ? COMMITTED_NOT_APPLIED : "log";
     }
 
     private long append(ByteBuffer entry) throws InterruptedException, ExecutionException {

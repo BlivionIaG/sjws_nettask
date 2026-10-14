@@ -855,8 +855,13 @@ class RaftClusterTest {
         assertTrue(interrupted.get(), "the slow callback was interrupted once the drain budget ran out");
         var failure = assertThrows(java.util.concurrent.ExecutionException.class,
                 () -> later.get(1, java.util.concurrent.TimeUnit.SECONDS));
-        assertInstanceOf(IllegalStateException.class, failure.getCause());
+        var notApplied = assertInstanceOf(CommittedNotAppliedException.class, failure.getCause(),
+                "a committed entry's future says committed, not a generic failure");
+        assertEquals(GROUP.value(), notApplied.group());
+        assertTrue(notApplied.index() > 0);
         assertEquals(0, after.get(), "nothing delivered after close()");
+        // "later": its callback and its future were abandoned, and counted.
+        assertTrue(node.abandonedDeliveries(GROUP) >= 2, "abandoned " + node.abandonedDeliveries(GROUP));
     }
 
     /**
@@ -927,5 +932,100 @@ class RaftClusterTest {
             Thread.sleep(1);
         }
         return true;
+    }
+
+    @Test
+    void closeLogsOneWarningWithTheAbandonedIndexRange() throws Exception {
+        var records = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        var logger = java.util.logging.Logger.getLogger(RaftGroup.class.getName());
+        var handler = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                if (record.getLevel() == java.util.logging.Level.WARNING) {
+                    records.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        logger.addHandler(handler);
+        try {
+            var executor = new DeliveryExecutor("g", 100);
+            var parked = new java.util.concurrent.CountDownLatch(1);
+            executor.submit(() -> {
+                parked.countDown();
+                try {
+                    Thread.sleep(60_000);
+                } catch (InterruptedException e) {
+                    // interrupted by close
+                }
+            }, 5);
+            assertTrue(parked.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            var committed = new java.util.concurrent.CompletableFuture<Void>();
+            var uncommitted = new java.util.concurrent.CompletableFuture<Void>();
+            executor.submit(() -> { }, 6);
+            executor.submit(() -> committed.complete(null), committed, 7);
+            executor.submit(() -> uncommitted.complete(null), uncommitted);
+            assertTrue(executor.close(Duration.ofMillis(200)));
+            assertEquals(3, executor.abandoned());
+            var abandonedWarnings = records.stream().filter(m -> m.contains("close abandoned")).toList();
+            assertEquals(1, abandonedWarnings.size(), "one WARN per group: " + records);
+            assertTrue(abandonedWarnings.get(0).contains("1 commit callbacks and 2 append futures"), abandonedWarnings.get(0));
+            assertTrue(abandonedWarnings.get(0).contains("indexes 6..7"), abandonedWarnings.get(0));
+            var e = assertThrows(java.util.concurrent.ExecutionException.class, committed::get);
+            assertEquals(7, assertInstanceOf(CommittedNotAppliedException.class, e.getCause()).index());
+            e = assertThrows(java.util.concurrent.ExecutionException.class, uncommitted::get);
+            assertFalse(e.getCause() instanceof CommittedNotAppliedException, "not committed: plain failure");
+            // After close: dropped and counted, no further WARN.
+            var late = new java.util.concurrent.CompletableFuture<Void>();
+            executor.submit(() -> late.complete(null), late, 8);
+            assertEquals(4, executor.abandoned());
+            assertInstanceOf(CommittedNotAppliedException.class,
+                    assertThrows(java.util.concurrent.ExecutionException.class, late::get).getCause());
+        } finally {
+            logger.removeHandler(handler);
+        }
+    }
+
+    @Test
+    void lagPastTheWarnThresholdIsCountedOncePerBacklog() throws Exception {
+        var executor = new DeliveryExecutor("g", 2); // warns at 2 x LAG_WARN_FACTOR = 8
+        var release = new java.util.concurrent.CountDownLatch(1);
+        executor.submit(() -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, 1);
+        for (int i = 2; i <= 20; i++) {
+            executor.submit(() -> { }, i);
+        }
+        assertEquals(1, executor.lagWarnings(), "one warning per backlog");
+        release.countDown();
+        assertTrue(executor.awaitIdle(Duration.ofSeconds(5)));
+        for (int round = 0; round < 2; round++) {
+            var hold = new java.util.concurrent.CountDownLatch(1);
+            executor.submit(() -> {
+                try {
+                    hold.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, 100 + round);
+            for (int i = 0; i < 10; i++) {
+                executor.submit(() -> { }, 200 + i);
+            }
+            hold.countDown();
+            assertTrue(executor.awaitIdle(Duration.ofSeconds(5)));
+        }
+        assertEquals(3, executor.lagWarnings(), "re-armed each time the queue drained");
+        assertTrue(executor.close(Duration.ofSeconds(1)));
     }
 }

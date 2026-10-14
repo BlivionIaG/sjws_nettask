@@ -311,4 +311,14 @@ class CpStoreTest {
         return ConfigDocument.of(document.server(), document.acme(), document.routing(), document.middleware(),
                 document.access(), document.node(), document.schemaVersion(), version, null, null);
     }
+
+    @org.junit.jupiter.api.Test
+    void aCommittedButUnappliedWriteIsNotReportedAsLost() {
+        var committed = new java.util.concurrent.ExecutionException(
+                new sjws_nettask.cluster.CommittedNotAppliedException("cp-config", 42));
+        org.junit.jupiter.api.Assertions.assertEquals(CpStore.COMMITTED_NOT_APPLIED, CpStore.logFailure(committed));
+        org.junit.jupiter.api.Assertions.assertEquals("log",
+                CpStore.logFailure(new java.util.concurrent.ExecutionException(new IllegalStateException("x"))));
+    }
 }
+

@@ -310,6 +310,16 @@ public final class ReplicatedNode implements ClusterNode {
         return group(groupId).deliveryLag();
     }
 
+    /** Deliveries of one group that {@link #close()} dropped after the drain budget (applied on reopen by replay). */
+    public long abandonedDeliveries(GroupId groupId) {
+        return group(groupId).abandonedDeliveries();
+    }
+
+    /** Times one group's apply lag crossed the warn threshold (4 x the lag limit; follower queues are unbounded). */
+    public long deliveryLagWarnings(GroupId groupId) {
+        return group(groupId).deliveryLagWarnings();
+    }
+
     /** Highest apply lag seen by one group. */
     public long maxDeliveryLag(GroupId groupId) {
         return group(groupId).maxDeliveryLag();
