@@ -569,4 +569,102 @@ class RaftClusterTest {
         assertEquals(threads * perThread - 1, parents);
         assertEquals(parents, nested, "an append made inside a callback was stranded");
     }
+
+    @Test
+    void slowCallbackDoesNotHoldUpHeartbeatsOrVotes() throws Exception {
+        var cluster = cluster(3, false, Durability.RELAXED, 1_000_000);
+        elect(cluster);
+        var leader = leader(cluster);
+        long term = leader.openGroup(GROUP, cluster.options, null).term();
+        var started = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        leader.openGroup(GROUP, cluster.options, entry -> {
+            if (text(entry.entry()).equals("slow")) {
+                started.countDown();
+                try {
+                    release.await(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        var slow = Thread.ofPlatform().start(() -> {
+            leader.append(GROUP, List.of(bytes("slow")));
+            ReplicatedNode.driveAll(cluster.nodes); // commits "slow" and drains it on this thread
+        });
+        try {
+            assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            long begin = System.nanoTime();
+            for (int round = 0; round < 10; round++) {
+                cluster.clock.advance(Duration.ofMillis(40)); // heartbeat interval; election is 100 ms
+                for (var node : cluster.nodes) {
+                    node.drive();
+                }
+            }
+            long tookMillis = (System.nanoTime() - begin) / 1_000_000;
+            assertTrue(tookMillis < 300, "ticks waited behind the slow callback: " + tookMillis + " ms");
+            for (var node : cluster.nodes) {
+                assertEquals(term, node.openGroup(GROUP, cluster.options, null).term(), "no election");
+            }
+            assertTrue(leader.openGroup(GROUP, cluster.options, null).isLeader());
+        } finally {
+            release.countDown();
+            slow.join(5_000);
+        }
+    }
+
+    @Test
+    void concurrentAppendsWithRaftTicksDeliverEachEntryOnceInOrder() throws Exception {
+        var cluster = cluster(1, false, Durability.RELAXED, 1_000_000);
+        elect(cluster);
+        var node = cluster.nodes.get(0);
+        var indexes = java.util.Collections.synchronizedList(new ArrayList<Long>());
+        var inFlight = new java.util.concurrent.atomic.AtomicInteger();
+        var overlaps = new java.util.concurrent.atomic.AtomicInteger();
+        node.openGroup(GROUP, cluster.options, entry -> {
+            if (inFlight.incrementAndGet() != 1) {
+                overlaps.incrementAndGet();
+            }
+            indexes.add(entry.index());
+            inFlight.decrementAndGet();
+        });
+        long base = node.append(GROUP, List.of(bytes("base"))).get().index();
+        indexes.clear();
+        int threads = 8;
+        int perThread = 200;
+        var start = new java.util.concurrent.CountDownLatch(1);
+        var stop = new java.util.concurrent.atomic.AtomicBoolean();
+        var ticker = Thread.ofPlatform().start(() -> {
+            while (!stop.get()) {
+                node.drive(); // tick path: tryLock
+            }
+        });
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            var futures = new ArrayList<java.util.concurrent.Future<?>>();
+            for (int t = 0; t < threads; t++) {
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < perThread; i++) {
+                        node.append(GROUP, List.of(bytes("e"))).get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (var f : futures) {
+                f.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            stop.set(true);
+            ticker.join(5_000);
+            pool.shutdownNow();
+        }
+        assertEquals(0, overlaps.get());
+        var seen = List.copyOf(indexes);
+        assertEquals(threads * perThread, seen.size(), "each entry delivered exactly once");
+        for (int i = 0; i < seen.size(); i++) {
+            assertEquals(base + 1 + i, seen.get(i), "in order, no gaps or repeats");
+        }
+    }
 }
