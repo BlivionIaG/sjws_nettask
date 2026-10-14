@@ -93,10 +93,11 @@ final class LogOffsets {
                     var r = rb.records().get(i);
                     var k = LogCompaction.key(r);
                     if (k == null || k.remaining() + 4 + 16 != r.length) continue;
-                    var ks = StandardCharsets.UTF_8.decode(k).toString();
+                    int klen = k.remaining();
+                    var ks = StandardCharsets.UTF_8.decode(k).toString(); // consumes k
                     int z = ks.indexOf('\0');
                     if (z <= 0) continue;
-                    var v = ByteBuffer.wrap(r, 4 + k.remaining(), 16);
+                    var v = ByteBuffer.wrap(r, 4 + klen, 16);
                     this.commits.computeIfAbsent(ks.substring(0, z), t -> new ConcurrentHashMap<>())
                             .put(ks.substring(z + 1), new Commit(v.getLong(), v.getLong(), 0));
                 }

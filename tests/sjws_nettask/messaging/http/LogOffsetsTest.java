@@ -113,7 +113,7 @@ class LogOffsetsTest {
     @Test
     void aCommittedButUnfetchedGroupPinsRetentionAndExpiryReleasesIt() throws Exception {
         var now = new AtomicLong(1_000_000);
-        try (var topics = topics(new LogRetention(2 * SEG, 0), 60_000, now)) {
+        try (var topics = topics(new LogRetention(1, 0), 60_000, now)) {
             var h = new MessagingHttp(topics);
             LogRetentionTest.fill(h, "t", 60);
             assertEquals(200, put(h, "t", "slow", 3).status());
