@@ -1,7 +1,8 @@
 # Configuration reference
 
 The canonical list of options, environment variables and defaults is the option tables in the
-[command-line page](command-line.md) (HTTP/1.1 options and the [HTTP/3](http3.md) table);
+[command-line page](command-line.md), the [HTTP/2](http2.md) and [HTTP/3](http3.md) tables and the
+[observability](../operations/observability.md) table;
 `java -jar sjws_nettask-<version>.jar --help` prints the same list. `DocsConsistencyTest` fails the
 build if those tables and `--help` disagree. This page explains how values are read.
 
@@ -11,7 +12,7 @@ build if those tables and `--help` disagree. This page explains how values are r
 
 * `[port]` and `[html folder]` are positional (first and second non-option argument); `--options`
   may appear anywhere.
-* Every option except `--help` has a `WEB_SERVER_*` environment variable. **Environment variables
+* Every option has a `WEB_SERVER_*` environment variable, except `--help` and the `--daemon`, `--stop`, `--status` and `--restart` actions. **Environment variables
   override command-line arguments.**
 * The TLS key password is accepted only from `WEB_SERVER_TLS_KEY_PASSWORD` or a file
   (`--key-password-file`), never as an argument; the variable wins over the file.

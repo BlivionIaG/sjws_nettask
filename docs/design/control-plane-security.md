@@ -1,7 +1,8 @@
 # Control plane: distributable access policy, operator RBAC and audit
 
-Status: building blocks in `sjws_nettask.controlplane`. Nothing is wired into the server yet, so
-a node that is not managed by a control plane (CP) runs exactly the code it ran before.
+Status: building blocks in `sjws_nettask.controlplane`. `Rbac`, `AuditLog` and the roles back the control-plane
+admin API (`cp.CpStore`, `cp.AdminServer`); `LivePolicy` and `AccessPolicyDocument` have no caller yet. A node that
+is not managed by a control plane (CP) loads none of it and runs exactly the code it ran before.
 `docs/design/control-plane.md` (the HA workstream) owns the overall CP design. This page covers
 only the security pieces, and the seams they leave for it.
 
@@ -40,6 +41,19 @@ publishes them with a compare-and-set:
   proxy router to attach to a route, never as a node default.
 * An invalid document throws, and the active policy stays in place.
 
+In order, `apply` does this:
+
+```mermaid
+flowchart TD
+    a["LivePolicy.apply(document)"] --> s{"The scope matches<br/>this node's labels?"}
+    s -->|no| nf["NOT_FOR_THIS_NODE<br/>nothing is compiled"]
+    s -->|yes| c["Compile the rules<br/>a bad pattern or owner<br/>throws, the active<br/>policy stays"]
+    c --> v{"Version above<br/>the active one?"}
+    v -->|no| st["STALE"]
+    v -->|yes| p["Publish version and rules<br/>together with a<br/>compare-and-set"]
+    p --> ap["APPLIED<br/>the next policy call<br/>reads it"]
+```
+
 To install it, build the handler with `new StaticFileHandler(root, …, livePolicy)` in place of
 the static `AccessRules`, only when the node is CP-managed.
 
@@ -65,6 +79,18 @@ API and the admin TUI make before every action.
 * `putOperator` and `removeOperator` need `MANAGE_OPERATORS`. Each change is atomic and takes
   effect immediately, so a removed or disabled operator is refused on its next request. A change that would leave no
   enabled admin is refused.
+
+What `authorize` does, in order. The first two steps end in a denial when their condition holds. The
+audit write then sits on every path, and an allowed decision whose line cannot be written is denied:
+
+```mermaid
+flowchart TD
+    a["Rbac.authorize(certificate,<br/>permission, target,<br/>version)"] --> c1["1. No known, enabled<br/>operator for the<br/>certificate subject: the<br/>decision is denied,<br/>unauthenticated"]
+    c1 --> c2["2. The operator's role<br/>does not allow the<br/>permission: the decision<br/>is denied"]
+    c2 --> c3["3. Otherwise the decision<br/>is allowed"]
+    c3 --> c4["4. The decision,<br/>whichever it is, is<br/>appended to the audit<br/>log. If the append fails,<br/>it becomes denied: audit<br/>unavailable"]
+    c4 --> c5["5. The decision is<br/>returned. After the<br/>action, complete()<br/>records ok or failed"]
+```
 
 ## Audit trail
 
