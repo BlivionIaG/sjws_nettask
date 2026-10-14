@@ -80,6 +80,8 @@ final class CpStoreControlPlane implements ControlPlane {
     private long started;
     private Thread driver;
     private volatile boolean running;
+    /** Real-time sleep after each voter's {@code drive()} in a round; 0 outside stress tests. */
+    private volatile long interTickGapMillis;
 
     CpStoreControlPlane(Path dir) {
         this.dir = dir;
@@ -445,7 +447,18 @@ final class CpStoreControlPlane implements ControlPlane {
         }
         for (var voter : order) {
             voter.store.drive();
+            if (this.interTickGapMillis > 0) {
+                pause(this.interTickGapMillis);
+            }
         }
+    }
+
+    /**
+     * Stress hook (#196): sleeps {@code gap} after each voter's tick in every drive round, which
+     * widens the window for a {@link ClusterClock#advance} to land mid-round.
+     */
+    void interTickGap(Duration gap) {
+        this.interTickGapMillis = gap.toMillis();
     }
 
     private static void pause() {
