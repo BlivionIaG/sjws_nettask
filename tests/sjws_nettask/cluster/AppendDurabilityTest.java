@@ -173,6 +173,91 @@ class AppendDurabilityTest {
         c.close();
     }
 
+    /** Security #203 re-review: a STRICT entry stalled after acceptance shows in gauges and one WARN. */
+    @Test
+    void strictEntryStalledAfterAcceptanceIsVisible() throws Exception {
+        var records = new java.util.concurrent.CopyOnWriteArrayList<java.util.logging.LogRecord>();
+        var handler = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        var jul = java.util.logging.Logger.getLogger(RaftGroup.class.getName());
+        jul.addHandler(handler);
+        try {
+            var c = cluster(Durability.RELAXED);
+            var leader = c.nodes.get(0);
+            assertEquals(0, leader.strictPending(GROUP));
+            assertEquals(0L, leader.oldestStrictPendingAgeNanos(GROUP));
+            var strict = leader.append(GROUP, List.of(payload("s")), Durability.STRICT); // n2 was just heard
+            c.net.cut(leader.self(), c.nodes.get(1).self());
+            c.net.cut(c.nodes.get(1).self(), c.nodes.get(2).self());
+            for (int i = 0; i < 25; i++) {
+                c.clock.advance(Duration.ofMillis(40));
+                c.drive();
+            }
+            assertFalse(strict.isDone());
+            assertEquals(1, leader.strictPending(GROUP));
+            assertTrue(leader.oldestStrictPendingAgeNanos(GROUP) >= Duration.ofMillis(900).toNanos());
+            var warnings = records.stream().filter(r -> r.getLevel() == java.util.logging.Level.WARNING
+                    && r.getMessage().contains("STRICT entry")).toList();
+            assertEquals(1, warnings.size(), "one WARN per stalled entry, not one per tick");
+            assertTrue(warnings.get(0).getMessage().contains("1 of 2 data copies"), warnings.get(0).getMessage());
+            assertEquals(0, c.nodes.get(1).strictPending(GROUP), "followers report 0");
+            c.net.heal(leader.self(), c.nodes.get(1).self());
+            c.net.heal(c.nodes.get(1).self(), c.nodes.get(2).self());
+            for (int i = 0; i < 25 && !strict.isDone(); i++) {
+                c.clock.advance(Duration.ofMillis(40));
+                c.drive();
+            }
+            if (c.groups.get(0).isLeader()) {
+                strict.get(5, TimeUnit.SECONDS);
+                assertEquals(0, leader.strictPending(GROUP));
+                assertEquals(0L, leader.oldestStrictPendingAgeNanos(GROUP));
+            }
+            c.close();
+        } finally {
+            jul.removeHandler(handler);
+        }
+    }
+
+    @Test
+    void appendRespNamingAnotherVoterIsDropped() throws Exception {
+        var n1 = new NodeId(1, "n1");
+        var n2 = new NodeId(2, "n2");
+        var n3 = new NodeId(3, "n3");
+        var clock = new FakeClock(0L);
+        var group = new RaftGroup(GROUP, n1, false, java.util.Set.of(n3), java.util.Set.of(n1, n2, n3),
+                List.of(n2, n3), w -> w == 1 ? n1 : w == 2 ? n2 : w == 3 ? n3 : null, QuorumPolicy.majority(), opts(),
+                new MemoryLogStorage(), (to, frame) -> { }, clock, null, 1024);
+        clock.advance(Duration.ofSeconds(1));
+        group.tick(clock.nanoTime());
+        group.tick(clock.nanoTime());
+        group.handle(n3, reply(RaftGroup.PRE_VOTE_RESP, 0, 3, true), clock.nanoTime());
+        group.handle(n3, reply(RaftGroup.VOTE_RESP, 1, 3, true), clock.nanoTime());
+        assertTrue(group.facade().isLeader());
+        long term = group.facade().term();
+        // The witness (authenticated as n3) sends an ack in n2's name: dropped.
+        var forged = ByteBuffer.allocate(21).putLong(term).putInt(2).put((byte) 1).putLong(1);
+        group.handle(n3, new SimTransport.Frame(GROUP, RaftGroup.APPEND_RESP, forged.array()), clock.nanoTime());
+        var refused = group.append(List.of(payload("s")), Durability.STRICT);
+        assertTrue(refused.isCompletedExceptionally(), "a forged ack must not make n2 look reachable");
+        var genuine = ByteBuffer.allocate(21).putLong(term).putInt(2).put((byte) 1).putLong(1);
+        group.handle(n2, new SimTransport.Frame(GROUP, RaftGroup.APPEND_RESP, genuine.array()), clock.nanoTime());
+        var accepted = group.append(List.of(payload("s")), Durability.STRICT);
+        assertFalse(accepted.isCompletedExceptionally(), "n2's own ack counts");
+        group.closeDeliveries(Duration.ofSeconds(1));
+    }
+
     @Test
     void relaxedOverrideInAStrictGroupStaysStrict() throws Exception {
         var c = cluster(Durability.STRICT);

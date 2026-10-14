@@ -99,13 +99,22 @@ been silent for a lease). That keeps a degraded group writable for RELAXED appen
 has heard from nobody yet, so it refuses STRICT overrides until its first heartbeat round is
 answered; retry. What remains: a data node that fails after a STRICT override was accepted
 holds that entry, and every entry behind it, until the node is back or a leader with two
-reachable data copies takes over. A STRICT group (`GroupOptions.durability()`) is unchanged and
-has no fail-fast.
+reachable data copies takes over (a new leader rescans the marker and needs the same copies, so
+stepping down does not help). Bringing the data node back is the only way out today; a bounded
+wait or an operator escape is tracked in #208. The leader makes such a stall visible:
+`ReplicatedNode.strictPending(group)` (uncommitted STRICT overrides) and
+`oldestStrictPendingAgeNanos(group)` (0 when none; followers report 0), and one WARNING per
+entry once it has waited 2 x lease, naming the group, the index and how many data copies it has.
+A STRICT group (`GroupOptions.durability()`) is unchanged and has no fail-fast.
+
+The leader counts an append response only when the voter id in its body matches the
+authenticated sender of the frame, so one member cannot refresh another's liveness or
+`matchIndex` (a member holding the group key can still lie about itself, #175).
 
 The marker byte is protected on the wire (inside the HMAC-covered frame body) but not on disk:
 `FileLogStorage` records (`index, term, len, data`) carry no checksum, so a bit flip on disk can
 turn `USER_STRICT` (4) into `USER` (0), or garble the payload, without detection. Per-record
-CRCs are a separate, tracked change. Every member holds the group key, so a compromised member
+CRCs are tracked in #207. Every member holds the group key, so a compromised member
 can forge the marker either way (the #175 limitation).
 
 ### Restart safety and the exact RELAXED guarantee
