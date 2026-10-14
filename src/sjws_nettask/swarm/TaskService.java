@@ -271,13 +271,18 @@ public final class TaskService {
         List<Task> out = null;
         for (int i = 0; i < this.shards; i++) {
             int s = (home + i) % this.shards;
-            if (!full && ps.ready.get(s) <= 0) continue;
+            long seen = ps.ready.get(s);
+            if (!full && seen <= 0) continue;
             int want = max - (out == null ? 0 : out.size());
             var p = partition(pool, s);
             this.shardPolls.increment();
             var got = p.poll(WORKERS, worker, want, visibilityMs);
             if (got.isEmpty()) {
-                ps.ready.set(s, 0); // the hint was stale (or a redelivery was counted elsewhere)
+                var hook = this.afterEmptyPoll;
+                if (hook != null) hook.run();
+                // The hint was stale. Reset only if no submit raced in since we read it: a blind set(s, 0) here lost
+                // the hint of a submit landing between the poll and the reset, and a claim then parked a full slice.
+                ps.ready.compareAndSet(s, seen, 0);
                 continue;
             }
             ps.taken(s, got.size());
@@ -292,6 +297,9 @@ public final class TaskService {
         }
         return out == null ? List.of() : out;
     }
+
+    /** Test seam: run between a sharded poll that came back empty and the reset of that shard's ready hint. */
+    volatile Runnable afterEmptyPoll;
 
     /** Longest park on the home shard of a waiting sharded claim before the other shards are swept again. */
     static final long SHARD_WAIT_SLICE_NANOS = 2_000_000;

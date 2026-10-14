@@ -253,6 +253,13 @@ public class SwarmBench {
         System.out.printf("heartbeat mode=%s dispatch_tasks/s=%.0f%s%n", mode, done / secs, tick);
     }
 
+    /** The measured-call index carried in the first 8 bytes of a reqreply body, or -1 (warm-up, short body). */
+    static int hopIndex(byte[] body, long warm, int measured) {
+        if (body.length < 8) return -1;
+        long k = java.nio.ByteBuffer.wrap(body).getLong() - warm;
+        return k >= 0 && k < measured ? (int) k : -1;
+    }
+
     static void reqreply(Swarm s, int rate, double secs, int workers) throws Exception {
         if (workers < 1) throw new IllegalArgumentException("workers >= 1: " + workers);
         if (rate < 1) throw new IllegalArgumentException("rate >= 1: " + rate);
@@ -261,6 +268,14 @@ public class SwarmBench {
         long callDeadlineMs = Long.getLong("sjws.bench.callDeadlineMs", 10_000);
         var seen = new AtomicLong();
         var t = s.tasks();
+        // Per-hop timestamps (absolute nanoTime, by call index; the index rides in the first 8 body bytes):
+        // submitted = call() returned, claimed = claim() returned it, written = replyAll() returned for its batch.
+        long gap0 = 1_000_000_000L / rate;
+        int measured = (int) ((long) (secs * 1e9 / gap0));
+        long warm0 = (long) (2e9 / gap0);
+        var submitted = new long[measured];
+        var claimed = new long[measured];
+        var written = new long[measured];
         var stop = new AtomicBoolean();
         var pool = new ArrayList<Thread>(workers);
         for (int w = 0; w < workers; w++) {
@@ -272,6 +287,11 @@ public class SwarmBench {
                     // blocking claim (#99, 50 ms), then one reply per task and one batched fenced ack (#100)
                     var got = t.claim("echo", consumer, 64, 30_000, 50_000_000L);
                     if (got.isEmpty()) continue;
+                    long tc = System.nanoTime();
+                    for (Task task : got) {
+                        int k = hopIndex(task.envelope().body(), warm0, measured);
+                        if (k >= 0) claimed[k] = tc;
+                    }
                     if (dropEvery > 0) {
                         var keep = new ArrayList<Task>(got.size());
                         for (Task task : got) {
@@ -283,6 +303,11 @@ public class SwarmBench {
                     var bodies = new ArrayList<byte[]>(got.size());
                     for (Task task : got) bodies.add(task.envelope().body());
                     t.replyAll(got, producer, seq + 1, "", bodies);
+                    long tw = System.nanoTime();
+                    for (byte[] b : bodies) {
+                        int k = hopIndex(b, warm0, measured);
+                        if (k >= 0) written[k] = tw;
+                    }
                     seq += got.size();
                 }
             }));
@@ -295,16 +320,21 @@ public class SwarmBench {
         var ok = new AtomicLong();
         var failed = new AtomicLong();
         long start = System.nanoTime();
-        var body = new byte[256];
+        var delivered = new long[lat.length];
         for (long i = 0; i < total; i++) {
             long due = start + i * gap;
             while (System.nanoTime() < due) Thread.onSpinWait();
             long idx = i - warm;
+            var body = new byte[256];
+            java.nio.ByteBuffer.wrap(body).putLong(i);
             var f = s.replies().call("echo", "", body, System.currentTimeMillis() + callDeadlineMs, "");
+            if (idx >= 0) submitted[(int) idx] = System.nanoTime();
             f.whenComplete((r, e) -> {
                 if (idx >= 0) {
                     if (e == null) {
-                        lat[(int) idx] = System.nanoTime() - due;
+                        long td = System.nanoTime();
+                        delivered[(int) idx] = td;
+                        lat[(int) idx] = td - due;
                         ok.incrementAndGet();
                     } else {
                         failed.incrementAndGet(); // a failure is a failure, never a 0 us sample
@@ -324,6 +354,26 @@ public class SwarmBench {
         System.out.printf("reqreply workers=%d rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d ok=%d failed=%d missing=%d%n",
                 workers, rate, n == 0 ? 0 : pct(okLat, n, 0.50) / 1e3, n == 0 ? 0 : pct(okLat, n, 0.99) / 1e3,
                 n == 0 ? 0 : pct(okLat, n, 1.0) / 1e3, n, ok.get(), failed.get(), missing);
+        // per-hop p50/p99 over completed calls with every timestamp present
+        long[][] hop = new long[4][lat.length];
+        int h = 0;
+        for (int k = 0; k < lat.length; k++) {
+            if (lat[k] < 0 || claimed[k] == 0 || written[k] == 0) continue;
+            long due = start + (k + warm) * gap;
+            hop[0][h] = submitted[k] - due;
+            hop[1][h] = claimed[k] - submitted[k];
+            hop[2][h] = written[k] - claimed[k];
+            hop[3][h] = delivered[k] - written[k];
+            h++;
+        }
+        String[] names = {"submit", "queue_to_claim", "claim_to_reply_written", "reply_delivered"};
+        var sb = new StringBuilder("reqreply hops n=" + h);
+        for (int x = 0; x < 4; x++) {
+            var v = java.util.Arrays.copyOf(hop[x], h);
+            sb.append(String.format(" %s_p50_us=%.1f %s_p99_us=%.1f", names[x], h == 0 ? 0 : pct(v, h, 0.50) / 1e3,
+                    names[x], h == 0 ? 0 : pct(v, h, 0.99) / 1e3));
+        }
+        System.out.println(sb);
         if (failed.get() + missing > 0) {
             System.out.println("INVALID: " + failed.get() + " failed, " + missing + " missing of " + lat.length);
             invalid = true;
