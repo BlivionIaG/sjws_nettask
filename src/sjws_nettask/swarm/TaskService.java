@@ -194,7 +194,7 @@ public final class TaskService {
         return p;
     }
 
-    /** The pool's dead-letter queue ({@code tasks.P.dlq}). */
+    /** Shard 0's dead-letter queue ({@code tasks.P.dlq}); the whole pool's for an unsharded pool. See {@link #deadLetterQueues}. */
     public Partition deadLetters(String pool) {
         return partition(pool).deadLetterQueue();
     }
@@ -202,6 +202,59 @@ public final class TaskService {
     /** The dead-letter queue of one shard. */
     public Partition deadLetters(String pool, int shard) {
         return partition(pool, shard).deadLetterQueue();
+    }
+
+    /** Every shard's dead-letter queue, shard order ({@link #deadLetters(String)} is shard 0 only). */
+    public List<Partition> deadLetterQueues(String pool) {
+        var out = new ArrayList<Partition>(this.shards);
+        for (int s = 0; s < this.shards; s++) out.add(deadLetters(pool, s));
+        return out;
+    }
+
+    /** One dead-lettered task and the shard whose DLQ holds it (settle it on {@code deadLetters(pool, shard)}). */
+    public record DeadLetter(int shard, sjws_nettask.messaging.delivery.Delivery delivery) { }
+
+    /**
+     * Polls the pool's dead letters across all shards for {@code group} (subscribed from the oldest on first use),
+     * sweeping from shard 0 until {@code max} are leased.
+     */
+    public List<DeadLetter> pollDeadLetters(String pool, String group, String consumer, int max, long visibilityMs) {
+        var out = new ArrayList<DeadLetter>();
+        for (int s = 0; s < this.shards && out.size() < max; s++) {
+            var dlq = deadLetters(pool, s);
+            dlq.subscribe(group, true);
+            for (var d : dlq.poll(group, consumer, max - out.size(), visibilityMs)) out.add(new DeadLetter(s, d));
+        }
+        return out;
+    }
+
+    /**
+     * Pool totals over all shards: the worker group's counts summed, the dead letters still in the DLQs, and the
+     * oldest unresolved task's enqueue time (0 if none). Exact, from each shard's published counts; unlike
+     * {@link #readyHints}, which are cheap claim-path hints only and may be stale.
+     */
+    public record PoolCounts(int shards, sjws_nettask.messaging.delivery.DeliverySnapshot.Counts workers, long deadLetterQueueSize,
+            long oldestUnresolvedAtMs) { }
+
+    public PoolCounts counts(String pool) {
+        long enq = 0, infl = 0, acked = 0, dead = 0, redel = 0, dlqSize = 0, oldest = 0;
+        for (int s = 0; s < this.shards; s++) {
+            var p = partition(pool, s);
+            var g = p.counts().groups().get(WORKERS);
+            if (g != null) {
+                var c = g.counts();
+                enq += c.enqueued();
+                infl += c.inFlight();
+                acked += c.acked();
+                dead += c.deadLettered();
+                redel += c.redeliveries();
+                if (g.oldestUnresolvedAtMs() > 0 && (oldest == 0 || g.oldestUnresolvedAtMs() < oldest)) oldest = g.oldestUnresolvedAtMs();
+            }
+            var dlq = p.deadLetterQueue();
+            if (dlq != null) dlqSize += dlq.counts().liveMessages();
+        }
+        return new PoolCounts(this.shards, new sjws_nettask.messaging.delivery.DeliverySnapshot.Counts(enq, infl, acked, dead, redel),
+                dlqSize, oldest);
     }
 
     /** Submits a task; a repeated {@code (producerId, seq)} in the dedup window is dropped (§4.4). */
@@ -271,13 +324,19 @@ public final class TaskService {
         List<Task> out = null;
         for (int i = 0; i < this.shards; i++) {
             int s = (home + i) % this.shards;
-            if (!full && ps.ready.get(s) <= 0) continue;
+            long seen = ps.ready.get(s);
+            if (!full && seen <= 0) continue;
             int want = max - (out == null ? 0 : out.size());
             var p = partition(pool, s);
             this.shardPolls.increment();
             var got = p.poll(WORKERS, worker, want, visibilityMs);
             if (got.isEmpty()) {
-                ps.ready.set(s, 0); // the hint was stale (or a redelivery was counted elsewhere)
+                this.afterEmptyPoll.run();
+                // The hint was stale. Reset only if no submit raced in since we read it: a blind set(s, 0) here lost
+                // the hint of a submit landing between the poll and the reset, and a claim then parked a full slice.
+                // A failed CAS also keeps the stale part of the hint: at worst one extra empty poll later (the next
+                // empty poll or full sweep resets it). Deliberate: do not "fix" this back to a blind set.
+                ps.ready.compareAndSet(s, seen, 0);
                 continue;
             }
             ps.taken(s, got.size());
@@ -292,6 +351,14 @@ public final class TaskService {
         }
         return out == null ? List.of() : out;
     }
+
+    static final Runnable NO_HOOK = () -> { };
+
+    /**
+     * Visible for testing only: runs between a sharded poll that came back empty and the reset of that shard's
+     * ready hint. Never null; production leaves it at {@link #NO_HOOK}.
+     */
+    volatile Runnable afterEmptyPoll = NO_HOOK;
 
     /** Longest park on the home shard of a waiting sharded claim before the other shards are swept again. */
     static final long SHARD_WAIT_SLICE_NANOS = 2_000_000;
