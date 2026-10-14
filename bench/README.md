@@ -62,6 +62,8 @@ java -cp target/classes bench/SwarmBench.java /tmp/sb heartbeat off 20       # d
 java -cp target/classes bench/SwarmBench.java /tmp/sb heartbeat keeper 20    # + LeaseKeeper: 10k leases, batched tick every 5 s
 java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply 10000 10      # ReplyRouter.call, open loop at 10k/s
 java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply-mw 4x10000 10 # same, 4 workers on the pool (variant, not the gate)
+
+`reqreply` and `reqreply-mw` print `n=` (completed calls), `ok=`, `failed=` and `missing=`; percentiles are over completed calls only, and a run with any failed or missing call prints `INVALID` and exits 3. For `reqreply-mw`, keep `W <= vCPU - 1`: the open-loop generator spins on one core, so more workers oversubscribe the box (as 16-on-8 does for dispatch).
 ```
 
 - **Comparisons.** Compare `heartbeat off` and `heartbeat keeper` with 5 alternating runs pinned with `taskset`.

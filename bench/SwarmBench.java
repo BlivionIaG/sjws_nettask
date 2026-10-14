@@ -64,6 +64,9 @@ public class SwarmBench {
         }
     }
 
+    /** Set when a run had failed or missing calls; main exits 3 after cleanup. */
+    static volatile boolean invalid;
+
     public static void main(String[] a) throws Exception {
         long free = Files.getFileStore(Path.of(a[0])).getUsableSpace();
         if (free < MIN_FREE) {
@@ -80,6 +83,7 @@ public class SwarmBench {
         } finally {
             deleteTree(dir);
         }
+        if (invalid) System.exit(3);
     }
 
     static void run(Path dir, String[] a) throws Exception {
@@ -96,6 +100,7 @@ public class SwarmBench {
                 case "reqreply" -> reqreply(s, Integer.parseInt(a[2]), secs, 1);
                 case "reqreply-mw" -> {
                     var wr = a[2].split("x"); // <workers>x<rate>
+                    if (wr.length != 2) throw new IllegalArgumentException("reqreply-mw takes <workers>x<rate>: " + a[2]);
                     reqreply(s, Integer.parseInt(wr[1]), secs, Integer.parseInt(wr[0]));
                 }
                 case "http" -> http(dir, a[2], secs);
@@ -250,17 +255,31 @@ public class SwarmBench {
 
     static void reqreply(Swarm s, int rate, double secs, int workers) throws Exception {
         if (workers < 1) throw new IllegalArgumentException("workers >= 1: " + workers);
+        if (rate < 1) throw new IllegalArgumentException("rate >= 1: " + rate);
+        // Test hooks: every Nth task is acked without a reply, and calls use a short deadline, so failures are real.
+        long dropEvery = Long.getLong("sjws.bench.dropEvery", 0);
+        long callDeadlineMs = Long.getLong("sjws.bench.callDeadlineMs", 10_000);
+        var seen = new AtomicLong();
         var t = s.tasks();
         var stop = new AtomicBoolean();
         var pool = new ArrayList<Thread>(workers);
         for (int w = 0; w < workers; w++) {
             long producer = 2 + w; // one reply producer per worker, so dedup windows never collide
+            String consumer = "w" + w; // a distinct consumer per worker
             pool.add(Thread.ofPlatform().name("worker-" + w).start(() -> {
                 long seq = 0;
                 while (!stop.get()) {
                     // blocking claim (#99, 50 ms), then one reply per task and one batched fenced ack (#100)
-                    var got = t.claim("echo", "w", 64, 30_000, 50_000_000L);
+                    var got = t.claim("echo", consumer, 64, 30_000, 50_000_000L);
                     if (got.isEmpty()) continue;
+                    if (dropEvery > 0) {
+                        var keep = new ArrayList<Task>(got.size());
+                        for (Task task : got) {
+                            if (seen.incrementAndGet() % dropEvery == 0) t.ack(task); else keep.add(task);
+                        }
+                        got = keep;
+                        if (got.isEmpty()) continue;
+                    }
                     var bodies = new ArrayList<byte[]>(got.size());
                     for (Task task : got) bodies.add(task.envelope().body());
                     t.replyAll(got, producer, seq + 1, "", bodies);
@@ -271,22 +290,43 @@ public class SwarmBench {
         long gap = 1_000_000_000L / rate;
         long warm = (long) (2e9 / gap), total = warm + (long) (secs * 1e9 / gap);
         var lat = new long[(int) (total - warm)];
+        java.util.Arrays.fill(lat, -1);
         var done = new AtomicLong();
+        var ok = new AtomicLong();
+        var failed = new AtomicLong();
         long start = System.nanoTime();
         var body = new byte[256];
         for (long i = 0; i < total; i++) {
             long due = start + i * gap;
             while (System.nanoTime() < due) Thread.onSpinWait();
             long idx = i - warm;
-            var f = s.replies().call("echo", "", body, System.currentTimeMillis() + 10_000, "");
-            f.whenComplete((r, e) -> { if (e == null && idx >= 0) lat[(int) idx] = System.nanoTime() - due; done.incrementAndGet(); });
+            var f = s.replies().call("echo", "", body, System.currentTimeMillis() + callDeadlineMs, "");
+            f.whenComplete((r, e) -> {
+                if (idx >= 0) {
+                    if (e == null) {
+                        lat[(int) idx] = System.nanoTime() - due;
+                        ok.incrementAndGet();
+                    } else {
+                        failed.incrementAndGet(); // a failure is a failure, never a 0 us sample
+                    }
+                }
+                done.incrementAndGet();
+            });
         }
         long until = System.nanoTime() + 30_000_000_000L;
         while (done.get() < total && System.nanoTime() < until) Thread.sleep(1);
         stop.set(true);
         for (var w : pool) w.join();
-        System.out.printf("reqreply workers=%d rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d%n", workers, rate,
-                pct(lat, lat.length, 0.50) / 1e3, pct(lat, lat.length, 0.99) / 1e3, pct(lat, lat.length, 1.0) / 1e3,
-                lat.length);
+        // percentiles over completed calls only; failed and still-pending (missing) calls are reported separately
+        var okLat = java.util.Arrays.stream(lat).filter(v -> v >= 0).toArray();
+        int n = okLat.length;
+        long missing = lat.length - n - failed.get();
+        System.out.printf("reqreply workers=%d rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d ok=%d failed=%d missing=%d%n",
+                workers, rate, n == 0 ? 0 : pct(okLat, n, 0.50) / 1e3, n == 0 ? 0 : pct(okLat, n, 0.99) / 1e3,
+                n == 0 ? 0 : pct(okLat, n, 1.0) / 1e3, n, ok.get(), failed.get(), missing);
+        if (failed.get() + missing > 0) {
+            System.out.println("INVALID: " + failed.get() + " failed, " + missing + " missing of " + lat.length);
+            invalid = true;
+        }
     }
 }
