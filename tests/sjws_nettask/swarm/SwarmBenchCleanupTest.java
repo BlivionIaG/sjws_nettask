@@ -123,6 +123,49 @@ class SwarmBenchCleanupTest {
         assertTrue(out.contains("n=250 ok=250 failed=0 missing=0"), out);
     }
 
+    private String runOk(List<String> flags, int exit, String... args) throws Exception {
+        var all = new ArrayList<String>();
+        all.add(this.dir.toString());
+        all.addAll(List.of(args));
+        var p = start(flags, all.toArray(String[]::new));
+        assertTrue(p.waitFor(180, TimeUnit.SECONDS), "bench finished");
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(exit, p.exitValue(), out);
+        return out;
+    }
+
+    private static long field(String out, String name) {
+        var m = java.util.regex.Pattern.compile(" " + name + "=(\\d+)").matcher(out);
+        assertTrue(m.find(), name + " in " + out);
+        return Long.parseLong(m.group(1));
+    }
+
+    @Test
+    void heartbeatCountsLostLeasesDirectly() throws Exception {
+        var held = runOk(List.of(), 0, "heartbeat", "keeper", "1");
+        assertEquals(10_000, field(held, "leases"));
+        assertEquals(0, field(held, "redelivered") + field(held, "ack_failed") + field(held, "lost_callbacks"), held);
+        // leases shorter than the keeper's first pass: some expire, and the bench must see them
+        var lost = runOk(List.of("-Dsjws.bench.holdVisibilityMs=200"), 0, "heartbeat", "keeper", "1");
+        assertTrue(field(lost, "redelivered") > 0, lost);
+        assertTrue(field(lost, "ack_failed") > 0, lost);
+        var off = runOk(List.of(), 0, "heartbeat", "off", "1");
+        assertEquals(0, field(off, "redelivered") + field(off, "ack_failed"), off);
+    }
+
+    @Test
+    void warmUpFailuresCount() throws Exception {
+        var out = runOk(List.of("-Dsjws.bench.dropEvery=5", "-Dsjws.bench.callDeadlineMs=300"), 3, "reqreply", "200", "0.5");
+        assertTrue(field(out, "warmup_failed") > 0, out);
+        assertTrue(out.contains("warm-up"), out);
+    }
+
+    @Test
+    void aDrainedDispatchBacklogIsMarkedIndicative() throws Exception {
+        var out = runOk(List.of("-Dsjws.bench.backlogPerSec=1000"), 0, "dispatch", "2", "1");
+        assertTrue(out.contains("(indicative:drained)"), out);
+    }
+
     @Test
     void singleWorkerRequestReplyReportsOneWorker() throws Exception {
         var p = start(List.of(), this.dir.toString(), "reqreply", "500", "0.5");

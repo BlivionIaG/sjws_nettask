@@ -172,7 +172,9 @@ public class SwarmBench {
         var seq = new AtomicLong();
         // Prefilled backlog, no concurrent producer: the measurement is claim (poll) + fenced ack only.
         // batched and sharded pools drain faster; tasks/s is over the window the backlog actually lasted
-        long backlog = (long) ((secs + 2) * (batch == 1 ? 120_000 : 400_000)) * Integer.getInteger("sjws.swarm.pool.shards", 1);
+        // per shard and second; sized so 8 workers at shards=4 (~500k tasks/s) don't drain it (override: sjws.bench.backlogPerSec)
+        long perSec = Long.getLong("sjws.bench.backlogPerSec", batch == 1 ? 250_000 : 400_000);
+        long backlog = (long) ((secs + 2) * perSec) * Integer.getInteger("sjws.swarm.pool.shards", 1);
         for (long i = 0; i < backlog; i++) t.submit("p", 1, seq.incrementAndGet(), env(body));
         long warmEnd = System.nanoTime() + 2_000_000_000L, end = warmEnd + (long) (secs * 1e9);
         var counts = new long[workers];
@@ -207,13 +209,14 @@ public class SwarmBench {
         long total = Arrays.stream(counts).sum();
         long last = Arrays.stream(lastWork).max().orElse(0);
         double window = last > warmEnd && last < end - 50_000_000L ? (last - warmEnd) / 1e9 : secs; // drained early?
-        if (window < secs) System.err.printf("WARN: backlog drained after %.2f of %.2f s%n", window, secs);
+        boolean drained = window < secs || total == 0; // total == 0: drained during warm-up
+        if (drained) System.err.printf("WARN: backlog drained after %.2f of %.2f s%n", window, secs);
         int n = Arrays.stream(ns).sum();
         var all = new long[n];
         int k = 0;
         for (int w = 0; w < workers; w++) { System.arraycopy(lat[w], 0, all, k, ns[w]); k += ns[w]; }
-        System.out.printf((batch == 1 ? "dispatch" : "batched batch=" + batch) + " workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / window,
-                pct(all, n, 0.50) / 1e3, pct(all, n, 0.99) / 1e3);
+        System.out.printf((batch == 1 ? "dispatch" : "batched batch=" + batch) + " workers=%d tasks/s=%.0f%s claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / window,
+                drained ? "(indicative:drained)" : "", pct(all, n, 0.50) / 1e3, pct(all, n, 0.99) / 1e3);
     }
 
     static void heartbeat(Swarm s, String mode, double secs) throws Exception {
@@ -221,16 +224,21 @@ public class SwarmBench {
         int leases = 10_000;
         for (int i = 0; i < leases; i++) t.submit("hold", 1, i + 1, env(new byte[1024]));
         var held = new ArrayList<Task>(leases);
+        boolean keep = mode.equals("keeper");
+        // With the keeper, leases are short (15 s < the run), so only the keeper's extends keep them held: a lease
+        // it fails to extend expires and is counted as lost (direct measurement, not only throughput loss).
+        long visibility = keep ? Long.getLong("sjws.bench.holdVisibilityMs", 15_000) : 3_600_000; // override: test hook
         while (held.size() < leases) {
-            var got = t.claim("hold", "holder", leases - held.size(), 3_600_000);
+            var got = t.claim("hold", "holder", leases - held.size(), visibility);
             if (got.isEmpty()) throw new IllegalStateException("held " + held.size() + " of " + leases);
             held.addAll(got);
         }
         System.err.println("heartbeat leases held=" + held.size());
         LeaseKeeper keeper = null;
         var stop = new AtomicBoolean();
-        if (mode.equals("keeper")) {
-            keeper = s.leaseKeeper(15_000, (x, r) -> { throw new AssertionError("lost lease " + r); });
+        var lostCallbacks = new AtomicLong();
+        if (keep) {
+            keeper = s.leaseKeeper(15_000, (x, r) -> lostCallbacks.incrementAndGet());
             held.forEach(keeper::hold);
             keeper.start(5_000); // spread: one batched extend of LeaseKeeper.SLICE leases every 50 ms
         }
@@ -250,7 +258,16 @@ public class SwarmBench {
             keeper.close();
             tick = " batches=" + keeper.batches();
         }
-        System.out.printf("heartbeat mode=%s dispatch_tasks/s=%.0f%s%n", mode, done / secs, tick);
+        // Lost leases, measured directly: any held lease that expired is claimable again (redelivered), and its
+        // fenced ack fails. Count both, plus the keeper's lost-lease callbacks.
+        long redelivered = 0;
+        for (var got = t.claim("hold", "probe", leases, 3_600_000); !got.isEmpty(); got = t.claim("hold", "probe", leases, 3_600_000)) {
+            redelivered += got.size();
+        }
+        long ackFailed = 0;
+        for (Task task : held) if (!t.ack(task).ok()) ackFailed++;
+        System.out.printf("heartbeat mode=%s dispatch_tasks/s=%.0f%s leases=%d lost_callbacks=%d redelivered=%d ack_failed=%d%n",
+                mode, done / secs, tick, leases, lostCallbacks.get(), redelivered, ackFailed);
     }
 
     static void reqreply(Swarm s, int rate, double secs, int workers) throws Exception {
@@ -294,6 +311,7 @@ public class SwarmBench {
         var done = new AtomicLong();
         var ok = new AtomicLong();
         var failed = new AtomicLong();
+        var warmFailed = new AtomicLong();
         // The open-loop generator runs on its own thread, named "sb-gen" (the Linux thread name), so a wrapper can
         // pin it to a CPU set disjoint from the server and workers (bench/README.md, "Disjoint CPU sets"). With
         // -Dsjws.bench.genReady=<file> it waits until that file exists, i.e. until the wrapper has pinned it.
@@ -319,6 +337,8 @@ public class SwarmBench {
                         } else {
                             failed.incrementAndGet(); // a failure is a failure, never a 0 us sample
                         }
+                    } else if (e != null) {
+                        warmFailed.incrementAndGet(); // warm-up calls aren't timed, but their failures count
                     }
                     done.incrementAndGet();
                 });
@@ -334,11 +354,14 @@ public class SwarmBench {
         var okLat = java.util.Arrays.stream(lat).filter(v -> v >= 0).toArray();
         int n = okLat.length;
         long missing = lat.length - n - failed.get();
-        System.out.printf("reqreply workers=%d rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d ok=%d failed=%d missing=%d%n",
+        // every call completes exactly once (done counts all); what never completed and wasn't measured is warm-up
+        long warmMissing = Math.max(0, total - done.get() - missing);
+        System.out.printf("reqreply workers=%d rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d ok=%d failed=%d missing=%d warmup_failed=%d warmup_missing=%d%n",
                 workers, rate, n == 0 ? 0 : pct(okLat, n, 0.50) / 1e3, n == 0 ? 0 : pct(okLat, n, 0.99) / 1e3,
-                n == 0 ? 0 : pct(okLat, n, 1.0) / 1e3, n, ok.get(), failed.get(), missing);
-        if (failed.get() + missing > 0) {
-            System.out.println("INVALID: " + failed.get() + " failed, " + missing + " missing of " + lat.length);
+                n == 0 ? 0 : pct(okLat, n, 1.0) / 1e3, n, ok.get(), failed.get(), missing, warmFailed.get(), warmMissing);
+        if (failed.get() + missing + warmFailed.get() + warmMissing > 0) {
+            System.out.println("INVALID: " + failed.get() + " failed, " + missing + " missing of " + lat.length
+                    + "; warm-up " + warmFailed.get() + " failed, " + warmMissing + " missing of " + warm);
             invalid = true;
         }
     }
