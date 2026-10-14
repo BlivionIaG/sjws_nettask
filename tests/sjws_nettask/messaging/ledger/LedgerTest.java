@@ -355,11 +355,11 @@ class LedgerTest {
     // ---- S1c: never block under a caller's lock; ASYNC fsync floor; NONE leaves the syncer alone ----
 
     @Test
-    void appendNoWaitNeverBlocksPastCapacityAndKeepsOrder() throws Exception {
-        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.NONE, 0, 1, 1 << 20)) {
+    void appendNoWaitGoesPastTheSoftBoundWithoutWaitingAndKeepsOrder() throws Exception {
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.NONE, 0, 4096, 1 << 20)) {
             var fs = new ArrayList<CompletableFuture<Long>>();
             long t0 = System.nanoTime();
-            for (int i = 0; i < 5000; i++) fs.add(w.appendNoWait(List.of(b("n" + i)), null)); // capacity 1
+            for (int i = 0; i < 5000; i++) fs.add(w.appendNoWait(List.of(b("n" + i)), null)); // past the soft bound
             assertTrue(System.nanoTime() - t0 < 5_000_000_000L);
             for (int i = 0; i < fs.size(); i++) assertEquals(i, fs.get(i).get());
             w.awaitCapacity(); // drained: returns at once

@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -52,6 +52,10 @@ public final class LedgerWriter implements AutoCloseable {
     private final int maxGroupBytes;
     private final BlockingQueue<Pending> queue;
     private final int capacity;
+    /** Set by the writer after each drain when the backlog is at the soft capacity; one volatile read on the fast path. */
+    private volatile boolean behind;
+    /** True while the syncer sleeps out the fsync floor; it wakes on its own timer, so writes need not unpark it. */
+    private volatile boolean flooring;
     private final AtomicReference<LedgerSnapshot> snapshot = new AtomicReference<>();
     private final ConcurrentLinkedQueue<Waiter> fsyncWaiters = new ConcurrentLinkedQueue<>();
     private final Thread thread;
@@ -77,8 +81,8 @@ public final class LedgerWriter implements AutoCloseable {
 
     /**
      * @param lingerNanos        extra wait to grow a group after the first pending append (0 = none)
-     * @param queueCapacity      hand-off queue bound (backpressure in {@link #append} / {@link #awaitCapacity}; the
-     *                           queue itself is unbounded so {@link #appendNoWait} never blocks)
+     * @param queueCapacity      soft hand-off bound (backpressure in {@link #append} / {@link #awaitCapacity}); the
+     *                           queue holds 2x this, so {@link #appendNoWait} after awaitCapacity does not block
      * @param maxGroupBytes      soft cap on bytes written per group
      * @param fsyncIntervalNanos minimum spacing of background fsyncs in ASYNC mode (0 = back to back);
      *                           bounds the power-loss window together with one fsync duration
@@ -92,7 +96,10 @@ public final class LedgerWriter implements AutoCloseable {
         this.maxGroupBytes = maxGroupBytes;
         if (queueCapacity < 1) throw new IllegalArgumentException("queueCapacity");
         this.capacity = queueCapacity;
-        this.queue = new LinkedBlockingQueue<>();
+        // Hard bound 2x the soft one: the slack absorbs appends made under a caller's lock (appendNoWait) by threads that
+        // passed awaitCapacity concurrently. ArrayBlockingQueue keeps the one-lock, allocation-free hand-off on the
+        // claim path (a LinkedBlockingQueue cost ~0.7 us of claim p50 at 16 workers).
+        this.queue = new ArrayBlockingQueue<>((int) Math.min(Integer.MAX_VALUE - 8, 2L * queueCapacity));
         this.written = log.nextOffset();
         this.durable = log.nextOffset(); // recovered data is treated as durable (it survived a restart)
         publish();
@@ -127,8 +134,8 @@ public final class LedgerWriter implements AutoCloseable {
      * the appends of threads that passed this check concurrently.
      */
     public void awaitCapacity() throws InterruptedException {
-        if (queue.size() < capacity) return;
-        while (queue.size() >= capacity && !closed && failure == null) {
+        if (!behind) return;
+        while (behind && queue.size() >= capacity && !closed && failure == null) {
             if (Thread.interrupted()) throw new InterruptedException();
             LockSupport.parkNanos(this, 50_000);
         }
@@ -140,7 +147,13 @@ public final class LedgerWriter implements AutoCloseable {
         RecordBatch.encodedSize(recs); // validate size eagerly
         if (closed || failure != null) return CompletableFuture.failedFuture(failure != null ? failure : new IllegalStateException("closed"));
         var f = new CompletableFuture<Long>();
-        queue.offer(new Pending(List.copyOf(recs), System.currentTimeMillis(), mode == null ? durability : mode, f));
+        var p = new Pending(List.copyOf(recs), System.currentTimeMillis(), mode == null ? durability : mode, f);
+        if (!queue.offer(p)) {
+            // Only past 2x capacity, i.e. the writer stalled while every caller skipped awaitCapacity: block rather than
+            // drop or reorder. Not reachable through Partition in practice (callers wait at the soft bound).
+            behind = true;
+            try { queue.put(p); } catch (InterruptedException e) { Thread.currentThread().interrupt(); f.completeExceptionally(e); }
+        }
         return f;
     }
 
@@ -155,6 +168,7 @@ public final class LedgerWriter implements AutoCloseable {
                     while (System.nanoTime() < deadline && queue.size() < 1024) LockSupport.parkNanos(Math.min(20_000, lingerNanos));
                 }
                 queue.drainTo(group);
+                behind = queue.size() >= capacity;
             } catch (InterruptedException e) {
                 stop = true;
             }
@@ -209,8 +223,9 @@ public final class LedgerWriter implements AutoCloseable {
                 else fsyncWaiters.add(new Waiter(end, o, p.done));
                 o = end;
             }
-            // NONE/GROUP/EACH writers only need the syncer for fsync waiters (GROUP overrides); ASYNC always.
-            if (durability == Durability.ASYNC || !fsyncWaiters.isEmpty()) LockSupport.unpark(syncer);
+            // NONE/GROUP/EACH writers only need the syncer for fsync waiters (GROUP overrides); ASYNC unless it is already
+            // sleeping out the fsync floor (an unpark per write would turn the floor into a wake-up per write).
+            if ((durability == Durability.ASYNC && !flooring) || !fsyncWaiters.isEmpty()) LockSupport.unpark(syncer);
         } catch (IOException | RuntimeException e) {
             // The in-memory tail may disagree with disk: fence the writer; reopening recovers.
             failure = e;
@@ -277,7 +292,12 @@ public final class LedgerWriter implements AutoCloseable {
                 continue;
             }
             long wait = lastFsync + fsyncIntervalNanos - System.nanoTime();
-            if (wait > 0 && fsyncWaiters.isEmpty() && !stopSyncer) { LockSupport.parkNanos(wait); continue; }
+            if (wait > 0 && fsyncWaiters.isEmpty() && !stopSyncer) {
+                flooring = true;
+                LockSupport.parkNanos(wait);
+                flooring = false;
+                continue;
+            }
             try {
                 log.force();
             } catch (IOException | RuntimeException e) {
