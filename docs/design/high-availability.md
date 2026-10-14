@@ -92,6 +92,22 @@ wait for it. A new leader rescans its uncommitted suffix for the marker. A RELAX
 STRICT group is still STRICT. The default interface method delegates `null` and fails anything
 else with `UnsupportedOperationException`.
 
+A STRICT override is refused up front, with `DurabilityUnavailableException` and nothing
+appended, when the leader plus the data voters that answered an append within the last lease
+are fewer than `dataCopiesRequired()` (in a two-data-plus-witness group: the other data node has
+been silent for a lease). That keeps a degraded group writable for RELAXED appends. A new leader
+has heard from nobody yet, so it refuses STRICT overrides until its first heartbeat round is
+answered; retry. What remains: a data node that fails after a STRICT override was accepted
+holds that entry, and every entry behind it, until the node is back or a leader with two
+reachable data copies takes over. A STRICT group (`GroupOptions.durability()`) is unchanged and
+has no fail-fast.
+
+The marker byte is protected on the wire (inside the HMAC-covered frame body) but not on disk:
+`FileLogStorage` records (`index, term, len, data`) carry no checksum, so a bit flip on disk can
+turn `USER_STRICT` (4) into `USER` (0), or garble the payload, without detection. Per-record
+CRCs are a separate, tracked change. Every member holds the group key, so a compromised member
+can forge the marker either way (the #175 limitation).
+
 ### Restart safety and the exact RELAXED guarantee
 
 What a voter keeps across a crash:

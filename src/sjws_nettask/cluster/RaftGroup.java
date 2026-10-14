@@ -98,6 +98,8 @@ final class RaftGroup {
     private boolean configFollowUpSent;
     private final Set<NodeId> votes = new HashSet<>();
     private final Map<NodeId, Long> matchIndex = new HashMap<>();
+    /** Leader view: when each peer last answered an append in this term (clock nanos). */
+    private final Map<NodeId, Long> heardAt = new HashMap<>();
     private final Map<NodeId, Long> nextIndex = new HashMap<>();
     private final TreeMap<Long, CompletableFuture<CommittedIndex>> pending = new TreeMap<>();
     private final List<CompletableFuture<Void>> reads = new ArrayList<>();
@@ -315,6 +317,16 @@ final class RaftGroup {
                 future.completeExceptionally(new IllegalArgumentException("batch exceeds maxBatchBytes"));
                 return future;
             }
+            if (marked) {
+                int required = dataCopiesRequired();
+                int reachable = reachableDataCopies(clock.nanoTime());
+                if (reachable < required) {
+                    // Refused before it enters the log: a STRICT entry that cannot commit would
+                    // hold every later RELAXED entry behind it (commits are a prefix).
+                    future.completeExceptionally(new DurabilityUnavailableException(groupId, reachable, required));
+                    return future;
+                }
+            }
             long last = 0;
             for (var copy : copies) {
                 last = appendRaw(user(copy, marked ? USER_STRICT : USER));
@@ -412,6 +424,7 @@ final class RaftGroup {
             nextIndex.put(peer, lastIndex() + 1);
             matchIndex.put(peer, 0L);
         }
+        heardAt.clear();
         strictPending.clear();
         for (long index = commitIndex + 1; index <= lastIndex(); index++) {
             var data = read(index);
@@ -624,6 +637,7 @@ final class RaftGroup {
         if (follower == null) {
             return;
         }
+        heardAt.put(follower, now);
         if (!success) {
             long next = nextIndex.getOrDefault(follower, lastIndex() + 1) - 1;
             nextIndex.put(follower, Math.max(snapIndex + 1, next));
@@ -855,6 +869,18 @@ final class RaftGroup {
     }
 
     /** STRICT needs two data disks when the group has two data voters and a witness. */
+    /** The leader plus data voters that answered an append within the last lease. */
+    private int reachableDataCopies(long now) {
+        int count = countsAsStored(self) ? 1 : 0;
+        for (var peer : peers) {
+            Long heard = heardAt.get(peer);
+            if (heard != null && now - heard <= options.leaseNanos() && isVoter(peer) && !witnesses.contains(peer)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     private int dataCopiesRequired() {
         int dataVoters = 0;
         boolean witnessVotes = false;

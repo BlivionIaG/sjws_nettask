@@ -19,6 +19,7 @@ package sjws_nettask.cluster;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -45,7 +46,7 @@ class AppendDurabilityTest {
     private static final GroupId GROUP = new GroupId("msg/1");
 
     private record Cluster(FakeClock clock, SimTransport net, List<ReplicatedNode> nodes, List<MemoryLogStorage> logs,
-            List<List<String>> seen) {
+            List<List<String>> seen, List<ReplicationGroup> groups) {
         void drive() {
             ReplicatedNode.driveAll(nodes);
         }
@@ -66,16 +67,18 @@ class AppendDurabilityTest {
         var nodes = new ArrayList<ReplicatedNode>();
         var logs = new ArrayList<MemoryLogStorage>();
         var seen = new ArrayList<List<String>>();
+        var groups = new ArrayList<ReplicationGroup>();
         for (var member : members) {
             var log = new MemoryLogStorage();
             var got = new CopyOnWriteArrayList<String>();
             logs.add(log);
             seen.add(got);
             var node = ReplicatedNode.open(member.id(), voters, clock, log, net);
-            node.openGroup(GROUP, opts, entry -> got.add(StandardCharsets.UTF_8.decode(entry.entry()).toString()));
+            groups.add(node.openGroup(GROUP, opts,
+                    entry -> got.add(StandardCharsets.UTF_8.decode(entry.entry()).toString())));
             nodes.add(node);
         }
-        var cluster = new Cluster(clock, net, nodes, logs, seen);
+        var cluster = new Cluster(clock, net, nodes, logs, seen, groups);
         clock.advance(Duration.ofMillis(100));
         cluster.drive();
         assertTrue(nodes.get(0).openGroup(GROUP, opts, null).isLeader());
@@ -124,6 +127,49 @@ class AppendDurabilityTest {
         c.drive();
         strict.get(5, TimeUnit.SECONDS);
         after.get(5, TimeUnit.SECONDS);
+        c.close();
+    }
+
+    /**
+     * Security #203 blocker 1: with one data node gone for longer than a lease, a STRICT override is
+     * refused before it enters the log, so it cannot wedge the RELAXED entries that follow.
+     */
+    @Test
+    void strictOverrideIsRefusedUpFrontWhenTheSecondDataCopyIsUnreachable() throws Exception {
+        var c = cluster(Durability.RELAXED);
+        c.net.cut(c.nodes.get(0).self(), c.nodes.get(1).self());
+        c.net.cut(c.nodes.get(1).self(), c.nodes.get(2).self());
+        for (int i = 0; i < 25; i++) { // 1 s of heartbeats that n2 never answers
+            c.clock.advance(Duration.ofMillis(40));
+            c.drive();
+        }
+        assertTrue(c.groups.get(0).isLeader(), "leader + witness keep the group");
+        long lastBefore = c.logs.get(0).lastIndex(GROUP);
+        var strict = c.nodes.get(0).append(GROUP, List.of(payload("s")), Durability.STRICT);
+        assertTrue(strict.isCompletedExceptionally(), "refused at once, not left pending");
+        var failure = assertThrows(java.util.concurrent.ExecutionException.class, strict::get);
+        var refused = (DurabilityUnavailableException) failure.getCause();
+        assertEquals(1, refused.reachable());
+        assertEquals(2, refused.required());
+        assertEquals(lastBefore, c.logs.get(0).lastIndex(GROUP), "nothing appended");
+        var relaxed = c.nodes.get(0).append(GROUP, List.of(payload("r")));
+        c.clock.advance(Duration.ofMillis(40));
+        c.drive();
+        relaxed.get(5, TimeUnit.SECONDS);
+        c.net.heal(c.nodes.get(0).self(), c.nodes.get(1).self());
+        c.net.heal(c.nodes.get(1).self(), c.nodes.get(2).self());
+        for (int i = 0; i < 25 && !c.groups.get(0).isLeader(); i++) {
+            c.clock.advance(Duration.ofMillis(40));
+            c.drive();
+        }
+        int leaderIdx = c.groups.get(0).isLeader() ? 0 : 1;
+        for (int i = 0; i < 5; i++) {
+            c.clock.advance(Duration.ofMillis(40));
+            c.drive();
+        }
+        var again = c.nodes.get(leaderIdx).append(GROUP, List.of(payload("s2")), Durability.STRICT);
+        c.drive();
+        again.get(5, TimeUnit.SECONDS);
         c.close();
     }
 
