@@ -106,11 +106,16 @@ public final class LedgerWriter implements AutoCloseable {
      * default). Blocks while the queue is full.
      */
     public CompletableFuture<Long> append(List<byte[]> recs, Durability mode) throws InterruptedException {
+        return append(recs, mode, System.currentTimeMillis());
+    }
+
+    /** As {@link #append(List, Durability)} with the batch timestamp given (a replica re-appending a primary's batch). */
+    public CompletableFuture<Long> append(List<byte[]> recs, Durability mode, long timestampMs) throws InterruptedException {
         if (recs.isEmpty()) throw new IllegalArgumentException("empty batch");
         RecordBatch.encodedSize(recs); // validate size eagerly
         if (closed || failure != null) return CompletableFuture.failedFuture(failure != null ? failure : new IllegalStateException("closed"));
         var f = new CompletableFuture<Long>();
-        queue.put(new Pending(List.copyOf(recs), System.currentTimeMillis(), mode == null ? durability : mode, f));
+        queue.put(new Pending(List.copyOf(recs), timestampMs, mode == null ? durability : mode, f));
         return f;
     }
 

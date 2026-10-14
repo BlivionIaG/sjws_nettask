@@ -101,7 +101,7 @@ final class MessagingHttp implements Handler {
                 }
                 case "GET" -> {
                     long t0 = System.nanoTime();
-                    var r = fetch(topic, query(q < 0 ? "" : target.substring(q + 1)));
+                    var r = fetch(topic, query(q < 0 ? "" : target.substring(q + 1)), first(request.headers().values(StandbyReplicator.TOKEN_HEADER)));
                     this.hooks.fetched(topic, r.status(), Math.max(0, r.contentLength()), System.nanoTime() - t0);
                     yield r;
                 }
@@ -185,8 +185,16 @@ final class MessagingHttp implements Handler {
     }
 
     private Response produce(String topic, Request request) throws BadRequest, IOException {
+        if (this.topics.standby(topic)) return problem(409, "standby", topic + " is replicated from the primary: produce there");
+        var header = request.headers().values("durability");
+        // "replicated" (durable-log-plan §3): locally durable (GROUP) and durable on the standby; a topic policy of
+        // replicated cannot be weakened by the header.
+        boolean replicated = this.topics.replicated(topic)
+                || (!header.isEmpty() && header.get(0).trim().equalsIgnoreCase("replicated"));
+        if (replicated && !this.topics.replicationConfigured()) return problem(503, "unavailable", "replication is not configured");
         // A request may only strengthen the topic's policy: a weaker Durability header is clamped up to it.
-        var durability = atLeast(durability(request.headers().values("durability")), this.topics.durability(topic));
+        var durability = replicated ? Durability.GROUP
+                : atLeast(durability(header), this.topics.durability(topic));
         var records = records(request);
         if (this.topics.compacted(topic)) {
             for (var r : records) if (LogTopics.key(r) == null) throw new BadRequest("keyed topic: each record is [keyLen:int][key][value]");
@@ -194,10 +202,15 @@ final class MessagingHttp implements Handler {
         var log = this.topics.get(topic, true);
         try {
             long base = log.writer().append(records, durability).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            if (replicated && !this.topics.replicaAcks().await(topic, base + records.size(), this.topics.replicaTimeoutMs())) {
+                // written and durable here, not (yet) on the standby: the client may retry (at-least-once)
+                return problem(503, "not replicated", "standby did not acknowledge offset " + (base + records.size() - 1)
+                        + " in " + this.topics.replicaTimeoutMs() + " ms");
+            }
             var json = "{\"baseOffset\":" + base + ",\"count\":" + records.size() + "}";
             var effective = durability != null ? durability : this.topics.durability(topic);
             var h = ResponseHeaders.of().set("content-type", "application/json")
-                    .set("durability-effective", effective.name().toLowerCase(java.util.Locale.ROOT));
+                    .set("durability-effective", replicated ? "replicated" : effective.name().toLowerCase(java.util.Locale.ROOT));
             return new Response(200, h, Body.Bytes.of(json.getBytes(StandardCharsets.US_ASCII)));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -209,12 +222,15 @@ final class MessagingHttp implements Handler {
         }
     }
 
-    private Response fetch(String topic, Map<String, String> query) throws BadRequest, IOException {
+    private Response fetch(String topic, Map<String, String> query, String replicaToken) throws BadRequest, IOException {
         long offset = number(query, "offset", 0, 0, Long.MAX_VALUE);
         long maxBytes = number(query, "maxBytes", DEFAULT_FETCH_BYTES, 1, MAX_FETCH_BYTES);
         var log = this.topics.get(topic, false);
         if (log == null) return problem(404, "no such topic", topic);
         long committed = log.writer().snapshot().nextOffset();
+        if (query.containsKey("replicaAcked") && this.topics.replicaTokenMatches(replicaToken)) {
+            this.topics.replicaAcks().advance(topic, Math.min(committed, number(query, "replicaAcked", 0, 0, Long.MAX_VALUE)));
+        }
         long start = log.log().startOffset();
         if (offset < start) return problem(416, "offset out of range", "log starts at " + start);
         long next = offset;
@@ -385,6 +401,10 @@ final class MessagingHttp implements Handler {
         } catch (NumberFormatException e) {
             throw new BadRequest(name + " must be a number");
         }
+    }
+
+    private static String first(List<String> v) {
+        return v.isEmpty() ? null : v.get(0);
     }
 
     static Map<String, String> query(String q) {

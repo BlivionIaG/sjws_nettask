@@ -75,6 +75,42 @@ final class LogTopics implements AutoCloseable {
         this.offsets = new ConsumerOffsets(this, ConsumerOffsets.DEFAULT_EXPIRY_MS, clockMs);
     }
 
+    // ---- standby replication (durable-log-plan §3) ----
+    private final ReplicaAcks replicaAcks = new ReplicaAcks();
+    private volatile byte[] replicaToken;
+    private volatile java.util.Set<String> replicatedTopics = java.util.Set.of();
+    private volatile java.util.Set<String> standbyTopics = java.util.Set.of();
+    private volatile long replicaTimeoutMs = MessagingHttp.ACK_TIMEOUT_MS;
+
+    ReplicaAcks replicaAcks() { return this.replicaAcks; }
+
+    /** Shared secret a standby sends with its fetches; acks without it are ignored. Null disables replication acks. */
+    void replicaToken(String token) {
+        this.replicaToken = token == null || token.isEmpty() ? null : token.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    boolean replicaTokenMatches(String presented) {
+        var t = this.replicaToken;
+        return t != null && presented != null
+                && java.security.MessageDigest.isEqual(t, presented.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    boolean replicationConfigured() { return this.replicaToken != null; }
+
+    /** Primary: topics whose every produce is {@code replicated} (the header can only strengthen, never weaken). */
+    void replicatedTopics(java.util.Set<String> t) { this.replicatedTopics = java.util.Set.copyOf(t); }
+
+    boolean replicated(String topic) { return this.replicatedTopics.contains(topic); }
+
+    /** Standby: topics fed by the primary; client produces to them are refused. */
+    void standbyTopics(java.util.Set<String> t) { this.standbyTopics = java.util.Set.copyOf(t); }
+
+    boolean standby(String topic) { return this.standbyTopics.contains(topic); }
+
+    void replicaTimeoutMs(long ms) { this.replicaTimeoutMs = ms; }
+
+    long replicaTimeoutMs() { return this.replicaTimeoutMs; }
+
     ConsumerOffsets offsets() {
         return this.offsets;
     }

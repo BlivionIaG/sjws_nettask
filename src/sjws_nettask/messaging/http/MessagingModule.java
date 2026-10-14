@@ -50,6 +50,16 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String COMPACTED_TOPICS_PROPERTY = "sjws.messaging.compacted.topics";
     /** How long a group's committed offset pins retention of its topic (default 7 days). */
     static final String OFFSETS_EXPIRY_PROPERTY = "sjws.messaging.offsets.expiry.ms";
+    /** Shared secret between primary and standby; enables {@code replicated} produces and replica acks. */
+    static final String REPLICA_TOKEN_PROPERTY = "sjws.messaging.replica.token";
+    /** Primary: comma-separated topics whose produces are always {@code replicated}. */
+    static final String REPLICATED_TOPICS_PROPERTY = "sjws.messaging.replicated.topics";
+    /** Standby: base URL of the primary (e.g. {@code https://primary:8443}); with {@link #STANDBY_TOPICS_PROPERTY}. */
+    static final String REPLICA_OF_PROPERTY = "sjws.messaging.replica.of";
+    /** Standby: comma-separated topics to replicate (read-only here). */
+    static final String STANDBY_TOPICS_PROPERTY = "sjws.messaging.standby.topics";
+    /** Primary: how long a {@code replicated} produce waits for the standby (ms, default 30 000). */
+    static final String REPLICA_TIMEOUT_PROPERTY = "sjws.messaging.replica.timeout.ms";
     static final String TOPIC_DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY_TOPICS";
 
     private final LogTopics topics;
@@ -101,6 +111,15 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, System::currentTimeMillis);
         this.topics.compacted(LogTopics.parseTopics(System.getProperty(COMPACTED_TOPICS_PROPERTY, "")));
         this.topics.offsetsExpiryMs(Long.getLong(OFFSETS_EXPIRY_PROPERTY, ConsumerOffsets.DEFAULT_EXPIRY_MS));
+        var token = System.getProperty(REPLICA_TOKEN_PROPERTY, "");
+        this.topics.replicaToken(token);
+        this.topics.replicatedTopics(LogTopics.parseTopics(System.getProperty(REPLICATED_TOPICS_PROPERTY, "")));
+        this.topics.replicaTimeoutMs(Long.getLong(REPLICA_TIMEOUT_PROPERTY, MessagingHttp.ACK_TIMEOUT_MS));
+        var primary = System.getProperty(REPLICA_OF_PROPERTY, "");
+        var standby = LogTopics.parseTopics(System.getProperty(STANDBY_TOPICS_PROPERTY, ""));
+        this.topics.standbyTopics(standby);
+        this.standby = primary.isEmpty() || standby.isEmpty() ? null
+                : new StandbyReplicator(this.topics, StandbyReplicator.http(primary, token), java.util.List.copyOf(standby), 5_000_000).start();
         if (retention.unlimited() && !this.topics.hasCompactedTopics()) {
             this.retentionTimer = null;
         } else {
@@ -117,6 +136,12 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         } catch (java.io.IOException | RuntimeException e) {
             System.err.println("WARN: messaging retention: " + e);
         }
+    }
+
+    private final StandbyReplicator standby;
+
+    StandbyReplicator standby() {
+        return this.standby;
     }
 
     LogTopics topics() {
@@ -158,6 +183,7 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     @Override
     public void close() {
+        if (this.standby != null) this.standby.close();
         if (this.retentionTimer != null) this.retentionTimer.shutdownNow();
         this.topics.close();
     }
