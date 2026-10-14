@@ -284,6 +284,29 @@ public final class TaskService {
         return partition(pool, shard).extend(WORKERS, offsets, attempts, visibilityMs);
     }
 
+    /**
+     * Acks every task in {@code tasks} (all from one pool) with <b>one batched fenced ack</b> (#100): one lock
+     * acquisition and one ledger record instead of one per task. Results are in input order; a stale or settled
+     * task gets {@code STALE_ATTEMPT} / {@code NOT_IN_FLIGHT} without affecting the others.
+     */
+    public List<LeaseResult> ackAll(List<Task> tasks) {
+        if (tasks.isEmpty()) {
+            return List.of();
+        }
+        var pool = tasks.get(0).pool();
+        var offs = new long[tasks.size()];
+        var atts = new int[tasks.size()];
+        for (int i = 0; i < tasks.size(); i++) {
+            var t = tasks.get(i);
+            if (!t.pool().equals(pool)) {
+                throw new IllegalArgumentException("tasks from one pool");
+            }
+            offs[i] = t.offset();
+            atts[i] = t.attempt();
+        }
+        return partition(pool).ack(WORKERS, offs, atts, null).results();
+    }
+
     public LeaseResult ack(Task t) {
         return partition(t.pool(), t.shard()).ack(WORKERS, t.offset(), t.attempt());
     }

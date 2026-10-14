@@ -263,6 +263,8 @@ class TcpTransportTest {
             await(() -> b.inboundConnections() == 0, "slowloris closed");
             assertTrue(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(3), "closed by the deadline");
         }
+        assertEquals(1, b.rejected(TcpTransport.Reason.TIMEOUT), "slowloris counted as TIMEOUT");
+        assertEquals(0, b.rejected(TcpTransport.Reason.MALFORMED), "not as MALFORMED");
         // An idle connection that never sends a prefix is closed too.
         try (var idle = new Socket("127.0.0.1", b.localPort())) {
             idle.setSoTimeout(5_000);
@@ -280,7 +282,7 @@ class TcpTransportTest {
             out.writeInt(TcpTransport.MAX_FRAME_BYTES - 1);
             out.write(new byte[100]);
             out.flush();
-            await(() -> b.inboundConnections() == 0, "closed");
+            await(() -> b.peakReadBuffer() > 0 && b.inboundConnections() == 0, "read, then closed");
         }
         assertTrue(b.peakReadBuffer() > 0);
         assertTrue(b.peakReadBuffer() <= TcpTransport.PREAUTH_CHUNK_BYTES, "peak " + b.peakReadBuffer());
@@ -335,6 +337,124 @@ class TcpTransportTest {
         assertEquals(3, got.get(0).type());
         assertEquals(2, a.oversizeDrops());
         assertEquals(2, a.sendDrops());
+    }
+
+    /** Security #158 follow-up: a trickled length prefix is inside the whole-frame deadline. */
+    @Test
+    void theFrameDeadlineStartsAtTheFirstPrefixByte() throws Exception {
+        var members = members(false, false, false);
+        var b = TcpTransport.open(members.get(1).id(), members, KEY, Clock.SYSTEM, 4, 1_000);
+        open.add(b);
+        try (var raw = new Socket("127.0.0.1", b.localPort())) {
+            var out = raw.getOutputStream();
+            await(() -> b.inboundConnections() == 1, "connection registered before trickling");
+            long started = System.nanoTime();
+            // One byte every 900 ms never trips the 1 s per-read timeout. Before the fix the 4-byte prefix
+            // alone took 2.7 s and the deadline only started after it (about 3.7 s to close).
+            for (int i = 0; i < 8 && b.inboundConnections() > 0; i++) {
+                try {
+                    out.write(0);
+                    out.flush();
+                } catch (IOException reset) {
+                    break;
+                }
+                long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(900);
+                while (System.nanoTime() < until && b.inboundConnections() > 0) {
+                    Thread.sleep(10);
+                }
+            }
+            await(() -> b.inboundConnections() == 0, "closed");
+            long took = System.nanoTime() - started;
+            assertTrue(took < TimeUnit.MILLISECONDS.toNanos(2_500), "closed after " + took / 1_000_000 + " ms");
+        }
+        assertEquals(1, b.rejected(TcpTransport.Reason.TIMEOUT));
+    }
+
+    /** Security #158 follow-up: until mTLS, only members' source addresses may hold an inbound slot. */
+    @Test
+    void aNonMemberSourceAddressIsRefusedAtAccept() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(canBind("127.0.0.2"), "127.0.0.2 not bindable here");
+        var members = members(false, false, false);
+        var b = TcpTransport.open(members.get(1).id(), members, KEY, Clock.SYSTEM, 4);
+        open.add(b);
+        for (int i = 0; i < 6; i++) { // more than the 4-slot cap: none of them takes a slot
+            try (var stranger = new Socket()) {
+                stranger.bind(new InetSocketAddress("127.0.0.2", 0));
+                stranger.connect(new InetSocketAddress("127.0.0.1", b.localPort()));
+                stranger.setSoTimeout(5_000);
+                assertEquals(-1, stranger.getInputStream().read(), "stranger closed at accept");
+            }
+        }
+        assertEquals(6, b.strangersRefused());
+        assertEquals(0, b.inboundRefused());
+        assertEquals(0, b.inboundConnections());
+        try (var member = new Socket("127.0.0.1", b.localPort())) {
+            await(() -> b.inboundConnections() == 1, "a member address is accepted");
+        }
+
+        // The filter stays on with any factory, and a failed handshake never takes a slot.
+        var refusing = new TcpTransport.SocketFactory() {
+            @Override
+            public ServerSocket listen(InetSocketAddress bind) throws IOException {
+                return TcpTransport.SocketFactory.PLAIN.listen(bind);
+            }
+
+            @Override
+            public Socket connect(InetSocketAddress to) throws IOException {
+                return TcpTransport.SocketFactory.PLAIN.connect(to);
+            }
+
+            @Override
+            public void handshake(Socket accepted, int totalMillis) throws IOException {
+                assertEquals(TcpTransport.HANDSHAKE_TIMEOUT_MILLIS, totalMillis);
+                throw new IOException("test: handshake refused");
+            }
+        };
+        var c = TcpTransport.open(members.get(2).id(), members, KEY, Clock.SYSTEM, 4, refusing);
+        open.add(c);
+        try (var stranger = new Socket()) {
+            stranger.bind(new InetSocketAddress("127.0.0.2", 0));
+            stranger.connect(new InetSocketAddress("127.0.0.1", c.localPort()));
+            stranger.setSoTimeout(5_000);
+            assertEquals(-1, stranger.getInputStream().read());
+        }
+        assertEquals(1, c.strangersRefused());
+        for (int i = 0; i < 6; i++) {
+            try (var member = new Socket("127.0.0.1", c.localPort())) {
+                member.setSoTimeout(5_000);
+                assertEquals(-1, member.getInputStream().read(), "closed after the failed handshake");
+            }
+        }
+        await(() -> c.handshakeFailures() == 6, "six handshake failures");
+        assertEquals(0, c.inboundRefused(), "a failed handshake never held a slot");
+        assertEquals(0, c.inboundConnections());
+    }
+
+    /** Security #158 follow-up: the writer catches only the dedicated too-large exception. */
+    @Test
+    void sealSignalsTooLargeWithADedicatedException() throws Exception {
+        var members = members(false, false, false);
+        var a = TcpTransport.open(members.get(0).id(), members, KEY, Clock.SYSTEM, 4);
+        open.add(a);
+        var to = members.get(1).id();
+        assertInstanceOf(TcpTransport.FrameTooLargeException.class, assertThrows(IllegalArgumentException.class,
+                () -> a.seal(a.currentMac(), 0, to, 1, 1, new SimTransport.Frame(new GroupId("g".repeat(70_000)), 1,
+                        new byte[1]))));
+        assertInstanceOf(TcpTransport.FrameTooLargeException.class, assertThrows(IllegalArgumentException.class,
+                () -> a.seal(a.currentMac(), 0, to, 1, 1, new SimTransport.Frame(GROUP, 1,
+                        new byte[TcpTransport.MAX_FRAME_BYTES]))));
+        var rpc = a.attach(members.get(0).id(), (from, frame) -> { });
+        rpc.send(to, new SimTransport.Frame(GROUP, 2, new byte[TcpTransport.MAX_FRAME_BYTES]));
+        await(() -> a.oversizeDrops() == 1, "counted as oversize");
+    }
+
+    private static boolean canBind(String host) {
+        try (var s = new ServerSocket()) {
+            s.bind(new InetSocketAddress(host, 0));
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private byte[] sealFrom(NodeId from, List<Member> base, NodeId to, long now, SimTransport.Frame frame)

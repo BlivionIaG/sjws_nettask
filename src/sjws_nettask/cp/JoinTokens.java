@@ -35,7 +35,8 @@ import java.util.Map;
  * </ul>
  * Callers evaluate with {@link #evaluate} first (read-only), then append a consume entry; the apply
  * runs the same decision again, so of two concurrent first uses exactly one wins. The CP apply
- * thread is the only writer; request threads only read (concurrent maps).
+ * thread is the only writer, and the writes hold {@link #writeLock} so the check and the burn are one
+ * atomic step even if apply were ever entered concurrently; request threads only read (concurrent maps).
  */
 public final class JoinTokens {
 
@@ -48,6 +49,7 @@ public final class JoinTokens {
 
     private final Map<String, Issued> tokens = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, Join> byNode = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.locks.ReentrantLock writeLock = new java.util.concurrent.locks.ReentrantLock();
 
     /** Validates an issue request; null if it can be appended. */
     public static String checkIssue(String tokenId, byte[] secret, long ttlMillis) {
@@ -65,6 +67,15 @@ public final class JoinTokens {
 
     /** Apply: records an issued token (an existing id is left unchanged). */
     public boolean issue(String tokenId, String secretHash, long expiresAtMillis, long nowMillis) {
+        writeLock.lock();
+        try {
+            return issueLocked(tokenId, secretHash, expiresAtMillis, nowMillis);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    private boolean issueLocked(String tokenId, String secretHash, long expiresAtMillis, long nowMillis) {
         if (!isHash(secretHash) || tokens.containsKey(tokenId)) {
             return false;
         }
@@ -110,6 +121,15 @@ public final class JoinTokens {
 
     /** Apply: burns the token if {@link #evaluate} still allows it; the outcome is deterministic. */
     public Result consume(String nodeId, String tokenId, String secretHash, long nowMillis) {
+        writeLock.lock();
+        try {
+            return consumeLocked(nodeId, tokenId, secretHash, nowMillis);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    private Result consumeLocked(String nodeId, String tokenId, String secretHash, long nowMillis) {
         var decision = evaluate(nodeId, tokenId, secretHash, nowMillis);
         if (!decision.accepted() || decision.replay()) {
             return decision;

@@ -57,6 +57,13 @@ final class RaftGroup {
     static final int PRE_VOTE_RESP = 7;
 
     private final ReentrantLock lock = new ReentrantLock();
+    /**
+     * Committed-entry callbacks and their append futures, queued under {@link #lock} in log order and
+     * run outside it by one thread at a time ({@link #deliveryLock}), so a listener sees entries
+     * strictly in index order and never concurrently, whichever thread drove the commit.
+     */
+    private final java.util.ArrayDeque<Runnable> deliveries = new java.util.ArrayDeque<>();
+    private final ReentrantLock deliveryLock = new ReentrantLock();
     private final GroupId groupId;
     private final NodeId self;
     private final boolean witness;
@@ -208,7 +215,7 @@ final class RaftGroup {
         } finally {
             lock.unlock();
         }
-        run(after);
+        runOnRaftThread(after);
     }
 
     void handle(NodeId from, SimTransport.Frame frame, long now) {
@@ -231,7 +238,7 @@ final class RaftGroup {
         } finally {
             lock.unlock();
         }
-        run(after);
+        runOnRaftThread(after);
     }
 
     CompletableFuture<CommittedIndex> append(List<ByteBuffer> batch) {
@@ -644,7 +651,7 @@ final class RaftGroup {
                     var payload = new byte[data.length - 1];
                     System.arraycopy(data, 1, payload, 0, payload.length);
                     long entryTerm = termAt(index);
-                    after.add(() -> {
+                    deliveries.add(() -> {
                         if (listener != null) {
                             listener.onCommitted(new CommittedEntry(groupId, entryTerm, index,
                                     ByteBuffer.wrap(payload)));
@@ -657,7 +664,7 @@ final class RaftGroup {
                     long entryTerm = termAt(index);
                     long applied = index;
                     var copy = List.copyOf(noopListeners);
-                    after.add(() -> {
+                    deliveries.add(() -> {
                         for (var listener : copy) {
                             listener.accept(entryTerm, applied);
                         }
@@ -678,7 +685,7 @@ final class RaftGroup {
             pending.remove(entry.getKey());
             long index = entry.getKey();
             long entryTerm = termAt(index);
-            after.add(() -> entry.getValue().complete(new CommittedIndex(groupId, entryTerm, index)));
+            deliveries.add(() -> entry.getValue().complete(new CommittedIndex(groupId, entryTerm, index)));
         }
     }
 
@@ -997,9 +1004,88 @@ final class RaftGroup {
         return ids;
     }
 
-    private static void run(List<Runnable> tasks) {
+    private void run(List<Runnable> tasks) {
         for (var task : tasks) {
             task.run();
+        }
+        deliver(false);
+    }
+
+    /**
+     * For tick and frame handling (the Raft thread): never waits for the delivery lock, so heartbeats
+     * and vote replies are not held up behind a slow commit callback running on another thread. If
+     * another thread is draining, it re-checks the queue after releasing the lock and delivers what
+     * this call queued.
+     */
+    private void runOnRaftThread(List<Runnable> tasks) {
+        for (var task : tasks) {
+            task.run();
+        }
+        deliver(true);
+    }
+
+    /**
+     * Runs queued commit callbacks in log order, one thread at a time.
+     * <ul>
+     * <li>A callback that appends re-enters here on the draining thread: that nested call returns at
+     * once and the outer loop delivers whatever it queued, so callbacks never overlap or reorder.</li>
+     * <li>With {@code nonBlocking}, a busy lock means another thread is draining; this call returns.
+     * Every drainer re-checks the queue after unlocking (entries are queued before any lock attempt),
+     * so an entry queued while the lock was held is never stranded.</li>
+     * <li>A callback that throws is logged and skipped so the rest of the queue still drains.</li>
+     * </ul>
+     */
+    private void deliver(boolean nonBlocking) {
+        if (deliveryLock.isHeldByCurrentThread()) {
+            return;
+        }
+        while (true) {
+            if (nonBlocking) {
+                if (!deliveryLock.tryLock()) {
+                    return; // the holder re-checks after unlocking
+                }
+            } else {
+                try {
+                    deliveryLock.lockInterruptibly();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return; // the current drainer, or the next run(), delivers what is queued
+                }
+            }
+            try {
+                drain();
+            } finally {
+                deliveryLock.unlock();
+            }
+            lock.lock();
+            try {
+                if (deliveries.isEmpty()) {
+                    return;
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
+    private void drain() {
+        while (true) {
+            Runnable next;
+            lock.lock();
+            try {
+                next = deliveries.poll();
+            } finally {
+                lock.unlock();
+            }
+            if (next == null) {
+                return;
+            }
+            try {
+                next.run();
+            } catch (RuntimeException e) {
+                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                        "commit callback failed in group " + groupId, e);
+            }
         }
     }
 

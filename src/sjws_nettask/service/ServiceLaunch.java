@@ -49,12 +49,20 @@ public final class ServiceLaunch {
      */
     public static ServiceHooks prepare(Path bootstrapFile, String expectedRole, long drainBudgetMs,
             Map<String, Object> yamlCp, Path configBase) throws IOException {
-        return new Hooks(Bootstrap.load(bootstrapFile, expectedRole), drainBudgetMs, yamlCp, configBase);
+        var bootstrap = Bootstrap.load(bootstrapFile, expectedRole);
+        if (bootstrap.role() == NodeRole.CONTROL && !controlConfigured(yamlCp, System::getProperty, System.getenv())) {
+            throw new IOException(CONTROL_UNCONFIGURED); // before any listener: exit 64
+        }
+        return new Hooks(bootstrap, drainBudgetMs, yamlCp, configBase);
     }
 
+    /** Why a CONTROL role without any {@code cp} settings refuses to start. */
+    static final String CONTROL_UNCONFIGURED = "control role without cp settings (no cp: block, sjws.cp.nodeId or"
+            + " SJWS_CP_NODE_ID): refusing to start; configure cp or run the data role";
+
     /**
-     * Hosting starts only when the operator configured it, so a control bootstrap without {@code cp} settings
-     * keeps today's behaviour. Once configured, any error is fatal (fail closed).
+     * True when the operator configured CONTROL hosting. A CONTROL role without it fails closed (it would
+     * otherwise run as a node that hosts nothing), and once configured any start error is fatal too.
      */
     static boolean controlConfigured(Map<String, Object> yamlCp, java.util.function.Function<String, String> props,
             Map<String, String> env) {
@@ -119,12 +127,8 @@ public final class ServiceLaunch {
                 this.watch = openWatch(server);
             }
             if (this.bootstrap.role() == NodeRole.CONTROL) {
-                if (controlConfigured(this.yamlCp, System::getProperty, System.getenv())) {
-                    this.control = launchControl(this.yamlCp, this.configBase);
-                } else {
-                    System.err.println("WARN: control role without cp settings (no cp: block, sjws.cp.nodeId or"
-                            + " SJWS_CP_NODE_ID): control-plane services are not hosted");
-                }
+                // prepare() already refused a CONTROL role without cp settings.
+                this.control = launchControl(this.yamlCp, this.configBase);
             }
         }
 

@@ -18,6 +18,9 @@ import sjws_nettask.swarm.TaskEnvelope;
  * Swarm S1 benches against the agent-swarm.md §13 targets (single node, in-process, ASYNC ledger).
  *   dispatch <workers> <secs>   pool "p" is prefilled with 1 KiB tasks; each worker claims 1 and acks it (fenced).
  *                               Prints tasks/s and claim() latency p50/p99. Target: >= 50k tasks/s, claim p99 < 100 us.
+ *   batched <W>x<B> <secs>      as dispatch, but each worker claims up to B (claim max > 1) and settles them with
+ *                               one batched fenced ack (TaskService.ackAll). claim p50/p99 is per claim call.
+ *                               A variant, not the §13 gate.
  *   heartbeat <off|keeper> <secs>  one dispatch worker (claim+ack, 1 KiB) while 10 000 leases in pool "hold" are kept
  *                               by LeaseKeeper.start(5 s), spread: one batched extend of 100 every 50 ms. Prints
  *                               dispatch tasks/s and tick latency. Target: < 2 % loss vs off.
@@ -49,7 +52,11 @@ public class SwarmBench {
         double secs = Double.parseDouble(a[3]);
         try (var s = Swarm.open(dir, "bench", 1, RetryPolicy.DEFAULT, System::currentTimeMillis, 600_000)) {
             switch (mode) {
-                case "dispatch" -> dispatch(s, Integer.parseInt(a[2]), secs);
+                case "dispatch" -> dispatch(s, Integer.parseInt(a[2]), secs, 1);
+                case "batched" -> {
+                    var wb = a[2].split("x"); // <workers>x<batch>
+                    dispatch(s, Integer.parseInt(wb[0]), secs, Integer.parseInt(wb[1]));
+                }
                 case "heartbeat" -> heartbeat(s, a[2], secs);
                 case "reqreply" -> reqreply(s, Integer.parseInt(a[2]), secs);
                 case "http" -> http(dir, a[2], secs);
@@ -115,12 +122,12 @@ public class SwarmBench {
                 pct(lat, n, 0.99) / 1e3);
     }
 
-    static void dispatch(Swarm s, int workers, double secs) throws Exception {
+    static void dispatch(Swarm s, int workers, double secs, int batch) throws Exception {
         var t = s.tasks();
         var body = new byte[1024];
         var seq = new AtomicLong();
         // Prefilled backlog, no concurrent producer: the measurement is claim (poll) + fenced ack only.
-        long backlog = (long) ((secs + 2) * 120_000);
+        long backlog = (long) ((secs + 2) * (batch == 1 ? 120_000 : 400_000)); // batched drains faster
         for (long i = 0; i < backlog; i++) t.submit("p", 1, seq.incrementAndGet(), env(body));
         long warmEnd = System.nanoTime() + 2_000_000_000L, end = warmEnd + (long) (secs * 1e9);
         var counts = new long[workers];
@@ -135,11 +142,15 @@ public class SwarmBench {
                 while (true) {
                     long t0 = System.nanoTime();
                     if (t0 > end) break;
-                    var got = t.claim("p", me, 1, 30_000);
+                    var got = t.claim("p", me, batch, 30_000);
                     long t1 = System.nanoTime();
-                    for (Task task : got) t.ack(task);
+                    if (batch == 1) {
+                        for (Task task : got) t.ack(task);
+                    } else {
+                        t.ackAll(got);
+                    }
                     if (t0 >= warmEnd && !got.isEmpty()) {
-                        counts[id]++;
+                        counts[id] += got.size();
                         if (ns[id] < lat[id].length) lat[id][ns[id]++] = t1 - t0;
                     }
                 }
@@ -151,7 +162,7 @@ public class SwarmBench {
         var all = new long[n];
         int k = 0;
         for (int w = 0; w < workers; w++) { System.arraycopy(lat[w], 0, all, k, ns[w]); k += ns[w]; }
-        System.out.printf("dispatch workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / secs,
+        System.out.printf((batch == 1 ? "dispatch" : "batched batch=" + batch) + " workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / secs,
                 pct(all, n, 0.50) / 1e3, pct(all, n, 0.99) / 1e3);
     }
 

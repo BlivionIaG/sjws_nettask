@@ -17,6 +17,7 @@
 package sjws_nettask.cp;
 
 import java.io.IOException;
+import sjws_nettask.cluster.ClusterTransport;
 import sjws_nettask.service.CpReloadable;
 
 /**
@@ -26,29 +27,66 @@ import sjws_nettask.service.CpReloadable;
 final class CpWitnessHost implements CpReloadable {
 
     private final CpWitness witness;
+    private final ClusterTransport transport;
+    private final CpServerTls peerTls;
 
-    private CpWitnessHost(CpWitness witness) {
+    private CpWitnessHost(CpWitness witness, ClusterTransport transport, CpServerTls peerTls) {
         this.witness = witness;
+        this.transport = transport;
+        this.peerTls = peerTls;
     }
 
     static CpReloadable start(CpConfig config, CpHostDeps deps) throws IOException {
-        var witness = CpWitness.open(config.keys().stateDir(), CpLaunch.nodeId(config.self()), CpLaunch.voters(config),
-                deps.clock(), deps.transport(config));
-        witness.start();
-        return new CpWitnessHost(witness);
+        CpServerTls peerTls;
+        try {
+            peerTls = deps.serverTls("cp-peer");
+        } catch (CpKeyException e) {
+            throw new IOException("control role: cp-peer TLS refused: " + e.getMessage(), e);
+        }
+        var transport = deps.transport(config, peerTls);
+        try {
+            var witness = CpWitness.open(config.keys().stateDir(), CpLaunch.nodeId(config.self()),
+                    CpLaunch.voters(config), deps.clock(), transport);
+            witness.start();
+            return new CpWitnessHost(witness, transport, peerTls);
+        } catch (IOException | RuntimeException e) {
+            closeOwned(transport);
+            throw e;
+        }
     }
 
     CpWitness witness() {
         return witness;
     }
 
+    /** SIGHUP: only the voter-link TLS, in place; the old material stays on failure. */
     @Override
     public String reload() {
-        return null;
+        if (peerTls == null) {
+            return null;
+        }
+        try {
+            peerTls.reloadTls();
+            return null;
+        } catch (CpKeyException | RuntimeException e) {
+            return "cp-peer TLS reload failed, keeping the current material: " + e.getMessage();
+        }
     }
 
     @Override
     public void close() {
         witness.close();
+        closeOwned(transport);
+    }
+
+    private static void closeOwned(ClusterTransport transport) {
+        if (transport instanceof AutoCloseable owned) {
+            try {
+                owned.close();
+            } catch (Exception e) {
+                System.getLogger(CpWitnessHost.class.getName()).log(System.Logger.Level.WARNING,
+                        "cp transport close failed: " + e.getMessage());
+            }
+        }
     }
 }

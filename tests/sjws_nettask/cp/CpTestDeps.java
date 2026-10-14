@@ -43,7 +43,7 @@ class CpTestDeps implements CpHostDeps {
     }
 
     @Override
-    public ClusterTransport transport(CpConfig config) {
+    public ClusterTransport transport(CpConfig config, CpServerTls peerTls) {
         return net;
     }
 

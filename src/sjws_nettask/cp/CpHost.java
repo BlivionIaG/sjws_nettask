@@ -49,6 +49,7 @@ public final class CpHost implements CpReloadable {
     private final List<String> events = new CopyOnWriteArrayList<>();
     final List<TlsReload> tlsReloads = new CopyOnWriteArrayList<>();
     private CpStore store;
+    private sjws_nettask.cluster.ClusterTransport transport;
     private AutoCloseable watch;
     private AutoCloseable admin;
     private Thread insecureWarner;
@@ -90,8 +91,13 @@ public final class CpHost implements CpReloadable {
         if (self == null) {
             store = CpStore.open(config.keys().stateDir(), keys, deps.clock());
         } else {
+            var peerTls = serverTls("cp-peer");
+            transport = deps.transport(config, peerTls);
+            if (peerTls != null) {
+                tlsReloads.add(peerTls::reloadTls);
+            }
             store = CpStore.open(config.keys().stateDir(), keys, deps.clock(), "urn:sjws:admin:root",
-                    CpLaunch.nodeId(self), CpLaunch.voters(config), deps.transport(config));
+                    CpLaunch.nodeId(self), CpLaunch.voters(config), transport);
         }
         store.start();
         events.add("store");
@@ -224,6 +230,9 @@ public final class CpHost implements CpReloadable {
         quiet(admin, "admin", failures);
         quiet(watch, "watch", failures);
         quiet(store, "store", failures);
+        if (transport instanceof AutoCloseable owned) {
+            quiet(owned, "transport", failures);
+        }
         for (var failure : failures) {
             System.getLogger(CpHost.class.getName()).log(System.Logger.Level.WARNING, failure);
         }
