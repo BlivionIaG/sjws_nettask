@@ -18,6 +18,9 @@ import sjws_nettask.swarm.TaskEnvelope;
  * Swarm S1 benches against the agent-swarm.md §13 targets (single node, in-process, ASYNC ledger).
  *   dispatch <workers> <secs>   pool "p" is prefilled with 1 KiB tasks; each worker claims 1 and acks it (fenced).
  *                               Prints tasks/s and claim() latency p50/p99. Target: >= 50k tasks/s, claim p99 < 100 us.
+ *   batched <W>x<B> <secs>      as dispatch, but each worker claims up to B (claim max > 1) and settles them with
+ *                               one batched fenced ack (TaskService.ackAll). claim p50/p99 is per claim call.
+ *                               A variant, not the §13 gate.
  *   heartbeat <off|keeper> <secs>  one dispatch worker (claim+ack, 1 KiB) while 10 000 leases in pool "hold" are kept
  *                               by LeaseKeeper.start(5 s), spread: one batched extend of 100 every 50 ms. Prints
  *                               dispatch tasks/s and tick latency. Target: < 2 % loss vs off.
@@ -33,6 +36,7 @@ import sjws_nettask.swarm.TaskEnvelope;
  */
 public class SwarmBench {
     static long pct(long[] a, int n, double p) {
+        if (n == 0) return 0; // a run too short to sample (the backlog drained during warm-up)
         var c = Arrays.copyOf(a, n);
         Arrays.sort(c);
         return c[Math.min(n - 1, (int) (n * p))];
@@ -43,13 +47,48 @@ public class SwarmBench {
         return new TaskEnvelope(id, id, "", TaskEnvelope.NO_DEADLINE, "", "", "", "", body);
     }
 
+    /** Minimum usable space on the bench directory's file system (override: -Dsjws.bench.minFreeBytes). */
+    static final long MIN_FREE = Long.getLong("sjws.bench.minFreeBytes", 10L << 30);
+
+    static void deleteTree(Path dir) {
+        if (!Files.exists(dir)) return;
+        try (var walk = Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try { Files.deleteIfExists(p); } catch (java.io.IOException e) { /* best effort */ }
+            });
+        } catch (java.io.IOException e) {
+            System.err.println("WARN: could not delete " + dir + ": " + e);
+        }
+    }
+
     public static void main(String[] a) throws Exception {
+        long free = Files.getFileStore(Path.of(a[0])).getUsableSpace();
+        if (free < MIN_FREE) {
+            System.err.printf("ABORT: %s has %d MiB free, below %d MiB (sjws.bench.minFreeBytes); the box disk is shared%n",
+                    a[0], free >> 20, MIN_FREE >> 20);
+            System.exit(2);
+        }
         Path dir = Files.createTempDirectory(Path.of(a[0]), "swarmbench");
+        // The ledger of a run is gigabytes: always remove it (normal exit, exception, or SIGTERM/SIGINT).
+        var cleanup = new Thread(() -> deleteTree(dir), "swarmbench-cleanup");
+        Runtime.getRuntime().addShutdownHook(cleanup);
+        try {
+            run(dir, a);
+        } finally {
+            deleteTree(dir);
+        }
+    }
+
+    static void run(Path dir, String[] a) throws Exception {
         String mode = a[1];
         double secs = Double.parseDouble(a[3]);
         try (var s = Swarm.open(dir, "bench", 1, RetryPolicy.DEFAULT, System::currentTimeMillis, 600_000)) {
             switch (mode) {
-                case "dispatch" -> dispatch(s, Integer.parseInt(a[2]), secs);
+                case "dispatch" -> dispatch(s, Integer.parseInt(a[2]), secs, 1);
+                case "batched" -> {
+                    var wb = a[2].split("x"); // <workers>x<batch>
+                    dispatch(s, Integer.parseInt(wb[0]), secs, Integer.parseInt(wb[1]));
+                }
                 case "heartbeat" -> heartbeat(s, a[2], secs);
                 case "reqreply" -> reqreply(s, Integer.parseInt(a[2]), secs);
                 case "http" -> http(dir, a[2], secs);
@@ -115,17 +154,19 @@ public class SwarmBench {
                 pct(lat, n, 0.99) / 1e3);
     }
 
-    static void dispatch(Swarm s, int workers, double secs) throws Exception {
+    static void dispatch(Swarm s, int workers, double secs, int batch) throws Exception {
         var t = s.tasks();
         var body = new byte[1024];
         var seq = new AtomicLong();
         // Prefilled backlog, no concurrent producer: the measurement is claim (poll) + fenced ack only.
-        long backlog = (long) ((secs + 2) * 120_000);
+        // batched and sharded pools drain faster; tasks/s is over the window the backlog actually lasted
+        long backlog = (long) ((secs + 2) * (batch == 1 ? 120_000 : 400_000)) * Integer.getInteger("sjws.swarm.pool.shards", 1);
         for (long i = 0; i < backlog; i++) t.submit("p", 1, seq.incrementAndGet(), env(body));
         long warmEnd = System.nanoTime() + 2_000_000_000L, end = warmEnd + (long) (secs * 1e9);
         var counts = new long[workers];
         var lat = new long[workers][];
         var ns = new int[workers];
+        var lastWork = new long[workers];
         var threads = new ArrayList<Thread>();
         for (int w = 0; w < workers; w++) {
             int id = w;
@@ -135,11 +176,16 @@ public class SwarmBench {
                 while (true) {
                     long t0 = System.nanoTime();
                     if (t0 > end) break;
-                    var got = t.claim("p", me, 1, 30_000);
+                    var got = t.claim("p", me, batch, 30_000);
                     long t1 = System.nanoTime();
-                    for (Task task : got) t.ack(task);
+                    if (batch == 1) {
+                        for (Task task : got) t.ack(task);
+                    } else {
+                        t.ackAll(got);
+                    }
                     if (t0 >= warmEnd && !got.isEmpty()) {
-                        counts[id]++;
+                        counts[id] += got.size();
+                        lastWork[id] = t1;
                         if (ns[id] < lat[id].length) lat[id][ns[id]++] = t1 - t0;
                     }
                 }
@@ -147,11 +193,14 @@ public class SwarmBench {
         }
         for (var th : threads) th.join();
         long total = Arrays.stream(counts).sum();
+        long last = Arrays.stream(lastWork).max().orElse(0);
+        double window = last > warmEnd && last < end - 50_000_000L ? (last - warmEnd) / 1e9 : secs; // drained early?
+        if (window < secs) System.err.printf("WARN: backlog drained after %.2f of %.2f s%n", window, secs);
         int n = Arrays.stream(ns).sum();
         var all = new long[n];
         int k = 0;
         for (int w = 0; w < workers; w++) { System.arraycopy(lat[w], 0, all, k, ns[w]); k += ns[w]; }
-        System.out.printf("dispatch workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / secs,
+        System.out.printf((batch == 1 ? "dispatch" : "batched batch=" + batch) + " workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / window,
                 pct(all, n, 0.50) / 1e3, pct(all, n, 0.99) / 1e3);
     }
 
@@ -159,7 +208,13 @@ public class SwarmBench {
         var t = s.tasks();
         int leases = 10_000;
         for (int i = 0; i < leases; i++) t.submit("hold", 1, i + 1, env(new byte[1024]));
-        var held = t.claim("hold", "holder", leases, 3_600_000);
+        var held = new ArrayList<Task>(leases);
+        while (held.size() < leases) {
+            var got = t.claim("hold", "holder", leases - held.size(), 3_600_000);
+            if (got.isEmpty()) throw new IllegalStateException("held " + held.size() + " of " + leases);
+            held.addAll(got);
+        }
+        System.err.println("heartbeat leases held=" + held.size());
         LeaseKeeper keeper = null;
         var stop = new AtomicBoolean();
         if (mode.equals("keeper")) {

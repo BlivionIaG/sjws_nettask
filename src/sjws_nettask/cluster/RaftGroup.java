@@ -57,6 +57,12 @@ final class RaftGroup {
     static final int PRE_VOTE_RESP = 7;
 
     private final ReentrantLock lock = new ReentrantLock();
+    /**
+     * Committed-entry callbacks and their append futures, submitted under {@link #lock} in log order and
+     * run by this group's single delivery thread, so a listener sees entries strictly in index order and
+     * never concurrently, and no Raft or appending thread ever runs or waits for a callback.
+     */
+    private final DeliveryExecutor deliveries;
     private final GroupId groupId;
     private final NodeId self;
     private final boolean witness;
@@ -107,7 +113,7 @@ final class RaftGroup {
 
     RaftGroup(GroupId groupId, NodeId self, boolean witness, Set<NodeId> witnesses, Set<NodeId> voters,
             List<NodeId> peers, Function<Integer, NodeId> byWire, QuorumPolicy quorum, GroupOptions options,
-            LogStorage storage, ClusterRpc rpc, Clock clock, GroupListener listener) {
+            LogStorage storage, ClusterRpc rpc, Clock clock, GroupListener listener, int deliveryLagLimit) {
         this.groupId = groupId;
         this.self = self;
         this.witness = witness;
@@ -120,6 +126,7 @@ final class RaftGroup {
         this.rpc = rpc;
         this.clock = clock;
         this.listener = listener;
+        this.deliveries = new DeliveryExecutor(groupId.value(), deliveryLagLimit);
         this.voters.addAll(voters);
         if (options.preferred()) {
             this.electionDeadline = Math.max(1L, options.electionTimeout().toNanos() / 5);
@@ -208,7 +215,7 @@ final class RaftGroup {
         } finally {
             lock.unlock();
         }
-        run(after);
+        runOnRaftThread(after);
     }
 
     void handle(NodeId from, SimTransport.Frame frame, long now) {
@@ -231,7 +238,7 @@ final class RaftGroup {
         } finally {
             lock.unlock();
         }
-        run(after);
+        runOnRaftThread(after);
     }
 
     CompletableFuture<CommittedIndex> append(List<ByteBuffer> batch) {
@@ -253,6 +260,10 @@ final class RaftGroup {
         try {
             if (role != Role.LEADER) {
                 future.completeExceptionally(notLeader());
+                return future;
+            }
+            if (deliveries.overLimit()) {
+                future.completeExceptionally(new ApplyLagException(groupId, deliveries.lag(), deliveries.lagLimit()));
                 return future;
             }
             if (total > options.maxBatchBytes()) {
@@ -644,7 +655,7 @@ final class RaftGroup {
                     var payload = new byte[data.length - 1];
                     System.arraycopy(data, 1, payload, 0, payload.length);
                     long entryTerm = termAt(index);
-                    after.add(() -> {
+                    deliveries.submit(() -> {
                         if (listener != null) {
                             listener.onCommitted(new CommittedEntry(groupId, entryTerm, index,
                                     ByteBuffer.wrap(payload)));
@@ -657,7 +668,7 @@ final class RaftGroup {
                     long entryTerm = termAt(index);
                     long applied = index;
                     var copy = List.copyOf(noopListeners);
-                    after.add(() -> {
+                    deliveries.submit(() -> {
                         for (var listener : copy) {
                             listener.accept(entryTerm, applied);
                         }
@@ -678,7 +689,8 @@ final class RaftGroup {
             pending.remove(entry.getKey());
             long index = entry.getKey();
             long entryTerm = termAt(index);
-            after.add(() -> entry.getValue().complete(new CommittedIndex(groupId, entryTerm, index)));
+            var future = entry.getValue();
+            deliveries.submit(() -> future.complete(new CommittedIndex(groupId, entryTerm, index)), future);
         }
     }
 
@@ -797,13 +809,11 @@ final class RaftGroup {
             }
             leader = null;
             var error = notLeader();
-            var doomed = new ArrayList<>(pending.values());
+            // Failed on the delivery thread too, after every callback already queued for earlier entries.
+            for (var future : pending.values()) {
+                deliveries.submit(() -> future.completeExceptionally(error), future);
+            }
             pending.clear();
-            after.add(() -> {
-                for (var future : doomed) {
-                    future.completeExceptionally(error);
-                }
-            });
             if (membershipChange != null) {
                 var change = membershipChange;
                 membershipChange = null;
@@ -997,10 +1007,39 @@ final class RaftGroup {
         return ids;
     }
 
-    private static void run(List<Runnable> tasks) {
+    private void run(List<Runnable> tasks) {
         for (var task : tasks) {
             task.run();
         }
+    }
+
+    /** Tick and frame handling (the Raft thread): never runs or waits for a commit callback. */
+    private void runOnRaftThread(List<Runnable> tasks) {
+        run(tasks);
+    }
+
+    /** Deliveries queued or running (apply lag), for metrics and backpressure tests. */
+    long deliveryLag() {
+        return deliveries.lag();
+    }
+
+    long maxDeliveryLag() {
+        return deliveries.maxLag();
+    }
+
+    /** True on this group's delivery thread (inside a callback). */
+    boolean onDeliveryThread() {
+        return deliveries.onExecutorThread();
+    }
+
+    /** Waits until every delivery submitted so far has run; false on timeout or on the delivery thread. */
+    boolean awaitDelivered(java.time.Duration timeout) {
+        return deliveries.awaitIdle(timeout);
+    }
+
+    /** Drain for up to {@code budget}, then abandon (futures fail) and stop the delivery thread. */
+    boolean closeDeliveries(java.time.Duration budget) {
+        return deliveries.close(budget);
     }
 
     private record Rec(long term, byte[] data) {

@@ -7,7 +7,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.FakeClock;
@@ -89,6 +92,43 @@ class JoinTokenStoreTest {
                 }
             }
             assertEquals(1, winners);
+        }
+    }
+
+    /** Loops the concurrent first use: commits driven from many threads must still yield one winner. */
+    @Test
+    void concurrentFirstUsesStress() throws Exception {
+        var keys = KeyRing.generate("online-1", NOW + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var clock = new FakeClock(0);
+        int threads = 8;
+        try (var store = CpStore.open(dir.resolve("cp"), keys, clock);
+                var pool = Executors.newFixedThreadPool(threads)) {
+            elect(store, clock);
+            for (int round = 0; round < 200; round++) {
+                var token = "race-" + round;
+                assertEquals(200, store.issueJoinToken(token, secret(7), NOW, TTL).status());
+                var start = new CountDownLatch(1);
+                var futures = new ArrayList<Future<JoinTokens.Result>>();
+                for (int i = 0; i < threads; i++) {
+                    var id = "edge-" + round + "-" + i;
+                    futures.add(pool.submit(() -> {
+                        start.await();
+                        return store.presentJoin(id, token, secret(7), NOW + 1);
+                    }));
+                }
+                start.countDown();
+                int winners = 0;
+                for (var f : futures) {
+                    var r = f.get(10, TimeUnit.SECONDS);
+                    if (r.accepted()) {
+                        assertFalse(r.replay());
+                        winners++;
+                    } else {
+                        assertEquals("used", r.error(), "round " + round);
+                    }
+                }
+                assertEquals(1, winners, "round " + round);
+            }
         }
     }
 

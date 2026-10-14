@@ -208,7 +208,7 @@ final class SwarmHttp implements Handler {
             case "ack" -> r = this.swarm.tasks().ack(t);
             case "nack" -> r = this.swarm.tasks().nack(t, number(query, "delayMs", 0, 0, 3_600_000));
             case "reject" -> r = this.swarm.tasks().reject(t, query.getOrDefault("reason", "rejected"));
-            case "extend" -> r = this.swarm.tasks().extend(t.pool(), new long[] {t.offset()}, new int[] {t.attempt()},
+            case "extend" -> r = this.swarm.tasks().extend(t.pool(), t.shard(), new long[] {t.offset()}, new int[] {t.attempt()},
                     number(query, "visibilityMs", 30_000, 1, 3_600_000)).get(0);
             case "reply" -> {
                 var f = readFrame(request);
@@ -228,7 +228,7 @@ final class SwarmHttp implements Handler {
             this.claimed.remove(id);
         } else if (held != null) {
             long until = this.swarm.topics().clock().getAsLong() + number(query, "visibilityMs", 30_000, 1, 3_600_000);
-            this.claimed.put(id, new Task(held.pool(), held.offset(), held.attempt(), until, held.envelope()));
+            this.claimed.put(id, held.withDeadline(until));
         }
         if (r.ok()) {
             return new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE);
@@ -263,7 +263,8 @@ final class SwarmHttp implements Handler {
     }
 
     static String leaseId(Task t) {
-        return t.pool() + "~" + t.offset() + "~" + t.attempt();
+        // shard > 0 rides on the attempt field ("attempt.shard"), so unsharded lease ids are unchanged
+        return t.pool() + "~" + t.offset() + "~" + t.attempt() + (t.shard() == 0 ? "" : "." + t.shard());
     }
 
     static Task parseLease(String id) throws BadRequest {
@@ -273,8 +274,12 @@ final class SwarmHttp implements Handler {
             throw new BadRequest("lease id is pool~offset~attempt");
         }
         try {
+            var last = id.substring(b + 1);
+            int dot = last.indexOf('.');
+            int shard = dot < 0 ? 0 : Integer.parseInt(last.substring(dot + 1));
+            if (shard < 0) throw new NumberFormatException("shard");
             return new Task(id.substring(0, a), Long.parseLong(id.substring(a + 1, b)),
-                    Integer.parseInt(id.substring(b + 1)), 0, null);
+                    Integer.parseInt(dot < 0 ? last : last.substring(0, dot)), 0, null, shard);
         } catch (NumberFormatException e) {
             throw new BadRequest("lease id is pool~offset~attempt");
         }

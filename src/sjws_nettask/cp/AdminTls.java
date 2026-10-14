@@ -108,14 +108,17 @@ public final class AdminTls {
     private final Path revocations;
     private final Audit audit;
     private final String label;
+    /** Peer links ({@code cp-peer}) dial as well as listen: same material, same revocation checks. */
+    private final boolean actsAsClient;
     private final SSLContext context;
     private final AtomicLong generation = new AtomicLong();
     private volatile Material current;
     private volatile Material previous;
 
     private AdminTls(String label, Path certPem, Path keyPem, String keyPassword, Path trustBundle, Path revocations,
-            Audit audit) throws IOException {
+            Audit audit, boolean actsAsClient) throws IOException {
         this.label = label;
+        this.actsAsClient = actsAsClient;
         this.certPem = certPem;
         this.keyPem = keyPem;
         this.keyPassword = keyPassword;
@@ -143,7 +146,7 @@ public final class AdminTls {
         if (certPem == null || keyPem == null || trustBundle == null) {
             throw new IOException("admin listener requires a server certificate, a key, and an admin CA trust bundle");
         }
-        return new AdminTls("admin-tls", certPem, keyPem, keyPassword, trustBundle, revocations, audit);
+        return new AdminTls("admin-tls", certPem, keyPem, keyPassword, trustBundle, revocations, audit, false);
     }
 
     /**
@@ -152,10 +155,20 @@ public final class AdminTls {
      */
     static AdminTls openListener(String label, Path certPem, Path keyPem, String keyPassword, Path trustBundle,
             Path revocations, Audit audit) throws IOException {
+        return openListener(label, certPem, keyPem, keyPassword, trustBundle, revocations, audit, false);
+    }
+
+    /**
+     * @param actsAsClient also dial with this context (CONTROL voter links): the client side presents the same
+     *        certificate and checks the server's chain against the same CA and revocations. Off for the admin and
+     *        watch listeners, which never act as a TLS client.
+     */
+    static AdminTls openListener(String label, Path certPem, Path keyPem, String keyPassword, Path trustBundle,
+            Path revocations, Audit audit, boolean actsAsClient) throws IOException {
         if (certPem == null || keyPem == null || trustBundle == null) {
             throw new IOException(label + " requires a certificate, a key, and a CA trust bundle");
         }
-        return new AdminTls(label, certPem, keyPem, keyPassword, trustBundle, revocations, audit);
+        return new AdminTls(label, certPem, keyPem, keyPassword, trustBundle, revocations, audit, actsAsClient);
     }
 
     public SSLContext context() {
@@ -410,17 +423,32 @@ public final class AdminTls {
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String authType, Socket socket)
                 throws CertificateException {
+            if (actsAsClient) {
+                current.trust().checkServerTrusted(chain, authType, socket);
+                checkRevoked(chain);
+                return;
+            }
             throw new CertificateException("admin listener does not act as a TLS client");
         }
 
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String authType, SSLEngine engine)
                 throws CertificateException {
+            if (actsAsClient) {
+                current.trust().checkServerTrusted(chain, authType, engine);
+                checkRevoked(chain);
+                return;
+            }
             throw new CertificateException("admin listener does not act as a TLS client");
         }
 
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+            if (actsAsClient) {
+                current.trust().checkServerTrusted(chain, authType);
+                checkRevoked(chain);
+                return;
+            }
             throw new CertificateException("admin listener does not act as a TLS client");
         }
 
@@ -465,12 +493,20 @@ public final class AdminTls {
 
         @Override
         public String[] getClientAliases(String keyType, Principal[] issuers) {
-            return null;
+            if (!actsAsClient) {
+                return null;
+            }
+            var m = current;
+            return tagAll(m, m.keys().getClientAliases(keyType, issuers));
         }
 
         @Override
         public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
-            return null;
+            if (!actsAsClient) {
+                return null;
+            }
+            var m = current;
+            return tag(m, m.keys().chooseClientAlias(keyType, issuers, socket));
         }
 
         @Override

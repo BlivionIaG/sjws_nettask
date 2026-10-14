@@ -339,14 +339,16 @@ The transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existing liste
 | S4 | `LlmGateway` (weighted routing, circuit breaking, retries only with `Idempotency-Key`, usage accounting); the opt-in **direct** token path for HTTP-gateway clients, with the final result still in the ledger (§5.2); OTLP exporter | Fault-injection tests (backend down, mid-stream abort); a test that a direct stream always produces a ledger result; wrk2 latency through the gateway |
 | S5 | Other SDKs | SDK conformance suite green |
 
-**S2 security note (2026-10-13).** `/swarm/v1` (`src/sjws_nettask/swarm/SwarmHttp.java`) has **no built-in authentication or authorization** on master: any client that reaches the listener can submit, claim and settle tasks on any pool. Until S2d lands, enable the swarm only on a trusted network. S2d (`AgentPolicy` + agent intermediate CA, §6) must be **deny by default**: a request without a verified agent identity, or whose identity lacks the permission for the target pool, is refused, and missing policy or trust material refuses to mount (fail closed, AGENTS.md *Security*).
+**S2 sub-phase labels.** S2a = exit tests for the S1 `extend`/`LeaseKeeper`; S2d = `AgentPolicy` document + agent intermediate CA (§6). The other S2 deliverables in the table above are not yet assigned sub-phase labels.
+
+**S2 security note.** On master, `/swarm/v1` is admitted only through the interim `SwarmGate`/`TokenGate` (§6): deny by default, bearer tokens per agent and pool. It does **not** bind a lease to the claiming agent, rate-limit failed authentication, or rotate tokens. S2d (`AgentPolicy` + agent intermediate CA, §6) replaces the implementation behind the same interface and must stay deny by default and fail closed when policy or trust material is missing (AGENTS.md *Security*).
 
 **Deferred items (recorded 2026-10-13, not scheduled in a phase yet):**
-- **Deadline sweeper.** Expired HTTP claims are dropped by a linear scan of the claimed-lease cache on every claim (`SwarmHttp.sweep`, `src/sjws_nettask/swarm/SwarmHttp.java`), and expired tasks are only noticed when claimed (`TaskService.claim`). Replace this with a hashed timing wheel (one thread, O(1) insert/cancel per lease or deadline), shared with the graph runner's per-shard step timers (graphs §6.2).
+- **Deadline sweeper.** Expired HTTP claims are dropped by a linear scan of the claimed-lease cache on every claim (`SwarmHttp.sweep`, `src/sjws_nettask/swarm/SwarmHttp.java`), and expired tasks are only noticed when claimed (`TaskService.claim`). Replace this with a hashed timing wheel (one thread, O(1) insert/cancel per lease or deadline), using the same timing-wheel implementation as the graph runner's per-shard step timers (graphs §6.2), not the same instance: graphs §6.2 specifies a per-shard wheel owned by the shard's runner thread (single-writer, graphs §5), so sharing an instance would add a cross-thread handoff.
 - **Reply-ack thread outlives `Swarm.close()`.** The durability-then-ack executor (`ACKER` in `src/sjws_nettask/swarm/TaskService.java`) is a static single-thread executor, so it is not shut down by `Swarm.close()` / `SwarmModule.close()` and survives module reloads. Make it owned by `Swarm` (closed with it, after pending acks drain) and add a test that no swarm thread remains after close.
 
 ## 13. Benchmark plan
-All runs report the machine (CPU model, vCPU count, RAM, disk, kernel, JDK) and the commit. Every A/B comparison uses **≥ 5 alternating runs** (master, branch, master, …), reported as mean ± stddev, as Messaging Core did for #69. The load generator and the server are pinned to disjoint CPUs with `taskset`.
+All runs report the machine (CPU model, vCPU count and the worker count, RAM, disk, kernel, JDK) and the commit. Every A/B comparison uses **≥ 5 alternating runs** (master, branch, master, …), reported as mean ± stddev, as Messaging Core did for #69. The load generator and the server are pinned to disjoint CPUs with `taskset`.
 
 **Messaging baseline already measured** (PR #69 body: `DeliveryBench`, ASYNC, 256 B, 5 alternating runs):
 - produce ×1: 74,342 ± 3,230 ops/s
@@ -361,13 +363,15 @@ These are the reference points for the targets below. Neither this PR nor the ta
 **Targets** (Messaging Core, single node, same box as #69; these are pass thresholds, not results):
 | Workload | Target |
 |---|---|
-| Task dispatch (poll + ack, 1 KiB task, 16 workers) | ≥ 50k tasks/s, poll p99 < 100 µs |
+| Task dispatch (poll + ack, 1 KiB task, **workers = vCPU count**; 8 on the reference box) | ≥ 50k tasks/s, poll p99 < 100 µs |
 | Heartbeat/extend (10k leases, every 5 s) | ≤ 2k appends/s; < 2 % throughput loss vs no heartbeats |
 | Request/reply round trip (in-process) | p50 < 50 µs, p99 < 500 µs at 10k req/s |
 | Token streaming (1 KiB chunks, 1k concurrent streams) | ≥ 100 MiB/s aggregate, in order, chunk p99 < 1 ms producer→consumer |
 | Lease-expiry redelivery | within visibility + 10 ms |
 | Recovery with 1 M in-flight tasks | < 5 s |
 | Off | wrk within the noise band; no messaging threads |
+
+**S1c gate (decided 2026-10-14, inceptor).** The S1c latency gate is: claim p99 < 100 µs on the task-dispatch row, heartbeat loss < 2 %, and request/reply p99 < 500 µs. Dispatch is measured with **workers = the machine's vCPU count**, and every result states that core count. The reference box has 8 vCPU, so the gate is `SwarmBench dispatch 8`. The 16-worker run (16 on 8 vCPU) is reported as a **stress line, not the gate**: with more runnable workers than cores, a lock holder can be descheduled mid-section, so its p99 measures scheduling as much as code. The batched variant (`SwarmBench batched <W>x<B>`: claim up to `B` and settle with one batched fenced ack, `TaskService.ackAll`) is reported separately and is not the gate, because its claim latency is per batch, not per task. The §13 claim-1/ack-1 workload stays as it is.
 
 **Architecture additions:**
 1. **Streaming over HTTP:** time-to-first-token and inter-token latency added by sjws, agent emit → caller receive, on HTTP/1.1 chunked, SSE, h2 and h3. Ledger leg vs the optional direct path (§5.2).

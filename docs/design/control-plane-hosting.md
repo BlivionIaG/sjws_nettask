@@ -24,8 +24,8 @@ the swarm so data-only builds load no CP class):
 5. Report ready only when `CpStore.ready(...)` is true.
 
 **Implemented** in `sjws_nettask.cp.CpLaunch` / `CpHost` / `CpWitnessHost`. Hosting starts only when `cp` settings
-exist (a `cp:` block, `sjws.cp.nodeId` or `SJWS_CP_NODE_ID`); a control bootstrap without them keeps today's
-behaviour and logs a WARN. Once configured, every error is fatal.
+exist (a `cp:` block, `sjws.cp.nodeId` or `SJWS_CP_NODE_ID`); a control bootstrap without them fails closed
+(exit 64, before any listener; inceptor's decision after #161). Once configured, every error is fatal.
 
 The start, as implemented:
 
@@ -238,7 +238,26 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
 | `sjws.cp.admin.listen` | `SJWS_CP_ADMIN_LISTEN` | `cp.admin.listen` | AdminServer |
-| — | — | `cp.tls.{cert,key,ca,adminCa}` | owned by Security |
+| — | — | `cp.tls.{cert,key,ca,adminCa,revocations}` | owned by Security; watch and admin listeners |
+| — | — | `cp.tls.{peerCert,peerKey,peerCa}` | voter links; all three required with `cp.peers`, no fallback; `peerCa` must not be `ca` |
+| — | `SJWS_CP_RAFT_KEY` (`SJWS_CP_RAFT_KEY_PREVIOUS` during rotation) | — | CP-only Raft frame HMAC key, same on every voter; required with `cp.peers`; must differ from `WEB_SERVER_HA_CLUSTER_KEY` |
+
+**Voter links (`cp.peers`).** Each voter (and the witness) opens one `cluster.TcpTransport` on its own
+`cp.peers` address. Every socket comes from `cp.CpPeerSockets`, a `TcpTransport.SocketFactory` over the
+`cp-peer` `CpServerTls.context()` with `parameters()` applied (TLS 1.3, client certificate required on both
+ends). The voter links have their own certificate and key (`peerCert`/`peerKey`) and trust only `peerCa`, a CA
+that issues voter certificates only: a data-node watch certificate (issued under `ca`) must never pass, so
+`peerCa` equal to `ca` (same path or same bytes) is refused, and `adminCa` equal to `ca` logs a WARN.
+Frames are HMAC-authenticated with `SJWS_CP_RAFT_KEY`, a CP-only secret: data nodes hold the HA cluster key,
+so the Raft key is never derived from it and a start where they are equal is refused (no value is printed).
+An accepted socket must finish the mTLS handshake within `TcpTransport.HANDSHAKE_TIMEOUT_MILLIS` (5 s total)
+before it takes an inbound slot, and non-member source addresses are refused at accept in every mode.
+SIGHUP reloads the `cp-peer` material with the other listeners; new dials use the reloaded revocation list.
+Without TLS material the start fails closed; only the test seam (`CpHostDeps.serverTls` returning null) allows
+plain links, and only when every peer is loopback. A CONTROL role with no `cp` settings at all refuses to start
+(exit 64, before any listener). Gap: there is no hostname check and peer certificates are not yet bound to the
+`cp.peers` id (any certificate from `peerCa` passes TLS, and the Raft key is shared by the group); tracked as a
+follow-up issue that must land before CP is on by default or multi-host CP is documented.
 
 The role key is the existing `--role` / `WEB_SERVER_ROLE` / `node.mode` (`NodeLifecycle.role`); there is no `sjws.cp.role`.
 Implemented in `sjws_nettask.cp.CpConfig` and `CpKeyConfig`; `ConfigLoader` keeps the `cp:` block raw so a
