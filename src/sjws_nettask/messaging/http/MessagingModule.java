@@ -48,9 +48,12 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String TOPIC_DURABILITY_PROPERTY = "sjws.messaging.durability.topics";
     static final String TOPIC_DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY_TOPICS";
 
+    static final String COMPACTION_TOPICS_PROPERTY = "sjws.messaging.compaction.topics";
+    static final String COMPACTION_TOPICS_ENV = "SJWS_MESSAGING_COMPACTION_TOPICS";
+
     private final LogTopics topics;
     private volatile MessagingHooks hooks = MessagingHooks.NONE;
-    /** Null unless a retention limit is set: no thread when retention is off. */
+    /** Null unless a retention limit or a compacted topic is set: no thread when both are off. */
     private final java.util.concurrent.ScheduledExecutorService retentionTimer;
 
     public MessagingModule() {
@@ -60,7 +63,18 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
                         number(setting(RETENTION_MS_PROPERTY, RETENTION_MS_ENV, ""), 0)),
                 number(setting(RETENTION_CHECK_MS_PROPERTY, RETENTION_CHECK_MS_ENV, ""), 10_000),
                 durability(setting(DURABILITY_PROPERTY, DURABILITY_ENV, "")),
-                topicDurability(setting(TOPIC_DURABILITY_PROPERTY, TOPIC_DURABILITY_ENV, "")));
+                topicDurability(setting(TOPIC_DURABILITY_PROPERTY, TOPIC_DURABILITY_ENV, "")),
+                compactionTopics(setting(COMPACTION_TOPICS_PROPERTY, COMPACTION_TOPICS_ENV, "")));
+    }
+
+    /** Topics with key compaction; a bad list is logged and ignored as a whole. */
+    static java.util.Set<String> compactionTopics(String v) {
+        try {
+            return LogCompaction.parseTopics(v);
+        } catch (IllegalArgumentException e) {
+            System.err.println("WARN: " + e.getMessage());
+            return java.util.Set.of();
+        }
     }
 
     /** The module default; a bad value is logged and falls back to the writer default (ASYNC). */
@@ -94,8 +108,14 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
             java.util.Map<String, Durability> topicDurability) {
-        this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, System::currentTimeMillis);
-        if (retention.unlimited()) {
+        this(dir, segmentBytes, retention, checkMs, durability, topicDurability, java.util.Set.of());
+    }
+
+    MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
+            java.util.Map<String, Durability> topicDurability, java.util.Set<String> compactionTopics) {
+        this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, compactionTopics,
+                System::currentTimeMillis);
+        if (retention.unlimited() && compactionTopics.isEmpty()) {
             this.retentionTimer = null;
         } else {
             this.retentionTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
@@ -109,6 +129,11 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
             this.topics.enforceRetention();
         } catch (java.io.IOException | RuntimeException e) {
             System.err.println("WARN: messaging retention: " + e);
+        }
+        try {
+            this.topics.compact();
+        } catch (java.io.IOException | RuntimeException e) {
+            System.err.println("WARN: messaging compaction: " + e);
         }
     }
 

@@ -47,7 +47,8 @@ import sjws_nettask.messaging.ledger.RecordBatch;
  *       one batch. Optional {@code Durability: none|async|group}, never weaker than the topic policy; the response's
  *       {@code Durability-Effective} names the mode that applied. 200 {@code {"baseOffset":n,"count":c}} once it holds.</li>
  *   <li>{@code GET /messaging/v1/topics/{t}/records?offset=&maxBytes=}: body = raw {@link RecordBatch} frames, byte-identical
- *       to the on-disk format, from the batch containing {@code offset}; at least one batch if any, then up to
+ *       to the on-disk format, from the batch containing {@code offset} (on a compacted topic, the next retained batch when
+ *       {@code offset} was compacted away); at least one batch if any, then up to
  *       {@code maxBytes}. {@code Next-Offset} gives the offset to fetch next. Only committed batches are returned.</li>
  * </ul>
  * Errors are RFC 9457 problems.
@@ -155,7 +156,7 @@ final class MessagingHttp implements Handler {
         log.reads().readLock().lock();
         try {
             while (next < committed && total < maxBytes) {
-                var b = log.log().read(next);
+                var b = log.topicCompacted() ? log.log().readCeil(next) : log.log().read(next); // compacted: skip gaps
                 if (b == null || b.nextOffset() > committed) break;
                 int size = RecordBatch.encodedSize(b.records());
                 if (!fits(total, size, maxBytes)) break;
