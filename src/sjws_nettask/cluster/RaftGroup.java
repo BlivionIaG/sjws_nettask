@@ -862,11 +862,11 @@ final class RaftGroup {
     /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
     private boolean stepDown(long newTerm, List<Runnable> after) {
         if (newTerm > term && !saveHardState(newTerm, null)) {
-            if (role == Role.LEADER) {
-                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
-                        "group " + groupId.value() + ": leader at term " + term + " saw term " + newTerm
-                                + " but could not persist it; staying in term " + term + " and sending nothing");
-            }
+            // Every role: a node stuck below the cluster's term should be visible, not only a leader.
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                    "group " + groupId.value() + ": " + role.name().toLowerCase(java.util.Locale.ROOT) + " at term "
+                            + term + " saw term " + newTerm + " but could not persist it; staying in term " + term
+                            + " and sending nothing");
             return false;
         }
         boolean wasLeader = role == Role.LEADER;

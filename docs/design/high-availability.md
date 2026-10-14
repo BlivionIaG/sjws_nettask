@@ -97,8 +97,14 @@ What a voter keeps across a crash:
   `ATOMIC_MOVE`, directory fsync sequence as the witness cursor. On open, a missing file with an
   empty log is term 0; a missing file with a log (an upgrade) is the last entry's term, treated as
   already voted (for this node), so it cannot grant a second vote in that term (a witness takes
-  the term of its forced cursor); a missing file after `{group}.vote-saved` exists (written and
-  fsynced before the first vote file) means the file was deleted and refuses to start; the file is
+  the term of its forced cursor); a missing file after `{group}.vote-saved` exists means the file was deleted and refuses to
+  start. The marker is written (atomically, fsynced) right after the first vote file, so a crash
+  between the two leaves a vote file and no marker, which loads normally, and the next save adds
+  the marker; a crash before the first vote file lands leaves neither, which is safe because the
+  vote was never sent. If an operator deletes both files, the node cannot tell this from an
+  upgrade: it comes back at the last log term, treated as voted, which prevents a double vote in
+  that term but not in a later term it had voted in before. Treat the state directory as one
+  unit: restore or wipe it whole, never file by file; the file is
   opened with `NOFOLLOW_LINKS`, so a symlink in its place refuses to start; a short file, a bad magic, an unknown version or a CRC mismatch refuses to start with an
   error naming the file. It is never silently reset. Before this,
   a restarted node came back at term 0 with no vote and could vote twice in one term. A custom

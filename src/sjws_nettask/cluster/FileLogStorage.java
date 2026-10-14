@@ -281,6 +281,7 @@ public final class FileLogStorage implements LogStorage {
             }
             channel.force(true);
         }
+        crashPoint(target.getFileName() + ":temp");
         Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
             dir.force(true);
@@ -293,6 +294,16 @@ public final class FileLogStorage implements LogStorage {
     }
 
     private record CursorFile(long index, long term) {
+    }
+
+    /** Tests only: throws at a named point to simulate a crash there. Null in production. */
+    volatile java.util.function.Consumer<String> crashHook;
+
+    private void crashPoint(String stage) throws IOException {
+        var hook = crashHook;
+        if (hook != null) {
+            hook.accept(stage);
+        }
     }
 
     /** {@code "SJVT"}: the vote file magic. */
@@ -317,12 +328,14 @@ public final class FileLogStorage implements LogStorage {
             crc.update(buf.array(), 0, 20);
             buf.putInt((int) crc.getValue());
             buf.flip();
+            writeAtomically(votePath(group), buf);
+            crashPoint("vote-written");
             var marker = voteMarkerPath(group);
             if (!Files.exists(marker, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-                // Durable before the first vote file, so a later missing vote file is never an upgrade.
+                // After the vote file: a crash between the two leaves a vote file and no marker, which
+                // loads as saved state. The other order would leave a marker and no vote, refusing startup.
                 writeAtomically(marker, ByteBuffer.wrap(new byte[] {1}));
             }
-            writeAtomically(votePath(group), buf);
         } finally {
             lock.unlock();
         }
