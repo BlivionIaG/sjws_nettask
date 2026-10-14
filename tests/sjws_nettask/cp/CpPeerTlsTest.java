@@ -82,6 +82,21 @@ class CpPeerTlsTest {
         }
     }
 
+    /**
+     * A refusal is a TLS handshake failure, not a timeout or deadline close that would also make the dial fail.
+     * The exception may arrive wrapped, so the cause chain is searched.
+     */
+    private static void assertRefused(Exception seen, String what) {
+        assertNotNull(seen, what);
+        for (Throwable t = seen; t != null; t = t.getCause()) {
+            if (t instanceof javax.net.ssl.SSLHandshakeException) {
+                return;
+            }
+            assertFalse(t instanceof java.net.SocketTimeoutException, what + ": timed out instead: " + seen);
+        }
+        fail(what + ": expected an SSLHandshakeException, got " + seen);
+    }
+
     private Path denylist(String name, java.math.BigInteger... serials) throws IOException {
         var text = new StringBuilder("# test denylist\n");
         for (var serial : serials) {
@@ -105,12 +120,12 @@ class CpPeerTlsTest {
         // The acceptor's cert is from another CA: the dialer refuses it.
         var serverForeign = dial(CpTls.serverContext(other.listener("cp-peer", "a")),
                 CpTls.serverContext(ca.listener("cp-peer", "b")));
-        assertNotNull(serverForeign.client(), "dialer accepted a server cert from a foreign CA");
-        assertNotNull(serverForeign.server());
+        assertRefused(serverForeign.client(), "dialer accepted a server cert from a foreign CA");
+        assertRefused(serverForeign.server(), "acceptor saw the dialer's refusal");
         // The dialer's cert is from another CA: the acceptor refuses it.
         var clientForeign = dial(CpTls.serverContext(ca.listener("cp-peer", "c")),
                 CpTls.serverContext(other.listener("cp-peer", "d")));
-        assertNotNull(clientForeign.server(), "acceptor accepted a client cert from a foreign CA");
+        assertRefused(clientForeign.server(), "acceptor accepted a client cert from a foreign CA");
     }
 
     @Test
@@ -119,10 +134,10 @@ class CpPeerTlsTest {
         long past = System.currentTimeMillis() - 60_000L;
         var expiredServer = dial(CpTls.serverContext(ca.listener("cp-peer", "a", past, null)),
                 CpTls.serverContext(ca.listener("cp-peer", "b")));
-        assertNotNull(expiredServer.client(), "dialer accepted an expired server cert");
+        assertRefused(expiredServer.client(), "dialer accepted an expired server cert");
         var expiredClient = dial(CpTls.serverContext(ca.listener("cp-peer", "c")),
                 CpTls.serverContext(ca.listener("cp-peer", "d", past, null)));
-        assertNotNull(expiredClient.server(), "acceptor accepted an expired client cert");
+        assertRefused(expiredClient.server(), "acceptor accepted an expired client cert");
     }
 
     @Test
@@ -133,14 +148,14 @@ class CpPeerTlsTest {
         var clientCfg = ca.listener("cp-peer", "b", System.currentTimeMillis() + 86_400_000L,
                 denylist("client-deny", revokedServerSerial));
         var revokedServer = dial(CpTls.serverContext(serverCfg), CpTls.serverContext(clientCfg));
-        assertNotNull(revokedServer.client(), "dialer accepted a revoked server cert");
+        assertRefused(revokedServer.client(), "dialer accepted a revoked server cert");
 
         var clientCert = ca.listener("cp-peer", "c");
         var revokedClientSerial = ca.lastSerial();
         var acceptor = ca.listener("cp-peer", "d", System.currentTimeMillis() + 86_400_000L,
                 denylist("server-deny", revokedClientSerial));
         var revokedClient = dial(CpTls.serverContext(acceptor), CpTls.serverContext(clientCert));
-        assertNotNull(revokedClient.server(), "acceptor accepted a revoked client cert");
+        assertRefused(revokedClient.server(), "acceptor accepted a revoked client cert");
     }
 
     @Test
@@ -242,6 +257,37 @@ class CpPeerTlsTest {
                 fail("timed out: " + what);
             }
             Thread.sleep(10);
+        }
+    }
+
+    /** More concurrent handshakes than the cap: the extra accepts are closed at once and counted. */
+    @Test
+    void inFlightHandshakesAreCapped() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca"));
+        var key = ClusterKey.of("cp-raft-key-for-tests-0123".getBytes(StandardCharsets.US_ASCII), null);
+        var members = new ArrayList<Member>();
+        for (int wire = 1; wire <= 2; wire++) {
+            members.add(new Member(new NodeId(wire, "cp-" + wire), new SiteId("cp"),
+                    new InetSocketAddress("127.0.0.1", freePort()), 1L, MemberState.ALIVE, false));
+        }
+        try (var b = TcpTransport.open(members.get(1).id(), members, key, Clock.SYSTEM, 64,
+                new CpPeerSockets(CpTls.serverContext(ca.listener("cp-peer", "cp-2"))))) {
+            int cap = Math.max(8, TcpTransport.HANDSHAKES_PER_PEER); // one peer
+            var stalled = new ArrayList<Socket>();
+            try {
+                for (int i = 0; i < cap + 4; i++) {
+                    var s = new Socket("127.0.0.1", b.localPort());
+                    s.getOutputStream().write(0x16); // a handshake that never finishes
+                    s.getOutputStream().flush();
+                    stalled.add(s);
+                }
+                await(() -> b.handshakesRefused() >= 4, "the accepts beyond the cap are refused");
+                assertTrue(b.handshaking() <= cap, "in flight " + b.handshaking());
+            } finally {
+                for (var s : stalled) {
+                    s.close();
+                }
+            }
         }
     }
 }
