@@ -230,7 +230,8 @@ public final class TaskService {
 
     /**
      * Pool totals over all shards: the worker group's counts summed, the dead letters still in the DLQs, and the
-     * oldest unresolved task's enqueue time (0 if none).
+     * oldest unresolved task's enqueue time (0 if none). Exact, from each shard's published counts; unlike
+     * {@link #readyHints}, which are cheap claim-path hints only and may be stale.
      */
     public record PoolCounts(int shards, sjws_nettask.messaging.delivery.DeliverySnapshot.Counts workers, long deadLetterQueueSize,
             long oldestUnresolvedAtMs) { }
