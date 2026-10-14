@@ -222,4 +222,45 @@ class DurableIndexTest {
         return new Member(new NodeId(wire, "n" + wire), new SiteId("local"),
                 new InetSocketAddress("127.0.0.1", 23_300 + wire), 1L, MemberState.ALIVE, witness);
     }
+
+    @Test
+    void aSyncDelayAboveTheLeaseIsWarnedAboutOnOpen() {
+        var records = new java.util.concurrent.CopyOnWriteArrayList<java.util.logging.LogRecord>();
+        var handler = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        var jul = java.util.logging.Logger.getLogger(RaftGroup.class.getName());
+        jul.addHandler(handler);
+        try {
+            var base = new GroupOptions(Durability.RELAXED, 1024, java.time.Duration.ofMillis(100),
+                    java.time.Duration.ofMillis(40), 1_000_000);
+            open(base.withRelaxedSyncBound(java.time.Duration.ofMillis(80), Long.MAX_VALUE), "g-ok");
+            open(base.withRelaxedSyncBound(java.time.Duration.ofMillis(81), Long.MAX_VALUE), "g-slow");
+            var warned = records.stream().filter(r -> r.getLevel() == java.util.logging.Level.WARNING
+                    && r.getMessage().contains("relaxedSyncDelay")).map(java.util.logging.LogRecord::getMessage).toList();
+            org.junit.jupiter.api.Assertions.assertEquals(1, warned.size(), String.valueOf(warned));
+            org.junit.jupiter.api.Assertions.assertTrue(warned.get(0).contains("g-slow"), warned.get(0));
+        } finally {
+            jul.removeHandler(handler);
+        }
+    }
+
+    private static void open(GroupOptions options, String name) {
+        var n1 = new NodeId(1, "n1");
+        var group = new RaftGroup(new GroupId(name), n1, false, java.util.Set.of(), java.util.Set.of(n1),
+                java.util.List.of(), w -> n1, QuorumPolicy.majority(), options, new MemoryLogStorage(),
+                (to, frame) -> { }, new FakeClock(0L), null, 1024);
+        group.closeDeliveries(java.time.Duration.ofSeconds(1));
+    }
 }
