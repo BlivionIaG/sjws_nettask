@@ -98,8 +98,7 @@ final class LogOffsets {
                     int z = ks.indexOf('\0');
                     if (z <= 0) continue;
                     var v = ByteBuffer.wrap(r, 4 + klen, 16);
-                    this.commits.computeIfAbsent(ks.substring(0, z), t -> new ConcurrentHashMap<>())
-                            .put(ks.substring(z + 1), new Commit(v.getLong(), v.getLong(), 0));
+                    groups(ks.substring(0, z)).put(ks.substring(z + 1), new Commit(v.getLong(), v.getLong(), 0));
                 }
             });
             this.loaded = true;
@@ -136,10 +135,17 @@ final class LogOffsets {
         }
         var c = new Commit(offset, now, s);
         return f.thenApply(base -> {
-            this.commits.computeIfAbsent(topic, t -> new ConcurrentHashMap<>())
-                    .merge(group, c, (old, nu) -> nu.seq() >= old.seq() ? nu : old);
+            groups(topic).merge(group, c, (old, nu) -> nu.seq() >= old.seq() ? nu : old);
             return base;
         });
+    }
+
+    private ConcurrentHashMap<String, Commit> groups(String topic) {
+        var m = this.commits.get(topic);
+        if (m != null) return m;
+        var fresh = new ConcurrentHashMap<String, Commit>();
+        m = this.commits.putIfAbsent(topic, fresh);
+        return m != null ? m : fresh;
     }
 
     /** The committed offset of {@code group} on {@code topic}, or -1 when it never committed. */

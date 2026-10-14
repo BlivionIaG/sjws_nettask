@@ -59,6 +59,8 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     private java.util.concurrent.ScheduledExecutorService retentionTimer;
     private final long checkMs;
     private boolean closed;
+    /** Guards {@link #retentionTimer} and {@link #closed}. */
+    private final java.util.concurrent.locks.ReentrantLock timerLock = new java.util.concurrent.locks.ReentrantLock();
 
     public MessagingModule() {
         this(Path.of(setting(DIR_PROPERTY, DIR_ENV, "messaging-data")),
@@ -131,11 +133,16 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         if (this.topics.maintenanceNeeded()) ensureTimer();
     }
 
-    private synchronized void ensureTimer() {
-        if (this.retentionTimer != null || this.closed) return;
-        this.retentionTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
-                r -> Thread.ofPlatform().name("messaging-retention").daemon().unstarted(r));
-        this.retentionTimer.scheduleWithFixedDelay(this::retain, this.checkMs, this.checkMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+    private void ensureTimer() {
+        this.timerLock.lock();
+        try {
+            if (this.retentionTimer != null || this.closed) return;
+            this.retentionTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+                    r -> Thread.ofPlatform().name("messaging-retention").daemon().unstarted(r));
+            this.retentionTimer.scheduleWithFixedDelay(this::retain, this.checkMs, this.checkMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } finally {
+            this.timerLock.unlock();
+        }
     }
 
     void retain() {
@@ -155,8 +162,13 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         return this.topics;
     }
 
-    synchronized boolean retentionScheduled() {
-        return this.retentionTimer != null;
+    boolean retentionScheduled() {
+        this.timerLock.lock();
+        try {
+            return this.retentionTimer != null;
+        } finally {
+            this.timerLock.unlock();
+        }
     }
 
     static long number(String v, long dflt) {
@@ -190,9 +202,12 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     @Override
     public void close() {
-        synchronized (this) {
+        this.timerLock.lock();
+        try {
             this.closed = true;
             if (this.retentionTimer != null) this.retentionTimer.shutdownNow();
+        } finally {
+            this.timerLock.unlock();
         }
         this.topics.close();
     }
