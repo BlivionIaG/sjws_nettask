@@ -109,6 +109,10 @@ final class RaftGroup {
     private byte[] snapData = new byte[0];
     private SnapshotTaker taker;
     private boolean takerInFlight;
+    /** Set with {@link SnapshotControl#setTruncationBound}; volatile because it is read without the lock. */
+    private volatile TruncationBound truncationBound;
+    /** Highest index this node has dropped from its log prefix (snapshot install or truncation). */
+    private long truncatedThrough;
     private boolean relaxedDirty;
     /** Clock time when the oldest entry not yet fsynced was stored. */
     private long dirtySince;
@@ -1551,6 +1555,7 @@ final class RaftGroup {
                 } catch (IOException failed) {
                     throw new UncheckedIOException(failed);
                 }
+                truncatedThrough = Math.max(truncatedThrough, snapIndex);
                 if (commitIndex < snapIndex) {
                     commitIndex = snapIndex;
                 }
@@ -1563,31 +1568,97 @@ final class RaftGroup {
         }
 
         @Override
+        public void setTruncationBound(TruncationBound bound) {
+            truncationBound = bound;
+        }
+
+        @Override
         public CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor) {
             Objects.requireNonNull(compactor, "compactor");
             var future = new CompletableFuture<Void>();
+            long through = ackedThrough;
+            var bound = truncationBound;
+            if (bound != null) {
+                try {
+                    through = Math.min(through, bound.truncatableThrough(groupId, currentSnapIndex()));
+                } catch (Exception failed) {
+                    future.completeExceptionally(failed);
+                    return future;
+                }
+            }
             lock.lock();
             try {
                 if (snapIndex < ackedThrough) {
                     future.completeExceptionally(new IllegalArgumentException("not snapshotted"));
                     return future;
                 }
-                try {
-                    storage.truncatePrefix(groupId, ackedThrough);
-                } catch (IOException failed) {
-                    future.completeExceptionally(failed);
+                if (!truncateLocked(through, compactor, future)) {
                     return future;
-                }
-                var current = new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
-                var compacted = compactor.compact(current);
-                if (compacted != null) {
-                    snapData = compacted;
                 }
                 future.complete(null);
             } finally {
                 lock.unlock();
             }
             return future;
+        }
+
+        @Override
+        public CompletableFuture<Long> truncateToBound(Compactor compactor) {
+            Objects.requireNonNull(compactor, "compactor");
+            var future = new CompletableFuture<Long>();
+            var bound = truncationBound;
+            if (bound == null) {
+                future.completeExceptionally(new IllegalStateException("no truncation bound set"));
+                return future;
+            }
+            long snapshot = currentSnapIndex();
+            long limit;
+            try {
+                limit = bound.truncatableThrough(groupId, snapshot);
+            } catch (Exception failed) {
+                future.completeExceptionally(failed);
+                return future;
+            }
+            lock.lock();
+            try {
+                // The snapshot can only have moved forward meanwhile; never past what the bound saw.
+                long through = Math.min(snapshot, limit);
+                if (!truncateLocked(through, compactor, future)) {
+                    return future;
+                }
+                future.complete(truncatedThrough);
+            } finally {
+                lock.unlock();
+            }
+            return future;
+        }
+
+        private long currentSnapIndex() {
+            lock.lock();
+            try {
+                return snapIndex;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /** Under the lock. False after failing {@code future}; nothing new to drop still compacts. */
+        private boolean truncateLocked(long through, Compactor compactor, CompletableFuture<?> future) {
+            if (through > truncatedThrough) {
+                try {
+                    storage.truncatePrefix(groupId, through);
+                } catch (IOException failed) {
+                    future.completeExceptionally(failed);
+                    return false;
+                }
+                truncatedThrough = through;
+            }
+            var current = new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
+            var compacted = compactor.compact(current);
+            if (compacted != null) {
+                snapData = compacted;
+            }
+            return true;
         }
     }
 }

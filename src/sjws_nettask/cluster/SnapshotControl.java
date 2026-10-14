@@ -41,4 +41,23 @@ public interface SnapshotControl {
     default void setSnapshotTaker(SnapshotTaker taker) {
         throw new UnsupportedOperationException("snapshot taker");
     }
+
+    /**
+     * Use {@code bound} (null removes it) to limit prefix truncation: with a bound,
+     * {@link #truncateAndCompact} never drops past it, and {@link #truncateToBound} truncates
+     * through {@code min(snapshot index, bound)}. Automatic snapshots never truncate the log, with or
+     * without a bound. The default refuses.
+     */
+    default void setTruncationBound(TruncationBound bound) {
+        throw new UnsupportedOperationException("truncation bound");
+    }
+
+    /**
+     * Truncate through {@code min(snapshot index, bound)} and compact. Completes with the index the
+     * log is now truncated through (unchanged when the bound allows nothing new); fails when no bound
+     * is set or the bound throws, truncating nothing. The default refuses.
+     */
+    default CompletableFuture<Long> truncateToBound(Compactor compactor) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException("truncation bound"));
+    }
 }

@@ -147,6 +147,36 @@ is refused inside a callback, and blocks until the delivery thread has run the t
 `GroupOptions.withoutAutoSnapshot()` (`snapshotEveryEntries == NO_AUTO_SNAPSHOT`) turns
 automatic snapshots off, so the application decides when to call `take`.
 
+### Truncation bound
+
+`SnapshotControl.setTruncationBound(TruncationBound)` lets the application limit how far the
+Raft log prefix may be dropped. `truncatableThrough(group, snapshotIndex)` returns the highest
+index the application no longer needs from Raft: its own state is durable through it, and
+nothing it still serves (retention low watermark, the oldest consumer offset, the ledger low
+watermark) lies at or below it. `Long.MAX_VALUE` means no limit beyond the snapshot, 0 keeps the
+log. With a bound set:
+
+- `truncateToBound(compactor)` truncates through `min(snapshot index, bound)`, compacts, and
+  completes with the index the log is truncated through. The snapshot index passed to the bound
+  is read first; the truncation never goes past it, even if a snapshot lands meanwhile.
+- `truncateAndCompact(ackedThrough, compactor)` truncates through `min(ackedThrough, bound)`.
+  Without a bound it behaves as before.
+- A bound that throws fails the future and truncates nothing. A bound lower than an earlier
+  truncation undoes nothing.
+
+The bound is called on the caller's thread without the group lock, so it may read application
+state but must not call back into the group. Automatic snapshots never truncate the log, with or
+without a bound: they only move the in-memory snapshot point, which makes a lagging follower
+receive the snapshot instead of entries. Truncation stays an explicit call (for messaging, from
+the maintenance timer after retention and compaction). A follower behind the leader's
+truncation point catches up through `install`. Unused, the bound costs a null check in the two
+truncation calls and nothing on the append or commit path.
+
+Two existing limits apply to any truncation and are not changed here: the snapshot image lives in
+memory only, so after a restart a node whose log was truncated has neither the dropped entries
+nor the image and depends on the application's own durable state; and `FileLogStorage` drops a
+prefix by rewriting the log file in place, which is not crash-atomic.
+
 ### Restart safety and the exact RELAXED guarantee
 
 What a voter keeps across a crash:
