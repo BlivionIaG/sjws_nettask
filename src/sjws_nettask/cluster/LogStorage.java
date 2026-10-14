@@ -54,4 +54,32 @@ public interface LogStorage {
      * is ignored. The stage is durable only after {@link #force}.
      */
     void noteWitness(GroupId group, long index, long term) throws IOException;
+
+    /**
+     * Make {@code term} and {@code votedFor} (a wire id, 0 for none) durable before returning, so a
+     * restarted voter cannot vote twice in one term. The default keeps nothing: a storage that does
+     * not override it restarts at term 0 with no vote, which is only safe for a single voter.
+     */
+    default void saveHardState(GroupId group, long term, int votedFor) throws IOException {
+        // Not persisted by default.
+    }
+
+    /**
+     * True when {@link #saveHardState} has ever completed for this group. When false, a voter
+     * starts at the term of its last log entry with no vote (an upgrade from a version that did
+     * not persist it). Corrupt state must throw rather than read as absent.
+     */
+    default boolean hasHardState(GroupId group) throws IOException {
+        return false;
+    }
+
+    /** Term last made durable by {@link #saveHardState}, or 0. */
+    default long hardStateTerm(GroupId group) throws IOException {
+        return 0L;
+    }
+
+    /** Vote (wire id) last made durable by {@link #saveHardState}, or 0 for none. */
+    default int hardStateVote(GroupId group) throws IOException {
+        return 0;
+    }
 }
