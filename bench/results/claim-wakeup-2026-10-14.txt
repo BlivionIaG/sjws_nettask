@@ -1,0 +1,28 @@
+# fix/swarm-claim-wakeup before/after, 2026-10-14 (Paris). before=8a3b536 TaskService + per-hop bench, after=CAS fix.
+# All: nice -n 10 taskset -c 0-7 (unpinned; pin-gen.sh is not on master), G1, shards=4, flock /tmp/sjws-bench.lock, waited for 1-min load < 4 before each run (up to 120 s). load = start/peak/end.
+## reqreply 10000/s 10 s, interleaved order
+start 07:10:20 load 6.20 7.04 6.45 others: 0
+rr-before 1 load 3.88/3.98/3.98: reqreply workers=1 rate=10000 rtt_p50_us=27.6 rtt_p99_us=1002.6 rtt_max_us=7660.9 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.4 submit_p99_us=17.4 queue_to_claim_p50_us=7.7 queue_to_claim_p99_us=83.5 claim_to_reply_written_p50_us=5.5 claim_to_reply_written_p99_us=28.8 reply_delivered_p50_us=6.7 reply_delivered_p99_us=30.3 
+rr-after 1 load 3.98/3.98/3.71: reqreply workers=1 rate=10000 rtt_p50_us=27.0 rtt_p99_us=561.5 rtt_max_us=9303.0 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.2 submit_p99_us=13.9 queue_to_claim_p50_us=7.6 queue_to_claim_p99_us=64.9 claim_to_reply_written_p50_us=5.4 claim_to_reply_written_p99_us=22.5 reply_delivered_p50_us=6.8 reply_delivered_p99_us=30.4 
+rr-after 2 load 3.71/4.38/4.38: reqreply workers=1 rate=10000 rtt_p50_us=26.9 rtt_p99_us=325.9 rtt_max_us=10358.5 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.4 submit_p99_us=16.0 queue_to_claim_p50_us=7.5 queue_to_claim_p99_us=44.0 claim_to_reply_written_p50_us=5.3 claim_to_reply_written_p99_us=20.4 reply_delivered_p50_us=6.5 reply_delivered_p99_us=28.0 
+rr-before 2 load 3.86/4.27/4.27: reqreply workers=1 rate=10000 rtt_p50_us=25.9 rtt_p99_us=847.7 rtt_max_us=6515.1 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.3 submit_p99_us=16.1 queue_to_claim_p50_us=7.3 queue_to_claim_p99_us=250.9 claim_to_reply_written_p50_us=5.2 claim_to_reply_written_p99_us=30.8 reply_delivered_p50_us=6.3 reply_delivered_p99_us=38.6 
+rr-before 3 load 3.93/4.17/4.17: reqreply workers=1 rate=10000 rtt_p50_us=27.9 rtt_p99_us=1617.7 rtt_max_us=7328.7 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.5 submit_p99_us=38.9 queue_to_claim_p50_us=7.7 queue_to_claim_p99_us=356.0 claim_to_reply_written_p50_us=5.5 claim_to_reply_written_p99_us=47.8 reply_delivered_p50_us=6.5 reply_delivered_p99_us=51.3 
+rr-after 3 load 3.84/4.97/4.89: reqreply workers=1 rate=10000 rtt_p50_us=26.7 rtt_p99_us=206.9 rtt_max_us=6244.0 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.5 submit_p99_us=14.6 queue_to_claim_p50_us=7.3 queue_to_claim_p99_us=41.6 claim_to_reply_written_p50_us=5.3 claim_to_reply_written_p99_us=20.1 reply_delivered_p50_us=6.5 reply_delivered_p99_us=26.5 
+rr-after 4 load 3.81/4.06/3.82: reqreply workers=1 rate=10000 rtt_p50_us=27.0 rtt_p99_us=800.0 rtt_max_us=7844.8 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.4 submit_p99_us=21.7 queue_to_claim_p50_us=7.6 queue_to_claim_p99_us=68.7 claim_to_reply_written_p50_us=5.3 claim_to_reply_written_p99_us=29.0 reply_delivered_p50_us=6.7 reply_delivered_p99_us=34.1 
+rr-before 4 load 3.82/4.63/4.47: reqreply workers=1 rate=10000 rtt_p50_us=26.8 rtt_p99_us=99.4 rtt_max_us=6838.6 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.4 submit_p99_us=15.9 queue_to_claim_p50_us=7.4 queue_to_claim_p99_us=29.5 claim_to_reply_written_p50_us=5.4 claim_to_reply_written_p99_us=19.7 reply_delivered_p50_us=6.3 reply_delivered_p99_us=25.9 
+rr-before 5 load 3.78/3.90/3.90: reqreply workers=1 rate=10000 rtt_p50_us=26.1 rtt_p99_us=242.2 rtt_max_us=6263.1 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.4 submit_p99_us=15.4 queue_to_claim_p50_us=7.2 queue_to_claim_p99_us=27.3 claim_to_reply_written_p50_us=5.2 claim_to_reply_written_p99_us=18.3 reply_delivered_p50_us=6.2 reply_delivered_p99_us=26.3 
+rr-after 5 load 3.90/4.62/4.61: reqreply workers=1 rate=10000 rtt_p50_us=26.5 rtt_p99_us=153.2 rtt_max_us=10005.9 n=100000 ok=100000 failed=0 missing=0 reqreply hops n=100000 submit_p50_us=6.5 submit_p99_us=15.5 queue_to_claim_p50_us=7.2 queue_to_claim_p99_us=27.4 claim_to_reply_written_p50_us=5.2 claim_to_reply_written_p99_us=17.0 reply_delivered_p50_us=6.3 reply_delivered_p99_us=25.3 
+end 07:13:31 load 4.61 5.59 5.96
+## dispatch 8 workers 5 s (from the first interleaved series; rr lines of that series are discarded: loads 7-11 from back-to-back dispatch)
+start 07:04:05 load 1.46 4.17 5.46 others: 0
+disp-after 1 load 3.22/5.53/5.53: dispatch workers=8 tasks/s=544633 claim_p50_us=1.85 claim_p99_us=19.04 
+disp-before 1 load 5.53/7.70/7.70: dispatch workers=8 tasks/s=566654 claim_p50_us=1.86 claim_p99_us=21.10 
+disp-after 2 load 7.57/7.57/6.96: dispatch workers=8 tasks/s=541688 claim_p50_us=1.85 claim_p99_us=23.92 
+disp-before 2 load 6.96/8.92/8.92: dispatch workers=8 tasks/s=519621 claim_p50_us=1.90 claim_p99_us=20.47 
+disp-after 3 load 8.01/9.23/9.23: dispatch workers=8 tasks/s=554877 claim_p50_us=1.92 claim_p99_us=19.18 
+disp-before 3 load 9.23/9.41/8.73: dispatch workers=8 tasks/s=533846 claim_p50_us=1.93 claim_p99_us=23.39 
+disp-after 4 load 7.95/8.89/8.89: dispatch workers=8 tasks/s=514772 claim_p50_us=1.92 claim_p99_us=21.66 
+disp-before 4 load 8.89/9.23/9.12: dispatch workers=8 tasks/s=506477 claim_p50_us=2.01 claim_p99_us=24.09 
+disp-after 5 load 9.02/9.60/9.60: dispatch workers=8 tasks/s=466407 claim_p50_us=1.93 claim_p99_us=25.08 
+disp-before 5 load 9.60/11.12/11.12: dispatch workers=8 tasks/s=515810 claim_p50_us=1.99 claim_p99_us=24.38 
+end 07:09:47 load 11.12 7.92 6.70
