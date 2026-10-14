@@ -256,7 +256,9 @@ public class SwarmBench {
     /** The measured-call index carried in the first 8 bytes of a reqreply body, or -1 (warm-up, short body). */
     static int hopIndex(byte[] body, long warm, int measured) {
         if (body.length < 8) return -1;
-        long k = java.nio.ByteBuffer.wrap(body).getLong() - warm;
+        long v = 0;
+        for (int b = 0; b < 8; b++) v = (v << 8) | (body[b] & 0xff); // no ByteBuffer per task on the workers
+        long k = v - warm;
         return k >= 0 && k < measured ? (int) k : -1;
     }
 
@@ -270,9 +272,12 @@ public class SwarmBench {
         var t = s.tasks();
         // Per-hop timestamps (absolute nanoTime, by call index; the index rides in the first 8 body bytes):
         // submitted = call() returned, claimed = claim() returned it, written = replyAll() returned for its batch.
-        long gap0 = 1_000_000_000L / rate;
-        int measured = (int) ((long) (secs * 1e9 / gap0));
-        long warm0 = (long) (2e9 / gap0);
+        // Derived once: the sender loop, lat[] and hopIndex all use these. A redelivery (dropEvery > 0) overwrites
+        // claimed[k], so queue_to_claim then measures the last attempt, not the first.
+        long gap = 1_000_000_000L / rate;
+        long warm = (long) (2e9 / gap), total = warm + (long) (secs * 1e9 / gap);
+        int measured = (int) (total - warm);
+        long warm0 = warm;
         var submitted = new long[measured];
         var claimed = new long[measured];
         var written = new long[measured];
@@ -312,21 +317,25 @@ public class SwarmBench {
                 }
             }));
         }
-        long gap = 1_000_000_000L / rate;
-        long warm = (long) (2e9 / gap), total = warm + (long) (secs * 1e9 / gap);
-        var lat = new long[(int) (total - warm)];
+        var lat = new long[measured];
         java.util.Arrays.fill(lat, -1);
         var done = new AtomicLong();
         var ok = new AtomicLong();
         var failed = new AtomicLong();
         long start = System.nanoTime();
         var delivered = new long[lat.length];
+        // Bodies preallocated before the clock starts (each carries its call index), so the timed loop allocates
+        // nothing per call: the same workload as the old single reused buffer, plus 8 index bytes.
+        var calls = new byte[(int) total][];
+        for (int i = 0; i < calls.length; i++) {
+            calls[i] = new byte[256];
+            for (int b = 0; b < 8; b++) calls[i][b] = (byte) (i >>> (56 - 8 * b));
+        }
         for (long i = 0; i < total; i++) {
             long due = start + i * gap;
             while (System.nanoTime() < due) Thread.onSpinWait();
             long idx = i - warm;
-            var body = new byte[256];
-            java.nio.ByteBuffer.wrap(body).putLong(i);
+            var body = calls[(int) i];
             var f = s.replies().call("echo", "", body, System.currentTimeMillis() + callDeadlineMs, "");
             if (idx >= 0) submitted[(int) idx] = System.nanoTime();
             f.whenComplete((r, e) -> {

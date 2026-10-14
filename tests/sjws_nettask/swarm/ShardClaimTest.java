@@ -68,7 +68,7 @@ class ShardClaimTest {
         var ps = t.pool("p");
         ps.added(s, 1); // stale: nothing in the partition
         t.afterEmptyPoll = () -> {
-            t.afterEmptyPoll = null;
+            t.afterEmptyPoll = TaskService.NO_HOOK;
             t.submit("p", 1, seqFor(t, s, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
         };
         var got = t.claim("p", worker, 1, 10_000, 0);
@@ -77,6 +77,17 @@ class ShardClaimTest {
         assertEquals(1, got.size());
         assertEquals(s, got.get(0).shard());
         assertEquals(1, t.readyHints("p")[s], "the raced-in submit's hint survived the empty-poll reset");
+    }
+
+    @Test
+    void aStaleHintWithNoRaceIsResetByTheEmptyPoll() {
+        // the CAS succeeds when nothing raced in: a regression to "never reset" would leave the 1
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        String worker = "w";
+        int s = Math.floorMod(worker.hashCode(), 4);
+        t.pool("p").added(s, 1); // stale: nothing in the partition
+        assertTrue(t.claim("p", worker, 1, 10_000, 0).isEmpty());
+        assertEquals(0, t.readyHints("p")[s], "the stale hint was reset");
     }
 
     @Test

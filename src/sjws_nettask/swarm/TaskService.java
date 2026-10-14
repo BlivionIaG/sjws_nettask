@@ -278,10 +278,11 @@ public final class TaskService {
             this.shardPolls.increment();
             var got = p.poll(WORKERS, worker, want, visibilityMs);
             if (got.isEmpty()) {
-                var hook = this.afterEmptyPoll;
-                if (hook != null) hook.run();
+                this.afterEmptyPoll.run();
                 // The hint was stale. Reset only if no submit raced in since we read it: a blind set(s, 0) here lost
                 // the hint of a submit landing between the poll and the reset, and a claim then parked a full slice.
+                // A failed CAS also keeps the stale part of the hint: at worst one extra empty poll later (the next
+                // empty poll or full sweep resets it). Deliberate: do not "fix" this back to a blind set.
                 ps.ready.compareAndSet(s, seen, 0);
                 continue;
             }
@@ -298,8 +299,13 @@ public final class TaskService {
         return out == null ? List.of() : out;
     }
 
-    /** Test seam: run between a sharded poll that came back empty and the reset of that shard's ready hint. */
-    volatile Runnable afterEmptyPoll;
+    static final Runnable NO_HOOK = () -> { };
+
+    /**
+     * Visible for testing only: runs between a sharded poll that came back empty and the reset of that shard's
+     * ready hint. Never null; production leaves it at {@link #NO_HOOK}.
+     */
+    volatile Runnable afterEmptyPoll = NO_HOOK;
 
     /** Longest park on the home shard of a waiting sharded claim before the other shards are swept again. */
     static final long SHARD_WAIT_SLICE_NANOS = 2_000_000;
