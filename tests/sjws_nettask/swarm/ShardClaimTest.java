@@ -152,6 +152,18 @@ class ShardClaimTest {
     }
 
     @Test
+    void readyHintsArePerShardSnapshots() {
+        var t = open(4, TaskService.SHARD_WAIT_SLICE_NANOS);
+        assertEquals(4, t.readyHints("p").length);
+        long seq = seqFor(t, 3, 0);
+        t.submit("p", 1, seq, TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        t.submit("p", 1, seqFor(t, 3, seq), TaskServiceTest.env("y", "", TaskEnvelope.NO_DEADLINE));
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new long[] {0, 0, 0, 2}, t.readyHints("p"));
+        t.claim("p", "w", 1, 10_000);
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new long[] {0, 0, 0, 1}, t.readyHints("p"));
+    }
+
+    @Test
     void oneShardKeepsThePlainPath() {
         var t = open(1, TaskService.SHARD_WAIT_SLICE_NANOS);
         t.submit("p", 1, 1, TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));

@@ -121,6 +121,20 @@ public final class TaskService {
     /** Partition polls done by sharded claims (tests: empty shards are skipped). */
     private final java.util.concurrent.atomic.LongAdder shardPolls = new java.util.concurrent.atomic.LongAdder();
 
+    /**
+     * Per-shard ready hints of {@code pool}: tasks submitted to each shard and not yet claimed, as seen by this
+     * service. A hint, not a count: it excludes redeliveries and other processes' submits, and is reset to 0 when a
+     * poll finds the shard empty. All zeros for a 1-shard pool or a pool not used yet. A snapshot copy.
+     */
+    public long[] readyHints(String pool) {
+        var out = new long[this.shards];
+        var ps = this.pools.get(pool);
+        if (ps != null) {
+            for (int i = 0; i < out.length; i++) out[i] = ps.ready.get(i);
+        }
+        return out;
+    }
+
     long shardPolls() {
         return this.shardPolls.sum();
     }
