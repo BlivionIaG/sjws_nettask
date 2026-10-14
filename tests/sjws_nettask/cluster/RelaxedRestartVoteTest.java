@@ -414,6 +414,103 @@ class RelaxedRestartVoteTest {
         log.close();
     }
 
+    /** Security follow-ups to #202 (review 5515587068, non-blocking notes). */
+    @Test
+    void upgradeTreatsTheLastLogTermAsAlreadyVoted() throws Exception {
+        var storage = new MemoryLogStorage();
+        storage.append(GROUP, 1, 4, new byte[] {RaftGroup.NOOP});
+        var out = new Outbox();
+        var group = node3(storage, out, new FakeClock(0L));
+        assertEquals(4L, group.facade().term());
+        group.handle(N1, append(4, N1, 1, 4, 1), 0); // caught up, so only the vote rule decides
+        group.handle(N2, vote(RaftGroup.VOTE, 4, N2, 1, 4), 0);
+        assertFalse(out.lastGrant(RaftGroup.VOTE_RESP), "may have voted in term 4 before the upgrade");
+        group.handle(N2, vote(RaftGroup.VOTE, 5, N2, 1, 4), 0);
+        assertTrue(out.lastGrant(RaftGroup.VOTE_RESP));
+    }
+
+    @Test
+    void upgradedWitnessTakesItsTermFromTheCursor() throws Exception {
+        var storage = new MemoryLogStorage();
+        storage.noteWitness(GROUP, 3, 6);
+        storage.force(GROUP);
+        var witness = new RaftGroup(GROUP, N3, true, Set.of(N3), Set.of(N1, N2, N3), List.of(N1, N2),
+                w -> w == 1 ? N1 : w == 2 ? N2 : w == 3 ? N3 : null, QuorumPolicy.majority(), OPTS, storage,
+                new Outbox(), new FakeClock(0L), null, 1024);
+        assertEquals(6L, witness.facade().term());
+    }
+
+    @Test
+    void deletedVoteFileAfterAFirstSaveRefusesStartup() throws Exception {
+        var root = Files.createTempDirectory("vote-marker");
+        var log = new FileLogStorage(root);
+        assertFalse(log.hasHardState(GROUP));
+        log.saveHardState(GROUP, 2, 1);
+        assertTrue(Files.exists(root.resolve("msg_0.vote-saved")));
+        log.saveHardState(GROUP, 3, 0); // marker already there
+        Files.delete(root.resolve("msg_0.vote"));
+        var error = org.junit.jupiter.api.Assertions.assertThrows(java.io.UncheckedIOException.class,
+                () -> node3(log, new Outbox(), new FakeClock(0L)));
+        assertTrue(error.getCause().getMessage().contains("is missing"), error.getCause().getMessage());
+        log.close();
+    }
+
+    @Test
+    void symlinkedVoteFileIsNotFollowed() throws Exception {
+        var root = Files.createTempDirectory("vote-link");
+        var log = new FileLogStorage(root);
+        log.saveHardState(GROUP, 2, 1);
+        var real = root.resolve("elsewhere.vote");
+        Files.move(root.resolve("msg_0.vote"), real);
+        Files.createSymbolicLink(root.resolve("msg_0.vote"), real);
+        var error = org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                () -> log.hardStateTerm(GROUP));
+        assertTrue(error.getMessage().contains("without following links"), error.getMessage());
+        log.close();
+    }
+
+    @Test
+    void leaderThatCannotPersistAHigherTermLogsAWarning() throws Exception {
+        var records = new java.util.concurrent.CopyOnWriteArrayList<java.util.logging.LogRecord>();
+        var handler = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        var jul = java.util.logging.Logger.getLogger(RaftGroup.class.getName());
+        jul.addHandler(handler);
+        try {
+            var storage = new FailingVotes();
+            var clock = new FakeClock(0L);
+            var group = node3(storage, new Outbox(), clock);
+            clock.advance(Duration.ofMillis(300));
+            group.tick(clock.nanoTime());
+            var preGrant = ByteBuffer.allocate(13).order(ByteOrder.BIG_ENDIAN).putLong(0).putInt(1).put((byte) 1);
+            group.handle(N1, new SimTransport.Frame(GROUP, RaftGroup.PRE_VOTE_RESP, preGrant.array()), clock.nanoTime());
+            var grant = ByteBuffer.allocate(13).order(ByteOrder.BIG_ENDIAN).putLong(1).putInt(1).put((byte) 1);
+            group.handle(N1, new SimTransport.Frame(GROUP, RaftGroup.VOTE_RESP, grant.array()), clock.nanoTime());
+            assertTrue(group.facade().isLeader());
+            storage.fail = true;
+            var higher = ByteBuffer.allocate(21).order(ByteOrder.BIG_ENDIAN).putLong(9).putInt(1).put((byte) 0)
+                    .putLong(0);
+            group.handle(N1, new SimTransport.Frame(GROUP, RaftGroup.APPEND_RESP, higher.array()), clock.nanoTime());
+            assertEquals(1L, group.facade().term());
+            assertTrue(records.stream().anyMatch(r -> r.getLevel() == java.util.logging.Level.WARNING
+                    && r.getMessage().contains("could not persist")), "warning logged");
+        } finally {
+            jul.removeHandler(handler);
+        }
+    }
+
     private static Member member(int wire, boolean witness) {
         return new Member(new NodeId(wire, "n" + wire), new SiteId("local"),
                 new InetSocketAddress("127.0.0.1", 23_100 + wire), 1L, MemberState.ALIVE, witness);

@@ -317,15 +317,36 @@ public final class FileLogStorage implements LogStorage {
             crc.update(buf.array(), 0, 20);
             buf.putInt((int) crc.getValue());
             buf.flip();
+            var marker = voteMarkerPath(group);
+            if (!Files.exists(marker, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                // Durable before the first vote file, so a later missing vote file is never an upgrade.
+                writeAtomically(marker, ByteBuffer.wrap(new byte[] {1}));
+            }
             writeAtomically(votePath(group), buf);
         } finally {
             lock.unlock();
         }
     }
 
+    /**
+     * A missing vote file is an upgrade only while the first-save marker is also missing. Once a
+     * vote has been saved, a missing vote file means it was deleted, and startup is refused.
+     */
     @Override
-    public boolean hasHardState(GroupId group) {
-        return Files.exists(votePath(group), java.nio.file.LinkOption.NOFOLLOW_LINKS);
+    public boolean hasHardState(GroupId group) throws IOException {
+        if (Files.exists(votePath(group), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            return true;
+        }
+        if (Files.exists(voteMarkerPath(group), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("vote file " + votePath(group) + " is missing but " + voteMarkerPath(group)
+                    + " shows a vote was saved; refusing to start with an unknown term");
+        }
+        return false;
+    }
+
+    private Path voteMarkerPath(GroupId group) {
+        var safe = group.value().replaceAll("[^A-Za-z0-9._-]", "_");
+        return root.resolve(safe + ".vote-saved");
     }
 
     @Override
@@ -346,7 +367,23 @@ public final class FileLogStorage implements LogStorage {
         if (!hasHardState(group)) {
             return null;
         }
-        var bytes = Files.readAllBytes(path);
+        java.nio.channels.SeekableByteChannel channel;
+        // NOFOLLOW_LINKS: a symlink in place of the vote file fails here (ELOOP) instead of being read.
+        try {
+            channel = Files.newByteChannel(path, java.util.Set.of(StandardOpenOption.READ,
+                    java.nio.file.LinkOption.NOFOLLOW_LINKS));
+        } catch (IOException refused) {
+            throw new IOException("vote file " + path + " cannot be opened without following links ("
+                    + refused.getMessage() + "); refusing to start", refused);
+        }
+        byte[] bytes;
+        try (channel) {
+            var buf = ByteBuffer.allocate(VOTE_FILE_BYTES + 1);
+            while (buf.hasRemaining() && channel.read(buf) > 0) {
+                // read at most one byte past the expected size
+            }
+            bytes = java.util.Arrays.copyOf(buf.array(), buf.position());
+        }
         if (bytes.length != VOTE_FILE_BYTES) {
             throw new IOException("vote file " + path + " has " + bytes.length + " bytes, expected "
                     + VOTE_FILE_BYTES + "; refusing to start with an unknown term");

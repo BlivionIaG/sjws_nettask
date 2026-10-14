@@ -144,9 +144,12 @@ final class RaftGroup {
                 this.votedFor = vote == 0 ? null : byWire.apply(vote);
             } else {
                 // Upgrade (or first start): no vote file. Terms only grow along the log, so the
-                // last entry carries the highest term this node can have voted in, with no vote.
-                long last = storage.lastIndex(groupId);
-                this.term = last == 0 ? 0L : storage.termAt(groupId, last);
+                // last entry carries the highest term this node can have voted in. Treat that term
+                // as already voted (for ourselves), so the node cannot grant a second vote in it.
+                // A witness keeps no entries; its forced cursor carries the term it last acked.
+                long last = witness ? 0L : storage.lastIndex(groupId);
+                this.term = witness ? storage.witnessTerm(groupId) : last == 0 ? 0L : storage.termAt(groupId, last);
+                this.votedFor = term == 0 ? null : self;
             }
         } catch (IOException failed) {
             throw new UncheckedIOException("cannot load the durable term/vote of " + groupId, failed);
@@ -859,6 +862,11 @@ final class RaftGroup {
     /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
     private boolean stepDown(long newTerm, List<Runnable> after) {
         if (newTerm > term && !saveHardState(newTerm, null)) {
+            if (role == Role.LEADER) {
+                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                        "group " + groupId.value() + ": leader at term " + term + " saw term " + newTerm
+                                + " but could not persist it; staying in term " + term + " and sending nothing");
+            }
             return false;
         }
         boolean wasLeader = role == Role.LEADER;
