@@ -133,7 +133,9 @@ it is never behind an entry the node acked. Under RELAXED it trails by a bounded
 That bound is also the RELAXED loss window in the guarantee below. One interaction: with one data node
 down in the 2 + 1 pair, a RELAXED commit waits for the leader's fsync (the witness stores
 nothing), so it now waits up to the time bound rather than one tick. Keep `relaxedSyncDelay` small,
-or use the entry bound, if that degraded mode must stay fast.
+or use the entry bound, if that degraded mode must stay fast. A RELAXED group whose `relaxedSyncDelay`
+exceeds the lease (`2 x heartbeat`) logs a WARNING when it opens. `durableIndex` never decreases
+except when this node truncates conflicting uncommitted entries.
 
 ### Restart safety and the exact RELAXED guarantee
 

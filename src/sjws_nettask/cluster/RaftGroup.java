@@ -147,6 +147,13 @@ final class RaftGroup {
         this.listener = listener;
         this.deliveries = new DeliveryExecutor(groupId.value(), deliveryLagLimit);
         this.voters.addAll(voters);
+        if (options.durability() == Durability.RELAXED && options.relaxedSyncDelay().toNanos() > options.leaseNanos()) {
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                    "group " + groupId.value() + ": relaxedSyncDelay " + options.relaxedSyncDelay().toMillis()
+                            + " ms exceeds the lease (" + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                                    options.leaseNanos()) + " ms): with one data node down a commit waits that"
+                            + " long, and the RELAXED loss window is that wide");
+        }
         try {
             if (storage.hasHardState(groupId)) {
                 this.term = storage.hardStateTerm(groupId);

@@ -41,6 +41,8 @@ public interface ReplicationGroup {
      * this node acked; under RELAXED it trails by at most {@link GroupOptions#relaxedSyncDelay()}
      * (rounded up to a tick) and {@link GroupOptions#relaxedSyncEntries()} entries. A witness stores
      * no entries and reports 0. The default, for groups that cannot tell, reports 0.
+     * Non-decreasing, except when this node truncates conflicting uncommitted entries: it then drops
+     * to just below the first truncated index.
      */
     default long durableIndex() {
         return 0L;

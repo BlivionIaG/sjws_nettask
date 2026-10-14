@@ -95,6 +95,8 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
     /**
      * Bound how far RELAXED fsync may lag: at most {@code delay} (rounded up to the next tick) after
      * the oldest unsynced entry, and at most {@code entries} unsynced entries. Ignored by STRICT.
+     * A delay above {@link #leaseNanos()} is allowed but logged as a WARNING when the group opens:
+     * with one data node down in a two-data-plus-witness group, every commit waits for it.
      */
     public GroupOptions withRelaxedSyncBound(Duration delay, long entries) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
