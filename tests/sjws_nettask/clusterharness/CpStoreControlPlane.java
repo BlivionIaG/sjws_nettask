@@ -75,6 +75,8 @@ final class CpStoreControlPlane implements ControlPlane {
     private KeyRing keys;
     private VoterSet voterSet;
     private Clock raftClock;
+    /** {@link ClusterClock} reading taken at the start of the current drive round; see {@link RaftClock}. */
+    private volatile long round;
     private long started;
     private Thread driver;
     private volatile boolean running;
@@ -109,7 +111,8 @@ final class CpStoreControlPlane implements ControlPlane {
             ids.add(id);
         }
         this.voterSet = VoterSet.majority(members, ids);
-        this.raftClock = new RaftClock(clusterClock);
+        this.round = clusterClock.nanoTime();
+        this.raftClock = new RaftClock();
         this.started = now;
         for (var member : members) {
             var voter = new Voter(member.id());
@@ -429,6 +432,7 @@ final class CpStoreControlPlane implements ControlPlane {
 
     /** One round: the current leader ticks first so its heartbeat lands before a follower's deadline. */
     private void driveOnce() {
+        this.round = this.clock.nanoTime();
         var order = new ArrayList<Voter>();
         for (var voter : this.voters) {
             if (!voter.dead) {
@@ -457,11 +461,17 @@ final class CpStoreControlPlane implements ControlPlane {
         }
     }
 
-    /** {@link ClusterClock} as Raft's clock, shifted by one election timeout. */
-    private record RaftClock(ClusterClock clock) implements Clock {
+    /**
+     * {@link ClusterClock} as Raft's clock, shifted by one election timeout and read once per drive
+     * round. A test thread can {@link ClusterClock#advance} at any moment; if voters read the live
+     * clock, an advance landing between the leader's tick and a follower's would let that follower
+     * see an expired election deadline before the leader's heartbeat for the new time exists, and
+     * win a spurious election. Freezing time for the whole round keeps "leader ticks first" true.
+     */
+    private final class RaftClock implements Clock {
         @Override
         public long nanoTime() {
-            return this.clock.nanoTime() + ELECTION.toNanos();
+            return round + ELECTION.toNanos();
         }
 
         @Override
