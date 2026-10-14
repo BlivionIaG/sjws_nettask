@@ -20,6 +20,10 @@ flags() { case $1 in
   serial)    echo "-XX:+UseSerialGC -Xmx256m" ;;
   parallel)  echo "-XX:+UseParallelGC -Xmx256m" ;;
   *) echo "unknown config $1" >&2; exit 2 ;; esac; }
+# Blackout windows (HHMM-HHMM, Paris box time): no block may start inside one. The start bound includes
+# a margin so a ~3 min block can't run into the window (default: Agent Swarm exclusive 06:45-07:45).
+BLACKOUT=${BLACKOUT:-0641-0745}
+inblackout() { local now; now=$(date +%H%M); for w in $BLACKOUT; do [ "$now" \> "${w%-*}" -o "$now" = "${w%-*}" ] && [ "$now" \< "${w#*-}" ] && return 0; done; return 1; }
 load() { cut -d' ' -f1 /proc/loadavg; }
 waitload() { while awk -v l="$(load)" -v m="$MAX_LOAD" 'BEGIN{exit !(l>=m)}'; do echo "# load $(load) >= $MAX_LOAD, waiting" >&2; sleep 30; done; }
 pauses() { # STW pauses from -Xlog:gc,gc+phases (G1/Serial/Parallel "Pause Young/Full", ZGC "Pause Mark Start/End/Relocate Start") + collection count
@@ -56,10 +60,12 @@ run_swarm() {
     rm -rf "$d"
   done
 }
+if [ "${1:-}" = __block ] && inblackout; then echo "# skipped $2 rep $3: blackout $BLACKOUT" >&2; exit 0; fi
 if [ "${1:-}" = __block ]; then run_http "$2" "$3"; run_msg "$2" "$3"; run_swarm "$2" "$3"; exit; fi
 for rep in $(seq "$REPS"); do
   for cfg in $CONFIGS; do
     [ -n "${SKIP:-}" ] && grep -qx "$cfg:$rep" <<<"$(tr ' ' '\n' <<<"$SKIP")" && continue
+    while inblackout; do echo "# blackout $BLACKOUT, sleeping" >&2; sleep 60; done
     waitload
     flock /tmp/sjws-bench.lock "$0" __block "$cfg" "$rep" | tee -a "$OUT/results.txt"
   done
