@@ -123,13 +123,13 @@ final class LogOffsets {
         this.topics.offsetsUsed();
         long now = this.clockMs.getAsLong();
         var rec = List.of(record(topic, group, offset, now));
-        l.writer().awaitCapacity(); // outside the order lock: appendNoWait below never blocks
+        l.appender().awaitCapacity(); // outside the order lock: appendNoWait below never blocks
         CompletableFuture<Long> f;
         long s;
         this.order.lock();
         try {
             s = ++this.seq;
-            f = l.writer().appendNoWait(rec, durability);
+            f = l.appender().appendNoWait(rec, durability);
         } finally {
             this.order.unlock();
         }
