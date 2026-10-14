@@ -320,6 +320,11 @@ public final class ReplicatedNode implements ClusterNode {
         return group(groupId).oldestStrictPendingAgeNanos();
     }
 
+    /** Snapshot images one group skipped: the taker threw, returned null or exceeded maxSnapshotBytes. */
+    public long skippedSnapshots(GroupId groupId) {
+        return group(groupId).skippedSnapshots();
+    }
+
     /** Apply lag of one group: deliveries queued or running. */
     public long deliveryLag(GroupId groupId) {
         return group(groupId).deliveryLag();

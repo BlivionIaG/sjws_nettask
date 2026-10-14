@@ -82,4 +82,26 @@ public interface LogStorage {
     default int hardStateVote(GroupId group) throws IOException {
         return 0;
     }
+
+    /**
+     * True when {@link #saveSnapshot} makes a snapshot durable. Raft deletes a log prefix
+     * (compaction, install) only after the snapshot covering it is durable; a storage that returns
+     * false here refuses prefix deletion instead of losing the entries on restart.
+     */
+    default boolean persistsSnapshots() {
+        return false;
+    }
+
+    /** Make the snapshot durable before returning, replacing any older one. */
+    default void saveSnapshot(GroupId group, LogSnapshot snapshot) throws IOException {
+        throw new UnsupportedOperationException("this storage keeps no snapshots");
+    }
+
+    /**
+     * The last snapshot saved for this group, or null. Corrupt, oversized (above {@code maxBytes})
+     * or insecure state must throw rather than read as absent.
+     */
+    default LogSnapshot loadSnapshot(GroupId group, int maxBytes) throws IOException {
+        return null;
+    }
 }

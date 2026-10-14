@@ -24,10 +24,29 @@ public interface SnapshotControl {
     /** Build a snapshot covering every committed entry through {@code lastIncludedIndex}. */
     LogSnapshot take(long lastIncludedIndex);
 
+    /**
+     * Replace the state through {@code snapshot.lastIncludedIndex()}. Refused (nothing changes)
+     * when the image exceeds {@link GroupOptions#maxSnapshotBytes()}, the index does not advance
+     * past the current snapshot, or the local log holds that index with a different term. The image
+     * is made durable before the log prefix it covers is deleted; a storage without durable
+     * snapshots refuses.
+     */
     void install(LogSnapshot snapshot);
 
+    /** {@link #install(LogSnapshot)} after checking {@link LogSnapshot#crc32c()} against {@code expectedCrc32c}. */
+    default void install(LogSnapshot snapshot, int expectedCrc32c) {
+        if (snapshot.crc32c() != expectedCrc32c) {
+            throw new IllegalArgumentException("snapshot fails its CRC32C; refused");
+        }
+        install(snapshot);
+    }
+
     /**
-     * Drop the log prefix at or below an index that is both snapshotted and acked, then compact.
+     * Compact the snapshot, make it durable, then drop the log prefix at or below an index that is
+     * both snapshotted and acked. A storage without durable snapshots refuses (the future fails and
+     * nothing is deleted). There is no snapshot transfer to followers: a follower whose next entry
+     * falls inside the dropped prefix cannot catch up from this leader until it is given the
+     * snapshot out of band ({@link #install}). Only drop through an index every follower has.
      */
     CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor);
 
