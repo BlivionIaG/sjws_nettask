@@ -48,7 +48,7 @@ The content request path reads the snapshot that is already installed. It does n
 flowchart TD
     tui["Admin TUI"] -->|"mTLS admin API"| cp["Control role<br/>sjws_nettask.cp<br/>group cp-config"]
     cp --- raft["cluster.ClusterNode"]
-    cp -.-> mv["3 or 5 voters<br/>over TCP"]
+    cp --> mv["voter set<br/>over TCP"]
     cp --> w{{"mTLS watch:<br/>long poll, ack"}}
     w --> g["data: gateway"]
     w --> st["data: static"]
@@ -64,14 +64,14 @@ flowchart TD
     live -.-> bl["broker loop"]
 
     classDef design stroke-dasharray: 5 5
-    class mv,pj,bl design
+    class pj,bl design
 ```
 
 Solid boxes and arrows run in a shipped process. Dashed ones do not: the role projection and the broker loop are
-not written, and the voter network exists in the tree (`cluster.TcpTransport`, a multi-voter `CpStore.open`) but
-nothing wires it up. A control process hosts one voter on an in-process transport: voter sets of 3, 5 or 2 +
-witness run only in tests, because the shipped dependencies refuse `cp.peers`. Every data role runs the same watch
-client against the whole document, with no per-role projection. See
+not written. A control process hosts one voter on an in-process transport, or, with `cp.peers`, one member of a
+static voter set (3 or 5 voters, or 2 + a witness) linked by `cluster.TcpTransport` over the `cp-peer` mTLS
+listener with a CP-only Raft key. Every data role runs the same watch client against the whole document, with no
+per-role projection. See
 [Control-plane and data-node service](../operations/control-plane-service.md) and
 [Control-plane process hosting](control-plane-hosting.md).
 

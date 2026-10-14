@@ -179,19 +179,40 @@ sequenceDiagram
     C->>S: a caller: POST /swarm/v1/tasks/POOL:call<br/>TASK frame, optional deadlineMs
     Note over S: token (else 401), size (413), POST only (405),<br/>pool allowed (403)
     Note over S: the first call, or the first after 10 idle<br/>minutes, opens reply.NODE and starts its<br/>poller thread before it produces
-    S->>M: produce on tasks.POOL, replyTo reply.NODE
-    C->>S: a worker: POST .../tasks/POOL:claim
-    S->>M: poll group workers
+    S->>M: produce on tasks.POOL, or its shard<br/>with sjws.swarm.pool.shards above 1,<br/>replyTo reply.NODE
+    C->>S: a worker: POST .../tasks/POOL:claim<br/>max, visibilityMs, waitMs
+    S->>M: poll group workers (claim diagram below)
     M-->>S: tasks leased, attempt n
-    S-->>C: 200, a LEASE frame per task,<br/>id POOL~offset~attempt (204: none)
+    S-->>C: 200, a LEASE frame per task, id<br/>POOL~offset~attempt[.shard] (204: none)
     C->>S: the worker: POST .../leases/ID:extend
-    S->>M: extend, fenced by the attempt
+    S->>M: extend on the lease's shard, fenced by the attempt
     C->>S: the worker: POST .../leases/ID:reply
-    S->>M: produce on reply.NODE (ASYNC),<br/>then ack the task, fenced
+    S->>M: produce on reply.NODE (ASYNC),<br/>then ack the task on its shard, fenced
     M-->>S: the poller reads the reply and completes<br/>the waiting call by correlation id
     S-->>C: to the caller: 200 RESULT frame,<br/>or 504 at the deadline
     Note over S: ack, nack and reject are lease verbs too:<br/>204, or 409 STALE_ATTEMPT or NOT_IN_FLIGHT<br/>when the lease was lost
 ```
+
+A claim, as `TaskService.claim` runs it. A pool has one partition unless `sjws.swarm.pool.shards` is above 1; then
+shard 0 is topic `tasks.POOL` and shard `i` is `tasks.POOL#i`, each with its own lock, ledger and dead-letter queue.
+The ready hint of a shard counts tasks submitted to it and not yet claimed by this service, so it ignores
+redeliveries and other processes' submits:
+
+```mermaid
+flowchart TD
+    c0["claim(pool, worker, max, wait)"] --> c1{{"A one-shard pool?"}}
+    c1 -->|yes| c2["Poll its partition,<br/>waiting up to the wait"]
+    c1 -->|no| c3["Sweep the shards from<br/>the worker's home<br/>shard, a hash of its<br/>name. Skip a shard<br/>whose ready hint is 0,<br/>except on a full sweep:<br/>every 64th claim, or<br/>the repeat of a hinted<br/>sweep that found<br/>nothing"]
+    c3 --> c4{{"Anything leased?"}}
+    c4 -->|yes| c5["Fill up to max across the<br/>shards. Each task keeps<br/>its shard"]
+    c4 -->|no| c6{{"Waiting, with time left?"}}
+    c6 -->|no| c7["Return nothing: 204"]
+    c6 -->|yes| c8["Park on the pool until<br/>a submit to any shard,<br/>or 2 ms. Then sweep<br/>again: hinted after a<br/>submit, full after the<br/>2 ms"]
+    c8 --> c3
+```
+
+A settle goes to the task's shard. `TaskService.ackAll` sends one batched fenced ack per shard, and
+`LeaseKeeper` batches its extends per pool and shard.
 
 ### 5.2 Token streaming
 There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP leg is Architecture's.

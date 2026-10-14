@@ -50,6 +50,27 @@ first delivery).
 - **Witness.** A witness never applies entries and has no listener; its executor thread is never
   started (lazy start), so it costs nothing and its behaviour is unchanged.
 
+One append, from the call to its future, as built:
+
+```mermaid
+sequenceDiagram
+    participant A as Appender
+    participant R as Raft thread
+    participant D as raft-deliver-NAME
+
+    A->>R: append(entry), on the leader
+    alt deliveries queued or running at 4096
+        R-->>A: the future fails at once with<br/>ApplyLagException, nothing appended
+    else
+        R->>R: replicate, a quorum acks,<br/>the entry commits
+        R->>D: submit the callback, then the<br/>future's completion, in log order
+        Note over R,D: submit never blocks, so heartbeats<br/>and votes never wait for a callback
+        Note over D: GroupListener.onCommitted(entry), in<br/>index order, never overlapping. It must be<br/>fast, do no IO and never join an append<br/>future: it completes on this thread
+        D-->>A: the future completes, after the callbacks<br/>of every entry up to its own
+    end
+    Note over R,D: on step-down the pending futures fail with<br/>NotLeader on D too, behind the queued callbacks
+```
+
 ## Manual driving
 
 `ReplicatedNode.drive()` (tests, `LocalCluster`, `CpStore.drive()`, `CpWitness.drive()`) is a step plus

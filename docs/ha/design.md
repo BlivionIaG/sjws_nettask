@@ -29,8 +29,9 @@ is detached, and otherwise `Lifecycle.drain()` followed by `close()`.
 
 What the code has today. Solid boxes run in a shipped process (`java -jar`). Dotted boxes are built, but a shipped
 process never reaches them. `HaSettings` is attached only by tests, embedders and the HA bench, and
-`GenerationSync`, `VipFence` and `TcpTransport` have no caller in `src` at all. The YAML `ha:` section is
-validated and starts nothing yet. The dashed box lists what is still only designed:
+`GenerationSync` and `VipFence` have no caller in `src` at all. The one shipped user of Raft is the control role
+(`cp.CpStore`), which is not an HA node: with `cp.peers` its voters talk over `TcpTransport`. The YAML `ha:`
+section is validated and starts nothing yet. The dashed box lists what is still only designed:
 
 ```mermaid
 flowchart LR
@@ -43,20 +44,20 @@ flowchart LR
         hh --> hb
         hh --> sh
         lc --> hb
-        raft["RaftGroup and<br/>ReplicatedNode. Shipped:<br/>one voter, RELAXED.<br/>Tests: more voters,<br/>pre-vote, lease,<br/>witness, STRICT"]
+        raft["RaftGroup and<br/>ReplicatedNode. Shipped:<br/>cp-config, RELAXED, one<br/>voter or a set of 3, 5<br/>or 2 + witness. Tests<br/>also run STRICT"]
         pol["QuorumPolicy and VoterSet"]
         tcp["TcpTransport"]
-        sim["SimTransport:<br/>in process"]
+        sim["SimTransport:<br/>in process, one voter"]
         mem["Membership detector and<br/>HeartbeatService:<br/>authenticated UDP<br/>heartbeats, not connected<br/>to Raft"]
         raft --> pol
         raft --> tcp
         raft --> sim
-    cp["cp.CpStore, the shipped<br/>user: group cp-config,<br/>one voter on an<br/>in-process transport"]
+    cp["cp.CpStore, the shipped<br/>user: group cp-config,<br/>one voter in process, or<br/>voters over TCP with<br/>cp.peers"]
     gs --> raft
     cp --> raft
 
     classDef lib stroke-dasharray: 2 4
-    class hh,hb,sh,lc,gs,vip,mem,tcp lib
+    class hh,hb,sh,lc,gs,vip,mem lib
     np["Not built: a Raft group<br/>per partition, content<br/>sync, and a failure<br/>detector that feeds<br/>quorum and /readyz"]
     classDef design stroke-dasharray: 5 5
     class np design
@@ -336,11 +337,11 @@ sequenceDiagram
     P->>R: append STAGE, generation and SHA-256
     Note over R: a follower's append fails<br/>with NotLeaderException
     R-->>N: STAGE committed
-    Note over N: pull the payload from HmacBundles,<br/>check its HMAC, rewrite the key file<br/>(mode 0600, ATOMIC_MOVE). The hash in<br/>the entry is not compared
+    Note over N: the commit callback copies the marker and<br/>hands it to the ha-generation-sync worker,<br/>which applies in order. STAGE: pull the<br/>payload from HmacBundles, check its HMAC,<br/>rewrite the key file (mode 0600,<br/>ATOMIC_MOVE). The hash in the entry is<br/>not compared
     R-->>P: the STAGE future completes
     P->>R: append ACTIVATE at once
     R-->>N: ACTIVATE committed
-    Note over N: onActivate(generation), a caller<br/>callback, a no-op by default
+    Note over N: the same worker: onActivate(generation),<br/>a caller callback, a no-op by default
 ```
 
 ## 10. Shared state

@@ -118,13 +118,14 @@ refuses the pre-vote, so the term does not move and the leader that holds the wi
 stays leader. `onTimeoutNow` (leadership transfer) still starts a real election; it does
 not go through the pre-vote.
 
-One election, from the first deadline to the lease, as three voters run it in tests. The Raft side runs in tests
-and in a control process (group `cp-config`, one voter, which sends no `PRE_VOTE` or `VOTE`), not yet in an HA pair:
+One election, from the first deadline to the lease, as a voter set runs it. The Raft side runs in tests and in a
+control process (group `cp-config`: one voter sends no `PRE_VOTE` or `VOTE`, a set of voters from `cp.peers` runs
+this exchange over TCP), not yet in an HA pair:
 
 ```mermaid
 sequenceDiagram
     participant F as Candidate
-    participant P as Other data node
+    participant P as Other full voter
     participant W as Witness
 
     Note over F: its election deadline passes, and it<br/>is not a witness

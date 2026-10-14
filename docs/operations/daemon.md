@@ -29,7 +29,7 @@ sequenceDiagram
     Note over P,F: refuse if the pid file names a live<br/>server, or the log file is not writable
     P->>C: start a second JVM
     Note over P,C: new session when setsid exists,<br/>SJWS_DAEMON_CHILD=1, WEB_SERVER_* settings<br/>(not the two HA key variables),<br/>output appended to the log file
-    Note over C: load the configuration, make SIGHUP a<br/>reload, start the server: optional modules,<br/>HTTP/3, HTTP/2, the TCP port
+    Note over C: load the configuration (with --bootstrap, the<br/>role settings too: a bad file, or a control<br/>role without cp settings, exits 64), make<br/>SIGHUP a reload, start the server: optional<br/>modules, HTTP/3, HTTP/2, the TCP port
     C->>F: write the pid file
     Note over C,F: once the server is listening
     Note over C: with --bootstrap the role hooks run after that.<br/>A failure there is normally only<br/>reported in the log

@@ -35,17 +35,18 @@ sequenceDiagram
     participant L as ServiceLaunch<br/>and CpLaunch
     participant C as CpHost
 
-    Note over M: parse the flags and the config,<br/>resolve the role: a bad combination<br/>exits 64. A control process binds no<br/>content port by default
-    M->>L: onListening, once the server has started
-    Note over L: write the status file. Without a cp: block,<br/>sjws.cp.nodeId or SJWS_CP_NODE_ID:<br/>a WARN, and nothing is hosted
+    Note over M: parse the flags and the config,<br/>resolve the role. A bad combination,<br/>or a control role without cp settings,<br/>exits 64 before any listener. A control<br/>process binds no content port by default
+    M->>L: onListening, after the server starts
+    Note over L: write the status file
     Note over L: CpConfig: system property, then the<br/>environment, then the YAML cp: block.<br/>peers, minBundleSerial and four more keys<br/>are YAML only. An unknown key, or a missing<br/>nodeId, stateDir, keyDir, rootPub,<br/>watch.listen or admin.listen: error
     Note over L: CpTiming.check, at the default drift ratio<br/>and margin: 80 ms x 1.01 + 10 ms = 90.8 ms<br/>must stay below the 100 ms election timeout
     L->>C: open, or CpWitnessHost on a witness
-    Note over C: KeyRing.load, then CpStore.open and<br/>start, then the mTLS WatchServer and<br/>the mTLS AdminServer. Both need cp.tls.<br/>cp.peers is refused: no voter network<br/>transport is wired yet
-    C-->>M: hosted. Any error closes what was<br/>opened, prints ERROR and exits 1, not 64
+    Note over C: KeyRing.load. With cp.peers, then the<br/>cp-peer TLS and a TcpTransport over it,<br/>which need cp.tls.peerCert, peerKey,<br/>peerCa and SJWS_CP_RAFT_KEY. Then<br/>CpStore.open and start, the mTLS<br/>WatchServer and AdminServer, which<br/>need cp.tls
+    C-->>M: hosted. Any error closes what was<br/>opened, prints ERROR, exits 1 (not 64)
 ```
 
-What a control process hosts once it is up. Activate and rollback are signed with the online key of the `KeyRing`:
+What a control process hosts once it is up. Activate and rollback are signed with the online key of the `KeyRing`.
+The two boxes at the bottom exist only with `cp.peers`; without it the one voter uses an in-process `SimTransport`:
 
 ```mermaid
 flowchart TB
@@ -56,6 +57,8 @@ flowchart TB
     store --> raft["ReplicatedNode,<br/>ReplicationGroup"]
     store -->|"sign"| keys["KeyRing"]
     store -->|"publishLatest"| wat
+    raft <-->|"Raft frames"| link["TcpTransport over<br/>CpPeerSockets: cp-peer<br/>mTLS and the Raft key"]
+    link <--> voters["Other voters<br/>and the witness"]
 ```
 
 **Proposed shutdown order** (reverse): stop accepting admin writes (close `AdminServer`) -> close `WatchServer`
@@ -258,6 +261,24 @@ plain links, and only when every peer is loopback. A CONTROL role with no `cp` s
 (exit 64, before any listener). Gap: there is no hostname check and peer certificates are not yet bound to the
 `cp.peers` id (any certificate from `peerCa` passes TLS, and the Raft key is shared by the group); tracked as a
 follow-up issue that must land before CP is on by default or multi-host CP is documented.
+
+What one inbound voter-link connection goes through, in order (`TcpTransport`; `peers` is the number of other
+voters in `cp.peers`). Every refusal closes the socket and is counted:
+
+```mermaid
+flowchart TD
+    a["A connection is accepted<br/>on this voter's cp.peers<br/>address"] --> s1{{"Source address is<br/>a member's address?"}}
+    s1 -->|no| r1["Closed, counted<br/>strangersRefused"]
+    s1 -->|yes| s2{{"Fewer than 8 x peers<br/>handshakes in flight?"}}
+    s2 -->|no| r2["Closed, counted<br/>handshakesRefused"]
+    s2 -->|yes| s3["mTLS handshake: TLS 1.3,<br/>a client certificate from<br/>cp.tls.peerCa, 5 s in total.<br/>No inbound slot is held yet"]
+    s3 -->|"fails or is late"| r3["Closed, counted<br/>handshakeFailures"]
+    s3 --> s4{{"Fewer than 2 x peers<br/>inbound connections?"}}
+    s4 -->|no| r4["Closed, counted<br/>inboundRefused"]
+    s4 -->|yes| s5["Read frames. Idle for 10 s:<br/>closed. A frame still<br/>incomplete 10 s after its first<br/>byte: closed, counted TIMEOUT"]
+    s5 --> s6["Each frame: length and<br/>version (MALFORMED),<br/>HMAC under the Raft key<br/>(TAG), destination (DEST),<br/>sender is a member<br/>(MEMBER), boot epoch<br/>(EPOCH), sequence (SEQ).<br/>A drop is counted by<br/>its reason"]
+    s6 --> s7["Queued for the Raft<br/>thread. A full queue<br/>counts an inbound drop"]
+```
 
 The role key is the existing `--role` / `WEB_SERVER_ROLE` / `node.mode` (`NodeLifecycle.role`); there is no `sjws.cp.role`.
 Implemented in `sjws_nettask.cp.CpConfig` and `CpKeyConfig`; `ConfigLoader` keeps the `cp:` block raw so a

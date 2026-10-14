@@ -63,8 +63,8 @@ flowchart TD
     s(["java -jar<br/>sjws_nettask.jar<br/>[options]"]) --> a["-h or --help: usage, exit<br/>0. --stop or --status: act<br/>on the pid file, then<br/>exit. Then load the config<br/>and resolve the role:<br/>invalid is exit 64"]
     a --> d{"--daemon or --restart?"}
     d -->|yes| e["A detached child JVM runs<br/>these steps again. The<br/>parent refuses a live pid<br/>file or an unwritable log<br/>file (exit 1), then waits<br/>for the child's pid file,<br/>20 s at most: a child that<br/>dies first passes its exit<br/>code on, a timeout is<br/>exit 1. --restart stops<br/>the old server first"]
-    d -->|no| bs["--bootstrap needs<br/>--pid-file and a valid<br/>bootstrap file: else exit<br/>64. A log file that cannot<br/>be written: exit 1. The<br/>root must be a directory:<br/>else exit 2. The pid file<br/>must not name a live<br/>server: else exit 1"]
+    d -->|no| bs["--bootstrap needs<br/>--pid-file and a valid<br/>bootstrap file, and a<br/>control role needs cp<br/>settings: else exit 64.<br/>A log file that cannot<br/>be written: exit 1. The<br/>root must be a directory:<br/>else exit 2. The pid file<br/>must not name a live<br/>server: else exit 1"]
     bs --> m["Start the enabled optional<br/>modules, then HTTP/3 and<br/>HTTP/2 (failure: WARN),<br/>then bind the TCP port.<br/>Failure: exit 1"]
-    m --> hk["If a pid file is used,<br/>claim it. With --bootstrap<br/>run the role hooks: status<br/>file, watch client or<br/>control-plane hosting.<br/>Failure: exit 1, except a<br/>watch that cannot start or<br/>a control role without cp<br/>settings: only a WARN"]
+    m --> hk["If a pid file is used,<br/>claim it. With --bootstrap<br/>run the role hooks: status<br/>file, watch client or<br/>control-plane hosting.<br/>Failure: exit 1, except a<br/>data node whose watch<br/>cannot start: only a WARN"]
     hk --> i["Serve until SIGTERM or<br/>SIGINT, drain, the JVM<br/>exits 143 or 130"]
 ```
