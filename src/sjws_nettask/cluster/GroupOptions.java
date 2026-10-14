@@ -25,9 +25,22 @@ import java.util.Objects;
  * Pass {@link Durability#STRICT} to opt into quorum commit plus fsync. A preferred node campaigns
  * sooner. Failback hysteresis keeps a demoted leader from campaigning again until that delay has
  * elapsed.
+ *
+ * <p>RELAXED fsync lag: entries acked from memory are fsynced once the oldest unsynced one is
+ * {@code relaxedSyncDelay} old (checked every tick, so {@link Duration#ZERO}, the default, means the
+ * next tick), or immediately inside the append or ack once {@code relaxedSyncEntries} entries are
+ * unsynced. {@link ReplicationGroup#durableIndex()} reports how far a node has got.
  */
 public record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
-        long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis) {
+        long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis, Duration relaxedSyncDelay,
+        long relaxedSyncEntries) {
+
+    /** Next-tick fsync, no entry cap: the behaviour before the bound was configurable. */
+    public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
+            long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis) {
+        this(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred, failbackHysteresis,
+                Duration.ZERO, Long.MAX_VALUE);
+    }
 
     public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
             long snapshotEveryEntries) {
@@ -56,6 +69,13 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
         if (failbackHysteresis.isNegative()) {
             throw new IllegalArgumentException("failback");
         }
+        Objects.requireNonNull(relaxedSyncDelay, "relaxedSyncDelay");
+        if (relaxedSyncDelay.isNegative()) {
+            throw new IllegalArgumentException("relaxedSyncDelay");
+        }
+        if (relaxedSyncEntries < 1) {
+            throw new IllegalArgumentException("relaxedSyncEntries");
+        }
     }
 
     public long leaseNanos() {
@@ -64,11 +84,20 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
 
     public GroupOptions withPreferred(Duration failbackHysteresis) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, true,
-                failbackHysteresis);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries);
     }
 
     public GroupOptions withFailback(Duration failbackHysteresis) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
-                failbackHysteresis);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries);
+    }
+
+    /**
+     * Bound how far RELAXED fsync may lag: at most {@code delay} (rounded up to the next tick) after
+     * the oldest unsynced entry, and at most {@code entries} unsynced entries. Ignored by STRICT.
+     */
+    public GroupOptions withRelaxedSyncBound(Duration delay, long entries) {
+        return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
+                failbackHysteresis, delay, entries);
     }
 }

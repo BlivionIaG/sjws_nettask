@@ -106,6 +106,8 @@ final class RaftGroup {
     private long snapTerm;
     private byte[] snapData = new byte[0];
     private boolean relaxedDirty;
+    /** Clock time when the oldest entry not yet fsynced was stored. */
+    private long dirtySince;
     private boolean forcedBeforeAck;
     private boolean ackedFromMemory;
     /** Highest index this node has forced to its own disk (data nodes only). */
@@ -232,7 +234,7 @@ final class RaftGroup {
         var after = new ArrayList<Runnable>();
         lock.lock();
         try {
-            if (relaxedDirty) {
+            if (relaxedDirty && now - dirtySince >= options.relaxedSyncDelay().toNanos()) {
                 force();
                 relaxedDirty = false;
                 if (role == Role.LEADER) {
@@ -326,7 +328,7 @@ final class RaftGroup {
             if (strict) {
                 force();
             } else {
-                relaxedDirty = true;
+                markDirty();
             }
             maybeCommit(after);
             replicate();
@@ -595,7 +597,7 @@ final class RaftGroup {
             force();
             forcedBeforeAck = true;
         } else {
-            relaxedDirty = true;
+            markDirty();
             ackedFromMemory = true;
         }
         ack(from, true, index);
@@ -965,6 +967,18 @@ final class RaftGroup {
         }
     }
 
+    /** RELAXED: fsync later (tick) or now when the entry bound is reached. */
+    private void markDirty() {
+        if (!relaxedDirty) {
+            relaxedDirty = true;
+            dirtySince = clock.nanoTime();
+        }
+        if (lastIndex() - durableIndex >= options.relaxedSyncEntries()) {
+            force();
+            relaxedDirty = false;
+        }
+    }
+
     private boolean abstaining() {
         return recovering && !quorum.hasQuorum(voters, Set.of(self));
     }
@@ -1235,6 +1249,16 @@ final class RaftGroup {
             lock.lock();
             try {
                 return commitIndex;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public long durableIndex() {
+            lock.lock();
+            try {
+                return durableIndex;
             } finally {
                 lock.unlock();
             }
