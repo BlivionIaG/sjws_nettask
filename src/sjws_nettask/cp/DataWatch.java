@@ -65,8 +65,15 @@ public final class DataWatch implements AutoCloseable {
     private volatile boolean running = true;
     private volatile HttpURLConnection open;
     private DataApply apply;
-    private volatile long applied;
-    private volatile String appliedHash;
+    /**
+     * Version and hash of the last applied envelope, published as one value so a reader never pairs a
+     * new version with the previous hash (#196).
+     */
+    private volatile Applied applied = Applied.NONE;
+
+    private record Applied(long version, String hash) {
+        static final Applied NONE = new Applied(0L, null);
+    }
     /** Status when no {@link NodeEnrollment} was given (several watches in one test process). */
     private volatile ControlPlaneBinding own;
     private long skipped;
@@ -148,12 +155,12 @@ public final class DataWatch implements AutoCloseable {
 
     /** Canonical hash of the envelope last applied through this watch; null before the first apply. */
     public String appliedHash() {
-        return this.appliedHash;
+        return this.applied.hash();
     }
 
     /** Highest version applied through this watch; 0 before the first apply. */
     public long appliedVersion() {
-        return this.applied;
+        return this.applied.version();
     }
 
     private void loop() {
@@ -161,7 +168,7 @@ public final class DataWatch implements AutoCloseable {
         boolean first = true;
         while (this.running) {
             try {
-                long after = Math.max(this.applied, this.skipped);
+                long after = Math.max(this.applied.version(), this.skipped);
                 var conn = request("GET", "/cp/v1/watch?after=" + after + "&waitMs=" + (first ? 0L : WAIT_MS));
                 int status = conn.getResponseCode();
                 if (status == 200) {
@@ -213,8 +220,7 @@ public final class DataWatch implements AutoCloseable {
             this.skipped = snapshot.version();
             return;
         }
-        this.applied = snapshot.version();
-        this.appliedHash = snapshot.canonicalHashHex();
+        this.applied = new Applied(snapshot.version(), snapshot.canonicalHashHex());
         report("connected");
         var ack = request("POST", "/cp/v1/watch/ack?version=" + snapshot.version());
         int status = ack.getResponseCode();
@@ -353,7 +359,7 @@ public final class DataWatch implements AutoCloseable {
 
     /** Rewrites the status file only on a change. {@code down} maps to disconnected or pending. */
     private void report(String next) {
-        long version = this.applied;
+        long version = this.applied.version();
         var binding = StatusBinding.data("connected".equals(next), version > 0, version);
         var shown = binding.connectionState();
         if (shown.equals(this.state) && version == this.reportedVersion) {
