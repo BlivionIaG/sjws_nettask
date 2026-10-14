@@ -51,6 +51,12 @@ public final class ReplicatedNode implements ClusterNode {
     private final Map<GroupId, RaftGroup> groups = new LinkedHashMap<>();
     private volatile Duration tick;
     private volatile boolean running;
+    /**
+     * An append wakes the background loop so it replicates now instead of at the next tick. Before #182 a
+     * closed-loop producer's next append landed inside the same step (its future completed on the Raft thread);
+     * with futures completing on the delivery thread it arrived just after the step and waited a whole tick.
+     */
+    private final java.util.concurrent.Semaphore wake = new java.util.concurrent.Semaphore(0);
     private Thread thread;
 
     private ReplicatedNode(NodeId self, List<Member> members, Set<NodeId> voters, QuorumPolicy quorum, Clock clock,
@@ -183,7 +189,7 @@ public final class ReplicatedNode implements ClusterNode {
         while (running) {
             try {
                 step();
-                clock.sleep(tick);
+                pause();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 break;
@@ -250,7 +256,21 @@ public final class ReplicatedNode implements ClusterNode {
             future.completeExceptionally(new IllegalStateException("no group " + groupId));
             return future;
         }
-        return group.append(batch);
+        var future = group.append(batch);
+        if (running && wake.availablePermits() == 0) {
+            wake.release();
+        }
+        return future;
+    }
+
+    /** One tick, cut short by an append; a fake clock (tests) keeps its own deterministic sleep. */
+    private void pause() throws InterruptedException {
+        if (clock != Clock.SYSTEM) {
+            clock.sleep(tick);
+            return;
+        }
+        wake.tryAcquire(tick.toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS);
+        wake.drainPermits();
     }
 
     @Override
