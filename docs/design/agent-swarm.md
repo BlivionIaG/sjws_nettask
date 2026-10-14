@@ -334,23 +334,33 @@ These are the reference points for the targets below. Neither this PR nor the ta
 
 **S1c gate (decided 2026-10-14, inceptor).** The S1c latency gate is: claim p99 < 100 µs on the task-dispatch row, heartbeat loss < 2 %, and request/reply p99 < 500 µs. Dispatch is measured with **workers = the machine's vCPU count**, and every result states that core count. The reference box has 8 vCPU, so the gate is `SwarmBench dispatch 8`. The 16-worker run (16 on 8 vCPU) is reported as a **stress line, not the gate**: with more runnable workers than cores, a lock holder can be descheduled mid-section, so its p99 measures scheduling as much as code. The batched variant (`SwarmBench batched <W>x<B>`: claim up to `B` and settle with one batched fenced ack, `TaskService.ackAll`) is reported separately and is not the gate, because its claim latency is per batch, not per task. The §13 claim-1/ack-1 workload stays as it is.
 
-**S1c result: NOT PASSED (re-measured 2026-10-14, 05:29–05:56 CEST).** An earlier PASSED call, based on the median of per-run p99s from the #176 quiet-window runs, was withdrawn by inceptor. **Gate statistic:** the mean ± stddev of the per-run p99 across ≥ 5 runs; no median.
-- **Setup:** commit `3097866` (master `1e09588` + bench fixes), OpenJDK 25.0.4.1, 8 vCPU, default G1, `-Dsjws.swarm.pool.shards=4`. Every run was under `flock /tmp/sjws-bench.lock`, with `nice -n 10 taskset -c 0-7` (the load generator and the server share those 8 CPUs; they are not disjoint). Raw output: `bench/results/s1c-2026-10-14.txt`.
-- **Load rule:** every run starts with the 1-minute load < 4. Request/reply runs whose peak or end load reached 4 were discarded and retried. Session load: 3.95 at the start, peak 10.25, 3.27 at the end. **Caveat:** `dispatch 8` and `heartbeat` keep 8 or more threads runnable on 8 vCPU, so they push the 1-minute load above 4 by themselves (peaks 4.7–6.7). Those runs are kept and marked self-loaded in the raw file.
+**S1c result: NOT PASSED (exclusive box window, 2026-10-14 06:45–07:00 CEST; earlier runs: `bench/results/s1c-2026-10-14.txt`).** Gate statistic: the mean ± stddev of per-run p99 over ≥ 5 runs (inceptor; no median). Request/reply fails; claim and heartbeat pass.
+- **Setup:** commit `55f97b8`, OpenJDK 25.0.4.1, 8 vCPU, default G1, `-Dsjws.swarm.pool.shards=4`, `nice -n 10`, everything under `flock /tmp/sjws-bench.lock`. Request/reply ran with the server JVM on CPUs 0–6 and the generator thread `sb-gen` alone on CPU 7 (`bench/pin-gen.sh`). Dispatch and heartbeat ran on `taskset -c 0-7`. Raw output: `bench/results/s1c-window-2026-10-14.txt`.
+- **Load:** no other java, sjws or mvn process and 1-minute load 0.39 at the start; peak 11.04; end 8.96. The rise is self-generated (8 dispatch workers, plus ledger fsync threads in I/O wait counted by the load average). From request/reply run 4 on, the process check counted one or two other java/mvn processes that were not identified; at 06:52 `top` showed no other busy process.
 
 | Metric (gate) | Command | Per-run values | Mean ± stddev | Verdict |
 |---|---|---|---|---|
-| Request/reply p99 (< 500 µs) | `SwarmBench reqreply 10000 10` (1 worker) | 1290 / 289 / 668 / 2629 / 2332 µs | **1441 ± 1019 µs** | **FAIL** |
-| Claim p99 (< 100 µs) | `SwarmBench dispatch 8 5` (workers = 8 = vCPU) | 26.7 / 23.3 / 27.0 / 23.4 / 24.4 µs; 495k ± 29k tasks/s | 25.0 ± 1.8 µs | pass (self-loaded) |
-| Heartbeat loss (< 2 %) | `SwarmBench heartbeat off` / `keeper 20`, 10 000 leases held, alternating | 3.2 / 4.1 / 5.8 / −3.3 / 0.4 % | **2.0 ± 3.5 %** (mean 2.04) | **FAIL** (and within noise) |
+| Request/reply p99 (< 500 µs) | `pin-gen.sh … reqreply 10000 10` (1 worker) | 4366 / 4194 / 4669 / 4804 / 4221 µs | **4451 ± 273 µs** | **FAIL** |
+| Claim p99 (< 100 µs) | `dispatch 8 5` (8 workers = vCPU, backlog not drained) | 30.5 / 23.6 / 32.4 / 25.8 / 25.5 µs; 549k ± 16k tasks/s | 27.6 ± 3.7 µs | pass |
+| Heartbeat (< 2 %) | `heartbeat off` / `keeper 20`, 10 000 leases held, 10 alternating pairs | lost leases (expired, redelivered or failed ack): **0 of 10 000 in all 10 keeper runs**; throughput loss −3.2 / 5.9 / −4.6 / −1.9 / −1.9 / 2.2 / 3.7 / −2.8 / 1.4 / 3.6 % | 0.25 ± 3.56 % | pass (no lost lease; loss within noise) |
 
-Not the gate, reported as extras:
-- **Multi-worker request/reply** (`reqreply-mw 4x10000 10`, G1): per-run p99 1346 / 2226 / 1539 / 2504 / 1622 µs, mean 1848 ± 493 µs.
-- **ZGC request/reply** (`-XX:+UseZGC reqreply 10000 10`): per-run p99 1604 / 790 / 912 / 1023 / 203 µs, mean 906 ± 502 µs.
-- **Failures:** 0 failed and 0 missing calls in every request/reply run (100 000 of 100 000 each). Failures are counted as failures, never as 0 µs samples.
+Extras, not gates: multi-worker `reqreply-mw 4x10000 10` p99 4218 / 5253 / 5606 / 5968 / 5827 µs (5374 ± 700); ZGC `reqreply 10000 10` p99 9046 / 4140 / 5940 / 4877 / 5259 µs (5852 ± 1900). Every request/reply run completed 100 000 of 100 000 calls, with 0 failed and 0 missing, including warm-up.
 
-**Root cause (open).** The request/reply p50 is about 27–32 µs in every run, but the p99 varies 9× between runs at similar load. That points to tail events outside the steady path rather than per-call cost. #176's JFR attributed the tail to G1 young-collection pauses. That attribution is not re-verified here, and ZGC is still above the gate (906 µs mean), so GC is unlikely to be the whole cause. Two other factors are untested: the generator and server share CPUs, and other tenants on the box. Heartbeat loss is dominated by run-to-run noise (stddev 3.5 points). A decision needs disjoint CPU sets for the generator and server, and a box free of other jobs.
-- **Known limit, not a gate:** `shards=1` on G1 (#176 quiet window: p99 896 µs).
+**Root cause: open, with evidence.**
+- **Not GC.** G1 young pauses total 47–56 ms per 12 s run (max 6.8–13.7 ms), and ZGC is no better (5852 µs mean).
+- **Not the generator.** On its own CPU it accounts for 81 % of CPU samples (spinning), and its own parks inside `Partition.produce` are at most 3.2 ms.
+- **The server path stalls for milliseconds.** A JFR with `jdk.ThreadPark` ≥ 200 µs (`/tmp/s1c-w/rr-park.jfr`, run p99 4030 µs) shows:
+  - the worker parked 461 times in the sharded `TaskService.claim` wait (`nonEmpty.awaitNanos`, line 255), up to 12.1 ms, although the wait slice is 2 ms;
+  - the worker blocked 51 times on the partition lock in `Partition.produce` (line 212) when writing replies, up to 9.2 ms.
+
+  So threads wait well past their timeout, on locks whose holders are stalled. The ledger writer and syncer threads park on fsync for up to ~100 ms (`LedgerWriter.syncLoop`), and the box shows I/O wait during runs.
+- **Pinning made it worse.** On the shared box, with the generator not pinned and the server on all 8 CPUs, the same bench gave 1441 ± 1019 µs. Here, with the server on 7 CPUs, the p99 is consistently about 4.4 ms.
+
+**Plan (owner: swarm, with Messaging Core for the partition lock):**
+1. Record per-hop timestamps (produce → claim wake → reply produce → reply durable → caller complete) in `reqreply`. The tail is then attributed per hop instead of inferred from parks.
+2. Find what holds the partition lock during the 9 ms `produce` waits: a JFR `jdk.JavaMonitorEnter`/lock-holder profile, or async-profiler `--lock`. Check whether the ledger handoff or fsync is reachable under the lock.
+3. Check the hint race in the sharded claim: `ready.set(s, 0)` after an empty poll can overwrite a concurrent `added()` increment, so a waiter can park on a stale "nothing ready". Add a stress test, and use a compare-and-set or a re-check before parking.
+4. Re-measure with the server on CPUs 0–5, the generator on 6, and the ledger I/O threads on 7, to separate CPU starvation from I/O stalls.
 
 **Architecture additions:**
 1. **Streaming over HTTP:** time-to-first-token and inter-token latency added by sjws, agent emit → caller receive, on HTTP/1.1 chunked, SSE, h2 and h3. Ledger leg vs the optional direct path (§5.2).

@@ -1,0 +1,49 @@
+# S1c exclusive window 2026-10-14 06:45-07:00 CEST (raw). <label> <run> load <start>/<peak>/<end> others=<other java/sjws/mvn procs>: output
+session start 06:45:02 load 0.39 2.30 3.36 commit 55f97b8 openjdk version "25.0.4.1" 2026-08-18 LTS nproc 8
+other java/sjws/mvn processes at start:
+(end of list)
+rr-g1 1 load 0.39/1.44/1.44 others=0: pin-gen: server cpus=0-6 gen tid=795022 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=36.3 rtt_p99_us=4365.9 rtt_max_us=13522.4 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rrmw-g1 1 load 1.44/1.99/1.91 others=0: pin-gen: server cpus=0-6 gen tid=796205 cpus=7 reqreply workers=4 rate=10000 rtt_p50_us=36.4 rtt_p99_us=4217.9 rtt_max_us=7550.1 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+disp-g1 1 load 1.91/6.27/6.49 others=0: dispatch workers=8 tasks/s=537950 claim_p50_us=1.88 claim_p99_us=30.52 
+rr-zgc 1 load 6.49/6.72/6.72 others=0: pin-gen: server cpus=0-6 gen tid=798061 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=39.0 rtt_p99_us=9046.0 rtt_max_us=28594.1 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rr-g1 2 load 6.72/6.89/6.89 others=0: pin-gen: server cpus=0-6 gen tid=799051 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=34.2 rtt_p99_us=4193.5 rtt_max_us=13699.1 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rrmw-g1 2 load 6.89/6.98/5.90 others=0: pin-gen: server cpus=0-6 gen tid=800141 cpus=7 reqreply workers=4 rate=10000 rtt_p50_us=36.1 rtt_p99_us=5253.1 rtt_max_us=24209.7 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+disp-g1 2 load 5.90/10.53/10.53 others=0: dispatch workers=8 tasks/s=567624 claim_p50_us=1.88 claim_p99_us=23.58 
+rr-zgc 2 load 10.53/10.53/9.43 others=0: pin-gen: server cpus=0-6 gen tid=802045 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=37.3 rtt_p99_us=4140.3 rtt_max_us=14642.1 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rr-g1 3 load 9.43/9.43/8.88 others=0: pin-gen: server cpus=0-6 gen tid=803102 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=35.2 rtt_p99_us=4668.7 rtt_max_us=14760.0 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rrmw-g1 3 load 8.88/9.13/9.13 others=0: pin-gen: server cpus=0-6 gen tid=804200 cpus=7 reqreply workers=4 rate=10000 rtt_p50_us=39.6 rtt_p99_us=5606.0 rtt_max_us=34128.7 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+disp-g1 3 load 9.13/10.87/10.87 others=0: dispatch workers=8 tasks/s=527457 claim_p50_us=1.98 claim_p99_us=32.44 
+rr-zgc 3 load 10.87/11.04/10.41 others=0: pin-gen: server cpus=0-6 gen tid=806672 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=37.7 rtt_p99_us=5939.6 rtt_max_us=18120.7 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rr-g1 4 load 10.41/10.41/9.57 others=1: pin-gen: server cpus=0-6 gen tid=807946 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=35.4 rtt_p99_us=4803.5 rtt_max_us=18177.9 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rrmw-g1 4 load 8.96/8.96/8.59 others=1: pin-gen: server cpus=0-6 gen tid=808989 cpus=7 reqreply workers=4 rate=10000 rtt_p50_us=37.1 rtt_p99_us=5967.9 rtt_max_us=26652.4 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+disp-g1 4 load 8.59/10.14/10.13 others=1: dispatch workers=8 tasks/s=555126 claim_p50_us=2.01 claim_p99_us=25.82 
+rr-zgc 4 load 10.13/10.26/10.00 others=1: pin-gen: server cpus=0-6 gen tid=810533 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=42.1 rtt_p99_us=4877.2 rtt_max_us=13489.3 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rr-g1 5 load 10.00/10.00/9.85 others=1: pin-gen: server cpus=0-6 gen tid=811478 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=37.4 rtt_p99_us=4221.3 rtt_max_us=11887.6 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+rrmw-g1 5 load 9.85/9.85/9.15 others=1: pin-gen: server cpus=0-6 gen tid=812431 cpus=7 reqreply workers=4 rate=10000 rtt_p50_us=38.8 rtt_p99_us=5826.5 rtt_max_us=20449.3 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+disp-g1 5 load 9.15/9.85/9.70 others=1: dispatch workers=8 tasks/s=558115 claim_p50_us=1.97 claim_p99_us=25.53 
+rr-zgc 5 load 9.70/9.70/8.93 others=1: pin-gen: server cpus=0-6 gen tid=813951 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=39.1 rtt_p99_us=5259.1 rtt_max_us=17245.9 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+hb-off 1 load 8.93/9.34/8.63 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=219883 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 1 load 8.63/9.32/9.30 others=1: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=226871 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 2 load 9.30/9.75/9.52 others=1: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=221556 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 2 load 9.52/9.72/9.31 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=235470 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 3 load 9.31/9.52/9.00 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=224654 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 3 load 9.00/9.30/8.96 others=1: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=234906 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 4 load 8.96/9.07/9.07 others=0: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=235118 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 4 load 9.07/10.88/10.73 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=230633 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 5 load 10.73/10.73/10.09 others=0: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=226611 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 5 load 10.09/10.54/9.44 others=0: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=230843 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 6 load 9.44/9.44/9.38 others=1: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=228126 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 6 load 9.38/9.38/9.13 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=233287 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 7 load 9.13/9.54/9.54 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=231778 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 7 load 9.54/10.14/9.89 others=1: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=223144 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 8 load 9.89/9.89/8.62 others=1: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=235114 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 8 load 8.62/8.73/8.67 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=228722 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 9 load 8.67/8.90/8.90 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=235785 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 9 load 8.90/9.33/9.31 others=1: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=232543 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-keeper 10 load 9.31/10.09/9.93 others=1: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=230458 batches=443 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+hb-off 10 load 9.93/10.25/9.49 others=1: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=239176 leases=10000 lost_callbacks=0 redelivered=0 ack_failed=0 
+rr-g1-jfr 1 load 9.49/9.49/8.96 others=2: pin-gen: server cpus=0-6 gen tid=823143 cpus=7 reqreply workers=1 rate=10000 rtt_p50_us=34.9 rtt_p99_us=4112.6 rtt_max_us=11450.7 n=100000 ok=100000 failed=0 missing=0 warmup_failed=0 warmup_missing=0 
+session end 06:59:27 load 8.96 8.92 7.01 peak 11.04
+# extra JFR run 06:59:49 (ThreadPark >= 200us), load 5.90 -> 5.92:
+rr-g1-park 1: reqreply workers=1 rate=10000 rtt_p50_us=35.4 rtt_p99_us=4029.9 rtt_max_us=14475.5 n=100000 ok=100000 failed=0 missing=0
+# G1 young pauses per rr-g1 run (gc log): 12 pauses, total 47-56 ms, max 6.8-13.7 ms
