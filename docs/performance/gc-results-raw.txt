@@ -1,0 +1,27 @@
+cfg=g1 rep=1 bench=startup ms=277
+cfg=g1 rep=1 bench=idle rss_kb=70192
+cfg=g1 rep=1 bench=http_1k rate=20000 load=3.41 p50=0.94ms p99=2.14ms p999=8.41ms rps=19895.45 
+cfg=g1 rep=1 bench=http_64k rate=4000 load=2.44 p50=0.90ms p99=1.92ms p999=2.35ms rps=3980.80 
+cfg=g1 rep=1 bench=http_after rss_kb=262724 hwm_kb=262724 gc_collections=57 gc_pauses=57 gc_pause_total_ms=70.2 gc_pause_max_ms=4.93
+cfg=g1 rep=1 bench=msg_produce load=1.90 messaging produce bytes=1024 threads=4 durability=default ops/s=229402 MB/s=234.9 p50_us=16.0 p99_us=33.6 p999_us=85.2 n=2294023 gc_collections=58 gc_pauses=58 gc_pause_total_ms=77.7 gc_pause_max_ms=4.63
+cfg=g1 rep=1 bench=msg_fetch load=2.43 messaging fetch bytes=1024 threads=4 durability=default ops/s=66462 MB/s=68.1 p50_us=58.6 p99_us=118.6 p999_us=1023.8 n=664621 gc_collections=253 gc_pauses=253 gc_pause_total_ms=295.2 gc_pause_max_ms=7.25
+cfg=g1 rep=1 bench=reqreply_s1 load=2.67 reqreply rate=10000 rtt_p50_us=25.9 rtt_p99_us=1189.1 rtt_max_us=12679.7 n=120000 gc_collections=14 gc_pauses=14 gc_pause_total_ms=65.2 gc_pause_max_ms=9.64
+cfg=g1 rep=1 bench=reqreply_s4 load=3.44 reqreply rate=10000 rtt_p50_us=27.8 rtt_p99_us=598.9 rtt_max_us=7259.3 n=120000 gc_collections=14 gc_pauses=14 gc_pause_total_ms=55.3 gc_pause_max_ms=8.16
+cfg=g1tuned rep=1 bench=startup ms=243
+cfg=g1tuned rep=1 bench=idle rss_kb=72368
+cfg=g1tuned rep=1 bench=http_1k rate=20000 load=3.50 p50=0.94ms p99=2.03ms p999=6.56ms rps=19895.43 
+cfg=g1tuned rep=1 bench=http_64k rate=4000 load=3.01 p50=0.88ms p99=1.94ms p999=3.18ms rps=3980.85 
+cfg=g1tuned rep=1 bench=http_after rss_kb=515484 hwm_kb=515488 gc_collections=20 gc_pauses=20 gc_pause_total_ms=44.3 gc_pause_max_ms=4.84
+cfg=g1tuned rep=1 bench=msg_produce load=2.34 messaging produce bytes=1024 threads=4 durability=default ops/s=227992 MB/s=233.5 p50_us=15.9 p99_us=33.7 p999_us=104.0 n=2279920 gc_collections=30 gc_pauses=30 gc_pause_total_ms=52.1 gc_pause_max_ms=4.74
+cfg=g1tuned rep=1 bench=msg_fetch load=2.99 messaging fetch bytes=1024 threads=4 durability=default ops/s=68033 MB/s=69.7 p50_us=56.0 p99_us=105.9 p999_us=1009.0 n=680325 gc_collections=644 gc_pauses=644 gc_pause_total_ms=569.4 gc_pause_max_ms=7.74
+cfg=g1tuned rep=1 bench=reqreply_s1 load=2.82 reqreply rate=10000 rtt_p50_us=26.4 rtt_p99_us=2057.9 rtt_max_us=8291.1 n=120000 gc_collections=4 gc_pauses=4 gc_pause_total_ms=21.0 gc_pause_max_ms=7.50
+cfg=g1tuned rep=1 bench=reqreply_s4 load=3.71 reqreply rate=10000 rtt_p50_us=26.7 rtt_p99_us=559.1 rtt_max_us=8115.3 n=120000 gc_collections=4 gc_pauses=4 gc_pause_total_ms=22.7 gc_pause_max_ms=6.88
+cfg=zgc rep=1 bench=startup ms=261
+cfg=zgc rep=1 bench=idle rss_kb=73040
+cfg=zgc rep=1 bench=http_1k rate=20000 load=3.56 p50=0.94ms p99=2.01ms p999=10.61ms rps=19280.24 
+cfg=zgc rep=1 bench=http_64k rate=4000 load=2.55 p50=0.88ms p99=1.98ms p999=3.28ms rps=3980.73 
+cfg=zgc rep=1 bench=http_after rss_kb=1185900 hwm_kb=1185900 gc_collections=21 gc_pauses=105 gc_pause_total_ms=1.6 gc_pause_max_ms=0.06
+cfg=zgc rep=1 bench=msg_produce load=2.14 messaging produce bytes=1024 threads=4 durability=default ops/s=183153 MB/s=187.5 p50_us=19.4 p99_us=44.1 p999_us=203.4 n=1831531 gc_collections=6 gc_pauses=28 gc_pause_total_ms=0.4 gc_pause_max_ms=0.05
+cfg=zgc rep=1 bench=msg_fetch load=2.96 messaging fetch bytes=1024 threads=4 durability=default ops/s=52185 MB/s=53.4 p50_us=77.3 p99_us=110.9 p999_us=212.0 n=521850 gc_collections=51 gc_pauses=169 gc_pause_total_ms=2.3 gc_pause_max_ms=0.05
+cfg=zgc rep=1 bench=reqreply_s1 load=3.05 reqreply rate=10000 rtt_p50_us=30.7 rtt_p99_us=2002.3 rtt_max_us=14622.6 n=120000 gc_collections=3 gc_pauses=15 gc_pause_total_ms=0.3 gc_pause_max_ms=0.05
+cfg=zgc rep=1 bench=reqreply_s4 load=3.55 reqreply rate=10000 rtt_p50_us=29.7 rtt_p99_us=414.9 rtt_max_us=7364.7 n=120000 gc_collections=3 gc_pauses=15 gc_pause_total_ms=0.2 gc_pause_max_ms=0.03
