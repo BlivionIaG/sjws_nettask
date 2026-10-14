@@ -4,7 +4,7 @@ HTTP/2 is opt-in and runs on its **own TCP port**, next to HTTP/1.1 (whose liste
 handling are unchanged by it), serving the same files through the same handler.
 
 What a connection speaks depends on the listener it arrived on. Both listeners first apply the
-connection caps (`--max-connections` and `--max-connections-per-ip`). The TLS listener (`--h2-port`):
+connection caps (`--max-connections`, and per client address the lower of `--max-connections-per-ip` and 16). The TLS listener (`--h2-port`):
 
 ```mermaid
 flowchart TB
@@ -41,9 +41,9 @@ flowchart TB
   (`SETTINGS_MAX_HEADER_LIST_SIZE`), at most 100 `RST_STREAM` per 10 s from a client (rapid reset,
   CVE-2023-44487: `GOAWAY ENHANCE_YOUR_CALM` and close), at most 16 consecutive small `CONTINUATION`
   frames (CONTINUATION flood: `GOAWAY` and close), 4096 requests in flight and 512 file responses
-  streaming server-wide, `--max-connections` / `--max-connections-per-ip`, the TLS handshake within
-  `--header-timeout`, idle connections closed after `--idle-timeout`, and a stalled stream (peer
-  window exhausted) reset after `--write-timeout`. File bodies are sent at the pace of the peer's
+  streaming server-wide, `--max-connections`, 16 connections per client address (or `--max-connections-per-ip` when lower), the TLS handshake within
+  `--header-timeout`, idle connections closed after `--idle-timeout`, a stream whose peer window stays closed for 5 s is cancelled, and a write that makes no
+  progress for `--write-timeout` is reset. File bodies are sent at the pace of the peer's
   flow-control windows, one 64 KiB chunk per stream in memory at most.
 * Quick check: `curl -k --http2 https://127.0.0.1:8443/` (h2), `curl --http2-prior-knowledge
   http://127.0.0.1:<h2c-port>/` (h2c).

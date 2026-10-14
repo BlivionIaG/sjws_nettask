@@ -38,7 +38,7 @@ flowchart TD
     p -->|"several, other units,<br/>malformed"| ok
 ```
 
-* **Small-file cache.** Files up to 256 KiB are kept in memory (both protocols), up to
+* **Small-file cache.** Files up to 256 KiB are kept in memory (all three protocols), up to
   `--cache-bytes` in total (body + key + ~256 bytes per entry) and 4096 entries; eviction is CLOCK
   (second chance: an approximation of least recently used, O(1) amortized, hits take no lock). The key is the decoded, normalized path without the query, so `?v=1`, `%68ello`, `./`
   spellings share one entry and can't push others out; 404s are never cached. **Every hit stats the
@@ -64,7 +64,7 @@ flowchart TD
   cached and the uncached path alike. `If-None-Match` (lists, `*`, weak
   comparison) takes precedence over `If-Modified-Since`; a 304 carries `ETag`, `Last-Modified` and
   `Date` only.
-* **Ranges** (both protocols, decided in core after the 304 conditionals). One `bytes=` range
+* **Ranges** (all three protocols, decided in core after the 304 conditionals). One `bytes=` range
   (`a-b`, `a-`, `-n`) gets `206` with `Content-Range` (from the cache: a slice; otherwise the file region,
   with `sendfile` above 64 KiB). Several ranges (no multipart), other units, malformed or > 18-digit
   positions are ignored (`200`, whole file); a range starting at or past the end, or `-0`, gets `416` with

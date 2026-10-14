@@ -1,8 +1,8 @@
 # Design: request routing and reverse proxy
 
-Status: **proposal, for review before merge**. The code on `feat/proxy-routing`
-(`sjws_nettask.routing.{Router, RedirectHandler, ProxyHandler}`) is a prototype; this plan
-may revise it.
+Status: **implemented** (phases 1 and 2, and the gateway features of §13). Sections 1-11 are the
+original design; §12 and §13 record what was built, and where they differ the code and the
+[config file](../user/config-file.md) reference win.
 
 ## 1. Goals and non-goals
 
@@ -10,11 +10,12 @@ Goals
 - Virtual hosts, path-prefix routes, prefix rewrites, and redirects in front of the static file handler.
 - A reverse proxy to HTTP/1.1 upstreams. It adds `X-Forwarded-*` and `Forwarded` headers, applies
   timeouts, and maps upstream failures to 502/504.
-- One design that serves both transports (HTTP/1.1 and HTTP/3) through `core.Handler`.
+- One design that serves every transport (HTTP/1.1, HTTP/2 and HTTP/3) through `core.Handler`.
 - Zero cost when disabled. When enabled, no per-request allocation spikes and a bounded memory footprint.
 
 Non-goals (for now)
-- Load balancing across several upstreams, health checks, retries, circuit breaking.
+- Active health checks. (Load balancing across `endpoints`, passive ejection, retries and circuit
+  breaking were non-goals at first and shipped later, see §13.)
 - Regex or glob path matching, header- or method-based routing, and response rewriting.
 - WebSocket / `Upgrade` tunnelling, HTTP/2 or HTTP/3 to upstreams, and caching proxy responses.
 - TLS client certificates to upstreams.
@@ -44,7 +45,8 @@ flowchart TB
 - `SjwsServer` (the composition root) builds the `Router` only when `routing.enabled`.
   Otherwise the chain ends directly at `StaticFileHandler`, exactly as today.
 - Per-route filters, such as auth on `/admin`, are expressed by wrapping that route's target handler.
-  This needs no Router feature. Open question: should the chain API offer `wrap(route)`, or is plain composition enough?
+  This needs no Router feature: plain composition is enough, and `RequestFilters.wrapping(handler)` does it
+  (`RoutingCompiler` uses it for a route's `rate_limit`).
 - The router moves no code into transports, and the `core` package does not depend on `routing`.
 
 ## 3. Route matching
@@ -71,19 +73,19 @@ flowchart TD
 
 - **Host.** The value is an exact name (`example.com`), a wildcard suffix (`*.example.com`, which
   matches sub-domains only), or absent (any host). Matching ignores case and strips the port
-  (bracketed IPv6 is handled). The host comes from `RequestHeaders.host` (HTTP/1 `Host` or HTTP/3 `:authority`).
+  (bracketed IPv6 is handled). The host comes from `RequestHeaders.host` (HTTP/1 `Host`, or `:authority` on HTTP/2 and HTTP/3).
   Host names are lower-cased once, at config load.
 - **Prefix.** The prefix must start with `/` and matches on a segment boundary: `/api` matches `/api`, `/api/…` and `/api?…`,
   but not `/apix`. Matching runs on the raw (still percent-encoded) target, so `/%61pi` does **not**
   match `/api`. That is deliberate and documented. The decoded-path resolver remains the static
   handler's job. A dot-segment target (`/api/../secret`) is rejected with 400 before routing.
-  The prototype does not do this yet; it is a phase-1 fix.
 - **Rewrite.** This replaces the matched prefix. `prefix=/api, rewrite=/` sends `/api/x?q` to `/x?q`. The query is kept.
 - **Ordering.** Routes are tried in config order and the first match wins. With no match, the request goes to the static
-  handler, or gets 404 when `static` is disabled. At load, config validation warns about routes that an earlier route
+  handler (a `Router` built without a fallback answers 404). At load, config validation warns about routes that an earlier route
   fully shadows.
-- **Scale.** Matching is a linear scan, which suits the expected tens of routes. If there are more, phase 3 groups routes
-  in a host→routes map, then sorts each group by prefix length (longest first). Order stays the user-visible contract.
+- **Scale.** Up to 8 routes, matching is a linear scan. Above that, `CompiledRoutes` groups routes by host class (any,
+  exact, `*.suffix`) and probes the prefixes in hash tables. The result is always the first route in config order, which
+  stays the user-visible contract.
 
 A route with `backends` instead of `proxy` goes through `WeightedHandler`, which picks the upstream
 before the proxy runs:
@@ -131,7 +133,7 @@ The client's own deadlines also stay in force, such as the write timeout via `Co
   - `X-Forwarded-For`, which appends the client IP to any incoming value only if the peer is in `trusted_proxies`; otherwise it replaces it;
   - `X-Forwarded-Proto` and `X-Forwarded-Host`;
   - RFC 7239 `Forwarded: for=…;proto=…;host="…"`, with values quoted and escaped.
-- *Optional:* `Via: 1.1 sjws`.
+- *Not sent:* `Via`. The design listed it as optional; there is no config key.
 
 **Response headers relayed.** All headers are relayed except hop-by-hop ones and the fields the writer owns (`Content-Length`, `Date`,
 `Server`, `Alt-Svc`, `Transfer-Encoding`). A header value that cannot be represented drops that one field, not the response.
@@ -143,10 +145,11 @@ The client's own deadlines also stay in force, such as the write timeout via `Co
 | connect refused / reset / DNS failure / malformed upstream response | 502 |
 | connect or response-head timeout | 504 |
 | failure after the head was sent (mid-body) | abort the connection/stream (never a short 200) |
-| upstream body exceeds `max_body` (buffered mode only) | 502 |
+| request body over `max_body` | 413 |
+| `Transfer-Encoding` request, or a body the transport could not attach | 501 |
 | target not origin-form, invalid method | 400 (normally caught earlier by the parser) |
 
-Errors are logged once per upstream per interval, rate-limited so log volume stays flat when an upstream is down.
+The proxy does not log upstream failures itself: they surface as 502/504 responses, in the access log and in the metrics.
 
 The order in which `ProxyHandler` decides. Each of the first five steps answers with the status shown
 when its condition holds, and otherwise passes the request on. Step 5 exists only when `circuit` is set
@@ -212,7 +215,7 @@ routing:
       connect_timeout: 5s
       response_timeout: 30s
       idle_read_timeout: 30s
-      max_body: 16m              # buffered-mode cap (phase 1); ignored once streaming lands
+      max_body: 16m              # largest request body forwarded (over it: 413)
       preserve_host: false
   routes:                        # ordered, first match wins
     - host: "example.com"        # optional: exact or "*.suffix"
@@ -239,7 +242,6 @@ unchanged.
   - Matching scans the target once (`indexOf('?')`), then does `startsWith` and a char check per route, which allocates nothing.
   - A new `Request` is allocated only when a rewrite applies.
   - Host comparison uses `regionMatches(ignoreCase)` on the raw header, with no substring or lower-casing.
-    The prototype still allocates via `stripPort` + `toLowerCase`; that is a phase-1 fix.
 - **Proxy:**
   - Pooled connections avoid handshakes.
   - Phase 1 buffers up to `max_body`, which is bounded but costs a copy.
@@ -249,20 +251,20 @@ unchanged.
     into a frame. There is no full-body copy.
 - **No per-request client, executor, or header-name normalisation tables.** Static sets are used for the hop-by-hop headers.
 
-## 8. Core contract gaps and proposed changes
+## 8. Core contract changes (landed)
 
-Today `Request(method, target, RequestHeaders)` carries only the static handler's six headers, and
-`Body` is sealed (`Empty | Bytes | FileBody`). The proxy needs four things:
+Before phase 2, `Request(method, target, RequestHeaders)` carried only the static handler's six headers, and
+`Body` was sealed (`Empty | Bytes | FileBody`). The proxy needed four things:
 
-| Gap | Proposed change (owned with Middleware Chain / core reviewers) |
+| Gap | Change |
 |---|---|
-| Request body | `Request.body(): RequestBody` with `RequestBody.EMPTY` default. It is a pull-style `InputStream`-like source with known/unknown length, produced by the HTTP/1 chunked/length decoder and the h3 stream. The static handler ignores it, but the transport must drain or close it if the handler does not consume it. |
-| Client address | `Request.peer(): InetSocketAddress` (nullable in tests), plus `secure(): boolean` for proto. |
-| Arbitrary headers | `RequestHeaders.all(): List<Map.Entry<String,String>>`, a lower-cased, ordered view filled by both transports. The existing typed fields stay as they are. |
-| Streaming response body | A new `Body.Stream(long lengthOrMinus1, Source)` variant. Writers use chunked encoding (HTTP/1.1, or close-delimited for 1.0) or DATA frames (HTTP/3) when the length is unknown. An abort on source error is never a short response. |
+| Request body | `Request.body(): RequestBody` with `RequestBody.EMPTY` default. It is a pull-style `InputStream`-like source with known/unknown length. Only HTTP/1.1 attaches one today, for a `Content-Length` request (`Http1Connection.BodyReader`). The static handler ignores it, and the transport closes the connection if the handler leaves any of it unread. |
+| Client address | `Request.peer(): InetSocketAddress` (nullable in tests), plus `secure(): boolean` for proto and `protocol()`. |
+| Arbitrary headers | `RequestHeaders.fields()` (a lower-cased map) and `all(): List<Map.Entry<String,String>>`. The existing typed fields stay as they are. HTTP/1.1 always fills the map, HTTP/3 only when a filter chain or a non-static terminal is installed at startup, and HTTP/2 leaves it empty. |
+| Streaming response body | A new `Body.Stream(long lengthOrMinus1, Source)` variant. Writers use chunked encoding (HTTP/1.1, or close-delimited for 1.0) or DATA frames (HTTP/2 and HTTP/3) when the length is unknown. An abort on source error is never a short response. |
 
-All four are additive, with existing constructors kept, so the static path and existing tests are unchanged. They are
-proposed as a separate core PR that lands before proxy phase 2.
+All four are additive, with existing constructors kept, so the static path and existing tests are unchanged. They landed
+before proxy phase 2 (§12).
 
 ## 9. Benchmark plan (wrk + wrk2)
 
@@ -315,23 +317,25 @@ upstream client in phase 2.
 
 ## 10. Phased rollout
 
+Phases 1 and 2 shipped (§12), and phase 3 as the gateway features B.1-B.4 (§13).
+
 0. **This document.** It is reviewed and agreed with Middleware Chain and Config & ACME.
 1. **Routing + buffered proxy, opt-in.** Revise the prototype (allocation-free host match, dot-segment
    rejection, config wiring in `SjwsServer`), with bodyless requests only. Proxy routes reject methods that carry a body with 501
    until phase 2. Run benchmarks 1–3.
 2. **Core contract additions** (§8) as a separate PR, then request-body forwarding, `X-Forwarded-For`/`Forwarded for=`
    with `trusted_proxies`, and streaming responses. Run benchmarks 3–6.
-3. **Optional:** host-indexed route table, multiple upstreams per name (round-robin), and passive health checks.
+3. **Done (B.1-B.4):** host-indexed route table, several endpoints per upstream (`round_robin`, `weighted_random`, `least_request`)
+   and passive health checks (a per-endpoint circuit).
 
-## 11. Open questions
+## 11. Open questions (all settled)
 
-1. Middleware Chain: are filters applied around the Router only, or should routes declare per-route filter lists?
-2. Core owners: do they agree with the four additive changes in §8, and with `Body.Stream` living in `core` (writer support in both transports)?
-3. Config & ACME: should the format be YAML (as above) or the existing config file format? Durations as `5s`, sizes as `16m`? Should ACME
-   HTTP-01 challenges (`/.well-known/acme-challenge/`) bypass routing? The proposal is that they are matched before the Router, always.
-4. Should Host default to the upstream host or be preserved? The proposal is upstream host plus `X-Forwarded-Host`, with `preserve_host` to opt in.
-5. HTTP/3 clients being proxied to HTTP/1.1 upstreams: should `Alt-Svc` from upstreams always be stripped? The proposal is yes.
-6. Should we keep HttpClient or move to the Netty client? **Decided: Netty** (§12). It is 1.5–5× faster than phase 1 depending on size.
+1. Middleware Chain: filters wrap the whole tree around the Router. A per-route behaviour is a route handler wrapped with `RequestFilters.wrapping` (`rate_limit`, `errors: problem`).
+2. Core owners: the four additive changes in §8 landed, and `Body.Stream` lives in `core` with writer support in all three transports.
+3. Config & ACME: the format is YAML, with durations such as `5s` and sizes such as `16m`. ACME HTTP-01 challenges (`/.well-known/acme-challenge/`) are answered before the Router, always.
+4. Host defaults to the upstream host plus `X-Forwarded-Host`, with `preserve_host` to opt in.
+5. `Alt-Svc` from an upstream is stripped (the writer owns that field).
+6. HttpClient or the Netty client? **Decided: Netty** (§12). It is 1.5–5× faster than phase 1 depending on size.
 
 ## 12. Phase 2: Netty upstream client and streaming (implemented)
 
@@ -343,7 +347,7 @@ upstream client in phase 2.
   - h2 waits for writability before each chunk, and ends with an empty DATA frame carrying END_STREAM.
   - h3 shuts down the stream output at the end.
   - The h2 → HTTP/1.1 fallback sets chunked for an unknown length.
-- Request bodies: HTTP/1.1 requests with Content-Length are streamed through `Http1Connection.BodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. A chunked request body, or any body on h2/h3, is not attached yet; the proxy answers it with 501, as it did in phase 1.
+- Request bodies: HTTP/1.1 requests with Content-Length are streamed through `Http1Connection.BodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. A chunked request body is not attached, and the proxy answers it with 501, as it did in phase 1; so does a declared body that the transport did not attach. Only HTTP/1.1 attaches request bodies today (§8).
 
 **Client (`routing.UpstreamPool` + `ProxyHandler`).**
 - The pipeline is `HttpClientCodec` + `Relay`, with autoRead off.
@@ -377,6 +381,6 @@ These build on the control-plane review on PR #38 (`UpstreamSet` snapshots swapp
 |---|---|---|---|
 | **Discovery** (implemented in B.4: `routing.discovery` types, `routing.EndpointBalancer`, static `endpoints` lists; the CP watch client feeds `UpstreamRegistry.lookup(service).update(set)`, see `docs/ha/discovery.md`. Differences: an empty update keeps the last non-empty set, a never-populated source gives 503; upstreams are named, not `{service, selector}`) | Routes target `upstream: {service, selector}`. An `UpstreamSource.current()` volatile read gives an immutable `UpstreamSet{endpointsVersion, Endpoint[]}`. There is one `UpstreamPool` per endpoint, reference-counted across sets, so a membership change does not drop warm connections. An empty set gives 503. | An `Endpoints` watch frame per service (signed, its own monotonic `endpointsVersion`, debounced), and `Register` carrying the services. Persisted beside last-good. | Nothing. This lives below the filter chain, in `ProxyHandler`. |
 | **Weighted / canary routes** (implemented in B.2: `backends` with `pin` for the match and route-level `sticky`; retry/circuit stay per upstream) | `route.backends: [{upstream, weight}]`, plus optional `match: {header, cookie}` to pin canaries. Selection uses a precomputed alias table (O(1), no allocation); the sticky choice uses a hash of a header or cookie. Weights are part of the compiled snapshot, so a change is a config version. | Shipping the weights as config. A staged rollout (§9 of #38) can push weight steps as versions. | A per-route filter list (open question 1) to run the canary-only filters. |
-| **Retries** (implemented in B.1, per upstream: see `docs/user/config-file.md`; per-endpoint selection waits for discovery) | Per-route `retry: {attempts, on: [connect, 502, 503, reset], budget: 10%}`. Only idempotent methods, or bodyless requests, are retried, and only before any response byte has been relayed. The next attempt picks a different endpoint. A token-bucket retry budget per upstream prevents storms. Phase 2 already retries stale keep-alive connections. | Nothing beyond the endpoint sets. | A way for filters to see the attempt count (a request attribute), so that logging and metrics are per try. |
+| **Retries** (implemented in B.1, per upstream: see `docs/user/config-file.md`) | Per-route `retry: {attempts, on: [connect, 502, 503, reset], budget: 10%}`. Only idempotent methods, or bodyless requests, are retried, and only before any response byte has been relayed. The next attempt picks a different endpoint. A token-bucket retry budget per upstream prevents storms. Phase 2 already retries stale keep-alive connections. | Nothing beyond the endpoint sets. | A way for filters to see the attempt count (a request attribute), so that logging and metrics are per try. |
 | **Circuit breaking** (B.1: consecutive failures per upstream; B.4: per endpoint with error-rate window and panic mode on multi-endpoint upstreams; `max_pending` is not done) | Per endpoint, a lock-free consecutive-failure / error-rate window (an `AtomicLong` packed state). States are closed, open (eject for `eject_for` with exponential backoff), and half-open (one probe). Ejected endpoints are skipped by load balancing. If more than `max_ejection` would be ejected, fall back to "panic" (use all). A per-upstream `max_pending` / `max_connections` limit gives 503 quickly. | Coarse health only (SUSPECT/DEAD). Local outlier state stays local and is never pushed back. | Nothing. Optionally an observer hook for state changes. |
 | **Rate limits** (implemented in B.3: `routing.RateLimitFilter`, GCRA in a fixed `AtomicLongArray`, per route through `RequestFilters.wrapping` plus `routing.rate_limit`; local only) | A filter, not a router feature: `RateLimitFilter{key: peer|header|route, rate, burst}`. It uses a sharded token bucket (striped `AtomicLong`s keyed by a hash, with a fixed table size, so there is no `computeIfAbsent` growth) and answers 429 with `Retry-After`. Local limits only in v1. A global limit would split the quota per node, with the share received from the CP (rate / ready gateway count). | v2 only: the per-node quota share, recomputed when gateway membership changes. | The chain's ordering (run before auth/proxy), per-route attachment, and a short-circuit response API, which `RequestFilters` already has. |

@@ -3,7 +3,7 @@
 Status: **Draft, for Blivion's review.** Nothing is built before approval. Base: master `3cdaa4e`. Scope: design only, no code changes.
 Owner: sjws Architecture. Builds on [agent-graphs.md](agent-graphs.md) (the "graphs doc", including its decisions in §11.1 and §11.3) and [agent-swarm.md](agent-swarm.md) (the "swarm doc").
 
-Every reference to existing code is a path and line on master `3cdaa4e`. There is **no graph code on master yet** (`rg -il graph src/sjws_nettask` finds nothing), so references to graph features point at sections of the graphs doc, not at code. This doc contains **no measurements**; §12 lists targets, which are pass thresholds, not results.
+Every reference to existing code is a path and line on master `3cdaa4e`. There is **no graph runner on master yet** (`rg -il 'swarm\.graph' src` finds nothing; the only graph-specific code is the retain-from pin API in `messaging/delivery/Partition.java`), so references to graph features point at sections of the graphs doc, not at code. This doc contains **no measurements**; §12 lists targets, which are pass thresholds, not results.
 
 ## 1. Goal and the hard rule
 
@@ -149,7 +149,7 @@ Optimizing against an automated metric invites specification gaming ([Krakovna e
 - **Thousands of candidates:**
   - Many independent research runs shard by `runId` (graphs §5.1, fixed shard count, graphs §11.1 item 1).
   - Within one run, a large population is evaluated by **batched evaluation**: one evaluation task carries up to `B` candidates (digests), so per-task overhead is amortized, and results return as one step result with `B` score vectors. `max_items` still bounds the map.
-  - Claim contention on the evaluator pool is the known limit today (16-worker claim p99 **458 µs after #103**, measured by Messaging Core, against the S1c target < 100 µs); batching reduces claims per candidate.
+  - Claim contention on the evaluator pool is the known limit today (16-worker claim p99 was **458 µs after #103**, measured by Messaging Core, a stress line since 2026-10-14; the S1c gate runs workers = vCPU count and sharded pools exist, swarm §5.1 and §13); batching reduces claims per candidate.
   - The lineage lives in the log; only the active population and best-so-far stay in runner memory.
 
 ## 9. Run-mode config and launch surface
@@ -176,7 +176,7 @@ It builds documents only; `s.serve(...)` (swarm §11.1) is unchanged for agents.
 A research view: running experiments, iteration, best-so-far with confidence, a **leaderboard** (top candidates by aggregate score, with held-out score when available), spend vs budget, plateau counter, and pending review gates with approve/reject. Data comes from run events (graphs §6.3) via the admin API. Today's TUI has `enum View { STATUS, CONFIG, LOGS }` (`src/sjws_nettask/admin/AdminTui.java:42`); adding a view is the **sjws Admin TUI workstream's** work and is a dependency (R3).
 
 ## 10. Zero cost when off
-- Package `sjws_nettask.swarm.graph.research`, loaded only when `swarm.enabled`, `swarm.graphs.enabled` and `swarm.graphs.research.enabled` are all true, through a string-named lazy hook as `OptionalModules.SWARM_CLASS` does (`src/sjws_nettask/OptionalModules.java:39`, loaded at `:73`).
+- Package `sjws_nettask.swarm.graph.research`, loaded only when `swarm.enabled`, `swarm.graphs.enabled` and `swarm.graphs.research.enabled` are all true, through a string-named lazy hook as `OptionalModules.SWARM_CLASS` does (`src/sjws_nettask/OptionalModules.java:39`, loaded at `:80`).
 - P1–P3 live in `swarm.graph` (they are graph features) but are inert unless a graph uses them; their cost when unused is checked by the graphs benchmarks (graphs §12).
 - **Dependency guard:** nothing outside `swarm.graph.research` names it except the hook (extending graphs §8).
 - **Class-load guard:** cloned from `tests/sjws_nettask/swarm/ClassLoadTest.java` (assertion at `:57`): no `sjws_nettask.swarm.graph.research.` class with (a) swarm off, (b) graphs off, (c) research off, in standalone and `data`/`gateway` mode (as `tests/sjws_nettask/swarm/RoleClassLoadTest.java`).
@@ -193,7 +193,7 @@ A research view: running experiments, iteration, best-so-far with confidence, a 
 | **R5** | Batched evaluation, islands, multi-node research runs | G5 (multi-node) | Thousands-of-candidates target (§12) met or recorded |
 
 ## 12. Benchmark plan
-Methodology as swarm §13 (machine and commit reported, ≥ 5 alternating runs, mean ± stddev, CPU-pinned). Numbers measured by others: 16-worker claim p99 458 µs after #103 (Messaging Core); request/reply p99 about 409–882 µs depending on load after #105/#108; S1c targets claim p99 < 100 µs, request/reply p99 < 500 µs.
+Methodology as swarm §13 (machine and commit reported, ≥ 5 alternating runs, mean ± stddev, CPU-pinned). Numbers measured by others: 16-worker claim p99 458 µs after #103 (Messaging Core; a stress line since 2026-10-14); request/reply p99 about 409–882 µs depending on load after #105/#108; S1c targets claim p99 < 100 µs, request/reply p99 < 500 µs.
 
 **Targets** (proposals for review, not results):
 | Workload | Measured | Target |

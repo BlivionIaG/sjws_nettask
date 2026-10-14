@@ -5,19 +5,25 @@ See [docs/design/architecture.md](architecture.md) for the layers, the `core.Han
 * **core** (`sjws_nettask.core`): protocol-neutral `Request`/`Response`/`Body` records, the
   `StaticFileHandler` (every status decision: path decoding and containment, index/listings, MIME,
   validators, conditionals, ranges), `SafeOpen` (no-follow, `openat`-based opens checked against the
-  resolved file identity), the small-file `FileCache` and the per-address connection counter. Both
-  transports call the same handler, so behaviour is identical by construction; a parity test compares
-  every HTTP/3 response with the HTTP/1.1 bytes for the same request. Optional request filters
+  resolved file identity), the small-file `FileCache` and the per-address connection counter. Every
+  transport calls the same handler, so behaviour is identical by construction; parity tests compare
+  every HTTP/2 and HTTP/3 response with the HTTP/1.1 bytes for the same request (`h2/Http2ServerTest`,
+  `h3/Http3ServerTest`). Optional request filters
   (`RequestFilters`, see [docs/development/filters.md](../development/filters.md)) wrap whatever `Handler` is terminal
   (the static file handler, or a router when one is installed) on every transport. With none
   registered, and no other terminal, the static handler is called directly. `Request` carries the
-  client address, whether the connection is TLS, and the raw header map.
+  client address, whether the connection is TLS, a streamed body (HTTP/1.1 `Content-Length` requests
+  only) and the raw header map (always filled on HTTP/1.1; on HTTP/3 only when a filter chain or a
+  non-static terminal is installed at startup; HTTP/2 leaves it empty).
 * **HTTP/1.1** (`sjws_nettask` + `sjws_nettask.http1`): one virtual thread per connection on a blocking
   `SocketChannel`; an incremental, strict byte-level head parser (CL/TE smuggling, limits, obs-fold,
   Host, Expect); responses written whole (head and small bodies in one `write`, `Date` formatted once
   per second); files over 64 KiB that are not cached go out with `FileChannel.transferTo` (`sendfile`).
   A single timer thread enforces the idle, request-head (408) and write-progress deadlines and ends
   expired connections with `shutdown(2)` (it never blocks in `close()`).
+* **HTTP/2** (`sjws_nettask.h2`): Netty on its own TCP port (`--h2`): TLS with ALPN `h2` and an
+  `http/1.1` fallback, optional h2c; a virtual thread per request runs the shared handler; caps on
+  streams, in-flight requests and file responses, rapid-reset and CONTINUATION-flood limits.
 * **HTTP/3** (`sjws_nettask.h3`, `sjws_nettask.tls`): Netty QUIC (quiche); a virtual thread per request
   stream runs the shared handler; file slots, a per-connection in-flight share, a minimum send rate
   under contention, handshake and half-open caps, GOAWAY drain.

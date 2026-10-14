@@ -1,7 +1,8 @@
 # Control plane: distributable access policy, operator RBAC and audit
 
-Status: building blocks in `sjws_nettask.controlplane`. Nothing is wired into the server yet, so
-a node that is not managed by a control plane (CP) runs exactly the code it ran before.
+Status: building blocks in `sjws_nettask.controlplane`. `Rbac`, `AuditLog` and the roles back the control-plane
+admin API (`cp.CpStore`, `cp.AdminServer`); `LivePolicy` and `AccessPolicyDocument` have no caller yet. A node that
+is not managed by a control plane (CP) loads none of it and runs exactly the code it ran before.
 `docs/design/control-plane.md` (the HA workstream) owns the overall CP design. This page covers
 only the security pieces, and the seams they leave for it.
 

@@ -1,27 +1,28 @@
 # Control-plane process hosting
 
-Status: revised after Security review (B1, B2, N1-N7). Docs only. Anything not already in master is marked **proposed**.
+Status: revised after Security review (B1, B2, N1-N7). The control role is implemented in `sjws_nettask.cp`
+(`CpLaunch`, `CpHost`, `CpWitnessHost`). A section still marked **proposed** is not built.
 Builds on `docs/design/control-plane.md`, `docs/design/control-plane-security.md` and the #38 review.
 
 ## 1. Starting a control-role process
 
 **Today (master):**
-- `NodeRole` is `CONTROL` or `DATA`. `CpStore.resolveRole(cli, env, yaml)` delegates to `NodeLifecycle.role`.
-- `ServiceLaunch.onListening` opens `NodeEnrollment` and, only for `NodeRole.DATA`, a `DataWatch`. No production
-  path opens `CpStore`, `WatchServer` or `AdminServer`; tests construct them directly.
+- `NodeRole` is `STANDALONE`, `CONTROL` or `DATA`. `CpStore.resolveRole(cli, env, yaml)` delegates to `NodeLifecycle.role`.
+- `ServiceLaunch.onListening` opens `NodeEnrollment`, then a `DataWatch` for `NodeRole.DATA` or `CpLaunch` (by name)
+  for `NodeRole.CONTROL`: `CpHost` opens `CpStore`, `WatchServer` and `AdminServer`, and `CpWitnessHost` a witness.
 - `CpStore.open(stateDir, KeyRing, Clock[, adminSan])` runs one Raft group `cp-config` with
-  `GroupOptions(RELAXED, 1 MiB, electionTimeout 100 ms, heartbeat 40 ms, ...)` (CpStore.java:114).
+  `GroupOptions(RELAXED, 1 MiB, electionTimeout 100 ms, heartbeat 40 ms, ...)` (`CpGroup.options()`).
   `ready()` = `/readyz` ok AND `leaderReady()`. `bindsContentPort()` is false for the control role.
-- `WatchServer` refuses a non-loopback plain listener; sockets come from `openServerSocket(address, AdminTls)`.
-  `AdminServer` refuses to bind without cert, key and admin-CA trust.
+- `WatchServer` refuses a non-loopback plain listener; hosted, both listeners come from `WatchServer.startMtls` and
+  `AdminServer.startMtls` over `CpServerTls.context()`. `AdminServer` refuses to bind without cert, key and admin-CA trust.
 
-**Proposed start order** (in `ServiceLaunch`, new `NodeRole.CONTROL` branch, reached by reflection the same way as
-the swarm so data-only builds load no CP class):
-1. Resolve role and CP config (section 4); validate file permissions (section 3). Any error -> exit non-zero.
+**Start order** (`ServiceLaunch` reaches `CpLaunch` by name for `NodeRole.CONTROL`, the same way as the swarm, so
+data-only builds load no CP class):
+1. Resolve role and CP config (section 4); validate file permissions (section 2.3). Any error -> exit non-zero.
 2. Load `KeyRing` from disk (section 2).
 3. `CpStore.open(stateDir, keys, clock)` with the peer list (multi-voter, below).
 4. Bind `WatchServer` (mTLS), then `AdminServer` (mTLS).
-5. Report ready only when `CpStore.ready(...)` is true.
+5. `CpHost.ready()` is true only when `CpStore.ready(...)` is; the start itself does not wait for a leader.
 
 **Implemented** in `sjws_nettask.cp.CpLaunch` / `CpHost` / `CpWitnessHost`. Hosting starts only when `cp` settings
 exist (a `cp:` block, `sjws.cp.nodeId` or `SJWS_CP_NODE_ID`); a control bootstrap without them fails closed
@@ -61,22 +62,22 @@ flowchart TB
     link <--> voters["Other voters<br/>and the witness"]
 ```
 
-**Proposed shutdown order** (reverse): stop accepting admin writes (close `AdminServer`) -> close `WatchServer`
-(watchers fail over to another voter) -> `CpStore.close()` (Raft node, log) -> zero private key bytes held in memory.
-Shutdown stays within the existing drain budget (`Sjws_nettask.drainBudgetMillis`).
+**Shutdown order** (reverse, `CpHost.close`): close `AdminServer` -> close `WatchServer` -> `CpStore.close()` (Raft node,
+log) -> the voter `TcpTransport`. It runs after `SjwsServer.drain()`. Private key bytes are not zeroed at shutdown (best
+effort only, 2.4).
 
-**Multi-voter fit (proposed, my next PR):** `CpStore.open` gains a static peer list (3 or 5 full voters, or
-2 data + 1 witness, section 6). Every voter hosts `WatchServer`; non-leaders answer watches from their applied
-state, admin writes go to the leader (existing `FailoverCpClient` already retries across addresses).
+**Multi-voter (implemented):** `CpStore.open(..., self, VoterSet, transport)` takes the static `cp.peers` set (3 or 5
+full voters, or 2 data + 1 witness, section 6). Every full voter hosts `WatchServer`; non-leaders answer watches from
+their applied state, and a write on a follower gets 503 `leader not ready`, so `FailoverCpClient` tries the next address.
 Peers come from config; membership changes are out of scope for v1.
 
 ## 2. KeyRing on disk
 
-**Today:** `KeyRing` is in-memory only: `KeyRing.generate(keyId, notAfter, versionMin, versionMax[, floor])` makes an
-Ed25519 root and online key; the root signs `SnapshotCrypto.trustInput(versionFloor, keys)`. There is no load path.
-That is what blocks Security.
+**Today:** `KeyRing.load(CpKeyConfig)` reads `root.pub`, `trust.bundle`, `online.key` and `trust.state`, failing closed
+(2.3.1). `KeyRing.generate(keyId, notAfter, versionMin, versionMax[, floor])` makes an Ed25519 root and online key and
+stays for tests and the ceremony tool; the root signs `SnapshotCrypto.trustInput(versionFloor, keys)`.
 
-**Proposed layout:**
+**Layout:**
 
 | File | Where | Content | Owner / mode |
 |---|---|---|---|
@@ -84,7 +85,7 @@ That is what blocks Security.
 | `trust.bundle` | `cp.keyDir` | signed binary bundle (section 2.1) | root or service uid, no group/other write |
 | `online.key` | `cp.keyDir` | PKCS#8 DER Ed25519 private key of **this voter's** online key | service uid, 0600 (0400 accepted) |
 | `keyDir` itself | | | service uid, 0700 |
-| `trust.state` | `cp.stateDir` (not a replaceable file) | anti-rollback floor `(maxBundleSerial, maxVersionFloor)` (section 2.2) | service uid, 0600, fsynced |
+| `trust.state` | `cp.stateDir` and `cp.keyDir` (two copies, the higher floor wins; not a replaceable file) | anti-rollback floor `(maxBundleSerial, maxVersionFloor)` (section 2.2) | service uid, 0600, fsynced |
 
 The root private key is **never** on a CP host. The CP process needs no write access to `root.pub`.
 
@@ -127,7 +128,7 @@ higher serial refused; a bundle signature fed to snapshot verification (and the 
 
 ### 2.3 Loading, fail closed (B2 included)
 
-A new `KeyRing.load(keyDir, rootPub, stateDir)`:
+`KeyRing.load(CpKeyConfig)`:
 1. **Permission checks (StrictModes-style):** open with `NOFOLLOW_LINKS`; check type (regular
    file / directory), owner and mode on the opened descriptor. `root.pub`, `trust.bundle`, `keyDir` and **every parent
    directory up to `/`** must be owned by root or the service uid and not group- or world-writable. A sticky directory
@@ -140,8 +141,8 @@ A new `KeyRing.load(keyDir, rootPub, stateDir)`:
 2. **Root pin:** parse `root.pub`. If `cp.rootPubSha256` is set (install time, config file), refuse on mismatch.
    Log the root fingerprint (SHA-256 of the SPKI) at startup; never log key bytes.
 3. Parse `trust.bundle` strictly (2.1), verify the root signature and `rootKeyId`, apply the anti-rollback check (2.2).
-4. Parse `online.key` (read into a `byte[]`, `Arrays.fill` right after `KeyFactory`); its public half must equal an
-   unexpired `TrustKey` in the bundle whose keyId belongs to this node.
+4. Parse `online.key` (read into a `byte[]`, `Arrays.fill` right after `KeyFactory`); it must sign a challenge that
+   verifies against an unexpired `TrustKey` in the bundle (keyIds are not yet bound to `cp.nodeId`).
 5. Any error throws and the process exits. No fallback, no auto-generate in production (`generate` stays for tests and
    the ceremony tool).
 
@@ -190,6 +191,9 @@ any failure the old material stays, the error is logged and counted. A half-load
 cannot introduce a key the root has not signed; it only picks up the ceremony's output. `root.pub` is **not** reloaded
 on SIGHUP, only on restart.
 
+That step is `CpHost.reload()`. The daemon does not call it on SIGHUP for a control process yet (the signal re-reads
+only the local YAML), so restart the process to pick up new key or TLS files.
+
 Shutdown "zeroing" is best effort: Java cannot zero a `PrivateKey` (`destroy()` is not implemented for EdDSA and the
 provider copies bytes). We fill our own buffers and disable heap and core dumps for the control role.
 
@@ -201,7 +205,7 @@ provider copies bytes). We fill our own buffers and disable heap and core dumps 
 - **Offline root:** on an air-gapped machine; signs only trust bundles.
 - **Rotation ceremony:** (1) each voter generates its new online pair **on the voter** (`sjws-cp keys gen`); private
   bytes never leave it; (2) only the SPKI is carried to the offline box; (3) the root signs a new `trust.bundle` with a
-  higher `bundleSerial`, fresh `issuedAt`, old + new keys; (4) copy the bundle to every voter; (5) SIGHUP or restart;
+  higher `bundleSerial`, fresh `issuedAt`, old + new keys; (4) copy the bundle to every voter; (5) restart (SIGHUP, once it reloads a control process, see 2.4);
   (6) once all data nodes report the new serial, sign another bundle (higher serial) without the old keys.
 - **Expiry alarm:** warn (log, metric, health) when an online key has less than 25% of its lifetime left.
 
@@ -210,7 +214,7 @@ provider copies bytes). We fill our own buffers and disable heap and core dumps 
 1. **Detect** (alert, audit anomaly, host compromise). Isolate the voter.
 2. **Re-sign:** on the offline box, the root signs a bundle with a higher `bundleSerial` that drops the bad key and
    sets `versionFloor` above the highest version the bad key could have signed (its `versionMax`).
-3. **Push:** copy to the remaining voters, SIGHUP; data nodes receive it via snapshot and verify it against `root.pub`.
+3. **Push:** copy to the remaining voters and restart them (SIGHUP, once wired, see 2.4); data nodes receive it via snapshot and verify it against `root.pub`.
 4. **Enforce:** every node advances `trust.state`; anything below the new serial or floor is refused, including a
    restored older bundle.
 5. **Audit** which versions the bad key signed; rebuild the voter with a newly generated key in a later bundle.
@@ -222,7 +226,7 @@ Root compromise is out of scope here: it needs a new `root.pub` on every node (r
 Audit events for: bundle loads (serial, floor, keyIds, root fingerprint), SIGHUP outcomes, and every refusal
 (rollback, signature, permission, pin mismatch).
 
-## 4. Config keys (proposed)
+## 4. Config keys
 
 Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` block; property > env > YAML.
 
@@ -235,8 +239,8 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | — | — | `cp.rootPubSha256` | optional install-time pin of the root SPKI |
 | — | — | `cp.insecureSkipPermissionChecks` | dev-only override (2.3), config file only; a property/env setting is refused |
 | — | — | `cp.minBundleSerial` | lowest accepted `bundleSerial` (default 0; Security) |
-| — | — | `cp.maxClockDriftRatio` | proposed, default 0.01 (1%); rate error over one lease (HA) |
-| — | — | `cp.leaseSafetyMargin` | proposed, default 10 ms; fixed margin in the startup check (HA) |
+| — | — | `cp.maxClockDriftRatio` | default 0.01 (1%), 0 to 0.5; rate error over one lease (HA) |
+| — | — | `cp.leaseSafetyMargin` | default 10 ms (needs a unit); fixed margin in the startup check (HA) |
 | `sjws.cp.nodeId` | `SJWS_CP_NODE_ID` | `cp.nodeId` | this voter |
 | — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
@@ -250,12 +254,13 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 `cp-peer` `CpServerTls.context()` with `parameters()` applied (TLS 1.3, client certificate required on both
 ends). The voter links have their own certificate and key (`peerCert`/`peerKey`) and trust only `peerCa`, a CA
 that issues voter certificates only: a data-node watch certificate (issued under `ca`) must never pass, so
-`peerCa` equal to `ca` (same path or same bytes) is refused, and `adminCa` equal to `ca` logs a WARN.
+`peerCa` equal to `ca` (same path, or a bundle that shares a CA public key with it) is refused, and `adminCa` equal to `ca` logs a WARN.
 Frames are HMAC-authenticated with `SJWS_CP_RAFT_KEY`, a CP-only secret: data nodes hold the HA cluster key,
-so the Raft key is never derived from it and a start where they are equal is refused (no value is printed).
+so the Raft key is never derived from it, and a start where it equals this process's `WEB_SERVER_HA_CLUSTER_KEY` or
+`_PREVIOUS` is refused (no value is printed; the YAML `ha:` key is not compared).
 An accepted socket must finish the mTLS handshake within `TcpTransport.HANDSHAKE_TIMEOUT_MILLIS` (5 s total)
 before it takes an inbound slot, and non-member source addresses are refused at accept in every mode.
-SIGHUP reloads the `cp-peer` material with the other listeners; new dials use the reloaded revocation list.
+`CpHost.reload()` reloads the `cp-peer` material with the other listeners, all or nothing (2.4 says when it runs).
 Without TLS material the start fails closed; only the test seam (`CpHostDeps.serverTls` returning null) allows
 plain links, and only when every peer is loopback. A CONTROL role with no `cp` settings at all refuses to start
 (exit 64, before any listener). Gap: there is no hostname check and peer certificates are not yet bound to the
@@ -286,10 +291,10 @@ non-control process names no cp class.
 
 ## 5. Zero cost when the CP role is off
 
-Existing guards: `tests/.../cp/ClassLoadTest`, `CpCoverageTest`, `SourceGuardTest`; `ServiceLaunch` already names
-no cp type except behind the role branch (`DataWatch` is typed loosely). Proposed: the control branch is reached by
-reflection; extend `cp/ClassLoadTest` to assert a data-role and a no-role start load no `CpStore`, `WatchServer`,
-`AdminServer` or `KeyRing`, a witness host loads no `KeyRing`, and `SourceGuardTest` to forbid those names outside `cp/` and the reflective entry.
+Guards: the control branch is reached by reflection (`ServiceLaunch` names `CpLaunch` once, as a string), and
+`SourceGuardTest` forbids the control types outside `cp/`. `cp/ClassLoadTest` asserts that a standalone and a data-role
+start load no `CpHost`, `CpStore`, `WatchServer`, `AdminServer`, `KeyRing`, `TcpTransport` or `ReplicatedNode`, and that a
+witness host loads no `KeyRing`; `CpCoverageTest` covers the rest.
 Benchmark: wrk A/B, CP off, 5 alternating pinned runs.
 
 ## 6. Voters and witnesses (HA input)
@@ -297,23 +302,24 @@ Benchmark: wrk A/B, CP off, 5 alternating pinned runs.
 Source: HA, #118, `docs/design/high-availability.md` (HA's doc), #133, #142, #146.
 1. **Witness = vote-only voter**, not a `CpStore` replica. No log; durably records last acked `(index, term)` and
    votes. Joins the CP Raft group as a witness voter (same groupId multiplexing), never serves reads, never leader.
-2. **Co-hosting allowed:** a data node may host a CP voter in-process as a separate Raft group over the shared
-   cluster transport, as long as the control role does not bind the content port (`CpStore.bindsContentPort()` is
-   already false). Failure domains are then shared, so the witness MUST be on a third host or site.
+2. **Co-location:** a control process may run on a data host as a separate process with its own `cp.peers` port;
+   hosting a CP voter inside a data-role process over a shared cluster transport is not built. Failure domains are
+   then shared, so the witness MUST be on a third host or site.
 3. **Voter counts:** 2 data + 1 witness (option A) or an odd number of full voters (3/5). A bare 2-voter config is
-   rejected at startup (`QuorumPolicy`, #142). Majority is always over all voters. STRICT needs both data nodes
+   rejected at startup (`VoterSet`, `CpConfig`, #142). Majority is always over all voters. STRICT needs both data nodes
    durable (a witness ack is not a disk copy); RELAXED needs any 2 of 3.
 4. **Timing (HA):** leases are measured on each node's monotonic clock, so wall-clock offset does not matter;
    only the clock *rate* error over one lease does. Startup check (fail closed):
    `lease * (1 + cp.maxClockDriftRatio) + cp.leaseSafetyMargin < electionTimeout`. Defaults:
    `cp.maxClockDriftRatio = 0.01`, `cp.leaseSafetyMargin = 10 ms`. With master's current CP timings
    (`electionTimeout = 100 ms`, `heartbeat = 40 ms`, `GroupOptions.leaseNanos()` = `heartbeat * 2` = 80 ms;
-   CpStore.java:114) that is `80 * 1.01 + 10 = 90.8 < 100`, so the check passes and the default timings do not
-   change. Pre-vote is mandatory. Heartbeats are HMAC-authenticated with a boot epoch (#134/#144/#145); the dead
-   interval drives both failover and lower-epoch acceptance. Other master defaults: `LocalCluster.start`
+   `CpGroup.options()`) that is `80 * 1.01 + 10 = 90.8 < 100`, so the check passes and the default timings do not
+   change. Pre-vote is mandatory. Heartbeats are HMAC-authenticated with a boot epoch (#134/#144/#145); the
+   election timeout drives failover, and the dead interval only gates lower-epoch acceptance (floor 5 s). Other master defaults: `LocalCluster.start`
    `deadAfter = Duration.ofSeconds(5)`; `HeartbeatAuthenticator.WINDOW_MILLIS = 5_000L`.
    **Note:** the 100 ms election timeout is aggressive given JVM GC pauses and can trigger spurious elections.
-   It is tunable; raising it is a follow-up that needs failover-time measurements (HA), not a change in this doc.
+   It is tunable in `CpGroup.options()` only (no `cp.*` key sets it); raising it is a follow-up that needs
+   failover-time measurements (HA), not a change in this doc.
 
 ## 7. Split of work
 
@@ -325,7 +331,7 @@ Source: HA, #118, `docs/design/high-availability.md` (HA's doc), #133, #142, #14
 
 ## 8. Resolved questions (Security review of #151)
 
-1. SIGHUP reloads TLS + `trust.bundle` + `online.key` atomically; `root.pub` only on restart (2.4).
+1. A reload (`CpHost.reload()`) replaces TLS + `trust.bundle` + `online.key` atomically; `root.pub` only on restart (2.4).
 2. Bundle encoding: versioned, domain-separated binary wrapper, strictly parsed (2.1).
 3. Non-POSIX: refuse; config-file-only override with recurring WARN and health flag (2.3).
 4. Max clock drift (**resolved, sjws High Availability**): not an absolute ms value. Use
@@ -333,7 +339,7 @@ Source: HA, #118, `docs/design/high-availability.md` (HA's doc), #133, #142, #14
    `lease * (1 + driftRatio) + margin < electionTimeout`. With current 80/100 ms timings the check passes
    (`90.8 < 100`); defaults stay. The 100 ms election timeout is flagged as aggressive for JVM GC and left
    tunable for a later HA follow-up with failover-time measurements.
-5. All voters host `AdminServer`; followers return the leader address for writes (control-plane.md §14); every voter
-   enforces RBAC and the denylist.
+5. All voters host `AdminServer`; a follower answers writes with 503 `leader not ready` and no leader address (clients
+   try the next endpoint); every voter enforces RBAC and the denylist.
 6. Static peers for v1; future membership changes are an `admin`-only, audited operation.
 7. Witness is a separate small class; witness hosts never load `KeyRing` (asserted in `ClassLoadTest`).

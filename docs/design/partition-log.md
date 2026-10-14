@@ -1,6 +1,6 @@
 # Durable single-node partition log: gap analysis and design
 
-Status: design note (2026-10-13). Scope: one node, one partition = one log. Replication, multi-partition topics and the
+Status: design note (2026-10-13); the gap PRs G1 to G4 in §3 are merged (G2 without its blocked-retention stat). Scope: one node, one partition = one log. Replication, multi-partition topics and the
 cluster CP are out of scope. Most of the log already exists in `messaging/ledger` (#21: segmented CRC32C ledger, group
 commit, kill -9 test; #69: snapshots and retention). This note maps each requirement to existing code or to a gap, makes
 the open decisions, and lists the small PRs that close the gaps.
@@ -10,18 +10,18 @@ the open decisions, and lists the small PRs that close the gaps.
 | # | Requirement | Status | Where / what is missing |
 |---|---|---|---|
 | R1 | Segmented append-only `PartitionLog` | **Exists** (named `SegmentedLog`) | `ledger/SegmentedLog.java` (append, read, scan, roll), `ledger/Segment.java` (`<base:020d>.log`). No rename: `PartitionLog` is this class. |
-| R2 | On-disk format = wire format | **Exists for batches**; wire side is a gap | `RecordBatch` frame `[len][crc32c][baseOffset][count][timestampMs] count×([recLen][bytes])` (`RecordBatch.java:9`). Nothing serves it on the wire yet (see R9). Fetch must return these frames unchanged (zero re-encode). |
+| R2 | On-disk format = wire format | **Exists** | `RecordBatch` frame `[len][crc32c][baseOffset][count][timestampMs] count×([recLen][bytes])` (`RecordBatch.java:9`). `MessagingHttp` serves it on `GET /messaging/v1/topics/{t}/records` (R9): the bytes equal the segment file, but fetch decodes each batch and re-encodes it into a pooled buffer instead of returning the frames unchanged (§2.2). |
 | R3 | Sparse offset index | **Exists** | `.index`, one entry per 4 KiB (`Segment.INDEX_INTERVAL`), rebuilt by scan on open when stale or corrupt (`LedgerTest.staleOrCorruptIndexFallsBackToScan`). |
 | R4 | Per-record CRC | **Per-batch exists; decision: per-batch suffices** | See §2.1. No per-record CRC is added. |
 | R5 | Recovery truncates a bad tail | **Exists** | `Segment.recover` truncates at the first torn or corrupt frame; later segments after a torn sealed one are dropped (`SegmentedLog.open`). Tests: `tornTailAtEveryByte`, `randomTailCorruptionRecoversPrefix`, `gapAfterTornSealedSegmentDropsLaterSegments`, `PartitionTest.tornTailRecoversAPrefixState`. |
-| R6 | Size and time retention | **Partial: gap** | `RetentionPolicy(keepResolvedMs, compactLiveRatio)` deletes sealed segments below the low watermark after a time. There is **no size cap** and **no time limit for unconsumed data** (by design the delivery layer never drops what a group still needs). Gap G2, §2.3. |
+| R6 | Size and time retention | **Exists for plain log topics** | `LogRetention(maxBytes, maxAgeMs)` deletes the oldest sealed segments of a plain log topic (`LogTopics.enforceRetention`, run by `MessagingModule` on a timer; `sjws.messaging.retention.bytes`, `.ms` and `.check.ms`). `RetentionPolicy(keepResolvedMs, compactLiveRatio)` still deletes delivery-topic segments below the low watermark only, and `Partition.maintain` is not scheduled: there is **no size cap** and **no time limit for unconsumed delivery data** (by design the delivery layer never drops what a group still needs). G2, §2.3. |
 | R7 | Single writer per partition, platform thread | **Exists** | `LedgerWriter`: `Thread.ofPlatform()` writer and syncer per log (`LedgerWriter.java:90-91`); producers hand off through a bounded queue. The shared writer/syncer pool (#86 §5.1, "PR 5") is planned; it keeps one writer *per partition at a time*. |
-| R8 | Per-topic durability none / group, fsync opt-in | **Exists** | `Durability {NONE, ASYNC, GROUP, EACH}` as writer default (per partition, so per topic) plus per-append override (`Durability.java`). `ASYNC` is the default (background fsync); `GROUP` is the fsync opt-in. A topic-level config key is a small gap (G3). |
-| R9 | Produce / fetch through the `core.Handler` seam, off by default | **Gap (main one)** | No messaging HTTP endpoints exist; only `swarm/SwarmHttp` (a `Handler`) uses messaging internally. Gap G1, §2.2. |
-| R10 | kill -9 and truncated-tail crash tests | **Exist** for the ledger; gap for the HTTP path | `LedgerCrashTest.noAckedRecordLostAfterSigkill` (child JVM, `destroyForcibly`) plus the torn-tail tests in R5. G1 adds a kill -9 test through produce over HTTP. |
-| R11 | LogBench-style benches: append throughput, p99 produce/fetch | **Partial** | `bench/LogBench.java` (prototype write path) and `bench/LedgerBench.java` (append throughput by durability mode). No fetch bench and no end-to-end HTTP produce/fetch p99. Gap G4. |
-| R12 | Zero cost on the static path when off | **To be shown** | The module will load only when configured (same pattern as `OptionalModules`/`SwarmModule`). Proof: wrk before/after on static files with the module off (G1 acceptance). |
-| R13 | Designed around JVM Footprint's shared buffer pool | **Agreed design, not merged** | `core.buf.BufferPool` (proposal: `sjws-slab-allocator-design.md`, JVM Footprint). Decisions are in §2.4. |
+| R8 | Per-topic durability none / group, fsync opt-in | **Exists** | `Durability {NONE, ASYNC, GROUP, EACH}` as writer default (per partition, so per topic) plus per-append override (`Durability.java`). `ASYNC` is the default (background fsync); `GROUP` is the fsync opt-in. `sjws.messaging.durability` sets the module default and `sjws.messaging.durability.topics` (`topic:mode,...`) overrides it per topic (G3). |
+| R9 | Produce / fetch through the `core.Handler` seam, off by default | **Exists** | `messaging/http/MessagingHttp.java` (produce and fetch), mounted by `MessagingModule` at `/messaging/v1` and loaded only when `sjws.messaging.enabled` is true (G1a, §2.2). `swarm/SwarmHttp` is the other `Handler` over messaging. |
+| R10 | kill -9 and truncated-tail crash tests | **Exist** | `LedgerCrashTest.noAckedRecordLostAfterSigkill` (child JVM, `destroyForcibly`) plus the torn-tail tests in R5. `MessagingHttpCrashTest` does the same through produce over HTTP: `noAckedProduceLostAfterSigkill`, `truncatedTailIsCutAndProduceContinues` and `corruptTailByteIsCut` (G1b). |
+| R11 | LogBench-style benches: append throughput, p99 produce/fetch | **Exists** | `bench/LogBench.java` (prototype write path) and `bench/LedgerBench.java` (append throughput by durability mode), plus `bench/MessagingLogBench.java` (in-process produce, fetch and fetch-fixed with p50/p99/p999) and `bench/messaging-http/run.sh` (wrk produce and fetch with latency) (G4). |
+| R12 | Zero cost on the static path when off | **Exists** | `MessagingModule` loads by class name only when `sjws.messaging.enabled` (or `SJWS_MESSAGING_ENABLED`) is `true` (`OptionalModules`, `OptionalModulesTest`); there is no YAML key. The wrk before/after on static files is not recorded here. |
+| R13 | Designed around JVM Footprint's shared buffer pool | **Exists for the HTTP handler** | `core.buf.BufferPool` ([buffer-pool.md](buffer-pool.md)); `MessagingHttp` uses its `messaging` budget. Segment reads and the writer do not use it yet. Decisions are in §2.4. |
 
 ## 2. Decisions
 
@@ -83,11 +83,15 @@ sequenceDiagram
     end
 ```
 
+Module settings, each a JVM property or the matching `SJWS_MESSAGING_*` variable: `sjws.messaging.enabled`, `.dir`,
+`.segment.bytes`, `.retention.bytes`, `.retention.ms`, `.retention.check.ms`, `.durability` (the default for every topic)
+and `.durability.topics` (`topic:mode,...`).
+
 ### 2.3 Retention (G2)
 Add `maxBytes` and `maxAgeMs` to the log-level policy for **plain log topics** (topics with no delivery groups, i.e. the
 fetch API). These delete the oldest sealed segments past either limit. Topics with delivery groups keep today's rule:
-nothing at or above the low watermark is deleted. A size cap may still not override it; it only reports `retention.blocked`
-in `MessagingStats`. This keeps work-queue semantics exact.
+nothing at or above the low watermark is deleted. A size cap may still not override it. Reporting that as `retention.blocked`
+in `MessagingStats` is not built, and delivery topics have no size cap yet. This keeps work-queue semantics exact.
 
 What exists today, for the two kinds of topic:
 
@@ -108,13 +112,13 @@ flowchart TB
 ### 2.4 Buffers (agreed with JVM Footprint, `core.buf.BufferPool`)
 - **Public API copies:** public `records()` keeps returning `byte[]` copies. An opt-in zero-copy view is used only by fetch/sendfile and by replication.
 - **Writer:** it encodes into its own per-partition group buffer. Writer and syncer threads may use per-thread pool caches.
-- **Recovery:** scan buffers come from the pool's large cache, and only during recovery.
-- **Fetch:** the fetch frame is byte-identical to the on-disk batch, so plain TCP uses sendfile (`FileChannel.transferTo`). There is no TLS in v1. Fetch takes buffers with `tryAcquire` and answers `503` + `Retry-After` under pool pressure instead of blocking.
+- **Recovery:** not built yet (`Segment` allocates heap scan buffers); the plan is the pool's large cache, only during recovery.
+- **Fetch:** the fetch frame is byte-identical to the on-disk batch. As built it is re-encoded into a pooled buffer (§2.2); `transferTo` on plain TCP is not used yet. There is no TLS in v1. Fetch takes buffers with `tryAcquire` and answers `503` + `Retry-After` under pool pressure instead of blocking.
 - **Budget:** one pool cap, with a messaging sub-budget.
-- **Observability:** it will define `sjws_messaging_*` metrics with `topic`/`partition`/`group` labels. The log leaves hook points (append bytes and latency, fetch bytes and 503s, pool acquire failures, retention deletes or blocks) and does not define metric names itself.
+- **Observability:** it will define `sjws_messaging_*` metrics with `topic`/`partition`/`group` labels. The log leaves two hook points, `MessagingHooks.produced` and `fetched` (topic, status, bytes, time; a fetch shed under pool pressure is status 503). Retention deletes or blocks have no hook yet. The exporter, not the log, defines the metric names.
 - **When off:** the log allocates nothing.
 
-## 3. Gap PRs (each one change)
+## 3. Gap PRs (each one change; all merged, G2 without its blocked-retention stat)
 1. **G1a**: `MessagingHttp` produce and fetch handler, off by default, with tests and a wrk static-path check (R9, R12).
 2. **G1b**: kill -9 through HTTP produce, plus a truncated-tail fetch test (R10).
 3. **G2**: size and age retention for group-less topics, with a blocked-retention stat (R6).

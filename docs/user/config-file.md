@@ -42,7 +42,7 @@ line and in the environment stay relative to the working directory.
 `--help` wins before a missing file is an error. A missing document root is exit
 code 2, including when the root comes from the file.
 
-`routing`, `middleware`, `access` and `node` are file-only. They do not add command-line flags.
+`routing` and `middleware` are file-only. They add no command-line flags.
 
 ## Node
 
@@ -200,8 +200,8 @@ The request path is that one volatile read and then the handler that was built
 with the snapshot. It does not parse YAML, match routes, or take the reload lock.
 
 Applied on the next request: document root, cache budget, unlistable-directory
-policy, the routing table, the middleware list and the access settings (stored,
-not dispatched), ACME settings (the renewal task is rescheduled), and a file
+policy, the routing table, the access settings and the middleware list (the list is
+stored, not dispatched), ACME settings (the renewal task is rescheduled), and a file
 certificate (`TlsMaterial.fromPem` into `Http3Server.replaceTls`). HTTP/1
 timeouts are applied when HTTP/3 is not running. The access-log writer, metrics
 exposure and `/healthz` probe stay as they were opened at startup.
@@ -346,9 +346,10 @@ handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
 idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
 HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
 response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
-streamed upstream (over `max_body` is 413). A chunked request body, or a body on HTTP/2 or
-HTTP/3, is 501 for now; see `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
-TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
+streamed upstream (over `max_body` is 413). A chunked request body is 501 for now, as is a declared body that the
+transport did not attach (HTTP/1.1 is the only transport that attaches request bodies today); see
+`docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
 and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
 growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
@@ -597,13 +598,15 @@ swarm:
 ```
 
 `swarm.enabled: true` starts the optional agent-swarm module (`docs/design/agent-swarm.md`)
-before the listener accepts. The module mounts `/swarm/v1/*`; those requests answer 501 until
-the task API lands, and every other path stays on the terminal the server already had. It is
+before the listener accepts. The module mounts `/swarm/v1/*`; every request needs an agent bearer token (`sjws.swarm.tokens.file` or
+`SJWS_SWARM_TOKENS_FILE`, a mode 0600 file) and answers 401 without one, and every other path stays on the terminal the server already had. It is
 node-local, like `server.bind_content`: it is not part of the
 canonical document, so the control plane does not distribute it and a config recovered from
 last-good starts with the swarm off. The JVM property `-Dsjws.swarm.enabled` and then the
 environment variable `SJWS_SWARM_ENABLED` win over the key when set. With the swarm off no
-`sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet.
+`sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet. Its other settings are JVM properties or
+variables only: `sjws.swarm.dir` / `SJWS_SWARM_DIR`, `sjws.swarm.node` / `SJWS_SWARM_NODE`, and
+`-Dsjws.swarm.pool.shards=N` (partitions per pool, 1..256, default 1, no variable).
 The key is read once, at startup: changing it takes effect on restart, not on reload.
 
 ## Buffers
@@ -668,7 +671,7 @@ the previous certificate until they close. Renewal does not restart the process
 and does not drain the UDP listener.
 
 Secrets. The file is not scanned for `${env:NAME}` or `${file:path}` placeholders.
-The one secret is the TLS key password. It is never a YAML value and never a
-command-line argument. `tls.key_password_file` is read when HTTP/3 stays enabled
+The secrets are the TLS key password, which is never a YAML value or a
+command-line argument, and the HA cluster key, which can be inline (`ha.cluster_key`) but is never an argument. `tls.key_password_file` is read when HTTP/3 stays enabled
 and neither `WEB_SERVER_TLS_KEY_PASSWORD` nor `WEB_SERVER_TLS_KEY_PASSWORD_FILE`
 nor `--key-password-file` was set. The environment variable wins over the file.

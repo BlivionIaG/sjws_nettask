@@ -45,5 +45,5 @@ and HTTP/3.
 `--require-owner` and `--require-world-readable` check the file being served (POSIX file systems only;
 elsewhere such files answer 403). A change of owner or mode changes the file's ctime, so the
 small-file cache drops the entry and the check runs again (with a revalidation window, only after it).
-An invalid pattern or unknown user stops startup (exit code 64). Matching costs tens of nanoseconds per
-request (see [measured performance](../design/implementation-and-performance.md)).
+An invalid pattern or unknown user stops startup (exit code 64). The per-request matching cost is printed by
+`AccessRulesBench` (see [testing](../development/testing.md)).

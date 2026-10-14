@@ -5,7 +5,7 @@ admin see its status and configuration, tail logs, and start, stop or reload it:
 
     java -cp "target/sjws_nettask-0.2-SNAPSHOT.jar:target/lib/*" sjws_nettask.admin.AdminMain [server arguments]
 
-It takes the same arguments and environment as the server, plus its own: `--log-file=PATH` (a file
+It takes the server's option flags and `WEB_SERVER_*` variables (not a `--config` file, and not the daemon, role and bootstrap options), plus its own: `--log-file=PATH` (a file
 shown in the logs view, e.g. redirected output), `--no-color`, `--no-autostart`. Commands (letter +
 Enter): `s` start, `x` stop, `r` reload (re-reads arguments and environment; an invalid config
 leaves the server running, a config that fails to bind restores the previous one), `v`/`c`/`l`

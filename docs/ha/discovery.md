@@ -22,7 +22,7 @@ if (source != null) {
 }
 ```
 
-Call `update` from the watch thread. It is synchronized, cheap (it builds an immutable view and
+Call `update` from the watch thread. It takes a short lock, is cheap (it builds an immutable view and
 swaps a reference), and listeners run on the caller's thread.
 
 Rules:

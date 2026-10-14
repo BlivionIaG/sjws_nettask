@@ -1,4 +1,4 @@
-# Control-plane console (mockup)
+# Control-plane console
 
 The console talks to the control plane's mTLS admin API (`/cp/v1`, see
 [control-plane design](../design/control-plane.md)) through `HttpCpClient`, spread over several
@@ -43,8 +43,9 @@ this), so the console costs nothing when it is not used.
   `zone=a,tier!=edge`, `*`). **Promote** (`p <selector>`) widens the rollout of the head version.
 - **Rollback** (`b <version>`): a new version with the old content, rolled out everywhere.
 - **Audit** (`l`): who did what, plus the endpoint switches of the failover client.
-- **Failover**: `FailoverCpClient` sticks to one endpoint, moves on when it is unreachable, follows
-  `NOT_LEADER` hints, and retries writes safely because every write carries an idempotency key.
+- **Failover**: `FailoverCpClient` sticks to one endpoint, moves on when it is unreachable or a follower
+  answers 503 `leader not ready`, follows `NOT_LEADER` hints (the demo client only), and retries writes
+  safely because every write carries an idempotency key.
 
 Apply (`a <selector>`) as the live console runs it. Every call goes through `FailoverCpClient`: a 503 or a
 connection failure moves to the next endpoint, and a retried write keeps its `Idempotency-Key`:

@@ -33,8 +33,8 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   `https`, so clients reach it directly when they know the UDP port:
   `curl --http3-only -k https://host:<udp port>/` (`-k` for the self-signed certificate).
   Browsers find HTTP/3 only through `Alt-Svc` received **over HTTPS** from a certificate they trust;
-  they ignore `Alt-Svc` on `http://` origins. Browser upgrade therefore needs a real HTTPS (TLS over
-  TCP) listener plus a trusted certificate, which this server does not have yet.
+  they ignore `Alt-Svc` on `http://` origins. Browser upgrade therefore needs `Alt-Svc` on an HTTPS (TLS over
+  TCP) listener with a trusted certificate; the `--h2` listener is one, but it does not send `Alt-Svc` yet.
 * **How a client finds HTTP/3.** Directly, when it knows the UDP port. Through `Alt-Svc`, only if it
   received the header over HTTPS, which this server's plain HTTP/1.1 TCP listener does not offer:
 
@@ -95,7 +95,7 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
 * The self-signed certificate is new on every start (its fingerprint is printed): a pinned fingerprint
   is valid until restart, although Alt-Svc tells clients to remember the endpoint for `ma` seconds.
 * With `--cert`/`--key`, startup warns (`WARN:`) if the key file is readable by group or others, or if the
-  certificate is expired or not yet valid. The key password is only read when `--h3` is on.
+  certificate is expired or not yet valid. The key password file is only read when `--h3` or `--h2` is on.
 * The QUIC transport is Netty's `netty-codec-http3` with its bundled native quiche library
   (linux x86_64/aarch64, macOS, Windows x86_64). On other platforms, or if the native library cannot be
   extracted (e.g. `/tmp` mounted `noexec`; set `-Dio.netty.native.workdir=<dir>`), `--h3` takes the

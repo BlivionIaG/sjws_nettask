@@ -2,7 +2,7 @@
 
 How a `control` or `data` process is started, how it learns its control plane, and how
 `--stop` drains it. The design this follows is
-[control plane](https://github.com/BlivionIaG/sjws_nettask/blob/cursor/control-plane-design-8cea/docs/design/control-plane.md)
+[control plane](../design/control-plane.md)
 (PR #38) and the HA drain in [high availability](../ha/design.md). Role `standalone` does
 not read this file and does not load `sjws_nettask.service`.
 
@@ -70,8 +70,10 @@ A control process does not bind the content port unless `--bind-content` /
 `WEB_SERVER_BIND_CONTENT` or `server.bind_content: true` says so. Data and standalone
 bind it unless that flag or key turns it off. The sample control file sets
 `bind_content: false`. The document root in the file must still exist: the process
-builds the content snapshot even when it does not listen. The admin listener is not
-in this slice.
+builds the content snapshot even when it does not listen. The admin and watch listeners
+come from the `cp:` block (`cp.admin.listen`, `cp.watch.listen`, mTLS from `cp.tls`; see
+[control-plane hosting](../design/control-plane-hosting.md)). A control role with no cp
+settings exits 64 before any listener, so the sample control file needs a `cp:` block.
 
 In order, the process settles its role, checks it against `--bootstrap`, and then decides on the
 content port:
@@ -105,8 +107,8 @@ capabilities=http1,proxy
 ```
 
 A control file uses `role=control`, omits `data-role` and `control-plane`, and may set
-`peers=10.0.0.2:7000,10.0.0.3:7000` and `listen=10.0.0.1:9443`. `listen` is stored and not
-bound. An empty `peers` list is the one-voter lab.
+`peers=` and `listen=`; both are stored and not used. The voter set is `cp.peers` in the YAML
+`cp:` block, and an empty `cp.peers` is the one-voter development control plane.
 
 The join-token file is mode `0600` or `0400`, not a symlink:
 
@@ -115,24 +117,28 @@ token-id=edge1-2026
 secret=<16 to 512 printable ASCII characters>
 ```
 
-On first start the token file is required and the pinned root public key must exist. A
-missing pin refuses to start. The process holds the secret in a `byte[]`. It does not open
-a socket and does not log the secret. `--status` then shows `connection=pending` and
-`config-version=0`.
+On first start the token file is required (unless the bootstrap names `cp-tls-cert`,
+`cp-tls-key` and `cp-tls-ca`, where the node certificate is the enrollment) and the pinned
+root public key must exist. A missing pin refuses to start. The process holds the secret in
+a `byte[]` and does not log it. A data node then dials its `control-plane=` contact (the
+watch client, `cp.DataWatch`), and `--status` shows `connection=pending` and
+`config-version=0` until the first answer.
 
-`NodeEnrollment.tokenConsumed()` is the call the control plane makes after `ConsumeToken`
-commits. It writes `state-dir/node.id` (mode `0600`) and then deletes the token file. A
-later start may omit the token file. Until that call, a restart reads the same file again.
-Join tokens are idempotent per node identity within their TTL: the control plane (HA's
-`ConsumeToken`, not this process) treats a repeated present of the same token for the
-same node as the same in-flight join. This process does not implement that check. It
-holds the file until `tokenConsumed()`.
+`NodeEnrollment.tokenConsumed()` is the call meant to run after the consume commits. It
+writes `state-dir/node.id` (mode `0600`) and then deletes the token file. No code calls it
+yet, so the token file stays. A later start may omit the token file once it has run. Until
+that call, a restart reads the same file again.
+Join tokens are idempotent per node identity for 10 minutes after use: the control plane
+(`CpStore.presentJoin` and `JoinTokens`, not this process) gives a repeat of the same token
+from the same node the join it already recorded.
+This process does not implement that check. It holds the file until `tokenConsumed()`.
 `NodeEnrollment.attach(ControlPlaneBinding)` updates connection state and config version.
 `NodeEnrollment.current()` is null when this process is standalone. A pending or
 disconnected connection does not drain the process.
 
-`sjws_nettask.cp` is not on this tree. The watch, Raft, and admin listener are not started.
-`SjwsServer.drain()` remains the only drain.
+A control process with `cp` settings hosts the control plane (`sjws_nettask.cp.CpHost`: a
+Raft voter, the mTLS watch and admin listeners, a voter set over `cp.peers`); a data
+process starts the watch client. `SjwsServer.drain()` remains the only drain.
 
 ## Status
 
@@ -148,8 +154,8 @@ file, so a recycled pid does not keep the previous node's version. Connection va
 ## Decided lifecycle
 
 These are the project-manager decisions for start, reload, drain, join, and control-plane
-failure. Items that belong to the control-plane client are named here and not implemented
-in this daemon slice.
+failure. Items that belong to the control plane or its client are named here and are
+implemented outside this daemon slice, in `sjws_nettask.cp`.
 
 1. **One drain.** The shutdown hook calls `SjwsServer.drain()`. With HA attached that is
    `Lifecycle.drain()` (not-ready, deregistration delay, `Connection: close`, then the
@@ -161,8 +167,8 @@ in this daemon slice.
    that budget plus 5 s, then SIGKILL, capped at 10 minutes. A missing status budget uses
    the same 30 s default. The units set `TimeoutStopSec=45`. The budget is not computed
    from `drainDelay` plus `drainTimeout`. `ConfigLoader` still does not build
-   `HaSettings`. An HA drain longer than 30 s needs a higher `--drain-budget` and a
-   matching `TimeoutStopSec`.
+   `HaSettings`. An embedder's HA drain of 30 s or more (`drainDelay + drainTimeout + 1 s`) is
+   refused at startup, and `--drain-budget` does not lift that check.
 
 3. **systemd active is the process, not `leaderReady()`.** The pid file is written when
    the process is up, including a control process that has not bound a content port.
@@ -171,11 +177,12 @@ in this daemon slice.
    `attach`. Do not treat "service started" as "config applied".
 
 4. **Data node, control plane down.** Decided behaviour, implemented by the control-plane
-   and HA workstream, not by a client in this process: boot from last-good when that
+   and HA workstream: boot from last-good when that
    snapshot is present; otherwise not-ready (`503` on `/readyz`, content port not bound)
    and retry with backoff. Past max-staleness, readiness is false and the process keeps
-   serving. There is no automatic drain. This daemon does not start a watch thread and
-   does not move `connection` off `pending` by itself. A missing config file on a data
+   serving. There is no automatic drain. For role data this daemon starts the watch client
+   (`cp.DataWatch`, a long poll), which moves `connection` between `pending`, `connected`
+   and `disconnected`. A missing config file on a data
    node already boots from `<stateDir>/config/last-good.json` when the envelope hash
    matches and `node.mode` is `data`. A leftover sibling `<file>.last-good` is read
    once when that JSON file is absent (`LastGoodStore`). `Requires=` stays off the data unit.
@@ -183,19 +190,20 @@ in this daemon slice.
 5. **SIGHUP is reload.** The daemon child installs `ReloadHook`. `ExecReload` is
    `kill -HUP`. A data node reloads local bootstrap settings only after
    `SjwsServer.applyRemote` has applied a document, and does not put the local YAML back
-   over that document. Control and standalone reload the local file. `setsid` still
-   detaches the session.
+   over that document. Control and standalone reload the local file. A hosted control plane's own key ring and
+   listener TLS (`CpHost.reload()`) are not reloaded by SIGHUP yet; restart to pick up new
+   key or TLS files. `setsid` still detaches the session.
 
-6. **The token is idempotent per node identity within its TTL.** HA implements that on
+6. **The token is idempotent per node identity for 10 minutes after use.** `CpStore.presentJoin` implements that on
    the control plane. This process checks the pin file and the token file's mode and
    holds the bytes. `copySecret()` returns a clone the caller must `Arrays.fill`.
    `tokenConsumed()` deletes the file only after the caller says the consume committed.
-   A `Restart=on-failure` before that presents the same token again. This slice does not
-   open the network.
+   A `Restart=on-failure` before that presents the same token again. For role data this
+   process presents the token on the watch (`DataWatch`), so it does open the network.
 
 7. **Control does not bind the content port by default.** Opt in with `--bind-content`
-   or `server.bind_content: true`. The admin and watch listeners arrive with the
-   control-plane API. `listen=` in the bootstrap is stored and not bound. A control
+   or `server.bind_content: true`. The admin and watch listeners are bound from
+   `cp.admin.listen` and `cp.watch.listen`. `listen=` in the bootstrap is stored and not bound. A control
    process with the content port off still writes the pid file, so the unit can be
    active.
 
