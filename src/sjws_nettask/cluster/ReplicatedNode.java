@@ -310,6 +310,16 @@ public final class ReplicatedNode implements ClusterNode {
         transport.detach(self);
     }
 
+    /** STRICT override entries the group's leader holds uncommitted (0 on a follower). */
+    public int strictPending(GroupId groupId) {
+        return group(groupId).strictPendingCount();
+    }
+
+    /** Age of the oldest uncommitted STRICT override on the group's leader, 0 when none. */
+    public long oldestStrictPendingAgeNanos(GroupId groupId) {
+        return group(groupId).oldestStrictPendingAgeNanos();
+    }
+
     /** Apply lag of one group: deliveries queued or running. */
     public long deliveryLag(GroupId groupId) {
         return group(groupId).deliveryLag();

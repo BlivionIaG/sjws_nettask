@@ -92,6 +92,31 @@ wait for it. A new leader rescans its uncommitted suffix for the marker. A RELAX
 STRICT group is still STRICT. The default interface method delegates `null` and fails anything
 else with `UnsupportedOperationException`.
 
+A STRICT override is refused up front, with `DurabilityUnavailableException` and nothing
+appended, when the leader plus the data voters that answered an append within the last lease
+are fewer than `dataCopiesRequired()` (in a two-data-plus-witness group: the other data node has
+been silent for a lease). That keeps a degraded group writable for RELAXED appends. A new leader
+has heard from nobody yet, so it refuses STRICT overrides until its first heartbeat round is
+answered; retry. What remains: a data node that fails after a STRICT override was accepted
+holds that entry, and every entry behind it, until the node is back or a leader with two
+reachable data copies takes over (a new leader rescans the marker and needs the same copies, so
+stepping down does not help). Bringing the data node back is the only way out today; a bounded
+wait or an operator escape is tracked in #208. The leader makes such a stall visible:
+`ReplicatedNode.strictPending(group)` (uncommitted STRICT overrides) and
+`oldestStrictPendingAgeNanos(group)` (0 when none; followers report 0), and one WARNING per
+entry once it has waited 2 x lease, naming the group, the index and how many data copies it has.
+A STRICT group (`GroupOptions.durability()`) is unchanged and has no fail-fast.
+
+The leader counts an append response only when the voter id in its body matches the
+authenticated sender of the frame, so one member cannot refresh another's liveness or
+`matchIndex` (a member holding the group key can still lie about itself, #175).
+
+The marker byte is protected on the wire (inside the HMAC-covered frame body) but not on disk:
+`FileLogStorage` records (`index, term, len, data`) carry no checksum, so a bit flip on disk can
+turn `USER_STRICT` (4) into `USER` (0), or garble the payload, without detection. Per-record
+CRCs are tracked in #207. Every member holds the group key, so a compromised member
+can forge the marker either way (the #175 limitation).
+
 ### durableIndex and the RELAXED fsync-lag bound
 
 `ReplicationGroup.durableIndex()` is the highest index this node has fsynced to its own log
@@ -130,14 +155,24 @@ What a voter keeps across a crash:
   is called, and must return only once durable, whenever `term` or `votedFor` changes, before
   the vote request or grant is sent. The write comes first and memory changes only when it
   succeeds (`startElection`, stepping down to a higher term, a vote grant). A failed write leaves
-  term and vote as they were, sends nothing, and the node stays a follower; a failed grant is a
+  term and vote as they were, sends nothing, and the node stays a follower (a leader that cannot
+  persist a higher term it has seen logs a WARNING and stays in its old term); a failed grant is a
   refusal. Messages only ever carry the durable term (a pre-vote reply carries the responder's own
   term, and the pre-candidate accepts a grant at a term at or below its own).
   `FileLogStorage` writes `{group}.vote`: 24 bytes big-endian, magic `SJVT`, version 1, term,
   voted-for wire id (0 for none), CRC32C of the first 20 bytes, with the same temp file, fsync,
   `ATOMIC_MOVE`, directory fsync sequence as the witness cursor. On open, a missing file with an
-  empty log is term 0; a missing file with a log (an upgrade) is the last entry's term with no
-  vote; a short file, a bad magic, an unknown version or a CRC mismatch refuses to start with an
+  empty log is term 0; a missing file with a log (an upgrade) is the last entry's term, treated as
+  already voted (for this node), so it cannot grant a second vote in that term (a witness takes
+  the term of its forced cursor); a missing file after `{group}.vote-saved` exists means the file was deleted and refuses to
+  start. The marker is written (atomically, fsynced) right after the first vote file, so a crash
+  between the two leaves a vote file and no marker, which loads normally, and the next save adds
+  the marker; a crash before the first vote file lands leaves neither, which is safe because the
+  vote was never sent. If an operator deletes both files, the node cannot tell this from an
+  upgrade: it comes back at the last log term, treated as voted, which prevents a double vote in
+  that term but not in a later term it had voted in before. Treat the state directory as one
+  unit: restore or wipe it whole, never file by file; the file is
+  opened with `NOFOLLOW_LINKS`, so a symlink in its place refuses to start; a short file, a bad magic, an unknown version or a CRC mismatch refuses to start with an
   error naming the file. It is never silently reset. Before this,
   a restarted node came back at term 0 with no vote and could vote twice in one term. A custom
   `LogStorage` that does not override the default methods keeps that old behaviour.
