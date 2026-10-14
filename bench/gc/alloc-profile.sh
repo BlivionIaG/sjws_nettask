@@ -14,7 +14,7 @@ python3 - "$jfr.json" <<'PY'
 import json, sys, collections
 ev = json.load(open(sys.argv[1]))["recording"]["events"]
 by_site, by_type, tot = collections.Counter(), collections.Counter(), 0
-skip = ("java.", "jdk.", "sun.")
+skip = ("java.", "jdk.", "sun.", "java/", "jdk/", "sun/")
 for e in ev:
     v = e["values"]; w = v["weight"]; tot += w
     by_type[v["objectClass"]["name"]] += w
