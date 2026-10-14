@@ -136,10 +136,19 @@ public final class FileLogStorage implements LogStorage {
         return rec == null ? 0L : rec.term;
     }
 
+    /**
+     * Loads the group's file on first use. Before this change a restarted node reported 0 here until some
+     * other call loaded the file, so it compared candidates against an empty log.
+     */
     @Override
     public long lastIndex(GroupId group) {
-        var log = logs.get(group);
-        if (log == null || log.isEmpty()) {
+        NavigableMap<Long, Rec> log;
+        try {
+            log = log(group);
+        } catch (IOException failed) {
+            throw new java.io.UncheckedIOException(failed);
+        }
+        if (log.isEmpty()) {
             return 0L;
         }
         return log.lastKey();
@@ -256,14 +265,17 @@ public final class FileLogStorage implements LogStorage {
     }
 
     private void writeCursor(GroupId group, long index, long term) throws IOException {
-        var target = witnessPath(group);
+        var buf = ByteBuffer.allocate(16);
+        buf.putLong(index);
+        buf.putLong(term);
+        buf.flip();
+        writeAtomically(witnessPath(group), buf);
+    }
+
+    private void writeAtomically(Path target, ByteBuffer buf) throws IOException {
         var tmp = root.resolve(target.getFileName().toString() + ".tmp");
         try (var channel = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
                 StandardOpenOption.TRUNCATE_EXISTING)) {
-            var buf = ByteBuffer.allocate(16);
-            buf.putLong(index);
-            buf.putLong(term);
-            buf.flip();
             while (buf.hasRemaining()) {
                 channel.write(buf);
             }
@@ -281,6 +293,46 @@ public final class FileLogStorage implements LogStorage {
     }
 
     private record CursorFile(long index, long term) {
+    }
+
+    /** {@code {group}.vote}: 12 bytes, term then votedFor, temp file + fsync + atomic move + dir fsync. */
+    @Override
+    public void saveHardState(GroupId group, long term, int votedFor) throws IOException {
+        lock.lock();
+        try {
+            var buf = ByteBuffer.allocate(12);
+            buf.putLong(term);
+            buf.putInt(votedFor);
+            buf.flip();
+            writeAtomically(votePath(group), buf);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public long hardStateTerm(GroupId group) throws IOException {
+        var buf = readVote(group);
+        return buf == null ? 0L : buf.getLong(0);
+    }
+
+    @Override
+    public int hardStateVote(GroupId group) throws IOException {
+        var buf = readVote(group);
+        return buf == null ? 0 : buf.getInt(8);
+    }
+
+    private ByteBuffer readVote(GroupId group) throws IOException {
+        var path = votePath(group);
+        if (!Files.isRegularFile(path) || Files.size(path) < 12) {
+            return null;
+        }
+        return ByteBuffer.wrap(Files.readAllBytes(path));
+    }
+
+    private Path votePath(GroupId group) {
+        var safe = group.value().replaceAll("[^A-Za-z0-9._-]", "_");
+        return root.resolve(safe + ".vote");
     }
 
     @Override

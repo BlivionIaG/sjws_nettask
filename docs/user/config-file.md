@@ -137,6 +137,10 @@ the descriptor in `/proc/self/fd` is used only when its device and inode match t
 file. Without `/proc`, the check is an `lstat` of the path while the channel is open,
 and the owner name is compared with `root` or `user.name`. Control-plane key files use
 the same helper (`sjws_nettask.config.SecureKeyFile`).
+That also refuses a server running as root whose key sits on a bind mount owned by the host
+user (for example uid 1000), or in a directory owned by a different service account: the key
+file and every parent directory must be owned by root or the server's user, so `chown` the
+key directory to the service user in container images.
 
 ## Server
 

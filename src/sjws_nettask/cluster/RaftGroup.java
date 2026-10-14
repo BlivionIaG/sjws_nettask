@@ -106,6 +106,15 @@ final class RaftGroup {
     private boolean relaxedDirty;
     private boolean forcedBeforeAck;
     private boolean ackedFromMemory;
+    /** Highest index this node has forced to its own disk (data nodes only). */
+    private long durableIndex;
+    /**
+     * A data voter that restarts with state on disk may have lost entries it acked from memory
+     * (RELAXED). Until it catches up to a leader's commit index, or {@link #recoveryUntil} passes,
+     * it neither grants votes or pre-votes nor campaigns, unless it alone is a quorum.
+     */
+    private boolean recovering;
+    private long recoveryUntil;
 
     private enum Role {
         FOLLOWER, PRE_CANDIDATE, CANDIDATE, LEADER
@@ -128,6 +137,18 @@ final class RaftGroup {
         this.listener = listener;
         this.deliveries = new DeliveryExecutor(groupId.value(), deliveryLagLimit);
         this.voters.addAll(voters);
+        try {
+            this.term = storage.hardStateTerm(groupId);
+            int vote = storage.hardStateVote(groupId);
+            this.votedFor = vote == 0 ? null : byWire.apply(vote);
+        } catch (IOException failed) {
+            throw new UncheckedIOException(failed);
+        }
+        if (!witness && (term > 0 || lastIndex() > 0)) {
+            this.durableIndex = lastIndex();
+            this.recovering = true;
+            this.recoveryUntil = clock.nanoTime() + options.leaseNanos() + 2 * options.electionTimeout().toNanos();
+        }
         if (options.preferred()) {
             this.electionDeadline = Math.max(1L, options.electionTimeout().toNanos() / 5);
         } else {
@@ -203,13 +224,19 @@ final class RaftGroup {
             if (relaxedDirty) {
                 force();
                 relaxedDirty = false;
+                if (role == Role.LEADER) {
+                    maybeCommit(after);
+                }
+            }
+            if (recovering && now >= recoveryUntil) {
+                recovering = false;
             }
             if (role == Role.LEADER) {
                 if (now >= nextHeartbeat) {
                     nextHeartbeat = now + options.heartbeat().toNanos();
                     replicate();
                 }
-            } else if (!witness && now >= electionDeadline && now >= campaignNotBefore) {
+            } else if (!witness && now >= electionDeadline && now >= campaignNotBefore && !abstaining()) {
                 startPreVote(now, after);
             }
         } finally {
@@ -306,6 +333,7 @@ final class RaftGroup {
         term++;
         role = Role.CANDIDATE;
         votedFor = self;
+        persistVote();
         leader = null;
         votes.clear();
         votes.add(self);
@@ -378,9 +406,15 @@ final class RaftGroup {
             long ourLast = witness ? witnessCursorIndex() : lastIndex();
             long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);
             boolean upToDate = lastTerm > ourTerm || (lastTerm == ourTerm && lastIndex >= ourLast);
-            if (upToDate && (votedFor == null || votedFor.equals(candidate))) {
+            if (upToDate && !abstaining() && (votedFor == null || votedFor.equals(candidate))) {
+                var previous = votedFor;
                 votedFor = candidate;
-                grant = true;
+                grant = tryPersistVote();
+                if (!grant) {
+                    votedFor = previous;
+                }
+            }
+            if (grant) {
                 electionDeadline = now + options.leaseNanos() + options.electionTimeout().toNanos();
             }
         }
@@ -428,7 +462,8 @@ final class RaftGroup {
         // electionDeadline, so that deadline no longer says the leader is fresh.
         boolean leaderFresh = role == Role.LEADER
                 || (role == Role.FOLLOWER && leader != null && now < electionDeadline);
-        if (theirTerm >= term && candidate != null && !leaderFresh && (!witness || witnessForced())) {
+        if (theirTerm >= term && candidate != null && !leaderFresh && !abstaining()
+                && (!witness || witnessForced())) {
             long ourLast = witness ? witnessCursorIndex() : lastIndex();
             long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);
             grant = candidateTerm > ourTerm || (candidateTerm == ourTerm && candidateIndex >= ourLast);
@@ -528,6 +563,9 @@ final class RaftGroup {
         if (leaderCommit > commitIndex) {
             commitIndex = Math.min(leaderCommit, lastIndex());
             apply(after);
+        }
+        if (recovering && commitIndex >= leaderCommit) {
+            recovering = false;
         }
     }
 
@@ -735,20 +773,29 @@ final class RaftGroup {
         return termAt(prevIndex) == prevTerm && prevIndex <= lastIndex();
     }
 
+    /**
+     * A witness stores no entry, so a quorum of leader-memory plus witness would leave the entry
+     * nowhere durable: a leader crash would lose it and the witness cursor would then refuse every
+     * data node forever. When no data peer has acked, the leader counts itself only through
+     * {@link #durableIndex}.
+     */
     private boolean quorumFor(long index) {
         var acks = new HashSet<NodeId>();
         int dataAcks = 0;
-        if (countsAsStored(self)) {
-            acks.add(self);
-            dataAcks++;
-        }
+        boolean witnessAcked = false;
         for (var peer : peers) {
             if (matchIndex.getOrDefault(peer, 0L) >= index && isVoter(peer)) {
                 acks.add(peer);
                 if (!witnesses.contains(peer)) {
                     dataAcks++;
+                } else {
+                    witnessAcked = true;
                 }
             }
+        }
+        if (countsAsStored(self) && (dataAcks > 0 || !witnessAcked || index <= durableIndex)) {
+            acks.add(self);
+            dataAcks++;
         }
         if (!isQuorum(acks)) {
             return false;
@@ -796,6 +843,7 @@ final class RaftGroup {
         if (newTerm > term) {
             term = newTerm;
             votedFor = null;
+            persistVote();
         }
         role = Role.FOLLOWER;
         if (wasLeader) {
@@ -857,6 +905,31 @@ final class RaftGroup {
         } catch (IOException failed) {
             throw new UncheckedIOException(failed);
         }
+        if (!witness) {
+            durableIndex = lastIndex();
+        }
+    }
+
+    private boolean abstaining() {
+        return recovering && !quorum.hasQuorum(voters, Set.of(self));
+    }
+
+    private void persistVote() {
+        try {
+            storage.saveHardState(groupId, term, votedFor == null ? 0 : votedFor.wire());
+        } catch (IOException failed) {
+            throw new UncheckedIOException(failed);
+        }
+    }
+
+    /** A vote that cannot be made durable is not granted. */
+    private boolean tryPersistVote() {
+        try {
+            persistVote();
+            return true;
+        } catch (UncheckedIOException failed) {
+            return false;
+        }
     }
 
     /** Force the staged witness cursor. A disk error refuses the vote and does not set votedFor. */
@@ -897,6 +970,7 @@ final class RaftGroup {
     }
 
     private void truncateSuffix(long fromIndex) {
+        durableIndex = Math.min(durableIndex, fromIndex - 1);
         try {
             storage.truncateSuffix(groupId, fromIndex);
         } catch (IOException failed) {

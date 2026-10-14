@@ -80,6 +80,38 @@ delay the future.
 `Durability.STRICT` is opt-in. Followers that store the batch fsync it before they ack,
 and the leader fsyncs before replicating.
 
+### Restart safety and the exact RELAXED guarantee
+
+What a voter keeps across a crash:
+
+- **Term and vote are durable** for every voter, RELAXED or STRICT. `LogStorage.saveHardState`
+  is called, and must return only once durable, whenever `term` or `votedFor` changes, before
+  the vote request or grant is sent. `FileLogStorage` writes `{group}.vote` (12 bytes, term then
+  voted-for wire id, 0 for none) with the same temp file, fsync, `ATOMIC_MOVE`, directory fsync
+  sequence as the witness cursor. A vote that cannot be made durable is not granted. Before this,
+  a restarted node came back at term 0 with no vote and could vote twice in one term. A custom
+  `LogStorage` that does not override the default methods keeps that old behaviour.
+- **A restarted data voter abstains.** When a data voter opens a group with a non-zero durable
+  term or a non-empty log, it may have lost entries it acked from memory. Until it accepts an
+  append whose `leaderCommit` it holds (`commitIndex >= leaderCommit`), or until
+  `leaseNanos + 2 * electionTimeout` passes, it grants no pre-vote or vote and does not campaign.
+  A voter that is a quorum on its own (`CpStore`'s single voter) is exempt. The window is what
+  lets a cluster that restarted as a whole elect a leader again.
+- **A witness ack is never the only other copy.** A witness stores no entry. When no data peer
+  has acked an index, the leader counts itself only up to its own forced index, so RELAXED with
+  one data node down commits after the leader's next batched fsync (one tick), not from memory.
+  Without this, a leader crash would lose the entry and the witness cursor, which had recorded
+  it, would then refuse both data nodes forever.
+- `FileLogStorage.lastIndex` loads the group's file. Before, a restarted node reported 0 until
+  another call loaded the file, and compared candidates against an empty log.
+
+The RELAXED guarantee is then: an acked entry survives the crash of **any one** voter, and of a
+data node that restarts while a leader holding the entry is reachable. It can be lost when every
+data copy that acked it crashes inside the same fsync window (at most one tick), for example both
+data nodes of the 2 + 1 pair on a shared power failure, or a restarted data node that is still
+inside its recovery window when the other data node is lost. STRICT has no such window: each
+data copy that counts toward a commit has fsynced it.
+
 `quorumFor` counts the witness in the ack set, so a witness vote still helps
 `QuorumPolicy.majority` (and would still satisfy `QuorumPolicy.witness`). It does not
 count as a data copy. When durability is `STRICT` and the group has a witness voter and

@@ -131,6 +131,26 @@ public final class MemoryLogStorage implements LogStorage {
         return increment ? count.incrementAndGet() : count.get();
     }
 
+    private final Map<GroupId, long[]> hardStates = new ConcurrentHashMap<>();
+
+    /** Kept across a simulated restart that reuses this instance, like the witness cursor. */
+    @Override
+    public void saveHardState(GroupId group, long term, int votedFor) {
+        hardStates.put(group, new long[] {term, votedFor});
+    }
+
+    @Override
+    public long hardStateTerm(GroupId group) {
+        var state = hardStates.get(group);
+        return state == null ? 0L : state[0];
+    }
+
+    @Override
+    public int hardStateVote(GroupId group) {
+        var state = hardStates.get(group);
+        return state == null ? 0 : (int) state[1];
+    }
+
     private record Rec(long term, byte[] data) {
     }
 }
