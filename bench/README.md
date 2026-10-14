@@ -82,3 +82,15 @@ java -cp target/classes bench/MessagingLogBench.java /tmp/mlb fetch   1024 4 10
 ```
 
 `messaging-http/run.sh <jar> [sizes]` runs the same operations end to end over HTTP with wrk (default sizes are 100 B, 1 KiB, 16 KiB and 256 KiB). Run every bench as `flock /tmp/sjws-bench.lock …`, only when the 1-minute load is under 4, and record that load next to the numbers.
+
+## Replicated publish on 3 voters (`RaftPublishBench`)
+
+Three in-process voters on loopback `TcpTransport`, memory logs, `RELAXED`, background Raft loops (1 ms tick).
+
+```sh
+mvn -q -DskipTests package
+java -cp target/classes bench/RaftPublishBench.java publish 4 10            # closed loop: ops/s, p50/p99/p99.9 append→future
+java -cp target/classes bench/RaftPublishBench.java overload 4 10 200       # 200 µs callbacks, open loop (512 outstanding per producer)
+```
+
+`overload` samples `deliveryLag`/`maxDeliveryLag` every 200 ms and counts `ApplyLagException`. It reads the metrics by reflection, so the same file runs on commits from before #182, where it prints `n/a`. Pin with `taskset` and run it under the bench lock like the others.
