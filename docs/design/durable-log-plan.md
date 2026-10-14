@@ -50,6 +50,14 @@ second mechanism. Each step is one PR. The benches are `MessagingLogBench` (prod
   [messaging-metrics.md](messaging-metrics.md) already defines), fed through a new `MessagingHooks` method (it has only
   `produced` and `fetched`).
 
+- **As built:** `LogOffsets`. Record = `[klen][topic\0group][offset:long][commitMs:long]`. `__offsets` is always
+  key-compacted, is excluded from size/age retention, and is opened/replayed lazily (first commit or read, or
+  maintenance finding the directory), so nothing changes while offsets are unused. The first commit starts the
+  maintenance timer. Expiry: `sjws.messaging.offsets.expiry.ms` (default 7 days, measured from the group's last
+  commit). The floor also caps §1 compaction (`LogCompaction.prepare(log, floor)`). User produce to `__*` topics is
+  400. Lag: `MessagingHooks.offsetCommitted(topic, group, lag)` (default no-op; no exporter yet).
+  Bench: `bench/OffsetCommitBench.java`.
+
 ## 3. Replication to HA peers
 
 This follows the [two-node HA decision](two-node-ha-decision.md): two data nodes plus a witness (option A, majority of three voters). The log

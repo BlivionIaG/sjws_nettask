@@ -70,8 +70,17 @@ public final class LogCompaction {
      * must keep retention and other compactions of this log out (a segment must not be deleted mid-pass).
      */
     public static List<Prepared> prepare(SegmentedLog log) throws IOException {
+        return prepare(log, Long.MAX_VALUE);
+    }
+
+    /**
+     * As {@link #prepare(SegmentedLog)}, limited to sealed segments that end at or below {@code limit} (the topic's
+     * consumer-offset floor, durable-log-plan §1 retention interplay): a consumer that has not fetched past
+     * {@code limit} never sees a key's history disappear under it.
+     */
+    public static List<Prepared> prepare(SegmentedLog log, long limit) throws IOException {
         var sealed = new ArrayList<SegmentedLog.SegmentInfo>();
-        for (var s : log.segments()) if (!s.active()) sealed.add(s);
+        for (var s : log.segments()) if (!s.active() && s.nextOffset() <= limit) sealed.add(s);
         if (sealed.isEmpty()) return List.of();
         long end = sealed.getLast().nextOffset();
         Map<ByteBuffer, Long> last = new HashMap<>();

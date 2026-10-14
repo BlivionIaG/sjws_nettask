@@ -87,12 +87,14 @@ final class MessagingHttp implements Handler {
         var target = request.target();
         int q = target.indexOf('?');
         var path = q < 0 ? target : target.substring(0, q);
+        if (path.startsWith(PREFIX) && path.indexOf("/offsets/", PREFIX.length()) > 0) return offsets(request, path);
         if (!path.startsWith(PREFIX) || !path.endsWith("/records")) return problem(404, "not found", path);
         var topic = URLDecoder.decode(path.substring(PREFIX.length(), path.length() - "/records".length()), StandardCharsets.UTF_8);
         if (!LogTopics.validName(topic)) return problem(400, "bad request", "topic name must match " + LogTopics.NAME);
         try {
             return switch (request.method()) {
                 case "POST" -> {
+                    if (topic.startsWith("__")) yield problem(400, "bad request", "topics starting with __ are internal");
                     long t0 = System.nanoTime();
                     var r = produce(topic, request);
                     this.hooks.produced(topic, r.status(), Math.max(0, request.body().length()), System.nanoTime() - t0);
@@ -117,6 +119,90 @@ final class MessagingHttp implements Handler {
         } catch (IllegalStateException e) {
             return problem(503, "unavailable", e.getMessage());
         }
+    }
+
+    static final java.util.regex.Pattern OFFSET_JSON = java.util.regex.Pattern.compile("\\{\\s*\"offset\"\\s*:\\s*(\\d{1,19})\\s*}\\s*");
+
+    /**
+     * {@code PUT|GET /messaging/v1/topics/{t}/offsets/{group}} (durable-log-plan §2). PUT body {@code {"offset":n}}, the
+     * next offset to fetch: 416 below the log start, 400 above the log end; stored in {@code __offsets} with GROUP
+     * durability unless the topic policy or a {@code Durability} header (which may only strengthen it) says otherwise.
+     * GET returns {@code {"offset":n,"lag":end-n}} or 404 when the group never committed.
+     */
+    private Response offsets(Request request, String path) {
+        int at = path.indexOf("/offsets/", PREFIX.length());
+        var topic = URLDecoder.decode(path.substring(PREFIX.length(), at), StandardCharsets.UTF_8);
+        var group = URLDecoder.decode(path.substring(at + "/offsets/".length()), StandardCharsets.UTF_8);
+        if (!LogTopics.validName(topic) || topic.startsWith("__")) return problem(400, "bad request", "bad topic name");
+        if (!LogTopics.validName(group)) return problem(400, "bad request", "group name must match " + LogTopics.NAME);
+        try {
+            var log = this.topics.get(topic, false);
+            if (log == null) return problem(404, "no such topic", topic);
+            long end = log.writer().snapshot().nextOffset();
+            var o = this.topics.offsets();
+            switch (request.method()) {
+                case "GET" -> {
+                    long c = o.committed(topic, group);
+                    if (c < 0) return problem(404, "no committed offset", group);
+                    return json(200, "{\"offset\":" + c + ",\"lag\":" + Math.max(0, end - c) + "}", null);
+                }
+                case "PUT" -> {
+                    var m = OFFSET_JSON.matcher(new String(small(request), StandardCharsets.UTF_8));
+                    if (!m.matches()) throw new BadRequest("body must be {\"offset\":n}");
+                    long off;
+                    try { off = Long.parseLong(m.group(1)); } catch (NumberFormatException e) { throw new BadRequest("offset too large"); }
+                    long start = log.log().startOffset();
+                    if (off < start) return problem(416, "offset out of range", "log starts at " + start);
+                    if (off > end) return problem(400, "bad request", "offset " + off + " is past the log end " + end);
+                    var dflt = this.topics.durability(LogOffsets.TOPIC);
+                    var d = atLeast(durability(request.headers().values("durability")), dflt);
+                    o.commit(topic, group, off, d).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                    this.hooks.offsetCommitted(topic, group, Math.max(0, end - off));
+                    return json(200, "{\"offset\":" + off + "}", (d != null ? d : dflt).name().toLowerCase(java.util.Locale.ROOT));
+                }
+                default -> {
+                    var r = problem(405, "method not allowed", "use GET or PUT");
+                    r.headers().set("allow", "GET, PUT");
+                    return r;
+                }
+            }
+        } catch (BadRequest e) {
+            return problem(400, "bad request", e.getMessage());
+        } catch (IOException e) {
+            return problem(500, "log error", e.toString());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return problem(503, "unavailable", "interrupted");
+        } catch (TimeoutException e) {
+            return problem(503, "unavailable", "offset commit not acknowledged in " + ACK_TIMEOUT_MS + " ms");
+        } catch (ExecutionException e) {
+            return problem(503, "unavailable", String.valueOf(e.getCause()));
+        } catch (IllegalStateException e) {
+            return problem(503, "unavailable", e.getMessage());
+        }
+    }
+
+    static Response json(int status, String body, String durabilityEffective) {
+        var h = ResponseHeaders.of().set("content-type", "application/json");
+        if (durabilityEffective != null) h.set("durability-effective", durabilityEffective);
+        return new Response(status, h, Body.Bytes.of(body.getBytes(StandardCharsets.US_ASCII)));
+    }
+
+    /** A small request body (at most 1 KiB). */
+    static byte[] small(Request request) throws BadRequest {
+        var body = request.body();
+        var out = new ByteArrayOutputStream();
+        var chunk = new byte[256];
+        try {
+            int n;
+            while ((n = body.read(chunk, 0, chunk.length)) >= 0) {
+                out.write(chunk, 0, n);
+                if (out.size() > 1024) throw new BadRequest("body larger than 1024 bytes");
+            }
+        } catch (IOException e) {
+            throw new BadRequest("request body: " + e.getMessage());
+        }
+        return out.toByteArray();
     }
 
     private Response produce(String topic, Request request) throws BadRequest, IOException {

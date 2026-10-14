@@ -35,4 +35,10 @@ public interface MessagingHooks {
 
     /** One {@code GET}: response status, response body bytes, handler time (excludes sending the body). */
     void fetched(String topic, int status, long bytes, long nanos);
+
+    /**
+     * One successful offset commit (durable-log-plan §2): {@code lagOffsets} is log end minus the committed offset, the
+     * input to {@code sjws_messaging_lag_offsets} (docs/design/messaging-metrics.md) for plain log topics.
+     */
+    default void offsetCommitted(String topic, String group, long lagOffsets) { }
 }
