@@ -21,6 +21,10 @@ package sjws_nettask.cluster;
  * index order and never overlap, though not always on the same thread. A callback may append to the
  * group; the new entry is delivered after this callback returns (by the same draining loop), so a
  * callback must not block waiting for its own append's future, which would deadlock.
+ * <p>
+ * Delivery can lag: if the thread draining callbacks is interrupted while waiting for the delivery
+ * lock, or the Raft thread finds another thread draining, the entries stay queued and are delivered
+ * by the current drainer or by the next tick or frame, so at most about one tick later.
  */
 @FunctionalInterface
 public interface GroupListener {
