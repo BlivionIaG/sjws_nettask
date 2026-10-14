@@ -237,10 +237,22 @@ class CpTcpVotersTest {
 
     @Test
     void peerCaMustNotBeTheDataNodeCaAndAdminCaEqualToCaOnlyWarns() throws Exception {
-        java.nio.file.Files.writeString(dir.resolve("ca.pem"), "same CA bytes");
-        java.nio.file.Files.writeString(dir.resolve("copy.pem"), "same CA bytes");
-        java.nio.file.Files.writeString(dir.resolve("peer.pem"), "another CA");
-        for (var sameAsCa : List.of("ca.pem", "./ca.pem", "copy.pem")) {
+        var ca = new CpTestCa(dir.resolve("ca-gen"));
+        var other = new CpTestCa(dir.resolve("other-gen"));
+        java.nio.file.Files.copy(ca.caPem(), dir.resolve("ca.pem"));
+        java.nio.file.Files.copy(ca.caPem(), dir.resolve("copy.pem"));
+        java.nio.file.Files.copy(other.caPem(), dir.resolve("peer.pem"));
+        // Same CA, different bytes: DER instead of PEM, and a bundle that also carries the CA.
+        try (var in = java.nio.file.Files.newInputStream(ca.caPem())) {
+            var cert = java.security.cert.CertificateFactory.getInstance("X.509").generateCertificate(in);
+            java.nio.file.Files.write(dir.resolve("ca.der"), cert.getEncoded());
+        }
+        java.nio.file.Files.writeString(dir.resolve("bundle.pem"), java.nio.file.Files.readString(other.caPem())
+                + java.nio.file.Files.readString(ca.caPem()));
+        java.nio.file.Files.writeString(dir.resolve("junk.pem"), "not a certificate");
+        assertFalse(java.util.Arrays.equals(java.nio.file.Files.readAllBytes(dir.resolve("ca.der")),
+                java.nio.file.Files.readAllBytes(dir.resolve("ca.pem"))), "sanity: the bytes differ");
+        for (var sameAsCa : List.of("ca.pem", "./ca.pem", "copy.pem", "ca.der", "bundle.pem")) {
             var y = Map.of("cert", "c", "key", "k", "ca", "ca.pem", "peerCert", "pc", "peerKey", "pk", "peerCa",
                     sameAsCa);
             var e = assertThrows(CpKeyException.class, () -> CpLaunch.listenerConfig(y, dir, "cp-peer", false));
@@ -248,6 +260,7 @@ class CpTcpVotersTest {
         }
         assertFalse(CpLaunch.sameCa(dir.resolve("peer.pem"), dir.resolve("ca.pem")));
         assertFalse(CpLaunch.sameCa(dir.resolve("absent.pem"), dir.resolve("ca.pem")));
+        assertFalse(CpLaunch.sameCa(dir.resolve("junk.pem"), dir.resolve("ca.pem")), "unparsable: left to the loader");
         assertFalse(CpLaunch.sameCa(null, dir.resolve("ca.pem")));
         var admin = CpLaunch.listenerConfig(Map.of("cert", "c", "key", "k", "ca", "ca.pem", "adminCa", "ca.pem"), dir,
                 "cp-admin", false);

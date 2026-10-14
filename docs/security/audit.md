@@ -11,13 +11,13 @@ Findings rated High or Critical stay generic here until their fix is merged.
 
 | # | Severity | Area | Summary | Status |
 |---|---|---|---|---|
-| F1 | High | ACME | Resource limit issue in a listener that only runs when ACME is enabled (details withheld until fixed) | Fix in review (#54) |
-| F2 | Medium | Routing / proxy | Dot-segment check only split segments at `/`. `..;`, `..\`, `..%2f` and `%2e%2e%5c` passed the router and were forwarded unchanged, so an upstream that honours them could resolve a path outside the route prefix or upstream base path | Fix in review (#43) |
-| F3 | Medium | Routing | Open redirect: a `keep_path` redirect to a relative location turned `/old//evil.example` into `Location: //evil.example` (also `/\evil.example`) | Fix in review (#57) |
-| F4 | Medium | Dependencies | Bouncy Castle 1.83 (pulled in by acme4j) has 6 advisories: CVE-2025-14813, CVE-2026-0636, CVE-2026-5588, CVE-2026-5598, CVE-2026-8763, CVE-2026-13506. Reachability is limited to the ACME client | Fix in review (#48) |
-| F5 | Medium | Proxy | Responses are buffered whole (`max_body`, default 16 MiB) per request. With 2048 HTTP/1 connections, slow clients fetching a large upstream resource can hold gigabytes of heap | Open: stream bodies (phase 2) or a global buffered-bytes budget |
-| F6 | Low | Filters | `RoutePattern` (middleware `route`) matches the raw percent-encoded target, while the file handler decodes it (`/%61dmin` is not `/admin`). No filter shipped today makes access decisions, but a future auth or IP filter scoped by route could be bypassed | Open: match on the normalised, decoded path before any security filter lands |
-| F7 | Low | Repository | No code scanning, no Dependabot version updates, secret scanning disabled | CodeQL + Dependabot in review (#49). Secret scanning must be enabled in repo settings |
+| F1 | High | ACME | Resource limit issue in a listener that only runs when ACME is enabled (details withheld until fixed) | Fixed (#54) |
+| F2 | Medium | Routing / proxy | Dot-segment check only split segments at `/`. `..;`, `..\`, `..%2f` and `%2e%2e%5c` passed the router and were forwarded unchanged, so an upstream that honours them could resolve a path outside the route prefix or upstream base path | Fixed (#43) |
+| F3 | Medium | Routing | Open redirect: a `keep_path` redirect to a relative location turned `/old//evil.example` into `Location: //evil.example` (also `/\evil.example`) | Fixed (#57) |
+| F4 | Medium | Dependencies | Bouncy Castle 1.83 (pulled in by acme4j) has 6 advisories: CVE-2025-14813, CVE-2026-0636, CVE-2026-5588, CVE-2026-5598, CVE-2026-8763, CVE-2026-13506. Reachability is limited to the ACME client | Fixed (#48, Bouncy Castle 1.86) |
+| F5 | Medium | Proxy | Responses are buffered whole (`max_body`, default 16 MiB) per request. With 2048 HTTP/1 connections, slow clients fetching a large upstream resource can hold gigabytes of heap | Fixed: bodies stream with a bounded read-ahead and a 64 MiB global budget (`-Dsjws.proxy.maxInflightBytes`) |
+| F6 | Low | Filters | `RoutePattern` (middleware `route`) matches the raw percent-encoded target, while the file handler decodes it (`/%61dmin` is not `/admin`). No filter shipped today makes access decisions, but a future auth or IP filter scoped by route could be bypassed | Fixed: `RoutePattern` matches the decoded, normalised path |
+| F7 | Low | Repository | No code scanning, no Dependabot version updates, secret scanning disabled | CodeQL + Dependabot merged (#49). Secret scanning must be enabled in repo settings |
 | F8 | Info | Tests | `Http2ServerTest.concurrentStreamsShareOneConnection` is flaky under load (REFUSED_STREAM from the 100 ms file-slot wait), about 1 failure in 3 on a loaded 8-core box | Open |
 
 ## Reviewed with no finding
@@ -30,7 +30,7 @@ Findings rated High or Critical stay generic here until their fix is merged.
 - **Proxy SSRF**: the upstream is fixed by configuration. The client target must be origin-form, redirects are not followed, and hop-by-hop and forwarding fields are replaced (X-Forwarded-For is extended only from trusted proxies).
 - **ACME store**: account and domain keys are written `0600` in a `0700` directory with atomic moves. HTTP-01 tokens are validated against the base64url grammar.
 - **Deserialization**: no Java serialization. YAML uses SnakeYAML `SafeConstructor` with duplicate keys refused.
-- **Admin, HA, messaging**: no network listener. The admin TUI is local, HA probes are read-only, and the messaging ledger is in-process only. `/metrics` is off by default and `localhost` when enabled bare.
+- **Admin, HA, messaging** (as of the audit base `d592aaf`): no network listener. The admin TUI is local, HA probes are read-only, and the messaging ledger is in-process only. The control-plane listeners and `/messaging/v1` came later and are not covered here. `/metrics` is off by default and `localhost` when enabled bare.
 - **Response hardening**: `X-Content-Type-Options: nosniff` everywhere and a script-free CSP on generated pages.
 
 ## Scanners
@@ -42,7 +42,5 @@ Findings rated High or Critical stay generic here until their fix is merged.
 
 ## Follow-ups
 
-- F5: a buffered-bytes budget shared by all proxy requests (503 when exceeded) until bodies stream.
-- F6: a decoded, normalised path on `Request` for filters, used by `RoutePattern`.
 - Enable secret scanning and push protection in the repository settings.
-- When the control-plane design lands: mTLS between nodes, signed and versioned config snapshots, single-use join tokens, and redaction of secrets in snapshots and logs.
+- Redaction of secrets in snapshots and logs. (mTLS between nodes, signed and versioned config snapshots and single-use join tokens have landed, see [SECURITY.md](../../SECURITY.md).)

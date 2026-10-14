@@ -2,6 +2,9 @@
 
 These filters are ordinary factories on the [declarative chain](filters.md). Nothing here runs,
 and none of these classes are loaded, until a caller binds them and a document names one.
+They read the raw header map (`request.headers().values(...)`). It is complete on HTTP/1.1, HTTP/3
+fills it only when a chain or a non-static terminal exists at startup, and HTTP/2 leaves it empty,
+so on HTTP/2 they see no headers.
 `GatewayFilters.install(registry)` binds all six. `SjwsServer.chainControl` still does not
 change the request path until the first successful `apply`.
 

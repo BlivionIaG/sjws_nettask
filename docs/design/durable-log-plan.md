@@ -1,6 +1,6 @@
 # Durable log: remaining plan
 
-Status: plan · Docs only · Follows [partition-log.md](partition-log.md) (G1–G4 are merged). Base: master.
+Status: plan · Docs only · Follows [partition-log.md](partition-log.md) (G1–G4 are merged; G2's blocked-retention stat was not built). Base: master.
 
 This plan covers what is left for the plain partition log (`/messaging/v1`, `LogTopics`, `SegmentedLog`) after
 G1–G4: segment compaction, consumer offsets, and replication to the HA peer. The delivery `Partition` already has
@@ -16,8 +16,9 @@ second mechanism. Each step is one PR. The benches are `MessagingLogBench` (prod
 - **Mechanism:** this is the same copy, fsync, marker, swap protocol as `Segment.writeCompacted` and
   `SegmentedLog.commitCompaction`. That protocol is already crash-tested for `Partition` (marker, then atomic rename,
   with recovery honouring the marker). The key index is built off-lock from the sealed segments, newest first.
-  Fetch already tolerates gaps (a compacted `Segment.read` returns null for a missing offset, and the fetch skips to
-  `Next-Offset`).
+  Fetch does not tolerate gaps yet: a compacted `Segment.read` returns null for a missing offset and
+  `MessagingHttp.fetch` stops there, so this step must make fetch skip to the next retained batch and report it as
+  `Next-Offset`.
 - **Readers:** the swap takes the topic's `reads` write lock (#155), so in-flight fetches finish on the old file.
 - **Retention interplay:** compaction runs only below `min(retention low watermark, oldest consumer offset)` once
   §2 lands, so a slow consumer never sees a key's history disappear under it.
@@ -39,12 +40,13 @@ second mechanism. Each step is one PR. The benches are `MessagingLogBench` (prod
   That bounds disk when a consumer disappears.
 - **Tests:** commit, then crash, then restart returns the committed offset; the retention floor holds history that a
   committed-but-unfetched group still needs; expiry releases it.
-- **Metrics:** `sjws_messaging_consumer_lag{topic,group}` (log-end minus committed), added through the existing
-  `MessagingHooks`.
+- **Metrics:** `sjws_messaging_lag_offsets` (log-end minus committed; the lag series that
+  [messaging-metrics.md](messaging-metrics.md) already defines), fed through a new `MessagingHooks` method (it has only
+  `produced` and `fetched`).
 
 ## 3. Replication to HA peers
 
-This follows the [two-node HA decision](two-node-ha-decision.md): a primary/standby pair with a witness. The log
+This follows the [two-node HA decision](two-node-ha-decision.md): two data nodes plus a witness (option A, majority of three voters). The log
 replicates under the same leadership (`RaftGroup` term and lease), not under a second consensus.
 
 - **Unit:** the raw RecordBatch frames, which are byte-identical on disk and on the wire (G1a). The standby fetches

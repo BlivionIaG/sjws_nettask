@@ -58,12 +58,11 @@ final class RaftGroup {
 
     private final ReentrantLock lock = new ReentrantLock();
     /**
-     * Committed-entry callbacks and their append futures, queued under {@link #lock} in log order and
-     * run outside it by one thread at a time ({@link #deliveryLock}), so a listener sees entries
-     * strictly in index order and never concurrently, whichever thread drove the commit.
+     * Committed-entry callbacks and their append futures, submitted under {@link #lock} in log order and
+     * run by this group's single delivery thread, so a listener sees entries strictly in index order and
+     * never concurrently, and no Raft or appending thread ever runs or waits for a callback.
      */
-    private final java.util.ArrayDeque<Runnable> deliveries = new java.util.ArrayDeque<>();
-    private final ReentrantLock deliveryLock = new ReentrantLock();
+    private final DeliveryExecutor deliveries;
     private final GroupId groupId;
     private final NodeId self;
     private final boolean witness;
@@ -114,7 +113,7 @@ final class RaftGroup {
 
     RaftGroup(GroupId groupId, NodeId self, boolean witness, Set<NodeId> witnesses, Set<NodeId> voters,
             List<NodeId> peers, Function<Integer, NodeId> byWire, QuorumPolicy quorum, GroupOptions options,
-            LogStorage storage, ClusterRpc rpc, Clock clock, GroupListener listener) {
+            LogStorage storage, ClusterRpc rpc, Clock clock, GroupListener listener, int deliveryLagLimit) {
         this.groupId = groupId;
         this.self = self;
         this.witness = witness;
@@ -127,6 +126,7 @@ final class RaftGroup {
         this.rpc = rpc;
         this.clock = clock;
         this.listener = listener;
+        this.deliveries = new DeliveryExecutor(groupId.value(), deliveryLagLimit);
         this.voters.addAll(voters);
         if (options.preferred()) {
             this.electionDeadline = Math.max(1L, options.electionTimeout().toNanos() / 5);
@@ -260,6 +260,10 @@ final class RaftGroup {
         try {
             if (role != Role.LEADER) {
                 future.completeExceptionally(notLeader());
+                return future;
+            }
+            if (deliveries.overLimit()) {
+                future.completeExceptionally(new ApplyLagException(groupId, deliveries.lag(), deliveries.lagLimit()));
                 return future;
             }
             if (total > options.maxBatchBytes()) {
@@ -651,7 +655,7 @@ final class RaftGroup {
                     var payload = new byte[data.length - 1];
                     System.arraycopy(data, 1, payload, 0, payload.length);
                     long entryTerm = termAt(index);
-                    deliveries.add(() -> {
+                    deliveries.submit(() -> {
                         if (listener != null) {
                             listener.onCommitted(new CommittedEntry(groupId, entryTerm, index,
                                     ByteBuffer.wrap(payload)));
@@ -664,7 +668,7 @@ final class RaftGroup {
                     long entryTerm = termAt(index);
                     long applied = index;
                     var copy = List.copyOf(noopListeners);
-                    deliveries.add(() -> {
+                    deliveries.submit(() -> {
                         for (var listener : copy) {
                             listener.accept(entryTerm, applied);
                         }
@@ -685,7 +689,8 @@ final class RaftGroup {
             pending.remove(entry.getKey());
             long index = entry.getKey();
             long entryTerm = termAt(index);
-            deliveries.add(() -> entry.getValue().complete(new CommittedIndex(groupId, entryTerm, index)));
+            var future = entry.getValue();
+            deliveries.submit(() -> future.complete(new CommittedIndex(groupId, entryTerm, index)), future);
         }
     }
 
@@ -804,13 +809,11 @@ final class RaftGroup {
             }
             leader = null;
             var error = notLeader();
-            var doomed = new ArrayList<>(pending.values());
+            // Failed on the delivery thread too, after every callback already queued for earlier entries.
+            for (var future : pending.values()) {
+                deliveries.submit(() -> future.completeExceptionally(error), future);
+            }
             pending.clear();
-            after.add(() -> {
-                for (var future : doomed) {
-                    future.completeExceptionally(error);
-                }
-            });
             if (membershipChange != null) {
                 var change = membershipChange;
                 membershipChange = null;
@@ -1008,87 +1011,35 @@ final class RaftGroup {
         for (var task : tasks) {
             task.run();
         }
-        deliver(false);
     }
 
-    /**
-     * For tick and frame handling (the Raft thread): never waits for the delivery lock, so heartbeats
-     * and vote replies are not held up behind a slow commit callback running on another thread. If
-     * another thread is draining, it re-checks the queue after releasing the lock and delivers what
-     * this call queued.
-     */
+    /** Tick and frame handling (the Raft thread): never runs or waits for a commit callback. */
     private void runOnRaftThread(List<Runnable> tasks) {
-        for (var task : tasks) {
-            task.run();
-        }
-        deliver(true);
+        run(tasks);
     }
 
-    /**
-     * Runs queued commit callbacks in log order, one thread at a time.
-     * <ul>
-     * <li>A callback that appends re-enters here on the draining thread: that nested call returns at
-     * once and the outer loop delivers whatever it queued, so callbacks never overlap or reorder.</li>
-     * <li>With {@code nonBlocking}, a busy lock means another thread is draining; this call returns.
-     * Every drainer re-checks the queue after unlocking (entries are queued before any lock attempt),
-     * so an entry queued while the lock was held is never stranded.</li>
-     * <li>A callback that throws is logged and skipped so the rest of the queue still drains.</li>
-     * </ul>
-     */
-    private void deliver(boolean nonBlocking) {
-        if (deliveryLock.isHeldByCurrentThread()) {
-            return;
-        }
-        while (true) {
-            if (nonBlocking) {
-                if (!deliveryLock.tryLock()) {
-                    return; // the holder re-checks after unlocking
-                }
-            } else {
-                try {
-                    deliveryLock.lockInterruptibly();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    // Entries stay queued: the current drainer, or the next tick or frame (at most about
-                    // one tick later), delivers them. See GroupListener.
-                    return;
-                }
-            }
-            try {
-                drain();
-            } finally {
-                deliveryLock.unlock();
-            }
-            lock.lock();
-            try {
-                if (deliveries.isEmpty()) {
-                    return;
-                }
-            } finally {
-                lock.unlock();
-            }
-        }
+    /** Deliveries queued or running (apply lag), for metrics and backpressure tests. */
+    long deliveryLag() {
+        return deliveries.lag();
     }
 
-    private void drain() {
-        while (true) {
-            Runnable next;
-            lock.lock();
-            try {
-                next = deliveries.poll();
-            } finally {
-                lock.unlock();
-            }
-            if (next == null) {
-                return;
-            }
-            try {
-                next.run();
-            } catch (RuntimeException e) {
-                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
-                        "commit callback failed in group " + groupId, e);
-            }
-        }
+    long maxDeliveryLag() {
+        return deliveries.maxLag();
+    }
+
+    /** True on this group's delivery thread (inside a callback). */
+    boolean onDeliveryThread() {
+        return deliveries.onExecutorThread();
+    }
+
+    /** Waits until every delivery submitted so far has run; false on timeout or on the delivery thread. */
+    boolean awaitDelivered(java.time.Duration timeout) {
+        return deliveries.awaitIdle(timeout);
+    }
+
+    /** Drain for up to {@code budget}, then abandon (futures fail) and stop the delivery thread. */
+    boolean closeDeliveries(java.time.Duration budget) {
+        return deliveries.close(budget);
     }
 
     private record Rec(long term, byte[] data) {

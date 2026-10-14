@@ -4,12 +4,33 @@ Filters sit between protocol decoding and the terminal `Handler`. That terminal 
 `StaticFileHandler` unless a caller installs another one (a router). HTTP/1.1, HTTP/2 and HTTP/3 use
 one chain. With nothing registered, and the terminal still the
 static file handler, that chain is not built and not called: HTTP/1.1 calls
-`StaticFileHandler.handle` directly, and HTTP/2 and HTTP/3 call the handler they were given
-at start.
+`StaticFileHandler.handle` directly, and HTTP/2 and HTTP/3 call the live config snapshot's
+handler.
 
 Register before start. `SjwsServer.start(config, filters)` compiles the registry once and shares
 it. `filterChain()` is null when the registry was null or empty. `handler()` stays the
 `StaticFileHandler` either way (the file cache lives there).
+
+One request through a chain with two filters:
+
+```mermaid
+sequenceDiagram
+    participant T as Transport
+    participant O as ObserveRequestFilter<br/>order 0
+    participant F as Your filter<br/>order 100
+    participant H as Terminal handler
+
+    T->>O: request
+    O->>F: proceed(request)
+    F->>H: proceed(request)
+    H-->>F: Response
+    F-->>O: Response
+    O-->>T: Response
+    Note over F,H: The response is built, not yet written.<br/>A filter may return it or a new one
+    Note over T: writes it, adding the fields it owns,<br/>such as Date, Server and Content-Length
+    Note over F,H: A filter that skips proceed short-circuits: later<br/>filters and the handler do not run. The observe<br/>filter does so for /healthz and /metrics
+    Note over O,H: A RuntimeException or a null return<br/>becomes the normal HTML 500. Outer filters<br/>see it as the result of proceed,<br/>and the connection stays open
+```
 
 ## Write a filter
 
@@ -38,16 +59,21 @@ peer address, `secure`, headers and body. `withHeaders` keeps the method, target
 `response.headers()` in place. Skip `proceed` to short-circuit; later filters and the terminal
 handler do not run.
 
-`request.peer()` is the client `InetSocketAddress` (one per HTTP/1 connection, one per HTTP/3
-stream), or null if the transport could not read it. `request.secure()` is false on plain HTTP/1
-and true on HTTP/3. `request.protocol()` is the version token. HTTP/1 copies the parsed version;
-a request built without one is `HTTP/1.1`, or `HTTP/3` when `secure` is true. `request.headers().fields()` is the raw field map (lower-case name to values,
+`request.peer()` is the client `InetSocketAddress` (one per HTTP/1 connection, one per HTTP/2 or
+HTTP/3 stream, taken from the connection), or null if the transport could not read it.
+`request.secure()` is true on HTTP/3 and on the HTTP/2 TLS listener (its HTTP/1.1 fallback
+included), and false on the plain HTTP/1 listener and on h2c. `request.protocol()` is the version
+token. HTTP/1 copies the parsed version, HTTP/2 sets `HTTP/2` and HTTP/3 sets `HTTP/3`; a request
+built without one is `HTTP/1.1`, or `HTTP/3` when `secure` is true. `request.headers().fields()` is the raw field map (lower-case name to values,
 first-seen order, pseudo-headers excluded). HTTP/1 stores the parser's map by reference: that map
 is built while parsing either way, and `RequestHeaders.of` does not copy it. `reset()` drops the
 parser's reference and does not clear the map, so a filter may retain the request. HTTP/3 copies
 every regular header only when a filter chain or a non-static terminal is installed (decided once
-at startup). With neither, it reads the six typed fields and leaves `fields()` empty, so a static
-request allocates no header map. When it does copy, that happens before the HEADERS frame is
+at startup, so a chain that `ChainControl` applies later to a server started without filters does
+not switch it on). With neither, it reads the six typed fields and leaves `fields()` empty, so a
+static request allocates no header map. HTTP/2, and the HTTP/1.1 fallback on its listener, read only
+the six typed fields and always leave `fields()` empty, so a filter or the proxy that needs another
+header sees none there. When it does copy, that happens before the HEADERS frame is
 released, because the handler runs later on another thread; the copy does not follow later changes
 to the frame. `values(name)` does not allocate when the name is absent. `all()` flattens and
 allocates; the static file handler does not call it. `:authority` wins over `host` for
@@ -218,24 +244,25 @@ A filter that answers on its own (for example a 429 from `RateLimitFilter`) with
 
 ## Request body
 
-This record has no body. Do not add a buffered `byte[]`: a proxy that relays a body needs a
-streaming read, and the static file handler must keep ignoring bodies.
+`Request.body()` is a pull-style `RequestBody`: `length()` (-1 when unknown) and
+`read(byte[], int, int)`. The default is `RequestBody.EMPTY`, a known length of 0.
+`Request.withBody` replaces it, and `withMethod`, `withTarget` and `withHeaders` keep it. Do not
+buffer it into a `byte[]`: a proxy that relays a body needs a streaming read, and the static file
+handler ignores bodies. Read it on the request thread, once, from start to end.
 
-Recommended later change (additive, so the static path stays as it is), before a proxy phase that
-forwards bodies:
+HTTP/1.1 is the only transport that attaches one: a `Content-Length` body of a method other than
+GET and HEAD. The first read sends `100 Continue` if the client asked for it, and each read that
+waits is bounded by the write deadline. The connection is kept only if the handler read the body
+whole. A chunked request body is not exposed: it is not read, and the connection closes after the
+response. A body on GET or HEAD is drained by the transport before the handler runs. HTTP/2 and
+HTTP/3 release request DATA frames, so a handler sees `EMPTY` there.
 
-* `Request.body()` returns a pull-style `RequestBody`. The default is empty, with a known length
-  of 0. HTTP/1 produces it from `Content-Length` or chunked decoding; HTTP/3 produces it from
-  DATA frames. The static handler does not read it. If the terminal handler does not consume it,
-  the transport drains it or closes the connection. Unknown length is allowed (chunked, or HTTP/3
-  until the stream ends).
-* Response side: `Body` gains a `Stream` variant, `length` or `-1` when the length is unknown,
-  plus a pull source. HTTP/1 writes chunked or close-delimited. HTTP/3 writes DATA frames. A
-  source error aborts the connection or stream and must not finish as a short 200.
-
-Proxy phase 1 can stay bodyless (methods that carry a body are rejected) until that core change
-lands. The fields above (`peer`, `secure`, `headers().fields()`) are already on `Request`, and
-`withMethod` / `withTarget` keep them, so a streaming body can be added beside them later.
+The response side is `Body.Stream`: a `length` (-1 when unknown) and a pull source that the writer
+closes exactly once. HTTP/1 writes it with `Content-Length`, chunked, or close-delimited; HTTP/2 and
+HTTP/3 write DATA frames. A source error aborts the connection or stream and never finishes as a
+short 200. `ProxyHandler` is the producer, and it copies a `Content-Length` request body upstream
+chunk by chunk (413 over `max_body`); a chunked request body is answered with 501 (see
+[proxy routing](../design/proxy-routing.md) §12).
 
 ## Custom transports
 
@@ -248,8 +275,25 @@ default exists so a factory that already overrides it still receives the chain; 
 default forwards to it and drops `terminal`. Dispatch with
 `FilterChain.dispatch(handler, terminal, chain)`: a non-null chain is `chain::handle` (the chain
 already closes over its terminal); a null chain and a null or static-handler terminal is
-`handler::handle`; any other terminal is `terminal::handle`. HTTP/2 and HTTP/3 do this, so the empty
-path stays a direct call on the concrete handler.
+`handler::handle`; any other terminal is `terminal::handle`. HTTP/3 does this, and HTTP/2 takes `terminal`
+when there is one and `handler` otherwise, so the empty path stays a direct call on the concrete handler.
+
+```mermaid
+flowchart TD
+    a{"A handler was published<br/>through armHandler?"} -->|"yes: a metrics arm,<br/>a ChainControl snapshot,<br/>or HTTP/2's live snapshot"| ar["Call that handler"]
+    a -->|no| s["The startup choice:<br/>FilterChain.dispatch(files,<br/>terminal, chain)"]
+    s --> c{"chain is not null?"}
+    c -->|yes| ch["Call chain.handle<br/>the chain already<br/>closes over its<br/>terminal"]
+    c -->|no| t{"terminal is null, or is<br/>the static file handler?"}
+    t -->|yes| fl["Call files.handle directly<br/>no chain object on<br/>the request path"]
+    t -->|no| tm["Call terminal.handle<br/>for example a router"]
+```
+That is the rule of `FilterChain.dispatch`, which `Http3Server` applies when it is built and a custom
+transport can apply. On a `SjwsServer` the transports then follow the request handler: HTTP/1.1 reads
+`override` (the chain, the prefix mounts, a replacement terminal or the HA handler) or, when there is none,
+the live snapshot handler. HTTP/3 is switched to the same `requestHandler()` at start. HTTP/2 takes
+`terminal` when there is one, and otherwise follows the live snapshot.
+
 `Transport.armHandler` is how a listener learns about a filter published by a later
 `metricsSnapshot()`. The default ignores it. HTTP/2 and HTTP/3 install that handler for the next
 request.
@@ -299,6 +343,18 @@ has already loaded a handler, including one blocked inside `proceed`, finishes o
 that fails to parse or compile throws, and the published handler stays. A version lower than the
 one being served is rejected the same way. An equal version is applied again, which is how a
 node picks up a label change without a new generation.
+
+In outline, `apply` does this:
+
+```mermaid
+flowchart TD
+    a["ChainControl.apply(document)<br/>under the publish lock"] --> v{"Version below<br/>the one being served?"}
+    v -->|yes| rej["Rejected: the published<br/>handler stays"]
+    v -->|no| c{"Does it compile?<br/>Every entry is built, so<br/>one bad param fails it all"}
+    c -->|no| rej
+    c -->|yes| m["Leave out entries whose<br/>label selector misses<br/>this node, sort by order<br/>The observe filter goes<br/>first, order 0"]
+    m --> w["Publish the new<br/>FilterChain, or the<br/>terminal itself if<br/>nothing is left One<br/>volatile write per<br/>transport, replacing the<br/>startup chain"]
+```
 
 An empty `filters` array is valid and calls the terminal handler directly. When that terminal
 is the static file handler, the call is still `StaticFileHandler.handle`. Opening the slot

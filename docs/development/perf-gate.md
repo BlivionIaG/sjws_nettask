@@ -14,6 +14,19 @@ Defaults: throughput 10 %, p99 20 % (tails are noisier on shared 2-vCPU runners)
 repository variables `PERF_THRESHOLD` / `PERF_P99_THRESHOLD`. The table goes to the job summary and
 raw results to the `perf-gate` artifact. Add the `skip-perf` label to skip a PR.
 
+The whole run, with the second pass described below:
+
+```mermaid
+flowchart TB
+    pr["A pull request that<br/>touches src/**, pom.xml,<br/>the gate or the sample<br/>config. The label<br/>skip-perf skips the job"] --> b["Build the base and the<br/>head jar on one runner"]
+    b --> p1["Pass 1: the default<br/>command line"]
+    b --> p2["Pass 2:<br/>--role=standalone with<br/>the sample config and<br/>the swarm forced off"]
+    p1 --> r["Each pass: start both<br/>servers on a 1 KiB file<br/>with 256 MiB of heap,<br/>warm each up for 5 s,<br/>then 5 rounds of 10 s<br/>with wrk (2 threads, 64<br/>connections). Base and<br/>head alternate their<br/>order every round"]
+    p2 --> r
+    r --> c["compare.py: the median<br/>requests per second and<br/>the median p99. A metric<br/>fails when it is worse<br/>than max(threshold, 2 x<br/>its relative MAD): 10<br/>percent and 20 percent<br/>by default. Any wrk<br/>error on the PR side<br/>fails too"]
+    c --> o["A table in the job<br/>summary and the raw<br/>results in the perf-gate<br/>artifact"]
+```
+
 Run locally:
 
     mvn -B -q -DskipTests package   # in two checkouts

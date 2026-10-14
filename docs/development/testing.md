@@ -1,6 +1,6 @@
 # sjws_nettask tests
 
-JUnit 5 via Maven (`pom.xml` at repo root, reusing the NetBeans `src/` layout).
+JUnit 6 (Jupiter) via Maven (`pom.xml` at repo root, reusing the NetBeans `src/` layout).
 Tests live in `tests/` because `test/` is listed in `.gitignore`.
 
     mvn test                          # unit + in-process tests (JaCoCo agent attached)
@@ -15,7 +15,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `http1/FileServingTest` | file/listing/error responses without a network (containment, symlinks, dotfiles, 301/403/304, exact-length sends) |
 | `ServerIntegrationTest`, `HardeningIntegrationTest` | real sockets: keep-alive, pipelining, deadlines, connection cap, leak check, process exit codes |
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
-| `config/ConfigLoaderTest`, `config/RouteTableTest`, `ReloadServerTest`, `ReloadCoverageTest` | YAML file, routing table validation (not dispatched), immutable snapshot reload, challenge-port rebind, HTTP/3 cert swap on reload |
+| `config/ConfigLoaderTest`, `config/RouteTableTest`, `ReloadServerTest`, `ReloadCoverageTest` | YAML file, routing table validation, immutable snapshot reload, challenge-port rebind, HTTP/3 cert swap on reload |
 | `ReloadHookTest` | reload hook registry |
 | `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance (linux/amd64), hot cert swap |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
@@ -58,8 +58,8 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `ha/ClusterBenchTest` | cluster-mode bench process runs a second node and the heartbeat thread |
 | `ha/HeartbeatAuthClassLoadTest` | HA off does not load `HeartbeatAuthenticator` or `ClusterKey`; cluster mode without a key exits 64 |
 | `SingleNodeHotPathTest` | clustering off: file handler, no role supplier, no drain supplier, no heartbeat or raft thread |
-| `clusterharness/ClusterScenariosTest` (`@Tag("cluster")`) | N control + M data nodes on the file-serving harness (ephemeral port, temp root, HTTP/1.1 client). Live: gateway-off and standalone serve the same file with no `cp-` thread. Partition, leader kill, slow node, and rollback stay `@Disabled`: `CpStore` is one voter and does not implement `ControlPlane`. `NodeFixtures.pending` starts a node at `connection=pending`. `ConnectedDataNodeTest` stays `@Disabled` until a data-node watch exists |
-| `SourceGuardTest` | static rules: no `synchronized`, no Netty in core/HTTP-1, h3 doesn't import HTTP-1 |
+| `clusterharness/ClusterScenariosTest`, `CpVoterRestartTest`, `ConnectedDataNodeTest` (`@Tag("cluster")`), `NodeFixturesTest` | N control + M data nodes on the file-serving harness (ephemeral port, temp root, HTTP/1.1 client). Gateway-off and standalone serve the same file with no `cp-` thread. 3 or 5 real `CpStore` voters on one `SimTransport` and a manual clock: election, network partition, leader kill, slow node and config rollback, with the content checked on every data node during the operation; a killed voter restarts from its log. `NodeFixtures.pending` starts a node at `connection=pending`, `NodeFixtures.connected` a data node joined through the real watch. Nothing is `@Disabled` |
+| `SourceGuardTest` | static rules: no `synchronized`, `computeIfAbsent` only without I/O, no Netty in `core`, `http1` or `cluster`, `core` imports no transport or sockets, `h3` doesn't import HTTP/1, `cluster` doesn't import `ha` or HTTP/1, nothing outside `swarm` names it (except the `OptionalModules` class-name string), `swarm.wire` imports only `core`, the control-role `cp` types stay inside `cp` |
 | `tls/TlsMaterialTest` | PEM/encrypted keys, self-signed certificates, key-file/validity warnings |
 | `h2/Http2ServerTest` | HTTP/2: ALPN h2 + http/1.1 fallback, parity with HTTP/1.1, concurrent streams, h2c Upgrade and prior knowledge, stream cap, rapid reset (GOAWAY ENHANCE_YOUR_CALM), CONTINUATION flood, header list size, flow control on a large file, stalled stream, in-flight cap |
 | `h2/Http2JuryTest` | security jury regressions: PINGs / unfinished header block don't keep an idle h2 connection, open streams do, never-ending request reset with NO_ERROR, slowloris on the HTTP/1.x fallback, header timeout vs keep-alive and upgrade, PING flood without reading |
@@ -80,12 +80,15 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `ClientManagerFaultTest`, `Http1EdgeTest` | accept-loop faults (back-off, reset before registration, setOption failure), EOF/CR/body-drain edge cases, failure log |
 | `http1/LegacyApiTest`, `core/CoreApiTest` | legacy wrappers (HTML/Page/Header/CONSTANTS) and small core APIs (ResponseHeaders, Mime, Response, FileCache bounds) |
 
+The tests under `routing/`, `cp/`, `messaging/`, `swarm/` and `controlplane/` are described with their design docs: [proxy routing](../design/proxy-routing.md), [control plane](../design/control-plane.md), [messaging](../messaging/design.md) and [agent swarm](../design/agent-swarm.md).
+
 Tags: `h3` = needs QUIC; those classes also skip themselves (JUnit assumption) when
 `Http3Server.isAvailable()` is false, and `QuicNativesReportTest` prints a `WARNING` line saying so.
 `jar` = needs the packaged jar; excluded from the default Surefire run and run by the `jar-tests`
 execution in the `integration-test` phase (without the JaCoCo agent: subprocesses aren't measured).
-`cluster` = the multi-node harness. Live cases run in CI. Fault scenarios in that class are
-`@Disabled` until the control plane exists (see below).
+`cluster` = the multi-node harness (`ClusterScenariosTest`, `ConnectedDataNodeTest`, `CpVoterRestartTest`).
+Every case is live and runs in CI (`mvn verify`, the `-Dgroups=cluster` step, and nightly in `cluster-tests.yml`).
+`e2e` = `FileServingEndToEndTest`, also run alone by its own CI step.
 
 Tests named `BUG_*` were written against the original code and failed there.
 New regressions can be added as `@Tag("bug")` tests first (`mvn test -DexcludedGroups=bug`

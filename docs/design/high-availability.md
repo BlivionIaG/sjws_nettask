@@ -41,7 +41,9 @@ and at least one data node is too). `VoterSet` does not use it.
 legal: `CpStore.open` calls the older `ReplicatedNode.open` with a single non-witness
 member and `QuorumPolicy.majority()`, and `VoterSet.majority` allows a set of one.
 Three data nodes and no witness stay legal. Two voters of which one is a witness are
-not the bare-pair case and are not rejected by that check.
+not the bare-pair case and are not rejected by that check. The control role opens its
+3 or 5 full voters through `VoterSet.majority` and 2 + witness through `dataAndWitness`
+(`CpLaunch`, `CpStore.open`).
 
 There is no async primary/standby and no one-node election. `GroupOptions.preferred`
 only shortens that node's first election deadline to `electionTimeout / 5` (at least 1 ns).
@@ -108,8 +110,8 @@ not the older `QuorumPolicy.witness` veto.
 A campaign calls `startPreVote` before it increments `term`. The pre-vote does not change
 `term` or `votedFor`. A receiver grants it only when the candidate's log is up to date
 (the witness compares the durable cursor, and forces it first) and the receiver does not
-still have a leader: `role == LEADER`, or `leader != null` and `now < electionDeadline`,
-refuses. A pre-vote quorum is what starts the real election. A node that is alone does
+still have a leader: `role == LEADER`, or a `FOLLOWER` with `leader != null` and
+`now < electionDeadline`, refuses. A pre-vote quorum is what starts the real election. A node that is alone does
 not raise the term, because its own pre-vote is not a majority of three.
 
 That is what keeps the partition row above from splitting. The data node that cannot
@@ -117,6 +119,33 @@ hear the leader still reaches the witness, but the witness has a fresh leader an
 refuses the pre-vote, so the term does not move and the leader that holds the witness
 stays leader. `onTimeoutNow` (leadership transfer) still starts a real election; it does
 not go through the pre-vote.
+
+One election, from the first deadline to the lease, as a voter set runs it. The Raft side runs in tests and in a
+control process (group `cp-config`: one voter sends no `PRE_VOTE` or `VOTE`, a set of voters from `cp.peers` runs
+this exchange over TCP), not yet in an HA pair:
+
+```mermaid
+sequenceDiagram
+    participant F as Candidate
+    participant P as Other full voter
+    participant W as Witness
+
+    Note over F: its election deadline passes, and it<br/>is not a witness
+    F->>P: PRE_VOTE, the term is unchanged
+    F->>W: PRE_VOTE
+    Note over P,W: refused while a leader is fresh. Otherwise granted<br/>if the candidate's log is up to date, the witness<br/>compares its forced cursor
+    Note over F: a pre-vote quorum starts the election:<br/>term + 1 and a vote for itself
+    F->>P: VOTE
+    F->>W: VOTE
+    Note over P,W: granted when the log is up to date and<br/>no other candidate has this term's vote
+    Note over F: a vote quorum makes it leader:<br/>lease = now + 2 heartbeats, append a NOOP
+    loop every heartbeat
+        F->>P: AppendEntries
+        P-->>F: ack
+        Note over F: a quorum ack of the last index<br/>renews the lease
+    end
+    Note over P,W: an append or a granted vote moves the election<br/>deadline to now + lease + election timeout
+```
 
 ## Leader lease
 
@@ -129,8 +158,10 @@ is `LEADER`, and `0` otherwise. A read barrier completes immediately while
 
 An append or a granted vote also sets the follower's election deadline to
 `now + lease + electionTimeout`, so a node that is hearing a leader does not campaign.
-A preferred node's first deadline is `electionTimeout / 5`. Every other node waits
-`electionTimeout + (wire - 1) * (electionTimeout / 5)`. Failback hysteresis defaults to
+A preferred node's first deadline is `electionTimeout / 5`. Every other node's first deadline is
+`electionTimeout + ((wire - 1) mod voters) * (electionTimeout / voters)`. Each retry after a
+failed pre-vote or vote waits `electionTimeout` plus a fresh jitter in `[0, electionTimeout)`,
+so the wait stays under `2 * electionTimeout`. Failback hysteresis defaults to
 `Duration.ZERO`; `withFailback` holds a demoted leader until that delay has elapsed.
 
 `VipFence` claims a VIP only for `FailoverPolicy.ACTIVE_PASSIVE`, and only while this
@@ -141,7 +172,8 @@ claims. The fence is not a substitute for the third vote. `isLeader` can stay tr
 node that has not yet seen a higher term; the lease is what drops the claim.
 
 Raft election timeout and heartbeat are caller-supplied `GroupOptions`. They are not
-`ha:` keys. The one place that picks them today is `CpStore.open`: `Durability.RELAXED`,
+`ha:` keys. The one place that picks them today is `CpGroup.options()` (used by `CpStore` and
+`CpWitness`): `Durability.RELAXED`,
 max batch `1024 * 1024` bytes, election timeout 100 ms, heartbeat 40 ms, snapshot every
 `10_000` entries. The lease for that group is 80 ms. `ReplicatedNode` builds its
 membership view with a 500 ms interval and a 5 s dead-after. `LocalCluster.start`'s
@@ -192,12 +224,26 @@ only members are inserted. A newer boot epoch resets that sender's sequence high
 mark, so a restart is accepted. An epoch later than the packet timestamp, or later than
 the receiver's now, by more than `WINDOW_MILLIS` (5000, inclusive at exactly ±5 seconds)
 is dropped and does not update that state. A lower epoch is accepted only after the
-sender has been silent for at least the membership dead interval (`deadAfterMillis`);
+sender has been silent for at least `max(deadAfterMillis, WINDOW_MILLIS)` (a 5 s floor);
 the `HeartbeatAuthenticator(ClusterKey, Clock)` constructor passes `0`, which never
 accepts a lower epoch, and `HeartbeatService` passes the membership dead interval.
 `LocalCluster` and `ReplicatedNode` use 5 s. A timestamp older than this process's boot
 is dropped. A destination other than this node is dropped. A sender that is not a member
 is dropped. Skew warnings are rate-limited to once per 5 s (`WARN_EVERY_MILLIS`).
+
+The order in which `HeartbeatAuthenticator.open` checks a datagram, and the reason that is counted when one check fails:
+
+```mermaid
+flowchart TB
+    c1["1. Shape and tag: 124<br/>bytes, version 1, key<br/>id 0 or 1 (else<br/>MALFORMED), then the<br/>HMAC-SHA256 tag under<br/>that key (else TAG)"]
+    c2["2. Time: within 5 s of<br/>now either way, and not<br/>before this process<br/>booted (else TIME)"]
+    c3["3. Body and address:<br/>the body decodes (else<br/>BODY) and is addressed<br/>to this node (else<br/>DEST)"]
+    c4["4. Epoch: the boot<br/>epoch is not later than<br/>the packet timestamp by<br/>more than 5 s (else<br/>EPOCH)"]
+    c5["5. Replay state, first<br/>checks: the destination<br/>field names this node<br/>(else DEST), the sender<br/>is a member (else<br/>MEMBER), the sequence<br/>is above 0 (else SEQ),<br/>and the boot epoch is<br/>not later than now by<br/>more than 5 s (else<br/>EPOCH)"]
+    c6["6. The sender's mark: a<br/>new sender, a newer boot<br/>epoch, or a lower one<br/>after silence resets the<br/>sequence. Otherwise a<br/>lower epoch is EPOCH<br/>and a sequence not above<br/>the last is SEQ"]
+    ok["Accepted:<br/>Membership.onHeartbeat.<br/>Every drop is counted<br/>under its reason"]
+    c1 --> c2 --> c3 --> c4 --> c5 --> c6 --> ok
+```
 
 Rotation is the previous key. Put the new secret in `ha.cluster_key` or
 `ha.cluster_key_file` and the key still in use in `ha.cluster_key_previous` or
@@ -228,14 +274,15 @@ does not move a lease. The error that matters is the clock *rate* over one lease
 node whose monotonic clock runs fast expires its lease early relative to a peer whose
 clock runs slow.
 
-This check is not implemented. `ConfigLoader` does not accept these keys. The same
-keys and the same inequality are what [control-plane hosting](control-plane-hosting.md)
-records as resolved with HA
-([#151](https://github.com/BlivionIaG/sjws_nettask/pull/151)). That note also flags the
-100 ms `CpStore` election timeout as aggressive for JVM GC pauses. The timeout stays
-the value `CpStore.open` hardcodes; the check below does not change it.
+This check is implemented for the control role: `CpLaunch.start` runs `CpTiming.check`
+against `CpGroup.options()` and refuses to start otherwise. The keys are read by
+`CpConfig` from the `cp:` block (YAML only; `ConfigLoader` keeps the block raw, so it does
+not list them). They are what [control-plane hosting](control-plane-hosting.md) records as
+resolved with HA ([#151](https://github.com/BlivionIaG/sjws_nettask/pull/151)). That note
+also flags the 100 ms `CpStore` election timeout as aggressive for JVM GC pauses. The
+timeout stays the value `CpGroup.options()` sets; the check below does not change it.
 
-| Key | Proposed default | Meaning |
+| Key | Default | Meaning |
 |---|---|---|
 | `cp.maxClockDriftRatio` | `0.01` | Rate error allowed over one lease (1%). |
 | `cp.leaseSafetyMargin` | `10 ms` | Fixed margin added in the startup check. |
@@ -247,11 +294,10 @@ lease * (1 + cp.maxClockDriftRatio) + cp.leaseSafetyMargin < electionTimeout
 ```
 
 `lease` is `GroupOptions.leaseNanos()` (`heartbeat * 2`). With the timings
-`CpStore.open` uses today (heartbeat 40 ms, lease 80 ms, election timeout 100 ms) the
+`CpGroup.options()` uses (heartbeat 40 ms, lease 80 ms, election timeout 100 ms) the
 expression is `80 * 1.01 + 10 = 90.8 ms`, and `90.8 < 100` holds, so those defaults
-would pass and would not force a timing change. A group whose election timeout is not
-strictly above that expression would be refused. `GroupOptions` does not run the check
-today.
+pass and force no timing change. A group whose election timeout is not strictly above
+that expression is refused. `GroupOptions` itself does not run the check.
 
 The ±5 second HMAC window (`HeartbeatAuthenticator.WINDOW_MILLIS`) is a separate bound.
 It compares wall clocks for heartbeat anti-replay. It is not the lease rate bound.

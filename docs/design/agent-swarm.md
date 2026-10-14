@@ -1,9 +1,9 @@
 # Agent swarm layer (optional module): design
 
-Status: **Draft** · Base: master `79610fd` · Scope: design only. No code changes.
-Owner: sjws Architecture. **Co-author: Messaging Core** for §4–§5 (marked below), pending their review.
+Status: **Draft, S1 shipped** · Base: master `e8389be` · Scope: design, plus as-built S1 notes.
+Owner: sjws Architecture. **Co-author: Messaging Core** for §4–§5 (marked below), who signed off on #90.
 
-Every reference to existing code is a path and line on master `79610fd`. This doc contains **no new benchmark numbers**. §13 quotes the messaging baseline already measured in PR #69 and lists pass targets; the swarm's own numbers will come from the runs §13 describes.
+Every reference to existing code is a path and line on master `e8389be`. This doc contains **no new benchmark numbers**. §13 quotes the messaging baseline already measured in PR #69 and lists pass targets; the swarm's own numbers will come from the runs §13 describes.
 
 ## 1. Goal and the hard rule
 
@@ -38,11 +38,12 @@ How this is enforced is in §3.3.
 ### 3.1 Packages
 | Package | Contents | May depend on |
 |---|---|---|
-| `sjws_nettask.swarm` (new) | `SwarmModule` (bootstrap), `TaskService`, `LeaseKeeper`, `ReplyRouter`, `TokenStream`, `AgentDirectory`, `BudgetLedger`, `TraceContext`, `LlmGateway` | `core`, `messaging.*`, `controlplane`, `cp` (read-only views), `routing` (`GcraTable`, `Resilience`, `discovery.*`, `WeightedHandler`, `ProxyHandler`), `observe` |
+| `sjws_nettask.swarm` | Built (S1): `SwarmModule` (bootstrap), `Swarm`, `Topics`, `TaskService`, `Task`, `TaskEnvelope`, `LeaseKeeper`, `ReplyRouter`, `SwarmHttp`, `SwarmGate`, `TokenGate`. Planned: `TokenStream`, `AgentDirectory`, `BudgetLedger`, `TraceContext`, `LlmGateway` | Built: `core`, `messaging.delivery`, `messaging.ledger`, `config.SecureKeyFile`, `swarm.wire`. Planned: `controlplane`, `cp` (read-only views), `routing` (`GcraTable`, `Resilience`, `discovery.*`, `WeightedHandler`, `ProxyHandler`), `observe` |
 | `sjws_nettask.swarm.wire` (new) | Frame codec for the swarm wire protocol (§11.2) | `core` only |
 | `sdk/python/sjws_swarm` (new, outside `src/`) | Thin client (§11.1) | — |
 
 ### 3.2 Direction
+Planned edges. In S1 only the arrows to `messaging.delivery` / `ledger` and `core` exist.
 ```
             swarm  ──▶  messaging.delivery / ledger
               │──────▶  controlplane (Rbac, Operator)   cp (signed config, node labels)
@@ -55,59 +56,73 @@ How this is enforced is in §3.3.
 
 ### 3.3 Enforcement (three mechanical checks plus one benchmark check)
 1. **Dependency test**, added next to `SourceGuardTest.coreDoesNotDependOnTransports` (`tests/sjws_nettask/SourceGuardTest.java:59-66`), in the same text-scan style. It asserts:
-   - no file under `src/sjws_nettask/{core,http1,h2,h3,routing,messaging,cp,controlplane,cluster,observe,config}` contains `sjws_nettask.swarm`;
+   - no file under `src/` outside `sjws_nettask/swarm/` contains `sjws_nettask.swarm`, except `OptionalModules.java`, which must name it exactly twice (the `SWARM_CLASS` constant and its javadoc);
    - `swarm.wire` imports only `core`.
 2. **Class-load test**, cloned from `tests/sjws_nettask/cp/ClassLoadTest.java:1-45`. That test starts `sjws_nettask.ha.BenchServer --mode=single` under `-Xlog:class+load=info` and asserts that no `sjws_nettask.cp.`, `cluster.` or `service.` class was loaded. The swarm test adds `assertFalse(text.contains("sjws_nettask.swarm."))`, in standalone mode and in `data`/`gateway` mode without `swarm.enabled`.
-3. **Single entry point** (shipped in #90). `sjws_nettask.OptionalModules` is the only code outside `swarm` that names the swarm, and it does so only as the string constant `SWARM_CLASS = "sjws_nettask.swarm.SwarmModule"` (`src/sjws_nettask/OptionalModules.java:33-35`).
-   - When the JVM property `-Dsjws.swarm.enabled=true` is set, or the environment variable `SJWS_SWARM_ENABLED=true` (the property wins), it loads `SwarmModule` by reflection, `Class.forName(...).asSubclass(OptionalModule.class)` (`OptionalModules.java:52-65`).
+3. **Single entry point** (shipped in #90). `sjws_nettask.OptionalModules` is the only code outside `swarm` that names the swarm, and it does so only as the string constant `SWARM_CLASS = "sjws_nettask.swarm.SwarmModule"` (`src/sjws_nettask/OptionalModules.java:39`).
+   - When the JVM property `-Dsjws.swarm.enabled=true` is set, or the environment variable `SJWS_SWARM_ENABLED=true` (the property wins), it loads `SwarmModule` by reflection, `Class.forName(...).asSubclass(OptionalModule.class)` (`OptionalModules.java:56-65` for the gate, `:131-139` for the load).
    - Otherwise it returns a shared no-op `OptionalModules.NONE`, so no swarm class is loaded or verified.
-   - Both startup paths call it once, before the listener accepts and outside any request path, so a module that implements `core.HandlerContributor` can mount handlers. `SwarmModule` mounts `/swarm/v1/*` (501 until S1). With the swarm off that class is not loaded and no mount table is installed.
-   - The YAML key `swarm.enabled` replaces the property/env gate in S1 (§12).
+   - Both startup paths call it once, before the listener accepts and outside any request path, so a module that implements `core.HandlerContributor` can mount handlers. `SwarmModule` mounts `SwarmHttp` at `/swarm/v1` (S1b). With the swarm off that class is not loaded and no mount table is installed.
+   - The YAML key `swarm.enabled` (S1, #94) is read last: the property, then the environment variable, then the key; the first one set wins.
    - No existing package used this pattern before #90: `service/Bootstrap.java:43` is only the `"messaging"` capability string, not a gate.
 4. **Off-mode wrk gate** (§13, item 3). It is the backstop, not the proof. wrk cannot resolve a single extra volatile read; tests 1–3 can.
 
-## 4. Task model on messaging (Co-author: Messaging Core; their notes integrated 2026-10-13, pending their review of this text)
+As built in S1, from the gate to the mount. `swarm` itself imports only `core`, `messaging.delivery`, `messaging.ledger`,
+`swarm.wire`, `config.SecureKeyFile` and the root `OptionalModule` interface, and the guard tests above keep every file
+except `OptionalModules` from naming it:
 
-This section is grounded in what is merged: #21 ledger, #33 delivery, #69 snapshots/retention, #37 stats, #39 config schema (doc only). Items marked **GAP** do not exist on master.
+```mermaid
+flowchart TB
+    g["Gate, first one set wins:<br/>-Dsjws.swarm.enabled,<br/>then SJWS_SWARM_ENABLED<br/>(true, any case), then the<br/>YAML key swarm.enabled<br/>(true, yes, on or 1; any<br/>other word fails the load)"]
+    g -->|"off, the default"| off["No swarm class is loaded<br/>and no thread starts.<br/>With messaging off too,<br/>OptionalModules.start<br/>returns at once and<br/>there is no dispatcher.<br/>/swarm/v1 is a<br/>static-file miss: GET<br/>404, POST 405"]
+    g -->|on| ld["Class.forName by name:<br/>sjws_nettask.swarm.SwarmModule.<br/>A load failure is a WARN<br/>and the module is<br/>skipped"]
+    ld --> m["SwarmModule opens the<br/>Swarm (partitions and the<br/>reply poller start on<br/>first use) and reads the<br/>agent tokens. None, or a<br/>bad file: a deny-all<br/>gate, every request is<br/>401"]
+    m --> mt["Before the listener<br/>accepts, contribute()<br/>mounts SwarmHttp at<br/>/swarm/v1, in front of<br/>the request handler"]
+    mt --> rq["Each request: SwarmHttp,<br/>then TaskService and<br/>ReplyRouter over<br/>delivery.Partition"]
+```
+
+## 4. Task model on messaging (Co-author: Messaging Core; their notes integrated 2026-10-13, signed off on #90)
+
+This section is grounded in what is merged: #21 ledger, #33 delivery, #69 snapshots/retention, #37 stats, #39 config schema (parsed and validated, not applied yet). Items marked **GAP** do not exist on master.
 
 ### 4.0 What exists today (single node)
-- A "topic" is **one `Partition`** (`messaging/delivery/Partition.java:52`). Multi-partition topics with key hashing are a **GAP**.
-- There are no message headers or keys. The payload is opaque `byte[]` (`Delivery.java:4-5`, `LedgerEntry.Enqueue` at `LedgerEntry.java:16`), so all swarm metadata rides in a payload envelope until headers exist (**GAP: headers**).
-- There is no broker network protocol and no replication of partitions (**GAP**). The swarm is therefore **single-node** for messaging until those land (§12).
+- A "topic" is **one `Partition`** (`messaging/delivery/Partition.java:53`). Multi-partition topics with key hashing are a **GAP**; the swarm shards a pool over several partitions itself (`sjws.swarm.pool.shards`, topics `tasks.<pool>#i`, §5.1).
+- There are no message headers or keys. The payload is opaque `byte[]` (`Delivery.java:8-9`, `LedgerEntry.Enqueue` at `LedgerEntry.java:16`), so all swarm metadata rides in a payload envelope until headers exist (**GAP: headers**).
+- There is no general broker network protocol and no replication of partitions (**GAP**): `/swarm/v1` is the only network binding of `Partition`'s poll and ack, and `/messaging/v1` serves plain log topics. The swarm is therefore **single-node** for messaging until those land (§12).
 - Stats: `MessagingStats.snapshot()` is lock-free and pull-based, and `MessagingStats.NONE` is used when messaging is off (`messaging/stats/MessagingStats.java:8-16`).
 
 ### 4.1 Mapping onto existing primitives
 | Swarm concept | Existing primitive (master) |
 |---|---|
-| Task queue for a service | Topic `tasks.<pool>` (the pool is the service name from §7). The worker pool is a consumer group; a worker is the `consumer` id in `poll`. Competing consumers are built in: each message is leased to one consumer of the group. |
+| Task queue for a service | Topic `tasks.<pool>` (the pool is the service name from §7; shard `i` is `tasks.<pool>#i` when `sjws.swarm.pool.shards` is above 1). The worker pool is a consumer group; a worker is the `consumer` id in `poll`. Competing consumers are built in: each message is leased to one consumer of the group. |
 | Submit | `Partition.produce(producerId, seq, payload[, durability])` . Dedup on `(producerId, seq)` with a window of 4096 per producer (`DeliveryState.java:40`), durable across restarts via snapshots. |
-| Claim + lease | `Partition.poll(group, consumer, max, visibilityMs)` . It records `LedgerEntry.Deliver(group, offset, consumer, deadlineMs, attempt)` (`LedgerEntry.java:27`). On expiry the message is redelivered on the next poll with `attempt + 1`. |
-| Complete | `Partition.ack(group, offset[, durability])`  |
-| Transient failure (rate limit, tool timeout) | `Partition.nack(group, offset, retryAfterMs)` : `notBefore = now + max(delay, backoff)`. Backoff is `RetryPolicy.backoffMs`, `base << (attempt-1)` capped at `backoffMaxMs`. The default is `RetryPolicy(5, 100, 30_000)` (`RetryPolicy.java:7-20`). |
-| Deterministic failure (bad input) | `Partition.reject(group, offset, reason)`  sends the message straight to the DLQ. |
+| Claim + lease | `Partition.poll(group, consumer, max, visibilityMs)` . It records `LedgerEntry.Deliver(group, offset, consumer, deadlineMs, attempt)` (`LedgerEntry.java:27`). A lease that expires is redelivered by the first poll at or after `deadline + backoffMs(attempt)` (no timer), with `attempt + 1`. |
+| Complete | `Partition.ack(group, offset, attempt[, durability])` (batched: `ack(group, offsets[], attempts[], durability)`)  |
+| Transient failure (rate limit, tool timeout) | `Partition.nack(group, offset, attempt, retryAfterMs)` : `notBefore = now + max(delay, backoff)`. Backoff is `RetryPolicy.backoffMs`, `base << (attempt-1)` capped at `backoffMaxMs`. The default is `RetryPolicy(5, 100, 30_000)` (`RetryPolicy.java:7-20`). |
+| Deterministic failure (bad input) | `Partition.reject(group, offset, attempt, reason)`  sends the message straight to the DLQ. |
 | Worker crash | Lease expiry, which counts as an attempt. |
 | Exhausted | At `maxAttempts` the message moves to `<topic>.dlq` (`Partition.deadLetterQueue()`, `Partition`) with origin group, offset, attempts and reason, e.g. `lease-expired:max-attempts` / `nacked:max-attempts` . |
 | State | `MessageState { ENQUEUED, IN_FLIGHT, ACKED, DEAD_LETTERED }` (`MessageState.java:4`) |
 
-The retry policy is set per topic through the `retry:` block of the #39 schema (`docs/messaging/config.md`). That schema is not parsed by code yet (**GAP**).
+The retry policy is set per topic through the `retry:` block of the #39 schema (`docs/messaging/config.md`). That schema is parsed and validated (`config/MessagingSettings.java`), but no code applies it to a `Partition`'s `RetryPolicy` yet (**GAP**).
 
-### 4.2 Heartbeat = lease extension (Messaging Core, #91 in review)
+### 4.2 Heartbeat = lease extension (Messaging Core, #91 merged)
 - `extend(group, offset, attempt, visibilityMs) → LeaseResult`.
 - Batched form: `extend(group, long[] offsets, int[] attempts, visibilityMs) → List<LeaseResult>`. The attempts travel with the offsets, because a bare list of offsets cannot be fenced.
 - Ledger record: `Extend(group, deadlineMs, offsets[], attempts[])`, **record type 7**. One record is written per call and covers the accepted leases only; replay sets the lease deadlines. A build older than #91 refuses a log that contains it.
 - `LeaseResult` is `{OK, NOT_IN_FLIGHT, STALE_ATTEMPT}`, the same result the fenced settles return (§4.3).
 - Cost: one small append per heartbeat call. Heartbeat at ≤ visibility/3. The #91 bench shows batched heartbeats cost −1.4 % (within noise) and unbatched about −9 %, so **`LeaseKeeper` must use the batched form**.
-- Until #91 merges, the swarm uses fixed leases only.
+- The swarm extends leases with `Partition.extend` (#91); the default claim lease is fixed.
 
 ### 4.3 Fencing (Messaging Core, **#87 merged**)
 - Before #87, `ack`/`nack`/`reject` took `(group, offset)` only, so a stale worker whose lease had expired and been re-leased could settle the *new* attempt.
 - #87 adds fenced forms that carry the `attempt` from `Delivery` as a lease token and return `LeaseResult {OK, NOT_IN_FLIGHT, STALE_ATTEMPT}`.
-- The old unfenced overloads still match any attempt. They are **deprecated now** (`@Deprecated(forRemoval = true)`, pointing at the fenced forms, in a small Messaging Core follow-up) and are **removed after one release**.
+- The old unfenced overloads still match any attempt. They are not yet deprecated: the `@Deprecated(forRemoval = true)` follow-up (pointing at the fenced forms) is pending in Messaging Core, and they are removed one release after it lands.
 - **The swarm SDK and wire protocol expose only fenced settles.** The SDK passes the attempt automatically.
 
 ### 4.4 Results, idempotency, exactly-once
 - **Order:** the worker writes the reply with `Durability.ASYNC` via `produce(…, durability)` and **acks the task only when the reply's durability future completes**. A crash before that redelivers the task, and the caller deduplicates by `taskId`. Results are not lossy. Once partitions replicate, the reply uses the decided majority in-memory ack (`strict` per topic is available), and the task ack follows the reply's replicated ack.
-- **Producer side** (implemented): `(producerId, seq)` dedup. Agents persist `producerId` and a monotonic `seq`, or derive `seq` deterministically (e.g. the step number in a plan), so a publish retried after a crash is dropped.
+- **Producer side** (implemented in `Partition.produce` and `TaskService.submit`; HTTP submits are anonymous, producerId 0, until an `Idempotency-Key` binding lands): `(producerId, seq)` dedup. Agents persist `producerId` and a monotonic `seq`, or derive `seq` deterministically (e.g. the step number in a plan), so a publish retried after a crash is dropped.
 - **Consumer side** (application): delivery is at-least-once, so side effects are keyed by `taskId` (plus `attempt` for fencing). Tools that call external APIs pass `taskId` as their idempotency key (also §10.2).
 - Exactly-once consume-transform-produce would need a cross-partition transaction (**GAP**). It is not proposed for v1.
 
@@ -125,34 +140,80 @@ When headers land (**GAP 3** in §4.8), the metadata fields move to headers and 
 - **Per-key ordering:** a single partition delivers in offset order, but with N concurrent leases tasks run in parallel. Strict per-key order needs `max in-flight per key = 1`.
 
 ### 4.7 Stats
-- `MessagingStats` already exposes, per group: lag, inFlight, acked, deadLettered, redeliveries, dlqDepth and oldestPendingAgeMs. That covers pool dashboards: queue depth, stuck work, retry storms.
-- Per-task detail (attempt history, current worker, lease deadline) comes from `LedgerInspector` pages (`messaging/delivery/LedgerInspector.java:16-27`) for the TUI drill-down, not from the stats provider.
+- `MessagingStats` can expose, per group: lag, inFlight, acked, deadLettered, redeliveries, dlqDepth and oldestPendingAgeMs, once the swarm registers its partitions in a `PartitionStatsRegistry` (not wired on master). That would cover pool dashboards: queue depth, stuck work, retry storms.
+- Per-task detail (attempt history, current worker, lease deadline) comes from `LedgerInspector` pages (`messaging/delivery/LedgerInspector.java:33-38`) for the TUI drill-down, not from the stats provider.
 - **GAP:** per-consumer counters (in-flight per worker, extends, last heartbeat age) in `DeliveryCounts`, plus fixed-bucket latency histograms (enqueue→first delivery, delivery→ack) updated on the partition thread.
 
 ### 4.8 Gap order (Messaging Core)
-1. Attempt-fenced ack/nack/reject (PR #87, **merged**); deprecate the unfenced forms now and remove them after one release.
-2. `extend`, with the `Extend` record (type 7) and the fenced batched form (PR #91, in review).
+1. Attempt-fenced ack/nack/reject (PR #87, **merged**); deprecate the unfenced forms (pending) and remove them one release later.
+2. `extend`, with the `Extend` record (type 7) and the fenced batched form (PR #91, **merged**).
 3. Message headers in `Enqueue`.
 4. Broker-side TTL / `expireAt`.
-5. Multi-partition topics with key hashing; max in-flight per key.
+5. Multi-partition topics with key hashing (the swarm's own pool sharding exists); max in-flight per key.
 6. DLQ redrive; deterministic jitter.
 7. Producer backpressure signal; per-consumer stats and latency histograms.
 8. Producer-id expiry (needed before long-lived agents churn producer ids).
 9. Network protocol and replication (per #17 / HA). These are required before agents run on more than one node.
 
-## 5. Request/reply and token streaming (Co-author: Messaging Core; their notes integrated, pending their review of this text)
+## 5. Request/reply and token streaming (Co-author: Messaging Core; their notes integrated, signed off on #90)
 
 ### 5.1 Request/reply
 - Reply topics are **one per requesting node or process**: `reply.<nodeId|processId>`, demultiplexed in memory by `correlationId` (`correlationId → future`). Each `Partition` owns writer, syncer and snapshotter threads, doubled with its `.dlq`, so a topic per agent would not scale.
-- Reply topics are created **without a DLQ**.
-- They are **closed after 10 minutes idle** (configurable; idle means lag 0 and no polls). The files are kept, the topic reopens on demand, and it is deleted after retention plus a grace period.
+- Reply topics are meant to be created **without a DLQ** (`Partition.open(..., deadLetterQueue = false)`, #106), but `swarm.Topics` still opens them with one.
+- They are **closed after 10 minutes idle** (a `ReplyRouter` constructor argument; idle means no pending call and no reply read). The files are kept and the topic reopens on demand; deletion after retention plus a grace period is not built.
 - A Messaging follow-up adds shared writer/syncer executors.
 - **Deadlines:**
-  - A worker rejects a request whose `deadlineMs` passed before it started (`reject("deadline")`, visible in the DLQ).
-  - The worker sets `visibilityMs ≤ deadlineMs − now`.
+  - `TaskService.claim` rejects a request whose `deadlineMs` passed before it started (`reject("deadline")`, DLQ reason `rejected:deadline`).
+  - `TaskService.claim` shortens a lease that would outlive `deadlineMs`, and `LeaseKeeper` never extends past it (HTTP `:extend` does not check).
   - The requester times out locally and answers the HTTP caller with a 504-class error. A late reply is acked and discarded.
   - Broker-side TTL is §4.6.
 - **Durability:** replies are written with `Durability.ASYNC` (`messaging/ledger/Durability.java`), and the task is acked only after the reply is durable (§4.4). `NONE` is not used for replies: a crash after the ack would lose both the reply and the task.
+
+As built in S1, one request and reply through `/swarm/v1`. Streaming, quotas and tracing are not built yet:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as SwarmHttp
+    participant M as Partition
+
+    C->>S: a caller: POST /swarm/v1/tasks/POOL:call<br/>TASK frame, optional deadlineMs
+    Note over S: token (else 401), size (413), POST only (405),<br/>pool allowed (403)
+    Note over S: the first call, or the first after 10 idle<br/>minutes, opens reply.NODE and starts its<br/>poller thread before it produces
+    S->>M: produce on tasks.POOL, or its shard<br/>with sjws.swarm.pool.shards above 1,<br/>replyTo reply.NODE
+    C->>S: a worker: POST .../tasks/POOL:claim<br/>max, visibilityMs, waitMs
+    S->>M: poll group workers (claim diagram below)
+    M-->>S: tasks leased, attempt n
+    S-->>C: 200, a LEASE frame per task, id<br/>POOL~offset~attempt[.shard] (204: none)
+    C->>S: the worker: POST .../leases/ID:extend
+    S->>M: extend on the lease's shard, fenced by the attempt
+    C->>S: the worker: POST .../leases/ID:reply
+    S->>M: produce on reply.NODE (ASYNC),<br/>then ack the task on its shard, fenced
+    M-->>S: the poller reads the reply and completes<br/>the waiting call by correlation id
+    S-->>C: to the caller: 200 RESULT frame,<br/>or 504 at the deadline
+    Note over S: ack, nack and reject are lease verbs too:<br/>204, or 409 STALE_ATTEMPT or NOT_IN_FLIGHT<br/>when the lease was lost
+```
+
+A claim, as `TaskService.claim` runs it. A pool has one partition unless `sjws.swarm.pool.shards` is above 1; then
+shard 0 is topic `tasks.POOL` and shard `i` is `tasks.POOL#i`, each with its own lock, ledger and dead-letter queue.
+The ready hint of a shard counts tasks submitted to it and not yet claimed by this service, so it ignores
+redeliveries and other processes' submits:
+
+```mermaid
+flowchart TD
+    c0["claim(pool, worker, max, wait)"] --> c1{{"A one-shard pool?"}}
+    c1 -->|yes| c2["Poll its partition,<br/>waiting up to the wait"]
+    c1 -->|no| c3["Sweep the shards from<br/>the worker's home<br/>shard, a hash of its<br/>name. Skip a shard<br/>whose ready hint is 0,<br/>except on a full sweep:<br/>every 64th claim, or<br/>the repeat of a hinted<br/>sweep that found<br/>nothing"]
+    c3 --> c4{{"Anything leased?"}}
+    c4 -->|yes| c5["Fill up to max across the<br/>shards. Each task keeps<br/>its shard"]
+    c4 -->|no| c6{{"Waiting, with time left?"}}
+    c6 -->|no| c7["Return nothing: 204"]
+    c6 -->|yes| c8["Park on the pool until<br/>a submit to any shard,<br/>or 2 ms. Then sweep<br/>again: hinted after a<br/>submit, full after the<br/>2 ms"]
+    c8 --> c3
+```
+
+A settle goes to the task's shard. `TaskService.ackAll` sends one batched fenced ack per shard, and
+`LeaseKeeper` batches its extends per pool and shard.
 
 ### 5.2 Token streaming
 There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP leg is Architecture's.
@@ -166,7 +227,7 @@ There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP l
   - **Consumer:** one consumer per stream, reordering by `chunkSeq`. Gaps after a lease expiry are filled by redelivery. Max in-flight per key = 1 is the later alternative (§4.6).
   - **Durability:** chunks use `NONE`/`ASYNC`. The final `LAST` chunk may use `GROUP` when the caller needs it durable. Per-append durability already exists .
 - **HTTP leg (Architecture).**
-  - The gateway node that holds the caller's session consumes the stream and writes it as HTTP/1.1 chunked (`http1/Http1Writer.java:236-251`), as `text/event-stream` ([WHATWG HTML, Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)), or as h2/h3 DATA frames.
+  - The gateway node that holds the caller's session consumes the stream and writes it as HTTP/1.1 chunked (`http1/Http1Writer.java:346-395`), as `text/event-stream` ([WHATWG HTML, Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)), or as h2/h3 DATA frames.
   - The body is a `core.Body.Stream`, which already pulls one chunk at a time (`routing/ProxyHandler.java:55-58`).
   - A reconnecting caller resumes from its last `chunkSeq`.
 - **Backpressure.**
@@ -236,7 +297,7 @@ Agents register under a **service name**, e.g. `summarize.v1`. The swarm reuses 
 - Quotas and budgets are checked at **submit** and at **LLM call**, never on the static-content path.
 
 ## 9. Tracing across a chain of agents
-- **There is no trace-context propagation on master today.** `rg -i traceparent src` finds nothing. `observe` has metrics, the access log and node reports (`observe/RequestObserver.java:39`, `observe/AccessLog.java`, `observe/ServerMetrics.java`).
+- **There is no trace-context propagation on master today.** `rg -i traceparent src` finds only the swarm's `TaskEnvelope` field and the `ReplyRouter.call` parameter; no code path reads or forwards the header. `observe` has metrics, the access log and node reports (`observe/RequestObserver.java:39`, `observe/AccessLog.java`, `observe/ServerMetrics.java`).
 - The swarm propagates [W3C Trace Context](https://www.w3.org/TR/trace-context/) `traceparent` and `tracestate`:
   - HTTP ingress reads the header;
   - the task envelope carries it (§4.5);
@@ -267,7 +328,7 @@ The swarm parses the backend usage report (the final SSE event, or the JSON `usa
 
 ## 11. Client SDK and wire protocol
 ### 11.1 Python SDK (first)
-`sjws_swarm` is a thin, dependency-light package (stdlib `ssl` + `asyncio`; an optional `httpx` transport). Its API is:
+`sjws_swarm` is a thin, dependency-light package. S1b ships a synchronous stdlib (`urllib`) `Client` with submit, call, claim and the lease verbs; the asyncio API below (stdlib `ssl` + `asyncio`, an optional `httpx` transport) is S2+:
 ```python
 async with Swarm.connect("sjws://gw:7443", cert=..., key=..., ca=...) as s:
     r = await s.call("summarize.v1", payload, deadline=30)            # request/reply
@@ -279,8 +340,8 @@ async with Swarm.connect("sjws://gw:7443", cert=..., key=..., ca=...) as s:
 Trace context is taken from the active OpenTelemetry context when present. The SDK holds no business logic, so other languages port by implementing §11.2.
 
 ### 11.2 Wire protocol (v1)
-The transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existing listeners, `h2` and `h3`, and their flow control. A raw TCP framing can be added later on the same frames.
-- **Unary operations:** `POST /swarm/v1/tasks/{service}` (submit), `POST /swarm/v1/tasks/{service}:claim`, `POST /swarm/v1/leases/{id}:extend`, `POST /swarm/v1/leases/{id}:ack|nack|reject`.
+The target transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existing listeners, `h2` and `h3`, and their flow control; S1 serves `/swarm/v1` behind the bearer-token gate (§6) and is exercised over HTTP/1.1. A raw TCP framing can be added later on the same frames.
+- **Unary operations:** `POST /swarm/v1/tasks/{service}` (submit), `POST /swarm/v1/tasks/{service}:claim`, `POST /swarm/v1/tasks/{service}:call` (request/reply), `POST /swarm/v1/leases/{id}:extend`, `POST /swarm/v1/leases/{id}:ack|nack|reject`, `POST /swarm/v1/leases/{id}:reply`.
 - **Streaming:** `GET /swarm/v1/replies/{session}`, as SSE, or as binary frames when `Accept: application/vnd.sjws.swarm.v1`.
 - **Binary frames:** `[version:u8][type:u8][flags:u8][len:u24][payload]`.
   - The leading version byte follows messaging's format-version decision (`docs/messaging/design.md` §10).
@@ -294,20 +355,22 @@ The transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existing liste
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
 | S0 | **Done (#90).** This design, plus the guard tests from §3.3 (dependency and class-load) and the single entry point, merged before any swarm code | Tests green on master ✅; Messaging Core sign-off on §4–§5 ✅, received on #90 (https://github.com/BlivionIaG/sjws_nettask/pull/90#pullrequestreview-5500560114) with three doc fixes, all applied here. **S0 exit criteria met.** |
-| S1 | Uses the Messaging Core fencing PR **#87** ("fence ack/nack/reject with the delivery attempt (lease token)"), which ships separately. `swarm` package: submit, claim with fixed lease, fenced ack/nack/reject, DLQ, request/reply via `reply.<nodeId|processId>`; `swarm.wire` codec; Python SDK unary. **Shipped early in S1 (S1b, #102):** messaging gap 2 (`Partition.extend`, batched and fenced, `Extend` record type 7) and the batched `LeaseKeeper` (`src/sjws_nettask/swarm/LeaseKeeper.java`), used by `TaskService.extend` and `/swarm/v1/leases/{id}:extend`. **Decided (2026-10-13, inceptor):** (a) the YAML key `swarm.enabled` is added in S1 together with Config & ACME, which owns `ConfigLoader`; the `-Dsjws.swarm.enabled` / `SJWS_SWARM_ENABLED` gate stays in use until then. (b) S1 adds a class-load test that starts a real `data`/`gateway` role process, using a CP fixture from Integration Tests, and asserts that no `sjws_nettask.swarm.` class is loaded with the swarm off | #87 merged; `swarm.enabled` YAML key parsed (off by default); data/gateway role class-load test green; §3.3 tests green; off-mode gate (§13) within band; task-dispatch and request/reply targets (§13) met or recorded |
-| S2 | Exit tests for the S1 `extend`/`LeaseKeeper` (S2a); ledger token streaming (`chunkSeq` framing + HTTP leg), the default; cancellation; W3C trace propagation; `AgentPolicy` document and the agent intermediate CA; GCRA quotas; `BudgetLedger` with the **soft global cap** (§8) | Stale-worker fencing and lease-expiry redelivery tests; heartbeat and streaming targets (§13); trace spans across 3 hops; mTLS-only agent auth with agent-CA revocation tests; 429 + `Retry-After` tests; a budget test asserting that the overshoot stays within the §8 bound |
+| S1 | Uses the Messaging Core fencing PR **#87** ("fence ack/nack/reject with the delivery attempt (lease token)"), which ships separately. `swarm` package: submit, claim with fixed lease, fenced ack/nack/reject, DLQ, request/reply via `reply.<nodeId|processId>`; `swarm.wire` codec; Python SDK unary. **Shipped early in S1:** messaging gap 2 (`Partition.extend`, batched and fenced, `Extend` record type 7, #91) and the batched `LeaseKeeper` (`src/sjws_nettask/swarm/LeaseKeeper.java`, #97), which calls `TaskService.extend`. `/swarm/v1/leases/{id}:extend` (#102) extends one lease per call; `LeaseKeeper` is not wired to HTTP. **Decided (2026-10-13, inceptor), done:** (a) the YAML key `swarm.enabled` (#94); the property and environment gate still take precedence over it. (b) a class-load test that starts a real `data`/`gateway` role process, using a CP fixture from Integration Tests, and asserts that no `sjws_nettask.swarm.` class is loaded with the swarm off (`RoleClassLoadTest`, #95) | #87 merged; `swarm.enabled` YAML key parsed (off by default); data/gateway role class-load test green; §3.3 tests green; off-mode gate (§13) within band; task-dispatch and request/reply targets (§13) met or recorded |
+| S2 | Exit tests for the S1 `extend`/`LeaseKeeper` (S2a, done: `LeaseExitTest`, #164); ledger token streaming (`chunkSeq` framing + HTTP leg), the default; cancellation; W3C trace propagation; `AgentPolicy` document and the agent intermediate CA; GCRA quotas; `BudgetLedger` with the **soft global cap** (§8) | Stale-worker fencing and lease-expiry redelivery tests; heartbeat and streaming targets (§13); trace spans across 3 hops; mTLS-only agent auth with agent-CA revocation tests; 429 + `Retry-After` tests; a budget test asserting that the overshoot stays within the §8 bound |
 | S3 | **Hard per-node budget sub-allocation by the CP**; `AgentDirectory` discovery for push-style agents | Sub-allocation tests (no node exceeds its grant; re-grant on node loss) |
 | S4 | `LlmGateway` (weighted routing, circuit breaking, retries only with `Idempotency-Key`, usage accounting); the opt-in **direct** token path for HTTP-gateway clients, with the final result still in the ledger (§5.2); OTLP exporter | Fault-injection tests (backend down, mid-stream abort); a test that a direct stream always produces a ledger result; wrk2 latency through the gateway |
 | S5 | Other SDKs | SDK conformance suite green |
 
-**S2 security note (2026-10-13).** `/swarm/v1` (`src/sjws_nettask/swarm/SwarmHttp.java`) has **no built-in authentication or authorization** on master: any client that reaches the listener can submit, claim and settle tasks on any pool. Until S2d lands, enable the swarm only on a trusted network. S2d (`AgentPolicy` + agent intermediate CA, §6) must be **deny by default**: a request without a verified agent identity, or whose identity lacks the permission for the target pool, is refused, and missing policy or trust material refuses to mount (fail closed, AGENTS.md *Security*).
+**S2 sub-phase labels.** S2a = exit tests for the S1 `extend`/`LeaseKeeper` (done: `LeaseExitTest`, #164); S2d = `AgentPolicy` document + agent intermediate CA (§6). The other S2 deliverables in the table above are not yet assigned sub-phase labels.
+
+**S2 security note.** On master, `/swarm/v1` is admitted only through the interim `SwarmGate`/`TokenGate` (§6): deny by default, bearer tokens per agent and pool. It does **not** bind a lease to the claiming agent, rate-limit failed authentication, or rotate tokens. S2d (`AgentPolicy` + agent intermediate CA, §6) replaces the implementation behind the same interface and must stay deny by default and fail closed when policy or trust material is missing (AGENTS.md *Security*).
 
 **Deferred items (recorded 2026-10-13, not scheduled in a phase yet):**
-- **Deadline sweeper.** Expired HTTP claims are dropped by a linear scan of the claimed-lease cache on every claim (`SwarmHttp.sweep`, `src/sjws_nettask/swarm/SwarmHttp.java`), and expired tasks are only noticed when claimed (`TaskService.claim`). Replace this with a hashed timing wheel (one thread, O(1) insert/cancel per lease or deadline), shared with the graph runner's per-shard step timers (graphs §6.2).
+- **Deadline sweeper.** Expired HTTP claims are dropped by a linear scan of the claimed-lease cache on every claim (`SwarmHttp.sweep`, `src/sjws_nettask/swarm/SwarmHttp.java`), and expired tasks are only noticed when claimed (`TaskService.claim`). Replace this with a hashed timing wheel (one thread, O(1) insert/cancel per lease or deadline), using the same timing-wheel implementation as the graph runner's per-shard step timers (graphs §6.2), not the same instance: graphs §6.2 specifies a per-shard wheel owned by the shard's runner thread (single-writer, graphs §5), so sharing an instance would add a cross-thread handoff.
 - **Reply-ack thread outlives `Swarm.close()`.** The durability-then-ack executor (`ACKER` in `src/sjws_nettask/swarm/TaskService.java`) is a static single-thread executor, so it is not shut down by `Swarm.close()` / `SwarmModule.close()` and survives module reloads. Make it owned by `Swarm` (closed with it, after pending acks drain) and add a test that no swarm thread remains after close.
 
 ## 13. Benchmark plan
-All runs report the machine (CPU model, vCPU count, RAM, disk, kernel, JDK) and the commit. Every A/B comparison uses **≥ 5 alternating runs** (master, branch, master, …), reported as mean ± stddev, as Messaging Core did for #69. The load generator and the server are pinned to disjoint CPUs with `taskset`.
+All runs report the machine (CPU model, vCPU count and the worker count, RAM, disk, kernel, JDK) and the commit. Every A/B comparison uses **≥ 5 alternating runs** (master, branch, master, …), reported as mean ± stddev, as Messaging Core did for #69. The load generator and the server are pinned to disjoint CPUs with `taskset`.
 
 **Messaging baseline already measured** (PR #69 body: `DeliveryBench`, ASYNC, 256 B, 5 alternating runs):
 - produce ×1: 74,342 ± 3,230 ops/s
@@ -326,11 +389,29 @@ These are the reference points for the targets below. Neither this PR nor the ta
 | Heartbeat/extend (10k leases, every 5 s) | ≤ 2k appends/s; < 2 % throughput loss vs no heartbeats |
 | Request/reply round trip (in-process) | p50 < 50 µs, p99 < 500 µs at 10k req/s |
 | Token streaming (1 KiB chunks, 1k concurrent streams) | ≥ 100 MiB/s aggregate, in order, chunk p99 < 1 ms producer→consumer |
-| Lease-expiry redelivery | within visibility + 10 ms |
+| Lease-expiry redelivery | within visibility + backoff + 10 ms (visibility + 10 ms with `backoffBaseMs = 0`) |
 | Recovery with 1 M in-flight tasks | < 5 s |
 | Off | wrk within the noise band; no messaging threads |
 
 **S1c gate (decided 2026-10-14, inceptor).** The S1c latency gate is: claim p99 < 100 µs on the task-dispatch row, heartbeat loss < 2 %, and request/reply p99 < 500 µs. Dispatch is measured with **workers = the machine's vCPU count**, and every result states that core count. The reference box has 8 vCPU, so the gate is `SwarmBench dispatch 8`. The 16-worker run (16 on 8 vCPU) is reported as a **stress line, not the gate**: with more runnable workers than cores, a lock holder can be descheduled mid-section, so its p99 measures scheduling as much as code. The batched variant (`SwarmBench batched <W>x<B>`: claim up to `B` and settle with one batched fenced ack, `TaskService.ackAll`) is reported separately and is not the gate, because its claim latency is per batch, not per task. The §13 claim-1/ack-1 workload stays as it is.
+
+**S1c result: NOT PASSED (re-measured 2026-10-14, 05:29–05:56 CEST).** An earlier PASSED call, based on the median of per-run p99s from the #176 quiet-window runs, was withdrawn by inceptor. **Gate statistic:** the mean ± stddev of the per-run p99 across ≥ 5 runs; no median.
+- **Setup:** commit `3097866` (master `1e09588` + bench fixes), OpenJDK 25.0.4.1, 8 vCPU, default G1, `-Dsjws.swarm.pool.shards=4`. Every run was under `flock /tmp/sjws-bench.lock`, with `nice -n 10 taskset -c 0-7` (the load generator and the server share those 8 CPUs; they are not disjoint). Raw output: `bench/results/s1c-2026-10-14.txt`.
+- **Load rule:** every run starts with the 1-minute load < 4. Request/reply runs whose peak or end load reached 4 were discarded and retried. Session load: 3.95 at the start, peak 10.25, 3.27 at the end. **Caveat:** `dispatch 8` and `heartbeat` keep 8 or more threads runnable on 8 vCPU, so they push the 1-minute load above 4 by themselves (peaks 4.7–6.7). Those runs are kept and marked self-loaded in the raw file.
+
+| Metric (gate) | Command | Per-run values | Mean ± stddev | Verdict |
+|---|---|---|---|---|
+| Request/reply p99 (< 500 µs) | `SwarmBench reqreply 10000 10` (1 worker) | 1290 / 289 / 668 / 2629 / 2332 µs | **1441 ± 1019 µs** | **FAIL** |
+| Claim p99 (< 100 µs) | `SwarmBench dispatch 8 5` (workers = 8 = vCPU) | 26.7 / 23.3 / 27.0 / 23.4 / 24.4 µs; 495k ± 29k tasks/s | 25.0 ± 1.8 µs | pass (self-loaded) |
+| Heartbeat loss (< 2 %) | `SwarmBench heartbeat off` / `keeper 20`, 10 000 leases held, alternating | 3.2 / 4.1 / 5.8 / −3.3 / 0.4 % | **2.0 ± 3.5 %** (mean 2.04) | **FAIL** (and within noise) |
+
+Not the gate, reported as extras:
+- **Multi-worker request/reply** (`reqreply-mw 4x10000 10`, G1): per-run p99 1346 / 2226 / 1539 / 2504 / 1622 µs, mean 1848 ± 493 µs.
+- **ZGC request/reply** (`-XX:+UseZGC reqreply 10000 10`): per-run p99 1604 / 790 / 912 / 1023 / 203 µs, mean 906 ± 502 µs.
+- **Failures:** 0 failed and 0 missing calls in every request/reply run (100 000 of 100 000 each). Failures are counted as failures, never as 0 µs samples.
+
+**Root cause (open).** The request/reply p50 is about 27–32 µs in every run, but the p99 varies 9× between runs at similar load. That points to tail events outside the steady path rather than per-call cost. #176's JFR attributed the tail to G1 young-collection pauses. That attribution is not re-verified here, and ZGC is still above the gate (906 µs mean), so GC is unlikely to be the whole cause. Two other factors are untested: the generator and server share CPUs, and other tenants on the box. Heartbeat loss is dominated by run-to-run noise (stddev 3.5 points). A decision needs disjoint CPU sets for the generator and server, and a box free of other jobs.
+- **Known limit, not a gate:** `shards=1` on G1 (#176 quiet window: p99 896 µs).
 
 **Architecture additions:**
 1. **Streaming over HTTP:** time-to-first-token and inter-token latency added by sjws, agent emit → caller receive, on HTTP/1.1 chunked, SSE, h2 and h3. Ledger leg vs the optional direct path (§5.2).
@@ -339,13 +420,14 @@ These are the reference points for the targets below. Neither this PR nor the ta
    - `wrk -t4 -c128 -d30s --latency`, plus `wrk2 -R` below saturation, against a 1 KiB static file.
    - Master vs branch with `swarm.enabled=false`, in standalone and `data`/`gateway` mode, alternating and CPU-pinned.
    - Pass when the difference lies within the measured A/A spread.
-   - Request-path cost is also asserted by the §3.3 tests: no `sjws_nettask.swarm.` class loaded, and (per Messaging Core) no `sjws_nettask.messaging.` class loaded when neither swarm nor messaging is configured. The latter check is already the pattern of `tests/sjws_nettask/cp/ClassLoadTest.java`.
+   - `tools/swarm-off-ab/swarm-off-ab.sh` scripts the wrk part in standalone and YAML-off mode (manual, not run in CI); wrk2 and `data`/`gateway` mode are not scripted.
+   - Request-path cost is also asserted by the §3.3 tests: no `sjws_nettask.swarm.` class loaded. The matching `sjws_nettask.messaging.` check (per Messaging Core, neither configured) is still to be added, in the pattern of `tests/sjws_nettask/cp/ClassLoadTest.java`.
 
 ## 14. Risks
 | Risk | Mitigation |
 |---|---|
 | The swarm leaks into core paths over time | §3.3 tests fail the build; reviewer checklist |
-| Missing lease extension forces long leases, so failure detection is slow | S2 depends on `Partition.extend`; S1 documents the fixed-lease limit |
+| Missing lease extension forces long leases, so failure detection is slow | `Partition.extend` and the batched `LeaseKeeper` shipped in S1 (#91, #97); the S2a exit tests are in `LeaseExitTest` |
 | Token-per-message ledger write amplification | Chunks coalesced to 1–4 KiB or 20 ms (§5.2); opt-in direct path for ephemeral HTTP token streams only (decided, §5.2) |
 | Direct-path stream lost on gateway failure | Not resumable by design; the final result is always in the ledger (§5.2) |
 | Stale worker acks a re-leased attempt | Attempt-fenced ack/nack/reject (#87) and extend (§4.3), used exclusively by the swarm |
@@ -373,5 +455,5 @@ Messaging Core answered every remaining question in its sign-off (https://github
 2. **Inline payload:** 1 MiB maximum by default, configurable per topic, with a 64 MiB hard limit (`RecordBatch.MAX_FRAME_BYTES`). Above that, use a by-reference blob store **owned by the swarm**, not messaging (§5.2).
 3. **Replicated results:** the decided majority in-memory ack, with `strict` per topic; the task ack follows the reply's replicated ack (§4.4).
 4. **Network protocol:** the swarm wire protocol (§11.2) is the **first network binding of `Partition`**. Its frames are defined generically (produce, poll, ack, nack, reject, extend, with lease tokens) and referenced from `docs/messaging/design.md` §10, rather than building a parallel broker protocol.
-5. **Reply topics:** one per node or process, `reply.<nodeId|processId>`, demultiplexed by `correlationId`. No DLQ; closed after 10 minutes idle, reopened on demand, deleted after retention plus a grace period (§5.1).
-6. **Unfenced settles:** deprecated now (#87 is merged) and removed after one release. The swarm exposes only fenced settles (§4.3).
+5. **Reply topics:** one per node or process, `reply.<nodeId|processId>`, demultiplexed by `correlationId`. Meant to have no DLQ (§5.1); closed after 10 minutes idle and reopened on demand; deletion after retention plus a grace period is not built.
+6. **Unfenced settles:** to be deprecated in a Messaging Core follow-up (#87 is merged) and removed one release later. The swarm exposes only fenced settles (§4.3).
