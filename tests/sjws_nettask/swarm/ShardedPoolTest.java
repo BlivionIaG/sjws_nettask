@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
@@ -153,5 +154,53 @@ class ShardedPoolTest {
         var got = waiter.get(20, TimeUnit.SECONDS);
         assertEquals(1, got.size());
         assertTrue(got.get(0).shard() != home);
+    }
+
+    @Test
+    void poolCountsAndDeadLettersAggregateAcrossShards() {
+        int n = 40;
+        for (int i = 1; i <= n; i++) this.tasks.submit("p", 0, 0, env("d" + i)); // round-robin: 10 per shard
+        var shardsRejected = new HashSet<Integer>();
+        int acked = 0, rejected = 0;
+        for (var got = this.tasks.claim("p", "w", 5, 60_000); !got.isEmpty(); got = this.tasks.claim("p", "w", 5, 60_000)) {
+            for (var t : got) {
+                if (t.offset() % 3 == 0) { assertEquals(LeaseResult.OK, this.tasks.reject(t, "bad")); rejected++; shardsRejected.add(t.shard()); }
+                else if (t.offset() % 3 == 1) { assertEquals(LeaseResult.OK, this.tasks.ack(t)); acked++; }
+                // the rest stay in flight
+            }
+        }
+        assertTrue(shardsRejected.size() > 1, "dead letters on several shards: " + shardsRejected);
+        var c = this.tasks.counts("p");
+        assertEquals(4, c.shards());
+        assertEquals(acked, c.workers().acked());
+        assertEquals(rejected, c.workers().deadLettered());
+        assertEquals(n - acked - rejected, c.workers().inFlight());
+        assertEquals(rejected, c.deadLetterQueueSize());
+        assertTrue(c.oldestUnresolvedAtMs() > 0);
+        assertEquals(4, this.tasks.deadLetterQueues("p").size());
+        var dead = this.tasks.pollDeadLetters("p", "audit", "a", 1000, 60_000);
+        assertEquals(rejected, dead.size());
+        var seen = new HashSet<Integer>();
+        for (var d : dead) {
+            seen.add(d.shard());
+            assertEquals("rejected:bad", d.delivery().originReason());
+            assertTrue(this.tasks.deadLetters("p", d.shard()).ack("audit", d.delivery().offset()));
+        }
+        assertEquals(shardsRejected, seen);
+        assertTrue(this.tasks.pollDeadLetters("p", "audit", "a", 1000, 60_000).isEmpty());
+    }
+
+    @Test
+    void unshardedPoolCountsEqualThePartitionsOwn() {
+        var one = new TaskService(this.topics, 1);
+        for (int i = 1; i <= 5; i++) one.submit("u", 1, i, env("u" + i));
+        var t = one.claim("u", "w", 2, 60_000);
+        one.ack(t.get(0));
+        one.reject(t.get(1), "x");
+        var c = one.counts("u");
+        var own = one.partition("u").counts().groups().get(TaskService.WORKERS).counts();
+        assertEquals(own, c.workers());
+        assertEquals(1, c.deadLetterQueueSize());
+        assertEquals(List.of(one.deadLetters("u")), one.deadLetterQueues("u"));
     }
 }
