@@ -211,7 +211,7 @@ final class MessagingHttp implements Handler {
         var records = records(request);
         var log = this.topics.get(topic, true);
         try {
-            long base = log.writer().append(records, durability).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            long base = log.appender().append(records, durability).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             var json = "{\"baseOffset\":" + base + ",\"count\":" + records.size() + "}";
             var effective = durability != null ? durability : this.topics.durability(topic);
             var h = ResponseHeaders.of().set("content-type", "application/json")

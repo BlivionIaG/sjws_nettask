@@ -42,6 +42,11 @@ final class LogTopics implements AutoCloseable {
         Log(SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantReadWriteLock reads) {
             this(log, writer, reads, false);
         }
+
+        /** The append seam for this topic (today the writer itself). */
+        sjws_nettask.messaging.ledger.PartitionAppender appender() {
+            return writer;
+        }
     }
 
     private final Path dir;
