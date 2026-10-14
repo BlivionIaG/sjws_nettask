@@ -33,7 +33,18 @@ import java.util.Objects;
  */
 public record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
         long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis, Duration relaxedSyncDelay,
-        long relaxedSyncEntries) {
+        long relaxedSyncEntries, int maxSnapshotBytes) {
+
+    /** Default {@link #maxSnapshotBytes}: 64 MiB. */
+    public static final int DEFAULT_MAX_SNAPSHOT_BYTES = 64 << 20;
+
+    /** Before the snapshot size limit was configurable: {@link #DEFAULT_MAX_SNAPSHOT_BYTES}. */
+    public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
+            long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis, Duration relaxedSyncDelay,
+            long relaxedSyncEntries) {
+        this(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred, failbackHysteresis,
+                relaxedSyncDelay, relaxedSyncEntries, DEFAULT_MAX_SNAPSHOT_BYTES);
+    }
 
     /** Next-tick fsync, no entry cap: the behaviour before the bound was configurable. */
     public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
@@ -76,6 +87,9 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
         if (relaxedSyncEntries < 1) {
             throw new IllegalArgumentException("relaxedSyncEntries");
         }
+        if (maxSnapshotBytes < 1) {
+            throw new IllegalArgumentException("maxSnapshotBytes");
+        }
     }
 
     public long leaseNanos() {
@@ -84,12 +98,12 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
 
     public GroupOptions withPreferred(Duration failbackHysteresis) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, true,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
     }
 
     public GroupOptions withFailback(Duration failbackHysteresis) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
     }
 
     /**
@@ -98,7 +112,7 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
      */
     public GroupOptions withRelaxedSyncBound(Duration delay, long entries) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
-                failbackHysteresis, delay, entries);
+                failbackHysteresis, delay, entries, maxSnapshotBytes);
     }
 
     /** {@code snapshotEveryEntries} value that never triggers an automatic snapshot. */
@@ -107,7 +121,17 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
     /** Automatic snapshots off: the log grows until the application calls {@link SnapshotControl#take}. */
     public GroupOptions withoutAutoSnapshot() {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, NO_AUTO_SNAPSHOT, preferred,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
+    }
+
+    /**
+     * Largest snapshot image accepted: from a {@link SnapshotTaker} (a larger one is skipped and
+     * counted, like a failing taker), in {@link SnapshotControl#install}, and when a durable
+     * snapshot is loaded on open.
+     */
+    public GroupOptions withMaxSnapshotBytes(int bytes) {
+        return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, bytes);
     }
 
     public boolean autoSnapshot() {

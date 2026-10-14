@@ -107,6 +107,8 @@ final class RaftGroup {
     private long snapIndex;
     private long snapTerm;
     private byte[] snapData = new byte[0];
+    /** Snapshot images refused or skipped: a taker that threw, returned null or exceeded maxSnapshotBytes. */
+    private long skippedSnapshots;
     private SnapshotTaker taker;
     private boolean takerInFlight;
     private boolean relaxedDirty;
@@ -149,6 +151,29 @@ final class RaftGroup {
         this.listener = listener;
         this.deliveries = new DeliveryExecutor(groupId.value(), deliveryLagLimit);
         this.voters.addAll(voters);
+        LogSnapshot restored = null;
+        if (!witness && storage.persistsSnapshots()) {
+            try {
+                restored = storage.loadSnapshot(groupId, options.maxSnapshotBytes());
+            } catch (IOException failed) {
+                throw new UncheckedIOException("cannot load the durable snapshot of " + groupId, failed);
+            }
+        }
+        if (restored != null) {
+            // The log prefix through this index may be gone from disk: the image replaces it.
+            this.snapIndex = restored.lastIncludedIndex();
+            this.snapTerm = restored.lastIncludedTerm();
+            this.snapData = restored.data();
+            this.commitIndex = snapIndex;
+            this.lastApplied = snapIndex;
+            var image = restored;
+            deliveries.submit(() -> {
+                var current = this.listener;
+                if (current != null) {
+                    current.onSnapshotRestored(image);
+                }
+            }, snapIndex);
+        }
         try {
             if (storage.hasHardState(groupId)) {
                 this.term = storage.hardStateTerm(groupId);
@@ -161,6 +186,9 @@ final class RaftGroup {
                 // A witness keeps no entries; its forced cursor carries the term it last acked.
                 long last = witness ? 0L : storage.lastIndex(groupId);
                 this.term = witness ? storage.witnessTerm(groupId) : last == 0 ? 0L : storage.termAt(groupId, last);
+                if (restored != null && restored.lastIncludedTerm() > term) {
+                    this.term = restored.lastIncludedTerm();
+                }
                 this.votedFor = term == 0 ? null : self;
             }
         } catch (IOException failed) {
@@ -1187,6 +1215,27 @@ final class RaftGroup {
         return new NotLeaderException(groupId, Optional.ofNullable(leader));
     }
 
+    /**
+     * Under the lock, before any log prefix is deleted: the current snapshot must be durable, or
+     * a restart would have neither the entries nor the image. Refuses on a storage without snapshots.
+     */
+    private void persistSnapshotBeforePrefixDelete() throws IOException {
+        if (!storage.persistsSnapshots()) {
+            throw new IllegalStateException("group " + groupId.value() + ": the log storage keeps no durable snapshot,"
+                    + " so deleting the log prefix would lose committed state on restart; refused");
+        }
+        storage.saveSnapshot(groupId, new LogSnapshot(groupId, snapIndex, snapTerm, snapData));
+    }
+
+    long skippedSnapshots() {
+        lock.lock();
+        try {
+            return skippedSnapshots;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void snapshotThrough(long index) {
         try {
             var out = new ByteArrayOutputStream();
@@ -1196,6 +1245,10 @@ final class RaftGroup {
                 if (data != null && data.length > 0 && (data[0] == USER || data[0] == USER_STRICT)) {
                     out.write(data, 1, data.length - 1);
                 }
+            }
+            if (out.size() > options.maxSnapshotBytes()) {
+                skippedSnapshots++;
+                return;
             }
             snapData = out.toByteArray();
             snapTerm = termAt(index);
@@ -1221,9 +1274,20 @@ final class RaftGroup {
                     done.completeExceptionally(failed);
                 }
             }
+            if (image != null && image.length > options.maxSnapshotBytes()) {
+                var tooBig = new IllegalStateException("snapshot image of " + image.length
+                        + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes());
+                image = null;
+                if (done != null) {
+                    done.completeExceptionally(tooBig);
+                }
+            }
             lock.lock();
             try {
                 takerInFlight = false;
+                if (image == null) {
+                    skippedSnapshots++;
+                }
                 if (image != null && index > snapIndex) {
                     snapTerm = termAt(index);
                     snapIndex = index;
@@ -1541,15 +1605,35 @@ final class RaftGroup {
             if (!snapshot.groupId().equals(groupId)) {
                 throw new IllegalArgumentException("group");
             }
+            if (snapshot.data().length > options.maxSnapshotBytes()) {
+                throw new IllegalArgumentException("snapshot image of " + snapshot.data().length
+                        + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes());
+            }
             lock.lock();
             try {
-                snapIndex = snapshot.lastIncludedIndex();
+                long index = snapshot.lastIncludedIndex();
+                if (index <= snapIndex) {
+                    throw new IllegalArgumentException("stale snapshot: index " + index + " does not advance past "
+                            + snapIndex);
+                }
+                long local = termAt(index);
+                if (local != 0 && local != snapshot.lastIncludedTerm()) {
+                    throw new IllegalArgumentException("snapshot term " + snapshot.lastIncludedTerm()
+                            + " conflicts with the local log's term " + local + " at index " + index);
+                }
+                var previous = new long[] {snapIndex, snapTerm};
+                var previousData = snapData;
+                snapIndex = index;
                 snapTerm = snapshot.lastIncludedTerm();
                 snapData = snapshot.data();
                 try {
+                    persistSnapshotBeforePrefixDelete();
                     storage.truncatePrefix(groupId, snapIndex);
-                } catch (IOException failed) {
-                    throw new UncheckedIOException(failed);
+                } catch (IOException | RuntimeException failed) {
+                    snapIndex = previous[0];
+                    snapTerm = previous[1];
+                    snapData = previousData;
+                    throw failed instanceof IOException io ? new UncheckedIOException(io) : (RuntimeException) failed;
                 }
                 if (commitIndex < snapIndex) {
                     commitIndex = snapIndex;
@@ -1572,16 +1656,23 @@ final class RaftGroup {
                     future.completeExceptionally(new IllegalArgumentException("not snapshotted"));
                     return future;
                 }
-                try {
-                    storage.truncatePrefix(groupId, ackedThrough);
-                } catch (IOException failed) {
-                    future.completeExceptionally(failed);
-                    return future;
-                }
                 var current = new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
                 var compacted = compactor.compact(current);
                 if (compacted != null) {
+                    if (compacted.length > options.maxSnapshotBytes()) {
+                        future.completeExceptionally(new IllegalStateException("compacted image of "
+                                + compacted.length + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes()));
+                        return future;
+                    }
                     snapData = compacted;
+                }
+                try {
+                    // Durable image first: after a restart the deleted prefix is rebuilt from it.
+                    persistSnapshotBeforePrefixDelete();
+                    storage.truncatePrefix(groupId, ackedThrough);
+                } catch (IOException | RuntimeException failed) {
+                    future.completeExceptionally(failed);
+                    return future;
                 }
                 future.complete(null);
             } finally {

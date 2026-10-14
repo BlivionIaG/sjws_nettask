@@ -28,4 +28,16 @@ public record LogSnapshot(GroupId groupId, long lastIncludedIndex, long lastIncl
             throw new IllegalArgumentException("snapshot");
         }
     }
+
+    /**
+     * CRC32C over index, term and image, for a snapshot that crossed a process or disk boundary.
+     * Pass it to {@link SnapshotControl#install(LogSnapshot, int)} on the receiving side.
+     */
+    public int crc32c() {
+        var crc = new java.util.zip.CRC32C();
+        var head = java.nio.ByteBuffer.allocate(16).putLong(lastIncludedIndex).putLong(lastIncludedTerm);
+        crc.update(head.array());
+        crc.update(data);
+        return (int) crc.getValue();
+    }
 }
