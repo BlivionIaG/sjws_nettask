@@ -74,7 +74,7 @@ Columns: g1, g1tuned, zgc, zgcpinned, serial. `http_after` = whole HTTP server r
 
 ## Allocation on the swarm request/reply path (JFR, default G1, shards=1, 10k req/s, 12 s)
 
-`bench/gc/alloc-profile.sh 1`: 1.9 GiB sampled (`jdk.ObjectAllocationSample`) for 120k calls ≈ 16 KiB per call. That run's p99 was 1323 µs. `byte[]` is 36% of it. Top first-party sites:
+`bench/gc/alloc-profile.sh 1`: 1.9 GiB sampled (`jdk.ObjectAllocationSample`) for ~140k calls including the 2 s warm-up (≈14 KiB per call, an upper bound since it includes background threads). That run's p99 was 1323 µs. `byte[]` is 36% of it. Top first-party sites:
 
 | share | site | what | proposal (owner) |
 |---|---|---|---|
@@ -89,7 +89,7 @@ Columns: g1, g1tuned, zgc, zgcpinned, serial. `http_after` = whole HTTP server r
 | 3.2% | `RecordBatch.crc:53` | `duplicate()` per CRC | `CRC32C.update(buf, off, len)` via absolute access (Messaging Core) |
 | 2.2% + 1.7% | `ReplyRouter.call:125/119` | `orTimeout`+`whenComplete` per call, `body.clone()` | shared timeout wheel; take ownership of the body (Agent Swarm, already in progress) |
 
-These are proposals only; the swarm and messaging code was not edited here. Together, the listed sites are about 43% of sampled bytes.
+These are proposals only; the swarm and messaging code was not edited here. Together, the listed sites are about 48% of sampled bytes.
 
 ## Gaps
 
