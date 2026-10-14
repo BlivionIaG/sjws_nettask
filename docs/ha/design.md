@@ -24,8 +24,44 @@ config file format and ACME (`ConfigSource`, `CertProvider`), reverse proxy, the
 backend (`MetricsSink`), daemon/service mode (signals, PID), and the CI workflow. `HaSettings`
 is attached in code (`SjwsServer.start(config, ha)`). This workstream does not add flags to
 `ServerConfig` — that parser, `--help`, and the docs option tables stay with the config
-workstream. The process shutdown hook in `Sjws_nettask.serve` still calls `close()`; signal
-wiring that should drain instead belongs to daemon mode, which can call `Lifecycle.drain()`.
+workstream. The process shutdown hook calls `SjwsServer.drain()`, which is `close()` when HA
+is detached, and otherwise `Lifecycle.drain()` followed by `close()`.
+
+What the code has today. Solid boxes run in a shipped process (`java -jar`). Dotted boxes are built, but a shipped
+process never reaches them. `HaSettings` is attached only by tests, embedders and the HA bench, and
+`GenerationSync` and `VipFence` have no caller in `src` at all. The one shipped user of Raft is the control role
+(`cp.CpStore`), which is not an HA node: with `cp.peers` its voters talk over `TcpTransport`. The YAML `ha:`
+section is validated and starts nothing yet. The dashed box lists what is still only designed:
+
+```mermaid
+flowchart LR
+        hh["HaHandler: probes,<br/>then the published<br/>generation, else the<br/>config snapshot"]
+        hb["HealthBoard: precomputed<br/>probes. Nothing sets<br/>quorumOk yet"]
+        sh["SnapshotHolder: atomic<br/>publish. Nothing<br/>publishes yet"]
+        lc["Lifecycle.drain() and<br/>ClientManager hooks"]
+        gs["GenerationSync: STAGE<br/>and ACTIVATE over Raft"]
+        vip["VipHook, VipFence,<br/>FailoverPolicy: fed the<br/>leader and its lease<br/>by a caller"]
+        hh --> hb
+        hh --> sh
+        lc --> hb
+        raft["RaftGroup and<br/>ReplicatedNode. Shipped:<br/>cp-config, RELAXED, one<br/>voter or a set of 3, 5<br/>or 2 + witness. Tests<br/>also run STRICT"]
+        pol["QuorumPolicy and VoterSet"]
+        tcp["TcpTransport"]
+        sim["SimTransport:<br/>in process, one voter"]
+        mem["Membership detector and<br/>HeartbeatService:<br/>authenticated UDP<br/>heartbeats, not connected<br/>to Raft"]
+        raft --> pol
+        raft --> tcp
+        raft --> sim
+    cp["cp.CpStore, the shipped<br/>user: group cp-config,<br/>one voter in process, or<br/>voters over TCP with<br/>cp.peers"]
+    gs --> raft
+    cp --> raft
+
+    classDef lib stroke-dasharray: 2 4
+    class hh,hb,sh,lc,gs,vip,mem lib
+    np["Not built: a Raft group<br/>per partition, content<br/>sync, and a failure<br/>detector that feeds<br/>quorum and /readyz"]
+    classDef design stroke-dasharray: 5 5
+    class np design
+```
 
 ## 2. Design principles
 
@@ -37,7 +73,7 @@ wiring that should drain instead belongs to daemon mode, which can call `Lifecyc
    not in the parser or the cache. Target: ≤1% throughput loss, ≤2% p99 delta vs single-node.
 2. **Cheap heartbeats.** Fixed-size UDP datagrams (64-byte membership body plus version,
    key id, timestamp, sequence, boot epoch, destination wire id, and a 32-byte HMAC-SHA256;
-   124 B on the wire, default 500 ms, jittered), one dedicated virtual thread, no allocation
+   124 B on the wire, one send per caller-supplied interval), one dedicated virtual thread, no allocation
    per beat beyond a reused buffer and a reused `DatagramPacket`. The MAC input is a domain
    label (`sjws-ha-hb`), the version, the key id, the body, the timestamp, the sequence, the
    boot epoch, and the destination. The HMAC key is HKDF-SHA256 of the cluster key
@@ -84,19 +120,20 @@ wiring that should drain instead belongs to daemon mode, which can call `Lifecyc
 
 ## 3. Core abstractions (generalise to N nodes / sites)
 
-All of these live in `sjws_nettask.cluster`. That package does not import HTTP, Netty, or
-`sjws_nettask` server types, so Messaging Core can depend on it without the file server.
+These live in `sjws_nettask.cluster`, except `FailoverPolicy` and `SnapshotHolder` (in `sjws_nettask.ha`). The
+cluster package does not import HTTP, Netty, or `sjws_nettask` server types, so Messaging Core can depend on it
+without the file server.
 
 - `NodeId`, `SiteId`, `Member{id, site, addr, incarnation, state}`; states
   ALIVE → SUSPECT → DEAD (SWIM-style, incarnation numbers refute stale suspicion).
 - `Membership`: static seed list now; pluggable gossip dissemination for N>3.
-- `QuorumPolicy`: `majority(n)`, `witness(n)` (2 data nodes + a tie-breaker that votes but
+- `QuorumPolicy`: `majority()`, `witness(NodeId)` (2 data nodes + a tie-breaker that votes but
   does not store the log), and later `perSite(local majority) + global(majority of sites)`.
   Pure function over a voter set and an ack set — not over a live RPC.
-- `LeaderElection`: lease-based (term, lease expiry, monotonic clock) built on the Raft
-  term of one replication group. The `ha-control` leader coordinates sync rollouts and VIP
-  ownership and never sees requests. Message partitions elect separately (§13a, Decisions
-  for PR #16).
+- Lease: the Raft term plus a lease expiry on the monotonic clock, one per replication
+  group (`ReplicationGroup.leaseExpiresAt()`); there is no separate `LeaderElection` type.
+  The `ha-control` leader coordinates sync rollouts and VIP ownership and never sees
+  requests. Message partitions elect separately (§13a, Decisions for PR #16).
 - `FailoverPolicy`: `ACTIVE_PASSIVE` (VIP hook), `ACTIVE_ACTIVE` (external LB/DNS using
   `/healthz` and `/readyz`), later `GeoDns` / `Anycast` / `GSLB`.
 - `SnapshotHolder` (in `sjws_nettask.ha`): versioned (monotonic `generation` + content hash)
@@ -125,13 +162,43 @@ The two-node choice (witness versus async primary/standby), the failure matrix, 
   (lightweight 3rd process, or an external arbiter plugged in behind the same `QuorumPolicy`).
   Without a witness, the configured `preferred` node wins ties by campaigning sooner, and the
   other demotes on peer loss only if it can still reach the witness ("no witness → no
-  promotion": `WitnessQuorum` is false unless the witness is in the ack set and at least one
+  promotion": `QuorumPolicy.witness(NodeId)` is false unless the witness is in the ack set and at least one
   data node is too). A data node alone does not become leader and does not claim the VIP.
 - Fencing: the losing node releases the VIP before lease expiry (lease shorter than the
   failure-detection margin). Fencing is the VIP hook, not a closed accept loop: `/healthz`
   is on the same listener as content, so a passive node still accepts on its own address.
   The accept loop's one volatile role read (passive mode only) feeds that hook and the
   `ha_role` gauge; it does not run per request.
+
+Two data nodes and a witness. The Raft side of this topology, an `ha-control` group of two data nodes and a
+witness, is built in `cluster` and runs only in tests: no shipped process runs an `ha-control` voter beside the
+content listener (dotted boxes, as above):
+
+```mermaid
+flowchart TB
+    lb["Load balancer or DNS<br/>probes /healthz<br/>and /readyz"]
+
+    subgraph a["Node A"]
+        sa["Static files<br/>served locally"]
+        ra["ha-control voter"]
+    end
+
+    subgraph b["Node B"]
+        sb["Static files<br/>served locally"]
+        rb["ha-control voter"]
+    end
+
+    w["Witness<br/>votes and acks,<br/>never leads, keeps a<br/>cursor, not the log"]
+
+    lb --> sa
+    lb --> sb
+    ra <-->|"Raft: any 2 of 3 commit"| rb
+    ra <--> w
+    rb <--> w
+
+    classDef lib stroke-dasharray: 2 4
+    class ra,rb,w lib
+```
 
 ### 4.2 Three nodes
 
@@ -147,8 +214,44 @@ The two-node choice (witness versus async primary/standby), the failure matrix, 
   `HealthBoard` precomputes the `Response` objects (plain text, 200 or 503) and `HaHandler`
   returns one of them. No allocation and no file I/O on the probe path.
 - The accept loop clears liveness in its `finally`, off the request path.
+
+  ```mermaid
+  flowchart TD
+      r["Request, with HA attached"] --> p1{"Path is /healthz?"}
+      p1 -->|yes| h["200 ok while the accept<br/>loop is alive, else 503<br/>precomputed, no allocation"]
+      p1 -->|no| p2{"Path is /readyz?"}
+      p2 -->|yes| rd["200 only when a snapshot<br/>is loaded, the node is<br/>not draining, and quorum<br/>is ok if the policy<br/>requires it, else 503"]
+      p2 -->|no| g{"A generation has<br/>been published?"}
+      g -->|yes| gh["Its handler, loaded once<br/>at the start of the call"]
+      g -->|no| ch["The config snapshot<br/>handler"]
+  ```
+
 - Peer failure detection: UDP heartbeat plus an indirect probe (k=2 via other members when
   N≥3). Defaults: interval 500 ms, suspect after 3 misses, dead after 5 s.
+
+  Member states, as `cluster.Membership` implements them. Only the HA bench and tests run it, and nothing
+  connects it to Raft or `/readyz` yet:
+
+  ```mermaid
+  stateDiagram-v2
+      [*] --> ALIVE
+      ALIVE --> SUSPECT: silent for 3 intervals
+      ALIVE --> DEAD: silent for deadAfter
+      SUSPECT --> DEAD: silent for deadAfter
+      SUSPECT --> ALIVE: a heartbeat or an indirect ack
+      DEAD --> ALIVE: a heartbeat
+      note right of SUSPECT
+          deadAfter counts from the
+          last time it was heard, 5 s
+          by default. A heartbeat
+          counts when its incarnation
+          is the same or higher.
+          A suspect is also probed
+          through up to 2 other alive
+          members, when 3 or more
+          are listed
+      end note
+  ```
 
 ## 6. Failover
 
@@ -170,6 +273,26 @@ The two-node choice (witness versus async primary/standby), the failure matrix, 
   `close()` stays the current interrupt-immediately behaviour.
 - Signal wiring belongs to the daemon-mode workstream. HA exposes `Lifecycle.drain()`.
 
+The drain as implemented by `Lifecycle.drain()` and `SjwsServer.drain()`:
+
+```mermaid
+sequenceDiagram
+    participant LB as Load balancer
+    participant L as Lifecycle.drain()
+    participant H as HealthBoard
+    participant S as SjwsServer
+
+    L->>H: setDraining(true)
+    LB->>H: GET /readyz
+    H-->>LB: 503, not ready
+    Note over L: wait drainDelay, default 5 s,<br/>so the balancer deregisters the node
+    Note over L: later keep-alive responses<br/>carry Connection close
+    L->>S: stop accepting
+    Note over S: expire idle connections,<br/>stop the TCP, HTTP/2 and HTTP/3 listeners
+    L->>S: wait for in-flight work
+    Note over L,S: bounded by drainTimeout, then close()
+```
+
 ## 8. Zero-downtime reload
 
 - Config/cert/content: a new snapshot is built off-path, validated, and published with
@@ -187,8 +310,9 @@ The two-node choice (witness versus async primary/standby), the failure matrix, 
 - Source of truth via `ConfigSource` / `CertProvider` (interfaces here; implementations,
   including ACME, belong to the other workstream). The leader pulls, computes a generation
   and a content hash, and announces `(generation, hash)` in heartbeats (8 B + 8 B). Peers
-  that lag pull the bundle over authenticated TCP (HMAC-SHA256 with the shared secret) on a
-  background thread. mTLS can replace the HMAC later behind the same `BundleTransport`.
+  that lag pull the bundle (HMAC-SHA256 with the shared secret, checked on pull) on a
+  background thread. Today the bundle store is an in-process map (`HmacBundles`); a network
+  transport for it, with mTLS in place of the HMAC, is not built.
 - Private keys are never copied into heartbeats. The bundle is transferred with the HMAC,
   and the key file is written mode `0600` via a temp file and `ATOMIC_MOVE`.
 - Two-phase rollout on the `ha-control` replication group (one `groupId` on the shared
@@ -201,6 +325,26 @@ The two-node choice (witness versus async primary/standby), the failure matrix, 
   a peer has the bytes, the peer keeps the last activated snapshot (fail static) and the new
   leader publishes again from `ConfigSource`. The log coordinates activation; it is not the
   only copy of the bytes.
+
+The rollout, as `ha.GenerationSync` implements it. It runs only in tests, inside one JVM: the bundle store is an
+in-process map, heartbeats do not announce generations, and nothing publishes a `SnapshotHolder` from ACTIVATE yet:
+
+```mermaid
+sequenceDiagram
+    participant P as publishFrom caller
+    participant R as ha-control group
+    participant N as Every data node,<br/>in log order
+
+    Note over P: load config, certificate and key<br/>from ConfigSource and CertProvider.<br/>Store the payload in HmacBundles,<br/>an in-process map
+    P->>R: append STAGE, generation and SHA-256
+    Note over R: a follower's append fails<br/>with NotLeaderException
+    R-->>N: STAGE committed
+    Note over N: the commit callback copies the marker and<br/>hands it to the ha-generation-sync worker,<br/>which applies in order. STAGE: pull the<br/>payload from HmacBundles, check its HMAC,<br/>rewrite the key file (mode 0600,<br/>ATOMIC_MOVE). The hash in the entry is<br/>not compared
+    R-->>P: the STAGE future completes
+    P->>R: append ACTIVATE at once
+    R-->>N: ACTIVATE committed
+    Note over N: the same worker: onActivate(generation),<br/>a caller callback, a no-op by default
+```
 
 ## 10. Shared state
 
@@ -278,11 +422,12 @@ interface ClusterNode extends AutoCloseable {
    * The future completes with the committed index after a majority has the batch.
    * Default (majority in memory): fsync follows on the group's timer and does not gate
    * the future. Opt-in quorum commit plus fsync: that majority has also fsynced the batch.
-   * One batch is one ordered span of indexes.
+   * One batch is one ordered span of indexes. When the group's delivery queue is at its limit,
+   * the future fails at once with ApplyLagException and nothing is appended.
    */
   CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
 
-  /** Leadership of this group only. Fires on the group thread, not on a request thread. */
+  /** Leadership of this group only. Fires on the Raft thread, not on a request thread. */
   void onLeaderChange(GroupId groupId, BiConsumer<Long /*term*/, Optional<NodeId>> listener);
 
   SnapshotControl snapshots(GroupId groupId);
@@ -293,6 +438,7 @@ interface ReplicationGroup {
   long term();
   Optional<NodeId> leader();
   boolean isLeader();
+  long leaseExpiresAt(); // monotonic nanos; 0 when this node is not leader
   long commitIndex();
   long lastApplied();
   CompletableFuture<Void> readBarrier(); // linearizable read; lease read when the lease is valid
@@ -326,7 +472,8 @@ record CommittedIndex(GroupId groupId, long term, long index) {}
 record CommittedEntry(GroupId groupId, long term, long index, ByteBuffer entry) {}
 record LogSnapshot(GroupId groupId, long lastIncludedIndex, long lastIncludedTerm, byte[] data) {}
 record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout,
-                    Duration heartbeat, long snapshotEveryEntries) {
+                    Duration heartbeat, long snapshotEveryEntries,
+                    boolean preferred, Duration failbackHysteresis) {
   /** Log options with the default ack mode: majority in memory. */
   GroupOptions(int maxBatchBytes, Duration electionTimeout, Duration heartbeat, long snapshotEveryEntries) {
     this(Durability.RELAXED, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries);
@@ -366,8 +513,8 @@ and [PR #17](https://github.com/BlivionIaG/sjws_nettask/pull/17) (§6 requiremen
 The choice is one argument on `GroupOptions`. The API does not change.
 
 Pluggable SPIs: `ClusterRpc` (in-JVM for tests; one TCP connection per peer, length-prefixed
-frames demuxed by `groupId`, append batches pipelined), `LogStorage` (segmented append-only
-files per group, sparse index, `FileChannel.force` on the strict ack path), `Clock`,
+frames demuxed by `groupId`, append batches pipelined), `LogStorage` (`FileLogStorage`: one
+append-only segment file per group with an in-memory index, `FileChannel.force` on the strict ack path), `Clock`,
 `QuorumPolicy` (majority; witness voter-without-log for the metadata group when running
 2 data nodes; per-site hierarchical later). Learners (non-voting) are read replicas and
 cross-site async followers. A witness votes in the metadata group and does not store
@@ -378,7 +525,7 @@ opt-in when the quorum fsyncs the batch once (not once per record). Per-record f
 not a target. The default in-memory ack does not wait for that fsync.
 The architecture bench (PR #16, group commit, p50 about 1.1 ms at 64 producers) is the
 local-disk input to that budget; the network hop has to stay inside the same single-digit
-milliseconds. Low-latency mechanics: one writer thread per group, batching, pipelining,
+milliseconds. Low-latency mechanics: one Raft thread per node, one delivery thread per group, batching, pipelining,
 `ByteBuffer` payloads copied once into the log, apply/commit callback single-threaded per
 group.
 
@@ -391,7 +538,7 @@ PR #16's T4 asks for a choice; this section is that choice.
 1. **Witness for 2-node mode: yes.** Dual-node HA includes a third lightweight witness.
    It votes and stores no log. Two data nodes alone are not a mode we fail over
    automatically: after one dies, the survivor cannot form a majority, and promoting it
-   would be a split brain. `WitnessQuorum` is false unless the witness is in the ack set
+   would be a split brain. `QuorumPolicy.witness(NodeId)` is false unless the witness is in the ack set
    and at least one data node is too ("no witness → no promotion"). The witness is a
    normal member of the metadata/control Raft group, not a special TCP service. Option (b)
    in T4 (manual or STONITH failover) and option (c) (async primary/standby that drops the
@@ -428,14 +575,15 @@ PR #16's T4 asks for a choice; this section is that choice.
      mode it can be lost with a simultaneous majority crash. Bytes already swapped into
      the snapshot stay served if a later publish is lost (fail static).
    - **RTO, crash:** a new group leader is elected within one election timeout after the
-     lease expires. Defaults: heartbeat 500 ms, lease 1 s, election timeout 1.5 s, so a
+     lease expires. Design timings (not code defaults; `cp-config` runs a 40 ms heartbeat, 80 ms lease and
+     100 ms election timeout): heartbeat 500 ms, lease 1 s, election timeout 1.5 s, so a
      crashed leader is replaced in about 2.5 s and inside the 2–6 s active/passive window.
-     Crash RTO target is **≤ election timeout + lease** (≤ 2.5 s with those defaults).
+     Crash RTO target is **≤ election timeout + lease** (≤ 2.5 s with those timings).
    - **RTO, planned restart:** **election timeout + `drainDelay`**. The leaving node drains
-     first (default `drainDelay` 5 s) so the LB drops it before the lease moves. With the
-     defaults that is ≤ 6.5 s.
+     first (default `drainDelay` 5 s) so the LB drops it before the lease moves. With those
+     timings that is ≤ 6.5 s.
    - **RTO, static active/active:** the upstream health-check interval. No election is on
-     the request path. These timeouts are what the heartbeat and election defaults are
+     the request path. These timeouts are what the heartbeat and election timings are
      sized to; changing them moves the RTO on purpose.
 
 4. **Ack mode: decided.** See **Default ack mode** above. The default is majority

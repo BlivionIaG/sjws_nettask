@@ -58,6 +58,39 @@ class ShardClaimTest {
     }
 
     @Test
+    void anEmptyPollDoesNotClobberTheHintOfASubmitThatRacedIn() throws Exception {
+        // Forces the lost-wakeup interleaving: shard s carries a stale hint (1), the hinted poll of s comes back
+        // empty, and a submit to s lands between that poll and the hint reset (the afterEmptyPoll seam). A blind
+        // ready.set(s, 0) wiped the submit's +1 too; the CAS reset (expects the 1 it read) must leave it.
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        String worker = "w";
+        int s = Math.floorMod(worker.hashCode(), 4);
+        var ps = t.pool("p");
+        ps.added(s, 1); // stale: nothing in the partition
+        t.afterEmptyPoll = () -> {
+            t.afterEmptyPoll = TaskService.NO_HOOK;
+            t.submit("p", 1, seqFor(t, s, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        };
+        var got = t.claim("p", worker, 1, 10_000, 0);
+        // the claim's follow-up full sweep takes the task either way; the hint tells the two resets apart:
+        // fixed: 1 (stale) + 1 (submit) kept by the failed CAS, minus 1 taken = 1; blind set: 0 - 1 -> 0
+        assertEquals(1, got.size());
+        assertEquals(s, got.get(0).shard());
+        assertEquals(1, t.readyHints("p")[s], "the raced-in submit's hint survived the empty-poll reset");
+    }
+
+    @Test
+    void aStaleHintWithNoRaceIsResetByTheEmptyPoll() {
+        // the CAS succeeds when nothing raced in: a regression to "never reset" would leave the 1
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        String worker = "w";
+        int s = Math.floorMod(worker.hashCode(), 4);
+        t.pool("p").added(s, 1); // stale: nothing in the partition
+        assertTrue(t.claim("p", worker, 1, 10_000, 0).isEmpty());
+        assertEquals(0, t.readyHints("p")[s], "the stale hint was reset");
+    }
+
+    @Test
     void aSubmitOnAnotherShardWakesAWaitingClaimAtOnce() throws Exception {
         // a 30 s backstop slice: without the pool-level signal the claim would sleep through the whole wait
         var t = open(4, TimeUnit.SECONDS.toNanos(30));

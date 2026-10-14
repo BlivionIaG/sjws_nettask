@@ -827,11 +827,9 @@ final class RaftGroup {
         long termNow = term;
         Optional<NodeId> who = Optional.ofNullable(leader);
         var copy = List.copyOf(leaderListeners);
-        if (copy.isEmpty()) {
-            return;
-        }
-        // On the delivery thread, in order with commit callbacks and no-op listeners: a leader change is seen
-        // before the new term's no-op is applied (readiness), as before the executor split them apart.
+        // On the delivery thread, queued before this term's no-op: a listener sees leadership changes in
+        // order with commit callbacks, so leaderReady() is still false inside onLeaderChange (#182 moved
+        // the no-op callback to the delivery thread; running this on the caller let the no-op overtake it).
         deliveries.submit(() -> {
             for (var listener : copy) {
                 listener.accept(termNow, who);

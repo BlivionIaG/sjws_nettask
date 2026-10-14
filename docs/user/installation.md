@@ -1,7 +1,7 @@
 # Installation and build
 
 Basic multi-threaded (virtual threads) static file server: HTTP/1.0 and 1.1 over TCP, plus opt-in
-HTTP/3 over QUIC, both served by the same protocol-neutral core. Requires Java 25+ (and Maven to build).
+HTTP/2 and HTTP/3 (QUIC), all served by the same protocol-neutral core. Requires Java 25+ (and Maven to build).
 
 Quick start:
 

@@ -24,7 +24,8 @@ first delivery).
 - **What runs on it.** Everything the group used to queue for delivery, in log order: user
   `GroupListener` callbacks, internal no-op listeners, and completion of pending `append()` futures
   (including failing them on step-down). The Raft thread and appenders only `submit`; they never run a
-  callback.
+  commit callback or complete an append future. Leader-change listeners, read barriers and
+  membership-change completions still run on the Raft thread.
 - **Ordering / no overlap.** One FIFO queue, one thread: entry *n*'s callback finishes before *n+1*'s
   starts, and an append future completes after the callbacks of every entry up to its own.
 - **Re-entrancy.** The old "already draining on this thread" guard becomes `onExecutorThread()`. A
@@ -41,18 +42,42 @@ first delivery).
   mark), plus a delivered counter in the executor.
 - **Deterministic close.** `close(drainBudget)`: wait up to the budget for the queue to go idle, then
   mark closed and *abandon* whatever is still queued (each future fails with
-  `IllegalStateException("group closed before delivery")`), interrupt a callback that overran, and join
-  the thread. After it returns no new delivery starts, so `heal()`/reopen cannot overlap an old drainer.
+  `IllegalStateException("group closed before delivery")`), join the thread for half the budget, interrupt a
+  callback that overran, and join for the other half. After it returns no new delivery starts, so
+  `heal()`/reopen does not interleave with an old drainer's queue. A callback that ignores the interrupt
+  can still be running: `close` then returns `false`, and `ReplicatedNode.close()` does not wait further.
   `ReplicatedNode.close()` stops the tick thread first, then closes each group's deliveries (1 s budget).
   Submits after close are abandoned the same way.
-- **Failures.** A callback that throws is logged (WARNING) and skipped; the stream continues. The
+- **Failures.** A callback that throws a `RuntimeException` is logged (WARNING) and skipped; the stream
+  continues. An `Error` ends the delivery thread. The
   interrupt flag is cleared after each item so one callback's interrupt does not leak into the next.
-- **Witness.** A witness never applies entries and has no listener; its executor thread is never
-  started (lazy start), so it costs nothing and its behaviour is unchanged.
+- **Witness.** A witness never applies entries and has only a no-op listener that is never called; its
+  executor thread is never started (lazy start), so it costs nothing and its behaviour is unchanged.
+
+One append, from the call to its future, as built:
+
+```mermaid
+sequenceDiagram
+    participant A as Appender
+    participant R as Raft thread
+    participant D as raft-deliver-NAME
+
+    A->>R: append(entry), on the leader
+    alt deliveries queued or running at 4096
+        R-->>A: the future fails at once with<br/>ApplyLagException, nothing appended
+    else
+        R->>R: replicate, a quorum acks,<br/>the entry commits
+        R->>D: submit the callback, then the<br/>future's completion, in log order
+        Note over R,D: submit never blocks, so heartbeats<br/>and votes never wait for a callback
+        Note over D: GroupListener.onCommitted(entry), in<br/>index order, never overlapping. It must be<br/>fast, do no IO and never join an append<br/>future: it completes on this thread
+        D-->>A: the future completes, after the callbacks<br/>of every entry up to its own
+    end
+    Note over R,D: on step-down the pending futures fail with<br/>NotLeader on D too, behind the queued callbacks
+```
 
 ## Manual driving
 
-`ReplicatedNode.drive()` (tests, `LocalCluster`, `CpStore.drive()`, `CpWitness.drive()`) is a step plus
+`ReplicatedNode.drive()` (tests, `ReplicatedNode.driveAll`, `CpStore.drive()`, `CpWitness.drive()`) is a step plus
 a bounded wait (5 s) for the deliveries it caused, so manual callers still observe callbacks right after
 `drive()` returns. The background loop calls `step()` and never waits. Tests that model "the Raft
 thread while a callback is parked" use `step()`.

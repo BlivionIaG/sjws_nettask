@@ -4,7 +4,7 @@ Status: Draft · Scope: control plane and config distribution
 Base: master `a38fdb5` (Java 25), which includes the config model from [PR #42](https://github.com/BlivionIaG/sjws_nettask/pull/42) and the Rights package from [PR #47](https://github.com/BlivionIaG/sjws_nettask/pull/47) (`sjws_nettask.controlplane`)
 Consistent with: [high availability](../ha/design.md) (the document PR #14 added as `docs/design/high-availability.md`; PR #34 moved it), the per-group Raft API shipped in [PR #29](https://github.com/BlivionIaG/sjws_nettask/pull/29), and the cluster harness in `tests/sjws_nettask/clusterharness`.
 
-PR #29 is merged into the HA stack (`cursor/ha-vip-restart-5d15` and its parents). It is not on master `a38fdb5`. This design calls that API. Implementation PRs merge the stack forward. They do not reimplement Raft.
+PR #29 is merged: the per-group Raft API is `sjws_nettask.cluster` on master. This design calls that API. Implementation PRs do not reimplement Raft.
 
 Binding decisions, which override a review where the two disagree:
 
@@ -37,35 +37,43 @@ The content request path reads the snapshot that is already installed. It does n
 1. **One binary, three startup roles.** `standalone` (the default), `control`, or `data`. The choice is made once at process start. `standalone` constructs no control-plane object, opens no `cp-config` group, and starts no watch. The HTTP path stays the path on master `a38fdb5`.
 2. **Zero cost when the control plane is off.** With `standalone`, the accept loop and `Http1Connection` do not read a role, a lease, a generation from Raft, or a control-plane flag. Evidence for every PR, including this one, is a `wrk` / `wrk2` before/after on the same host. The gate is the same shape as HA: report req/s and p50/p90/p99/p99.9.
 3. **Lock-free hot path.** A request performs one volatile read of an immutable snapshot (`LiveConfig.get` / `handler()`), then runs that snapshot's `Handler`. Publish is an atomic swap (`AtomicReference.set`) of the whole snapshot. The handler chain, the HA generation leaf, and the HTTP/3 handler supplier all read that snapshot. They do not keep a leaf captured at startup (§5.6). Readers take no lock. An in-flight request keeps the handler it already loaded.
-4. **Raft I/O on dedicated threads.** Append, fsync, election, and `GroupListener.onCommitted` run on the cluster group's threads (PR #29: one apply thread per group, index order). Those threads are distinct from the accept loop and from request virtual threads.
+4. **Raft I/O on dedicated threads.** Election, replication and the `RELAXED` fsync run on the node's Raft thread (`raft-<node>`, one per process; a `STRICT` fsync runs on the appender). `GroupListener.onCommitted` and the append futures of a group run on that group's own delivery thread (`raft-deliver-<group>`, index order, `ApplyLagException` past 4096 queued deliveries; see [the delivery executor](raft-delivery-executor.md)). Those threads are distinct from the accept loop and from request virtual threads.
 5. **The control plane bootstraps without the broker.** `sjws_nettask.cp` does not import `sjws_nettask.messaging`. Messaging does not import `sjws_nettask.cp`. Topic and group desired state is a neutral schema in `sjws_nettask.config` (§13.5). The control plane names those records and does not name broker runtime types. The broker opens partitions from the applied document on its reconcile thread.
 6. **Fail static.** A data-plane node that cannot reach a leader keeps the last successfully applied snapshot, including across a restart from the persisted last-good file. A minority of control nodes cannot publish.
 7. **Config & ACME own the model.** The control plane stores, versions, signs, and ships the document that workstream already validates. It does not invent a second schema.
 
 ## 3. Architecture
 
+```mermaid
+flowchart TD
+    tui["Admin TUI"] -->|"mTLS admin API"| cp["Control role<br/>sjws_nettask.cp<br/>group cp-config"]
+    cp --- raft["cluster.ClusterNode"]
+    cp --> mv["voter set<br/>over TCP"]
+    cp --> w{{"mTLS watch:<br/>long poll, ack"}}
+    w --> g["data: gateway"]
+    w --> st["data: static"]
+    w --> b["data: broker"]
+    w --> e["data: edge"]
+    w -.-> pj["role projection"]
+    g --> sw{{"atomic swap,<br/>off the request path"}}
+    st --> sw
+    b --> sw
+    e --> sw
+    sw --> live["LiveConfig /<br/>ConfigSnapshot"]
+    live --> use["HTTP, filters, router"]
+    live -.-> bl["broker loop"]
+
+    classDef design stroke-dasharray: 5 5
+    class pj,bl design
 ```
-                    admin TUI
-                        │  mTLS admin API
-                        ▼
-              ┌─────────────────────┐
-              │  control role (3|5) │
-              │  sjws_nettask.cp    │
-              │  group: cp-config   │── Raft (cluster.ClusterNode)
-              └──────────┬──────────┘
-                         │  mTLS watch: push, ack, resume
-           ┌─────────────┼──────────────┐
-           ▼             ▼              ▼
-     data: gateway   data: static   data: broker    data: edge
-           │             │              │
-           └─────────────┴──────────────┘
-                         │  atomic swap, off the request path
-                         ▼
-              LiveConfig / ConfigSnapshot
-                         │
-                         ▼
-              HTTP, filters, router, broker loop
-```
+
+Solid boxes and arrows run in a shipped process. Dashed ones do not: the role projection and the broker loop are
+not written. A control process hosts one voter on an in-process transport, or, with `cp.peers`, one member of a
+static voter set (3 or 5 voters, or 2 + a witness) linked by `cluster.TcpTransport` over the `cp-peer` mTLS
+listener with a CP-only Raft key. Every data role runs the same watch client against the whole document, with no
+per-role projection. See
+[Control-plane and data-node service](../operations/control-plane-service.md) and
+[Control-plane process hosting](control-plane-hosting.md).
 
 ### 3.1 Packages and the dependency cut
 
@@ -78,7 +86,7 @@ The content request path reads the snapshot that is already installed. It does n
 
 `sjws_nettask.cp` does not import `sjws_nettask.messaging`, `sjws_nettask.routing`, `sjws_nettask.http1`, `sjws_nettask.h2`, or `sjws_nettask.h3`. The only messaging shape it is allowed to name is the neutral records in `sjws_nettask.config` (`MessagingSettings`, `TopicSpec`, `GroupSpec`, `PartitionAssignment`). It does not name `Partition`, `LedgerWriter`, `MessagingStats`, or any other broker type. A control process boots, elects, and reaches `leaderReady` with no messaging class loaded (§15). `cp-config` has its own log directory and its own segments. It does not share the messaging ledger's segments, so compaction or truncation of one cannot affect the other. A broker is not a `cp-config` voter by default. Co-location is allowed and couples the two failure domains; production placement keeps them apart.
 
-The composition root is `Sjws_nettask` / `SjwsServer`. It is the only place that may mention both a data-plane server and `sjws_nettask.cp`, and only through `sjws_nettask.cp.CpBootstrap`, reached from the `control` or `data` branch. `standalone` does not name that class, so the verifier does not load `sjws_nettask.cp` or `sjws_nettask.cluster` (§16).
+The composition root is `Sjws_nettask` / `SjwsServer`, with `sjws_nettask.service.ServiceLaunch` as the role branch. The control role is reached only by name (`sjws_nettask.cp.CpLaunch`, a string) and the data role opens `cp.DataWatch`. `standalone` names neither, so the verifier does not load `sjws_nettask.cp` or `sjws_nettask.cluster` (§16).
 
 ### 3.2 Narrow snapshot interface
 
@@ -115,7 +123,7 @@ Transports do not import `AppliedConfig`. They already depend on `Supplier<Handl
 
 A data node also carries labels (`String` map) and capabilities (`http1`, `http2`, `http3`, `proxy`, `static`, `messaging`). Labels select rollout stages. Capabilities bound the projection in §12.4.
 
-The role is chosen once, before any socket is bound. Precedence is the command line (`--role`), then the environment (`WEB_SERVER_ROLE`), then YAML (`node.mode` for `standalone` / `control` / `data`, and `node.role` for the data-plane role). A later source does not override an earlier one. When none of the three names `control` or `data`, the process is `standalone`.
+The role is chosen once, before any socket is bound. Precedence is the command line (`--role`), then the environment (`WEB_SERVER_ROLE`), then YAML (`node.mode` for `standalone` / `control` / `data`; the data-plane role is `data-role` in the bootstrap file). A later source does not override an earlier one. When none of the three names `control` or `data`, the process is `standalone`.
 
 The control role binds the admin listener (§14) and does not bind the content port by default. `listen=` in the daemon bootstrap is the admin address, not a content listener. A content port on a control process exists only when the operator sets one. Firewall rules for the control unit therefore do not assume a content listener.
 
@@ -124,10 +132,11 @@ The control role binds the admin listener (§14) and does not bind the content p
 | Work | Thread |
 |---|---|
 | Accept, parse, `Handler.handle` | Existing accept loop and request virtual threads. They read the live snapshot supplier only. |
-| Raft election, append, fsync, apply | `sjws_nettask.cluster` group threads. `onCommitted` does not compile or sign. |
-| Compile and sign on a control leader | A dedicated compiler thread. A large document cannot stall Raft apply. |
+| Raft election, replication, fsync | The node's `raft-<node>` virtual thread (one per process). A `STRICT` fsync runs on the appender. |
+| Apply: `onCommitted`, append futures | `raft-deliver-<group>`, one virtual thread per group. It does not compile or sign. |
+| Compile and sign on a control leader | The admin request thread (`CpStore`); there is no dedicated compiler thread yet. Raft apply is a different thread, so a large document cannot stall it. |
 | Verify, compile, `publish` on a data node | One applicator thread per process, started only for role `data`. It is the only caller of remote `publish`, so it serializes with itself. |
-| Admin API | Its own listener and virtual threads, control role only, distinct port from content. |
+| Admin API | Its own listener, control role only, distinct port from content. |
 | Watch stream | One virtual thread per data node, not a content request. A slow ack blocks that thread only. |
 | ACME | Existing ACME thread, and only on the control leader after `leaderReady()`. |
 
@@ -141,11 +150,11 @@ cluster.openGroup(new GroupId("cp-config"), options, listener);
 
 `options` uses the `GroupOptions` constructor that omits durability, so the ack mode is `Durability.RELAXED` (majority in memory, fsync after the ack). A deployment that must not lose a committed config under a simultaneous majority crash passes `Durability.STRICT`. That is the same choice HA records for `ha-control`.
 
-Voters are the control nodes. The supported counts are 3 and 5 (majority 2 and 3). Data-plane nodes are not voters. A 1-node group exists only during bootstrap (§12.3) and is not a production configuration. Two control nodes are not a supported failover mode: a single survivor cannot commit, which matches the HA decision that two data nodes without a majority do not publish.
+Voters are the control nodes. The supported sets are 3 or 5 full voters (majority 2 and 3), or 2 full voters plus a witness. Data-plane nodes are not voters. A 1-voter group (no `cp.peers`) is a development configuration and logs a WARN. Two control nodes without a witness are not a supported failover mode: a single survivor cannot commit, which matches the HA decision that two data nodes without a majority do not publish.
 
-The group shares the cluster transport. Frames carry `groupId`. Opening `cp-config` does not open a second socket beside the one `ClusterNode` already uses. `ha-control` (membership, VIP, static-generation STAGE/ACTIVATE) stays a different group. Config bytes are log entries of `cp-config` only. Static file bytes stay out of every log, as HA §13a requires. Message records stay in per-partition groups owned by messaging.
+A control process runs `cp-config` on its own `ReplicatedNode` and `TcpTransport` (the `cp.peers` listener, `cp-peer` mTLS). Frames carry `groupId`, so another group on that node adds no socket. `ha-control` (membership, VIP, static-generation STAGE/ACTIVATE) stays a different group. Config bytes are log entries of `cp-config` only. Static file bytes stay out of every log, as HA §13a requires. Message records stay in per-partition groups owned by messaging.
 
-The state machine, applied in index order on the group thread:
+The state machine, applied in index order on the group's delivery thread (`raft-deliver-cp-config`):
 
 | Entry | Effect |
 |---|---|
@@ -161,7 +170,9 @@ The state machine, applied in index order on the group thread:
 | `Audit` | One control-plane audit record (§12.10). Replicated so one voter cannot drop it. |
 | `CertReference` | ACME result: chain reference and envelope-encrypted key material (§5.7, §12.6). |
 
-`SnapshotControl.take` / `install` / `truncateAndCompact` compact the log to the latest activated snapshot plus the live registration table. Compaction runs off the request path, on the group thread, past an index that is both snapshotted and acked. The compactor keeps the latest value per key (current desired snapshot, denylist, registrations). History required for rollback is retained for a configured number of activated versions (default 8) inside the snapshot payload, then dropped.
+As built, the log carries `Propose`, signed `Activate` and `Rollback`, `Rbac`, `Revoke`, rollout and advance entries, idempotency wrappers, and join issue and consume entries. Audit lines are written per voter to `<stateDir>/audit.jsonl` and are not replicated.
+
+Designed, not wired: `SnapshotControl.take` / `install` / `truncateAndCompact` compact the log to the latest activated snapshot plus the live registration table. Compaction runs off the request path, on the group's delivery thread, past an index that is both snapshotted and acked. The compactor keeps the latest value per key (current desired snapshot, denylist, registrations). History required for rollback is retained for a configured number of activated versions (default 8) inside the snapshot payload, then dropped. As built, `cp-config` keeps its whole log, and the history of 8 activated versions is held in `CpStore` memory.
 
 Membership changes of the voters use `ReplicationGroup.changeMembership` (joint consensus). Learners are non-voting (§11).
 
@@ -333,21 +344,21 @@ public interface ControlLeadership {
     long term();
 
     /**
-     * term, leader id. Empty when the leader is unknown. Group thread.
+     * term, leader id. Empty when the leader is unknown. Raft thread.
      * Wired to ClusterNode.onLeaderChange(new GroupId("cp-config"), ...).
      * Never invoked on a content request thread.
      */
     void onLeaderChange(BiConsumer<Long, Optional<String>> listener);
 
     /**
-     * Fired on the group thread only after this leader's election Noop is applied.
+     * Fired on the group's delivery thread only after this leader's election Noop is applied.
      * appliedIndex is that entry. Not fired merely because isLeader() is true.
      */
     void leaderReady(BiConsumer<Long, Long> listener);
 }
 ```
 
-On each transition to leader, the new leader appends a single `Noop` in the new term before it proposes config or starts an ACME order. `leaderReady()` becomes true, and `leaderReady(term, appliedIndex)` fires, when `onCommitted` observes that `Noop`. A leadership loss, or a leader id that is not this node, clears `leaderReady()` and cancels an in-flight ACME order. A later `leaderReady` for the new term may start again. ACME subscribes to `leaderReady(term, appliedIndex)` and does not contact the directory on `isLeader()` alone.
+On each transition to leader, the new leader appends a single `Noop` in the new term before it proposes config or starts an ACME order. `leaderReady()` becomes true, and `leaderReady(term, appliedIndex)` fires, when the group applies that `Noop` (`onNoopApplied`). A leadership loss, or a leader id that is not this node, clears `leaderReady()` and cancels an in-flight ACME order. A later `leaderReady` for the new term may start again. ACME subscribes to `leaderReady(term, appliedIndex)` and does not contact the directory on `isLeader()` alone.
 
 `standalone` uses a local stub that is leader and fires `leaderReady` once at startup, so today's ACME path is unchanged. `control` uses the real group. `data` does not construct an `AcmeService`.
 
@@ -359,11 +370,11 @@ On each transition to leader, the new leader appends a single `Noop` in the new 
 
 systemd `active` means the pid file exists. It is not readiness. Readiness is `GET /readyz` returning 200. A control node is ready only when `/readyz` is 200 and `leaderReady()` is true. `isLeader()` alone is not ready: the election `Noop` has to be applied first. A data node is ready when it is serving a verified snapshot that is still inside max-staleness. `/healthz` stays a liveness probe and can be 200 while `/readyz` is 503.
 
-`--status` reports the control plane through `sjws_nettask.service.ControlPlaneBinding`: `connectionState()` is one of `pending`, `connecting`, `connected`, `disconnected`, `leader`, `follower`, and `configVersion()` is the applied version or `0`. The store publishes an implementation with `NodeEnrollment.attach`. Until `attach`, `--status` stays `connection=pending` and `config-version=0`. `NodeEnrollment.current()` is null in a standalone process, and that class is not loaded there. Drain is still `SjwsServer.drain()`. `ControlPlaneBinding` has no stop method.
+`--status` reports the control plane through `sjws_nettask.service.ControlPlaneBinding`: `connectionState()` is one of `pending`, `connecting`, `connected`, `disconnected`, `leader`, `follower`, and `configVersion()` is the applied version or `0`. `CpStore` can publish an implementation with `NodeEnrollment.attach`. `CpHost` does not call it yet, so a hosted control process still reports `connection=pending` and `config-version=0`; a data node's `DataWatch` attaches its own. `NodeEnrollment.current()` is null in a standalone process, and that class is not loaded there. Drain is still `SjwsServer.drain()`. `ControlPlaneBinding` has no stop method.
 
-`NodeEnrollment.copySecret()` returns a clone of the join secret. The caller wipes the clone. `NodeEnrollment.tokenConsumed()` runs after the join commit: it writes `stateDir/node.id` and then deletes the token file. A restart before that call presents the same token again, which is the same join (§12.4).
+`NodeEnrollment.copySecret()` returns a clone of the join secret. The caller wipes the clone. `NodeEnrollment.tokenConsumed()` is meant to run after the join commit: it writes `stateDir/node.id` and then deletes the token file. No production code calls it yet, so the token file stays. A restart before that call presents the same token again, which is the same join (§12.4).
 
-Drain is one call, `SjwsServer.drain()`. With HA attached that is `Lifecycle.drain()` (not-ready, deregistration delay, `Connection: close`, then close). With HA absent it is `close()`. The call has to finish inside the daemon's `drain-ms` budget. The default budget is 30 seconds, which covers the HA defaults (`drainDelay` 5 s plus `drainTimeout` 15 s) and leaves slack for the accept-loop join. A deployment that raises `drainDelay` or `drainTimeout` past that budget has to raise `drain-ms` in the same change. `--stop` waits for the recorded budget, capped at 10 minutes. The role units' `TimeoutStopSec` stays above the budget. There is no second drain API.
+Drain is one call, `SjwsServer.drain()`. With HA attached that is `Lifecycle.drain()` (not-ready, deregistration delay, `Connection: close`, then close). With HA absent it is `close()`. The call has to finish inside the daemon's `drain-ms` budget. The default budget is 30 seconds, which covers the HA defaults (`drainDelay` 5 s plus `drainTimeout` 15 s) and leaves slack for the accept-loop join. A deployment whose `drainDelay + drainTimeout + 1 s` would reach that budget is refused at startup (`NodeLifecycle.drainBudgetMillis`), and `--drain-budget` does not lift that check. `--stop` waits for the recorded budget, capped at 10 minutes. The role units' `TimeoutStopSec` stays above the budget. There is no second drain API.
 
 The control role does not bind the content port by default (§3.3). Role precedence is CLI, then environment, then YAML (§3.3).
 
@@ -391,6 +402,52 @@ The client speaks first:
 2. `Watch { fromVersion }`, where `fromVersion` is the last version this node has applied and persisted, or `0`.
 
 The server then sends, in version order, a full `SignedSnapshot` for every version above `fromVersion`. A client that already holds the parent still receives the full document. Patches are not a frame type.
+
+The exchange as designed, from a data node's side:
+
+```mermaid
+sequenceDiagram
+    participant D as Data node
+    participant L as Control leader
+
+    D->>L: Register
+    Note over D,L: one mTLS connection to the<br/>leader of cp-config
+    D->>L: Watch fromVersion
+    loop each version above fromVersion, then each new one
+        L->>D: full SignedSnapshot
+        Note over D: applyRemote, then persist<br/>floor, trust and last-good
+        D->>L: Ack
+    end
+    Note over L: at most maxInFlight versions<br/>unacked, 1 by default
+    L-->>D: freshness frame, at least every 30 s
+    D-->>L: heartbeat, every 1 s
+```
+
+As built, the watch is a long poll, not a stream. `DataWatch` asks the one control address it was started with
+(there is no voter list and no failover) for the newest activated version, and `WatchServer` answers from that
+voter's applied state, so a follower can serve it too. A node's first presentation of its token needs the leader:
+a follower answers 401. `N` is the highest version the node applied or skipped, and its first poll does not wait.
+There is no `Register`, no heartbeat, no freshness frame and no window of unacked versions, and a node that is
+behind gets only the newest envelope. A rejected envelope is logged and skipped, and it is not acked:
+
+```mermaid
+sequenceDiagram
+    participant D as Data node, DataWatch
+    participant V as Control voter, WatchServer
+
+    loop until the node stops
+        D->>V: GET /cp/v1/watch?after=N&waitMs=25000
+        Note over V: TLS 1.3 with a client certificate: the handshake<br/>checks it, the listener does not tie it to the node.<br/>X-Sjws-Node-Id, X-Sjws-Token-Id and X-Sjws-Join-Secret<br/>are required. The request is held for 30 s at most
+        alt nothing newer than N
+            V-->>D: 204
+        else a newer activated version
+            V-->>D: 200, the newest envelope and the trust bundle
+            Note over D: applyRemote: DataApply.decide checks the<br/>signature and the envelope rules, then the swap,<br/>then the last-good, floor and trust files
+            D->>V: POST /cp/v1/watch/ack?version=V
+            V-->>D: 204
+        end
+    end
+```
 
 After the client is caught up, the server sends each newly activated version the same way. The client replies after `applyRemote` has swapped the live snapshot, the side effects in §5.6 have run, and `floor.json`, `trust.json`, and `last-good.json` are durable. Swapping the snapshot is not the whole ack when the node hosts partitions. Opening a partition can take seconds, so a broker ack names each partition:
 
@@ -423,6 +480,59 @@ The leader pushes the staged version only to nodes in the open stage. Other node
 `Advance` opens the next stage after the open stage has enough `Ack`s. The default requirement is every targeted node that is `ALIVE`. A stage that targets brokers advances when those brokers report `serving` for the partitions that stage opened, not when they have only swapped the snapshot (§13.5). The operator can set a minimum count. A node that is `DEAD` is reported and, under the default policy, blocks advance; the operator may skip it explicitly. That skip is itself a log entry.
 
 `Activate` commits when the last stage has met its ack rule, or when an identity with role `operator` forces it. Activation publishes the version as desired. Nodes that have not acked still receive it (subject to their window) and still serve last-good until they apply.
+
+As designed, a proposal moves through these states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> STAGED: Propose, once the leader validated it
+    STAGED --> StageOpen: Stage binds the ordered selectors
+    StageOpen --> StageOpen: Advance, the open stage has enough Acks
+    StageOpen --> DESIRED: Activate, the last stage met its ack rule<br/>or an operator forces it
+    DESIRED --> [*]
+    note right of StageOpen
+        only nodes in the open
+        stage receive the version
+    end note
+    note left of DESIRED
+        Rollback appends a new,
+        higher version with an
+        older activated content
+        and rolls it out the
+        same way
+    end note
+```
+
+As built, the stages are bookkeeping. Nothing is pushed before `Activate`, and every watcher then gets the newest
+activated version:
+
+```mermaid
+stateDiagram-v2
+    [*] --> STAGED: propose
+    STAGED --> DESIRED: activate
+    DESIRED --> [*]
+    note right of STAGED
+        one staged proposal
+        at a time, a second
+        propose is 409.
+        Acks are not consulted
+    end note
+    note left of DESIRED
+        signed, kept in a
+        history of 8. Watchers
+        get the newest, the
+        older ones serve
+        /config/{v} and rollback.
+        Rollback is a new
+        higher version with the
+        old content, immediate,
+        and it drops a staged
+        proposal
+    end note
+```
+
+`rollout` and `advance` are not transitions. They are accepted in any state and only record the selectors and a
+stage counter, which `GET /cp/v1/rollout` reports. An activate or a rollback does not clear them.
 
 `Rollback { toVersion }` appends a new version whose `canonicalHash` and canonical YAML equal the retained activated snapshot `toVersion`. The new version is higher than any current version, so anti-replay still moves forward. The rollout of a rollback uses the same stage list unless the operator selects a single stage of all nodes. Nodes that never installed the bad version treat the rollback as a no-op if their installed hash already matches, and ack it.
 
@@ -468,7 +578,7 @@ The content listener is outside the control-plane trust boundary. Compromise of 
 
 ### 12.2 mTLS, identity, and cert rotation
 
-TLS is 1.3 only. There is no fallback to 1.2, no 0-RTT early data, and no session-ticket resumption across an identity change (ticket keys rotate with the identity). Leaf keys are Ed25519 or ECDSA P-256. The URI SAN is exactly `urn:sjws:node:<nodeId>`. A verifier matches that SAN to the peer it expected: a voter checks a voter id, and a data node checks that the peer is a voter or learner id named by the trust bundle, not merely that the CA signed something. Extended key usage splits `serverAuth` and `clientAuth`.
+TLS is 1.3 only. There is no fallback to 1.2, no 0-RTT early data, and no session-ticket resumption across an identity change (ticket keys rotate with the identity). Leaf keys are Ed25519 or ECDSA P-256. The URI SAN is exactly `urn:sjws:node:<nodeId>`. A verifier matches that SAN to the peer it expected: a voter checks a voter id, and a data node checks that the peer is a voter or learner id named by the trust bundle, not merely that the CA signed something. Today the voter links accept any certificate from the configured peer CA; binding it to the id is a tracked follow-up (see [control-plane hosting](control-plane-hosting.md) §4). Extended key usage splits `serverAuth` and `clientAuth`.
 
 Three intermediates, each signed by the offline root (§12.3): one for voters, one for data nodes, one for admin clients. A data-node certificate cannot authenticate as a voter or as an admin. The online intermediate private keys live on the control leader only while `leaderReady()`, mode `0600`. The root private key does not.
 
@@ -476,7 +586,7 @@ Node certificates last 24 hours. The node renews by CSR at two thirds of that li
 
 A peer that fails verification closes the watch or the admin connection. The data node keeps last-good. Content connections are unaffected.
 
-Voter-to-voter mTLS is a ship blocker for every deployment except a single-node lab. A group with more than one voter refuses to start until voter mTLS is on. The HMAC shared secret from HA §9 is allowed only in that lab, behind an explicit flag, and it is not a production identity. The watch and the admin API are mTLS in every role, including the lab.
+Voter-to-voter mTLS is a ship blocker for every deployment except a single-node lab. A group with more than one voter refuses to start until voter mTLS is on (`cp.tls.peerCert`, `peerKey`, `peerCa`). Its frames also carry an HMAC under a CP-only key (`SJWS_CP_RAFT_KEY`) that must not equal the HA cluster key, and plain links exist only behind a test seam, on loopback. The watch and the admin API are mTLS in every role, including the lab.
 
 ### 12.3 Keys, signatures, freshness, and anti-replay
 
@@ -514,13 +624,33 @@ Key compromise: the operator signs a new `TrustBundle` with the root. The bundle
 
 ### 12.4 Join tokens and bootstrap
 
-A join token is `{tokenId, secret}` issued for one node identity. It is the only token the control plane accepts. It is not an admin credential and it is not an `Authorization` bearer. The control plane stores the hash of `secret`, a TTL (default 1 hour, maximum 24 hours), the role, the labels, the capabilities, and the node id. Within that TTL the token is one-shot for that identity: presenting it again, including after a restart that still has the token file and including after a leadership change, is the same join, not a second enrollment and not a reusable session. The committed consume entry is returned again. A second enrollment is not created. A different node identity is rejected. A presentation after the TTL is rejected.
+A join token is `{tokenId, secret}` issued for one node identity. It is the only token the control plane accepts. It is not an admin credential and it is not an `Authorization` bearer. The control plane stores the hash of `secret`, a TTL (default 1 hour, maximum 24 hours), the role, the labels, the capabilities, and the node id. Within that TTL the token is one-shot: the first use burns it for that node identity, and the same node presenting it again within 10 minutes of the consume (after a restart or a leadership change) gets the recorded join back, not a second enrollment. Any other identity is rejected as used, and a presentation after the TTL is rejected. A joined node keeps authenticating with the same token id and secret until revoked. As built, an issued token records only its id, the secret hash and the expiry; the node id is recorded by the first consume.
 
 The data node checks the pinned CA fingerprint **before** it sends the token. Role `data` has no trust-on-first-use path. A lab process may pass `--insecure-tofu`, and that flag is refused when the role is `data` or when the group has more than one voter. The bootstrap API returns the fingerprint and the token to its caller. A test does not scrape stdout for either value.
 
 Role, labels, and capabilities come from the token record. The leader writes them into the node certificate (SAN and a role extension). The projection is derived from that certificate. `Register` cannot raise them. A `Register` that claims a different role is rejected.
 
 `ConsumeToken` and `Register` are one Raft entry. The leader appends that entry and waits until it commits, and only then returns the certificate. A leadership change does not mint a second join for the same token and the same identity: the consume is already in the log and the re-presentation returns it, or it is not committed and the certificate was not sent. A different identity does not reuse that entry. Failed presentations are rate-limited and audited per source address. The token is checked before any CSR is signed, so an unauthenticated joiner does not cost a signature. `NodeEnrollment.tokenConsumed()` runs only after that commit (§6.1).
+
+The join, in order, as designed. As built, a node sends its node id and join token in `X-Sjws-*` headers on the
+watch (the hosted listener also requires a TLS client certificate, which it does not tie to the node id), the
+leader commits one `JOIN_CONSUME` entry for the token, and there is no `Register`, no CSR and no node certificate
+issued. No admin route issues join tokens yet:
+
+```mermaid
+sequenceDiagram
+    participant N as Data node
+    participant L as Control leader
+    participant R as cp-config log
+
+    Note over N: check the pinned CA fingerprint<br/>before sending the token
+    N->>L: join token and CSR
+    Note over L: check the token before<br/>any CSR is signed
+    L->>R: ConsumeToken and Register,<br/>one entry
+    R-->>L: committed
+    L-->>N: node certificate
+    Note over N: tokenConsumed(): write node.id,<br/>then delete the token file
+```
 
 Voter bootstrap tokens follow the same TTL, hash, and per-identity idempotency rules, and an enrolled `admin` must approve them. The one-voter lab configuration is not a production deployment. Production failure tests use 3 voters. The operator retires the one-voter group before data nodes join.
 
@@ -594,7 +724,7 @@ The signature is verified before a payload is parsed or decompressed. Compile is
 
 ### 12.9 Audit
 
-An append-only audit stream, separate from the access log, records actor SAN, role, action, target, `version`, `raftIndex`, result, source address, and timestamp. It covers every admin mutation, join success and failure, revoke, key and CA rotation, signature and anti-replay rejection, and admin authentication failure. Control-plane events are `Audit` log entries, so one voter cannot drop them. The stream never contains token or secret bytes (§12.6).
+An append-only audit stream, separate from the access log, records actor SAN, role, action, target, `version`, `raftIndex`, result, source address, and timestamp. It covers every admin mutation, join success and failure, revoke, key and CA rotation, signature and anti-replay rejection, and admin authentication failure. In the design the control-plane events are `Audit` log entries, so one voter cannot drop them. As built, each voter writes its own hash-chained `<stateDir>/audit.jsonl` and the lines are not replicated (§4). The stream never contains token or secret bytes (§12.6).
 
 ### 12.10 What `standalone` does not do
 
@@ -728,10 +858,16 @@ The control role binds a dedicated admin address and does not bind the content p
 | `POST` | `/cp/v1/rollback` | `operator` | `ROLLBACK` | `{ "toVersion": <long> }` |
 | `GET` | `/cp/v1/nodes` | `viewer` | `READ` | id, role, labels, version, freshness, and the last heartbeat aggregate (per-topic lag, in-flight, DLQ depth). Not a second stats path. |
 | `POST` | `/cp/v1/nodes/{id}/revoke` | `admin` | `MANAGE_OPERATORS` | denylist |
+| `GET` | `/cp/v1/config/{version}` | `viewer` | `READ` | one of the retained activated versions (the last 8): metadata and canonical YAML. Any other version is 404. |
+| `GET` | `/cp/v1/rollout` | `viewer` | `READ` | the current stage and the ordered selectors |
+| `GET` | `/cp/v1/audit?after=&limit=` | `viewer` | `READ` | this voter's audit entries with a `seq` above `after`, at most 100 |
+| `POST` | `/cp/v1/config:validate` | `operator` | `EDIT_ROUTES` | canonical YAML. The same checks as `Propose`, and no log entry. |
+| `POST` | `/cp/v1/activate` | `operator` | `ROLLOUT` | signs and commits the staged proposal. 409 when nothing is staged. |
+| `POST` | `/cp/v1/rbac` | `admin` | `MANAGE_OPERATORS` | `{ "san": <certificate SAN>, "role": <role> }` grants a role |
 
 Every route authenticates with the client certificate. There is no `Authorization` bearer. A missing or unmapped certificate is 401. A mapped certificate whose role lacks the permission is 403.
 
-Responses are JSON. Mutations return the committed `version` and `raftIndex`, or a validation error and no committed entry. A follower responds with the leader address and does not append.
+Responses are JSON. Mutations return the committed `version` and `raftIndex`, or a validation error and no committed entry. A follower answers 503 `leader not ready` and does not append; clients try the next endpoint (the answer carries no leader address yet).
 
 `sjws_nettask.admin.ServerControl` stays the in-process control for `standalone` (start, stop, reload). The TUI gains a control-plane client that implements the calls above when the operator points it at an admin URL. The standalone screens are unchanged. The TUI never links the admin client into `Http1Connection`.
 
@@ -741,7 +877,7 @@ In-JVM unless a row says otherwise. The cluster transport is the PR #29 sim tran
 
 ### 15.1 Harness seams
 
-The suite that will run the four outage scenarios is already in the tree: `tests/sjws_nettask/clusterharness`. `ClusterHarness.open(controlNodes, dataNodes, root, role, clock)` starts data nodes the way `FileServingEndToEndTest` does (`SjwsServer` on port 0). Control nodes go through `ControlPlane`. `PendingControlPlane` refuses every call until `sjws_nettask.cp` implements that interface. The implementation reads `ClusterClock` for election, heartbeat, suspect, dead, watch retry, max-staleness, and `delay`. `GroupOptions` durations are arguments of the test cluster, not only the production defaults. The four scenarios stay `@Disabled` until `ControlPlane.available()` is true. Enabling one is removing `@Disabled` and pointing `ClusterHarness.newControlPlane()` at the real factory.
+The suite that runs the four outage scenarios is in the tree: `tests/sjws_nettask/clusterharness`. `ClusterHarness.open(controlNodes, dataNodes, root, role, clock)` starts data nodes the way `FileServingEndToEndTest` does (`SjwsServer` on port 0). Control nodes go through `ControlPlane`: `CpStoreControlPlane` runs real `CpStore` voters, and `PendingControlPlane` only stands in when a scenario asks for none. The implementation reads `ClusterClock` for election, heartbeat, suspect, dead, watch retry, max-staleness, and `delay`. `GroupOptions` durations are arguments of the test cluster, not only the production defaults. The four scenarios run in `ClusterScenariosTest`, and none is `@Disabled`.
 
 The in-JVM observation does not mint a `viewer` certificate. `ControlPlane` is the direct read: `leader()`, `ControlNode.leaderReady()`, `ControlNode.adminPort()`, `ControlNode.term()`, `push`, `rollback`, `contentHash(version)` (that value is `canonicalHash`), `partitionDataFromControl`, `heal`, `killLeader`, `delay`, and `awaitConverged`. A follower's leader address is data on that interface, not a log line. Admin and watch listeners bind `127.0.0.1:0` and return the bound port from `start`. A subprocess prints one line, `content=<port> admin=<port> watch=<port>`. Bootstrap returns the CA fingerprint and the join token to the caller. A test does not scrape stdout for either value.
 
@@ -828,6 +964,6 @@ Each PR is based on current master (this document's base or newer), merges the H
 
 1. **Design.** This document.
 2. **Store and admin API.** `sjws_nettask.cp`: open `cp-config`, the state machine, `SignedSnapshot`, `ControlLeadership` including the election `Noop`, and `ConfigDiff.between` as a report. `SjwsServer.applyRemote` verifies the signature and the rollback inside the lock and fails closed, then uses `ConfigReloader.apply`. The handler chain reads the live snapshot. Last-good is `<stateDir>/config/last-good.json`. Admin routes in §14 authorize through `sjws_nettask.controlplane.Rbac` with `Role.VIEWER`, `Role.OPERATOR`, and `Role.ADMIN`. The client certificate is the only admin credential. RBAC stays out of `Propose`. Expose `sjws_nettask.service.ControlPlaneBinding` and `NodeEnrollment` with the signatures in §6.1. SIGHUP stays a local reload. Drain stays inside the 30 s `drain-ms` budget. Readiness is `/readyz` plus `leaderReady()` on a control node. Join tokens are one-shot and idempotent per node identity. The control role does not bind the content port by default. Role precedence is CLI, then environment, then YAML. This PR does not import `sjws_nettask.messaging`, does not compute partition placement, and does not open a partition. The topic schema, the destructive-change guards, CP-computed placement, and per-partition acks are the contract in §13.5. Tests from §15 that do not need a data-node watch, including the class-load test. Benchmark as §16.
-3. **Registration and distribution.** Watch client and server, projection, ack window, full snapshots only, `<stateDir>/config/last-good.json`, staged rollout and rollback, label selection. Data role calls `applyRemote`. The broker projection is that node's assignments plus those topic specs, and `Ack` carries the per-partition states in §8. Placement is computed on the control leader and committed in `cp-config`. Implement `ControlPlane` so the four harness scenarios can drop `@Disabled`. Tests for resume, backpressure, canary, partition, revoke, destructive messaging changes, add-before-remove rebalance, and the broker serving from last-good while the control plane is down. Benchmark as §16.
+3. **Registration and distribution.** Watch client and server, projection, ack window, full snapshots only, `<stateDir>/config/last-good.json`, staged rollout and rollback, label selection. Data role calls `applyRemote`. The broker projection is that node's assignments plus those topic specs, and `Ack` carries the per-partition states in §8. Placement is computed on the control leader and committed in `cp-config`. `ControlPlane` is implemented (`CpStoreControlPlane`), so the four harness scenarios run. Tests for resume, backpressure, canary, partition, revoke, destructive messaging changes, add-before-remove rebalance, and the broker serving from last-good while the control plane is down. Benchmark as §16.
 
 The request path in both implementation PRs stays a volatile read of the immutable snapshot.

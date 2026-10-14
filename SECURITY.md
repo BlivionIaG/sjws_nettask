@@ -95,8 +95,8 @@ What the code enforces today:
   (`viewer`, `operator`, `admin`), and every decision is written to the audit log before it is
   returned.
 - **Admin certificate rotation and revocation**: the admin listener reloads its certificate, key
-  and admin-CA bundle without a restart, either on an explicit reload (`AdminServer.reloadTls()`,
-  for example from a SIGHUP handler) or through an optional file watch. A reload that fails keeps
+  and admin-CA bundle without a restart, either on an explicit reload of the control host (`CpHost.reload()`
+  reloads every listener's TLS and the key ring) or, in the library API, through an optional file watch. A reload that fails keeps
   the previous material and is audited. An optional revocation file is checked at every handshake,
   against every certificate in the client chain. It holds either PEM CRLs, each of which must be
   signed by the admin CA, or a denylist of `sha256:<fingerprint>` and `serial:<hex>` entries. A
@@ -136,12 +136,14 @@ What the code enforces today:
 
 Recommendations:
 
-- **Keep cluster traffic on a private, trusted network.** The HA heartbeat is plain UDP. Enable
-  `cpTls` (below) whenever the node-to-control-plane watch leaves loopback.
+- **Keep cluster traffic on a private, trusted network.** The HA heartbeat is HMAC-authenticated but not encrypted UDP. Enable
+  `cpTls` (above) whenever the node-to-control-plane watch leaves loopback.
 - Deliver each join token through a file readable only by the service user, use the shortest
   practical TTL, and never put tokens in arguments, logs or the repository.
-- The swarm (`/swarm/v1`) endpoints have no built-in authentication. Enable them only behind the
-  gateway's API-key or JWT filters, or on a private listener.
+- The swarm (`/swarm/v1`) endpoints answer 401 until agent bearer tokens are configured (`sjws.swarm.tokens.file` or
+  `SJWS_SWARM_TOKENS_FILE`, a mode 0600 file), and a token reaches only its listed pools. The gate is interim, so keep
+  them on a private listener or behind the gateway's filters. The messaging endpoints (`/messaging/v1`, off by default)
+  have no authentication.
 - Issue admin client certificates from a dedicated admin CA. When a key is lost or a person
   leaves, add the certificate to the admin revocation list. Rotate the CA and server certificate by
   replacing the files and reloading.
