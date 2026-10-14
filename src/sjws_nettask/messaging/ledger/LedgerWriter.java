@@ -28,7 +28,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * After every commit, and after every background fsync, an immutable {@link LedgerSnapshot} is
  * published through an atomic reference.
  */
-public final class LedgerWriter implements AutoCloseable {
+public final class LedgerWriter implements PartitionAppender, AutoCloseable {
 
     public static final int DEFAULT_QUEUE = 65_536;
     public static final Durability DEFAULT_DURABILITY = Durability.ASYNC;
@@ -122,6 +122,7 @@ public final class LedgerWriter implements AutoCloseable {
      * Enqueues one batch; completes with its base offset once durable per {@code mode} (null = writer
      * default). Blocks while the queue holds {@code queueCapacity} appends (see {@link #awaitCapacity}).
      */
+    @Override
     public CompletableFuture<Long> append(List<byte[]> recs, Durability mode) throws InterruptedException {
         awaitCapacity();
         return appendNoWait(recs, mode);
@@ -133,6 +134,7 @@ public final class LedgerWriter implements AutoCloseable {
      * slow writer throttles producers without ever stalling a lock holder. The bound is soft: it can be overshot by
      * the appends of threads that passed this check concurrently.
      */
+    @Override
     public void awaitCapacity() throws InterruptedException {
         if (!behind) return;
         while (behind && queue.size() >= capacity && !closed && failure == null) {
@@ -142,6 +144,7 @@ public final class LedgerWriter implements AutoCloseable {
     }
 
     /** As {@link #append} but never blocks: no capacity wait (see {@link #awaitCapacity}). Safe under a caller's lock. */
+    @Override
     public CompletableFuture<Long> appendNoWait(List<byte[]> recs, Durability mode) {
         if (recs.isEmpty()) throw new IllegalArgumentException("empty batch");
         RecordBatch.encodedSize(recs); // validate size eagerly

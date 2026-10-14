@@ -60,6 +60,8 @@ public final class Partition implements AutoCloseable {
     private final String topic;
     private final SegmentedLog log;
     private final LedgerWriter writer;
+    /** Every append goes through the seam (today {@link #writer} itself; durable-log-plan §3 replication later). */
+    private final sjws_nettask.messaging.ledger.PartitionAppender appender;
     private final DeliveryState state;
     private final Partition dlq;
     private final LongSupplier clockMs;
@@ -105,6 +107,7 @@ public final class Partition implements AutoCloseable {
         this.topic = topic;
         this.log = log;
         this.writer = writer;
+        this.appender = writer;
         this.state = state;
         this.dlq = dlq;
         this.clockMs = clockMs;
@@ -606,7 +609,7 @@ public final class Partition implements AutoCloseable {
     private void lockForAppend() {
         if (!lock.isHeldByCurrentThread()) {
             try {
-                writer.awaitCapacity();
+                appender.awaitCapacity();
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("interrupted", ie);
@@ -630,7 +633,7 @@ public final class Partition implements AutoCloseable {
         List<byte[]> enc;
         if (es.size() == 1) enc = List.of(LedgerEntry.encode(es.get(0)));
         else { enc = new ArrayList<>(es.size()); for (var e : es) enc.add(LedgerEntry.encode(e)); }
-        f = writer.appendNoWait(enc, durability); // never blocks: capacity was awaited before the lock (lockForAppend)
+        f = appender.appendNoWait(enc, durability); // never blocks: capacity was awaited before the lock (lockForAppend)
         if (f.isCompletedExceptionally()) {
             f.join(); // rethrows: the writer is fenced; nothing was applied
         }
