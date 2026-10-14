@@ -48,13 +48,17 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String TOPIC_DURABILITY_PROPERTY = "sjws.messaging.durability.topics";
     static final String TOPIC_DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY_TOPICS";
 
+    static final String OFFSETS_EXPIRY_MS_PROPERTY = "sjws.messaging.offsets.expiry.ms";
+    static final String OFFSETS_EXPIRY_MS_ENV = "SJWS_MESSAGING_OFFSETS_EXPIRY_MS";
     static final String COMPACTION_TOPICS_PROPERTY = "sjws.messaging.compaction.topics";
     static final String COMPACTION_TOPICS_ENV = "SJWS_MESSAGING_COMPACTION_TOPICS";
 
     private final LogTopics topics;
     private volatile MessagingHooks hooks = MessagingHooks.NONE;
     /** Null unless a retention limit or a compacted topic is set: no thread when both are off. */
-    private final java.util.concurrent.ScheduledExecutorService retentionTimer;
+    private java.util.concurrent.ScheduledExecutorService retentionTimer;
+    private final long checkMs;
+    private boolean closed;
 
     public MessagingModule() {
         this(Path.of(setting(DIR_PROPERTY, DIR_ENV, "messaging-data")),
@@ -64,7 +68,8 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
                 number(setting(RETENTION_CHECK_MS_PROPERTY, RETENTION_CHECK_MS_ENV, ""), 10_000),
                 durability(setting(DURABILITY_PROPERTY, DURABILITY_ENV, "")),
                 topicDurability(setting(TOPIC_DURABILITY_PROPERTY, TOPIC_DURABILITY_ENV, "")),
-                compactionTopics(setting(COMPACTION_TOPICS_PROPERTY, COMPACTION_TOPICS_ENV, "")));
+                compactionTopics(setting(COMPACTION_TOPICS_PROPERTY, COMPACTION_TOPICS_ENV, "")),
+                Math.max(1, number(setting(OFFSETS_EXPIRY_MS_PROPERTY, OFFSETS_EXPIRY_MS_ENV, ""), LogOffsets.DEFAULT_EXPIRY_MS)));
     }
 
     /** Topics with key compaction; a bad list is logged and ignored as a whole. */
@@ -113,15 +118,24 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
             java.util.Map<String, Durability> topicDurability, java.util.Set<String> compactionTopics) {
+        this(dir, segmentBytes, retention, checkMs, durability, topicDurability, compactionTopics, LogOffsets.DEFAULT_EXPIRY_MS);
+    }
+
+    MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
+            java.util.Map<String, Durability> topicDurability, java.util.Set<String> compactionTopics, long offsetsExpiryMs) {
         this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, compactionTopics,
-                System::currentTimeMillis);
-        if (retention.unlimited() && compactionTopics.isEmpty()) {
-            this.retentionTimer = null;
-        } else {
-            this.retentionTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
-                    r -> Thread.ofPlatform().name("messaging-retention").daemon().unstarted(r));
-            this.retentionTimer.scheduleWithFixedDelay(this::retain, checkMs, checkMs, java.util.concurrent.TimeUnit.MILLISECONDS);
-        }
+                offsetsExpiryMs, System::currentTimeMillis);
+        this.checkMs = checkMs;
+        // No thread while there is no maintenance work; the first offset commit starts it (__offsets is compacted).
+        this.topics.onOffsetsUse(this::ensureTimer);
+        if (this.topics.maintenanceNeeded()) ensureTimer();
+    }
+
+    private synchronized void ensureTimer() {
+        if (this.retentionTimer != null || this.closed) return;
+        this.retentionTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+                r -> Thread.ofPlatform().name("messaging-retention").daemon().unstarted(r));
+        this.retentionTimer.scheduleWithFixedDelay(this::retain, this.checkMs, this.checkMs, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     void retain() {
@@ -141,7 +155,7 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         return this.topics;
     }
 
-    boolean retentionScheduled() {
+    synchronized boolean retentionScheduled() {
         return this.retentionTimer != null;
     }
 
@@ -176,7 +190,10 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     @Override
     public void close() {
-        if (this.retentionTimer != null) this.retentionTimer.shutdownNow();
+        synchronized (this) {
+            this.closed = true;
+            if (this.retentionTimer != null) this.retentionTimer.shutdownNow();
+        }
         this.topics.close();
     }
 }

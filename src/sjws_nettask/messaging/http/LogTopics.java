@@ -58,6 +58,8 @@ final class LogTopics implements AutoCloseable {
     private final ConcurrentHashMap<String, Log> logs = new ConcurrentHashMap<>();
     private final java.util.concurrent.locks.ReentrantLock opening = new java.util.concurrent.locks.ReentrantLock();
     private volatile boolean closed;
+    /** Consumer offsets (durable-log-plan §2); lazily backed by the {@code __offsets} topic. */
+    private final LogOffsets offsets;
 
     LogTopics(Path dir, Durability durability) {
         this(dir, durability, SegmentedLog.DEFAULT_SEGMENT_BYTES, LogRetention.NONE, System::currentTimeMillis);
@@ -74,6 +76,12 @@ final class LogTopics implements AutoCloseable {
 
     LogTopics(Path dir, Durability durability, java.util.Map<String, Durability> topicDurability, long segmentBytes,
             LogRetention retention, java.util.Set<String> compacted, java.util.function.LongSupplier clockMs) {
+        this(dir, durability, topicDurability, segmentBytes, retention, compacted, LogOffsets.DEFAULT_EXPIRY_MS, clockMs);
+    }
+
+    LogTopics(Path dir, Durability durability, java.util.Map<String, Durability> topicDurability, long segmentBytes,
+            LogRetention retention, java.util.Set<String> compacted, long offsetsExpiryMs, java.util.function.LongSupplier clockMs) {
+        this.offsets = new LogOffsets(this, offsetsExpiryMs, clockMs);
         this.compacted = java.util.Set.copyOf(compacted);
         this.dir = dir;
         this.durability = java.util.Objects.requireNonNull(durability);
@@ -85,7 +93,9 @@ final class LogTopics implements AutoCloseable {
 
     /** The writer default for {@code topic}: its override, else the module default. */
     Durability durability(String topic) {
-        return this.topicDurability.getOrDefault(topic, this.durability);
+        var d = this.topicDurability.get(topic);
+        if (d != null) return d;
+        return LogOffsets.TOPIC.equals(topic) ? LogOffsets.DEFAULT_DURABILITY : this.durability;
     }
 
     /**
@@ -127,6 +137,7 @@ final class LogTopics implements AutoCloseable {
         if (this.retention.unlimited()) return 0;
         this.maintenance.lock();
         try {
+            this.offsets.loadIfPresent();
             return enforceRetentionLocked();
         } finally {
             this.maintenance.unlock();
@@ -137,19 +148,51 @@ final class LogTopics implements AutoCloseable {
         return !this.compacted.isEmpty();
     }
 
+    private volatile Runnable offsetsListener;
+    private volatile boolean offsetsUsed;
+
+    /** Called once, on the first offset commit (the module starts its maintenance timer). */
+    void onOffsetsUse(Runnable r) {
+        this.offsetsListener = r;
+    }
+
+    void offsetsUsed() {
+        if (this.offsetsUsed) return;
+        this.offsetsUsed = true;
+        var r = this.offsetsListener;
+        if (r != null) r.run();
+    }
+
+    LogOffsets offsets() {
+        return this.offsets;
+    }
+
+    /** Whether {@code topic} is key-compacted: listed, or the internal {@code __offsets} topic. */
+    boolean isCompacted(String topic) {
+        return this.compacted.contains(topic) || LogOffsets.TOPIC.equals(topic);
+    }
+
+    /** Whether there is any maintenance work: retention, a compacted topic, or consumer offsets on disk or in use. */
+    boolean maintenanceNeeded() {
+        return !this.retention.unlimited() || !this.compacted.isEmpty() || this.logs.containsKey(LogOffsets.TOPIC)
+                || java.nio.file.Files.isDirectory(this.dir.resolve(LogOffsets.TOPIC));
+    }
+
     /**
      * One key-compaction pass over every open compacted topic ({@link LogCompaction}). Copies are written without
      * blocking fetches or produces; only the swap of each rewritten segment takes the topic's {@code reads} write lock,
      * so an in-flight fetch finishes on the old file first.
      */
     LogCompaction.Result compact() throws IOException {
-        if (this.compacted.isEmpty()) return LogCompaction.Result.NONE;
+        if (this.compacted.isEmpty() && !this.logs.containsKey(LogOffsets.TOPIC)) return LogCompaction.Result.NONE;
         var total = LogCompaction.Result.NONE;
         this.maintenance.lock();
         try {
-            for (var l : this.logs.values()) {
+            this.offsets.loadIfPresent();
+            for (var e : this.logs.entrySet()) {
+                var l = e.getValue();
                 if (!l.topicCompacted()) continue;
-                var prepared = LogCompaction.prepare(l.log());
+                var prepared = LogCompaction.prepare(l.log(), this.offsets.floor(e.getKey()));
                 for (var p : prepared) {
                     l.reads().writeLock().lock();
                     try {
@@ -169,12 +212,15 @@ final class LogTopics implements AutoCloseable {
     private int enforceRetentionLocked() throws IOException {
         int deleted = 0;
         long now = this.clockMs.getAsLong();
-        for (var l : this.logs.values()) {
+        for (var e : this.logs.entrySet()) {
+            if (LogOffsets.TOPIC.equals(e.getKey())) continue; // bounded by compaction; retention would lose commits
+            var l = e.getValue();
+            long floor = this.offsets.floor(e.getKey()); // a committed-but-unfetched group pins its history (§2)
             l.reads().writeLock().lock();
             try {
                 long total = l.log().totalBytes();
                 for (var seg : l.log().segments()) {
-                    if (seg.active() || !this.retention.expired(total, seg.lastModifiedMs(), now)) break;
+                    if (seg.active() || seg.nextOffset() > floor || !this.retention.expired(total, seg.lastModifiedMs(), now)) break;
                     l.log().deleteSegment(seg.baseOffset());
                     total -= seg.bytes();
                     deleted++;
@@ -202,7 +248,7 @@ final class LogTopics implements AutoCloseable {
             if (l == null) {
                 var log = SegmentedLog.open(this.dir.resolve(topic), this.segmentBytes);
                 l = new Log(log, new LedgerWriter(log, durability(topic)), new java.util.concurrent.locks.ReentrantReadWriteLock(),
-                        this.compacted.contains(topic));
+                        isCompacted(topic));
                 this.logs.put(topic, l);
             }
             return l;
