@@ -16,7 +16,12 @@
  */
 package sjws_nettask.cluster;
 
-/** Per-group committed-entry stream. One caller thread, index order. Equivalent to a state-machine callback. */
+/**
+ * Per-group committed-entry stream. Equivalent to a state-machine callback: calls arrive strictly in
+ * index order and never overlap, though not always on the same thread. A callback may append to the
+ * group; the new entry is delivered after this callback returns (by the same draining loop), so a
+ * callback must not block waiting for its own append's future, which would deadlock.
+ */
 @FunctionalInterface
 public interface GroupListener {
 

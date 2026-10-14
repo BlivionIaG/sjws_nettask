@@ -20,5 +20,15 @@ package sjws_nettask.swarm;
  * One claimed task: the lease is {@code (pool, offset, attempt)}; {@code attempt} is the fencing token
  * (agent-swarm.md §4.3) and every settle passes it.
  */
-public record Task(String pool, long offset, int attempt, long leaseDeadlineMs, TaskEnvelope envelope) {
+public record Task(String pool, long offset, int attempt, long leaseDeadlineMs, TaskEnvelope envelope, int shard) {
+
+    /** A task of shard 0 (an unsharded pool). */
+    public Task(String pool, long offset, int attempt, long leaseDeadlineMs, TaskEnvelope envelope) {
+        this(pool, offset, attempt, leaseDeadlineMs, envelope, 0);
+    }
+
+    /** The same lease with another deadline. */
+    Task withDeadline(long leaseDeadlineMs) {
+        return new Task(this.pool, this.offset, this.attempt, leaseDeadlineMs, this.envelope, this.shard);
+    }
 }
