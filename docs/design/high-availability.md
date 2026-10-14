@@ -88,14 +88,24 @@ What a voter keeps across a crash:
   is called, and must return only once durable, whenever `term` or `votedFor` changes, before
   the vote request or grant is sent. The write comes first and memory changes only when it
   succeeds (`startElection`, stepping down to a higher term, a vote grant). A failed write leaves
-  term and vote as they were, sends nothing, and the node stays a follower; a failed grant is a
+  term and vote as they were, sends nothing, and the node stays a follower (a leader that cannot
+  persist a higher term it has seen logs a WARNING and stays in its old term); a failed grant is a
   refusal. Messages only ever carry the durable term (a pre-vote reply carries the responder's own
   term, and the pre-candidate accepts a grant at a term at or below its own).
   `FileLogStorage` writes `{group}.vote`: 24 bytes big-endian, magic `SJVT`, version 1, term,
   voted-for wire id (0 for none), CRC32C of the first 20 bytes, with the same temp file, fsync,
   `ATOMIC_MOVE`, directory fsync sequence as the witness cursor. On open, a missing file with an
-  empty log is term 0; a missing file with a log (an upgrade) is the last entry's term with no
-  vote; a short file, a bad magic, an unknown version or a CRC mismatch refuses to start with an
+  empty log is term 0; a missing file with a log (an upgrade) is the last entry's term, treated as
+  already voted (for this node), so it cannot grant a second vote in that term (a witness takes
+  the term of its forced cursor); a missing file after `{group}.vote-saved` exists means the file was deleted and refuses to
+  start. The marker is written (atomically, fsynced) right after the first vote file, so a crash
+  between the two leaves a vote file and no marker, which loads normally, and the next save adds
+  the marker; a crash before the first vote file lands leaves neither, which is safe because the
+  vote was never sent. If an operator deletes both files, the node cannot tell this from an
+  upgrade: it comes back at the last log term, treated as voted, which prevents a double vote in
+  that term but not in a later term it had voted in before. Treat the state directory as one
+  unit: restore or wipe it whole, never file by file; the file is
+  opened with `NOFOLLOW_LINKS`, so a symlink in its place refuses to start; a short file, a bad magic, an unknown version or a CRC mismatch refuses to start with an
   error naming the file. It is never silently reset. Before this,
   a restarted node came back at term 0 with no vote and could vote twice in one term. A custom
   `LogStorage` that does not override the default methods keeps that old behaviour.
