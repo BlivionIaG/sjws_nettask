@@ -17,7 +17,7 @@
 package sjws_nettask.cluster;
 
 /**
- * {@code append()} refused because this group's committed entries are not being applied fast enough: the
+ * The {@code append()} future fails with this because this group's committed entries are not being applied fast enough: the
  * delivery queue (callbacks plus future completions) reached its limit. Retry later; nothing was appended.
  */
 public final class ApplyLagException extends IllegalStateException {

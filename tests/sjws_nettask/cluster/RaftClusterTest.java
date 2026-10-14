@@ -788,7 +788,7 @@ class RaftClusterTest {
         node.deliveryLagLimit = 4;
         var parked = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
-        node.openGroup(lagged, cluster.options, entry -> {
+        var handle = node.openGroup(lagged, cluster.options, entry -> {
             if (text(entry.entry()).equals("slow")) {
                 parked.countDown();
                 try {
@@ -799,16 +799,19 @@ class RaftClusterTest {
             }
         });
         elect(cluster);
-        assertTrue(node.openGroup(lagged, cluster.options, null).isLeader());
+        assertTrue(handle.isLeader()); // (re-opening with a null listener would drop ours)
         var accepted = new ArrayList<java.util.concurrent.CompletableFuture<?>>();
         accepted.add(node.append(lagged, List.of(bytes("slow"))));
         assertTrue(parked.await(5, java.util.concurrent.TimeUnit.SECONDS));
         ApplyLagException refused = null;
         for (int i = 0; i < 20 && refused == null; i++) {
-            try {
-                accepted.add(node.append(lagged, List.of(bytes("e" + i))));
-            } catch (ApplyLagException e) {
-                refused = e;
+            var f = node.append(lagged, List.of(bytes("e" + i)));
+            // Refused like the other append refusals: the returned future fails at once, nothing is appended.
+            if (f.isCompletedExceptionally()) {
+                var cause = assertThrows(java.util.concurrent.ExecutionException.class, f::get).getCause();
+                refused = assertInstanceOf(ApplyLagException.class, cause);
+            } else {
+                accepted.add(f);
             }
         }
         assertNotNull(refused, "append kept accepting while apply lagged");
@@ -868,7 +871,7 @@ class RaftClusterTest {
         var leader = leader(cluster);
         var parked = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
-        leader.openGroup(GROUP, cluster.options, entry -> {
+        var handle = leader.openGroup(GROUP, cluster.options, entry -> {
             if (text(entry.entry()).equals("slow")) {
                 parked.countDown();
                 try {
@@ -895,7 +898,7 @@ class RaftClusterTest {
         assertTrue(awaitDelivered(follower), "follower deliveries");
         assertEquals(List.of("slow", "n0", "n1", "n2"), List.copyOf(followerSeen), "committed while parked");
         assertEquals(List.of(), List.copyOf(completed), "no future completes before the parked callback returns");
-        assertTrue(leader.openGroup(GROUP, cluster.options, null).isLeader());
+        assertTrue(handle.isLeader());
         release.countDown();
         for (var f : futures) {
             f.get(5, java.util.concurrent.TimeUnit.SECONDS);

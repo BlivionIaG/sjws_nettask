@@ -32,7 +32,7 @@ first delivery).
   helpers (`awaitIdle`, `ReplicatedNode.drive()`) return at once on the executor thread instead of
   waiting for themselves.
 - **Bounded queue + backpressure.** `lag` = deliveries queued or running. When `lag` reaches the limit
-  (`DEFAULT_LAG_LIMIT` = 4096), `append()` on the leader **fails fast** with `ApplyLagException`
+  (`DEFAULT_LAG_LIMIT` = 4096), `append()` on the leader **fails fast**: its future fails at once with `ApplyLagException`
   (nothing appended; the caller retries later). We chose fail over block: blocking an appender that is
   itself a callback would deadlock, and blocking while holding the group lock would stall Raft.
   Submissions from the Raft thread (follower commits, step-down) are never refused, so the Raft thread

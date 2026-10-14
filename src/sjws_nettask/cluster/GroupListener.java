@@ -24,7 +24,7 @@ package sjws_nettask.cluster;
  * Rules for implementations:
  * <ul>
  * <li><b>Be fast.</b> Every later callback and every append-future completion of the group waits behind this
- * one; while deliveries back up past the limit, {@code append()} fails with {@link ApplyLagException}.</li>
+ * one; while deliveries back up past the limit, {@code append()} futures fail with {@link ApplyLagException}.</li>
  * <li><b>No IO</b> (disk, network, pulls). Hand slow work to your own worker and return.</li>
  * <li><b>Never block on your own append's future</b> (or any later entry's): it completes on this thread,
  * after this callback returns, so waiting for it deadlocks the group's deliveries. Appending is fine; chain on
