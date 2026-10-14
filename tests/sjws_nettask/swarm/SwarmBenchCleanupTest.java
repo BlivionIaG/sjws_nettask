@@ -62,6 +62,64 @@ class SwarmBenchCleanupTest {
     }
 
     @Test
+    void multiWorkerRequestReplyVariantRuns() throws Exception {
+        var p = start(List.of(), this.dir.toString(), "reqreply-mw", "3x500", "0.5");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(0, p.exitValue(), out);
+        // n= counts completions (ok), and it equals the 250 measured calls only because none failed
+        var m = java.util.regex.Pattern.compile("reqreply workers=3 rate=500 .* n=(\\d+) ok=(\\d+) failed=0 missing=0").matcher(out);
+        assertTrue(m.find(), out);
+        assertEquals(250, Long.parseLong(m.group(1)));
+        assertEquals(m.group(1), m.group(2));
+        assertEquals(0, benchDirs(), "no swarmbench* directory left: " + out);
+    }
+
+    @Test
+    void failedCallsAreCountedNotTreatedAsZero() throws Exception {
+        // every 5th task is acked without a reply; its call times out after 300 ms and must count as failed
+        var p = start(List.of("-Dsjws.bench.dropEvery=5", "-Dsjws.bench.callDeadlineMs=300"), this.dir.toString(),
+                "reqreply-mw", "2x200", "1");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(3, p.exitValue(), "a run with failures is invalid: " + out);
+        var m = java.util.regex.Pattern.compile("n=(\\d+) ok=(\\d+) failed=(\\d+) missing=(\\d+)").matcher(out);
+        assertTrue(m.find(), out);
+        long n = Long.parseLong(m.group(1)), failed = Long.parseLong(m.group(3)), missing = Long.parseLong(m.group(4));
+        assertTrue(failed > 0, out);
+        assertEquals(200, n + failed + missing, "every measured call is ok, failed or missing: " + out);
+        assertTrue(n < 200, "n is completions, not the array size: " + out);
+        assertTrue(out.contains("INVALID:"), out);
+        // p99 is over completed calls only, so it can't be 0 from failed slots
+        var p99 = java.util.regex.Pattern.compile("rtt_p50_us=([\\d.]+)").matcher(out);
+        assertTrue(p99.find() && Double.parseDouble(p99.group(1)) > 0, out);
+    }
+
+    @Test
+    void workersUseDistinctConsumersAndArgsAreValidated() throws Exception {
+        var src = Files.readString(Path.of("bench", "SwarmBench.java"));
+        assertTrue(src.contains("String consumer = \"w\" + w;"), "one consumer name per worker");
+        assertTrue(src.contains("t.claim(\"echo\", consumer,"), "workers claim under their own consumer");
+        var p = start(List.of(), this.dir.toString(), "reqreply-mw", "3", "0.5");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS));
+        assertTrue(p.exitValue() != 0);
+        assertTrue(Files.readString(this.dir.resolve("out.txt")).contains("<workers>x<rate>"));
+        var q = start(List.of(), this.dir.toString(), "reqreply-mw", "2x0", "0.5");
+        assertTrue(q.waitFor(120, TimeUnit.SECONDS));
+        assertTrue(q.exitValue() != 0);
+        assertTrue(Files.readString(this.dir.resolve("out.txt")).contains("rate >= 1"));
+    }
+
+    @Test
+    void singleWorkerRequestReplyReportsOneWorker() throws Exception {
+        var p = start(List.of(), this.dir.toString(), "reqreply", "500", "0.5");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(0, p.exitValue(), out);
+        assertTrue(out.contains("reqreply workers=1 rate=500"), out);
+    }
+
+    @Test
     void theTempDirectoryIsDeletedWhenTheRunIsKilled() throws Exception {
         var p = start(List.of(), this.dir.toString(), "dispatch", "1", "600");
         long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);

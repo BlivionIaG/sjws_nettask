@@ -395,6 +395,24 @@ These are the reference points for the targets below. Neither this PR nor the ta
 
 **S1c gate (decided 2026-10-14, inceptor).** The S1c latency gate is: claim p99 < 100 µs on the task-dispatch row, heartbeat loss < 2 %, and request/reply p99 < 500 µs. Dispatch is measured with **workers = the machine's vCPU count**, and every result states that core count. The reference box has 8 vCPU, so the gate is `SwarmBench dispatch 8`. The 16-worker run (16 on 8 vCPU) is reported as a **stress line, not the gate**: with more runnable workers than cores, a lock holder can be descheduled mid-section, so its p99 measures scheduling as much as code. The batched variant (`SwarmBench batched <W>x<B>`: claim up to `B` and settle with one batched fenced ack, `TaskService.ackAll`) is reported separately and is not the gate, because its claim latency is per batch, not per task. The §13 claim-1/ack-1 workload stays as it is.
 
+**S1c result: NOT PASSED (re-measured 2026-10-14, 05:29–05:56 CEST).** An earlier PASSED call, based on the median of per-run p99s from the #176 quiet-window runs, was withdrawn by inceptor. **Gate statistic:** the mean ± stddev of the per-run p99 across ≥ 5 runs; no median.
+- **Setup:** commit `3097866` (master `1e09588` + bench fixes), OpenJDK 25.0.4.1, 8 vCPU, default G1, `-Dsjws.swarm.pool.shards=4`. Every run was under `flock /tmp/sjws-bench.lock`, with `nice -n 10 taskset -c 0-7` (the load generator and the server share those 8 CPUs; they are not disjoint). Raw output: `bench/results/s1c-2026-10-14.txt`.
+- **Load rule:** every run starts with the 1-minute load < 4. Request/reply runs whose peak or end load reached 4 were discarded and retried. Session load: 3.95 at the start, peak 10.25, 3.27 at the end. **Caveat:** `dispatch 8` and `heartbeat` keep 8 or more threads runnable on 8 vCPU, so they push the 1-minute load above 4 by themselves (peaks 4.7–6.7). Those runs are kept and marked self-loaded in the raw file.
+
+| Metric (gate) | Command | Per-run values | Mean ± stddev | Verdict |
+|---|---|---|---|---|
+| Request/reply p99 (< 500 µs) | `SwarmBench reqreply 10000 10` (1 worker) | 1290 / 289 / 668 / 2629 / 2332 µs | **1441 ± 1019 µs** | **FAIL** |
+| Claim p99 (< 100 µs) | `SwarmBench dispatch 8 5` (workers = 8 = vCPU) | 26.7 / 23.3 / 27.0 / 23.4 / 24.4 µs; 495k ± 29k tasks/s | 25.0 ± 1.8 µs | pass (self-loaded) |
+| Heartbeat loss (< 2 %) | `SwarmBench heartbeat off` / `keeper 20`, 10 000 leases held, alternating | 3.2 / 4.1 / 5.8 / −3.3 / 0.4 % | **2.0 ± 3.5 %** (mean 2.04) | **FAIL** (and within noise) |
+
+Not the gate, reported as extras:
+- **Multi-worker request/reply** (`reqreply-mw 4x10000 10`, G1): per-run p99 1346 / 2226 / 1539 / 2504 / 1622 µs, mean 1848 ± 493 µs.
+- **ZGC request/reply** (`-XX:+UseZGC reqreply 10000 10`): per-run p99 1604 / 790 / 912 / 1023 / 203 µs, mean 906 ± 502 µs.
+- **Failures:** 0 failed and 0 missing calls in every request/reply run (100 000 of 100 000 each). Failures are counted as failures, never as 0 µs samples.
+
+**Root cause (open).** The request/reply p50 is about 27–32 µs in every run, but the p99 varies 9× between runs at similar load. That points to tail events outside the steady path rather than per-call cost. #176's JFR attributed the tail to G1 young-collection pauses. That attribution is not re-verified here, and ZGC is still above the gate (906 µs mean), so GC is unlikely to be the whole cause. Two other factors are untested: the generator and server share CPUs, and other tenants on the box. Heartbeat loss is dominated by run-to-run noise (stddev 3.5 points). A decision needs disjoint CPU sets for the generator and server, and a box free of other jobs.
+- **Known limit, not a gate:** `shards=1` on G1 (#176 quiet window: p99 896 µs).
+
 **Architecture additions:**
 1. **Streaming over HTTP:** time-to-first-token and inter-token latency added by sjws, agent emit → caller receive, on HTTP/1.1 chunked, SSE, h2 and h3. Ledger leg vs the optional direct path (§5.2).
 2. **Throughput through the swarm wire protocol** (§11.2), not only in-process: tasks/s at saturation with 256 B and 4 KiB payloads.
