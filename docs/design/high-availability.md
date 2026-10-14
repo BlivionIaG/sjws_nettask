@@ -117,6 +117,24 @@ turn `USER_STRICT` (4) into `USER` (0), or garble the payload, without detection
 CRCs are tracked in #207. Every member holds the group key, so a compromised member
 can forge the marker either way (the #175 limitation).
 
+### durableIndex and the RELAXED fsync-lag bound
+
+`ReplicationGroup.durableIndex()` is the highest index this node has fsynced to its own log
+(0 on a witness, which stores no entries; on restart, the last index found on disk). Under STRICT
+it is never behind an entry the node acked. Under RELAXED it trails by a bounded amount set with
+`GroupOptions.withRelaxedSyncBound(delay, entries)`:
+
+- **Time:** the node fsyncs on the first tick at which the oldest unsynced entry is at least
+  `relaxedSyncDelay` old. The default is `Duration.ZERO`, meaning the next tick, which is the earlier behaviour.
+  The worst case is `relaxedSyncDelay` plus one tick interval.
+- **Entries:** once `relaxedSyncEntries` entries are unsynced, the node fsyncs inside the append
+  (leader) or before the ack (follower). The default is `Long.MAX_VALUE`, meaning no entry cap.
+
+That bound is also the RELAXED loss window in the guarantee below. One interaction: with one data node
+down in the 2 + 1 pair, a RELAXED commit waits for the leader's fsync (the witness stores
+nothing), so it now waits up to the time bound rather than one tick. Keep `relaxedSyncDelay` small,
+or use the entry bound, if that degraded mode must stay fast.
+
 ### Restart safety and the exact RELAXED guarantee
 
 What a voter keeps across a crash:
@@ -170,7 +188,7 @@ What a voter keeps across a crash:
 
 The RELAXED guarantee is then: an acked entry survives the crash of **any one** voter, and of a
 data node that restarts while a leader holding the entry is reachable. It can be lost when every
-data copy that acked it crashes inside the same fsync window (at most one tick), for example both
+data copy that acked it crashes inside the same fsync window (the RELAXED sync bound above; one tick by default), for example both
 data nodes of the 2 + 1 pair on a shared power failure, or a restarted data node that is still
 inside its recovery window when the other data node is lost. STRICT has no such window: each
 data copy that counts toward a commit has fsynced it.
