@@ -427,27 +427,22 @@ public final class TaskService {
             return CompletableFuture.completedFuture(List.of());
         }
         var pool = tasks.get(0).pool();
-        int shard = tasks.get(0).shard();
-        var offs = new long[tasks.size()];
-        var atts = new int[tasks.size()];
         var durable = new java.util.ArrayList<CompletableFuture<Long>>(tasks.size());
         for (int i = 0; i < tasks.size(); i++) {
             var t = tasks.get(i);
-            if (!t.pool().equals(pool) || t.shard() != shard) {
-                throw new IllegalArgumentException("tasks from one pool (and shard)");
+            if (!t.pool().equals(pool)) {
+                throw new IllegalArgumentException("tasks from one pool");
             }
             var to = t.envelope().replyTo();
             if (to.isEmpty()) {
                 throw new IllegalArgumentException("task has no replyTo");
             }
-            offs[i] = t.offset();
-            atts[i] = t.attempt();
             durable.add(this.topics.partition(to).produce(producerId, firstSeq + i,
                     t.envelope().replyOwned(contentType, bodies.get(i)).encode(), Durability.ASYNC).durable());
         }
         // Different reply topics are different logs, so wait for each topic's futures (normally one topic).
         return CompletableFuture.allOf(durable.toArray(CompletableFuture[]::new))
-                .thenApplyAsync(x -> partition(pool, shard).ack(WORKERS, offs, atts, null).results(), ACKER);
+                .thenApplyAsync(x -> ackAll(tasks), ACKER); // one batched ack per shard (a claim may span shards)
     }
 
     public CompletableFuture<LeaseResult> reply(Task t, long producerId, long seq, String contentType, byte[] body) {

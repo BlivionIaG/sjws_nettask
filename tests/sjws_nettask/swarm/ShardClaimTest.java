@@ -136,6 +136,22 @@ class ShardClaimTest {
     }
 
     @Test
+    void replyAllAcksTasksFromSeveralShards() throws Exception {
+        var t = open(4, TaskService.SHARD_WAIT_SLICE_NANOS);
+        long seq = 0;
+        for (int s = 0; s < 4; s++) {
+            seq = seqFor(t, s, seq);
+            t.submit("p", 1, seq, TaskServiceTest.env("r" + s, "replies", TaskEnvelope.NO_DEADLINE));
+        }
+        var got = t.claim("p", "w", 4, 10_000);
+        assertEquals(4, got.size());
+        var bodies = new ArrayList<byte[]>();
+        got.forEach(x -> bodies.add(new byte[] {1}));
+        var r = t.replyAll(got, 9, 1, "", bodies).get(10, TimeUnit.SECONDS);
+        assertEquals(List.of(LeaseResult.OK, LeaseResult.OK, LeaseResult.OK, LeaseResult.OK), r);
+    }
+
+    @Test
     void oneShardKeepsThePlainPath() {
         var t = open(1, TaskService.SHARD_WAIT_SLICE_NANOS);
         t.submit("p", 1, 1, TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));

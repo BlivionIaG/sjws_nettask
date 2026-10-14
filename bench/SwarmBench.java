@@ -159,12 +159,14 @@ public class SwarmBench {
         var body = new byte[1024];
         var seq = new AtomicLong();
         // Prefilled backlog, no concurrent producer: the measurement is claim (poll) + fenced ack only.
-        long backlog = (long) ((secs + 2) * (batch == 1 ? 120_000 : 400_000)); // batched drains faster
+        // batched and sharded pools drain faster; tasks/s is over the window the backlog actually lasted
+        long backlog = (long) ((secs + 2) * (batch == 1 ? 120_000 : 400_000)) * Integer.getInteger("sjws.swarm.pool.shards", 1);
         for (long i = 0; i < backlog; i++) t.submit("p", 1, seq.incrementAndGet(), env(body));
         long warmEnd = System.nanoTime() + 2_000_000_000L, end = warmEnd + (long) (secs * 1e9);
         var counts = new long[workers];
         var lat = new long[workers][];
         var ns = new int[workers];
+        var lastWork = new long[workers];
         var threads = new ArrayList<Thread>();
         for (int w = 0; w < workers; w++) {
             int id = w;
@@ -183,6 +185,7 @@ public class SwarmBench {
                     }
                     if (t0 >= warmEnd && !got.isEmpty()) {
                         counts[id] += got.size();
+                        lastWork[id] = t1;
                         if (ns[id] < lat[id].length) lat[id][ns[id]++] = t1 - t0;
                     }
                 }
@@ -190,11 +193,14 @@ public class SwarmBench {
         }
         for (var th : threads) th.join();
         long total = Arrays.stream(counts).sum();
+        long last = Arrays.stream(lastWork).max().orElse(0);
+        double window = last > warmEnd && last < end - 50_000_000L ? (last - warmEnd) / 1e9 : secs; // drained early?
+        if (window < secs) System.err.printf("WARN: backlog drained after %.2f of %.2f s%n", window, secs);
         int n = Arrays.stream(ns).sum();
         var all = new long[n];
         int k = 0;
         for (int w = 0; w < workers; w++) { System.arraycopy(lat[w], 0, all, k, ns[w]); k += ns[w]; }
-        System.out.printf((batch == 1 ? "dispatch" : "batched batch=" + batch) + " workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / secs,
+        System.out.printf((batch == 1 ? "dispatch" : "batched batch=" + batch) + " workers=%d tasks/s=%.0f claim_p50_us=%.2f claim_p99_us=%.2f%n", workers, total / window,
                 pct(all, n, 0.50) / 1e3, pct(all, n, 0.99) / 1e3);
     }
 
