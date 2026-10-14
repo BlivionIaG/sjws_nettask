@@ -1,0 +1,70 @@
+# S1c re-measure 2026-10-14 (raw). Format: <label> <run> load <start>/<peak>/<end>: <bench output>
+# session 1 (05:15, aborted: dispatch/heartbeat can't meet load<4 because they load the box themselves)
+session start 05:15:23 load 5.31 4.53 3.56 commit 3097866 java openjdk version "25.0.4.1" 2026-08-18 LTS
+rr-g1 1 load 3.22/3.85/3.85: reqreply workers=1 rate=10000 rtt_p50_us=26.7 rtt_p99_us=577.8 rtt_max_us=9859.0 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 1 try1 DISCARDED load 3.85/4.18/4.18: reqreply workers=4 rate=10000 rtt_p50_us=30.4 rtt_p99_us=1545.2 rtt_max_us=12379.3 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 1 load 2.80/3.32/3.32: reqreply workers=4 rate=10000 rtt_p50_us=30.9 rtt_p99_us=2599.6 rtt_max_us=11967.3 n=100000 ok=100000 failed=0 missing=0 
+disp-g1 1 try1 DISCARDED load 3.32/6.06/6.06: WARN: backlog drained after 4.34 of 5.00 s dispatch workers=8 tasks/s=515953 claim_p50_us=1.81 claim_p99_us=26.37 
+disp-g1 1 try2 DISCARDED load 3.74/6.13/6.13: WARN: backlog drained after 3.72 of 5.00 s dispatch workers=8 tasks/s=559019 claim_p50_us=1.84 claim_p99_us=19.81 
+disp-g1 1 try3 DISCARDED load 3.71/6.74/6.74: WARN: backlog drained after 4.09 of 5.00 s dispatch workers=8 tasks/s=545743 claim_p50_us=1.87 claim_p99_us=25.69 
+disp-g1 1 try4 DISCARDED load 3.28/5.57/5.28: WARN: backlog drained after 4.47 of 5.00 s dispatch workers=8 tasks/s=501830 claim_p50_us=1.86 claim_p99_us=29.02 
+disp-g1 1 FAILED 4 tries
+hb-off 1 try1 DISCARDED load 3.20/5.09/5.09: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=226780 
+hb-off 1 try2 DISCARDED load 3.14/5.43/5.43: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=236140 
+hb-off 1 try3 DISCARDED load 3.43/4.75/5.25: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=222721 
+hb-off 1 try4 DISCARDED load 3.39/4.66/4.37: heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=221534 
+hb-off 1 FAILED 4 tries
+hb-keeper 1 load 2.65/3.92/3.69: heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=223916 batches=443 
+rr-zgc 1 try1 DISCARDED load 3.69/4.44/4.44: reqreply workers=1 rate=10000 rtt_p50_us=32.9 rtt_p99_us=2048.9 rtt_max_us=20434.5 n=100000 ok=100000 failed=0 missing=0 
+rr-zgc 1 load 2.83/3.47/3.19: reqreply workers=1 rate=10000 rtt_p50_us=37.8 rtt_p99_us=2624.5 rtt_max_us=8900.1 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 2 load 3.19/3.70/3.70: reqreply workers=1 rate=10000 rtt_p50_us=26.6 rtt_p99_us=343.1 rtt_max_us=7642.1 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 2 try1 DISCARDED load 3.70/4.35/4.35: reqreply workers=4 rate=10000 rtt_p50_us=30.1 rtt_p99_us=1394.2 rtt_max_us=15153.0 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 2 load 2.63/3.07/3.07: reqreply workers=4 rate=10000 rtt_p50_us=30.7 rtt_p99_us=2123.3 rtt_max_us=16941.4 n=100000 ok=100000 failed=0 missing=0 
+disp-g1 2 try1 DISCARDED load 3.07/5.04/4.88: WARN: backlog drained after 4.61 of 5.00 s dispatch workers=8 tasks/s=488588 claim_p50_us=1.94 claim_p99_us=28.34 
+# session 2 (05:29-05:56, used for the tables)
+session start 05:29:59 load 3.95 3.70 3.68 commit 3097866 java openjdk version "25.0.4.1" 2026-08-18 LTS
+rr-g1 1 try1 DISCARDED load 3.95/4.80/4.80: reqreply workers=1 rate=10000 rtt_p50_us=30.0 rtt_p99_us=1888.3 rtt_max_us=7273.2 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 1 try2 DISCARDED load 2.91/4.71/4.71: reqreply workers=1 rate=10000 rtt_p50_us=27.7 rtt_p99_us=900.1 rtt_max_us=12210.9 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 1 try3 DISCARDED load 2.91/4.51/4.51: reqreply workers=1 rate=10000 rtt_p50_us=28.3 rtt_p99_us=1166.3 rtt_max_us=7723.0 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 1 load 3.13/3.13/3.52: reqreply workers=1 rate=10000 rtt_p50_us=29.9 rtt_p99_us=1289.9 rtt_max_us=8498.6 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 1 try1 DISCARDED load 3.52/4.74/4.74: reqreply workers=4 rate=10000 rtt_p50_us=31.4 rtt_p99_us=2375.8 rtt_max_us=10257.9 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 1 load 2.87/3.27/3.17: reqreply workers=4 rate=10000 rtt_p50_us=30.5 rtt_p99_us=1346.3 rtt_max_us=11976.5 n=100000 ok=100000 failed=0 missing=0 
+disp-g1 1 load 3.17/6.74/6.74 (self-loaded): dispatch workers=8 tasks/s=482827 claim_p50_us=1.95 claim_p99_us=26.68 
+hb-off 1 load 3.28/5.13/5.84 (self-loaded): heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=234147 
+hb-keeper 1 load 3.67/4.69/4.55 (self-loaded): heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=226743 batches=443 
+rr-zgc 1 try1 DISCARDED load 3.62/4.06/3.73: reqreply workers=1 rate=10000 rtt_p50_us=35.3 rtt_p99_us=1327.8 rtt_max_us=12199.5 n=100000 ok=100000 failed=0 missing=0 
+rr-zgc 1 load 2.33/3.49/3.49: reqreply workers=1 rate=10000 rtt_p50_us=34.8 rtt_p99_us=1604.2 rtt_max_us=10275.1 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 2 load 3.49/3.87/3.87: reqreply workers=1 rate=10000 rtt_p50_us=26.4 rtt_p99_us=288.7 rtt_max_us=7047.7 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 2 try1 DISCARDED load 3.87/4.77/4.77: reqreply workers=4 rate=10000 rtt_p50_us=29.5 rtt_p99_us=1130.1 rtt_max_us=10240.6 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 2 load 2.89/3.44/3.44: reqreply workers=4 rate=10000 rtt_p50_us=30.8 rtt_p99_us=2225.7 rtt_max_us=15983.9 n=100000 ok=100000 failed=0 missing=0 
+disp-g1 2 load 3.44/5.33/5.14 (self-loaded): WARN: backlog drained after 4.28 of 5.00 s dispatch workers=8 tasks/s=530767 claim_p50_us=1.81 claim_p99_us=23.30 
+hb-off 2 load 3.23/4.75/4.75 (self-loaded): heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=223219 
+hb-keeper 2 load 3.76/5.23/5.23 (self-loaded): heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=214033 batches=443 
+rr-zgc 2 try1 DISCARDED load 3.22/4.04/4.04: reqreply workers=1 rate=10000 rtt_p50_us=33.3 rtt_p99_us=883.7 rtt_max_us=10860.1 n=100000 ok=100000 failed=0 missing=0 
+rr-zgc 2 load 2.75/3.41/3.41: reqreply workers=1 rate=10000 rtt_p50_us=30.9 rtt_p99_us=789.6 rtt_max_us=7228.8 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 3 load 3.41/3.91/3.91: reqreply workers=1 rate=10000 rtt_p50_us=27.1 rtt_p99_us=667.7 rtt_max_us=12795.2 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 3 try1 DISCARDED load 3.91/5.17/5.16: reqreply workers=4 rate=10000 rtt_p50_us=29.6 rtt_p99_us=1066.4 rtt_max_us=14313.5 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 3 load 3.32/3.37/3.37: reqreply workers=4 rate=10000 rtt_p50_us=31.3 rtt_p99_us=1538.8 rtt_max_us=15088.4 n=100000 ok=100000 failed=0 missing=0 
+disp-g1 3 load 3.37/6.14/6.14 (self-loaded): WARN: backlog drained after 4.31 of 5.00 s dispatch workers=8 tasks/s=515964 claim_p50_us=1.82 claim_p99_us=27.04 
+hb-off 3 load 3.80/5.98/5.98 (self-loaded): heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=226006 
+hb-keeper 3 load 3.62/5.56/5.56 (self-loaded): heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=212988 batches=443 
+rr-zgc 3 try1 DISCARDED load 3.37/3.95/4.11: reqreply workers=1 rate=10000 rtt_p50_us=33.7 rtt_p99_us=446.8 rtt_max_us=8563.4 n=100000 ok=100000 failed=0 missing=0 
+rr-zgc 3 load 2.81/3.22/3.22: reqreply workers=1 rate=10000 rtt_p50_us=33.6 rtt_p99_us=912.1 rtt_max_us=10739.4 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 4 try1 DISCARDED load 3.22/4.48/4.48: reqreply workers=1 rate=10000 rtt_p50_us=26.7 rtt_p99_us=725.7 rtt_max_us=9205.3 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 4 try2 DISCARDED load 2.71/4.25/4.25: reqreply workers=1 rate=10000 rtt_p50_us=27.2 rtt_p99_us=711.7 rtt_max_us=9412.6 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 4 load 2.58/2.78/2.78: reqreply workers=1 rate=10000 rtt_p50_us=29.5 rtt_p99_us=2629.3 rtt_max_us=8527.4 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 4 load 2.78/3.42/3.42: reqreply workers=4 rate=10000 rtt_p50_us=29.9 rtt_p99_us=2504.3 rtt_max_us=14544.1 n=100000 ok=100000 failed=0 missing=0 
+disp-g1 4 load 3.42/6.12/6.12 (self-loaded): WARN: backlog drained after 4.95 of 5.00 s dispatch workers=8 tasks/s=457402 claim_p50_us=1.80 claim_p99_us=23.43 
+hb-off 4 load 3.78/6.63/6.26 (self-loaded): heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=215310 
+hb-keeper 4 load 3.98/5.40/5.40 (self-loaded): heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=222358 batches=443 
+rr-zgc 4 load 3.32/3.79/3.79: reqreply workers=1 rate=10000 rtt_p50_us=34.1 rtt_p99_us=1023.1 rtt_max_us=13054.2 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 5 try1 DISCARDED load 3.79/4.53/10.25: reqreply workers=1 rate=10000 rtt_p50_us=26.9 rtt_p99_us=347.3 rtt_max_us=8507.3 n=100000 ok=100000 failed=0 missing=0 
+rr-g1 5 load 3.76/3.88/3.88: reqreply workers=1 rate=10000 rtt_p50_us=31.7 rtt_p99_us=2331.5 rtt_max_us=7416.0 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 5 try1 DISCARDED load 3.88/4.59/4.59: reqreply workers=4 rate=10000 rtt_p50_us=29.2 rtt_p99_us=1397.8 rtt_max_us=11001.7 n=100000 ok=100000 failed=0 missing=0 
+rrmw-g1 5 load 2.84/3.40/3.40: reqreply workers=4 rate=10000 rtt_p50_us=30.3 rtt_p99_us=1622.4 rtt_max_us=11954.4 n=100000 ok=100000 failed=0 missing=0 
+disp-g1 5 load 3.40/5.74/5.74 (self-loaded): WARN: backlog drained after 4.54 of 5.00 s dispatch workers=8 tasks/s=485930 claim_p50_us=1.92 claim_p99_us=24.44 
+hb-off 5 load 3.61/5.15/5.15 (self-loaded): heartbeat leases held=10000 heartbeat mode=off dispatch_tasks/s=226774 
+hb-keeper 5 load 3.24/4.80/4.80 (self-loaded): heartbeat leases held=10000 heartbeat mode=keeper dispatch_tasks/s=225904 batches=443 
+rr-zgc 5 try1 DISCARDED load 3.74/4.08/4.48: reqreply workers=1 rate=10000 rtt_p50_us=31.8 rtt_p99_us=673.2 rtt_max_us=10105.4 n=100000 ok=100000 failed=0 missing=0 
+rr-zgc 5 load 2.86/3.27/3.27: reqreply workers=1 rate=10000 rtt_p50_us=30.3 rtt_p99_us=202.9 rtt_max_us=7021.6 n=100000 ok=100000 failed=0 missing=0 
+session end 05:56:29 load 3.27 4.05 4.07 peak 10.25
