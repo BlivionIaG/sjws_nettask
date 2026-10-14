@@ -111,6 +111,19 @@ class SwarmBenchCleanupTest {
     }
 
     @Test
+    void generatorWaitsForTheReadyFile() throws Exception {
+        var ready = this.dir.resolve("gen-ready");
+        var p = start(List.of("-Dsjws.bench.genReady=" + ready), this.dir.toString(), "reqreply", "500", "0.5");
+        Thread.sleep(3000);
+        assertTrue(p.isAlive(), "the generator does not start before the wrapper has pinned it");
+        Files.writeString(ready, "");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(0, p.exitValue(), out);
+        assertTrue(out.contains("n=250 ok=250 failed=0 missing=0"), out);
+    }
+
+    @Test
     void singleWorkerRequestReplyReportsOneWorker() throws Exception {
         var p = start(List.of(), this.dir.toString(), "reqreply", "500", "0.5");
         assertTrue(p.waitFor(120, TimeUnit.SECONDS), "bench finished");

@@ -64,6 +64,14 @@ java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply 10000 10      # R
 java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply-mw 4x10000 10 # same, 4 workers on the pool (variant, not the gate)
 
 `reqreply` and `reqreply-mw` print `n=` (completed calls), `ok=`, `failed=` and `missing=`; percentiles are over completed calls only, and a run with any failed or missing call prints `INVALID` and exits 3. For `reqreply-mw`, keep `W <= vCPU - 1`: the open-loop generator spins on one core, so more workers oversubscribe the box (as 16-on-8 does for dispatch).
+
+**Disjoint CPU sets** (§13). SwarmBench is one JVM, so the generator and server can't be separate processes without changing the measured path (the in-process `ReplyRouter.call` becomes an HTTP call). Instead, the request/reply generator runs on its own thread named `sb-gen`, and `bench/pin-gen.sh` starts the JVM on `SERVER_CPUS` (default `0-6`), moves only that thread to `GEN_CPUS` (default `7`) with `taskset -p`, then lets it start (`-Dsjws.bench.genReady`):
+
+```sh
+SERVER_CPUS=0-6 GEN_CPUS=7 nice -n 10 bench/pin-gen.sh -Dsjws.swarm.pool.shards=4 -- /tmp/sb reqreply 10000 10
+```
+
+Reply completions still run on server threads; only the spinning sender is isolated. `dispatch` and `heartbeat` have no separate generator (the workers are the measured load), so they stay on `taskset -c 0-7`.
 ```
 
 - **Comparisons.** Compare `heartbeat off` and `heartbeat keeper` with 5 alternating runs pinned with `taskset`.

@@ -294,25 +294,38 @@ public class SwarmBench {
         var done = new AtomicLong();
         var ok = new AtomicLong();
         var failed = new AtomicLong();
-        long start = System.nanoTime();
-        var body = new byte[256];
-        for (long i = 0; i < total; i++) {
-            long due = start + i * gap;
-            while (System.nanoTime() < due) Thread.onSpinWait();
-            long idx = i - warm;
-            var f = s.replies().call("echo", "", body, System.currentTimeMillis() + callDeadlineMs, "");
-            f.whenComplete((r, e) -> {
-                if (idx >= 0) {
-                    if (e == null) {
-                        lat[(int) idx] = System.nanoTime() - due;
-                        ok.incrementAndGet();
-                    } else {
-                        failed.incrementAndGet(); // a failure is a failure, never a 0 us sample
+        // The open-loop generator runs on its own thread, named "sb-gen" (the Linux thread name), so a wrapper can
+        // pin it to a CPU set disjoint from the server and workers (bench/README.md, "Disjoint CPU sets"). With
+        // -Dsjws.bench.genReady=<file> it waits until that file exists, i.e. until the wrapper has pinned it.
+        var ready = System.getProperty("sjws.bench.genReady");
+        var gen = Thread.ofPlatform().name("sb-gen").unstarted(() -> {
+            try {
+                while (ready != null && !Files.exists(Path.of(ready))) Thread.sleep(10);
+            } catch (InterruptedException e) {
+                return;
+            }
+            long start = System.nanoTime();
+            var body = new byte[256];
+            for (long i = 0; i < total; i++) {
+                long due = start + i * gap;
+                while (System.nanoTime() < due) Thread.onSpinWait();
+                long idx = i - warm;
+                var f = s.replies().call("echo", "", body, System.currentTimeMillis() + callDeadlineMs, "");
+                f.whenComplete((r, e) -> {
+                    if (idx >= 0) {
+                        if (e == null) {
+                            lat[(int) idx] = System.nanoTime() - due;
+                            ok.incrementAndGet();
+                        } else {
+                            failed.incrementAndGet(); // a failure is a failure, never a 0 us sample
+                        }
                     }
-                }
-                done.incrementAndGet();
-            });
-        }
+                    done.incrementAndGet();
+                });
+            }
+        });
+        gen.start();
+        gen.join();
         long until = System.nanoTime() + 30_000_000_000L;
         while (done.get() < total && System.nanoTime() < until) Thread.sleep(1);
         stop.set(true);
