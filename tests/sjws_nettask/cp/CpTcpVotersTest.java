@@ -216,15 +216,42 @@ class CpTcpVotersTest {
     }
 
     @Test
-    void peerListenerTrustsPeerCaOrFallsBackToCa() throws Exception {
-        var both = CpLaunch.listenerConfig(Map.of("cert", "c", "key", "k", "ca", "ca.pem", "peerCa", "peer.pem"),
-                dir, "cp-peer", false);
-        assertEquals(dir.resolve("peer.pem"), both.caPem());
-        var fallback = CpLaunch.listenerConfig(Map.of("cert", "c", "key", "k", "ca", "ca.pem"), dir, "cp-peer", false);
-        assertEquals(dir.resolve("ca.pem"), fallback.caPem());
-        assertEquals(dir.resolve("ca.pem"),
-                CpLaunch.listenerConfig(Map.of("cert", "c", "key", "k", "ca", "ca.pem", "peerCa", "p.pem"), dir,
-                        "cp-watch", false).caPem());
+    void peerListenerNeedsItsOwnCertKeyAndCaWithNoFallback() throws Exception {
+        var full = Map.of("cert", "c", "key", "k", "ca", "ca.pem", "peerCert", "pc", "peerKey", "pk", "peerCa",
+                "peer.pem");
+        var peer = CpLaunch.listenerConfig(full, dir, "cp-peer", false);
+        assertEquals(dir.resolve("pc"), peer.certPem());
+        assertEquals(dir.resolve("pk"), peer.keyPem());
+        assertEquals(dir.resolve("peer.pem"), peer.caPem());
+        for (var missing : List.of("peerCert", "peerKey", "peerCa")) {
+            var partial = new HashMap<String, Object>(full);
+            partial.remove(missing);
+            var e = assertThrows(CpKeyException.class, () -> CpLaunch.listenerConfig(partial, dir, "cp-peer", false));
+            assertTrue(e.getMessage().contains("cp.tls." + missing), e.getMessage());
+        }
+        // The watch listener keeps the shared cert and ca.
+        var watch = CpLaunch.listenerConfig(full, dir, "cp-watch", false);
+        assertEquals(dir.resolve("c"), watch.certPem());
+        assertEquals(dir.resolve("ca.pem"), watch.caPem());
+    }
+
+    @Test
+    void peerCaMustNotBeTheDataNodeCaAndAdminCaEqualToCaOnlyWarns() throws Exception {
+        java.nio.file.Files.writeString(dir.resolve("ca.pem"), "same CA bytes");
+        java.nio.file.Files.writeString(dir.resolve("copy.pem"), "same CA bytes");
+        java.nio.file.Files.writeString(dir.resolve("peer.pem"), "another CA");
+        for (var sameAsCa : List.of("ca.pem", "./ca.pem", "copy.pem")) {
+            var y = Map.of("cert", "c", "key", "k", "ca", "ca.pem", "peerCert", "pc", "peerKey", "pk", "peerCa",
+                    sameAsCa);
+            var e = assertThrows(CpKeyException.class, () -> CpLaunch.listenerConfig(y, dir, "cp-peer", false));
+            assertTrue(e.getMessage().contains("must not be the data-node CA"), e.getMessage());
+        }
+        assertFalse(CpLaunch.sameCa(dir.resolve("peer.pem"), dir.resolve("ca.pem")));
+        assertFalse(CpLaunch.sameCa(dir.resolve("absent.pem"), dir.resolve("ca.pem")));
+        assertFalse(CpLaunch.sameCa(null, dir.resolve("ca.pem")));
+        var admin = CpLaunch.listenerConfig(Map.of("cert", "c", "key", "k", "ca", "ca.pem", "adminCa", "ca.pem"), dir,
+                "cp-admin", false);
+        assertEquals(dir.resolve("ca.pem"), admin.caPem(), "allowed, with a WARN");
     }
 
     private CpHost leader() {

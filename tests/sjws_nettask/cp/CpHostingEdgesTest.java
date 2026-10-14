@@ -92,15 +92,34 @@ class CpHostingEdgesTest {
         y.put("insecureSkipPermissionChecks", true);
         var deps = CpLaunch.production(y, dir);
         assertSame(Clock.SYSTEM, deps.clock());
-        // cp.peers without the voter frame key refuses (the env var name is reported, never a value).
+        // cp.peers without the CP-only Raft key refuses (the env var name is reported, never a value).
+        var raft = CpLaunch.RAFT_KEY_ENV;
+        var ha = sjws_nettask.cluster.ClusterKey.ENV_CURRENT;
         var noKey = assertThrows(IOException.class, () -> CpLaunch.peerKey(Map.of()));
-        assertTrue(noKey.getMessage().contains(sjws_nettask.cluster.ClusterKey.ENV_CURRENT), noKey.getMessage());
-        assertThrows(IOException.class, () -> CpLaunch.peerKey(Map.of(sjws_nettask.cluster.ClusterKey.ENV_CURRENT, " ")));
-        var shortKey = assertThrows(IOException.class,
-                () -> CpLaunch.peerKey(Map.of(sjws_nettask.cluster.ClusterKey.ENV_CURRENT, "short")));
+        assertTrue(noKey.getMessage().contains(raft), noKey.getMessage());
+        // The HA key alone is not enough: no fallback.
+        assertThrows(IOException.class, () -> CpLaunch.peerKey(Map.of(ha, "0123456789abcdef0123")));
+        assertThrows(IOException.class, () -> CpLaunch.peerKey(Map.of(raft, " ")));
+        var shortKey = assertThrows(IOException.class, () -> CpLaunch.peerKey(Map.of(raft, "short")));
         assertFalse(shortKey.getMessage().contains("short"), shortKey.getMessage());
-        assertNotNull(CpLaunch.peerKey(Map.of(sjws_nettask.cluster.ClusterKey.ENV_CURRENT, "0123456789abcdef0123")));
-        if (System.getenv(sjws_nettask.cluster.ClusterKey.ENV_CURRENT) == null) {
+        assertThrows(IOException.class, () -> CpLaunch.peerKey(Map.of(raft, "0123456789abcdef0123",
+                CpLaunch.RAFT_KEY_PREVIOUS_ENV, " ")));
+        // Equal to the HA key (current or previous, any encoding) is refused without printing either value.
+        var secret = "0123456789abcdef0123";
+        for (var env : List.of(Map.of(raft, secret, ha, secret),
+                Map.of(raft, "hex:" + java.util.HexFormat.of().formatHex(secret.getBytes()), ha, secret),
+                Map.of(raft, "raft-key-differs-0123", sjws_nettask.cluster.ClusterKey.ENV_PREVIOUS, "raft-key-differs-0123"),
+                Map.of(raft, "raft-key-differs-0123", CpLaunch.RAFT_KEY_PREVIOUS_ENV, secret, ha, secret))) {
+            var same = assertThrows(IOException.class, () -> CpLaunch.peerKey(env), env.keySet().toString());
+            assertTrue(same.getMessage().contains("must differ"), same.getMessage());
+            assertFalse(same.getMessage().contains(secret) || same.getMessage().contains("raft-key-differs"),
+                    same.getMessage());
+        }
+        assertNotNull(CpLaunch.peerKey(Map.of(raft, "raft-key-differs-0123", ha, secret)));
+        assertNotNull(CpLaunch.peerKey(Map.of(raft, "raft-key-differs-0123", ha, "x"))); // unusable HA key
+        assertNotNull(CpLaunch.peerKey(Map.of(raft, "raft-key-differs-0123", CpLaunch.RAFT_KEY_PREVIOUS_ENV,
+                "raft-key-previous-0123")));
+        if (System.getenv(CpLaunch.RAFT_KEY_ENV) == null) {
             var peered = base();
             peered.put("peers", java.util.List.of(Map.of("id", "cp-1", "address", "127.0.0.1:1"),
                     Map.of("id", "cp-2", "address", "127.0.0.1:2"), Map.of("id", "cp-3", "address", "127.0.0.1:3")));

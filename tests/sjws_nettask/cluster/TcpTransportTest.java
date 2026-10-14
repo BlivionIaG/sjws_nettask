@@ -282,7 +282,7 @@ class TcpTransportTest {
             out.writeInt(TcpTransport.MAX_FRAME_BYTES - 1);
             out.write(new byte[100]);
             out.flush();
-            await(() -> b.inboundConnections() == 0, "closed");
+            await(() -> b.peakReadBuffer() > 0 && b.inboundConnections() == 0, "read, then closed");
         }
         assertTrue(b.peakReadBuffer() > 0);
         assertTrue(b.peakReadBuffer() <= TcpTransport.PREAUTH_CHUNK_BYTES, "peak " + b.peakReadBuffer());
@@ -347,10 +347,11 @@ class TcpTransportTest {
         open.add(b);
         try (var raw = new Socket("127.0.0.1", b.localPort())) {
             var out = raw.getOutputStream();
+            await(() -> b.inboundConnections() == 1, "connection registered before trickling");
             long started = System.nanoTime();
             // One byte every 900 ms never trips the 1 s per-read timeout. Before the fix the 4-byte prefix
             // alone took 2.7 s and the deadline only started after it (about 3.7 s to close).
-            for (int i = 0; i < 8 && b.inboundConnections() > 0 || i == 0; i++) {
+            for (int i = 0; i < 8 && b.inboundConnections() > 0; i++) {
                 try {
                     out.write(0);
                     out.flush();
@@ -391,8 +392,8 @@ class TcpTransportTest {
             await(() -> b.inboundConnections() == 1, "a member address is accepted");
         }
 
-        // A factory that authenticates peers itself (mTLS) lifts the address filter.
-        var authenticating = new TcpTransport.SocketFactory() {
+        // The filter stays on with any factory, and a failed handshake never takes a slot.
+        var refusing = new TcpTransport.SocketFactory() {
             @Override
             public ServerSocket listen(InetSocketAddress bind) throws IOException {
                 return TcpTransport.SocketFactory.PLAIN.listen(bind);
@@ -404,19 +405,29 @@ class TcpTransportTest {
             }
 
             @Override
-            public boolean authenticatesPeers() {
-                return true;
+            public void handshake(Socket accepted, int totalMillis) throws IOException {
+                assertEquals(TcpTransport.HANDSHAKE_TIMEOUT_MILLIS, totalMillis);
+                throw new IOException("test: handshake refused");
             }
         };
-        assertFalse(TcpTransport.SocketFactory.PLAIN.authenticatesPeers());
-        var c = TcpTransport.open(members.get(2).id(), members, KEY, Clock.SYSTEM, 4, authenticating);
+        var c = TcpTransport.open(members.get(2).id(), members, KEY, Clock.SYSTEM, 4, refusing);
         open.add(c);
         try (var stranger = new Socket()) {
             stranger.bind(new InetSocketAddress("127.0.0.2", 0));
             stranger.connect(new InetSocketAddress("127.0.0.1", c.localPort()));
-            await(() -> c.inboundConnections() == 1, "accepted under an authenticating factory");
+            stranger.setSoTimeout(5_000);
+            assertEquals(-1, stranger.getInputStream().read());
         }
-        assertEquals(0, c.strangersRefused());
+        assertEquals(1, c.strangersRefused());
+        for (int i = 0; i < 6; i++) {
+            try (var member = new Socket("127.0.0.1", c.localPort())) {
+                member.setSoTimeout(5_000);
+                assertEquals(-1, member.getInputStream().read(), "closed after the failed handshake");
+            }
+        }
+        await(() -> c.handshakeFailures() == 6, "six handshake failures");
+        assertEquals(0, c.inboundRefused(), "a failed handshake never held a slot");
+        assertEquals(0, c.inboundConnections());
     }
 
     /** Security #158 follow-up: the writer catches only the dedicated too-large exception. */

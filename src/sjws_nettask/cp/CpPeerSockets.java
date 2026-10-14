@@ -29,14 +29,19 @@ import sjws_nettask.cluster.TcpTransport;
  * {@link CpServerTls#context()} with {@link CpServerTls#parameters()} applied (TLS 1.3, client certificate
  * required), so the listener and the dialer both present the node certificate and trust the peer CA. A reload
  * swaps the material inside the same context, so new connections pick it up. The accepted side's handshake runs
- * lazily on the transport's reader thread, under its read timeout; frames stay HMAC-authenticated on top.
+ * explicitly in {@link #handshake}, under a total deadline, before the connection takes an inbound slot; frames
+ * stay HMAC-authenticated on top with the CP-only Raft key.
+ *
+ * <p><b>No hostname or id check:</b> {@code endpointIdentificationAlgorithm} is deliberately unset, so a peer is
+ * accepted for any certificate chaining to {@code cp.tls.peerCa} (a CA that must issue only voter certificates).
+ * Binding the certificate to the {@code cp.peers} id is a tracked follow-up; do not assume it is checked.
  */
 final class CpPeerSockets implements TcpTransport.SocketFactory {
 
     /** Listener name of the voter links; its {@link CpServerTls} also dials (client side of mTLS). */
     static final String LISTENER = "cp-peer";
     static final int CONNECT_TIMEOUT_MILLIS = 1_000;
-    static final int HANDSHAKE_TIMEOUT_MILLIS = 5_000;
+    static final int HANDSHAKE_TIMEOUT_MILLIS = TcpTransport.HANDSHAKE_TIMEOUT_MILLIS;
 
     private final CpServerTls tls;
 
@@ -75,9 +80,38 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         return socket;
     }
 
-    /** mTLS proves the peer, so the transport's source-address filter is not needed. */
+    /**
+     * The accepted side's mTLS handshake under one total deadline: a watchdog closes the socket when it passes, so
+     * a client trickling handshake bytes cannot stretch it with per-read timeouts. The transport counts the
+     * connection as an inbound slot only after this returns.
+     */
     @Override
-    public boolean authenticatesPeers() {
-        return true;
+    public void handshake(Socket accepted, int totalMillis) throws IOException {
+        var ssl = (SSLSocket) accepted;
+        var done = new java.util.concurrent.atomic.AtomicBoolean();
+        var watchdog = Thread.ofVirtual().name("cp-peer-handshake-deadline").start(() -> {
+            try {
+                Thread.sleep(totalMillis);
+            } catch (InterruptedException finished) {
+                return;
+            }
+            if (!done.get()) {
+                try {
+                    ssl.close();
+                } catch (IOException ignored) {
+                    // Closing a stalled handshake; nothing to report.
+                }
+            }
+        });
+        try {
+            ssl.setSoTimeout(totalMillis);
+            ssl.startHandshake();
+        } finally {
+            done.set(true);
+            watchdog.interrupt();
+        }
+        if (ssl.isClosed()) {
+            throw new IOException("cp-peer handshake missed its " + totalMillis + " ms deadline");
+        }
     }
 }

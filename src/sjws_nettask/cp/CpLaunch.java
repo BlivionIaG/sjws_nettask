@@ -125,21 +125,54 @@ public final class CpLaunch {
         return TcpTransport.open(nodeId(config.self()), members, key, clock, PEER_QUEUE, sockets);
     }
 
+    /** The CP-only Raft frame key, same value on every voter. Data nodes never hold it. */
+    static final String RAFT_KEY_ENV = "SJWS_CP_RAFT_KEY";
+    /** The previous Raft frame key, still accepted during a rotation. */
+    static final String RAFT_KEY_PREVIOUS_ENV = "SJWS_CP_RAFT_KEY_PREVIOUS";
+
     /**
-     * The voter frame key: {@code WEB_SERVER_HA_CLUSTER_KEY} (and {@code _PREVIOUS} during rotation), the same on
-     * every voter. TcpTransport derives its own HKDF key from it, so it is not the heartbeat key. Never logged.
+     * The voter frame key: {@value #RAFT_KEY_ENV} (and {@value #RAFT_KEY_PREVIOUS_ENV} during rotation), its own
+     * secret, never derived from the HA cluster key that data nodes hold. Refused when missing, malformed, or equal
+     * to {@code WEB_SERVER_HA_CLUSTER_KEY} (or its previous key). No value is ever printed.
      */
     static ClusterKey peerKey(Map<String, String> env) throws IOException {
-        var raw = env.get(ClusterKey.ENV_CURRENT);
+        var raw = env.get(RAFT_KEY_ENV);
         if (raw == null || raw.isBlank()) {
-            throw new IOException("cp.peers needs the voter frame key: set " + ClusterKey.ENV_CURRENT
-                    + " (same value on every voter); refusing to start");
+            throw new IOException("cp.peers needs the CP-only Raft frame key: set " + RAFT_KEY_ENV
+                    + " (same value on every voter, never the HA cluster key); refusing to start");
         }
+        byte[] current;
+        byte[] previous = null;
         try {
-            return ClusterKey.fromEnvironment(env);
+            current = ClusterKey.parse(raw);
+            var prev = env.get(RAFT_KEY_PREVIOUS_ENV);
+            if (prev != null) {
+                if (prev.isBlank()) {
+                    throw new IllegalArgumentException(RAFT_KEY_PREVIOUS_ENV + " is empty");
+                }
+                previous = ClusterKey.parse(prev);
+            }
         } catch (IllegalArgumentException e) {
-            throw new IOException("cp.peers voter frame key refused: " + e.getMessage(), e);
+            throw new IOException(RAFT_KEY_ENV + " refused: " + e.getMessage(), e);
         }
+        for (var haName : new String[] {ClusterKey.ENV_CURRENT, ClusterKey.ENV_PREVIOUS}) {
+            var ha = env.get(haName);
+            if (ha == null || ha.isBlank()) {
+                continue;
+            }
+            byte[] haKey;
+            try {
+                haKey = ClusterKey.parse(ha);
+            } catch (IllegalArgumentException e) {
+                continue; // not a usable HA key, so it cannot equal ours
+            }
+            if (java.security.MessageDigest.isEqual(haKey, current)
+                    || (previous != null && java.security.MessageDigest.isEqual(haKey, previous))) {
+                throw new IOException(RAFT_KEY_ENV + " must differ from " + haName
+                        + ": data nodes hold the HA key; refusing to start");
+            }
+        }
+        return ClusterKey.of(current, previous);
     }
 
     /**
@@ -173,9 +206,11 @@ public final class CpLaunch {
     }
 
     /**
-     * {@code cp.tls.{cert,key,ca,adminCa,peerCa,revocations}}: the watch listener trusts {@code ca} (data nodes),
-     * the admin listener {@code adminCa}, the voter links ({@code cp-peer}) {@code peerCa}, or {@code ca} when it
-     * is not set. Paths only.
+     * {@code cp.tls.{cert,key,ca,adminCa,peerCert,peerKey,peerCa,revocations}}: the watch listener trusts {@code ca}
+     * (data nodes), the admin listener {@code adminCa}. The voter links ({@code cp-peer}) use their own
+     * {@code peerCert}/{@code peerKey} and trust {@code peerCa}; all three are required, with no fallback to the
+     * shared cert or {@code ca}, and {@code peerCa} must not be the same CA as {@code ca} (data-node certs would
+     * pass). An {@code adminCa} equal to {@code ca} is allowed but warned about. Paths only.
      */
     static CpListenerConfig listenerConfig(Object tls, Path base, String listener, boolean insecure)
             throws CpKeyException {
@@ -183,20 +218,54 @@ public final class CpLaunch {
             throw new CpKeyException("cp.tls is required for " + listener);
         }
         for (var key : map.keySet()) {
-            if (!java.util.Set.of("cert", "key", "ca", "adminCa", "peerCa", "revocations").contains(key)) {
+            if (!java.util.Set.of("cert", "key", "ca", "adminCa", "peerCert", "peerKey", "peerCa", "revocations")
+                    .contains(key)) {
                 throw new CpKeyException("Unknown key cp.tls." + key);
             }
         }
+        boolean peer = CpPeerSockets.LISTENER.equals(listener);
         var ca = switch (listener) {
             case "cp-admin" -> "adminCa";
-            case "cp-peer" -> map.get("peerCa") != null ? "peerCa" : "ca";
+            case CpPeerSockets.LISTENER -> "peerCa";
             default -> "ca";
         };
+        if (peer) {
+            for (var required : new String[] {"peerCert", "peerKey", "peerCa"}) {
+                if (map.get(required) == null) {
+                    throw new CpKeyException("cp.tls." + required + " is required with cp.peers (voter links have"
+                            + " their own certificate and CA; no fallback to cp.tls.cert/ca)");
+                }
+            }
+            if (sameCa(path(map, "peerCa", base), path(map, "ca", base))) {
+                throw new CpKeyException("cp.tls.peerCa must not be the data-node CA cp.tls.ca: data-node"
+                        + " certificates would pass on the voter links");
+            }
+        } else if ("cp-admin".equals(listener) && sameCa(path(map, "adminCa", base), path(map, "ca", base))) {
+            System.getLogger(CpLaunch.class.getName()).log(System.Logger.Level.WARNING,
+                    "cp.tls.adminCa is the same CA as cp.tls.ca: data-node certificates chain to the admin CA");
+        }
         try {
-            return new CpListenerConfig(listener, path(map, "cert", base), path(map, "key", base),
-                    path(map, ca, base), path(map, "revocations", base), insecure);
+            return new CpListenerConfig(listener, path(map, peer ? "peerCert" : "cert", base),
+                    path(map, peer ? "peerKey" : "key", base), path(map, ca, base), path(map, "revocations", base),
+                    insecure);
         } catch (IllegalArgumentException e) {
             throw new CpKeyException("cp.tls: " + e.getMessage(), e);
+        }
+    }
+
+    /** Same path, same file, or byte-identical contents. Unreadable files are left to the TLS loader. */
+    static boolean sameCa(Path a, Path b) {
+        if (a == null || b == null) {
+            return false;
+        }
+        if (a.normalize().equals(b.normalize())) {
+            return true;
+        }
+        try {
+            return java.nio.file.Files.isSameFile(a, b) || java.util.Arrays.equals(java.nio.file.Files.readAllBytes(a),
+                    java.nio.file.Files.readAllBytes(b));
+        } catch (IOException e) {
+            return false;
         }
     }
 

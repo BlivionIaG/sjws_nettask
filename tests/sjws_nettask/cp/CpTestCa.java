@@ -59,9 +59,22 @@ final class CpTestCa {
 
     /** Listener material for {@code node}: leaf cert + chain, a 0600 key, and this CA as the trust anchor. */
     CpListenerConfig listener(String listener, String node) throws Exception {
+        return listener(listener, node, System.currentTimeMillis() + 86_400_000L, null);
+    }
+
+    /** Serial of the last certificate {@link #listener} issued. */
+    BigInteger lastSerial() {
+        return BigInteger.valueOf(serial - 1);
+    }
+
+    /**
+     * @param notAfter certificate expiry (in the past for an expired-cert test)
+     * @param revocations denylist file for this listener, or null
+     */
+    CpListenerConfig listener(String listener, String node, long notAfter, Path revocations) throws Exception {
         var leafKeys = ec();
         var b = new JcaX509v3CertificateBuilder(caName, BigInteger.valueOf(serial++),
-                new Date(System.currentTimeMillis() - 3_600_000L), new Date(System.currentTimeMillis() + 86_400_000L),
+                new Date(Math.min(notAfter, System.currentTimeMillis()) - 3_600_000L), new Date(notAfter),
                 new X500Name("CN=" + node), leafKeys.getPublic());
         var leaf = sign(b);
         var certPem = pem(dir.resolve(node + "-" + listener + ".pem"), leaf, ca);
@@ -70,7 +83,7 @@ final class CpTestCa {
                 + Base64.getMimeEncoder().encodeToString(leafKeys.getPrivate().getEncoded())
                 + "\n-----END PRIVATE KEY-----\n");
         Files.setPosixFilePermissions(keyPem, PosixFilePermissions.fromString("rw-------"));
-        return new CpListenerConfig(listener, certPem, keyPem, caPem, null, false);
+        return new CpListenerConfig(listener, certPem, keyPem, caPem, revocations, false);
     }
 
     private X509Certificate sign(JcaX509v3CertificateBuilder b) throws Exception {

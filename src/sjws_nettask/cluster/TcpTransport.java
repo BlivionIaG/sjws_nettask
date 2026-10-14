@@ -69,9 +69,10 @@ import javax.crypto.spec.SecretKeySpec;
  * <p>Pre-authentication limits: accepted sockets get a read timeout ({@link #READ_TIMEOUT_MILLIS}
  * by default) that bounds both idle time between frames and the time to receive one whole frame,
  * so a slowloris sender is closed; the whole-frame deadline starts at the first length-prefix byte and a frame
- * that misses it is counted as {@link Reason#TIMEOUT}. Until the {@link SocketFactory} authenticates peers
- * (mTLS), a connection whose source address is not a member's address is closed at accept and counted in
- * {@link #strangersRefused}, so strangers cannot hold the inbound slots. At most {@code 2 x peers} inbound connections are open at once;
+ * that misses it is counted as {@link Reason#TIMEOUT}. A connection whose source address is not a member's
+ * address is closed at accept and counted in {@link #strangersRefused}, with or without mTLS. An accepted socket
+ * then completes {@link SocketFactory#handshake} within {@link #HANDSHAKE_TIMEOUT_MILLIS} in total before it
+ * counts as an inbound slot, so a stalled handshake cannot hold one. At most {@code 2 x peers} inbound connections are open at once;
  * extra ones are closed at accept and counted in {@link #inboundRefused}. A frame body is read into
  * a buffer that starts at {@link #PREAUTH_CHUNK_BYTES} and grows with the bytes actually received,
  * so a large length prefix alone does not allocate. An idle follower-to-follower link that the
@@ -100,6 +101,8 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private static final int CONNECT_TIMEOUT_MILLIS = 1_000;
     /** Default idle and whole-frame read deadline on accepted sockets. */
     public static final int READ_TIMEOUT_MILLIS = 10_000;
+    /** Total deadline for an accepted socket's {@link SocketFactory#handshake}; it holds no slot meanwhile. */
+    public static final int HANDSHAKE_TIMEOUT_MILLIS = 5_000;
     /** Largest step the pre-auth read buffer grows by. */
     static final int PREAUTH_CHUNK_BYTES = 64 << 10;
 
@@ -131,11 +134,11 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         Socket connect(InetSocketAddress to) throws IOException;
 
         /**
-         * True when every accepted socket proves its peer's identity itself (mTLS with client auth). Until then
-         * the transport refuses connections whose source address is not a member's address.
+         * Completes an accepted socket's authentication (the mTLS handshake) before it may take an inbound slot.
+         * Must finish or throw within {@code totalMillis} in total, not per read. Runs off the acceptor thread.
+         * Plain sockets have nothing to do.
          */
-        default boolean authenticatesPeers() {
-            return false;
+        default void handshake(Socket accepted, int totalMillis) throws IOException {
         }
 
         SocketFactory PLAIN = new SocketFactory() {
@@ -173,6 +176,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private final AtomicLong inboundDrops = new AtomicLong();
     private final AtomicLong inboundRefused = new AtomicLong();
     private final AtomicLong strangersRefused = new AtomicLong();
+    private final AtomicLong handshakeFailures = new AtomicLong();
     private final Set<java.net.InetAddress> memberHosts = new java.util.HashSet<>();
     private final AtomicLong oversizeDrops = new AtomicLong();
     private final AtomicLong peakReadBuffer = new AtomicLong();
@@ -320,6 +324,11 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         return strangersRefused.get();
     }
 
+    /** Accepted sockets closed because {@link SocketFactory#handshake} failed or missed its deadline. */
+    public long handshakeFailures() {
+        return handshakeFailures.get();
+    }
+
     /** Outbound frames dropped because they could not be sealed (body or group too large). */
     public long oversizeDrops() {
         return oversizeDrops.get();
@@ -331,7 +340,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     }
 
     /** Inbound connections currently open. */
-    int inboundConnections() {
+    public int inboundConnections() {
         return inboundCount.get();
     }
 
@@ -373,34 +382,47 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 }
                 continue;
             }
-            if (!sockets.authenticatesPeers() && !memberHosts.contains(socket.getInetAddress())) {
+            if (!memberHosts.contains(socket.getInetAddress())) {
                 strangersRefused.incrementAndGet();
                 closeQuietly(socket);
                 continue;
             }
-            if (inboundCount.incrementAndGet() > maxInbound) {
-                inboundCount.decrementAndGet();
-                inboundRefused.incrementAndGet();
-                closeQuietly(socket);
-                continue;
-            }
-            inboundSockets.add(socket);
+            inboundSockets.add(socket); // closed by close() even while its handshake runs
             if (!open) {
                 closeQuietly(socket);
                 inboundSockets.remove(socket);
-                inboundCount.decrementAndGet();
                 return;
             }
-            try {
-                socket.setSoTimeout(readTimeoutMillis);
-            } catch (IOException failed) {
-                closeQuietly(socket);
-                inboundSockets.remove(socket);
-                inboundCount.decrementAndGet();
-                continue;
-            }
-            Thread.ofVirtual().name("raft-read-" + self.name()).start(() -> read(socket));
+            Thread.ofVirtual().name("raft-admit-" + self.name()).start(() -> admit(socket));
         }
+    }
+
+    /** Handshake first (no slot held), then take a slot or be refused, then read. */
+    private void admit(Socket socket) {
+        try {
+            sockets.handshake(socket, HANDSHAKE_TIMEOUT_MILLIS);
+        } catch (IOException | RuntimeException failed) {
+            handshakeFailures.incrementAndGet();
+            closeQuietly(socket);
+            inboundSockets.remove(socket);
+            return;
+        }
+        if (inboundCount.incrementAndGet() > maxInbound) {
+            inboundCount.decrementAndGet();
+            inboundRefused.incrementAndGet();
+            closeQuietly(socket);
+            inboundSockets.remove(socket);
+            return;
+        }
+        try {
+            socket.setSoTimeout(readTimeoutMillis);
+        } catch (IOException failed) {
+            closeQuietly(socket);
+            inboundSockets.remove(socket);
+            inboundCount.decrementAndGet();
+            return;
+        }
+        read(socket);
     }
 
     private void read(Socket socket) {
