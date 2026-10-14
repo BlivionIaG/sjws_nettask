@@ -36,6 +36,7 @@ import sjws_nettask.swarm.TaskEnvelope;
  */
 public class SwarmBench {
     static long pct(long[] a, int n, double p) {
+        if (n == 0) return 0; // a run too short to sample (the backlog drained during warm-up)
         var c = Arrays.copyOf(a, n);
         Arrays.sort(c);
         return c[Math.min(n - 1, (int) (n * p))];
@@ -46,8 +47,39 @@ public class SwarmBench {
         return new TaskEnvelope(id, id, "", TaskEnvelope.NO_DEADLINE, "", "", "", "", body);
     }
 
+    /** Minimum usable space on the bench directory's file system (override: -Dsjws.bench.minFreeBytes). */
+    static final long MIN_FREE = Long.getLong("sjws.bench.minFreeBytes", 10L << 30);
+
+    static void deleteTree(Path dir) {
+        if (!Files.exists(dir)) return;
+        try (var walk = Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try { Files.deleteIfExists(p); } catch (java.io.IOException e) { /* best effort */ }
+            });
+        } catch (java.io.IOException e) {
+            System.err.println("WARN: could not delete " + dir + ": " + e);
+        }
+    }
+
     public static void main(String[] a) throws Exception {
+        long free = Files.getFileStore(Path.of(a[0])).getUsableSpace();
+        if (free < MIN_FREE) {
+            System.err.printf("ABORT: %s has %d MiB free, below %d MiB (sjws.bench.minFreeBytes); the box disk is shared%n",
+                    a[0], free >> 20, MIN_FREE >> 20);
+            System.exit(2);
+        }
         Path dir = Files.createTempDirectory(Path.of(a[0]), "swarmbench");
+        // The ledger of a run is gigabytes: always remove it (normal exit, exception, or SIGTERM/SIGINT).
+        var cleanup = new Thread(() -> deleteTree(dir), "swarmbench-cleanup");
+        Runtime.getRuntime().addShutdownHook(cleanup);
+        try {
+            run(dir, a);
+        } finally {
+            deleteTree(dir);
+        }
+    }
+
+    static void run(Path dir, String[] a) throws Exception {
         String mode = a[1];
         double secs = Double.parseDouble(a[3]);
         try (var s = Swarm.open(dir, "bench", 1, RetryPolicy.DEFAULT, System::currentTimeMillis, 600_000)) {
@@ -170,7 +202,13 @@ public class SwarmBench {
         var t = s.tasks();
         int leases = 10_000;
         for (int i = 0; i < leases; i++) t.submit("hold", 1, i + 1, env(new byte[1024]));
-        var held = t.claim("hold", "holder", leases, 3_600_000);
+        var held = new ArrayList<Task>(leases);
+        while (held.size() < leases) {
+            var got = t.claim("hold", "holder", leases - held.size(), 3_600_000);
+            if (got.isEmpty()) throw new IllegalStateException("held " + held.size() + " of " + leases);
+            held.addAll(got);
+        }
+        System.err.println("heartbeat leases held=" + held.size());
         LeaseKeeper keeper = null;
         var stop = new AtomicBoolean();
         if (mode.equals("keeper")) {
