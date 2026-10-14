@@ -250,13 +250,18 @@ public final class ReplicatedNode implements ClusterNode {
 
     @Override
     public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch) {
+        return append(groupId, batch, null);
+    }
+
+    @Override
+    public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability) {
         var group = groups.get(groupId);
         if (group == null) {
             var future = new CompletableFuture<CommittedIndex>();
             future.completeExceptionally(new IllegalStateException("no group " + groupId));
             return future;
         }
-        var future = group.append(batch);
+        var future = group.append(batch, durability);
         if (running && wake.availablePermits() == 0) {
             wake.release();
         }
@@ -303,6 +308,16 @@ public final class ReplicatedNode implements ClusterNode {
             group.closeDeliveries(CLOSE_DRAIN);
         }
         transport.detach(self);
+    }
+
+    /** STRICT override entries the group's leader holds uncommitted (0 on a follower). */
+    public int strictPending(GroupId groupId) {
+        return group(groupId).strictPendingCount();
+    }
+
+    /** Age of the oldest uncommitted STRICT override on the group's leader, 0 when none. */
+    public long oldestStrictPendingAgeNanos(GroupId groupId) {
+        return group(groupId).oldestStrictPendingAgeNanos();
     }
 
     /** Apply lag of one group: deliveries queued or running. */
