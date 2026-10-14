@@ -67,11 +67,15 @@ class GenerationSyncTest {
         var secret = "shared-secret".getBytes(StandardCharsets.UTF_8);
         var dir = Files.createTempDirectory("ha-gen");
         var activated = new AtomicInteger();
+        var activatedOn = new java.util.concurrent.atomic.AtomicReference<String>();
         GenerationSync leaderSync = null;
         var syncs = new ArrayList<GenerationSync>();
         for (var node : nodes) {
             var sync = new GenerationSync(node, group, options, bundles, secret, dir.resolve("n" + node.self().wire() + ".key"),
-                    node == leader ? generation -> activated.incrementAndGet() : null);
+                    node == leader ? generation -> {
+                        activatedOn.set(Thread.currentThread().getName());
+                        activated.incrementAndGet();
+                    } : null);
             syncs.add(sync);
             if (node == leader) {
                 leaderSync = sync;
@@ -94,7 +98,12 @@ class GenerationSyncTest {
         ReplicatedNode.driveAll(nodes);
         assertEquals(7L, published.get().groupId().value().equals("ha-control") ? 7L : -1L);
         ReplicatedNode.driveAll(nodes);
+        for (var sync : syncs) {
+            assertTrue(sync.awaitApplied(java.time.Duration.ofSeconds(5)), "worker applied the markers");
+        }
         assertTrue(activated.get() >= 1);
+        // Pull + key write + activate run on GenerationSync's own worker, never on the Raft delivery thread.
+        assertEquals("ha-generation-sync", activatedOn.get());
         for (var node : nodes) {
             var path = dir.resolve("n" + node.self().wire() + ".key");
             assertArrayEquals(key, Files.readAllBytes(path));
@@ -104,6 +113,10 @@ class GenerationSyncTest {
         leader.append(group, List.of(ByteBuffer.wrap(new byte[] {1})));
         ReplicatedNode.driveAll(nodes);
         assertThrows(java.io.IOException.class, () -> bundles.pull(7L, "nope".getBytes(StandardCharsets.UTF_8)));
+        for (var sync : syncs) {
+            sync.close();
+            assertFalse(sync.awaitApplied(java.time.Duration.ofMillis(100)), "closed worker takes no more work");
+        }
         assertThrows(java.io.IOException.class, () -> bundles.pull(99L, secret));
         var payload = GenerationSync.payload(config, cert, key);
         assertArrayEquals(key, GenerationSync.privateKey(payload));

@@ -123,7 +123,28 @@ public final class ReplicatedNode implements ClusterNode {
         }
     }
 
+    /**
+     * One manual step (tests, simulations, {@code CpStore.drive()}): ticks, frames, then waits up to
+     * {@link #DRIVE_DELIVERY_WAIT} for the deliveries it caused, so callers see callbacks deterministically.
+     * The background loop ({@link #begin}) never waits for a callback.
+     */
     public void drive() {
+        step();
+        for (var group : groups.values()) {
+            if (!group.onDeliveryThread()) {
+                group.awaitDelivered(DRIVE_DELIVERY_WAIT);
+            }
+        }
+    }
+
+    /** Apply-lag limit for groups opened afterwards; tests lower it to exercise backpressure. */
+    volatile int deliveryLagLimit = DeliveryExecutor.DEFAULT_LAG_LIMIT;
+
+    /** How long {@link #drive()} waits for deliveries; a slower callback just finishes later. */
+    static final Duration DRIVE_DELIVERY_WAIT = Duration.ofSeconds(5);
+
+    /** {@link #drive()} without waiting for deliveries: what the background Raft thread runs. */
+    void step() {
         long now = clock.nanoTime();
         for (var group : groups.values()) {
             group.tick(now);
@@ -161,7 +182,7 @@ public final class ReplicatedNode implements ClusterNode {
     private void loop() {
         while (running) {
             try {
-                drive();
+                step();
                 clock.sleep(tick);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -216,7 +237,7 @@ public final class ReplicatedNode implements ClusterNode {
             }
         }
         var group = new RaftGroup(groupId, self, witness, witnesses, voters, peers, byWire::get, quorum, options,
-                storage, rpc, clock, listener);
+                storage, rpc, clock, listener, deliveryLagLimit);
         groups.put(groupId, group);
         return group.facade();
     }
@@ -258,6 +279,22 @@ public final class ReplicatedNode implements ClusterNode {
                 Thread.currentThread().interrupt();
             }
         }
+        for (var group : groups.values()) {
+            group.closeDeliveries(CLOSE_DRAIN);
+        }
         transport.detach(self);
     }
+
+    /** Apply lag of one group: deliveries queued or running. */
+    public long deliveryLag(GroupId groupId) {
+        return group(groupId).deliveryLag();
+    }
+
+    /** Highest apply lag seen by one group. */
+    public long maxDeliveryLag(GroupId groupId) {
+        return group(groupId).maxDeliveryLag();
+    }
+
+    /** {@link #close()} drains each group's deliveries this long, then abandons the rest. */
+    static final Duration CLOSE_DRAIN = Duration.ofSeconds(1);
 }
