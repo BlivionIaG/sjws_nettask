@@ -110,6 +110,18 @@ down in the 2 + 1 pair, a RELAXED commit waits for the leader's fsync (the witne
 nothing), so it now waits up to the time bound rather than one tick. Keep `relaxedSyncDelay` small,
 or use the entry bound, if that degraded mode must stay fast.
 
+### Application snapshots
+
+`SnapshotControl.setSnapshotTaker(SnapshotTaker)` replaces the built-in snapshot image (the
+concatenated user payloads) with application bytes. The taker runs on the group's delivery
+thread, queued after the delivery of every entry through `lastIncludedIndex` and ahead of later
+ones, so the state it reads is exactly the state at that index. Its result moves the snapshot
+forward only if it is still ahead of the current one. If the taker throws or returns null, that
+snapshot is skipped and the log is kept. With a taker, `take(i)` accepts only `i == commitIndex()`,
+is refused inside a callback, and blocks until the delivery thread has run the taker.
+`GroupOptions.withoutAutoSnapshot()` (`snapshotEveryEntries == NO_AUTO_SNAPSHOT`) turns
+automatic snapshots off, so the application decides when to call `take`.
+
 ### Restart safety and the exact RELAXED guarantee
 
 What a voter keeps across a crash:

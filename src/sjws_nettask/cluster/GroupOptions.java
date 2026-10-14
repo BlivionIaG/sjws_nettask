@@ -100,4 +100,17 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
                 failbackHysteresis, delay, entries);
     }
+
+    /** {@code snapshotEveryEntries} value that never triggers an automatic snapshot. */
+    public static final long NO_AUTO_SNAPSHOT = Long.MAX_VALUE;
+
+    /** Automatic snapshots off: the log grows until the application calls {@link SnapshotControl#take}. */
+    public GroupOptions withoutAutoSnapshot() {
+        return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, NO_AUTO_SNAPSHOT, preferred,
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries);
+    }
+
+    public boolean autoSnapshot() {
+        return snapshotEveryEntries != NO_AUTO_SNAPSHOT;
+    }
 }

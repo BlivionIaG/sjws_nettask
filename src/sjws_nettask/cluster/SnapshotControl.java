@@ -30,4 +30,15 @@ public interface SnapshotControl {
      * Drop the log prefix at or below an index that is both snapshotted and acked, then compact.
      */
     CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor);
+
+    /**
+     * Use {@code taker} (null restores the built-in image) for automatic snapshots and for
+     * {@link #take}. With a taker, {@link #take} accepts only the current commit index, because the
+     * taker sees the application state at the point it runs. Pair it with
+     * {@link GroupOptions#withoutAutoSnapshot()} to snapshot only when the application asks.
+     * The default refuses.
+     */
+    default void setSnapshotTaker(SnapshotTaker taker) {
+        throw new UnsupportedOperationException("snapshot taker");
+    }
 }

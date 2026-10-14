@@ -105,6 +105,8 @@ final class RaftGroup {
     private long snapIndex;
     private long snapTerm;
     private byte[] snapData = new byte[0];
+    private SnapshotTaker taker;
+    private boolean takerInFlight;
     private boolean relaxedDirty;
     /** Clock time when the oldest entry not yet fsynced was stored. */
     private long dirtySince;
@@ -712,8 +714,13 @@ final class RaftGroup {
                 commitIndex = index;
                 strictPending.headSet(index, true).clear();
                 apply(after);
-                if (commitIndex - snapIndex >= options.snapshotEveryEntries()) {
-                    snapshotThrough(commitIndex);
+                if (options.autoSnapshot() && commitIndex - snapIndex >= options.snapshotEveryEntries()) {
+                    if (taker == null) {
+                        snapshotThrough(commitIndex);
+                    } else if (!takerInFlight) {
+                        takerInFlight = true;
+                        submitTaker(taker, commitIndex, null);
+                    }
                 }
                 return;
             }
@@ -1108,6 +1115,41 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * Queued behind every delivery for indexes up to {@code index} and ahead of later ones, so the
+     * taker reads the application state at exactly {@code index}. The result is installed under the
+     * lock if it still moves the snapshot forward.
+     */
+    private void submitTaker(SnapshotTaker use, long index, CompletableFuture<LogSnapshot> done) {
+        deliveries.submit(() -> {
+            byte[] image;
+            try {
+                image = use.snapshot(groupId, index);
+            } catch (Exception failed) {
+                image = null;
+                if (done != null) {
+                    done.completeExceptionally(failed);
+                }
+            }
+            lock.lock();
+            try {
+                takerInFlight = false;
+                if (image != null && index > snapIndex) {
+                    snapTerm = termAt(index);
+                    snapIndex = index;
+                    snapData = image;
+                }
+                if (done != null && image != null) {
+                    done.complete(new LogSnapshot(groupId, snapIndex, snapTerm, snapData));
+                } else if (done != null) {
+                    done.completeExceptionally(new IllegalStateException("snapshot taker returned no image"));
+                }
+            } finally {
+                lock.unlock();
+            }
+        }, done);
+    }
+
     private static byte[] user(byte[] payload, byte marker) {
         var out = new byte[payload.length + 1];
         out[0] = marker;
@@ -1354,7 +1396,43 @@ final class RaftGroup {
         }
 
         @Override
+        public void setSnapshotTaker(SnapshotTaker next) {
+            lock.lock();
+            try {
+                taker = next;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
         public LogSnapshot take(long lastIncludedIndex) {
+            CompletableFuture<LogSnapshot> done = null;
+            lock.lock();
+            try {
+                if (taker != null) {
+                    if (lastIncludedIndex != commitIndex) {
+                        throw new IllegalArgumentException("with a SnapshotTaker, take(commitIndex()) only");
+                    }
+                    if (lastIncludedIndex == snapIndex) {
+                        return new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
+                    }
+                    if (deliveries.onExecutorThread()) {
+                        throw new IllegalStateException("take() with a SnapshotTaker cannot run inside a callback");
+                    }
+                    done = new CompletableFuture<>();
+                    submitTaker(taker, lastIncludedIndex, done);
+                }
+            } finally {
+                lock.unlock();
+            }
+            if (done != null) {
+                try {
+                    return done.join();
+                } catch (java.util.concurrent.CompletionException failed) {
+                    throw new IllegalStateException("snapshot taker failed", failed.getCause());
+                }
+            }
             lock.lock();
             try {
                 if (lastIncludedIndex > commitIndex || lastIncludedIndex < snapIndex) {
