@@ -247,6 +247,173 @@ class RelaxedRestartVoteTest {
         }
     }
 
+    /** Memory log whose hard-state write can be made to fail. */
+    private static final class FailingVotes implements LogStorage {
+        final MemoryLogStorage inner = new MemoryLogStorage();
+        boolean fail;
+
+        @Override
+        public void append(GroupId group, long index, long term, byte[] data) {
+            inner.append(group, index, term, data);
+        }
+
+        @Override
+        public byte[] read(GroupId group, long index) {
+            return inner.read(group, index);
+        }
+
+        @Override
+        public long termAt(GroupId group, long index) {
+            return inner.termAt(group, index);
+        }
+
+        @Override
+        public long lastIndex(GroupId group) {
+            return inner.lastIndex(group);
+        }
+
+        @Override
+        public void truncateSuffix(GroupId group, long fromIndex) {
+            inner.truncateSuffix(group, fromIndex);
+        }
+
+        @Override
+        public void truncatePrefix(GroupId group, long throughIndex) {
+            inner.truncatePrefix(group, throughIndex);
+        }
+
+        @Override
+        public void force(GroupId group) {
+            inner.force(group);
+        }
+
+        @Override
+        public int forces(GroupId group) {
+            return inner.forces(group);
+        }
+
+        @Override
+        public long witnessIndex(GroupId group) {
+            return inner.witnessIndex(group);
+        }
+
+        @Override
+        public long witnessTerm(GroupId group) {
+            return inner.witnessTerm(group);
+        }
+
+        @Override
+        public void noteWitness(GroupId group, long index, long term) {
+            inner.noteWitness(group, index, term);
+        }
+
+        @Override
+        public void saveHardState(GroupId group, long term, int votedFor) throws java.io.IOException {
+            if (fail) {
+                throw new java.io.IOException("disk full");
+            }
+            inner.saveHardState(group, term, votedFor);
+        }
+
+        @Override
+        public boolean hasHardState(GroupId group) {
+            return inner.hasHardState(group);
+        }
+
+        @Override
+        public long hardStateTerm(GroupId group) {
+            return inner.hardStateTerm(group);
+        }
+
+        @Override
+        public int hardStateVote(GroupId group) {
+            return inner.hardStateVote(group);
+        }
+    }
+
+    @Test
+    void failedVoteWriteRefusesTheVote() throws Exception {
+        var storage = new FailingVotes();
+        var out = new Outbox();
+        var group = node3(storage, out, new FakeClock(0L));
+        group.handle(N1, append(5, N1, 0, 0, 0), 0); // term 5 is durable, no vote yet
+        storage.fail = true;
+        group.handle(N2, vote(RaftGroup.VOTE, 5, N2, 0, 0), 0);
+        assertFalse(out.lastGrant(RaftGroup.VOTE_RESP));
+        assertEquals(0, storage.hardStateVote(GROUP));
+        storage.fail = false;
+        group.handle(N2, vote(RaftGroup.VOTE, 5, N2, 0, 0), 0);
+        assertTrue(out.lastGrant(RaftGroup.VOTE_RESP), "the vote was not recorded in memory either");
+    }
+
+    @Test
+    void failedWriteOnAHigherTermChangesNothingAndSendsNothing() throws Exception {
+        var storage = new FailingVotes();
+        var out = new Outbox();
+        var group = node3(storage, out, new FakeClock(0L));
+        storage.fail = true;
+        for (var frame : List.of(append(7, N1, 0, 0, 0), vote(RaftGroup.VOTE, 7, N2, 0, 0))) {
+            group.handle(N1, frame, 0);
+            assertEquals(0L, group.facade().term());
+            assertTrue(out.sent.isEmpty(), "nothing carrying the unsaved term goes out");
+            assertTrue(group.facade().leader().isEmpty());
+        }
+    }
+
+    @Test
+    void failedWriteInStartElectionChangesNothingAndSendsNoVote() throws Exception {
+        var storage = new FailingVotes();
+        var out = new Outbox();
+        var clock = new FakeClock(0L);
+        var group = node3(storage, out, clock);
+        clock.advance(Duration.ofMillis(300));
+        group.tick(clock.nanoTime());
+        assertTrue(group.campaigning(), "pre-vote sent");
+        out.sent.clear();
+        storage.fail = true;
+        var grant = ByteBuffer.allocate(13).order(ByteOrder.BIG_ENDIAN).putLong(0).putInt(1).put((byte) 1);
+        group.handle(N1, new SimTransport.Frame(GROUP, RaftGroup.PRE_VOTE_RESP, grant.array()), clock.nanoTime());
+        assertEquals(0L, group.facade().term());
+        assertFalse(group.campaigning());
+        assertTrue(out.sent.isEmpty(), "no VOTE at an unsaved term");
+        assertFalse(storage.hasHardState(GROUP));
+    }
+
+    @Test
+    void voteFileFormatRefusesBadInputAndUpgradesFromTheLog() throws Exception {
+        var root = Files.createTempDirectory("vote-file");
+        var log = new FileLogStorage(root);
+        var clock = new FakeClock(0L);
+        assertEquals(0L, node3(log, new Outbox(), clock).facade().term(), "no file, empty log: term 0");
+        log.append(GROUP, 1, 3, new byte[] {RaftGroup.NOOP});
+        log.append(GROUP, 2, 4, new byte[] {RaftGroup.NOOP});
+        var upgraded = node3(log, new Outbox(), clock);
+        assertEquals(4L, upgraded.facade().term(), "no file, log present: last log term");
+        assertFalse(log.hasHardState(GROUP));
+
+        log.saveHardState(GROUP, 9, 2);
+        var vote = root.resolve("msg_0.vote");
+        assertEquals(FileLogStorage.VOTE_FILE_BYTES, Files.size(vote));
+        assertEquals(9L, node3(log, new Outbox(), clock).facade().term());
+        var good = Files.readAllBytes(vote);
+        for (int corrupt = 0; corrupt < 4; corrupt++) {
+            var bytes = good.clone();
+            switch (corrupt) {
+                case 0 -> bytes = java.util.Arrays.copyOf(good, 12); // short (the old 12-byte layout)
+                case 1 -> bytes[0] ^= 1; // magic
+                case 2 -> bytes[7] = 2; // version
+                default -> bytes[10] ^= 1; // term bit flip: CRC
+            }
+            Files.write(vote, bytes);
+            var bad = new FileLogStorage(root);
+            var error = org.junit.jupiter.api.Assertions.assertThrows(java.io.UncheckedIOException.class,
+                    () -> node3(bad, new Outbox(), clock), "case " + corrupt);
+            assertTrue(error.getCause().getMessage().contains("refusing to start"), error.getCause().getMessage());
+            bad.close();
+        }
+        log.close();
+    }
+
     private static Member member(int wire, boolean witness) {
         return new Member(new NodeId(wire, "n" + wire), new SiteId("local"),
                 new InetSocketAddress("127.0.0.1", 23_100 + wire), 1L, MemberState.ALIVE, witness);

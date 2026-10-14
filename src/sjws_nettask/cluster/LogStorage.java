@@ -64,6 +64,15 @@ public interface LogStorage {
         // Not persisted by default.
     }
 
+    /**
+     * True when {@link #saveHardState} has ever completed for this group. When false, a voter
+     * starts at the term of its last log entry with no vote (an upgrade from a version that did
+     * not persist it). Corrupt state must throw rather than read as absent.
+     */
+    default boolean hasHardState(GroupId group) throws IOException {
+        return false;
+    }
+
     /** Term last made durable by {@link #saveHardState}, or 0. */
     default long hardStateTerm(GroupId group) throws IOException {
         return 0L;

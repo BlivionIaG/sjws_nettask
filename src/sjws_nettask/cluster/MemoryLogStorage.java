@@ -140,6 +140,11 @@ public final class MemoryLogStorage implements LogStorage {
     }
 
     @Override
+    public boolean hasHardState(GroupId group) {
+        return hardStates.containsKey(group);
+    }
+
+    @Override
     public long hardStateTerm(GroupId group) {
         var state = hardStates.get(group);
         return state == null ? 0L : state[0];

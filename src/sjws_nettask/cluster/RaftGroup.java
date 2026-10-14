@@ -138,11 +138,18 @@ final class RaftGroup {
         this.deliveries = new DeliveryExecutor(groupId.value(), deliveryLagLimit);
         this.voters.addAll(voters);
         try {
-            this.term = storage.hardStateTerm(groupId);
-            int vote = storage.hardStateVote(groupId);
-            this.votedFor = vote == 0 ? null : byWire.apply(vote);
+            if (storage.hasHardState(groupId)) {
+                this.term = storage.hardStateTerm(groupId);
+                int vote = storage.hardStateVote(groupId);
+                this.votedFor = vote == 0 ? null : byWire.apply(vote);
+            } else {
+                // Upgrade (or first start): no vote file. Terms only grow along the log, so the
+                // last entry carries the highest term this node can have voted in, with no vote.
+                long last = storage.lastIndex(groupId);
+                this.term = last == 0 ? 0L : storage.termAt(groupId, last);
+            }
         } catch (IOException failed) {
-            throw new UncheckedIOException(failed);
+            throw new UncheckedIOException("cannot load the durable term/vote of " + groupId, failed);
         }
         if (!witness && (term > 0 || lastIndex() > 0)) {
             this.durableIndex = lastIndex();
@@ -330,10 +337,16 @@ final class RaftGroup {
     }
 
     private void startElection(long now, List<Runnable> after) {
+        if (!saveHardState(term + 1, self)) {
+            // Nothing changed in memory and nothing is sent; retry after a fresh timeout.
+            role = Role.FOLLOWER;
+            votes.clear();
+            electionDeadline = now + retryTimeout();
+            return;
+        }
         term++;
         role = Role.CANDIDATE;
         votedFor = self;
-        persistVote();
         leader = null;
         votes.clear();
         votes.add(self);
@@ -398,7 +411,9 @@ final class RaftGroup {
         long lastIndex = body.getLong();
         long lastTerm = body.getLong();
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            if (!stepDown(theirTerm, after)) {
+                return;
+            }
         }
         var candidate = byWire.apply(candidateWire);
         boolean grant = false;
@@ -407,11 +422,9 @@ final class RaftGroup {
             long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);
             boolean upToDate = lastTerm > ourTerm || (lastTerm == ourTerm && lastIndex >= ourLast);
             if (upToDate && !abstaining() && (votedFor == null || votedFor.equals(candidate))) {
-                var previous = votedFor;
-                votedFor = candidate;
-                grant = tryPersistVote();
-                if (!grant) {
-                    votedFor = previous;
+                grant = candidate.equals(votedFor) || saveHardState(term, candidate);
+                if (grant) {
+                    votedFor = candidate;
                 }
             }
             if (grant) {
@@ -432,7 +445,7 @@ final class RaftGroup {
         int voterWire = body.getInt();
         boolean granted = body.get() == 1;
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            stepDown(theirTerm, after); // a failed write leaves memory unchanged either way
             return;
         }
         if (role != Role.CANDIDATE || theirTerm != term || !granted) {
@@ -469,7 +482,8 @@ final class RaftGroup {
             grant = candidateTerm > ourTerm || (candidateTerm == ourTerm && candidateIndex >= ourLast);
         }
         var reply = ByteBuffer.allocate(8 + 4 + 1).order(java.nio.ByteOrder.BIG_ENDIAN);
-        reply.putLong(Math.max(term, theirTerm));
+        // Only our own (durable) term goes out; the pre-candidate accepts a grant at a term <= its own.
+        reply.putLong(term);
         reply.putInt(self.wire());
         reply.put((byte) (grant ? 1 : 0));
         if (candidate != null) {
@@ -482,10 +496,10 @@ final class RaftGroup {
         int voterWire = body.getInt();
         boolean granted = body.get() == 1;
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            stepDown(theirTerm, after); // a failed write leaves memory unchanged either way
             return;
         }
-        if (role != Role.PRE_CANDIDATE || theirTerm != term || !granted) {
+        if (role != Role.PRE_CANDIDATE || theirTerm > term || !granted) {
             return;
         }
         var voter = byWire.apply(voterWire);
@@ -517,7 +531,9 @@ final class RaftGroup {
             return;
         }
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            if (!stepDown(theirTerm, after)) {
+                return;
+            }
         }
         if (role == Role.CANDIDATE || role == Role.PRE_CANDIDATE || role == Role.LEADER) {
             role = Role.FOLLOWER;
@@ -575,7 +591,7 @@ final class RaftGroup {
         boolean success = body.get() == 1;
         long match = body.getLong();
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            stepDown(theirTerm, after); // a failed write leaves memory unchanged either way
             return;
         }
         if (role != Role.LEADER || theirTerm != term) {
@@ -608,7 +624,9 @@ final class RaftGroup {
             return;
         }
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            if (!stepDown(theirTerm, after)) {
+                return;
+            }
         }
         electionDeadline = now;
         startElection(now, after);
@@ -838,12 +856,15 @@ final class RaftGroup {
         return quorum.hasQuorum(voters, acks);
     }
 
-    private void stepDown(long newTerm, List<Runnable> after) {
+    /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
+    private boolean stepDown(long newTerm, List<Runnable> after) {
+        if (newTerm > term && !saveHardState(newTerm, null)) {
+            return false;
+        }
         boolean wasLeader = role == Role.LEADER;
         if (newTerm > term) {
             term = newTerm;
             votedFor = null;
-            persistVote();
         }
         role = Role.FOLLOWER;
         if (wasLeader) {
@@ -869,6 +890,7 @@ final class RaftGroup {
             }
             fireLeader(after);
         }
+        return true;
     }
 
     private void fireLeader(List<Runnable> after) {
@@ -914,20 +936,15 @@ final class RaftGroup {
         return recovering && !quorum.hasQuorum(voters, Set.of(self));
     }
 
-    private void persistVote() {
+    /**
+     * Write the next term and vote before memory changes. False on failure: the caller leaves
+     * term and votedFor as they were and sends nothing that carries the new term.
+     */
+    private boolean saveHardState(long nextTerm, NodeId nextVote) {
         try {
-            storage.saveHardState(groupId, term, votedFor == null ? 0 : votedFor.wire());
-        } catch (IOException failed) {
-            throw new UncheckedIOException(failed);
-        }
-    }
-
-    /** A vote that cannot be made durable is not granted. */
-    private boolean tryPersistVote() {
-        try {
-            persistVote();
+            storage.saveHardState(groupId, nextTerm, nextVote == null ? 0 : nextVote.wire());
             return true;
-        } catch (UncheckedIOException failed) {
+        } catch (IOException | RuntimeException failed) {
             return false;
         }
     }

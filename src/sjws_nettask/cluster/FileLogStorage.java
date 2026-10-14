@@ -295,14 +295,27 @@ public final class FileLogStorage implements LogStorage {
     private record CursorFile(long index, long term) {
     }
 
-    /** {@code {group}.vote}: 12 bytes, term then votedFor, temp file + fsync + atomic move + dir fsync. */
+    /** {@code "SJVT"}: the vote file magic. */
+    static final int VOTE_MAGIC = 0x534A5654;
+    static final int VOTE_VERSION = 1;
+    static final int VOTE_FILE_BYTES = 24;
+
+    /**
+     * {@code {group}.vote}, 24 bytes big-endian: magic, version, term, votedFor wire id, then the
+     * CRC32C of the first 20 bytes. Temp file + fsync + atomic move + directory fsync.
+     */
     @Override
     public void saveHardState(GroupId group, long term, int votedFor) throws IOException {
         lock.lock();
         try {
-            var buf = ByteBuffer.allocate(12);
+            var buf = ByteBuffer.allocate(VOTE_FILE_BYTES);
+            buf.putInt(VOTE_MAGIC);
+            buf.putInt(VOTE_VERSION);
             buf.putLong(term);
             buf.putInt(votedFor);
+            var crc = new java.util.zip.CRC32C();
+            crc.update(buf.array(), 0, 20);
+            buf.putInt((int) crc.getValue());
             buf.flip();
             writeAtomically(votePath(group), buf);
         } finally {
@@ -311,23 +324,47 @@ public final class FileLogStorage implements LogStorage {
     }
 
     @Override
+    public boolean hasHardState(GroupId group) {
+        return Files.exists(votePath(group), java.nio.file.LinkOption.NOFOLLOW_LINKS);
+    }
+
+    @Override
     public long hardStateTerm(GroupId group) throws IOException {
         var buf = readVote(group);
-        return buf == null ? 0L : buf.getLong(0);
+        return buf == null ? 0L : buf.getLong(8);
     }
 
     @Override
     public int hardStateVote(GroupId group) throws IOException {
         var buf = readVote(group);
-        return buf == null ? 0 : buf.getInt(8);
+        return buf == null ? 0 : buf.getInt(16);
     }
 
+    /** Null when absent. Anything else that is not a valid version-1 record refuses to load. */
     private ByteBuffer readVote(GroupId group) throws IOException {
         var path = votePath(group);
-        if (!Files.isRegularFile(path) || Files.size(path) < 12) {
+        if (!hasHardState(group)) {
             return null;
         }
-        return ByteBuffer.wrap(Files.readAllBytes(path));
+        var bytes = Files.readAllBytes(path);
+        if (bytes.length != VOTE_FILE_BYTES) {
+            throw new IOException("vote file " + path + " has " + bytes.length + " bytes, expected "
+                    + VOTE_FILE_BYTES + "; refusing to start with an unknown term");
+        }
+        var buf = ByteBuffer.wrap(bytes);
+        if (buf.getInt(0) != VOTE_MAGIC) {
+            throw new IOException("vote file " + path + " has a bad magic; refusing to start");
+        }
+        if (buf.getInt(4) != VOTE_VERSION) {
+            throw new IOException("vote file " + path + " has unsupported version " + buf.getInt(4)
+                    + "; refusing to start");
+        }
+        var crc = new java.util.zip.CRC32C();
+        crc.update(bytes, 0, 20);
+        if ((int) crc.getValue() != buf.getInt(20)) {
+            throw new IOException("vote file " + path + " fails its CRC32C; refusing to start");
+        }
+        return buf;
     }
 
     private Path votePath(GroupId group) {

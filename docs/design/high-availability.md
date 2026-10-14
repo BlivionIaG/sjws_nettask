@@ -86,9 +86,17 @@ What a voter keeps across a crash:
 
 - **Term and vote are durable** for every voter, RELAXED or STRICT. `LogStorage.saveHardState`
   is called, and must return only once durable, whenever `term` or `votedFor` changes, before
-  the vote request or grant is sent. `FileLogStorage` writes `{group}.vote` (12 bytes, term then
-  voted-for wire id, 0 for none) with the same temp file, fsync, `ATOMIC_MOVE`, directory fsync
-  sequence as the witness cursor. A vote that cannot be made durable is not granted. Before this,
+  the vote request or grant is sent. The write comes first and memory changes only when it
+  succeeds (`startElection`, stepping down to a higher term, a vote grant). A failed write leaves
+  term and vote as they were, sends nothing, and the node stays a follower; a failed grant is a
+  refusal. Messages only ever carry the durable term (a pre-vote reply carries the responder's own
+  term, and the pre-candidate accepts a grant at a term at or below its own).
+  `FileLogStorage` writes `{group}.vote`: 24 bytes big-endian, magic `SJVT`, version 1, term,
+  voted-for wire id (0 for none), CRC32C of the first 20 bytes, with the same temp file, fsync,
+  `ATOMIC_MOVE`, directory fsync sequence as the witness cursor. On open, a missing file with an
+  empty log is term 0; a missing file with a log (an upgrade) is the last entry's term with no
+  vote; a short file, a bad magic, an unknown version or a CRC mismatch refuses to start with an
+  error naming the file. It is never silently reset. Before this,
   a restarted node came back at term 0 with no vote and could vote twice in one term. A custom
   `LogStorage` that does not override the default methods keeps that old behaviour.
 - **A restarted data voter abstains.** When a data voter opens a group with a non-zero durable
@@ -97,6 +105,14 @@ What a voter keeps across a crash:
   `leaseNanos + 2 * electionTimeout` passes, it grants no pre-vote or vote and does not campaign.
   A voter that is a quorum on its own (`CpStore`'s single voter) is exempt. The window is what
   lets a cluster that restarted as a whole elect a leader again.
+
+  **Caveat:** once that window expires, a RELAXED node that lost acked entries votes and campaigns
+  again with its shorter log, and can help elect a leader that also lacks them. That only matters
+  when no leader holding those entries reached it within `leaseNanos + 2 * electionTimeout` of its
+  restart: the leader is down or partitioned from it too (a second failure), or the whole cluster
+  restarted after losing them. In the 2 + 1 pair the witness cursor still refuses it if the
+  witness acked those entries. STRICT entries are not affected: they were on disk before they
+  counted.
 - **A witness ack is never the only other copy.** A witness stores no entry. When no data peer
   has acked an index, the leader counts itself only up to its own forced index, so RELAXED with
   one data node down commits after the leader's next batched fsync (one tick), not from memory.
