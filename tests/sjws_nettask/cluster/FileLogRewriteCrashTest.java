@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -68,16 +69,18 @@ class FileLogRewriteCrashTest {
 
     @ParameterizedTest(name = "{0} crash at {1}")
     @CsvSource({
-        "prefix, rewrite-written, old",
-        "prefix, rewrite-temp, old",
-        "prefix, rewrite-renamed, new",
-        "prefix, rewrite-dir-synced, new",
-        "suffix, rewrite-written, old",
-        "suffix, rewrite-temp, old",
-        "suffix, rewrite-renamed, new",
-        "suffix, rewrite-dir-synced, new",
+        "prefix, rewrite-written, old, usable",
+        "prefix, rewrite-temp, old, usable",
+        "prefix, rewrite-renamed, new, closed",
+        "prefix, rewrite-dir-sync, new, closed",
+        "prefix, rewrite-dir-synced, new, usable",
+        "suffix, rewrite-written, old, usable",
+        "suffix, rewrite-temp, old, usable",
+        "suffix, rewrite-renamed, new, closed",
+        "suffix, rewrite-dir-sync, new, closed",
+        "suffix, rewrite-dir-synced, new, usable",
     })
-    void crashAtEveryStepLeavesAWholeSegment(String op, String stage, String expect) throws Exception {
+    void crashAtEveryStepLeavesAWholeSegment(String op, String stage, String expect, String live) throws Exception {
         var root = Files.createTempDirectory("rewrite-crash");
         var log = filled(root);
         log.crashHook = at -> {
@@ -86,9 +89,13 @@ class FileLogRewriteCrashTest {
             }
         };
         assertThrows(IllegalStateException.class, () -> truncate(log, op));
-        // The live instance matches the disk too: nothing is appended to a replaced segment.
         log.crashHook = null;
-        if (expect.equals("old")) {
+        if (live.equals("closed")) {
+            // Past the rename, a failure leaves the instance unsure what is durable: it fails closed.
+            assertThrows(IOException.class, () -> log.append(GROUP, 6, 2, b("x")));
+            assertThrows(IOException.class, () -> log.force(GROUP));
+            assertThrows(IOException.class, () -> truncate(log, op));
+        } else if (expect.equals("old")) {
             assertOld(log);
         } else {
             assertNew(log, op);
@@ -101,28 +108,58 @@ class FileLogRewriteCrashTest {
             assertNew(reopened, op);
         }
         assertFalse(Files.exists(root.resolve("msg_0.log.rewrite")), "a stale temp is dropped on open");
+        long next = reopened.lastIndex(GROUP) + 1;
+        reopened.append(GROUP, next, 2, b("after-restart"));
+        reopened.force(GROUP);
+        assertArrayEquals(b("after-restart"), reopened.read(GROUP, next));
         reopened.close();
     }
 
+    /** A real I/O failure of the directory fsync (not only the hook) also fails the storage closed. */
     @ParameterizedTest(name = "{0}")
     @CsvSource({"prefix", "suffix"})
-    void appendAfterAFailedDirSyncLandsInTheLiveSegment(String op) throws Exception {
-        var root = Files.createTempDirectory("rewrite-after-fail");
+    void appendAfterAFailedDirSyncIsRefused(String op) throws Exception {
+        var root = Files.createTempDirectory("rewrite-dir-sync-fail");
         var log = filled(root);
         log.crashHook = at -> {
-            if (at.equals("msg_0.log:rewrite-renamed")) {
-                throw new IllegalStateException("crash at " + at);
+            if (at.equals("msg_0.log:rewrite-dir-sync")) {
+                throw new java.io.UncheckedIOException(new IOException("injected: directory fsync failed"));
             }
         };
-        assertThrows(IllegalStateException.class, () -> truncate(log, op));
+        assertThrows(java.io.UncheckedIOException.class, () -> truncate(log, op));
         log.crashHook = null;
-        long next = log.lastIndex(GROUP) + 1;
-        log.append(GROUP, next, 2, b("after"));
-        log.force(GROUP);
+        var refused = assertThrows(IOException.class, () -> log.append(GROUP, 6, 2, b("after")));
+        assertTrue(refused.getMessage().contains("restart"), refused.getMessage());
+        assertThrows(IOException.class, () -> log.force(GROUP));
         log.close();
         var reopened = new FileLogStorage(root);
-        assertArrayEquals(b("after"), reopened.read(GROUP, next));
+        assertNew(reopened, op);
         reopened.close();
+    }
+
+    @Test
+    void theRewriteTempIsCreatedOwnerOnlyAndAPlantedSymlinkIsNotFollowed() throws Exception {
+        var root = Files.createTempDirectory("rewrite-perms");
+        var log = filled(root);
+        var victim = Files.createTempFile("victim", ".txt");
+        Files.writeString(victim, "untouched");
+        Files.createSymbolicLink(root.resolve("msg_0.log.rewrite"), victim);
+        var seen = new java.util.concurrent.atomic.AtomicReference<java.util.Set<java.nio.file.attribute.PosixFilePermission>>();
+        log.crashHook = at -> {
+            if (at.equals("msg_0.log:rewrite-written")) {
+                try {
+                    var tmp = root.resolve("msg_0.log.rewrite");
+                    assertFalse(Files.isSymbolicLink(tmp));
+                    seen.set(Files.getPosixFilePermissions(tmp, java.nio.file.LinkOption.NOFOLLOW_LINKS));
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            }
+        };
+        log.truncatePrefix(GROUP, 2);
+        assertEquals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"), seen.get());
+        assertEquals("untouched", Files.readString(victim));
+        log.close();
     }
 
     @Test

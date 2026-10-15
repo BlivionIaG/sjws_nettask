@@ -105,6 +105,7 @@ public final class FileLogStorage implements LogStorage {
         if (index < 1) {
             throw new IllegalArgumentException("index");
         }
+        checkUsable();
         var copy = data.clone();
         var log = log(group);
         lock.lock();
@@ -174,8 +175,10 @@ public final class FileLogStorage implements LogStorage {
     /**
      * Rewrites the segment crash-safely: the kept records go to {@code <group>.log.rewrite}, which is
      * fsynced, atomically renamed over the segment, and the directory is fsynced. A crash at any point
-     * leaves either the whole old segment or the whole new one, never a half-written file. Before this
-     * change the segment was truncated to zero in place and refilled without an fsync.
+     * leaves either the whole old segment or the whole new one, never a half-written file. The temp
+     * is created fresh ({@code CREATE_NEW}, links not followed, mode 0600, so the segment ends up
+     * 0600 too). A failure after the rename fails the storage closed (see {@link #checkUsable}).
+     * Before this change the segment was truncated to zero in place and refilled without an fsync.
      */
     private void rewrite(GroupId group, NavigableMap<Long, Rec> keep) throws IOException {
         lock.lock();
@@ -183,8 +186,11 @@ public final class FileLogStorage implements LogStorage {
             var target = path(group);
             var tmp = rewritePath(group);
             var fresh = new ConcurrentSkipListMap<Long, Rec>();
-            try (var out = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
-                    StandardOpenOption.TRUNCATE_EXISTING)) {
+            checkUsable();
+            Files.deleteIfExists(tmp);
+            try (var out = FileChannel.open(tmp, java.util.Set.of(StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.WRITE, java.nio.file.LinkOption.NOFOLLOW_LINKS),
+                    OWNER_ONLY)) {
                 for (var entry : keep.entrySet()) {
                     var rec = entry.getValue();
                     var header = ByteBuffer.allocate(20 + rec.data.length);
@@ -203,21 +209,43 @@ public final class FileLogStorage implements LogStorage {
             }
             crashPoint(target.getFileName() + ":rewrite-temp");
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            // Swap to the new file before anything else can fail, so this instance never keeps
-            // appending to the replaced (unlinked) segment.
-            var reopened = FileChannel.open(target, StandardOpenOption.READ, StandardOpenOption.WRITE);
-            var old = channels.put(group, reopened);
-            logs.put(group, fresh);
-            if (old != null) {
-                old.close();
-            }
-            crashPoint(target.getFileName() + ":rewrite-renamed");
-            try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
-                dir.force(true);
+            // Past the rename the disk holds the new segment. Any failure from here on leaves this
+            // instance unsure what is durable, so it fails closed: every later append, force and
+            // truncate is refused until the process restarts and reloads the segment from disk.
+            try {
+                crashPoint(target.getFileName() + ":rewrite-renamed");
+                var reopened = FileChannel.open(target, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                var old = channels.put(group, reopened);
+                logs.put(group, fresh);
+                if (old != null) {
+                    old.close();
+                }
+                crashPoint(target.getFileName() + ":rewrite-dir-sync");
+                try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
+                    dir.force(true);
+                }
+            } catch (IOException | RuntimeException failed) {
+                failedClosed = new IOException("log storage failed after renaming the rewritten segment of " + group
+                        + "; restart to recover from disk", failed);
+                throw failed;
             }
             crashPoint(target.getFileName() + ":rewrite-dir-synced");
         } finally {
             lock.unlock();
+        }
+    }
+
+    /** rw------- for the rewrite temp file, like the snapshot and vote files. */
+    private static final java.nio.file.attribute.FileAttribute<?> OWNER_ONLY = java.nio.file.attribute.PosixFilePermissions
+            .asFileAttribute(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+
+    /** Set once a segment rewrite fails past its rename; then appends, forces and truncates are refused. */
+    private volatile IOException failedClosed;
+
+    private void checkUsable() throws IOException {
+        var failed = failedClosed;
+        if (failed != null) {
+            throw new IOException(failed.getMessage(), failed);
         }
     }
 
@@ -227,6 +255,7 @@ public final class FileLogStorage implements LogStorage {
 
     @Override
     public void force(GroupId group) throws IOException {
+        checkUsable();
         log(group);
         lock.lock();
         try {
