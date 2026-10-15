@@ -198,20 +198,24 @@ public final class FileLogStorage implements LogStorage {
                     }
                     fresh.put(entry.getKey(), rec);
                 }
+                crashPoint(target.getFileName() + ":rewrite-written");
                 out.force(true);
             }
             crashPoint(target.getFileName() + ":rewrite-temp");
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            // Swap to the new file before anything else can fail, so this instance never keeps
+            // appending to the replaced (unlinked) segment.
+            var reopened = FileChannel.open(target, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            var old = channels.put(group, reopened);
+            logs.put(group, fresh);
+            if (old != null) {
+                old.close();
+            }
             crashPoint(target.getFileName() + ":rewrite-renamed");
             try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
                 dir.force(true);
             }
-            var reopened = FileChannel.open(target, StandardOpenOption.READ, StandardOpenOption.WRITE);
-            var old = channels.put(group, reopened);
-            if (old != null) {
-                old.close();
-            }
-            logs.put(group, fresh);
+            crashPoint(target.getFileName() + ":rewrite-dir-synced");
         } finally {
             lock.unlock();
         }
