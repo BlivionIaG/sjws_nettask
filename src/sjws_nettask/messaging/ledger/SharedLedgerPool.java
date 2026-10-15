@@ -1,6 +1,9 @@
 package sjws_nettask.messaging.ledger;
 
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
@@ -15,6 +18,9 @@ import java.util.concurrent.locks.LockSupport;
  * Sized to the CPUs by default ({@value #PROPERTY} unset or {@code auto}). Set the property to
  * {@code 0} / {@code false} for the legacy per-writer threads. No threads run until the first
  * writer registers (zero cost when messaging is unused).
+ * <p>
+ * Each shard blocks on a ready queue (signalled from {@link LedgerWriter#appendNoWait}), matching
+ * the dedicated {@code ArrayBlockingQueue.take} wake path instead of polling.
  */
 public final class SharedLedgerPool {
 
@@ -62,7 +68,7 @@ public final class SharedLedgerPool {
         return shards.length;
     }
 
-    /** Registers {@code w} on a shard; returns the shard index for unpark. */
+    /** Registers {@code w} on a shard; returns the shard index for signalling. */
     int register(LedgerWriter w) {
         int i = Math.floorMod(rr.getAndIncrement(), shards.length);
         shards[i].add(w);
@@ -74,8 +80,9 @@ public final class SharedLedgerPool {
         shards[shard].remove(w);
     }
 
-    void unparkWriter(int shard) {
-        if (shard >= 0 && shard < shards.length) LockSupport.unpark(shards[shard].writer);
+    /** Writer has work: wake the shard's writer thread (idempotent if already runnable). */
+    void signalWriter(int shard, LedgerWriter w) {
+        if (shard >= 0 && shard < shards.length) shards[shard].signalWriter(w);
     }
 
     void unparkSyncer(int shard) {
@@ -85,6 +92,8 @@ public final class SharedLedgerPool {
     private static final class Shard {
         final int index;
         final CopyOnWriteArrayList<LedgerWriter> members = new CopyOnWriteArrayList<>();
+        /** Bounded ready queue; offer never blocks (drop if full — writer is already scheduled). */
+        final BlockingQueue<LedgerWriter> ready = new ArrayBlockingQueue<>(1024);
         final Thread writer;
         final Thread syncer;
         volatile boolean stop;
@@ -99,24 +108,35 @@ public final class SharedLedgerPool {
 
         void add(LedgerWriter w) {
             members.addIfAbsent(w);
-            LockSupport.unpark(writer);
-            LockSupport.unpark(syncer);
         }
 
         void remove(LedgerWriter w) {
             members.remove(w);
+            ready.offer(w); // wake take() so the loop notices unregister / can exit drain
+        }
+
+        void signalWriter(LedgerWriter w) {
+            ready.offer(w);
         }
 
         private void writeLoop() {
             while (!stop) {
-                boolean any = false;
-                for (var w : members) {
-                    if (w.drainAndCommit()) any = true;
+                LedgerWriter w;
+                try {
+                    w = ready.poll(100, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
-                if (!any) {
-                    if (stop) return;
-                    LockSupport.parkNanos(this, 100_000L); // 100 us: wake on offer unpark or backstop
+                if (w == null) {
+                    // Backstop: drain any member that has work if a signal was lost.
+                    for (var m : members) {
+                        if (m.drainAndCommit()) { /* keep going */ }
+                    }
+                    continue;
                 }
+                // Drain this writer fully; coalesced signals for the same writer are fine.
+                while (w.drainAndCommit()) { }
             }
         }
 

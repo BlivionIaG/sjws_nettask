@@ -173,7 +173,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             behind = true;
             try { queue.put(p); } catch (InterruptedException e) { Thread.currentThread().interrupt(); f.completeExceptionally(e); }
         }
-        if (sharedPool != null) sharedPool.unparkWriter(sharedShard);
+        if (sharedPool != null) sharedPool.signalWriter(sharedShard, this);
         return f;
     }
 
