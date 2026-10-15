@@ -28,6 +28,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import sjws_nettask.cp.ControlLeadership;
 
 /** #212: a demoted leader must stop reporting leaderReady() before its leader-change notice is delivered. */
@@ -36,6 +37,7 @@ class ControlLeadershipDemotionTest {
     private static final GroupId GROUP = new GroupId("cp-demote");
 
     @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
     void demotedLeaderIsNotReadyWhileDeliveriesAreBackedUp() throws Exception {
         var clock = new FakeClock(0L);
         var net = new SimTransport();
