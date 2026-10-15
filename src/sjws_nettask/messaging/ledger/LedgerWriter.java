@@ -14,10 +14,11 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Single writer for one {@link SegmentedLog}. A dedicated platform thread drains a bounded queue
- * (backpressure) and writes each drained group with one positional write; every append is its own
- * batch. When a future completes depends on the append's effective {@link Durability} (per-append
- * override, else the writer default):
+ * Single writer for one {@link SegmentedLog}. Appends go through a bounded queue (backpressure); a
+ * writer thread drains groups with one positional write each. By default the writer and syncer run on
+ * {@link SharedLedgerPool} (CPU-sized); set {@link SharedLedgerPool#PROPERTY} to {@code 0} for a
+ * dedicated pair of threads per writer. When a future completes depends on the append's effective
+ * {@link Durability} (per-append override, else the writer default):
  * <ul>
  *   <li>NONE / ASYNC: right after the write (page cache). ASYNC is the default; a background syncer
  *       thread fsyncs off the ack path and advances {@link LedgerSnapshot#durableOffset}.</li>
@@ -58,8 +59,13 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private volatile boolean flooring;
     private final AtomicReference<LedgerSnapshot> snapshot = new AtomicReference<>();
     private final ConcurrentLinkedQueue<Waiter> fsyncWaiters = new ConcurrentLinkedQueue<>();
+    /** Dedicated writer thread, or null when this writer is on {@link SharedLedgerPool}. */
     private final Thread thread;
+    /** Dedicated syncer thread, or null when shared. */
     private final Thread syncer;
+    /** Shard index in the shared pool, or -1 when dedicated. */
+    private final int sharedShard;
+    private final SharedLedgerPool sharedPool;
     private volatile boolean closed;
     private volatile boolean stopSyncer;
     private volatile Throwable failure;
@@ -103,11 +109,21 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         this.written = log.nextOffset();
         this.durable = log.nextOffset(); // recovered data is treated as durable (it survived a restart)
         publish();
-        var name = log.dir().getFileName();
-        this.syncer = Thread.ofPlatform().name("ledger-syncer-" + name).daemon().unstarted(this::syncLoop);
-        this.thread = Thread.ofPlatform().name("ledger-writer-" + name).daemon().unstarted(this::run);
-        syncer.start();
-        thread.start();
+        var pool = SharedLedgerPool.sharedOrNull();
+        if (pool != null) {
+            this.sharedPool = pool;
+            this.thread = null;
+            this.syncer = null;
+            this.sharedShard = pool.register(this);
+        } else {
+            this.sharedPool = null;
+            this.sharedShard = -1;
+            var name = log.dir().getFileName();
+            this.syncer = Thread.ofPlatform().name("ledger-syncer-" + name).daemon().unstarted(this::syncLoop);
+            this.thread = Thread.ofPlatform().name("ledger-writer-" + name).daemon().unstarted(this::run);
+            syncer.start();
+            thread.start();
+        }
     }
 
     /** The latest published state; one volatile read. */
@@ -157,8 +173,86 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             behind = true;
             try { queue.put(p); } catch (InterruptedException e) { Thread.currentThread().interrupt(); f.completeExceptionally(e); }
         }
+        if (sharedPool != null) sharedPool.unparkWriter(sharedShard);
         return f;
     }
+
+    private void unparkSyncer() {
+        if (sharedPool != null) sharedPool.unparkSyncer(sharedShard);
+        else LockSupport.unpark(syncer);
+    }
+
+    /**
+     * Shared-pool writer entry: drain this writer's queue and commit. Returns true when any work was done.
+     * Called only from a shared writer thread (or {@link #close} on the closer).
+     */
+    boolean drainAndCommit() {
+        Pending first = queue.poll();
+        if (first == null) return false;
+        var group = drainBuf();
+        group.add(first);
+        queue.drainTo(group);
+        behind = queue.size() >= capacity;
+        int poison = indexOfPoison(group);
+        if (poison >= 0) {
+            // Shared mode: poison means this writer is closing; drop poison and commit the rest.
+            group.subList(poison, group.size()).clear();
+            stopSyncer = true;
+        }
+        if (!group.isEmpty()) commit(group);
+        group.clear();
+        return true;
+    }
+
+    private static final ThreadLocal<ArrayList<Pending>> DRAIN = ThreadLocal.withInitial(() -> new ArrayList<>(64));
+
+    private static ArrayList<Pending> drainBuf() {
+        var g = DRAIN.get();
+        g.clear();
+        return g;
+    }
+
+    /**
+     * One shared-syncer slice for this writer: complete covered waiters, fsync if needed, respect the floor.
+     * Returns true when this writer still looks busy (dirty or flooring), so the shard keeps polling.
+     */
+    boolean sharedSyncSlice() {
+        if (stopSyncer && queue.isEmpty() && fsyncWaiters.isEmpty() && written <= durableNow()) return false;
+        long d0 = durableNow();
+        Waiter w0;
+        while ((w0 = fsyncWaiters.peek()) != null && w0.endOffset <= d0) { fsyncWaiters.poll(); w0.done.complete(w0.base); }
+        long target = written;
+        boolean dirty = target > durableNow();
+        boolean wanted = dirty && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
+        if (!wanted) return false;
+        // Floor: leave the work for a later slice; shared syncer parks at shard level.
+        // Track flooring so writers skip unpark storms (same as dedicated syncLoop).
+        long wait = lastSharedFsync + fsyncIntervalNanos - System.nanoTime();
+        if (wait > 0 && fsyncWaiters.isEmpty() && !stopSyncer) {
+            flooring = true;
+            LockSupport.parkNanos(wait); // same floor as dedicated syncLoop; holds this shard's syncer
+            flooring = false;
+            return true;
+        }
+        flooring = false;
+        try {
+            log.force();
+        } catch (IOException | RuntimeException e) {
+            failure = e;
+            failWaiters(e);
+            return false;
+        }
+        lastSharedFsync = System.nanoTime();
+        lock.lock();
+        try { fsyncs++; if (target > durable) durable = target; } finally { lock.unlock(); }
+        publish();
+        Waiter w;
+        while ((w = fsyncWaiters.peek()) != null && w.endOffset <= target) { fsyncWaiters.poll(); w.done.complete(w.base); }
+        return written > durableNow() || !fsyncWaiters.isEmpty();
+    }
+
+    /** Last fsync time for {@link #sharedSyncSlice} (dedicated syncLoop keeps its own local). */
+    private long lastSharedFsync;
 
     private void run() {
         var group = new ArrayList<Pending>();
@@ -228,7 +322,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             }
             // NONE/GROUP/EACH writers only need the syncer for fsync waiters (GROUP overrides); ASYNC unless it is already
             // sleeping out the fsync floor (an unpark per write would turn the floor into a wake-up per write).
-            if ((durability == Durability.ASYNC && !flooring) || !fsyncWaiters.isEmpty()) LockSupport.unpark(syncer);
+            if ((durability == Durability.ASYNC && !flooring) || !fsyncWaiters.isEmpty()) unparkSyncer();
         } catch (IOException | RuntimeException e) {
             // The in-memory tail may disagree with disk: fence the writer; reopening recovers.
             failure = e;
@@ -339,11 +433,24 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     @Override public void close() throws InterruptedException {
         if (closed) return;
         closed = true;
-        queue.put(POISON);
-        thread.join(TimeUnit.SECONDS.toMillis(30));
-        stopSyncer = true;
-        LockSupport.unpark(syncer);
-        syncer.join(TimeUnit.SECONDS.toMillis(30));
+        if (sharedPool != null) {
+            // Leave the shard first so a shared worker does not race the closer's drain.
+            sharedPool.unregister(this, sharedShard);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (System.nanoTime() < deadline) {
+                if (!drainAndCommit() && queue.isEmpty()) break;
+            }
+            stopSyncer = true;
+            while (System.nanoTime() < deadline && (written > durableNow() || !fsyncWaiters.isEmpty())) {
+                if (!sharedSyncSlice()) break;
+            }
+        } else {
+            queue.put(POISON);
+            thread.join(TimeUnit.SECONDS.toMillis(30));
+            stopSyncer = true;
+            LockSupport.unpark(syncer);
+            syncer.join(TimeUnit.SECONDS.toMillis(30));
+        }
         if (failure == null && written > durableNow()) {
             try { forceInline(); } catch (IOException e) { failure = e; }
         }

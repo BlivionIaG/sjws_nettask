@@ -212,13 +212,18 @@ public final class Partition implements AutoCloseable {
      * rejected as a duplicate with offset -1.
      */
     public ProduceResult produce(long producerId, long seq, byte[] payload, Durability durability) {
+        // Allocate and encode outside the partition lock so a descheduled lock holder does less work under
+        // contention (claim-wakeup #184: reply produce held the lock while writer/syncer threads ran).
+        long ts = clockMs.getAsLong();
+        var entry = new LedgerEntry.Enqueue(producerId, seq, ts, "", -1, 0, "", payload);
+        var enc = List.of(LedgerEntry.encode(entry));
         lockForAppend();
         try {
             long dup = state.duplicateOf(producerId, seq);
             if (dup == -2) return new ProduceResult(-1, true, CompletableFuture.completedFuture(-1L));
             if (dup != -1) return new ProduceResult(dup, true, CompletableFuture.completedFuture(dup));
             long o = state.nextOffset;
-            var f = append(new LedgerEntry.Enqueue(producerId, seq, clockMs.getAsLong(), "", -1, 0, "", payload), durability);
+            var f = appendEncoded(entry, enc, durability);
             return new ProduceResult(o, false, f);
         } finally {
             lock.unlock();
@@ -623,17 +628,29 @@ public final class Partition implements AutoCloseable {
      * order) matches apply order.
      */
     private CompletableFuture<Long> append(LedgerEntry e, Durability durability) {
-        return appendAll(List.of(e), durability);
+        return appendEncoded(e, List.of(LedgerEntry.encode(e)), durability);
     }
 
     /** As {@link #append}, for several entries written as one batch; the future yields the first offset. */
     private CompletableFuture<Long> appendAll(List<LedgerEntry> es, Durability durability) {
-        long offset = state.nextOffset;
-        CompletableFuture<Long> f;
         List<byte[]> enc;
         if (es.size() == 1) enc = List.of(LedgerEntry.encode(es.get(0)));
         else { enc = new ArrayList<>(es.size()); for (var e : es) enc.add(LedgerEntry.encode(e)); }
-        f = appender.appendNoWait(enc, durability); // never blocks: capacity was awaited before the lock (lockForAppend)
+        return appendEncodedAll(es, enc, durability);
+    }
+
+    /** Lock held. Single entry with pre-encoded bytes (encode done outside the lock on the produce path). */
+    private CompletableFuture<Long> appendEncoded(LedgerEntry e, List<byte[]> enc, Durability durability) {
+        return appendEncodedAll(List.of(e), enc, durability);
+    }
+
+    /**
+     * Lock held. Queue hand-off still happens here so log order matches apply order; produce has already done
+     * allocation/encode outside. Wake stays under the lock ({@link java.util.concurrent.locks.Condition} requires it).
+     */
+    private CompletableFuture<Long> appendEncodedAll(List<LedgerEntry> es, List<byte[]> enc, Durability durability) {
+        long offset = state.nextOffset;
+        var f = appender.appendNoWait(enc, durability); // never blocks: capacity was awaited before the lock
         if (f.isCompletedExceptionally()) {
             f.join(); // rethrows: the writer is fenced; nothing was applied
         }

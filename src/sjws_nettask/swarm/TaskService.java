@@ -516,7 +516,8 @@ public final class TaskService {
      * Replies to every task in {@code tasks} ({@code bodies[i]} for {@code tasks.get(i)}, all from one pool), each
      * with {@code (producerId, firstSeq + i)}, then acks them with <b>one batched fenced ack</b> (#100) once the last
      * reply is durable. Takes ownership of the {@code bodies} arrays (no copy). When a {@link ReplyRouter} is bound
-     * and {@code replyTo} is local, each caller is completed as soon as its envelope is built (before the write).
+     * and {@code replyTo} is local, each caller is completed right after a successful produce (still before
+     * {@code durable()} / the poller), so a produce failure does not leave a completed caller without a ledger copy.
      */
     public CompletableFuture<List<LeaseResult>> replyAll(List<Task> tasks, long producerId, long firstSeq,
             String contentType, List<byte[]> bodies) {
@@ -538,9 +539,10 @@ public final class TaskService {
                 throw new IllegalArgumentException("task has no replyTo");
             }
             var reply = t.envelope().replyOwned(contentType, bodies.get(i));
-            deliverLocal(to, reply); // wake the caller before the ledger write / poller
-            durable.add(this.topics.partition(to).produce(producerId, firstSeq + i,
-                    reply.encode(), Durability.ASYNC).durable());
+            var produced = this.topics.partition(to).produce(producerId, firstSeq + i,
+                    reply.encode(), Durability.ASYNC);
+            deliverLocal(to, reply); // after a successful produce; still before durable()/poller
+            durable.add(produced.durable());
         }
         // Different reply topics are different logs, so wait for each topic's futures (normally one topic).
         return CompletableFuture.allOf(durable.toArray(CompletableFuture[]::new))
@@ -553,8 +555,8 @@ public final class TaskService {
             throw new IllegalArgumentException("task has no replyTo");
         }
         var reply = t.envelope().reply(contentType, body);
-        deliverLocal(to, reply); // wake the caller before the ledger write / poller
         var r = this.topics.partition(to).produce(producerId, seq, reply.encode(), Durability.ASYNC);
+        deliverLocal(to, reply); // after a successful produce; still before durable()/poller
         return r.durable().thenApplyAsync(off -> ack(t), ACKER);
     }
 }

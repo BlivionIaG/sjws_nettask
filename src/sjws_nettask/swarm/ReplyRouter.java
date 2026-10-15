@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ul>
  * The poller blocks in {@code Partition.poll(..., waitNanos)} (#99), woken by the reply's append: no spinning.
  * <p>Same-process replies are completed by {@link #completeLocal} from {@link TaskService#reply}/{@link TaskService#replyAll}
- * as soon as the envelope is built, so the caller does not wait for the poller (or the ledger write). The poller still
+ * right after a successful produce, so the caller does not wait for the poller (or {@code durable()}). The poller still
  * reads and acks every reply for retention; a reply already handed to its caller is not counted as late.
  */
 public final class ReplyRouter implements AutoCloseable {
@@ -61,6 +61,8 @@ public final class ReplyRouter implements AutoCloseable {
     private final AtomicLong late = new AtomicLong();
     /** Correlation keys completed by {@link #completeLocal}; the poller removes them so they are not counted late. */
     private final java.util.Set<Key> deliveredLocal = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Insertion order for {@link #deliveredLocal} so a lagging poller evicts oldest keys instead of clearing all. */
+    private final java.util.concurrent.ConcurrentLinkedQueue<Key> deliveredOrder = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     private record Key(long hi, long lo) { }
 
@@ -104,9 +106,13 @@ public final class ReplyRouter implements AutoCloseable {
         }
         if (f.complete(env)) {
             this.deliveredLocal.add(key);
-            // Bound the set if the poller lags (should stay near empty under load).
-            if (this.deliveredLocal.size() > 65_536) {
-                this.deliveredLocal.clear();
+            this.deliveredOrder.add(key);
+            // Bound without clear-all: dropping oldest keys can at worst bump lateReplies once the poller
+            // catches up, never double-complete (pending already removed).
+            while (this.deliveredLocal.size() > 65_536) {
+                var old = this.deliveredOrder.poll();
+                if (old == null) break;
+                this.deliveredLocal.remove(old);
             }
             return true;
         }
