@@ -188,6 +188,15 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         return v == null || v.isBlank() ? dflt : v.trim();
     }
 
+    /**
+     * HA on (msg-replication-sketch phase A): replicates the given topics and {@code __offsets} through {@code r}. The
+     * HA bootstrap calls this once, before the server mounts the module; with HA off it is never called and messaging
+     * appends straight to the local writer.
+     */
+    public void replication(sjws_nettask.messaging.ledger.PartitionReplicator r) throws java.io.IOException {
+        this.topics.replication(r);
+    }
+
     /** Installs the metrics hooks (see {@link MessagingHooks}); call before the server mounts the module. */
     public void hooks(MessagingHooks h) {
         this.hooks = java.util.Objects.requireNonNull(h);
