@@ -40,11 +40,7 @@ public final class SharedLedgerPool {
     static int resolveSize() {
         String v = System.getProperty(PROPERTY);
         if (v == null || v.isBlank() || v.equalsIgnoreCase("auto") || v.equalsIgnoreCase("true")) {
-            // Cap threads, but keep shards wide enough that a typical swarm (a few dozen partitions)
-            // stays 1:1 on the single-member blockingDrain path — CPU count alone packs writers and
-            // adds ready-queue latency on the p50 path.
-            int cpus = Math.max(1, Runtime.getRuntime().availableProcessors());
-            return Math.max(cpus * 4, 32);
+            return Math.max(1, Runtime.getRuntime().availableProcessors());
         }
         if (v.equals("0") || v.equalsIgnoreCase("false") || v.equalsIgnoreCase("off")) {
             return 0;
