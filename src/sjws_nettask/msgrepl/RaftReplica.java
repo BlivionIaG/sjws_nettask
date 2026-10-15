@@ -72,6 +72,8 @@ final class RaftReplica implements Replica {
     private final int self;
     private final FileChannel stamps;
     private final java.util.function.LongSupplier nanoClock;
+    /** Single-member group: no peers renew the lease, and none can be elected instead. */
+    private final boolean solo;
     private final AtomicLong seqs = new AtomicLong();
     private final ConcurrentHashMap<Long, CompletableFuture<Long>> pending = new ConcurrentHashMap<>();
     /** Term whose election no-op this node applied as leader; -1 before. */
@@ -85,6 +87,7 @@ final class RaftReplica implements Replica {
     RaftReplica(ClusterNode node, GroupId groupId, GroupOptions options, LedgerWriter local, Durability defaultMode,
             Consumer<List<byte[]>> onApplied, Map<String, String> urls, Path stampFile, java.util.function.LongSupplier nanoClock) throws IOException {
         this.nanoClock = nanoClock;
+        this.solo = node.membership().others().isEmpty();
         this.node = node;
         this.groupId = groupId;
         this.local = local;
@@ -228,7 +231,8 @@ final class RaftReplica implements Replica {
 
     private boolean leaderReady(long term) {
         // Ready = this term's no-op applied here, still leader, and inside its lease (an isolated old leader stops acking).
-        return this.readyTerm == term && this.group.isLeader() && this.group.leaseExpiresAt() > this.nanoClock.getAsLong();
+        return this.readyTerm == term && this.group.isLeader()
+                && (this.solo || this.group.leaseExpiresAt() > this.nanoClock.getAsLong());
     }
 
     @Override
