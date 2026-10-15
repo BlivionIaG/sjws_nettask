@@ -145,4 +145,76 @@ class ReplyRouterTest {
             assertInstanceOf(IllegalArgumentException.class, e.getCause());
         }
     }
+
+    /** #219 review: the poller drains each direct delivery's key, so the dedup map does not grow with traffic. */
+    @Test
+    void directDeliveryKeysAreDrainedByThePoller() throws Exception {
+        try (var swarm = Swarm.open(this.dir, "drain", 7)) {
+            int n = 300;
+            for (int i = 0; i < n; i++) {
+                long deadline = System.currentTimeMillis() + 10_000;
+                var f = swarm.replies().call("echo", "text/plain", new byte[] {1}, deadline, "");
+                var t = swarm.tasks().claim("echo", "w", 1, 5_000).get(0);
+                swarm.tasks().reply(t, 5, i + 1, "text/plain", new byte[] {2}).get(5, TimeUnit.SECONDS);
+                f.get(5, TimeUnit.SECONDS);
+            }
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (swarm.replies().deliveredLocalSize() > 0 && System.nanoTime() < until) {
+                Thread.sleep(5);
+            }
+            assertEquals(0, swarm.replies().deliveredLocalSize());
+            assertEquals(0, swarm.replies().lateReplies());
+        }
+    }
+
+    /**
+     * #219 review: completeLocal runs before produce. When produce throws, the caller is completed exactly once, the
+     * task is not acked, it is redelivered after its lease, and the retried reply does not complete the caller again.
+     */
+    @Test
+    void produceFailureAfterLocalCompletionRedeliversWithoutASecondCompletion() throws Exception {
+        try (var swarm = Swarm.open(this.dir, "throws", 7)) {
+            long deadline = System.currentTimeMillis() + 30_000;
+            var f = swarm.replies().call("echo", "text/plain", new byte[] {1}, deadline, "");
+            var t = swarm.tasks().claim("echo", "w", 1, 300).get(0);
+            // Close the reply partition in place (still registered): produce runs after completeLocal and fails.
+            var replyTopic = swarm.replies().topic();
+            swarm.topics().partition(replyTopic).close();
+            boolean failed;
+            try {
+                swarm.tasks().reply(t, 5, 1, "text/plain", new byte[] {2}).get(5, TimeUnit.SECONDS);
+                failed = false;
+            } catch (RuntimeException | ExecutionException e) {
+                failed = true;
+            }
+            assertTrue(failed, "reply must fail when its produce fails");
+            var r = f.get(1, TimeUnit.SECONDS);
+            assertEquals(2, r.body()[0]);
+            // Reopen the reply topic for the retry (the poller re-resolves the partition each slice).
+            swarm.topics().close(replyTopic);
+            assertEquals(0, swarm.replies().pending());
+            // Not acked: the lease expires and the task comes back.
+            var again = swarm.tasks().claim("echo", "w", 1, 5_000);
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (again.isEmpty() && System.nanoTime() < until) {
+                Thread.sleep(20);
+                again = swarm.tasks().claim("echo", "w", 1, 5_000);
+            }
+            assertFalse(again.isEmpty(), "task redelivered after a failed reply");
+            assertEquals(t.offset(), again.get(0).offset());
+            assertEquals(LeaseResult.OK, swarm.tasks().reply(again.get(0), 5, 2, "text/plain", new byte[] {3})
+                    .get(5, TimeUnit.SECONDS));
+            // The retry finds no pending caller, so the first completion stands. Its ledger copy is the first one the
+            // poller sees for that key: it consumes the remembered direct delivery (so the key does not leak) and is
+            // acked without counting late.
+            assertEquals(2, f.get().body()[0]);
+            until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (swarm.replies().deliveredLocalSize() > 0 && System.nanoTime() < until) {
+                Thread.sleep(5);
+            }
+            assertEquals(0, swarm.replies().deliveredLocalSize());
+            assertEquals(0, swarm.replies().lateReplies());
+            assertEquals(0, swarm.replies().pending());
+        }
+    }
 }

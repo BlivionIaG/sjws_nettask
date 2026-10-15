@@ -1,7 +1,7 @@
 package sjws_nettask.messaging.ledger;
 
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -83,27 +83,54 @@ public final class SharedLedgerPool {
         if (shard >= 0 && shard < shards.length) shards[shard].unpark();
     }
 
+    /**
+     * One shared syncer. Membership and the {@code syncer} field change only under {@code startLock}, and the syncer
+     * exits only after it has seen, under that lock, that the shard is empty and has cleared itself. A writer added
+     * after that sees {@code syncer == null} and starts a new thread, so a member never ends up without a syncer
+     * (#219 review: start/stop race left ASYNC {@code durable()} hanging).
+     */
     private static final class Shard {
         final int index;
         final CopyOnWriteArrayList<LedgerWriter> members = new CopyOnWriteArrayList<>();
-        final Object startLock = new Object();
+        final ReentrantLock startLock = new ReentrantLock();
         volatile Thread syncer;
-        volatile boolean stop;
 
         Shard(int index) {
             this.index = index;
         }
 
         void add(LedgerWriter w) {
-            members.addIfAbsent(w);
-            ensureStarted();
+            startLock.lock();
+            try {
+                members.addIfAbsent(w);
+                if (syncer == null) {
+                    var t = Thread.ofPlatform().name("ledger-syncer-shared-" + index).daemon().unstarted(this::syncLoop);
+                    syncer = t;
+                    t.start();
+                }
+            } finally {
+                startLock.unlock();
+            }
             unpark();
         }
 
         void remove(LedgerWriter w) {
-            members.remove(w);
+            startLock.lock();
+            try {
+                members.remove(w);
+            } finally {
+                startLock.unlock();
+            }
+            // The syncer notices the empty shard on its next idle check and retires itself.
             unpark();
-            if (members.isEmpty()) stopSyncer();
+        }
+
+        int memberCount() {
+            return members.size();
+        }
+
+        Thread syncerThread() {
+            return syncer;
         }
 
         void unpark() {
@@ -111,58 +138,52 @@ public final class SharedLedgerPool {
             if (t != null) LockSupport.unpark(t);
         }
 
-        private void ensureStarted() {
-            if (syncer != null) return;
-            synchronized (startLock) {
-                if (syncer != null) return;
-                stop = false;
-                var t = Thread.ofPlatform().name("ledger-syncer-shared-" + index).daemon().unstarted(this::syncLoop);
-                syncer = t;
-                t.start();
-            }
-        }
-
-        private void stopSyncer() {
-            synchronized (startLock) {
-                stop = true;
-                var t = syncer;
+        /** True when this thread should exit: it is no longer the syncer, or the shard is empty (then it clears itself). */
+        private boolean retire(Thread me) {
+            if (!members.isEmpty() && syncer == me) return false;
+            startLock.lock();
+            try {
+                if (syncer != me) return true;
+                if (!members.isEmpty()) return false;
                 syncer = null;
-                if (t != null) {
-                    LockSupport.unpark(t);
-                    try {
-                        t.join(5_000);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-                stop = false;
+                return true;
+            } finally {
+                startLock.unlock();
             }
         }
 
         private void syncLoop() {
-            while (!stop) {
+            var me = Thread.currentThread();
+            while (true) {
                 boolean busy = false;
                 for (var w : members) {
                     if (w.sharedSyncSlice()) busy = true;
                 }
                 if (busy) continue;
-                if (stop || members.isEmpty()) return;
+                if (retire(me)) return;
                 // Brief spin so an unpark that races the idle check is not delayed by a long park.
-                for (int i = 0; i < 256; i++) {
-                    if (stop) return;
+                for (int i = 0; i < 256 && !busy; i++) {
                     for (var w : members) {
                         if (w.needsSharedSync()) {
                             busy = true;
                             break;
                         }
                     }
-                    if (busy) break;
-                    Thread.onSpinWait();
+                    if (!busy) Thread.onSpinWait();
                 }
                 if (busy) continue;
-                if (stop || members.isEmpty()) return;
+                if (retire(me)) return;
                 LockSupport.parkNanos(this, LedgerWriter.IDLE_PARK_NANOS);
             }
         }
+    }
+
+    /** Test hooks. */
+    int memberCount(int shard) {
+        return shards[shard].memberCount();
+    }
+
+    Thread syncerThread(int shard) {
+        return shards[shard].syncerThread();
     }
 }

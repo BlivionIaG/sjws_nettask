@@ -37,7 +37,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ul>
  * The poller blocks in {@code Partition.poll(..., waitNanos)} (#99), woken by the reply's append: no spinning.
  * <p>Same-process replies are completed by {@link #completeLocal} from {@link TaskService#reply}/{@link TaskService#replyAll}
- * as soon as the envelope is built (before the ledger write), so the caller does not wait for the poller. The poller still
+ * as soon as the envelope is built (before the ledger write), so the caller does not wait for the poller.
+ * <p><b>Ordering: complete before produce (accepted, #219 review).</b> Replies are ASYNC, so completing after produce
+ * would only wait on the page-cache hand-off and give the caller no durability. If produce then throws, the worker's
+ * reply future fails, the task is not acked, its lease expires and it is redelivered; the second reply finds no pending
+ * caller ({@link #completeLocal} returns false). Its ledger copy is the first the poller sees for that correlation key,
+ * so it consumes the remembered direct delivery and is acked silently (it counts late only if that key was evicted). So: no double completion, no lost caller,
+ * at-least-once handler execution (which swarm already assumes). The poller still
  * reads and acks every reply for retention; a reply already handed to its caller is not counted as late.
  */
 public final class ReplyRouter implements AutoCloseable {
@@ -59,10 +65,19 @@ public final class ReplyRouter implements AutoCloseable {
     private volatile Thread poller;
     private volatile boolean closed;
     private final AtomicLong late = new AtomicLong();
-    /** Correlation keys completed by {@link #completeLocal}; the poller removes them so they are not counted late. */
-    private final java.util.Set<Key> deliveredLocal = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /** Insertion order for {@link #deliveredLocal} so a lagging poller evicts oldest keys instead of clearing all. */
-    private final java.util.concurrent.ConcurrentLinkedQueue<Key> deliveredOrder = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /** Upper bound on remembered direct deliveries; past it the eldest is dropped (worst case: one late count). */
+    static final int DELIVERED_LOCAL_MAX = 65_536;
+    /**
+     * Correlation keys completed by {@link #completeLocal} whose ledger copy the poller has not read yet. The poller
+     * removes each key when it reads that reply, so this stays near empty; insertion order bounds it if the poller lags.
+     */
+    private final java.util.Map<Key, Boolean> deliveredLocal = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<>(64, 0.75f, false) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<Key, Boolean> e) {
+                    return size() > DELIVERED_LOCAL_MAX;
+                }
+            });
 
     private record Key(long hi, long lo) { }
 
@@ -105,18 +120,15 @@ public final class ReplyRouter implements AutoCloseable {
             return false;
         }
         if (f.complete(env)) {
-            this.deliveredLocal.add(key);
-            this.deliveredOrder.add(key);
-            // Bound without clear-all: dropping oldest keys can at worst bump lateReplies once the poller
-            // catches up, never double-complete (pending already removed).
-            while (this.deliveredLocal.size() > 65_536) {
-                var old = this.deliveredOrder.poll();
-                if (old == null) break;
-                this.deliveredLocal.remove(old);
-            }
+            this.deliveredLocal.put(key, Boolean.TRUE);
             return true;
         }
         return false;
+    }
+
+    /** Direct deliveries whose ledger copy the poller has not read yet (tests). */
+    int deliveredLocalSize() {
+        return this.deliveredLocal.size();
     }
 
     public int pending() {
@@ -216,7 +228,7 @@ public final class ReplyRouter implements AutoCloseable {
                 if (!f.complete(env)) {
                     this.late.incrementAndGet(); // raced with the caller's timeout
                 }
-            } else if (!this.deliveredLocal.remove(key)) {
+            } else if (this.deliveredLocal.remove(key) == null) {
                 this.late.incrementAndGet(); // timed out, or not an in-flight call
             }
         }

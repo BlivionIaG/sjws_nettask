@@ -181,60 +181,6 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         else LockSupport.unpark(syncer);
     }
 
-    /**
-     * Shared-pool writer entry: drain this writer's queue and commit. Returns true when any work was done.
-     * Called only from a shared writer thread (or {@link #close} on the closer).
-     */
-    /**
-     * Shared single-member shard: block for up to {@code waitNanos} for the first pending append, then drain.
-     * Returns after one drain cycle (possibly empty on timeout).
-     */
-    void blockingDrain(long waitNanos) throws InterruptedException {
-        Pending first = queue.poll(waitNanos, TimeUnit.NANOSECONDS);
-        if (first == null) return;
-        var group = drainBuf();
-        group.add(first);
-        queue.drainTo(group);
-        behind = queue.size() >= capacity;
-        int poison = indexOfPoison(group);
-        if (poison >= 0) {
-            group.subList(poison, group.size()).clear();
-            stopSyncer = true;
-        }
-        if (!group.isEmpty()) commit(group);
-        group.clear();
-    }
-
-    boolean drainAndCommit() {
-        Pending first = queue.poll();
-        if (first == null) return false;
-        var group = drainBuf();
-        group.add(first);
-        queue.drainTo(group);
-        behind = queue.size() >= capacity;
-        int poison = indexOfPoison(group);
-        if (poison >= 0) {
-            // Shared mode: poison means this writer is closing; drop poison and commit the rest.
-            group.subList(poison, group.size()).clear();
-            stopSyncer = true;
-        }
-        if (!group.isEmpty()) commit(group);
-        group.clear();
-        return true;
-    }
-
-    private static final ThreadLocal<ArrayList<Pending>> DRAIN = ThreadLocal.withInitial(() -> new ArrayList<>(64));
-
-    private static ArrayList<Pending> drainBuf() {
-        var g = DRAIN.get();
-        g.clear();
-        return g;
-    }
-
-    /**
-     * One shared-syncer slice for this writer: complete covered waiters, fsync if needed, respect the floor.
-     * Returns true when this writer still looks busy (dirty or flooring), so the shard keeps polling.
-     */
     /** Cheap check for the shared syncer's spin-then-park idle path. */
     boolean needsSharedSync() {
         if (stopSyncer && queue.isEmpty() && fsyncWaiters.isEmpty()) return false;
@@ -278,7 +224,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     }
 
     /** Last fsync time for {@link #sharedSyncSlice} (dedicated syncLoop keeps its own local). */
-    private long lastSharedFsync;
+    private volatile long lastSharedFsync;
 
     private void run() {
         var group = new ArrayList<Pending>();
