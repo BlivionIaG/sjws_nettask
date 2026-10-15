@@ -169,10 +169,38 @@ advance past the current snapshot, and an index the local log holds with a diffe
 `install(snapshot, crc32c)` also checks `LogSnapshot.crc32c()` for a snapshot that crossed a
 process or disk boundary. `GroupOptions.withMaxSnapshotBytes` (default 64 MiB) also bounds the
 image a taker returns and the built-in image: a larger one is skipped and counted
-(`ReplicatedNode.skippedSnapshots`), like a failing taker. There is no snapshot transfer to
-followers: a follower whose next entry falls inside a deleted prefix cannot catch up from the
-leader until it is given the snapshot out of band (`install`), so only delete through an index
-every follower has.
+(`ReplicatedNode.skippedSnapshots`), like a failing taker.
+
+### Snapshot transfer to followers
+
+A data follower whose next entry is at or below the leader's snapshot index gets the snapshot
+from the leader instead of entries (frames `SNAP_CHUNK` and `SNAP_RESP`). A witness keeps no
+data and still gets the empty append it already handled. The leader sends the image in chunks of
+1 MiB (well under `TcpTransport.MAX_FRAME_BYTES`); each chunk carries the term, the image's last
+included index and term, its total length, the leader's commit index, the CRC32C of index, term
+and image (`LogSnapshot.crc32c()`, as on disk), the offset and the bytes. The transfer is
+stop-and-wait: the next chunk goes out when the follower acks the previous one, and the current
+one is resent on each heartbeat until then. A transfer pins the image it started with. If the
+leader compacts again meanwhile, the follower's `nextIndex` still lands inside the snapshot when
+it completes, and another transfer starts.
+
+The follower runs the leader checks of an append (term, step down, lease, election deadline). It
+takes chunks only in order from offset 0 and answers anything else with the offset it wants. It
+refuses an image whose total length is above its own `maxSnapshotBytes`, and checks the CRC32C of
+the assembled image; a mismatch drops it and asks again from 0. A complete image is installed like
+`install`: it is persisted before any prefix delete (refused on a storage without durable
+snapshots), the local log is kept past the image only if it holds the image's index with the
+image's term and is otherwise dropped, commit and apply move to the image index, and the image
+goes to `GroupListener.onSnapshotRestored` on the delivery thread before any later entry. A
+restarted voter's catch-up gate opens only when its commit index reaches the leader's commit index
+carried in the chunk, as for an append, not merely because an image was installed. An
+image at or below the follower's snapshot or commit index (with a matching term) is acked as
+already installed. Counters: `ReplicatedNode.snapshotsSent` and `snapshotsInstalled`.
+
+The CRC32C catches corruption, not forgery: the frames ride the authenticated Raft transport
+(HMAC per frame on `TcpTransport`), which already decides who may act as leader. A follower holds
+at most one image in memory (bounded by `maxSnapshotBytes`). The leader holds a reference to the
+image it is sending, not a copy.
 
 ### Truncation bound
 
@@ -195,8 +223,8 @@ The bound is called on the caller's thread without the group lock, so it may rea
 state but must not call back into the group. Automatic snapshots never truncate the log, with or
 without a bound: they only move the in-memory snapshot point, which makes a lagging follower
 receive the snapshot instead of entries. Truncation stays an explicit call (for messaging, from
-the maintenance timer after retention and compaction). A follower behind the leader's
-truncation point catches up through `install`. Unused, the bound costs a null check in the two
+the maintenance timer after retention and compaction). A data follower behind the leader's
+truncation point catches up through a snapshot transfer (see above). Unused, the bound costs a null check in the two
 truncation calls and nothing on the append or commit path.
 
 Every truncation path persists the snapshot first (see Application snapshots) and refuses on a

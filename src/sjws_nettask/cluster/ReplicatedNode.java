@@ -325,6 +325,26 @@ public final class ReplicatedNode implements ClusterNode {
         return group(groupId).skippedSnapshots();
     }
 
+    /** Snapshot images this node, as leader, fully sent to a follower behind its compacted log. */
+    public long snapshotsSent(GroupId groupId) {
+        return group(groupId).snapshotsSent();
+    }
+
+    /** Snapshot images this node received from a leader and installed. */
+    public long snapshotsInstalled(GroupId groupId) {
+        return group(groupId).snapshotsInstalled();
+    }
+
+    /** Tests only: whether one group's restarted-voter gate is still closed. */
+    boolean recovering(GroupId groupId) {
+        return group(groupId).recovering();
+    }
+
+    /** Tests only: bytes per snapshot chunk on one group. */
+    void snapshotChunkBytes(GroupId groupId, int bytes) {
+        group(groupId).snapshotChunkBytes = bytes;
+    }
+
     /** Apply lag of one group: deliveries queued or running. */
     public long deliveryLag(GroupId groupId) {
         return group(groupId).deliveryLag();

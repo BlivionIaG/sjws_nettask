@@ -44,9 +44,8 @@ public interface SnapshotControl {
     /**
      * Compact the snapshot, make it durable, then drop the log prefix at or below an index that is
      * both snapshotted and acked. A storage without durable snapshots refuses (the future fails and
-     * nothing is deleted). There is no snapshot transfer to followers: a follower whose next entry
-     * falls inside the dropped prefix cannot catch up from this leader until it is given the
-     * snapshot out of band ({@link #install}). Only drop through an index every follower has.
+     * nothing is deleted). A data follower whose next entry falls inside the dropped prefix
+     * catches up from the leader through a chunked snapshot transfer.
      */
     CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor);
 
