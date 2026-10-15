@@ -237,6 +237,31 @@ class RaftClusterTest {
     }
 
     @Test
+    void prefixDeleteOnADurableLogSavesTheSnapshotToDiskFirst() throws Exception {
+        // #214 refused this outright while the snapshot lived only in memory; with #205 the snapshot is
+        // saved to disk before the prefix is deleted (a storage that cannot do that still refuses:
+        // SnapshotPersistenceTest).
+        var again = cluster(1, false, Durability.STRICT, 1_000_000);
+        elect(again);
+        var solo = again.nodes.get(0);
+        var idx = solo.append(GROUP, List.of(bytes("keep"))).get().index();
+        var snap = solo.snapshots(GROUP).take(idx);
+        var root = java.nio.file.Files.createTempDirectory("durable-snap");
+        var followerLog = new FileLogStorage(root);
+        followerLog.append(GROUP, 1, 1, "e1".getBytes(StandardCharsets.UTF_8));
+        followerLog.force(GROUP);
+        var follower = ReplicatedNode.open(member(2, false).id(), List.of(member(1, false), member(2, false)),
+                Set.of(member(1, false).id(), member(2, false).id()), QuorumPolicy.majority(), again.clock, followerLog,
+                again.net);
+        follower.openGroup(GROUP, again.options, null);
+        follower.snapshots(GROUP).install(snap);
+        var saved = followerLog.loadSnapshot(GROUP, again.options.maxSnapshotBytes());
+        assertEquals(idx, saved.lastIncludedIndex());
+        assertArrayEquals(snap.data(), saved.data());
+        followerLog.close();
+    }
+
+    @Test
     void preferredCampaignsSoonerAndFailbackDelaysTheDemotedLeader() {
         var clock = new FakeClock(0L);
         var net = new SimTransport();

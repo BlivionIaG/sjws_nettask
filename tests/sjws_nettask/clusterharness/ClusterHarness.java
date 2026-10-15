@@ -33,6 +33,7 @@ import java.util.Map;
 import java.util.Objects;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.SjwsServer;
+import sjws_nettask.cp.DataWatch.Applied;
 
 /**
  * N control nodes plus M data nodes.
@@ -230,6 +231,11 @@ public final class ClusterHarness implements AutoCloseable {
         @Override
         public String contentHash() {
             return null;
+        }
+
+        @Override
+        public Applied applied() {
+            return Applied.NONE;
         }
 
         @Override

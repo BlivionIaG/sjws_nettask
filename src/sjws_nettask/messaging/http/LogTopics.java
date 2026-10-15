@@ -38,15 +38,44 @@ final class LogTopics implements AutoCloseable {
      * chunk cache and sequential hint as immutable volatile records, so concurrent readers are safe and at worst lose a
      * hint); retention takes the write lock.
      */
-    record Log(SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantReadWriteLock reads, boolean topicCompacted) {
+    record Log(SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantReadWriteLock reads, boolean topicCompacted,
+            sjws_nettask.messaging.ledger.Replica replica) {
         Log(SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantReadWriteLock reads) {
-            this(log, writer, reads, false);
+            this(log, writer, reads, false, null);
         }
 
-        /** The append seam for this topic (today the writer itself). */
-        sjws_nettask.messaging.ledger.PartitionAppender appender() {
-            return writer;
+        Log(SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantReadWriteLock reads, boolean topicCompacted) {
+            this(log, writer, reads, topicCompacted, null);
         }
+
+        /** The append seam for this topic: the writer itself, or its replica when HA replication is installed. */
+        sjws_nettask.messaging.ledger.PartitionAppender appender() {
+            var r = replica;
+            return r == null ? writer : r;
+        }
+    }
+
+    /** Set once by the HA bootstrap ({@link #replication}); null with HA off. */
+    private volatile sjws_nettask.messaging.ledger.PartitionReplicator replicator;
+
+    /**
+     * Installs replication (msg-replication-sketch phase A) before any topic is open; opens every replicated topic and
+     * {@code __offsets} now so this node receives their entries as a follower too.
+     */
+    void replication(sjws_nettask.messaging.ledger.PartitionReplicator r) throws IOException {
+        this.opening.lock();
+        try {
+            if (this.replicator != null || !this.logs.isEmpty()) throw new IllegalStateException("replication must be installed first, once");
+            this.replicator = java.util.Objects.requireNonNull(r);
+        } finally {
+            this.opening.unlock();
+        }
+        for (var t : r.topics()) get(t, true);
+        get(LogOffsets.TOPIC, true);
+    }
+
+    sjws_nettask.messaging.ledger.PartitionReplicator replicator() {
+        return this.replicator;
     }
 
     private final Path dir;
@@ -251,9 +280,18 @@ final class LogTopics implements AutoCloseable {
             if (this.closed) throw new IllegalStateException("closed");
             l = this.logs.get(topic);
             if (l == null) {
+                var rep = this.replicator;
+                if (rep != null && !LogOffsets.TOPIC.equals(topic) && !rep.topics().contains(topic)) {
+                    throw new IllegalStateException("topic " + topic + " is not replicated on this cluster");
+                }
                 var log = SegmentedLog.open(this.dir.resolve(topic), this.segmentBytes);
-                l = new Log(log, new LedgerWriter(log, durability(topic)), new java.util.concurrent.locks.ReentrantReadWriteLock(),
-                        isCompacted(topic));
+                var writer = new LedgerWriter(log, durability(topic));
+                sjws_nettask.messaging.ledger.Replica replica = null;
+                if (rep != null) {
+                    java.util.function.Consumer<java.util.List<byte[]>> applied = LogOffsets.TOPIC.equals(topic) ? this.offsets::applied : recs -> { };
+                    replica = rep.open(topic, writer, durability(topic), applied);
+                }
+                l = new Log(log, writer, new java.util.concurrent.locks.ReentrantReadWriteLock(), isCompacted(topic), replica);
                 this.logs.put(topic, l);
             }
             return l;
@@ -272,6 +310,7 @@ final class LogTopics implements AutoCloseable {
         }
         for (var l : this.logs.values()) {
             try {
+                if (l.replica() != null) l.replica().close();
                 l.writer().close();
                 l.log().close();
             } catch (IOException | InterruptedException e) {
