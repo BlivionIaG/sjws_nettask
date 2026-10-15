@@ -216,6 +216,7 @@ class DurableIndexTest {
             }
         };
         assertEquals(0L, bare.durableIndex());
+        assertEquals(-1L, bare.leaderTerm());
     }
 
     private static Member member(int wire, boolean witness) {

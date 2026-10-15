@@ -29,6 +29,10 @@ import sjws_nettask.cluster.ReplicationGroup;
 /**
  * Leadership for one group. {@link #leaderReady()} becomes true only after this leader's election
  * no-op is applied. {@link #onLeaderChange} runs while {@link #leaderReady()} is still false.
+ * <p>
+ * Leader-change notices arrive through the group's delivery queue, so they can lag the live role while
+ * deliveries are backed up (#212). {@link #leaderReady()} therefore also checks the live role and term:
+ * a demoted node, or one in a later term, reads false at once rather than when the notice drains.
  */
 public final class ControlLeadership {
 
@@ -37,7 +41,7 @@ public final class ControlLeadership {
     private final ReentrantLock lock = new ReentrantLock();
     private final List<BiConsumer<Long, Optional<String>>> changes = new ArrayList<>();
     private final List<BiConsumer<Long, Long>> ready = new ArrayList<>();
-    private volatile boolean leaderReady;
+    /** Term whose election no-op was applied while this node led it; {@code -1} when not ready. */
     private volatile long readyTerm = -1L;
     private volatile String leaderId;
 
@@ -57,8 +61,13 @@ public final class ControlLeadership {
         return group.isLeader();
     }
 
+    /**
+     * True only if this node's no-op for the current term was applied and the node is still leader in
+     * that same term. A follower returns from one volatile read; a ready leader takes the group lock once.
+     */
     public boolean leaderReady() {
-        return leaderReady;
+        long term = readyTerm;
+        return term >= 0 && group.leaderTerm() == term;
     }
 
     public long term() {
@@ -91,7 +100,6 @@ public final class ControlLeadership {
         boolean mine = leader.isPresent() && leader.get().equals(self);
         leaderId = leader.map(NodeId::name).orElse(null);
         if (!mine) {
-            leaderReady = false;
             readyTerm = -1L;
         }
         List<BiConsumer<Long, Optional<String>>> copy;
@@ -108,10 +116,9 @@ public final class ControlLeadership {
     }
 
     private void onNoop(long term, long index) {
-        if (!group.isLeader() || group.term() != term || readyTerm == term) {
+        if (group.leaderTerm() != term || readyTerm == term) {
             return;
         }
-        leaderReady = true;
         readyTerm = term;
         List<BiConsumer<Long, Long>> copy;
         lock.lock();

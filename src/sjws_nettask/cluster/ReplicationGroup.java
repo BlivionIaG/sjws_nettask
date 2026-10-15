@@ -31,6 +31,15 @@ public interface ReplicationGroup {
 
     boolean isLeader();
 
+    /**
+     * The current term if this node is leader in it, else {@code -1}: {@link #isLeader()} and
+     * {@link #term()} read together, so a caller cannot pair a role with the wrong term.
+     */
+    default long leaderTerm() {
+        long term = term();
+        return isLeader() && term() == term ? term : -1L;
+    }
+
     /** Monotonic nanos when this leader's lease ends. {@code 0} when this node is not leader. */
     long leaseExpiresAt();
 
