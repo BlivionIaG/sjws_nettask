@@ -133,6 +133,9 @@ final class RaftGroup {
     /** Highest pending STRICT index already reported as stalled, so each entry warns once. */
     private long strictWarnedIndex;
     private long recoveryUntil;
+    private boolean persistWarned;
+    private long persistWarnAt;
+    private long persistWarnSuppressed;
 
     private enum Role {
         FOLLOWER, PRE_CANDIDATE, CANDIDATE, LEADER
@@ -485,6 +488,11 @@ final class RaftGroup {
             }
         }
         appendRaw(new byte[] {NOOP});
+        if (options.durability() != Durability.STRICT) {
+            // RELAXED: schedule the no-op's fsync like any append. Otherwise a leader elected with only the witness
+            // (2+1, other data node down) never counts itself and the no-op stays uncommitted until a user append.
+            markDirty();
+        }
         // Leadership is visible before the no-op callback, so leaderReady stays false in onLeaderChange.
         fireLeader(after);
         maybeCommit(after);
@@ -771,10 +779,34 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * Commits the highest index above {@code commitIndex} that is in the current term and has a
+     * quorum. {@link #quorumFor} only changes value at a peer's matchIndex, at {@code durableIndex},
+     * and just below the first pending STRICT entry, so the highest qualifying index is always one
+     * of those points (or {@code lastIndex()}). Checking only them keeps this O(voters) per call;
+     * scanning every uncommitted index made it O(backlog) under the group lock, on every append and
+     * every ack (#194).
+     */
     private void maybeCommit(List<Runnable> after) {
         long last = lastIndex();
-        for (long index = last; index > commitIndex; index--) {
-            if (termAt(index) != term) {
+        if (last <= commitIndex) {
+            return;
+        }
+        var candidates = new java.util.TreeSet<Long>(java.util.Comparator.reverseOrder());
+        candidates.add(last);
+        for (var peer : peers) {
+            candidates.add(matchIndex.getOrDefault(peer, 0L));
+        }
+        candidates.add(durableIndex);
+        var firstStrict = strictPending.ceilingKey(commitIndex + 1);
+        if (firstStrict != null) {
+            candidates.add(firstStrict - 1);
+        }
+        for (long index : candidates) {
+            if (index <= commitIndex) {
+                break;
+            }
+            if (index > last || termAt(index) != term) {
                 continue;
             }
             if (quorumFor(index)) {
@@ -1022,14 +1054,34 @@ final class RaftGroup {
         return quorum.hasQuorum(voters, acks);
     }
 
+    /** At most one persist-failure WARNING per group per this interval; the rest are counted. */
+    static final long PERSIST_WARN_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+
+    /**
+     * Every role: a node stuck below the cluster's term should be visible. Rate-limited, because a
+     * failing disk sees every higher-term frame (several per heartbeat interval per peer).
+     */
+    private void warnPersistFailed(long newTerm) {
+        long now = clock.nanoTime();
+        if (persistWarned && now - persistWarnAt < PERSIST_WARN_INTERVAL_NANOS) {
+            persistWarnSuppressed++;
+            return;
+        }
+        String suppressed = persistWarnSuppressed == 0 ? ""
+                : " (" + persistWarnSuppressed + " similar warnings suppressed)";
+        persistWarned = true;
+        persistWarnAt = now;
+        persistWarnSuppressed = 0;
+        System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                "group " + groupId.value() + ": " + role.name().toLowerCase(java.util.Locale.ROOT) + " at term "
+                        + term + " saw term " + newTerm + " but could not persist it; staying in term " + term
+                        + " and sending nothing" + suppressed);
+    }
+
     /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
     private boolean stepDown(long newTerm, List<Runnable> after) {
         if (newTerm > term && !saveHardState(newTerm, null)) {
-            // Every role: a node stuck below the cluster's term should be visible, not only a leader.
-            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
-                    "group " + groupId.value() + ": " + role.name().toLowerCase(java.util.Locale.ROOT) + " at term "
-                            + term + " saw term " + newTerm + " but could not persist it; staying in term " + term
-                            + " and sending nothing");
+            warnPersistFailed(newTerm);
             return false;
         }
         boolean wasLeader = role == Role.LEADER;

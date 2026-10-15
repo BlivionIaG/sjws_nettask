@@ -71,8 +71,9 @@ public final class DataWatch implements AutoCloseable {
      */
     private volatile Applied applied = Applied.NONE;
 
-    private record Applied(long version, String hash) {
-        static final Applied NONE = new Applied(0L, null);
+    /** Version and canonical hash of one applied envelope; {@link #NONE} before the first apply. */
+    public record Applied(long version, String hash) {
+        public static final Applied NONE = new Applied(0L, null);
     }
     /** Status when no {@link NodeEnrollment} was given (several watches in one test process). */
     private volatile ControlPlaneBinding own;
@@ -151,6 +152,15 @@ public final class DataWatch implements AutoCloseable {
             throw new IOException("plain control-plane watch is loopback-only; configure cpTls for a remote CP");
         }
         return URI.create(scheme + "://" + uri.getHost() + ":" + uri.getPort());
+    }
+
+    /**
+     * Version and hash of the envelope last applied through this watch, from one record. Use this
+     * when both are needed: separate {@link #appliedVersion()} and {@link #appliedHash()} calls can
+     * straddle an apply and pair values from different envelopes.
+     */
+    public Applied applied() {
+        return this.applied;
     }
 
     /** Canonical hash of the envelope last applied through this watch; null before the first apply. */

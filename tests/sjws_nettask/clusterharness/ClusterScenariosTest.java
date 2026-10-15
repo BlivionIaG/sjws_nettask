@@ -171,15 +171,17 @@ class ClusterScenariosTest {
                 long version = cp.push(yamlV1());
                 cp.awaitConverged(version, Duration.ofSeconds(2));
             });
-            long installed = cluster.dataNodes().get(0).version();
-            String hash = cluster.dataNodes().get(0).contentHash();
+            var first = cluster.dataNodes().get(0).applied();
+            long installed = first.version();
+            String hash = first.hash();
             assertTrue(installed > 0L);
             cp.partitionDataFromControl();
             clock.advance(Duration.ofSeconds(5));
             assertQuiet(cluster);
             for (var node : cluster.dataNodes()) {
-                assertEquals(installed, node.version(), node.id());
-                assertEquals(hash, node.contentHash(), node.id());
+                var applied = node.applied();
+                assertEquals(installed, applied.version(), node.id());
+                assertEquals(hash, applied.hash(), node.id());
                 assertEquals(BODY, cluster.get(node, "/hello.txt").body());
             }
             cp.heal();
@@ -264,8 +266,9 @@ class ClusterScenariosTest {
             assertEquals(hash, cp.contentHash(rolled[0]));
             cp.awaitConverged(rolled[0], Duration.ofSeconds(2));
             for (var node : cluster.dataNodes()) {
-                assertEquals(rolled[0], node.version(), node.id());
-                assertEquals(hash, node.contentHash(), node.id());
+                var applied = node.applied();
+                assertEquals(rolled[0], applied.version(), node.id());
+                assertEquals(hash, applied.hash(), node.id());
                 assertEquals(200, cluster.get(node, "/hello.txt").statusCode());
                 assertEquals(BODY, cluster.get(node, "/hello.txt").body());
             }
