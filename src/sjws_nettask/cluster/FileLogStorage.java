@@ -32,7 +32,8 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * One segment file per group. {@link #force} calls {@link FileChannel#force}. A truncate rewrites
- * the segment from the in-memory index; the hot path only appends.
+ * the segment from the in-memory index into a temp file and renames it into place (see
+ * {@link #rewrite}); the hot path only appends.
  */
 public final class FileLogStorage implements LogStorage {
 
@@ -61,6 +62,7 @@ public final class FileLogStorage implements LogStorage {
             }
             var loaded = new ConcurrentSkipListMap<Long, Rec>();
             var path = path(group);
+            Files.deleteIfExists(rewritePath(group));
             if (Files.exists(path) && Files.size(path) > 0) {
                 try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
                     var header = ByteBuffer.allocate(20);
@@ -155,6 +157,11 @@ public final class FileLogStorage implements LogStorage {
     }
 
     @Override
+    public boolean survivesRestart() {
+        return true;
+    }
+
+    @Override
     public void truncateSuffix(GroupId group, long fromIndex) throws IOException {
         rewrite(group, log(group).headMap(fromIndex, false));
     }
@@ -164,30 +171,54 @@ public final class FileLogStorage implements LogStorage {
         rewrite(group, log(group).tailMap(throughIndex, false));
     }
 
+    /**
+     * Rewrites the segment crash-safely: the kept records go to {@code <group>.log.rewrite}, which is
+     * fsynced, atomically renamed over the segment, and the directory is fsynced. A crash at any point
+     * leaves either the whole old segment or the whole new one, never a half-written file. Before this
+     * change the segment was truncated to zero in place and refilled without an fsync.
+     */
     private void rewrite(GroupId group, NavigableMap<Long, Rec> keep) throws IOException {
         lock.lock();
         try {
+            var target = path(group);
+            var tmp = rewritePath(group);
             var fresh = new ConcurrentSkipListMap<Long, Rec>();
-            var channel = channels.get(group);
-            channel.truncate(0);
-            channel.position(0);
-            for (var entry : keep.entrySet()) {
-                var rec = entry.getValue();
-                var header = ByteBuffer.allocate(20 + rec.data.length);
-                header.putLong(entry.getKey());
-                header.putLong(rec.term);
-                header.putInt(rec.data.length);
-                header.put(rec.data);
-                header.flip();
-                while (header.hasRemaining()) {
-                    channel.write(header);
+            try (var out = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING)) {
+                for (var entry : keep.entrySet()) {
+                    var rec = entry.getValue();
+                    var header = ByteBuffer.allocate(20 + rec.data.length);
+                    header.putLong(entry.getKey());
+                    header.putLong(rec.term);
+                    header.putInt(rec.data.length);
+                    header.put(rec.data);
+                    header.flip();
+                    while (header.hasRemaining()) {
+                        out.write(header);
+                    }
+                    fresh.put(entry.getKey(), rec);
                 }
-                fresh.put(entry.getKey(), rec);
+                out.force(true);
+            }
+            crashPoint(target.getFileName() + ":rewrite-temp");
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            crashPoint(target.getFileName() + ":rewrite-renamed");
+            try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
+                dir.force(true);
+            }
+            var reopened = FileChannel.open(target, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            var old = channels.put(group, reopened);
+            if (old != null) {
+                old.close();
             }
             logs.put(group, fresh);
         } finally {
             lock.unlock();
         }
+    }
+
+    private Path rewritePath(GroupId group) {
+        return root.resolve(path(group).getFileName() + ".rewrite");
     }
 
     @Override

@@ -237,6 +237,29 @@ class RaftClusterTest {
     }
 
     @Test
+    void prefixDeleteIsRefusedWhenOnlyAnInMemorySnapshotCoversADurableLog() throws Exception {
+        var again = cluster(1, false, Durability.STRICT, 1_000_000);
+        elect(again);
+        var solo = again.nodes.get(0);
+        var idx = solo.append(GROUP, List.of(bytes("keep"))).get().index();
+        var snap = solo.snapshots(GROUP).take(idx);
+        var root = java.nio.file.Files.createTempDirectory("memory-only-snap");
+        var followerLog = new FileLogStorage(root);
+        followerLog.append(GROUP, 1, 1, "e1".getBytes(StandardCharsets.UTF_8));
+        followerLog.force(GROUP);
+        var follower = ReplicatedNode.open(member(2, false).id(), List.of(member(1, false), member(2, false)),
+                Set.of(member(1, false).id(), member(2, false).id()), QuorumPolicy.majority(), again.clock, followerLog,
+                again.net);
+        follower.openGroup(GROUP, again.options, null);
+        assertThrows(IllegalStateException.class, () -> follower.snapshots(GROUP).install(snap));
+        var refused = follower.snapshots(GROUP).truncateAndCompact(0, snapshot -> null);
+        assertInstanceOf(IllegalStateException.class,
+                assertThrows(ExecutionException.class, refused::get).getCause());
+        assertEquals("e1", new String(followerLog.read(GROUP, 1), StandardCharsets.UTF_8));
+        followerLog.close();
+    }
+
+    @Test
     void preferredCampaignsSoonerAndFailbackDelaysTheDemotedLeader() {
         var clock = new FakeClock(0L);
         var net = new SimTransport();
