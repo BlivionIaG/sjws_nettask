@@ -516,7 +516,9 @@ public final class TaskService {
      * Replies to every task in {@code tasks} ({@code bodies[i]} for {@code tasks.get(i)}, all from one pool), each
      * with {@code (producerId, firstSeq + i)}, then acks them with <b>one batched fenced ack</b> (#100) once the last
      * reply is durable. Takes ownership of the {@code bodies} arrays (no copy). When a {@link ReplyRouter} is bound
-     * and {@code replyTo} is local, each caller is completed as soon as its envelope is built (before the write).
+     * and {@code replyTo} is local, each caller is completed as soon as its envelope is built (before the write),
+     * so RTT does not wait on the ledger hand-off. A rare produce failure after that still fails the worker's
+     * future; the caller already has the reply and dedups by task id on redelivery.
      */
     public CompletableFuture<List<LeaseResult>> replyAll(List<Task> tasks, long producerId, long firstSeq,
             String contentType, List<byte[]> bodies) {
@@ -538,7 +540,7 @@ public final class TaskService {
                 throw new IllegalArgumentException("task has no replyTo");
             }
             var reply = t.envelope().replyOwned(contentType, bodies.get(i));
-            deliverLocal(to, reply); // wake the caller before the ledger write / poller
+            deliverLocal(to, reply); // before produce: RTT must not wait on the ledger hand-off
             durable.add(this.topics.partition(to).produce(producerId, firstSeq + i,
                     reply.encode(), Durability.ASYNC).durable());
         }
@@ -553,7 +555,7 @@ public final class TaskService {
             throw new IllegalArgumentException("task has no replyTo");
         }
         var reply = t.envelope().reply(contentType, body);
-        deliverLocal(to, reply); // wake the caller before the ledger write / poller
+        deliverLocal(to, reply); // before produce: RTT must not wait on the ledger hand-off
         var r = this.topics.partition(to).produce(producerId, seq, reply.encode(), Durability.ASYNC);
         return r.durable().thenApplyAsync(off -> ack(t), ACKER);
     }
