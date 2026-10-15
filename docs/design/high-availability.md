@@ -200,8 +200,9 @@ truncation point catches up through `install`. Unused, the bound costs a null ch
 truncation calls and nothing on the append or commit path.
 
 Every truncation path persists the snapshot first (see Application snapshots) and refuses on a
-storage without durable snapshots. One existing limit is not changed here: `FileLogStorage`
-drops a prefix by rewriting the log file in place, which is not crash-atomic.
+storage without durable snapshots. `FileLogStorage` drops a prefix (or suffix) by writing the
+kept records to a temp file and renaming it into place with fsyncs (#214), so a crash leaves the
+whole old segment or the whole new one.
 
 ### Restart safety and the exact RELAXED guarantee
 
