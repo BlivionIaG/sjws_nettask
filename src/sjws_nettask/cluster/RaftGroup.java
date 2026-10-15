@@ -111,6 +111,10 @@ final class RaftGroup {
     private long skippedSnapshots;
     private SnapshotTaker taker;
     private boolean takerInFlight;
+    /** Set with {@link SnapshotControl#setTruncationBound}; volatile because it is read without the lock. */
+    private volatile TruncationBound truncationBound;
+    /** Highest index this node has dropped from its log prefix (snapshot install or truncation). */
+    private long truncatedThrough;
     private boolean relaxedDirty;
     /** Clock time when the oldest entry not yet fsynced was stored. */
     private long dirtySince;
@@ -1688,6 +1692,7 @@ final class RaftGroup {
                 try {
                     persistSnapshotBeforePrefixDelete();
                     storage.truncatePrefix(groupId, snapIndex);
+                    truncatedThrough = Math.max(truncatedThrough, snapIndex);
                 } catch (IOException | RuntimeException failed) {
                     snapIndex = previous[0];
                     snapTerm = previous[1];
@@ -1706,38 +1711,105 @@ final class RaftGroup {
         }
 
         @Override
+        public void setTruncationBound(TruncationBound bound) {
+            truncationBound = bound;
+        }
+
+        @Override
         public CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor) {
             Objects.requireNonNull(compactor, "compactor");
             var future = new CompletableFuture<Void>();
+            long through = ackedThrough;
+            var bound = truncationBound;
+            if (bound != null) {
+                try {
+                    through = Math.min(through, bound.truncatableThrough(groupId, currentSnapIndex()));
+                } catch (Exception failed) {
+                    future.completeExceptionally(failed);
+                    return future;
+                }
+            }
             lock.lock();
             try {
                 if (snapIndex < ackedThrough) {
                     future.completeExceptionally(new IllegalArgumentException("not snapshotted"));
                     return future;
                 }
-                var current = new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
-                var compacted = compactor.compact(current);
-                if (compacted != null) {
-                    if (compacted.length > options.maxSnapshotBytes()) {
-                        future.completeExceptionally(new IllegalStateException("compacted image of "
-                                + compacted.length + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes()));
-                        return future;
-                    }
-                    snapData = compacted;
+                if (truncateLocked(through, compactor, future)) {
+                    future.complete(null);
                 }
-                try {
-                    // Durable image first: after a restart the deleted prefix is rebuilt from it.
-                    persistSnapshotBeforePrefixDelete();
-                    storage.truncatePrefix(groupId, ackedThrough);
-                } catch (IOException | RuntimeException failed) {
-                    future.completeExceptionally(failed);
-                    return future;
-                }
-                future.complete(null);
             } finally {
                 lock.unlock();
             }
             return future;
+        }
+
+        @Override
+        public CompletableFuture<Long> truncateToBound(Compactor compactor) {
+            Objects.requireNonNull(compactor, "compactor");
+            var future = new CompletableFuture<Long>();
+            var bound = truncationBound;
+            if (bound == null) {
+                future.completeExceptionally(new IllegalStateException("no truncation bound set"));
+                return future;
+            }
+            long snapshot = currentSnapIndex();
+            long limit;
+            try {
+                limit = bound.truncatableThrough(groupId, snapshot);
+            } catch (Exception failed) {
+                future.completeExceptionally(failed);
+                return future;
+            }
+            lock.lock();
+            try {
+                // The snapshot can only have moved forward meanwhile; never past what the bound saw.
+                if (truncateLocked(Math.min(snapshot, limit), compactor, future)) {
+                    future.complete(truncatedThrough);
+                }
+            } finally {
+                lock.unlock();
+            }
+            return future;
+        }
+
+        private long currentSnapIndex() {
+            lock.lock();
+            try {
+                return snapIndex;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * Under the lock: compact, make the snapshot durable, then drop the prefix through
+         * {@code through} if that is new. False after failing {@code future}; nothing is deleted then.
+         */
+        private boolean truncateLocked(long through, Compactor compactor, CompletableFuture<?> future) {
+            var current = new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
+            var compacted = compactor.compact(current);
+            if (compacted != null) {
+                if (compacted.length > options.maxSnapshotBytes()) {
+                    future.completeExceptionally(new IllegalStateException("compacted image of "
+                            + compacted.length + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes()));
+                    return false;
+                }
+                snapData = compacted;
+            }
+            if (through <= truncatedThrough) {
+                return true;
+            }
+            try {
+                // Durable image first: after a restart the deleted prefix is rebuilt from it.
+                persistSnapshotBeforePrefixDelete();
+                storage.truncatePrefix(groupId, through);
+            } catch (IOException | RuntimeException failed) {
+                future.completeExceptionally(failed);
+                return false;
+            }
+            truncatedThrough = through;
+            return true;
         }
     }
 }

@@ -174,6 +174,36 @@ followers: a follower whose next entry falls inside a deleted prefix cannot catc
 leader until it is given the snapshot out of band (`install`), so only delete through an index
 every follower has.
 
+### Truncation bound
+
+`SnapshotControl.setTruncationBound(TruncationBound)` lets the application limit how far the
+Raft log prefix may be dropped. `truncatableThrough(group, snapshotIndex)` returns the highest
+index the application no longer needs from Raft: its own state is durable through it, and
+nothing it still serves (retention low watermark, the oldest consumer offset, the ledger low
+watermark) lies at or below it. `Long.MAX_VALUE` means no limit beyond the snapshot, 0 keeps the
+log. With a bound set:
+
+- `truncateToBound(compactor)` truncates through `min(snapshot index, bound)`, compacts, and
+  completes with the index the log is truncated through. The snapshot index passed to the bound
+  is read first; the truncation never goes past it, even if a snapshot lands meanwhile.
+- `truncateAndCompact(ackedThrough, compactor)` truncates through `min(ackedThrough, bound)`.
+  Without a bound it behaves as before.
+- A bound that throws fails the future and truncates nothing. A bound lower than an earlier
+  truncation undoes nothing.
+
+The bound is called on the caller's thread without the group lock, so it may read application
+state but must not call back into the group. Automatic snapshots never truncate the log, with or
+without a bound: they only move the in-memory snapshot point, which makes a lagging follower
+receive the snapshot instead of entries. Truncation stays an explicit call (for messaging, from
+the maintenance timer after retention and compaction). A follower behind the leader's
+truncation point catches up through `install`. Unused, the bound costs a null check in the two
+truncation calls and nothing on the append or commit path.
+
+Every truncation path persists the snapshot first (see Application snapshots) and refuses on a
+storage without durable snapshots. `FileLogStorage` drops a prefix (or suffix) by writing the
+kept records to a temp file and renaming it into place with fsyncs (#214), so a crash leaves the
+whole old segment or the whole new one.
+
 ### Restart safety and the exact RELAXED guarantee
 
 What a voter keeps across a crash:
