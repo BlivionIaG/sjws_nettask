@@ -34,6 +34,11 @@ public final class TaskService {
     public static final String TOPIC_PREFIX = "tasks.";
 
     private final Topics topics;
+    /**
+     * Same-process {@link ReplyRouter}, or null when this service is used alone. A null check on the reply path;
+     * when set, {@link #reply}/{@link #replyAll} complete the caller before the ledger write returns.
+     */
+    private volatile ReplyRouter localReplies;
 
     /**
      * Partitions per pool (S1c step 2). Shard 0 is topic {@code tasks.P} (so a 1-shard pool is exactly the old
@@ -66,6 +71,19 @@ public final class TaskService {
         this.topics = topics;
         this.shards = shards;
         this.waitSliceNanos = waitSliceNanos;
+    }
+
+    /** Wires the node's {@link ReplyRouter} so in-process replies wake the caller directly. Idempotent. */
+    void bindLocalReplies(ReplyRouter replies) {
+        this.localReplies = replies;
+    }
+
+    /** Completes a same-process caller when {@code replyTo} is this node's reply topic; no-op otherwise. */
+    private void deliverLocal(String replyTo, TaskEnvelope reply) {
+        var local = this.localReplies;
+        if (local != null && local.topic().equals(replyTo)) {
+            local.completeLocal(reply);
+        }
     }
 
     /** Backstop park of a waiting sharded claim (redeliveries do not signal); appends wake it at once. */
@@ -497,7 +515,8 @@ public final class TaskService {
     /**
      * Replies to every task in {@code tasks} ({@code bodies[i]} for {@code tasks.get(i)}, all from one pool), each
      * with {@code (producerId, firstSeq + i)}, then acks them with <b>one batched fenced ack</b> (#100) once the last
-     * reply is durable. Takes ownership of the {@code bodies} arrays (no copy).
+     * reply is durable. Takes ownership of the {@code bodies} arrays (no copy). When a {@link ReplyRouter} is bound
+     * and {@code replyTo} is local, each caller is completed as soon as its envelope is built (before the write).
      */
     public CompletableFuture<List<LeaseResult>> replyAll(List<Task> tasks, long producerId, long firstSeq,
             String contentType, List<byte[]> bodies) {
@@ -518,8 +537,10 @@ public final class TaskService {
             if (to.isEmpty()) {
                 throw new IllegalArgumentException("task has no replyTo");
             }
+            var reply = t.envelope().replyOwned(contentType, bodies.get(i));
+            deliverLocal(to, reply); // wake the caller before the ledger write / poller
             durable.add(this.topics.partition(to).produce(producerId, firstSeq + i,
-                    t.envelope().replyOwned(contentType, bodies.get(i)).encode(), Durability.ASYNC).durable());
+                    reply.encode(), Durability.ASYNC).durable());
         }
         // Different reply topics are different logs, so wait for each topic's futures (normally one topic).
         return CompletableFuture.allOf(durable.toArray(CompletableFuture[]::new))
@@ -532,6 +553,7 @@ public final class TaskService {
             throw new IllegalArgumentException("task has no replyTo");
         }
         var reply = t.envelope().reply(contentType, body);
+        deliverLocal(to, reply); // wake the caller before the ledger write / poller
         var r = this.topics.partition(to).produce(producerId, seq, reply.encode(), Durability.ASYNC);
         return r.durable().thenApplyAsync(off -> ack(t), ACKER);
     }

@@ -34,6 +34,7 @@ public final class Swarm implements AutoCloseable {
         this.topics = topics;
         this.tasks = new TaskService(topics);
         this.replies = new ReplyRouter(topics, this.tasks, id, producerId, idleCloseMs);
+        this.tasks.bindLocalReplies(this.replies);
     }
 
     public static Swarm open(Path dir, String id, long producerId, RetryPolicy policy, LongSupplier clockMs,

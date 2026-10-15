@@ -117,6 +117,27 @@ class ReplyRouterTest {
     }
 
     @Test
+    void aSameProcessReplyCompletesTheCallerBeforeThePollerAndIsNotLate() throws Exception {
+        try (var swarm = Swarm.open(this.dir, "direct", 7)) {
+            long deadline = System.currentTimeMillis() + 10_000;
+            var f = swarm.replies().call("echo", "text/plain", "ping".getBytes(StandardCharsets.UTF_8), deadline, "");
+            var t = swarm.tasks().claim("echo", "w", 1, 5_000).get(0);
+            assertEquals(LeaseResult.OK, swarm.tasks().reply(t, 5, 1, "text/plain", "pong".getBytes(StandardCharsets.UTF_8))
+                    .get(5, TimeUnit.SECONDS));
+            // Caller is already done (completeLocal); waiting here must not take the poller's 50 ms slice.
+            var r = f.get(50, TimeUnit.MILLISECONDS);
+            assertEquals("pong", new String(r.body(), StandardCharsets.UTF_8));
+            assertEquals(0, swarm.replies().pending());
+            // Give the poller time to ack the ledger copy; it must not count the direct delivery as late.
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (swarm.replies().lateReplies() == 0 && System.nanoTime() < until) {
+                Thread.sleep(5);
+            }
+            assertEquals(0, swarm.replies().lateReplies());
+        }
+    }
+
+    @Test
     void aSubmitFailureFailsTheCall() throws Exception {
         try (var swarm = Swarm.open(this.dir, "f", 1)) {
             var f = swarm.replies().call("bad/pool", "", new byte[0], System.currentTimeMillis() + 60_000, "");
