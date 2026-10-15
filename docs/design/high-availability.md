@@ -177,7 +177,8 @@ A data follower whose next entry is at or below the leader's snapshot index gets
 from the leader instead of entries (frames `SNAP_CHUNK` and `SNAP_RESP`). A witness keeps no
 data and still gets the empty append it already handled. The leader sends the image in chunks of
 1 MiB (well under `TcpTransport.MAX_FRAME_BYTES`); each chunk carries the term, the image's last
-included index and term, its total length, its CRC32C, the offset and the bytes. The transfer is
+included index and term, its total length, the leader's commit index, the CRC32C of index, term
+and image (`LogSnapshot.crc32c()`, as on disk), the offset and the bytes. The transfer is
 stop-and-wait: the next chunk goes out when the follower acks the previous one, and the current
 one is resent on each heartbeat until then. A transfer pins the image it started with. If the
 leader compacts again meanwhile, the follower's `nextIndex` still lands inside the snapshot when
@@ -190,7 +191,9 @@ the assembled image; a mismatch drops it and asks again from 0. A complete image
 `install`: it is persisted before any prefix delete (refused on a storage without durable
 snapshots), the local log is kept past the image only if it holds the image's index with the
 image's term and is otherwise dropped, commit and apply move to the image index, and the image
-goes to `GroupListener.onSnapshotRestored` on the delivery thread before any later entry. An
+goes to `GroupListener.onSnapshotRestored` on the delivery thread before any later entry. A
+restarted voter's catch-up gate opens only when its commit index reaches the leader's commit index
+carried in the chunk, as for an append, not merely because an image was installed. An
 image at or below the follower's snapshot or commit index (with a matching term) is acked as
 already installed. Counters: `ReplicatedNode.snapshotsSent` and `snapshotsInstalled`.
 

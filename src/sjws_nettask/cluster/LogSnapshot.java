@@ -34,6 +34,11 @@ public record LogSnapshot(GroupId groupId, long lastIncludedIndex, long lastIncl
      * Pass it to {@link SnapshotControl#install(LogSnapshot, int)} on the receiving side.
      */
     public int crc32c() {
+        return crc32c(lastIncludedIndex, lastIncludedTerm, data);
+    }
+
+    /** The same CRC32C (index, term, image) without copying {@code data}; also used for snapshot transfer. */
+    static int crc32c(long lastIncludedIndex, long lastIncludedTerm, byte[] data) {
         var crc = new java.util.zip.CRC32C();
         var head = java.nio.ByteBuffer.allocate(16).putLong(lastIncludedIndex).putLong(lastIncludedTerm);
         crc.update(head.array());

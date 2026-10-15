@@ -759,19 +759,18 @@ final class RaftGroup {
     private void sendSnapshotChunk(NodeId peer) {
         var send = snapSends.get(peer);
         if (send == null || send.term != term) {
-            var crc = new java.util.zip.CRC32C();
-            crc.update(snapData);
-            send = new SnapSend(term, snapIndex, snapTerm, snapData, (int) crc.getValue());
+            send = new SnapSend(term, snapIndex, snapTerm, snapData, LogSnapshot.crc32c(snapIndex, snapTerm, snapData));
             snapSends.put(peer, send);
         }
         int len = Math.min(snapshotChunkBytes, send.data.length - send.offset);
-        var body = ByteBuffer.allocate(8 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + len).order(java.nio.ByteOrder.BIG_ENDIAN);
+        var body = ByteBuffer.allocate(8 + 4 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + len).order(java.nio.ByteOrder.BIG_ENDIAN);
         body.putLong(term);
         body.putInt(self.wire());
         body.putLong(send.index);
         body.putLong(send.imageTerm);
         body.putInt(send.data.length);
         body.putInt(send.crc32c);
+        body.putLong(commitIndex);
         body.putInt(send.offset);
         body.putInt(len);
         body.put(send.data, send.offset, len);
@@ -801,6 +800,7 @@ final class RaftGroup {
         long imageTerm = body.getLong();
         int total = body.getInt();
         int crc32c = body.getInt();
+        long leaderCommit = body.getLong();
         int offset = body.getInt();
         int len = body.getInt();
         if (len < 0 || len > body.remaining() || offset < 0 || total < 0 || (long) offset + len > total) {
@@ -863,9 +863,7 @@ final class RaftGroup {
             return;
         }
         snapReceive = null;
-        var crc = new java.util.zip.CRC32C();
-        crc.update(receive.data);
-        if ((int) crc.getValue() != crc32c) {
+        if (LogSnapshot.crc32c(index, imageTerm, receive.data) != crc32c) {
             System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING, "group "
                     + groupId.value() + ": snapshot from the leader failed its CRC32C; asking again");
             snapResp(from, false, lastIndex(), 0);
@@ -873,6 +871,10 @@ final class RaftGroup {
         }
         if (!installFromLeader(index, imageTerm, receive.data, after)) {
             return;
+        }
+        if (recovering && commitIndex >= leaderCommit) {
+            // As in onAppend: the restart gate opens only once this node has the leader's commit point.
+            recovering = false;
         }
         snapshotsInstalled++;
         snapResp(from, true, index, total);
@@ -918,9 +920,6 @@ final class RaftGroup {
         if (durableIndex < index) {
             durableIndex = index;
         }
-        if (recovering) {
-            recovering = false;
-        }
         return true;
     }
 
@@ -960,6 +959,16 @@ final class RaftGroup {
         send.offset = nextOffset;
         if (progressed && nextOffset < send.data.length) {
             sendSnapshotChunk(follower);
+        }
+    }
+
+    /** Tests: whether the restarted-voter gate (see {@link #recovering}) is still closed. */
+    boolean recovering() {
+        lock.lock();
+        try {
+            return recovering;
+        } finally {
+            lock.unlock();
         }
     }
 

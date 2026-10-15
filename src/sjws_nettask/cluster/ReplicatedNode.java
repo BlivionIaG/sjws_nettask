@@ -335,6 +335,11 @@ public final class ReplicatedNode implements ClusterNode {
         return group(groupId).snapshotsInstalled();
     }
 
+    /** Tests only: whether one group's restarted-voter gate is still closed. */
+    boolean recovering(GroupId groupId) {
+        return group(groupId).recovering();
+    }
+
     /** Tests only: bytes per snapshot chunk on one group. */
     void snapshotChunkBytes(GroupId groupId, int bytes) {
         group(groupId).snapshotChunkBytes = bytes;
