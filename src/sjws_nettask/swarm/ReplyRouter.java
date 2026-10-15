@@ -36,6 +36,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * topic is closed; its files are kept. The next {@link #call} reopens it.</li>
  * </ul>
  * The poller blocks in {@code Partition.poll(..., waitNanos)} (#99), woken by the reply's append: no spinning.
+ * <p>Same-process replies are completed by {@link #completeLocal} from {@link TaskService#reply}/{@link TaskService#replyAll}
+ * as soon as the envelope is built, so the caller does not wait for the poller (or the ledger write). The poller still
+ * reads and acks every reply for retention; a reply already handed to its caller is not counted as late.
  */
 public final class ReplyRouter implements AutoCloseable {
 
@@ -56,6 +59,8 @@ public final class ReplyRouter implements AutoCloseable {
     private volatile Thread poller;
     private volatile boolean closed;
     private final AtomicLong late = new AtomicLong();
+    /** Correlation keys completed by {@link #completeLocal}; the poller removes them so they are not counted late. */
+    private final java.util.Set<Key> deliveredLocal = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private record Key(long hi, long lo) { }
 
@@ -81,6 +86,31 @@ public final class ReplyRouter implements AutoCloseable {
     /** Replies that arrived after their caller gave up; acked and discarded. */
     public long lateReplies() {
         return this.late.get();
+    }
+
+    /**
+     * Completes a same-process caller whose {@code replyTo} is this router's topic, without waiting for the poller.
+     * Returns {@code true} when a pending call was completed. The envelope is still written to the reply topic for
+     * durability and ack; the poller then acks it and does not count it as late.
+     */
+    public boolean completeLocal(TaskEnvelope env) {
+        if (env == null || this.closed) {
+            return false;
+        }
+        var key = new Key(env.correlationHi(), env.correlationLo());
+        var f = this.pending.remove(key);
+        if (f == null) {
+            return false;
+        }
+        if (f.complete(env)) {
+            this.deliveredLocal.add(key);
+            // Bound the set if the poller lags (should stay near empty under load).
+            if (this.deliveredLocal.size() > 65_536) {
+                this.deliveredLocal.clear();
+            }
+            return true;
+        }
+        return false;
     }
 
     public int pending() {
@@ -170,9 +200,18 @@ public final class ReplyRouter implements AutoCloseable {
             } catch (IllegalArgumentException e) {
                 // not an envelope: acked and dropped below
             }
-            var f = env == null ? null : this.pending.remove(new Key(env.correlationHi(), env.correlationLo()));
-            if (f == null || !f.complete(env)) {
-                this.late.incrementAndGet();
+            if (env == null) {
+                this.late.incrementAndGet(); // not an envelope: acked and dropped
+                continue;
+            }
+            var key = new Key(env.correlationHi(), env.correlationLo());
+            var f = this.pending.remove(key);
+            if (f != null) {
+                if (!f.complete(env)) {
+                    this.late.incrementAndGet(); // raced with the caller's timeout
+                }
+            } else if (!this.deliveredLocal.remove(key)) {
+                this.late.incrementAndGet(); // timed out, or not an in-flight call
             }
         }
         p.ack(GROUP, offs, atts, null); // one batched fenced ack (#100) for every reply read
