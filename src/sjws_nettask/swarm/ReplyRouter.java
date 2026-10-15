@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ul>
  * The poller blocks in {@code Partition.poll(..., waitNanos)} (#99), woken by the reply's append: no spinning.
  * <p>Same-process replies are completed by {@link #completeLocal} from {@link TaskService#reply}/{@link TaskService#replyAll}
- * right after a successful produce, so the caller does not wait for the poller (or {@code durable()}). The poller still
+ * as soon as the envelope is built (before the ledger write), so the caller does not wait for the poller. The poller still
  * reads and acks every reply for retention; a reply already handed to its caller is not counted as late.
  */
 public final class ReplyRouter implements AutoCloseable {
