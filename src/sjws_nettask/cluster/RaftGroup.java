@@ -125,6 +125,9 @@ final class RaftGroup {
     /** Highest pending STRICT index already reported as stalled, so each entry warns once. */
     private long strictWarnedIndex;
     private long recoveryUntil;
+    private boolean persistWarned;
+    private long persistWarnAt;
+    private long persistWarnSuppressed;
 
     private enum Role {
         FOLLOWER, PRE_CANDIDATE, CANDIDATE, LEADER
@@ -1000,14 +1003,34 @@ final class RaftGroup {
         return quorum.hasQuorum(voters, acks);
     }
 
+    /** At most one persist-failure WARNING per group per this interval; the rest are counted. */
+    static final long PERSIST_WARN_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+
+    /**
+     * Every role: a node stuck below the cluster's term should be visible. Rate-limited, because a
+     * failing disk sees every higher-term frame (several per heartbeat interval per peer).
+     */
+    private void warnPersistFailed(long newTerm) {
+        long now = clock.nanoTime();
+        if (persistWarned && now - persistWarnAt < PERSIST_WARN_INTERVAL_NANOS) {
+            persistWarnSuppressed++;
+            return;
+        }
+        String suppressed = persistWarnSuppressed == 0 ? ""
+                : " (" + persistWarnSuppressed + " similar warnings suppressed)";
+        persistWarned = true;
+        persistWarnAt = now;
+        persistWarnSuppressed = 0;
+        System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                "group " + groupId.value() + ": " + role.name().toLowerCase(java.util.Locale.ROOT) + " at term "
+                        + term + " saw term " + newTerm + " but could not persist it; staying in term " + term
+                        + " and sending nothing" + suppressed);
+    }
+
     /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
     private boolean stepDown(long newTerm, List<Runnable> after) {
         if (newTerm > term && !saveHardState(newTerm, null)) {
-            // Every role: a node stuck below the cluster's term should be visible, not only a leader.
-            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
-                    "group " + groupId.value() + ": " + role.name().toLowerCase(java.util.Locale.ROOT) + " at term "
-                            + term + " saw term " + newTerm + " but could not persist it; staying in term " + term
-                            + " and sending nothing");
+            warnPersistFailed(newTerm);
             return false;
         }
         boolean wasLeader = role == Role.LEADER;
