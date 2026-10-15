@@ -38,6 +38,7 @@ import sjws_nettask.core.buf.BufferBudget;
 import sjws_nettask.core.buf.BufferPool;
 import sjws_nettask.core.buf.PooledBuffer;
 import sjws_nettask.messaging.ledger.Durability;
+import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.RecordBatch;
 
 /**
@@ -96,13 +97,13 @@ final class MessagingHttp implements Handler {
                 case "POST" -> {
                     if (topic.startsWith("__")) yield problem(400, "bad request", "topics starting with __ are internal");
                     long t0 = System.nanoTime();
-                    var r = produce(topic, request);
+                    var r = produce(topic, request, target);
                     this.hooks.produced(topic, r.status(), Math.max(0, request.body().length()), System.nanoTime() - t0);
                     yield r;
                 }
                 case "GET" -> {
                     long t0 = System.nanoTime();
-                    var r = fetch(topic, query(q < 0 ? "" : target.substring(q + 1)));
+                    var r = fetch(topic, query(q < 0 ? "" : target.substring(q + 1)), request, target);
                     this.hooks.fetched(topic, r.status(), Math.max(0, r.contentLength()), System.nanoTime() - t0);
                     yield r;
                 }
@@ -156,6 +157,9 @@ final class MessagingHttp implements Handler {
                     if (off > end) return problem(400, "bad request", "offset " + off + " is past the log end " + end);
                     var dflt = this.topics.durability(LogOffsets.TOPIC);
                     var d = atLeast(durability(request.headers().values("durability")), dflt);
+                    var olog = this.topics.get(LogOffsets.TOPIC, false);
+                    var fenced = olog == null ? null : fence(olog, request, request.target());
+                    if (fenced != null) return fenced;
                     o.commit(topic, group, off, d).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                     this.hooks.offsetCommitted(topic, group, Math.max(0, end - off));
                     return json(200, "{\"offset\":" + off + "}", (d != null ? d : dflt).name().toLowerCase(java.util.Locale.ROOT));
@@ -176,7 +180,9 @@ final class MessagingHttp implements Handler {
         } catch (TimeoutException e) {
             return problem(503, "unavailable", "offset commit not acknowledged in " + ACK_TIMEOUT_MS + " ms");
         } catch (ExecutionException e) {
-            return problem(503, "unavailable", String.valueOf(e.getCause()));
+            return failed(e, request.target());
+        } catch (LeaderUnavailableException e) {
+            return notLeader(e, request.target());
         } catch (IllegalStateException e) {
             return problem(503, "unavailable", e.getMessage());
         }
@@ -205,11 +211,13 @@ final class MessagingHttp implements Handler {
         return out.toByteArray();
     }
 
-    private Response produce(String topic, Request request) throws BadRequest, IOException {
+    private Response produce(String topic, Request request, String target) throws BadRequest, IOException {
         // A request may only strengthen the topic's policy: a weaker Durability header is clamped up to it.
         var durability = atLeast(durability(request.headers().values("durability")), this.topics.durability(topic));
         var records = records(request);
         var log = this.topics.get(topic, true);
+        var fenced = fence(log, request, target);
+        if (fenced != null) return fenced;
         try {
             long base = log.appender().append(records, durability).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             var json = "{\"baseOffset\":" + base + ",\"count\":" + records.size() + "}";
@@ -223,15 +231,31 @@ final class MessagingHttp implements Handler {
         } catch (TimeoutException e) {
             return problem(503, "unavailable", "append not acknowledged in " + ACK_TIMEOUT_MS + " ms");
         } catch (ExecutionException e) {
-            return problem(503, "unavailable", String.valueOf(e.getCause()));
+            return failed(e, target);
+        } catch (LeaderUnavailableException e) {
+            return notLeader(e, target);
         }
     }
 
-    private Response fetch(String topic, Map<String, String> query) throws BadRequest, IOException {
+    private Response fetch(String topic, Map<String, String> query, Request request, String target) throws BadRequest, IOException {
         long offset = number(query, "offset", 0, 0, Long.MAX_VALUE);
         long maxBytes = number(query, "maxBytes", DEFAULT_FETCH_BYTES, 1, MAX_FETCH_BYTES);
         var log = this.topics.get(topic, false);
         if (log == null) return problem(404, "no such topic", topic);
+        if (log.replica() != null && leaderRead(query, request)) { // sketch §5: default reads this node's applied data
+            try {
+                log.replica().leaderRead().get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return problem(503, "unavailable", "interrupted");
+            } catch (TimeoutException e) {
+                return problem(503, "unavailable", "leader read not confirmed in " + ACK_TIMEOUT_MS + " ms");
+            } catch (ExecutionException e) {
+                return failed(e, target);
+            } catch (LeaderUnavailableException e) {
+                return notLeader(e, target);
+            }
+        }
         long committed = log.writer().snapshot().nextOffset();
         long start = log.log().startOffset();
         if (offset < start) return problem(416, "offset out of range", "log starts at " + start);
@@ -404,6 +428,60 @@ final class MessagingHttp implements Handler {
             throw new BadRequest(name + " must be a number");
         }
     }
+
+    /** {@code ?consistency=leader} or {@code Read-Consistency: leader}. */
+    private static boolean leaderRead(Map<String, String> query, Request request) {
+        if ("leader".equalsIgnoreCase(query.get("consistency"))) return true;
+        for (var v : request.headers().values("read-consistency")) if ("leader".equalsIgnoreCase(v.trim())) return true;
+        return false;
+    }
+
+    /**
+     * Replicated topics only: a write on a node that is not the ready leader, or carrying an {@code If-Term} other than
+     * the current term, is refused before it is proposed (sketch §3 stopgap, §6). Null when the write may proceed.
+     */
+    private static Response fence(LogTopics.Log log, Request request, String target) {
+        var rep = log.replica();
+        if (rep == null) return null;
+        var ifTerm = request.headers().values("if-term");
+        if (!ifTerm.isEmpty()) {
+            long t;
+            try { t = Long.parseLong(ifTerm.get(0).trim()); } catch (NumberFormatException e) { return problem(400, "bad request", "If-Term must be a number"); }
+            long now = rep.term();
+            if (t != now) {
+                var r = problem(409, "stale term", "If-Term " + t + " but the partition is at term " + now);
+                r.headers().set("sjws-term", Long.toString(now));
+                return r;
+            }
+        }
+        if (!rep.leaderReady()) return notLeader(new LeaderUnavailableException("not the ready leader", rep.term(), rep.leaderName(), rep.leaderUrl()), target);
+        return null;
+    }
+
+    private static Response failed(ExecutionException e, String target) {
+        Throwable c = e.getCause();
+        while (c instanceof java.util.concurrent.CompletionException && c.getCause() != null) c = c.getCause();
+        if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
+        return problem(503, "unavailable", String.valueOf(c));
+    }
+
+    /** 307 to the leader when known (method and body preserved), else 503 + Retry-After; RFC 9457 type not-leader. */
+    static Response notLeader(LeaderUnavailableException e, String target) {
+        boolean redirect = e.leaderUrl() != null;
+        var json = "{\"type\":\"" + NOT_LEADER_TYPE + "\",\"title\":\"not leader\",\"status\":" + (redirect ? 307 : 503)
+                + ",\"detail\":" + quote(String.valueOf(e.getMessage())) + ",\"term\":" + e.term() + "}";
+        var h = ResponseHeaders.of().set("content-type", "application/problem+json").set("sjws-term", Long.toString(e.term()));
+        if (e.leaderName() != null) h.set("sjws-leader", e.leaderName());
+        if (redirect) {
+            var base = e.leaderUrl();
+            h.set("location", (base.endsWith("/") ? base.substring(0, base.length() - 1) : base) + target);
+        } else {
+            h.set("retry-after", "1");
+        }
+        return new Response(redirect ? 307 : 503, h, Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    static final String NOT_LEADER_TYPE = "https://sjws.dev/problems/not-leader";
 
     static Map<String, String> query(String q) {
         var out = new HashMap<String, String>();

@@ -41,6 +41,15 @@ public interface LogStorage {
     int forces(GroupId group);
 
     /**
+     * Whether the log is still there after a process restart. Informational: {@link RaftGroup} deletes a
+     * log prefix only after {@link #saveSnapshot} has made the covering snapshot durable, and refuses on a
+     * storage whose {@link #persistsSnapshots} is false.
+     */
+    default boolean survivesRestart() {
+        return false;
+    }
+
+    /**
      * Last witness ack that {@link #force} has made durable, or 0. This is not {@link #lastIndex}:
      * a witness records the cursor without storing entries.
      */

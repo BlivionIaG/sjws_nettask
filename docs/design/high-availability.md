@@ -225,8 +225,9 @@ truncation point catches up through a snapshot transfer (see above). Unused, the
 truncation calls and nothing on the append or commit path.
 
 Every truncation path persists the snapshot first (see Application snapshots) and refuses on a
-storage without durable snapshots. One existing limit is not changed here: `FileLogStorage`
-drops a prefix by rewriting the log file in place, which is not crash-atomic.
+storage without durable snapshots. `FileLogStorage` drops a prefix (or suffix) by writing the
+kept records to a temp file and renaming it into place with fsyncs (#214), so a crash leaves the
+whole old segment or the whole new one.
 
 ### Restart safety and the exact RELAXED guarantee
 
@@ -236,8 +237,9 @@ What a voter keeps across a crash:
   is called, and must return only once durable, whenever `term` or `votedFor` changes, before
   the vote request or grant is sent. The write comes first and memory changes only when it
   succeeds (`startElection`, stepping down to a higher term, a vote grant). A failed write leaves
-  term and vote as they were, sends nothing, and the node stays a follower (a leader that cannot
-  persist a higher term it has seen logs a WARNING and stays in its old term); a failed grant is a
+  term and vote as they were, sends nothing, and the node stays a follower (a node in any role that
+  cannot persist a higher term it has seen logs a WARNING, at most one per group per 10 s with a
+  count of the suppressed ones, and stays in its old term); a failed grant is a
   refusal. Messages only ever carry the durable term (a pre-vote reply carries the responder's own
   term, and the pre-candidate accepts a grant at a term at or below its own).
   `FileLogStorage` writes `{group}.vote`: 24 bytes big-endian, magic `SJVT`, version 1, term,

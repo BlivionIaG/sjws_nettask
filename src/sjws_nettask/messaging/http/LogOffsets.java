@@ -91,18 +91,37 @@ final class LogOffsets {
                 for (int i = 0; i < rb.count(); i++) {
                     if (rb.baseOffset() + i >= committed) return;
                     var r = rb.records().get(i);
-                    var k = LogCompaction.key(r);
-                    if (k == null || k.remaining() + 4 + 16 != r.length) continue;
-                    int klen = k.remaining();
-                    var ks = StandardCharsets.UTF_8.decode(k).toString(); // consumes k
-                    int z = ks.indexOf('\0');
-                    if (z <= 0) continue;
-                    var v = ByteBuffer.wrap(r, 4 + klen, 16);
-                    groups(ks.substring(0, z)).put(ks.substring(z + 1), new Commit(v.getLong(), v.getLong(), 0));
+                    apply(r);
                 }
             });
             this.loaded = true;
             return l;
+        } finally {
+            this.loading.unlock();
+        }
+    }
+
+    /** One {@code __offsets} record into the map (replay and replicated apply); malformed records are skipped. */
+    private void apply(byte[] r) {
+        var k = LogCompaction.key(r);
+        if (k == null || k.remaining() + 4 + 16 != r.length) return;
+        int klen = k.remaining();
+        var ks = StandardCharsets.UTF_8.decode(k).toString(); // consumes k
+        int z = ks.indexOf('\0');
+        if (z <= 0) return;
+        var v = ByteBuffer.wrap(r, 4 + klen, 16);
+        groups(ks.substring(0, z)).put(ks.substring(z + 1), new Commit(v.getLong(), v.getLong(), 0));
+    }
+
+    /**
+     * Replicated mode: a batch applied to {@code __offsets}, in log order, on every node. Before the first load the
+     * replay picks it up from the log; the loading lock orders this against that replay.
+     */
+    void applied(List<byte[]> records) {
+        this.loading.lock();
+        try {
+            if (!this.loaded) return;
+            for (var r : records) apply(r);
         } finally {
             this.loading.unlock();
         }
@@ -133,6 +152,7 @@ final class LogOffsets {
         } finally {
             this.order.unlock();
         }
+        if (l.replica() != null) return f; // the map follows the applied log (applied), on leader and followers alike
         var c = new Commit(offset, now, s);
         return f.thenApply(base -> {
             groups(topic).merge(group, c, (old, nu) -> nu.seq() >= old.seq() ? nu : old);
