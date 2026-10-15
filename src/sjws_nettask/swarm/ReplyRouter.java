@@ -200,13 +200,17 @@ public final class ReplyRouter implements AutoCloseable {
             } catch (IllegalArgumentException e) {
                 // not an envelope: acked and dropped below
             }
-            var key = env == null ? null : new Key(env.correlationHi(), env.correlationLo());
-            var f = key == null ? null : this.pending.remove(key);
+            if (env == null) {
+                this.late.incrementAndGet(); // not an envelope: acked and dropped
+                continue;
+            }
+            var key = new Key(env.correlationHi(), env.correlationLo());
+            var f = this.pending.remove(key);
             if (f != null) {
                 if (!f.complete(env)) {
                     this.late.incrementAndGet(); // raced with the caller's timeout
                 }
-            } else if (key != null && !this.deliveredLocal.remove(key)) {
+            } else if (!this.deliveredLocal.remove(key)) {
                 this.late.incrementAndGet(); // timed out, or not an in-flight call
             }
         }
