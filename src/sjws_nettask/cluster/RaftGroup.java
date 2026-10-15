@@ -738,10 +738,34 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * Commits the highest index above {@code commitIndex} that is in the current term and has a
+     * quorum. {@link #quorumFor} only changes value at a peer's matchIndex, at {@code durableIndex},
+     * and just below the first pending STRICT entry, so the highest qualifying index is always one
+     * of those points (or {@code lastIndex()}). Checking only them keeps this O(voters) per call;
+     * scanning every uncommitted index made it O(backlog) under the group lock, on every append and
+     * every ack (#194).
+     */
     private void maybeCommit(List<Runnable> after) {
         long last = lastIndex();
-        for (long index = last; index > commitIndex; index--) {
-            if (termAt(index) != term) {
+        if (last <= commitIndex) {
+            return;
+        }
+        var candidates = new java.util.TreeSet<Long>(java.util.Comparator.reverseOrder());
+        candidates.add(last);
+        for (var peer : peers) {
+            candidates.add(matchIndex.getOrDefault(peer, 0L));
+        }
+        candidates.add(durableIndex);
+        var firstStrict = strictPending.ceilingKey(commitIndex + 1);
+        if (firstStrict != null) {
+            candidates.add(firstStrict - 1);
+        }
+        for (long index : candidates) {
+            if (index <= commitIndex) {
+                break;
+            }
+            if (index > last || termAt(index) != term) {
                 continue;
             }
             if (quorumFor(index)) {
