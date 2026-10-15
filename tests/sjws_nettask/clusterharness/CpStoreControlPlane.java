@@ -41,6 +41,7 @@ import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.cp.AdminServer;
 import sjws_nettask.cp.CpStore;
 import sjws_nettask.cp.DataWatch;
+import sjws_nettask.cp.DataWatch.Applied;
 import sjws_nettask.cp.JoinTokens;
 import sjws_nettask.cp.KeyRing;
 import sjws_nettask.cp.LastGoodFiles;
@@ -557,12 +558,17 @@ final class CpStoreControlPlane implements ControlPlane {
 
         @Override
         public long version() {
-            return this.watch.appliedVersion();
+            return this.watch.applied().version();
         }
 
         @Override
         public String contentHash() {
-            return this.watch.appliedHash();
+            return this.watch.applied().hash();
+        }
+
+        @Override
+        public Applied applied() {
+            return this.watch.applied();
         }
 
         @Override
