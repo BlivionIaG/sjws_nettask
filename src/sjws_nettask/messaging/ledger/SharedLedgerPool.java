@@ -15,7 +15,7 @@ import java.util.concurrent.locks.LockSupport;
  * {@code Partition.lock}, so a lock holder that is descheduled stalls submit, claim and reply
  * together (claim-wakeup write-up on #184).
  * <p>
- * Default size is {@code max(4×CPUs, 32)} ({@value #PROPERTY} unset or {@code auto}) so typical Set the property to
+ * Sized to the CPUs by default ({@value #PROPERTY} unset or {@code auto}). Set the property to
  * {@code 0} / {@code false} for the legacy per-writer threads. No threads run until the first
  * writer registers (zero cost when messaging is unused).
  * <p>
