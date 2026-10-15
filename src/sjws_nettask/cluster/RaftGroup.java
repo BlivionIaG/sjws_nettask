@@ -57,6 +57,12 @@ final class RaftGroup {
     static final int TIMEOUT_NOW = 5;
     static final int PRE_VOTE = 6;
     static final int PRE_VOTE_RESP = 7;
+    /** Leader to a data follower behind the leader's compacted prefix: one chunk of the snapshot image. */
+    static final int SNAP_CHUNK = 8;
+    /** Follower to leader: the next offset it wants, or that the image is installed. */
+    static final int SNAP_RESP = 9;
+    /** Default {@link #snapshotChunkBytes}: 1 MiB, well under the 16 MiB transport frame cap. */
+    static final int DEFAULT_SNAPSHOT_CHUNK_BYTES = 1 << 20;
 
     private final ReentrantLock lock = new ReentrantLock();
     /**
@@ -133,6 +139,15 @@ final class RaftGroup {
     /** Highest pending STRICT index already reported as stalled, so each entry warns once. */
     private long strictWarnedIndex;
     private long recoveryUntil;
+    /** Bytes of image per {@link #SNAP_CHUNK}; package-private so tests can force many chunks. */
+    int snapshotChunkBytes = DEFAULT_SNAPSHOT_CHUNK_BYTES;
+    /** Leader view: the snapshot transfer in progress to each data follower behind the compacted prefix. */
+    private final Map<NodeId, SnapSend> snapSends = new HashMap<>();
+    /** Follower view: the image being received, or null. */
+    private SnapReceive snapReceive;
+    /** Images fully sent and acknowledged (leader) and installed from a leader (follower). */
+    private long snapshotsSent;
+    private long snapshotsInstalled;
 
     private enum Role {
         FOLLOWER, PRE_CANDIDATE, CANDIDATE, LEADER
@@ -322,6 +337,8 @@ final class RaftGroup {
                 case APPEND -> onAppend(from, body, now, after);
                 case APPEND_RESP -> onAppendResp(from, body, now, after);
                 case TIMEOUT_NOW -> onTimeoutNow(body, now, after);
+                case SNAP_CHUNK -> onSnapChunk(from, body, now, after);
+                case SNAP_RESP -> onSnapResp(from, body, now, after);
                 default -> {
                     // Unknown frames are ignored so a newer peer cannot crash an older one.
                 }
@@ -726,9 +743,277 @@ final class RaftGroup {
         startElection(now, after);
     }
 
+    /**
+     * Sends the chunk at the peer's current offset. A transfer pins the image it started with, so a
+     * newer local snapshot does not restart it; when it completes, {@code nextIndex} lands past that
+     * image and, if the log was compacted further meanwhile, the next round starts a fresh transfer.
+     */
+    private void sendSnapshotChunk(NodeId peer) {
+        var send = snapSends.get(peer);
+        if (send == null || send.term != term) {
+            var crc = new java.util.zip.CRC32C();
+            crc.update(snapData);
+            send = new SnapSend(term, snapIndex, snapTerm, snapData, (int) crc.getValue());
+            snapSends.put(peer, send);
+        }
+        int len = Math.min(snapshotChunkBytes, send.data.length - send.offset);
+        var body = ByteBuffer.allocate(8 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + len).order(java.nio.ByteOrder.BIG_ENDIAN);
+        body.putLong(term);
+        body.putInt(self.wire());
+        body.putLong(send.index);
+        body.putLong(send.imageTerm);
+        body.putInt(send.data.length);
+        body.putInt(send.crc32c);
+        body.putInt(send.offset);
+        body.putInt(len);
+        body.put(send.data, send.offset, len);
+        rpc.send(peer, new SimTransport.Frame(groupId, SNAP_CHUNK, body.array()));
+    }
+
+    private void snapResp(NodeId to, boolean done, long match, int nextOffset) {
+        var body = ByteBuffer.allocate(8 + 4 + 1 + 8 + 4).order(java.nio.ByteOrder.BIG_ENDIAN);
+        body.putLong(term);
+        body.putInt(self.wire());
+        body.put((byte) (done ? 1 : 0));
+        body.putLong(match);
+        body.putInt(nextOffset);
+        rpc.send(to, new SimTransport.Frame(groupId, SNAP_RESP, body.array()));
+    }
+
+    /**
+     * Follower side. Leadership checks are those of {@link #onAppend}. Chunks must arrive in order;
+     * anything else is answered with the offset wanted. The assembled image is checked against its
+     * size cap and CRC32C, then installed exactly as {@link SnapshotControl#install} would: persisted
+     * before any prefix delete, the log kept past the image only if it agrees with the image's term.
+     */
+    private void onSnapChunk(NodeId from, ByteBuffer body, long now, List<Runnable> after) {
+        long theirTerm = body.getLong();
+        int leaderWire = body.getInt();
+        long index = body.getLong();
+        long imageTerm = body.getLong();
+        int total = body.getInt();
+        int crc32c = body.getInt();
+        int offset = body.getInt();
+        int len = body.getInt();
+        if (len < 0 || len > body.remaining() || offset < 0 || total < 0 || (long) offset + len > total) {
+            return;
+        }
+        if (theirTerm < term) {
+            snapResp(from, false, lastIndex(), 0);
+            return;
+        }
+        if (theirTerm > term) {
+            if (!stepDown(theirTerm, after)) {
+                return;
+            }
+        }
+        if (role == Role.CANDIDATE || role == Role.PRE_CANDIDATE || role == Role.LEADER) {
+            role = Role.FOLLOWER;
+        }
+        var newLeader = byWire.apply(leaderWire);
+        if (newLeader != null && !newLeader.equals(leader)) {
+            leader = newLeader;
+            fireLeader(after);
+        }
+        electionDeadline = now + options.leaseNanos() + options.electionTimeout().toNanos();
+        leaseExpires = now + options.leaseNanos();
+        if (witness) {
+            return;
+        }
+        if (index <= snapIndex || (index <= commitIndex && termAt(index) == imageTerm)) {
+            // Already covered: committed entries agree with the leader's (log matching).
+            snapReceive = null;
+            snapResp(from, true, index, total);
+            return;
+        }
+        if (total > options.maxSnapshotBytes()) {
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING, "group "
+                    + groupId.value() + ": refusing a snapshot of " + total + " bytes from the leader (maxSnapshotBytes "
+                    + options.maxSnapshotBytes() + ")");
+            snapReceive = null;
+            return;
+        }
+        var receive = snapReceive;
+        if (receive == null || receive.term != theirTerm || receive.index != index || receive.crc32c != crc32c
+                || receive.data.length != total) {
+            if (offset != 0) {
+                snapReceive = null;
+                snapResp(from, false, lastIndex(), 0);
+                return;
+            }
+            receive = new SnapReceive(theirTerm, index, imageTerm, crc32c, new byte[total]);
+            snapReceive = receive;
+        }
+        if (offset != receive.received) {
+            snapResp(from, false, lastIndex(), receive.received);
+            return;
+        }
+        body.get(receive.data, offset, len);
+        receive.received += len;
+        if (receive.received < total) {
+            snapResp(from, false, lastIndex(), receive.received);
+            return;
+        }
+        snapReceive = null;
+        var crc = new java.util.zip.CRC32C();
+        crc.update(receive.data);
+        if ((int) crc.getValue() != crc32c) {
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING, "group "
+                    + groupId.value() + ": snapshot from the leader failed its CRC32C; asking again");
+            snapResp(from, false, lastIndex(), 0);
+            return;
+        }
+        if (!installFromLeader(index, imageTerm, receive.data, after)) {
+            return;
+        }
+        snapshotsInstalled++;
+        snapResp(from, true, index, total);
+    }
+
+    private boolean installFromLeader(long index, long imageTerm, byte[] image, List<Runnable> after) {
+        boolean keepSuffix = termAt(index) == imageTerm && storage.lastIndex(groupId) >= index;
+        long[] previous = {snapIndex, snapTerm};
+        var previousData = snapData;
+        snapIndex = index;
+        snapTerm = imageTerm;
+        snapData = image;
+        try {
+            persistSnapshotBeforePrefixDelete();
+            if (keepSuffix) {
+                storage.truncatePrefix(groupId, index);
+            } else {
+                // The local log disagrees with (or ends before) the image: none of it can be kept.
+                storage.truncatePrefix(groupId, Long.MAX_VALUE - 1);
+            }
+            truncatedThrough = Math.max(truncatedThrough, index);
+        } catch (IOException | RuntimeException failed) {
+            snapIndex = previous[0];
+            snapTerm = previous[1];
+            snapData = previousData;
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING, "group "
+                    + groupId.value() + ": cannot install the leader's snapshot at " + index + ": " + failed);
+            return false;
+        }
+        if (commitIndex < index) {
+            commitIndex = index;
+        }
+        if (lastApplied < index) {
+            lastApplied = index;
+            var installed = new LogSnapshot(groupId, index, imageTerm, image);
+            deliveries.submit(() -> {
+                var current = this.listener;
+                if (current != null) {
+                    current.onSnapshotRestored(installed);
+                }
+            }, index);
+        }
+        if (durableIndex < index) {
+            durableIndex = index;
+        }
+        if (recovering) {
+            recovering = false;
+        }
+        return true;
+    }
+
+    private void onSnapResp(NodeId from, ByteBuffer body, long now, List<Runnable> after) {
+        long theirTerm = body.getLong();
+        int followerWire = body.getInt();
+        boolean done = body.get() == 1;
+        long match = body.getLong();
+        int nextOffset = body.getInt();
+        if (theirTerm > term) {
+            stepDown(theirTerm, after);
+            return;
+        }
+        if (role != Role.LEADER || theirTerm != term) {
+            return;
+        }
+        var follower = byWire.apply(followerWire);
+        if (follower == null || (from != null && !from.equals(follower))) {
+            return;
+        }
+        heardAt.put(follower, now);
+        var send = snapSends.get(follower);
+        if (done) {
+            if (send != null) {
+                snapSends.remove(follower);
+                snapshotsSent++;
+            }
+            matchIndex.put(follower, Math.max(matchIndex.getOrDefault(follower, 0L), match));
+            nextIndex.put(follower, Math.max(nextIndex.getOrDefault(follower, 0L), match + 1));
+            maybeCommit(after);
+            return;
+        }
+        if (send == null || nextOffset < 0 || nextOffset > send.data.length) {
+            return;
+        }
+        boolean progressed = nextOffset > send.offset;
+        send.offset = nextOffset;
+        if (progressed && nextOffset < send.data.length) {
+            sendSnapshotChunk(follower);
+        }
+    }
+
+    long snapshotsSent() {
+        lock.lock();
+        try {
+            return snapshotsSent;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    long snapshotsInstalled() {
+        lock.lock();
+        try {
+            return snapshotsInstalled;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static final class SnapSend {
+        final long term;
+        final long index;
+        final long imageTerm;
+        final byte[] data;
+        final int crc32c;
+        int offset;
+
+        SnapSend(long term, long index, long imageTerm, byte[] data, int crc32c) {
+            this.term = term;
+            this.index = index;
+            this.imageTerm = imageTerm;
+            this.data = data;
+            this.crc32c = crc32c;
+        }
+    }
+
+    private static final class SnapReceive {
+        final long term;
+        final long index;
+        final long imageTerm;
+        final int crc32c;
+        final byte[] data;
+        int received;
+
+        SnapReceive(long term, long index, long imageTerm, int crc32c, byte[] data) {
+            this.term = term;
+            this.index = index;
+            this.imageTerm = imageTerm;
+            this.crc32c = crc32c;
+            this.data = data;
+        }
+    }
+
     private void replicate() {
         for (var peer : peers) {
             long next = nextIndex.getOrDefault(peer, lastIndex() + 1);
+            if (next <= snapIndex && !witnesses.contains(peer)) {
+                sendSnapshotChunk(peer);
+                continue;
+            }
             if (next <= snapIndex) {
                 var body = ByteBuffer.allocate(8 + 4 + 8 + 8 + 8 + 4).order(java.nio.ByteOrder.BIG_ENDIAN);
                 body.putLong(term);
