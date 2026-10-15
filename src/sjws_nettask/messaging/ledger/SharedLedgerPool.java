@@ -15,7 +15,7 @@ import java.util.concurrent.locks.LockSupport;
  * {@code Partition.lock}, so a lock holder that is descheduled stalls submit, claim and reply
  * together (claim-wakeup write-up on #184).
  * <p>
- * Sized to the CPUs by default ({@value #PROPERTY} unset or {@code auto}). Set the property to
+ * Default size is {@code max(4×CPUs, 32)} ({@value #PROPERTY} unset or {@code auto}) so typical Set the property to
  * {@code 0} / {@code false} for the legacy per-writer threads. No threads run until the first
  * writer registers (zero cost when messaging is unused).
  * <p>
@@ -40,7 +40,11 @@ public final class SharedLedgerPool {
     static int resolveSize() {
         String v = System.getProperty(PROPERTY);
         if (v == null || v.isBlank() || v.equalsIgnoreCase("auto") || v.equalsIgnoreCase("true")) {
-            return Math.max(1, Runtime.getRuntime().availableProcessors());
+            // Cap threads, but keep shards wide enough that a typical swarm (a few dozen partitions)
+            // stays 1:1 on the single-member blockingDrain path — CPU count alone packs writers and
+            // adds ready-queue latency on the p50 path.
+            int cpus = Math.max(1, Runtime.getRuntime().availableProcessors());
+            return Math.max(cpus * 4, 32);
         }
         if (v.equals("0") || v.equalsIgnoreCase("false") || v.equalsIgnoreCase("off")) {
             return 0;
