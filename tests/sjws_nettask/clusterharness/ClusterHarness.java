@@ -233,6 +233,11 @@ public final class ClusterHarness implements AutoCloseable {
         }
 
         @Override
+        public sjws_nettask.cp.DataWatch.Applied applied() {
+            return sjws_nettask.cp.DataWatch.Applied.NONE;
+        }
+
+        @Override
         public SjwsServer server() {
             return this.server;
         }

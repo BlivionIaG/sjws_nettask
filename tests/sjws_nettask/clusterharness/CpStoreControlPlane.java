@@ -557,12 +557,17 @@ final class CpStoreControlPlane implements ControlPlane {
 
         @Override
         public long version() {
-            return this.watch.appliedVersion();
+            return this.watch.applied().version();
         }
 
         @Override
         public String contentHash() {
-            return this.watch.appliedHash();
+            return this.watch.applied().hash();
+        }
+
+        @Override
+        public DataWatch.Applied applied() {
+            return this.watch.applied();
         }
 
         @Override
