@@ -598,6 +598,52 @@ class RelaxedRestartVoteTest {
         }
     }
 
+    @Test
+    void persistFailureWarningIsRateLimited() throws Exception {
+        var records = new java.util.concurrent.CopyOnWriteArrayList<java.util.logging.LogRecord>();
+        var handler = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        var jul = java.util.logging.Logger.getLogger(RaftGroup.class.getName());
+        jul.addHandler(handler);
+        try {
+            var storage = new FailingVotes();
+            storage.fail = true;
+            var clock = new FakeClock(0L);
+            var group = node3(storage, new Outbox(), clock);
+            for (int i = 0; i < 5; i++) {
+                var vote = ByteBuffer.allocate(28).order(ByteOrder.BIG_ENDIAN).putLong(7 + i).putInt(1).putLong(0)
+                        .putLong(0);
+                group.handle(N1, new SimTransport.Frame(GROUP, RaftGroup.VOTE, vote.array()), clock.nanoTime());
+            }
+            assertEquals(1, warnings(records), "one WARN for a burst");
+            clock.advance(Duration.ofNanos(RaftGroup.PERSIST_WARN_INTERVAL_NANOS));
+            var vote = ByteBuffer.allocate(28).order(ByteOrder.BIG_ENDIAN).putLong(20).putInt(1).putLong(0).putLong(0);
+            group.handle(N1, new SimTransport.Frame(GROUP, RaftGroup.VOTE, vote.array()), clock.nanoTime());
+            assertEquals(2, warnings(records));
+            assertTrue(records.get(records.size() - 1).getMessage().contains("4 similar warnings suppressed"),
+                    records.get(records.size() - 1).getMessage());
+        } finally {
+            jul.removeHandler(handler);
+        }
+    }
+
+    private static long warnings(java.util.List<java.util.logging.LogRecord> records) {
+        return records.stream().filter(r -> r.getLevel() == java.util.logging.Level.WARNING
+                && r.getMessage().contains("could not persist")).count();
+    }
+
     private static Member member(int wire, boolean witness) {
         return new Member(new NodeId(wire, "n" + wire), new SiteId("local"),
                 new InetSocketAddress("127.0.0.1", 23_100 + wire), 1L, MemberState.ALIVE, witness);
