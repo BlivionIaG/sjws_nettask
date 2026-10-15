@@ -237,13 +237,16 @@ class RaftClusterTest {
     }
 
     @Test
-    void prefixDeleteIsRefusedWhenOnlyAnInMemorySnapshotCoversADurableLog() throws Exception {
+    void prefixDeleteOnADurableLogSavesTheSnapshotToDiskFirst() throws Exception {
+        // #214 refused this outright while the snapshot lived only in memory; with #205 the snapshot is
+        // saved to disk before the prefix is deleted (a storage that cannot do that still refuses:
+        // SnapshotPersistenceTest).
         var again = cluster(1, false, Durability.STRICT, 1_000_000);
         elect(again);
         var solo = again.nodes.get(0);
         var idx = solo.append(GROUP, List.of(bytes("keep"))).get().index();
         var snap = solo.snapshots(GROUP).take(idx);
-        var root = java.nio.file.Files.createTempDirectory("memory-only-snap");
+        var root = java.nio.file.Files.createTempDirectory("durable-snap");
         var followerLog = new FileLogStorage(root);
         followerLog.append(GROUP, 1, 1, "e1".getBytes(StandardCharsets.UTF_8));
         followerLog.force(GROUP);
@@ -251,11 +254,10 @@ class RaftClusterTest {
                 Set.of(member(1, false).id(), member(2, false).id()), QuorumPolicy.majority(), again.clock, followerLog,
                 again.net);
         follower.openGroup(GROUP, again.options, null);
-        assertThrows(IllegalStateException.class, () -> follower.snapshots(GROUP).install(snap));
-        var refused = follower.snapshots(GROUP).truncateAndCompact(0, snapshot -> null);
-        assertInstanceOf(IllegalStateException.class,
-                assertThrows(ExecutionException.class, refused::get).getCause());
-        assertEquals("e1", new String(followerLog.read(GROUP, 1), StandardCharsets.UTF_8));
+        follower.snapshots(GROUP).install(snap);
+        var saved = followerLog.loadSnapshot(GROUP, again.options.maxSnapshotBytes());
+        assertEquals(idx, saved.lastIncludedIndex());
+        assertArrayEquals(snap.data(), saved.data());
         followerLog.close();
     }
 

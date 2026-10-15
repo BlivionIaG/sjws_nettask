@@ -133,7 +133,46 @@ it is never behind an entry the node acked. Under RELAXED it trails by a bounded
 That bound is also the RELAXED loss window in the guarantee below. One interaction: with one data node
 down in the 2 + 1 pair, a RELAXED commit waits for the leader's fsync (the witness stores
 nothing), so it now waits up to the time bound rather than one tick. Keep `relaxedSyncDelay` small,
-or use the entry bound, if that degraded mode must stay fast.
+or use the entry bound, if that degraded mode must stay fast. A RELAXED group whose `relaxedSyncDelay`
+exceeds the lease (`2 x heartbeat`) logs a WARNING when it opens. `durableIndex` never decreases
+except when this node truncates conflicting uncommitted entries.
+
+### Application snapshots
+
+`SnapshotControl.setSnapshotTaker(SnapshotTaker)` replaces the built-in snapshot image (the
+concatenated user payloads) with application bytes. The taker runs on the group's delivery
+thread, queued after the delivery of every entry through `lastIncludedIndex` and ahead of later
+ones, so the state it reads is exactly the state at that index. Its result moves the snapshot
+forward only if it is still ahead of the current one. If the taker throws or returns null, that
+snapshot is skipped and the log is kept. With a taker, `take(i)` accepts only `i == commitIndex()`,
+is refused inside a callback, and blocks until the delivery thread has run the taker.
+`GroupOptions.withoutAutoSnapshot()` (`snapshotEveryEntries == NO_AUTO_SNAPSHOT`) turns
+automatic snapshots off, so the application decides when to call `take`.
+
+Snapshots are held in memory and made durable only when a log prefix is about to be deleted.
+`truncateAndCompact` and `install` first write the image through `LogStorage.saveSnapshot` and
+only then delete the prefix; a storage whose `persistsSnapshots()` is false (the interface
+default) refuses both, so committed state is never left in memory alone. `FileLogStorage` writes
+`{group}.snap`: magic `SJSN`, version 1, last included index and term, image length, image, and
+a CRC32C of all of it, created mode 0600 (the CP image holds token hashes and RBAC state), then
+fsync, `ATOMIC_MOVE` and directory fsync. On open it is read with the `SecureKeyFile` rules
+(leaf not followed, regular file, mode 0600 or 0400, owned by this process, parents not writable
+by others) and validated (magic, version, length, `maxSnapshotBytes`, CRC); any failure refuses
+to start. A group that opens with a snapshot starts with its commit and apply point at the
+snapshot index and hands the image to `GroupListener.onSnapshotRestored` on the delivery thread
+before any later entry; the default method ignores it, which is only right for a group that never
+compacts. Under RELAXED the persisted image can be ahead of the local `durableIndex`: it holds
+committed state, which is what a restart needs.
+
+`install` refuses, changing nothing, an image above `maxSnapshotBytes`, an index that does not
+advance past the current snapshot, and an index the local log holds with a different term;
+`install(snapshot, crc32c)` also checks `LogSnapshot.crc32c()` for a snapshot that crossed a
+process or disk boundary. `GroupOptions.withMaxSnapshotBytes` (default 64 MiB) also bounds the
+image a taker returns and the built-in image: a larger one is skipped and counted
+(`ReplicatedNode.skippedSnapshots`), like a failing taker. There is no snapshot transfer to
+followers: a follower whose next entry falls inside a deleted prefix cannot catch up from the
+leader until it is given the snapshot out of band (`install`), so only delete through an index
+every follower has.
 
 ### Restart safety and the exact RELAXED guarantee
 
