@@ -48,10 +48,19 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String TOPIC_DURABILITY_PROPERTY = "sjws.messaging.durability.topics";
     static final String TOPIC_DURABILITY_ENV = "SJWS_MESSAGING_DURABILITY_TOPICS";
 
+    static final String OFFSETS_EXPIRY_MS_PROPERTY = "sjws.messaging.offsets.expiry.ms";
+    static final String OFFSETS_EXPIRY_MS_ENV = "SJWS_MESSAGING_OFFSETS_EXPIRY_MS";
+    static final String COMPACTION_TOPICS_PROPERTY = "sjws.messaging.compaction.topics";
+    static final String COMPACTION_TOPICS_ENV = "SJWS_MESSAGING_COMPACTION_TOPICS";
+
     private final LogTopics topics;
     private volatile MessagingHooks hooks = MessagingHooks.NONE;
-    /** Null unless a retention limit is set: no thread when retention is off. */
-    private final java.util.concurrent.ScheduledExecutorService retentionTimer;
+    /** Null unless a retention limit or a compacted topic is set: no thread when both are off. */
+    private java.util.concurrent.ScheduledExecutorService retentionTimer;
+    private final long checkMs;
+    private boolean closed;
+    /** Guards {@link #retentionTimer} and {@link #closed}. */
+    private final java.util.concurrent.locks.ReentrantLock timerLock = new java.util.concurrent.locks.ReentrantLock();
 
     public MessagingModule() {
         this(Path.of(setting(DIR_PROPERTY, DIR_ENV, "messaging-data")),
@@ -60,7 +69,19 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
                         number(setting(RETENTION_MS_PROPERTY, RETENTION_MS_ENV, ""), 0)),
                 number(setting(RETENTION_CHECK_MS_PROPERTY, RETENTION_CHECK_MS_ENV, ""), 10_000),
                 durability(setting(DURABILITY_PROPERTY, DURABILITY_ENV, "")),
-                topicDurability(setting(TOPIC_DURABILITY_PROPERTY, TOPIC_DURABILITY_ENV, "")));
+                topicDurability(setting(TOPIC_DURABILITY_PROPERTY, TOPIC_DURABILITY_ENV, "")),
+                compactionTopics(setting(COMPACTION_TOPICS_PROPERTY, COMPACTION_TOPICS_ENV, "")),
+                Math.max(1, number(setting(OFFSETS_EXPIRY_MS_PROPERTY, OFFSETS_EXPIRY_MS_ENV, ""), LogOffsets.DEFAULT_EXPIRY_MS)));
+    }
+
+    /** Topics with key compaction; a bad list is logged and ignored as a whole. */
+    static java.util.Set<String> compactionTopics(String v) {
+        try {
+            return LogCompaction.parseTopics(v);
+        } catch (IllegalArgumentException e) {
+            System.err.println("WARN: " + e.getMessage());
+            return java.util.Set.of();
+        }
     }
 
     /** The module default; a bad value is logged and falls back to the writer default (ASYNC). */
@@ -94,13 +115,33 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
             java.util.Map<String, Durability> topicDurability) {
-        this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, System::currentTimeMillis);
-        if (retention.unlimited()) {
-            this.retentionTimer = null;
-        } else {
+        this(dir, segmentBytes, retention, checkMs, durability, topicDurability, java.util.Set.of());
+    }
+
+    MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
+            java.util.Map<String, Durability> topicDurability, java.util.Set<String> compactionTopics) {
+        this(dir, segmentBytes, retention, checkMs, durability, topicDurability, compactionTopics, LogOffsets.DEFAULT_EXPIRY_MS);
+    }
+
+    MessagingModule(Path dir, long segmentBytes, LogRetention retention, long checkMs, Durability durability,
+            java.util.Map<String, Durability> topicDurability, java.util.Set<String> compactionTopics, long offsetsExpiryMs) {
+        this.topics = new LogTopics(dir, durability, topicDurability, segmentBytes, retention, compactionTopics,
+                offsetsExpiryMs, System::currentTimeMillis);
+        this.checkMs = checkMs;
+        // No thread while there is no maintenance work; the first offset commit starts it (__offsets is compacted).
+        this.topics.onOffsetsUse(this::ensureTimer);
+        if (this.topics.maintenanceNeeded()) ensureTimer();
+    }
+
+    private void ensureTimer() {
+        this.timerLock.lock();
+        try {
+            if (this.retentionTimer != null || this.closed) return;
             this.retentionTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
                     r -> Thread.ofPlatform().name("messaging-retention").daemon().unstarted(r));
-            this.retentionTimer.scheduleWithFixedDelay(this::retain, checkMs, checkMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            this.retentionTimer.scheduleWithFixedDelay(this::retain, this.checkMs, this.checkMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } finally {
+            this.timerLock.unlock();
         }
     }
 
@@ -110,6 +151,11 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         } catch (java.io.IOException | RuntimeException e) {
             System.err.println("WARN: messaging retention: " + e);
         }
+        try {
+            this.topics.compact();
+        } catch (java.io.IOException | RuntimeException e) {
+            System.err.println("WARN: messaging compaction: " + e);
+        }
     }
 
     LogTopics topics() {
@@ -117,7 +163,12 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     }
 
     boolean retentionScheduled() {
-        return this.retentionTimer != null;
+        this.timerLock.lock();
+        try {
+            return this.retentionTimer != null;
+        } finally {
+            this.timerLock.unlock();
+        }
     }
 
     static long number(String v, long dflt) {
@@ -151,7 +202,13 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     @Override
     public void close() {
-        if (this.retentionTimer != null) this.retentionTimer.shutdownNow();
+        this.timerLock.lock();
+        try {
+            this.closed = true;
+            if (this.retentionTimer != null) this.retentionTimer.shutdownNow();
+        } finally {
+            this.timerLock.unlock();
+        }
         this.topics.close();
     }
 }

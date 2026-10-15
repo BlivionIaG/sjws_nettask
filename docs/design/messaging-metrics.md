@@ -1,6 +1,6 @@
 # Messaging metrics
 
-Status: proposal, revised 2026-10-13 with input from sjws Messaging Core. The produce and fetch histogram names are decided (`*_duration_seconds`) and are not implemented yet. The gauge names in the [proposed](#proposed-names) section are still `PROPOSED` and not stable, so Messaging Core can change them before anything is scraped. The [shipped](#shipped-partition-lag) lag gauges are already in the tree; this doc does not rename them.
+Status: proposal, revised 2026-10-13 with input from sjws Messaging Core. The produce and fetch histogram names are decided (`*_duration_seconds`). The hook points exist (`messaging.http.MessagingHooks`), but no exporter implements them, so the series are not on `/metrics`. The gauge names in the [proposed](#proposed-names) section are still `PROPOSED` and not stable, so Messaging Core can change them before anything is scraped. The [shipped](#shipped-partition-lag) lag gauges are already in the tree; this doc does not rename them.
 
 No code in this change. Nothing here adds a `ServerConfig` flag, a request-path branch, or a series on `/metrics`.
 
@@ -18,9 +18,9 @@ No code in this change. Nothing here adds a `ServerConfig` flag, a request-path 
 
 [docs/messaging/design.md](../messaging/design.md) §2 is that ledger. §5 lists `ReplicatedLedger` as a later package, with a `LocalOnly` implementation until the cluster adapter exists. §6 is one replication group per partition: the leader appends, every replica applies in index order, only the leader serves `poll` and `ack`, and the cluster log may share segments with the ledger so the log index and the ledger position are the same offset.
 
-The cluster code that exists today is `sjws_nettask.cluster.ReplicationGroup` / `RaftGroup`: `term`, `isLeader`, `commitIndex`, `lastApplied`, and a private `matchIndex`. `RaftGroup.Role` is `FOLLOWER`, `CANDIDATE`, or `LEADER`. There is no in-sync replica set yet. Messaging Core will take replica state from the HA groups (PR #29 names `commitIndex` and `durableIndex`; this tree exposes `commitIndex()` and does not yet have `durableIndex`). A partition log and the control-plane Raft group are different groups ([docs/design/control-plane.md](control-plane.md)): losing the control plane does not truncate a partition log. Architecture T4 is the data-plane shape those gauges describe: one leader per partition, followers fetch, commit is a majority, consumers see only the high watermark.
+The cluster code that exists today is `sjws_nettask.cluster.ReplicationGroup` / `RaftGroup`: `term`, `isLeader`, `commitIndex`, `lastApplied`, and a private `matchIndex`. `RaftGroup.Role` is `FOLLOWER`, `PRE_CANDIDATE`, `CANDIDATE`, or `LEADER`. There is no in-sync replica set yet. Messaging Core will take replica state from the HA groups (PR #29 names `commitIndex` and `durableIndex`; this tree exposes `commitIndex()` and does not yet have `durableIndex`). A partition log and the control-plane Raft group are different groups ([docs/design/control-plane.md](control-plane.md)): losing the control plane does not truncate a partition log. Architecture T4 is the data-plane shape those gauges describe: one leader per partition, followers fetch, commit is a majority, consumers see only the high watermark.
 
-HTTP produce and fetch through `core.Handler` is the next Messaging Core step. That handler, and `docs/design/partition-log.md`, are not in this tree yet. The latency wrappers below sit on that handler once it exists.
+HTTP produce and fetch through `core.Handler` are merged (`messaging.http.MessagingHttp`, [partition-log.md](partition-log.md)), and off by default. They call `MessagingHooks.produced` and `fetched` around each request.
 
 ## Offsets and per-group stats
 
@@ -48,7 +48,7 @@ Per-group consumer state lives on `MessagingStats` (PR #37): committed offset, i
 
 The committed offset is on `GroupStats` and is the input to `sjws_messaging_lag_offsets`. It is not its own scraped series. In-flight, DLQ depth, and oldest-pending age are the three gauges above.
 
-They are not appended to the HTTP `/metrics` page. `Partition.counts()` is the read the registry uses when messaging is on: one volatile load, no partition lock, not on the produce path beyond the republish the ledger already does after each entry.
+They are not appended to the HTTP `/metrics` page. `Partition.counts()` is the read the registry uses when messaging is on: a volatile load while nothing has changed; otherwise the first read after a change takes the partition lock briefly and rebuilds the counts (O(groups)). The produce path only marks them stale.
 
 The existing exposition has no cap on group names. The cap in [cardinality](#cardinality) is proposed for the new series. Applying that same cap to these five gauges is a follow-up for Messaging Core the next time that method changes. This doc does not change it.
 
@@ -70,13 +70,13 @@ Histogram names follow the Prometheus convention and use the `*_duration_seconds
 
 `sjws_messaging_produce_duration_seconds` — histogram.
 
-Labels: `topic`, `partition` (the partition index, rendered as a decimal).
+Labels: `topic`, `partition` (the partition index, rendered as a decimal). The hook that exists on `/messaging/v1` (`MessagingHooks.produced`) passes `topic` and `status` and no `partition`, because a plain log topic is one log.
 
-Produce path: `Partition.produce` → `LedgerWriter` queue → group write/fsync → apply → ack future. The sample starts when the batch is enqueued on `LedgerWriter` (`append` → `queue.put`) and ends when that ack future completes. That is the ack the producer waits for (`async`, `group`, `each`, or the replicated majority ack once `ReplicatedLedger` exists).
+Produce path: `Partition.produce` → `LedgerWriter` queue → apply → group write/fsync → ack future. The sample starts when the batch is enqueued on `LedgerWriter` (`append` → `queue.put`) and ends when that ack future completes. That is the ack the producer waits for (`async`, `group`, `each`, or the replicated majority ack once `ReplicatedLedger` exists).
 
 A duplicate `(producerId, seq)` that appends nothing is still one sample, in the same histogram. There is no `duplicate` label. Retries stay visible without doubling the series. A duplicate has no enqueue; its sample is the time until the already-completed future returns.
 
-When the HTTP handler in the forthcoming `docs/design/partition-log.md` becomes the public ack point, the histogram keeps this name and still times enqueue through the ack future.
+As built, the `/messaging/v1` hook (`MessagingHooks.produced`: topic, status, bytes, handler time) times the whole handler: body read, parse, append and ack wait. `Partition.produce` itself is not timed.
 
 ### Fetch latency
 
@@ -86,7 +86,7 @@ Labels: `topic`, `partition`, `group`. `group` is only on consumer series. There
 
 Fetch path: `Partition.poll(group, max, waitNanos)` → lease → ack / nack / extend. The Java method also takes `consumer` and `visibilityMs` (`poll(group, consumer, max, visibilityMs, waitNanos)`); Messaging Core's shorthand is the same call. The sample is request to response: from the poll invocation until the delivery list is returned, which includes the long-poll wait. Ack, nack, and extend are the rest of the lease and are outside this histogram.
 
-When fetch moves onto `core.Handler`, the histogram still times that request to its response.
+The `/messaging/v1` fetch hook (`MessagingHooks.fetched`: topic, status, bytes, handler time without the body send) is the first fetch timing; it covers plain log topics. The `Partition.poll` path above is not hooked, and `group` applies only to it.
 
 ### Log offsets and high watermark
 
@@ -109,7 +109,7 @@ Gauges. Labels: `topic`, `partition`. No `peer` label: each replica is scraped o
 
 | Name | Value |
 |---|---|
-| `sjws_messaging_replication_leader` | 1 when `ReplicationGroup.isLeader()` is true, otherwise 0. `CANDIDATE` and `FOLLOWER` are both 0. A role label would publish three series for a value that is almost always leader or not. |
+| `sjws_messaging_replication_leader` | 1 when `ReplicationGroup.isLeader()` is true, otherwise 0. `PRE_CANDIDATE`, `CANDIDATE` and `FOLLOWER` are all 0. A role label would publish three series for a value that is almost always leader or not. |
 | `sjws_messaging_replication_term` | `ReplicationGroup.term()` |
 | `sjws_messaging_replication_commit_offset` | `ReplicationGroup.commitIndex()`. While design §6 holds (log index and ledger position are the same), this is the committed ledger offset. On a cluster this is also the high watermark until `durableIndex` exists. |
 | `sjws_messaging_replication_applied_offset` | `ReplicationGroup.lastApplied()` |
@@ -139,17 +139,17 @@ Group overflow on the shipped lag gauges is deliberately not part of this propos
 
 ## Hook points
 
-Off means the listener is absent. The cost is the same shape as HTTP observability: the filter is not installed, so the hot path does not call `nanoTime`, does not update a bucket, and does not look at a registry.
+Off means no exporter. HTTP observability costs nothing when off (the filter is not installed, so the hot path does not call `nanoTime`, update a bucket or look at a registry). The messaging hooks cost two clock reads per `/messaging/v1` request even with no exporter, and that module is off by default.
 
-1. **Produce.** `Partition.produce` and `LedgerWriter` stay as they are. The caller that times the ack is the forthcoming `core.Handler` produce path (see `docs/design/partition-log.md`), and only when that caller was given a listener. The listener is null when metrics are off, and the call is the plain produce. When the listener is present, the wrapper reads the clock at enqueue onto the `LedgerWriter` queue and records the sample when the ack future completes, on the completion thread. `SegmentedLog` and `LedgerWriter` do not gain metric calls. A log opened by a test does not pay for them.
+1. **Produce.** `Partition.produce` and `LedgerWriter` stay as they are. The caller that times the ack is the `core.Handler` produce path (`MessagingHttp`, see [partition-log.md](partition-log.md)), which calls `MessagingHooks.produced` once the response is built. With no exporter the hooks are `MessagingHooks.NONE`, a no-op object (never null), and `MessagingHttp` still reads the clock twice per request. `SegmentedLog` and `LedgerWriter` do not gain metric calls. A log opened by a test does not pay for them.
 
-2. **Fetch.** The same wrapper around `Partition.poll`, including the waiting overload `poll(group, consumer, max, visibilityMs, waitNanos)`. The sample is request to response. The waiting poll already reads the clock for its own deadline. This proposal does not add another read inside `Partition`. The wrapper's read sits outside, and only when the listener is installed. The same wrapper moves onto `core.Handler` when HTTP fetch lands.
+2. **Fetch.** `GET /messaging/v1/topics/{t}/records` is hooked (`MessagingHooks.fetched`). A wrapper around `Partition.poll`, including the waiting overload `poll(group, consumer, max, visibilityMs, waitNanos)`, is proposed and not built. The sample is request to response. The waiting poll already reads the clock for its own deadline. This proposal does not add another read inside `Partition`. The wrapper's read sits outside, and only when the listener is installed.
 
 3. **Partition lag.** Already behind `MessagingStats.NONE` (PR #37). No new hook.
 
 4. **Offsets and high watermark.** Scrape-time only. Copy `LedgerSnapshot` (already published lock-free per committed batch) and, when a replication group is attached, `commitIndex` / `durableIndex`. The produce path does not publish these gauges. With messaging off, the families are absent from the text.
 
-5. **Replication.** The Raft thread writes a few volatiles when leadership or the commit index changes (`onLeadership`, commit advance). A scrape copies them. The produce path does not read them. With no group attached, the families are absent from the text, not a block of zeros. Replica membership waits on the HA groups.
+5. **Replication.** The Raft thread writes a few volatiles when leadership or the commit index changes (`ClusterNode.onLeaderChange`, commit advance). A scrape copies them. The produce path does not read them. With no group attached, the families are absent from the text, not a block of zeros. Replica membership waits on the HA groups.
 
 6. **`PartitionLog` and `core.Handler`.** When HTTP produce and fetch replace the direct `Partition` calls as the public ack and fetch points, the wrappers move with those handler methods. The series names do not change. Internal segment reads stay untimed.
 

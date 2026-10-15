@@ -39,7 +39,7 @@ import sjws_nettask.cluster.GroupOptions;
  * HMAC bundle and write the key mode {@code 0600}, then ACTIVATE commits. The HTTP request
  * path never calls {@link ClusterNode#append}.
  */
-public final class GenerationSync {
+public final class GenerationSync implements AutoCloseable {
 
     static final byte STAGE = 1;
     static final byte ACTIVATE = 2;
@@ -50,6 +50,12 @@ public final class GenerationSync {
     private final byte[] secret;
     private final Path keyFile;
     private final Consumer<Long> onActivate;
+    /**
+     * STAGE pulls the bundle and writes the key (IO), so it never runs in the commit callback: the callback
+     * only hands each marker to this single worker, which keeps STAGE before its ACTIVATE.
+     */
+    private final java.util.concurrent.ExecutorService worker = java.util.concurrent.Executors
+            .newSingleThreadExecutor(Thread.ofVirtual().name("ha-generation-sync").factory());
 
     public GenerationSync(ClusterNode node, GroupId group, GroupOptions options, HmacBundles bundles, byte[] secret,
             Path keyFile, Consumer<Long> onActivate) {
@@ -60,7 +66,7 @@ public final class GenerationSync {
         this.keyFile = Objects.requireNonNull(keyFile, "keyFile");
         this.onActivate = onActivate == null ? generation -> {
         } : onActivate;
-        node.openGroup(group, options, entry -> onCommitted(entry.entry()));
+        node.openGroup(group, options, entry -> handOff(entry.entry()));
     }
 
     public CompletableFuture<CommittedIndex> publishFrom(long generation, ConfigSource config, CertProvider certs)
@@ -77,9 +83,69 @@ public final class GenerationSync {
                 .append(group, List.of(ByteBuffer.wrap(marker(ACTIVATE, generation, hash)))));
     }
 
-    private void onCommitted(ByteBuffer entry) {
+    /** The commit callback: copy the marker and return; no IO here (GroupListener rules). */
+    private void handOff(ByteBuffer entry) {
         var copy = new byte[entry.remaining()];
         entry.duplicate().get(copy);
+        try {
+            worker.execute(() -> {
+                try {
+                    apply(copy);
+                } catch (RuntimeException failed) {
+                    System.getLogger(GenerationSync.class.getName()).log(System.Logger.Level.WARNING,
+                            "generation sync failed: " + failed.getMessage(), failed);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            // Closed: later markers are not applied.
+        }
+    }
+
+    /** Waits until every marker handed off so far has been applied (tests). */
+    boolean awaitApplied(java.time.Duration timeout) throws InterruptedException {
+        var done = new java.util.concurrent.CountDownLatch(1);
+        try {
+            worker.execute(done::countDown);
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            return false;
+        }
+        return done.await(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    /** How long {@link #close()} waits for markers already handed off. */
+    static final java.time.Duration CLOSE_WAIT = java.time.Duration.ofSeconds(2);
+
+    /**
+     * Stops the worker after the markers already handed off, waiting up to {@link #CLOSE_WAIT}. A STAGE still
+     * running past that is safe: the key file is written to a temp file and renamed into place atomically, so it
+     * is either the old key or the new one, never partial.
+     */
+    @Override
+    public void close() {
+        closeWithin(CLOSE_WAIT);
+    }
+
+    /** {@link #close()} with an explicit wait; true when the worker finished in time. */
+    boolean closeWithin(java.time.Duration wait) {
+        worker.shutdown();
+        try {
+            if (worker.awaitTermination(wait.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                return true;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        System.getLogger(GenerationSync.class.getName()).log(System.Logger.Level.WARNING,
+                "generation sync still applying after " + wait.toMillis() + " ms at close");
+        return false;
+    }
+
+    /** Runs {@code task} on the sync worker, after every marker handed off so far (tests). */
+    void onWorker(Runnable task) {
+        worker.execute(task);
+    }
+
+    void apply(byte[] copy) {
         if (copy.length < 1 + 8 + 32) {
             return;
         }

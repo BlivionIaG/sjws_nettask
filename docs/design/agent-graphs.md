@@ -1,6 +1,6 @@
 # Agent graphs (addendum to the agent swarm design)
 
-Status: **Draft** · Base: master `a9ebb4c` · Scope: design only. No code changes.
+Status: **Draft** · Base: master `a9ebb4c` · Scope: design only. No graph code; the retain-from pin API it asks for exists since #149.
 Owner: sjws Architecture. Messaging-facing sections (§4, §6) need **Messaging Core** review.
 Parent design: [agent-swarm.md](agent-swarm.md) (the "swarm doc"). Section numbers like "swarm §4.4" refer to it.
 
@@ -10,7 +10,7 @@ Every reference to existing code is a path and line on master `a9ebb4c`. This do
 
 Blivion's requirement: the swarm must run **agent graphs**, from a handful of agents to thousands, and from one run to thousands of concurrent runs.
 
-A *graph* is a versioned definition of steps (agent calls) and edges. A *run* is one execution of a graph version with an input. The graph layer is a **thin orchestrator on top of the swarm task model**: every step is an ordinary swarm task (swarm §4), and every run's state is an event log in the messaging ledger.
+A *graph* is a versioned definition of steps (agent calls) and edges. A *run* is one execution of a graph version with an input. The graph layer is a **thin orchestrator on top of the swarm task model**: every step is an ordinary swarm task (swarm §4), except the built-in steps listed in §2, and every run's state is an event log in the messaging ledger.
 
 **HARD RULE (inherited from swarm §1): optional and zero cost when off.**
 - The graph feature lives in a new package `sjws_nettask.swarm.graph`, loaded only when **both** `swarm.enabled` and `swarm.graphs.enabled` are true.
@@ -21,8 +21,8 @@ A *graph* is a versioned definition of steps (agent calls) and edges. A *run* is
 
 ## 2. Non-goals
 - **An agent framework or planner.** sjws does not decide *what* agents do. It executes a graph someone defined. Prompting, tool selection and LLM-driven planning stay in agents (swarm §2).
-- **Turing-complete workflows in the server.** Conditions are a small, side-effect-free expression language over step outputs (§3.4). No user code runs in the server.
-- **Unbounded loops or unbounded spawning.** Every cycle and every dynamic spawn has a hard limit (§3.3, §3.6).
+- **Turing-complete workflows in the server.** Conditions are a small, side-effect-free expression language over step outputs and run-scoped carried state (§3.4). No user code runs in the server. The runner itself executes only a fixed set of **built-in steps** (today: `select`, swarm research §5.2 P2). They are pure, seeded and versioned with the server, and their outcomes (including random draws) are recorded in the run log, where at replay the recorded outcome wins. Run-scoped **carried state** (`$.carry`, P1) changes only through a fixed set of reducers (`replace`, `append(max_len)`, `merge`, `top_k(by, k)`) under a declared schema and byte limit, so every run remains a bounded, finite-state computation.
+- **Unbounded loops or unbounded spawning.** Every cycle and every dynamic spawn has a hard limit (§3.5, §3.6): a loop edge always declares `max_iterations` even when its exit is a condition, and a map step always declares `max_items` even when its count comes from an expression or `repeat` (P3). The resolved count is recorded before spawning.
 - **Exactly-once side effects.** We give exactly-once *recorded step results* per run (§4.4). External effects remain at-least-once, as in swarm §4.4.
 - **Deterministic replay of agent code** (as Temporal does for workflow code). Agents are external and non-deterministic; we replay *recorded results*, never re-execute to rebuild state.
 - **Cross-run transactions** and **multi-node graph execution before messaging has a network protocol and replication** (swarm §4.8 gap 9).
@@ -55,7 +55,7 @@ A join records **which** predecessor results it consumed in the `StepReady` even
 
 ### 3.4 Conditional edges
 - `when:` is an expression over the JSON output of the source step and the run input, written in a **JSONPath subset** (decided §11.1; not CEL). The subset, based on [RFC 9535](https://www.rfc-editor.org/rfc/rfc9535):
-  - **Paths:** root `$` (the run context: `$.input`, `$.<stepId>` for completed step outputs), member access `.name` or `['name']`, array index `[n]` (non-negative). No wildcards, slices, recursive descent (`..`) or filter selectors, so every path selects at most one value.
+  - **Paths:** root `$` (the run context: `$.input`, `$.<stepId>` for completed step outputs, `$.carry` for run-scoped carried state, P1 in swarm research §5.2), member access `.name` or `['name']`, array index `[n]` (non-negative). No wildcards, slices, recursive descent (`..`) or filter selectors, so every path selects at most one value.
   - **Literals:** strings, numbers, `true`, `false`, `null`.
   - **Operators:** `== != < <= > >=`, `&&`, `||`, `!`, parentheses, `in` (value in a literal list), and the one function `len(path)` (string, array or object size).
   - **Missing values:** a path that does not resolve yields `null`; comparisons with `null` other than `==`/`!=` are false.
@@ -81,7 +81,7 @@ A join records **which** predecessor results it consumed in the `StepReady` even
 | Graph concept | Swarm / messaging primitive |
 |---|---|
 | Step instance dispatch | A normal swarm task on `tasks.<service>` via `TaskService.submit(pool, producerId, seq, envelope)` (`src/sjws_nettask/swarm/TaskService.java:77`). Workers do not know they are in a graph. |
-| Step result | The worker's normal fenced reply-then-ack, `TaskService.reply(...)` (`TaskService.java:206`), whose `replyTo` is the run's **shard topic** instead of a reply topic. Workers write results **directly** into the shard topic, with no runner copy (decided §11.3). The envelope already carries `replyTo` (`TaskEnvelope.java:93`). |
+| Step result | The worker's normal reply-then-fenced-ack, `TaskService.reply(...)` (`TaskService.java:206`; only the ack is fenced, the reply is written first), whose `replyTo` is the run's **shard topic** instead of a reply topic. Workers write results **directly** into the shard topic, with no runner copy (decided §11.3). The envelope already carries `replyTo` (`TaskEnvelope.java:93`). |
 | Run event log | Topic `graph.runs.<shard>`, `shard = hash(runId) mod S`. One shard = one `Partition` (`messaging/delivery/Partition.java:52`) opened through `swarm.Topics.partition` (`swarm/Topics.java:52`). Multi-partition topics are a messaging GAP (swarm §4.8 gap 5), so sharding is by topic name until they exist. |
 | Step identity | `stepInstanceId = stepId[#iteration][/mapIndex]`, deterministic from the graph and the recorded run state. |
 | Idempotency key | `(runId, stepInstanceId, stepAttempt)` in the envelope `taskId` field (16 B: a hash of the triple) and, for LLM calls, in the `Idempotency-Key` header (swarm §10.2). |
@@ -92,7 +92,7 @@ A join records **which** predecessor results it consumed in the `StepReady` even
 ### 4.2 Durable per-run state: event-sourced in the ledger
 Each shard topic is the **source of truth**. Events, all keyed by `runId`:
 
-`RunStarted{graph@version, input-ref, deadline, budget, traceparent}` · `StepReady{stepInstanceId, consumedResults[]}` · `StepDispatched{stepInstanceId, stepAttempt, taskId, pool, offset}` · `StepResult{stepInstanceId, stepAttempt, status, output-ref, usage}` · `EdgeDecided{from, to, taken}` · `Spawned{stepInstanceId, n}` · `StepCancelled` · `RunCheckpoint{...}` · `RunFinished{status, output-ref}`.
+`RunStarted{graph@version, input-ref, deadline, budget, traceparent}` · `StepReady{stepInstanceId, consumedResults[]}` · `StepDispatched{stepInstanceId, stepAttempt, taskId, pool, offset}` · `StepResult{stepInstanceId, stepAttempt, status, output-ref, usage}` · `EdgeDecided{from, to, taken}` · `Spawned{stepInstanceId, n}` · `StepCancelled` · `CarryUpdated{digest}` · `Selected{kept, dropped, draws}` · `RunCheckpoint{...}` · `RunFinished{status, output-ref}`.
 
 - Payloads above the 1 MiB inline limit go by reference to the swarm-owned blob store (swarm §5.2, §16 item 2).
 - **One topic per shard, one total order** (decided §11.3): decisions and results share the shard partition, so replay picks the same accepted result (§4.4 point 2), with one snapshot, one retention low watermark and one `poll` loop. If result volume starves the runner (visible as runner group lag in `MessagingStats`), the fix is more shards, not more topics per shard. Workers that are not trusted to write run history are excluded through `AgentPolicy` rights, not by adding a reply topic.
@@ -100,7 +100,7 @@ Each shard topic is the **source of truth**. Events, all keyed by `runId`:
 - Prior art: event-sourced workflow history in [Temporal](https://docs.temporal.io/workflow-execution/event); the difference (§2) is that we record decisions too, so no workflow code is replayed.
 
 ### 4.3 Checkpoints and resume
-- The runner keeps an in-memory table `runId → RunState` for runs in its shard. Every `K` events or `T` ms (operator-tuned; no values fixed here) it writes a `RunCheckpoint` containing the compact state of all active runs in the shard plus the shard offset it covers, and the runner's producer `seq`.
+- The runner keeps an in-memory table `runId → RunState` for runs in its shard. Every `K` events or `T` ms (operator-tuned; no values fixed here) it writes a `RunCheckpoint` containing the compact state of all active runs in the shard plus the shard offset it covers, and the runner's producer `seq`. Carried state (`$.carry`, P1) is part of `RunState`, so it is included in `RunCheckpoint`.
 - This is a per-shard snapshot of an event-sourced log, similar in spirit to [Flink's checkpoints](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/#checkpointing) (state + source offset), but trivially consistent because one thread owns the shard. Messaging's own snapshots (#69) keep the partition recovery bounded underneath.
 - **Resume after failure** (process crash, node restart): open shard, read the last `RunCheckpoint`, replay events after its offset, rebuild `RunState`. Then reconcile in-flight steps: a `StepDispatched` without `StepResult` is still a live task in `tasks.<pool>` (it survives in its own partition), so the runner just waits, with the step timeout (§6.2) as the backstop. Nothing is re-dispatched merely because the runner restarted.
 - **Retention** (decided §11.3). History below a checkpoint can be freed while runs are active, under these rules:
@@ -108,7 +108,7 @@ Each shard topic is the **source of truth**. Events, all keyed by `runId`:
   - The runner exposes the floor to messaging as an **explicit "retain from" pin**, not via consumer-group commit timing. The runner group's committed offset already pins the delivery low watermark (`RetentionPolicy`), so unconsumed results are never lost.
   - Order: partition snapshot (#69) at or above the checkpoint offset, then the checkpoint, then retention. Retention never deletes at or above the newest snapshot, so recovery cannot replay into a gap.
   - Finished-run history for the TUI and tracing (§6.3) is a time floor (`keepResolvedMs`), applied only below the checkpoint floor.
-  - The retain-from pin is a messaging API addition (Messaging Core); it does not exist on master.
+  - The retain-from pin exists on master: `Partition.retainFrom(owner, offset)`, `releaseRetain(owner)`, `retainFloor()` and `retainPins()` (`messaging/delivery/Partition.java`). Pins are durable (`retain-from.pins`), and `maintain()` never deletes or compacts at or above the lowest pin.
 
 ### 4.4 Exactly-once step results (and what it does not mean)
 Guarantee: **for each `(runId, stepInstanceId)`, the run state records exactly one accepted result, and downstream steps see only that result.**
@@ -129,8 +129,8 @@ How:
 ### 5.1 Partitioning and no global locks
 - Runs are partitioned by `runId` into `S` shards; each shard has one runner thread (a virtual thread blocking on `Partition.poll(..., waitNanos)`, `Partition.java:262`, from #99). Runs never move between shards, so a run's state is touched by one thread only: **no locks on run state**.
 - The only shared structures are per-shard (the shard `Partition`, which has its own `ReentrantLock`, `Partition.java:65`) and per-pool (`tasks.<pool>`). There is no global lock and no global counter on the dispatch path. Budget counters are striped (§5.4).
-- Worker side is unchanged: thousands of agents are thousands of consumers on pools, each claiming via `TaskService.claim` (`TaskService.java:89-94`) and heartbeating through the batched `LeaseKeeper` (`swarm/LeaseKeeper.java:41`, `:117`).
-- Pool contention is the current limit, not the graph layer: 16-worker claim p99 is **458 µs after #103** (measured by Messaging Core) against the S1c target of < 100 µs. Graphs that fan out to one pool inherit that until the S1c gate is met; multi-partition pools (gap 5) are the scale-out path.
+- Worker side is unchanged: thousands of agents are thousands of consumers on pools, each claiming via `TaskService.claim` (`TaskService.java:89-94`) and heartbeating with `:extend` (one lease per call over HTTP; the batched `LeaseKeeper`, `swarm/LeaseKeeper.java:41`, serves in-process workers only).
+- Pool contention was the limit when measured, not the graph layer: 16-worker claim p99 was **458 µs after #103** (measured by Messaging Core; a stress line since 2026-10-14, the S1c gate runs workers = vCPU count, swarm §13). Graphs that fan out to one pool inherit the pool's claim latency; sharded pools (`sjws.swarm.pool.shards`, swarm §5.1) are the scale-out path.
 - Shard count `S` is **fixed per deployment** (decided §11.1); changing it requires draining. Online resharding is deferred and not scheduled in G0–G5.
 - Multi-node: shards are assigned to broker nodes by the CP once messaging replicates (gap 9). Until then, graphs are single-node, like the rest of the swarm.
 
@@ -219,7 +219,7 @@ await run.cancel()
 Agents serving steps use the existing `s.serve(...)` unchanged; step metadata (`runId`, `stepInstanceId`, `stepAttempt`, idempotency key) is exposed on the task object.
 
 ### 7.3 HTTP surface (on the `/swarm/v1` mount)
-Added to the swarm handler mounted through `HandlerContributor` (PR #101; `SwarmModule`, `swarm/SwarmModule.java`), under `/swarm/v1/graphs/...` and `/swarm/v1/runs/...`: start, get, events (SSE / binary frames per swarm §11.2), cancel. When graphs are off these paths return `404` from the swarm handler without loading graph classes (`SwarmHttp`, `swarm/SwarmHttp.java:77`, dispatches by path; a graph prefix is delegated to a lazily loaded handler only when enabled).
+Added to the swarm handler mounted through `HandlerContributor` (PR #101; `SwarmModule`, `swarm/SwarmModule.java`), under `/swarm/v1/graphs/...` and `/swarm/v1/runs/...`: start, get, events (SSE / binary frames per swarm §11.2), cancel. When graphs are off, an authenticated POST to these paths returns `404` from the swarm handler without loading graph classes (`SwarmHttp`, `swarm/SwarmHttp.java:77`, authenticates, then dispatches by path; the GET paths need the handler to accept GET first; a graph prefix is delegated to a lazily loaded handler only when enabled).
 
 ### 7.4 Versioning
 - `name@version` is immutable. Publishing a changed definition requires a new version.
@@ -237,7 +237,7 @@ Added to the swarm handler mounted through `HandlerContributor` (PR #101; `Swarm
 ## 8. Module boundaries and the zero-cost check
 - `sjws_nettask.swarm.graph` may depend on `swarm`, `swarm.wire`, `messaging.*`, `routing.GcraTable`, `observe`, `core`. Nothing outside `swarm.graph` imports it except one lazy, string-named hook in `SwarmModule` (the same pattern as `OptionalModules.SWARM_CLASS`, `src/sjws_nettask/OptionalModules.java:39`).
 - **Dependency test:** extend the swarm guard (swarm §3.3 item 1) so no file in `swarm` (outside `swarm.graph`) or any core package contains `sjws_nettask.swarm.graph`, except that hook's string constant.
-- **Class-load test:** clone `tests/sjws_nettask/swarm/ClassLoadTest.java` (it asserts `assertFalse(text.contains(SWARM))` at `:57`) to assert that `sjws_nettask.swarm.graph.` is absent (a) with the swarm off, (b) with the swarm on and graphs off, in standalone and in `data`/`gateway` mode (as `tests/sjws_nettask/swarm/RoleClassLoadTest.java`).
+- **Class-load test:** clone `tests/sjws_nettask/swarm/ClassLoadTest.java` (it asserts `assertFalse(text.contains(SWARM))` at `:57`) to assert that `sjws_nettask.swarm.graph.` is absent (a) with the swarm off, (b) with the swarm on and graphs off, in standalone and in `data`/`gateway` mode (as `tests/sjws_nettask/swarm/RoleClassLoadTest.java`). With graphs on and research mode off, the P1–P3 classes (G2b) load, but no `swarm.graph.research.*` class may load.
 - **Off-mode wrk A/B** (§12, item 4).
 
 ## 9. Phases (fit with S2+)
@@ -246,8 +246,9 @@ Added to the swarm handler mounted through `HandlerContributor` (PR #101; `Swarm
 | Phase | Deliverable | Depends on | Exit criteria |
 |---|---|---|---|
 | **G0** | This doc approved; JSON Schema for graph docs; dependency + class-load guards for `swarm.graph` (empty package, lazy hook) | S1c gate; Blivion approval | Guards green; off-mode wrk A/B within A/A band |
-| **G1** | Single-node runner, `S = 1..n` shards: static DAG, `all` join, event log + checkpoints + resume, step retries/timeouts, runner-side result fencing, idempotency key, run start/get/cancel API, local-directory graph loading | S2 (`LeaseKeeper` + `extend`, cancellation, trace propagation) | Crash-resume tests (kill runner at every event type, results identical); stale-result fencing test; duplicate-submit test; per-hop latency and 1k fan-out targets (§12) met or recorded |
+| **G1** | Single-node runner, `S = 1..n` shards: static DAG, `all` join, event log + checkpoints + resume, step retries/timeouts, runner-side result fencing, idempotency key, run start/get/cancel API, local-directory graph loading | S1 (`LeaseKeeper` + `extend`); S2 (cancellation, trace propagation) | Crash-resume tests (kill runner at every event type, results identical); stale-result fencing test; duplicate-submit test; per-hop latency and 1k fan-out targets (§12) met or recorded |
 | **G2** | Conditional edges (JSONPath subset, §3.4), `any`/`quorum`, bounded loops, map steps, subgraphs, deadline inheritance, recursive cancel, per-edge spans | G1 | Loop-bound and spawn-bound tests; join race replay test; cancellation reaches all descendants within one runner tick; trace for a 3-level subgraph |
+| **G2b** | P1–P3 as general graph features ([swarm research mode](swarm-research-mode.md) §5.2): P1 loop-carried state (`$.carry`, reducers), P2 built-in `select` step, P3 dynamic counts | G2 | Class-load check (§8): P1–P3 load with graphs on and research off, `swarm.graph.research.*` does not |
 | **G3** | Budgets per run and **per-graph window** on `BudgetLedger`, GCRA run admission, backpressure (lag-based), Python SDK builder + run API, `GraphDocument` in the CP (signed, versioned, pinned runs), `GRAPH_PUBLISH` | S2 (`BudgetLedger`, `AgentPolicy`) ; CP document plumbing | Budget overshoot within swarm §8 bound per scope; 10k concurrent-run target (§12) met or recorded; version pinning test across a publish |
 | **G4** | Agent-requested spawn (deferred here from the model; map steps only before G4); TUI run view; OTLP export of run/edge spans | G3; S4 (OTLP exporter) | Spawn limits tests; TUI drill-down |
 | **G5** | Multi-node: shard assignment by the CP, shard failover | Messaging network protocol + replication (swarm §4.8 gap 9); HA | Shard failover test without lost or duplicated accepted results |
@@ -255,7 +256,7 @@ Added to the swarm handler mounted through `HandlerContributor` (PR #101; `Swarm
 ## 10. Risks
 | Risk | Mitigation |
 |---|---|
-| Pool claim contention dominates large fan-outs (458 µs p99 today, §5.1) | S1c gate before G0; `concurrency` per map step; multi-partition pools (gap 5) |
+| Pool claim contention dominates large fan-outs (458 µs p99 when measured, §5.1) | S1c gate before G0; `concurrency` per map step; sharded pools (`sjws.swarm.pool.shards`) |
 | Runner shard becomes a hotspot (one hot graph) | Shard by `runId`, not graph; `max_active_runs_per_shard`; per-graph GCRA |
 | Shard log grows with long runs | Checkpoints + retention (§4.3); outputs by reference |
 | Duplicate external effects | Idempotency key per step attempt; stated caveat (§4.4) |
@@ -280,7 +281,7 @@ No inceptor/Blivion questions remain open.
 None. Messaging Core answered every question (Messaging Core, [#111 review](https://github.com/BlivionIaG/sjws_nettask/pull/111#pullrequestreview-5503546631)); see §11.3.
 
 ### 11.3 Decided (2026-10-13, Messaging Core)
-1. **Results:** workers write results directly into the run's shard topic; the fenced reply-then-ack path (`TaskService.reply`) works unchanged with `replyTo` set to the shard topic. This saves one append and one runner copy per step. Untrusted workers are excluded through rights, not topology (§4.1, §4.2).
+1. **Results:** workers write results directly into the run's shard topic; the reply-then-fenced-ack path (`TaskService.reply`) works unchanged with `replyTo` set to the shard topic. This saves one append and one runner copy per step. Untrusted workers are excluded through rights, not topology (§4.1, §4.2).
 2. **Topics:** one topic per shard for decisions and results, giving a single total order; split only if runner group lag shows starvation, and then add shards (§4.2).
 3. **Producer-id expiry:** on idle time, `> max_run_duration + max step timeout + clock-skew margin`, evaluated from ledger timestamps; runner producer ids are stable per shard (§4.1, §4.4).
 4. **Lag polling:** cheap (about 2.6 µs, measured by Messaging Core); read `lagMessages` from the published snapshot, not `counts()`, rate-limited to about once per ms or per poll batch (§5.3).
@@ -290,7 +291,7 @@ None. Messaging Core answered every question (Messaging Core, [#111 review](http
 All runs follow swarm §13 methodology: machine and commit reported, ≥ 5 alternating runs, mean ± stddev, load generator and server pinned to disjoint CPUs.
 
 **Known numbers (measured by others, not by this doc):**
-- 16-worker claim p99 **458 µs** after #103 (Messaging Core).
+- 16-worker claim p99 **458 µs** after #103 (Messaging Core; a stress line since 2026-10-14).
 - Request/reply p99 **about 409–882 µs** depending on load, after #105/#108 (Messaging Core / Architecture S1c runs).
 - S1c gate **targets**: claim p99 < 100 µs, request/reply p99 < 500 µs (swarm §13; inceptor).
 

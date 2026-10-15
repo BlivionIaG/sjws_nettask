@@ -21,7 +21,29 @@ transports behind `core.Handler`; it gets its own doc), the admin TUI itself, an
   low watermark). Exclusive per-partition assignment within a group, so order is preserved.
 - **Message states** (per group): `ENQUEUED → IN_FLIGHT → ACKED`, with
   `IN_FLIGHT → ENQUEUED` on nack/visibility timeout (attempts+1) and
-  `→ DEAD_LETTERED` once `attempts > maxDeliveries` or on an explicit reject.
+  `→ DEAD_LETTERED` once it has been delivered `maxAttempts` times and is nacked or its lease expires, or on an explicit reject.
+
+```mermaid
+stateDiagram-v2
+    [*] --> ENQUEUED: produce
+    ENQUEUED --> IN_FLIGHT: poll leases it to a consumer
+    IN_FLIGHT --> ACKED: ack
+    IN_FLIGHT --> ENQUEUED: nack
+    IN_FLIGHT --> IN_FLIGHT: extend, or expiry redelivery
+    IN_FLIGHT --> DEAD_LETTERED: reject, or max attempts
+    ACKED --> [*]
+    DEAD_LETTERED --> [*]
+
+    note right of ENQUEUED: redelivered after its backoff,<br/>or the nack's delay if longer,<br/>attempt + 1
+    note right of DEAD_LETTERED: copied to the topic.dlq partition first, if the topic has one
+```
+
+This is what `messaging.delivery.Partition` implements today. A settle (ack, nack, reject, extend) carries
+the attempt it was leased under, and an older attempt is refused as `STALE_ATTEMPT` (`NOT_IN_FLIGHT` once the
+message is no longer in flight). `extend` keeps the
+attempt and moves the lease deadline. A lease expires lazily: nothing fires at the deadline, and the next
+poll of the group redelivers it as attempt + 1 once the deadline plus the backoff has passed, or
+dead-letters it when it has used `maxAttempts`.
 
 ## 2. Durable ledger
 Every non-acked message and each of its state transitions is durable before it is
@@ -29,19 +51,19 @@ acknowledged to the caller.
 
 ### 2.1 Layout (per partition directory)
 ```
-p-0007/
+<topic>/
   00000000000000000000.log   # append-only segment (<baseOffset:020d>.log, 1 GiB default, per PR #16 T3)
-  00000000000000000000.index # sparse relative offset -> file position (every 4 KiB)
-  state.snap                 # snapshot of the ledger state machine (+ covered index)
-  MANIFEST                   # active segments + snapshot; updated by atomic rename
+  00000000000000000000.index # sparse relative offset -> file position (every 4 KiB), written when a segment is sealed
+  state-00000000000000000000.snap  # snapshot of the delivery state, named by offset; the newest two are kept
+  retain-from.pins           # only while a retain-from pin is set
 ```
-Record types: `ENQUEUE(offset,msg)`, `DELIVER(group,offset,consumer,deadline,attempt)`,
-`ACK(group,offset|range)`, `NACK(group,offset)`, `DLQ(group,offset,reason)`,
-`OFFSET_COMMIT(group,offset)`. Messages and their state transitions share one ordered log, so the
+Record types: `ENQUEUE(producerId,seq,ts,origin…,payload)`, `SUBSCRIBE(group,fromOffset)`,
+`DELIVER(group,offset,consumer,deadline,attempt)`, `EXTEND(group,deadline,offsets,attempts)`,
+`ACK(group,offset)`, `NACK(group,offset,notBefore)`, `DLQ(group,offset,reason)`. Messages and their state transitions share one ordered log, so the
 log defines the state exactly. Framing follows PR #16 T3: records are grouped in batches
-`[len:int][crc32c:int][baseOffset:long][count][timestamp][producerId][producerSeq][records…]`;
+`[len:int][crc32c:int][baseOffset:long][count:int][timestampMs:long] count×([recLen:int][bytes])`;
 the CRC32C covers the batch. Batches are the unit of write, fsync, replication and fetch
-(disk format = wire format, see §10.5). Segments roll at 1 GiB (configurable) and are preallocated.
+(disk format = wire format, see §10.5). Segments roll at 1 GiB (configurable); they are not preallocated.
 
 ### 2.2 Group commit / fsync
 - One dedicated **platform thread** per partition writer (PR #16 T1: blocking file I/O must not pin
@@ -50,11 +72,11 @@ the CRC32C covers the batch. Batches are the unit of write, fsync, replication a
   `force(false)` (fdatasync) continuously, off the ack path, and advances `durableOffset`. The ledger
   therefore records **every** enqueued and undelivered message durably (lagging at most one fsync behind
   the ack), without fsync latency on the default ack (decision by Blivion, 2026-10-12).
-- The batch closes on `maxBatchBytes` (256 KiB), `maxBatchDelay` (200 µs) or an idle queue, whichever comes first.
+- A group closes at `maxGroupBytes` (4 MiB), after `lingerNanos` (0 by default) or on an idle queue, whichever comes first.
   Under load this amortizes fsync across thousands of records; when idle, latency is about one fsync.
   Measured in PR #16 §B2: one fsync ≈ 0.5 ms, so per-record fsync (`each`) caps at ~1.7k rec/s,
   while `group` reaches 48.6k rec/s at p50 1.12 ms / p99 4.95 ms with 64 producers. The linger
-  (`maxBatchDelay`) is PR #16's proposed "later option", which addresses the 1-producer case (1.7k rec/s).
+  (`lingerNanos`, set only in benchmarks and tests) is PR #16's proposed "later option", which addresses the 1-producer case (1.7k rec/s).
 - Local durability modes (implemented in PR #21 `messaging.ledger.Durability`), selectable **per topic
   and per append (producer)**:
   - `async` (**default**): ack after write(2); background group fsync. PR #21 bench: 288k rec/s, p50 171 µs at 64 producers.
@@ -65,26 +87,49 @@ the CRC32C covers the batch. Batches are the unit of write, fsync, replication a
   replica fsyncing in the background. **Quorum + fsync (`strict`) is opt-in per topic or per producer**
   (§6, req. 2). See §2.6 for what each mode can lose.
 
+The local write path, as `messaging.ledger.LedgerWriter` implements it:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant W as ledger-writer<br/>thread
+    participant L as SegmentedLog
+    participant S as ledger-syncer<br/>thread
+
+    P->>W: append(batch)
+    Note over P,W: bounded queue, 65,536 entries:<br/>the producer blocks while it is full
+    W->>L: write the drained group
+    alt NONE or ASYNC, the default
+        W-->>P: ack after the write
+    else GROUP or EACH
+        W-->>P: ack once an fsync covers it
+        Note over W,S: W fsyncs inline if its default is GROUP<br/>or EACH. Otherwise S does it
+    end
+    S->>L: force(false)
+    Note left of S: S runs when an ASYNC writer<br/>is dirty or an append waits for<br/>an fsync. W wakes it after every<br/>write, except on an EACH writer.<br/>Then durableOffset advances and<br/>a LedgerSnapshot is published
+```
+
 ### 2.3 In-memory state machine
-Per partition and group: `nextOffset`, `committedOffset`, an in-flight map backed by a deadline
-min-heap, a redelivery queue, and per-state counters. Payloads are not held in memory; they are
-read back from segments (page cache) via the index.
+Per partition and group: `nextOffset`, `committedOffset`, an in-flight map with a deadline-ordered
+set, a retry map, and per-state counters. Payloads are kept only for recent messages (a ring bounded by
+`payloadCacheBytes`, 64 MiB by default, trimmed once every group has settled them); older ones are read back from
+segments (page cache) via the index.
 
 ### 2.4 Crash recovery (exact replay)
-1. Load `MANIFEST` and `state.snap`.
-2. Replay records after the snapshot index deterministically.
-3. Truncate the tail at the first bad length or CRC (torn write). In replicated mode,
+1. Open the segments; this truncates the tail at the first bad length or CRC (torn write).
+2. Load the newest valid `state-<offset>.snap` (falling back to an older one).
+3. Replay records after the snapshot deterministically. In replicated mode,
    reconcile with the group's committed index (§6).
-4. Expired `IN_FLIGHT` messages go back to `ENQUEUED` (at-least-once).
+4. Leases in flight keep their deadlines; the next poll redelivers the expired ones (at-least-once).
 Invariant: `state(replay(log)) == pre-crash state` for every fsynced prefix (process crashes keep the
 page cache, so after SIGKILL that means every write; PR #21's crash test checks it). This is
-property-tested with a fault-injecting `FileChannel` that kills the process at arbitrary byte offsets.
+tested by cutting the log at every byte, random tail corruption, and kill -9 of a child JVM.
 
 ### 2.5 Retention, truncation, compaction
-- Partition low watermark = min(group committed offsets, oldest non-acked or DLQ'd entry).
+- Partition low watermark = min(oldest retained snapshot, oldest message not yet resolved by every group (a dead letter counts), lowest retain-from pin).
   A segment entirely below it *and* covered by a snapshot is deleted.
-- Background compaction rewrites mostly-acked segments, keeping live records only, and swaps them in via `MANIFEST`.
-- The DLQ is a topic (`<topic>.dlq`) with the original offset, reason and attempts in its headers.
+- `Partition.maintain()` rewrites sealed segments that a snapshot covers but a few live messages pin, keeping only those records, and swaps them in through a `.cmp` file and a `.compacted` marker. Nothing schedules it yet.
+- The DLQ is a topic (`<topic>.dlq`) with the original offset, reason and attempts in the origin fields of its ENQUEUE record.
 
 ### 2.6 Crash-loss window
 What an **acked** message can lose, by mode. "Unsynced window" W = records written but not yet fsynced
@@ -113,8 +158,8 @@ Notes:
 ## 3. Delivery, redelivery, DLQ
 - `poll(group, consumer, max, visibilityTimeout)` writes `DELIVER` records;
   `ack(group, offsets)`, `nack(group, offset, delay?)`, `reject(group, offset)`.
-- A timer wheel expires in-flight messages; backoff = `min(base·2^attempt, max)` (existing `Backoff`).
-- Optional `orderedByKey`: a redelivered message blocks later messages with the same key.
+- A lease expires lazily: the next poll redelivers it once its deadline plus the backoff `min(base·2^(attempt-1), max)` (`RetryPolicy.backoffMs`) has passed.
+- `orderedByKey` is not built (the ledger entry has no key).
 - At-least-once; producer idempotency `(producerId, seq)` dedups retried appends within a window.
 - **Topics without a DLQ.** `Partition.open(..., deadLetterQueue = false)` opens a
   topic with no `<topic>.dlq` partition (the control plane's `dlq.enabled: false` is meant to map to it): no directory and no writer, syncer or snapshotter threads for it. A message
@@ -133,8 +178,9 @@ Read-only, served from in-memory state and segments, with no locks on the hot pa
   `{offset, state, attempts, consumer, deadline, enqueuedAt, size, headers}`.
 - `get(topic, partition, offset)`: the message and its full state history.
 - Audited admin mutations, written to the ledger: requeue from the DLQ, purge, reset offset.
-Exposed as Java `messaging.Inspector` and as JSON at `/_admin/messaging/...` behind the
-rights decorator; metrics go to the observability `MetricsSink`. Proposed series names
+Exposed as Java `messaging.delivery.LedgerInspector` (counts and paged items) and
+`messaging.stats.PartitionStatsRegistry` (Prometheus text). The JSON admin endpoint, `get`, the histograms and the
+audited mutations are not built. Proposed series names
 (produce and fetch latency, log-end / durable / unsynced / high-watermark gauges, replication
 status) and the cardinality caps are in
 [docs/design/messaging-metrics.md](../design/messaging-metrics.md). Those names are not stable.
@@ -145,6 +191,38 @@ The lag gauges already rendered by `PartitionStatsRegistry` are listed there as 
 `sjws_nettask.messaging`: `Broker`, `Partition`, `Ledger`, `Segment`, `SegmentIndex`,
 `GroupCommitWriter`, `LedgerStateMachine`, `Snapshotter`, `RedeliveryTimer`, `Inspector`,
 `ReplicatedLedger` (cluster adapter; a `LocalOnly` implementation until the cluster layer lands).
+
+The list above is the original plan. Some names changed when the code was written. This is what exists
+(solid) and what the rest of the design still needs (dashed). Two modules reach it, both opt-in and off by
+default: the messaging HTTP module (`sjws.messaging.enabled`), which logs plain topics without a `Partition`,
+and the swarm (`sjws.swarm.enabled`), the only production user of `Partition`:
+
+```mermaid
+flowchart LR
+    mh["messaging.http:<br/>MessagingModule, with the<br/>retention timer, and<br/>MessagingHttp at<br/>/messaging/v1"]
+    sh["swarm: SwarmHttp,<br/>TaskService and Topics<br/>at /swarm/v1"]
+    br["Broker and native binary<br/>protocol"]
+    tools["delivery.LedgerInspector<br/>and messaging.stats:<br/>only tests and a bench<br/>call them"]
+    rep["Replication through the<br/>cluster layer"]
+    lt["messaging.http.LogTopics:<br/>one log and writer per<br/>topic, enforceRetention"]
+    part["delivery.Partition:<br/>produce, poll, extend,<br/>ack, nack, reject,<br/>snapshots, maintain<br/>(nothing schedules it)"]
+    ds["delivery.DeliveryState:<br/>cursor, leases, retries,<br/>dead letters, dedup"]
+    dlq["Partition for topic.dlq:<br/>dead-lettered copies"]
+    led["ledger.LedgerWriter and<br/>SegmentedLog: writer<br/>thread, group commit,<br/>syncer, segments,<br/>recovery, compaction"]
+
+    mh --> lt
+    lt --> led
+    sh --> part
+    br -.-> part
+    tools --> part
+    part --> ds
+    part --> dlq
+    part --> led
+    rep -.-> led
+
+    classDef design stroke-dasharray: 5 5
+    class br,rep design
+```
 
 ## 6. Replication via the cluster layer
 One replication group per partition. PR #16 T4 proposes Raft for metadata plus Kafka-style
@@ -168,22 +246,21 @@ log and the ledger may share segments (log index == ledger position), so each en
    batched cross-group frames), scaling to thousands of groups per node.
 5. **Snapshot + log truncation** past acked/snapshotted indexes; snapshot install for
    lagging or new replicas; compaction-aware snapshots.
-6. **Assumed API**:
+6. **API** (as in `cluster.ClusterNode`):
    ```java
-   CompletableFuture<Long> append(GroupId g, List<ByteBuffer> batch);             // -> committed index (group default durability)
-   CompletableFuture<Long> append(GroupId g, List<ByteBuffer> batch, Durability d); // per-append override (per producer)
-   void onCommitted(GroupId g, CommittedEntryCallback cb);            // in-order apply
-   void onLeadership(GroupId g, Consumer<LeadershipEvent> l);         // gained/lost + term
-   void snapshotHooks(GroupId g, SnapshotTaker take, SnapshotInstaller install);
-   void truncateBefore(GroupId g, long index);
+   CompletableFuture<CommittedIndex> append(GroupId g, List<ByteBuffer> batch);           // group default durability
+   ReplicationGroup openGroup(GroupId g, GroupOptions options, GroupListener listener); // in-order onCommitted
+   void onLeaderChange(GroupId g, BiConsumer<Long, Optional<NodeId>> listener);          // term + leader
+   SnapshotControl snapshots(GroupId g);                       // take / install / truncateAndCompact
    ```
-   Membership and quorum come from HA (`Membership`, `QuorumPolicy`). Fencing: a deposed leader
+   Still missing for requirement 2: a per-append durability override (`append(g, batch, durability)`) and a per-group
+   durable index. Membership and quorum come from HA (`Membership`, `QuorumPolicy`). Fencing: a deposed leader
    fails pending futures and stops serving before the new term's lease starts.
 
 ## 7. Benchmark plan
-JMH for components plus a load generator (`tests/bench/`), run on NVMe and on a cloud volume, with results kept as CSV.
+Plain Java harnesses in `bench/` (no JMH) plus a load generator, run on NVMe and on a cloud volume, with results kept as CSV.
 - Raw fsync cost (`force(false)`) for 4 KiB–1 MiB writes, preallocated vs not.
-- Group commit: throughput and p50/p99/p999 vs `maxBatchDelay` {0, 50, 200, 1000 µs} ×
+- Group commit: throughput and p50/p99/p999 vs `lingerNanos` {0, 50, 200, 1000 µs} ×
   producers {1, 8, 64} × size {100 B, 1 KiB, 16 KiB}.
 - End-to-end produce→consume→ack latency and redelivery overhead.
 - Recovery time vs log size and snapshot interval.
@@ -193,11 +270,11 @@ within 10 % of `LogBench` `group` (PR #16 phase 2 exit criterion), i.e. ≥ ~44k
 for 256 B payloads with p99 ≤ ~5.5 ms on that VM. NVMe targets are set after measuring. Recovery ≤ 1 s per GiB of un-snapshotted log.
 
 ## 8. Implementation plan (separate PRs)
-1. Segments, `GroupCommitWriter`, torn-write recovery; fault-injection tests.
-2. `LedgerStateMachine` (states, offsets, redelivery, DLQ) and snapshots; property tests.
-3. `Broker` API, `Inspector` and the admin endpoint; benchmarks.
-4. Retention, truncation and compaction.
-5. `ReplicatedLedger` on the HA cluster layer.
+1. (done) Segments, `GroupCommitWriter` (as `LedgerWriter`), torn-write recovery; fault-injection tests.
+2. (done) `LedgerStateMachine` (states, offsets, redelivery, DLQ) and snapshots; property tests.
+3. (partial: the inspection API only) `Broker` API, `Inspector` and the admin endpoint; benchmarks.
+4. (done; `maintain()` is not scheduled) Retention, truncation and compaction.
+5. (open) `ReplicatedLedger` on the HA cluster layer.
 
 
 ## 9. Remaining open questions
@@ -236,4 +313,4 @@ for 256 B payloads with p99 ≤ ~5.5 ms on that VM. NVMe targets are set after m
    stored exactly as produced on the wire (after the leader assigns the base offset and
    validates the CRC32C), which enables sendfile fetch for consumers and followers (PR #16 T1) and one
    fsync per batch. State records (DELIVER/ACK…) use the same batch framing with a record-type field.
-   Upgrades use a batch `magic`/version byte; old segments stay readable.
+   A batch version byte is not in the format yet.

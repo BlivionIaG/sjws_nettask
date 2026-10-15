@@ -45,6 +45,25 @@ public interface ClusterNode extends AutoCloseable {
      */
     CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
 
+    /**
+     * As {@link #append(GroupId, List)} with a per-batch durability. {@code null} uses the group's
+     * {@link GroupOptions#durability()}. A STRICT batch in a RELAXED group completes only once the
+     * leader and every data copy counted toward its commit have fsynced it (two data disks in the
+     * two-data-node-plus-witness group); RELAXED batches around it keep acking from memory. A RELAXED
+     * override in a STRICT group is still STRICT: a group never weakens below its option. Committing
+     * a later index commits earlier ones, so a RELAXED batch behind a pending STRICT one waits for it.
+     * The default implementation cannot honour an override, so it delegates {@code null} and fails
+     * the future with {@link UnsupportedOperationException} otherwise.
+     */
+    default CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability) {
+        if (durability == null) {
+            return append(groupId, batch);
+        }
+        var future = new CompletableFuture<CommittedIndex>();
+        future.completeExceptionally(new UnsupportedOperationException("per-append durability"));
+        return future;
+    }
+
     /** Leadership of this group only. Invoked off the request path. */
     void onLeaderChange(GroupId groupId, BiConsumer<Long, Optional<NodeId>> listener);
 

@@ -524,7 +524,7 @@ class RaftClusterTest {
                 indexes.add(entry.index());
                 texts.add(text);
                 if (text.startsWith("p")) {
-                    node.append(GROUP, List.of(bytes("c" + text.substring(1)))); // re-enters deliver()
+                    node.append(GROUP, List.of(bytes("c" + text.substring(1)))); // nested append from the delivery thread
                 }
                 if (text.equals("boom")) {
                     throw new IllegalStateException("test");
@@ -590,7 +590,7 @@ class RaftClusterTest {
         });
         var slow = Thread.ofPlatform().start(() -> {
             leader.append(GROUP, List.of(bytes("slow")));
-            ReplicatedNode.driveAll(cluster.nodes); // commits "slow" and drains it on this thread
+            ReplicatedNode.driveAll(cluster.nodes); // commits "slow"; drive() then waits for its delivery
         });
         try {
             assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS));
@@ -598,7 +598,7 @@ class RaftClusterTest {
             for (int round = 0; round < 10; round++) {
                 cluster.clock.advance(Duration.ofMillis(40)); // heartbeat interval; election is 100 ms
                 for (var node : cluster.nodes) {
-                    node.drive();
+                    node.step(); // the Raft thread's path: never waits for a callback
                 }
             }
             long tookMillis = (System.nanoTime() - begin) / 1_000_000;
@@ -636,7 +636,7 @@ class RaftClusterTest {
         var stop = new java.util.concurrent.atomic.AtomicBoolean();
         var ticker = Thread.ofPlatform().start(() -> {
             while (!stop.get()) {
-                node.drive(); // tick path: tryLock
+                node.step(); // Raft-thread path, concurrent with appends
             }
         });
         var pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
@@ -712,9 +712,9 @@ class RaftClusterTest {
                 try {
                     // heartbeat: leader tick sends APPEND, the follower handles it on the Raft path
                     cluster.clock.advance(cluster.options.heartbeat());
-                    leader.drive();
-                    follower.drive();
-                    leader.drive();
+                    leader.step();
+                    follower.step();
+                    leader.step();
                     // vote request from the third member at a higher term, with a log at least as new
                     cluster.net.detach(other.self()); // a probe takes the third member's id
                     var rpc = cluster.net.attach(other.self(), (from, frame) -> {
@@ -726,7 +726,7 @@ class RaftClusterTest {
                     vote.putLong(term + 1).putInt(other.self().wire()).putLong(Long.MAX_VALUE / 2)
                             .putLong(Long.MAX_VALUE / 2);
                     rpc.send(follower.self(), new SimTransport.Frame(GROUP, RaftGroup.VOTE, vote.array()));
-                    follower.drive();
+                    follower.step();
                     raft.complete(null);
                 } catch (Throwable t) {
                     raft.completeExceptionally(t);
@@ -743,5 +743,289 @@ class RaftClusterTest {
             release.countDown();
             drainer.join(10_000);
         }
+    }
+
+    @Test
+    void callbacksAndFuturesRunOnTheDeliveryThreadInOrder() throws Exception {
+        var cluster = cluster(1, false, Durability.RELAXED, 1_000_000);
+        elect(cluster);
+        var node = cluster.nodes.get(0);
+        var callbackThreads = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+        var events = java.util.Collections.synchronizedList(new ArrayList<String>());
+        node.openGroup(GROUP, cluster.options, entry -> {
+            callbackThreads.add(Thread.currentThread().getName());
+            events.add("cb" + entry.index());
+        });
+        var futures = new ArrayList<java.util.concurrent.CompletableFuture<?>>();
+        var futureThreads = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+        for (int i = 0; i < 20; i++) {
+            var f = node.append(GROUP, List.of(bytes("x" + i)));
+            futures.add(f.thenAccept(c -> {
+                futureThreads.add(Thread.currentThread().getName());
+                events.add("f" + c.index());
+            }));
+        }
+        for (var f : futures) {
+            f.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        assertEquals(Set.of("raft-deliver-" + GROUP.value()), callbackThreads);
+        // thenAccept on an already-complete future runs on the caller, so only check the ones that ran async
+        futureThreads.remove(Thread.currentThread().getName());
+        assertTrue(callbackThreads.containsAll(futureThreads), "futures complete on the delivery thread");
+        var seen = List.copyOf(events);
+        for (var e : seen) {
+            if (e.startsWith("f")) {
+                assertTrue(seen.indexOf("cb" + e.substring(1)) < seen.indexOf(e), "callback before its future: " + seen);
+            }
+        }
+    }
+
+    @Test
+    void appendFailsFastWhenApplyLags() throws Exception {
+        var cluster = cluster(1, false, Durability.RELAXED, 1_000_000);
+        var node = cluster.nodes.get(0);
+        var lagged = new GroupId("lagged");
+        node.deliveryLagLimit = 4;
+        var parked = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var handle = node.openGroup(lagged, cluster.options, entry -> {
+            if (text(entry.entry()).equals("slow")) {
+                parked.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        elect(cluster);
+        assertTrue(handle.isLeader()); // (re-opening with a null listener would drop ours)
+        var accepted = new ArrayList<java.util.concurrent.CompletableFuture<?>>();
+        accepted.add(node.append(lagged, List.of(bytes("slow"))));
+        assertTrue(parked.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        ApplyLagException refused = null;
+        for (int i = 0; i < 20 && refused == null; i++) {
+            var f = node.append(lagged, List.of(bytes("e" + i)));
+            // Refused like the other append refusals: the returned future fails at once, nothing is appended.
+            if (f.isCompletedExceptionally()) {
+                var cause = assertThrows(java.util.concurrent.ExecutionException.class, f::get).getCause();
+                refused = assertInstanceOf(ApplyLagException.class, cause);
+            } else {
+                accepted.add(f);
+            }
+        }
+        assertNotNull(refused, "append kept accepting while apply lagged");
+        assertTrue(refused.lag() >= 4, "lag " + refused.lag());
+        assertTrue(node.deliveryLag(lagged) >= 4);
+        release.countDown();
+        for (var f : accepted) {
+            f.get(5, java.util.concurrent.TimeUnit.SECONDS); // everything accepted is still delivered
+        }
+        assertTrue(node.maxDeliveryLag(lagged) >= 4);
+        node.append(lagged, List.of(bytes("after"))).get(5, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    @Test
+    void closeDuringSlowCallbackIsBoundedAndAbandonsTheRest() throws Exception {
+        var cluster = cluster(1, false, Durability.RELAXED, 1_000_000);
+        elect(cluster);
+        var node = cluster.nodes.get(0);
+        var parked = new java.util.concurrent.CountDownLatch(1);
+        var interrupted = new java.util.concurrent.atomic.AtomicBoolean();
+        var after = new java.util.concurrent.atomic.AtomicInteger();
+        node.openGroup(GROUP, cluster.options, entry -> {
+            if (text(entry.entry()).equals("slow")) {
+                parked.countDown();
+                try {
+                    Thread.sleep(60_000);
+                } catch (InterruptedException e) {
+                    interrupted.set(true);
+                }
+            } else {
+                after.incrementAndGet();
+            }
+        });
+        node.append(GROUP, List.of(bytes("slow")));
+        assertTrue(parked.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        var later = node.append(GROUP, List.of(bytes("later")));
+        long begin = System.nanoTime();
+        node.close();
+        long tookMillis = (System.nanoTime() - begin) / 1_000_000;
+        assertTrue(tookMillis < 5_000, "close() waited " + tookMillis + " ms");
+        assertTrue(interrupted.get(), "the slow callback was interrupted once the drain budget ran out");
+        var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> later.get(1, java.util.concurrent.TimeUnit.SECONDS));
+        var notApplied = assertInstanceOf(CommittedNotAppliedException.class, failure.getCause(),
+                "a committed entry's future says committed, not a generic failure");
+        assertEquals(GROUP.value(), notApplied.group());
+        assertTrue(notApplied.index() > 0);
+        assertEquals(0, after.get(), "nothing delivered after close()");
+        // "later": its callback and its future were abandoned, and counted.
+        assertTrue(node.abandonedDeliveries(GROUP) >= 2, "abandoned " + node.abandonedDeliveries(GROUP));
+    }
+
+    /**
+     * Latched, leader side, 3 voters: while the leader's callback is parked on the delivery thread, the
+     * group keeps replicating and committing (a follower applies every entry) and the leader's futures
+     * complete in log order only once the callback is released.
+     */
+    @Test
+    void parkedLeaderCallbackStillCommitsAndCompletesFuturesInOrder() throws Exception {
+        var cluster = cluster(3, false, Durability.RELAXED, 1_000_000);
+        elect(cluster);
+        var leader = leader(cluster);
+        var parked = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var handle = leader.openGroup(GROUP, cluster.options, entry -> {
+            if (text(entry.entry()).equals("slow")) {
+                parked.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        var follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
+        var followerSeen = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        follower.openGroup(GROUP, cluster.options, entry -> followerSeen.add(text(entry.entry())));
+        var completed = new java.util.concurrent.CopyOnWriteArrayList<Long>();
+        var futures = new ArrayList<java.util.concurrent.CompletableFuture<?>>();
+        futures.add(leader.append(GROUP, List.of(bytes("slow"))).thenAccept(c -> completed.add(c.index())));
+        stepAll(cluster);
+        assertTrue(parked.await(5, java.util.concurrent.TimeUnit.SECONDS), "callback never parked");
+        for (int i = 0; i < 3; i++) {
+            futures.add(leader.append(GROUP, List.of(bytes("n" + i))).thenAccept(c -> completed.add(c.index())));
+        }
+        stepAll(cluster);
+        cluster.clock.advance(cluster.options.heartbeat());
+        stepAll(cluster); // the heartbeat carries the commit index to the followers
+        assertTrue(awaitDelivered(follower), "follower deliveries");
+        assertEquals(List.of("slow", "n0", "n1", "n2"), List.copyOf(followerSeen), "committed while parked");
+        assertEquals(List.of(), List.copyOf(completed), "no future completes before the parked callback returns");
+        assertTrue(handle.isLeader());
+        release.countDown();
+        for (var f : futures) {
+            f.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        var order = List.copyOf(completed);
+        assertEquals(4, order.size());
+        for (int i = 1; i < order.size(); i++) {
+            assertTrue(order.get(i) > order.get(i - 1), "futures out of order: " + order);
+        }
+    }
+
+    private static void stepAll(Cluster cluster) {
+        for (int round = 0; round < 4; round++) {
+            for (var node : cluster.nodes) {
+                node.step();
+            }
+        }
+    }
+
+    private static boolean awaitDelivered(ReplicatedNode node) throws InterruptedException {
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (node.deliveryLag(GROUP) > 0) {
+            if (System.nanoTime() > deadline) {
+                return false;
+            }
+            Thread.sleep(1);
+        }
+        return true;
+    }
+
+    @Test
+    void closeLogsOneWarningWithTheAbandonedIndexRange() throws Exception {
+        var records = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        var logger = java.util.logging.Logger.getLogger(RaftGroup.class.getName());
+        var handler = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                if (record.getLevel() == java.util.logging.Level.WARNING) {
+                    records.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        logger.addHandler(handler);
+        try {
+            var executor = new DeliveryExecutor("g", 100);
+            var parked = new java.util.concurrent.CountDownLatch(1);
+            executor.submit(() -> {
+                parked.countDown();
+                try {
+                    Thread.sleep(60_000);
+                } catch (InterruptedException e) {
+                    // interrupted by close
+                }
+            }, 5);
+            assertTrue(parked.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            var committed = new java.util.concurrent.CompletableFuture<Void>();
+            var uncommitted = new java.util.concurrent.CompletableFuture<Void>();
+            executor.submit(() -> { }, 6);
+            executor.submit(() -> committed.complete(null), committed, 7);
+            executor.submit(() -> uncommitted.complete(null), uncommitted);
+            assertTrue(executor.close(Duration.ofMillis(200)));
+            assertEquals(3, executor.abandoned());
+            var abandonedWarnings = records.stream().filter(m -> m.contains("close abandoned")).toList();
+            assertEquals(1, abandonedWarnings.size(), "one WARN per group: " + records);
+            assertTrue(abandonedWarnings.get(0).contains("1 commit callbacks and 2 append futures"), abandonedWarnings.get(0));
+            assertTrue(abandonedWarnings.get(0).contains("indexes 6..7"), abandonedWarnings.get(0));
+            var e = assertThrows(java.util.concurrent.ExecutionException.class, committed::get);
+            assertEquals(7, assertInstanceOf(CommittedNotAppliedException.class, e.getCause()).index());
+            e = assertThrows(java.util.concurrent.ExecutionException.class, uncommitted::get);
+            assertFalse(e.getCause() instanceof CommittedNotAppliedException, "not committed: plain failure");
+            // After close: dropped and counted, no further WARN.
+            var late = new java.util.concurrent.CompletableFuture<Void>();
+            executor.submit(() -> late.complete(null), late, 8);
+            assertEquals(4, executor.abandoned());
+            assertInstanceOf(CommittedNotAppliedException.class,
+                    assertThrows(java.util.concurrent.ExecutionException.class, late::get).getCause());
+        } finally {
+            logger.removeHandler(handler);
+        }
+    }
+
+    @Test
+    void lagPastTheWarnThresholdIsCountedOncePerBacklog() throws Exception {
+        var executor = new DeliveryExecutor("g", 2); // warns at 2 x LAG_WARN_FACTOR = 8
+        var release = new java.util.concurrent.CountDownLatch(1);
+        executor.submit(() -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, 1);
+        for (int i = 2; i <= 20; i++) {
+            executor.submit(() -> { }, i);
+        }
+        assertEquals(1, executor.lagWarnings(), "one warning per backlog");
+        release.countDown();
+        assertTrue(executor.awaitIdle(Duration.ofSeconds(5)));
+        for (int round = 0; round < 2; round++) {
+            var hold = new java.util.concurrent.CountDownLatch(1);
+            executor.submit(() -> {
+                try {
+                    hold.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, 100 + round);
+            for (int i = 0; i < 10; i++) {
+                executor.submit(() -> { }, 200 + i);
+            }
+            hold.countDown();
+            assertTrue(executor.awaitIdle(Duration.ofSeconds(5)));
+        }
+        assertEquals(3, executor.lagWarnings(), "re-armed each time the queue drained");
+        assertTrue(executor.close(Duration.ofSeconds(1)));
     }
 }

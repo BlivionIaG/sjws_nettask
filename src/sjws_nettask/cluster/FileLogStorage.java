@@ -136,10 +136,19 @@ public final class FileLogStorage implements LogStorage {
         return rec == null ? 0L : rec.term;
     }
 
+    /**
+     * Loads the group's file on first use. Before this change a restarted node reported 0 here until some
+     * other call loaded the file, so it compared candidates against an empty log.
+     */
     @Override
     public long lastIndex(GroupId group) {
-        var log = logs.get(group);
-        if (log == null || log.isEmpty()) {
+        NavigableMap<Long, Rec> log;
+        try {
+            log = log(group);
+        } catch (IOException failed) {
+            throw new java.io.UncheckedIOException(failed);
+        }
+        if (log.isEmpty()) {
             return 0L;
         }
         return log.lastKey();
@@ -256,19 +265,23 @@ public final class FileLogStorage implements LogStorage {
     }
 
     private void writeCursor(GroupId group, long index, long term) throws IOException {
-        var target = witnessPath(group);
+        var buf = ByteBuffer.allocate(16);
+        buf.putLong(index);
+        buf.putLong(term);
+        buf.flip();
+        writeAtomically(witnessPath(group), buf);
+    }
+
+    private void writeAtomically(Path target, ByteBuffer buf) throws IOException {
         var tmp = root.resolve(target.getFileName().toString() + ".tmp");
         try (var channel = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
                 StandardOpenOption.TRUNCATE_EXISTING)) {
-            var buf = ByteBuffer.allocate(16);
-            buf.putLong(index);
-            buf.putLong(term);
-            buf.flip();
             while (buf.hasRemaining()) {
                 channel.write(buf);
             }
             channel.force(true);
         }
+        crashPoint(target.getFileName() + ":temp");
         Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
             dir.force(true);
@@ -281,6 +294,132 @@ public final class FileLogStorage implements LogStorage {
     }
 
     private record CursorFile(long index, long term) {
+    }
+
+    /** Tests only: throws at a named point to simulate a crash there. Null in production. */
+    volatile java.util.function.Consumer<String> crashHook;
+
+    private void crashPoint(String stage) throws IOException {
+        var hook = crashHook;
+        if (hook != null) {
+            hook.accept(stage);
+        }
+    }
+
+    /** {@code "SJVT"}: the vote file magic. */
+    static final int VOTE_MAGIC = 0x534A5654;
+    static final int VOTE_VERSION = 1;
+    static final int VOTE_FILE_BYTES = 24;
+
+    /**
+     * {@code {group}.vote}, 24 bytes big-endian: magic, version, term, votedFor wire id, then the
+     * CRC32C of the first 20 bytes. Temp file + fsync + atomic move + directory fsync.
+     */
+    @Override
+    public void saveHardState(GroupId group, long term, int votedFor) throws IOException {
+        lock.lock();
+        try {
+            var buf = ByteBuffer.allocate(VOTE_FILE_BYTES);
+            buf.putInt(VOTE_MAGIC);
+            buf.putInt(VOTE_VERSION);
+            buf.putLong(term);
+            buf.putInt(votedFor);
+            var crc = new java.util.zip.CRC32C();
+            crc.update(buf.array(), 0, 20);
+            buf.putInt((int) crc.getValue());
+            buf.flip();
+            writeAtomically(votePath(group), buf);
+            crashPoint("vote-written");
+            var marker = voteMarkerPath(group);
+            if (!Files.exists(marker, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                // After the vote file: a crash between the two leaves a vote file and no marker, which
+                // loads as saved state. The other order would leave a marker and no vote, refusing startup.
+                writeAtomically(marker, ByteBuffer.wrap(new byte[] {1}));
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * A missing vote file is an upgrade only while the first-save marker is also missing. Once a
+     * vote has been saved, a missing vote file means it was deleted, and startup is refused.
+     */
+    @Override
+    public boolean hasHardState(GroupId group) throws IOException {
+        if (Files.exists(votePath(group), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            return true;
+        }
+        if (Files.exists(voteMarkerPath(group), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("vote file " + votePath(group) + " is missing but " + voteMarkerPath(group)
+                    + " shows a vote was saved; refusing to start with an unknown term");
+        }
+        return false;
+    }
+
+    private Path voteMarkerPath(GroupId group) {
+        var safe = group.value().replaceAll("[^A-Za-z0-9._-]", "_");
+        return root.resolve(safe + ".vote-saved");
+    }
+
+    @Override
+    public long hardStateTerm(GroupId group) throws IOException {
+        var buf = readVote(group);
+        return buf == null ? 0L : buf.getLong(8);
+    }
+
+    @Override
+    public int hardStateVote(GroupId group) throws IOException {
+        var buf = readVote(group);
+        return buf == null ? 0 : buf.getInt(16);
+    }
+
+    /** Null when absent. Anything else that is not a valid version-1 record refuses to load. */
+    private ByteBuffer readVote(GroupId group) throws IOException {
+        var path = votePath(group);
+        if (!hasHardState(group)) {
+            return null;
+        }
+        java.nio.channels.SeekableByteChannel channel;
+        // NOFOLLOW_LINKS: a symlink in place of the vote file fails here (ELOOP) instead of being read.
+        try {
+            channel = Files.newByteChannel(path, java.util.Set.of(StandardOpenOption.READ,
+                    java.nio.file.LinkOption.NOFOLLOW_LINKS));
+        } catch (IOException refused) {
+            throw new IOException("vote file " + path + " cannot be opened without following links ("
+                    + refused.getMessage() + "); refusing to start", refused);
+        }
+        byte[] bytes;
+        try (channel) {
+            var buf = ByteBuffer.allocate(VOTE_FILE_BYTES + 1);
+            while (buf.hasRemaining() && channel.read(buf) > 0) {
+                // read at most one byte past the expected size
+            }
+            bytes = java.util.Arrays.copyOf(buf.array(), buf.position());
+        }
+        if (bytes.length != VOTE_FILE_BYTES) {
+            throw new IOException("vote file " + path + " has " + bytes.length + " bytes, expected "
+                    + VOTE_FILE_BYTES + "; refusing to start with an unknown term");
+        }
+        var buf = ByteBuffer.wrap(bytes);
+        if (buf.getInt(0) != VOTE_MAGIC) {
+            throw new IOException("vote file " + path + " has a bad magic; refusing to start");
+        }
+        if (buf.getInt(4) != VOTE_VERSION) {
+            throw new IOException("vote file " + path + " has unsupported version " + buf.getInt(4)
+                    + "; refusing to start");
+        }
+        var crc = new java.util.zip.CRC32C();
+        crc.update(bytes, 0, 20);
+        if ((int) crc.getValue() != buf.getInt(20)) {
+            throw new IOException("vote file " + path + " fails its CRC32C; refusing to start");
+        }
+        return buf;
+    }
+
+    private Path votePath(GroupId group) {
+        var safe = group.value().replaceAll("[^A-Za-z0-9._-]", "_");
+        return root.resolve(safe + ".vote");
     }
 
     @Override

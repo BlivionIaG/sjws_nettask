@@ -60,6 +60,8 @@ public final class Partition implements AutoCloseable {
     private final String topic;
     private final SegmentedLog log;
     private final LedgerWriter writer;
+    /** Every append goes through the seam (today {@link #writer} itself; durable-log-plan §3 replication later). */
+    private final sjws_nettask.messaging.ledger.PartitionAppender appender;
     private final DeliveryState state;
     private final Partition dlq;
     private final LongSupplier clockMs;
@@ -105,6 +107,7 @@ public final class Partition implements AutoCloseable {
         this.topic = topic;
         this.log = log;
         this.writer = writer;
+        this.appender = writer;
         this.state = state;
         this.dlq = dlq;
         this.clockMs = clockMs;
@@ -209,7 +212,7 @@ public final class Partition implements AutoCloseable {
      * rejected as a duplicate with offset -1.
      */
     public ProduceResult produce(long producerId, long seq, byte[] payload, Durability durability) {
-        lock.lock();
+        lockForAppend();
         try {
             long dup = state.duplicateOf(producerId, seq);
             if (dup == -2) return new ProduceResult(-1, true, CompletableFuture.completedFuture(-1L));
@@ -229,7 +232,7 @@ public final class Partition implements AutoCloseable {
         // Groups are never removed, so a group seen once stays subscribed: callers that re-subscribe before every
         // claim/ack (TaskService) skip the partition lock entirely.
         if (subscribed.contains(group)) return false;
-        lock.lock();
+        lockForAppend();
         try {
             if (state.groups.containsKey(group)) { subscribed.add(group); return false; }
             long from = fromStart ? (state.messages.isEmpty() ? state.nextOffset : Math.min(state.messages.firstKey(), state.nextOffset))
@@ -250,7 +253,7 @@ public final class Partition implements AutoCloseable {
     public List<Delivery> poll(String group, String consumer, int max, long visibilityMs) {
         if (max < 1 || visibilityMs < 1) throw new IllegalArgumentException("max/visibility");
         List<Leased> got;
-        lock.lock();
+        lockForAppend();
         try {
             got = pollLocked(group, consumer, max, visibilityMs);
         } finally {
@@ -273,7 +276,7 @@ public final class Partition implements AutoCloseable {
     private List<Leased> pollWaiting(String group, String consumer, int max, long visibilityMs, long waitNanos) {
         if (max < 1 || visibilityMs < 1 || waitNanos < 0) throw new IllegalArgumentException("max/visibility/wait");
         long deadline = System.nanoTime() + waitNanos;
-        lock.lock();
+        lockForAppend();
         try {
             while (true) {
                 var out = pollLocked(group, consumer, max, visibilityMs);
@@ -423,7 +426,7 @@ public final class Partition implements AutoCloseable {
 
     /** Fenced ack: applied only if {@code attempt} is the current lease ({@link Delivery#attempt()}). */
     public LeaseResult ack(String group, long offset, int attempt) {
-        lock.lock();
+        lockForAppend();
         try { // no result allocation on the common path
             var r = fence(state.group(group).inFlight.get(offset), attempt);
             if (r != null) return r;
@@ -436,7 +439,7 @@ public final class Partition implements AutoCloseable {
 
     /** Fenced ack with a per-record durability override. */
     public AckResult ack(String group, long offset, int attempt, Durability durability) {
-        lock.lock();
+        lockForAppend();
         try {
             var r = fence(state.group(group).inFlight.get(offset), attempt);
             if (r != null) return new AckResult(r, null);
@@ -454,7 +457,7 @@ public final class Partition implements AutoCloseable {
 
     /** Fenced nack: applied only if {@code attempt} is the current lease. */
     public LeaseResult nack(String group, long offset, int attempt, long delayMs) {
-        lock.lock();
+        lockForAppend();
         try {
             var g = state.group(group);
             var l = g.inFlight.get(offset);
@@ -477,7 +480,7 @@ public final class Partition implements AutoCloseable {
 
     /** Fenced reject: applied only if {@code attempt} is the current lease. */
     public LeaseResult reject(String group, long offset, int attempt, String reason) {
-        lock.lock();
+        lockForAppend();
         try {
             var l = state.group(group).inFlight.get(offset);
             var r = fence(l, attempt);
@@ -495,7 +498,7 @@ public final class Partition implements AutoCloseable {
      */
     public LeaseResult extend(String group, long offset, int attempt, long visibilityMs) {
         if (visibilityMs < 1) throw new IllegalArgumentException("visibility");
-        lock.lock();
+        lockForAppend();
         try {
             var r = fence(state.group(group).inFlight.get(offset), attempt);
             if (r != null) return r;
@@ -513,7 +516,7 @@ public final class Partition implements AutoCloseable {
     public List<LeaseResult> extend(String group, long[] offsets, int[] attempts, long visibilityMs) {
         if (visibilityMs < 1 || offsets.length != attempts.length) throw new IllegalArgumentException("extend");
         var out = new ArrayList<LeaseResult>(offsets.length);
-        lock.lock();
+        lockForAppend();
         try {
             var g = state.group(group);
             var okOff = new long[offsets.length];
@@ -541,7 +544,7 @@ public final class Partition implements AutoCloseable {
     public BatchAckResult ack(String group, long[] offsets, int[] attempts, Durability durability) {
         if (offsets.length != attempts.length) throw new IllegalArgumentException("ack");
         var out = new LeaseResult[offsets.length];
-        lock.lock();
+        lockForAppend();
         try {
             var g = state.group(group);
             var entries = new ArrayList<LedgerEntry>(offsets.length);
@@ -588,7 +591,7 @@ public final class Partition implements AutoCloseable {
 
     private CompletableFuture<Long> enqueueDeadLetter(String group, long offset, int attempts, String reason,
             DeliveryState.Message m, byte[] payload) {
-        lock.lock();
+        lockForAppend();
         try {
             if (state.hasOrigin(group, offset)) return CompletableFuture.completedFuture(-1L);
             return append(new LedgerEntry.Enqueue(0, 0, m.timestampMs(), group, offset, attempts, reason,
@@ -596,6 +599,23 @@ public final class Partition implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Takes {@link #lock}, first waiting (unlocked) while the writer queue is at capacity. Appends under the lock use
+     * {@link LedgerWriter#appendNoWait}, so a lock holder never blocks on the writer (S1c: a blocking queue.put under
+     * this lock stalled every produce, poll and ack of the partition). Reentrant calls skip the wait.
+     */
+    private void lockForAppend() {
+        if (!lock.isHeldByCurrentThread()) {
+            try {
+                appender.awaitCapacity();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted", ie);
+            }
+        }
+        lock.lock();
     }
 
     /**
@@ -610,15 +630,10 @@ public final class Partition implements AutoCloseable {
     private CompletableFuture<Long> appendAll(List<LedgerEntry> es, Durability durability) {
         long offset = state.nextOffset;
         CompletableFuture<Long> f;
-        try {
-            List<byte[]> enc;
-            if (es.size() == 1) enc = List.of(LedgerEntry.encode(es.get(0)));
-            else { enc = new ArrayList<>(es.size()); for (var e : es) enc.add(LedgerEntry.encode(e)); }
-            f = writer.append(enc, durability);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted", ie);
-        }
+        List<byte[]> enc;
+        if (es.size() == 1) enc = List.of(LedgerEntry.encode(es.get(0)));
+        else { enc = new ArrayList<>(es.size()); for (var e : es) enc.add(LedgerEntry.encode(e)); }
+        f = appender.appendNoWait(enc, durability); // never blocks: capacity was awaited before the lock (lockForAppend)
         if (f.isCompletedExceptionally()) {
             f.join(); // rethrows: the writer is fenced; nothing was applied
         }
@@ -742,7 +757,7 @@ public final class Partition implements AutoCloseable {
 
     /** Serializes the state now (under the lock) and writes it in the background; completes with its offset once durable. */
     public CompletableFuture<Long> snapshotNow() {
-        lock.lock();
+        lockForAppend();
         try { return snapshotLocked(); } finally { lock.unlock(); }
     }
 
@@ -860,7 +875,7 @@ public final class Partition implements AutoCloseable {
         int deleted = 0, compacted = 0;
         long reclaimed = 0, lw;
         long oldestSnap = snapshots.isEmpty() ? 0 : snapshots.first(); // no durable snapshot yet: the whole log is needed
-        lock.lock();
+        lockForAppend();
         try {
             lw = Math.min(Math.min(oldestSnap, state.oldestNeededMessageOffset()), retainFloor());
             for (var seg : log.segments()) {
@@ -878,7 +893,7 @@ public final class Partition implements AutoCloseable {
                 if (seg.active() || seg.nextOffset() > Math.min(oldestSnap, retainFloor())) break; // never rewrite pinned history
                 java.util.Set<Long> keep;
                 long liveBytes = 0;
-                lock.lock();
+                lockForAppend();
                 try {
                     keep = new java.util.HashSet<>(state.messages.subMap(seg.baseOffset(), true, seg.nextOffset(), false).keySet());
                     for (long k : keep) liveBytes += state.messages.get(k).size() + RecordBatch.HEADER_BYTES + 12 + 4;
@@ -887,7 +902,7 @@ public final class Partition implements AutoCloseable {
                 }
                 if (liveBytes >= seg.bytes() * pol.compactLiveRatio()) continue;
                 long newSize = log.prepareCompaction(seg.baseOffset(), keep::contains);
-                lock.lock();
+                lockForAppend();
                 try { log.commitCompaction(seg.baseOffset()); } finally { lock.unlock(); }
                 compacted++;
                 reclaimed += seg.bytes() - newSize;
@@ -982,7 +997,7 @@ public final class Partition implements AutoCloseable {
     public DeliveryCounts counts() {
         var c = counts.get();
         if (c != null) return c;
-        lock.lock();
+        lockForAppend();
         try {
             c = counts.get();
             if (c == null) { c = state.counts(); counts.set(c); }
@@ -1009,7 +1024,7 @@ public final class Partition implements AutoCloseable {
 
     /** Rebuilds under the lock and returns a view that includes every entry applied so far. */
     public DeliverySnapshot freshSnapshot() {
-        lock.lock();
+        lockForAppend();
         try { return rebuild(); } finally { lock.unlock(); }
     }
 
@@ -1025,7 +1040,7 @@ public final class Partition implements AutoCloseable {
     private boolean eager;
 
     /** When true, the paged view is rebuilt after every operation (tests, low-rate topics). Default: rate-limited. */
-    public void eagerSnapshots(boolean on) { lock.lock(); try { eager = on; publish(); } finally { lock.unlock(); } }
+    public void eagerSnapshots(boolean on) { lockForAppend(); try { eager = on; publish(); } finally { lock.unlock(); } }
 
     /** Groups known to exist (lock-free hint for {@link #subscribe}); only ever grows, like the groups themselves. */
     private final java.util.Set<String> subscribed = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -1057,10 +1072,10 @@ public final class Partition implements AutoCloseable {
     }
 
     /** Canonical state dump (tests). */
-    String canonicalState() { lock.lock(); try { return state.canonical(); } finally { lock.unlock(); } }
+    String canonicalState() { lockForAppend(); try { return state.canonical(); } finally { lock.unlock(); } }
 
     @Override public void close() throws IOException {
-        lock.lock();
+        lockForAppend();
         try {
             closed = true;
             for (var w : waiters.values()) w.cond.signalAll();

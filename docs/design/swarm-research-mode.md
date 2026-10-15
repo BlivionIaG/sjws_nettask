@@ -3,7 +3,7 @@
 Status: **Draft, for Blivion's review.** Nothing is built before approval. Base: master `3cdaa4e`. Scope: design only, no code changes.
 Owner: sjws Architecture. Builds on [agent-graphs.md](agent-graphs.md) (the "graphs doc", including its decisions in §11.1 and §11.3) and [agent-swarm.md](agent-swarm.md) (the "swarm doc").
 
-Every reference to existing code is a path and line on master `3cdaa4e`. There is **no graph code on master yet** (`rg -il graph src/sjws_nettask` finds nothing), so references to graph features point at sections of the graphs doc, not at code. This doc contains **no measurements**; §12 lists targets, which are pass thresholds, not results.
+Every reference to existing code is a path and line on master `3cdaa4e`. There is **no graph runner on master yet** (`rg -il 'swarm\.graph' src` finds nothing; the only graph-specific code is the retain-from pin API in `messaging/delivery/Partition.java`), so references to graph features point at sections of the graphs doc, not at code. This doc contains **no measurements**; §12 lists targets, which are pass thresholds, not results.
 
 ## 1. Goal and the hard rule
 
@@ -85,6 +85,7 @@ question ─▶ plan ─▶ map[hypotheses ≤ H] ─▶ (research | experiment)
 - All artifacts (candidates, experiment outputs, logs, retrieved documents, reports) go to the **swarm-owned blob store** (swarm §5.2 and §16 item 2), **content-addressed** by SHA-256 of the bytes (as Git addresses objects, [Git internals](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects)). The run log stores only digests (graphs §4.2: outputs by reference).
 - Each artifact has a **provenance record** (in the run log, not the blob): `{digest, kind, producedBy: (runId, stepInstanceId, stepAttempt), agentId (cert subject, swarm §6), service@version, model id, inputs: [digests], seed, createdAt}`. The [W3C PROV](https://www.w3.org/TR/prov-overview/) entity/activity/agent model is the reference vocabulary; we store the minimal subset above.
 - Synthesis must cite evidence digests; a citation to a digest not in the run's provenance is a sanity-check failure (§7.3).
+- **Retention** (§14.1 item 7): the lineage ancestors of the top-k candidates plus a time window are retained; other candidates are reclaimed.
 - The blob store does not exist on master; it is a swarm deliverable (owner: swarm), and research mode depends on it (§11).
 
 ## 5. Mapping onto graph primitives
@@ -124,7 +125,7 @@ A crash resumes from the graph checkpoint (graphs §4.3): population, carry, lin
 ## 7. Evaluators
 
 ### 7.1 Sandboxed execution
-- The evaluator agent launches each candidate in an isolated process or container: Linux namespaces + seccomp, or a container runtime with [gVisor](https://gvisor.dev/docs/) for stronger isolation. **No network by default** (an empty network namespace); allow-lists are declared per research document and audited.
+- The evaluator agent launches each candidate in an isolated process or container: Linux namespaces + seccomp are the reference sandbox; a container runtime with [gVisor](https://gvisor.dev/docs/) is optional, for stronger isolation. **No network** (an empty network namespace); there is no allow-list. Retrieval is done by a separate research agent with its own identity (§4.1).
 - Resource limits per evaluation (CPU, memory, wall-clock, disk, process count) via cgroups v2 ([kernel docs](https://docs.kernel.org/admin-guide/cgroup-v2.html)); exceeding any is a failed evaluation, not a crash.
 - Read-only inputs, a fresh scratch directory, and output collected only from a declared path, hashed into the blob store.
 - sjws itself stays out of the sandbox: it only dispatches tasks and records results (§2).
@@ -138,7 +139,7 @@ Optimizing against an automated metric invites specification gaming ([Krakovna e
 1. **Held-out evaluation:** a held-out set (digest in the manifest) that proposers never see and the search loop never scores against; it is used only for the final report and for promotion gates. Optional periodic held-out checks to detect overfitting (a widening gap between search and held-out scores raises an alert).
 2. **Evaluator isolation from proposers:** distinct services, distinct agent identities under `AgentPolicy` (swarm §6): proposers have no `TASK_CLAIM` on evaluator pools and no read access to evaluator code, held-out data or evaluator artifacts; evaluators cannot write candidates. The evaluator image is pinned by digest.
 3. **Sanity checks**, run by the evaluator before scoring: the candidate does not modify the harness or test files (hash check), output format and invariants hold, the run actually executed (minimum work counters), scores outside a declared plausible range are flagged, and suspiciously large jumps trigger re-evaluation on fresh seeds.
-4. **Human review gates:** a `gate` step (a task to a human-review pool served through the SDK/TUI) before promoting a best candidate, and optionally every `N` accepted improvements. The run waits, bounded by a timeout (default: stop, not approve).
+4. **Human review gates:** a `gate` step (a task to a human-review pool served through the SDK/TUI) before promoting a best candidate, and optionally every `N` accepted improvements. The run waits, bounded by a timeout (default: stop, not approve). The gate's approver must be an authenticated identity with its own permission, different from the run launcher, and is recorded in `AuditLog` (#121 review note 13).
 5. **Critique by a different model** in autoresearch (§4.1), and synthesis citations checked against provenance (§4.2).
 
 ## 8. Budgets and scale
@@ -148,13 +149,13 @@ Optimizing against an automated metric invites specification gaming ([Krakovna e
 - **Thousands of candidates:**
   - Many independent research runs shard by `runId` (graphs §5.1, fixed shard count, graphs §11.1 item 1).
   - Within one run, a large population is evaluated by **batched evaluation**: one evaluation task carries up to `B` candidates (digests), so per-task overhead is amortized, and results return as one step result with `B` score vectors. `max_items` still bounds the map.
-  - Claim contention on the evaluator pool is the known limit today (16-worker claim p99 **458 µs after #103**, measured by Messaging Core, against the S1c target < 100 µs); batching reduces claims per candidate.
+  - Claim contention on the evaluator pool is the known limit today (16-worker claim p99 was **458 µs after #103**, measured by Messaging Core, a stress line since 2026-10-14; the S1c gate runs workers = vCPU count and sharded pools exist, swarm §5.1 and §13); batching reduces claims per candidate.
   - The lineage lives in the log; only the active population and best-so-far stay in runner memory.
 
 ## 9. Run-mode config and launch surface
 
 ### 9.1 CP document
-`swarm.ResearchDocument`, a CP document **signed and versioned like `GraphDocument`** (graphs §7.5, which follows `controlplane.AccessPolicyDocument`, `src/sjws_nettask/controlplane/AccessPolicyDocument.java:50`). It names: the pinned graph `name@version` (a hill-climb or autoresearch template), the objective (§3.2), accept rule and schedule, `P`, `R`, `H`, stop conditions, budgets, evaluator sandbox profile and network allow-list, dataset digests, and review gates. Launching requires a new `RESEARCH_RUN` permission in `AgentPolicy` (not core RBAC, swarm §6). Runs pin the document version, like graph versions. Standalone mode loads it from a local directory, unsigned, as graphs §7.5.
+`swarm.ResearchDocument`, a CP document **signed and versioned like `GraphDocument`** (graphs §7.5, which follows `controlplane.AccessPolicyDocument`, `src/sjws_nettask/controlplane/AccessPolicyDocument.java:50`). It names: the pinned graph `name@version` (a hill-climb or autoresearch template), the objective (§3.2), accept rule and schedule, `P`, `R`, `H`, stop conditions, budgets, evaluator sandbox profile, dataset digests, and review gates. Launching requires a new `RESEARCH_RUN` permission in `AgentPolicy` (not core RBAC, swarm §6). Runs pin the document version, like graph versions. Standalone mode loads it from a local directory, unsigned, as graphs §7.5.
 
 ### 9.2 Python SDK
 ```python
@@ -175,7 +176,7 @@ It builds documents only; `s.serve(...)` (swarm §11.1) is unchanged for agents.
 A research view: running experiments, iteration, best-so-far with confidence, a **leaderboard** (top candidates by aggregate score, with held-out score when available), spend vs budget, plateau counter, and pending review gates with approve/reject. Data comes from run events (graphs §6.3) via the admin API. Today's TUI has `enum View { STATUS, CONFIG, LOGS }` (`src/sjws_nettask/admin/AdminTui.java:42`); adding a view is the **sjws Admin TUI workstream's** work and is a dependency (R3).
 
 ## 10. Zero cost when off
-- Package `sjws_nettask.swarm.graph.research`, loaded only when `swarm.enabled`, `swarm.graphs.enabled` and `swarm.graphs.research.enabled` are all true, through a string-named lazy hook as `OptionalModules.SWARM_CLASS` does (`src/sjws_nettask/OptionalModules.java:39`, loaded at `:73`).
+- Package `sjws_nettask.swarm.graph.research`, loaded only when `swarm.enabled`, `swarm.graphs.enabled` and `swarm.graphs.research.enabled` are all true, through a string-named lazy hook as `OptionalModules.SWARM_CLASS` does (`src/sjws_nettask/OptionalModules.java:39`, loaded at `:80`).
 - P1–P3 live in `swarm.graph` (they are graph features) but are inert unless a graph uses them; their cost when unused is checked by the graphs benchmarks (graphs §12).
 - **Dependency guard:** nothing outside `swarm.graph.research` names it except the hook (extending graphs §8).
 - **Class-load guard:** cloned from `tests/sjws_nettask/swarm/ClassLoadTest.java` (assertion at `:57`): no `sjws_nettask.swarm.graph.research.` class with (a) swarm off, (b) graphs off, (c) research off, in standalone and `data`/`gateway` mode (as `tests/sjws_nettask/swarm/RoleClassLoadTest.java`).
@@ -185,14 +186,14 @@ A research view: running experiments, iteration, best-so-far with confidence, a 
 | Phase | Deliverable | Depends on | Exit criteria |
 |---|---|---|---|
 | **R0** | This doc approved by Blivion; research gate + dependency/class-load guards (empty package) | G0 (which starts only after the S1c gate) | Guards green; off-mode wrk A/B within the A/A spread |
-| **R1** | P1 carry, P2 select (greedy, anneal, tournament), P3 dynamic counts; hill-climb template graph; objective with repeats and noise rule; stop conditions; lineage events; reproducibility manifest | G2 (loops, map, conditions, joins); swarm blob store | Replay test: identical decisions from the log; resume test mid-iteration; seeded anneal determinism; plateau/target/max-iteration stop tests |
-| **R2** | Evaluator sandbox reference agent (namespaces/seccomp or gVisor, no network), harness hook, sanity checks, held-out eval, `AgentPolicy` isolation between proposers and evaluators | R1; S2 (`AgentPolicy`, agent CA) | Sandbox escape-attempt tests (network, harness modification) fail closed; isolation policy tests |
+| **R1** | P1 carry, P2 select (greedy, anneal, tournament), P3 dynamic counts; hill-climb template graph; objective with repeats and noise rule; stop conditions; lineage events; reproducibility manifest | G2 (loops, map, conditions, joins); G2b (P1–P3 graph primitives); swarm blob store | Replay test: identical decisions from the log; resume test mid-iteration; seeded anneal determinism; plateau/target/max-iteration stop tests |
+| **R2** | Evaluator sandbox reference agent (namespaces + seccomp as the reference sandbox; gVisor optional, for stronger isolation; no network), harness hook, sanity checks, held-out eval, `AgentPolicy` isolation between proposers and evaluators | R1; S2 (`AgentPolicy`, agent CA) | Sandbox escape-attempt tests (network, harness modification) fail closed; isolation policy tests |
 | **R3** | `ResearchDocument` in the CP, `RESEARCH_RUN`, budgets incl. eval compute, static worst case, Python SDK, TUI research view and leaderboard, human review gates | G3 (budgets, `GraphDocument`, SDK); Admin TUI workstream | Budget stays within swarm §8 bound; gate timeout defaults to stop; TUI shows leaderboard from events |
 | **R4** | Autoresearch template (plan → map → join → synthesize → critique loop), evidence store provenance, citation checks | R3 | End-to-end autoresearch run with provenance for every cited digest |
 | **R5** | Batched evaluation, islands, multi-node research runs | G5 (multi-node) | Thousands-of-candidates target (§12) met or recorded |
 
 ## 12. Benchmark plan
-Methodology as swarm §13 (machine and commit reported, ≥ 5 alternating runs, mean ± stddev, CPU-pinned). Numbers measured by others: 16-worker claim p99 458 µs after #103 (Messaging Core); request/reply p99 about 409–882 µs depending on load after #105/#108; S1c targets claim p99 < 100 µs, request/reply p99 < 500 µs.
+Methodology as swarm §13 (machine and commit reported, ≥ 5 alternating runs, mean ± stddev, CPU-pinned). Numbers measured by others: 16-worker claim p99 458 µs after #103 (Messaging Core; a stress line since 2026-10-14); request/reply p99 about 409–882 µs depending on load after #105/#108; S1c targets claim p99 < 100 µs, request/reply p99 < 500 µs.
 
 **Targets** (proposals for review, not results):
 | Workload | Measured | Target |
@@ -209,9 +210,9 @@ Methodology as swarm §13 (machine and commit reported, ≥ 5 alternating runs, 
 |---|---|
 | Reward hacking / overfitting to the evaluator | Held-out set, evaluator isolation, sanity checks, review gates (§7.3) |
 | Noisy metrics produce false improvements | Repeats, `min_effect`, optional t-test, incumbent re-evaluation (§3.2) |
-| Sandbox escape or data exfiltration | No network by default, gVisor option, cgroup limits; sjws never runs candidates (§7.1) |
+| Sandbox escape or data exfiltration | No network, namespaces + seccomp reference sandbox with gVisor optional, cgroup limits; sjws never runs candidates (§7.1) |
 | Runaway spend | Required `max_iterations`, budgets, static worst case shown at launch (§8) |
-| Blob store growth from thousands of candidates | Content addressing dedups; retention for non-lineage-relevant artifacts is an open question |
+| Blob store growth from thousands of candidates | Content addressing dedups; lineage ancestors of the top-k plus a time window are retained; other candidates are reclaimed (§14.1 item 7) |
 | LLM non-determinism limits reproducibility | Stated caveat; replay from recorded outputs (§6.1) |
 | Dependencies slip (G2/G3, blob store, TUI) | Phases gated explicitly (§11) |
 | New primitives creep into general graph complexity | Only P1–P3, fixed reducer set, no user code (§5.2) |
@@ -227,12 +228,12 @@ Methodology as swarm §13 (machine and commit reported, ≥ 5 alternating runs, 
 8. **First target use case:** sjws's own performance tuning through the `bench/` harness, or an external workload?
 
 ### 14.1 Decisions (2026-10-13, Blivion via inceptor)
-1. **Default accept rule:** greedy with elitism (§3.3). Annealing and tournament stay opt-in.
+1. **Default accept rule:** greedy with elitism (§3.3). Annealing, tournament and islands stay opt-in.
 2. **Noise test:** `min_effect` plus repeats by default; Welch's t-test is opt-in (`test: welch_t(alpha)`, §3.2).
 3. **Human review gate:** **required** before any result is promoted (§7.3 item 4); the gate timeout still defaults to stop, not approve.
 4. **Evaluator sandbox:** Linux namespaces + seccomp are the reference (base) sandbox; gVisor is optional (§7.1).
 5. **Evaluator network:** none. Evaluators get no network and no allow-list; retrieval (e.g. literature fetches in autoresearch) is done by a separate research agent with its own identity (§7.1, §4.1).
-6. **P1–P3** (loop-carried state, select step, dynamic counts) become **general graph features** in `swarm.graph` (§5.2); [agent-graphs.md](agent-graphs.md) is to be amended accordingly (events, checkpoint contents, phase).
+6. **P1–P3** (loop-carried state, select step, dynamic counts) become **general graph features** in `swarm.graph` (§5.2); [agent-graphs.md](agent-graphs.md) is amended accordingly (§1, §2, §3.4, §4.2, §4.3, §8, and phase G2b in §9), tracked in the [#121 follow-up](https://github.com/BlivionIaG/sjws_nettask/pull/121#issuecomment-6158136683).
 7. **Artifact retention:** keep the lineage ancestors of the top-k plus a time window; other candidates may be reclaimed (§4.2, §13).
 8. **First use case:** sjws's own performance tuning through the [`bench/`](../../bench/README.md) harness (§7.2).
 

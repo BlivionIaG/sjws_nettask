@@ -18,20 +18,22 @@ Back to the [README](../README.md) (quick start).
 - [Docker image](deployment/docker.md): multi-stage build, non-root runtime, health check
 - [Control-plane and data-node service](operations/control-plane-service.md): systemd units, join bootstrap, status, drain
 - [Admin console (TUI)](operations/admin-console.md)
-- [Control-plane console (mockup)](operations/cp-console.md)
+- [Control-plane console](operations/cp-console.md)
 - [Releasing](operations/releasing.md)
 
 ## Design
 - [Architecture](design/architecture.md)
 - [Implementation overview and measured performance](design/implementation-and-performance.md)
-- [Request routing and reverse proxy (proposal)](design/proxy-routing.md)
+- [Request routing and reverse proxy (design and results)](design/proxy-routing.md)
 - [Control plane: distributable access policy, operator RBAC and audit](design/control-plane-security.md)
 - [Messaging core (draft)](messaging/design.md)
 - [Messaging metrics (proposal)](design/messaging-metrics.md)
 - [Messaging config and broker apply (draft)](messaging/config.md)
+- [Durable partition log](design/partition-log.md) · [plan](design/durable-log-plan.md)
 - [High availability, as implemented](design/high-availability.md)
-- [High availability (draft)](ha/design.md)
-- [Control plane / API gateway mode (draft)](design/control-plane.md)
+- [High availability (draft)](ha/design.md) · [two-node decision](design/two-node-ha-decision.md) · [upstream discovery](ha/discovery.md)
+- [Raft delivery executor](design/raft-delivery-executor.md)
+- [Control plane / API gateway mode (draft)](design/control-plane.md) · [process hosting](design/control-plane-hosting.md)
 - [Agent swarm layer (optional, draft)](design/agent-swarm.md)
 - [Agent graphs (swarm addendum, draft)](design/agent-graphs.md)
 - [Swarm research mode (draft)](design/swarm-research-mode.md)

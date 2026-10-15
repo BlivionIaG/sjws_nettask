@@ -158,4 +158,21 @@ class SourceGuardTest {
         assertEquals(1, launch.split("\"sjws_nettask\\.cp\\.CpLaunch\"", -1).length - 1,
                 "ServiceLaunch names CpLaunch once, as a string");
     }
+
+    /** Security review of #157: the {@code SecureKeyFile.beforeOpen} race hook is test-only. */
+    @Test
+    void secureKeyFileBeforeOpenIsAssignedOnlyInTests() throws IOException {
+        var assign = java.util.regex.Pattern.compile("\\bbeforeOpen\\s*=[^=]");
+        var offenders = new ArrayList<String>();
+        try (var walk = Files.walk(Path.of("src"))) {
+            for (var p : (Iterable<Path>) walk::iterator) {
+                if (p.toString().endsWith(".java") && assign.matcher(Files.readString(p)).find()) {
+                    offenders.add(p.toString());
+                }
+            }
+        }
+        assertTrue(offenders.isEmpty(), "beforeOpen assigned in production code: " + offenders);
+        var tests = all(Path.of("tests/sjws_nettask/config"));
+        assertTrue(assign.matcher(tests).find(), "the guard pattern still matches the test assignments");
+    }
 }

@@ -351,4 +351,58 @@ class LedgerTest {
         assertThrows(java.util.concurrent.ExecutionException.class, () -> f.get(10, java.util.concurrent.TimeUnit.SECONDS));
         w.close();
     }
+
+    // ---- S1c: never block under a caller's lock; ASYNC fsync floor; NONE leaves the syncer alone ----
+
+    @Test
+    void appendNoWaitGoesPastTheSoftBoundWithoutWaitingAndKeepsOrder() throws Exception {
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.NONE, 0, 4096, 1 << 20)) {
+            var fs = new ArrayList<CompletableFuture<Long>>();
+            long t0 = System.nanoTime();
+            for (int i = 0; i < 5000; i++) fs.add(w.appendNoWait(List.of(b("n" + i)), null)); // past the soft bound
+            assertTrue(System.nanoTime() - t0 < 5_000_000_000L);
+            for (int i = 0; i < fs.size(); i++) assertEquals(i, fs.get(i).get());
+            w.awaitCapacity(); // drained: returns at once
+            assertEquals(5000, w.snapshot().nextOffset());
+        }
+    }
+
+    @Test
+    void awaitCapacityBlocksUntilTheWriterDrains() throws Exception {
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.NONE, 0, 4, 1 << 20)) {
+            for (int i = 0; i < 2000; i++) w.appendNoWait(List.of(b("x".repeat(512))), null);
+            w.awaitCapacity();
+            var f = w.append(List.of(b("after"))); // append() still applies backpressure
+            assertEquals(2000, f.get());
+        }
+    }
+
+    @Test
+    void noneWriterNeverFsyncsInTheBackground() throws Exception {
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.NONE)) {
+            for (int i = 0; i < 2000; i++) w.append(List.of(b("n" + i)));
+            w.append(List.of(b("end"))).get();
+            Thread.sleep(50);
+            assertEquals(0, w.snapshot().fsyncs(), "NONE must not wake the syncer");
+            // a GROUP override on a NONE writer is still served by the syncer
+            long base = w.append(List.of(b("g")), Durability.GROUP).get();
+            assertTrue(w.snapshot().durableOffset() > base);
+        }
+    }
+
+    @Test
+    void asyncDefaultCoalescesFsyncsToTheFloor() throws Exception {
+        assertEquals(1_000_000L, LedgerWriter.DEFAULT_FSYNC_INTERVAL_NANOS);
+        try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log)) {
+            long t0 = System.nanoTime();
+            long last = -1;
+            for (int i = 0; i < 20_000; i++) last = w.append(List.of(b("a" + i))).get();
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            long fs = w.snapshot().fsyncs();
+            assertTrue(fs <= ms + 2, "fsyncs " + fs + " in " + ms + " ms");
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            while (w.snapshot().durableOffset() <= last && System.nanoTime() < deadline) Thread.sleep(1);
+            assertEquals(last + 1, w.snapshot().durableOffset());
+        }
+    }
 }

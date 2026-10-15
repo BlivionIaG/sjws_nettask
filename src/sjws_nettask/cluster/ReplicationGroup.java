@@ -36,6 +36,16 @@ public interface ReplicationGroup {
 
     long commitIndex();
 
+    /**
+     * Highest index this node has fsynced to its own log. Under STRICT it is never behind an entry
+     * this node acked; under RELAXED it trails by at most {@link GroupOptions#relaxedSyncDelay()}
+     * (rounded up to a tick) and {@link GroupOptions#relaxedSyncEntries()} entries. A witness stores
+     * no entries and reports 0. The default, for groups that cannot tell, reports 0.
+     */
+    default long durableIndex() {
+        return 0L;
+    }
+
     long lastApplied();
 
     /** Linearizable read. A lease read when this leader's lease is still valid. */

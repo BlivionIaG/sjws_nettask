@@ -22,7 +22,7 @@ if (source != null) {
 }
 ```
 
-Call `update` from the watch thread. It is synchronized, cheap (it builds an immutable view and
+Call `update` from the watch thread. It takes a short lock, is cheap (it builds an immutable view and
 swaps a reference), and listeners run on the caller's thread.
 
 Rules:
@@ -48,3 +48,56 @@ Rules:
 - Per-endpoint circuit: consecutive failures and an error-rate window, ejection with doubling
   backoff and one probe, panic mode above `max_ejection` (see `docs/user/config-file.md`).
 - An upstream with a single `url` does not go through any of this.
+
+One request through an upstream with `endpoints` (`routing.EndpointBalancer`). An endpoint upstream never
+runs the `ProxyHandler`'s own retry or circuit breaker: the balancer owns both, with one retry budget per
+upstream and the health of each endpoint.
+
+```mermaid
+flowchart TD
+    s1["1. No set was ever<br/>published: 503 without<br/>Retry-After"] --> s2["2. Pick an endpoint<br/>(next diagram)"]
+    s2 --> s3["3. Send on its pool: the<br/>ProxyHandler checks 501,<br/>413 and 400, then<br/>exchanges"]
+    s3 --> s4{"4. Failed? connect,<br/>timeout, reset, 502, 503<br/>or 504"}
+    s4 -->|no| ok["Record a success on the<br/>endpoint, relay the<br/>response"]
+    s4 -->|yes| s5["5. Record a failure on<br/>the endpoint. Retry gate<br/>open? kind in retry.on,<br/>idempotent method, no<br/>body, attempts left,<br/>budget token"]
+    s5 -->|"yes: discard the body,<br/>mark the endpoint tried"| s2
+    s5 -->|no| last["Relay the last result:<br/>the upstream response<br/>unchanged, or 504 or 502"]
+```
+
+How an endpoint is picked. An endpoint is available when it is in rotation, or is the one request that wins
+the half-open probe after `eject_for`. Endpoints of weight 0, a `SUSPECT` one or a configured `weight: 0`, are
+left for last by the weighted pass:
+
+```mermaid
+flowchart TD
+    p0["Panic mode when more<br/>than max_ejection<br/>percent of the endpoints<br/>are ejected: ejection is<br/>then ignored"]
+    p1["1. Up to 4 draws by the<br/>lb policy:<br/>weighted_random,<br/>round_robin or<br/>least_request. Take a<br/>draw that is untried and<br/>available"]
+    p2["2. Else scan from a<br/>random start, weighted<br/>endpoints first, then<br/>weight 0. Take one that<br/>is untried and available"]
+    p3["3. Else any available<br/>endpoint, even one<br/>already tried"]
+    p4["4. Else a policy draw<br/>regardless: everything<br/>is ejected, still answer"]
+    p0 --> p1 --> p2 --> p3 --> p4
+```
+
+Passive health of one endpoint. It is ejected after `failures` consecutive failures (default 5), or when the
+error rate over `window` (default 10 s, in two buckets) reaches `error_rate` (default 50 %) with at least
+`min_requests` (default 20) requests. It stays out for `eject_for` (default 10 s). Every failure while it is
+out, a failed probe or a straggling request, ejects it again for twice as long, up to 32 times `eject_for`. Only
+connect, timeout, reset and 502, 503 or 504 count as failures:
+
+```mermaid
+stateDiagram-v2
+    [*] --> IN_ROTATION
+    IN_ROTATION --> EJECTED: consecutive failures,<br/>or the error rate
+    EJECTED --> HALF_OPEN: eject_for elapsed,<br/>one request wins the probe
+    HALF_OPEN --> IN_ROTATION: a success
+    HALF_OPEN --> EJECTED: a failure
+    EJECTED --> EJECTED: a failure<br/>from a straggler
+    EJECTED --> IN_ROTATION: a success from<br/>a straggling request
+    note right of EJECTED
+        selection skips it. In panic
+        mode ejection is ignored.
+        Each failure while ejected
+        ejects it again for twice as
+        long, up to 32 times eject_for
+    end note
+```

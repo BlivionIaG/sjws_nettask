@@ -47,6 +47,8 @@ final class RaftGroup {
     static final byte JOINT = 1;
     static final byte NEW_CONFIG = 2;
     static final byte NOOP = 3;
+    /** User data appended with a STRICT override: every data copy fsyncs it before it counts. */
+    static final byte USER_STRICT = 4;
 
     static final int VOTE = 1;
     static final int VOTE_RESP = 2;
@@ -58,12 +60,11 @@ final class RaftGroup {
 
     private final ReentrantLock lock = new ReentrantLock();
     /**
-     * Committed-entry callbacks and their append futures, queued under {@link #lock} in log order and
-     * run outside it by one thread at a time ({@link #deliveryLock}), so a listener sees entries
-     * strictly in index order and never concurrently, whichever thread drove the commit.
+     * Committed-entry callbacks and their append futures, submitted under {@link #lock} in log order and
+     * run by this group's single delivery thread, so a listener sees entries strictly in index order and
+     * never concurrently, and no Raft or appending thread ever runs or waits for a callback.
      */
-    private final java.util.ArrayDeque<Runnable> deliveries = new java.util.ArrayDeque<>();
-    private final ReentrantLock deliveryLock = new ReentrantLock();
+    private final DeliveryExecutor deliveries;
     private final GroupId groupId;
     private final NodeId self;
     private final boolean witness;
@@ -97,6 +98,8 @@ final class RaftGroup {
     private boolean configFollowUpSent;
     private final Set<NodeId> votes = new HashSet<>();
     private final Map<NodeId, Long> matchIndex = new HashMap<>();
+    /** Leader view: when each peer last answered an append in this term (clock nanos). */
+    private final Map<NodeId, Long> heardAt = new HashMap<>();
     private final Map<NodeId, Long> nextIndex = new HashMap<>();
     private final TreeMap<Long, CompletableFuture<CommittedIndex>> pending = new TreeMap<>();
     private final List<CompletableFuture<Void>> reads = new ArrayList<>();
@@ -105,8 +108,23 @@ final class RaftGroup {
     private long snapTerm;
     private byte[] snapData = new byte[0];
     private boolean relaxedDirty;
+    /** Clock time when the oldest entry not yet fsynced was stored. */
+    private long dirtySince;
     private boolean forcedBeforeAck;
     private boolean ackedFromMemory;
+    /** Highest index this node has forced to its own disk (data nodes only). */
+    private long durableIndex;
+    /**
+     * A data voter that restarts with state on disk may have lost entries it acked from memory
+     * (RELAXED). Until it catches up to a leader's commit index, or {@link #recoveryUntil} passes,
+     * it neither grants votes or pre-votes nor campaigns, unless it alone is a quorum.
+     */
+    private boolean recovering;
+    /** Uncommitted indexes (leader view) that carry {@link #USER_STRICT}. */
+    private final java.util.TreeMap<Long, Long> strictPending = new java.util.TreeMap<>();
+    /** Highest pending STRICT index already reported as stalled, so each entry warns once. */
+    private long strictWarnedIndex;
+    private long recoveryUntil;
 
     private enum Role {
         FOLLOWER, PRE_CANDIDATE, CANDIDATE, LEADER
@@ -114,7 +132,7 @@ final class RaftGroup {
 
     RaftGroup(GroupId groupId, NodeId self, boolean witness, Set<NodeId> witnesses, Set<NodeId> voters,
             List<NodeId> peers, Function<Integer, NodeId> byWire, QuorumPolicy quorum, GroupOptions options,
-            LogStorage storage, ClusterRpc rpc, Clock clock, GroupListener listener) {
+            LogStorage storage, ClusterRpc rpc, Clock clock, GroupListener listener, int deliveryLagLimit) {
         this.groupId = groupId;
         this.self = self;
         this.witness = witness;
@@ -127,7 +145,30 @@ final class RaftGroup {
         this.rpc = rpc;
         this.clock = clock;
         this.listener = listener;
+        this.deliveries = new DeliveryExecutor(groupId.value(), deliveryLagLimit);
         this.voters.addAll(voters);
+        try {
+            if (storage.hasHardState(groupId)) {
+                this.term = storage.hardStateTerm(groupId);
+                int vote = storage.hardStateVote(groupId);
+                this.votedFor = vote == 0 ? null : byWire.apply(vote);
+            } else {
+                // Upgrade (or first start): no vote file. Terms only grow along the log, so the
+                // last entry carries the highest term this node can have voted in. Treat that term
+                // as already voted (for ourselves), so the node cannot grant a second vote in it.
+                // A witness keeps no entries; its forced cursor carries the term it last acked.
+                long last = witness ? 0L : storage.lastIndex(groupId);
+                this.term = witness ? storage.witnessTerm(groupId) : last == 0 ? 0L : storage.termAt(groupId, last);
+                this.votedFor = term == 0 ? null : self;
+            }
+        } catch (IOException failed) {
+            throw new UncheckedIOException("cannot load the durable term/vote of " + groupId, failed);
+        }
+        if (!witness && (term > 0 || lastIndex() > 0)) {
+            this.durableIndex = lastIndex();
+            this.recovering = true;
+            this.recoveryUntil = clock.nanoTime() + options.leaseNanos() + 2 * options.electionTimeout().toNanos();
+        }
         if (options.preferred()) {
             this.electionDeadline = Math.max(1L, options.electionTimeout().toNanos() / 5);
         } else {
@@ -200,16 +241,25 @@ final class RaftGroup {
         var after = new ArrayList<Runnable>();
         lock.lock();
         try {
-            if (relaxedDirty) {
+            if (relaxedDirty && now - dirtySince >= options.relaxedSyncDelay().toNanos()) {
                 force();
                 relaxedDirty = false;
+                if (role == Role.LEADER) {
+                    maybeCommit(after);
+                }
+            }
+            if (recovering && now >= recoveryUntil) {
+                recovering = false;
+            }
+            if (role == Role.LEADER && !strictPending.isEmpty()) {
+                warnStalledStrict(now);
             }
             if (role == Role.LEADER) {
                 if (now >= nextHeartbeat) {
                     nextHeartbeat = now + options.heartbeat().toNanos();
                     replicate();
                 }
-            } else if (!witness && now >= electionDeadline && now >= campaignNotBefore) {
+            } else if (!witness && now >= electionDeadline && now >= campaignNotBefore && !abstaining()) {
                 startPreVote(now, after);
             }
         } finally {
@@ -229,7 +279,7 @@ final class RaftGroup {
                 case PRE_VOTE -> onPreVote(body, now, after);
                 case PRE_VOTE_RESP -> onPreVoteResp(body, now, after);
                 case APPEND -> onAppend(from, body, now, after);
-                case APPEND_RESP -> onAppendResp(body, now, after);
+                case APPEND_RESP -> onAppendResp(from, body, now, after);
                 case TIMEOUT_NOW -> onTimeoutNow(body, now, after);
                 default -> {
                     // Unknown frames are ignored so a newer peer cannot crash an older one.
@@ -242,6 +292,13 @@ final class RaftGroup {
     }
 
     CompletableFuture<CommittedIndex> append(List<ByteBuffer> batch) {
+        return append(batch, null);
+    }
+
+    /** {@code durability} null uses {@link GroupOptions#durability()}. */
+    CompletableFuture<CommittedIndex> append(List<ByteBuffer> batch, Durability durability) {
+        boolean marked = durability == Durability.STRICT && options.durability() != Durability.STRICT;
+        boolean strict = marked || options.durability() == Durability.STRICT;
         if (batch == null || batch.isEmpty()) {
             throw new IllegalArgumentException("batch");
         }
@@ -262,19 +319,36 @@ final class RaftGroup {
                 future.completeExceptionally(notLeader());
                 return future;
             }
+            if (deliveries.overLimit()) {
+                future.completeExceptionally(new ApplyLagException(groupId, deliveries.lag(), deliveries.lagLimit()));
+                return future;
+            }
             if (total > options.maxBatchBytes()) {
                 future.completeExceptionally(new IllegalArgumentException("batch exceeds maxBatchBytes"));
                 return future;
             }
+            if (marked) {
+                int required = dataCopiesRequired();
+                int reachable = reachableDataCopies(clock.nanoTime());
+                if (reachable < required) {
+                    // Refused before it enters the log: a STRICT entry that cannot commit would
+                    // hold every later RELAXED entry behind it (commits are a prefix).
+                    future.completeExceptionally(new DurabilityUnavailableException(groupId, reachable, required));
+                    return future;
+                }
+            }
             long last = 0;
             for (var copy : copies) {
-                last = appendRaw(user(copy));
+                last = appendRaw(user(copy, marked ? USER_STRICT : USER));
+                if (marked) {
+                    strictPending.put(last, clock.nanoTime());
+                }
             }
             pending.put(last, future);
-            if (options.durability() == Durability.STRICT) {
+            if (strict) {
                 force();
             } else {
-                relaxedDirty = true;
+                markDirty();
             }
             maybeCommit(after);
             replicate();
@@ -299,6 +373,13 @@ final class RaftGroup {
     }
 
     private void startElection(long now, List<Runnable> after) {
+        if (!saveHardState(term + 1, self)) {
+            // Nothing changed in memory and nothing is sent; retry after a fresh timeout.
+            role = Role.FOLLOWER;
+            votes.clear();
+            electionDeadline = now + retryTimeout();
+            return;
+        }
         term++;
         role = Role.CANDIDATE;
         votedFor = self;
@@ -353,6 +434,15 @@ final class RaftGroup {
             nextIndex.put(peer, lastIndex() + 1);
             matchIndex.put(peer, 0L);
         }
+        heardAt.clear();
+        strictPending.clear();
+        strictWarnedIndex = 0;
+        for (long index = commitIndex + 1; index <= lastIndex(); index++) {
+            var data = read(index);
+            if (data != null && data.length > 0 && data[0] == USER_STRICT) {
+                strictPending.put(index, now); // age counts from this leader's term
+            }
+        }
         appendRaw(new byte[] {NOOP});
         // Leadership is visible before the no-op callback, so leaderReady stays false in onLeaderChange.
         fireLeader(after);
@@ -366,7 +456,9 @@ final class RaftGroup {
         long lastIndex = body.getLong();
         long lastTerm = body.getLong();
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            if (!stepDown(theirTerm, after)) {
+                return;
+            }
         }
         var candidate = byWire.apply(candidateWire);
         boolean grant = false;
@@ -374,9 +466,13 @@ final class RaftGroup {
             long ourLast = witness ? witnessCursorIndex() : lastIndex();
             long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);
             boolean upToDate = lastTerm > ourTerm || (lastTerm == ourTerm && lastIndex >= ourLast);
-            if (upToDate && (votedFor == null || votedFor.equals(candidate))) {
-                votedFor = candidate;
-                grant = true;
+            if (upToDate && !abstaining() && (votedFor == null || votedFor.equals(candidate))) {
+                grant = candidate.equals(votedFor) || saveHardState(term, candidate);
+                if (grant) {
+                    votedFor = candidate;
+                }
+            }
+            if (grant) {
                 electionDeadline = now + options.leaseNanos() + options.electionTimeout().toNanos();
             }
         }
@@ -394,7 +490,7 @@ final class RaftGroup {
         int voterWire = body.getInt();
         boolean granted = body.get() == 1;
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            stepDown(theirTerm, after); // a failed write leaves memory unchanged either way
             return;
         }
         if (role != Role.CANDIDATE || theirTerm != term || !granted) {
@@ -424,13 +520,15 @@ final class RaftGroup {
         // electionDeadline, so that deadline no longer says the leader is fresh.
         boolean leaderFresh = role == Role.LEADER
                 || (role == Role.FOLLOWER && leader != null && now < electionDeadline);
-        if (theirTerm >= term && candidate != null && !leaderFresh && (!witness || witnessForced())) {
+        if (theirTerm >= term && candidate != null && !leaderFresh && !abstaining()
+                && (!witness || witnessForced())) {
             long ourLast = witness ? witnessCursorIndex() : lastIndex();
             long ourTerm = witness ? witnessCursorTerm() : termAt(ourLast);
             grant = candidateTerm > ourTerm || (candidateTerm == ourTerm && candidateIndex >= ourLast);
         }
         var reply = ByteBuffer.allocate(8 + 4 + 1).order(java.nio.ByteOrder.BIG_ENDIAN);
-        reply.putLong(Math.max(term, theirTerm));
+        // Only our own (durable) term goes out; the pre-candidate accepts a grant at a term <= its own.
+        reply.putLong(term);
         reply.putInt(self.wire());
         reply.put((byte) (grant ? 1 : 0));
         if (candidate != null) {
@@ -443,10 +541,10 @@ final class RaftGroup {
         int voterWire = body.getInt();
         boolean granted = body.get() == 1;
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            stepDown(theirTerm, after); // a failed write leaves memory unchanged either way
             return;
         }
-        if (role != Role.PRE_CANDIDATE || theirTerm != term || !granted) {
+        if (role != Role.PRE_CANDIDATE || theirTerm > term || !granted) {
             return;
         }
         var voter = byWire.apply(voterWire);
@@ -478,7 +576,9 @@ final class RaftGroup {
             return;
         }
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            if (!stepDown(theirTerm, after)) {
+                return;
+            }
         }
         if (role == Role.CANDIDATE || role == Role.PRE_CANDIDATE || role == Role.LEADER) {
             role = Role.FOLLOWER;
@@ -503,8 +603,10 @@ final class RaftGroup {
             return;
         }
         long index = prevIndex;
+        boolean strictEntry = false;
         for (var entry : entries) {
             index++;
+            strictEntry |= entry.data.length > 0 && entry.data[0] == USER_STRICT;
             long existing = termAt(index);
             if (existing != entry.term) {
                 if (existing != 0) {
@@ -513,11 +615,11 @@ final class RaftGroup {
                 appendStored(index, entry.term, entry.data);
             }
         }
-        if (options.durability() == Durability.STRICT) {
+        if (options.durability() == Durability.STRICT || strictEntry) {
             force();
             forcedBeforeAck = true;
         } else {
-            relaxedDirty = true;
+            markDirty();
             ackedFromMemory = true;
         }
         ack(from, true, index);
@@ -525,15 +627,18 @@ final class RaftGroup {
             commitIndex = Math.min(leaderCommit, lastIndex());
             apply(after);
         }
+        if (recovering && commitIndex >= leaderCommit) {
+            recovering = false;
+        }
     }
 
-    private void onAppendResp(ByteBuffer body, long now, List<Runnable> after) {
+    private void onAppendResp(NodeId from, ByteBuffer body, long now, List<Runnable> after) {
         long theirTerm = body.getLong();
         int followerWire = body.getInt();
         boolean success = body.get() == 1;
         long match = body.getLong();
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            stepDown(theirTerm, after); // a failed write leaves memory unchanged either way
             return;
         }
         if (role != Role.LEADER || theirTerm != term) {
@@ -543,6 +648,12 @@ final class RaftGroup {
         if (follower == null) {
             return;
         }
+        if (from != null && !from.equals(follower)) {
+            // The body names a different voter than the authenticated sender: one member must
+            // not refresh another's liveness or matchIndex (#175).
+            return;
+        }
+        heardAt.put(follower, now);
         if (!success) {
             long next = nextIndex.getOrDefault(follower, lastIndex() + 1) - 1;
             nextIndex.put(follower, Math.max(snapIndex + 1, next));
@@ -566,7 +677,9 @@ final class RaftGroup {
             return;
         }
         if (theirTerm > term) {
-            stepDown(theirTerm, after);
+            if (!stepDown(theirTerm, after)) {
+                return;
+            }
         }
         electionDeadline = now;
         startElection(now, after);
@@ -625,6 +738,7 @@ final class RaftGroup {
             }
             if (quorumFor(index)) {
                 commitIndex = index;
+                strictPending.headMap(index, true).clear();
                 apply(after);
                 if (commitIndex - snapIndex >= options.snapshotEveryEntries()) {
                     snapshotThrough(commitIndex);
@@ -647,16 +761,16 @@ final class RaftGroup {
             }
             lastApplied = index;
             switch (data[0]) {
-                case USER -> {
+                case USER, USER_STRICT -> {
                     var payload = new byte[data.length - 1];
                     System.arraycopy(data, 1, payload, 0, payload.length);
                     long entryTerm = termAt(index);
-                    deliveries.add(() -> {
+                    deliveries.submit(() -> {
                         if (listener != null) {
                             listener.onCommitted(new CommittedEntry(groupId, entryTerm, index,
                                     ByteBuffer.wrap(payload)));
                         }
-                    });
+                    }, index);
                 }
                 case JOINT -> applyJoint(data, after);
                 case NEW_CONFIG -> applyNew(data, after);
@@ -664,11 +778,11 @@ final class RaftGroup {
                     long entryTerm = termAt(index);
                     long applied = index;
                     var copy = List.copyOf(noopListeners);
-                    deliveries.add(() -> {
+                    deliveries.submit(() -> {
                         for (var listener : copy) {
                             listener.accept(entryTerm, applied);
                         }
-                    });
+                    }, applied);
                 }
                 default -> {
                     // Leave unknown markers applied so a bad record cannot stall the group.
@@ -685,7 +799,8 @@ final class RaftGroup {
             pending.remove(entry.getKey());
             long index = entry.getKey();
             long entryTerm = termAt(index);
-            deliveries.add(() -> entry.getValue().complete(new CommittedIndex(groupId, entryTerm, index)));
+            var future = entry.getValue();
+            deliveries.submit(() -> future.complete(new CommittedIndex(groupId, entryTerm, index)), future, index);
         }
     }
 
@@ -730,28 +845,103 @@ final class RaftGroup {
         return termAt(prevIndex) == prevTerm && prevIndex <= lastIndex();
     }
 
+    /**
+     * A witness stores no entry, so a quorum of leader-memory plus witness would leave the entry
+     * nowhere durable: a leader crash would lose it and the witness cursor would then refuse every
+     * data node forever. When no data peer has acked, the leader counts itself only through
+     * {@link #durableIndex}.
+     */
     private boolean quorumFor(long index) {
         var acks = new HashSet<NodeId>();
         int dataAcks = 0;
-        if (countsAsStored(self)) {
-            acks.add(self);
-            dataAcks++;
-        }
+        boolean witnessAcked = false;
         for (var peer : peers) {
             if (matchIndex.getOrDefault(peer, 0L) >= index && isVoter(peer)) {
                 acks.add(peer);
                 if (!witnesses.contains(peer)) {
                     dataAcks++;
+                } else {
+                    witnessAcked = true;
                 }
             }
+        }
+        if (countsAsStored(self) && (dataAcks > 0 || !witnessAcked || index <= durableIndex)) {
+            acks.add(self);
+            dataAcks++;
         }
         if (!isQuorum(acks)) {
             return false;
         }
-        return options.durability() != Durability.STRICT || dataAcks >= dataCopiesRequired();
+        return !strictUpTo(index) || dataAcks >= dataCopiesRequired();
+    }
+
+    /** Committing {@code index} commits a STRICT entry: a STRICT group, or a STRICT override in range. */
+    private boolean strictUpTo(long index) {
+        if (options.durability() == Durability.STRICT) {
+            return true;
+        }
+        var first = strictPending.ceilingKey(commitIndex + 1);
+        return first != null && first <= index;
     }
 
     /** STRICT needs two data disks when the group has two data voters and a witness. */
+    /**
+     * A STRICT entry pending longer than 2 x lease is stalled (usually its second data copy died
+     * after it was accepted). Warn once per entry: committing resumes only when that data node is
+     * back, so an operator has to act.
+     */
+    private void warnStalledStrict(long now) {
+        var oldest = strictPending.firstEntry();
+        if (oldest.getKey() <= strictWarnedIndex || now - oldest.getValue() < 2 * options.leaseNanos()) {
+            return;
+        }
+        strictWarnedIndex = oldest.getKey();
+        int copies = countsAsStored(self) ? 1 : 0;
+        for (var peer : peers) {
+            if (matchIndex.getOrDefault(peer, 0L) >= oldest.getKey() && isVoter(peer) && !witnesses.contains(peer)) {
+                copies++;
+            }
+        }
+        System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                "group " + groupId.value() + ": STRICT entry " + oldest.getKey() + " pending for "
+                        + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(now - oldest.getValue()) + " ms with "
+                        + copies + " of " + dataCopiesRequired() + " data copies; " + strictPending.size()
+                        + " STRICT and every later entry wait until a data node is back");
+    }
+
+    /** Leader view: uncommitted STRICT override entries. */
+    int strictPendingCount() {
+        lock.lock();
+        try {
+            return role == Role.LEADER ? strictPending.size() : 0;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Leader view: how long the oldest uncommitted STRICT override has waited, 0 when none. */
+    long oldestStrictPendingAgeNanos() {
+        lock.lock();
+        try {
+            var oldest = role == Role.LEADER ? strictPending.firstEntry() : null;
+            return oldest == null ? 0L : Math.max(0L, clock.nanoTime() - oldest.getValue());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** The leader plus data voters that answered an append within the last lease. */
+    private int reachableDataCopies(long now) {
+        int count = countsAsStored(self) ? 1 : 0;
+        for (var peer : peers) {
+            Long heard = heardAt.get(peer);
+            if (heard != null && now - heard <= options.leaseNanos() && isVoter(peer) && !witnesses.contains(peer)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     private int dataCopiesRequired() {
         int dataVoters = 0;
         boolean witnessVotes = false;
@@ -786,7 +976,16 @@ final class RaftGroup {
         return quorum.hasQuorum(voters, acks);
     }
 
-    private void stepDown(long newTerm, List<Runnable> after) {
+    /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
+    private boolean stepDown(long newTerm, List<Runnable> after) {
+        if (newTerm > term && !saveHardState(newTerm, null)) {
+            // Every role: a node stuck below the cluster's term should be visible, not only a leader.
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                    "group " + groupId.value() + ": " + role.name().toLowerCase(java.util.Locale.ROOT) + " at term "
+                            + term + " saw term " + newTerm + " but could not persist it; staying in term " + term
+                            + " and sending nothing");
+            return false;
+        }
         boolean wasLeader = role == Role.LEADER;
         if (newTerm > term) {
             term = newTerm;
@@ -804,13 +1003,11 @@ final class RaftGroup {
             }
             leader = null;
             var error = notLeader();
-            var doomed = new ArrayList<>(pending.values());
+            // Failed on the delivery thread too, after every callback already queued for earlier entries.
+            for (var future : pending.values()) {
+                deliveries.submit(() -> future.completeExceptionally(error), future);
+            }
             pending.clear();
-            after.add(() -> {
-                for (var future : doomed) {
-                    future.completeExceptionally(error);
-                }
-            });
             if (membershipChange != null) {
                 var change = membershipChange;
                 membershipChange = null;
@@ -818,17 +1015,21 @@ final class RaftGroup {
             }
             fireLeader(after);
         }
+        return true;
     }
 
     private void fireLeader(List<Runnable> after) {
         long termNow = term;
         Optional<NodeId> who = Optional.ofNullable(leader);
         var copy = List.copyOf(leaderListeners);
-        after.add(() -> {
+        // On the delivery thread, queued before this term's no-op: a listener sees leadership changes in
+        // order with commit callbacks, so leaderReady() is still false inside onLeaderChange (#182 moved
+        // the no-op callback to the delivery thread; running this on the caller let the no-op overtake it).
+        deliveries.submit(() -> {
             for (var listener : copy) {
                 listener.accept(termNow, who);
             }
-        });
+        }, (java.util.concurrent.CompletableFuture<?>) null);
     }
 
     private long appendRaw(byte[] data) {
@@ -850,6 +1051,38 @@ final class RaftGroup {
             storage.force(groupId);
         } catch (IOException failed) {
             throw new UncheckedIOException(failed);
+        }
+        if (!witness) {
+            durableIndex = lastIndex();
+        }
+    }
+
+    /** RELAXED: fsync later (tick) or now when the entry bound is reached. */
+    private void markDirty() {
+        if (!relaxedDirty) {
+            relaxedDirty = true;
+            dirtySince = clock.nanoTime();
+        }
+        if (lastIndex() - durableIndex >= options.relaxedSyncEntries()) {
+            force();
+            relaxedDirty = false;
+        }
+    }
+
+    private boolean abstaining() {
+        return recovering && !quorum.hasQuorum(voters, Set.of(self));
+    }
+
+    /**
+     * Write the next term and vote before memory changes. False on failure: the caller leaves
+     * term and votedFor as they were and sends nothing that carries the new term.
+     */
+    private boolean saveHardState(long nextTerm, NodeId nextVote) {
+        try {
+            storage.saveHardState(groupId, nextTerm, nextVote == null ? 0 : nextVote.wire());
+            return true;
+        } catch (IOException | RuntimeException failed) {
+            return false;
         }
     }
 
@@ -891,6 +1124,7 @@ final class RaftGroup {
     }
 
     private void truncateSuffix(long fromIndex) {
+        durableIndex = Math.min(durableIndex, fromIndex - 1);
         try {
             storage.truncateSuffix(groupId, fromIndex);
         } catch (IOException failed) {
@@ -952,7 +1186,7 @@ final class RaftGroup {
             out.write(snapData);
             for (long i = snapIndex + 1; i <= index; i++) {
                 var data = read(i);
-                if (data != null && data.length > 0 && data[0] == USER) {
+                if (data != null && data.length > 0 && (data[0] == USER || data[0] == USER_STRICT)) {
                     out.write(data, 1, data.length - 1);
                 }
             }
@@ -964,9 +1198,9 @@ final class RaftGroup {
         }
     }
 
-    private static byte[] user(byte[] payload) {
+    private static byte[] user(byte[] payload, byte marker) {
         var out = new byte[payload.length + 1];
-        out[0] = USER;
+        out[0] = marker;
         System.arraycopy(payload, 0, out, 1, payload.length);
         return out;
     }
@@ -1008,87 +1242,43 @@ final class RaftGroup {
         for (var task : tasks) {
             task.run();
         }
-        deliver(false);
     }
 
-    /**
-     * For tick and frame handling (the Raft thread): never waits for the delivery lock, so heartbeats
-     * and vote replies are not held up behind a slow commit callback running on another thread. If
-     * another thread is draining, it re-checks the queue after releasing the lock and delivers what
-     * this call queued.
-     */
+    /** Tick and frame handling (the Raft thread): never runs or waits for a commit callback. */
     private void runOnRaftThread(List<Runnable> tasks) {
-        for (var task : tasks) {
-            task.run();
-        }
-        deliver(true);
+        run(tasks);
     }
 
-    /**
-     * Runs queued commit callbacks in log order, one thread at a time.
-     * <ul>
-     * <li>A callback that appends re-enters here on the draining thread: that nested call returns at
-     * once and the outer loop delivers whatever it queued, so callbacks never overlap or reorder.</li>
-     * <li>With {@code nonBlocking}, a busy lock means another thread is draining; this call returns.
-     * Every drainer re-checks the queue after unlocking (entries are queued before any lock attempt),
-     * so an entry queued while the lock was held is never stranded.</li>
-     * <li>A callback that throws is logged and skipped so the rest of the queue still drains.</li>
-     * </ul>
-     */
-    private void deliver(boolean nonBlocking) {
-        if (deliveryLock.isHeldByCurrentThread()) {
-            return;
-        }
-        while (true) {
-            if (nonBlocking) {
-                if (!deliveryLock.tryLock()) {
-                    return; // the holder re-checks after unlocking
-                }
-            } else {
-                try {
-                    deliveryLock.lockInterruptibly();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    // Entries stay queued: the current drainer, or the next tick or frame (at most about
-                    // one tick later), delivers them. See GroupListener.
-                    return;
-                }
-            }
-            try {
-                drain();
-            } finally {
-                deliveryLock.unlock();
-            }
-            lock.lock();
-            try {
-                if (deliveries.isEmpty()) {
-                    return;
-                }
-            } finally {
-                lock.unlock();
-            }
-        }
+    /** Deliveries queued or running (apply lag), for metrics and backpressure tests. */
+    long deliveryLag() {
+        return deliveries.lag();
     }
 
-    private void drain() {
-        while (true) {
-            Runnable next;
-            lock.lock();
-            try {
-                next = deliveries.poll();
-            } finally {
-                lock.unlock();
-            }
-            if (next == null) {
-                return;
-            }
-            try {
-                next.run();
-            } catch (RuntimeException e) {
-                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
-                        "commit callback failed in group " + groupId, e);
-            }
-        }
+    long maxDeliveryLag() {
+        return deliveries.maxLag();
+    }
+
+    long abandonedDeliveries() {
+        return deliveries.abandoned();
+    }
+
+    long deliveryLagWarnings() {
+        return deliveries.lagWarnings();
+    }
+
+    /** True on this group's delivery thread (inside a callback). */
+    boolean onDeliveryThread() {
+        return deliveries.onExecutorThread();
+    }
+
+    /** Waits until every delivery submitted so far has run; false on timeout or on the delivery thread. */
+    boolean awaitDelivered(java.time.Duration timeout) {
+        return deliveries.awaitIdle(timeout);
+    }
+
+    /** Drain for up to {@code budget}, then abandon (futures fail) and stop the delivery thread. */
+    boolean closeDeliveries(java.time.Duration budget) {
+        return deliveries.close(budget);
     }
 
     private record Rec(long term, byte[] data) {
@@ -1149,6 +1339,16 @@ final class RaftGroup {
             lock.lock();
             try {
                 return commitIndex;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public long durableIndex() {
+            lock.lock();
+            try {
+                return durableIndex;
             } finally {
                 lock.unlock();
             }

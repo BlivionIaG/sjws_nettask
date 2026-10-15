@@ -15,6 +15,20 @@ java -jar sjws_nettask.jar --config=sjws.yaml
 
 Defaults, then the file, then arguments, then environment variables.
 
+```mermaid
+flowchart TB
+    d["Built-in defaults"] -->|"overridden by"| f["YAML file<br/>--config, or<br/>WEB_SERVER_CONFIG"]
+    f -->|"overridden by"| a["Command-line arguments"]
+    a -->|"overridden by"| e["Environment variables<br/>WEB_SERVER_*"]
+    e --> doc["ConfigDocument,<br/>parsed strictly"]
+    doc --> snap["ConfigSnapshot<br/>immutable, one<br/>prebuilt handler"]
+    snap --> live["LiveConfig<br/>one AtomicReference,<br/>swapped on reload"]
+```
+
+Two settings do not follow this chain: the role (`--role`, then `WEB_SERVER_ROLE`, then `node.mode`, see
+[Node](#node)) and the access rules, which are merged with the flags
+(see [Precedence with the command line](#precedence-with-the-command-line)).
+
 The file is strict: an unknown key or a bad value is an error and the process exits
 64. The existing server flags stay lenient (a bad number warns and falls back).
 There is no `--key-password` and no `key_password` key; a password lives in
@@ -28,7 +42,7 @@ line and in the environment stay relative to the working directory.
 `--help` wins before a missing file is an error. A missing document root is exit
 code 2, including when the root comes from the file.
 
-`routing`, `middleware`, `access` and `node` are file-only. They do not add command-line flags.
+`routing` and `middleware` are file-only. They add no command-line flags.
 
 ## Node
 
@@ -123,6 +137,10 @@ the descriptor in `/proc/self/fd` is used only when its device and inode match t
 file. Without `/proc`, the check is an `lstat` of the path while the channel is open,
 and the owner name is compared with `root` or `user.name`. Control-plane key files use
 the same helper (`sjws_nettask.config.SecureKeyFile`).
+That also refuses a server running as root whose key sits on a bind mount owned by the host
+user (for example uid 1000), or in a directory owned by a different service account: the key
+file and every parent directory must be owned by root or the server's user, so `chown` the
+key directory to the service user in container images.
 
 ## Server
 
@@ -178,17 +196,16 @@ A bad signature, a canonical hash that is not the SHA-256 of the canonical
 document, or a lower non-zero `version` is rejected before the swap. An incoming
 canonical hash equal to the running snapshot's is a no-op: the file cache and
 upstream pools are left in place. It does not re-read the file and it does not
-replace the file: the user's YAML stays put. A data node writes last-good only
-after the swap, and only after the reload lock is released. HTTP/1 and HTTP/3
-can observe the new snapshot a moment apart: the publish updates the live
-reference, then the HTTP/3 handler and certificate.
+replace the file: the user's YAML stays put. A data node writes last-good after
+the swap. HTTP/1, HTTP/2 and HTTP/3 all read the live reference, so they see the
+new snapshot with the publish; the HTTP/3 certificate is replaced a moment later.
 
 The request path is that one volatile read and then the handler that was built
 with the snapshot. It does not parse YAML, match routes, or take the reload lock.
 
 Applied on the next request: document root, cache budget, unlistable-directory
-policy, the routing table, the middleware list and the access settings (stored,
-not dispatched), ACME settings (the renewal task is rescheduled), and a file
+policy, the routing table, the access settings and the middleware list (the list is
+stored, not dispatched), ACME settings (the renewal task is rescheduled), and a file
 certificate (`TlsMaterial.fromPem` into `Http3Server.replaceTls`). HTTP/1
 timeouts are applied when HTTP/3 is not running. The access-log writer, metrics
 exposure and `/healthz` probe stay as they were opened at startup.
@@ -199,6 +216,34 @@ running) the idle, header and write timeouts. HTTP/3's QUIC idle timeout and
 stream limits are fixed at start.
 
 No config file means reload reports `no config file` and changes nothing.
+
+`reload()` re-reads the file with the original arguments and environment (`SIGHUP` reaches it in the daemon child;
+the admin console's `r` restarts the server instead, see [admin console](../operations/admin-console.md));
+`applyRemote` takes a document that a control plane pushed instead. *Valid* means it parses, `ConfigValidator` accepts it
+(schema version, document root is a directory, certificate and key files, no `tls.cert` together with
+ACME, node labels), the certificate loads, and a new HTTP-01 port can be opened. A pushed document is
+also refused when its non-zero `version` is lower than the running one. The steps, in order, with
+every rejection leaving the previous snapshot in place:
+
+```mermaid
+flowchart TD
+    r["reload(): SIGHUP to the<br/>daemon child, through<br/>ReloadHook. A data node<br/>that took a push keeps it<br/>and re-reads only its<br/>bootstrap settings.<br/>Otherwise the file is<br/>re-read (none or<br/>invalid: rejected)"]
+    p["applyRemote(SignedSnapshot),<br/>a push. DataApply.decide<br/>checks the signature and<br/>every envelope rule<br/>(refused: rejected). The<br/>same envelope is a<br/>no-op. Then the YAML is<br/>parsed"]
+    r --> s1
+    p --> s1
+    s1["1. Valid (schema,<br/>validator, messaging<br/>shape, files) and not an<br/>older bundle version,<br/>else rejected"]
+    s1 --> s2["2. A destructive<br/>messaging change without<br/>allow_destructive:<br/>rejected. A partition<br/>decrease is rejected<br/>even with it"]
+    s2 --> s3["3. Same canonical hash as<br/>the running snapshot: a<br/>no-op, nothing is swapped"]
+    s3 --> s4["4. Bind-time settings and<br/>node.mode keep their old<br/>value (needsRestart), the<br/>certificate loads, the<br/>next snapshot compiles"]
+    s4 --> s5["5. reload() on a data<br/>node: a changed routing,<br/>middleware, access, acme<br/>or topics section is<br/>rejected, it needs a push"]
+    s5 --> s6["6. A new HTTP-01 listener<br/>opens, then one<br/>AtomicReference write<br/>publishes. After it:<br/>close the old pools,<br/>update the reaper<br/>timeouts, replace the<br/>HTTP/3 certificate, close<br/>the old HTTP-01 listener,<br/>start or update ACME"]
+    s6 --> s7["7. A data node writes<br/>last-good: inside the<br/>lock for a push, after it<br/>for reload()"]
+```
+
+HTTP/2 reads the live snapshot on every request, as HTTP/1.1 does, so a reload reaches it with
+the publish. Its TLS certificate is read when it starts: a reload or an ACME renewal replaces
+the certificate on HTTP/3 only (`Http3Server.replaceTls`). See
+[Handler composition](../design/architecture.md#handler-composition).
 
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
 the JDK does not expose `sun.misc.Signal`, and when this process already ignores
@@ -257,6 +302,37 @@ scheduled for `notAfter - renew_before`. A delay under one minute after a
 successful issue is stretched to one hour. Failures back off from 30 seconds,
 doubling up to 15 minutes.
 
+```mermaid
+sequenceDiagram
+    participant R as acme-renew thread
+    participant CA as ACME CA
+    participant B as ChallengeBoard
+    participant H3 as Http3Server
+
+    Note over R: starts once this node is leader-ready:<br/>a standalone node at once, a control node<br/>after leaderReady, a data node never
+    Note over R: load the stored certificate
+    opt it is still valid
+        R->>H3: replaceTls(stored)
+    end
+    alt valid, and the renewal point is a minute or more away
+        Note over R: sleep until notAfter minus renew_before
+    else missing, expired or inside the window
+        R->>CA: place an order
+        CA-->>R: HTTP-01 challenge
+        R->>B: put(token, authorization)
+        R->>CA: trigger the challenge
+        CA->>B: GET the token
+        Note over CA,B: answered by the main listener,<br/>or by the dedicated http_port listener
+        B-->>CA: key authorization
+        CA-->>R: authorization valid
+        R->>CA: finalize with the domain key
+        CA-->>R: certificate chain
+        Note over R: write it to the store,<br/>remove the token from the board
+        R->>H3: replaceTls(new)
+    end
+    Note over R: A failure is logged and retried after 30 s,<br/>doubling up to 15 min. Losing leadership<br/>cancels the queued attempt, one already<br/>running still finishes
+```
+
 The published chain is installed with `Http3Server.replaceTls`. BoringSSL asks
 the key manager on every handshake, so new connections use the new certificate
 and connections that already shook hands keep the old one.
@@ -274,9 +350,10 @@ handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
 idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
 HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
 response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
-streamed upstream (over `max_body` is 413). A chunked request body, or a body on HTTP/2 or
-HTTP/3, is 501 for now; see `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
-TCP and `https` on HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
+streamed upstream (over `max_body` is 413). A chunked request body is 501 for now, as is a declared body that the
+transport did not attach (HTTP/1.1 is the only transport that attaches request bodies today); see
+`docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
 and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
 growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
@@ -525,13 +602,15 @@ swarm:
 ```
 
 `swarm.enabled: true` starts the optional agent-swarm module (`docs/design/agent-swarm.md`)
-before the listener accepts. The module mounts `/swarm/v1/*`; those requests answer 501 until
-the task API lands, and every other path stays on the terminal the server already had. It is
+before the listener accepts. The module mounts `/swarm/v1/*`; every request needs an agent bearer token (`sjws.swarm.tokens.file` or
+`SJWS_SWARM_TOKENS_FILE`, a mode 0600 file) and answers 401 without one, and every other path stays on the terminal the server already had. It is
 node-local, like `server.bind_content`: it is not part of the
 canonical document, so the control plane does not distribute it and a config recovered from
 last-good starts with the swarm off. The JVM property `-Dsjws.swarm.enabled` and then the
 environment variable `SJWS_SWARM_ENABLED` win over the key when set. With the swarm off no
-`sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet.
+`sjws_nettask.swarm` class is loaded. `swarm` accepts no other key yet. Its other settings are JVM properties or
+variables only: `sjws.swarm.dir` / `SJWS_SWARM_DIR`, `sjws.swarm.node` / `SJWS_SWARM_NODE`, and
+`-Dsjws.swarm.pool.shards=N` (partitions per pool, 1..256, default 1, no variable).
 The key is read once, at startup: changing it takes effect on restart, not on reload.
 
 ## Buffers
@@ -596,7 +675,7 @@ the previous certificate until they close. Renewal does not restart the process
 and does not drain the UDP listener.
 
 Secrets. The file is not scanned for `${env:NAME}` or `${file:path}` placeholders.
-The one secret is the TLS key password. It is never a YAML value and never a
-command-line argument. `tls.key_password_file` is read when HTTP/3 stays enabled
+The secrets are the TLS key password, which is never a YAML value or a
+command-line argument, and the HA cluster key, which can be inline (`ha.cluster_key`) but is never an argument. `tls.key_password_file` is read when HTTP/3 stays enabled
 and neither `WEB_SERVER_TLS_KEY_PASSWORD` nor `WEB_SERVER_TLS_KEY_PASSWORD_FILE`
 nor `--key-password-file` was set. The environment variable wins over the file.

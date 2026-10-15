@@ -16,6 +16,28 @@ java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --restart --pid-file=/run/sjws_ne
     --log-file=/var/log/sjws_nettask.log 8080 /var/www/html
 ```
 
+```mermaid
+sequenceDiagram
+    participant U as Shell
+    participant P as Parent JVM
+    participant C as Child JVM
+    participant F as Pid file<br/>and log file
+
+    U->>P: java -jar ... --daemon
+    Note over P: load the configuration and resolve the role,<br/>invalid: exit 64
+    P->>F: check the pid file and log file
+    Note over P,F: refuse if the pid file names a live<br/>server, or the log file is not writable
+    P->>C: start a second JVM
+    Note over P,C: new session when setsid exists,<br/>SJWS_DAEMON_CHILD=1, WEB_SERVER_* settings<br/>(not the two HA key variables),<br/>output appended to the log file
+    Note over C: load the configuration (with --bootstrap, the<br/>role settings too: a bad file, or a control<br/>role without cp settings, exits 64), make<br/>SIGHUP a reload, start the server: optional<br/>modules, HTTP/3, HTTP/2, the TCP port
+    C->>F: write the pid file
+    Note over C,F: once the server is listening
+    Note over C: with --bootstrap the role hooks run after that.<br/>A failure there is normally only<br/>reported in the log
+    P->>F: poll for the child's pid
+    P-->>U: Started sjws_nettask (pid N), exit 0
+    Note over P,C: If the child exits first, or 20 s pass<br/>without a pid file (the child is then<br/>stopped), the parent prints the last<br/>log lines and exits non-zero
+```
+
 `--stop` sends SIGTERM and waits for the drain budget (default 30 seconds, or `drain-ms` from the
 status file) plus 5 seconds, then SIGKILL. `--shutdown-timeout` is not added to that wait.
 `--status` prints `running pid=<n>`, `stopped`, or `stopped stale pid=<n>`. A control or data
@@ -37,6 +59,24 @@ parallel with that wait. `--stop` waits for the HA budget recorded in the status
 is present, then the same 5 second margin as before. A foreground process with
 `--pid-file` writes the same file, so `--stop` works for it too; without `--log-file` it keeps
 logging to the console.
+
+```mermaid
+sequenceDiagram
+    participant H as Shutdown hook
+    participant S as SjwsServer
+
+    Note over H: SIGTERM or SIGINT, --stop sends SIGTERM
+    H->>S: drain()
+    Note over S: with HA attached (embedders only),<br/>Lifecycle.drain runs first: not-ready,<br/>deregistration delay, Connection: close
+    Note over S: close() removes the SIGHUP hook, stops<br/>ACME renewal and the HTTP-01 listener,<br/>withdraws Alt-Svc
+    Note over S: stop accepting on every listener: HTTP/2<br/>GOAWAY, HTTP/3 refuses new connections, the<br/>TCP socket closes. Idle and half-read<br/>HTTP/1.1 connections are dropped at once
+    Note over S: responses in progress finish, up to<br/>--shutdown-timeout (default 10 s). HTTP/2 and<br/>HTTP/3 drain in parallel, HTTP/3 up to 2 s.<br/>Whatever is still open is closed
+    Note over S: close the proxy's upstream pools,<br/>then the access-log writer
+    S-->>H: drained
+    Note over H: wait up to 5 s for main to log<br/>Server Terminated properly !
+    Note over H: role hooks: a control process closes its<br/>control plane (admin, watch, store), a data<br/>process stops its watch client, and the<br/>status file is removed
+    Note over H: remove the pid file, then the JVM exits<br/>143 (SIGTERM) or 130 (SIGINT)
+```
 
 `contrib/sjws` is a small start/stop/status/restart wrapper (`SJWS_JAR`, `SJWS_PID_FILE`,
 `SJWS_LOG_FILE`, `JAVA`). `contrib/sjws_nettask.service` is a systemd `Type=forking` example

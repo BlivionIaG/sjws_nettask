@@ -17,14 +17,24 @@
 package sjws_nettask.cluster;
 
 /**
- * Per-group committed-entry stream. Equivalent to a state-machine callback: calls arrive strictly in
- * index order and never overlap, though not always on the same thread. A callback may append to the
- * group; the new entry is delivered after this callback returns (by the same draining loop), so a
- * callback must not block waiting for its own append's future, which would deadlock.
+ * Per-group committed-entry stream. Equivalent to a state-machine callback: calls arrive strictly in index order,
+ * never overlap, and always run on the group's single delivery thread (docs/design/raft-delivery-executor.md).
+ * Append futures complete on that same thread, after the callbacks of every entry up to theirs.
  * <p>
- * Delivery can lag: if the thread draining callbacks is interrupted while waiting for the delivery
- * lock, or the Raft thread finds another thread draining, the entries stay queued and are delivered
- * by the current drainer or by the next tick or frame, so at most about one tick later.
+ * Rules for implementations:
+ * <ul>
+ * <li><b>Be fast.</b> Every later callback and every append-future completion of the group waits behind this
+ * one; while deliveries back up past the limit, {@code append()} futures fail with {@link ApplyLagException}.</li>
+ * <li><b>No IO</b> (disk, network, pulls). Hand slow work to your own worker and return.</li>
+ * <li><b>Never block on your own append's future</b> (or any later entry's): it completes on this thread,
+ * after this callback returns, so waiting for it deadlocks the group's deliveries. Appending is fine; chain on
+ * the future instead of joining it.</li>
+ * <li>A callback that throws is logged and skipped; the stream continues.</li>
+ * <li><b>State must be rebuildable by replaying the log.</b> {@code close()} drains for a bounded time, then may
+ * interrupt a running callback mid-way and drop the rest (one WARN with the count and index range; their append
+ * futures fail with {@link CommittedNotAppliedException}). Those entries are committed and are delivered again
+ * when the group reopens and replays.</li>
+ * </ul>
  */
 @FunctionalInterface
 public interface GroupListener {

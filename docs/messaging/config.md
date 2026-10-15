@@ -5,7 +5,10 @@ Status: Draft (proposal pending Blivion and the HA/control-plane workstream) · 
 ## 0. Context and assumptions
 The control-plane (CP) direction (via inceptor, 2026-10-12): Raft control nodes push **versioned config** to
 **labeled data-plane nodes**, and the message broker is one node role. HA owns `docs/design/control-plane.md`.
-**Update:** the control-plane design is now [PR #38](https://github.com/BlivionIaG/sjws_nettask/pull/38) (`docs/design/control-plane.md`). Its §13.5 `topics:` list is the anchor this schema extends. No CP interfaces exist in code yet, so the apply contract below stays an assumed interface until #38's implementation PRs land.
+**Update:** the control-plane design is [PR #38](https://github.com/BlivionIaG/sjws_nettask/pull/38) (`docs/design/control-plane.md`). Its §13.5 holds the `topics:` schema, the validation, the destructive-change guards and the placement and rebalance rules. The control plane is merged: `cp.DataWatch` hands each signed snapshot to `SjwsServer.applyRemote`, and `config.MessagingSettings` carries the topic schema. No broker code consumes it yet, so the apply contract below stays an assumed interface.
+
+## 4. Placement and rebalance
+The control plane computes the assignment ([control plane](../design/control-plane.md) §13.5, "Placement, computed by the control plane"). Moving a replica is add-before-remove:
   1. The CP adds the new replica as a **learner** (`changeMembership(voters, learners + new)`).
   2. The learner catches up: snapshot install plus log tail (step 3: on-disk state snapshots).
   3. Once the learner's lag is ≤ `catch_up_entries`, it is promoted to voter by joint consensus.
@@ -31,7 +34,7 @@ interface ApplyReport {                          // reported back to the CP (and
 ```
 `MessagingConfigApplier implements ConfigSubscriber<MessagingConfig>`:
 1. If `version ≤ applied`, ignore it (idempotent, at-least-once delivery safe).
-2. Validate (§2). On error, keep the old state and report `errors`. The broker never applies half a version.
+2. Validate (control-plane.md §13.5). On error, keep the old state and report `errors`. The broker never applies half a version.
 3. Diff against the current state:
    - **Open:** partitions assigned to this node and not open (open the ledger, replay, register stats, join the replication group).
    - **Update in place:** retry and visibility settings (an atomic swap of the partition policy; in-flight leases keep their deadlines),
@@ -51,7 +54,7 @@ Requirements on the control plane (posted as review feedback on #38):
 2. **Node labels** in membership, including `role: broker`, so placement can select brokers, plus a topology label (zone) for spreading.
 3. **An assignment computed by the CP leader**, part of the versioned config and deterministic, so brokers never compute placement themselves.
 4. **Access to replication-group membership changes** (learner add, joint-consensus promote, remove) and `transferLeadership`.
-   The #29 cluster API had these, but its code is not on master d592aaf; please confirm where it now lives.
+   `cluster.ReplicationGroup` has them: `changeMembership(voters, learners)` (joint consensus) and `transferLeadership(target)`.
 5. **Separation of planes:** the CP Raft group holds config and assignment only. Message data goes through per-partition groups
    (design.md §6) and never through the CP log.
 6. **Fencing:** the CP must not move a partition away from a node until the node's removal is committed in that partition's group,
@@ -59,6 +62,6 @@ Requirements on the control plane (posted as review feedback on #38):
 7. **Zero cost when off:** a node without the broker role gets no messaging section, and nothing messaging-related starts.
 
 ## 7. Implementation plan
-1. A `messaging:` section in `ConfigDocument` (parse and validate). Single node, no CP: apply on start and on reload, which is useful now.
+1. Done: the `messaging:` section in `ConfigDocument` (`config.MessagingSettings`: parse, validate, diff, destructive-change guards). To do: apply it on start and on reload (single node, no CP), which is useful now.
 2. `MessagingConfigApplier` against `ConfigSubscriber`, once the CP interfaces exist.
 3. Rebalance hooks (learner → voter) on the replication groups.

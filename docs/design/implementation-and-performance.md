@@ -5,22 +5,72 @@ See [docs/design/architecture.md](architecture.md) for the layers, the `core.Han
 * **core** (`sjws_nettask.core`): protocol-neutral `Request`/`Response`/`Body` records, the
   `StaticFileHandler` (every status decision: path decoding and containment, index/listings, MIME,
   validators, conditionals, ranges), `SafeOpen` (no-follow, `openat`-based opens checked against the
-  resolved file identity), the small-file `FileCache` and the per-address connection counter. Both
-  transports call the same handler, so behaviour is identical by construction; a parity test compares
-  every HTTP/3 response with the HTTP/1.1 bytes for the same request. Optional request filters
+  resolved file identity), the small-file `FileCache` and the per-address connection counter. Every
+  transport calls the same handler, so behaviour is identical by construction; parity tests compare
+  every HTTP/2 and HTTP/3 response with the HTTP/1.1 bytes for the same request (`h2/Http2ServerTest`,
+  `h3/Http3ServerTest`). Optional request filters
   (`RequestFilters`, see [docs/development/filters.md](../development/filters.md)) wrap whatever `Handler` is terminal
   (the static file handler, or a router when one is installed) on every transport. With none
   registered, and no other terminal, the static handler is called directly. `Request` carries the
-  client address, whether the connection is TLS, and the raw header map.
+  client address, whether the connection is TLS, a streamed body (HTTP/1.1 `Content-Length` requests
+  only) and the raw header map (always filled on HTTP/1.1; on HTTP/3 only when a filter chain or a
+  non-static terminal is installed at startup; HTTP/2 leaves it empty).
 * **HTTP/1.1** (`sjws_nettask` + `sjws_nettask.http1`): one virtual thread per connection on a blocking
   `SocketChannel`; an incremental, strict byte-level head parser (CL/TE smuggling, limits, obs-fold,
   Host, Expect); responses written whole (head and small bodies in one `write`, `Date` formatted once
   per second); files over 64 KiB that are not cached go out with `FileChannel.transferTo` (`sendfile`).
   A single timer thread enforces the idle, request-head (408) and write-progress deadlines and ends
   expired connections with `shutdown(2)` (it never blocks in `close()`).
+* **HTTP/2** (`sjws_nettask.h2`): Netty on its own TCP port (`--h2`): TLS with ALPN `h2` and an
+  `http/1.1` fallback, optional h2c; a virtual thread per request runs the shared handler; caps on
+  streams, in-flight requests and file responses, rapid-reset and CONTINUATION-flood limits.
 * **HTTP/3** (`sjws_nettask.h3`, `sjws_nettask.tls`): Netty QUIC (quiche); a virtual thread per request
   stream runs the shared handler; file slots, a per-connection in-flight share, a minimum send rate
   under contention, handshake and half-open caps, GOAWAY drain.
+
+Threads at runtime. Every request runs the shared handler on a virtual thread; platform threads exist
+only for accepting, timing, event loops and background work:
+
+```mermaid
+flowchart TB
+    subgraph tcp["HTTP/1.1: blocking NIO"]
+        direction TB
+        acc["accept-loop<br/>platform thread,<br/>one virtual thread<br/>per connection"]
+        rp["http1-reaper<br/>platform daemon thread,<br/>every 50 ms expires<br/>overdue deadlines"]
+        vt1["virtual thread<br/>per connection"]
+        acc ~~~ rp
+        acc --> vt1
+        rp -.-> vt1
+    end
+
+    subgraph h2["HTTP/2: Netty"]
+        direction TB
+        el2["boss and worker<br/>event loops"]
+        vt2["virtual thread<br/>per stream"]
+        el2 --> vt2
+    end
+
+    subgraph h3["HTTP/3: Netty QUIC"]
+        direction TB
+        el3["one event loop thread:<br/>the UDP socket and<br/>every QUIC connection"]
+        vt3["virtual thread<br/>per request"]
+        el3 --> vt3
+    end
+
+    hh["Handler.handle(Request)<br/>file reads and<br/>writes happen here,<br/>never on an event loop"]
+    vt1 --> hh
+    vt2 --> hh
+    vt3 --> hh
+
+    up["upstream-io-N<br/>shared Netty event loops<br/>platform daemon threads<br/>max(2, CPUs / 2)"]
+    hh -->|"proxy route"| up
+```
+
+More daemon threads exist only when their feature is on: `access-log` drains the bounded log queue,
+`acme-renew` issues and renews certificates, and `acme-http-01` accepts on the dedicated HTTP-01 port.
+The `upstream-io-N` event loops belong to the reverse proxy (`routing.enabled` with a proxy route).
+One group serves every upstream pool in the process: the first pool creates it and the last one
+closing shuts it down. The upstream socket I/O runs there while the request's virtual thread waits.
 
 **Measured** (loopback, 8 cores: server pinned to 4, `wrk -t4` to the other 4; 8 s per point, fresh JVM
 with G1 and a 1 GB heap, 3 repetitions, medians; requests/s, or GB/s for 50 MB with a 30 s wrk timeout).

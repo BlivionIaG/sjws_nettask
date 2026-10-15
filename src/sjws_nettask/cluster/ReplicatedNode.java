@@ -51,6 +51,12 @@ public final class ReplicatedNode implements ClusterNode {
     private final Map<GroupId, RaftGroup> groups = new LinkedHashMap<>();
     private volatile Duration tick;
     private volatile boolean running;
+    /**
+     * An append wakes the background loop so it replicates now instead of at the next tick. Before #182 a
+     * closed-loop producer's next append landed inside the same step (its future completed on the Raft thread);
+     * with futures completing on the delivery thread it arrived just after the step and waited a whole tick.
+     */
+    private final java.util.concurrent.Semaphore wake = new java.util.concurrent.Semaphore(0);
     private Thread thread;
 
     private ReplicatedNode(NodeId self, List<Member> members, Set<NodeId> voters, QuorumPolicy quorum, Clock clock,
@@ -123,7 +129,28 @@ public final class ReplicatedNode implements ClusterNode {
         }
     }
 
+    /**
+     * One manual step (tests, simulations, {@code CpStore.drive()}): ticks, frames, then waits up to
+     * {@link #DRIVE_DELIVERY_WAIT} for the deliveries it caused, so callers see callbacks deterministically.
+     * The background loop ({@link #begin}) never waits for a callback.
+     */
     public void drive() {
+        step();
+        for (var group : groups.values()) {
+            if (!group.onDeliveryThread()) {
+                group.awaitDelivered(DRIVE_DELIVERY_WAIT);
+            }
+        }
+    }
+
+    /** Apply-lag limit for groups opened afterwards; tests lower it to exercise backpressure. */
+    volatile int deliveryLagLimit = DeliveryExecutor.DEFAULT_LAG_LIMIT;
+
+    /** How long {@link #drive()} waits for deliveries; a slower callback just finishes later. */
+    static final Duration DRIVE_DELIVERY_WAIT = Duration.ofSeconds(5);
+
+    /** {@link #drive()} without waiting for deliveries: what the background Raft thread runs. */
+    void step() {
         long now = clock.nanoTime();
         for (var group : groups.values()) {
             group.tick(now);
@@ -161,8 +188,8 @@ public final class ReplicatedNode implements ClusterNode {
     private void loop() {
         while (running) {
             try {
-                drive();
-                clock.sleep(tick);
+                step();
+                pause();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 break;
@@ -216,20 +243,39 @@ public final class ReplicatedNode implements ClusterNode {
             }
         }
         var group = new RaftGroup(groupId, self, witness, witnesses, voters, peers, byWire::get, quorum, options,
-                storage, rpc, clock, listener);
+                storage, rpc, clock, listener, deliveryLagLimit);
         groups.put(groupId, group);
         return group.facade();
     }
 
     @Override
     public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch) {
+        return append(groupId, batch, null);
+    }
+
+    @Override
+    public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability) {
         var group = groups.get(groupId);
         if (group == null) {
             var future = new CompletableFuture<CommittedIndex>();
             future.completeExceptionally(new IllegalStateException("no group " + groupId));
             return future;
         }
-        return group.append(batch);
+        var future = group.append(batch, durability);
+        if (running && wake.availablePermits() == 0) {
+            wake.release();
+        }
+        return future;
+    }
+
+    /** One tick, cut short by an append; a fake clock (tests) keeps its own deterministic sleep. */
+    private void pause() throws InterruptedException {
+        if (clock != Clock.SYSTEM) {
+            clock.sleep(tick);
+            return;
+        }
+        wake.tryAcquire(tick.toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS);
+        wake.drainPermits();
     }
 
     @Override
@@ -258,6 +304,42 @@ public final class ReplicatedNode implements ClusterNode {
                 Thread.currentThread().interrupt();
             }
         }
+        for (var group : groups.values()) {
+            group.closeDeliveries(CLOSE_DRAIN);
+        }
         transport.detach(self);
     }
+
+    /** STRICT override entries the group's leader holds uncommitted (0 on a follower). */
+    public int strictPending(GroupId groupId) {
+        return group(groupId).strictPendingCount();
+    }
+
+    /** Age of the oldest uncommitted STRICT override on the group's leader, 0 when none. */
+    public long oldestStrictPendingAgeNanos(GroupId groupId) {
+        return group(groupId).oldestStrictPendingAgeNanos();
+    }
+
+    /** Apply lag of one group: deliveries queued or running. */
+    public long deliveryLag(GroupId groupId) {
+        return group(groupId).deliveryLag();
+    }
+
+    /** Deliveries of one group that {@link #close()} dropped after the drain budget (applied on reopen by replay). */
+    public long abandonedDeliveries(GroupId groupId) {
+        return group(groupId).abandonedDeliveries();
+    }
+
+    /** Times one group's apply lag crossed the warn threshold (4 x the lag limit; follower queues are unbounded). */
+    public long deliveryLagWarnings(GroupId groupId) {
+        return group(groupId).deliveryLagWarnings();
+    }
+
+    /** Highest apply lag seen by one group. */
+    public long maxDeliveryLag(GroupId groupId) {
+        return group(groupId).maxDeliveryLag();
+    }
+
+    /** {@link #close()} drains each group's deliveries this long, then abandons the rest. */
+    static final Duration CLOSE_DRAIN = Duration.ofSeconds(1);
 }

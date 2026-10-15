@@ -253,7 +253,12 @@ public final class CpLaunch {
         }
     }
 
-    /** Same path, same file, or byte-identical contents. Unreadable files are left to the TLS loader. */
+    /**
+     * Same path, or the two bundles share a CA public key (re-encoded or re-issued PEMs of the same CA still
+     * match; byte comparison missed those). Unreadable or unparsable files are left to the TLS loader, which
+     * still fails closed: {@code AdminTls} refuses to start a listener whose CA bundle it cannot read or parse, so
+     * {@code false} here never lets an unchecked CA through.
+     */
     static boolean sameCa(Path a, Path b) {
         if (a == null || b == null) {
             return false;
@@ -262,9 +267,17 @@ public final class CpLaunch {
             return true;
         }
         try {
-            return java.nio.file.Files.isSameFile(a, b) || java.util.Arrays.equals(java.nio.file.Files.readAllBytes(a),
-                    java.nio.file.Files.readAllBytes(b));
-        } catch (IOException e) {
+            var keys = new java.util.HashSet<String>();
+            for (var cert : AdminTls.trustCertificates(a)) {
+                keys.add(java.util.HexFormat.of().formatHex(cert.getPublicKey().getEncoded()));
+            }
+            for (var cert : AdminTls.trustCertificates(b)) {
+                if (keys.contains(java.util.HexFormat.of().formatHex(cert.getPublicKey().getEncoded()))) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (IOException | RuntimeException e) {
             return false;
         }
     }
