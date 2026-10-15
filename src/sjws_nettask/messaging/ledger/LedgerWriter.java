@@ -186,6 +186,26 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      * Shared-pool writer entry: drain this writer's queue and commit. Returns true when any work was done.
      * Called only from a shared writer thread (or {@link #close} on the closer).
      */
+    /**
+     * Shared single-member shard: block for up to {@code waitNanos} for the first pending append, then drain.
+     * Returns after one drain cycle (possibly empty on timeout).
+     */
+    void blockingDrain(long waitNanos) throws InterruptedException {
+        Pending first = queue.poll(waitNanos, TimeUnit.NANOSECONDS);
+        if (first == null) return;
+        var group = drainBuf();
+        group.add(first);
+        queue.drainTo(group);
+        behind = queue.size() >= capacity;
+        int poison = indexOfPoison(group);
+        if (poison >= 0) {
+            group.subList(poison, group.size()).clear();
+            stopSyncer = true;
+        }
+        if (!group.isEmpty()) commit(group);
+        group.clear();
+    }
+
     boolean drainAndCommit() {
         Pending first = queue.poll();
         if (first == null) return false;

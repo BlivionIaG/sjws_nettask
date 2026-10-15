@@ -80,7 +80,7 @@ public final class SharedLedgerPool {
         shards[shard].remove(w);
     }
 
-    /** Writer has work: wake the shard's writer thread (idempotent if already runnable). */
+    /** Writer has work: wake the shard writer thread (idempotent if already runnable). */
     void signalWriter(int shard, LedgerWriter w) {
         if (shard >= 0 && shard < shards.length) shards[shard].signalWriter(w);
     }
@@ -121,6 +121,17 @@ public final class SharedLedgerPool {
 
         private void writeLoop() {
             while (!stop) {
+                // Fast path: one member on this shard — block on its queue like a dedicated writer.
+                if (members.size() == 1) {
+                    var only = members.get(0);
+                    try {
+                        only.blockingDrain(100_000_000L); // up to 100 ms, then re-check membership
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    continue;
+                }
                 LedgerWriter w;
                 try {
                     w = ready.poll(100, TimeUnit.MILLISECONDS);
@@ -129,13 +140,11 @@ public final class SharedLedgerPool {
                     return;
                 }
                 if (w == null) {
-                    // Backstop: drain any member that has work if a signal was lost.
                     for (var m : members) {
                         if (m.drainAndCommit()) { /* keep going */ }
                     }
                     continue;
                 }
-                // Drain this writer fully; coalesced signals for the same writer are fine.
                 while (w.drainAndCommit()) { }
             }
         }
