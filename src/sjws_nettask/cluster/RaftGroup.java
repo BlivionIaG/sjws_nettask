@@ -1788,6 +1788,16 @@ final class RaftGroup {
         }
 
         @Override
+        public long leaderTerm() {
+            lock.lock();
+            try {
+                return role == Role.LEADER ? term : -1L;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
         public long leaseExpiresAt() {
             lock.lock();
             try {
