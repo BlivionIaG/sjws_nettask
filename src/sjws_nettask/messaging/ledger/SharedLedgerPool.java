@@ -46,7 +46,7 @@ public final class SharedLedgerPool {
 
     private final Shard[] shards;
 
-    private SharedLedgerPool(int n) {
+    SharedLedgerPool(int n) { // package-private for tests
         if (n == 0) {
             this.shards = new Shard[0];
             return;
@@ -138,12 +138,14 @@ public final class SharedLedgerPool {
             if (t != null) LockSupport.unpark(t);
         }
 
-        /** True when this thread should exit: it is no longer the syncer, or the shard is empty (then it clears itself). */
-        private boolean retire(Thread me) {
-            if (!members.isEmpty() && syncer == me) return false;
+        /**
+         * True when the shard is empty; the syncer then clears itself under the lock. Only the running syncer clears
+         * {@code syncer} and {@code add} sets it only when null, so {@code syncer == current thread} holds here.
+         */
+        private boolean retire() {
+            if (!members.isEmpty()) return false;
             startLock.lock();
             try {
-                if (syncer != me) return true;
                 if (!members.isEmpty()) return false;
                 syncer = null;
                 return true;
@@ -153,14 +155,13 @@ public final class SharedLedgerPool {
         }
 
         private void syncLoop() {
-            var me = Thread.currentThread();
             while (true) {
                 boolean busy = false;
                 for (var w : members) {
                     if (w.sharedSyncSlice()) busy = true;
                 }
                 if (busy) continue;
-                if (retire(me)) return;
+                if (retire()) return;
                 // Brief spin so an unpark that races the idle check is not delayed by a long park.
                 for (int i = 0; i < 256 && !busy; i++) {
                     for (var w : members) {
@@ -172,7 +173,7 @@ public final class SharedLedgerPool {
                     if (!busy) Thread.onSpinWait();
                 }
                 if (busy) continue;
-                if (retire(me)) return;
+                if (retire()) return;
                 LockSupport.parkNanos(this, LedgerWriter.IDLE_PARK_NANOS);
             }
         }

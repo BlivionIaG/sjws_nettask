@@ -58,4 +58,77 @@ class SharedLedgerPoolTest {
             if (pool.memberCount(s) == 0) assertNull(pool.syncerThread(s), "shard " + s + " syncer still running");
         }
     }
+
+    @Test
+    void resolveSizeParsesTheProperty() {
+        String old = System.getProperty(SharedLedgerPool.PROPERTY);
+        int cpus = Math.max(1, Runtime.getRuntime().availableProcessors());
+        try {
+            System.clearProperty(SharedLedgerPool.PROPERTY);
+            assertEquals(cpus, SharedLedgerPool.resolveSize());
+            for (var v : List.of(" ", "auto", "AUTO", "true")) {
+                System.setProperty(SharedLedgerPool.PROPERTY, v);
+                assertEquals(cpus, SharedLedgerPool.resolveSize(), v);
+            }
+            for (var v : List.of("0", "false", "off")) {
+                System.setProperty(SharedLedgerPool.PROPERTY, v);
+                assertEquals(0, SharedLedgerPool.resolveSize(), v);
+            }
+            System.setProperty(SharedLedgerPool.PROPERTY, " 3 ");
+            assertEquals(3, SharedLedgerPool.resolveSize());
+            System.setProperty(SharedLedgerPool.PROPERTY, "-1");
+            assertThrows(IllegalArgumentException.class, SharedLedgerPool::resolveSize);
+            System.setProperty(SharedLedgerPool.PROPERTY, "x");
+            assertThrows(NumberFormatException.class, SharedLedgerPool::resolveSize);
+        } finally {
+            if (old == null) System.clearProperty(SharedLedgerPool.PROPERTY);
+            else System.setProperty(SharedLedgerPool.PROPERTY, old);
+        }
+    }
+
+    @Test
+    void emptyPoolHasNoShardsAndIgnoresOutOfRangeShards() {
+        var p = new SharedLedgerPool(0);
+        assertEquals(0, p.size());
+        p.unparkSyncer(0);
+        p.unparkSyncer(-1);
+        p.unregister(null, 0);
+        p.unregister(null, -1);
+    }
+
+    /** Least-loaded placement prefers an empty shard; syncers start on first member and retire on last. */
+    @Test
+    void registerSpreadsWritersAndSyncersFollowMembership() throws Exception {
+        var p = new SharedLedgerPool(2);
+        try (var l1 = SegmentedLog.open(dir.resolve("a")); var w1 = new LedgerWriter(l1, Durability.ASYNC);
+                var l2 = SegmentedLog.open(dir.resolve("b")); var w2 = new LedgerWriter(l2, Durability.ASYNC);
+                var l3 = SegmentedLog.open(dir.resolve("c")); var w3 = new LedgerWriter(l3, Durability.ASYNC)) {
+            int s1 = p.register(w1), s2 = p.register(w2);
+            assertNotEquals(s1, s2, "second writer goes to the empty shard");
+            assertNotNull(p.syncerThread(s1));
+            assertNotNull(p.syncerThread(s2));
+            p.unregister(w2, s2);
+            int s3 = p.register(w3); // shard s2 is empty again: preferred
+            assertEquals(s2, s3);
+            int s4 = p.register(w2); // both have one: ties keep the lowest index
+            assertEquals(0, s4);
+            assertEquals(2, p.memberCount(0));
+            assertEquals(3, p.memberCount(0) + p.memberCount(1));
+            p.unparkSyncer(s1);
+            p.unparkSyncer(5);
+            p.unregister(w1, 7); // out of range: ignored
+            assertEquals(3, p.memberCount(0) + p.memberCount(1));
+            p.unregister(w1, s1);
+            p.unregister(w2, s4);
+            p.unregister(w3, s3);
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            while ((p.syncerThread(0) != null || p.syncerThread(1) != null) && System.nanoTime() < deadline) Thread.sleep(1);
+            assertNull(p.syncerThread(0));
+            assertNull(p.syncerThread(1));
+            // Restart after retirement.
+            int s5 = p.register(w1);
+            assertNotNull(p.syncerThread(s5));
+            p.unregister(w1, s5);
+        }
+    }
 }
