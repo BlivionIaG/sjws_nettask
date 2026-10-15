@@ -1517,6 +1517,7 @@ final class RaftGroup {
             }
             lock.lock();
             try {
+                refuseMemoryOnlyPrefixDelete();
                 snapIndex = snapshot.lastIncludedIndex();
                 snapTerm = snapshot.lastIncludedTerm();
                 snapData = snapshot.data();
@@ -1536,6 +1537,22 @@ final class RaftGroup {
             }
         }
 
+        /**
+         * The snapshot lives only in memory here, so deleting the log prefix from a storage that
+         * survives a restart would lose those entries when the process restarts. Refuse until the
+         * snapshot is persisted first (#205).
+         */
+        private void refuseMemoryOnlyPrefixDelete() {
+            if (storage.survivesRestart()) {
+                throw memoryOnlySnapshot();
+            }
+        }
+
+        private IllegalStateException memoryOnlySnapshot() {
+            return new IllegalStateException("refusing to delete the log prefix of " + groupId
+                    + ": the snapshot is held only in memory and the log survives a restart");
+        }
+
         @Override
         public CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor) {
             Objects.requireNonNull(compactor, "compactor");
@@ -1544,6 +1561,10 @@ final class RaftGroup {
             try {
                 if (snapIndex < ackedThrough) {
                     future.completeExceptionally(new IllegalArgumentException("not snapshotted"));
+                    return future;
+                }
+                if (storage.survivesRestart()) {
+                    future.completeExceptionally(memoryOnlySnapshot());
                     return future;
                 }
                 try {
