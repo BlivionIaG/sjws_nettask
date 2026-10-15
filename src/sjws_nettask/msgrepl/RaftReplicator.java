@@ -62,6 +62,7 @@ public final class RaftReplicator implements PartitionReplicator {
     private final Map<String, String> urls;
     private final Path stateDir;
     private final GroupOptions options;
+    private final java.util.function.LongSupplier nanoClock;
 
     /**
      * @param topics   replicated topics ({@code __offsets} is always added)
@@ -70,6 +71,13 @@ public final class RaftReplicator implements PartitionReplicator {
      */
     public RaftReplicator(ClusterNode node, Set<String> topics, Map<String, String> urls, Path stateDir,
             Duration electionTimeout, Duration heartbeat) throws IOException {
+        this(node, topics, urls, stateDir, electionTimeout, heartbeat, System::nanoTime);
+    }
+
+    /** {@code nanoClock} must be the node's clock: a leader whose lease ran out stops accepting appends. */
+    public RaftReplicator(ClusterNode node, Set<String> topics, Map<String, String> urls, Path stateDir,
+            Duration electionTimeout, Duration heartbeat, java.util.function.LongSupplier nanoClock) throws IOException {
+        this.nanoClock = Objects.requireNonNull(nanoClock);
         this.node = Objects.requireNonNull(node);
         this.topics = Set.copyOf(topics);
         this.urls = Map.copyOf(urls);
@@ -99,7 +107,7 @@ public final class RaftReplicator implements PartitionReplicator {
     @Override
     public Replica open(String topic, LedgerWriter local, Durability defaultMode, Consumer<List<byte[]>> onApplied) throws IOException {
         return new RaftReplica(this.node, group(topic), this.options, local, defaultMode, onApplied, this.urls,
-                this.stateDir.resolve(topic + ".applied"));
+                this.stateDir.resolve(topic + ".applied"), this.nanoClock);
     }
 
     @Override

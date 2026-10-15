@@ -444,6 +444,11 @@ final class RaftGroup {
             }
         }
         appendRaw(new byte[] {NOOP});
+        if (options.durability() != Durability.STRICT) {
+            // RELAXED: schedule the no-op's fsync like any append. Otherwise a leader elected with only the witness
+            // (2+1, other data node down) never counts itself and the no-op stays uncommitted until a user append.
+            markDirty();
+        }
         // Leadership is visible before the no-op callback, so leaderReady stays false in onLeaderChange.
         fireLeader(after);
         maybeCommit(after);
