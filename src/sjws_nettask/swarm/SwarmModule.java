@@ -91,7 +91,7 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
     }
 
     /** Messaging Core's tracking issue for cross-process stream delivery. */
-    static final String STREAM_TRACKING = "TODO(messaging-core): cross-process stream delivery issue";
+    static final String STREAM_TRACKING = "#236";
 
     /**
      * Why this process runs with others: the composition root's {@code launch} reason ({@code --bootstrap},
