@@ -82,6 +82,12 @@ final class SwarmHttp implements Handler {
      */
     private final boolean trace;
 
+    /**
+     * S2c HTTP leg (PR 4), or null with {@code sjws.swarm.stream.enabled} off: then {@link StreamHttp} is never
+     * referenced, so it is not loaded, and the stream routes answer 404.
+     */
+    private final StreamHttp streams;
+
     SwarmHttp(Swarm swarm, long workerProducerId, SwarmGate gate) {
         this(swarm, workerProducerId, gate, false);
     }
@@ -91,6 +97,12 @@ final class SwarmHttp implements Handler {
         this.workerProducerId = workerProducerId;
         this.gate = java.util.Objects.requireNonNull(gate);
         this.trace = trace;
+        this.streams = swarm.tasks().streams() == null ? null
+                : new StreamHttp(swarm, workerProducerId, this.replySeq, StreamHttp.MAX_SESSIONS_PER_AGENT);
+    }
+
+    StreamHttp streams() {
+        return this.streams;
     }
 
     /** The validated ingress traceparent, or {@code ""} (always {@code ""} with tracing off). */
@@ -123,7 +135,7 @@ final class SwarmHttp implements Handler {
             request = request.withBody(capped(request.body(), this.gate.maxRequestBytes()));
         }
         if (!"POST".equals(request.method())) {
-            return problem(405, "method not allowed", "use POST").withAllow();
+            return notPost(agent, request);
         }
         var target = request.target();
         int q = target.indexOf('?');
@@ -146,6 +158,10 @@ final class SwarmHttp implements Handler {
                     case "" -> submit(pool, request, query);
                     case "call" -> call(pool, request, query);
                     case "claim" -> claim(pool, query);
+                    case "stream" -> this.streams == null ? problem(404, "unknown task verb", verb).response()
+                            : this.streams.submit(agent, pool, taskBody(request),
+                                    deadline(query, this.swarm.topics().clock().getAsLong() + DEFAULT_DEADLINE_MS),
+                                    traceparent(request));
                     default -> problem(404, "unknown task verb", verb).response();
                 };
             }
@@ -252,6 +268,13 @@ final class SwarmHttp implements Handler {
             case "reject" -> r = this.swarm.tasks().reject(t, query.getOrDefault("reason", "rejected"));
             case "extend" -> r = this.swarm.tasks().extend(t.pool(), t.shard(), new long[] {t.offset()}, new int[] {t.attempt()},
                     number(query, "visibilityMs", 30_000, 1, 3_600_000)).get(0);
+            case "chunk" -> {
+                if (this.streams == null) {
+                    return problem(404, "unknown lease verb", verb).response();
+                }
+                var f = readFrame(request);
+                return this.streams.chunk(held, f, () -> this.claimed.remove(id));
+            }
             case "reply" -> {
                 var f = readFrame(request);
                 if (f.type() != Frame.Type.RESULT) {
@@ -278,15 +301,45 @@ final class SwarmHttp implements Handler {
         return leaseProblem(r).response();
     }
 
+    /** Non-POST requests: {@code GET replies/{session}} when streaming is on; otherwise 404 there and 405 elsewhere. */
+    private Response notPost(SwarmGate.Agent agent, Request request) {
+        var target = request.target();
+        int q = target.indexOf('?');
+        var path = q < 0 ? target : target.substring(0, q);
+        var replies = PREFIX + "replies/";
+        if (!path.startsWith(replies) || path.length() == replies.length()) {
+            return problem(405, "method not allowed", "use POST").withAllow();
+        }
+        if (this.streams == null) {
+            return problem(404, "not found", path).response();
+        }
+        if (!"GET".equals(request.method())) {
+            var r = problem(405, "method not allowed", "use GET").response();
+            r.headers().set("allow", "GET");
+            return r;
+        }
+        try {
+            return this.streams.replies(agent, decode(path.substring(replies.length())), request,
+                    q < 0 ? Map.of() : query(target.substring(q + 1)));
+        } catch (BadRequest e) {
+            return problem(400, "bad request", e.getMessage()).response();
+        }
+    }
+
     static final String CANCELLED_TYPE = "https://sjws.dev/problems/cancelled";
 
     /** Every non-OK {@link LeaseResult} is a 409; CANCELLED (extend only, #224) carries its own problem type. */
     static Problem leaseProblem(LeaseResult r) {
         return switch (r) {
-            case CANCELLED -> new Problem(409, "cancelled", "task cancelled; stop and ack the lease", CANCELLED_TYPE);
+            case CANCELLED -> cancelled("cancelled");
             case NOT_IN_FLIGHT, STALE_ATTEMPT -> problem(409, "lease not held", r.name());
             case OK -> throw new IllegalArgumentException("OK is not a problem");
         };
+    }
+
+    /** 409 cancelled; {@code reason} is {@code cancelled} or {@code deadline} (problem extension member). */
+    static Problem cancelled(String reason) {
+        return new Problem(409, "cancelled", "task cancelled; stop and ack the lease", CANCELLED_TYPE, reason);
     }
 
     /** Drops claims whose lease ran out (the messaging lease is authoritative; this is only the envelope cache). */
@@ -422,14 +475,19 @@ final class SwarmHttp implements Handler {
         return new Response(status, h, Body.Bytes.of(data));
     }
 
-    record Problem(int status, String title, String detail, String type) {
+    record Problem(int status, String title, String detail, String type, String reason) {
         Problem(int status, String title, String detail) {
-            this(status, title, detail, "about:blank");
+            this(status, title, detail, "about:blank", null);
+        }
+
+        Problem(int status, String title, String detail, String type) {
+            this(status, title, detail, type, null);
         }
 
         Response response() {
             var json = "{\"type\":" + quote(this.type) + ",\"title\":" + quote(this.title) + ",\"status\":" + this.status
-                    + ",\"detail\":" + quote(this.detail) + "}";
+                    + ",\"detail\":" + quote(this.detail) + (this.reason == null ? "" : ",\"reason\":" + quote(this.reason))
+                    + "}";
             var h = ResponseHeaders.of().set("content-type", "application/problem+json");
             return new Response(this.status, h, Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
         }

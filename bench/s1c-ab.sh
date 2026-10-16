@@ -8,8 +8,9 @@
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 [ $# -ge 3 ] || { sed -n 2,7p "$0"; exit 64; }
-base=$(cd "$1" && pwd); pr=$(cd "$2" && pwd); out=$3; iters=${4:-5}; rate=${5:-10000}; secs=${6:-10}
+base=$(cd "$1" && pwd); pr=$(cd "$2" && pwd); out=$(mkdir -p "$3" && realpath "$3"); iters=${4:-5}; rate=${5:-10000}; secs=${6:-10}
 JVM_FLAGS=${JVM_FLAGS:--XX:+UseZGC -Dsjws.swarm.pool.shards=4}
+# <out-dir> is resolved to an absolute path: each run cds into its worktree, so a relative one lost the dumps.
 mkdir -p "$out/dumps"; log="$out/runs.log"
 one() { # side dir name args...
   local side=$1 dir=$2 name=$3; shift 3

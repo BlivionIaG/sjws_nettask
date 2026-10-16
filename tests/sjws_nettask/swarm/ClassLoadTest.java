@@ -130,6 +130,8 @@ class ClassLoadTest {
         var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml());
         assertFalse(text.contains("sjws_nettask.swarm.TokenStreams"), text);
+        assertFalse(text.contains("sjws_nettask.swarm.StreamHttp"), text); // S2c PR 4: no HTTP leg when off
+        assertTrue(text.contains("sjws_nettask.swarm.SwarmHttp "), text);
         assertFalse(text.contains("token streaming on"), text);
     }
 
@@ -138,6 +140,7 @@ class ClassLoadTest {
         var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true"), "Server started:", 401,
                 "sjws_nettask.Sjws_nettask", "--config=" + yaml());
         assertTrue(text.contains("sjws_nettask.swarm.TokenStreams"), text);
+        assertTrue(text.contains("sjws_nettask.swarm.StreamHttp "), text);
         assertTrue(text.contains("swarm: token streaming on, shards=1"), text);
     }
 

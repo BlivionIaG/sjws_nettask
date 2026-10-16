@@ -223,6 +223,22 @@ class TokenStreamsTest {
         assertEquals(1, this.streams.lastFailures());
     }
 
+    /** #230 review nit: after its own LAST's ack is refused, that attempt cannot write again; a newer one can. */
+    @Test
+    void olderAttemptIsRefusedAfterItsOwnFailedLastAck() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        submit(id(10));
+        var old = claim(1_000);
+        this.now.addAndGet(5_000);
+        var fresh = claim(30_000); // redelivered, but the newer attempt has not produced yet
+        var last = new StreamChunk(42, 10, 0, StreamChunk.FIRST | Frame.LAST, new byte[0]);
+        assertNotEquals(LeaseResult.OK, this.swarm.tasks().streamLast(old, 9, 1, last, "x", new byte[0]).get(5, TimeUnit.SECONDS));
+        assertEquals(LeaseResult.STALE_ATTEMPT,
+                this.swarm.tasks().streamChunk(old, 9, 3, new StreamChunk(42, 10, 1, 0, new byte[0])));
+        assertEquals(LeaseResult.OK,
+                this.swarm.tasks().streamChunk(fresh, 9, 4, new StreamChunk(42, 10, 0, StreamChunk.FIRST, new byte[0])));
+    }
+
     @Test
     void argumentChecks() {
         this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);

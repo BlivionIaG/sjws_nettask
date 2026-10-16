@@ -102,6 +102,7 @@ public final class TokenStreams {
         final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
         int attempt; // guarded by lock
         boolean settled; // guarded by lock: tombstone after a successful final ack
+        int floor = Integer.MIN_VALUE; // guarded by lock: attempts below are refused (a LAST whose ack failed)
         volatile long touchedMs;
 
         Fence(long now) {
@@ -193,7 +194,7 @@ public final class TokenStreams {
             if (this.fences.get(key) != f) { // purged between get and lock: retry on the live entry
                 return admitAndWrite(t, producerId, seq, c);
             }
-            if (f.settled || t.attempt() < f.attempt) {
+            if (f.settled || t.attempt() < f.attempt || t.attempt() < f.floor) {
                 return new Admitted(LeaseResult.STALE_ATTEMPT, null);
             }
             f.attempt = t.attempt();
@@ -218,6 +219,25 @@ public final class TokenStreams {
             f.lock.lock();
             try {
                 f.settled = true;
+                f.touchedMs = this.topics.clock().getAsLong();
+            } finally {
+                f.lock.unlock();
+            }
+        }
+    }
+
+    /**
+     * After a final ack that was refused: that attempt lost its lease, so it may not produce again (#230 review
+     * nit); a later attempt still can.
+     */
+    void retire(Task t) {
+        var f = this.fences.get(new FenceKey(t.pool(), t.shard(), t.offset()));
+        if (f != null) {
+            f.lock.lock();
+            try {
+                if (t.attempt() != Integer.MAX_VALUE) {
+                    f.floor = Math.max(f.floor, t.attempt() + 1);
+                }
                 f.touchedMs = this.topics.clock().getAsLong();
             } finally {
                 f.lock.unlock();
@@ -256,8 +276,15 @@ public final class TokenStreams {
 
     private void deliverLocal(StreamChunk c) {
         var s = this.sinks.get(new Key(c.streamHi(), c.streamLo()));
-        if (s != null && !s.offer(c)) {
-            this.sinkDrops.incrementAndGet();
+        if (s != null) {
+            if (!s.offer(c)) {
+                this.sinkDrops.incrementAndGet();
+                s.dropped = true;
+            }
+            var l = s.listener;
+            if (l != null) {
+                l.run(); // e.g. the HTTP leg drains into its session before the first GET
+            }
         }
     }
 
@@ -272,6 +299,10 @@ public final class TokenStreams {
         private final ArrayBlockingQueue<StreamChunk> queue;
         private final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
         private final AtomicLong conflicts = new AtomicLong();
+        /** Set once a chunk for this stream could not be queued: the stream has a gap. */
+        volatile boolean dropped;
+        /** Run on the producer thread after every offer (set once by the consumer). */
+        volatile Runnable listener;
 
         Sink(TokenStreams owner, Key key, Config config) {
             this.owner = owner;
@@ -306,6 +337,11 @@ public final class TokenStreams {
             return this.queue.poll(timeout, unit);
         }
 
+        /** The next in-order chunk if one is queued, else null; never blocks. */
+        public StreamChunk poll0() {
+            return this.queue.poll();
+        }
+
         /** Drains whatever is queued, in order. */
         public List<StreamChunk> drain() {
             var out = new ArrayList<StreamChunk>();
@@ -321,6 +357,16 @@ public final class TokenStreams {
             } finally {
                 this.lock.unlock();
             }
+        }
+
+        /** True once a chunk was dropped (sink full or reorder overflow): the consumer must report a gap. */
+        public boolean dropped() {
+            return this.dropped;
+        }
+
+        /** Called after every offer, on the producer thread; must be cheap and must not block. */
+        public void onOffer(Runnable listener) {
+            this.listener = listener;
         }
 
         public long conflicts() {

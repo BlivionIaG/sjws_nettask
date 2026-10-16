@@ -784,6 +784,8 @@ public final class TaskService {
             var a = ack(t);
             if (a == LeaseResult.OK) {
                 s.settle(t); // tombstone: a zombie older attempt cannot write after LAST
+            } else {
+                s.retire(t); // this attempt lost its lease: refuse its later chunks
             }
             return a;
         }, ACKER).whenComplete((a, e) -> {
