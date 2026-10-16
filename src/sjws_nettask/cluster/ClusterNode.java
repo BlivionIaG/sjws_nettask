@@ -41,7 +41,10 @@ public interface ClusterNode extends AutoCloseable {
     /**
      * Leader only; otherwise the future completes with {@link NotLeaderException}. The future
      * completes with the committed index after a quorum has the batch. Strict groups have also
-     * fsynced it. One batch is one ordered span of indexes.
+     * fsynced it. One batch is one ordered span of indexes, and it is all-or-nothing: if a log write
+     * fails partway, the leader rolls the batch back and the future fails; if the rollback fails too,
+     * the group fails closed until restart. Every refusal (an empty batch, a null entry, a bad
+     * {@code expectedTerm}, a storage error) fails the future rather than throwing.
      */
     CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
 

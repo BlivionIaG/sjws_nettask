@@ -263,7 +263,9 @@ public final class ReplicatedNode implements ClusterNode {
     public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability,
             long expectedTerm) {
         if (expectedTerm <= 0 && expectedTerm != RaftGroup.ANY_TERM) {
-            throw new IllegalArgumentException("expectedTerm");
+            var refused = new CompletableFuture<CommittedIndex>();
+            refused.completeExceptionally(new IllegalArgumentException("expectedTerm"));
+            return refused;
         }
         var group = groups.get(groupId);
         if (group == null) {
