@@ -118,10 +118,18 @@ public final class TokenStreams {
     private final ConcurrentHashMap<Key, Sink> sinks = new ConcurrentHashMap<>();
     private final AtomicLong sinkDrops = new AtomicLong();
 
+    /** S2c PR 5 cancel state: cancelled and deadline-bound stream tasks (swarm memory only, never in messaging). */
+    private final CancelSet cancels;
+
     public TokenStreams(Topics topics, String node, Config config) {
         this.topics = topics;
         this.node = node;
         this.config = config;
+        this.cancels = new CancelSet(topics.clock());
+    }
+
+    public CancelSet cancels() {
+        return this.cancels;
     }
 
     public Config config() {
@@ -178,7 +186,19 @@ public final class TokenStreams {
         if (c.streamHi() != env.correlationHi() || c.streamLo() != env.correlationLo()) {
             throw new IllegalArgumentException("chunk stream id is not the task's correlation id");
         }
+        if (c.reset()) {
+            throw new IllegalArgumentException("RESET is consumer-only");
+        }
+        c = c.withAttempt(t.attempt() & StreamChunk.MAX_ATTEMPT); // the lease's attempt, not the client's (§12 rule 3)
         long now = this.topics.clock().getAsLong();
+        // S2c PR 5: a cancelled (or past-deadline) task fails fast on its next chunk; LAST still goes through so
+        // the worker can end the stream (LAST|CANCELLED) and ack (§12 Q3)
+        if (!c.last()) {
+            var why = this.cancels.reason(TaskService.topic(t.pool(), t.shard()), t.offset(), now);
+            if (why != null) {
+                return new Admitted(LeaseResult.CANCELLED, null);
+            }
+        }
         var key = new FenceKey(t.pool(), t.shard(), t.offset());
         var f = this.fences.get(key);
         if (f == null) {
@@ -295,10 +315,15 @@ public final class TokenStreams {
     public static final class Sink implements AutoCloseable {
         private final TokenStreams owner;
         private final Key key;
-        private final TokenStream.Reorder reorder;
+        private final Config config;
+        private TokenStream.Reorder reorder; // guarded by lock; replaced on RESET
+        /** The attempt being delivered, -1 before the first chunk; guarded by lock (§12 reset rule). */
+        private long attempt = -1;
         private final ArrayBlockingQueue<StreamChunk> queue;
         private final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
         private final AtomicLong conflicts = new AtomicLong();
+        private final AtomicLong stale = new AtomicLong();
+        private final AtomicLong resets = new AtomicLong();
         /** Set once a chunk for this stream could not be queued: the stream has a gap. */
         volatile boolean dropped;
         /** Run on the producer thread after every offer (set once by the consumer). */
@@ -307,14 +332,35 @@ public final class TokenStreams {
         Sink(TokenStreams owner, Key key, Config config) {
             this.owner = owner;
             this.key = key;
+            this.config = config;
             this.reorder = new TokenStream.Reorder(key.hi(), key.lo(), config.window());
             this.queue = new ArrayBlockingQueue<>(config.sinkChunks());
         }
 
-        /** False when the chunk could not be queued (sink full); duplicates and conflicts are not failures. */
+        /**
+         * False when the chunk could not be queued (sink full); duplicates, conflicts and stale attempts are not
+         * failures. Reorder state is per {@code (streamId, attempt)} (§12 reset rule): a chunk of a newer attempt
+         * discards everything buffered or queued for the older one, queues {@code RESET(attempt)} and restarts at
+         * {@code chunkSeq} 0; a chunk of an older attempt is dropped and counted in {@link #staleChunks()}.
+         */
         boolean offer(StreamChunk c) {
             this.lock.lock();
             try {
+                if (c.streamHi() == this.key.hi() && c.streamLo() == this.key.lo()) {
+                    if (this.attempt < 0) {
+                        this.attempt = c.attempt();
+                    } else if (c.attempt() < this.attempt) {
+                        this.stale.incrementAndGet();
+                        return true;
+                    } else if (c.attempt() > this.attempt) {
+                        this.queue.clear();
+                        this.reorder = new TokenStream.Reorder(this.key.hi(), this.key.lo(), this.config.window());
+                        this.attempt = c.attempt();
+                        this.dropped = false; // a gap of the discarded attempt no longer matters
+                        this.queue.add(StreamChunk.reset(this.key.hi(), this.key.lo(), c.attempt()));
+                        this.resets.incrementAndGet();
+                    }
+                }
                 if (this.queue.remainingCapacity() < 1 + this.reorder.held()) {
                     return false;
                 }
@@ -371,6 +417,26 @@ public final class TokenStreams {
 
         public long conflicts() {
             return this.conflicts.get();
+        }
+
+        /** Chunks of an attempt older than the one being delivered, dropped (§12 reset rule). */
+        public long staleChunks() {
+            return this.stale.get();
+        }
+
+        /** {@code RESET} markers queued: times a newer attempt replaced the buffered one. */
+        public long resets() {
+            return this.resets.get();
+        }
+
+        /** The attempt being delivered, or -1 before the first chunk. */
+        public long attempt() {
+            this.lock.lock();
+            try {
+                return this.attempt;
+            } finally {
+                this.lock.unlock();
+            }
         }
 
         @Override

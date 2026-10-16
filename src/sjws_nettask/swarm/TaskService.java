@@ -441,6 +441,37 @@ public final class TaskService {
         return r;
     }
 
+    /** Where {@link #submitStream} put a task: its shard topic and offset (the cancel key). */
+    record Placed(String topic, long offset) { }
+
+    /**
+     * S2c PR 5: submits a streaming task like {@link #submit} (anonymous, no dedup) and returns where it landed, so
+     * the HTTP leg can track its deadline and cancel it. Streaming must be on.
+     */
+    Placed submitStream(String pool, TaskEnvelope task) {
+        requireStreams();
+        int shard = shardOf(0, 0);
+        var r = partition(pool, shard).produce(0, 0, task.encode());
+        if (this.shards > 1) {
+            var ps = pool(pool);
+            ps.added(shard, 1);
+            handoff(pool, ps, shard);
+        }
+        return new Placed(topic(pool, shard), r.offset());
+    }
+
+    /**
+     * S2c PR 5: produces the opaque cancel record of the task at {@code target} on that task's own topic (an ordinary
+     * produce, no new messaging entry type; §12 ruling). A worker that claims the record applies it to its node's
+     * {@link CancelSet} and acks it; it is never handed out as a task. Streaming must be on.
+     */
+    void produceCancel(Placed target, byte[] correlationId) {
+        requireStreams();
+        var p = this.topics.partition(target.topic());
+        p.subscribe(WORKERS, true);
+        p.produce(0, 0, CancelSet.record(target.offset(), correlationId), Durability.ASYNC);
+    }
+
     /**
      * Claims up to {@code max} tasks with a fixed lease of {@code visibilityMs} (§5.1 deadlines):
      * <ul>
@@ -580,11 +611,22 @@ public final class TaskService {
             try {
                 env = TaskEnvelope.decode(d.payload());
             } catch (IllegalArgumentException e) {
+                var st = this.streams; // S2c PR 5: with streaming off, never anything but bad-envelope
+                if (st != null && CancelSet.isRecord(d.payload())) {
+                    st.cancels().cancel(p.topic(), CancelSet.recordTarget(d.payload()));
+                    p.ack(WORKERS, d.offset(), d.attempt());
+                    continue;
+                }
                 p.reject(WORKERS, d.offset(), d.attempt(), "bad-envelope");
                 continue;
             }
             if (env.expiredAt(now)) {
                 p.reject(WORKERS, d.offset(), d.attempt(), "deadline");
+                continue;
+            }
+            var st = this.streams;
+            if (st != null && CancelSet.CANCELLED.equals(st.cancels().reason(p.topic(), d.offset(), now))) {
+                p.reject(WORKERS, d.offset(), d.attempt(), "cancelled"); // redelivered after a cancel (§12 Q3)
                 continue;
             }
             long lease = d.deadlineMs();

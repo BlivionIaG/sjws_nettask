@@ -66,6 +66,7 @@ public final class Swarm implements AutoCloseable {
      */
     public TokenStreams enableStreams(TokenStreams.Config config) {
         var s = new TokenStreams(this.topics, this.replies.topic().substring("reply.".length()), config);
+        this.topics.installProbes(s.cancels()::probe); // S2c PR 5: extend answers CANCELLED for cancelled tasks
         this.tasks.bindStreams(s);
         return s;
     }

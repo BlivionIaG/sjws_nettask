@@ -57,6 +57,11 @@ class SwarmHttpTest {
     /** Lets every request through: these tests cover the endpoints; SwarmGateTest covers admission. */
     static final SwarmGate ALLOW_ALL = new SwarmGate() {
         @Override
+        public boolean isAdmin(Agent agent) {
+            return false;
+        }
+
+        @Override
         public Agent authenticate(Request request) {
             return new Agent("test");
         }

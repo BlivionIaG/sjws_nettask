@@ -26,7 +26,8 @@ import org.junit.jupiter.api.Test;
 
 class StreamChunkTest {
 
-    static final Path GOLDEN = Path.of("tests/sjws_nettask/swarm/wire/golden-chunks-v1.txt");
+    static final Path GOLDEN = Path.of("tests/sjws_nettask/swarm/wire/golden-chunks-v2.txt");
+    static final Path GOLDEN_V1 = Path.of("tests/sjws_nettask/swarm/wire/golden-chunks-v1.txt");
 
     @Test
     void goldenChunksRoundTripThroughTokenFrames() throws Exception {
@@ -46,7 +47,46 @@ class StreamChunkTest {
             assertEquals(c, StreamChunk.decode(fr.payload()), f[0]);
             n++;
         }
+        assertEquals(5, n);
+    }
+
+    @Test
+    void v1ChunksStillDecodeAsAttemptZeroAndReencodeAsV2() throws Exception {
+        var hex = HexFormat.of();
+        int n = 0;
+        for (var line : Files.readAllLines(GOLDEN_V1)) {
+            if (line.isBlank() || line.startsWith("#")) {
+                continue;
+            }
+            var f = line.split(" ");
+            var c = StreamChunk.decode(hex.parseHex(f[2]));
+            assertEquals(Integer.parseInt(f[1]), c.flags(), f[0]);
+            assertEquals(0, c.attempt(), f[0]);
+            assertEquals(StreamChunk.VERSION, c.encode()[0]);
+            assertEquals(c, StreamChunk.decode(c.encode()));
+            n++;
+        }
         assertEquals(4, n);
+    }
+
+    @Test
+    void attemptIsCarriedAndResetIsAnEmptySeqZeroMarker() {
+        var c = new StreamChunk(1, 2, 0xffff_ffffL, 5, 0, new byte[] {9});
+        assertEquals(0xffff_ffffL, StreamChunk.decode(c.encode()).attempt());
+        assertEquals(c, StreamChunk.decode(c.encode()));
+        assertEquals(7, c.withAttempt(7).attempt());
+        org.junit.jupiter.api.Assertions.assertSame(c, c.withAttempt(0xffff_ffffL));
+        org.junit.jupiter.api.Assertions.assertNotEquals(c, c.withAttempt(1));
+        var r = StreamChunk.reset(1, 2, 3);
+        assertEquals(true, r.reset());
+        assertEquals(0, r.chunkSeq());
+        assertEquals(0, r.size());
+        assertEquals(0, r.toFrame().flags(), "RESET is chunk-only");
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, () -> new StreamChunk(1, 2, -1, 0, 0, new byte[0]));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> new StreamChunk(1, 2, 1L << 32, 0, 0, new byte[0]));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> StreamChunk.decode(new byte[] {2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
     }
 
     @Test
@@ -62,7 +102,7 @@ class StreamChunkTest {
     void validation() {
         assertThrows(IllegalArgumentException.class, () -> new StreamChunk(0, 0, -1, 0, new byte[0]));
         assertThrows(IllegalArgumentException.class, () -> new StreamChunk(0, 0, StreamChunk.MAX_SEQ + 1, 0, new byte[0]));
-        assertThrows(IllegalArgumentException.class, () -> new StreamChunk(0, 0, 0, 0x10, new byte[0]));
+        assertThrows(IllegalArgumentException.class, () -> new StreamChunk(0, 0, 0, 0x20, new byte[0]));
         assertThrows(IllegalArgumentException.class, () -> new StreamChunk(0, 0, 0, Frame.CANCELLED, new byte[0]));
         assertThrows(IllegalArgumentException.class, () -> new StreamChunk(0, 0, 0, Frame.ERROR, new byte[0]));
         assertThrows(IllegalArgumentException.class, () -> new StreamChunk(0, 0, 0, 0, null));
@@ -70,7 +110,7 @@ class StreamChunkTest {
                 () -> new StreamChunk(0, 0, 0, 0, new byte[Frame.MAX_PAYLOAD - StreamChunk.HEADER + 1]));
         assertThrows(IllegalArgumentException.class, () -> StreamChunk.decode(new byte[21]));
         var bad = new StreamChunk(1, 2, 3, 0, new byte[] {9}).encode();
-        bad[0] = 2;
+        bad[0] = 3;
         assertThrows(IllegalArgumentException.class, () -> StreamChunk.decode(bad));
     }
 
