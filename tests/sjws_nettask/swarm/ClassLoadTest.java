@@ -117,6 +117,14 @@ class ClassLoadTest {
         assertFalse(text.contains(SECRET), "the token never reaches the output");
     }
 
+    @Test
+    void swarmOnLoadsNoTokenStreamClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
+        assertFalse(text.contains("sjws_nettask.swarm.TokenStream") || text.contains("StreamChunk"), text);
+    }
+
     private static final String TRACE = "sjws_nettask.swarm.trace.";
 
     @Test

@@ -1,0 +1,7 @@
+# Token-stream chunks (agent-swarm.md §5.2): [version:u8][streamId:16][chunkSeq:u32][flags:u8][bytes] in a TOKEN frame.
+# FIRST=0x08 is chunk-only; the frame carries LAST/CANCELLED/ERROR. Shared by StreamChunkTest and sdk/python/tests/test_chunks.py.
+# name chunk-flags chunk-hex frame-hex
+first 8 010123456789abcdeffedcba987654321000000000086869 010600000018010123456789abcdeffedcba987654321000000000086869
+mid-empty 0 01000000000000000100000000000000020000000700 01060000001601000000000000000100000000000000020000000700
+last-cancelled 3 0100000000000000010000000000000002ffffffff03 0106030000160100000000000000010000000000000002ffffffff03
+last-error-utf8 5 01ffffffffffffffffffffffffffffffff000000030500f09f9880 01060500001b01ffffffffffffffffffffffffffffffff000000030500f09f9880
