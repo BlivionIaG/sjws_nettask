@@ -409,11 +409,12 @@ public final class TaskService {
     static final long SHARD_WAIT_SLICE_NANOS = 2_000_000;
 
     /**
-     * Spin before a sharded claim parks ({@link #claim}). Tuned to the S1c open-loop gap (~100 µs at 10k/s): long
-     * enough to often absorb the next submit without parking, short enough not to burn a core when the pool is idle.
-     * Tests may pass 0 to disable.
+     * 1 ms: at the S1c open-loop rate (10k/s, ~100 µs gap) a worker that has just replied almost always sees
+     * the next submit during the spin and never parks. Parking on this host was measured oversleeping to
+     * 14–70 ms (#184), so avoiding the park under load is the goal. Idle pools still fall through to the
+     * 2 ms condition wait after one spin. Tests may pass 0 to disable.
      */
-    static final long CLAIM_SPIN_NANOS = 100_000L;
+    static final long CLAIM_SPIN_NANOS = 1_000_000L;
 
     /** Decodes, deadline-checks and lease-shortens one shard's deliveries. */
     private List<Task> tasks(String pool, int shard, Partition p, List<sjws_nettask.messaging.delivery.Delivery> got) {
