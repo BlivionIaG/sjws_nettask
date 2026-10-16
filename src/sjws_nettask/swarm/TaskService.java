@@ -753,18 +753,14 @@ public final class TaskService {
         if (c.last()) {
             throw new IllegalArgumentException("LAST goes through streamLast");
         }
-        var r = s.admit(t);
-        if (r != LeaseResult.OK) {
-            return r;
-        }
-        s.write(t, producerId, seq, c);
-        return LeaseResult.OK;
+        return s.admitAndWrite(t, producerId, seq, c).result();
     }
 
     /**
      * S2c: ends {@code t}'s stream (§4.4 order): writes {@code last} (a {@code LAST} chunk, ASYNC) with
      * {@code (producerId, seq)} and the reply with {@code (producerId, seq + 1)}, and acks the task (fenced) only
-     * once both are durable. A stale attempt gets {@code STALE_ATTEMPT} and writes nothing.
+     * once both are durable. A stale attempt gets {@code STALE_ATTEMPT} and writes nothing. The reply uses
+     * {@code seq + 1} on the reply topic: the caller's next produce must skip it (use {@code seq + 2}).
      */
     public CompletableFuture<LeaseResult> streamLast(Task t, long producerId, long seq,
             sjws_nettask.swarm.wire.StreamChunk last, String contentType, byte[] body) {
@@ -776,19 +772,25 @@ public final class TaskService {
         if (to.isEmpty()) {
             throw new IllegalArgumentException("task has no replyTo");
         }
-        var r = s.admit(t);
-        if (r != LeaseResult.OK) {
-            return CompletableFuture.completedFuture(r);
+        var w = s.admitAndWrite(t, producerId, seq, last);
+        if (w.result() != LeaseResult.OK) {
+            return CompletableFuture.completedFuture(w.result());
         }
-        var lastDurable = s.write(t, producerId, seq, last).durable();
+        var lastDurable = w.produced().durable();
         var reply = t.envelope().reply(contentType, body);
         deliverLocal(to, reply);
         var replyDurable = this.topics.partition(to).produce(producerId, seq + 1, reply.encode(), Durability.ASYNC).durable();
         return CompletableFuture.allOf(lastDurable, replyDurable).thenApplyAsync(x -> {
             var a = ack(t);
-            s.settle(t);
+            if (a == LeaseResult.OK) {
+                s.settle(t); // tombstone: a zombie older attempt cannot write after LAST
+            }
             return a;
-        }, ACKER);
+        }, ACKER).whenComplete((a, e) -> {
+            if (e != null) {
+                s.lastFailed(e);
+            }
+        });
     }
 
     private TokenStreams requireStreams() {

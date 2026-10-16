@@ -40,8 +40,11 @@ import sjws_nettask.swarm.wire.StreamChunk;
  * <li><b>Stream id:</b> the task's {@code correlationId} (an internal routing key; the caller-facing session id
  * of §12 Q2 is minted by the HTTP leg, PR 4).</li>
  * <li><b>Fence:</b> per task (pool, shard, offset), the highest attempt that has produced a chunk on this node.
- * A chunk from a lower attempt is {@code STALE_ATTEMPT} and is not written. The final ack is the messaging fence
- * (#87). Entries are removed by {@link TaskService#streamLast} and purged after {@link #FENCE_TTL_MS} idle.</li>
+ * The check and the write are atomic under the task's fence lock: a chunk from a lower attempt is
+ * {@code STALE_ATTEMPT} and is not written, and no older attempt's chunk lands after a newer one's. After a
+ * successful final ack the entry becomes a tombstone (every later chunk is stale); entries are purged after
+ * {@link #FENCE_TTL_MS} idle. The fence is node-local; the cross-node rule (attempt in the chunk header, consumer
+ * reset) is recorded in §12 for PR 4/5. The final ack is the messaging fence (#87).</li>
  * <li><b>Local delivery:</b> a same-process caller that {@link #open opened} the stream gets each chunk pushed to a
  * bounded {@link Sink} (in order, deduplicated by {@code TokenStream.Reorder}) before the ledger write, as
  * {@code ReplyRouter.completeLocal} does for unary replies. A full sink drops the chunk and counts it; the
@@ -94,12 +97,15 @@ public final class TokenStreams {
 
     private record Key(long hi, long lo) { }
 
+    /** Per-task fence: the highest admitted attempt; its lock makes the attempt check and the chunk write atomic. */
     private static final class Fence {
-        final int attempt;
+        final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
+        int attempt; // guarded by lock
+        boolean settled; // guarded by lock: tombstone after a successful final ack
         volatile long touchedMs;
 
-        Fence(int attempt, long now) {
-            this.attempt = attempt;
+        Fence(long now) {
+            this.attempt = Integer.MIN_VALUE;
             this.touchedMs = now;
         }
     }
@@ -143,42 +149,91 @@ public final class TokenStreams {
         return this.fences.size();
     }
 
+    /** Test hook, run inside the fence lock just before the produce hand-off. */
+    volatile Runnable beforeWrite;
+    private final AtomicLong lastFailures = new AtomicLong();
+
+    /** Final writes ({@code LAST} or reply) that failed before the ack; the fence then lives until its TTL. */
+    public long lastFailures() {
+        return this.lastFailures.get();
+    }
+
+    void lastFailed(Throwable e) {
+        this.lastFailures.incrementAndGet();
+        System.err.println("WARN: swarm: stream LAST/reply write failed, task not acked: " + e);
+    }
+
+    /** The outcome of {@link #admitAndWrite}: {@code result} OK with the produce result, or a refusal. */
+    record Admitted(LeaseResult result, Partition.ProduceResult produced) { }
+
     /**
-     * Admits a chunk from {@code t}: OK if {@code t.attempt()} is the highest attempt seen for its task (and records
-     * it), {@code STALE_ATTEMPT} if a later attempt has already produced.
+     * Atomically checks the fence and writes {@code c}: under the task's fence lock, a chunk is refused with
+     * {@code STALE_ATTEMPT} if a later attempt was admitted or the stream was settled; otherwise its attempt becomes
+     * the fence and the chunk is handed to the shard <b>before</b> the lock is released, so no older attempt's chunk
+     * can land after a newer attempt's on this node.
      */
-    LeaseResult admit(Task t) {
-        long now = this.topics.clock().getAsLong();
-        var key = new FenceKey(t.pool(), t.shard(), t.offset());
-        if (this.fences.size() >= FENCE_PURGE_AT && !this.fences.containsKey(key)) {
-            purge(now);
-        }
-        int att = t.attempt();
-        var f = this.fences.compute(key, (k, old) -> old == null || old.attempt < att ? new Fence(att, now) : old);
-        if (att < f.attempt) {
-            return LeaseResult.STALE_ATTEMPT;
-        }
-        f.touchedMs = now;
-        return LeaseResult.OK;
-    }
-
-    void settle(Task t) {
-        this.fences.remove(new FenceKey(t.pool(), t.shard(), t.offset()));
-    }
-
-    private void purge(long now) {
-        this.fences.values().removeIf(f -> now - f.touchedMs > FENCE_TTL_MS);
-    }
-
-    /** Writes {@code c} to its shard; the chunk's stream id must be {@code t}'s correlation id. */
-    Partition.ProduceResult write(Task t, long producerId, long seq, StreamChunk c) {
+    Admitted admitAndWrite(Task t, long producerId, long seq, StreamChunk c) {
         var env = t.envelope();
         if (c.streamHi() != env.correlationHi() || c.streamLo() != env.correlationLo()) {
             throw new IllegalArgumentException("chunk stream id is not the task's correlation id");
         }
-        deliverLocal(c); // before produce, as completeLocal: latency must not wait on the ledger hand-off
-        return partitionFor(c.streamHi(), c.streamLo()).produce(producerId, seq, c.encode(),
-                c.last() ? Durability.ASYNC : Durability.NONE);
+        long now = this.topics.clock().getAsLong();
+        var key = new FenceKey(t.pool(), t.shard(), t.offset());
+        var f = this.fences.get(key);
+        if (f == null) {
+            if (this.fences.size() >= FENCE_PURGE_AT) {
+                purge(now);
+            }
+            var fresh = new Fence(now);
+            var prior = this.fences.putIfAbsent(key, fresh);
+            f = prior != null ? prior : fresh;
+        }
+        f.lock.lock();
+        try {
+            if (this.fences.get(key) != f) { // purged between get and lock: retry on the live entry
+                return admitAndWrite(t, producerId, seq, c);
+            }
+            if (f.settled || t.attempt() < f.attempt) {
+                return new Admitted(LeaseResult.STALE_ATTEMPT, null);
+            }
+            f.attempt = t.attempt();
+            f.touchedMs = now;
+            var hook = this.beforeWrite;
+            if (hook != null) {
+                hook.run();
+            }
+            deliverLocal(c); // before produce, as completeLocal: latency must not wait on the ledger hand-off
+            var r = partitionFor(c.streamHi(), c.streamLo()).produce(producerId, seq, c.encode(),
+                    c.last() ? Durability.ASYNC : Durability.NONE);
+            return new Admitted(LeaseResult.OK, r);
+        } finally {
+            f.lock.unlock();
+        }
+    }
+
+    /** After a successful final ack: tombstones the fence so no attempt of this task can produce again. */
+    void settle(Task t) {
+        var f = this.fences.get(new FenceKey(t.pool(), t.shard(), t.offset()));
+        if (f != null) {
+            f.lock.lock();
+            try {
+                f.settled = true;
+                f.touchedMs = this.topics.clock().getAsLong();
+            } finally {
+                f.lock.unlock();
+            }
+        }
+    }
+
+    private void purge(long now) {
+        this.fences.entrySet().removeIf(e -> {
+            var f = e.getValue();
+            if (now - f.touchedMs <= FENCE_TTL_MS || !f.lock.tryLock()) {
+                return false;
+            }
+            f.lock.unlock();
+            return true;
+        });
     }
 
     /** Opens a same-process consumer for the stream of {@code correlationId} (16 bytes); close it when done. */

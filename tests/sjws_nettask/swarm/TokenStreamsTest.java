@@ -103,7 +103,7 @@ class TokenStreamsTest {
                 got.writeBytes(c.bytes());
             }
             assertArrayEquals(src, got.toByteArray());
-            assertEquals(0, this.streams.fenceEntries(), "settled");
+            assertEquals(1, this.streams.fenceEntries(), "settled: tombstone until the TTL");
             assertEquals(LeaseResult.NOT_IN_FLIGHT, this.swarm.tasks().ack(t), "acked by streamLast");
         }
         assertEquals(0, this.streams.openSinks());
@@ -138,6 +138,89 @@ class TokenStreamsTest {
                 this.swarm.tasks().streamLast(old, 9, 4, last, "x", new byte[0]).get(5, TimeUnit.SECONDS));
         assertEquals(LeaseResult.OK, this.swarm.tasks().streamLast(fresh, 9, 5, last, "x", new byte[0]).get(5, TimeUnit.SECONDS));
         assertNotNull(cid);
+    }
+
+    /** Race 1 (#230 review): the fence check and the write are atomic, so an older attempt cannot land after a newer one. */
+    @Test
+    void olderAttemptMidWriteBlocksTheNewerOneAndIsThenStale() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        submit(id(7));
+        var old = claim(1_000);
+        this.now.addAndGet(5_000);
+        var fresh = claim(30_000);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var oldThread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        this.streams.beforeWrite = () -> {
+            if (Thread.currentThread() == oldThread.get()) {
+                entered.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            var a = pool.submit(() -> {
+                oldThread.set(Thread.currentThread());
+                return this.swarm.tasks().streamChunk(old, 9, 1, new StreamChunk(42, 7, 0, StreamChunk.FIRST, new byte[] {1}));
+            });
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            var b = pool.submit(() -> this.swarm.tasks().streamChunk(fresh, 9, 2,
+                    new StreamChunk(42, 7, 0, StreamChunk.FIRST, new byte[] {2})));
+            Thread.sleep(200);
+            assertFalse(b.isDone(), "the newer attempt waits for the older attempt's write to finish");
+            release.countDown();
+            assertEquals(LeaseResult.OK, a.get(5, TimeUnit.SECONDS));
+            assertEquals(LeaseResult.OK, b.get(5, TimeUnit.SECONDS));
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(LeaseResult.STALE_ATTEMPT,
+                this.swarm.tasks().streamChunk(old, 9, 3, new StreamChunk(42, 7, 1, 0, new byte[] {3})));
+        var shard = this.swarm.topics().partitionWithoutDlq(this.streams.topicFor(42, 7));
+        shard.subscribe("g", true);
+        var got = shard.poll("g", "c", 10, 1_000);
+        assertEquals(2, got.size(), "the stale chunk was not written");
+        assertEquals(1, StreamChunk.decode(got.get(0).payload()).bytes()[0], "older attempt first");
+        assertEquals(2, StreamChunk.decode(got.get(1).payload()).bytes()[0], "newer attempt after it");
+    }
+
+    /** Race 2 (#230 review): after a successful LAST the fence is a tombstone; a zombie older attempt stays stale. */
+    @Test
+    void afterLastAZombieOlderAttemptCannotWrite() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        submit(id(8));
+        var old = claim(1_000);
+        assertEquals(LeaseResult.OK, this.swarm.tasks().streamChunk(old, 9, 1, new StreamChunk(42, 8, 0, StreamChunk.FIRST, new byte[0])));
+        this.now.addAndGet(5_000);
+        var fresh = claim(30_000);
+        var last = new StreamChunk(42, 8, 0, StreamChunk.FIRST | Frame.LAST, new byte[0]);
+        assertEquals(LeaseResult.OK, this.swarm.tasks().streamLast(fresh, 9, 2, last, "x", new byte[0]).get(5, TimeUnit.SECONDS));
+        assertEquals(LeaseResult.STALE_ATTEMPT,
+                this.swarm.tasks().streamChunk(old, 9, 4, new StreamChunk(42, 8, 1, 0, new byte[0])));
+        assertEquals(LeaseResult.STALE_ATTEMPT,
+                this.swarm.tasks().streamChunk(fresh, 9, 5, new StreamChunk(42, 8, 1, 0, new byte[0])), "settled");
+        assertEquals(1, this.streams.fenceEntries(), "tombstone kept until the TTL");
+        assertEquals(0, this.streams.lastFailures());
+    }
+
+    /** A stale final ack does not tombstone the fence (only an OK ack settles). */
+    @Test
+    void staleAckDoesNotSettle() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        submit(id(9));
+        var t = claim(1_000);
+        this.now.addAndGet(5_000);
+        var fresh = claim(30_000); // redelivered: the old attempt's final ack is refused
+        var last = new StreamChunk(42, 9, 0, StreamChunk.FIRST | Frame.LAST, new byte[0]);
+        assertNotEquals(LeaseResult.OK, this.swarm.tasks().streamLast(t, 9, 1, last, "x", new byte[0]).get(5, TimeUnit.SECONDS));
+        assertEquals(LeaseResult.OK, this.swarm.tasks().streamChunk(fresh, 9, 3, new StreamChunk(42, 9, 0, StreamChunk.FIRST, new byte[0])),
+                "a redelivered attempt may still stream");
+        this.streams.lastFailed(new RuntimeException("test"));
+        assertEquals(1, this.streams.lastFailures());
     }
 
     @Test
@@ -188,13 +271,14 @@ class TokenStreamsTest {
         this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
         submit(id(6));
         var t = claim(30_000);
-        assertEquals(LeaseResult.OK, this.streams.admit(t));
+        assertEquals(LeaseResult.OK, this.streams.admitAndWrite(t, 9, 1, new StreamChunk(42, 6, 0, 0, new byte[0])).result());
         assertEquals(1, this.streams.fenceEntries());
         this.now.addAndGet(TokenStreams.FENCE_TTL_MS + 1);
         for (int i = 0; i < TokenStreams.FENCE_PURGE_AT; i++) {
-            this.streams.admit(new Task("q", i, 1, 0, t.envelope(), 0));
+            this.streams.admitAndWrite(new Task("q", i, 1, 0, t.envelope(), 0), 9, 2 + i, new StreamChunk(42, 6, 0, 0, new byte[0]));
         }
-        this.streams.admit(new Task("q", -1, 1, 0, t.envelope(), 0)); // triggers the purge of idle entries
+        this.streams.admitAndWrite(new Task("q", -1, 1, 0, t.envelope(), 0), 9, 1 << 20,
+                new StreamChunk(42, 6, 0, 0, new byte[0])); // triggers the purge of idle entries
         assertEquals(TokenStreams.FENCE_PURGE_AT + 1, this.streams.fenceEntries(), "the idle entry of t was purged");
         this.streams.settle(t);
     }
