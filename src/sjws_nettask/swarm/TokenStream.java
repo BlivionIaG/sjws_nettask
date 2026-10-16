@@ -244,11 +244,12 @@ public final class TokenStream {
         }
 
         private void grow(long need) {
-            int n = this.ring.length;
+            // need <= window <= 65536 (checked by the OVERFLOW test before the call), so the long counter never overflows
+            long n = this.ring.length;
             while (n < need) {
                 n = Math.min(n * 2, this.window);
             }
-            var r = new StreamChunk[n];
+            var r = new StreamChunk[(int) n];
             for (var h : this.ring) {
                 if (h != null) {
                     r[(int) (h.chunkSeq() % n)] = h;

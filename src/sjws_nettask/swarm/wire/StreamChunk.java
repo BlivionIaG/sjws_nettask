@@ -42,10 +42,11 @@ public final class StreamChunk {
 
     /** Copies {@code bytes}. */
     public StreamChunk(long streamHi, long streamLo, long chunkSeq, int flags, byte[] bytes) {
-        this(streamHi, streamLo, chunkSeq, flags, bytes == null ? null : bytes.clone(), true);
+        this(bytes == null ? null : bytes.clone(), streamHi, streamLo, chunkSeq, flags);
     }
 
-    private StreamChunk(long streamHi, long streamLo, long chunkSeq, int flags, byte[] bytes, boolean owned) {
+    /** Takes ownership of {@code bytes}. */
+    private StreamChunk(byte[] bytes, long streamHi, long streamLo, long chunkSeq, int flags) {
         if (chunkSeq < 0 || chunkSeq > MAX_SEQ) {
             throw new IllegalArgumentException("chunkSeq " + chunkSeq);
         }
@@ -67,7 +68,7 @@ public final class StreamChunk {
 
     /** As the public constructor, but takes ownership of {@code bytes} (no copy): the caller must not reuse the array. */
     public static StreamChunk owned(long streamHi, long streamLo, long chunkSeq, int flags, byte[] bytes) {
-        return new StreamChunk(streamHi, streamLo, chunkSeq, flags, bytes, true);
+        return new StreamChunk(bytes, streamHi, streamLo, chunkSeq, flags);
     }
 
     public long streamHi() {
