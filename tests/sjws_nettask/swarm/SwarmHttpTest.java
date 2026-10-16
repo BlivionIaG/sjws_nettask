@@ -317,4 +317,17 @@ class SwarmHttpTest {
         assertThrows(IllegalArgumentException.class,
                 () -> SwarmHttp.leaseProblem(sjws_nettask.messaging.delivery.LeaseResult.OK));
     }
+
+    /** #225 review: a CANCELLED extend leaves the cached lease deadline as it was; OK moves it. */
+    @Test
+    void cancelledExtendKeepsTheCachedDeadline() throws Exception {
+        this.swarm.tasks().submit("p", 1, 1, TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        var t = this.swarm.tasks().claim("p", "w", 1, 5_000).get(0);
+        long before = t.leaseDeadlineMs();
+        var kept = SwarmHttp.cachedAfterExtend(t, sjws_nettask.messaging.delivery.LeaseResult.CANCELLED, before + 60_000);
+        assertEquals(before, kept.leaseDeadlineMs());
+        assertTrue(kept == t, "CANCELLED returns the cached task unchanged");
+        var moved = SwarmHttp.cachedAfterExtend(t, sjws_nettask.messaging.delivery.LeaseResult.OK, before + 60_000);
+        assertEquals(before + 60_000, moved.leaseDeadlineMs());
+    }
 }
