@@ -94,12 +94,13 @@ public final class TaskService {
      * tasks submitted to shard {@code s} and not yet claimed. Claims sweep only shards with {@code ready > 0},
      * plus a full sweep every {@link #FULL_SWEEP_EVERY} sweeps and whenever a wait slice expires, which finds
      * redeliveries (expired leases, nacks past their backoff) and tasks submitted by other processes. A submit
-     * signals the pool's waiters, so an append on any shard wakes a claim parked on the pool.
+     * on a sharded pool claims from its own shard for the oldest parked claim and unparks it with the tasks in
+     * hand (direct handoff, no lock/Condition); cross-shard drain is still the pre-park sweep and full sweep.
      */
     static final class PoolShards {
         final java.util.concurrent.atomic.AtomicLongArray ready;
-        final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
-        final java.util.concurrent.locks.Condition nonEmpty = this.lock.newCondition();
+        /** Parked claims, oldest first; a submit claims for the first one it can take (direct handoff). */
+        final java.util.concurrent.ConcurrentLinkedQueue<Waiter> waiters = new java.util.concurrent.ConcurrentLinkedQueue<>();
         final java.util.concurrent.atomic.AtomicInteger waiting = new java.util.concurrent.atomic.AtomicInteger();
         final java.util.concurrent.atomic.AtomicLong sweeps = new java.util.concurrent.atomic.AtomicLong();
 
@@ -116,19 +117,160 @@ public final class TaskService {
 
         void added(int shard, long n) {
             this.ready.addAndGet(shard, n);
-            if (this.waiting.get() > 0) {
-                this.lock.lock();
-                try {
-                    this.nonEmpty.signalAll();
-                } finally {
-                    this.lock.unlock();
-                }
-            }
         }
 
         void taken(int shard, long n) {
             this.ready.getAndUpdate(shard, v -> Math.max(0, v - n));
         }
+    }
+
+    /**
+     * A sharded claim parked on its pool. A submit that finds it moves it WAITING -> CLAIMING (exclusive), polls
+     * its own shard with the waiter's worker/max/visibility, stores the result in {@link #handed} and moves it to
+     * DONE before unparking it. The waiter can only leave on its own by WAITING -> CANCELLED; once a submit holds
+     * CLAIMING it waits for DONE and returns what it was handed, so a task claimed on its behalf is never dropped.
+     */
+    static final class Waiter {
+        static final int WAITING = 0, CLAIMING = 1, DONE = 2, CANCELLED = 3;
+        final Thread thread;
+        final String worker;
+        final int max;
+        final long visibilityMs;
+        final java.util.concurrent.atomic.AtomicInteger state = new java.util.concurrent.atomic.AtomicInteger(WAITING);
+        /** Written before state DONE (volatile), read after it. */
+        List<Task> handed = List.of();
+        /** Ledger clock at the submitter's poll for {@link #handed}; written before DONE, read after it. */
+        long handedAtMs;
+
+        Waiter(Thread thread, String worker, int max, long visibilityMs) {
+            this.thread = thread;
+            this.worker = worker;
+            this.max = max;
+            this.visibilityMs = visibilityMs;
+        }
+
+        boolean cancel() {
+            return this.state.compareAndSet(WAITING, CANCELLED);
+        }
+    }
+
+    /** Claims handed to a parked claim by the submitting thread (tests and benches). */
+    private final java.util.concurrent.atomic.LongAdder handoffs = new java.util.concurrent.atomic.LongAdder();
+
+    long handoffs() {
+        return this.handoffs.sum();
+    }
+
+    /** Handoffs whose poll threw (the waiter then sweeps for itself); tests and benches. */
+    private final java.util.concurrent.atomic.LongAdder handoffErrors = new java.util.concurrent.atomic.LongAdder();
+
+    long handoffErrors() {
+        return this.handoffErrors.sum();
+    }
+
+    /** Handed leases re-extended by the woken waiter because the clock moved during its wake (tests, benches). */
+    private final java.util.concurrent.atomic.LongAdder handoffRefreshes = new java.util.concurrent.atomic.LongAdder();
+
+    long handoffRefreshes() {
+        return this.handoffRefreshes.sum();
+    }
+
+    /**
+     * Visible for testing only: runs on the submitting thread after a handoff poll leased tasks for a waiter and
+     * before the waiter is released (simulates the waiter's schedule gap). Production leaves it at {@link #NO_HOOK}.
+     */
+    volatile Runnable afterHandoffPoll = NO_HOOK;
+
+    /**
+     * Lease refresh on receipt (review of #223): the submitter's poll started the handed leases before the
+     * waiter was even runnable, so the lease would otherwise tick through the waiter's schedule gap and a short
+     * {@code visibilityMs} could expire (and redeliver) a task the waiter is about to run. Once the waiter is on
+     * CPU it re-extends the handed leases to {@code now + visibilityMs} (never past a task's own deadline), so the
+     * lease window starts when the worker runs, as on master. Skipped when the ledger clock has not moved since
+     * the poll (the common sub-millisecond handoff), so the fast path costs no extra ledger write. A lease that
+     * was already fenced (expired and redelivered while the waiter was descheduled) is dropped from the result:
+     * the redelivery owns it now.
+     */
+    private List<Task> refreshHanded(Waiter w) {
+        List<Task> ts = w.handed;
+        long now = this.topics.clock().getAsLong();
+        if (now <= w.handedAtMs) return ts;
+        var t0 = ts.get(0);
+        var p = partition(t0.pool(), t0.shard());
+        int k = ts.size();
+        var fullOff = new long[k];
+        var fullAtt = new int[k];
+        var fullIdx = new int[k];
+        var shortOff = new long[k];
+        var shortAtt = new int[k];
+        var shortIdx = new int[k];
+        int nf = 0, ns = 0;
+        long shortest = Long.MAX_VALUE;
+        for (int i = 0; i < k; i++) {
+            var t = ts.get(i);
+            long dl = t.envelope().deadlineMs();
+            if (dl - now >= w.visibilityMs) {
+                fullOff[nf] = t.offset(); fullAtt[nf] = t.attempt(); fullIdx[nf++] = i;
+            } else if (dl > now) {
+                shortOff[ns] = t.offset(); shortAtt[ns] = t.attempt(); shortIdx[ns++] = i;
+                shortest = Math.min(shortest, dl - now);
+            } // else past its own deadline: leave the lease as is, the handler sees the deadline
+        }
+        var out = new ArrayList<>(ts);
+        var dropped = new boolean[k];
+        if (nf > 0) {
+            var r = p.extend(WORKERS, java.util.Arrays.copyOf(fullOff, nf), java.util.Arrays.copyOf(fullAtt, nf), w.visibilityMs);
+            for (int j = 0; j < nf; j++) {
+                if (r.get(j) == LeaseResult.OK) out.set(fullIdx[j], ts.get(fullIdx[j]).withDeadline(now + w.visibilityMs));
+                else dropped[fullIdx[j]] = true;
+            }
+        }
+        if (ns > 0) {
+            var r = p.extend(WORKERS, java.util.Arrays.copyOf(shortOff, ns), java.util.Arrays.copyOf(shortAtt, ns), shortest);
+            for (int j = 0; j < ns; j++) {
+                if (r.get(j) == LeaseResult.OK) out.set(shortIdx[j], ts.get(shortIdx[j]).withDeadline(now + shortest));
+                else dropped[shortIdx[j]] = true;
+            }
+        }
+        this.handoffRefreshes.increment();
+        var kept = new ArrayList<Task>(k);
+        for (int i = 0; i < k; i++) if (!dropped[i]) kept.add(out.get(i));
+        return kept;
+    }
+
+    /**
+     * Direct handoff (S1c): the submitting thread, already running, claims from {@code shard} for the oldest parked
+     * claim and unparks it with the tasks in hand. The woken worker then returns at once: no pool-lock reacquire,
+     * no sweep and no partition lock after the wake, so a worker descheduled right after its wake holds nothing
+     * that the next submit needs. A submit that finds no waiter (the common busy case) does nothing here.
+     */
+    private void handoff(String pool, PoolShards ps, int shard) {
+        if (ps.waiting.get() == 0) return;
+        Waiter w;
+        while ((w = ps.waiters.poll()) != null) {
+            if (w.state.compareAndSet(Waiter.WAITING, Waiter.CLAIMING)) break;
+        }
+        if (w == null) return;
+        List<Task> ts = List.of();
+        try {
+            var p = partition(pool, shard);
+            w.handedAtMs = this.topics.clock().getAsLong();
+            this.shardPolls.increment();
+            var got = p.poll(WORKERS, w.worker, w.max, w.visibilityMs);
+            if (!got.isEmpty()) {
+                ps.taken(shard, got.size());
+                ts = tasks(pool, shard, p, got);
+            }
+            if (!ts.isEmpty()) this.afterHandoffPoll.run();
+        } catch (RuntimeException e) {
+            // The submit itself succeeded; the waiter sweeps for the task (or a later claim takes it).
+            this.handoffErrors.increment();
+        } finally {
+            w.handed = ts;
+            w.state.set(Waiter.DONE);
+            java.util.concurrent.locks.LockSupport.unpark(w.thread);
+        }
+        if (!ts.isEmpty()) this.handoffs.increment();
     }
 
     static final int FULL_SWEEP_EVERY = 64;
@@ -280,7 +422,9 @@ public final class TaskService {
         int shard = shardOf(producerId, seq);
         var r = partition(pool, shard).produce(producerId, seq, task.encode());
         if (this.shards > 1) {
-            pool(pool).added(shard, 1); // a deduped resubmit over-counts by one: a hint, corrected on claim
+            var ps = pool(pool);
+            ps.added(shard, 1); // a deduped resubmit over-counts by one: a hint, corrected on claim
+            handoff(pool, ps, shard); // after the hint: a claim parking concurrently sees one or the other
         }
         return r;
     }
@@ -319,19 +463,45 @@ public final class TaskService {
             }
             long left = deadline - System.nanoTime();
             if (waitNanos <= 0 || left <= 0) return List.of();
+            var w = new Waiter(Thread.currentThread(), worker, max, visibilityMs);
             ps.waiting.incrementAndGet();
-            ps.lock.lock();
+            ps.waiters.add(w);
             try {
-                if (!ps.anyReady()) {
-                    ps.nonEmpty.awaitNanos(Math.min(left, this.waitSliceNanos));
+                // Lost-wakeup check: a submit bumps the hint and then looks for waiters; we enqueue and then look
+                // at the hints. Both sides are volatile, so at least one of them sees the other.
+                if (ps.anyReady() && w.cancel()) {
+                    ps.waiters.remove(w);
+                    full = false;
+                    continue;
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return List.of();
+                long until = System.nanoTime() + Math.min(left, this.waitSliceNanos);
+                while (true) {
+                    int st = w.state.get();
+                    if (st == Waiter.DONE || st == Waiter.CANCELLED) break;
+                    if (st == Waiter.CLAIMING) { // a submit is polling for us right now: its unpark follows
+                        java.util.concurrent.locks.LockSupport.parkNanos(this, 1_000_000);
+                        continue;
+                    }
+                    long r = until - System.nanoTime();
+                    if (r <= 0 || Thread.currentThread().isInterrupted()) {
+                        if (w.cancel()) ps.waiters.remove(w);
+                        continue; // CANCELLED, or a submit won the race: wait for its DONE
+                    }
+                    java.util.concurrent.locks.LockSupport.parkNanos(this, r);
+                }
             } finally {
-                ps.lock.unlock();
                 ps.waiting.decrementAndGet();
             }
+            if (w.state.get() == Waiter.DONE && !w.handed.isEmpty()) {
+                List<Task> kept;
+                try {
+                    kept = refreshHanded(w);
+                } catch (RuntimeException e) { // closing partition: return the handed leases as polled
+                    kept = w.handed;
+                }
+                if (!kept.isEmpty()) return kept;
+            }
+            if (Thread.currentThread().isInterrupted()) return List.of();
             full = !ps.anyReady(); // woken by a submit: hinted sweep; slice expired: full sweep
         }
     }
