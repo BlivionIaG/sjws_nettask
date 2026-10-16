@@ -120,4 +120,66 @@ class OptionalModulesTest {
             System.clearProperty("sjws.messaging.dir");
         }
     }
+
+    /** A module whose configuration must stop the process. */
+    public static final class Refusing implements OptionalModule {
+        public Refusing() {
+            throw new OptionalModule.Refused("no");
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    /** A module that fails in an ordinary way: skipped with a warning. */
+    public static final class Failing implements OptionalModule {
+        public Failing() {
+            throw new IllegalStateException("boom");
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    @Test
+    void aRefusedModuleStopsStartupAndAFailingOneIsSkipped() {
+        var err = new ByteArrayOutputStream();
+        var ps = new PrintStream(err, true, StandardCharsets.UTF_8);
+        var e = org.junit.jupiter.api.Assertions.assertThrows(OptionalModule.Refused.class,
+                () -> OptionalModules.load(Refusing.class.getName(), ps));
+        assertEquals("no", e.getMessage());
+        assertSame(OptionalModules.NONE, OptionalModules.load(Failing.class.getName(), ps));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("not started"));
+    }
+
+    @Test
+    void multiProcessIsRecordedForModulesAndDerivedFromBootstrapOrCpPeers() {
+        try {
+            OptionalModules.multiProcess("why");
+            assertEquals("why", OptionalModules.multiProcess());
+        } finally {
+            OptionalModules.multiProcess(null);
+        }
+        assertSame(OptionalModules.NONE, OptionalModules.start(false, "why", System.err));
+        assertEquals(null, OptionalModules.multiProcess(), "cleared after the start");
+        // a swarm with streaming on in a multi-process deployment refuses to start, through the real loader
+        System.setProperty("sjws.swarm.stream.enabled", "true");
+        try {
+            var e = org.junit.jupiter.api.Assertions.assertThrows(OptionalModule.Refused.class,
+                    () -> OptionalModules.start(true, "why", System.err));
+            assertTrue(e.getMessage().contains("but why."), e.getMessage());
+            assertEquals(null, OptionalModules.multiProcess());
+        } finally {
+            System.clearProperty("sjws.swarm.stream.enabled");
+        }
+        assertEquals(null, Sjws_nettask.multiProcess(null, null));
+        assertEquals(null, Sjws_nettask.multiProcess(null, Map.of("nodeId", "c1")));
+        assertEquals(null, Sjws_nettask.multiProcess(null, Map.of("peers", List.of())), "single-voter dev CP");
+        assertTrue(Sjws_nettask.multiProcess(null, Map.of("peers", List.of("a", "b", "c"))).contains("cp.peers (3"));
+        ServiceHooks hooks = java.lang.reflect.Proxy.newProxyInstance(ServiceHooks.class.getClassLoader(),
+                new Class<?>[] {ServiceHooks.class}, (p, m, a) -> null) instanceof ServiceHooks h ? h : null;
+        assertTrue(Sjws_nettask.multiProcess(hooks, null).contains("--bootstrap"));
+    }
 }

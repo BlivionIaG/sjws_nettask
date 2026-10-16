@@ -86,6 +86,9 @@ class TokenStreamsTest {
         var call = this.swarm.replies().call("p", "text/plain", new byte[0], this.now.get() + 60_000, "");
         var t = claim(30_000);
         // the call submitted its own task; ours is the one we claimed first
+        // #234: the node's shard reader consumes (and acks) the shard; a second group keeps the ledger copies to check
+        var shard = this.swarm.topics().partitionWithoutDlq(this.streams.topicFor(42, 2));
+        shard.subscribe("g", false);
         try (var sink = this.streams.open(cid)) {
             var co = new TokenStream.Coalescer(42, 2, 1024, 20, System::nanoTime);
             var src = new byte[5000];
@@ -109,9 +112,7 @@ class TokenStreamsTest {
         assertEquals(0, this.streams.openSinks());
         call.cancel(true);
         // the chunks are on the stream shard, with no DLQ partition
-        var shard = this.swarm.topics().partitionWithoutDlq(this.streams.topicFor(42, 2));
         assertNull(shard.deadLetterQueue());
-        shard.subscribe("g", true);
         var chunks = shard.poll("g", "c", 100, 1_000);
         assertEquals(5, chunks.size(), "4 full 1 KiB chunks + LAST(904 B)");
         var lastOnLedger = StreamChunk.decode(chunks.get(4).payload());
@@ -322,5 +323,132 @@ class TokenStreamsTest {
         var on = new SwarmModule(this.swarm, SwarmGate.DENY_ALL, false, true);
         assertNotNull(on.swarm().tasks().streams());
         assertEquals(1, on.swarm().tasks().streams().config().shards());
+    }
+
+    @Test
+    void submitterOfTakesTheNodeFromReplyToOrFallsBackToThisNode() {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var id = id(20);
+        java.util.function.Function<String, String> of = to -> this.streams.submitterOf(
+                new TaskEnvelope(id, id, to, TaskEnvelope.NO_DEADLINE, "", "", "", "", new byte[0]));
+        assertEquals("nb", of.apply("reply.nb"));
+        assertEquals("n1", of.apply("reply."), "empty node: this node");
+        assertEquals("n1", of.apply("other.nb"));
+        assertEquals("n1", of.apply(""));
+        assertEquals("stream.nb#0", this.streams.topicFor("nb", 42, 5));
+    }
+
+    @Test
+    void reorderHasCoversDeliveredBufferedAndUnseen() {
+        var r = new TokenStream.Reorder(1, 2, 8);
+        assertFalse(r.has(0), "nothing seen, no ring");
+        var out = new java.util.ArrayList<StreamChunk>();
+        r.offer(new StreamChunk(1, 2, 0, StreamChunk.FIRST, new byte[] {1}), out);
+        assertTrue(r.has(0), "delivered");
+        assertFalse(r.has(2));
+        r.offer(new StreamChunk(1, 2, 2, 0, new byte[] {3}), out);
+        assertTrue(r.has(2), "buffered");
+        assertFalse(r.has(3));
+        assertFalse(r.has(1_000), "past the ring");
+    }
+
+    @Test
+    void ledgerOfferSkipsWhatTheSinkHasAndOffersTheRest() {
+        this.streams = this.swarm.enableStreams(new TokenStreams.Config(1, 64, 2));
+        try (var s = this.streams.open(id(21))) {
+            assertFalse(s.offerFromLedger(new StreamChunk(9, 9, 1, 0, StreamChunk.FIRST, new byte[0])), "other stream");
+            assertTrue(s.offerFromLedger(new StreamChunk(42, 21, 2, 0, StreamChunk.FIRST, new byte[] {1})), "first");
+            assertFalse(s.offerFromLedger(new StreamChunk(42, 21, 2, 0, StreamChunk.FIRST, new byte[] {1})), "held");
+            assertFalse(s.offerFromLedger(new StreamChunk(42, 21, 1, 5, 0, new byte[0])), "older attempt");
+            assertEquals(0, s.staleChunks(), "ledger skips are not counted");
+            assertTrue(s.offerFromLedger(new StreamChunk(42, 21, 2, 1, 0, new byte[] {2})));
+            assertFalse(s.dropped());
+            assertTrue(s.offerFromLedger(new StreamChunk(42, 21, 2, 2, 0, new byte[] {3})), "offered, but the sink is full");
+            assertTrue(s.dropped());
+            assertEquals(1, this.streams.sinkDrops());
+            assertTrue(s.offerFromLedger(new StreamChunk(42, 21, 3, 0, StreamChunk.FIRST, new byte[] {4})), "newer: RESET");
+            assertEquals(1, s.resets());
+        }
+    }
+
+    @Test
+    void shardReaderSkipsForeignPayloadsAndChunksWithoutASinkThenStopsWhenIdle() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var shard = this.swarm.topics().partitionWithoutDlq(this.streams.shardTopic(0));
+        var sink = this.streams.open(id(22));
+        assertTrue(this.streams.reading());
+        shard.produce(5, 1, new byte[] {9, 9}); // not a chunk
+        shard.produce(5, 2, new StreamChunk(42, 99, 0, StreamChunk.FIRST, new byte[] {1}).encode()); // no sink
+        shard.produce(5, 3, new StreamChunk(42, 22, 0, StreamChunk.FIRST, new byte[] {1}).encode());
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (this.streams.ledgerChunks() < 1 && System.nanoTime() < until) {
+            Thread.sleep(5);
+        }
+        assertEquals(1, this.streams.ledgerChunks());
+        assertEquals(1, sink.drain().size());
+        sink.close();
+        // idle: no sink for READER_IDLE_MS on the topics' clock
+        this.now.addAndGet(TokenStreams.READER_IDLE_MS + 1);
+        until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (this.streams.reading() && System.nanoTime() < until) {
+            Thread.sleep(5);
+        }
+        assertFalse(this.streams.reading(), "stopped after the idle period");
+        try (var again = this.streams.open(id(23))) {
+            assertTrue(this.streams.reading(), "restarted by the next sink");
+        }
+    }
+
+    @Test
+    void submitterShardsReadsTheStampFallsBackWhenAbsentAndRefusesInvalidValues() {
+        this.streams = this.swarm.enableStreams(new TokenStreams.Config(3, 64, 256));
+        var id = id(30);
+        java.util.function.Function<String, TaskEnvelope> env = ts -> new TaskEnvelope(id, id, "reply.n2",
+                TaskEnvelope.NO_DEADLINE, "", ts, "", "", new byte[0]);
+        assertEquals("sjws-stream=shards:3", this.streams.shardsTracestate());
+        assertEquals(3, this.streams.submitterShards(env.apply("")), "absent: this node's count");
+        assertEquals(3, this.streams.submitterShards(env.apply("vendor=abc")), "other members only");
+        assertEquals(1, this.streams.submitterShards(env.apply("sjws-stream=shards:1")));
+        assertEquals(64, this.streams.submitterShards(env.apply("vendor=abc, sjws-stream=shards:64")));
+        assertEquals(0, this.streams.invalidShardStamps());
+        int bad = 0;
+        for (var v : new String[] {"shards:0", "shards:65", "shards:-1", "shards:x", "shards:", "shards:123", "4", "",
+                "nope=shards:4"}) {
+            assertThrows(IllegalArgumentException.class, () -> this.streams.submitterShards(env.apply("sjws-stream=" + v)),
+                    v);
+            assertEquals(++bad, this.streams.invalidShardStamps(), v);
+        }
+        assertEquals(3, this.streams.submitterShards(env.apply("sjws-streamx=shards:9,sjws-stream")),
+                "a member without '=' or with another key is ignored");
+        assertEquals("stream.n2#" + TokenStream.shardOf(42, 30, 5),
+                this.streams.partitionFor(env.apply("sjws-stream=shards:5"), 42, 30).topic(), "the submitter's count");
+    }
+
+    @Test
+    void aChunkWithAnInvalidShardStampIsRefusedBeforeTheFenceMoves() {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var id = id(31);
+        var env = new TaskEnvelope(id, id, this.swarm.replies().topic(), TaskEnvelope.NO_DEADLINE, "",
+                "sjws-stream=shards:99", "", "text/plain", new byte[] {1});
+        this.swarm.tasks().submit("p", 1, 31, env);
+        var t = claim(30_000);
+        var c = new StreamChunk(42, 31, 0, StreamChunk.FIRST, new byte[] {1});
+        assertThrows(IllegalArgumentException.class, () -> this.swarm.tasks().streamChunk(t, 9, 1, c));
+        assertEquals(1, this.streams.invalidShardStamps());
+        assertFalse(this.swarm.topics().isOpen("stream.n1#0"), "nothing written");
+    }
+
+    @Test
+    void shardReaderStopsWhenTheTopicsClose() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var sink = this.streams.open(id(32));
+        assertTrue(this.streams.reading());
+        this.swarm.close();
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (this.streams.reading() && System.nanoTime() < until) {
+            Thread.sleep(5);
+        }
+        assertFalse(this.streams.reading(), "the reader exits with the topics, even with a sink open");
+        sink.close();
     }
 }

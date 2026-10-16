@@ -149,6 +149,10 @@ final class SwarmHttp implements Handler {
         var verb = colon < 0 ? "" : rest.substring(colon + 1);
         var noun = colon < 0 ? rest : rest.substring(0, colon);
         try {
+            if (noun.startsWith("tasks/") && "cancel".equals(verb) && this.streams != null) {
+                // S2c PR 5: {id} is the stream session; the submitter or an admin (not the pool grant) decides
+                return this.streams.cancel(agent, decode(noun.substring("tasks/".length())), this.gate.isAdmin(agent));
+            }
             if (noun.startsWith("tasks/")) {
                 var pool = decode(noun.substring("tasks/".length()));
                 if (!this.gate.allows(agent, pool)) {
@@ -266,8 +270,24 @@ final class SwarmHttp implements Handler {
             case "ack" -> r = this.swarm.tasks().ack(t);
             case "nack" -> r = this.swarm.tasks().nack(t, number(query, "delayMs", 0, 0, 3_600_000));
             case "reject" -> r = this.swarm.tasks().reject(t, query.getOrDefault("reason", "rejected"));
-            case "extend" -> r = this.swarm.tasks().extend(t.pool(), t.shard(), new long[] {t.offset()}, new int[] {t.attempt()},
-                    number(query, "visibilityMs", 30_000, 1, 3_600_000)).get(0);
+            case "extend" -> {
+                long vis = number(query, "visibilityMs", 30_000, 1, 3_600_000);
+                if (this.streams != null && held != null) { // S2c PR 5 (flag on only): clamp to the task deadline
+                    long dl = held.envelope().deadlineMs();
+                    long now = this.swarm.topics().clock().getAsLong();
+                    if (dl != TaskEnvelope.NO_DEADLINE) {
+                        if (now > dl) {
+                            return cancelled(CancelSet.DEADLINE).response(); // still held: ack it
+                        }
+                        vis = Math.max(1, Math.min(vis, dl - now));
+                    }
+                }
+                r = this.swarm.tasks().extend(t.pool(), t.shard(), new long[] {t.offset()}, new int[] {t.attempt()}, vis)
+                        .get(0);
+                if (r.ok() && held != null) {
+                    this.claimed.put(id, held.withDeadline(this.swarm.topics().clock().getAsLong() + vis));
+                }
+            }
             case "chunk" -> {
                 if (this.streams == null) {
                     return problem(404, "unknown lease verb", verb).response();
@@ -291,12 +311,12 @@ final class SwarmHttp implements Handler {
         }
         if (!"extend".equals(verb) || !r.ok() && r != LeaseResult.CANCELLED) { // CANCELLED: still held, settle it
             this.claimed.remove(id);
-        } else if (held != null && r.ok()) { // CANCELLED: messaging did not extend, so the cached deadline stays
-            long until = this.swarm.topics().clock().getAsLong() + number(query, "visibilityMs", 30_000, 1, 3_600_000);
-            this.claimed.put(id, held.withDeadline(until));
-        }
+        } // extend OK: the cached deadline was moved above; CANCELLED: messaging did not extend, it stays
         if (r.ok()) {
             return new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE);
+        }
+        if (r == LeaseResult.CANCELLED && this.streams != null) { // reason cancelled or deadline (§12 ruling)
+            return cancelled(this.streams.reason(held != null ? held : t)).response();
         }
         return leaseProblem(r).response();
     }
