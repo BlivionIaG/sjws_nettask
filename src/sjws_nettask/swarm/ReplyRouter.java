@@ -155,6 +155,33 @@ public final class ReplyRouter implements AutoCloseable {
     }
 
     /**
+     * Registers a call that was submitted elsewhere with {@code replyTo = }{@link #topic()} and correlation id
+     * {@code correlationId} (16 bytes, e.g. from {@link #newId()}), such as an S2c streaming call whose final
+     * {@code LAST} reply lands here after its chunks went to a stream shard. Without this, that reply finds no
+     * pending call and is counted late. The returned future completes with the final reply (same-process through
+     * {@link #completeLocal}, otherwise through the poller) or times out at {@code deadlineMs}; either way the entry
+     * is removed. Unary {@link #call}s don't use this, so their path is unchanged.
+     */
+    public CompletableFuture<TaskEnvelope> expect(byte[] correlationId, long deadlineMs) {
+        if (this.closed) {
+            throw new IllegalStateException("closed");
+        }
+        if (correlationId.length != 16) {
+            throw new IllegalArgumentException("correlationId must be 16 bytes");
+        }
+        var b = ByteBuffer.wrap(correlationId);
+        var key = new Key(b.getLong(0), b.getLong(8));
+        var f = new CompletableFuture<TaskEnvelope>();
+        if (this.pending.putIfAbsent(key, f) != null) {
+            throw new IllegalStateException("correlation id already pending");
+        }
+        ensurePolling();
+        long wait = deadlineMs - this.topics.clock().getAsLong();
+        f.orTimeout(Math.max(0, wait), TimeUnit.MILLISECONDS).whenComplete((r, e) -> this.pending.remove(key, f));
+        return f;
+    }
+
+    /**
      * Submits {@code body} to {@code pool} and completes with the reply envelope, or with {@link TimeoutException}
      * at {@code deadlineMs} (absolute, the topics' clock). The task id is the correlation id.
      */
