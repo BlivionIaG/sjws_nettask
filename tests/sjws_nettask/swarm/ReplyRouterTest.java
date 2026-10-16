@@ -250,55 +250,68 @@ class ReplyRouterTest {
         }
     }
 
-    /** Fix: registering the stream's correlation with expect() makes its final reply a normal, non-late result. */
+    /** Fix: a registered stream's final reply is acked without counting late, with no pending entry held. */
     @Test
-    void anExpectedStreamResultCompletesAndIsNotLate() throws Exception {
-        try (var swarm = Swarm.open(this.dir, "expect", 7)) {
+    void aRegisteredStreamResultIsNotLate() throws Exception {
+        try (var swarm = Swarm.open(this.dir, "registered", 7)) {
+            var c = swarm.replies().call("gen", "text/plain", new byte[] {1}, System.currentTimeMillis() + 10_000, "");
+            var u = swarm.tasks().claim("gen", "w", 1, 5_000).get(0);
+            swarm.tasks().reply(u, 5, 100, "text/plain", new byte[] {2}).get(5, TimeUnit.SECONDS);
+            c.get(5, TimeUnit.SECONDS);
             var id = ReplyRouter.newId();
-            long deadline = System.currentTimeMillis() + 10_000;
-            var f = swarm.replies().expect(id, deadline);
-            assertEquals(1, swarm.replies().pending());
-            assertThrows(IllegalStateException.class, () -> swarm.replies().expect(id, deadline));
-            assertThrows(IllegalArgumentException.class, () -> swarm.replies().expect(new byte[8], deadline));
-            var t = submitStreamLike(swarm, id, deadline);
+            swarm.replies().registerStream(id);
+            assertEquals(0, swarm.replies().pending(), "no pending future for a stream");
+            assertEquals(1, swarm.replies().streams());
+            assertThrows(IllegalArgumentException.class, () -> swarm.replies().registerStream(new byte[8]));
+            var t = submitStreamLike(swarm, id, System.currentTimeMillis() + 10_000);
             assertEquals(LeaseResult.OK, swarm.tasks().reply(t, 5, 1, "text/plain", new byte[] {9}).get(5, TimeUnit.SECONDS));
-            assertEquals(9, f.get(1, TimeUnit.SECONDS).body()[0]);
-            assertEquals(0, swarm.replies().pending());
             long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (swarm.replies().deliveredLocalSize() > 0 && System.nanoTime() < until) {
+            while (swarm.replies().streams() > 0 && System.nanoTime() < until) {
                 Thread.sleep(5);
             }
-            assertEquals(0, swarm.replies().deliveredLocalSize());
+            assertEquals(0, swarm.replies().streams(), "cleared when the final reply is read");
+            Thread.sleep(100);
             assertEquals(0, swarm.replies().lateReplies());
         }
     }
 
-    /** The poller path (reply produced by another process): an expected result completes there, not late. */
+    /** registerStream starts the poller: the final reply is read even when no unary call ever ran. */
     @Test
-    void anExpectedStreamResultFromAnotherProcessCompletesThroughThePoller() throws Exception {
-        try (var swarm = Swarm.open(this.dir, "poller", 7)) {
+    void registeringAStreamStartsThePoller() throws Exception {
+        try (var swarm = Swarm.open(this.dir, "nocall", 7)) {
             var id = ReplyRouter.newId();
-            long deadline = System.currentTimeMillis() + 10_000;
-            var f = swarm.replies().expect(id, deadline);
-            var env = new TaskEnvelope(id, id, swarm.replies().topic(), deadline, "00-tp", "", "b1", "text/plain", new byte[] {1});
-            // written straight to the reply topic: no completeLocal, as from a worker on another node
+            swarm.replies().registerStream(id);
+            var env = new TaskEnvelope(id, id, swarm.replies().topic(), 0, "00-tp", "", "b1", "text/plain", new byte[] {1});
+            // straight to the reply topic, as from a worker on another node
             swarm.topics().partition(swarm.replies().topic()).produce(99, 1, env.reply("text/plain", new byte[] {7}).encode(),
                     sjws_nettask.messaging.ledger.Durability.ASYNC);
-            assertEquals(7, f.get(5, TimeUnit.SECONDS).body()[0]);
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (swarm.replies().streams() > 0 && System.nanoTime() < until) {
+                Thread.sleep(5);
+            }
+            assertEquals(0, swarm.replies().streams());
             assertEquals(0, swarm.replies().lateReplies());
         }
     }
 
-    /** An expected result that never comes times out at the deadline and leaves nothing pending. */
+    /** A cleared stream (session expired) no longer suppresses the late count. */
     @Test
-    void anExpectedStreamResultTimesOutAtItsDeadline() throws Exception {
-        try (var swarm = Swarm.open(this.dir, "timeout", 7)) {
-            var f = swarm.replies().expect(ReplyRouter.newId(), System.currentTimeMillis() + 50);
-            var e = assertThrows(ExecutionException.class, () -> f.get(5, TimeUnit.SECONDS));
-            assertInstanceOf(TimeoutException.class, e.getCause());
-            assertEquals(0, swarm.replies().pending());
+    void aClearedStreamCountsLateAgainAndCloseRefusesRegistration() throws Exception {
+        try (var swarm = Swarm.open(this.dir, "cleared", 7)) {
+            var id = ReplyRouter.newId();
+            swarm.replies().registerStream(id);
+            swarm.replies().clearStream(id);
+            assertEquals(0, swarm.replies().streams());
+            var env = new TaskEnvelope(id, id, swarm.replies().topic(), 0, "00-tp", "", "b1", "text/plain", new byte[] {1});
+            swarm.topics().partition(swarm.replies().topic()).produce(99, 1, env.reply("text/plain", new byte[] {7}).encode(),
+                    sjws_nettask.messaging.ledger.Durability.ASYNC);
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (swarm.replies().lateReplies() == 0 && System.nanoTime() < until) {
+                Thread.sleep(5);
+            }
+            assertEquals(1, swarm.replies().lateReplies());
             swarm.replies().close();
-            assertThrows(IllegalStateException.class, () -> swarm.replies().expect(ReplyRouter.newId(), 0));
+            assertThrows(IllegalStateException.class, () -> swarm.replies().registerStream(ReplyRouter.newId()));
         }
     }
 }

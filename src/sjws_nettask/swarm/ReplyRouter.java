@@ -65,6 +65,8 @@ public final class ReplyRouter implements AutoCloseable {
     private volatile Thread poller;
     private volatile boolean closed;
     private final AtomicLong late = new AtomicLong();
+    /** S2c streaming calls whose final reply lands here ({@link #registerStream}); empty unless streaming is used. */
+    private final java.util.Set<Key> streams = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** Upper bound on remembered direct deliveries; past it the eldest is dropped (worst case: one late count). */
     static final int DELIVERED_LOCAL_MAX = 65_536;
     /**
@@ -155,31 +157,39 @@ public final class ReplyRouter implements AutoCloseable {
     }
 
     /**
-     * Registers a call that was submitted elsewhere with {@code replyTo = }{@link #topic()} and correlation id
-     * {@code correlationId} (16 bytes, e.g. from {@link #newId()}), such as an S2c streaming call whose final
-     * {@code LAST} reply lands here after its chunks went to a stream shard. Without this, that reply finds no
-     * pending call and is counted late. The returned future completes with the final reply (same-process through
-     * {@link #completeLocal}, otherwise through the poller) or times out at {@code deadlineMs}; either way the entry
-     * is removed. Unary {@link #call}s don't use this, so their path is unchanged.
+     * S2c: registers a streaming call submitted outside {@link #call} (e.g. {@code :stream}) with
+     * {@code replyTo = }{@link #topic()} and correlation id {@code correlationId} (16 bytes, e.g. {@link #newId()}).
+     * Its final {@code LAST} reply is then acked without counting late, and the key is cleared when that reply is
+     * read. No pending future is held for the stream. Starts the poller, so the reply is read even when no unary
+     * call is in flight, and keeps it from idle-closing while streams are registered. Call {@link #clearStream}
+     * when the session ends without a final reply (expiry, cancel). Unary calls don't touch this.
      */
-    public CompletableFuture<TaskEnvelope> expect(byte[] correlationId, long deadlineMs) {
+    public void registerStream(byte[] correlationId) {
         if (this.closed) {
             throw new IllegalStateException("closed");
         }
+        this.streams.add(key(correlationId));
+        ensurePolling();
+    }
+
+    /** S2c: forgets a stream registered with {@link #registerStream}; a reply read afterwards counts late. */
+    public void clearStream(byte[] correlationId) {
+        this.streams.remove(key(correlationId));
+    }
+
+    /** Streams registered and not yet ended (tests, stats). */
+    public int streams() {
+        return this.streams.size();
+    }
+
+    private static Key key(byte[] correlationId) {
         if (correlationId.length != 16) {
             throw new IllegalArgumentException("correlationId must be 16 bytes");
         }
         var b = ByteBuffer.wrap(correlationId);
-        var key = new Key(b.getLong(0), b.getLong(8));
-        var f = new CompletableFuture<TaskEnvelope>();
-        if (this.pending.putIfAbsent(key, f) != null) {
-            throw new IllegalStateException("correlation id already pending");
-        }
-        ensurePolling();
-        long wait = deadlineMs - this.topics.clock().getAsLong();
-        f.orTimeout(Math.max(0, wait), TimeUnit.MILLISECONDS).whenComplete((r, e) -> this.pending.remove(key, f));
-        return f;
+        return new Key(b.getLong(0), b.getLong(8));
     }
+
 
     /**
      * Submits {@code body} to {@code pool} and completes with the reply envelope, or with {@link TimeoutException}
@@ -255,8 +265,8 @@ public final class ReplyRouter implements AutoCloseable {
                 if (!f.complete(env)) {
                     this.late.incrementAndGet(); // raced with the caller's timeout
                 }
-            } else if (this.deliveredLocal.remove(key) == null) {
-                this.late.incrementAndGet(); // timed out, or not an in-flight call
+            } else if (this.deliveredLocal.remove(key) == null && !this.streams.remove(key)) {
+                this.late.incrementAndGet(); // timed out, or not an in-flight call or registered stream
             }
         }
         p.ack(GROUP, offs, atts, null); // one batched fenced ack (#100) for every reply read
@@ -270,7 +280,8 @@ public final class ReplyRouter implements AutoCloseable {
             long now = this.topics.clock().getAsLong();
             if (n > 0) {
                 lastActive = now;
-            } else if (this.pending.isEmpty() && now - lastActive >= this.idleCloseMs && idleClose()) {
+            } else if (this.pending.isEmpty() && this.streams.isEmpty() && now - lastActive >= this.idleCloseMs
+                    && idleClose()) {
                 return;
             }
         }
@@ -280,7 +291,7 @@ public final class ReplyRouter implements AutoCloseable {
     private boolean idleClose() {
         this.lifecycle.lock();
         try {
-            if (!this.pending.isEmpty()) {
+            if (!this.pending.isEmpty() || !this.streams.isEmpty()) {
                 return false;
             }
             this.poller = null;
