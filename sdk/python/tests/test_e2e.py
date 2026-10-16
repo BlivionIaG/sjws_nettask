@@ -47,7 +47,7 @@ class EndToEndTest(unittest.TestCase):
         cls.log = open(pathlib.Path(cls.tmp, "server.log"), "w")
         cls.proc = subprocess.Popen(
             [java, "-Dsjws.swarm.enabled=true", "-Dsjws.swarm.dir=" + str(pathlib.Path(cls.tmp, "swarm")),
-             "-Dsjws.swarm.node=e2e", "-Dsjws.swarm.tokens.file=" + str(tokens), "-jar", JAR, str(cls.port), str(site)],
+             "-Dsjws.swarm.node=e2e", "-Dsjws.swarm.trace.enabled=true", "-Dsjws.swarm.tokens.file=" + str(tokens), "-jar", JAR, str(cls.port), str(site)],
             stdout=cls.log, stderr=subprocess.STDOUT, cwd=cls.tmp)
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -80,6 +80,24 @@ class EndToEndTest(unittest.TestCase):
         t.start()
         self.assertEqual(b"HELLO SWARM", self.client.call("upper.v1", b"hello swarm", deadline=15))
         t.join(15)
+
+    def test_traceparent_crosses_a_python_worker(self):
+        tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        got = {}
+
+        def worker():
+            for lease in self.client.claim("trace.v1", wait=10):
+                got["span"] = lease.traceparent
+                lease.reply(b"ok")
+
+        t = threading.Thread(target=worker)
+        t.start()
+        body, reply_tp = self.client.call_traced("trace.v1", b"q", deadline=20, traceparent=tp)
+        t.join(15)
+        self.assertEqual(b"ok", body)
+        self.assertEqual(tp[3:35], got["span"][3:35])
+        self.assertNotEqual(tp[36:52], got["span"][36:52])
+        self.assertEqual(got["span"], reply_tp)
 
     def test_submit_claim_and_fenced_settles(self):
         task_id = self.client.submit("jobs.v1", b"job-1")

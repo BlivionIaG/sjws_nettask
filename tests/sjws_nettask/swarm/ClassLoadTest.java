@@ -117,6 +117,30 @@ class ClassLoadTest {
         assertFalse(text.contains(SECRET), "the token never reaches the output");
     }
 
+    private static final String TRACE = "sjws_nettask.swarm.trace.";
+
+    @Test
+    void swarmOnTraceOffLoadsNoTraceClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.SwarmHttp"), text);
+        assertFalse(text.contains(TRACE), text);
+    }
+
+    @Test
+    void traceFlagWithSwarmOffLoadsNoSwarmClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.trace.enabled=true"), "Server started:", 404, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml());
+        assertFalse(text.contains(SWARM), text);
+    }
+
+    @Test
+    void traceOnLoadsTheTraceClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.trace.enabled=true"), "Server started:", 401,
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.trace.SwarmTrace"), text);
+    }
+
     static final String SECRET = "s3cret-token-for-classload-test-0123456789abcdefXYZ";
 
     private Path tokens() throws Exception {
@@ -153,6 +177,7 @@ class ClassLoadTest {
         cmd.addAll(List.of(main));
         var pb = new ProcessBuilder(cmd).redirectErrorStream(true).redirectOutput(log.toFile());
         pb.environment().remove("SJWS_SWARM_ENABLED");
+        pb.environment().remove("SJWS_SWARM_TRACE_ENABLED");
         pb.environment().remove("WEB_SERVER_DIR");
         pb.environment().remove("WEB_SERVER_PORT");
         var process = pb.start();

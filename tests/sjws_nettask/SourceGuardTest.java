@@ -100,6 +100,36 @@ class SourceGuardTest {
     }
 
     /**
+     * S2b (swarm §9): trace propagation is off by default and costs nothing when off. {@code swarm.trace} is a
+     * leaf with no sjws imports, it is named only by SwarmHttp (behind its {@code trace} flag) and SwarmModule
+     * (when tracing is enabled), and the core request path never names it.
+     */
+    @Test
+    void swarmTraceIsALeafNamedOnlyBySwarmHttpAndSwarmModule() throws IOException {
+        var trace = Path.of("src/sjws_nettask/swarm/trace");
+        assertTrue(Files.isDirectory(trace));
+        assertFalse(all(trace).contains("import sjws_nettask."), "swarm.trace must not import sjws packages");
+        var allowed = java.util.Set.of("src/sjws_nettask/swarm/SwarmHttp.java", "src/sjws_nettask/swarm/SwarmModule.java");
+        var offenders = new ArrayList<String>();
+        try (var walk = Files.walk(Path.of("src"))) {
+            for (var p : (Iterable<Path>) walk::iterator) {
+                var name = p.toString().replace('\\', '/');
+                if (!name.endsWith(".java") || name.startsWith("src/sjws_nettask/swarm/trace/") || allowed.contains(name)) {
+                    continue;
+                }
+                var text = Files.readString(p);
+                if (text.contains("swarm.trace") || text.contains("SwarmTrace")) {
+                    offenders.add(name);
+                }
+            }
+        }
+        assertTrue(offenders.isEmpty(), "only SwarmHttp and SwarmModule may name swarm.trace: " + offenders);
+        var http = Files.readString(Path.of("src/sjws_nettask/swarm/SwarmHttp.java"));
+        assertFalse(http.contains("import sjws_nettask.swarm.trace"), "SwarmHttp names SwarmTrace fully qualified, behind the flag");
+        assertTrue(http.contains("private final boolean trace;"), "SwarmHttp gates tracing on a final flag");
+    }
+
+    /**
      * control-plane-hosting.md §5: outside the cp package nothing names the CONTROL-role types, so a data or
      * standalone process cannot load them; ServiceLaunch reaches the role through the CpLaunch name only.
      */

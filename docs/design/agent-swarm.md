@@ -297,7 +297,12 @@ Agents register under a **service name**, e.g. `summarize.v1`. The swarm reuses 
 - Quotas and budgets are checked at **submit** and at **LLM call**, never on the static-content path.
 
 ## 9. Tracing across a chain of agents
-- **There is no trace-context propagation on master today.** `rg -i traceparent src` finds only the swarm's `TaskEnvelope` field and the `ReplyRouter.call` parameter; no code path reads or forwards the header. `observe` has metrics, the access log and node reports (`observe/RequestObserver.java:39`, `observe/AccessLog.java`, `observe/ServerMetrics.java`).
+- **S2b (propagation) is implemented**, off by default: `-Dsjws.swarm.trace.enabled=true` / `SJWS_SWARM_TRACE_ENABLED=true`, with the swarm on. Code: `src/sjws_nettask/swarm/trace/SwarmTrace.java` (a leaf with no sjws imports), used only by `SwarmHttp` behind a final `trace` flag and by `SwarmModule`. With tracing off no `sjws_nettask.swarm.trace.` class is loaded (`ClassLoadTest`) and the handler allocates nothing for tracing; `SourceGuardTest` pins that only those two files name the package. `observe` has no tracing code to reuse (metrics, the access log and node reports only: `observe/RequestObserver.java`, `observe/AccessLog.java`, `observe/ServerMetrics.java`).
+  - Ingress: `submit` and `:call` read `traceparent`, validate it strictly (W3C Trace Context §3.2: lower-case hex only, so upper case is invalid; an invalid value is dropped, never forwarded; more than one `traceparent` field is invalid, so the trace restarts; future versions are accepted by their first 55 characters and re-emitted as `00`) and store it in `TaskEnvelope.traceparent`. The envelope is stored per shard unchanged, so it survives any shard count.
+  - Each claim mints a child span (same trace id and flags, fresh span id). `:claim` returns them in `sjws-lease-traceparent`, one entry per `LEASE` frame in frame order, `-` for an untraced task.
+  - `:reply` writes the reply with the claim's child span, and `:call` returns it as the `traceparent` response header. Every outgoing value is re-validated (`child(parse(stored))`, and `parse` of the reply's traceparent), because stored envelopes can also come from in-process callers; an invalid stored value yields `-` / no header, never a failed claim.
+  - A re-claim after lease expiry gets a new sibling child of the caller's span: the ledger keeps the parent, and the child lives only in the HTTP claimed-lease cache.
+  - Not yet: `tracestate` ingress, span recording and export (S4).
 - The swarm propagates [W3C Trace Context](https://www.w3.org/TR/trace-context/) `traceparent` and `tracestate`:
   - HTTP ingress reads the header;
   - the task envelope carries it (§4.5);

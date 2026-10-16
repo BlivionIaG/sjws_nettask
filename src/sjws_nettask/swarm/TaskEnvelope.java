@@ -139,6 +139,12 @@ public final class TaskEnvelope {
         return this.deadlineMs != NO_DEADLINE && nowMs >= this.deadlineMs;
     }
 
+    /** This envelope with another {@code traceparent} (S2b: a claim's child span); shares the body array. */
+    TaskEnvelope withTraceparent(String traceparent) {
+        return new TaskEnvelope(this.taskId, this.correlationId, this.replyTo, this.deadlineMs, traceparent,
+                this.tracestate, this.budgetRef, this.contentType, this.body, true);
+    }
+
     /** The reply to this task: same ids, empty {@code replyTo}, the given body (copied). */
     public TaskEnvelope reply(String contentType, byte[] body) {
         return replyOwned(contentType, body.clone());
