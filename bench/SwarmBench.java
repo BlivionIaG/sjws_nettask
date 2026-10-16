@@ -255,7 +255,6 @@ public class SwarmBench {
     }
 
     /** The measured-call index carried in the first 8 bytes of a reqreply body, or -1 (warm-up, short body). */
-    static final boolean DBG = Boolean.getBoolean("sjws.bench.dbg");
     static int hopIndex(byte[] body, long warm, int measured) {
         if (body.length < 8) return -1;
         long v = 0;
@@ -299,7 +298,6 @@ public class SwarmBench {
                     for (Task task : got) {
                         int k = hopIndex(task.envelope().body(), warm0, measured);
                         if (k >= 0) claimed[k] = tc;
-                        if (DBG && seen.incrementAndGet() < 3) System.err.println("DBG body len=" + task.envelope().body().length + " first=" + java.util.Arrays.toString(java.util.Arrays.copyOf(task.envelope().body(), 12)) + " k=" + k + " warm=" + warm0);
                     }
                     if (dropEvery > 0) {
                         var keep = new ArrayList<Task>(got.size());
