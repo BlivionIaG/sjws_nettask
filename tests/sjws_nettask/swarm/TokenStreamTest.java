@@ -152,6 +152,66 @@ class TokenStreamTest {
     }
 
     @Test
+    void secondLastWithADifferentSeqIsAConflictAndDoesNotMoveTheEnd() {
+        var r = new Reorder(7, 9);
+        var out = new ArrayList<StreamChunk>();
+        assertEquals(Offer.BUFFERED, r.offer(ch(3, Frame.LAST), out));
+        assertEquals(Offer.CONFLICT, r.offer(ch(5, Frame.LAST), out));
+        assertEquals(Offer.CONFLICT, r.offer(ch(2, Frame.LAST), out));
+        assertEquals(Offer.DUPLICATE, r.offer(ch(3, Frame.LAST), out), "the same LAST again is a duplicate");
+        for (int i = 0; i < 3; i++) {
+            r.offer(ch(i, i == 0 ? StreamChunk.FIRST : 0), out);
+        }
+        assertTrue(r.complete());
+        assertEquals(List.of(0L, 1L, 2L, 3L), out.stream().map(StreamChunk::chunkSeq).toList());
+        assertEquals(Offer.CONFLICT, r.offer(ch(9, Frame.LAST), out));
+    }
+
+    @Test
+    void lastBelowBufferedOrDeliveredChunksIsAConflictAndNeverCompletes() {
+        var r = new Reorder(7, 9);
+        var out = new ArrayList<StreamChunk>();
+        assertEquals(Offer.BUFFERED, r.offer(ch(4, 0), out));
+        assertEquals(Offer.CONFLICT, r.offer(ch(2, Frame.LAST), out), "below a buffered seq");
+        assertEquals(Offer.CONFLICT, r.offer(ch(4, Frame.LAST), out), "at a buffered non-LAST seq");
+        r.offer(ch(0, StreamChunk.FIRST), out);
+        assertEquals(Offer.CONFLICT, r.offer(ch(0, Frame.LAST), out), "at a delivered seq");
+        assertFalse(r.complete());
+        assertEquals(1, r.held(), "the buffered chunk is still held");
+        for (int i = 1; i < 4; i++) {
+            r.offer(ch(i, 0), out);
+        }
+        assertEquals(Offer.DELIVERED, r.offer(ch(5, Frame.LAST), out));
+        assertTrue(r.complete());
+        assertEquals(6, out.size());
+    }
+
+    @Test
+    void ringGrowsLazilyUpToTheWindow() {
+        var r = new Reorder(7, 9, 100);
+        var out = new ArrayList<StreamChunk>();
+        assertEquals(Offer.BUFFERED, r.offer(ch(99, 0), out));
+        assertEquals(Offer.OVERFLOW, r.offer(ch(100, 0), out));
+        assertEquals(Offer.BUFFERED, r.offer(ch(17, 0), out));
+        assertEquals(Offer.DUPLICATE, r.offer(ch(99, 0), out));
+        for (int i = 0; i < 99; i++) {
+            if (i != 17) {
+                r.offer(ch(i, 0), out);
+            }
+        }
+        assertEquals(100, out.size());
+        assertEquals(0, r.held());
+        assertEquals(Reorder.DEFAULT_WINDOW, 64);
+    }
+
+    @Test
+    void appendWithoutACutAllocatesNoList() {
+        var c = co(1024, 20);
+        assertSame(List.of(), c.append(new byte[10]));
+        assertThrows(UnsupportedOperationException.class, () -> c.append(new byte[1]).add(null));
+    }
+
+    @Test
     void shuffledDuplicatedRedeliveryReassemblesTheExactBytes() {
         var rnd = new Random(42);
         var src = new byte[50_000];

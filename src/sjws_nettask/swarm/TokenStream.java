@@ -81,10 +81,10 @@ public final class TokenStream {
             this.buf = new ByteArrayOutputStream(chunkBytes);
         }
 
-        /** Appends token bytes; returns the chunks that became full (usually none or one). */
+        /** Appends token bytes; returns the chunks that became full (usually none: an empty immutable list, no allocation). */
         public List<StreamChunk> append(byte[] token) {
             ensureOpen();
-            var out = new ArrayList<StreamChunk>(1);
+            List<StreamChunk> out = List.of();
             if (token.length > 0 && this.buf.size() == 0) {
                 this.firstAt = this.nanoClock.getAsLong();
             }
@@ -94,6 +94,9 @@ public final class TokenStream {
                 this.buf.write(token, off, n);
                 off += n;
                 if (this.buf.size() == this.chunkBytes) {
+                    if (out.isEmpty()) {
+                        out = new ArrayList<>(2);
+                    }
                     out.add(cut(0));
                     if (off < token.length) {
                         this.firstAt = this.nanoClock.getAsLong();
@@ -136,7 +139,7 @@ public final class TokenStream {
                 throw new IllegalStateException("chunkSeq exhausted");
             }
             int f = flags | (this.seq == 0 ? StreamChunk.FIRST : 0);
-            var c = new StreamChunk(this.hi, this.lo, this.seq++, f, this.buf.toByteArray());
+            var c = StreamChunk.owned(this.hi, this.lo, this.seq++, f, this.buf.toByteArray());
             this.buf.reset();
             return c;
         }
@@ -156,12 +159,21 @@ public final class TokenStream {
      */
     public static final class Reorder {
 
-        public enum Offer { DELIVERED, BUFFERED, DUPLICATE, OVERFLOW, WRONG_STREAM, AFTER_LAST }
+        /**
+         * {@code CONFLICT}: a {@code LAST} that disagrees with an earlier {@code LAST}, or that would end the stream at or
+         * below a chunk already delivered or buffered. A protocol error, never absorbed; the chunk is not kept.
+         */
+        public enum Offer { DELIVERED, BUFFERED, DUPLICATE, OVERFLOW, WRONG_STREAM, AFTER_LAST, CONFLICT }
+
+        /** Default reorder window (chunks ahead of the next expected seq); slots are allocated lazily. */
+        public static final int DEFAULT_WINDOW = 64;
 
         private final long hi;
         private final long lo;
-        private final StreamChunk[] ring;
+        private final int window;
+        private StreamChunk[] ring;
         private long next;
+        private long maxSeen = -1;
         private int held;
         private long lastSeq = -1;
 
@@ -171,7 +183,11 @@ public final class TokenStream {
             }
             this.hi = streamHi;
             this.lo = streamLo;
-            this.ring = new StreamChunk[window];
+            this.window = window;
+        }
+
+        public Reorder(long streamHi, long streamLo) {
+            this(streamHi, streamLo, DEFAULT_WINDOW);
         }
 
         /** Offers one chunk; any chunks that became deliverable, in order, are appended to {@code out}. */
@@ -180,29 +196,40 @@ public final class TokenStream {
                 return Offer.WRONG_STREAM;
             }
             long s = c.chunkSeq();
+            if (c.last()) {
+                if (this.lastSeq >= 0 ? s != this.lastSeq : s <= this.maxSeen) {
+                    return Offer.CONFLICT;
+                }
+            }
             if (s < this.next) {
                 return Offer.DUPLICATE;
             }
             if (this.lastSeq >= 0 && s > this.lastSeq) {
                 return Offer.AFTER_LAST;
             }
-            if (s - this.next >= this.ring.length) {
+            if (s - this.next >= this.window) {
                 return Offer.OVERFLOW;
             }
-            int i = (int) (s % this.ring.length);
             if (s != this.next) {
+                if (this.ring == null) {
+                    this.ring = new StreamChunk[Math.min(this.window, 16)];
+                }
+                if (s - this.next >= this.ring.length) {
+                    grow(s - this.next + 1);
+                }
+                int i = (int) (s % this.ring.length);
                 if (this.ring[i] != null) {
                     return Offer.DUPLICATE;
                 }
                 this.ring[i] = c;
                 this.held++;
-                noteLast(c);
+                seen(c);
                 return Offer.BUFFERED;
             }
-            noteLast(c);
+            seen(c);
             out.add(c);
             this.next++;
-            for (;;) {
+            while (this.held > 0) {
                 int j = (int) (this.next % this.ring.length);
                 var h = this.ring[j];
                 if (h == null) {
@@ -216,7 +243,22 @@ public final class TokenStream {
             return Offer.DELIVERED;
         }
 
-        private void noteLast(StreamChunk c) {
+        private void grow(long need) {
+            int n = this.ring.length;
+            while (n < need) {
+                n = Math.min(n * 2, this.window);
+            }
+            var r = new StreamChunk[n];
+            for (var h : this.ring) {
+                if (h != null) {
+                    r[(int) (h.chunkSeq() % n)] = h;
+                }
+            }
+            this.ring = r;
+        }
+
+        private void seen(StreamChunk c) {
+            this.maxSeen = Math.max(this.maxSeen, c.chunkSeq());
             if (c.last()) {
                 this.lastSeq = c.chunkSeq();
             }

@@ -94,5 +94,10 @@ class StreamChunkTest {
         assertFalse(c.last());
         assertEquals(0, c.toFrame().flags());
         assertTrue(c.toString().contains("seq=3"));
+        var owned = new byte[] {5};
+        var o = StreamChunk.owned(1, 2, 0, 0, owned);
+        assertEquals(5, o.view().get(0));
+        assertTrue(o.view().isReadOnly());
+        assertEquals(StreamChunk.MAX_BYTES, Frame.MAX_PAYLOAD - StreamChunk.HEADER);
     }
 }

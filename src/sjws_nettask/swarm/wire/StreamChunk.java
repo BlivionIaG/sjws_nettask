@@ -25,15 +25,27 @@ import java.util.Arrays;
  * {@code LAST}, {@code CANCELLED} and {@code ERROR} share their values with {@link Frame}; {@code FIRST} is chunk-only.
  * JDK only, so SDK conformance tests can use it without the server.
  */
-public record StreamChunk(long streamHi, long streamLo, long chunkSeq, int flags, byte[] bytes) {
+public final class StreamChunk {
 
     public static final int VERSION = 1;
     public static final int HEADER = 22;
     public static final int FIRST = 0x08;
     public static final int KNOWN_FLAGS = Frame.LAST | Frame.CANCELLED | Frame.ERROR | FIRST;
     public static final long MAX_SEQ = 0xffff_ffffL;
+    public static final int MAX_BYTES = Frame.MAX_PAYLOAD - HEADER;
 
-    public StreamChunk {
+    private final long streamHi;
+    private final long streamLo;
+    private final long chunkSeq;
+    private final int flags;
+    private final byte[] bytes;
+
+    /** Copies {@code bytes}. */
+    public StreamChunk(long streamHi, long streamLo, long chunkSeq, int flags, byte[] bytes) {
+        this(streamHi, streamLo, chunkSeq, flags, bytes == null ? null : bytes.clone(), true);
+    }
+
+    private StreamChunk(long streamHi, long streamLo, long chunkSeq, int flags, byte[] bytes, boolean owned) {
         if (chunkSeq < 0 || chunkSeq > MAX_SEQ) {
             throw new IllegalArgumentException("chunkSeq " + chunkSeq);
         }
@@ -43,15 +55,45 @@ public record StreamChunk(long streamHi, long streamLo, long chunkSeq, int flags
         if ((flags & (Frame.CANCELLED | Frame.ERROR)) != 0 && (flags & Frame.LAST) == 0) {
             throw new IllegalArgumentException("CANCELLED/ERROR need LAST: " + flags);
         }
-        if (bytes == null || bytes.length > Frame.MAX_PAYLOAD - HEADER) {
+        if (bytes == null || bytes.length > MAX_BYTES) {
             throw new IllegalArgumentException("bytes");
         }
-        bytes = bytes.clone();
+        this.streamHi = streamHi;
+        this.streamLo = streamLo;
+        this.chunkSeq = chunkSeq;
+        this.flags = flags;
+        this.bytes = bytes;
     }
 
-    @Override
+    /** As the public constructor, but takes ownership of {@code bytes} (no copy): the caller must not reuse the array. */
+    public static StreamChunk owned(long streamHi, long streamLo, long chunkSeq, int flags, byte[] bytes) {
+        return new StreamChunk(streamHi, streamLo, chunkSeq, flags, bytes, true);
+    }
+
+    public long streamHi() {
+        return this.streamHi;
+    }
+
+    public long streamLo() {
+        return this.streamLo;
+    }
+
+    public long chunkSeq() {
+        return this.chunkSeq;
+    }
+
+    public int flags() {
+        return this.flags;
+    }
+
+    /** A copy of the chunk bytes; use {@link #view()} to read without copying. */
     public byte[] bytes() {
         return this.bytes.clone();
+    }
+
+    /** A read-only view of the chunk bytes, no copy. */
+    public ByteBuffer view() {
+        return ByteBuffer.wrap(this.bytes).asReadOnlyBuffer();
     }
 
     public int size() {
@@ -85,7 +127,7 @@ public record StreamChunk(long streamHi, long streamLo, long chunkSeq, int flags
         long lo = in.getLong();
         long seq = in.getInt() & MAX_SEQ;
         int flags = in.get() & 0xff;
-        return new StreamChunk(hi, lo, seq, flags, Arrays.copyOfRange(payload, HEADER, payload.length));
+        return owned(hi, lo, seq, flags, Arrays.copyOfRange(payload, HEADER, payload.length));
     }
 
     @Override

@@ -42,6 +42,10 @@ class ChunksTest(unittest.TestCase):
             decode_chunk(bytes(21))
         with self.assertRaises(ValueError):
             decode_chunk(bytes([2]) + bytes(21))
+        with self.assertRaises(ValueError):
+            decode_chunk(bytes([1]) + bytes((1 << 24) - 1))
+        with self.assertRaises(ValueError):
+            StreamChunk(sid, 0, 0, bytes((1 << 24) - 22))
         self.assertEqual(FIRST | LAST, StreamChunk(sid, 0, FIRST | LAST).flags)
 
 
