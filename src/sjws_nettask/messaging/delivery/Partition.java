@@ -165,7 +165,13 @@ public final class Partition implements AutoCloseable {
         Partition dlq = isDlq || !deadLetterQueue ? null
                 : open(dir, topic + DLQ_SUFFIX, RetryPolicy.NO_DLQ, clockMs, durability, segmentBytes, false);
         var logDir = dir.resolve(topic);
-        var log = SegmentedLog.open(logDir, segmentBytes);
+        SegmentedLog log;
+        try {
+            log = SegmentedLog.open(logDir, segmentBytes); // takes the directory lock (one process per ledger dir)
+        } catch (IOException | RuntimeException e) {
+            if (dlq != null) dlq.close(); // do not leave the DLQ (and its lock) open behind a failed open
+            throw e;
+        }
         var policyFor = isDlq ? RetryPolicy.NO_DLQ : policy;
         DeliveryState st = null;
         var snaps = new java.util.TreeSet<Long>();
@@ -207,11 +213,18 @@ public final class Partition implements AutoCloseable {
         }
         // Keep the loaded snapshot and older ones the log still covers (fallbacks); drop unusable newer ones.
         var keep = new java.util.TreeSet<Long>();
-        for (long so : snaps) {
-            if (fromSnap >= 0 && so <= fromSnap && so >= log.startOffset()) keep.add(so);
-            else Files.deleteIfExists(logDir.resolve(snapName(so)));
+        Map<String, Long> pinned;
+        try {
+            for (long so : snaps) {
+                if (fromSnap >= 0 && so <= fromSnap && so >= log.startOffset()) keep.add(so);
+                else Files.deleteIfExists(logDir.resolve(snapName(so)));
+            }
+            pinned = readPins(logDir); // before any thread starts: a corrupt pin file fails the open cleanly
+        } catch (IOException | RuntimeException e) {
+            log.close(); // releases the directory lock
+            if (dlq != null) dlq.close();
+            throw e;
         }
-        var pinned = readPins(logDir); // before any thread starts: a corrupt pin file fails the open cleanly
         var p = new Partition(topic, log, new LedgerWriter(log, durability), st, dlq, clockMs, logDir, keep, fromSnap, replayed[0],
                 cancelProbe);
         p.pins = pinned;
