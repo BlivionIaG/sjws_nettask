@@ -366,7 +366,20 @@ The target transport is mTLS over **HTTP/2 or HTTP/3**, so it reuses the existin
 | S4 | `LlmGateway` (weighted routing, circuit breaking, retries only with `Idempotency-Key`, usage accounting); the opt-in **direct** token path for HTTP-gateway clients, with the final result still in the ledger (§5.2); OTLP exporter | Fault-injection tests (backend down, mid-stream abort); a test that a direct stream always produces a ledger result; wrk2 latency through the gateway |
 | S5 | Other SDKs | SDK conformance suite green |
 
-**S2 sub-phase labels.** S2a = exit tests for the S1 `extend`/`LeaseKeeper` (done: `LeaseExitTest`, #164); S2d = `AgentPolicy` document + agent intermediate CA (§6). The other S2 deliverables in the table above are not yet assigned sub-phase labels.
+**S2 sub-phase labels.** S2a = exit tests for the S1 `extend`/`LeaseKeeper` (done: `LeaseExitTest`, #164); S2c = ledger token streaming (`chunkSeq` framing + HTTP leg) and cancellation (scope: §5.2, wire §11.2); S2d = `AgentPolicy` document + agent intermediate CA (§6), and follows S2c. The other S2 deliverables in the table above are not yet assigned sub-phase labels.
+
+**S2c decisions (2026-10-16, inceptor).**
+- **Scope:** the ledger leg, the HTTP leg and cancellation of §5.2, using the `TOKEN`/`CANCEL`/`CREDIT` frames of §11.2. The opt-in direct path (§5.2) stays in S4.
+- **Flag:** `sjws.swarm.stream.enabled`, **off by default**, read only when the swarm itself is on. When it is off, no streaming route is mounted and no streaming class is loaded, so the off cost is zero (AGENTS.md *Efficiency rule*, §3.3).
+- **Exit criteria:** the streaming targets of §13 (token-streaming row and Architecture addition 1, streaming over HTTP), the off-mode gate of §13, and the S1c request/reply gate kept passing: pooled absolute rr p99 < 500 µs.
+
+**Open questions (S2c).** To be answered before S2c PR 2; answers are recorded here.
+1. Do stream chunks go on the caller's `reply.<node>` topic (demultiplexed by `streamId`) or on separate stream shards (one `Partition` per shard, §5.2 ledger leg)? *Owner: Messaging Core + Architecture.*
+   Answer:
+2. Is the session id of `GET /swarm/v1/replies/{session}` (§11.2) the `correlationId`, bound to the caller's token so that only the submitter can read it (§6)? *Owner: Architecture.*
+   Answer:
+3. Does the worker learn of a cancel (§5.2 *Cancellation*) by getting `CANCELLED` back on its next chunk produce or `:extend` call? *Owner: Architecture + Messaging Core.*
+   Answer:
 
 **S2 security note.** On master, `/swarm/v1` is admitted only through the interim `SwarmGate`/`TokenGate` (§6): deny by default, bearer tokens per agent and pool. It does **not** bind a lease to the claiming agent, rate-limit failed authentication, or rotate tokens. S2d (`AgentPolicy` + agent intermediate CA, §6) replaces the implementation behind the same interface and must stay deny by default and fail closed when policy or trust material is missing (AGENTS.md *Security*).
 
