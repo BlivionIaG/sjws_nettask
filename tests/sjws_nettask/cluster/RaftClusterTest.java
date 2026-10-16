@@ -374,6 +374,8 @@ class RaftClusterTest {
         assertThrows(UnsupportedOperationException.class, () -> local.append(GROUP, List.of()));
         assertThrows(UnsupportedOperationException.class, () -> local.onLeaderChange(GROUP, (t, l) -> {
         }));
+        assertThrows(UnsupportedOperationException.class, () -> local.onNoopApplied(GROUP, (t, i) -> {
+        }));
         assertThrows(UnsupportedOperationException.class, () -> local.snapshots(GROUP));
         local.close();
 
