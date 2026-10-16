@@ -158,4 +158,26 @@ public final class MemoryLogStorage implements LogStorage {
 
     private record Rec(long term, byte[] data) {
     }
+
+    private final Map<GroupId, LogSnapshot> snapshots = new ConcurrentHashMap<>();
+
+    /** Durable for the life of this object, like the rest of this storage. */
+    @Override
+    public boolean persistsSnapshots() {
+        return true;
+    }
+
+    @Override
+    public void saveSnapshot(GroupId group, LogSnapshot snapshot) {
+        snapshots.put(group, snapshot);
+    }
+
+    @Override
+    public LogSnapshot loadSnapshot(GroupId group, int maxBytes) throws java.io.IOException {
+        var snap = snapshots.get(group);
+        if (snap != null && snap.data().length > maxBytes) {
+            throw new java.io.IOException("snapshot of " + group.value() + " exceeds " + maxBytes + " bytes");
+        }
+        return snap;
+    }
 }

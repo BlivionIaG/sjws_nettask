@@ -33,7 +33,18 @@ import java.util.Objects;
  */
 public record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
         long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis, Duration relaxedSyncDelay,
-        long relaxedSyncEntries) {
+        long relaxedSyncEntries, int maxSnapshotBytes) {
+
+    /** Default {@link #maxSnapshotBytes}: 64 MiB. */
+    public static final int DEFAULT_MAX_SNAPSHOT_BYTES = 64 << 20;
+
+    /** Before the snapshot size limit was configurable: {@link #DEFAULT_MAX_SNAPSHOT_BYTES}. */
+    public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
+            long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis, Duration relaxedSyncDelay,
+            long relaxedSyncEntries) {
+        this(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred, failbackHysteresis,
+                relaxedSyncDelay, relaxedSyncEntries, DEFAULT_MAX_SNAPSHOT_BYTES);
+    }
 
     /** Next-tick fsync, no entry cap: the behaviour before the bound was configurable. */
     public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
@@ -76,6 +87,9 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
         if (relaxedSyncEntries < 1) {
             throw new IllegalArgumentException("relaxedSyncEntries");
         }
+        if (maxSnapshotBytes < 1) {
+            throw new IllegalArgumentException("maxSnapshotBytes");
+        }
     }
 
     public long leaseNanos() {
@@ -84,20 +98,45 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
 
     public GroupOptions withPreferred(Duration failbackHysteresis) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, true,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
     }
 
     public GroupOptions withFailback(Duration failbackHysteresis) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
     }
 
     /**
      * Bound how far RELAXED fsync may lag: at most {@code delay} (rounded up to the next tick) after
      * the oldest unsynced entry, and at most {@code entries} unsynced entries. Ignored by STRICT.
+     * A delay above {@link #leaseNanos()} is allowed but logged as a WARNING when the group opens:
+     * with one data node down in a two-data-plus-witness group, every commit waits for it.
      */
     public GroupOptions withRelaxedSyncBound(Duration delay, long entries) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
-                failbackHysteresis, delay, entries);
+                failbackHysteresis, delay, entries, maxSnapshotBytes);
+    }
+
+    /** {@code snapshotEveryEntries} value that never triggers an automatic snapshot. */
+    public static final long NO_AUTO_SNAPSHOT = Long.MAX_VALUE;
+
+    /** Automatic snapshots off: the log grows until the application calls {@link SnapshotControl#take}. */
+    public GroupOptions withoutAutoSnapshot() {
+        return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, NO_AUTO_SNAPSHOT, preferred,
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
+    }
+
+    /**
+     * Largest snapshot image accepted: from a {@link SnapshotTaker} (a larger one is skipped and
+     * counted, like a failing taker), in {@link SnapshotControl#install}, and when a durable
+     * snapshot is loaded on open.
+     */
+    public GroupOptions withMaxSnapshotBytes(int bytes) {
+        return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, bytes);
+    }
+
+    public boolean autoSnapshot() {
+        return snapshotEveryEntries != NO_AUTO_SNAPSHOT;
     }
 }

@@ -18,6 +18,7 @@ package sjws_nettask.clusterharness;
 
 import java.util.Map;
 import sjws_nettask.SjwsServer;
+import sjws_nettask.cp.DataWatch.Applied;
 
 /**
  * One data-plane process. Today this is a real {@link SjwsServer} on an ephemeral port.
@@ -39,6 +40,9 @@ public interface DataNode extends AutoCloseable {
 
     /** Lowercase SHA-256 of the applied canonical YAML, or null when the node has no cp snapshot. */
     String contentHash();
+
+    /** {@link #version()} and {@link #contentHash()} read together, from one applied envelope. */
+    Applied applied();
 
     SjwsServer server();
 

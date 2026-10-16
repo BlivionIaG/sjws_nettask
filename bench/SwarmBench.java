@@ -360,9 +360,9 @@ public class SwarmBench {
         var okLat = java.util.Arrays.stream(lat).filter(v -> v >= 0).toArray();
         int n = okLat.length;
         long missing = lat.length - n - failed.get();
-        System.out.printf("reqreply workers=%d rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d ok=%d failed=%d missing=%d%n",
+        System.out.printf("reqreply workers=%d rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_p999_us=%.1f rtt_max_us=%.1f n=%d ok=%d failed=%d missing=%d%n",
                 workers, rate, n == 0 ? 0 : pct(okLat, n, 0.50) / 1e3, n == 0 ? 0 : pct(okLat, n, 0.99) / 1e3,
-                n == 0 ? 0 : pct(okLat, n, 1.0) / 1e3, n, ok.get(), failed.get(), missing);
+                n == 0 ? 0 : pct(okLat, n, 0.999) / 1e3, n == 0 ? 0 : pct(okLat, n, 1.0) / 1e3, n, ok.get(), failed.get(), missing);
         // per-hop p50/p99 over completed calls with every timestamp present
         long[][] hop = new long[4][lat.length];
         int h = 0;
@@ -372,15 +372,17 @@ public class SwarmBench {
             hop[0][h] = submitted[k] - due;
             hop[1][h] = claimed[k] - submitted[k];
             hop[2][h] = written[k] - claimed[k];
-            hop[3][h] = delivered[k] - written[k];
+            // With completeLocal, the caller may finish before replyAll returns; clamp so the hop stays non-negative.
+            hop[3][h] = Math.max(0L, delivered[k] - written[k]);
             h++;
         }
         String[] names = {"submit", "queue_to_claim", "claim_to_reply_written", "reply_delivered"};
         var sb = new StringBuilder("reqreply hops n=" + h);
         for (int x = 0; x < 4; x++) {
             var v = java.util.Arrays.copyOf(hop[x], h);
-            sb.append(String.format(" %s_p50_us=%.1f %s_p99_us=%.1f", names[x], h == 0 ? 0 : pct(v, h, 0.50) / 1e3,
-                    names[x], h == 0 ? 0 : pct(v, h, 0.99) / 1e3));
+            sb.append(String.format(" %s_p50_us=%.1f %s_p99_us=%.1f %s_p999_us=%.1f", names[x],
+                    h == 0 ? 0 : pct(v, h, 0.50) / 1e3, names[x], h == 0 ? 0 : pct(v, h, 0.99) / 1e3,
+                    names[x], h == 0 ? 0 : pct(v, h, 0.999) / 1e3));
         }
         System.out.println(sb);
         if (failed.get() + missing > 0) {

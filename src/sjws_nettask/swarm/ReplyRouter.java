@@ -36,6 +36,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * topic is closed; its files are kept. The next {@link #call} reopens it.</li>
  * </ul>
  * The poller blocks in {@code Partition.poll(..., waitNanos)} (#99), woken by the reply's append: no spinning.
+ * <p>Same-process replies are completed by {@link #completeLocal} from {@link TaskService#reply}/{@link TaskService#replyAll}
+ * as soon as the envelope is built (before the ledger write), so the caller does not wait for the poller.
+ * <p><b>Ordering: complete before produce (accepted, #219 review).</b> Replies are ASYNC, so completing after produce
+ * would only wait on the page-cache hand-off and give the caller no durability. If produce then throws, the worker's
+ * reply future fails, the task is not acked, its lease expires and it is redelivered; the second reply finds no pending
+ * caller ({@link #completeLocal} returns false). Its ledger copy is the first the poller sees for that correlation key,
+ * so it consumes the remembered direct delivery and is acked silently (it counts late only if that key was evicted). So: no double completion, no lost caller,
+ * at-least-once handler execution (which swarm already assumes). The poller still
+ * reads and acks every reply for retention; a reply already handed to its caller is not counted as late.
  */
 public final class ReplyRouter implements AutoCloseable {
 
@@ -56,6 +65,19 @@ public final class ReplyRouter implements AutoCloseable {
     private volatile Thread poller;
     private volatile boolean closed;
     private final AtomicLong late = new AtomicLong();
+    /** Upper bound on remembered direct deliveries; past it the eldest is dropped (worst case: one late count). */
+    static final int DELIVERED_LOCAL_MAX = 65_536;
+    /**
+     * Correlation keys completed by {@link #completeLocal} whose ledger copy the poller has not read yet. The poller
+     * removes each key when it reads that reply, so this stays near empty; insertion order bounds it if the poller lags.
+     */
+    private final java.util.Map<Key, Boolean> deliveredLocal = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<>(64, 0.75f, false) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<Key, Boolean> e) {
+                    return size() > DELIVERED_LOCAL_MAX;
+                }
+            });
 
     private record Key(long hi, long lo) { }
 
@@ -81,6 +103,32 @@ public final class ReplyRouter implements AutoCloseable {
     /** Replies that arrived after their caller gave up; acked and discarded. */
     public long lateReplies() {
         return this.late.get();
+    }
+
+    /**
+     * Completes a same-process caller whose {@code replyTo} is this router's topic, without waiting for the poller.
+     * Returns {@code true} when a pending call was completed. The envelope is still written to the reply topic for
+     * durability and ack; the poller then acks it and does not count it as late.
+     */
+    public boolean completeLocal(TaskEnvelope env) {
+        if (env == null || this.closed) {
+            return false;
+        }
+        var key = new Key(env.correlationHi(), env.correlationLo());
+        var f = this.pending.remove(key);
+        if (f == null) {
+            return false;
+        }
+        if (f.complete(env)) {
+            this.deliveredLocal.put(key, Boolean.TRUE);
+            return true;
+        }
+        return false;
+    }
+
+    /** Direct deliveries whose ledger copy the poller has not read yet (tests). */
+    int deliveredLocalSize() {
+        return this.deliveredLocal.size();
     }
 
     public int pending() {
@@ -170,9 +218,18 @@ public final class ReplyRouter implements AutoCloseable {
             } catch (IllegalArgumentException e) {
                 // not an envelope: acked and dropped below
             }
-            var f = env == null ? null : this.pending.remove(new Key(env.correlationHi(), env.correlationLo()));
-            if (f == null || !f.complete(env)) {
-                this.late.incrementAndGet();
+            if (env == null) {
+                this.late.incrementAndGet(); // not an envelope: acked and dropped
+                continue;
+            }
+            var key = new Key(env.correlationHi(), env.correlationLo());
+            var f = this.pending.remove(key);
+            if (f != null) {
+                if (!f.complete(env)) {
+                    this.late.incrementAndGet(); // raced with the caller's timeout
+                }
+            } else if (this.deliveredLocal.remove(key) == null) {
+                this.late.incrementAndGet(); // timed out, or not an in-flight call
             }
         }
         p.ack(GROUP, offs, atts, null); // one batched fenced ack (#100) for every reply read

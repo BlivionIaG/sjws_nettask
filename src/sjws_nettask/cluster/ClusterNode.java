@@ -67,6 +67,14 @@ public interface ClusterNode extends AutoCloseable {
     /** Leadership of this group only. Invoked off the request path. */
     void onLeaderChange(GroupId groupId, BiConsumer<Long, Optional<NodeId>> listener);
 
+    /**
+     * Election no-op after it is applied. Args are term and applied index. Same registration
+     * shape as {@link #onLeaderChange}. Invoked off the request path. Callers that gate serve
+     * on leader-ready (Messaging Core, control plane) register here rather than casting to
+     * {@code ReplicatedNode}.
+     */
+    void onNoopApplied(GroupId groupId, BiConsumer<Long, Long> listener);
+
     SnapshotControl snapshots(GroupId groupId);
 
     @Override

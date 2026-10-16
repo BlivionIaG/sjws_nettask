@@ -32,7 +32,8 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * One segment file per group. {@link #force} calls {@link FileChannel#force}. A truncate rewrites
- * the segment from the in-memory index; the hot path only appends.
+ * the segment from the in-memory index into a temp file and renames it into place (see
+ * {@link #rewrite}); the hot path only appends.
  */
 public final class FileLogStorage implements LogStorage {
 
@@ -61,6 +62,7 @@ public final class FileLogStorage implements LogStorage {
             }
             var loaded = new ConcurrentSkipListMap<Long, Rec>();
             var path = path(group);
+            Files.deleteIfExists(rewritePath(group));
             if (Files.exists(path) && Files.size(path) > 0) {
                 try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
                     var header = ByteBuffer.allocate(20);
@@ -103,6 +105,7 @@ public final class FileLogStorage implements LogStorage {
         if (index < 1) {
             throw new IllegalArgumentException("index");
         }
+        checkUsable();
         var copy = data.clone();
         var log = log(group);
         lock.lock();
@@ -155,6 +158,11 @@ public final class FileLogStorage implements LogStorage {
     }
 
     @Override
+    public boolean survivesRestart() {
+        return true;
+    }
+
+    @Override
     public void truncateSuffix(GroupId group, long fromIndex) throws IOException {
         rewrite(group, log(group).headMap(fromIndex, false));
     }
@@ -164,34 +172,90 @@ public final class FileLogStorage implements LogStorage {
         rewrite(group, log(group).tailMap(throughIndex, false));
     }
 
+    /**
+     * Rewrites the segment crash-safely: the kept records go to {@code <group>.log.rewrite}, which is
+     * fsynced, atomically renamed over the segment, and the directory is fsynced. A crash at any point
+     * leaves either the whole old segment or the whole new one, never a half-written file. The temp
+     * is created fresh ({@code CREATE_NEW}, links not followed, mode 0600, so the segment ends up
+     * 0600 too). A failure after the rename fails the storage closed (see {@link #checkUsable}).
+     * Before this change the segment was truncated to zero in place and refilled without an fsync.
+     */
     private void rewrite(GroupId group, NavigableMap<Long, Rec> keep) throws IOException {
         lock.lock();
         try {
+            var target = path(group);
+            var tmp = rewritePath(group);
             var fresh = new ConcurrentSkipListMap<Long, Rec>();
-            var channel = channels.get(group);
-            channel.truncate(0);
-            channel.position(0);
-            for (var entry : keep.entrySet()) {
-                var rec = entry.getValue();
-                var header = ByteBuffer.allocate(20 + rec.data.length);
-                header.putLong(entry.getKey());
-                header.putLong(rec.term);
-                header.putInt(rec.data.length);
-                header.put(rec.data);
-                header.flip();
-                while (header.hasRemaining()) {
-                    channel.write(header);
+            checkUsable();
+            Files.deleteIfExists(tmp);
+            try (var out = FileChannel.open(tmp, java.util.Set.of(StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.WRITE, java.nio.file.LinkOption.NOFOLLOW_LINKS),
+                    OWNER_ONLY)) {
+                for (var entry : keep.entrySet()) {
+                    var rec = entry.getValue();
+                    var header = ByteBuffer.allocate(20 + rec.data.length);
+                    header.putLong(entry.getKey());
+                    header.putLong(rec.term);
+                    header.putInt(rec.data.length);
+                    header.put(rec.data);
+                    header.flip();
+                    while (header.hasRemaining()) {
+                        out.write(header);
+                    }
+                    fresh.put(entry.getKey(), rec);
                 }
-                fresh.put(entry.getKey(), rec);
+                crashPoint(target.getFileName() + ":rewrite-written");
+                out.force(true);
             }
-            logs.put(group, fresh);
+            crashPoint(target.getFileName() + ":rewrite-temp");
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            // Past the rename the disk holds the new segment. Any failure from here on leaves this
+            // instance unsure what is durable, so it fails closed: every later append, force and
+            // truncate is refused until the process restarts and reloads the segment from disk.
+            try {
+                crashPoint(target.getFileName() + ":rewrite-renamed");
+                var reopened = FileChannel.open(target, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                var old = channels.put(group, reopened);
+                logs.put(group, fresh);
+                if (old != null) {
+                    old.close();
+                }
+                crashPoint(target.getFileName() + ":rewrite-dir-sync");
+                try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
+                    dir.force(true);
+                }
+            } catch (IOException | RuntimeException failed) {
+                failedClosed = new IOException("log storage failed after renaming the rewritten segment of " + group
+                        + "; restart to recover from disk", failed);
+                throw failed;
+            }
+            crashPoint(target.getFileName() + ":rewrite-dir-synced");
         } finally {
             lock.unlock();
         }
     }
 
+    /** rw------- for the rewrite temp file, like the snapshot and vote files. */
+    private static final java.nio.file.attribute.FileAttribute<?> OWNER_ONLY = java.nio.file.attribute.PosixFilePermissions
+            .asFileAttribute(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+
+    /** Set once a segment rewrite fails past its rename; then appends, forces and truncates are refused. */
+    private volatile IOException failedClosed;
+
+    private void checkUsable() throws IOException {
+        var failed = failedClosed;
+        if (failed != null) {
+            throw new IOException(failed.getMessage(), failed);
+        }
+    }
+
+    private Path rewritePath(GroupId group) {
+        return root.resolve(path(group).getFileName() + ".rewrite");
+    }
+
     @Override
     public void force(GroupId group) throws IOException {
+        checkUsable();
         log(group);
         lock.lock();
         try {
@@ -441,5 +505,120 @@ public final class FileLogStorage implements LogStorage {
     }
 
     private record Rec(long term, byte[] data) {
+    }
+
+    /** {@code "SJSN"}: the snapshot file magic. */
+    static final int SNAP_MAGIC = 0x534A534E;
+    static final int SNAP_VERSION = 1;
+    /** magic, version, index, term, length. */
+    static final int SNAP_HEADER_BYTES = 4 + 4 + 8 + 8 + 4;
+
+    @Override
+    public boolean persistsSnapshots() {
+        return true;
+    }
+
+    /**
+     * {@code {group}.snap}: magic, version, last included index and term, image length, image, then
+     * the CRC32C of everything before it. Mode 0600 from creation (the image can hold token hashes
+     * and RBAC state), temp file + fsync + atomic move + directory fsync.
+     */
+    @Override
+    public void saveSnapshot(GroupId group, LogSnapshot snapshot) throws IOException {
+        var data = snapshot.data();
+        var buf = ByteBuffer.allocate(SNAP_HEADER_BYTES + data.length + 4);
+        buf.putInt(SNAP_MAGIC);
+        buf.putInt(SNAP_VERSION);
+        buf.putLong(snapshot.lastIncludedIndex());
+        buf.putLong(snapshot.lastIncludedTerm());
+        buf.putInt(data.length);
+        buf.put(data);
+        var crc = new java.util.zip.CRC32C();
+        crc.update(buf.array(), 0, buf.position());
+        buf.putInt((int) crc.getValue());
+        buf.flip();
+        var target = snapPath(group);
+        var tmp = root.resolve(target.getFileName() + ".tmp");
+        lock.lock();
+        try {
+            Files.deleteIfExists(tmp);
+            var attrs = new java.util.ArrayList<java.nio.file.attribute.FileAttribute<?>>();
+            if (root.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+                attrs.add(java.nio.file.attribute.PosixFilePermissions.asFileAttribute(
+                        java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")));
+            }
+            try (var channel = FileChannel.open(tmp, java.util.Set.of(StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.WRITE, java.nio.file.LinkOption.NOFOLLOW_LINKS),
+                    attrs.toArray(new java.nio.file.attribute.FileAttribute<?>[0]))) {
+                while (buf.hasRemaining()) {
+                    channel.write(buf);
+                }
+                channel.force(true);
+            }
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
+                dir.force(true);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Read with {@link sjws_nettask.config.SecureKeyFile} rules: leaf opened without following
+     * links, regular file, mode 0600/0400, owned by this process, parents not writable by others.
+     * Any failed check, size, magic, version, length or CRC refuses to start.
+     */
+    @Override
+    public LogSnapshot loadSnapshot(GroupId group, int maxBytes) throws IOException {
+        var path = snapPath(group);
+        if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            return null;
+        }
+        byte[] bytes;
+        try {
+            bytes = sjws_nettask.config.SecureKeyFile.read(path, "snapshot " + path,
+                    (int) Math.min(Integer.MAX_VALUE - 8, (long) maxBytes + SNAP_HEADER_BYTES + 4 + 1));
+        } catch (RuntimeException refused) {
+            throw new IOException("snapshot " + path + " refused (" + refused.getMessage() + "); refusing to start",
+                    refused);
+        }
+        if (bytes.length < SNAP_HEADER_BYTES + 4) {
+            throw new IOException("snapshot " + path + " is truncated; refusing to start");
+        }
+        var buf = ByteBuffer.wrap(bytes);
+        if (buf.getInt(0) != SNAP_MAGIC) {
+            throw new IOException("snapshot " + path + " has a bad magic; refusing to start");
+        }
+        if (buf.getInt(4) != SNAP_VERSION) {
+            throw new IOException("snapshot " + path + " has unsupported version " + buf.getInt(4)
+                    + "; refusing to start");
+        }
+        int length = buf.getInt(24);
+        if (length < 0 || length > maxBytes) {
+            throw new IOException("snapshot " + path + " image of " + length + " bytes exceeds the limit of " + maxBytes
+                    + "; refusing to start");
+        }
+        if (bytes.length != SNAP_HEADER_BYTES + length + 4) {
+            throw new IOException("snapshot " + path + " has " + bytes.length + " bytes, header says "
+                    + (SNAP_HEADER_BYTES + length + 4) + "; refusing to start");
+        }
+        var crc = new java.util.zip.CRC32C();
+        crc.update(bytes, 0, SNAP_HEADER_BYTES + length);
+        if ((int) crc.getValue() != buf.getInt(SNAP_HEADER_BYTES + length)) {
+            throw new IOException("snapshot " + path + " fails its CRC32C; refusing to start");
+        }
+        long index = buf.getLong(8);
+        long term = buf.getLong(16);
+        if (index < 0 || term < 0) {
+            throw new IOException("snapshot " + path + " has a negative index or term; refusing to start");
+        }
+        return new LogSnapshot(group, index, term, java.util.Arrays.copyOfRange(bytes, SNAP_HEADER_BYTES,
+                SNAP_HEADER_BYTES + length));
+    }
+
+    private Path snapPath(GroupId group) {
+        var safe = group.value().replaceAll("[^A-Za-z0-9._-]", "_");
+        return root.resolve(safe + ".snap");
     }
 }

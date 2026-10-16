@@ -31,6 +31,15 @@ public interface ReplicationGroup {
 
     boolean isLeader();
 
+    /**
+     * The current term if this node is leader in it, else {@code -1}: {@link #isLeader()} and
+     * {@link #term()} read together, so a caller cannot pair a role with the wrong term.
+     */
+    default long leaderTerm() {
+        long term = term();
+        return isLeader() && term() == term ? term : -1L;
+    }
+
     /** Monotonic nanos when this leader's lease ends. {@code 0} when this node is not leader. */
     long leaseExpiresAt();
 
@@ -41,6 +50,8 @@ public interface ReplicationGroup {
      * this node acked; under RELAXED it trails by at most {@link GroupOptions#relaxedSyncDelay()}
      * (rounded up to a tick) and {@link GroupOptions#relaxedSyncEntries()} entries. A witness stores
      * no entries and reports 0. The default, for groups that cannot tell, reports 0.
+     * Non-decreasing, except when this node truncates conflicting uncommitted entries: it then drops
+     * to just below the first truncated index.
      */
     default long durableIndex() {
         return 0L;

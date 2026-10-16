@@ -40,4 +40,13 @@ package sjws_nettask.cluster;
 public interface GroupListener {
 
     void onCommitted(CommittedEntry entry);
+
+    /**
+     * On open, when the storage holds a durable snapshot (written before a log prefix was deleted):
+     * the image through {@code snapshot.lastIncludedIndex()}, delivered on the delivery thread before
+     * any later entry. The entries it covers are not delivered again. The default ignores it, which
+     * is only correct for a group that never compacts.
+     */
+    default void onSnapshotRestored(LogSnapshot snapshot) {
+    }
 }

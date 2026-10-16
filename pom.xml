@@ -185,6 +185,14 @@
               </rule>
               <rule>
                 <element>PACKAGE</element>
+                <includes><include>sjws_nettask.msgrepl</include></includes>
+                <limits>
+                  <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.85</minimum></limit>
+                  <limit><counter>BRANCH</counter><value>COVEREDRATIO</value><minimum>0.65</minimum></limit>
+                </limits>
+              </rule>
+              <rule>
+                <element>PACKAGE</element>
                 <includes><include>sjws_nettask.messaging.stats</include></includes>
                 <limits>
                   <limit><counter>LINE</counter><value>COVEREDRATIO</value><minimum>0.90</minimum></limit>

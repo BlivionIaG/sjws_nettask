@@ -57,6 +57,12 @@ final class RaftGroup {
     static final int TIMEOUT_NOW = 5;
     static final int PRE_VOTE = 6;
     static final int PRE_VOTE_RESP = 7;
+    /** Leader to a data follower behind the leader's compacted prefix: one chunk of the snapshot image. */
+    static final int SNAP_CHUNK = 8;
+    /** Follower to leader: the next offset it wants, or that the image is installed. */
+    static final int SNAP_RESP = 9;
+    /** Default {@link #snapshotChunkBytes}: 1 MiB, well under the 16 MiB transport frame cap. */
+    static final int DEFAULT_SNAPSHOT_CHUNK_BYTES = 1 << 20;
 
     private final ReentrantLock lock = new ReentrantLock();
     /**
@@ -107,6 +113,14 @@ final class RaftGroup {
     private long snapIndex;
     private long snapTerm;
     private byte[] snapData = new byte[0];
+    /** Snapshot images refused or skipped: a taker that threw, returned null or exceeded maxSnapshotBytes. */
+    private long skippedSnapshots;
+    private SnapshotTaker taker;
+    private boolean takerInFlight;
+    /** Set with {@link SnapshotControl#setTruncationBound}; volatile because it is read without the lock. */
+    private volatile TruncationBound truncationBound;
+    /** Highest index this node has dropped from its log prefix (snapshot install or truncation). */
+    private long truncatedThrough;
     private boolean relaxedDirty;
     /** Clock time when the oldest entry not yet fsynced was stored. */
     private long dirtySince;
@@ -125,6 +139,18 @@ final class RaftGroup {
     /** Highest pending STRICT index already reported as stalled, so each entry warns once. */
     private long strictWarnedIndex;
     private long recoveryUntil;
+    /** Bytes of image per {@link #SNAP_CHUNK}; package-private so tests can force many chunks. */
+    int snapshotChunkBytes = DEFAULT_SNAPSHOT_CHUNK_BYTES;
+    /** Leader view: the snapshot transfer in progress to each data follower behind the compacted prefix. */
+    private final Map<NodeId, SnapSend> snapSends = new HashMap<>();
+    /** Follower view: the image being received, or null. */
+    private SnapReceive snapReceive;
+    /** Images fully sent and acknowledged (leader) and installed from a leader (follower). */
+    private long snapshotsSent;
+    private long snapshotsInstalled;
+    private boolean persistWarned;
+    private long persistWarnAt;
+    private long persistWarnSuppressed;
 
     private enum Role {
         FOLLOWER, PRE_CANDIDATE, CANDIDATE, LEADER
@@ -147,6 +173,36 @@ final class RaftGroup {
         this.listener = listener;
         this.deliveries = new DeliveryExecutor(groupId.value(), deliveryLagLimit);
         this.voters.addAll(voters);
+        if (options.durability() == Durability.RELAXED && options.relaxedSyncDelay().toNanos() > options.leaseNanos()) {
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                    "group " + groupId.value() + ": relaxedSyncDelay " + options.relaxedSyncDelay().toMillis()
+                            + " ms exceeds the lease (" + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                                    options.leaseNanos()) + " ms): with one data node down a commit waits that"
+                            + " long, and the RELAXED loss window is that wide");
+        }
+        LogSnapshot restored = null;
+        if (!witness && storage.persistsSnapshots()) {
+            try {
+                restored = storage.loadSnapshot(groupId, options.maxSnapshotBytes());
+            } catch (IOException failed) {
+                throw new UncheckedIOException("cannot load the durable snapshot of " + groupId, failed);
+            }
+        }
+        if (restored != null) {
+            // The log prefix through this index may be gone from disk: the image replaces it.
+            this.snapIndex = restored.lastIncludedIndex();
+            this.snapTerm = restored.lastIncludedTerm();
+            this.snapData = restored.data();
+            this.commitIndex = snapIndex;
+            this.lastApplied = snapIndex;
+            var image = restored;
+            deliveries.submit(() -> {
+                var current = this.listener;
+                if (current != null) {
+                    current.onSnapshotRestored(image);
+                }
+            }, snapIndex);
+        }
         try {
             if (storage.hasHardState(groupId)) {
                 this.term = storage.hardStateTerm(groupId);
@@ -159,6 +215,9 @@ final class RaftGroup {
                 // A witness keeps no entries; its forced cursor carries the term it last acked.
                 long last = witness ? 0L : storage.lastIndex(groupId);
                 this.term = witness ? storage.witnessTerm(groupId) : last == 0 ? 0L : storage.termAt(groupId, last);
+                if (restored != null && restored.lastIncludedTerm() > term) {
+                    this.term = restored.lastIncludedTerm();
+                }
                 this.votedFor = term == 0 ? null : self;
             }
         } catch (IOException failed) {
@@ -281,6 +340,8 @@ final class RaftGroup {
                 case APPEND -> onAppend(from, body, now, after);
                 case APPEND_RESP -> onAppendResp(from, body, now, after);
                 case TIMEOUT_NOW -> onTimeoutNow(body, now, after);
+                case SNAP_CHUNK -> onSnapChunk(from, body, now, after);
+                case SNAP_RESP -> onSnapResp(from, body, now, after);
                 default -> {
                     // Unknown frames are ignored so a newer peer cannot crash an older one.
                 }
@@ -444,6 +505,11 @@ final class RaftGroup {
             }
         }
         appendRaw(new byte[] {NOOP});
+        if (options.durability() != Durability.STRICT) {
+            // RELAXED: schedule the no-op's fsync like any append. Otherwise a leader elected with only the witness
+            // (2+1, other data node down) never counts itself and the no-op stays uncommitted until a user append.
+            markDirty();
+        }
         // Leadership is visible before the no-op callback, so leaderReady stays false in onLeaderChange.
         fireLeader(after);
         maybeCommit(after);
@@ -685,9 +751,286 @@ final class RaftGroup {
         startElection(now, after);
     }
 
+    /**
+     * Sends the chunk at the peer's current offset. A transfer pins the image it started with, so a
+     * newer local snapshot does not restart it; when it completes, {@code nextIndex} lands past that
+     * image and, if the log was compacted further meanwhile, the next round starts a fresh transfer.
+     */
+    private void sendSnapshotChunk(NodeId peer) {
+        var send = snapSends.get(peer);
+        if (send == null || send.term != term) {
+            send = new SnapSend(term, snapIndex, snapTerm, snapData, LogSnapshot.crc32c(snapIndex, snapTerm, snapData));
+            snapSends.put(peer, send);
+        }
+        int len = Math.min(snapshotChunkBytes, send.data.length - send.offset);
+        var body = ByteBuffer.allocate(8 + 4 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + len).order(java.nio.ByteOrder.BIG_ENDIAN);
+        body.putLong(term);
+        body.putInt(self.wire());
+        body.putLong(send.index);
+        body.putLong(send.imageTerm);
+        body.putInt(send.data.length);
+        body.putInt(send.crc32c);
+        body.putLong(commitIndex);
+        body.putInt(send.offset);
+        body.putInt(len);
+        body.put(send.data, send.offset, len);
+        rpc.send(peer, new SimTransport.Frame(groupId, SNAP_CHUNK, body.array()));
+    }
+
+    private void snapResp(NodeId to, boolean done, long match, int nextOffset) {
+        var body = ByteBuffer.allocate(8 + 4 + 1 + 8 + 4).order(java.nio.ByteOrder.BIG_ENDIAN);
+        body.putLong(term);
+        body.putInt(self.wire());
+        body.put((byte) (done ? 1 : 0));
+        body.putLong(match);
+        body.putInt(nextOffset);
+        rpc.send(to, new SimTransport.Frame(groupId, SNAP_RESP, body.array()));
+    }
+
+    /**
+     * Follower side. Leadership checks are those of {@link #onAppend}. Chunks must arrive in order;
+     * anything else is answered with the offset wanted. The assembled image is checked against its
+     * size cap and CRC32C, then installed exactly as {@link SnapshotControl#install} would: persisted
+     * before any prefix delete, the log kept past the image only if it agrees with the image's term.
+     */
+    private void onSnapChunk(NodeId from, ByteBuffer body, long now, List<Runnable> after) {
+        long theirTerm = body.getLong();
+        int leaderWire = body.getInt();
+        long index = body.getLong();
+        long imageTerm = body.getLong();
+        int total = body.getInt();
+        int crc32c = body.getInt();
+        long leaderCommit = body.getLong();
+        int offset = body.getInt();
+        int len = body.getInt();
+        if (len < 0 || len > body.remaining() || offset < 0 || total < 0 || (long) offset + len > total) {
+            return;
+        }
+        if (theirTerm < term) {
+            snapResp(from, false, lastIndex(), 0);
+            return;
+        }
+        if (theirTerm > term) {
+            if (!stepDown(theirTerm, after)) {
+                return;
+            }
+        }
+        if (role == Role.CANDIDATE || role == Role.PRE_CANDIDATE || role == Role.LEADER) {
+            role = Role.FOLLOWER;
+        }
+        var newLeader = byWire.apply(leaderWire);
+        if (newLeader != null && !newLeader.equals(leader)) {
+            leader = newLeader;
+            fireLeader(after);
+        }
+        electionDeadline = now + options.leaseNanos() + options.electionTimeout().toNanos();
+        leaseExpires = now + options.leaseNanos();
+        if (witness) {
+            return;
+        }
+        if (index <= snapIndex || (index <= commitIndex && termAt(index) == imageTerm)) {
+            // Already covered: committed entries agree with the leader's (log matching).
+            snapReceive = null;
+            snapResp(from, true, index, total);
+            return;
+        }
+        if (total > options.maxSnapshotBytes()) {
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING, "group "
+                    + groupId.value() + ": refusing a snapshot of " + total + " bytes from the leader (maxSnapshotBytes "
+                    + options.maxSnapshotBytes() + ")");
+            snapReceive = null;
+            return;
+        }
+        var receive = snapReceive;
+        if (receive == null || receive.term != theirTerm || receive.index != index || receive.crc32c != crc32c
+                || receive.data.length != total) {
+            if (offset != 0) {
+                snapReceive = null;
+                snapResp(from, false, lastIndex(), 0);
+                return;
+            }
+            receive = new SnapReceive(theirTerm, index, imageTerm, crc32c, new byte[total]);
+            snapReceive = receive;
+        }
+        if (offset != receive.received) {
+            snapResp(from, false, lastIndex(), receive.received);
+            return;
+        }
+        body.get(receive.data, offset, len);
+        receive.received += len;
+        if (receive.received < total) {
+            snapResp(from, false, lastIndex(), receive.received);
+            return;
+        }
+        snapReceive = null;
+        if (LogSnapshot.crc32c(index, imageTerm, receive.data) != crc32c) {
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING, "group "
+                    + groupId.value() + ": snapshot from the leader failed its CRC32C; asking again");
+            snapResp(from, false, lastIndex(), 0);
+            return;
+        }
+        if (!installFromLeader(index, imageTerm, receive.data, after)) {
+            return;
+        }
+        if (recovering && commitIndex >= leaderCommit) {
+            // As in onAppend: the restart gate opens only once this node has the leader's commit point.
+            recovering = false;
+        }
+        snapshotsInstalled++;
+        snapResp(from, true, index, total);
+    }
+
+    private boolean installFromLeader(long index, long imageTerm, byte[] image, List<Runnable> after) {
+        boolean keepSuffix = termAt(index) == imageTerm && storage.lastIndex(groupId) >= index;
+        long[] previous = {snapIndex, snapTerm};
+        var previousData = snapData;
+        snapIndex = index;
+        snapTerm = imageTerm;
+        snapData = image;
+        try {
+            persistSnapshotBeforePrefixDelete();
+            if (keepSuffix) {
+                storage.truncatePrefix(groupId, index);
+            } else {
+                // The local log disagrees with (or ends before) the image: none of it can be kept.
+                storage.truncatePrefix(groupId, Long.MAX_VALUE - 1);
+            }
+            truncatedThrough = Math.max(truncatedThrough, index);
+        } catch (IOException | RuntimeException failed) {
+            snapIndex = previous[0];
+            snapTerm = previous[1];
+            snapData = previousData;
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING, "group "
+                    + groupId.value() + ": cannot install the leader's snapshot at " + index + ": " + failed);
+            return false;
+        }
+        if (commitIndex < index) {
+            commitIndex = index;
+        }
+        if (lastApplied < index) {
+            lastApplied = index;
+            var installed = new LogSnapshot(groupId, index, imageTerm, image);
+            deliveries.submit(() -> {
+                var current = this.listener;
+                if (current != null) {
+                    current.onSnapshotRestored(installed);
+                }
+            }, index);
+        }
+        if (durableIndex < index) {
+            durableIndex = index;
+        }
+        return true;
+    }
+
+    private void onSnapResp(NodeId from, ByteBuffer body, long now, List<Runnable> after) {
+        long theirTerm = body.getLong();
+        int followerWire = body.getInt();
+        boolean done = body.get() == 1;
+        long match = body.getLong();
+        int nextOffset = body.getInt();
+        if (theirTerm > term) {
+            stepDown(theirTerm, after);
+            return;
+        }
+        if (role != Role.LEADER || theirTerm != term) {
+            return;
+        }
+        var follower = byWire.apply(followerWire);
+        if (follower == null || (from != null && !from.equals(follower))) {
+            return;
+        }
+        heardAt.put(follower, now);
+        var send = snapSends.get(follower);
+        if (done) {
+            if (send != null) {
+                snapSends.remove(follower);
+                snapshotsSent++;
+            }
+            matchIndex.put(follower, Math.max(matchIndex.getOrDefault(follower, 0L), match));
+            nextIndex.put(follower, Math.max(nextIndex.getOrDefault(follower, 0L), match + 1));
+            maybeCommit(after);
+            return;
+        }
+        if (send == null || nextOffset < 0 || nextOffset > send.data.length) {
+            return;
+        }
+        boolean progressed = nextOffset > send.offset;
+        send.offset = nextOffset;
+        if (progressed && nextOffset < send.data.length) {
+            sendSnapshotChunk(follower);
+        }
+    }
+
+    /** Tests: whether the restarted-voter gate (see {@link #recovering}) is still closed. */
+    boolean recovering() {
+        lock.lock();
+        try {
+            return recovering;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    long snapshotsSent() {
+        lock.lock();
+        try {
+            return snapshotsSent;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    long snapshotsInstalled() {
+        lock.lock();
+        try {
+            return snapshotsInstalled;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static final class SnapSend {
+        final long term;
+        final long index;
+        final long imageTerm;
+        final byte[] data;
+        final int crc32c;
+        int offset;
+
+        SnapSend(long term, long index, long imageTerm, byte[] data, int crc32c) {
+            this.term = term;
+            this.index = index;
+            this.imageTerm = imageTerm;
+            this.data = data;
+            this.crc32c = crc32c;
+        }
+    }
+
+    private static final class SnapReceive {
+        final long term;
+        final long index;
+        final long imageTerm;
+        final int crc32c;
+        final byte[] data;
+        int received;
+
+        SnapReceive(long term, long index, long imageTerm, int crc32c, byte[] data) {
+            this.term = term;
+            this.index = index;
+            this.imageTerm = imageTerm;
+            this.crc32c = crc32c;
+            this.data = data;
+        }
+    }
+
     private void replicate() {
         for (var peer : peers) {
             long next = nextIndex.getOrDefault(peer, lastIndex() + 1);
+            if (next <= snapIndex && !witnesses.contains(peer)) {
+                sendSnapshotChunk(peer);
+                continue;
+            }
             if (next <= snapIndex) {
                 var body = ByteBuffer.allocate(8 + 4 + 8 + 8 + 8 + 4).order(java.nio.ByteOrder.BIG_ENDIAN);
                 body.putLong(term);
@@ -730,18 +1073,47 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * Commits the highest index above {@code commitIndex} that is in the current term and has a
+     * quorum. {@link #quorumFor} only changes value at a peer's matchIndex, at {@code durableIndex},
+     * and just below the first pending STRICT entry, so the highest qualifying index is always one
+     * of those points (or {@code lastIndex()}). Checking only them keeps this O(voters) per call;
+     * scanning every uncommitted index made it O(backlog) under the group lock, on every append and
+     * every ack (#194).
+     */
     private void maybeCommit(List<Runnable> after) {
         long last = lastIndex();
-        for (long index = last; index > commitIndex; index--) {
-            if (termAt(index) != term) {
+        if (last <= commitIndex) {
+            return;
+        }
+        var candidates = new java.util.TreeSet<Long>(java.util.Comparator.reverseOrder());
+        candidates.add(last);
+        for (var peer : peers) {
+            candidates.add(matchIndex.getOrDefault(peer, 0L));
+        }
+        candidates.add(durableIndex);
+        var firstStrict = strictPending.ceilingKey(commitIndex + 1);
+        if (firstStrict != null) {
+            candidates.add(firstStrict - 1);
+        }
+        for (long index : candidates) {
+            if (index <= commitIndex) {
+                break;
+            }
+            if (index > last || termAt(index) != term) {
                 continue;
             }
             if (quorumFor(index)) {
                 commitIndex = index;
                 strictPending.headMap(index, true).clear();
                 apply(after);
-                if (commitIndex - snapIndex >= options.snapshotEveryEntries()) {
-                    snapshotThrough(commitIndex);
+                if (options.autoSnapshot() && commitIndex - snapIndex >= options.snapshotEveryEntries()) {
+                    if (taker == null) {
+                        snapshotThrough(commitIndex);
+                    } else if (!takerInFlight) {
+                        takerInFlight = true;
+                        submitTaker(taker, commitIndex, null);
+                    }
                 }
                 return;
             }
@@ -976,14 +1348,34 @@ final class RaftGroup {
         return quorum.hasQuorum(voters, acks);
     }
 
+    /** At most one persist-failure WARNING per group per this interval; the rest are counted. */
+    static final long PERSIST_WARN_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+
+    /**
+     * Every role: a node stuck below the cluster's term should be visible. Rate-limited, because a
+     * failing disk sees every higher-term frame (several per heartbeat interval per peer).
+     */
+    private void warnPersistFailed(long newTerm) {
+        long now = clock.nanoTime();
+        if (persistWarned && now - persistWarnAt < PERSIST_WARN_INTERVAL_NANOS) {
+            persistWarnSuppressed++;
+            return;
+        }
+        String suppressed = persistWarnSuppressed == 0 ? ""
+                : " (" + persistWarnSuppressed + " similar warnings suppressed)";
+        persistWarned = true;
+        persistWarnAt = now;
+        persistWarnSuppressed = 0;
+        System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                "group " + groupId.value() + ": " + role.name().toLowerCase(java.util.Locale.ROOT) + " at term "
+                        + term + " saw term " + newTerm + " but could not persist it; staying in term " + term
+                        + " and sending nothing" + suppressed);
+    }
+
     /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
     private boolean stepDown(long newTerm, List<Runnable> after) {
         if (newTerm > term && !saveHardState(newTerm, null)) {
-            // Every role: a node stuck below the cluster's term should be visible, not only a leader.
-            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
-                    "group " + groupId.value() + ": " + role.name().toLowerCase(java.util.Locale.ROOT) + " at term "
-                            + term + " saw term " + newTerm + " but could not persist it; staying in term " + term
-                            + " and sending nothing");
+            warnPersistFailed(newTerm);
             return false;
         }
         boolean wasLeader = role == Role.LEADER;
@@ -1180,6 +1572,27 @@ final class RaftGroup {
         return new NotLeaderException(groupId, Optional.ofNullable(leader));
     }
 
+    /**
+     * Under the lock, before any log prefix is deleted: the current snapshot must be durable, or
+     * a restart would have neither the entries nor the image. Refuses on a storage without snapshots.
+     */
+    private void persistSnapshotBeforePrefixDelete() throws IOException {
+        if (!storage.persistsSnapshots()) {
+            throw new IllegalStateException("group " + groupId.value() + ": the log storage keeps no durable snapshot,"
+                    + " so deleting the log prefix would lose committed state on restart; refused");
+        }
+        storage.saveSnapshot(groupId, new LogSnapshot(groupId, snapIndex, snapTerm, snapData));
+    }
+
+    long skippedSnapshots() {
+        lock.lock();
+        try {
+            return skippedSnapshots;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void snapshotThrough(long index) {
         try {
             var out = new ByteArrayOutputStream();
@@ -1190,12 +1603,62 @@ final class RaftGroup {
                     out.write(data, 1, data.length - 1);
                 }
             }
+            if (out.size() > options.maxSnapshotBytes()) {
+                skippedSnapshots++;
+                return;
+            }
             snapData = out.toByteArray();
             snapTerm = termAt(index);
             snapIndex = index;
         } catch (IOException failed) {
             throw new UncheckedIOException(failed);
         }
+    }
+
+    /**
+     * Queued behind every delivery for indexes up to {@code index} and ahead of later ones, so the
+     * taker reads the application state at exactly {@code index}. The result is installed under the
+     * lock if it still moves the snapshot forward.
+     */
+    private void submitTaker(SnapshotTaker use, long index, CompletableFuture<LogSnapshot> done) {
+        deliveries.submit(() -> {
+            byte[] image;
+            try {
+                image = use.snapshot(groupId, index);
+            } catch (Exception failed) {
+                image = null;
+                if (done != null) {
+                    done.completeExceptionally(failed);
+                }
+            }
+            if (image != null && image.length > options.maxSnapshotBytes()) {
+                var tooBig = new IllegalStateException("snapshot image of " + image.length
+                        + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes());
+                image = null;
+                if (done != null) {
+                    done.completeExceptionally(tooBig);
+                }
+            }
+            lock.lock();
+            try {
+                takerInFlight = false;
+                if (image == null) {
+                    skippedSnapshots++;
+                }
+                if (image != null && index > snapIndex) {
+                    snapTerm = termAt(index);
+                    snapIndex = index;
+                    snapData = image;
+                }
+                if (done != null && image != null) {
+                    done.complete(new LogSnapshot(groupId, snapIndex, snapTerm, snapData));
+                } else if (done != null) {
+                    done.completeExceptionally(new IllegalStateException("snapshot taker returned no image"));
+                }
+            } finally {
+                lock.unlock();
+            }
+        }, done);
     }
 
     private static byte[] user(byte[] payload, byte marker) {
@@ -1325,6 +1788,16 @@ final class RaftGroup {
         }
 
         @Override
+        public long leaderTerm() {
+            lock.lock();
+            try {
+                return role == Role.LEADER ? term : -1L;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
         public long leaseExpiresAt() {
             lock.lock();
             try {
@@ -1444,7 +1917,43 @@ final class RaftGroup {
         }
 
         @Override
+        public void setSnapshotTaker(SnapshotTaker next) {
+            lock.lock();
+            try {
+                taker = next;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
         public LogSnapshot take(long lastIncludedIndex) {
+            CompletableFuture<LogSnapshot> done = null;
+            lock.lock();
+            try {
+                if (taker != null) {
+                    if (lastIncludedIndex != commitIndex) {
+                        throw new IllegalArgumentException("with a SnapshotTaker, take(commitIndex()) only");
+                    }
+                    if (lastIncludedIndex == snapIndex) {
+                        return new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
+                    }
+                    if (deliveries.onExecutorThread()) {
+                        throw new IllegalStateException("take() with a SnapshotTaker cannot run inside a callback");
+                    }
+                    done = new CompletableFuture<>();
+                    submitTaker(taker, lastIncludedIndex, done);
+                }
+            } finally {
+                lock.unlock();
+            }
+            if (done != null) {
+                try {
+                    return done.join();
+                } catch (java.util.concurrent.CompletionException failed) {
+                    throw new IllegalStateException("snapshot taker failed", failed.getCause());
+                }
+            }
             lock.lock();
             try {
                 if (lastIncludedIndex > commitIndex || lastIncludedIndex < snapIndex) {
@@ -1463,15 +1972,36 @@ final class RaftGroup {
             if (!snapshot.groupId().equals(groupId)) {
                 throw new IllegalArgumentException("group");
             }
+            if (snapshot.data().length > options.maxSnapshotBytes()) {
+                throw new IllegalArgumentException("snapshot image of " + snapshot.data().length
+                        + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes());
+            }
             lock.lock();
             try {
-                snapIndex = snapshot.lastIncludedIndex();
+                long index = snapshot.lastIncludedIndex();
+                if (index <= snapIndex) {
+                    throw new IllegalArgumentException("stale snapshot: index " + index + " does not advance past "
+                            + snapIndex);
+                }
+                long local = termAt(index);
+                if (local != 0 && local != snapshot.lastIncludedTerm()) {
+                    throw new IllegalArgumentException("snapshot term " + snapshot.lastIncludedTerm()
+                            + " conflicts with the local log's term " + local + " at index " + index);
+                }
+                var previous = new long[] {snapIndex, snapTerm};
+                var previousData = snapData;
+                snapIndex = index;
                 snapTerm = snapshot.lastIncludedTerm();
                 snapData = snapshot.data();
                 try {
+                    persistSnapshotBeforePrefixDelete();
                     storage.truncatePrefix(groupId, snapIndex);
-                } catch (IOException failed) {
-                    throw new UncheckedIOException(failed);
+                    truncatedThrough = Math.max(truncatedThrough, snapIndex);
+                } catch (IOException | RuntimeException failed) {
+                    snapIndex = previous[0];
+                    snapTerm = previous[1];
+                    snapData = previousData;
+                    throw failed instanceof IOException io ? new UncheckedIOException(io) : (RuntimeException) failed;
                 }
                 if (commitIndex < snapIndex) {
                     commitIndex = snapIndex;
@@ -1485,31 +2015,105 @@ final class RaftGroup {
         }
 
         @Override
+        public void setTruncationBound(TruncationBound bound) {
+            truncationBound = bound;
+        }
+
+        @Override
         public CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor) {
             Objects.requireNonNull(compactor, "compactor");
             var future = new CompletableFuture<Void>();
+            long through = ackedThrough;
+            var bound = truncationBound;
+            if (bound != null) {
+                try {
+                    through = Math.min(through, bound.truncatableThrough(groupId, currentSnapIndex()));
+                } catch (Exception failed) {
+                    future.completeExceptionally(failed);
+                    return future;
+                }
+            }
             lock.lock();
             try {
                 if (snapIndex < ackedThrough) {
                     future.completeExceptionally(new IllegalArgumentException("not snapshotted"));
                     return future;
                 }
-                try {
-                    storage.truncatePrefix(groupId, ackedThrough);
-                } catch (IOException failed) {
-                    future.completeExceptionally(failed);
-                    return future;
+                if (truncateLocked(through, compactor, future)) {
+                    future.complete(null);
                 }
-                var current = new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
-                var compacted = compactor.compact(current);
-                if (compacted != null) {
-                    snapData = compacted;
-                }
-                future.complete(null);
             } finally {
                 lock.unlock();
             }
             return future;
+        }
+
+        @Override
+        public CompletableFuture<Long> truncateToBound(Compactor compactor) {
+            Objects.requireNonNull(compactor, "compactor");
+            var future = new CompletableFuture<Long>();
+            var bound = truncationBound;
+            if (bound == null) {
+                future.completeExceptionally(new IllegalStateException("no truncation bound set"));
+                return future;
+            }
+            long snapshot = currentSnapIndex();
+            long limit;
+            try {
+                limit = bound.truncatableThrough(groupId, snapshot);
+            } catch (Exception failed) {
+                future.completeExceptionally(failed);
+                return future;
+            }
+            lock.lock();
+            try {
+                // The snapshot can only have moved forward meanwhile; never past what the bound saw.
+                if (truncateLocked(Math.min(snapshot, limit), compactor, future)) {
+                    future.complete(truncatedThrough);
+                }
+            } finally {
+                lock.unlock();
+            }
+            return future;
+        }
+
+        private long currentSnapIndex() {
+            lock.lock();
+            try {
+                return snapIndex;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * Under the lock: compact, make the snapshot durable, then drop the prefix through
+         * {@code through} if that is new. False after failing {@code future}; nothing is deleted then.
+         */
+        private boolean truncateLocked(long through, Compactor compactor, CompletableFuture<?> future) {
+            var current = new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
+            var compacted = compactor.compact(current);
+            if (compacted != null) {
+                if (compacted.length > options.maxSnapshotBytes()) {
+                    future.completeExceptionally(new IllegalStateException("compacted image of "
+                            + compacted.length + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes()));
+                    return false;
+                }
+                snapData = compacted;
+            }
+            if (through <= truncatedThrough) {
+                return true;
+            }
+            try {
+                // Durable image first: after a restart the deleted prefix is rebuilt from it.
+                persistSnapshotBeforePrefixDelete();
+                storage.truncatePrefix(groupId, through);
+            } catch (IOException | RuntimeException failed) {
+                future.completeExceptionally(failed);
+                return false;
+            }
+            truncatedThrough = through;
+            return true;
         }
     }
 }

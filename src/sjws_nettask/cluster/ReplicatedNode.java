@@ -284,6 +284,7 @@ public final class ReplicatedNode implements ClusterNode {
     }
 
     /** The election no-op, after it is applied. {@code term} and the applied index. */
+    @Override
     public void onNoopApplied(GroupId groupId, BiConsumer<Long, Long> listener) {
         group(groupId).addNoopListener(listener);
     }
@@ -318,6 +319,31 @@ public final class ReplicatedNode implements ClusterNode {
     /** Age of the oldest uncommitted STRICT override on the group's leader, 0 when none. */
     public long oldestStrictPendingAgeNanos(GroupId groupId) {
         return group(groupId).oldestStrictPendingAgeNanos();
+    }
+
+    /** Snapshot images one group skipped: the taker threw, returned null or exceeded maxSnapshotBytes. */
+    public long skippedSnapshots(GroupId groupId) {
+        return group(groupId).skippedSnapshots();
+    }
+
+    /** Snapshot images this node, as leader, fully sent to a follower behind its compacted log. */
+    public long snapshotsSent(GroupId groupId) {
+        return group(groupId).snapshotsSent();
+    }
+
+    /** Snapshot images this node received from a leader and installed. */
+    public long snapshotsInstalled(GroupId groupId) {
+        return group(groupId).snapshotsInstalled();
+    }
+
+    /** Tests only: whether one group's restarted-voter gate is still closed. */
+    boolean recovering(GroupId groupId) {
+        return group(groupId).recovering();
+    }
+
+    /** Tests only: bytes per snapshot chunk on one group. */
+    void snapshotChunkBytes(GroupId groupId, int bytes) {
+        group(groupId).snapshotChunkBytes = bytes;
     }
 
     /** Apply lag of one group: deliveries queued or running. */

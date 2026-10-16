@@ -133,7 +133,104 @@ it is never behind an entry the node acked. Under RELAXED it trails by a bounded
 That bound is also the RELAXED loss window in the guarantee below. One interaction: with one data node
 down in the 2 + 1 pair, a RELAXED commit waits for the leader's fsync (the witness stores
 nothing), so it now waits up to the time bound rather than one tick. Keep `relaxedSyncDelay` small,
-or use the entry bound, if that degraded mode must stay fast.
+or use the entry bound, if that degraded mode must stay fast. A RELAXED group whose `relaxedSyncDelay`
+exceeds the lease (`2 x heartbeat`) logs a WARNING when it opens. `durableIndex` never decreases
+except when this node truncates conflicting uncommitted entries.
+
+### Application snapshots
+
+`SnapshotControl.setSnapshotTaker(SnapshotTaker)` replaces the built-in snapshot image (the
+concatenated user payloads) with application bytes. The taker runs on the group's delivery
+thread, queued after the delivery of every entry through `lastIncludedIndex` and ahead of later
+ones, so the state it reads is exactly the state at that index. Its result moves the snapshot
+forward only if it is still ahead of the current one. If the taker throws or returns null, that
+snapshot is skipped and the log is kept. With a taker, `take(i)` accepts only `i == commitIndex()`,
+is refused inside a callback, and blocks until the delivery thread has run the taker.
+`GroupOptions.withoutAutoSnapshot()` (`snapshotEveryEntries == NO_AUTO_SNAPSHOT`) turns
+automatic snapshots off, so the application decides when to call `take`.
+
+Snapshots are held in memory and made durable only when a log prefix is about to be deleted.
+`truncateAndCompact` and `install` first write the image through `LogStorage.saveSnapshot` and
+only then delete the prefix; a storage whose `persistsSnapshots()` is false (the interface
+default) refuses both, so committed state is never left in memory alone. `FileLogStorage` writes
+`{group}.snap`: magic `SJSN`, version 1, last included index and term, image length, image, and
+a CRC32C of all of it, created mode 0600 (the CP image holds token hashes and RBAC state), then
+fsync, `ATOMIC_MOVE` and directory fsync. On open it is read with the `SecureKeyFile` rules
+(leaf not followed, regular file, mode 0600 or 0400, owned by this process, parents not writable
+by others) and validated (magic, version, length, `maxSnapshotBytes`, CRC); any failure refuses
+to start. A group that opens with a snapshot starts with its commit and apply point at the
+snapshot index and hands the image to `GroupListener.onSnapshotRestored` on the delivery thread
+before any later entry; the default method ignores it, which is only right for a group that never
+compacts. Under RELAXED the persisted image can be ahead of the local `durableIndex`: it holds
+committed state, which is what a restart needs.
+
+`install` refuses, changing nothing, an image above `maxSnapshotBytes`, an index that does not
+advance past the current snapshot, and an index the local log holds with a different term;
+`install(snapshot, crc32c)` also checks `LogSnapshot.crc32c()` for a snapshot that crossed a
+process or disk boundary. `GroupOptions.withMaxSnapshotBytes` (default 64 MiB) also bounds the
+image a taker returns and the built-in image: a larger one is skipped and counted
+(`ReplicatedNode.skippedSnapshots`), like a failing taker.
+
+### Snapshot transfer to followers
+
+A data follower whose next entry is at or below the leader's snapshot index gets the snapshot
+from the leader instead of entries (frames `SNAP_CHUNK` and `SNAP_RESP`). A witness keeps no
+data and still gets the empty append it already handled. The leader sends the image in chunks of
+1 MiB (well under `TcpTransport.MAX_FRAME_BYTES`); each chunk carries the term, the image's last
+included index and term, its total length, the leader's commit index, the CRC32C of index, term
+and image (`LogSnapshot.crc32c()`, as on disk), the offset and the bytes. The transfer is
+stop-and-wait: the next chunk goes out when the follower acks the previous one, and the current
+one is resent on each heartbeat until then. A transfer pins the image it started with. If the
+leader compacts again meanwhile, the follower's `nextIndex` still lands inside the snapshot when
+it completes, and another transfer starts.
+
+The follower runs the leader checks of an append (term, step down, lease, election deadline). It
+takes chunks only in order from offset 0 and answers anything else with the offset it wants. It
+refuses an image whose total length is above its own `maxSnapshotBytes`, and checks the CRC32C of
+the assembled image; a mismatch drops it and asks again from 0. A complete image is installed like
+`install`: it is persisted before any prefix delete (refused on a storage without durable
+snapshots), the local log is kept past the image only if it holds the image's index with the
+image's term and is otherwise dropped, commit and apply move to the image index, and the image
+goes to `GroupListener.onSnapshotRestored` on the delivery thread before any later entry. A
+restarted voter's catch-up gate opens only when its commit index reaches the leader's commit index
+carried in the chunk, as for an append, not merely because an image was installed. An
+image at or below the follower's snapshot or commit index (with a matching term) is acked as
+already installed. Counters: `ReplicatedNode.snapshotsSent` and `snapshotsInstalled`.
+
+The CRC32C catches corruption, not forgery: the frames ride the authenticated Raft transport
+(HMAC per frame on `TcpTransport`), which already decides who may act as leader. A follower holds
+at most one image in memory (bounded by `maxSnapshotBytes`). The leader holds a reference to the
+image it is sending, not a copy.
+
+### Truncation bound
+
+`SnapshotControl.setTruncationBound(TruncationBound)` lets the application limit how far the
+Raft log prefix may be dropped. `truncatableThrough(group, snapshotIndex)` returns the highest
+index the application no longer needs from Raft: its own state is durable through it, and
+nothing it still serves (retention low watermark, the oldest consumer offset, the ledger low
+watermark) lies at or below it. `Long.MAX_VALUE` means no limit beyond the snapshot, 0 keeps the
+log. With a bound set:
+
+- `truncateToBound(compactor)` truncates through `min(snapshot index, bound)`, compacts, and
+  completes with the index the log is truncated through. The snapshot index passed to the bound
+  is read first; the truncation never goes past it, even if a snapshot lands meanwhile.
+- `truncateAndCompact(ackedThrough, compactor)` truncates through `min(ackedThrough, bound)`.
+  Without a bound it behaves as before.
+- A bound that throws fails the future and truncates nothing. A bound lower than an earlier
+  truncation undoes nothing.
+
+The bound is called on the caller's thread without the group lock, so it may read application
+state but must not call back into the group. Automatic snapshots never truncate the log, with or
+without a bound: they only move the in-memory snapshot point, which makes a lagging follower
+receive the snapshot instead of entries. Truncation stays an explicit call (for messaging, from
+the maintenance timer after retention and compaction). A data follower behind the leader's
+truncation point catches up through a snapshot transfer (see above). Unused, the bound costs a null check in the two
+truncation calls and nothing on the append or commit path.
+
+Every truncation path persists the snapshot first (see Application snapshots) and refuses on a
+storage without durable snapshots. `FileLogStorage` drops a prefix (or suffix) by writing the
+kept records to a temp file and renaming it into place with fsyncs (#214), so a crash leaves the
+whole old segment or the whole new one.
 
 ### Restart safety and the exact RELAXED guarantee
 
@@ -143,8 +240,9 @@ What a voter keeps across a crash:
   is called, and must return only once durable, whenever `term` or `votedFor` changes, before
   the vote request or grant is sent. The write comes first and memory changes only when it
   succeeds (`startElection`, stepping down to a higher term, a vote grant). A failed write leaves
-  term and vote as they were, sends nothing, and the node stays a follower (a leader that cannot
-  persist a higher term it has seen logs a WARNING and stays in its old term); a failed grant is a
+  term and vote as they were, sends nothing, and the node stays a follower (a node in any role that
+  cannot persist a higher term it has seen logs a WARNING, at most one per group per 10 s with a
+  count of the suppressed ones, and stays in its old term); a failed grant is a
   refusal. Messages only ever carry the durable term (a pre-vote reply carries the responder's own
   term, and the pre-candidate accepts a grant at a term at or below its own).
   `FileLogStorage` writes `{group}.vote`: 24 bytes big-endian, magic `SJVT`, version 1, term,

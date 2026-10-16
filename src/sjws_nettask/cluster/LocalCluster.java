@@ -121,6 +121,11 @@ public final class LocalCluster implements ClusterNode {
     }
 
     @Override
+    public void onNoopApplied(GroupId groupId, BiConsumer<Long, Long> listener) {
+        throw new UnsupportedOperationException("membership-only node");
+    }
+
+    @Override
     public SnapshotControl snapshots(GroupId groupId) {
         throw new UnsupportedOperationException("membership-only node");
     }

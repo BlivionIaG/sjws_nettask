@@ -175,4 +175,24 @@ class SourceGuardTest {
         var tests = all(Path.of("tests/sjws_nettask/config"));
         assertTrue(assign.matcher(tests).find(), "the guard pattern still matches the test assignments");
     }
+
+    /** Security review of #206: the {@code FileLogStorage.crashHook} fault hook is test-only. */
+    @Test
+    void fileLogStorageCrashHookIsAssignedOnlyInTests() throws IOException {
+        var assign = java.util.regex.Pattern.compile("\\bcrashHook\\s*=[^=]");
+        var offenders = new ArrayList<String>();
+        try (var walk = Files.walk(Path.of("src"))) {
+            for (var p : (Iterable<Path>) walk::iterator) {
+                if (p.toString().endsWith(".java") && assign.matcher(Files.readString(p)).find()) {
+                    offenders.add(p.toString());
+                }
+            }
+        }
+        assertTrue(offenders.isEmpty(), "crashHook assigned in production code: " + offenders);
+        var storage = Files.readString(Path.of("src/sjws_nettask/cluster/FileLogStorage.java"));
+        assertTrue(storage.contains("volatile java.util.function.Consumer<String> crashHook;"),
+                "crashHook is declared without an initializer (null in production)");
+        var tests = all(Path.of("tests/sjws_nettask/cluster"));
+        assertTrue(assign.matcher(tests).find(), "the guard pattern still matches the test assignments");
+    }
 }

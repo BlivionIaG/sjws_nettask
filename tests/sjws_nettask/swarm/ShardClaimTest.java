@@ -214,4 +214,136 @@ class ShardClaimTest {
         th.join(5_000);
         assertTrue(!th.isAlive());
     }
+
+    @Test
+    void aSubmitHandsItsTaskToAParkedClaimDirectly() throws Exception {
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        var claim = CompletableFuture.supplyAsync(() -> t.claim("p", "w", 4, 10_000, TimeUnit.SECONDS.toNanos(20)));
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (t.pool("p").waiting.get() == 0 && System.nanoTime() < until) Thread.onSpinWait();
+        assertEquals(1, t.pool("p").waiting.get(), "the claim is parked");
+        long polls = t.shardPolls();
+        t.submit("p", 1, seqFor(t, 2, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        var got = claim.get(5, TimeUnit.SECONDS);
+        assertEquals(1, got.size());
+        assertEquals(2, got.get(0).shard());
+        assertEquals(1, t.handoffs(), "claimed by the submitter for the parked worker");
+        assertEquals(1, t.shardPolls() - polls, "the woken worker did not sweep again");
+        assertEquals(0, t.readyHints("p")[2]);
+        assertTrue(t.pool("p").waiters.isEmpty());
+        assertEquals(LeaseResult.OK, t.ack(got.get(0)));
+    }
+
+    @Test
+    void handoffUnderRaceClaimsEveryTaskExactlyOnce() throws Exception {
+        // W workers park/claim with a tiny backstop slice (so cancel races the submitters' handoff constantly),
+        // S submitters push N tasks. Every task must be claimed once: none lost to a cancelled waiter, none twice.
+        var t = open(4, 50_000);
+        int workers = 6, submitters = 3, perSubmitter = 3_000, n = submitters * perSubmitter;
+        var seen = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+        var dup = new AtomicLong();
+        var count = new AtomicLong();
+        var stop = new java.util.concurrent.atomic.AtomicBoolean();
+        var pool = new ArrayList<Thread>();
+        for (int w = 0; w < workers; w++) {
+            String name = "w" + w;
+            pool.add(Thread.ofPlatform().start(() -> {
+                while (!stop.get()) {
+                    var got = t.claim("p", name, 1 + (name.hashCode() & 3), 600_000, 5_000_000);
+                    for (var x : got) {
+                        if (!seen.add(x.shard() + ":" + x.offset())) dup.incrementAndGet();
+                        count.incrementAndGet();
+                    }
+                    if (!got.isEmpty()) t.ackAll(got);
+                }
+            }));
+        }
+        var subs = new ArrayList<Thread>();
+        for (int s = 0; s < submitters; s++) {
+            long producer = 10 + s;
+            subs.add(Thread.ofPlatform().start(() -> {
+                for (int i = 1; i <= perSubmitter; i++) {
+                    t.submit("p", producer, i, TaskServiceTest.env("t", "", TaskEnvelope.NO_DEADLINE));
+                    if ((i & 63) == 0) Thread.yield();
+                }
+            }));
+        }
+        for (var s : subs) s.join(60_000);
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (count.get() < n && System.nanoTime() < until) Thread.sleep(1);
+        stop.set(true);
+        for (var w : pool) w.join(10_000);
+        assertEquals(0, dup.get(), "no task claimed twice");
+        assertEquals(n, count.get(), "every task claimed");
+        assertEquals(n, seen.size());
+        assertTrue(t.handoffs() > 0, "the handoff path ran");
+        assertTrue(t.pool("p").waiters.isEmpty(), "no waiter left behind");
+        assertEquals(0, t.pool("p").waiting.get());
+    }
+
+    @Test
+    void aTaskHandedToAWaiterThatIsBeingInterruptedIsStillReturned() throws Exception {
+        // interrupt and submit race on a parked claim; whichever wins, the task is either returned or still
+        // claimable, never leased to nobody
+        for (int round = 0; round < 200; round++) {
+            this.topics = new Topics(this.dir.resolve("r" + round), new RetryPolicy(5, 0, 0), this.now::get);
+            var t = new TaskService(this.topics, 2, TimeUnit.SECONDS.toNanos(30));
+            t.claim("p", "warm", 1, 1_000); // opens both shards on this thread, not on the one we interrupt
+            var out = new java.util.concurrent.atomic.AtomicReference<List<Task>>();
+            var th = Thread.ofPlatform().start(() -> out.set(t.claim("p", "w", 1, 600_000, TimeUnit.SECONDS.toNanos(10))));
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (t.pool("p").waiting.get() == 0 && System.nanoTime() < until) Thread.onSpinWait();
+            var sub = Thread.ofPlatform().start(() -> t.submit("p", 1, 1, TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE)));
+            th.interrupt();
+            sub.join(5_000);
+            th.join(5_000);
+            assertTrue(!th.isAlive());
+            int returned = out.get().size();
+            int left = t.claim("p", "other", 1, 600_000).size();
+            assertEquals(1, returned + left, "round " + round + ": returned=" + returned + " left=" + left);
+            this.topics.close();
+            this.topics = null;
+        }
+    }
+
+    @Test
+    void aHandedLeaseStartsWhenTheWokenWorkerRunsNotAtTheSubmittersPoll() throws Exception {
+        // Review of #223: the submitter polls (lease starts) before the waiter is runnable. Simulate a schedule gap
+        // longer than a short visibilityMs between that poll and the waiter's return: the waiter must refresh the
+        // lease on receipt, so the task is not redelivered to another worker while the first one still holds it.
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        long vis = 100;
+        long gap = 150; // > vis: without the refresh the handed lease would already be expired on receipt
+        t.afterHandoffPoll = () -> this.now.addAndGet(gap);
+        var claim = CompletableFuture.supplyAsync(() -> t.claim("p", "w", 1, vis, TimeUnit.SECONDS.toNanos(20)));
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (t.pool("p").waiting.get() == 0 && System.nanoTime() < until) Thread.onSpinWait();
+        long polledAt = this.now.get();
+        t.submit("p", 1, seqFor(t, 2, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        var got = claim.get(5, TimeUnit.SECONDS);
+        t.afterHandoffPoll = TaskService.NO_HOOK;
+        assertEquals(1, got.size());
+        assertEquals(1, t.handoffs(), "taken by the handoff path");
+        assertEquals(1, t.handoffRefreshes(), "the woken worker refreshed the handed lease");
+        long received = polledAt + gap;
+        assertTrue(got.get(0).leaseDeadlineMs() >= received + vis,
+                "lease runs from receipt: " + got.get(0).leaseDeadlineMs() + " < " + (received + vis));
+        // past the poll-time deadline, inside the refreshed one: nobody else may get it
+        this.now.addAndGet(vis / 2);
+        assertTrue(t.claim("p", "other", 4, vis).isEmpty(), "not redelivered while the first worker holds it");
+        assertEquals(LeaseResult.OK, t.ack(got.get(0)));
+    }
+
+    @Test
+    void aSubMillisecondHandoffDoesNotRewriteTheLease() throws Exception {
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        var claim = CompletableFuture.supplyAsync(() -> t.claim("p", "w", 1, 10_000, TimeUnit.SECONDS.toNanos(20)));
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (t.pool("p").waiting.get() == 0 && System.nanoTime() < until) Thread.onSpinWait();
+        t.submit("p", 1, seqFor(t, 1, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        var got = claim.get(5, TimeUnit.SECONDS);
+        assertEquals(1, got.size());
+        assertEquals(0, t.handoffRefreshes(), "clock did not move: no extra ledger write on the fast path");
+        assertEquals(LeaseResult.OK, t.ack(got.get(0)));
+    }
 }
