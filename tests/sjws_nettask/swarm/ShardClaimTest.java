@@ -41,8 +41,12 @@ class ShardClaimTest {
     Topics topics;
 
     TaskService open(int shards, long sliceNanos) {
+        return open(shards, sliceNanos, TaskService.CLAIM_SPIN_NANOS);
+    }
+
+    TaskService open(int shards, long sliceNanos, long spinNanos) {
         this.topics = new Topics(this.dir, new RetryPolicy(5, 0, 0), this.now::get);
-        return new TaskService(this.topics, shards, sliceNanos);
+        return new TaskService(this.topics, shards, sliceNanos, spinNanos);
     }
 
     @AfterEach
@@ -214,4 +218,53 @@ class ShardClaimTest {
         th.join(5_000);
         assertTrue(!th.isAlive());
     }
+
+    @Test
+    void aSubmitDuringTheClaimSpinIsTakenWithoutParking() throws Exception {
+        // Long spin, long backstop slice: the claim stays in the spin (waiting still 0) until a submit bumps the
+        // ready hint; it must return the task without ever registering as parked.
+        var t = open(4, TimeUnit.SECONDS.toNanos(30), TimeUnit.SECONDS.toNanos(5));
+        String worker = "w";
+        int home = Math.floorMod(worker.hashCode(), 4);
+        int other = (home + 1) % 4;
+        var claim = CompletableFuture.supplyAsync(() -> t.claim("p", worker, 1, 10_000, TimeUnit.SECONDS.toNanos(20)));
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        // Give the claim time to finish its empty sweeps and enter the spin; it must not park.
+        while (System.nanoTime() < until && !claim.isDone()) {
+            assertEquals(0, t.pool("p").waiting.get(), "spinning claim is not parked");
+            Thread.sleep(1);
+        }
+        assertTrue(!claim.isDone(), "still spinning / waiting for the submit");
+        assertEquals(0, t.pool("p").waiting.get());
+        long t0 = System.nanoTime();
+        t.submit("p", 1, seqFor(t, other, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        var got = claim.get(5, TimeUnit.SECONDS);
+        long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        assertEquals(1, got.size());
+        assertEquals(other, got.get(0).shard());
+        assertEquals(0, t.pool("p").waiting.get(), "never parked");
+        assertTrue(tookMs < 500, "taken from the spin in " + tookMs + " ms");
+    }
+
+    @Test
+    void zeroSpinStillWakesOnSubmitViaThePoolCondition() throws Exception {
+        // Regression: spin disabled (0) keeps the old park + signalAll path.
+        var t = open(4, TimeUnit.SECONDS.toNanos(30), 0);
+        String worker = "w";
+        int home = Math.floorMod(worker.hashCode(), 4);
+        int other = (home + 1) % 4;
+        var claim = CompletableFuture.supplyAsync(() -> t.claim("p", worker, 1, 10_000, TimeUnit.SECONDS.toNanos(20)));
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (t.pool("p").waiting.get() == 0 && System.nanoTime() < until) Thread.onSpinWait();
+        assertEquals(1, t.pool("p").waiting.get(), "the claim is parked");
+        long t0 = System.nanoTime();
+        t.submit("p", 1, seqFor(t, other, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        var got = claim.get(5, TimeUnit.SECONDS);
+        long wakeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        assertEquals(1, got.size());
+        assertEquals(other, got.get(0).shard());
+        assertTrue(wakeMs < 1_000, "woken by the cross-shard submit in " + wakeMs + " ms, not by the 30 s slice");
+    }
+
+
 }

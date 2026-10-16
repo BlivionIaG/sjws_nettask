@@ -67,10 +67,16 @@ public final class TaskService {
     }
 
     TaskService(Topics topics, int shards, long waitSliceNanos) {
+        this(topics, shards, waitSliceNanos, CLAIM_SPIN_NANOS);
+    }
+
+    TaskService(Topics topics, int shards, long waitSliceNanos, long claimSpinNanos) {
         if (shards < 1 || shards > 256) throw new IllegalArgumentException("shards 1..256: " + shards);
+        if (claimSpinNanos < 0) throw new IllegalArgumentException("claimSpinNanos >= 0: " + claimSpinNanos);
         this.topics = topics;
         this.shards = shards;
         this.waitSliceNanos = waitSliceNanos;
+        this.claimSpinNanos = claimSpinNanos;
     }
 
     /** Wires the node's {@link ReplyRouter} so in-process replies wake the caller directly. Idempotent. */
@@ -88,6 +94,9 @@ public final class TaskService {
 
     /** Backstop park of a waiting sharded claim (redeliveries do not signal); appends wake it at once. */
     private final long waitSliceNanos;
+
+    /** Brief spin before a sharded claim parks, so a soon-arriving submit is taken without an OS wakeup. */
+    private final long claimSpinNanos;
 
     /**
      * Per-pool sharding state (sharded pools only; a 1-shard pool never creates one). {@code ready[s]} is a hint:
@@ -319,6 +328,24 @@ public final class TaskService {
             }
             long left = deadline - System.nanoTime();
             if (waitNanos <= 0 || left <= 0) return List.of();
+            // Spin off the pool lock before parking. During the spin {@code waiting} is still 0, so a submit only
+            // bumps the ready hint (no signalAll); we see it here and sweep without an OS wakeup of a parked thread.
+            // At the S1c open-loop rate (~100 µs between submits) this often keeps the worker on-CPU for the next
+            // task. A descheduled park was measured oversleeping to 14–70 ms on this host (#184).
+            if (this.claimSpinNanos > 0) {
+                long spinUntil = System.nanoTime() + Math.min(left, this.claimSpinNanos);
+                boolean saw = false;
+                while (System.nanoTime() < spinUntil) {
+                    if (ps.anyReady()) { saw = true; break; }
+                    Thread.onSpinWait();
+                }
+                if (saw || ps.anyReady()) {
+                    full = false; // hinted sweep: a submit landed during the spin
+                    continue;
+                }
+                left = deadline - System.nanoTime();
+                if (left <= 0) return List.of();
+            }
             ps.waiting.incrementAndGet();
             ps.lock.lock();
             try {
@@ -380,6 +407,13 @@ public final class TaskService {
 
     /** Longest park on the home shard of a waiting sharded claim before the other shards are swept again. */
     static final long SHARD_WAIT_SLICE_NANOS = 2_000_000;
+
+    /**
+     * Spin before a sharded claim parks ({@link #claim}). Tuned to the S1c open-loop gap (~100 µs at 10k/s): long
+     * enough to often absorb the next submit without parking, short enough not to burn a core when the pool is idle.
+     * Tests may pass 0 to disable.
+     */
+    static final long CLAIM_SPIN_NANOS = 100_000L;
 
     /** Decodes, deadline-checks and lease-shortens one shard's deliveries. */
     private List<Task> tasks(String pool, int shard, Partition p, List<sjws_nettask.messaging.delivery.Delivery> got) {
