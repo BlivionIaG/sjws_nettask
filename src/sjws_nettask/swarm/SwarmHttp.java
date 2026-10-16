@@ -98,7 +98,7 @@ final class SwarmHttp implements Handler {
         this.gate = java.util.Objects.requireNonNull(gate);
         this.trace = trace;
         this.streams = swarm.tasks().streams() == null ? null
-                : new StreamHttp(swarm, workerProducerId, this.replySeq, StreamHttp.DEFAULT_MAX_SESSIONS);
+                : new StreamHttp(swarm, workerProducerId, this.replySeq, StreamHttp.MAX_SESSIONS_PER_AGENT);
     }
 
     StreamHttp streams() {

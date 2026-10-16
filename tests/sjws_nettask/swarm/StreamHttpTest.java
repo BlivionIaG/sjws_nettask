@@ -76,7 +76,11 @@ class StreamHttpTest {
     }
 
     void streamsOn() {
-        this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        streamsOn(TokenStreams.Config.DEFAULT);
+    }
+
+    void streamsOn(TokenStreams.Config config) {
+        this.swarm.enableStreams(config);
         this.http = new SwarmHttp(this.swarm, 4, BY_HEADER);
     }
 
@@ -171,6 +175,8 @@ class StreamHttpTest {
         assertEquals(200, r.status());
         assertEquals("text/event-stream", r.headers().get("content-type"));
         assertEquals("""
+                retry: 1000
+
                 id: 0
                 event: chunk
                 data: hel
@@ -192,8 +198,8 @@ class StreamHttpTest {
                 """, drain(r));
         // resume: Last-Event-ID n -> from n + 1; ?from=n -> from n
         var resumed = drain(req("GET", "a", session, new byte[0], "last-event-id", "1"));
-        assertTrue(resumed.startsWith("id: 2\n"), resumed);
-        assertTrue(drain(req("GET", "a", session + "?from=1", new byte[0])).startsWith("id: 1\n"));
+        assertTrue(resumed.startsWith("retry: 1000\n\nid: 2\n"), resumed);
+        assertTrue(drain(req("GET", "a", session + "?from=1", new byte[0])).startsWith("retry: 1000\n\nid: 1\n"));
         assertEquals(409, chunk(c, 3, 0, "late").status(), "the lease is settled after LAST");
     }
 
@@ -255,7 +261,7 @@ class StreamHttpTest {
         var again = req("GET", "a", session, new byte[0]);
         assertEquals(200, again.status());
         ((Body.Stream) again.body()).source().close();
-        for (int i = 1; i < StreamHttp.DEFAULT_MAX_SESSIONS; i++) {
+        for (int i = 1; i < StreamHttp.MAX_SESSIONS_PER_AGENT; i++) {
             startStream("");
         }
         assertEquals(503, post("/swarm/v1/tasks/gen:stream", SwarmHttpTest.task("p").encode()).status());
@@ -316,5 +322,96 @@ class StreamHttpTest {
         var cr = new String(StreamHttp.sse(new StreamChunk(1, 1, 0, 0, "a\rb\n".getBytes(StandardCharsets.UTF_8))),
                 StandardCharsets.UTF_8);
         assertEquals("id: 0\nevent: chunk\ndata: a\ndata: b\ndata: \n\n", cr);
+    }
+
+    /** inceptor (1): chunks before the first GET are retained up to the bound; beyond it the reader gets a gap. */
+    @Test
+    @org.junit.jupiter.api.Timeout(20)
+    void overflowBeforeFirstGetIsAnExplicitGapAndLastIsKept() throws Exception {
+        streamsOn(new TokenStreams.Config(1, 64, 4));
+        var session = startStream("");
+        var c = claim();
+        assertEquals(204, chunk(c, 0, StreamChunk.FIRST, "c0").status());
+        for (int i = 1; i < 10; i++) {
+            assertEquals(204, chunk(c, i, 0, "c" + i).status());
+        }
+        assertEquals(204, chunk(c, 10, Frame.LAST, "end").status());
+        var text = drain(req("GET", "a", session, new byte[0]));
+        assertEquals("retry: 1000\n\nevent: gap\ndata: 0 6 overflow\n\nevent: end\ndata: error\n\n", text);
+        var tail = drain(req("GET", "a", session + "?from=7", new byte[0]));
+        assertTrue(tail.contains("id: 9\nevent: chunk\ndata: c9\n") && tail.endsWith("id: 10\nevent: end\ndata: ok\n\n"),
+                tail);
+        var bin = ByteBuffer.wrap(drainBytes(req("GET", "a", session, new byte[0], "accept", SwarmHttp.CONTENT_TYPE)));
+        var f = Frame.decode(bin);
+        assertEquals(Frame.Type.ERROR, f.type());
+        assertEquals("gap 0 6 overflow", new String(f.payload(), StandardCharsets.UTF_8));
+    }
+
+    /** inceptor (1): a hole in the stream (a dropped chunk) is reported, never skipped. */
+    @Test
+    @org.junit.jupiter.api.Timeout(20)
+    void droppedChunkIsAGapNotASkip() throws Exception {
+        streamsOn(new TokenStreams.Config(1, 4, 256));
+        var session = startStream("");
+        var c = claim();
+        assertEquals(204, chunk(c, 0, StreamChunk.FIRST, "a").status());
+        assertEquals(204, chunk(c, 50, 0, "far").status()); // beyond the reorder window: dropped
+        var text = drain(req("GET", "a", session, new byte[0]));
+        assertEquals("retry: 1000\n\nid: 0\nevent: chunk\ndata: a\n\nevent: gap\ndata: 1 ? overflow\n\nevent: end\ndata: error\n\n",
+                text);
+    }
+
+    /** inceptor (2): reconnecting after the end returns the terminal state at once (no wait for the deadline). */
+    @Test
+    @org.junit.jupiter.api.Timeout(10)
+    void reconnectAfterEndReturnsTerminalImmediately() throws Exception {
+        streamsOn();
+        var session = startStream("?deadlineMs=3600000");
+        var c = claim();
+        chunk(c, 0, StreamChunk.FIRST, "x");
+        chunk(c, 1, Frame.LAST | Frame.ERROR, "");
+        drain(req("GET", "a", session, new byte[0]));
+        long t0 = System.nanoTime();
+        assertEquals("retry: 1000\n\nid: 1\nevent: end\ndata: error\n\n",
+                drain(req("GET", "a", session, new byte[0], "last-event-id", "1")));
+        var bin = ByteBuffer.wrap(drainBytes(req("GET", "a", session + "?from=2", new byte[0], "accept", SwarmHttp.CONTENT_TYPE)));
+        var last = StreamChunk.decode(Frame.decode(bin).payload());
+        assertTrue(last.last() && last.chunkSeq() == 1 && last.size() == 0, last.toString());
+        assertTrue(System.nanoTime() - t0 < 2_000_000_000L);
+    }
+
+    /** A live reader is woken by the producer (no 250 ms poll step per chunk). */
+    @Test
+    @org.junit.jupiter.api.Timeout(20)
+    void liveReaderSeesChunksAsTheyArrive() throws Exception {
+        streamsOn();
+        var session = startStream("");
+        var c = claim();
+        var r = req("GET", "a", session, new byte[0]);
+        var src = ((Body.Stream) r.body()).source();
+        src.next(); // retry
+        var producer = Thread.ofVirtual().start(() -> {
+            chunk(c, 0, StreamChunk.FIRST, "hi");
+            chunk(c, 1, Frame.LAST, "");
+        });
+        var first = src.next();
+        assertTrue(StandardCharsets.UTF_8.decode(first).toString().contains("data: hi"));
+        assertTrue(StandardCharsets.UTF_8.decode(src.next()).toString().contains("data: ok"));
+        assertNull(src.next());
+        src.close();
+        producer.join();
+    }
+
+    @Test
+    void sweepDropsExpiredUnreadSessions() {
+        streamsOn();
+        startStream("?deadlineMs=1000");
+        assertEquals(1, this.http.streams().sessionCount());
+        this.now.addAndGet(1000 + StreamHttp.GRACE_MS + 1);
+        this.http.streams().sweep();
+        assertEquals(0, this.http.streams().sessionCount());
+        for (int i = 0; i < StreamHttp.MAX_SESSIONS_PER_AGENT; i++) {
+            startStream(""); // the per-agent count was released
+        }
     }
 }

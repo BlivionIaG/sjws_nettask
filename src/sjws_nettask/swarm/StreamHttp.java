@@ -27,6 +27,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import sjws_nettask.core.Body;
@@ -41,31 +42,42 @@ import sjws_nettask.swarm.wire.StreamChunk;
  * S2c HTTP leg (agent-swarm.md §5.2, §11.2, §12 Q2; S2c PR 4). Created only when {@code sjws.swarm.stream.enabled}
  * is on; with the flag off {@link SwarmHttp} never references this class, so it is not loaded.
  * <ul>
- * <li>{@code POST /swarm/v1/tasks/{pool}:stream?deadlineMs=}: submits a streaming call. 201 with a {@code TASK}
- * frame whose payload is the 16-byte session id, and {@code Location: /swarm/v1/replies/{hex}}.</li>
- * <li>{@code GET /swarm/v1/replies/{session}}: the stream as {@code text/event-stream} (default; one
- * {@code event: chunk} per chunk, {@code id} = chunkSeq, data = the chunk bytes as UTF-8, one {@code data:} line per
- * line, then {@code event: end} with {@code data: ok|cancelled|error}), or as {@code TOKEN} frames when
- * {@code Accept: application/vnd.sjws.swarm.v1}. Resume with {@code Last-Event-ID: n} (from n + 1) or
- * {@code ?from=n} (from n), out of the session's retained chunks.</li>
+ * <li>{@code POST /swarm/v1/tasks/{pool}:stream?deadlineMs=}: submits a streaming call (deadline default 30 s, max 1 h;
+ * a stream always has a deadline). 201 with a {@code TASK} frame whose payload is the 16-byte session id, and
+ * {@code Location: /swarm/v1/replies/{hex}}.</li>
+ * <li>{@code GET /swarm/v1/replies/{session}}: the stream as {@code text/event-stream} (default) or {@code TOKEN}
+ * frames ({@code Accept: application/vnd.sjws.swarm.v1}). SSE: {@code retry: 1000} once, then per chunk {@code id:
+ * <chunkSeq>}, {@code event: chunk}, the bytes as UTF-8 (invalid UTF-8 is replaced with U+FFFD: SSE is for text, use
+ * the binary type for bytes), one {@code data:} line per line. Terminal: {@code event: end} with {@code data:
+ * ok|cancelled|error|deadline}. A missing range is never skipped: {@code event: gap} with {@code data: <from> <to>
+ * <reason>} ({@code to} is {@code ?} when unknown), then {@code end: error}. Binary terminals are the {@code LAST}
+ * {@code TOKEN} frame, or an {@code ERROR|LAST} frame whose payload is {@code deadline} or {@code gap <from> <to>
+ * <reason>}. Resume: {@code Last-Event-ID: n} (from n + 1) or {@code ?from=n}; resuming after the end returns the
+ * terminal at once.</li>
  * <li>{@code POST /swarm/v1/leases/{leaseId}:chunk}: body one {@code TOKEN} frame (StreamChunk v1 payload; the stream
- * id must be the task's correlation id). 204; 409 when the lease is stale, or {@code cancelled} with
- * {@code "reason":"deadline"} once the task's deadline has passed. A {@code LAST} chunk writes the reply (body =
- * the chunk bytes) and acks once both are durable (§4.4).</li>
+ * id must be the task's correlation id). 204; 409 when the lease is stale, or {@code cancelled} with {@code
+ * "reason":"deadline"} once the task's deadline has passed (the claim stays cached: ack it). A {@code LAST} chunk
+ * writes the reply (body = the chunk bytes) and acks once both are durable (§4.4); 504 (retry) if that takes over
+ * 30 s.</li>
  * </ul>
- * <b>Session (§12 Q2):</b> a server-minted random 128-bit id ({@link SecureRandom}) bound to the
- * {@link SwarmGate.Agent} id. Unknown, expired, or another agent's session: 404 (existence is not revealed). One reader
- * at a time (409 otherwise). Sessions live in memory until {@code LAST} + {@link #GRACE_MS} or the call deadline + grace;
- * a node restart loses them. At most {@code maxSessions} per agent (503 beyond).
- * <b>Not yet (PR 5):</b> attempt in the chunk header and RESET (the §12 reset rule), resume across nodes / from the
- * ledger, cancel.
+ * <b>Session (§12 Q2):</b> a server-minted random 128-bit id bound to the {@link SwarmGate.Agent} id. Unknown,
+ * expired or another agent's session: 404. One reader at a time (409). At most {@link #MAX_SESSIONS_PER_AGENT} per
+ * agent and {@link #MAX_SESSIONS} per node (503). Chunks are drained into the session as they are produced, also
+ * before the first GET, and retained up to {@link #RETAIN_BYTES} and {@code sinkChunks}; older ones are trimmed and
+ * a reader that needs them gets a {@code gap} (reason {@code overflow}). {@code LAST} is always kept. Sessions live
+ * until {@code LAST} + {@link #GRACE_MS} or the deadline + grace, swept on every stream request (no timer); a node
+ * restart loses them.
+ * <b>Not yet (PR 5):</b> attempt in the chunk header / resume token and RESET (§12 reset rule), ledger or cross-node
+ * resume, cancel.
  */
 final class StreamHttp {
 
     static final String SSE = "text/event-stream";
     static final long GRACE_MS = 60_000;
     static final long HEARTBEAT_MS = 15_000;
-    static final int DEFAULT_MAX_SESSIONS = 64;
+    static final int MAX_SESSIONS_PER_AGENT = 64;
+    static final int MAX_SESSIONS = 4096;
+    static final long RETAIN_BYTES = 4L << 20;
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final HexFormat HEX = HexFormat.of();
 
@@ -73,11 +85,12 @@ final class StreamHttp {
     private final TokenStreams streams;
     private final long producerId;
     private final AtomicLong seq;
-    private final int maxSessions;
+    private final int maxPerAgent;
     private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, AtomicLong> perAgent = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> perAgent = new ConcurrentHashMap<>();
+    private final AtomicInteger total = new AtomicInteger();
 
-    StreamHttp(Swarm swarm, long producerId, AtomicLong seq, int maxSessions) {
+    StreamHttp(Swarm swarm, long producerId, AtomicLong seq, int maxPerAgent) {
         this.swarm = swarm;
         this.streams = swarm.tasks().streams();
         if (this.streams == null) {
@@ -85,7 +98,7 @@ final class StreamHttp {
         }
         this.producerId = producerId;
         this.seq = seq;
-        this.maxSessions = maxSessions;
+        this.maxPerAgent = maxPerAgent;
     }
 
     private long now() {
@@ -96,86 +109,127 @@ final class StreamHttp {
         return this.sessions.size();
     }
 
-    /** One caller-facing stream: the bound agent, the local sink, and the chunks retained for resume. */
+    /** What a reader gets next at a position. */
+    sealed interface Next permits Chunk, Gap, Ended, Wait { }
+
+    record Chunk(StreamChunk c) implements Next { }
+
+    /** {@code to} is -1 when unknown. */
+    record Gap(long from, long to, String reason) implements Next { }
+
+    record Ended(StreamChunk last) implements Next { }
+
+    enum Wait implements Next { INSTANCE }
+
+    /** One caller-facing stream: the bound agent, the local sink, and the retained chunks. */
     static final class Session {
         final String agent;
         final TokenStreams.Sink sink;
         final long deadlineMs;
         final ReentrantLock lock = new ReentrantLock();
+        final java.util.concurrent.locks.Condition grew = this.lock.newCondition();
         final ArrayDeque<StreamChunk> retained = new ArrayDeque<>(); // guarded by lock
+        long retainedBytes; // guarded by lock
+        long trimmedThrough = -1; // guarded by lock: highest seq trimmed out of retained
         final int retainMax;
+        final long retainBytes;
         final AtomicBoolean reading = new AtomicBoolean();
         volatile StreamChunk last;
         volatile long expiresMs;
 
-        Session(String agent, TokenStreams.Sink sink, long deadlineMs, int retainMax) {
+        Session(String agent, TokenStreams.Sink sink, long deadlineMs, int retainMax, long retainBytes) {
             this.agent = agent;
             this.sink = sink;
             this.deadlineMs = deadlineMs;
             this.retainMax = retainMax;
-            this.expiresMs = deadlineMs == TaskEnvelope.NO_DEADLINE ? Long.MAX_VALUE : deadlineMs + GRACE_MS;
+            this.retainBytes = retainBytes;
+            this.expiresMs = deadlineMs + GRACE_MS;
         }
 
-        /** Pulls what the sink has into the retained window (oldest dropped past retainMax). */
-        void pump(long waitMs) throws InterruptedException {
-            var c = this.sink.poll(waitMs, TimeUnit.MILLISECONDS);
-            if (c == null) {
-                return;
-            }
+        /** Moves what the sink holds into the retained window; never blocks (runs on producer threads too). */
+        void drain() {
             this.lock.lock();
             try {
-                for (; c != null; c = this.sink.poll(0, TimeUnit.MILLISECONDS)) {
+                StreamChunk c;
+                boolean any = false;
+                while ((c = this.sink.poll0()) != null) {
+                    any = true;
                     this.retained.addLast(c);
-                    if (this.retained.size() > this.retainMax) {
-                        this.retained.removeFirst();
-                    }
+                    this.retainedBytes += c.size();
                     if (c.last()) {
                         this.last = c;
                     }
-                }
-            } finally {
-                this.lock.unlock();
-            }
-        }
-
-        /** The first retained chunk with seq >= from; null when none yet; throws Gone when from was dropped. */
-        StreamChunk at(long from) throws Gone {
-            this.lock.lock();
-            try {
-                var first = this.retained.peekFirst();
-                if (first != null && from < first.chunkSeq()) {
-                    throw new Gone();
-                }
-                for (var c : this.retained) {
-                    if (c.chunkSeq() >= from) {
-                        return c;
+                    while (this.retained.size() > 1
+                            && (this.retained.size() > this.retainMax || this.retainedBytes > this.retainBytes)) {
+                        var old = this.retained.removeFirst(); // never the newest, so never a just-arrived LAST
+                        this.retainedBytes -= old.size();
+                        this.trimmedThrough = old.chunkSeq();
                     }
                 }
-                return null;
+                if (any || this.sink.dropped()) {
+                    this.grew.signalAll();
+                }
             } finally {
                 this.lock.unlock();
             }
         }
-    }
 
-    static final class Gone extends Exception {
-        Gone() {
-            super(null, null, false, false);
+        /** Waits up to {@code ms} for the retained window to change. */
+        void await(long ms) throws InterruptedException {
+            this.lock.lock();
+            try {
+                if (at(this.awaitFrom) == Wait.INSTANCE) {
+                    this.grew.await(ms, TimeUnit.MILLISECONDS);
+                }
+            } finally {
+                this.lock.unlock();
+            }
+        }
+
+        long awaitFrom; // set by the single reader before await
+
+        /** What a reader at {@code from} gets now. */
+        Next at(long from) {
+            drain();
+            this.lock.lock();
+            try {
+                if (from <= this.trimmedThrough) {
+                    var first = this.retained.peekFirst();
+                    return new Gap(from, first == null ? this.trimmedThrough : first.chunkSeq() - 1, "overflow");
+                }
+                for (var c : this.retained) {
+                    if (c.chunkSeq() == from) {
+                        return new Chunk(c);
+                    }
+                    if (c.chunkSeq() > from) {
+                        return new Gap(from, c.chunkSeq() - 1, "dropped");
+                    }
+                }
+                var l = this.last;
+                if (l != null && from > l.chunkSeq()) {
+                    return new Ended(l);
+                }
+                if (this.sink.dropped()) {
+                    return new Gap(from, -1, "overflow");
+                }
+                return Wait.INSTANCE;
+            } finally {
+                this.lock.unlock();
+            }
         }
     }
 
     /** {@code POST tasks/{pool}:stream}. */
     Response submit(SwarmGate.Agent agent, String pool, byte[] body, long deadlineMs, String traceparent) {
         sweep();
-        var count = this.perAgent.get(agent.id());
-        if (count == null) {
-            var fresh = new AtomicLong();
-            count = this.perAgent.putIfAbsent(agent.id(), fresh);
-            count = count == null ? fresh : count;
+        if (this.total.incrementAndGet() > MAX_SESSIONS) {
+            this.total.decrementAndGet();
+            return SwarmHttp.problem(503, "too many streams", "node session limit " + MAX_SESSIONS).response();
         }
-        if (count.incrementAndGet() > this.maxSessions) {
-            count.decrementAndGet();
-            return SwarmHttp.problem(503, "too many streams", "at most " + this.maxSessions + " open sessions per agent")
+        var n = this.perAgent.merge(agent.id(), 1, Integer::sum);
+        if (n > this.maxPerAgent) {
+            release(agent.id());
+            return SwarmHttp.problem(503, "too many streams", "at most " + this.maxPerAgent + " open sessions per agent")
                     .response();
         }
         var correlation = ReplyRouter.newId();
@@ -183,14 +237,18 @@ final class StreamHttp {
         var sid = new byte[16];
         RANDOM.nextBytes(sid);
         var key = HEX.formatHex(sid);
-        this.sessions.put(key, new Session(agent.id(), sink, deadlineMs, this.streams.config().sinkChunks()));
+        var s = new Session(agent.id(), sink, deadlineMs, this.streams.config().sinkChunks(), RETAIN_BYTES);
+        sink.onOffer(s::drain); // retain chunks produced before the first GET
+        this.sessions.put(key, s);
         try {
-            // the final reply goes to the caller's reply topic; the stream itself is read from the sink
+            // the final reply goes to the caller's reply topic (counted late there: Messaging Core follow-up)
             var env = new TaskEnvelope(correlation, correlation, this.swarm.replies().topic(), deadlineMs, traceparent,
                     "", "", "", body);
             this.swarm.tasks().submit(pool, 0, 0, env);
         } catch (RuntimeException e) {
-            drop(key);
+            if (this.sessions.remove(key, s)) {
+                closeSession(s);
+            }
             throw e;
         }
         var r = new Response(201, ResponseHeaders.of().set("content-type", SwarmHttp.CONTENT_TYPE),
@@ -199,23 +257,25 @@ final class StreamHttp {
         return r;
     }
 
-    private void drop(String key) {
-        var s = this.sessions.remove(key);
-        if (s != null) {
-            s.sink.close();
-            var c = this.perAgent.get(s.agent);
-            if (c != null) {
-                c.decrementAndGet();
-            }
-        }
+    private void release(String agent) {
+        this.total.decrementAndGet();
+        this.perAgent.computeIfPresent(agent, (k, v) -> v <= 1 ? null : v - 1);
     }
 
-    /** Drops expired sessions. */
+    private void closeSession(Session s) {
+        s.sink.close();
+        release(s.agent);
+    }
+
+    /** Drops expired sessions that have no reader; the CAS keeps a reader from attaching to a dropped one. */
     void sweep() {
         long now = now();
         for (var e : this.sessions.entrySet()) {
-            if (e.getValue().expiresMs < now && !e.getValue().reading.get()) {
-                drop(e.getKey());
+            var s = e.getValue();
+            if (s.expiresMs < now && s.reading.compareAndSet(false, true)) {
+                if (this.sessions.remove(e.getKey(), s)) {
+                    closeSession(s);
+                }
             }
         }
     }
@@ -223,6 +283,7 @@ final class StreamHttp {
     /** {@code GET replies/{session}}. */
     Response replies(SwarmGate.Agent agent, String key, Request request, Map<String, String> query)
             throws SwarmHttp.BadRequest {
+        sweep();
         var s = this.sessions.get(key);
         if (s == null || !s.agent.equals(agent.id()) || s.expiresMs < now()) {
             return SwarmHttp.problem(404, "not found", "no such session").response();
@@ -240,30 +301,27 @@ final class StreamHttp {
         if (!s.reading.compareAndSet(false, true)) {
             return SwarmHttp.problem(409, "session busy", "one reader at a time").response();
         }
-        try {
-            s.at(from);
-        } catch (Gone g) {
+        if (this.sessions.get(key) != s) { // swept between get and CAS
             s.reading.set(false);
-            return SwarmHttp.problem(410, "gone", "chunks before " + from + " are no longer retained").response();
+            return SwarmHttp.problem(404, "not found", "no such session").response();
         }
         var h = ResponseHeaders.of().set("content-type", binary ? SwarmHttp.CONTENT_TYPE : SSE)
                 .set("cache-control", "no-store");
-        return new Response(200, h, new Body.Stream(-1, new Reader(this, key, s, from, binary)));
+        return new Response(200, h, new Body.Stream(-1, new Reader(this, s, from, binary)));
     }
 
     /** Writes the session's chunks from {@code next}; one writer thread. */
     static final class Reader implements Body.Stream.Source {
         private final StreamHttp owner;
-        private final String key;
         private final Session s;
         private final boolean binary;
         private long next;
+        private boolean started;
         private boolean ended;
         private boolean closed;
 
-        Reader(StreamHttp owner, String key, Session s, long from, boolean binary) {
+        Reader(StreamHttp owner, Session s, long from, boolean binary) {
             this.owner = owner;
-            this.key = key;
             this.s = s;
             this.next = from;
             this.binary = binary;
@@ -274,39 +332,63 @@ final class StreamHttp {
             if (this.ended) {
                 return null;
             }
-            long waited = 0;
+            if (!this.started && !this.binary) {
+                this.started = true;
+                return utf8("retry: 1000\n\n");
+            }
+            long t0 = System.nanoTime();
             while (true) {
-                StreamChunk c;
-                try {
-                    c = this.s.at(this.next);
-                } catch (Gone g) {
-                    throw new java.io.IOException("reader fell behind the retained window");
-                }
-                if (c != null) {
-                    this.next = c.chunkSeq() + 1;
-                    if (c.last()) {
-                        this.ended = true;
-                        this.s.expiresMs = Math.min(this.s.expiresMs, this.owner.now() + GRACE_MS);
+                var n = this.s.at(this.next);
+                switch (n) {
+                    case Chunk(var c) -> {
+                        this.next = c.chunkSeq() + 1;
+                        if (c.last()) {
+                            end();
+                        }
+                        return ByteBuffer.wrap(this.binary ? c.toFrame().encode() : sse(c));
                     }
-                    return ByteBuffer.wrap(this.binary ? c.toFrame().encode() : sse(c));
-                }
-                if (this.owner.now() > this.s.deadlineMs) {
-                    this.ended = true;
-                    return ByteBuffer.wrap(this.binary
-                            ? new Frame(Frame.Type.ERROR, Frame.LAST, "deadline".getBytes(StandardCharsets.UTF_8)).encode()
-                            : "event: end\ndata: deadline\n\n".getBytes(StandardCharsets.UTF_8));
-                }
-                try {
-                    this.s.pump(250);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new java.io.InterruptedIOException();
-                }
-                waited += 250;
-                if (!this.binary && waited >= HEARTBEAT_MS) {
-                    return ByteBuffer.wrap(":\n\n".getBytes(StandardCharsets.UTF_8));
+                    case Ended(var l) -> { // reconnect after the end: the terminal state at once
+                        end();
+                        return ByteBuffer.wrap(this.binary
+                                ? StreamChunk.owned(l.streamHi(), l.streamLo(), l.chunkSeq(), l.flags(), new byte[0])
+                                        .toFrame().encode()
+                                : endEvent(l).getBytes(StandardCharsets.UTF_8));
+                    }
+                    case Gap g -> {
+                        end();
+                        var what = g.from() + " " + (g.to() < 0 ? "?" : Long.toString(g.to())) + " " + g.reason();
+                        return ByteBuffer.wrap(this.binary
+                                ? new Frame(Frame.Type.ERROR, Frame.LAST, ("gap " + what).getBytes(StandardCharsets.UTF_8))
+                                        .encode()
+                                : ("event: gap\ndata: " + what + "\n\nevent: end\ndata: error\n\n")
+                                        .getBytes(StandardCharsets.UTF_8));
+                    }
+                    case Wait w -> {
+                        if (this.owner.now() > this.s.deadlineMs) {
+                            this.ended = true;
+                            return ByteBuffer.wrap(this.binary
+                                    ? new Frame(Frame.Type.ERROR, Frame.LAST, "deadline".getBytes(StandardCharsets.UTF_8))
+                                            .encode()
+                                    : "event: end\ndata: deadline\n\n".getBytes(StandardCharsets.UTF_8));
+                        }
+                        try {
+                            this.s.awaitFrom = this.next;
+                            this.s.await(250);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new java.io.InterruptedIOException();
+                        }
+                        if (!this.binary && System.nanoTime() - t0 >= TimeUnit.MILLISECONDS.toNanos(HEARTBEAT_MS)) {
+                            return utf8(":\n\n");
+                        }
+                    }
                 }
             }
+        }
+
+        private void end() {
+            this.ended = true;
+            this.s.expiresMs = Math.min(this.s.expiresMs, this.owner.now() + GRACE_MS);
         }
 
         @Override
@@ -314,11 +396,17 @@ final class StreamHttp {
             if (!this.closed) {
                 this.closed = true;
                 this.s.reading.set(false);
-                if (this.ended && this.s.last != null) {
-                    this.owner.sweep();
-                }
             }
         }
+    }
+
+    private static ByteBuffer utf8(String s) {
+        return ByteBuffer.wrap(s.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String endEvent(StreamChunk last) {
+        var how = (last.flags() & Frame.CANCELLED) != 0 ? "cancelled" : (last.flags() & Frame.ERROR) != 0 ? "error" : "ok";
+        return "id: " + last.chunkSeq() + "\nevent: end\ndata: " + how + "\n\n";
     }
 
     /** One SSE event: {@code id}, {@code event: chunk}, one {@code data:} line per line; {@code LAST} adds an end event. */
@@ -340,8 +428,7 @@ final class StreamHttp {
             b.append('\n');
         }
         if (c.last()) {
-            var how = (c.flags() & Frame.CANCELLED) != 0 ? "cancelled" : (c.flags() & Frame.ERROR) != 0 ? "error" : "ok";
-            b.append("id: ").append(c.chunkSeq()).append("\nevent: end\ndata: ").append(how).append("\n\n");
+            b.append(endEvent(c));
         }
         return b.toString().getBytes(StandardCharsets.UTF_8);
     }
@@ -362,7 +449,7 @@ final class StreamHttp {
         }
         long deadline = held.envelope().deadlineMs();
         if (deadline != TaskEnvelope.NO_DEADLINE && now() > deadline) {
-            return SwarmHttp.cancelled("deadline").response();
+            return SwarmHttp.cancelled("deadline").response(); // the claim stays cached: the worker acks it
         }
         if (!c.last()) {
             var r = this.swarm.tasks().streamChunk(held, this.producerId, this.seq.incrementAndGet(), c);
@@ -371,14 +458,18 @@ final class StreamHttp {
             }
             return r.ok() ? new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE) : SwarmHttp.leaseProblem(r).response();
         }
+        sweep();
         LeaseResult r;
         try {
             long s = this.seq.addAndGet(2) - 1; // LAST uses s, the reply s + 1
             r = this.swarm.tasks().streamLast(held, this.producerId, s, c, "", c.bytes()).get(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            r = LeaseResult.NOT_IN_FLIGHT;
-        } catch (ExecutionException | TimeoutException e) {
+            return SwarmHttp.problem(503, "unavailable", "interrupted; retry the LAST chunk").response();
+        } catch (TimeoutException e) {
+            // the ack may still land: not a lease answer; a retried LAST is deduplicated by chunkSeq
+            return SwarmHttp.problem(504, "timeout", "LAST not durable within 30 s; retry").response();
+        } catch (ExecutionException e) {
             r = LeaseResult.NOT_IN_FLIGHT;
         }
         release.run();
