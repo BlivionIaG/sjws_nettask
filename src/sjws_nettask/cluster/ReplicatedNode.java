@@ -284,6 +284,7 @@ public final class ReplicatedNode implements ClusterNode {
     }
 
     /** The election no-op, after it is applied. {@code term} and the applied index. */
+    @Override
     public void onNoopApplied(GroupId groupId, BiConsumer<Long, Long> listener) {
         group(groupId).addNoopListener(listener);
     }

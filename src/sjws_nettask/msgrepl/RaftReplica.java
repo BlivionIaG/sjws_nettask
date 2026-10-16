@@ -36,7 +36,6 @@ import sjws_nettask.cluster.GroupId;
 import sjws_nettask.cluster.GroupOptions;
 import sjws_nettask.cluster.NodeId;
 import sjws_nettask.cluster.NotLeaderException;
-import sjws_nettask.cluster.ReplicatedNode;
 import sjws_nettask.cluster.ReplicationGroup;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
@@ -100,9 +99,7 @@ final class RaftReplica implements Replica {
         this.skipTo = ledgerEnd;
         recover(ledgerEnd);
         this.group = node.openGroup(groupId, options, this::onCommitted);
-        if (node instanceof ReplicatedNode rn) {
-            rn.onNoopApplied(groupId, (term, index) -> this.readyTerm = term);
-        }
+        node.onNoopApplied(groupId, (term, index) -> this.readyTerm = term);
     }
 
     /** Reads the stamp file: resume after the last batch wholly in the ledger; drops stamps past it. */

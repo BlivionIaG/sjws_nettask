@@ -341,6 +341,10 @@ class AppendDurabilityTest {
             }
 
             @Override
+            public void onNoopApplied(GroupId groupId, BiConsumer<Long, Long> listener) {
+            }
+
+            @Override
             public SnapshotControl snapshots(GroupId groupId) {
                 return null;
             }
