@@ -73,6 +73,18 @@ public final class TaskService {
         this.waitSliceNanos = waitSliceNanos;
     }
 
+    /** S2c: set only when {@code sjws.swarm.stream.enabled} is on; null otherwise (no stream class loaded). */
+    private volatile TokenStreams streams;
+
+    /** Wires the S2c stream produce path ({@link SwarmModule}, flag on only). */
+    void bindStreams(TokenStreams streams) {
+        this.streams = streams;
+    }
+
+    TokenStreams streams() {
+        return this.streams;
+    }
+
     /** Wires the node's {@link ReplyRouter} so in-process replies wake the caller directly. Idempotent. */
     void bindLocalReplies(ReplyRouter replies) {
         this.localReplies = replies;
@@ -728,5 +740,62 @@ public final class TaskService {
         deliverLocal(to, reply); // before produce: RTT must not wait on the ledger hand-off
         var r = this.topics.partition(to).produce(producerId, seq, reply.encode(), Durability.ASYNC);
         return r.durable().thenApplyAsync(off -> ack(t), ACKER);
+    }
+
+    /**
+     * S2c: writes one non-final chunk of {@code t}'s token stream (§5.2), fenced by attempt: a chunk from an attempt
+     * older than one that already produced is {@code STALE_ATTEMPT} and not written. {@code c}'s stream id is the
+     * task's correlation id. Chunks use the agent's own {@code (producerId, seq)}. Throws
+     * {@link IllegalStateException} when streaming is off.
+     */
+    public LeaseResult streamChunk(Task t, long producerId, long seq, sjws_nettask.swarm.wire.StreamChunk c) {
+        var s = requireStreams();
+        if (c.last()) {
+            throw new IllegalArgumentException("LAST goes through streamLast");
+        }
+        var r = s.admit(t);
+        if (r != LeaseResult.OK) {
+            return r;
+        }
+        s.write(t, producerId, seq, c);
+        return LeaseResult.OK;
+    }
+
+    /**
+     * S2c: ends {@code t}'s stream (§4.4 order): writes {@code last} (a {@code LAST} chunk, ASYNC) with
+     * {@code (producerId, seq)} and the reply with {@code (producerId, seq + 1)}, and acks the task (fenced) only
+     * once both are durable. A stale attempt gets {@code STALE_ATTEMPT} and writes nothing.
+     */
+    public CompletableFuture<LeaseResult> streamLast(Task t, long producerId, long seq,
+            sjws_nettask.swarm.wire.StreamChunk last, String contentType, byte[] body) {
+        var s = requireStreams();
+        if (!last.last()) {
+            throw new IllegalArgumentException("streamLast needs a LAST chunk");
+        }
+        var to = t.envelope().replyTo();
+        if (to.isEmpty()) {
+            throw new IllegalArgumentException("task has no replyTo");
+        }
+        var r = s.admit(t);
+        if (r != LeaseResult.OK) {
+            return CompletableFuture.completedFuture(r);
+        }
+        var lastDurable = s.write(t, producerId, seq, last).durable();
+        var reply = t.envelope().reply(contentType, body);
+        deliverLocal(to, reply);
+        var replyDurable = this.topics.partition(to).produce(producerId, seq + 1, reply.encode(), Durability.ASYNC).durable();
+        return CompletableFuture.allOf(lastDurable, replyDurable).thenApplyAsync(x -> {
+            var a = ack(t);
+            s.settle(t);
+            return a;
+        }, ACKER);
+    }
+
+    private TokenStreams requireStreams() {
+        var s = this.streams;
+        if (s == null) {
+            throw new IllegalStateException("streaming is off (sjws.swarm.stream.enabled)");
+        }
+        return s;
     }
 }

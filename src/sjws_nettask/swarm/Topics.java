@@ -72,6 +72,33 @@ public final class Topics implements AutoCloseable {
         }
     }
 
+    /**
+     * The open partition for {@code topic}, opening it <b>without</b> a {@code .dlq} if needed
+     * ({@code Partition.openWithoutDlq}, #225): the lazy stream shards {@code stream.<node>#i} (S2c, #224).
+     */
+    public Partition partitionWithoutDlq(String topic) {
+        if (this.closed) {
+            throw new IllegalStateException("closed");
+        }
+        var p = this.open.get(topic);
+        if (p != null) {
+            return p;
+        }
+        this.opening.lock();
+        try {
+            p = this.open.get(topic);
+            if (p == null) {
+                p = Partition.openWithoutDlq(this.dir, topic, this.policy, this.clockMs);
+                this.open.put(topic, p);
+            }
+            return p;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        } finally {
+            this.opening.unlock();
+        }
+    }
+
     public boolean isOpen(String topic) {
         return this.open.containsKey(topic);
     }
