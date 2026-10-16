@@ -356,8 +356,20 @@ final class RaftGroup {
         return append(batch, null);
     }
 
+    /** {@link #append(List, Durability, long)} with no term condition. */
+    static final long ANY_TERM = -1L;
+
     /** {@code durability} null uses {@link GroupOptions#durability()}. */
     CompletableFuture<CommittedIndex> append(List<ByteBuffer> batch, Durability durability) {
+        return append(batch, durability, ANY_TERM);
+    }
+
+    /**
+     * {@code expectedTerm} {@link #ANY_TERM} appends in whatever term this leader is in; otherwise the
+     * append is refused with {@link TermChangedException} unless {@code term == expectedTerm}, checked
+     * under the lock together with the role, so no step-down or re-election can slip in between.
+     */
+    CompletableFuture<CommittedIndex> append(List<ByteBuffer> batch, Durability durability, long expectedTerm) {
         boolean marked = durability == Durability.STRICT && options.durability() != Durability.STRICT;
         boolean strict = marked || options.durability() == Durability.STRICT;
         if (batch == null || batch.isEmpty()) {
@@ -378,6 +390,10 @@ final class RaftGroup {
         try {
             if (role != Role.LEADER) {
                 future.completeExceptionally(notLeader());
+                return future;
+            }
+            if (expectedTerm != ANY_TERM && term != expectedTerm) {
+                future.completeExceptionally(new TermChangedException(groupId, expectedTerm, term));
                 return future;
             }
             if (deliveries.overLimit()) {
