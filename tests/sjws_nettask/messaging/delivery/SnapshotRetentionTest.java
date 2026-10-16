@@ -187,7 +187,7 @@ class SnapshotRetentionTest {
         try (var q = open()) {
             assertEquals(before, q.canonicalState());
             assertEquals("after", new String(q.poll("g", "c", 5, 1000).getFirst().payload(), StandardCharsets.UTF_8));
-            try (var log = SegmentedLog.open(dir.resolve("t"), SEG)) { assertTrue(log.startOffset() > 0); }
+            assertTrue(diskStart(dir.resolve("t")) > 0); // q holds the directory lock
         }
     }
 
@@ -210,7 +210,12 @@ class SnapshotRetentionTest {
         assertThrows(IllegalArgumentException.class, () -> new RetentionPolicy(0, 2));
     }
 
-    static String segs(Path d) throws IOException { try (var l = SegmentedLog.open(d, SEG)) { return l.segments().toString(); } }
+    /** Segment files on disk (the open partition holds the directory lock, so no second SegmentedLog). */
+    static String segs(Path d) throws IOException {
+        try (var s = java.nio.file.Files.list(d)) {
+            return s.map(f -> f.getFileName().toString()).filter(n -> n.endsWith(".log")).sorted().toList().toString();
+        }
+    }
 
     /**
      * One more append after a burst. The writer may coalesce the burst into a single batch larger
@@ -344,6 +349,14 @@ class SnapshotRetentionTest {
             assertEquals(0, log.segments().get(1).bytes());
             long b2 = log.segments().get(2).baseOffset();
             log.scanFrom(0, rb -> assertTrue(rb.baseOffset() == 1 || rb.baseOffset() >= b2));
+        }
+    }
+
+    /** Lowest segment base offset on disk, read from file names: the live partition holds the directory lock. */
+    static long diskStart(java.nio.file.Path d) throws java.io.IOException {
+        try (var s = java.nio.file.Files.list(d)) {
+            return s.map(f -> f.getFileName().toString()).filter(n -> n.matches("\\d{20}\\.log"))
+                    .mapToLong(n -> Long.parseLong(n.substring(0, 20))).min().orElse(0);
         }
     }
 }
