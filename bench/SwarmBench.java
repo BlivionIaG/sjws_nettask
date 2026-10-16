@@ -104,6 +104,7 @@ public class SwarmBench {
                     reqreply(s, Integer.parseInt(wr[1]), secs, Integer.parseInt(wr[0]));
                 }
                 case "http" -> http(dir, a[2], secs);
+                case "echo" -> echo(Integer.parseInt(a[2]), secs);
                 default -> throw new IllegalArgumentException(mode);
             }
         }
@@ -254,6 +255,7 @@ public class SwarmBench {
     }
 
     /** The measured-call index carried in the first 8 bytes of a reqreply body, or -1 (warm-up, short body). */
+    static final boolean DBG = Boolean.getBoolean("sjws.bench.dbg");
     static int hopIndex(byte[] body, long warm, int measured) {
         if (body.length < 8) return -1;
         long v = 0;
@@ -281,6 +283,7 @@ public class SwarmBench {
         var submitted = new long[measured];
         var claimed = new long[measured];
         var written = new long[measured];
+        var replyStart = new long[measured];
         var stop = new AtomicBoolean();
         var pool = new ArrayList<Thread>(workers);
         for (int w = 0; w < workers; w++) {
@@ -296,6 +299,7 @@ public class SwarmBench {
                     for (Task task : got) {
                         int k = hopIndex(task.envelope().body(), warm0, measured);
                         if (k >= 0) claimed[k] = tc;
+                        if (DBG && seen.incrementAndGet() < 3) System.err.println("DBG body len=" + task.envelope().body().length + " first=" + java.util.Arrays.toString(java.util.Arrays.copyOf(task.envelope().body(), 12)) + " k=" + k + " warm=" + warm0);
                     }
                     if (dropEvery > 0) {
                         var keep = new ArrayList<Task>(got.size());
@@ -307,6 +311,11 @@ public class SwarmBench {
                     }
                     var bodies = new ArrayList<byte[]>(got.size());
                     for (Task task : got) bodies.add(task.envelope().body());
+                    long trs = System.nanoTime();
+                    for (byte[] b : bodies) {
+                        int k = hopIndex(b, warm0, measured);
+                        if (k >= 0) replyStart[k] = trs;
+                    }
                     t.replyAll(got, producer, seq + 1, "", bodies);
                     long tw = System.nanoTime();
                     for (byte[] b : bodies) {
@@ -322,36 +331,52 @@ public class SwarmBench {
         var done = new AtomicLong();
         var ok = new AtomicLong();
         var failed = new AtomicLong();
-        long start = System.nanoTime();
         var delivered = new long[lat.length];
         // Bodies preallocated before the clock starts (each carries its call index), so the timed loop allocates
         // nothing per call: the same workload as the old single reused buffer, plus 8 index bytes.
         var calls = new byte[(int) total][];
         for (int i = 0; i < calls.length; i++) {
             calls[i] = new byte[256];
-            for (int b = 0; b < 8; b++) calls[i][b] = (byte) (i >>> (56 - 8 * b));
+            for (int b = 0; b < 8; b++) calls[i][b] = (byte) ((long) i >>> (56 - 8 * b));
         }
-        for (long i = 0; i < total; i++) {
-            long due = start + i * gap;
-            while (System.nanoTime() < due) Thread.onSpinWait();
-            long idx = i - warm;
-            var body = calls[(int) i];
-            var f = s.replies().call("echo", "", body, System.currentTimeMillis() + callDeadlineMs, "");
-            if (idx >= 0) submitted[(int) idx] = System.nanoTime();
-            f.whenComplete((r, e) -> {
-                if (idx >= 0) {
-                    if (e == null) {
-                        long td = System.nanoTime();
-                        delivered[(int) idx] = td;
-                        lat[(int) idx] = td - due;
-                        ok.incrementAndGet();
-                    } else {
-                        failed.incrementAndGet(); // a failure is a failure, never a 0 us sample
+        // The open-loop generator runs on its own thread, named "sb-gen" (the Linux thread name), so a wrapper can
+        // pin it to a CPU set disjoint from the server and workers (bench/pin-gen.sh). With
+        // -Dsjws.bench.genReady=<file> it waits until that file exists, i.e. until the wrapper has pinned it.
+        var ready = System.getProperty("sjws.bench.genReady");
+        var startHolder = new long[1];
+        var gen = Thread.ofPlatform().name("sb-gen").unstarted(() -> {
+            try {
+                while (ready != null && !Files.exists(Path.of(ready))) Thread.sleep(10);
+            } catch (InterruptedException e) {
+                return;
+            }
+            long start = System.nanoTime();
+            startHolder[0] = start;
+            for (long i = 0; i < total; i++) {
+                long due = start + i * gap;
+                while (System.nanoTime() < due) Thread.onSpinWait();
+                long idx = i - warm;
+                var body = calls[(int) i];
+                var f = s.replies().call("echo", "", body, System.currentTimeMillis() + callDeadlineMs, "");
+                if (idx >= 0) submitted[(int) idx] = System.nanoTime();
+                f.whenComplete((r, e) -> {
+                    if (idx >= 0) {
+                        if (e == null) {
+                            long td = System.nanoTime();
+                            delivered[(int) idx] = td;
+                            lat[(int) idx] = td - due;
+                            ok.incrementAndGet();
+                        } else {
+                            failed.incrementAndGet(); // a failure is a failure, never a 0 us sample
+                        }
                     }
-                }
-                done.incrementAndGet();
-            });
-        }
+                    done.incrementAndGet();
+                });
+            }
+        });
+        gen.start();
+        gen.join();
+        long start = startHolder[0];
         long until = System.nanoTime() + 30_000_000_000L;
         while (done.get() < total && System.nanoTime() < until) Thread.sleep(1);
         stop.set(true);
@@ -385,9 +410,95 @@ public class SwarmBench {
                     names[x], h == 0 ? 0 : pct(v, h, 0.999) / 1e3));
         }
         System.out.println(sb);
+        var hs = new long[4][lat.length];
+        for (int k = 0; k < lat.length; k++) {
+            boolean all = lat[k] >= 0 && claimed[k] != 0 && written[k] != 0;
+            long due = start + (k + warm) * gap;
+            hs[0][k] = all ? submitted[k] - due : -1; hs[1][k] = all ? claimed[k] - submitted[k] : -1;
+            hs[2][k] = all ? written[k] - claimed[k] : -1; hs[3][k] = all ? delivered[k] - written[k] : -1;
+        }
+        // raw absolute stamps (ns since start) for outlier attribution: submitted claimed replyStart written delivered
+        var ab = new long[5][lat.length];
+        for (int k = 0; k < lat.length; k++) {
+            long[] src = {submitted[k], claimed[k], replyStart[k], written[k], delivered[k]};
+            for (int x = 0; x < 5; x++) ab[x][k] = src[x] == 0 ? -1 : src[x] - start;
+        }
+        dump(start, gap, warm, lat, hs[0], hs[1], hs[2], hs[3], ab[0], ab[1], ab[2], ab[3], ab[4]);
         if (failed.get() + missing > 0) {
             System.out.println("INVALID: " + failed.get() + " failed, " + missing + " missing of " + lat.length);
             invalid = true;
         }
+    }
+
+    /** Diagnostic dump (-Dsjws.bench.dump=file): one line per measured call: due as JVM uptime ns, then the given columns (ns, -1 = absent). */
+    static void dump(long startNano, long gap, long warm, long[]... cols) throws java.io.IOException {
+        var f = System.getProperty("sjws.bench.dump");
+        if (f == null) return;
+        long n0 = System.nanoTime(), up0 = java.lang.management.ManagementFactory.getRuntimeMXBean().getUptime() * 1_000_000L;
+        try (var w = new java.io.PrintWriter(new java.io.BufferedWriter(new java.io.FileWriter(f)))) {
+            for (int k = 0; k < cols[0].length; k++) {
+                long due = startNano + (k + warm) * gap;
+                var sb = new StringBuilder().append(due - n0 + up0);
+                for (var c : cols) sb.append(' ').append(c[k]);
+                w.println(sb);
+            }
+        }
+    }
+
+    /** Baseline: the reqreply generator, bodies and statistic, but the "server" is one worker thread taking calls
+     *  off a blocking queue and completing the caller's future with the same body. No swarm, no ledger. */
+    static void echo(int rate, double secs) throws Exception {
+        record Call(byte[] body, java.util.concurrent.CompletableFuture<byte[]> f) {}
+        var q = new java.util.concurrent.LinkedBlockingQueue<Call>();
+        var stop = new AtomicBoolean();
+        var worker = Thread.ofPlatform().name("worker-0").start(() -> {
+            try {
+                while (!stop.get()) {
+                    var c = q.poll(50, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (c != null) c.f().complete(c.body());
+                }
+            } catch (InterruptedException e) { }
+        });
+        long gap = 1_000_000_000L / rate;
+        long warm = (long) (2e9 / gap), total = warm + (long) (secs * 1e9 / gap);
+        int measured = (int) (total - warm);
+        var lat = new long[measured];
+        java.util.Arrays.fill(lat, -1);
+        var done = new AtomicLong();
+        var calls = new byte[(int) total][];
+        for (int i = 0; i < calls.length; i++) calls[i] = new byte[256];
+        var echoStart = new long[1];
+        var ready = System.getProperty("sjws.bench.genReady");
+        var gen = Thread.ofPlatform().name("sb-gen").unstarted(() -> {
+            try {
+                while (ready != null && !Files.exists(Path.of(ready))) Thread.sleep(10);
+            } catch (InterruptedException e) { return; }
+            long start = System.nanoTime();
+            echoStart[0] = start;
+            for (long i = 0; i < total; i++) {
+                long due = start + i * gap;
+                while (System.nanoTime() < due) Thread.onSpinWait();
+                long idx = i - warm;
+                var f = new java.util.concurrent.CompletableFuture<byte[]>();
+                q.add(new Call(calls[(int) i], f));
+                f.whenComplete((r, e) -> {
+                    if (idx >= 0 && e == null) lat[(int) idx] = System.nanoTime() - due;
+                    done.incrementAndGet();
+                });
+            }
+        });
+        gen.start();
+        gen.join();
+        long until = System.nanoTime() + 30_000_000_000L;
+        while (done.get() < total && System.nanoTime() < until) Thread.sleep(1);
+        stop.set(true);
+        worker.join();
+        var okLat = java.util.Arrays.stream(lat).filter(v -> v >= 0).toArray();
+        int n = okLat.length;
+        System.out.printf("echo workers=1 rate=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f n=%d missing=%d%n", rate,
+                n == 0 ? 0 : pct(okLat, n, 0.50) / 1e3, n == 0 ? 0 : pct(okLat, n, 0.99) / 1e3,
+                n == 0 ? 0 : pct(okLat, n, 1.0) / 1e3, n, measured - n);
+        dump(echoStart[0], gap, warm, lat);
+        if (n < measured) invalid = true;
     }
 }
