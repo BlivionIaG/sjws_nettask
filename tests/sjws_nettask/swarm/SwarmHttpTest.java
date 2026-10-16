@@ -18,6 +18,7 @@ package sjws_nettask.swarm;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -296,6 +297,18 @@ class SwarmHttpTest {
         Thread.sleep(5);
         post("/swarm/v1/tasks/s:claim", new byte[0]);
         assertTrue(this.http.claimedCount() <= 1);
+    }
+
+    /** An extend answered CANCELLED did not move the lease, so the cached claim keeps its deadline. */
+    @Test
+    void extendCancelledKeepsTheCachedClaimDeadline() {
+        var held = new Task("p", 7, 2, 1_000, null, 1);
+        assertSame(held, SwarmHttp.afterExtend(held, sjws_nettask.messaging.delivery.LeaseResult.CANCELLED, 99_000));
+        assertEquals(1_000, SwarmHttp.afterExtend(held, sjws_nettask.messaging.delivery.LeaseResult.CANCELLED, 99_000).leaseDeadlineMs());
+        assertSame(held, SwarmHttp.afterExtend(held, sjws_nettask.messaging.delivery.LeaseResult.STALE_ATTEMPT, 99_000));
+        var moved = SwarmHttp.afterExtend(held, sjws_nettask.messaging.delivery.LeaseResult.OK, 99_000);
+        assertEquals(99_000, moved.leaseDeadlineMs());
+        assertEquals(1, moved.shard());
     }
 
     /** #224: CANCELLED (extend only) is a 409 problem+json with its own type; the other refusals keep theirs. */

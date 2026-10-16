@@ -268,14 +268,19 @@ final class SwarmHttp implements Handler {
         }
         if (!"extend".equals(verb) || !r.ok() && r != LeaseResult.CANCELLED) { // CANCELLED: still held, settle it
             this.claimed.remove(id);
-        } else if (held != null) {
+        } else if (held != null && r.ok()) { // CANCELLED did not move the lease: keep the cached deadline
             long until = this.swarm.topics().clock().getAsLong() + number(query, "visibilityMs", 30_000, 1, 3_600_000);
-            this.claimed.put(id, held.withDeadline(until));
+            this.claimed.put(id, afterExtend(held, r, until));
         }
         if (r.ok()) {
             return new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE);
         }
         return leaseProblem(r).response();
+    }
+
+    /** The cached claim after an extend: moved to {@code until} only on OK; CANCELLED (or any refusal) keeps it. */
+    static Task afterExtend(Task held, LeaseResult r, long until) {
+        return r.ok() ? held.withDeadline(until) : held;
     }
 
     static final String CANCELLED_TYPE = "https://sjws.dev/problems/cancelled";
