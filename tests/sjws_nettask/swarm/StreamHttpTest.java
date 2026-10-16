@@ -201,6 +201,13 @@ class StreamHttpTest {
         assertTrue(resumed.startsWith("retry: 1000\n\nid: 2\n"), resumed);
         assertTrue(drain(req("GET", "a", session + "?from=1", new byte[0])).startsWith("retry: 1000\n\nid: 1\n"));
         assertEquals(409, chunk(c, 3, 0, "late").status(), "the lease is settled after LAST");
+        // #232: the stream's final reply on reply.<node> is consumed by the router without counting late
+        long until = System.nanoTime() + 5_000_000_000L;
+        while (this.swarm.replies().streams() > 0 && System.nanoTime() < until) {
+            Thread.sleep(10);
+        }
+        assertEquals(0, this.swarm.replies().streams());
+        assertEquals(0, this.swarm.replies().lateReplies());
     }
 
     @Test
@@ -265,6 +272,7 @@ class StreamHttpTest {
             startStream("");
         }
         assertEquals(503, post("/swarm/v1/tasks/gen:stream", SwarmHttpTest.task("p").encode()).status());
+        assertEquals(StreamHttp.MAX_SESSIONS_PER_AGENT, this.swarm.replies().streams(), "a refused submit registers nothing");
         assertEquals(201, req("POST", "b", "/swarm/v1/tasks/gen:stream", SwarmHttpTest.task("p").encode()).status(),
                 "the cap is per agent");
         assertEquals(405, req("DELETE", "a", session, new byte[0]).status());
@@ -407,11 +415,32 @@ class StreamHttpTest {
         streamsOn();
         startStream("?deadlineMs=1000");
         assertEquals(1, this.http.streams().sessionCount());
+        assertEquals(1, this.swarm.replies().streams(), "registered with the reply router (#232)");
         this.now.addAndGet(1000 + StreamHttp.GRACE_MS + 1);
         this.http.streams().sweep();
         assertEquals(0, this.http.streams().sessionCount());
+        assertEquals(0, this.swarm.replies().streams(), "cleared on expiry without LAST");
         for (int i = 0; i < StreamHttp.MAX_SESSIONS_PER_AGENT; i++) {
             startStream(""); // the per-agent count was released
         }
+    }
+
+    /** #232: a refused router registration fails the submit explicitly and leaves no session or count behind. */
+    @Test
+    void routerRefusalIs503() {
+        System.setProperty(ReplyRouter.MAX_STREAMS_PROPERTY, "1");
+        try {
+            this.swarm.close();
+            open();
+            streamsOn();
+        } finally {
+            System.clearProperty(ReplyRouter.MAX_STREAMS_PROPERTY);
+        }
+        startStream("");
+        var r = post("/swarm/v1/tasks/gen:stream", SwarmHttpTest.task("p").encode());
+        assertEquals(503, r.status());
+        assertTrue(SwarmHttpTest.text(r).contains("reply router stream limit"), SwarmHttpTest.text(r));
+        assertEquals(1, this.http.streams().sessionCount());
+        assertEquals(1, this.swarm.replies().streams());
     }
 }

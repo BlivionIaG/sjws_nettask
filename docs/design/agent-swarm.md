@@ -238,7 +238,7 @@ There are two delivery legs. Messaging Core specifies the ledger leg; the HTTP l
             - A `LAST` chunk writes the reply (body = the chunk bytes) and acks once both are durable. If that takes over 30 s, the answer is 504 (retry).
             - A 409 `cancelled` carries `"reason":"cancelled"` (extend) or `"reason":"deadline"` (a chunk past the task deadline). The claim stays cached, so the worker acks it.
         - **Before the flag may be enabled:**
-            - The stream's final reply is still counted as late on `reply.<node>` (Messaging Core fix, `/workspace/bench-out/s2c-pr4/late-last.md`).
+            - ~~Final reply counted late on `reply.<node>`~~: resolved by #232; `:stream` registers the session with `ReplyRouter.registerStream(id, deadline + 60 s)` (503 if refused) and every session exit calls `clearStream`.
             - The resume token must carry the attempt (PR 5, reset rule item 4).
         - **Also PR 5:** the attempt in the chunk header and `RESET`, resume from the ledger or across nodes, and cancel. PR 4 serves only a worker on the same node as the session.
   - Chunks are produced with the **agent's own `producerId`/`seq`**, not a per-stream producer id. Producer dedup state (≤ 4096 seqs per producerId) is never evicted, so per-stream ids would leak forever; producer-id expiry is recorded as a messaging gap (§4.8). **Consumers drop duplicates by `(streamId, chunkSeq)`**, which they already track in order to reorder.

@@ -124,6 +124,7 @@ final class StreamHttp {
     /** One caller-facing stream: the bound agent, the local sink, and the retained chunks. */
     static final class Session {
         final String agent;
+        final byte[] correlation;
         final TokenStreams.Sink sink;
         final long deadlineMs;
         final ReentrantLock lock = new ReentrantLock();
@@ -137,8 +138,10 @@ final class StreamHttp {
         volatile StreamChunk last;
         volatile long expiresMs;
 
-        Session(String agent, TokenStreams.Sink sink, long deadlineMs, int retainMax, long retainBytes) {
+        Session(String agent, byte[] correlation, TokenStreams.Sink sink, long deadlineMs, int retainMax,
+                long retainBytes) {
             this.agent = agent;
+            this.correlation = correlation;
             this.sink = sink;
             this.deadlineMs = deadlineMs;
             this.retainMax = retainMax;
@@ -233,15 +236,28 @@ final class StreamHttp {
                     .response();
         }
         var correlation = ReplyRouter.newId();
-        var sink = this.streams.open(correlation);
+        // #232: the final reply on reply.<node> is the router's, not late; refused past the router's cap
+        if (!this.swarm.replies().registerStream(correlation, deadlineMs + GRACE_MS)) {
+            release(agent.id());
+            return SwarmHttp.problem(503, "too many streams", "reply router stream limit reached; retry later")
+                    .response();
+        }
+        TokenStreams.Sink sink;
+        try {
+            sink = this.streams.open(correlation);
+        } catch (RuntimeException e) {
+            this.swarm.replies().clearStream(correlation);
+            release(agent.id());
+            throw e;
+        }
         var sid = new byte[16];
         RANDOM.nextBytes(sid);
         var key = HEX.formatHex(sid);
-        var s = new Session(agent.id(), sink, deadlineMs, this.streams.config().sinkChunks(), RETAIN_BYTES);
+        var s = new Session(agent.id(), correlation, sink, deadlineMs, this.streams.config().sinkChunks(), RETAIN_BYTES);
         sink.onOffer(s::drain); // retain chunks produced before the first GET
         this.sessions.put(key, s);
         try {
-            // the final reply goes to the caller's reply topic (counted late there: Messaging Core follow-up)
+            // the final reply goes to this node's reply topic, registered above (#232)
             var env = new TaskEnvelope(correlation, correlation, this.swarm.replies().topic(), deadlineMs, traceparent,
                     "", "", "", body);
             this.swarm.tasks().submit(pool, 0, 0, env);
@@ -262,9 +278,14 @@ final class StreamHttp {
         this.perAgent.computeIfPresent(agent, (k, v) -> v <= 1 ? null : v - 1);
     }
 
+    /** Every exit path of a session (expiry, submit failure; cancel in PR 5) ends here. */
     private void closeSession(Session s) {
-        s.sink.close();
-        release(s.agent);
+        try {
+            s.sink.close();
+        } finally {
+            this.swarm.replies().clearStream(s.correlation); // no-op once the LAST reply was read
+            release(s.agent);
+        }
     }
 
     /** Drops expired sessions that have no reader; the CAS keeps a reader from attaching to a dropped one. */
