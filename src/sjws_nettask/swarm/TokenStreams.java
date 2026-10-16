@@ -265,6 +265,11 @@ public final class TokenStreams {
         }
     }
 
+    /** The periodic sweep's fence purge (stream flag on); the inline purge at {@link #FENCE_PURGE_AT} is a backstop. */
+    void purgeFences(long now) {
+        purge(now);
+    }
+
     private void purge(long now) {
         this.fences.entrySet().removeIf(e -> {
             var f = e.getValue();

@@ -81,8 +81,9 @@ import sjws_nettask.swarm.wire.StreamChunk;
  * attempt gets {@code RESET(current)} first. A bare {@code chunkSeq} means the current attempt.
  * <b>Sweep:</b> expired sessions and cancel entries are also swept every {@link #SWEEP_MS} by one shared daemon thread,
  * started only when the first {@code StreamHttp} is built (flag on).
- * <b>Not yet:</b> ledger or cross-node resume; cancel reaches another node's lease only once a worker there claims the
- * cancel record.
+ * <b>Cancel across nodes:</b> the record carries the task deadline; whichever node claims it creates the cancelled
+ * entry in its own {@link CancelSet} (no prior tracking needed), so a lease held there gets 409 / {@code CANCELLED}.
+ * <b>Not yet:</b> ledger or cross-node resume.
  */
 final class StreamHttp {
 
@@ -165,6 +166,7 @@ final class StreamHttp {
         this.sweeps.incrementAndGet();
         sweep();
         this.streams.cancels().sweep(now());
+        this.streams.purgeFences(now()); // idle fences leave here, off the worker thread (#234 review)
     }
 
     private long now() {
@@ -213,6 +215,8 @@ final class StreamHttp {
         final AtomicBoolean exited = new AtomicBoolean();
         /** Where the task landed (cancel key); set once after submit. */
         volatile TaskService.Placed placed;
+        /** The task-side cancel ran (at most once, by cancel or by submit). */
+        final AtomicBoolean cancelApplied = new AtomicBoolean();
 
         Session(String agent, byte[] correlation, TokenStreams.Sink sink, long deadlineMs, int retainMax,
                 long retainBytes) {
@@ -352,11 +356,12 @@ final class StreamHttp {
         if (!s.agent.equals(agent.id()) && !admin) {
             return SwarmHttp.problem(403, "forbidden", "only the submitter or an admin may cancel").response();
         }
-        var placed = s.placed;
-        if (placed != null && markCancelled(s)) {
-            this.streams.cancels().cancel(placed.topic(), placed.offset()); // worker: next chunk or :extend
+        // #234 review 3: a cancel before the submit is placed still cancels. markCancelled ends the session now; the
+        // task-side cancel (CancelSet + ledger record) runs here if placed, else submit runs it right after placing
+        // (volatile cancelled/placed on both sides, applyCancel at most once).
+        if (markCancelled(s)) {
             try {
-                this.swarm.tasks().produceCancel(placed, s.correlation);
+                applyCancel(s);
             } finally {
                 s.expiresMs = Math.min(s.expiresMs, now() + GRACE_MS); // kept for idempotent cancels and the reader
                 exit(s);
@@ -377,6 +382,26 @@ final class StreamHttp {
     }
 
     /** {@code POST tasks/{pool}:stream}. */
+    /** The task side of a cancel: mark this node's CancelSet and produce the ledger record; once, and only when placed. */
+    private void applyCancel(Session s) {
+        var placed = s.placed;
+        if (placed == null || !s.cancelApplied.compareAndSet(false, true)) {
+            return;
+        }
+        this.streams.cancels().cancel(placed.topic(), placed.offset()); // worker: next chunk or :extend
+        this.swarm.tasks().produceCancel(placed, s.deadlineMs, s.correlation);
+    }
+
+    /** Test hook: runs after the session is visible and before the task is placed. */
+    volatile Runnable beforePlace;
+
+    private final AtomicLong cancelRejections = new AtomicLong();
+
+    /** Streams refused with 503 because the node's CancelSet was full (#234 review 4). */
+    long cancelRejections() {
+        return this.cancelRejections.get();
+    }
+
     Response submit(SwarmGate.Agent agent, String pool, byte[] body, long deadlineMs, String traceparent) {
         sweep();
         if (this.total.incrementAndGet() > MAX_SESSIONS) {
@@ -389,9 +414,17 @@ final class StreamHttp {
             return SwarmHttp.problem(503, "too many streams", "at most " + this.maxPerAgent + " open sessions per agent")
                     .response();
         }
+        // #234 review 4: a stream always has cancel and deadline state; a full CancelSet refuses it loudly, before submit
+        if (!this.streams.cancels().reserve()) {
+            this.cancelRejections.incrementAndGet();
+            release(agent.id());
+            return SwarmHttp.problem(503, "too many streams", "cancel set limit " + CancelSet.MAX_ENTRIES + "; retry later")
+                    .response();
+        }
         var correlation = ReplyRouter.newId();
         // #232: the final reply on reply.<node> is the router's, not late; refused past the router's cap
         if (!this.swarm.replies().registerStream(correlation, deadlineMs + GRACE_MS)) {
+            this.streams.cancels().unreserve();
             release(agent.id());
             return SwarmHttp.problem(503, "too many streams", "reply router stream limit reached; retry later")
                     .response();
@@ -401,6 +434,7 @@ final class StreamHttp {
             sink = this.streams.open(correlation);
         } catch (RuntimeException e) {
             this.swarm.replies().clearStream(correlation);
+            this.streams.cancels().unreserve();
             release(agent.id());
             throw e;
         }
@@ -414,11 +448,22 @@ final class StreamHttp {
             // the final reply goes to this node's reply topic, registered above (#232)
             var env = new TaskEnvelope(correlation, correlation, this.swarm.replies().topic(), deadlineMs, traceparent,
                     "", "", "", body);
-            var placed = this.swarm.tasks().submitStream(pool, env);
+            var hook = this.beforePlace;
+            if (hook != null) {
+                hook.run();
+            }
+            TaskService.Placed placed;
+            try {
+                placed = this.swarm.tasks().submitStream(pool, env);
+            } catch (RuntimeException e) {
+                this.streams.cancels().unreserve();
+                throw e;
+            }
+            this.streams.cancels().trackReserved(placed.topic(), placed.offset(), deadlineMs);
             s.placed = placed;
-            // past the deadline the probe makes :extend answer CANCELLED/deadline; full: the task still runs, the
-            // HTTP checks (chunk and extend) still see its deadline
-            this.streams.cancels().track(placed.topic(), placed.offset(), deadlineMs);
+            if (s.cancelled) { // cancelled before it was placed (#234 review 3): cancel the task now
+                applyCancel(s);
+            }
         } catch (RuntimeException e) {
             if (this.sessions.remove(key, s)) {
                 exit(s);

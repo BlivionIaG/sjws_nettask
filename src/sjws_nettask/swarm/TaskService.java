@@ -462,14 +462,14 @@ public final class TaskService {
 
     /**
      * S2c PR 5: produces the opaque cancel record of the task at {@code target} on that task's own topic (an ordinary
-     * produce, no new messaging entry type; §12 ruling). A worker that claims the record applies it to its node's
-     * {@link CancelSet} and acks it; it is never handed out as a task. Streaming must be on.
+     * produce, no new messaging entry type; §12 ruling). A claim that reads the record applies it to its node's
+     * {@link CancelSet} (creating the entry if that node never saw the task) and acks it; it is never handed out as a task. Streaming must be on.
      */
-    void produceCancel(Placed target, byte[] correlationId) {
+    void produceCancel(Placed target, long deadlineMs, byte[] correlationId) {
         requireStreams();
         var p = this.topics.partition(target.topic());
         p.subscribe(WORKERS, true);
-        p.produce(0, 0, CancelSet.record(target.offset(), correlationId), Durability.ASYNC);
+        p.produce(0, 0, CancelSet.record(target.offset(), deadlineMs, correlationId), Durability.ASYNC);
     }
 
     /**
@@ -613,7 +613,7 @@ public final class TaskService {
             } catch (IllegalArgumentException e) {
                 var st = this.streams; // S2c PR 5: with streaming off, never anything but bad-envelope
                 if (st != null && CancelSet.isRecord(d.payload())) {
-                    st.cancels().cancel(p.topic(), CancelSet.recordTarget(d.payload()));
+                    st.cancels().apply(p.topic(), CancelSet.recordTarget(d.payload()), CancelSet.recordDeadline(d.payload()));
                     p.ack(WORKERS, d.offset(), d.attempt());
                     continue;
                 }

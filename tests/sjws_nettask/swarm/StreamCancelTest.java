@@ -231,13 +231,167 @@ class StreamCancelTest {
         assertEquals(before + 1, after, "one opaque record on the task's own topic");
         // a claim applies and acks the record; nothing is handed out
         assertEquals(204, post("w", "/swarm/v1/tasks/gen:claim").status());
-        // a remote cancel (record only, no local mark) is applied by the claim that reads it
+        // a remote cancel (record only, never tracked on this node: no track() call) is applied by the claim
         var cs = this.swarm.tasks().streams().cancels();
-        assertTrue(cs.track(topic, 999, this.now.get() + 60_000));
-        this.swarm.topics().partition(topic).produce(0, 0, CancelSet.record(999, new byte[16]));
         assertNull(cs.reason(topic, 999, this.now.get()));
+        int size = cs.size();
+        this.swarm.topics().partition(topic).produce(0, 0, CancelSet.record(999, this.now.get() + 60_000, new byte[16]));
         assertEquals(204, post("w", "/swarm/v1/tasks/gen:claim").status());
-        assertEquals("cancelled", cs.reason(topic, 999, this.now.get()));
+        assertEquals("cancelled", cs.reason(topic, 999, this.now.get()), "created by apply");
+        assertEquals(size + 1, cs.size());
+        // it lives until the record's deadline + grace
+        this.now.addAndGet(60_000 + CancelSet.GRACE_MS + 1);
+        cs.sweep(this.now.get());
+        assertNull(cs.reason(topic, 999, this.now.get()));
+    }
+
+    @Test
+    void cancelTakesEffectOnAnotherNodeAfterATakeover() throws Exception {
+        // node B shares the ledger; enabled last, so the task partition opens with B's probe (B serves the lease)
+        var b = Swarm.sharing(this.swarm, "nodeb", 7, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
+        try {
+            var bStreams = b.enableStreams(TokenStreams.Config.DEFAULT);
+            var bHttp = new SwarmHttp(b, 8, GATE);
+            java.util.function.BiFunction<String, byte[], Response> onB = (target, body) -> bHttp.handle(new Request("POST",
+                    target, RequestHeaders.of(Map.of("x-agent", List.of("w"))), null, false, null, SwarmHttpTest.body(body)));
+            var session = start("");
+            // attempt 1 on node A, lease lost; node B takes it over with a higher attempt (ledger delivery count)
+            var c1 = claim();
+            long a1 = held(c1.lease()).attempt();
+            assertEquals(204, chunk(c1, 0, 0, StreamChunk.FIRST, "a").status());
+            assertEquals(204, post("w", "/swarm/v1/leases/" + c1.lease() + ":nack").status());
+            var ls = SwarmHttpTest.leases(onB.apply("/swarm/v1/tasks/gen:claim?visibilityMs=60000", new byte[0]));
+            assertEquals(1, ls.size());
+            var lease = ls.get(0).id();
+            var t = heldOn(bHttp, lease);
+            assertTrue(t.attempt() > a1, "takeover on another node has a higher attempt");
+            var topic = TaskService.topic(t.pool(), t.shard());
+            assertNull(bStreams.cancels().reason(topic, t.offset(), this.now.get()), "B never tracked the task");
+            var corr = ByteBuffer.wrap(t.envelope().correlationId());
+            long hi = corr.getLong(), lo = corr.getLong();
+            java.util.function.Function<StreamChunk, Response> chunkB = sc -> onB.apply(
+                    "/swarm/v1/leases/" + lease + ":chunk", sc.toFrame().encode());
+            assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 0, StreamChunk.FIRST, "b0".getBytes())).status());
+            // the submitter cancels on node A; B learns only through the ledger record
+            assertEquals("{\"state\":\"cancelled\"}",
+                    SwarmHttpTest.text(post("a", "/swarm/v1/tasks/" + key(session) + ":cancel")));
+            assertEquals(204, onB.apply("/swarm/v1/tasks/gen:claim", new byte[0]).status(), "B applies and acks the record");
+            assertEquals("cancelled", bStreams.cancels().reason(topic, t.offset(), this.now.get()));
+            var r = chunkB.apply(new StreamChunk(hi, lo, 0, 1, 0, "b1".getBytes()));
+            assertEquals(409, r.status(), "B's worker learns on its next chunk");
+            assertTrue(SwarmHttpTest.text(r).contains("\"reason\":\"cancelled\""));
+            var ext = onB.apply("/swarm/v1/leases/" + lease + ":extend?visibilityMs=1000", new byte[0]);
+            assertEquals(409, ext.status(), "and on :extend (B's probe)");
+            assertTrue(SwarmHttpTest.text(ext).contains("\"reason\":\"cancelled\""));
+            // the worker ends the stream and acks
+            assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 2, Frame.LAST | Frame.CANCELLED, new byte[0])).status());
+            assertEquals(0, this.swarm.tasks().counts("gen").workers().inFlight());
+        } finally {
+            b.replies().close();
+        }
+    }
+
+    @Test
+    void aRemoteNodeHoldingTheTaskAppliesTheRecordOnItsNextClaim() {
+        var b = Swarm.sharing(this.swarm, "nodeb", 7, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
+        try {
+            b.enableStreams(TokenStreams.Config.DEFAULT);
+            var bHttp = new SwarmHttp(b, 8, GATE);
+            var session = start("");
+            assertEquals(200, post("a", "/swarm/v1/tasks/" + key(session) + ":cancel").status());
+            // A's own claim never runs: B claims both the task and the record
+            var claim = bHttp.handle(new Request("POST", "/swarm/v1/tasks/gen:claim", RequestHeaders.of(Map.of("x-agent",
+                    List.of("w"))), null, false, null, SwarmHttpTest.body(new byte[0])));
+            // the task precedes the record: handed out first, then the next claim applies the record
+            assertEquals(200, claim.status());
+            {
+                var lease = SwarmHttpTest.leases(claim).get(0).id();
+                assertEquals(204, bHttp.handle(new Request("POST", "/swarm/v1/tasks/gen:claim", RequestHeaders.of(Map.of(
+                        "x-agent", List.of("w"))), null, false, null, SwarmHttpTest.body(new byte[0]))).status());
+                var ext = bHttp.handle(new Request("POST", "/swarm/v1/leases/" + lease + ":extend?visibilityMs=1000",
+                        RequestHeaders.of(Map.of("x-agent", List.of("w"))), null, false, null,
+                        SwarmHttpTest.body(new byte[0])));
+                assertEquals(409, ext.status());
+            }
+        } finally {
+            b.replies().close();
+        }
+    }
+
+    @Test
+    void cancelBeforeTheTaskIsPlacedStillCancels() throws Exception {
+        var sh = streamHttp();
+        var answer = new java.util.concurrent.atomic.AtomicReference<Response>();
+        sh.beforePlace = () -> {
+            sh.beforePlace = null;
+            // the session is visible, nothing placed yet
+            var key = sessionKeys(sh).iterator().next();
+            answer.set(post("a", "/swarm/v1/tasks/" + key + ":cancel"));
+        };
+        var session = start("");
+        assertEquals(200, answer.get().status());
+        assertEquals("{\"state\":\"cancelled\"}", SwarmHttpTest.text(answer.get()), "never 200 running");
+        assertEquals(1, sh.cancels());
+        // the task side ran once placed: the claim applies the record and rejects the cancelled task
+        assertEquals(204, post("w", "/swarm/v1/tasks/gen:claim").status());
+        assertEquals(204, post("w", "/swarm/v1/tasks/gen:claim").status());
+        assertEquals(1, this.swarm.tasks().counts("gen").workers().deadLettered(), "rejected: cancelled");
+        var text = StreamHttpTest.drain(req("GET", "a", session, new byte[0]));
+        assertTrue(text.endsWith("event: end\ndata: cancelled\n\n"), text);
+        assertEquals("{\"state\":\"cancelled\"}",
+                SwarmHttpTest.text(post("a", "/swarm/v1/tasks/" + key(session) + ":cancel")), "idempotent");
+    }
+
+    @Test
+    void aFullCancelSetRefusesTheStreamWith503() {
+        var sh = streamHttp();
+        var cs = this.swarm.tasks().streams().cancels();
+        for (int i = cs.size(); i < CancelSet.MAX_ENTRIES; i++) {
+            assertTrue(cs.track("filler", i, this.now.get() + 600_000));
+        }
+        long enq = this.swarm.tasks().counts("gen").workers().enqueued();
+        var r = req("POST", "a", "/swarm/v1/tasks/gen:stream", SwarmHttpTest.task("prompt").encode());
+        assertEquals(503, r.status(), SwarmHttpTest.text(r));
+        assertEquals(1, sh.cancelRejections());
+        assertEquals(1, cs.refused());
+        assertEquals(enq, this.swarm.tasks().counts("gen").workers().enqueued(), "nothing submitted");
+        assertEquals(0, this.swarm.replies().streams(), "router slot given back");
+        // room again: streams are accepted, with cancel state
+        this.now.addAndGet(600_000 + CancelSet.GRACE_MS + 1);
+        start("");
+    }
+
+    StreamHttp streamHttp() {
+        try {
+            var f = SwarmHttp.class.getDeclaredField("streams");
+            f.setAccessible(true);
+            return (StreamHttp) f.get(this.http);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    static java.util.Set<String> sessionKeys(StreamHttp sh) {
+        try {
+            var f = StreamHttp.class.getDeclaredField("sessions");
+            f.setAccessible(true);
+            return ((Map<String, ?>) f.get(sh)).keySet();
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    static Task heldOn(SwarmHttp h, String lease) {
+        try {
+            var f = SwarmHttp.class.getDeclaredField("claimed");
+            f.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            var m = (Map<String, Task>) f.get(h);
+            return m.get(lease);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 
     @Test
@@ -341,8 +495,9 @@ class StreamCancelTest {
         assertTrue(cs.track("t", 2, this.now.get() - 1));
         assertEquals("deadline", cs.reason("t", 2, this.now.get()));
         assertFalse(cs.probe("t").isCancelled("g", 3));
-        assertTrue(CancelSet.isRecord(CancelSet.record(5, new byte[16])));
-        assertEquals(5, CancelSet.recordTarget(CancelSet.record(5, new byte[16])));
+        assertTrue(CancelSet.isRecord(CancelSet.record(5, 77, new byte[16])));
+        assertEquals(5, CancelSet.recordTarget(CancelSet.record(5, 77, new byte[16])));
+        assertEquals(77, CancelSet.recordDeadline(CancelSet.record(5, 77, new byte[16])));
         assertFalse(CancelSet.isRecord(new byte[CancelSet.RECORD_BYTES]));
         assertEquals(2, cs.sweep(this.now.get() + CancelSet.GRACE_MS + 11));
         assertEquals(0, cs.size());
