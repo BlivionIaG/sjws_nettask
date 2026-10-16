@@ -266,7 +266,7 @@ final class SwarmHttp implements Handler {
                 return problem(404, "unknown lease verb", verb).response();
             }
         }
-        if (!"extend".equals(verb) || !r.ok()) {
+        if (!"extend".equals(verb) || !r.ok() && r != LeaseResult.CANCELLED) { // CANCELLED: still held, settle it
             this.claimed.remove(id);
         } else if (held != null) {
             long until = this.swarm.topics().clock().getAsLong() + number(query, "visibilityMs", 30_000, 1, 3_600_000);
@@ -275,7 +275,18 @@ final class SwarmHttp implements Handler {
         if (r.ok()) {
             return new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE);
         }
-        return problem(409, "lease not held", r.name()).response();
+        return leaseProblem(r).response();
+    }
+
+    static final String CANCELLED_TYPE = "https://sjws.dev/problems/cancelled";
+
+    /** Every non-OK {@link LeaseResult} is a 409; CANCELLED (extend only, #224) carries its own problem type. */
+    static Problem leaseProblem(LeaseResult r) {
+        return switch (r) {
+            case CANCELLED -> new Problem(409, "cancelled", "task cancelled; stop and ack the lease", CANCELLED_TYPE);
+            case NOT_IN_FLIGHT, STALE_ATTEMPT -> problem(409, "lease not held", r.name());
+            case OK -> throw new IllegalArgumentException("OK is not a problem");
+        };
     }
 
     /** Drops claims whose lease ran out (the messaging lease is authoritative; this is only the envelope cache). */
@@ -411,9 +422,13 @@ final class SwarmHttp implements Handler {
         return new Response(status, h, Body.Bytes.of(data));
     }
 
-    record Problem(int status, String title, String detail) {
+    record Problem(int status, String title, String detail, String type) {
+        Problem(int status, String title, String detail) {
+            this(status, title, detail, "about:blank");
+        }
+
         Response response() {
-            var json = "{\"type\":\"about:blank\",\"title\":" + quote(this.title) + ",\"status\":" + this.status
+            var json = "{\"type\":" + quote(this.type) + ",\"title\":" + quote(this.title) + ",\"status\":" + this.status
                     + ",\"detail\":" + quote(this.detail) + "}";
             var h = ResponseHeaders.of().set("content-type", "application/problem+json");
             return new Response(this.status, h, Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
