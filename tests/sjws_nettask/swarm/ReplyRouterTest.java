@@ -408,8 +408,72 @@ class ReplyRouterTest {
             else System.setProperty(ReplyRouter.MAX_STREAMS_PROPERTY, old);
         }
         System.setProperty(ReplyRouter.MAX_STREAMS_PROPERTY, "-1");
-        try {
-            assertThrows(IllegalArgumentException.class, () -> Swarm.open(this.dir, "bad", 7));
+        try (var swarm = Swarm.open(this.dir, "bad", 7)) { // never breaks a router: falls back to the default
+            assertEquals(ReplyRouter.DEFAULT_MAX_STREAMS, swarm.replies().maxStreams());
+        } finally {
+            if (old == null) System.clearProperty(ReplyRouter.MAX_STREAMS_PROPERTY);
+            else System.setProperty(ReplyRouter.MAX_STREAMS_PROPERTY, old);
+        }
+    }
+
+    /** #232 nit: an invalid or negative cap logs a WARN and falls back to the default. */
+    @Test
+    void invalidMaxRegisteredFallsBackToTheDefault() {
+        assertEquals(ReplyRouter.DEFAULT_MAX_STREAMS, ReplyRouter.resolveMaxStreams(null));
+        assertEquals(ReplyRouter.DEFAULT_MAX_STREAMS, ReplyRouter.resolveMaxStreams(" "));
+        assertEquals(ReplyRouter.DEFAULT_MAX_STREAMS, ReplyRouter.resolveMaxStreams("-5"));
+        assertEquals(ReplyRouter.DEFAULT_MAX_STREAMS, ReplyRouter.resolveMaxStreams("lots"));
+        assertEquals(ReplyRouter.DEFAULT_MAX_STREAMS, ReplyRouter.resolveMaxStreams("99999999999"));
+        assertEquals(0, ReplyRouter.resolveMaxStreams("0"));
+        assertEquals(12, ReplyRouter.resolveMaxStreams(" 12 "));
+    }
+
+    /** #232 nit: concurrent registrations never exceed the cap; re-registration, clear and sweep keep slots exact. */
+    @Test
+    void concurrentRegistrationNeverExceedsTheCap() throws Exception {
+        String old = System.getProperty(ReplyRouter.MAX_STREAMS_PROPERTY);
+        System.setProperty(ReplyRouter.MAX_STREAMS_PROPERTY, "100");
+        try (var swarm = Swarm.open(this.dir, "race", 7)) {
+            var r = swarm.replies();
+            int threads = 8, each = 50;
+            long dl = System.currentTimeMillis() + 60_000;
+            var shared = new byte[threads][];
+            for (int i = 0; i < threads; i++) shared[i] = ReplyRouter.newId();
+            var accepted = new java.util.concurrent.atomic.AtomicInteger();
+            var maxSeen = new java.util.concurrent.atomic.AtomicInteger();
+            var go = new java.util.concurrent.CountDownLatch(1);
+            var ts = new java.util.ArrayList<Thread>();
+            for (int t = 0; t < threads; t++) {
+                ts.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        go.await();
+                        for (int i = 0; i < each; i++) {
+                            if (r.registerStream(ReplyRouter.newId(), dl)) accepted.incrementAndGet();
+                            r.registerStream(shared[i % threads], dl); // same keys from every thread
+                            maxSeen.accumulateAndGet(r.streamSlots(), Math::max);
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }));
+            }
+            go.countDown();
+            for (var t : ts) t.join(30_000);
+            assertEquals(100, r.streams());
+            assertEquals(100, r.streamSlots(), "slots match held keys");
+            assertTrue(maxSeen.get() <= 100, "slots never above the cap: " + maxSeen.get());
+            // 100 fresh-or-shared keys fit; every other fresh registration was refused and counted
+            assertTrue(accepted.get() <= 100);
+            assertTrue(r.streamRejections() >= threads * each - 100L);
+            for (var s : shared) r.clearStream(s);
+            r.clearStream(shared[0]); // a second clear releases nothing
+            assertEquals(r.streams(), r.streamSlots());
+            r.sweepStreams(dl);
+            assertEquals(0, r.streams());
+            assertEquals(0, r.streamSlots());
+            assertTrue(r.registerStream(ReplyRouter.newId(), dl), "slots freed by sweep are reusable");
+            r.close();
+            assertEquals(0, r.streamSlots(), "close releases every slot");
         } finally {
             if (old == null) System.clearProperty(ReplyRouter.MAX_STREAMS_PROPERTY);
             else System.setProperty(ReplyRouter.MAX_STREAMS_PROPERTY, old);
