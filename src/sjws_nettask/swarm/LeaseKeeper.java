@@ -32,7 +32,8 @@ import sjws_nettask.messaging.delivery.LeaseResult;
  * −1.4 % batched vs about −9 % unbatched). The single-lease form is never called.
  * <ul>
  * <li>A lease answered {@code NOT_IN_FLIGHT} or {@code STALE_ATTEMPT} is dropped and reported to the listener:
- * the worker lost it and must not settle it.</li>
+ * the worker lost it and must not settle it. A lease answered {@code CANCELLED} (#224) is dropped and reported
+ * the same way, but the worker still holds it: it should stop and ack it.</li>
  * <li>A lease is never extended past its task's deadline: once {@code now + visibilityMs} would pass it, the lease
  * leaves the batch and runs out at its current deadline, which is already no later than the task's.</li>
  * </ul>

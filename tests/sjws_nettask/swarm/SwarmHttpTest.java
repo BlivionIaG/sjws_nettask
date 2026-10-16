@@ -297,4 +297,24 @@ class SwarmHttpTest {
         post("/swarm/v1/tasks/s:claim", new byte[0]);
         assertTrue(this.http.claimedCount() <= 1);
     }
+
+    /** #224: CANCELLED (extend only) is a 409 problem+json with its own type; the other refusals keep theirs. */
+    @Test
+    void cancelledLeaseMapsTo409WithACancelledProblemType() {
+        var r = SwarmHttp.leaseProblem(sjws_nettask.messaging.delivery.LeaseResult.CANCELLED).response();
+        assertEquals(409, r.status());
+        assertEquals("application/problem+json", r.headers().get("content-type"));
+        var json = new String(bytes(r), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"type\":\"" + SwarmHttp.CANCELLED_TYPE + "\""), json);
+        assertTrue(SwarmHttp.CANCELLED_TYPE.endsWith("/cancelled"));
+        for (var other : java.util.List.of(sjws_nettask.messaging.delivery.LeaseResult.NOT_IN_FLIGHT,
+                sjws_nettask.messaging.delivery.LeaseResult.STALE_ATTEMPT)) {
+            var o = SwarmHttp.leaseProblem(other).response();
+            assertEquals(409, o.status());
+            var j = new String(bytes(o), java.nio.charset.StandardCharsets.UTF_8);
+            assertTrue(j.contains("\"type\":\"about:blank\"") && j.contains(other.name()), j);
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> SwarmHttp.leaseProblem(sjws_nettask.messaging.delivery.LeaseResult.OK));
+    }
 }
