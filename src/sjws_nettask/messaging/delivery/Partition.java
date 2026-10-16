@@ -96,8 +96,13 @@ public final class Partition implements AutoCloseable {
     private final java.util.concurrent.locks.ReentrantLock pinLock = new java.util.concurrent.locks.ReentrantLock();
     static final String PINS_FILE = "retain-from.pins";
 
+    /** Optional, set at open (#224): {@code null} unless swarm installs one; read only by {@code extend}. */
+    private final CancelProbe cancelProbe;
+
     private Partition(String topic, SegmentedLog log, LedgerWriter writer, DeliveryState state, Partition dlq, LongSupplier clockMs,
-            Path logDir, java.util.Collection<Long> snaps, long recoveredFromSnapshot, long replayedEntries) {
+            Path logDir, java.util.Collection<Long> snaps, long recoveredFromSnapshot, long replayedEntries,
+            CancelProbe cancelProbe) {
+        this.cancelProbe = cancelProbe;
         this.logDir = logDir;
         this.snapshots.addAll(snaps);
         this.recoveredFromSnapshot = recoveredFromSnapshot;
@@ -133,6 +138,28 @@ public final class Partition implements AutoCloseable {
      */
     public static Partition open(Path dir, String topic, RetryPolicy policy, LongSupplier clockMs, Durability durability,
             long segmentBytes, boolean deadLetterQueue) throws IOException {
+        return open(dir, topic, policy, clockMs, durability, segmentBytes, deadLetterQueue, null);
+    }
+
+    /**
+     * Opens {@code dir/<topic>} with no {@code <topic>.dlq} partition, the default writer (ASYNC) and segment size:
+     * the open path for short-lived topics such as lazy swarm stream shards ({@code stream.<node>#i}, #224) that
+     * should not cost a second writer, syncer and snapshotter. Dead-letter semantics are as in
+     * {@link #open(Path, String, RetryPolicy, LongSupplier, Durability, long, boolean)} with {@code false}.
+     */
+    public static Partition openWithoutDlq(Path dir, String topic, RetryPolicy policy, LongSupplier clockMs)
+            throws IOException {
+        return open(dir, topic, policy, clockMs, Durability.ASYNC, SegmentedLog.DEFAULT_SEGMENT_BYTES, false, null);
+    }
+
+    /**
+     * As {@link #open(Path, String, RetryPolicy, LongSupplier, Durability, long, boolean)}, installing
+     * {@code cancelProbe} (may be {@code null}: exactly the behaviour without one). The probe is asked only by
+     * {@code extend}, after the lease fence, and makes it return {@link LeaseResult#CANCELLED} (#224). It is not
+     * installed on this topic's {@code .dlq} partition.
+     */
+    public static Partition open(Path dir, String topic, RetryPolicy policy, LongSupplier clockMs, Durability durability,
+            long segmentBytes, boolean deadLetterQueue, CancelProbe cancelProbe) throws IOException {
         if (topic.isEmpty() || topic.contains("/") || topic.contains("\\")) throw new IllegalArgumentException("topic");
         boolean isDlq = topic.endsWith(DLQ_SUFFIX);
         Partition dlq = isDlq || !deadLetterQueue ? null
@@ -185,7 +212,8 @@ public final class Partition implements AutoCloseable {
             else Files.deleteIfExists(logDir.resolve(snapName(so)));
         }
         var pinned = readPins(logDir); // before any thread starts: a corrupt pin file fails the open cleanly
-        var p = new Partition(topic, log, new LedgerWriter(log, durability), st, dlq, clockMs, logDir, keep, fromSnap, replayed[0]);
+        var p = new Partition(topic, log, new LedgerWriter(log, durability), st, dlq, clockMs, logDir, keep, fromSnap, replayed[0],
+                cancelProbe);
         p.pins = pinned;
         p.publish();
         return p;
@@ -500,6 +528,9 @@ public final class Partition implements AutoCloseable {
     /**
      * Heartbeat: moves the lease of {@code offset} (held under {@code attempt}) to {@code now + visibilityMs}.
      * Appends one EXTEND record. The new deadline may be earlier than the current one (shortening is allowed).
+     * With a {@link CancelProbe} installed and reporting the offset cancelled, returns {@link LeaseResult#CANCELLED}
+     * after the fence ({@code NOT_IN_FLIGHT}/{@code STALE_ATTEMPT} win) and writes nothing: the lease keeps its
+     * current deadline.
      */
     public LeaseResult extend(String group, long offset, int attempt, long visibilityMs) {
         if (visibilityMs < 1) throw new IllegalArgumentException("visibility");
@@ -507,6 +538,8 @@ public final class Partition implements AutoCloseable {
         try {
             var r = fence(state.group(group).inFlight.get(offset), attempt);
             if (r != null) return r;
+            var probe = cancelProbe;
+            if (probe != null && probe.isCancelled(group, offset)) return LeaseResult.CANCELLED; // not extended, not released
             append(new LedgerEntry.Extend(group, clockMs.getAsLong() + visibilityMs, new long[] {offset}, new int[] {attempt}), null);
             return LeaseResult.OK;
         } finally {
@@ -527,8 +560,10 @@ public final class Partition implements AutoCloseable {
             var okOff = new long[offsets.length];
             var okAtt = new int[offsets.length];
             int n = 0;
+            var probe = cancelProbe;
             for (int i = 0; i < offsets.length; i++) { // a duplicate offset is written twice; applying it is idempotent
                 var r = fence(g.inFlight.get(offsets[i]), attempts[i]);
+                if (r == null && probe != null && probe.isCancelled(group, offsets[i])) r = LeaseResult.CANCELLED;
                 if (r == null) { okOff[n] = offsets[i]; okAtt[n] = attempts[i]; n++; r = LeaseResult.OK; }
                 out.add(r);
             }
