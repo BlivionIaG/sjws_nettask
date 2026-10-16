@@ -291,6 +291,113 @@ class StreamCancelTest {
         }
     }
 
+    /** Waits until A's shard reader has handed {@code n} chunks to sinks (it runs on its own thread). */
+    void awaitLedgerChunks(long n) throws InterruptedException {
+        var streams = this.swarm.tasks().streams();
+        long until = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+        while (streams.ledgerChunks() < n && System.nanoTime() < until) {
+            Thread.sleep(5);
+        }
+        assertEquals(n, streams.ledgerChunks(), "chunks read from stream.cancel#i");
+    }
+
+    @Test
+    void chunksFromATakeoverOnAnotherNodeReachTheReaderOnTheSubmitter() throws Exception {
+        var b = Swarm.sharing(this.swarm, "nodeb", 7, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
+        try {
+            b.enableStreams(TokenStreams.Config.DEFAULT);
+            var bHttp = new SwarmHttp(b, 8, GATE);
+            java.util.function.BiFunction<String, byte[], Response> onB = (target, body) -> bHttp.handle(new Request("POST",
+                    target, RequestHeaders.of(Map.of("x-agent", List.of("w"))), null, false, null, SwarmHttpTest.body(body)));
+            var session = start(""); // A is the submitter; its sink (the reader) is open
+            var aStreams = this.swarm.tasks().streams();
+            assertTrue(aStreams.reading(), "the shard reader starts with the first sink");
+            // attempt 1: a worker on A streams two chunks, then loses the lease
+            var c1 = claim();
+            long a1 = held(c1.lease()).attempt();
+            assertEquals(204, chunk(c1, 0, 0, StreamChunk.FIRST, "a0").status());
+            assertEquals(204, chunk(c1, 0, 1, 0, "a1").status());
+            assertEquals(204, post("w", "/swarm/v1/leases/" + c1.lease() + ":nack").status());
+            // node B takes over at a higher attempt and streams to the end
+            var ls = SwarmHttpTest.leases(onB.apply("/swarm/v1/tasks/gen:claim?visibilityMs=60000", new byte[0]));
+            assertEquals(1, ls.size());
+            var lease = ls.get(0).id();
+            var t = heldOn(bHttp, lease);
+            long a2 = t.attempt();
+            assertTrue(a2 > a1);
+            var corr = ByteBuffer.wrap(t.envelope().correlationId());
+            long hi = corr.getLong(), lo = corr.getLong();
+            java.util.function.Function<StreamChunk, Response> chunkB = sc -> onB.apply(
+                    "/swarm/v1/leases/" + lease + ":chunk", sc.toFrame().encode());
+            assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 0, StreamChunk.FIRST, "b0".getBytes())).status());
+            assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 1, 0, "b1".getBytes())).status());
+            assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 2, Frame.LAST, new byte[0])).status());
+            // B wrote to the submitter's shard, never to its own
+            assertTrue(this.swarm.topics().isOpen("stream.cancel#0"));
+            assertFalse(this.swarm.topics().isOpen("stream.nodeb#0"), "no chunk goes to the worker node's shards");
+            // A's reader: a0/a1 came in-process (their ledger copies are skipped), B's three from the ledger
+            awaitLedgerChunks(3);
+            var sink = sink();
+            assertEquals(1, sink.resets(), "RESET(" + a2 + ") queued when B's first chunk arrived");
+            assertEquals(a2, sink.attempt());
+            assertEquals(0, sink.staleChunks());
+            assertFalse(sink.dropped());
+            assertTrue(sink.complete(), "LAST from B ends the stream on A");
+            var text = StreamHttpTest.drain(req("GET", "a", session, new byte[0], "last-event-id", a1 + ".1"));
+            assertTrue(text.startsWith("retry: 1000\n\nevent: reset\ndata: " + a2 + "\n\nid: " + a2
+                    + ".0\nevent: chunk\ndata: b0\n\nid: " + a2 + ".1\nevent: chunk\ndata: b1\n"), text);
+            assertTrue(text.endsWith("id: " + a2 + ".2\nevent: end\ndata: ok\n\n"), text);
+            assertFalse(text.contains("data: a"), text);
+            assertEquals(0, this.swarm.tasks().counts("gen").workers().inFlight(), "B acked after LAST");
+        } finally {
+            b.replies().close();
+        }
+    }
+
+    @Test
+    void chunksFromAFirstWorkerOnAnotherNodeReachTheReaderOnTheSubmitter() throws Exception {
+        var b = Swarm.sharing(this.swarm, "nodeb", 7, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
+        try {
+            b.enableStreams(TokenStreams.Config.DEFAULT);
+            var bHttp = new SwarmHttp(b, 8, GATE);
+            java.util.function.BiFunction<String, byte[], Response> onB = (target, body) -> bHttp.handle(new Request("POST",
+                    target, RequestHeaders.of(Map.of("x-agent", List.of("w"))), null, false, null, SwarmHttpTest.body(body)));
+            var session = start("");
+            var ls = SwarmHttpTest.leases(onB.apply("/swarm/v1/tasks/gen:claim?visibilityMs=60000", new byte[0]));
+            assertEquals(1, ls.size());
+            var lease = ls.get(0).id();
+            var t = heldOn(bHttp, lease);
+            long a = t.attempt();
+            var corr = ByteBuffer.wrap(t.envelope().correlationId());
+            long hi = corr.getLong(), lo = corr.getLong();
+            java.util.function.Function<StreamChunk, Response> chunkB = sc -> onB.apply(
+                    "/swarm/v1/leases/" + lease + ":chunk", sc.toFrame().encode());
+            assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 0, StreamChunk.FIRST, "b0".getBytes())).status());
+            assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 1, Frame.LAST, new byte[0])).status());
+            assertFalse(this.swarm.topics().isOpen("stream.nodeb#0"));
+            awaitLedgerChunks(2);
+            var sink = sink();
+            assertEquals(0, sink.resets(), "no takeover, no RESET");
+            assertTrue(sink.complete());
+            var text = StreamHttpTest.drain(req("GET", "a", session, new byte[0]));
+            assertTrue(text.startsWith("retry: 1000\n\nid: " + a + ".0\nevent: chunk\ndata: b0\n"), text);
+            assertTrue(text.endsWith("id: " + a + ".1\nevent: end\ndata: ok\n\n"), text);
+            assertFalse(text.contains("reset"), text);
+        } finally {
+            b.replies().close();
+        }
+    }
+
+    @Test
+    void submitterOfFollowsTheReplyTopic() {
+        var s = this.swarm.tasks().streams();
+        var id = new byte[16];
+        assertEquals("nodea", s.submitterOf(new TaskEnvelope(id, id, "reply.nodea", 0, null, "", "", "", new byte[0])));
+        assertEquals("cancel", s.submitterOf(new TaskEnvelope(id, id, null, 0, null, "", "", "", new byte[0])),
+                "no reply topic: this node");
+        assertEquals("stream.nodea#0", TokenStreams.shardTopic("nodea", 0));
+    }
+
     @Test
     void aRemoteNodeHoldingTheTaskAppliesTheRecordOnItsNextClaim() {
         var b = Swarm.sharing(this.swarm, "nodeb", 7, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
