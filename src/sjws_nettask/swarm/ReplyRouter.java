@@ -52,7 +52,8 @@ public final class ReplyRouter implements AutoCloseable {
     public static final long DEFAULT_IDLE_CLOSE_MS = TimeUnit.MINUTES.toMillis(10);
     private static final SecureRandom RANDOM = new SecureRandom();
     /** Longest blocking poll; also bounds how late the idle check and {@link #close} are noticed. */
-    private static final long POLL_WAIT_NS = TimeUnit.MILLISECONDS.toNanos(50);
+    private static final long POLL_WAIT_MS = 50;
+    private static final long POLL_WAIT_NS = TimeUnit.MILLISECONDS.toNanos(POLL_WAIT_MS);
 
     private final Topics topics;
     private final TaskService tasks;
@@ -66,7 +67,14 @@ public final class ReplyRouter implements AutoCloseable {
     private volatile boolean closed;
     private final AtomicLong late = new AtomicLong();
     /** S2c streaming calls whose final reply lands here ({@link #registerStream}); empty unless streaming is used. */
-    private final java.util.Set<Key> streams = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.ConcurrentHashMap<Key, Long> streams = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Cap on registered streams ({@value #MAX_STREAMS_PROPERTY}, read at construction); past it registration is refused. */
+    private final int maxStreams;
+    private final AtomicLong streamRejections = new AtomicLong();
+    private final AtomicLong streamsExpired = new AtomicLong();
+    /** Property for {@link #maxStreams}; default {@value #DEFAULT_MAX_STREAMS}. */
+    public static final String MAX_STREAMS_PROPERTY = "sjws.swarm.stream.maxRegistered";
+    static final int DEFAULT_MAX_STREAMS = 65_536;
     /** Upper bound on remembered direct deliveries; past it the eldest is dropped (worst case: one late count). */
     static final int DELIVERED_LOCAL_MAX = 65_536;
     /**
@@ -96,6 +104,10 @@ public final class ReplyRouter implements AutoCloseable {
         this.topic = "reply." + id;
         this.producerId = producerId;
         this.idleCloseMs = idleCloseMs;
+        this.maxStreams = Integer.getInteger(MAX_STREAMS_PROPERTY, DEFAULT_MAX_STREAMS);
+        if (this.maxStreams < 0) {
+            throw new IllegalArgumentException(MAX_STREAMS_PROPERTY + " >= 0");
+        }
     }
 
     public String topic() {
@@ -161,15 +173,27 @@ public final class ReplyRouter implements AutoCloseable {
      * {@code replyTo = }{@link #topic()} and correlation id {@code correlationId} (16 bytes, e.g. {@link #newId()}).
      * Its final {@code LAST} reply is then acked without counting late, and the key is cleared when that reply is
      * read. No pending future is held for the stream. Starts the poller, so the reply is read even when no unary
-     * call is in flight, and keeps it from idle-closing while streams are registered. Call {@link #clearStream}
-     * when the session ends without a final reply (expiry, cancel). Unary calls don't touch this.
+     * call is in flight, and keeps it from idle-closing while streams are registered.
+     * <p>
+     * Self-healing: the key expires at {@code deadlineMs} (pass the session deadline plus a grace period); the poller
+     * sweeps expired keys at most once per poll slice, and only while any are registered. Callers should still
+     * {@link #clearStream} on every exit path. At most {@value #MAX_STREAMS_PROPERTY} keys are held: past it the
+     * registration is refused, counted in {@link #streamRejections()}, and that stream's reply would count late.
+     *
+     * @return false when refused by the cap
      */
-    public void registerStream(byte[] correlationId) {
+    public boolean registerStream(byte[] correlationId, long deadlineMs) {
         if (this.closed) {
             throw new IllegalStateException("closed");
         }
-        this.streams.add(key(correlationId));
+        var key = key(correlationId);
+        if (this.streams.size() >= this.maxStreams && !this.streams.containsKey(key)) {
+            this.streamRejections.incrementAndGet();
+            return false;
+        }
+        this.streams.put(key, deadlineMs);
         ensurePolling();
+        return true;
     }
 
     /** S2c: forgets a stream registered with {@link #registerStream}; a reply read afterwards counts late. */
@@ -180,6 +204,27 @@ public final class ReplyRouter implements AutoCloseable {
     /** Streams registered and not yet ended (tests, stats). */
     public int streams() {
         return this.streams.size();
+    }
+
+    /** Registrations refused because {@value #MAX_STREAMS_PROPERTY} keys were already held. */
+    public long streamRejections() {
+        return this.streamRejections.get();
+    }
+
+    /** Stream keys dropped by the deadline sweep (a caller that never cleared them). */
+    public long streamsExpired() {
+        return this.streamsExpired.get();
+    }
+
+    /** Drops stream keys whose deadline passed at {@code now}. */
+    void sweepStreams(long now) {
+        var it = this.streams.entrySet().iterator();
+        while (it.hasNext()) {
+            if (it.next().getValue() <= now) {
+                it.remove();
+                this.streamsExpired.incrementAndGet();
+            }
+        }
     }
 
     private static Key key(byte[] correlationId) {
@@ -265,7 +310,7 @@ public final class ReplyRouter implements AutoCloseable {
                 if (!f.complete(env)) {
                     this.late.incrementAndGet(); // raced with the caller's timeout
                 }
-            } else if (this.deliveredLocal.remove(key) == null && !this.streams.remove(key)) {
+            } else if (this.deliveredLocal.remove(key) == null && this.streams.remove(key) == null) {
                 this.late.incrementAndGet(); // timed out, or not an in-flight call or registered stream
             }
         }
@@ -275,9 +320,15 @@ public final class ReplyRouter implements AutoCloseable {
 
     private void pollLoop() {
         long lastActive = this.topics.clock().getAsLong();
+        long lastSweep = lastActive;
         while (!this.closed) {
             int n = pollOnce(POLL_WAIT_NS);
             long now = this.topics.clock().getAsLong();
+            // Stream-key sweep: only while streams are registered, at most once per poll slice.
+            if (!this.streams.isEmpty() && now - lastSweep >= POLL_WAIT_MS) {
+                lastSweep = now;
+                sweepStreams(now);
+            }
             if (n > 0) {
                 lastActive = now;
             } else if (this.pending.isEmpty() && this.streams.isEmpty() && now - lastActive >= this.idleCloseMs
@@ -324,5 +375,6 @@ public final class ReplyRouter implements AutoCloseable {
         for (var f : this.pending.values()) {
             f.completeExceptionally(new IllegalStateException("closed"));
         }
+        this.streams.clear();
     }
 }
