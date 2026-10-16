@@ -361,6 +361,38 @@ class StreamCancelTest {
         start("");
     }
 
+    @Test
+    void aFailureBeforePlacementGivesTheCancelSlotBack() {
+        var sh = streamHttp();
+        var cs = this.swarm.tasks().streams().cancels();
+        int size = cs.size();
+        long enq = this.swarm.tasks().counts("gen").workers().enqueued();
+        // a body just over the inline limit passes MAX_REQUEST but the envelope refuses it (400, store by reference)
+        var big = SwarmHttpTest.task("prompt").encode();
+        var body = new Frame(Frame.Type.TASK, 0, new byte[TaskEnvelope.MAX_INLINE_BODY + 1]).encode();
+        for (int i = 0; i < 100; i++) {
+            var r = req("POST", "a", "/swarm/v1/tasks/gen:stream", body);
+            assertEquals(400, r.status(), SwarmHttpTest.text(r));
+        }
+        assertEquals(size, cs.size(), "an oversized envelope leaks no CancelSet slot");
+        // any other failure before the task is placed (beforePlace hook throwing)
+        sh.beforePlace = () -> {
+            throw new IllegalStateException("boom");
+        };
+        try {
+            req("POST", "a", "/swarm/v1/tasks/gen:stream", big);
+        } catch (IllegalStateException expected) {
+            // rethrown or mapped: either way the slot must be back
+        }
+        sh.beforePlace = null;
+        assertEquals(size, cs.size(), "a pre-placement failure leaks no CancelSet slot");
+        assertEquals(enq, this.swarm.tasks().counts("gen").workers().enqueued(), "nothing submitted");
+        assertEquals(0, this.swarm.replies().streams(), "router slots given back");
+        // placed streams still hold their slot
+        start("");
+        assertEquals(size + 1, cs.size());
+    }
+
     StreamHttp streamHttp() {
         try {
             var f = SwarmHttp.class.getDeclaredField("streams");

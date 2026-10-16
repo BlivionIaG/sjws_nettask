@@ -276,8 +276,11 @@ public final class TokenStreams {
             if (now - f.touchedMs <= FENCE_TTL_MS || !f.lock.tryLock()) {
                 return false;
             }
-            f.lock.unlock();
-            return true;
+            try { // #234 re-review: a writer may have touched it between the read above and the lock
+                return now - f.touchedMs > FENCE_TTL_MS;
+            } finally {
+                f.lock.unlock();
+            }
         });
     }
 

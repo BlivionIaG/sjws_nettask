@@ -444,6 +444,9 @@ final class StreamHttp {
         var s = new Session(agent.id(), correlation, sink, deadlineMs, this.streams.config().sinkChunks(), RETAIN_BYTES);
         sink.onOffer(s::drain); // retain chunks produced before the first GET
         this.sessions.put(key, s);
+        // #234 re-review: the CancelSet slot is held until trackReserved takes it over; every failure before that
+        // (envelope 413, beforePlace, submitStream) gives it back, so pre-placement errors cannot exhaust the set
+        var reserved = true;
         try {
             // the final reply goes to this node's reply topic, registered above (#232)
             var env = new TaskEnvelope(correlation, correlation, this.swarm.replies().topic(), deadlineMs, traceparent,
@@ -452,19 +455,17 @@ final class StreamHttp {
             if (hook != null) {
                 hook.run();
             }
-            TaskService.Placed placed;
-            try {
-                placed = this.swarm.tasks().submitStream(pool, env);
-            } catch (RuntimeException e) {
-                this.streams.cancels().unreserve();
-                throw e;
-            }
+            var placed = this.swarm.tasks().submitStream(pool, env);
+            reserved = false; // trackReserved owns the slot from here (and gives it back itself if apply won)
             this.streams.cancels().trackReserved(placed.topic(), placed.offset(), deadlineMs);
             s.placed = placed;
             if (s.cancelled) { // cancelled before it was placed (#234 review 3): cancel the task now
                 applyCancel(s);
             }
         } catch (RuntimeException e) {
+            if (reserved) {
+                this.streams.cancels().unreserve();
+            }
             if (this.sessions.remove(key, s)) {
                 exit(s);
             }
