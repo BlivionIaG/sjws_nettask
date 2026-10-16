@@ -68,10 +68,33 @@ public final class ReplyRouter implements AutoCloseable {
     private final AtomicLong late = new AtomicLong();
     /** S2c streaming calls whose final reply lands here ({@link #registerStream}); empty unless streaming is used. */
     private final java.util.concurrent.ConcurrentHashMap<Key, Long> streams = new java.util.concurrent.ConcurrentHashMap<>();
-    /** Cap on registered streams ({@value #MAX_STREAMS_PROPERTY}, read at construction); past it registration is refused. */
+    /**
+     * Cap on registered streams ({@value #MAX_STREAMS_PROPERTY}, read at construction; an invalid or negative value
+     * logs a WARN and falls back to the default, so it never breaks a router); past it registration is refused.
+     */
     private final int maxStreams;
+    /** Keys held in {@link #streams}, reserved by CAS before insertion so concurrent registrations never pass the cap. */
+    private final java.util.concurrent.atomic.AtomicInteger streamCount = new java.util.concurrent.atomic.AtomicInteger();
     private final AtomicLong streamRejections = new AtomicLong();
     private final AtomicLong streamsExpired = new AtomicLong();
+    /** Parses {@value #MAX_STREAMS_PROPERTY}: unset gives the default; invalid or negative logs a WARN and gives it too. */
+    static int resolveMaxStreams(String v) {
+        if (v == null || v.isBlank()) {
+            return DEFAULT_MAX_STREAMS;
+        }
+        try {
+            int n = Integer.parseInt(v.trim());
+            if (n >= 0) {
+                return n;
+            }
+        } catch (NumberFormatException e) {
+            // fall through
+        }
+        System.getLogger(ReplyRouter.class.getName()).log(System.Logger.Level.WARNING,
+                "invalid " + MAX_STREAMS_PROPERTY + "=" + v + "; using " + DEFAULT_MAX_STREAMS);
+        return DEFAULT_MAX_STREAMS;
+    }
+
     /** Property for {@link #maxStreams}; default {@value #DEFAULT_MAX_STREAMS}. */
     public static final String MAX_STREAMS_PROPERTY = "sjws.swarm.stream.maxRegistered";
     static final int DEFAULT_MAX_STREAMS = 65_536;
@@ -104,10 +127,7 @@ public final class ReplyRouter implements AutoCloseable {
         this.topic = "reply." + id;
         this.producerId = producerId;
         this.idleCloseMs = idleCloseMs;
-        this.maxStreams = Integer.getInteger(MAX_STREAMS_PROPERTY, DEFAULT_MAX_STREAMS);
-        if (this.maxStreams < 0) {
-            throw new IllegalArgumentException(MAX_STREAMS_PROPERTY + " >= 0");
-        }
+        this.maxStreams = resolveMaxStreams(System.getProperty(MAX_STREAMS_PROPERTY));
     }
 
     public String topic() {
@@ -178,7 +198,9 @@ public final class ReplyRouter implements AutoCloseable {
      * Self-healing: the key expires at {@code deadlineMs} (pass the session deadline plus a grace period); the poller
      * sweeps expired keys at most once per poll slice, and only while any are registered. Callers should still
      * {@link #clearStream} on every exit path. At most {@value #MAX_STREAMS_PROPERTY} keys are held: past it the
-     * registration is refused, counted in {@link #streamRejections()}, and that stream's reply would count late.
+     * registration is refused, counted in {@link #streamRejections()}, and that stream's reply would count late. The cap is
+     * exact under concurrency (a slot is reserved by CAS before insertion); re-registering a held key only refreshes
+     * its deadline and takes no new slot.
      *
      * @return false when refused by the cap
      */
@@ -187,23 +209,50 @@ public final class ReplyRouter implements AutoCloseable {
             throw new IllegalStateException("closed");
         }
         var key = key(correlationId);
-        if (this.streams.size() >= this.maxStreams && !this.streams.containsKey(key)) {
-            this.streamRejections.incrementAndGet();
-            return false;
+        if (this.streams.replace(key, deadlineMs) == null) { // a held key only refreshes its deadline
+            // Reserve a slot first (CAS), so concurrent registrations never exceed the cap.
+            int n;
+            do {
+                n = this.streamCount.get();
+                if (n >= this.maxStreams) {
+                    this.streamRejections.incrementAndGet();
+                    return false;
+                }
+            } while (!this.streamCount.compareAndSet(n, n + 1));
+            if (this.streams.put(key, deadlineMs) != null) {
+                this.streamCount.decrementAndGet(); // raced with a registration of the same key: one slot
+            }
         }
-        this.streams.put(key, deadlineMs);
         ensurePolling();
         return true;
     }
 
     /** S2c: forgets a stream registered with {@link #registerStream}; a reply read afterwards counts late. */
     public void clearStream(byte[] correlationId) {
-        this.streams.remove(key(correlationId));
+        removeStream(key(correlationId));
+    }
+
+    /** Removes {@code key} and releases its slot; true when it was held. */
+    private boolean removeStream(Key key) {
+        if (this.streams.remove(key) != null) {
+            this.streamCount.decrementAndGet();
+            return true;
+        }
+        return false;
     }
 
     /** Streams registered and not yet ended (tests, stats). */
     public int streams() {
         return this.streams.size();
+    }
+
+    /** Slots reserved against the cap (tests: always equals {@link #streams()} when quiescent). */
+    int streamSlots() {
+        return this.streamCount.get();
+    }
+
+    int maxStreams() {
+        return this.maxStreams;
     }
 
     /** Registrations refused because {@value #MAX_STREAMS_PROPERTY} keys were already held. */
@@ -218,10 +267,10 @@ public final class ReplyRouter implements AutoCloseable {
 
     /** Drops stream keys whose deadline passed at {@code now}. */
     void sweepStreams(long now) {
-        var it = this.streams.entrySet().iterator();
-        while (it.hasNext()) {
-            if (it.next().getValue() <= now) {
-                it.remove();
+        for (var e : this.streams.entrySet()) {
+            // remove(key, value): a key re-registered meanwhile (new deadline) is kept
+            if (e.getValue() <= now && this.streams.remove(e.getKey(), e.getValue())) {
+                this.streamCount.decrementAndGet();
                 this.streamsExpired.incrementAndGet();
             }
         }
@@ -310,7 +359,7 @@ public final class ReplyRouter implements AutoCloseable {
                 if (!f.complete(env)) {
                     this.late.incrementAndGet(); // raced with the caller's timeout
                 }
-            } else if (this.deliveredLocal.remove(key) == null && this.streams.remove(key) == null) {
+            } else if (this.deliveredLocal.remove(key) == null && !removeStream(key)) {
                 this.late.incrementAndGet(); // timed out, or not an in-flight call or registered stream
             }
         }
@@ -375,6 +424,8 @@ public final class ReplyRouter implements AutoCloseable {
         for (var f : this.pending.values()) {
             f.completeExceptionally(new IllegalStateException("closed"));
         }
-        this.streams.clear();
+        for (var k : this.streams.keySet()) {
+            removeStream(k);
+        }
     }
 }
