@@ -39,6 +39,8 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
     static final String NODE_ENV = "SJWS_SWARM_NODE";
     static final String TRACE_PROPERTY = "sjws.swarm.trace.enabled";
     static final String TRACE_ENV = "SJWS_SWARM_TRACE_ENABLED";
+    static final String STREAM_PROPERTY = "sjws.swarm.stream.enabled";
+    static final String STREAM_ENV = "SJWS_SWARM_STREAM_ENABLED";
 
     private final Swarm swarm;
     private final SwarmGate gate;
@@ -56,9 +58,19 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
     }
 
     SwarmModule(Swarm swarm, SwarmGate gate, boolean trace) {
+        this(swarm, gate, trace, Boolean.parseBoolean(setting(STREAM_PROPERTY, STREAM_ENV, "false")));
+    }
+
+    SwarmModule(Swarm swarm, SwarmGate gate, boolean trace, boolean stream) {
         this.swarm = swarm;
         this.gate = gate;
         this.trace = trace;
+        if (stream) {
+            // S2c, off by default: the only place TokenStreams is created; read once at startup (shards fixed)
+            var s = swarm.enableStreams(TokenStreams.Config.from(n -> setting(n, n.toUpperCase(java.util.Locale.ROOT)
+                    .replace('.', '_'), null)));
+            System.err.println("swarm: token streaming on, shards=" + s.config().shards());
+        }
         if (trace) {
             // S2b, off by default: the only place the trace package is named outside SwarmHttp's guarded paths
             System.err.println("swarm: " + sjws_nettask.swarm.trace.SwarmTrace.describe());

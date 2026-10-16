@@ -60,6 +60,16 @@ public final class Swarm implements AutoCloseable {
     }
 
     /** A lease keeper for one worker, using the batched fenced extend. */
+    /**
+     * Turns on the S2c stream produce path with {@code config} (call once, at startup, only when
+     * {@code sjws.swarm.stream.enabled} is on). The node id names the stream shards {@code stream.<node>#i}.
+     */
+    public TokenStreams enableStreams(TokenStreams.Config config) {
+        var s = new TokenStreams(this.topics, this.replies.topic().substring("reply.".length()), config);
+        this.tasks.bindStreams(s);
+        return s;
+    }
+
     public LeaseKeeper leaseKeeper(long visibilityMs, java.util.function.BiConsumer<Task, sjws_nettask.messaging.delivery.LeaseResult> lost) {
         return new LeaseKeeper(this.tasks, visibilityMs, lost);
     }

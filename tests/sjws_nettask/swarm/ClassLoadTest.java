@@ -125,6 +125,29 @@ class ClassLoadTest {
         assertFalse(text.contains("sjws_nettask.swarm.TokenStream") || text.contains("StreamChunk"), text);
     }
 
+    @Test
+    void swarmOnStreamOffLoadsNoTokenStreamsClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml());
+        assertFalse(text.contains("sjws_nettask.swarm.TokenStreams"), text);
+        assertFalse(text.contains("token streaming on"), text);
+    }
+
+    @Test
+    void streamFlagOnLoadsTokenStreams() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true"), "Server started:", 401,
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.TokenStreams"), text);
+        assertTrue(text.contains("swarm: token streaming on, shards=1"), text);
+    }
+
+    @Test
+    void streamFlagWithoutSwarmLoadsNothing() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.stream.enabled=true"), "Server started:", 404, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml());
+        assertFalse(text.contains(SWARM), text);
+    }
+
     private static final String TRACE = "sjws_nettask.swarm.trace.";
 
     @Test
