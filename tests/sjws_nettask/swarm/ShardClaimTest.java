@@ -305,4 +305,45 @@ class ShardClaimTest {
             this.topics = null;
         }
     }
+
+    @Test
+    void aHandedLeaseStartsWhenTheWokenWorkerRunsNotAtTheSubmittersPoll() throws Exception {
+        // Review of #223: the submitter polls (lease starts) before the waiter is runnable. Simulate a schedule gap
+        // longer than a short visibilityMs between that poll and the waiter's return: the waiter must refresh the
+        // lease on receipt, so the task is not redelivered to another worker while the first one still holds it.
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        long vis = 100;
+        long gap = 150; // > vis: without the refresh the handed lease would already be expired on receipt
+        t.afterHandoffPoll = () -> this.now.addAndGet(gap);
+        var claim = CompletableFuture.supplyAsync(() -> t.claim("p", "w", 1, vis, TimeUnit.SECONDS.toNanos(20)));
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (t.pool("p").waiting.get() == 0 && System.nanoTime() < until) Thread.onSpinWait();
+        long polledAt = this.now.get();
+        t.submit("p", 1, seqFor(t, 2, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        var got = claim.get(5, TimeUnit.SECONDS);
+        t.afterHandoffPoll = TaskService.NO_HOOK;
+        assertEquals(1, got.size());
+        assertEquals(1, t.handoffs(), "taken by the handoff path");
+        assertEquals(1, t.handoffRefreshes(), "the woken worker refreshed the handed lease");
+        long received = polledAt + gap;
+        assertTrue(got.get(0).leaseDeadlineMs() >= received + vis,
+                "lease runs from receipt: " + got.get(0).leaseDeadlineMs() + " < " + (received + vis));
+        // past the poll-time deadline, inside the refreshed one: nobody else may get it
+        this.now.addAndGet(vis / 2);
+        assertTrue(t.claim("p", "other", 4, vis).isEmpty(), "not redelivered while the first worker holds it");
+        assertEquals(LeaseResult.OK, t.ack(got.get(0)));
+    }
+
+    @Test
+    void aSubMillisecondHandoffDoesNotRewriteTheLease() throws Exception {
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        var claim = CompletableFuture.supplyAsync(() -> t.claim("p", "w", 1, 10_000, TimeUnit.SECONDS.toNanos(20)));
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (t.pool("p").waiting.get() == 0 && System.nanoTime() < until) Thread.onSpinWait();
+        t.submit("p", 1, seqFor(t, 1, 0), TaskServiceTest.env("x", "", TaskEnvelope.NO_DEADLINE));
+        var got = claim.get(5, TimeUnit.SECONDS);
+        assertEquals(1, got.size());
+        assertEquals(0, t.handoffRefreshes(), "clock did not move: no extra ledger write on the fast path");
+        assertEquals(LeaseResult.OK, t.ack(got.get(0)));
+    }
 }
