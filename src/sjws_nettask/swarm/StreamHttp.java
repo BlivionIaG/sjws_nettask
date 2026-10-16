@@ -450,7 +450,7 @@ final class StreamHttp {
         try {
             // the final reply goes to this node's reply topic, registered above (#232)
             var env = new TaskEnvelope(correlation, correlation, this.swarm.replies().topic(), deadlineMs, traceparent,
-                    "", "", "", body);
+                    this.streams.shardsTracestate(), "", "", body); // writers use the submitter's shard count
             var hook = this.beforePlace;
             if (hook != null) {
                 hook.run();

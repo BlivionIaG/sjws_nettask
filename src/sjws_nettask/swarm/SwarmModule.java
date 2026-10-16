@@ -62,9 +62,22 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
     }
 
     SwarmModule(Swarm swarm, SwarmGate gate, boolean trace, boolean stream) {
+        this(swarm, gate, trace, stream, multiProcessReason(System::getProperty, System.getenv(),
+                sjws_nettask.OptionalModule.Launch.multiProcess()));
+    }
+
+    SwarmModule(Swarm swarm, SwarmGate gate, boolean trace, boolean stream, String multiProcess) {
         this.swarm = swarm;
         this.gate = gate;
         this.trace = trace;
+        if (stream && multiProcess != null) {
+            // until Messaging Core's remote write path lands, chunks reach readers only through this process's
+            // ledger: a stream whose worker or submitter is another process would lose its chunks (§5.2, §12)
+            swarm.close();
+            throw new sjws_nettask.OptionalModule.Refused(STREAM_PROPERTY + "=true needs a single-process deployment"
+                    + " until cross-process stream delivery lands (" + STREAM_TRACKING + "), but " + multiProcess
+                    + ". Turn the stream flag off or run this node alone.");
+        }
         if (stream) {
             // S2c, off by default: the only place TokenStreams is created; read once at startup (shards fixed)
             var s = swarm.enableStreams(TokenStreams.Config.from(n -> setting(n, n.toUpperCase(java.util.Locale.ROOT)
@@ -75,6 +88,34 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
             // S2b, off by default: the only place the trace package is named outside SwarmHttp's guarded paths
             System.err.println("swarm: " + sjws_nettask.swarm.trace.SwarmTrace.describe());
         }
+    }
+
+    /** Messaging Core's tracking issue for cross-process stream delivery. */
+    static final String STREAM_TRACKING = "TODO(messaging-core): cross-process stream delivery issue";
+
+    /**
+     * Why this process runs with others: the composition root's {@code launch} reason ({@code --bootstrap},
+     * {@code cp.peers} in the config file), else a control-plane node id or peer list in {@code sjws.cp.*} /
+     * {@code SJWS_CP_*}; null when standalone.
+     */
+    static String multiProcessReason(java.util.function.Function<String, String> props, java.util.Map<String, String> env,
+            String launch) {
+        if (launch != null) {
+            return launch;
+        }
+        for (var name : new String[] {"sjws.cp.nodeId", "sjws.cp.peers"}) {
+            var v = props.apply(name);
+            if (v != null && !v.isBlank()) {
+                return name + " is set";
+            }
+        }
+        for (var name : new String[] {"SJWS_CP_NODE_ID", "SJWS_CP_PEERS"}) {
+            var v = env.get(name);
+            if (v != null && !v.isBlank()) {
+                return name + " is set";
+            }
+        }
+        return null;
     }
 
     boolean trace() {

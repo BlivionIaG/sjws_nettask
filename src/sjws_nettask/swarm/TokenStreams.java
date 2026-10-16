@@ -174,15 +174,80 @@ public final class TokenStreams {
      */
     String submitterOf(TaskEnvelope env) {
         var to = env.replyTo();
-        return to != null && to.startsWith(REPLY_PREFIX) && to.length() > REPLY_PREFIX.length()
-                ? to.substring(REPLY_PREFIX.length()) : this.node;
+        if (to == null || !to.startsWith(REPLY_PREFIX) || to.length() == REPLY_PREFIX.length()) {
+            return this.node;
+        }
+        var name = to.substring(REPLY_PREFIX.length());
+        if (!SAFE_NODE.matcher(name).matches()) { // #234 review: never build a topic name from an unsafe string
+            this.invalidSubmitters.incrementAndGet();
+            return this.node;
+        }
+        return name;
     }
 
     private static final String REPLY_PREFIX = "reply.";
+    /** Node ids, as {@code cp.JoinTokens} validates them. */
+    static final java.util.regex.Pattern SAFE_NODE = java.util.regex.Pattern.compile("[A-Za-z0-9._:-]{1,64}");
+    /** W3C {@code tracestate} member the submitter stamps with its shard count (#234 review 2). */
+    static final String SHARDS_MEMBER = "sjws-stream";
+    private static final String SHARDS_VALUE = "shards:";
+
+    private final AtomicLong invalidSubmitters = new AtomicLong();
+    private final AtomicLong invalidShardStamps = new AtomicLong();
+
+    /** Tasks whose {@code replyTo} named an unsafe node; their chunks went to this node's shards. */
+    public long invalidSubmitters() {
+        return this.invalidSubmitters.get();
+    }
+
+    /** Tasks whose shard stamp was malformed or out of 1..64; their chunks were refused. */
+    public long invalidShardStamps() {
+        return this.invalidShardStamps.get();
+    }
+
+    /** The {@code tracestate} a submitter puts on a stream task: its own {@code sjws.swarm.stream.shards}. */
+    String shardsTracestate() {
+        return SHARDS_MEMBER + "=" + SHARDS_VALUE + this.config.shards();
+    }
+
+    /**
+     * The submitter's shard count for {@code env}, from the {@value #SHARDS_MEMBER} member of its {@code tracestate};
+     * this node's own count only when the member is absent (a task from a submitter without the stamp). A present but
+     * malformed or out-of-range value is refused, never clamped: a guessed count would pick a shard no reader polls.
+     */
+    int submitterShards(TaskEnvelope env) {
+        var ts = env.tracestate();
+        if (ts == null || ts.isEmpty()) {
+            return this.config.shards();
+        }
+        for (var member : ts.split(",")) {
+            var m = member.trim();
+            int eq = m.indexOf('=');
+            if (eq < 0 || !m.substring(0, eq).equals(SHARDS_MEMBER)) {
+                continue;
+            }
+            var v = m.substring(eq + 1);
+            int n = -1;
+            if (v.startsWith(SHARDS_VALUE) && v.length() > SHARDS_VALUE.length() && v.length() <= SHARDS_VALUE.length() + 2) {
+                try {
+                    n = Integer.parseInt(v.substring(SHARDS_VALUE.length()));
+                } catch (NumberFormatException e) {
+                    n = -1;
+                }
+            }
+            if (n < 1 || n > 64) {
+                this.invalidShardStamps.incrementAndGet();
+                throw new IllegalArgumentException("stream task has an invalid shard stamp: " + v);
+            }
+            return n;
+        }
+        return this.config.shards();
+    }
 
     /** The submitter's shard partition for the chunks of {@code env}'s stream, opened lazily (no DLQ). */
     Partition partitionFor(TaskEnvelope env, long streamHi, long streamLo) {
-        return this.topics.partitionWithoutDlq(topicFor(submitterOf(env), streamHi, streamLo));
+        var topic = shardTopic(submitterOf(env), TokenStream.shardOf(streamHi, streamLo, submitterShards(env)));
+        return this.topics.partitionWithoutDlq(topic);
     }
 
     /** Chunks dropped because a local sink was full (resume from the ledger is PR 4). */
@@ -235,6 +300,8 @@ public final class TokenStreams {
                 return new Admitted(LeaseResult.CANCELLED, null);
             }
         }
+        // the submitter's shard, resolved before the fence moves: a refused stamp leaves no trace
+        var part = partitionFor(env, c.streamHi(), c.streamLo());
         var key = new FenceKey(t.pool(), t.shard(), t.offset());
         var f = this.fences.get(key);
         if (f == null) {
@@ -260,7 +327,7 @@ public final class TokenStreams {
                 hook.run();
             }
             deliverLocal(c); // before produce, as completeLocal: latency must not wait on the ledger hand-off
-            var r = partitionFor(env, c.streamHi(), c.streamLo()).produce(producerId, seq, c.encode(),
+            var r = part.produce(producerId, seq, c.encode(),
                     c.last() ? Durability.ASYNC : Durability.NONE);
             return new Admitted(LeaseResult.OK, r);
         } finally {

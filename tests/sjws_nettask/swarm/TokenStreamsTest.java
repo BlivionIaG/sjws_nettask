@@ -398,4 +398,57 @@ class TokenStreamsTest {
             assertTrue(this.streams.reading(), "restarted by the next sink");
         }
     }
+
+    @Test
+    void submitterShardsReadsTheStampFallsBackWhenAbsentAndRefusesInvalidValues() {
+        this.streams = this.swarm.enableStreams(new TokenStreams.Config(3, 64, 256));
+        var id = id(30);
+        java.util.function.Function<String, TaskEnvelope> env = ts -> new TaskEnvelope(id, id, "reply.n2",
+                TaskEnvelope.NO_DEADLINE, "", ts, "", "", new byte[0]);
+        assertEquals("sjws-stream=shards:3", this.streams.shardsTracestate());
+        assertEquals(3, this.streams.submitterShards(env.apply("")), "absent: this node's count");
+        assertEquals(3, this.streams.submitterShards(env.apply("vendor=abc")), "other members only");
+        assertEquals(1, this.streams.submitterShards(env.apply("sjws-stream=shards:1")));
+        assertEquals(64, this.streams.submitterShards(env.apply("vendor=abc, sjws-stream=shards:64")));
+        assertEquals(0, this.streams.invalidShardStamps());
+        int bad = 0;
+        for (var v : new String[] {"shards:0", "shards:65", "shards:-1", "shards:x", "shards:", "shards:123", "4", "",
+                "nope=shards:4"}) {
+            assertThrows(IllegalArgumentException.class, () -> this.streams.submitterShards(env.apply("sjws-stream=" + v)),
+                    v);
+            assertEquals(++bad, this.streams.invalidShardStamps(), v);
+        }
+        assertEquals(3, this.streams.submitterShards(env.apply("sjws-streamx=shards:9,sjws-stream")),
+                "a member without '=' or with another key is ignored");
+        assertEquals("stream.n2#" + TokenStream.shardOf(42, 30, 5),
+                this.streams.partitionFor(env.apply("sjws-stream=shards:5"), 42, 30).topic(), "the submitter's count");
+    }
+
+    @Test
+    void aChunkWithAnInvalidShardStampIsRefusedBeforeTheFenceMoves() {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var id = id(31);
+        var env = new TaskEnvelope(id, id, this.swarm.replies().topic(), TaskEnvelope.NO_DEADLINE, "",
+                "sjws-stream=shards:99", "", "text/plain", new byte[] {1});
+        this.swarm.tasks().submit("p", 1, 31, env);
+        var t = claim(30_000);
+        var c = new StreamChunk(42, 31, 0, StreamChunk.FIRST, new byte[] {1});
+        assertThrows(IllegalArgumentException.class, () -> this.swarm.tasks().streamChunk(t, 9, 1, c));
+        assertEquals(1, this.streams.invalidShardStamps());
+        assertFalse(this.swarm.topics().isOpen("stream.n1#0"), "nothing written");
+    }
+
+    @Test
+    void shardReaderStopsWhenTheTopicsClose() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var sink = this.streams.open(id(32));
+        assertTrue(this.streams.reading());
+        this.swarm.close();
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (this.streams.reading() && System.nanoTime() < until) {
+            Thread.sleep(5);
+        }
+        assertFalse(this.streams.reading(), "the reader exits with the topics, even with a sink open");
+        sink.close();
+    }
 }

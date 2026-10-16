@@ -388,6 +388,87 @@ class StreamCancelTest {
         }
     }
 
+    /**
+     * #234 review 2: A submits streams with {@code aShards}; node B, configured with {@code bShards}, works every one.
+     * B must write to the shard A reads (A's stamped count), so no chunk is lost whatever the mismatch.
+     */
+    void noChunkIsLostWithDifferentShardCounts(int aShards, int bShards) throws Exception {
+        this.swarm.close();
+        this.swarm = Swarm.open(this.dir.resolve("mismatch"), "cancel", 3,
+                new sjws_nettask.messaging.delivery.RetryPolicy(5, 0, 0), this.now::get, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
+        this.swarm.enableStreams(new TokenStreams.Config(aShards, 64, 256));
+        this.http = new SwarmHttp(this.swarm, 4, GATE);
+        var b = Swarm.sharing(this.swarm, "nodeb", 7, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
+        try {
+            b.enableStreams(new TokenStreams.Config(bShards, 64, 256));
+            var bHttp = new SwarmHttp(b, 8, GATE);
+            java.util.function.BiFunction<String, byte[], Response> onB = (target, body) -> bHttp.handle(new Request("POST",
+                    target, RequestHeaders.of(Map.of("x-agent", List.of("w"))), null, false, null, SwarmHttpTest.body(body)));
+            int n = 12;
+            var sessions = new java.util.ArrayList<String>();
+            for (int i = 0; i < n; i++) {
+                sessions.add(start(""));
+            }
+            var shardsUsed = new java.util.HashSet<Integer>();
+            for (int i = 0; i < n; i++) {
+                var ls = SwarmHttpTest.leases(onB.apply("/swarm/v1/tasks/gen:claim?visibilityMs=60000", new byte[0]));
+                assertEquals(1, ls.size());
+                var lease = ls.get(0).id();
+                var t = heldOn(bHttp, lease);
+                assertEquals("sjws-stream=shards:" + aShards, t.envelope().tracestate(), "A stamped its own count");
+                var corr = ByteBuffer.wrap(t.envelope().correlationId());
+                long hi = corr.getLong(), lo = corr.getLong();
+                shardsUsed.add(TokenStream.shardOf(hi, lo, aShards));
+                java.util.function.Function<StreamChunk, Response> chunkB = sc -> onB.apply(
+                        "/swarm/v1/leases/" + lease + ":chunk", sc.toFrame().encode());
+                assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 0, StreamChunk.FIRST, "x".getBytes())).status());
+                assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 1, 0, "y".getBytes())).status());
+                assertEquals(204, chunkB.apply(new StreamChunk(hi, lo, 0, 2, Frame.LAST, new byte[0])).status());
+            }
+            if (aShards > 1) {
+                assertTrue(shardsUsed.size() > 1, "the streams spread over A's shards: " + shardsUsed);
+            }
+            for (int i = 0; i < Math.max(aShards, bShards); i++) {
+                if (i >= aShards) {
+                    assertFalse(this.swarm.topics().isOpen("stream.cancel#" + i), "no shard beyond A's count");
+                }
+                assertFalse(this.swarm.topics().isOpen("stream.nodeb#" + i));
+            }
+            awaitLedgerChunks(3L * n);
+            for (var session : sessions) {
+                var text = StreamHttpTest.drain(req("GET", "a", session, new byte[0]));
+                assertTrue(text.contains("event: chunk\ndata: x\n") && text.contains("event: chunk\ndata: y\n"), text);
+                assertTrue(text.endsWith("event: end\ndata: ok\n\n"), text);
+            }
+            assertEquals(0, this.swarm.tasks().streams().sinkDrops());
+        } finally {
+            b.replies().close();
+        }
+    }
+
+    @Test
+    void noChunkIsLostWhenTheSubmitterHasOneShardAndTheWriterFour() throws Exception {
+        noChunkIsLostWithDifferentShardCounts(1, 4);
+    }
+
+    @Test
+    void noChunkIsLostWhenTheSubmitterHasFourShardsAndTheWriterOne() throws Exception {
+        noChunkIsLostWithDifferentShardCounts(4, 1);
+    }
+
+    @Test
+    void anUnsafeSubmitterNameFallsBackToThisNodeAndIsCounted() {
+        var s = this.swarm.tasks().streams();
+        var id = new byte[16];
+        for (var bad : new String[] {"reply.a/b", "reply.a b", "reply." + "n".repeat(65), "reply.n\u00e9", "reply.a#1"}) {
+            assertEquals("cancel", s.submitterOf(new TaskEnvelope(id, id, bad, 0, null, "", "", "", new byte[0])), bad);
+        }
+        assertEquals(5, s.invalidSubmitters());
+        assertEquals("node-b.1:x_y", s.submitterOf(new TaskEnvelope(id, id, "reply.node-b.1:x_y", 0, null, "", "", "",
+                new byte[0])), "the node id pattern");
+        assertEquals(5, s.invalidSubmitters());
+    }
+
     @Test
     void submitterOfFollowsTheReplyTopic() {
         var s = this.swarm.tasks().streams();

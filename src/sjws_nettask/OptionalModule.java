@@ -23,6 +23,38 @@ package sjws_nettask;
  */
 public interface OptionalModule extends AutoCloseable {
 
+    /**
+     * Thrown by a module's constructor when its configuration must stop the process from starting (not just skip the
+     * module), for example token streaming enabled on a node configured to run with other processes.
+     */
+    final class Refused extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        public Refused(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * What the composition root knows about the deployment before modules start. {@link #multiProcess()} is why this
+     * process runs alongside other processes (a {@code --bootstrap} node, or {@code cp.peers} in the config file), or
+     * null for a standalone process; read by single-process-only features (token streaming, agent-swarm.md §5.2).
+     */
+    final class Launch {
+        private static volatile String multiProcess;
+
+        private Launch() {
+        }
+
+        public static String multiProcess() {
+            return multiProcess;
+        }
+
+        static void multiProcess(String reason) {
+            multiProcess = reason;
+        }
+    }
+
     /** Closing never throws; a module logs its own failures. */
     @Override
     void close();
