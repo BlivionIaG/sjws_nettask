@@ -54,6 +54,9 @@ class BatchAtomicityTest {
         volatile boolean failForce;
         volatile boolean failTruncate;
         int appends;
+        /** Every storage call that writes, counted whether or not it then fails. */
+        final java.util.concurrent.atomic.AtomicInteger writes = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger snapshots = new java.util.concurrent.atomic.AtomicInteger();
 
         Faulty(LogStorage d, Path segment) {
             this.d = d;
@@ -73,6 +76,7 @@ class BatchAtomicityTest {
 
         @Override
         public void append(GroupId g, long index, long term, byte[] data) throws IOException {
+            writes.incrementAndGet();
             if (failAppendAfter >= 0 && appends++ >= failAppendAfter) {
                 failAppendAfter = -1;
                 if (segment != null) {
@@ -101,6 +105,7 @@ class BatchAtomicityTest {
 
         @Override
         public void truncateSuffix(GroupId g, long fromIndex) throws IOException {
+            writes.incrementAndGet();
             if (failTruncate) {
                 throw new IOException("injected truncate failure");
             }
@@ -109,11 +114,13 @@ class BatchAtomicityTest {
 
         @Override
         public void truncatePrefix(GroupId g, long throughIndex) throws IOException {
+            writes.incrementAndGet();
             d.truncatePrefix(g, throughIndex);
         }
 
         @Override
         public void force(GroupId g) throws IOException {
+            writes.incrementAndGet();
             if (failForce) {
                 failForce = false;
                 throw new IOException("injected fsync failure");
@@ -143,11 +150,13 @@ class BatchAtomicityTest {
 
         @Override
         public void noteWitness(GroupId g, long index, long term) throws IOException {
+            writes.incrementAndGet();
             d.noteWitness(g, index, term);
         }
 
         @Override
         public void saveHardState(GroupId g, long term, int votedFor) throws IOException {
+            writes.incrementAndGet();
             d.saveHardState(g, term, votedFor);
         }
 
@@ -173,6 +182,8 @@ class BatchAtomicityTest {
 
         @Override
         public void saveSnapshot(GroupId g, LogSnapshot snapshot) throws IOException {
+            writes.incrementAndGet();
+            snapshots.incrementAndGet();
             d.saveSnapshot(g, snapshot);
         }
 
@@ -292,20 +303,38 @@ class BatchAtomicityTest {
 
     @Test
     void failedRollbackFailsTheGroupClosedAndAnotherNodeTakesOver() throws Exception {
-        start(Durability.RELAXED, false);
+        start(Durability.RELAXED, true); // file log: snapshots and prefix deletes are real
         int l = leader();
-        settle(nodes.get(l).append(GROUP, batch("before", 1)));
-        storages.get(l).failTruncate = true;
-        storages.get(l).armAppend(2);
+        var faulty = storages.get(l);
+        settle(nodes.get(l).append(GROUP, batch("before", 3)));
+        faulty.failTruncate = true;
+        faulty.armAppend(2);
         var failed = nodes.get(l).append(GROUP, batch("bad", 4));
         var cause = assertThrows(ExecutionException.class, failed::get).getCause();
         assertInstanceOf(UncheckedIOException.class, cause);
         assertTrue(cause.getMessage().contains("outcome unknown"), cause.getMessage());
         assertFalse(group(l).isLeader(), "a group that cannot roll back must step down");
+        assertTrue(nodes.get(l).failedClosed(GROUP), "failed-closed state must be visible for health");
+        assertFalse(nodes.get(1 - l).failedClosed(GROUP));
 
-        storages.get(l).disarm(); // even with a healthy disk again, it stays closed until restart
+        faulty.disarm(); // even with a healthy disk again, it stays closed until restart
+        int writes = faulty.writes.get();
+        int snapshots = faulty.snapshots.get();
+        long commit = group(l).commitIndex();
+        long last = faulty.lastIndex(GROUP);
+        long term = group(l).term();
+
         var refused = nodes.get(l).append(GROUP, batch("later", 1));
-        assertInstanceOf(UncheckedIOException.class, assertThrows(ExecutionException.class, refused::get).getCause());
+        assertFenced(assertThrows(ExecutionException.class, refused::get).getCause());
+        var control = nodes.get(l).snapshots(GROUP);
+        assertFenced(assertThrows(UncheckedIOException.class, () -> control.take(commit)));
+        assertFenced(assertThrows(UncheckedIOException.class,
+                () -> control.install(new LogSnapshot(GROUP, last + 10, term, new byte[] {1}))));
+        var compacted = control.truncateAndCompact(commit, snap -> new byte[] {2});
+        assertFenced(assertThrows(ExecutionException.class, compacted::get).getCause());
+        control.setTruncationBound((g, snapshotIndex) -> Long.MAX_VALUE);
+        var bounded = control.truncateToBound(snap -> new byte[] {3});
+        assertFenced(assertThrows(ExecutionException.class, bounded::get).getCause());
 
         int other = 1 - l;
         for (int k = 0; k < 60 && !group(other).isLeader(); k++) {
@@ -318,6 +347,16 @@ class BatchAtomicityTest {
             step();
         }
         assertFalse(group(l).isLeader(), "the failed-closed node must not campaign");
+        assertEquals(writes, faulty.writes.get(), "a failed-closed group must not touch its storage");
+        assertEquals(snapshots, faulty.snapshots.get(), "a failed-closed group must not write a snapshot");
+        assertEquals(last, faulty.lastIndex(GROUP), "nothing appended or truncated after failing closed");
+        assertEquals(commit, group(l).commitIndex(), "commit must not advance after failing closed");
+        assertFalse(contains(applied.get(l), "next"), "a failed-closed group must not apply new entries");
+    }
+
+    private static void assertFenced(Throwable error) {
+        assertInstanceOf(UncheckedIOException.class, error);
+        assertTrue(error.getMessage().contains("failed closed"), error.getMessage());
     }
 
     @ParameterizedTest(name = "file log, fail after entry {0} of 3")

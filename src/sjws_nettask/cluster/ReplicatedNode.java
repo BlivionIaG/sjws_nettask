@@ -358,6 +358,14 @@ public final class ReplicatedNode implements ClusterNode {
         group(groupId).snapshotChunkBytes = bytes;
     }
 
+    /**
+     * Health: true once one group failed closed after a log write it could not roll back (#237). The group
+     * then refuses appends, snapshots and truncation and takes no part in Raft until the process restarts.
+     */
+    public boolean failedClosed(GroupId groupId) {
+        return group(groupId).failedClosed();
+    }
+
     /** Apply lag of one group: deliveries queued or running. */
     public long deliveryLag(GroupId groupId) {
         return group(groupId).deliveryLag();

@@ -471,6 +471,23 @@ final class RaftGroup {
      */
     private UncheckedIOException storageFailed;
 
+    /** Under the lock: throws {@link #fencedError()} once the group has failed closed. */
+    private void refuseIfFailedClosed() {
+        if (storageFailed != null) {
+            throw fencedError();
+        }
+    }
+
+    /** Health/metrics: true once a failed batch could not be rolled back; cleared only by a restart. */
+    boolean failedClosed() {
+        lock.lock();
+        try {
+            return storageFailed != null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private UncheckedIOException fencedError() {
         return new UncheckedIOException("group " + groupId.value()
                 + " failed closed after a log write it could not roll back; restart to recover from disk",
@@ -483,7 +500,9 @@ final class RaftGroup {
      * through a temp file, fsync, rename and directory fsync: it also drops any torn bytes the failed write left
      * at the end of the segment, and re-syncs earlier entries whose fsync may have been lost with the failure.
      * If the rollback fails as well, the batch's fate on disk is unknown, so the group fails closed (see
-     * {@link #storageFailed}). Returns the error for the batch's future.
+     * {@link #storageFailed}). Returns the error for the batch's future. In that case part of the batch may
+     * still be on disk, and after a restart a leader may commit it like any uncommitted entry, so a caller
+     * must treat an {@code outcome unknown} failure like a timeout (retry with its own dedup key).
      */
     private RuntimeException rollBackBatch(long first, RuntimeException failed, List<Runnable> after) {
         var log = System.getLogger(RaftGroup.class.getName());
@@ -1665,6 +1684,7 @@ final class RaftGroup {
      * a restart would have neither the entries nor the image. Refuses on a storage without snapshots.
      */
     private void persistSnapshotBeforePrefixDelete() throws IOException {
+        refuseIfFailedClosed();
         if (!storage.persistsSnapshots()) {
             throw new IllegalStateException("group " + groupId.value() + ": the log storage keeps no durable snapshot,"
                     + " so deleting the log prefix would lose committed state on restart; refused");
@@ -1730,6 +1750,13 @@ final class RaftGroup {
             lock.lock();
             try {
                 takerInFlight = false;
+                if (storageFailed != null) {
+                    // Failed closed while the taker ran: install nothing, not even in memory.
+                    if (done != null) {
+                        done.completeExceptionally(fencedError());
+                    }
+                    return;
+                }
                 if (image == null) {
                     skippedSnapshots++;
                 }
@@ -2019,6 +2046,7 @@ final class RaftGroup {
             CompletableFuture<LogSnapshot> done = null;
             lock.lock();
             try {
+                refuseIfFailedClosed();
                 if (taker != null) {
                     if (lastIncludedIndex != commitIndex) {
                         throw new IllegalArgumentException("with a SnapshotTaker, take(commitIndex()) only");
@@ -2044,6 +2072,7 @@ final class RaftGroup {
             }
             lock.lock();
             try {
+                refuseIfFailedClosed();
                 if (lastIncludedIndex > commitIndex || lastIncludedIndex < snapIndex) {
                     throw new IllegalArgumentException("snapshot index");
                 }
@@ -2066,6 +2095,7 @@ final class RaftGroup {
             }
             lock.lock();
             try {
+                refuseIfFailedClosed();
                 long index = snapshot.lastIncludedIndex();
                 if (index <= snapIndex) {
                     throw new IllegalArgumentException("stale snapshot: index " + index + " does not advance past "
@@ -2111,6 +2141,9 @@ final class RaftGroup {
         public CompletableFuture<Void> truncateAndCompact(long ackedThrough, Compactor compactor) {
             Objects.requireNonNull(compactor, "compactor");
             var future = new CompletableFuture<Void>();
+            if (failedClosed(future)) {
+                return future;
+            }
             long through = ackedThrough;
             var bound = truncationBound;
             if (bound != null) {
@@ -2140,6 +2173,9 @@ final class RaftGroup {
         public CompletableFuture<Long> truncateToBound(Compactor compactor) {
             Objects.requireNonNull(compactor, "compactor");
             var future = new CompletableFuture<Long>();
+            if (failedClosed(future)) {
+                return future;
+            }
             var bound = truncationBound;
             if (bound == null) {
                 future.completeExceptionally(new IllegalStateException("no truncation bound set"));
@@ -2165,6 +2201,20 @@ final class RaftGroup {
             return future;
         }
 
+        /** Fails {@code future} with {@link #fencedError()} when the group has failed closed. */
+        private boolean failedClosed(CompletableFuture<?> future) {
+            lock.lock();
+            try {
+                if (storageFailed == null) {
+                    return false;
+                }
+                future.completeExceptionally(fencedError());
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        }
+
         private long currentSnapIndex() {
             lock.lock();
             try {
@@ -2179,6 +2229,10 @@ final class RaftGroup {
          * {@code through} if that is new. False after failing {@code future}; nothing is deleted then.
          */
         private boolean truncateLocked(long through, Compactor compactor, CompletableFuture<?> future) {
+            if (storageFailed != null) { // re-checked under the lock: it may have failed closed since the first look
+                future.completeExceptionally(fencedError());
+                return false;
+            }
             var current = new LogSnapshot(groupId, snapIndex, snapTerm, snapData);
             var compacted = compactor.compact(current);
             if (compacted != null) {
