@@ -36,6 +36,10 @@ public final class Topics implements AutoCloseable {
     private final LongSupplier clockMs;
     private final ConcurrentHashMap<String, Partition> open = new ConcurrentHashMap<>();
     private final java.util.concurrent.locks.ReentrantLock opening = new java.util.concurrent.locks.ReentrantLock();
+    /** Partitions {@link #close(String)} has started closing; only touched under {@link #opening}. */
+    private final java.util.Set<Partition> closing = ConcurrentHashMap.newKeySet();
+    /** {@code closing.size()} as one volatile read, so a cached hit skips the set when nothing is closing. */
+    private volatile int closingCount;
     private volatile boolean closed;
 
     public Topics(Path dir, RetryPolicy policy, LongSupplier clockMs) {
@@ -54,11 +58,15 @@ public final class Topics implements AutoCloseable {
             throw new IllegalStateException("closed");
         }
         var p = this.open.get(topic);
-        if (p != null) {
-            return p;
+        if (p != null && usable(p)) {
+            return p; // hot path: a lock-free cached hit
         }
         this.opening.lock(); // opening does I/O: not inside computeIfAbsent
         try {
+            if (this.closed) {
+                throw new IllegalStateException("closed");
+            }
+            // close(String) removes and closes under this lock, so a partition seen here is never closing
             p = this.open.get(topic);
             if (p == null) {
                 p = Partition.open(this.dir, topic, this.policy, this.clockMs);
@@ -81,11 +89,15 @@ public final class Topics implements AutoCloseable {
             throw new IllegalStateException("closed");
         }
         var p = this.open.get(topic);
-        if (p != null) {
-            return p;
+        if (p != null && usable(p)) {
+            return p; // hot path: a lock-free cached hit
         }
         this.opening.lock();
         try {
+            if (this.closed) {
+                throw new IllegalStateException("closed");
+            }
+            // close(String) removes and closes under this lock, so a partition seen here is never closing
             p = this.open.get(topic);
             if (p == null) {
                 p = Partition.openWithoutDlq(this.dir, topic, this.policy, this.clockMs);
@@ -103,11 +115,35 @@ public final class Topics implements AutoCloseable {
         return this.open.containsKey(topic);
     }
 
-    /** Closes {@code topic} and keeps its files; the next {@link #partition} reopens it. */
+    /** False while {@link #close(String)} is closing {@code p}: the caller must take the lock and reopen. */
+    private boolean usable(Partition p) {
+        return this.closingCount == 0 || !this.closing.contains(p);
+    }
+
+    /**
+     * Closes {@code topic} and keeps its files; the next {@link #partition} reopens it. Holds {@link #opening}
+     * across the remove and the close so a concurrent reopen can't open a second {@link Partition} on the same
+     * directory, and marks the partition closing first so a cached hit racing this doesn't hand it out.
+     * A caller that got the partition before the close started still holds a closed one and must retry.
+     */
     public void close(String topic) {
-        var p = this.open.remove(topic);
-        if (p != null) {
-            closeQuietly(p);
+        this.opening.lock();
+        try {
+            var p = this.open.get(topic);
+            if (p == null) {
+                return;
+            }
+            this.closing.add(p);
+            this.closingCount++;
+            try {
+                this.open.remove(topic, p);
+                closeQuietly(p);
+            } finally {
+                this.closing.remove(p);
+                this.closingCount--;
+            }
+        } finally {
+            this.opening.unlock();
         }
     }
 
