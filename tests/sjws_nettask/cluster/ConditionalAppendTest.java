@@ -146,8 +146,11 @@ class ConditionalAppendTest {
     void rejectsANonPositiveTerm() {
         start();
         var node = nodes.get(leader());
-        assertThrows(IllegalArgumentException.class, () -> node.append(GROUP, List.of(payload("a")), null, 0L));
-        assertThrows(IllegalArgumentException.class, () -> node.append(GROUP, List.of(payload("a")), null, -5L));
+        for (long bad : new long[] {0L, -5L}) {
+            var refused = node.append(GROUP, List.of(payload("a")), null, bad);
+            assertInstanceOf(IllegalArgumentException.class,
+                    assertThrows(ExecutionException.class, refused::get).getCause());
+        }
     }
 
     @Test
