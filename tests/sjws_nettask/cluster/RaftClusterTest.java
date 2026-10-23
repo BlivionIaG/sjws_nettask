@@ -329,7 +329,8 @@ class RaftClusterTest {
         var node = cluster.nodes.get(0);
         var missing = node.append(new GroupId("missing"), List.of(bytes("x")));
         assertInstanceOf(IllegalStateException.class, assertThrows(ExecutionException.class, missing::get).getCause());
-        assertThrows(IllegalArgumentException.class, () -> node.append(GROUP, List.of()));
+        var empty = node.append(GROUP, List.of());
+        assertInstanceOf(IllegalArgumentException.class, assertThrows(ExecutionException.class, empty::get).getCause());
         assertThrows(IllegalArgumentException.class, () -> node.begin(Duration.ZERO));
         node.begin(Duration.ofMillis(20));
         node.begin(Duration.ofMillis(20));
