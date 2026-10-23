@@ -263,7 +263,9 @@ public final class ReplicatedNode implements ClusterNode {
     public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability,
             long expectedTerm) {
         if (expectedTerm <= 0 && expectedTerm != RaftGroup.ANY_TERM) {
-            throw new IllegalArgumentException("expectedTerm");
+            var refused = new CompletableFuture<CommittedIndex>();
+            refused.completeExceptionally(new IllegalArgumentException("expectedTerm"));
+            return refused;
         }
         var group = groups.get(groupId);
         if (group == null) {
@@ -354,6 +356,14 @@ public final class ReplicatedNode implements ClusterNode {
     /** Tests only: bytes per snapshot chunk on one group. */
     void snapshotChunkBytes(GroupId groupId, int bytes) {
         group(groupId).snapshotChunkBytes = bytes;
+    }
+
+    /**
+     * Health: true once one group failed closed after a log write it could not roll back (#237). The group
+     * then refuses appends, snapshots and truncation and takes no part in Raft until the process restarts.
+     */
+    public boolean failedClosed(GroupId groupId) {
+        return group(groupId).failedClosed();
     }
 
     /** Apply lag of one group: deliveries queued or running. */
