@@ -64,9 +64,8 @@ class RetainFromTest {
             p.snapshotNow().get();
             var r = p.maintain();
             assertEquals(checkpoint, r.lowWatermark(), "the pin caps the low watermark");
-            try (var log = sjws_nettask.messaging.ledger.SegmentedLog.open(dir.resolve("shard"), SEG)) {
-                assertTrue(log.startOffset() <= checkpoint, "history from the pin is still on disk: start " + log.startOffset());
-            }
+            long start = diskStart(dir.resolve("shard")); // the open partition holds the directory lock
+            assertTrue(start <= checkpoint, "history from the pin is still on disk: start " + start);
             assertTrue(r.deletedSegments() > 0, "below the pin the normal rules still free segments");
             // moving the pin forward frees more
             long before = p.logBytes();
@@ -123,5 +122,13 @@ class RetainFromTest {
         assertThrows(IOException.class, this::open);
         Files.writeString(f, "a=notanumber\n");
         assertThrows(IOException.class, this::open);
+    }
+
+    /** Lowest segment base offset on disk, read from file names: the live partition holds the directory lock. */
+    static long diskStart(java.nio.file.Path d) throws java.io.IOException {
+        try (var s = java.nio.file.Files.list(d)) {
+            return s.map(f -> f.getFileName().toString()).filter(n -> n.matches("\\d{20}\\.log"))
+                    .mapToLong(n -> Long.parseLong(n.substring(0, 20))).min().orElse(0);
+        }
     }
 }

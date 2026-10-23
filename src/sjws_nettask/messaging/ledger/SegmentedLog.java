@@ -27,6 +27,8 @@ public final class SegmentedLog implements AutoCloseable {
     private final long recoveredTruncatedBytes;
     /** Active segment, readable by a background syncer thread while the writer appends. */
     private volatile Segment active;
+    /** Held from open to close: one process per ledger directory. */
+    private DirectoryLock dirLock;
 
     private SegmentedLog(Path dir, long segmentBytes, long truncated) {
         this.dir = dir;
@@ -40,6 +42,18 @@ public final class SegmentedLog implements AutoCloseable {
     public static SegmentedLog open(Path dir, long segmentBytes) throws IOException {
         if (segmentBytes < RecordBatch.HEADER_BYTES) throw new IllegalArgumentException("segmentBytes");
         Files.createDirectories(dir);
+        var lock = DirectoryLock.acquire(dir); // fail fast before touching any segment
+        try {
+            var log = openLocked(dir, segmentBytes);
+            log.dirLock = lock;
+            return log;
+        } catch (IOException | RuntimeException e) {
+            lock.close();
+            throw e;
+        }
+    }
+
+    private static SegmentedLog openLocked(Path dir, long segmentBytes) throws IOException {
         var bases = new ArrayList<Long>();
         try (var s = Files.list(dir)) {
             s.forEach(p -> {
@@ -201,6 +215,9 @@ public final class SegmentedLog implements AutoCloseable {
     @Override public void close() throws IOException {
         IOException first = null;
         for (var s : segments) try { s.close(); } catch (IOException e) { if (first == null) first = e; }
+        var l = dirLock;
+        dirLock = null;
+        if (l != null) try { l.close(); } catch (IOException e) { if (first == null) first = e; }
         if (first != null) throw first;
     }
 }
