@@ -131,6 +131,8 @@ class ClassLoadTest {
                 "--config=" + yaml());
         assertFalse(text.contains("sjws_nettask.swarm.TokenStreams"), text);
         assertFalse(text.contains("sjws_nettask.swarm.StreamHttp"), text); // S2c PR 4: no HTTP leg when off
+        assertFalse(text.contains("sjws_nettask.swarm.CancelSet"), text); // S2c PR 5: no cancel state, probe or sweep
+        assertFalse(text.contains("sjws_nettask.swarm.TaskService$Placed"), text);
         assertTrue(text.contains("sjws_nettask.swarm.SwarmHttp "), text);
         assertFalse(text.contains("token streaming on"), text);
     }
@@ -141,6 +143,7 @@ class ClassLoadTest {
                 "sjws_nettask.Sjws_nettask", "--config=" + yaml());
         assertTrue(text.contains("sjws_nettask.swarm.TokenStreams"), text);
         assertTrue(text.contains("sjws_nettask.swarm.StreamHttp "), text);
+        assertTrue(text.contains("sjws_nettask.swarm.CancelSet "), text);
         assertTrue(text.contains("swarm: token streaming on, shards=1"), text);
     }
 

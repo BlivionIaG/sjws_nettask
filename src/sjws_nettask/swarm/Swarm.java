@@ -42,6 +42,14 @@ public final class Swarm implements AutoCloseable {
         return new Swarm(new Topics(dir, policy, clockMs), id, producerId, idleCloseMs);
     }
 
+    /**
+     * Another node on the same ledger as {@code other} (its own task service, reply router, streams and CancelSet;
+     * shared topics). For multi-node tests; close it with {@code replies().close()}, the topics belong to {@code other}.
+     */
+    static Swarm sharing(Swarm other, String id, long producerId, long idleCloseMs) {
+        return new Swarm(other.topics, id, producerId, idleCloseMs);
+    }
+
     public static Swarm open(Path dir, String id, long producerId) {
         return open(dir, id, producerId, RetryPolicy.DEFAULT, System::currentTimeMillis,
                 ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
@@ -66,6 +74,7 @@ public final class Swarm implements AutoCloseable {
      */
     public TokenStreams enableStreams(TokenStreams.Config config) {
         var s = new TokenStreams(this.topics, this.replies.topic().substring("reply.".length()), config);
+        this.topics.installProbes(s.cancels()::probe); // S2c PR 5: extend answers CANCELLED for cancelled tasks
         this.tasks.bindStreams(s);
         return s;
     }

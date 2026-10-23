@@ -43,6 +43,11 @@ public interface SwarmGate {
         }
 
         @Override
+        public boolean isAdmin(Agent agent) {
+            return false;
+        }
+
+        @Override
         public long maxRequestBytes() {
             return 0;
         }
@@ -58,6 +63,14 @@ public interface SwarmGate {
 
     /** @return whether {@code agent} may submit to, claim from or settle leases of {@code pool} */
     boolean allows(Agent agent, String pool);
+
+    /**
+     * Whether {@code agent} is an admin: may cancel any agent's stream (S2c PR 5). Default: nobody. {@link TokenGate}:
+     * an agent granted pool {@code *}. S2d's {@code AgentPolicy} replaces this with an explicit role. Abstract on
+     * purpose: a default method would make loading any gate initialize this interface (and load {@link #DENY_ALL}'s
+     * class) with streaming off.
+     */
+    boolean isAdmin(Agent agent);
 
     /** Largest request body accepted, in bytes; larger (or unknown-length beyond it) bodies get 413. */
     long maxRequestBytes();
