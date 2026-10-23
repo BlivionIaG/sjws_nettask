@@ -77,10 +77,19 @@ class TopicsCloseRaceTest {
                             var p = withoutDlq ? topics.partitionWithoutDlq(topic) : topics.partition(topic);
                             try {
                                 var r = p.produce(pid, seq, new byte[] {1});
+                                // An offset counts only once durable: a produce that slipped in after Partition.close
+                                // set closed but before writer.close() gets an offset whose durable future then fails
+                                // with "closed", and the reopened instance reuses that offset. The retry keeps
+                                // (pid, seq), so if the record did reach the log the reopen dedups it to its offset
+                                // (counted here, once).
+                                awaitDurable(r, p, () -> withoutDlq ? topics.partitionWithoutDlq(topic) : topics.partition(topic));
                                 offsetsByInstance.computeIfAbsent(p, k -> ConcurrentHashMap.newKeySet()).add(r.offset());
                                 produced.incrementAndGet();
                                 break;
-                            } catch (RuntimeException closedUnderUs) {
+                            } catch (RuntimeException e) {
+                                if (!closedUnderUs(e)) {
+                                    throw e; // an unrelated failure must fail the test, not be retried
+                                }
                                 // got it just before a close started: the retry must get a fresh one
                                 retries.incrementAndGet();
                                 var again = withoutDlq ? topics.partitionWithoutDlq(topic) : topics.partition(topic);
@@ -139,6 +148,50 @@ class TopicsCloseRaceTest {
         assertSame(fresh, withoutDlq ? topics.partitionWithoutDlq(topic) : topics.partition(topic));
         assertEquals(produced.get(), fresh.produce(99, 1, new byte[] {2}).offset());
         topics.close();
+    }
+
+    /**
+     * Waits for {@code r} to be durable. A produce that passed the writer's closed check just as
+     * {@code LedgerWriter.close()} drained its queue can be left with a durable future that never completes
+     * (Partition.produce does not check {@code closed} under its lock yet: the Messaging Core follow-up from the #240
+     * review). That can only happen on an instance {@link Topics#close(String)} already removed, so a wait that stalls
+     * while {@code p} is no longer the current instance counts as closed under us. Retrying is safe either way: the retry
+     * keeps (pid, seq), so a record that did reach the log is deduplicated to its offset.
+     */
+    private static void awaitDurable(Partition.ProduceResult r, Partition p, java.util.function.Supplier<Partition> current) {
+        while (true) {
+            try {
+                r.durable().get(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                return;
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw new java.util.concurrent.CompletionException(e.getCause());
+            } catch (java.util.concurrent.TimeoutException e) {
+                if (current.get() != p) {
+                    throw new StrandedOnClose();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted", e);
+            }
+        }
+    }
+
+    /** A durable wait that stalled on an instance {@link Topics#close(String)} had already removed. */
+    private static final class StrandedOnClose extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        StrandedOnClose() {
+            super("durable wait stalled on a closed partition", null, false, false);
+        }
+    }
+
+    /** The failure of a produce on a partition closed under the caller: the writer's "closed", possibly wrapped. */
+    private static boolean closedUnderUs(Throwable e) {
+        while ((e instanceof java.util.concurrent.CompletionException
+                || e instanceof java.util.concurrent.ExecutionException) && e.getCause() != null) {
+            e = e.getCause();
+        }
+        return e instanceof StrandedOnClose || e instanceof IllegalStateException && "closed".equals(e.getMessage());
     }
 
     @Test
