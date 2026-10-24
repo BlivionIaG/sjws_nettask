@@ -354,6 +354,34 @@ class BatchAtomicityTest {
         assertFalse(contains(applied.get(l), "next"), "a failed-closed group must not apply new entries");
     }
 
+    @Test
+    void failingClosedFailsEarlierPendingWritesAsOutcomeUnknownNotNotLeader() throws Exception {
+        start(Durability.RELAXED, false);
+        int l = leader();
+        var faulty = storages.get(l);
+        settle(nodes.get(l).append(GROUP, batch("before", 1)));
+        // Keep the next batch pending: in the log, but no quorum can ack it.
+        net.cut(nodes.get(l).self(), nodes.get(1 - l).self());
+        net.cut(nodes.get(l).self(), nodes.get(2).self());
+        var inFlight = nodes.get(l).append(GROUP, batch("inflight", 2));
+        assertFalse(inFlight.isDone(), "the in-flight batch must still be pending");
+        long pendingLast = faulty.lastIndex(GROUP);
+
+        faulty.failTruncate = true;
+        faulty.armAppend(1);
+        var failed = nodes.get(l).append(GROUP, batch("bad", 3));
+        assertTrue(assertThrows(ExecutionException.class, failed::get).getCause().getMessage()
+                .contains("outcome unknown"));
+        assertTrue(nodes.get(l).failedClosed(GROUP));
+
+        var cause = assertThrows(ExecutionException.class,
+                () -> inFlight.get(10, java.util.concurrent.TimeUnit.SECONDS)).getCause();
+        assertFalse(cause instanceof NotLeaderException, "an in-log write may still commit; not-leader says it won't");
+        assertInstanceOf(UncheckedIOException.class, cause);
+        assertTrue(cause.getMessage().contains("outcome unknown"), cause.getMessage());
+        assertTrue(cause.getMessage().contains("index " + pendingLast), cause.getMessage());
+    }
+
     private static void assertFenced(Throwable error) {
         assertInstanceOf(UncheckedIOException.class, error);
         assertTrue(error.getMessage().contains("failed closed"), error.getMessage());

@@ -44,7 +44,9 @@ public interface ClusterNode extends AutoCloseable {
      * fsynced it. One batch is one ordered span of indexes, and it is all-or-nothing: if a log write
      * fails partway, the leader rolls the batch back and the future fails; if the rollback fails too,
      * the group fails closed until restart. That failure says {@code outcome unknown}: part of the batch may
-     * still commit after the restart, so treat it like a timeout and deduplicate on retry. Every refusal (an empty batch, a null entry, a bad
+     * still commit after the restart, so treat it like a timeout and deduplicate on retry. Earlier
+     * batches still pending when the group fails closed fail the same way, not with
+     * {@link NotLeaderException}. Every refusal (an empty batch, a null entry, a bad
      * {@code expectedTerm}, a storage error) fails the future rather than throwing.
      */
     CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
