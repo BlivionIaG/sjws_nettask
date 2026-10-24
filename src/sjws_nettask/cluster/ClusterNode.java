@@ -41,7 +41,11 @@ public interface ClusterNode extends AutoCloseable {
     /**
      * Leader only; otherwise the future completes with {@link NotLeaderException}. The future
      * completes with the committed index after a quorum has the batch. Strict groups have also
-     * fsynced it. One batch is one ordered span of indexes.
+     * fsynced it. One batch is one ordered span of indexes, and it is all-or-nothing: if a log write
+     * fails partway, the leader rolls the batch back and the future fails; if the rollback fails too,
+     * the group fails closed until restart. That failure says {@code outcome unknown}: part of the batch may
+     * still commit after the restart, so treat it like a timeout and deduplicate on retry. Every refusal (an empty batch, a null entry, a bad
+     * {@code expectedTerm}, a storage error) fails the future rather than throwing.
      */
     CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
 
@@ -64,6 +68,24 @@ public interface ClusterNode extends AutoCloseable {
         return future;
     }
 
+    /**
+     * Conditional append: as {@link #append(GroupId, List, Durability)}, but only if this node leads
+     * the group in {@code expectedTerm}. The leader role and term are checked together, under the same
+     * lock as the log write, so a deposed leader's in-flight produce cannot land in a new term under the
+     * old term's assumptions. Fails with {@link NotLeaderException} when this node does not lead, and
+     * with {@link TermChangedException} when it leads in another term; nothing is appended in either case.
+     * The check is at append time: once appended, the entry follows normal Raft rules (a later leader may
+     * still commit it, so callers keep their own stale-term fence on apply). {@code expectedTerm} must be
+     * positive. The default implementation cannot check the term atomically and fails the future with
+     * {@link UnsupportedOperationException}.
+     */
+    default CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability,
+            long expectedTerm) {
+        var future = new CompletableFuture<CommittedIndex>();
+        future.completeExceptionally(new UnsupportedOperationException("conditional append"));
+        return future;
+    }
+
     /** Leadership of this group only. Invoked off the request path. */
     void onLeaderChange(GroupId groupId, BiConsumer<Long, Optional<NodeId>> listener);
 
@@ -72,8 +94,18 @@ public interface ClusterNode extends AutoCloseable {
      * shape as {@link #onLeaderChange}. Invoked off the request path. Callers that gate serve
      * on leader-ready (Messaging Core, control plane) register here rather than casting to
      * {@code ReplicatedNode}.
+     *
+     * <p>It fires on every replica that applies the no-op, followers included, not only on the
+     * leader that wrote it, and it may arrive after this node has already been deposed. A callback
+     * proves only that every entry before the no-op has been applied here; a caller that gates on
+     * leadership must re-check the live role and term together (for example
+     * {@code group.leaderTerm() == term}) before serving.
+     *
+     * <p>The default throws {@link UnsupportedOperationException}, as a membership-only node does.
      */
-    void onNoopApplied(GroupId groupId, BiConsumer<Long, Long> listener);
+    default void onNoopApplied(GroupId groupId, BiConsumer<Long, Long> listener) {
+        throw new UnsupportedOperationException("onNoopApplied");
+    }
 
     SnapshotControl snapshots(GroupId groupId);
 

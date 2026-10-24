@@ -66,10 +66,14 @@ public final class Topics implements AutoCloseable {
         }
         var p = this.open.get(topic);
         if (p != null) {
-            return p;
+            return p; // hot path: a lock-free cached hit
         }
         this.opening.lock(); // opening does I/O: not inside computeIfAbsent
         try {
+            if (this.closed) {
+                throw new IllegalStateException("closed");
+            }
+            // close(String) removes and closes under this lock, so a partition seen here is never closing or closed
             p = this.open.get(topic);
             if (p == null) {
                 var pr = this.probes;
@@ -99,10 +103,14 @@ public final class Topics implements AutoCloseable {
         }
         var p = this.open.get(topic);
         if (p != null) {
-            return p;
+            return p; // hot path: a lock-free cached hit
         }
         this.opening.lock();
         try {
+            if (this.closed) {
+                throw new IllegalStateException("closed");
+            }
+            // close(String) removes and closes under this lock, so a partition seen here is never closing or closed
             p = this.open.get(topic);
             if (p == null) {
                 p = Partition.openWithoutDlq(this.dir, topic, this.policy, this.clockMs);
@@ -124,11 +132,24 @@ public final class Topics implements AutoCloseable {
         return this.open.containsKey(topic);
     }
 
-    /** Closes {@code topic} and keeps its files; the next {@link #partition} reopens it. */
+    /**
+     * Closes {@code topic} and keeps its files; the next {@link #partition} reopens it. Holds {@link #opening}
+     * across the remove and the close, so a concurrent reopen (which only opens under {@link #opening}) can't open a
+     * second {@link Partition} on the same directory while this one is still closing. A caller that got the
+     * partition from the lock-free cached hit before the remove still holds one that is (or is about to be) closed:
+     * its produce fails with "closed" and it must retry; the retry misses, waits on {@link #opening} and gets a
+     * fresh one.
+     */
     public void close(String topic) {
-        var p = this.open.remove(topic);
-        if (p != null) {
-            closeQuietly(p);
+        this.opening.lock();
+        try {
+            var p = this.open.get(topic);
+            if (p != null) {
+                this.open.remove(topic, p); // removed first: from here on a lookup misses and blocks on opening
+                closeQuietly(p);
+            }
+        } finally {
+            this.opening.unlock();
         }
     }
 

@@ -37,6 +37,7 @@ import sjws_nettask.cluster.GroupOptions;
 import sjws_nettask.cluster.NodeId;
 import sjws_nettask.cluster.NotLeaderException;
 import sjws_nettask.cluster.ReplicationGroup;
+import sjws_nettask.cluster.TermChangedException;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.LedgerWriter;
@@ -206,13 +207,15 @@ final class RaftReplica implements Replica {
     @Override
     public CompletableFuture<Long> appendNoWait(List<byte[]> records, Durability mode) {
         var m = mode == null ? this.defaultMode : mode;
-        long term = this.group.term();
+        long term = this.group.leaderTerm();
         if (!leaderReady(term)) return CompletableFuture.failedFuture(unavailable("not the ready leader"));
         long seq = this.seqs.incrementAndGet();
         var acked = new CompletableFuture<Long>();
         this.pending.put(seq, acked);
         var cd = m == Durability.GROUP || m == Durability.EACH ? sjws_nettask.cluster.Durability.STRICT : null;
-        this.node.append(this.groupId, List.of(encode(records, m, term, this.self, seq)), cd).whenComplete((ci, err) -> {
+        // Conditional on the term just checked: a step-down and re-election between the check and the
+        // log write fails the append instead of proposing under the old term's readiness.
+        this.node.append(this.groupId, List.of(encode(records, m, term, this.self, seq)), cd, term).whenComplete((ci, err) -> {
             if (err != null) {
                 var p = this.pending.remove(seq);
                 if (p != null) p.completeExceptionally(map(err));
@@ -226,15 +229,19 @@ final class RaftReplica implements Replica {
         this.local.awaitCapacity();
     }
 
-    private boolean leaderReady(long term) {
-        // Ready = this term's no-op applied here, still leader, and inside its lease (an isolated old leader stops acking).
-        return this.readyTerm == term && this.group.isLeader()
+    /**
+     * {@code leaderTerm} is one {@link ReplicationGroup#leaderTerm()} read (role and term together, {@code -1}
+     * when not leader). Ready = this term's no-op applied here, still leader in it, and inside its lease (an
+     * isolated old leader stops acking).
+     */
+    private boolean leaderReady(long leaderTerm) {
+        return leaderTerm > 0 && this.readyTerm == leaderTerm
                 && (this.solo || this.group.leaseExpiresAt() > this.nanoClock.getAsLong());
     }
 
     @Override
     public boolean leaderReady() {
-        return leaderReady(this.group.term());
+        return leaderReady(this.group.leaderTerm());
     }
 
     @Override
@@ -272,7 +279,8 @@ final class RaftReplica implements Replica {
 
     private Throwable map(Throwable err) {
         var c = err instanceof CompletionException && err.getCause() != null ? err.getCause() : err;
-        return c instanceof NotLeaderException ? unavailable("not leader") : c;
+        if (c instanceof NotLeaderException) return unavailable("not leader");
+        return c instanceof TermChangedException ? unavailable("term moved") : c;
     }
 
     @Override

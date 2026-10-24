@@ -255,13 +255,25 @@ public final class ReplicatedNode implements ClusterNode {
 
     @Override
     public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability) {
+        return append(groupId, batch, durability, RaftGroup.ANY_TERM);
+    }
+
+    /** Leader role and {@code expectedTerm} are checked under the group lock, with the log write. */
+    @Override
+    public CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch, Durability durability,
+            long expectedTerm) {
+        if (expectedTerm <= 0 && expectedTerm != RaftGroup.ANY_TERM) {
+            var refused = new CompletableFuture<CommittedIndex>();
+            refused.completeExceptionally(new IllegalArgumentException("expectedTerm"));
+            return refused;
+        }
         var group = groups.get(groupId);
         if (group == null) {
             var future = new CompletableFuture<CommittedIndex>();
             future.completeExceptionally(new IllegalStateException("no group " + groupId));
             return future;
         }
-        var future = group.append(batch, durability);
+        var future = group.append(batch, durability, expectedTerm);
         if (running && wake.availablePermits() == 0) {
             wake.release();
         }
@@ -344,6 +356,14 @@ public final class ReplicatedNode implements ClusterNode {
     /** Tests only: bytes per snapshot chunk on one group. */
     void snapshotChunkBytes(GroupId groupId, int bytes) {
         group(groupId).snapshotChunkBytes = bytes;
+    }
+
+    /**
+     * Health: true once one group failed closed after a log write it could not roll back (#237). The group
+     * then refuses appends, snapshots and truncation and takes no part in Raft until the process restarts.
+     */
+    public boolean failedClosed(GroupId groupId) {
+        return group(groupId).failedClosed();
     }
 
     /** Apply lag of one group: deliveries queued or running. */
