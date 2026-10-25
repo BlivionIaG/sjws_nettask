@@ -1,6 +1,7 @@
 name: Cluster tests
 
-# Multi-node cluster harness (tests/sjws_nettask/clusterharness, tag `cluster`) plus the
+# Multi-node cluster harness (tests/sjws_nettask/clusterharness, tag `cluster`, including the
+# multi-process HA messaging scenario MsgReplClusterTest, gate G3) plus the
 # standalone vs gateway-off wrk comparison, at full length. Nightly, on demand, and on PRs
 # carrying the `cluster-tests` label. The short versions already run in CI on every PR.
 on:

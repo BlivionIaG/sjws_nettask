@@ -186,18 +186,32 @@ class MsgReplClusterTest {
             p.produce(150);
             // kill -9 the leader while a producer keeps writing from another thread
             var errors = new ArrayList<Throwable>();
+            var killedAt = new java.util.concurrent.atomic.AtomicLong();
+            var firstAckAfter = new java.util.concurrent.atomic.AtomicLong();
+            int ackedBeforeKill = p.acked.size();
             var writer = Thread.ofPlatform().start(() -> {
                 try {
-                    p.produce(150);
+                    int afterKill = 0;
+                    while (afterKill < 150) {
+                        p.produce(1);
+                        if (killedAt.get() != 0) {
+                            firstAckAfter.compareAndSet(0, System.nanoTime());
+                            afterKill++;
+                        }
+                    }
                 } catch (Throwable t) {
                     errors.add(t);
                 }
             });
-            Thread.sleep(300);
+            Thread.sleep(500); // the producer is mid-stream
+            killedAt.set(System.nanoTime());
             c.kill(leader);
             writer.join(Duration.ofSeconds(120));
             assertFalse(writer.isAlive(), "producer stuck after failover");
             assertTrue(errors.isEmpty(), errors.toString());
+            assertTrue(p.acked.size() > ackedBeforeKill + 150, "the producer was writing when the leader died");
+            System.out.printf("G3 leader-kill: killed=%s acked=%d uncertain=%d resent=%d failover=%dms%n", leader,
+                    p.acked.size(), p.uncertain, p.resent, (firstAckAfter.get() - killedAt.get()) / 1_000_000);
             var survivor = "a".equals(leader) ? "b" : "a";
             assertEquals(survivor, c.awaitLeader(FAILOVER), "the surviving data node leads with the witness");
             p.produce(50);
@@ -208,6 +222,7 @@ class MsgReplClusterTest {
             var log = assertLog(c, p, survivor, leader);
             assertEquals(p.acked.size(), log.size(), "exactly the acked records (uncertain=" + p.uncertain
                     + ", resent=" + p.resent + ")");
+            assertTrue(c.logText(leader).contains("ha messaging: replication on"), "restarted with replication");
         }
     }
 
