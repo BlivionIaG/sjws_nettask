@@ -29,23 +29,23 @@ jobs:
         run: |
           fails=0
           for i in $(seq 30); do
-            mvn -B -o -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test > out.txt 2>&1 || fails=$((fails+1))
-            grep -E 'DIAG265|no spin' out.txt | cut -c1-600
+            mvn -B -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test > out.txt 2>&1 || { fails=$((fails+1)); grep -E 'ERROR' out.txt | head -15 | cut -c1-400; }
+            grep -E 'DIAG265|no spin|Tests run:' out.txt | cut -c1-600
           done
           echo "FAILED_RUNS=$fails/30"
       - name: Same with one unrelated busy thread in the JVM (expected to fail)
         run: |
-          DIAG265_HOG=1 mvn -B -o -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test 2>&1 | grep -E 'DIAG265|no spin|Tests run' | cut -c1-600 || true
+          DIAG265_HOG=1 mvn -B -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test 2>&1 | grep -E 'DIAG265|no spin|Tests run' | cut -c1-600 || true
       - name: strace sendfile/splice syscalls over both tests
         run: |
           sudo apt-get install -y -q strace >/dev/null 2>&1 || true
-          strace -f -c -e trace=sendfile,splice,pread64,write,writev -o strace.txt mvn -B -o -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test > out.txt 2>&1 || true
-          grep -E 'DIAG265|no spin|Tests run' out.txt | cut -c1-600; cat strace.txt
+          strace -f -c -e trace=sendfile,splice,pread64,write,writev -o strace.txt mvn -B -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test > out.txt 2>&1 || true
+          grep -E 'DIAG265|no spin|Tests run|ERROR' out.txt | head -30 | cut -c1-600; cat strace.txt
   suite:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-26.04]
+        os: [ubuntu-26.04]
         ref: [8fdf93df282eeb82e6edf409c33c1f3a8f47e152]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
