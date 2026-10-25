@@ -56,6 +56,7 @@ class BatchAtomicityTest {
         volatile int failAppendAfter = -1; // appends allowed before the injected failure; -1 = never
         volatile boolean failForce;
         volatile boolean failTruncate;
+        volatile boolean failRead;
         int appends;
         /** Every storage call that writes, counted whether or not it then fails. */
         final java.util.concurrent.atomic.AtomicInteger writes = new java.util.concurrent.atomic.AtomicInteger();
@@ -93,6 +94,9 @@ class BatchAtomicityTest {
 
         @Override
         public byte[] read(GroupId g, long index) throws IOException {
+            if (failRead) {
+                throw new IOException("injected read failure at index " + index);
+            }
             return d.read(g, index);
         }
 
@@ -302,6 +306,47 @@ class BatchAtomicityTest {
         assertEquals(last, storages.get(l).lastIndex(GROUP));
         settle(nodes.get(l).append(GROUP, batch("after", 1)));
         assertFalse(contains(applied.get(l), "bad"));
+    }
+
+    /**
+     * #254 (Security): a storage error after the batch is in the log (here: reading it back to replicate) fails the
+     * future as outcome unknown. It used to be thrown out of append(), which a caller reads as "not appended".
+     */
+    @Test
+    void aStorageErrorAfterTheBatchIsAppendedFailsTheFutureAsOutcomeUnknown() throws Exception {
+        start(Durability.RELAXED, false);
+        int l = leader();
+        settle(nodes.get(l).append(GROUP, batch("before", 1)));
+        long last = storages.get(l).lastIndex(GROUP);
+        storages.get(l).failRead = true;
+        java.util.concurrent.CompletableFuture<CommittedIndex> accepted;
+        try {
+            accepted = org.junit.jupiter.api.Assertions.assertDoesNotThrow(
+                    () -> nodes.get(l).append(GROUP, batch("accepted", 2)));
+        } finally {
+            storages.get(l).failRead = false;
+        }
+        assertEquals(last + 2, storages.get(l).lastIndex(GROUP), "the batch is in the log");
+        var cause = assertThrows(ExecutionException.class, () -> accepted.get(10, TimeUnit.SECONDS)).getCause();
+        assertInstanceOf(OutcomeUnknownException.class, cause);
+        assertInstanceOf(UncheckedIOException.class, cause.getCause());
+    }
+
+    /** #254 (Security): a cleanly rolled-back batch and a fenced group get their own refusal types. */
+    @Test
+    void rolledBackAndFencedRefusalsHaveDedicatedTypes() throws Exception {
+        start(Durability.RELAXED, false);
+        int l = leader();
+        settle(nodes.get(l).append(GROUP, batch("before", 1)));
+        storages.get(l).armAppend(1);
+        var rolledBack = nodes.get(l).append(GROUP, batch("bad", 3));
+        assertInstanceOf(BatchRolledBackException.class, assertThrows(ExecutionException.class, rolledBack::get).getCause());
+        storages.get(l).failTruncate = true;
+        storages.get(l).armAppend(1);
+        var unknown = nodes.get(l).append(GROUP, batch("worse", 3));
+        assertInstanceOf(OutcomeUnknownException.class, assertThrows(ExecutionException.class, unknown::get).getCause());
+        var fenced = nodes.get(l).append(GROUP, batch("after", 1));
+        assertInstanceOf(GroupFencedException.class, assertThrows(ExecutionException.class, fenced::get).getCause());
     }
 
     @Test

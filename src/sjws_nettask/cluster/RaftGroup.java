@@ -300,8 +300,8 @@ final class RaftGroup {
         var after = new ArrayList<Runnable>();
         lock.lock();
         try {
-            if (storageFailed != null) {
-                return; // failed closed: no fsync, heartbeat or campaign until restart
+            if (storageFailed != null || closed) {
+                return; // failed closed or node closed: no fsync, heartbeat or campaign (until restart)
             }
             if (relaxedDirty && now - dirtySince >= options.relaxedSyncDelay().toNanos()) {
                 force();
@@ -335,8 +335,8 @@ final class RaftGroup {
         var after = new ArrayList<Runnable>();
         lock.lock();
         try {
-            if (storageFailed != null) {
-                return; // failed closed: no acks, votes or terms until restart
+            if (storageFailed != null || closed) {
+                return; // failed closed or node closed: no acks, votes or terms (until restart)
             }
             var body = ByteBuffer.wrap(frame.body()).order(java.nio.ByteOrder.BIG_ENDIAN);
             switch (frame.type()) {
@@ -405,6 +405,10 @@ final class RaftGroup {
                 future.completeExceptionally(fencedError());
                 return future;
             }
+            if (closed) {
+                future.completeExceptionally(new GroupClosedException(groupId));
+                return future;
+            }
             if (role != Role.LEADER) {
                 future.completeExceptionally(notLeader());
                 return future;
@@ -452,15 +456,23 @@ final class RaftGroup {
                 rolledBack = true;
             }
             if (!rolledBack) {
-                if (marked) {
-                    long now = clock.nanoTime();
-                    for (long index = first; index <= last; index++) {
-                        strictPending.put(index, now);
+                try {
+                    if (marked) {
+                        long now = clock.nanoTime();
+                        for (long index = first; index <= last; index++) {
+                            strictPending.put(index, now);
+                        }
                     }
+                    pending.put(last, future);
+                    maybeCommit(after);
+                    replicate();
+                } catch (RuntimeException accepted) {
+                    // The batch is in the log and may already be on its way to a follower: its fate is unknown. Fail
+                    // the future as such; never throw to the caller, which would read as "not appended" (#254).
+                    pending.remove(last, future);
+                    future.completeExceptionally(new OutcomeUnknownException(groupId, "a storage error after the batch"
+                            + " at " + first + ".." + last + " was appended", Optional.empty(), accepted));
                 }
-                pending.put(last, future);
-                maybeCommit(after);
-                replicate();
             }
         } finally {
             lock.unlock();
@@ -517,9 +529,7 @@ final class RaftGroup {
     }
 
     private UncheckedIOException fencedError() {
-        return new UncheckedIOException("group " + groupId.value()
-                + " failed closed after a log write it could not roll back; restart to recover from disk",
-                storageFailed.getCause());
+        return new GroupFencedException(groupId, storageFailed.getCause());
     }
 
     /**
@@ -534,6 +544,12 @@ final class RaftGroup {
      * (retry with its own dedup key). A batch rolled back cleanly fails with the storage error itself: nothing of it
      * is in the log, a refusal.
      */
+    /**
+     * Set once by {@link #closeGroup()}, under {@link #lock}: the node closed. A closed group ignores ticks and frames,
+     * never campaigns (so it can never be elected again) and refuses new appends with {@link GroupClosedException}.
+     */
+    private boolean closed;
+
     private Throwable rollBackBatch(long first, RuntimeException failed, List<Runnable> after) {
         var log = System.getLogger(RaftGroup.class.getName());
         try {
@@ -543,7 +559,7 @@ final class RaftGroup {
             }
             WRITE_FAILURES.log(System.Logger.Level.WARNING, "group " + groupId.value() + ": log write failed at index "
                     + first + " or later; rolled the batch back, nothing of it stays in the log", failed);
-            return failed;
+            return new BatchRolledBackException(groupId, first, failed); // a refusal: safe to retry (#254)
         } catch (RuntimeException rollback) {
             failed.addSuppressed(rollback);
             var cause = failed instanceof UncheckedIOException io ? io.getCause()
@@ -595,6 +611,9 @@ final class RaftGroup {
     }
 
     private void startElection(long now, List<Runnable> after) {
+        if (closed) {
+            return; // a closed node never campaigns, so it is never elected again (#254)
+        }
         if (role == Role.LEADER) {
             failPendingWrites(after); // onTimeoutNow does not check the sender's term: a stale one reaches a leader
         }
@@ -1580,17 +1599,25 @@ final class RaftGroup {
      * on a follower may still commit under the next leader, so callers deduplicate on retry (#254).
      */
     private void failPendingWrites(List<Runnable> after) {
-        failPendingWrites(after, Optional.ofNullable(self.equals(leader) ? null : leader));
+        failPendingWrites(after, Optional.ofNullable(self.equals(leader) ? null : leader), true);
     }
 
-    /** As {@link #failPendingWrites(List)}, naming {@code hint} as the leader to retry or read back at. */
-    private void failPendingWrites(List<Runnable> after, Optional<NodeId> hint) {
+    /**
+     * As {@link #failPendingWrites(List)}, naming {@code hint} as the leader to retry or read back at. Appends fail on
+     * the delivery thread ({@code viaDeliveries}), after every callback queued before; {@link #closeGroup()} passes
+     * false because its delivery thread is already closed, and fails them in {@code after}, outside the lock.
+     */
+    private void failPendingWrites(List<Runnable> after, Optional<NodeId> hint, boolean viaDeliveries) {
         // Accepted writes: in the log, fate unknown (#254). Not NotLeaderException, which says "nothing appended".
         var unknown = new OutcomeUnknownException(groupId, "this node stopped leading before the write committed",
                 hint, null);
         // Failed on the delivery thread too, after every callback already queued for earlier entries.
         for (var future : pending.values()) {
-            deliveries.fail(future, unknown);
+            if (viaDeliveries) {
+                deliveries.fail(future, unknown);
+            } else {
+                after.add(() -> future.completeExceptionally(unknown));
+            }
         }
         pending.clear();
         // Read barriers waiting for a quorum round would otherwise hang (only a quorum ack as leader completed
@@ -1608,40 +1635,41 @@ final class RaftGroup {
     }
 
     /**
-     * {@link ReplicatedNode#close()}, after the Raft thread stopped and this group's deliveries closed: stops leading
-     * for good and fails every future still unresolved, so nothing waits on a closed node (#254). Pending appends and
-     * a pending membership change are in the log: {@link OutcomeUnknownException}. Waiting read barriers:
-     * {@link NotLeaderException}. Later calls are refused as not leader (role follower, never campaigns again).
-     * Completed directly here: the delivery executor is already closed. Idempotent.
+     * {@link ReplicatedNode#close()}, after the Raft thread stopped and this group's deliveries closed: a permanent
+     * step-down (#254). It goes through the shared {@link #failPendingWrites} path, so pending appends and a pending
+     * membership change fail with {@link OutcomeUnknownException} (they are in the log) and waiting read barriers with
+     * {@link NotLeaderException}. Afterwards the group ignores ticks and frames and never campaigns, so it is never
+     * elected again; appends are refused with {@link GroupClosedException} (nothing appended). Idempotent.
      */
-    void closeGroup() {
-        var failed = new ArrayList<Runnable>();
+    /**
+     * First step of {@link ReplicatedNode#close()}, before it waits for the Raft thread: from here the group never
+     * campaigns, votes, acks or accepts an append, even if that thread is still running a tick (#254). Idempotent.
+     */
+    void markClosed() {
         lock.lock();
         try {
-            var hint = Optional.ofNullable(self.equals(leader) ? null : leader);
-            var unknown = new OutcomeUnknownException(groupId, "node closed before the write committed", hint, null);
-            var refused = new NotLeaderException(groupId, hint);
+            closed = true;
+            campaignNotBefore = Long.MAX_VALUE;
+            electionDeadline = Long.MAX_VALUE;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    void closeGroup() {
+        var after = new ArrayList<Runnable>();
+        lock.lock();
+        try {
+            closed = true;
+            failPendingWrites(after, Optional.ofNullable(self.equals(leader) ? null : leader), false);
             role = Role.FOLLOWER;
             leader = null;
             campaignNotBefore = Long.MAX_VALUE;
             electionDeadline = Long.MAX_VALUE;
-            for (var future : pending.values()) {
-                failed.add(() -> future.completeExceptionally(unknown));
-            }
-            pending.clear();
-            if (membershipChange != null) {
-                var change = membershipChange;
-                membershipChange = null;
-                failed.add(() -> change.completeExceptionally(unknown));
-            }
-            for (var read : reads) {
-                failed.add(() -> read.completeExceptionally(refused));
-            }
-            reads.clear();
         } finally {
             lock.unlock();
         }
-        run(failed);
+        run(after);
     }
 
     private void fireLeader(List<Runnable> after) {
@@ -2153,7 +2181,7 @@ final class RaftGroup {
                 leader = null;
                 // Like stepDown: without this the futures stayed pending and a later commit at their index (another
                 // leader's entry) completed them as committed (#250). The transfer target is the likely next leader.
-                failPendingWrites(after, Optional.of(target));
+                failPendingWrites(after, Optional.of(target), true);
                 long now = clock.nanoTime();
                 long wait = options.leaseNanos() + options.electionTimeout().toNanos();
                 long failback = options.failbackHysteresis().toNanos();

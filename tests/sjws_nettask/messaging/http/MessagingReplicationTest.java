@@ -259,6 +259,42 @@ class MessagingReplicationTest {
         assertTrue(body.contains("\"leaderUrl\":\"http://" + target + ".test/messaging/v1/topics/t/records\""), body);
     }
 
+    /**
+     * #254: cluster and messaging each have an outcome-unknown type (messaging may not load cluster classes), joined at
+     * exactly one boundary, RaftReplica.map. Pin that both reach the same typed 503 problem body, never a 307.
+     */
+    @Test
+    void clusterAndMessagingOutcomeUnknownGiveTheSameTyped503() throws Exception {
+        start();
+        int l = leader("t");
+        int f = 1 - l;
+        var replica = topics.get(l).get("t", false).replica();
+        var target = "/messaging/v1/topics/t/records";
+        var hint = "n" + (f + 1);
+        var cluster = new sjws_nettask.cluster.OutcomeUnknownException(RaftReplicator.group("t"), "stopped leading",
+                java.util.Optional.of(nodes.get(f).self()), null);
+        var viaBoundary = MessagingHttp.failed(new java.util.concurrent.ExecutionException(
+                new java.util.concurrent.CompletionException(sjws_nettask.msgrepl.ReplicaErrors.map(replica, cluster))), target, true);
+        var messaging = MessagingHttp.failed(new java.util.concurrent.ExecutionException(
+                new sjws_nettask.messaging.ledger.WriteOutcomeUnknownException("other text", replica.term(), hint,
+                        "http://" + hint + ".test", null)), target, true);
+        for (var r : List.of(viaBoundary, messaging)) {
+            assertEquals(503, r.status());
+            assertNull(r.headers().get("location"), "never a redirect");
+            assertEquals("1", r.headers().get("retry-after"));
+            assertEquals(hint, r.headers().get("sjws-leader"));
+            assertEquals(Long.toString(replica.term()), r.headers().get("sjws-term"));
+        }
+        assertEquals(LogOffsetsTest.text(messaging), LogOffsetsTest.text(viaBoundary), "the same problem body");
+        assertTrue(LogOffsetsTest.text(viaBoundary).contains("\"type\":\"" + MessagingHttp.OUTCOME_UNKNOWN_TYPE + "\""));
+
+        // Were the cluster type ever to skip the boundary, it would still be the typed outcome-unknown 503, not a 307.
+        var raw = MessagingHttp.failed(new java.util.concurrent.ExecutionException(cluster), target, true);
+        assertEquals(503, raw.status());
+        assertNull(raw.headers().get("location"));
+        assertTrue(LogOffsetsTest.text(raw).contains(MessagingHttp.OUTCOME_UNKNOWN_TYPE));
+    }
+
     /** #254 + #245 through the real handler: a batch the leader could neither write nor roll back. */
     @Test
     void produceOnAFailedClosedGroupIsOutcomeUnknownWithoutInternals() throws Exception {

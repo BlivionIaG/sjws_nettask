@@ -31,10 +31,13 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 import sjws_nettask.cluster.ApplyLagException;
+import sjws_nettask.cluster.BatchRolledBackException;
 import sjws_nettask.cluster.ClusterNode;
 import sjws_nettask.cluster.CommittedEntry;
 import sjws_nettask.cluster.CommittedNotAppliedException;
 import sjws_nettask.cluster.DurabilityUnavailableException;
+import sjws_nettask.cluster.GroupClosedException;
+import sjws_nettask.cluster.GroupFencedException;
 import sjws_nettask.cluster.GroupId;
 import sjws_nettask.cluster.GroupOptions;
 import sjws_nettask.cluster.NodeId;
@@ -224,7 +227,7 @@ final class RaftReplica implements Replica {
         this.node.append(this.groupId, List.of(encode(records, m, term, this.self, seq)), cd, term).whenComplete((ci, err) -> {
             if (err != null) {
                 var p = this.pending.remove(seq);
-                if (p != null) p.completeExceptionally(map(err));
+                if (p != null) p.completeExceptionally(map(err, true));
             }
         });
         return acked;
@@ -274,7 +277,7 @@ final class RaftReplica implements Replica {
     public CompletableFuture<Void> leaderRead() {
         if (!leaderReady()) return CompletableFuture.failedFuture(unavailable("not the ready leader"));
         return this.group.readBarrier().handle((v, err) -> {
-            if (err != null) throw new CompletionException(map(err));
+            if (err != null) throw new CompletionException(map(err, false));
             return null;
         });
     }
@@ -284,23 +287,30 @@ final class RaftReplica implements Replica {
     }
 
     /**
-     * Consensus errors on {@code node.append} to messaging ones (#254):
+     * Consensus errors to messaging ones (#254). For a leader read ({@code write} false) only the leadership refusals
+     * are translated; anything else passes through, and HTTP answers a generic 503 (a read has no write outcome).
+     * For an append:
      * <ul>
      * <li>refused for leadership (not leader, term moved): {@link LeaderUnavailableException}, which HTTP may answer
      * with a 307 that resends the body;
      * <li>refused otherwise, nothing appended: {@link WriteRefusedException}, retryable for apply backpressure, too
-     * few STRICT data copies and a storage error on a fenced group or a cleanly rolled-back batch, not retryable for
-     * argument errors (empty or oversized batch);
+     * few STRICT data copies, a closed node and a storage error on a fenced group or a cleanly rolled-back batch,
+     * not retryable for argument errors (empty or oversized batch);
      * <li>in the log, fate unknown (leadership lost, failed closed, closed, committed but not applied here):
      * {@link WriteOutcomeUnknownException} with the leader hint, never a redirect: if it commits, a resent body
      * would be a second entry;
      * <li>anything unclassified passes through, and HTTP reports it as outcome unknown (the safe default).
      * </ul>
+     * This is the one place where consensus errors become messaging errors: every append and leader-read failure
+     * passes through it, and messaging code never has to know a cluster type (MessagingClusterIsolationTest).
      */
-    Throwable map(Throwable err) {
+    Throwable map(Throwable err, boolean write) {
         var c = err instanceof CompletionException && err.getCause() != null ? err.getCause() : err;
         if (c instanceof NotLeaderException) return unavailable("not leader");
         if (c instanceof TermChangedException) return unavailable("term moved");
+        if (!write) {
+            return c; // a leader read has no write outcome: never not-appended or outcome unknown; HTTP says 503
+        }
         if (c instanceof OutcomeUnknownException u) {
             var name = u.hint().map(NodeId::name).orElseGet(this::leaderName);
             return outcomeUnknown(u.getMessage(), name, c);
@@ -308,8 +318,8 @@ final class RaftReplica implements Replica {
         if (c instanceof CommittedNotAppliedException) {
             return outcomeUnknown(c.getMessage(), leaderName(), c);
         }
-        if (c instanceof ApplyLagException || c instanceof DurabilityUnavailableException
-                || c instanceof java.io.UncheckedIOException) {
+        if (c instanceof ApplyLagException || c instanceof DurabilityUnavailableException || c instanceof GroupClosedException
+                || c instanceof GroupFencedException || c instanceof BatchRolledBackException) {
             return new WriteRefusedException(this.groupId.value() + ": not appended: " + c.getMessage(), true, c);
         }
         if (c instanceof IllegalArgumentException) {

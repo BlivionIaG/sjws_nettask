@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import org.junit.jupiter.api.Test;
@@ -110,6 +111,52 @@ class MessagingHttpFailedTest {
         assertTrue(json.contains("\"type\":\"" + MessagingHttp.OUTCOME_UNKNOWN_TYPE + "\""), json);
         assertTrue(json.contains("\"leaderUrl\":\"http://n2:8080/messaging/v1/topics/t/records\""), json);
         assertFalse(json.contains("msg_p0") || json.contains("IOException") || json.contains("/var/lib"), json);
+    }
+
+    /**
+     * #254: the two 503s a write can get must not be confused. not-appended: definitely not applied, safe to retry.
+     * outcome-unknown: may or may not be applied. Both carry Retry-After; type, title and detail differ.
+     */
+    @Test
+    void notAppendedAndOutcomeUnknownCannotBeConfused() {
+        var target = "/messaging/v1/topics/t/records";
+        var notAppended = MessagingHttp.failed(new ExecutionException(
+                new sjws_nettask.messaging.ledger.WriteRefusedException("lag", true, null)), target, true);
+        var unknown = MessagingHttp.failed(new ExecutionException(
+                new sjws_nettask.messaging.ledger.WriteOutcomeUnknownException("lost", 3, null, null, null)), target, true);
+        assertEquals(503, notAppended.status());
+        assertEquals(503, unknown.status());
+        assertEquals(MessagingHttp.RETRY_AFTER_SECONDS, notAppended.headers().get("retry-after"));
+        assertEquals(MessagingHttp.RETRY_AFTER_SECONDS, unknown.headers().get("retry-after"));
+        var a = body(notAppended);
+        var u = body(unknown);
+        assertTrue(a.contains("\"type\":\"" + MessagingHttp.NOT_APPENDED_TYPE + "\""), a);
+        assertTrue(a.contains("\"title\":\"not appended\"") && a.contains("nothing was appended"), a);
+        assertFalse(a.contains(MessagingHttp.OUTCOME_UNKNOWN_TYPE), a);
+        assertTrue(u.contains("\"type\":\"" + MessagingHttp.OUTCOME_UNKNOWN_TYPE + "\""), u);
+        assertTrue(u.contains("\"title\":\"outcome unknown\"") && u.contains("may or may not"), u);
+        assertFalse(u.contains(MessagingHttp.NOT_APPENDED_TYPE) || u.contains("nothing was appended"), u);
+        assertFalse(MessagingHttp.NOT_APPENDED_TYPE.equals(MessagingHttp.OUTCOME_UNKNOWN_TYPE));
+    }
+
+    /**
+     * Messaging Core C2: a leader read (GET) that fails on a fenced group, or with any refusal, is a plain 503
+     * unavailable: never not-appended or outcome-unknown, which describe writes.
+     */
+    @Test
+    void aFailedLeaderReadIsNeverAWriteOutcome() {
+        var target = "/messaging/v1/topics/t/records";
+        var fenced = sjws_nettask.cluster.ClusterErrors.fenced(new sjws_nettask.cluster.GroupId("msg/t"));
+        for (Throwable c : List.<Throwable>of(fenced,
+                new sjws_nettask.messaging.ledger.WriteRefusedException("lag", true, null),
+                new sjws_nettask.messaging.ledger.WriteOutcomeUnknownException("lost", 3, "n2", "http://n2", null))) {
+            var r = MessagingHttp.failed(new ExecutionException(new CompletionException(c)), target, false);
+            var json = body(r);
+            assertEquals(503, r.status(), json);
+            assertTrue(json.contains("\"title\":\"unavailable\""), json);
+            assertFalse(json.contains(MessagingHttp.NOT_APPENDED_TYPE) || json.contains(MessagingHttp.OUTCOME_UNKNOWN_TYPE), json);
+            assertEquals(null, r.headers().get("location"));
+        }
     }
 
     /** #254: per-failure logs carry a full trace once per interval per exception type, one line otherwise. */

@@ -448,7 +448,7 @@ public final class CpStore implements AutoCloseable {
         if (staged == null || staged.version != version) {
             return Outcome.error(503, "propose did not commit");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public Outcome activate(long nowMillis, long ttlMillis) {
@@ -546,7 +546,7 @@ public final class CpStore implements AutoCloseable {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public Outcome revoke(String nodeId) {
@@ -571,7 +571,7 @@ public final class CpStore implements AutoCloseable {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public Outcome rollout(List<String> stages) {
@@ -596,7 +596,7 @@ public final class CpStore implements AutoCloseable {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public Outcome advance() {
@@ -622,7 +622,7 @@ public final class CpStore implements AutoCloseable {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public String healthJson() {
@@ -853,7 +853,7 @@ public final class CpStore implements AutoCloseable {
         if (current == null || current.version() != version) {
             return Outcome.error(503, "activate did not commit");
         }
-        return outcome;
+        return settled(key, fingerprint, outcome);
     }
 
     private void onCommitted(ByteBuffer entry) {
@@ -869,6 +869,14 @@ public final class CpStore implements AutoCloseable {
                 int status = body.getInt();
                 var response = readString(body);
                 var fp = readString(body);
+                if (replay.containsKey(idemKey)) {
+                    // This key was already applied (#254): skip this entry's change on every replica. Same fingerprint:
+                    // a retry that passed admission while the original was still uncommitted (both got appended).
+                    // Different fingerprint: a reused key that raced the same way; the first applied entry wins, and
+                    // its caller is answered 409 by settled(). Deterministic: every replica rebuilds `replay` from
+                    // the log in log order (the CP group has no Raft snapshot).
+                    return;
+                }
                 replay.put(idemKey, new Cached(fp, new Outcome(status, response, 0)));
             } catch (java.nio.BufferUnderflowException e) {
                 return; // a truncated marker must not stall apply
@@ -1214,6 +1222,26 @@ public final class CpStore implements AutoCloseable {
 
     private static String readString(ByteBuffer body) {
         return new String(readBytes(body), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * After a keyed append committed and applied: the answer for {@code key}. Two entries with one key can both reach
+     * the log (a retry admitted while the original was uncommitted); only the first applied takes effect (see
+     * {@link #onCommitted}), so a later one answers with the first one's outcome (same fingerprint) or 409 (a
+     * different request under the same key), never with an outcome of its own that did not happen (#254).
+     */
+    private Outcome settled(String key, String fp, Outcome mine) {
+        if (key == null || key.isBlank()) {
+            return mine;
+        }
+        var cached = replay.get(key);
+        if (cached == null) {
+            return mine;
+        }
+        if (!cached.fingerprint.equals(fp)) {
+            return Outcome.error(409, "idempotency key reused");
+        }
+        return cached.outcome;
     }
 
     private Outcome replayed(String key, String fp) {

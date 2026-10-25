@@ -23,6 +23,10 @@ import java.util.function.LongSupplier;
  * Per-failure logging that cannot flood: the full stack trace at most once per interval per exception type, a
  * one-line message (type and message, no trace) otherwise. Used where every failed request or batch logs, so a
  * failing disk or a partition under load cannot fill the log with identical traces (#254).
+ *
+ * <p>Deliberately duplicated as the replication layer's {@code ThrottledLog}: there is no package both may import. {@code cluster} imports no
+ * other sjws package, and {@code messaging} must not load consensus classes with HA off
+ * (MessagingClusterIsolationTest). Keep the two copies identical.
  */
 final class ThrottledLog {
 

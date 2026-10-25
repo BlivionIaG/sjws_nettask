@@ -17,4 +17,12 @@ public final class ClusterErrors {
     public static TermChangedException termChanged(GroupId g) {
         return new TermChangedException(g, 1, 2);
     }
+
+    public static GroupFencedException fenced(GroupId g) {
+        return new GroupFencedException(g, new java.io.IOException("injected"));
+    }
+
+    public static BatchRolledBackException rolledBack(GroupId g) {
+        return new BatchRolledBackException(g, 7, new java.io.UncheckedIOException(new java.io.IOException("injected")));
+    }
 }

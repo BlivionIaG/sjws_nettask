@@ -177,7 +177,7 @@ public final class ReplicatedNode implements ClusterNode {
         return group(groupId).voters();
     }
 
-    private RaftGroup group(GroupId groupId) {
+    RaftGroup group(GroupId groupId) { // package-private for tests
         var group = groups.get(groupId);
         if (group == null) {
             throw new IllegalStateException("no group " + groupId);
@@ -309,6 +309,9 @@ public final class ReplicatedNode implements ClusterNode {
     @Override
     public void close() {
         running = false;
+        for (var group : groups.values()) {
+            group.markClosed(); // before the 1 s join below: a still-running Raft thread can no longer campaign
+        }
         if (thread != null) {
             thread.interrupt();
             try {

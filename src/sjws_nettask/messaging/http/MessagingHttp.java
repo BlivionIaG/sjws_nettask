@@ -483,9 +483,9 @@ final class MessagingHttp implements Handler {
         Throwable c = e.getCause();
         while (c instanceof java.util.concurrent.CompletionException && c.getCause() != null) c = c.getCause();
         if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
-        if (c instanceof WriteRefusedException r) return refused(r, target);
+        if (write && c instanceof WriteRefusedException r) return refused(r, target);
         FAILURES.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + target + " failed", c);
-        if (c instanceof WriteOutcomeUnknownException u) return outcomeUnknown(u.term(), u.leaderName(), u.leaderUrl(), target);
+        if (write && c instanceof WriteOutcomeUnknownException u) return outcomeUnknown(u.term(), u.leaderName(), u.leaderUrl(), target);
         if (write) return outcomeUnknown(-1, null, null, target);
         var r = problem(503, "unavailable", "leader read failed");
         r.headers().set("retry-after", RETRY_AFTER_SECONDS);

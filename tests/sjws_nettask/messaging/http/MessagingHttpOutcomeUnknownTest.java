@@ -95,6 +95,25 @@ class MessagingHttpOutcomeUnknownTest {
         assertEquals("n1", r.headers().get("sjws-leader"), "hint: this node still leads; read back here");
     }
 
+    /** Same for an offset commit whose ack does not arrive in time: it may still land (#254). */
+    @Test
+    void offsetCommitTimeoutIsATypedOutcomeUnknown503() throws Exception {
+        var h = http(() -> new CompletableFuture<>() {
+            @Override
+            public Long get(long timeout, TimeUnit unit) throws TimeoutException {
+                throw new TimeoutException("stub: no ack");
+            }
+        });
+        var r = h.handle(new sjws_nettask.core.Request("PUT", "/messaging/v1/topics/t/offsets/g",
+                sjws_nettask.core.RequestHeaders.of(Map.of())).withBody(
+                        MessagingHttpTest.body("{\"offset\":0}".getBytes(java.nio.charset.StandardCharsets.UTF_8))));
+        var body = LogOffsetsTest.text(r);
+        assertEquals(503, r.status(), body);
+        assertNull(r.headers().get("location"), body);
+        assertEquals(MessagingHttp.RETRY_AFTER_SECONDS, r.headers().get("retry-after"));
+        assertTrue(body.contains("\"type\":\"" + MessagingHttp.OUTCOME_UNKNOWN_TYPE + "\""), body);
+    }
+
     @Test
     void notLeaderRefusalStillRedirects() throws Exception {
         var r = produce(http(() -> CompletableFuture.failedFuture(
