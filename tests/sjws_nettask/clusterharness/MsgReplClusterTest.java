@@ -51,12 +51,17 @@ class MsgReplClusterTest {
     @TempDir
     Path dir;
 
-    /** Produces with read-back deduplication; remembers what was acked and what was ever sent. */
+    /** Produces with read-back deduplication; remembers what was acked, at which offset, and what was ever sent. */
     static final class Producer {
+        static final java.util.regex.Pattern BASE = java.util.regex.Pattern.compile("\"baseOffset\":(\\d+)");
         final MsgReplCluster c;
         final String name;
         final Set<String> acked = new LinkedHashSet<>();
+        /** The offset each 200 answer gave; ids resolved by a read-back have none. */
+        final Map<String, Long> ackOffset = new HashMap<>();
         final Set<String> sent = new LinkedHashSet<>();
+        /** Ids whose answer was not a definite yes or no (outcome-unknown, a dropped connection). */
+        final Set<String> uncertainIds = new LinkedHashSet<>();
         /** Ids resent after an uncertain answer whose read-back did not find them yet. */
         final Set<String> resentAfterUncertain = new LinkedHashSet<>();
         int seq;
@@ -68,7 +73,7 @@ class MsgReplClusterTest {
             this.name = name;
         }
 
-        String next() {
+        synchronized String next() {
             return this.name + "-" + String.format("%05d", this.seq++);
         }
 
@@ -78,10 +83,16 @@ class MsgReplClusterTest {
             }
         }
 
-        /** Returns once {@code id} is in the log exactly as acked; never sends it while it may already be there. */
-        void produceOne(String id) throws Exception {
+        synchronized void produceOne(String id) throws Exception {
+            produceOne(id, false);
+        }
+
+        /**
+         * Returns once {@code id} is in the log exactly as acked; never sends it while it may already be there.
+         * {@code maybeStored}: an earlier attempt's outcome is unknown, so read back first.
+         */
+        synchronized void produceOne(String id, boolean maybeStored) throws Exception {
             long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
-            boolean maybeStored = false;
             while (System.nanoTime() < deadline) {
                 if (maybeStored) {
                     var leader = this.c.awaitLeader(FAILOVER);
@@ -114,33 +125,76 @@ class MsgReplClusterTest {
                     }
                 } catch (IOException e) {
                     this.uncertain++;
+                    this.uncertainIds.add(id);
                     maybeStored = true; // the request may have reached the leader before it died
                     continue;
                 }
                 if (r.statusCode() == 200) {
+                    var m = BASE.matcher(r.body());
+                    assertTrue(m.find(), "200 without baseOffset: " + r.body());
+                    this.ackOffset.put(id, Long.parseLong(m.group(1)));
                     this.acked.add(id);
                     return;
                 }
                 if (r.body().contains("outcome-unknown")) {
+                    // The contract: 503, never a redirect (a resent body could be stored twice).
+                    assertEquals(503, r.statusCode(), r.body());
+                    assertTrue(r.headers().firstValue("location").isEmpty(), "outcome-unknown with a Location");
                     this.uncertain++;
+                    this.uncertainIds.add(id);
                     maybeStored = true;
                     continue;
                 }
-                // not leader / no leader / not appended: refused before the log, safe to resend
+                // Refused before the log, safe to resend: not leader (a second 307, or 503 without a leader),
+                // retryable not-appended, or unavailable, each a 503 with Retry-After. Anything else is a bug here.
+                boolean retryable = r.statusCode() == 307 || r.statusCode() == 503
+                        && r.headers().firstValue("retry-after").isPresent();
+                if (!retryable) {
+                    fail("unexpected answer for " + id + ": " + r.statusCode() + " " + r.body());
+                }
                 Thread.sleep(50);
             }
             fail("could not produce " + id);
         }
+
+        /**
+         * Sends {@code id} to {@code node} as a request known to be open (all but its last byte), runs
+         * {@code whileOpen} (the kill), and then resolves it the way any unknown outcome is resolved.
+         */
+        synchronized void produceHeldOpen(String node, Runnable whileOpen) throws Exception {
+            var id = next();
+            this.sent.add(id);
+            try (var s = this.c.holdOpen(node, MsgReplCluster.frame(id))) {
+                whileOpen.run();
+                int got;
+                try {
+                    got = s.getInputStream().read();
+                } catch (IOException e) {
+                    got = -1;
+                }
+                assertEquals(-1, got, "the killed node answered a request it never fully received");
+            }
+            this.uncertain++;
+            this.uncertainIds.add(id);
+            produceOne(id, true);
+        }
     }
 
     /**
-     * Every acked id once, nothing that was never sent, no id twice, acked ids in ack order (the producer is
-     * sequential), in one order on every listed node.
+     * Every acked id once, nothing that was never sent, no id twice, offsets without gaps from 0, each id acked with
+     * an offset stored at exactly that offset, acked ids in ack order (the producer is sequential), every uncertain id
+     * stored exactly once, and one log on every listed node.
      */
     static List<String> assertLog(MsgReplCluster c, Producer p, String... nodes) throws Exception {
         List<String> first = null;
         for (var node : nodes) {
-            List<String> recs = awaitRecords(c, node, p.acked);
+            awaitRecords(c, node, p.acked);
+            var entries = c.entries(node, false);
+            var recs = entries.stream().map(MsgReplCluster.Entry::id).toList();
+            for (int i = 0; i < entries.size(); i++) {
+                assertEquals(i, entries.get(i).offset(), node + " offsets have a gap or do not start at 0 at "
+                        + entries.get(i));
+            }
             var counts = new HashMap<String, Integer>();
             for (var r : recs) {
                 counts.merge(r, 1, Integer::sum);
@@ -155,8 +209,16 @@ class MsgReplClusterTest {
             for (var id : p.acked) {
                 assertTrue(counts.containsKey(id), node + " lost acked record " + id);
             }
+            for (var id : p.uncertainIds) {
+                assertEquals(1, counts.getOrDefault(id, 0), node + " uncertain write " + id + " is not stored once");
+            }
             for (var r : recs) {
                 assertTrue(p.sent.contains(r), node + " has a record nobody sent: " + r);
+            }
+            for (var e : p.ackOffset.entrySet()) {
+                int at = recs.indexOf(e.getKey());
+                assertEquals(e.getValue().longValue(), entries.get(at).offset(), node + " stores " + e.getKey()
+                        + " at another offset than its ack gave");
             }
             var inLog = recs.stream().filter(p.acked::contains).toList();
             var ackOrder = List.copyOf(p.acked);
@@ -210,10 +272,11 @@ class MsgReplClusterTest {
             var killedAt = new java.util.concurrent.atomic.AtomicLong();
             var firstAckAfter = new java.util.concurrent.atomic.AtomicLong();
             int ackedBeforeKill = p.acked.size();
+            var stop = new java.util.concurrent.atomic.AtomicBoolean();
             var writer = Thread.ofPlatform().start(() -> {
                 try {
                     int afterKill = 0;
-                    while (afterKill < 150) {
+                    while (afterKill < 150 && !stop.get()) {
                         p.produce(1);
                         if (killedAt.get() != 0) {
                             firstAckAfter.compareAndSet(0, System.nanoTime());
@@ -225,12 +288,27 @@ class MsgReplClusterTest {
                 }
             });
             Thread.sleep(500); // the producer is mid-stream
-            killedAt.set(System.nanoTime());
-            c.kill(leader);
-            writer.join(Duration.ofSeconds(120));
-            assertFalse(writer.isAlive(), "producer stuck after failover");
+            try {
+                // Deterministic unknown outcome: the leader dies while one produce is known to be open on it.
+                p.produceHeldOpen(leader, () -> {
+                    killedAt.set(System.nanoTime());
+                    try {
+                        c.kill(leader);
+                    } catch (InterruptedException e) {
+                        throw new IllegalStateException(e);
+                    }
+                });
+                writer.join(Duration.ofSeconds(120));
+                assertFalse(writer.isAlive(), "producer stuck after failover");
+            } finally {
+                stop.set(true);
+                writer.interrupt();
+                writer.join(Duration.ofSeconds(10));
+            }
             assertTrue(errors.isEmpty(), errors.toString());
             assertTrue(p.acked.size() > ackedBeforeKill + 150, "the producer was writing when the leader died");
+            assertTrue(p.uncertain >= 1, "the leader kill produced no unknown outcome");
+            assertFalse(p.resentAfterUncertain.isEmpty(), "the held-open write was resolved by read-back and resent");
             System.out.printf("G3 leader-kill: killed=%s acked=%d uncertain=%d resent=%d failover=%dms%n", leader,
                     p.acked.size(), p.uncertain, p.resent, (firstAckAfter.get() - killedAt.get()) / 1_000_000);
             var survivor = "a".equals(leader) ? "b" : "a";
@@ -311,6 +389,14 @@ class MsgReplClusterTest {
             var after = c.records(leader, false);
             assertEquals(before.size() + 1, after.size());
             assertEquals("after-off", after.get(after.size() - 1));
+
+            // Turning replication back on after that local write must refuse (exit 64), not fork the offsets.
+            c.stop(leader);
+            int code = c.startExpectingExit(leader, "on");
+            var refused = c.logText(leader);
+            assertEquals(64, code, refused);
+            assertTrue(refused.contains("replicated topic " + MsgReplCluster.TOPIC + " ledger end is "
+                    + (before.size() + 1) + " but replication stopped cleanly at " + before.size()), refused);
         }
     }
 }

@@ -469,6 +469,8 @@
               </targetTests>
               <excludedGroups>
                 <param>jar</param>
+                <!-- multi-JVM harness tests (MsgReplClusterTest, ...): not run under every mutant -->
+                <param>cluster</param>
               </excludedGroups>
               <threads>4</threads>
               <timeoutConstant>8000</timeoutConstant>

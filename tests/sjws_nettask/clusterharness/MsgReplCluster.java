@@ -60,7 +60,12 @@ final class MsgReplCluster implements AutoCloseable {
     final HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER)
             .connectTimeout(Duration.ofSeconds(2)).build();
 
+    /** Kills the child JVMs if this test JVM ends without {@link #close} (a killed surefire fork, SIGTERM). */
+    private final Thread reaper = new Thread(() -> this.processes.values().forEach(Process::destroyForcibly),
+            "msgrepl-cluster-reaper");
+
     MsgReplCluster(Path dir) throws IOException {
+        Runtime.getRuntime().addShutdownHook(this.reaper);
         this.dir = dir;
         for (var n : NODES) {
             this.raft.put(n, freePort());
@@ -170,6 +175,35 @@ final class MsgReplCluster implements AutoCloseable {
         throw new IllegalStateException(node + " did not start:\n" + text);
     }
 
+    /**
+     * Starts {@code node} expecting it to refuse: waits for the process to exit and returns its exit code; the log is
+     * {@link #logText}.
+     */
+    int startExpectingExit(String node, String mode) throws Exception {
+        launch(node, mode);
+        var p = this.processes.get(node);
+        if (!p.waitFor(START_TIMEOUT.toSeconds(), TimeUnit.SECONDS)) {
+            throw new IllegalStateException(node + " did not exit:\n" + logText(node));
+        }
+        return p.exitValue();
+    }
+
+    /**
+     * A produce to {@code node} that is known to be open when this returns: the headers and all but the last body
+     * byte are written, so the server is still reading it. Killing the node now leaves the client an unknown outcome
+     * (here: never stored). Close the socket to finish.
+     */
+    java.net.Socket holdOpen(String node, byte[] body) throws IOException {
+        var s = new java.net.Socket("127.0.0.1", this.http.get(node));
+        s.setSoTimeout(10_000);
+        var out = s.getOutputStream();
+        out.write(("POST /messaging/v1/topics/" + TOPIC + "/records HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: "
+                + body.length + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        out.write(body, 0, body.length - 1);
+        out.flush();
+        return s;
+    }
+
     String logText(String node) throws IOException {
         return Files.readString(log(node));
     }
@@ -257,7 +291,16 @@ final class MsgReplCluster implements AutoCloseable {
      * leader read; otherwise it is the node's local applied log (what a follower serves).
      */
     List<String> records(String node, boolean leaderRead) throws IOException, InterruptedException {
-        var out = new ArrayList<String>();
+        return entries(node, leaderRead).stream().map(Entry::id).toList();
+    }
+
+    /** One stored record: its offset as the server reports it (batch base offset plus position) and its text. */
+    record Entry(long offset, String id) {
+    }
+
+    /** As {@link #records}, with each record's offset. */
+    List<Entry> entries(String node, boolean leaderRead) throws IOException, InterruptedException {
+        var out = new ArrayList<Entry>();
         long offset = 0;
         while (true) {
             var b = HttpRequest.newBuilder(URI.create(url(node, "?offset=" + offset + "&maxBytes=4194304")))
@@ -279,8 +322,9 @@ final class MsgReplCluster implements AutoCloseable {
                 } catch (Exception e) {
                     throw new IOException("corrupt batch from " + node, e);
                 }
+                long at = batch.baseOffset();
                 for (var rec : batch.records()) {
-                    out.add(new String(rec, StandardCharsets.UTF_8));
+                    out.add(new Entry(at++, new String(rec, StandardCharsets.UTF_8)));
                 }
                 next = batch.nextOffset();
                 in.position(in.position() + 4 + len);
@@ -300,6 +344,11 @@ final class MsgReplCluster implements AutoCloseable {
 
     @Override
     public void close() {
+        try {
+            Runtime.getRuntime().removeShutdownHook(this.reaper);
+        } catch (IllegalStateException e) {
+            // already shutting down: the hook runs anyway
+        }
         for (var p : this.processes.values()) {
             p.destroyForcibly();
         }
