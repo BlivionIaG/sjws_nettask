@@ -105,6 +105,11 @@ final class StreamHttp {
     private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Integer> perAgent = new ConcurrentHashMap<>();
     private final AtomicInteger total = new AtomicInteger();
+    /**
+     * S2c PR 6 CREDIT, or null with {@code sjws.swarm.stream.credit.enabled} off: then {@link StreamCredit} is never
+     * loaded, no session carries credit state and {@code :chunk} answers exactly as before.
+     */
+    private final StreamCredit credit;
 
     StreamHttp(Swarm swarm, long producerId, AtomicLong seq, int maxPerAgent) {
         this.swarm = swarm;
@@ -115,7 +120,18 @@ final class StreamHttp {
         this.producerId = producerId;
         this.seq = seq;
         this.maxPerAgent = maxPerAgent;
+        this.credit = this.streams.config().credit() ? new StreamCredit(this.streams.config().sinkChunks(), RETAIN_BYTES)
+                : null;
+        if (this.credit != null) {
+            System.err.println("swarm: stream credit on, window=" + this.credit.sinkChunks + " chunks + "
+                    + (RETAIN_BYTES >> 20) + " MiB");
+        }
         startSweeper(this);
+    }
+
+    /** The node's credit state (tests and counters); null with the credit sub-flag off. */
+    StreamCredit credit() {
+        return this.credit;
     }
 
     /** One daemon thread for every StreamHttp of the process; created by the first one (stream flag on only). */
@@ -217,6 +233,8 @@ final class StreamHttp {
         volatile TaskService.Placed placed;
         /** The task-side cancel ran (at most once, by cancel or by submit). */
         final AtomicBoolean cancelApplied = new AtomicBoolean();
+        /** S2c PR 6: this session's published credit state; null with the credit sub-flag off (set before submit). */
+        volatile StreamCredit.State credit;
 
         Session(String agent, byte[] correlation, TokenStreams.Sink sink, long deadlineMs, int retainMax,
                 long retainBytes) {
@@ -233,6 +251,7 @@ final class StreamHttp {
         void drain() {
             this.lock.lock();
             try {
+                var cr = this.credit; // null with the credit sub-flag off
                 StreamChunk c;
                 boolean any = false;
                 while ((c = this.sink.poll0()) != null) {
@@ -246,7 +265,10 @@ final class StreamHttp {
                         this.trimmedThrough = -1;
                         this.maxSeq = -1;
                         this.last = null;
-                        this.attempt = c.attempt();
+                        if (cr != null) {
+                            cr.reset();
+                        }
+                        this.attempt = c.attempt(); // published last (#248 r2 N2)
                         continue;
                     }
                     if (this.attempt < 0) {
@@ -255,6 +277,9 @@ final class StreamHttp {
                     this.maxSeq = Math.max(this.maxSeq, c.chunkSeq());
                     this.retained.addLast(c);
                     this.retainedBytes += c.size();
+                    if (cr != null) {
+                        cr.appended(c.size(), this.maxSeq);
+                    }
                     if (c.last()) {
                         this.last = c;
                     }
@@ -263,6 +288,9 @@ final class StreamHttp {
                         var old = this.retained.removeFirst(); // never the newest, so never a just-arrived LAST
                         this.retainedBytes -= old.size();
                         this.trimmedThrough = old.chunkSeq();
+                        if (cr != null) {
+                            cr.trimmed();
+                        }
                     }
                 }
                 if (any || this.sink.dropped()) {
@@ -337,6 +365,10 @@ final class StreamHttp {
             var end = StreamChunk.owned(b.getLong(), b.getLong(), Math.max(0, s.attempt), s.maxSeq + 1,
                     Frame.LAST | Frame.CANCELLED, new byte[0]);
             s.retained.addLast(end);
+            var cr = s.credit;
+            if (cr != null) {
+                cr.pushOffset(cr.appendedBytes); // parallel to retained; the marker is not a chunk of the window
+            }
             s.last = end;
             s.cancelled = true;
             s.grew.signalAll();
@@ -443,6 +475,9 @@ final class StreamHttp {
         var key = HEX.formatHex(sid);
         var s = new Session(agent.id(), correlation, sink, deadlineMs, this.streams.config().sinkChunks(), RETAIN_BYTES);
         sink.onOffer(s::drain); // retain chunks produced before the first GET
+        if (this.credit != null) {
+            sink.credit = this.credit.register(s); // before the task exists, so before its first chunk
+        }
         this.sessions.put(key, s);
         // #234 re-review: the CancelSet slot is held until trackReserved takes it over; every failure before that
         // (envelope 413, beforePlace, submitStream) gives it back, so pre-placement errors cannot exhaust the set
@@ -467,6 +502,7 @@ final class StreamHttp {
                 this.streams.cancels().unreserve();
             }
             if (this.sessions.remove(key, s)) {
+                forget(s);
                 exit(s);
             }
             throw e;
@@ -498,6 +534,13 @@ final class StreamHttp {
         }
     }
 
+    /** A session left the table: its stream no longer has credit on this node. */
+    private void forget(Session s) {
+        if (this.credit != null) {
+            this.credit.unregister(s);
+        }
+    }
+
     /** Drops expired sessions that have no reader; the CAS keeps a reader from attaching to a dropped one. */
     void sweep() {
         long now = now();
@@ -505,6 +548,7 @@ final class StreamHttp {
             var s = e.getValue();
             if (s.expiresMs < now && s.reading.compareAndSet(false, true)) {
                 if (this.sessions.remove(e.getKey(), s)) {
+                    forget(s);
                     exit(s);
                 }
             }
@@ -568,6 +612,37 @@ final class StreamHttp {
             this.attempt = attempt;
             this.next = from;
             this.binary = binary;
+            var cr = s.credit;
+            if (cr != null) { // S2c PR 6: a (re)attached reader publishes where it reads from; a rewind moves back
+                s.lock.lock();
+                try {
+                    long a = attempt >= 0 ? attempt : s.attempt;
+                    cr.publishRead(a, a == s.attempt ? cr.offsetOf(from, firstSeq(s)) : 0, from);
+                } finally {
+                    s.lock.unlock();
+                }
+            }
+        }
+
+        private static long firstSeq(Session s) {
+            var f = s.retained.peekFirst();
+            return f == null ? -1 : f.chunkSeq();
+        }
+
+        /** S2c PR 6: chunk {@code c} was handed to the transport; it counts as read. */
+        private void read(StreamHttp.Session s, StreamCredit.State cr, StreamChunk c) {
+            long bytes;
+            if (c.attempt() == cr.readAttempt) {
+                bytes = cr.readBytes + c.size(); // the reader advances one chunk at a time: offset(c) + size(c)
+            } else {
+                s.lock.lock();
+                try {
+                    bytes = cr.offsetOf(c.chunkSeq(), firstSeq(s)) + c.size();
+                } finally {
+                    s.lock.unlock();
+                }
+            }
+            cr.publishRead(c.attempt(), bytes, c.chunkSeq() + 1);
         }
 
         @Override
@@ -586,6 +661,10 @@ final class StreamHttp {
                     case Reset(var a) -> {
                         this.attempt = a;
                         this.next = 0;
+                        var cr = this.s.credit;
+                        if (cr != null) {
+                            cr.publishRead(a, 0, 0);
+                        }
                         var b = java.nio.ByteBuffer.wrap(this.s.correlation);
                         return ByteBuffer.wrap(this.binary ? StreamChunk.reset(b.getLong(), b.getLong(), a).toFrame().encode()
                                 : ("event: reset\ndata: " + a + "\n\n").getBytes(StandardCharsets.UTF_8));
@@ -593,6 +672,10 @@ final class StreamHttp {
                     case Chunk(var c) -> {
                         this.attempt = c.attempt();
                         this.next = c.chunkSeq() + 1;
+                        var cr = this.s.credit;
+                        if (cr != null) {
+                            read(this.s, cr, c);
+                        }
                         if (c.last()) {
                             end();
                         }
@@ -714,6 +797,11 @@ final class StreamHttp {
             return SwarmHttp.cancelled("deadline").response(); // the claim stays cached: the worker acks it
         }
         if (!c.last()) {
+            var cr = this.credit;
+            if (cr != null && !c.reset() && c.streamHi() == held.envelope().correlationHi()
+                    && c.streamLo() == held.envelope().correlationLo()) { // else the admit refuses it (400) as before
+                return creditChunk(cr, held, c, release);
+            }
             var r = this.swarm.tasks().streamChunk(held, this.producerId, this.seq.incrementAndGet(), c);
             if (r == LeaseResult.CANCELLED) { // still held: the worker sends LAST|CANCELLED or acks
                 return SwarmHttp.cancelled(reason(held)).response();
@@ -739,5 +827,78 @@ final class StreamHttp {
         }
         release.run();
         return r.ok() ? new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE) : SwarmHttp.leaseProblem(r).response();
+    }
+
+    /**
+     * S2c PR 6, credit sub-flag on: a non-{@code LAST} chunk (agent-swarm.md §5.2 <i>Backpressure</i>). Precedence: the
+     * 400/409/deadline answers above, then (only when credit would refuse) a read-only cancel lookup, then {@code 429}
+     * {@code problems/credit}, then the admit. The reservation is taken before the producer seq is allocated, so a
+     * {@code 429} leaves no trace, and released exactly once in the {@code finally} after the admit.
+     */
+    private Response creditChunk(StreamCredit cr, Task held, StreamChunk c, Runnable release) {
+        var s = cr.session(c.streamHi(), c.streamLo());
+        if (s == null) { // the session lives on another node (or is gone): credit unknown, never refused
+            var r = this.swarm.tasks().streamChunk(held, this.producerId, this.seq.incrementAndGet(), c);
+            var answer = admitted(r, held, release);
+            if (answer == null) {
+                cr.unknownSession();
+                return new Response(204, ResponseHeaders.of(), Body.Empty.INSTANCE);
+            }
+            return answer;
+        }
+        var st = s.credit;
+        long la = held.attempt() & StreamChunk.MAX_ATTEMPT;
+        long sa = s.attempt;
+        boolean reservedOne = false;
+        if (sa < 0 || la >= sa) { // an older attempt skips the check: the admit answers 409 STALE_ATTEMPT
+            if (!cr.reserve(s, st, la, c.chunkSeq(), c.size())) {
+                return refuse(cr, held, s, st, la, c);
+            }
+            reservedOne = true;
+        }
+        LeaseResult r;
+        try {
+            r = this.swarm.tasks().streamChunk(held, this.producerId, this.seq.incrementAndGet(), c);
+        } finally {
+            if (reservedOne) {
+                cr.release(st, c.size()); // exactly once, after the chunk was published or discarded (#248 r4 B2)
+            }
+        }
+        var answer = admitted(r, held, release);
+        return answer != null ? answer : creditFrame(cr.snapshot(s, st, c.streamHi(), c.streamLo(), la));
+    }
+
+    /** The admit's refusal answer, or null when it was accepted. */
+    private Response admitted(LeaseResult r, Task held, Runnable release) {
+        if (r == LeaseResult.OK) {
+            return null;
+        }
+        if (r == LeaseResult.CANCELLED) { // still held: the worker sends LAST|CANCELLED or acks
+            return SwarmHttp.cancelled(reason(held)).response();
+        }
+        release.run();
+        return SwarmHttp.leaseProblem(r).response();
+    }
+
+    /** No credit: {@code 409} {@code cancelled} if the task is cancelled (lookup on the refusal path only), else 429. */
+    private Response refuse(StreamCredit cr, Task held, Session s, StreamCredit.State st, long la, StreamChunk c) {
+        var why = this.streams.cancels().reason(TaskService.topic(held.pool(), held.shard()), held.offset(), now());
+        if (why != null) {
+            return SwarmHttp.cancelled(why).response();
+        }
+        if (la == s.attempt && c.chunkSeq() <= st.maxSeq) {
+            // #248 r5 C2: a retry of a chunk already accepted in this attempt; nothing to admit, the snapshot answers
+            return creditFrame(cr.snapshot(s, st, c.streamHi(), c.streamLo(), la));
+        }
+        cr.refused();
+        var r = new SwarmHttp.Problem(429, "no credit", "stream credit exhausted; retry the same chunk", StreamCredit.TYPE,
+                "credit").response();
+        r.headers().set("retry-after", "1");
+        return r;
+    }
+
+    private static Response creditFrame(sjws_nettask.swarm.wire.Credit credit) {
+        return new Response(200, ResponseHeaders.of().set("content-type", SwarmHttp.CONTENT_TYPE),
+                Body.Bytes.of(credit.toFrame().encode()));
     }
 }

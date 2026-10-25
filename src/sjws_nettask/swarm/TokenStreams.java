@@ -70,8 +70,16 @@ public final class TokenStreams {
     static final long READER_IDLE_MS = TimeUnit.SECONDS.toMillis(30);
     private static final long READER_WAIT_NS = TimeUnit.MILLISECONDS.toNanos(50);
 
-    /** Startup settings; {@code sjws.swarm.stream.*} system properties or {@code SJWS_SWARM_STREAM_*} env. */
-    public record Config(int shards, int window, int sinkChunks) {
+    /**
+     * Startup settings; {@code sjws.swarm.stream.*} system properties or {@code SJWS_SWARM_STREAM_*} env. {@code credit}
+     * is {@code sjws.swarm.stream.credit.enabled} (S2c PR 6, off by default): with it off no credit state exists.
+     */
+    public record Config(int shards, int window, int sinkChunks, boolean credit) {
+        /** Credit off. */
+        public Config(int shards, int window, int sinkChunks) {
+            this(shards, window, sinkChunks, false);
+        }
+
         public Config {
             if (shards < 1 || shards > 64) {
                 throw new IllegalArgumentException("sjws.swarm.stream.shards 1..64: " + shards);
@@ -89,7 +97,19 @@ public final class TokenStreams {
         /** {@code get} maps a property name ({@code sjws.swarm.stream.shards}) to its value or null. */
         public static Config from(Function<String, String> get) {
             return new Config(intSetting(get, "shards", 1), intSetting(get, "window", TokenStream.Reorder.DEFAULT_WINDOW),
-                    intSetting(get, "sinkChunks", 256));
+                    intSetting(get, "sinkChunks", 256), boolSetting(get, "credit.enabled"));
+        }
+
+        /** {@code true} or {@code false} (any case); anything else is refused (fail closed, never a silent default). */
+        private static boolean boolSetting(Function<String, String> get, String name) {
+            var v = get.apply("sjws.swarm.stream." + name);
+            if (v == null || v.isBlank() || v.trim().equalsIgnoreCase("false")) {
+                return false;
+            }
+            if (v.trim().equalsIgnoreCase("true")) {
+                return true;
+            }
+            throw new IllegalArgumentException("sjws.swarm.stream." + name + ": " + v);
         }
 
         private static int intSetting(Function<String, String> get, String name, int dflt) {
@@ -507,11 +527,21 @@ public final class TokenStreams {
                 continue;
             }
             var s = this.sinks.get(new Key(c.streamHi(), c.streamLo()));
-            if (s != null && s.offerFromLedger(c)) {
-                this.ledgerChunks.incrementAndGet();
-                var l = s.listener;
-                if (l != null) {
-                    l.run();
+            if (s != null) {
+                var credit = s.credit; // S2c PR 6: null unless the credit sub-flag is on
+                long lower = s.offerFromLedger(c, credit);
+                if (lower != Sink.SKIPPED) {
+                    this.ledgerChunks.incrementAndGet();
+                    try {
+                        var l = s.listener;
+                        if (l != null) {
+                            l.run();
+                        }
+                    } finally {
+                        if (credit != null) {
+                            credit.lowerHeld(lower); // only after the drain published the flushed chunks (#248 r4 B3)
+                        }
+                    }
                 }
             }
         }
@@ -526,13 +556,26 @@ public final class TokenStreams {
     private void deliverLocal(StreamChunk c) {
         var s = this.sinks.get(new Key(c.streamHi(), c.streamLo()));
         if (s != null) {
-            if (!s.offer(c)) {
+            var credit = s.credit; // S2c PR 6: null unless the credit sub-flag is on
+            long lower = s.offer(c, credit);
+            if (lower < 0) {
                 this.sinkDrops.incrementAndGet();
                 s.dropped = true;
             }
-            var l = s.listener;
-            if (l != null) {
-                l.run(); // e.g. the HTTP leg drains into its session before the first GET
+            if (credit == null) {
+                var l = s.listener;
+                if (l != null) {
+                    l.run(); // e.g. the HTTP leg drains into its session before the first GET
+                }
+                return;
+            }
+            try {
+                var l = s.listener;
+                if (l != null) {
+                    l.run();
+                }
+            } finally {
+                credit.lowerHeld(lower & ~Sink.DROPPED); // only after the drain published them (#248 r4 B3)
             }
         }
     }
@@ -557,6 +600,15 @@ public final class TokenStreams {
         volatile boolean dropped;
         /** Run on the producer thread after every offer (set once by the consumer). */
         volatile Runnable listener;
+        /**
+         * S2c PR 6 credit state of the HTTP session reading this sink (set once by {@link StreamHttp} before the task
+         * is submitted); null with the credit sub-flag off, and for in-process consumers.
+         */
+        volatile StreamCredit.State credit;
+        /** {@link #offer(StreamChunk, StreamCredit.State)}: the chunk was not queued (sink full or reorder overflow). */
+        static final long DROPPED = Long.MIN_VALUE;
+        /** {@link #offerFromLedger(StreamChunk, StreamCredit.State)}: the chunk was skipped, not offered. */
+        static final long SKIPPED = -1L;
 
         Sink(TokenStreams owner, Key key, Config config) {
             this.owner = owner;
@@ -573,15 +625,32 @@ public final class TokenStreams {
          * {@code chunkSeq} 0; a chunk of an older attempt is dropped and counted in {@link #staleChunks()}.
          */
         boolean offer(StreamChunk c) {
+            return offer(c, null) >= 0;
+        }
+
+        /**
+         * {@link #offer(StreamChunk)}, also keeping {@code credit}'s held counters when it is not null (S2c PR 6, #248 r4
+         * B3, r5 C1): a {@code BUFFERED} chunk raises them here, under the sink lock; chunks that leave the reorder
+         * buffer (a flush, or the discard of an older attempt on RESET) are not lowered here: their count and bytes,
+         * captured under this lock, are returned packed ({@code chunks << 40 | bytes}) for the caller to subtract
+         * after its listener (the session drain) returned. Never a store: a concurrent {@code BUFFERED} of the new
+         * attempt is never wiped out. {@link #DROPPED} is or-ed in when the chunk was not queued.
+         */
+        long offer(StreamChunk c, StreamCredit.State credit) {
             this.lock.lock();
             try {
+                long lower = 0;
                 if (c.streamHi() == this.key.hi() && c.streamLo() == this.key.lo()) {
                     if (this.attempt < 0) {
                         this.attempt = c.attempt();
                     } else if (c.attempt() < this.attempt) {
                         this.stale.incrementAndGet();
-                        return true;
+                        return 0;
                     } else if (c.attempt() > this.attempt) {
+                        if (credit != null) { // the discarded attempt's held chunks, subtracted after the drain
+                            lower = (long) this.reorder.held() << 40 | credit.heldBytesLocked;
+                            credit.heldBytesLocked = 0;
+                        }
                         this.queue.clear();
                         this.reorder = new TokenStream.Reorder(this.key.hi(), this.key.lo(), this.config.window());
                         this.attempt = c.attempt();
@@ -591,17 +660,31 @@ public final class TokenStreams {
                     }
                 }
                 if (this.queue.remainingCapacity() < 1 + this.reorder.held()) {
-                    return false;
+                    return lower | DROPPED;
                 }
                 var out = new ArrayList<StreamChunk>(2);
                 var r = this.reorder.offer(c, out);
                 if (r == TokenStream.Reorder.Offer.CONFLICT) {
                     this.conflicts.incrementAndGet();
                 } else if (r == TokenStream.Reorder.Offer.OVERFLOW) {
-                    return false;
+                    return lower | DROPPED;
+                }
+                if (credit != null) {
+                    if (r == TokenStream.Reorder.Offer.BUFFERED) {
+                        credit.heldChunks.incrementAndGet();
+                        credit.heldBytes.addAndGet(c.size());
+                        credit.heldBytesLocked += c.size();
+                    } else if (out.size() > 1) { // out[0] is c; the rest left the reorder buffer
+                        long b = 0;
+                        for (int i = 1; i < out.size(); i++) {
+                            b += out.get(i).size();
+                        }
+                        credit.heldBytesLocked -= b;
+                        lower += (long) (out.size() - 1) << 40 | b;
+                    }
                 }
                 this.queue.addAll(out);
-                return true;
+                return lower;
             } finally {
                 this.lock.unlock();
             }
@@ -614,20 +697,26 @@ public final class TokenStreams {
          * (the caller then runs the listener); a full sink is recorded by {@link #offer} as a drop.
          */
         boolean offerFromLedger(StreamChunk c) {
+            return offerFromLedger(c, null) != SKIPPED;
+        }
+
+        /** {@link #offerFromLedger(StreamChunk)} with credit counters: {@link #SKIPPED}, or the held delta to lower. */
+        long offerFromLedger(StreamChunk c, StreamCredit.State credit) {
             this.lock.lock();
             try {
                 if (c.streamHi() != this.key.hi() || c.streamLo() != this.key.lo()) {
-                    return false;
+                    return SKIPPED;
                 }
                 if (this.attempt >= 0 && (c.attempt() < this.attempt
                         || c.attempt() == this.attempt && this.reorder.has(c.chunkSeq()))) {
-                    return false;
+                    return SKIPPED;
                 }
-                if (!offer(c)) {
+                long lower = offer(c, credit);
+                if (lower < 0) {
                     this.owner.sinkDrops.incrementAndGet();
                     this.dropped = true;
                 }
-                return true;
+                return lower & ~DROPPED;
             } finally {
                 this.lock.unlock();
             }
