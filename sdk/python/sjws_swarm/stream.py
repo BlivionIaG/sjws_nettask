@@ -430,6 +430,7 @@ class ChunkWriter:
         self._retry: list[_Job] = []  # issued and to be re-issued (429 or transport error)
         self._out: dict[int, _Job] = {}  # in flight, by issue index
         self._unaccepted: set[int] = set()  # issued seqs not yet accepted
+        self._backing_off: set[int] = set()  # seqs refused (429) or failed in transport, until accepted
         self._issue = 0
         self._mode = "unknown"  # unknown (slow start) | credit | none (204: no credit info)
         self._snap: tuple[int, int, int] | None = None  # (issue index, chunks, bytes)
@@ -625,7 +626,9 @@ class ChunkWriter:
                 self._retry.remove(j)
                 j.waiting = False
                 return j
-            return None  # no new chunk while a 429 (or transport) retry is pending (#261 Q9)
+            return None
+        if self._backing_off:
+            return None  # no new chunk while a 429 (or transport) retry is pending, in flight or not (#261 Q9)
         if not self._queue:
             return None
         j = self._queue[0]
@@ -703,10 +706,12 @@ class ChunkWriter:
             j.not_before = now + retry_backoff(j.tries, self._rnd)
             j.tries += 1
             self._retry.append(j)
+            self._backing_off.add(j.seq)
             return None
         status, headers, data = answer
         if status in (200, 204):
             self._unaccepted.discard(j.seq)
+            self._backing_off.discard(j.seq)
             if status == 204:
                 self._mode, self._snap = "none", None
             else:
@@ -723,6 +728,7 @@ class ChunkWriter:
                 j.not_before = now + ra
             j.tries += 1
             self._retry.append(j)
+            self._backing_off.add(j.seq)
             return None
         err = _problem_error(status, problem)
         if isinstance(err, StreamCancelled):
