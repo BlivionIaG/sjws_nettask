@@ -239,6 +239,27 @@ class TimeoutNowTest {
         assertTrue(typesSent().isEmpty(), typesSent().toString());
     }
 
+    @Test
+    void aCandidateThatCannotPersistAHigherTermDoesNotWinItsStaleTerm() throws Exception {
+        group = node(new MemoryLogStorage());
+        clock.advance(Duration.ofSeconds(1));
+        group.tick(clock.nanoTime());
+        group.handle(N3, grant(RaftGroup.PRE_VOTE_RESP, 0, N3), clock.nanoTime());
+        assertTrue(group.campaigning());
+        assertEquals(1L, group.facade().term());
+        failHardState = true;
+        sent.clear();
+
+        group.handle(N2, refusal(RaftGroup.VOTE_RESP, 2, N2), clock.nanoTime()); // a later term, which we cannot save
+        assertFalse(group.campaigning(), "a candidate that knows of a later term stops campaigning");
+        assertEquals(1L, group.facade().term(), "the unsaved term is not adopted");
+
+        group.handle(N3, grant(RaftGroup.VOTE_RESP, 1, N3), clock.nanoTime()); // the grant that would have won term 1
+        assertFalse(group.facade().isLeader(), "no win in the stale term");
+        assertTrue(group.facade().leader().isEmpty());
+        assertTrue(typesSent().isEmpty(), "no APPEND or no-op from a stale-term leader: " + typesSent());
+    }
+
     // --- same-term demotion --------------------------------------------------------------------------------
 
     @Test
@@ -341,6 +362,11 @@ class TimeoutNowTest {
 
     private static SimTransport.Frame grant(int type, long term, NodeId voter) {
         var body = ByteBuffer.allocate(13).order(ByteOrder.BIG_ENDIAN).putLong(term).putInt(voter.wire()).put((byte) 1);
+        return new SimTransport.Frame(GROUP, type, body.array());
+    }
+
+    private static SimTransport.Frame refusal(int type, long term, NodeId voter) {
+        var body = ByteBuffer.allocate(13).order(ByteOrder.BIG_ENDIAN).putLong(term).putInt(voter.wire()).put((byte) 0);
         return new SimTransport.Frame(GROUP, type, body.array());
     }
 

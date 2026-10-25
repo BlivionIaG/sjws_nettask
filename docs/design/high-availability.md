@@ -242,9 +242,10 @@ What a voter keeps across a crash:
   succeeds (`startElection`, stepping down to a higher term, a vote grant). A failed write leaves
   term and vote as they were, sends nothing, and the node stays a follower (a node in any role that
   cannot persist a higher term it has seen logs a WARNING, at most one per group per 10 s with a
-  count of the suppressed ones, and stays in its old term); a leader in that case also steps down
-  at its own term, which needs no write, so it stops reporting itself as leader and acking, and
-  its pending writes fail as outcome unknown (#255); a failed grant is a
+  count of the suppressed ones, and stays in its old term); a leader or candidate in that case
+  also steps down at its own term, which needs no write: a leader stops reporting itself as
+  leader and acking, and its pending writes fail as outcome unknown, and a candidate cannot go on
+  to win the stale term (#255); a failed grant is a
   refusal. Messages only ever carry the durable term (a pre-vote reply carries the responder's own
   term, and the pre-candidate accepts a grant at a term at or below its own).
   `FileLogStorage` writes `{group}.vote`: 24 bytes big-endian, magic `SJVT`, version 1, term,

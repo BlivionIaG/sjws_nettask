@@ -1578,13 +1578,14 @@ final class RaftGroup {
 
     /**
      * False when a higher term could not be made durable: term and vote are unchanged and the caller sends nothing.
-     * A leader in that case still steps down, at its own term (no write needed): it knows a later term exists, so
-     * it must stop reporting itself as leader and stop acking (#255). Its pending writes fail as outcome unknown.
+     * A leader or candidate in that case still steps down, at its own term (no write needed): it knows a later term
+     * exists, so a leader must stop reporting itself as leader and stop acking, and a candidate must not go on to
+     * win its stale term (#255). A leader's pending writes fail as outcome unknown.
      */
     private boolean stepDown(long newTerm, List<Runnable> after) {
         if (newTerm > term && !saveHardState(newTerm, null)) {
             warnPersistFailed(newTerm);
-            if (role == Role.LEADER) {
+            if (role == Role.LEADER || role == Role.CANDIDATE) {
                 stepDown(term, after);
             }
             return false;
