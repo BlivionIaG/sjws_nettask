@@ -50,6 +50,11 @@ class ClassLoadTest {
                 Thread.sleep(50);
             }
             assertTrue(text.contains("bench port="), text);
+            // #175 voter certificate binding: the pinned-identity sockets and the ORIGIN path stay unloaded.
+            for (var name : new String[] {"sjws_nettask.cp.CpPeerSockets ", "sjws_nettask.cp.CpConfig$Peer ",
+                    "sjws_nettask.cluster.TcpTransport$OriginMismatch "}) {
+                assertFalse(text.contains(name), name.strip() + " loaded by a standalone start");
+            }
             assertFalse(text.contains("sjws_nettask.cp."), text);
             for (var cp : new String[] {"KeyRing", "KeyRingLoader", "TrustBundle", "TrustState", "CpKeyConfig",
                     "CpListenerConfig", "CpServerTls", "CpTls"}) {
@@ -57,11 +62,6 @@ class ClassLoadTest {
             }
             assertFalse(text.contains("sjws_nettask.cluster."), text);
             assertFalse(text.contains("sjws_nettask.cluster.TcpTransport"), text);
-            // #175 voter certificate binding: the pinned-identity sockets and the ORIGIN path stay unloaded.
-            for (var name : new String[] {"sjws_nettask.cp.CpPeerSockets ", "sjws_nettask.cp.CpConfig$Peer ",
-                    "sjws_nettask.cluster.TcpTransport$OriginMismatch "}) {
-                assertFalse(text.contains(name), name.strip() + " loaded by a standalone start");
-            }
             assertFalse(text.contains("sjws_nettask.service."), text);
         } finally {
             process.destroy();
