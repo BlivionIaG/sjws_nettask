@@ -113,9 +113,41 @@ class Http1TransportTest {
         return head.toString(StandardCharsets.ISO_8859_1);
     }
 
-    private static long cpuNanos() {
-        return ((com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean())
-                .getProcessCpuTime();
+    /**
+     * CPU time of the threads that run this server, selected by name: the virtual-thread carriers
+     * ({@code ForkJoinPool-N-worker-M}; a connection's sender runs on one), the JDK's I/O pollers
+     * ({@code *Poller}), the {@code http1-reaper} and the test's {@code accept-loop}. Not the whole process: surefire
+     * runs every test class in one JVM, so GC, JIT and any other class's leftover threads would
+     * count, and one unrelated busy thread alone exceeds the budget (issue #265). Threads that
+     * start during the window count in full; threads that end are dropped.
+     */
+    private static final class ServerCpu {
+        private static final java.util.regex.Pattern SERVER_THREADS = java.util.regex.Pattern
+                .compile("ForkJoinPool-\\d+-worker-\\d+|[A-Za-z-]*Poller|http1-reaper|accept-loop");
+
+        private final java.util.Map<Long, Long> start = cpuByThread();
+
+        private static java.util.Map<Long, Long> cpuByThread() {
+            var mx = ManagementFactory.getThreadMXBean();
+            var cpu = new java.util.HashMap<Long, Long>();
+            for (var t : Thread.getAllStackTraces().keySet()) {
+                if (SERVER_THREADS.matcher(t.getName()).matches()) {
+                    long ns = mx.getThreadCpuTime(t.threadId());
+                    if (ns >= 0) {
+                        cpu.put(t.threadId(), ns);
+                    }
+                }
+            }
+            return cpu;
+        }
+
+        long elapsedNanos() {
+            long sum = 0;
+            for (var e : cpuByThread().entrySet()) {
+                sum += e.getValue() - start.getOrDefault(e.getKey(), 0L);
+            }
+            return sum;
+        }
     }
 
     @Test
@@ -308,7 +340,7 @@ class Http1TransportTest {
             try (var w = FileChannel.open(file, StandardOpenOption.WRITE)) {
                 w.truncate(1024 * 1024);
             }
-            long cpu0 = cpuNanos();
+            var serverCpu = new ServerCpu();
             long t0 = System.nanoTime();
             long got = 1024 * 1024;
             var buf = new byte[64 * 1024];
@@ -321,9 +353,9 @@ class Http1TransportTest {
             }
             assertTrue(got < LARGE, "short response: " + got);
             waitFor(() -> manager.activeConnections() == 0, 3000, "connection closed");
-            Thread.sleep(500); // a spinning sender would burn a core here
+            Thread.sleep(500); // a spinning sender would burn a core (a carrier thread) here
             long wall = System.nanoTime() - t0;
-            long cpu = cpuNanos() - cpu0;
+            long cpu = serverCpu.elapsedNanos();
             assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
         }
         assertEquals(0, manager.reaper().tracked());
@@ -383,7 +415,7 @@ class Http1TransportTest {
             try (var w = FileChannel.open(file, StandardOpenOption.WRITE)) {
                 w.truncate(from + 2 * 1024 * 1024); // inside the range
             }
-            long cpu0 = cpuNanos();
+            var serverCpu = new ServerCpu();
             long t0 = System.nanoTime();
             long got = first.length;
             var buf = new byte[64 * 1024];
@@ -398,7 +430,7 @@ class Http1TransportTest {
             waitFor(() -> manager.activeConnections() == 0, 3000, "connection closed");
             Thread.sleep(500);
             long wall = System.nanoTime() - t0;
-            long cpu = cpuNanos() - cpu0;
+            long cpu = serverCpu.elapsedNanos();
             assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
         }
         assertEquals(0, manager.reaper().writeExpirations(), "ended by shrink detection");
