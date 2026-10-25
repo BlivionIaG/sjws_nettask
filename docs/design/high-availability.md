@@ -549,7 +549,8 @@ The settings are read once at startup; changing them needs a restart.
 Any `ha.members` list also marks the process as multi-process for the swarm stream guard
 (`Sjws_nettask.multiProcess`, #236), whatever `ha.messaging` resolves to.
 
-**Rollback.** Stop every node cleanly, then `ha.messaging: off` (or remove `ha.members`) and restart: each node
+**Rollback.** Stop every node cleanly (SIGTERM or `--stop`: the signal hook waits up to 20 s for the messaging
+module to close, which records each replicated topic's end), then `ha.messaging: off` (or remove `ha.members`) and restart: each node
 serves its local applied ledger without consensus. The nodes no longer agree; keep one node writable and drain
 the others. The Raft state under `state_dir` stays. Turning replication back on:
 
