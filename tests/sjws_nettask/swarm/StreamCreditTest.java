@@ -18,6 +18,7 @@ package sjws_nettask.swarm;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -948,8 +949,12 @@ class StreamCreditTest {
         assertFalse(TokenStreams.Config.from(Map.of("sjws.swarm.stream.credit.enabled", "false")::get).credit());
         assertFalse(TokenStreams.Config.from(Map.of("sjws.swarm.stream.credit.enabled", "")::get).credit());
         assertFalse(TokenStreams.Config.from(k -> null).credit());
-        assertThrows(IllegalArgumentException.class,
-                () -> TokenStreams.Config.from(Map.of("sjws.swarm.stream.credit.enabled", "yes")::get));
+        for (var bad : List.of("yes", "1", "on", "tru", "true false")) { // #257 N-c: stops the process, names the value
+            var e = assertThrows(sjws_nettask.OptionalModule.Refused.class,
+                    () -> TokenStreams.Config.from(Map.of("sjws.swarm.stream.credit.enabled", bad)::get), bad);
+            assertTrue(e.getMessage().contains("sjws.swarm.stream.credit.enabled must be true or false"), e.getMessage());
+            assertTrue(e.getMessage().contains("\"" + bad + "\""), e.getMessage());
+        }
         assertFalse(new TokenStreams.Config(1, 64, 256).credit(), "the three-setting constructor keeps credit off");
     }
 
@@ -1057,12 +1062,55 @@ class StreamCreditTest {
                         () -> new SwarmModule(other, SwarmGate.DENY_ALL, false, true, null));
                 assertTrue(e.getMessage().contains("sjws.swarm.stream.window (64)")
                         && e.getMessage().contains("sjws.swarm.stream.sinkChunks (32)"), e.getMessage());
+                assertThrows(IllegalStateException.class, () -> other.replies().registerStream(new byte[16], Long.MAX_VALUE));
             } finally {
                 other.close();
             }
         } finally {
             System.clearProperty("sjws.swarm.stream.credit.enabled");
             System.clearProperty("sjws.swarm.stream.sinkChunks");
+        }
+    }
+
+    @Test
+    void aMalformedCreditFlagRefusesToStartTheProcess() {
+        // #257 N-c: as R2, end to end through the module the process loads, not a warning and a node without swarm
+        System.setProperty("sjws.swarm.stream.credit.enabled", "yes");
+        try {
+            var other = Swarm.open(this.dir.resolve("malformed"), "m", 1,
+                    sjws_nettask.messaging.delivery.RetryPolicy.DEFAULT, System::currentTimeMillis, 600_000);
+            try {
+                var e = assertThrows(sjws_nettask.OptionalModule.Refused.class,
+                        () -> new SwarmModule(other, SwarmGate.DENY_ALL, false, true, null));
+                assertTrue(e.getMessage().contains("sjws.swarm.stream.credit.enabled must be true or false")
+                        && e.getMessage().contains("\"yes\""), e.getMessage());
+                // the module closed the swarm before refusing (#262 review nit)
+                assertThrows(IllegalStateException.class, () -> other.replies().registerStream(new byte[16], Long.MAX_VALUE));
+            } finally {
+                other.close();
+            }
+        } finally {
+            System.clearProperty("sjws.swarm.stream.credit.enabled");
+        }
+    }
+
+    @Test
+    void aMalformedCreditFlagReachesTheModuleLoaderAsRefused() throws Exception {
+        // the loader (OptionalModules.load, pinned by OptionalModulesTest) constructs the module reflectively and
+        // rethrows a Refused cause, so the process does not start; a plain exception would be logged and skipped
+        System.setProperty("sjws.swarm.stream.enabled", "true");
+        System.setProperty("sjws.swarm.stream.credit.enabled", "maybe");
+        System.setProperty("sjws.swarm.dir", this.dir.resolve("loader").toString());
+        try {
+            var e = assertThrows(java.lang.reflect.InvocationTargetException.class,
+                    () -> SwarmModule.class.getDeclaredConstructor().newInstance());
+            var r = assertInstanceOf(sjws_nettask.OptionalModule.Refused.class, e.getCause());
+            assertTrue(r.getMessage().contains("sjws.swarm.stream.credit.enabled must be true or false (any case), got"
+                    + " \"maybe\""), r.getMessage());
+        } finally {
+            for (var k : List.of("sjws.swarm.stream.enabled", "sjws.swarm.stream.credit.enabled", "sjws.swarm.dir")) {
+                System.clearProperty(k);
+            }
         }
     }
 

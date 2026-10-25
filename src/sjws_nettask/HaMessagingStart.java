@@ -47,29 +47,24 @@ final class HaMessagingStart {
         if (!settings.replicate()) {
             return modules;
         }
-        AutoCloseable handle;
+        OptionalModule ha;
         try {
             var start = Class.forName(CLASS).getMethod("start", HaMessagingSettings.class, Path.class, byte[].class,
                     byte[].class, Object.class, PrintStream.class);
-            handle = (AutoCloseable) start.invoke(null, settings, settings.stateDirOr(loaded.document().stateDir()),
+            ha = (OptionalModule) start.invoke(null, settings, settings.stateDirOr(loaded.document().stateDir()),
                     loaded.haClusterKey(), loaded.haClusterKeyPrevious(), messaging(modules), err);
         } catch (InvocationTargetException e) {
-            switch (e.getCause()) {
-                case IOException io -> throw io;
-                case IllegalArgumentException refused -> throw new OptionalModule.Refused(refused.getMessage());
-                case RuntimeException other -> throw other;
-                default -> throw new IllegalStateException(e.getCause());
+            var cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
             }
+            if (cause instanceof IllegalArgumentException refused) {
+                throw new OptionalModule.Refused(refused.getMessage());
+            }
+            throw new IllegalStateException("HA messaging bootstrap failed: " + cause, cause);
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("HA messaging bootstrap missing: " + e, e);
         }
-        OptionalModule ha = () -> {
-            try {
-                handle.close();
-            } catch (Exception e) {
-                err.println("WARN: ha messaging: close: " + e);
-            }
-        };
         return new OptionalModules.Both(ha, modules);
     }
 

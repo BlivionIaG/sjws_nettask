@@ -51,7 +51,7 @@ import sjws_nettask.messaging.http.MessagingModule;
  * {@link RaftReplicator} to {@link MessagingModule#replication}; the witness opens the same groups, from the same
  * {@code ha.topics} with the same timings, through {@link RaftReplicator#openForWitness} (#217 item 1).
  */
-public final class HaMessaging implements AutoCloseable {
+public final class HaMessaging implements sjws_nettask.OptionalModule {
 
     /** Raft tick; the heartbeat and election timeouts are multiples of it. */
     static final Duration TICK = Duration.ofMillis(10);
