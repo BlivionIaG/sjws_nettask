@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   analyze:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # Pinned for #265: unpin once all three failing tests pass on 26.04
     permissions:
       contents: read
       security-events: write
