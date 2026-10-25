@@ -122,6 +122,7 @@ ha:
   election_timeout: 1s          # default 1s
   heartbeat: 100ms              # default 100ms; 2 * heartbeat * 1.01 + 10ms must be below election_timeout
   state_dir: /var/lib/sjws/msgrepl   # default <--state-dir>/msgrepl
+  messaging_insecure_plaintext: true   # required while any member address is off loopback (#277)
   members:                      # 2 data nodes + 1 witness, or 3 or more data nodes; same list everywhere
     - { id: a, address: "10.0.0.1:7100", http_url: "http://10.0.0.1:8080" }
     - { id: b, address: "10.0.0.2:7100", http_url: "http://10.0.0.2:8080" }
@@ -136,13 +137,16 @@ ha:
 | `ha.topics` | `[]` | Replicated topics. Consumer offsets are always replicated. Producing to an unlisted topic is refused on a replicated node. |
 | `ha.election_timeout`, `ha.heartbeat` | `1s`, `100ms` | Raft timings for every `msg/*` group. |
 | `ha.state_dir` | `<--state-dir>/msgrepl` | Raft log (`raft/`) and apply state (`apply/`). Relative to the config file. |
+| `ha.messaging_insecure_plaintext` | `false` | The member links are HMAC-authenticated but not encrypted, and the sender is not bound to its connection ([#277](https://github.com/BlivionIaG/sjws_nettask/issues/277)). A replicating node with any `members[].address` off loopback refuses to start (exit 64) unless this is `true`; with it, startup logs a WARN. Loopback-only member lists need nothing. |
 
 An invalid member list is refused in `on` and `auto`: a bare pair (`two voters require a witness`), more than
 one witness, a witness with other than two data nodes, a `node_id` that is not listed, a data node without
 `http_url`. With `off` only the syntax is checked. A data node needs messaging on
 (`sjws.messaging.enabled=true`); the witness must have it off. Any `members` list counts as a multi-process
-deployment for `sjws.swarm.stream.enabled`. Raft frames are HMAC-authenticated, not encrypted: keep the member
-network private. Changes need a restart.
+deployment for `sjws.swarm.stream.enabled`. Raft frames are HMAC-authenticated (their own frame domain,
+HKDF info `sjws-msgrepl-frame-v1`), not encrypted: a member off loopback needs
+`ha.messaging_insecure_plaintext: true` until #277, and the member network must stay private. Changes need a
+restart.
 
 `WEB_SERVER_HA_CLUSTER_KEY` overrides `ha.cluster_key` and `ha.cluster_key_file`.
 `WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS` overrides the previous key. An empty variable is an error

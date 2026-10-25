@@ -487,6 +487,9 @@ proposal (G1-G7) are met.
 | `on` | refuses to start (exit 64) | replicates | refuses to start (exit 64) | refuses to start (exit 64) |
 | `auto` | single node, silently | replicates | refuses to start (exit 64) | single node, with a warning |
 
+In `on` and `auto`, a replicating member list with any address off loopback also refuses to start (exit 64)
+unless `ha.messaging_insecure_plaintext: true` (#277); `off` and the single-node cases resolve no address.
+
 A valid member list is two data nodes plus one witness, or three or more data nodes. A bare pair is refused
 with the `VoterSet` words (`two voters require a witness`), and `VoterSet.majority` refuses it again when
 the node opens. Every data node needs `http_url` (the 307 target when it leads). The timings must pass the
@@ -495,10 +498,16 @@ the node opens. Every data node needs `http_url` (the 307 target when it leads).
 When the mode resolves to replication, the composition root (`HaMessagingStart`) loads
 `sjws_nettask.msgrepl.HaMessaging` by name, before the server mounts the messaging module:
 
-1. One `TcpTransport` on this member's `address`, HMAC-SHA256 per frame under `ha.cluster_key` (HKDF info
-   `sjws-raft-frame-v1`, so the key is not a heartbeat tag). Frames are authenticated, not encrypted; a
-   member off loopback logs a warning. Any key holder can act as any member until #175's cert-to-peer
-   binding covers this transport: keep the member network private.
+1. One `TcpTransport` on this member's `address`, HMAC-SHA256 per frame under `ha.cluster_key`, in its own
+   frame domain `msgrepl` (tag label `sjws-msgrepl-frame\0`, HKDF info `sjws-msgrepl-frame-v1`), so the key
+   is not a heartbeat tag and a CP voter (`sjws-raft-frame-v1`) or swarm peer frame never opens here, nor the
+   reverse, even under the same key. Frames are authenticated, not encrypted, and on these plain sockets the
+   claimed sender is not bound to the connection: any key holder can act as any member. Encryption and
+   sender-to-connection binding are tracked in
+   [#277](https://github.com/BlivionIaG/sjws_nettask/issues/277). Until then, as `CpLaunch` does for
+   `cp.peers` without `cp.tls`, a member list with any address off loopback is refused (exit 64) unless
+   `ha.messaging_insecure_plaintext: true` is set; with it, startup logs a WARN citing #277. Keep the member
+   network private.
 2. One `FileLogStorage` under `<state_dir>/raft` (default `<--state-dir>/msgrepl`), and one
    `ReplicatedNode` with `VoterSet.dataAndWitness` (with a witness) or `VoterSet.majority`.
 3. A data node builds `RaftReplicator(node, ha.topics, data-node http_urls, <state_dir>/apply, ...)` and hands
@@ -521,7 +530,9 @@ state under `state_dir` stays; turning replication back on resumes from it if th
 as a whole.
 
 Known limits (gates before any default change): msg groups never snapshot or truncate their consensus log
-(#270); no multi-process test yet (G3); torn last record (#241).
+(#270); no multi-process test yet (G3); torn last record (#241); member links not encrypted and the sender not
+bound to its connection (#277: until it ships, `ha.messaging_insecure_plaintext` stays mandatory for members
+off loopback).
 
 ## Zero cost when HA is off
 
