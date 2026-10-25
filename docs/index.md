@@ -33,6 +33,7 @@ Back to the [README](../README.md) (quick start).
 - [High availability, as implemented](design/high-availability.md)
 - [High availability (draft)](ha/design.md) · [two-node decision](design/two-node-ha-decision.md) · [upstream discovery](ha/discovery.md)
 - [Raft delivery executor](design/raft-delivery-executor.md)
+- [Swarm peer forwarding (#236), as implemented](design/swarm-peer-forwarding.md)
 - [Control plane / API gateway mode (draft)](design/control-plane.md) · [process hosting](design/control-plane-hosting.md)
 - [Agent swarm layer (optional, draft)](design/agent-swarm.md)
 - [Agent graphs (swarm addendum, draft)](design/agent-graphs.md)

@@ -124,4 +124,39 @@ class SwarmModuleTest {
         assertEquals("SJWS_CP_PEERS is set", SwarmModule.multiProcessReason(none,
                 java.util.Map.of("SJWS_CP_PEERS", "a", "SJWS_CP_NODE_ID", ""), null));
     }
+
+    @Test
+    void peerSettingsRunTheFailClosedStartupChecks() {
+        java.util.function.Function<String, String> none = k -> null;
+        assertEquals(null, SwarmModule.checkPeers(none, java.util.Map.of()), "no peer setting: nothing runs");
+        var keyOnly = org.junit.jupiter.api.Assertions.assertThrows(sjws_nettask.OptionalModule.Refused.class,
+                () -> SwarmModule.checkPeers(none, java.util.Map.of("SJWS_SWARM_PEER_KEY", "k".repeat(32))));
+        assertFalse(keyOnly.getMessage().contains("kkkk"), "the key never reaches the message");
+        java.util.Map<String, String> single = java.util.Map.of("sjws.swarm.peers", "a=1@127.0.0.1:7001",
+                "sjws.swarm.node", "a");
+        var line = SwarmModule.checkPeers(single::get, java.util.Map.of());
+        assertTrue(line.startsWith("swarm: "), line);
+        java.util.Map<String, String> two = java.util.Map.of("sjws.swarm.peers",
+                "a=1@127.0.0.1:7001,b=2@127.0.0.1:7002", "sjws.swarm.node", "a");
+        org.junit.jupiter.api.Assertions.assertThrows(sjws_nettask.OptionalModule.Refused.class,
+                () -> SwarmModule.checkPeers(two::get, java.util.Map.of("SJWS_SWARM_PEER_KEY", "k".repeat(32))),
+                "two nodes without mTLS material");
+        org.junit.jupiter.api.Assertions.assertThrows(sjws_nettask.OptionalModule.Refused.class,
+                () -> SwarmModule.checkPeers(k -> k.equals("sjws.swarm.peers") ? "a=1@127.0.0.1:7001" : null,
+                        java.util.Map.of()), "a map that does not list this node");
+        assertTrue(SwarmModule.peersConfigured(k -> k.equals("sjws.swarm.peer.keyFile") ? "/k" : null,
+                java.util.Map.of()));
+        assertFalse(SwarmModule.peersConfigured(k -> " ", java.util.Map.of("SJWS_SWARM_PEERS", "")));
+    }
+
+    @Test
+    void aPeerMapWithOtherNodesStillCountsAsMultiProcessForTheStreamGuard() {
+        // #236 PR 1 forwards no swarm family, so the #234 guard stays until the chunk-forwarding slice
+        assertEquals("sjws.swarm.peers lists other nodes", SwarmModule.multiProcessReason(
+                k -> k.equals("sjws.swarm.peers") ? "a=1@h:1,b=2@h:2" : null, java.util.Map.of(), null));
+        assertEquals("sjws.swarm.peers lists other nodes", SwarmModule.multiProcessReason(k -> null,
+                java.util.Map.of("SJWS_SWARM_PEERS", "a=1@h:1,b=2@h:2"), null));
+        assertEquals(null, SwarmModule.multiProcessReason(k -> k.equals("sjws.swarm.peers") ? "a=1@h:1" : null,
+                java.util.Map.of(), null), "a single-node map is one process");
+    }
 }
