@@ -527,18 +527,18 @@ class StreamBudgetTest {
 
     @Test
     void sessionAdmissionAnswers503AtTheAdmitWatermarkAndLeavesNoState() throws Exception {
-        on(cfg(16 * MIB, 0.75, 0.9)); // admit at 14.4 MiB
+        on(cfg(16 * MIB, 0.5, 0.5)); // admit at 8 MiB
         var a = new ArrayList<Stream>();
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 2; i++) {
             a.add(stream("a" + i));
-            for (int seq = 0; seq < 3; seq++) {
+            for (int seq = 0; seq < 4; seq++) {
                 var r = chunk(a.get(i), seq, MIB);
                 if (r.status() != 200) {
                     break;
                 }
             }
         }
-        assertTrue(budget().charged() + StreamBudget.LAST_TICKET > (long) (0.9 * 16 * MIB), "at the watermark: "
+        assertTrue(budget().charged() + StreamBudget.LAST_TICKET > 8 * MIB, "at the watermark: "
                 + budget().charged());
         int cancels = this.swarm.tasks().streams().cancels().size();
         long charged = budget().charged();
@@ -549,8 +549,8 @@ class StreamBudgetTest {
         assertEquals(1, budget().sessionAdmitRefusals());
         assertEquals(charged, budget().charged(), "the ticket was given back");
         assertEquals(cancels, this.swarm.tasks().streams().cancels().size(), "no CancelSet slot taken");
-        assertEquals(4, this.http.streams().sessionCount());
-        assertEquals(4, budget().openSessions());
+        assertEquals(2, this.http.streams().sessionCount());
+        assertEquals(2, budget().openSessions());
         assertAccounting();
     }
 
@@ -609,8 +609,10 @@ class StreamBudgetTest {
                 assertTrue(b.admitSession());
                 var st = new StreamCredit.State(owner);
                 st.lastTicket.set(true);
-                b.resident(st, (long) (rnd.nextDouble() * b.budgetBytes() / n));
                 sts.add(st);
+            }
+            for (var st : sts) {
+                b.resident(st, (long) (rnd.nextDouble() * b.budgetBytes() / n));
             }
             for (var st : sts) {
                 long adv = b.advertise(st);
@@ -620,10 +622,7 @@ class StreamBudgetTest {
                     b.release(got);
                 }
                 long more = b.admit(st, adv + 1, false, false);
-                if (more >= 0) {
-                    b.release(more);
-                }
-                assertTrue(more < 0 || adv + 1 <= Math.max(0, b.budgetBytes() - b.charged()), "round " + round);
+                assertTrue(more < 0, "the advertisement is tight: one byte more is refused (round " + round + ")");
             }
             assertEquals(0, b.budgetUnderflows());
         }
@@ -633,7 +632,7 @@ class StreamBudgetTest {
 
     @Test
     void underPressureReadChunksAreTrimmedToTheResumeTailAndUnreadOnesNever() throws Exception {
-        on(cfg(16 * MIB, 0.75, 0.9));
+        on(cfg(16 * MIB, 0.6, 0.9)); // soft 9.6 MiB
         var a = stream("a");
         var u = stream("u");
         var x = stream("x");
@@ -752,7 +751,11 @@ class StreamBudgetTest {
         credit(chunk(s, 0, 1000));
         credit(chunk(s, 2, 2000)); // held, gap ticket
         assertEquals(StreamBudget.LAST_TICKET + StreamBudget.GAP_TICKET + 3000, budget().charged());
-        assertEquals(204, chunk(s, 5, Frame.LAST, data(10)).status()); // an out-of-order LAST: held, ticket converted
+        // an out-of-order LAST (delivered in process, so the task is not acked): held, its ticket converted
+        var sink = session(s).sink;
+        long lower = sink.offer(new StreamChunk(s.hi(), s.lo(), s.attempt(), 5, Frame.LAST, data(10)), st(s));
+        sink.listener.run();
+        st(s).lowerHeld(lower);
         assertFalse(st(s).lastTicket.get());
         assertEquals(StreamBudget.GAP_TICKET + 3010, budget().charged());
         var n = takeover(s);
