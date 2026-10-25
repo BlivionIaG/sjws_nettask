@@ -27,6 +27,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import java.util.regex.Pattern;
 
@@ -214,21 +215,58 @@ class DaemonTest {
         var root = Files.createDirectory(tmp.resolve("html"));
         var pid = tmp.resolve("child.pid");
         var log = tmp.resolve("child.log");
-        var savedOut = System.out;
-        var savedErr = System.err;
-        try {
-            int code = Sjws_nettask.run(
-                    new String[] {"--pid-file=" + pid, "--log-file=" + log, String.valueOf(freePort()), root.toString()},
-                    Map.of(Daemon.CHILD_ENV, "1"), out, err, NO_H3, SjwsServer::close);
-            assertEquals(Sjws_nettask.EXIT_OK, code, err());
-        } finally {
-            System.setOut(savedOut);
-            System.setErr(savedErr);
-        }
+        var beforeOut = System.out;
+        var beforeErr = System.err;
+        int code = Sjws_nettask.run(
+                new String[] {"--pid-file=" + pid, "--log-file=" + log, String.valueOf(freePort()), root.toString()},
+                Map.of(Daemon.CHILD_ENV, "1"), out, err, NO_H3, SjwsServer::close);
+        assertEquals(Sjws_nettask.EXIT_OK, code, err());
+        assertSame(beforeOut, System.out, "in-process child must not replace System.out");
+        assertSame(beforeErr, System.err, "in-process child must not replace System.err");
         assertFalse(Files.exists(pid));
         assertTrue(Files.readString(log).contains("Server started:"), Files.readString(log));
         assertTrue(Daemon.ignoreSignal("HUP"));
         assertFalse(Daemon.ignoreSignal("NOT_A_REAL_SIGNAL_XYZ"));
+    }
+
+    @Test
+    void daemonPathsLeaveStandardStreamsAlone() throws Exception {
+        var beforeOut = System.out;
+        var beforeErr = System.err;
+        var root = Files.createDirectory(tmp.resolve("html"));
+        var pid = tmp.resolve("hook.pid");
+        var log = tmp.resolve("hook.log");
+        var redirected = new AtomicReference<PrintStream>();
+        int code = Sjws_nettask.run(
+                new String[] {"--pid-file=" + pid, "--log-file=" + log, String.valueOf(freePort()), root.toString()},
+                Map.of(Daemon.CHILD_ENV, "1"), out, err, NO_H3, SjwsServer::close, redirected::set);
+        assertEquals(Sjws_nettask.EXIT_OK, code, err());
+        assertNotNull(redirected.get(), "the detached-child hook receives the log stream");
+        assertSame(beforeOut, System.out);
+        assertSame(beforeErr, System.err);
+        assertTrue(Files.readString(log).contains("Server started:"), Files.readString(log));
+
+        var notChild = new AtomicReference<PrintStream>();
+        assertEquals(Daemon.STATUS_STOPPED, Sjws_nettask.run(
+                new String[] {"--status", "--pid-file=" + tmp.resolve("missing.pid")}, Map.of(), out, err, NO_H3,
+                SjwsServer::close, notChild::set));
+        assertNull(notChild.get(), "a non-child run does not redirect");
+        assertSame(beforeOut, System.out);
+        assertSame(beforeErr, System.err);
+
+        var savedOut = System.out;
+        var savedErr = System.err;
+        var sink = new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8);
+        try {
+            Daemon.redirectStandardStreams(sink);
+            assertSame(sink, System.out);
+            assertSame(sink, System.err);
+        } finally {
+            System.setOut(savedOut);
+            System.setErr(savedErr);
+        }
+        assertSame(beforeOut, System.out);
+        assertSame(beforeErr, System.err);
     }
 
     // --- command line -----------------------------------------------------------------
@@ -608,10 +646,14 @@ class DaemonTest {
         var nested = Files.createDirectory(store.resolve("nested"));
         var linkDir = store.resolve("link-dir.pid");
         Files.createSymbolicLink(linkDir, nested.getFileName());
+        var linkAttrs = Files.readAttributes(linkDir, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        assertTrue(linkAttrs.isSymbolicLink(), "NOFOLLOW sees the symlink, not the directory");
+        assertFalse(linkAttrs.isRegularFile());
         var linkDirSnap = PidFile.read(linkDir);
         assertTrue(linkDirSnap.stale(), "symlink to a directory of size " + Files.size(nested));
         var linkDirEx = assertThrows(IOException.class, () -> PidFile.claim(linkDir));
         assertTrue(linkDirEx.getMessage().contains("symlink"), linkDirEx.getMessage());
+        assertFalse(linkDirEx.getMessage().contains("not a regular file"), linkDirEx.getMessage());
         reset();
         assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(linkDir, Duration.ofSeconds(1), out, err));
         assertFalse(Files.exists(linkDir), "symlink removed");
