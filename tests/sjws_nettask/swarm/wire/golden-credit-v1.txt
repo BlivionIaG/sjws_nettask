@@ -1,0 +1,18 @@
+# CREDIT payload v1 (agent-swarm.md §5.2 Backpressure, §11.2; #247): [version:u8=1][streamId:16][attempt:u32][chunks:u32][bytes:u32]
+# in a CREDIT frame (type 9, flags 0), big-endian, exactly 29 bytes. chunks and bytes are an absolute snapshot of the send
+# credit left (unsigned u32), attempt is the lease's attempt. To be shared by the Java and Python CREDIT payload codecs (S2c PR 6).
+# name streamId-hex attempt chunks bytes payload-hex frame-hex
+full-window 0123456789abcdeffedcba9876543210 1 256 4194304 010123456789abcdeffedcba9876543210000000010000010000400000 01090000001d010123456789abcdeffedcba9876543210000000010000010000400000
+partial 00000000000000010000000000000002 0 200 3145728 010000000000000001000000000000000200000000000000c800300000 01090000001d010000000000000001000000000000000200000000000000c800300000
+chunks-exhausted 00000000000000010000000000000002 3 0 1048576 0100000000000000010000000000000002000000030000000000100000 01090000001d0100000000000000010000000000000002000000030000000000100000
+bytes-exhausted 000102030405060708090a0b0c0d0e0f 7 128 0 01000102030405060708090a0b0c0d0e0f000000070000008000000000 01090000001d01000102030405060708090a0b0c0d0e0f000000070000008000000000
+u32-max ffffffffffffffffffffffffffffffff 4294967295 4294967295 4294967295 01ffffffffffffffffffffffffffffffffffffffffffffffffffffffff 01090000001d01ffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+# Negative payload vectors: each frame decodes as a CREDIT frame, but the v1 payload decoder must reject the payload.
+# Decode order: an empty payload is "length"; otherwise a version byte other than 1 is "version"; then a length other than 29 is "length".
+# credit-1024 is golden-v1.txt's frame vector, byte-identical; its payload 00000400 starts with 0x00, so it is not a v1 payload.
+# name ! reason payload-hex ("-" = empty) frame-hex
+credit-1024 ! version 00000400 01090000000400000400
+bad-version ! version 020123456789abcdeffedcba9876543210000000010000010000400000 01090000001d020123456789abcdeffedcba9876543210000000010000010000400000
+short ! length 010123456789abcdeffedcba98765432100000000100000100004000 01090000001c010123456789abcdeffedcba98765432100000000100000100004000
+long ! length 010123456789abcdeffedcba987654321000000001000001000040000000 01090000001e010123456789abcdeffedcba987654321000000001000001000040000000
+empty ! length - 010900000000
