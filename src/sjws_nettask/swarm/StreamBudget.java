@@ -31,7 +31,7 @@ import sjws_nettask.swarm.wire.StreamChunk;
  * {@link #FLOOR}, with an unbounded heap and no {@code bytes}, or on a malformed setting.</li>
  * <li><b>One word:</b> {@link #charged} is the sum of request-scoped reservations ({@code :chunk} between its reserve
  * and its {@code finally}) and residency (retained and held chunk bytes, plus gap and {@code LAST} tickets). Every
- * charge has exactly one release; a release that would go below 0 is counted in {@link #underflows()} (a bug
+ * charge has exactly one release; a release that would go below 0 is counted in {@link #budgetUnderflows()} (a bug
  * counter, expected 0).</li>
  * <li><b>Refusal</b> (non-exempt chunks only): over the budget, or above the soft watermark from a session whose own
  * resident bytes would exceed {@link #fairShare()}. The liveness filler, a newer attempt's chunk and {@code LAST} are
