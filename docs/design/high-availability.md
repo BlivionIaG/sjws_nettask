@@ -499,10 +499,12 @@ When the mode resolves to replication, the composition root (`HaMessagingStart`)
    `sjws-raft-frame-v1`, so the key is not a heartbeat tag). Frames are authenticated, not encrypted; a
    member off loopback logs a warning. Any key holder can act as any member until #175's cert-to-peer
    binding covers this transport: keep the member network private.
-2. One `FileLogStorage` under `<state_dir>/raft` (default `<--state-dir>/msgrepl`), and one
+2. One rolling `FileLogStorage` under `<state_dir>/raft` (default `<--state-dir>/msgrepl`; files of
+   `ha.snapshot.log_segment_bytes`), and one
    `ReplicatedNode` with `VoterSet.dataAndWitness` (with a witness) or `VoterSet.majority`.
-3. A data node builds `RaftReplicator(node, ha.topics, data-node http_urls, <state_dir>/apply, ...)` and hands
-   it to `MessagingModule.replication`. Messaging must be enabled there (`sjws.messaging.enabled`), or the
+3. A data node opens the snapshot runtime (`<state_dir>/snap`, one scheduler thread) and the install
+   listener (Raft port + `ha.snapshot.port_offset`), builds `RaftReplicator(node, ha.topics, data-node
+   http_urls, <state_dir>/apply, ..., runtime)` and hands it to `MessagingModule.replication`. Messaging must be enabled there (`sjws.messaging.enabled`), or the
    process refuses to start. The witness must not run messaging; it calls `RaftReplicator.openForWitness`
    with the same `ha.topics` and timings, so its groups match the data nodes' (#217 item 1).
 4. `ReplicatedNode.begin` (10 ms tick). One INFO line names the node, the voter count, the topics and the
@@ -520,8 +522,98 @@ ledger without consensus. The nodes no longer agree; keep one node writable and 
 state under `state_dir` stays; turning replication back on resumes from it if the directory is kept or wiped
 as a whole.
 
-Known limits (gates before any default change): msg groups never snapshot or truncate their consensus log
-(#270); no multi-process test yet (G3); torn last record (#241).
+Known limits (gates before any default change): no multi-process test yet (G3); torn last record (#241).
+
+### msg/* snapshots, truncation and install (#270)
+
+Each data node snapshots its own `msg/*` groups and truncates their consensus log; a follower too far behind
+installs a peer's ledger segments. Settings: `ha.snapshot` (defaults: every 10 000 applied entries, 1 000
+entries kept behind, 1 MiB chunks, 64 MiB/s install rate, install port = Raft port + 1, 16 MiB consensus log
+files). Classes: `msgrepl.RaftReplica` (taker, install, retention), `MsgSnapshot` (the manifest),
+`SnapshotStore` (pins), `SnapshotTransfer` (side channel), `Snapshots` (settings and the shared runtime).
+
+**What the snapshot is.** The consensus image is a small `MsgSnapshot` manifest, recorded with
+`SnapshotControl.recordSnapshot` (the group's own taker stays off). It names the snapshot point
+`(index, term)`, the ledger offset `endOffset` right after it, the replicated log start, an optional
+application-state section, and for each segment file from the log start to `endOffset` its byte length at the
+point, its compaction marker and one SHA-256 per chunk. The data stays in the topic's segments; nothing is
+copied into the Raft log.
+
+**Taking one** (`snapshotAt`, on one scheduler thread per node; never on the produce path):
+
+1. The point is the newest batch whose local append completed (`lastApplied`, published by the append
+   completion). If the ledger's durable offset is behind it, the active segment is fsynced first, so the
+   point is a **fsynced** offset, not only an applied one (constraint 1).
+2. `SnapshotStore.pin` hard-links the segment files into `<state_dir>/snap/<topic>/<index>/` with a fsynced
+   manifest, through a `.tmp` directory renamed into place. A link keeps the bytes of that inode whatever
+   compaction (rename over) or retention (unlink) does later. The newest two pins per topic are kept, plus
+   any a transfer is reading. Digests of whole chunks are cached per inode, so a sealed segment is hashed once.
+3. `recordSnapshot` makes the manifest the group's durable snapshot (`FileLogStorage.saveSnapshot`, off the
+   group lock). This is the persisted (index, term) to offset mapping.
+4. `truncateToBound` drops the consensus log through `snapshot index - log_tail_entries` (the bound set at
+   open; constraint 5). `FileLogStorage` for HA messaging rolls into `<group>.<first>.seg` files at
+   `log_segment_bytes`, so truncation unlinks whole files instead of rewriting the log.
+5. The apply stamp file (`apply/<topic>.applied`) is rewritten to start with the point as its header.
+
+A crash anywhere leaves the previous snapshot and the whole log (each step is atomic, and later steps only
+run after earlier ones are durable). `MsgSnapshotClusterTest.crashMidSnapshotRecovers` injects faults after
+the pin, after the record, and after the stamp rewrite.
+
+**Catch-up.** A data follower whose next entry is still in the kept tail gets entries
+(`RaftGroup.inLogTail`, only when a truncation bound is set). Further behind, the leader sends the manifest as a
+normal chunked Raft snapshot. On the follower's delivery thread `onSnapshotRestored` sees that its ledger ends
+before `endOffset` and installs:
+
+1. Write `apply/<topic>.install` (the manifest, fsynced). From now on no entry applies and no append is
+   accepted on this replica; a restart redoes the install (on a virtual thread once the group is open,
+   entries wait for it).
+2. Fetch the newest pin at or above the index from the data nodes, leader first, with backoff, into
+   `apply/<topic>.staging` (`SnapshotTransfer.fetch`). Chunks already staged with the right digest are kept,
+   so an interrupted transfer resumes.
+3. Wait for local appends in flight, take the topic's reads write lock, replace every segment with the staged
+   ones (`SegmentedLog.replaceWith`: hard links, directory fsync) and reset the writer (`LedgerWriter.reload`).
+4. Move the apply point to the snapshot, rewrite the stamps, restore the application state, run the
+   `reloaded` hook (`LogOffsets.reload` for `__offsets`), delete the marker and the staging directory.
+
+The follower keeps nothing below the leader's log start, and the files it installs are the leader's files
+as they are, compacted or not (constraint 4, option b): no compaction is re-run, and each chunk is checked
+against the manifest's SHA-256. `MsgSnapshotClusterTest.crashMidInstallRedoesItOnRestart` faults after the
+marker, after the fetch, after the swap and after the stamps.
+
+On restart a node restores its own manifest: its ledger already holds `endOffset` (constraint 1), so it
+adopts the point and replays the kept tail. Entries already in the ledger are not appended again; with an
+application state, they are fed to `onApplied` again after the image is restored.
+
+**Install transfer and the #175 trust boundary.** One TCP listener per data node on the member's host at Raft
+port + `port_offset`. Requests are HMAC-SHA256 under `HKDF-SHA256(cluster key, "sjws-msg-snapshot-v1")` (the
+rotation key is accepted, and the reply uses the key the client proved), with a fresh 16-byte nonce (an LRU of
+8192 refuses replays) and a timestamp within 120 s. Anything that fails is closed without an answer and
+counted (`refused`). The manifest reply is MACed and bound to both nonces; chunk requests are MACed with a
+strictly increasing sequence number. Segment bytes are not MACed: they are sent with `FileChannel.transferTo`
+(sendfile, zero-copy) and the client checks each chunk's SHA-256 from the authenticated manifest before
+writing it. Bounds: a plain topic name (no path), files named only from numeric bases, manifest at most
+`maxSnapshotBytes`, chunks 4 KiB to 16 MiB, at most 4 sessions, 15 s read timeouts, one token bucket per sender
+(`install_rate`, constraint 7). Like Raft frames, the channel is authenticated, not encrypted.
+
+**Retention (constraint 3).** With replication, `LogTopics` does not delete segments on its own. Only the
+ready leader computes the cut its retention pass would make and proposes `[R][term][origin][seq][offset]`
+("advance the log start to offset"). Every replica applies it in log order: it raises `logStartOffset`, stamps
+it (a restart keeps it), and deletes whole sealed segments ending at or below it under the reads write lock
+(left to the next maintenance pass when one is running). All replicas therefore delete at the same logical
+point.
+
+**Producer dedup and offsets (constraint 2).** Consumer offsets live in `__offsets`, whose segments are
+snapshotted and installed like any topic; `LogOffsets.reload` rebuilds the map from them after an install.
+Producer dedup state for replicated topics does not exist yet (M2). The manifest carries its
+`ReplicaHooks.ReplicatedState` section (`snapshotState` / `restoreState`), and the tests use a dedup table
+through it: a duplicate is still recognised after truncation, a restart, or an install.
+
+**Witness (constraint 6).** Unchanged: it stores no entries, never receives snapshots (the leader never
+sends one to a witness), and keeps only its hard state (term, vote) and its vote cursor (index and term of the
+last entry it acked, at or past the snapshot point). No segments, pins or manifests.
+
+**Zero cost when off.** Without `ha.messaging` replication none of this loads (`ReplicaHooks` and every
+msgrepl class stay unloaded; `cp.ClassLoadTest`). A `RaftReplicator` built without a runtime never snapshots.
 
 ## Zero cost when HA is off
 

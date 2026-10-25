@@ -122,6 +122,13 @@ ha:
   election_timeout: 1s          # default 1s
   heartbeat: 100ms              # default 100ms; 2 * heartbeat * 1.01 + 10ms must be below election_timeout
   state_dir: /var/lib/sjws/msgrepl   # default <--state-dir>/msgrepl
+  snapshot:                     # optional; the defaults are shown
+    every_entries: 10000        # applied entries between snapshots of each topic
+    log_tail_entries: 1000      # consensus entries kept behind a snapshot (brief lag catches up from these)
+    chunk_bytes: 1m             # install chunk (one SHA-256 each), 4k to 16m
+    install_rate: 64m           # install bytes per second a node sends, all transfers together
+    port_offset: 1              # install listener: each member's Raft port plus this
+    log_segment_bytes: 16m      # consensus log file size; truncation deletes whole files
   members:                      # 2 data nodes + 1 witness, or 3 or more data nodes; same list everywhere
     - { id: a, address: "10.0.0.1:7100", http_url: "http://10.0.0.1:8080" }
     - { id: b, address: "10.0.0.2:7100", http_url: "http://10.0.0.2:8080" }
@@ -135,14 +142,21 @@ ha:
 | `ha.members[]` | none | `id` (1-64 of `A-Za-z0-9._-`), `address` (`host:port` of the Raft link), `http_url` (data nodes: base URL for 307s to the leader), `witness` (default false), `wire` (default: 1-based position; keep the list order the same everywhere or set it). |
 | `ha.topics` | `[]` | Replicated topics. Consumer offsets are always replicated. Producing to an unlisted topic is refused on a replicated node. |
 | `ha.election_timeout`, `ha.heartbeat` | `1s`, `100ms` | Raft timings for every `msg/*` group. |
-| `ha.state_dir` | `<--state-dir>/msgrepl` | Raft log (`raft/`) and apply state (`apply/`). Relative to the config file. |
+| `ha.state_dir` | `<--state-dir>/msgrepl` | Raft log (`raft/`), apply state (`apply/`) and snapshot pins (`snap/`). Relative to the config file. |
+| `ha.snapshot.every_entries` | `10000` | Each data node snapshots a topic after this many applied entries, then truncates its consensus log. |
+| `ha.snapshot.log_tail_entries` | `1000` | Entries kept behind the snapshot. A follower less than this far behind catches up from the log; further behind it installs a peer's segments. |
+| `ha.snapshot.chunk_bytes` | `1m` | Install chunk size (4k to 16m); each chunk is checked against its SHA-256. |
+| `ha.snapshot.install_rate` | `64m` | Bytes per second a node sends to installing followers, all transfers together. |
+| `ha.snapshot.port_offset` | `1` | Data nodes listen for installs on their `address` port plus this. Open it between data nodes only. |
+| `ha.snapshot.log_segment_bytes` | `16m` | Consensus log file size. |
 
 An invalid member list is refused in `on` and `auto`: a bare pair (`two voters require a witness`), more than
 one witness, a witness with other than two data nodes, a `node_id` that is not listed, a data node without
 `http_url`. With `off` only the syntax is checked. A data node needs messaging on
 (`sjws.messaging.enabled=true`); the witness must have it off. Any `members` list counts as a multi-process
-deployment for `sjws.swarm.stream.enabled`. Raft frames are HMAC-authenticated, not encrypted: keep the member
-network private. Changes need a restart.
+deployment for `sjws.swarm.stream.enabled`. Raft frames and install transfers are HMAC-authenticated, not
+encrypted: keep the member network private. With replication, retention (`sjws.messaging.retention.*`) is decided
+by the leader and applied on every data node at the same offset. Changes need a restart.
 
 `WEB_SERVER_HA_CLUSTER_KEY` overrides `ha.cluster_key` and `ha.cluster_key_file`.
 `WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS` overrides the previous key. An empty variable is an error
