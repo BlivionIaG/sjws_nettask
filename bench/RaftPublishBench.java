@@ -36,6 +36,12 @@ import sjws_nettask.cluster.TcpTransport;
  *   java -cp target/classes bench/RaftPublishBench.java overload <producers> <seconds> <callbackMicros> [tickMicros]
  *       leader callback spins callbackMicros per entry; producers append open loop (no wait) with at most
  *       512 outstanding each. Samples deliveryLag/maxDeliveryLag every 200 ms; counts ApplyLagException.
+ *
+ * With {@code -Dbench.cpPeerTls=<dir>} the voters talk over the CONTROL voter links instead of plain sockets:
+ * {@code cp.CpPeerSockets} over {@code cp-peer} mTLS 1.3, with {@code <dir>/ca.pem} and {@code <dir>/n<w>.pem},
+ * {@code <dir>/n<w>.key} (certificate with URI SAN {@code urn:sjws:node:n<w>}, PKCS#8 key) for wires 1..3. The
+ * sockets are built by reflection, pinning each voter's SAN when the build supports it (#175), so the same file runs
+ * against builds before and after that change.
  */
 public class RaftPublishBench {
     static final GroupId GROUP = new GroupId("bench");
@@ -62,7 +68,9 @@ public class RaftPublishBench {
         var handles = new ArrayList<ReplicationGroup>();
         var applied = new AtomicLong();
         for (var m : members) {
-            var t = TcpTransport.open(m.id(), members, key, Clock.SYSTEM, 4096);
+            var tlsDir = System.getProperty("bench.cpPeerTls");
+            var t = tlsDir == null ? TcpTransport.open(m.id(), members, key, Clock.SYSTEM, 4096)
+                    : TcpTransport.open(m.id(), members, key, Clock.SYSTEM, 4096, cpPeerSockets(tlsDir, m, members));
             transports.add(t);
             var node = ReplicatedNode.open(m.id(), members, voters, QuorumPolicy.majority(), Clock.SYSTEM, new MemoryLogStorage(), t);
             nodes.add(node);
@@ -266,6 +274,36 @@ public class RaftPublishBench {
             return Double.NaN;
         }
         return sorted[Math.min(sorted.length - 1, (int) (q * sorted.length))] / 1000.0;
+    }
+
+    /** {@code cp.CpPeerSockets} for {@code self}: pinned (#175) when the build has the pinning constructor. */
+    static TcpTransport.SocketFactory cpPeerSockets(String dir, Member self, List<Member> members) throws Exception {
+        var d = java.nio.file.Path.of(dir);
+        var wire = self.id().wire();
+        var config = new sjws_nettask.cp.CpListenerConfig("cp-peer", d.resolve("n" + wire + ".pem"),
+                d.resolve("n" + wire + ".key"), d.resolve("ca.pem"), null, true);
+        var tls = sjws_nettask.cp.CpTls.serverContext(config);
+        var cls = Class.forName("sjws_nettask.cp.CpPeerSockets");
+        Object sockets;
+        try {
+            var ctor = cls.getDeclaredConstructor(sjws_nettask.cp.CpServerTls.class, List.class, String.class);
+            var peerCtor = sjws_nettask.cp.CpConfig.Peer.class.getConstructor(int.class, String.class,
+                    InetSocketAddress.class, boolean.class, String.class);
+            var peers = new ArrayList<Object>();
+            for (var m : members) {
+                peers.add(peerCtor.newInstance(m.id().wire(), m.id().name(), m.address(), false,
+                        "urn:sjws:node:" + m.id().name()));
+            }
+            ctor.setAccessible(true);
+            sockets = ctor.newInstance(tls, peers, self.id().name());
+            System.err.println("bench: cp-peer mTLS, pinned SANs");
+        } catch (NoSuchMethodException unpinned) {
+            var ctor = cls.getDeclaredConstructor(sjws_nettask.cp.CpServerTls.class);
+            ctor.setAccessible(true);
+            sockets = ctor.newInstance(tls);
+            System.err.println("bench: cp-peer mTLS, no pinning in this build");
+        }
+        return (TcpTransport.SocketFactory) sockets;
     }
 
     static int freePort() throws Exception {
