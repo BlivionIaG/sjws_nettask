@@ -20,7 +20,8 @@ package sjws_nettask.cluster;
  * The entry behind this {@code append()} future <b>is committed</b> (it is in the replicated log and will be applied
  * on every replica, including this one when it reopens and replays), but this node closed before applying it
  * locally. Not a failure of the write: do not retry it as if it had not landed. Distinct from
- * {@link NotLeaderException} and {@link ApplyLagException}, which mean nothing was appended.
+ * {@link NotLeaderException} and {@link ApplyLagException}, which mean nothing was appended, and from
+ * {@link OutcomeUnknownException}, which means it was appended and may or may not commit.
  */
 public final class CommittedNotAppliedException extends RuntimeException {
 

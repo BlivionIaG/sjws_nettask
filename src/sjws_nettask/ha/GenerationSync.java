@@ -74,6 +74,13 @@ public final class GenerationSync implements AutoCloseable {
         return publish(generation, config.load(), certs.certificate(), certs.privateKey());
     }
 
+    /**
+     * STAGE, then ACTIVATE once STAGE commits. Never retried here: a failure with
+     * {@link sjws_nettask.cluster.NotLeaderException} means the failed marker was refused, while
+     * {@link sjws_nettask.cluster.OutcomeUnknownException} means it may still commit (a STAGE without its ACTIVATE
+     * is harmless; an ACTIVATE may yet take effect). A caller re-publishes the same generation only after reading
+     * the group back (#254).
+     */
     public CompletableFuture<CommittedIndex> publish(long generation, byte[] config, byte[] certificate,
             byte[] privateKey) {
         var payload = payload(config, certificate, privateKey);

@@ -39,19 +39,23 @@ public interface ClusterNode extends AutoCloseable {
     ReplicationGroup openGroup(GroupId groupId, GroupOptions options, GroupListener listener);
 
     /**
-     * Leader only; otherwise the future completes with {@link NotLeaderException}. The future
-     * completes with the committed index after a quorum has the batch. Strict groups have also
-     * fsynced it. One batch is one ordered span of indexes, and it is all-or-nothing: if a log write
-     * fails partway, the leader rolls the batch back and the future fails; if the rollback fails too,
-     * the group fails closed until restart. That failure says {@code outcome unknown}: part of the batch may
-     * still commit after the restart, so treat it like a timeout and deduplicate on retry. Earlier
-     * batches still pending when the group fails closed fail the same way, not with
-     * {@link NotLeaderException}. A batch that was accepted but is still pending when this node stops
-     * leading (it steps down or transfers leadership) fails with {@link NotLeaderException} too; it is
-     * never reported committed by a node that no longer leads (#250). Its outcome is unknown as well: a
-     * follower may already hold it and the next leader may commit it, so deduplicate on retry. Every
-     * refusal (an empty batch, a null entry, a bad {@code expectedTerm}, a storage error) fails the future
-     * rather than throwing.
+     * Leader only. The future completes with the committed index after a quorum has the batch; strict groups have
+     * also fsynced it. One batch is one ordered span of indexes, and it is all-or-nothing. A failed future says
+     * one of two things, and callers must tell them apart (#254):
+     * <ul>
+     * <li><b>Refused, nothing appended</b>: {@link NotLeaderException} (this node does not lead),
+     * {@link TermChangedException}, {@link ApplyLagException}, {@link DurabilityUnavailableException}, an argument
+     * error (empty batch, null entry, bad {@code expectedTerm}, too large), a fenced group, or a storage error on a
+     * batch the leader rolled back cleanly. Retrying (at the leader) cannot duplicate it.
+     * <li><b>Accepted, outcome unknown</b>: {@link OutcomeUnknownException}. The batch entered the log and may still
+     * commit, or may be discarded: this node stopped leading before it committed (step-down, leadership transfer,
+     * an election started as leader), the group failed closed after a log write it could not roll back (the
+     * storage error is the cause; earlier batches still pending fail the same way), or the node closed. Treat it
+     * like a timeout: never resend as if nothing had been appended; retry only with your own deduplication, or
+     * read back. A node that no longer leads never reports a batch committed (#250).
+     * </ul>
+     * {@link CommittedNotAppliedException} means the batch committed but this node closed before applying it.
+     * Every failure completes the future rather than throwing.
      */
     CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
 

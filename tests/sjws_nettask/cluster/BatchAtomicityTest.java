@@ -56,6 +56,7 @@ class BatchAtomicityTest {
         volatile int failAppendAfter = -1; // appends allowed before the injected failure; -1 = never
         volatile boolean failForce;
         volatile boolean failTruncate;
+        volatile boolean failRead;
         int appends;
         /** Every storage call that writes, counted whether or not it then fails. */
         final java.util.concurrent.atomic.AtomicInteger writes = new java.util.concurrent.atomic.AtomicInteger();
@@ -93,6 +94,9 @@ class BatchAtomicityTest {
 
         @Override
         public byte[] read(GroupId g, long index) throws IOException {
+            if (failRead) {
+                throw new IOException("injected read failure at index " + index);
+            }
             return d.read(g, index);
         }
 
@@ -304,6 +308,47 @@ class BatchAtomicityTest {
         assertFalse(contains(applied.get(l), "bad"));
     }
 
+    /**
+     * #254 (Security): a storage error after the batch is in the log (here: reading it back to replicate) fails the
+     * future as outcome unknown. It used to be thrown out of append(), which a caller reads as "not appended".
+     */
+    @Test
+    void aStorageErrorAfterTheBatchIsAppendedFailsTheFutureAsOutcomeUnknown() throws Exception {
+        start(Durability.RELAXED, false);
+        int l = leader();
+        settle(nodes.get(l).append(GROUP, batch("before", 1)));
+        long last = storages.get(l).lastIndex(GROUP);
+        storages.get(l).failRead = true;
+        java.util.concurrent.CompletableFuture<CommittedIndex> accepted;
+        try {
+            accepted = org.junit.jupiter.api.Assertions.assertDoesNotThrow(
+                    () -> nodes.get(l).append(GROUP, batch("accepted", 2)));
+        } finally {
+            storages.get(l).failRead = false;
+        }
+        assertEquals(last + 2, storages.get(l).lastIndex(GROUP), "the batch is in the log");
+        var cause = assertThrows(ExecutionException.class, () -> accepted.get(10, TimeUnit.SECONDS)).getCause();
+        assertInstanceOf(OutcomeUnknownException.class, cause);
+        assertInstanceOf(UncheckedIOException.class, cause.getCause());
+    }
+
+    /** #254 (Security): a cleanly rolled-back batch and a fenced group get their own refusal types. */
+    @Test
+    void rolledBackAndFencedRefusalsHaveDedicatedTypes() throws Exception {
+        start(Durability.RELAXED, false);
+        int l = leader();
+        settle(nodes.get(l).append(GROUP, batch("before", 1)));
+        storages.get(l).armAppend(1);
+        var rolledBack = nodes.get(l).append(GROUP, batch("bad", 3));
+        assertInstanceOf(BatchRolledBackException.class, assertThrows(ExecutionException.class, rolledBack::get).getCause());
+        storages.get(l).failTruncate = true;
+        storages.get(l).armAppend(1);
+        var unknown = nodes.get(l).append(GROUP, batch("worse", 3));
+        assertInstanceOf(OutcomeUnknownException.class, assertThrows(ExecutionException.class, unknown::get).getCause());
+        var fenced = nodes.get(l).append(GROUP, batch("after", 1));
+        assertInstanceOf(GroupFencedException.class, assertThrows(ExecutionException.class, fenced::get).getCause());
+    }
+
     @Test
     void failedRollbackFailsTheGroupClosedAndAnotherNodeTakesOver() throws Exception {
         start(Durability.RELAXED, true); // file log: snapshots and prefix deletes are real
@@ -314,7 +359,8 @@ class BatchAtomicityTest {
         faulty.armAppend(2);
         var failed = nodes.get(l).append(GROUP, batch("bad", 4));
         var cause = assertThrows(ExecutionException.class, failed::get).getCause();
-        assertInstanceOf(UncheckedIOException.class, cause);
+        assertInstanceOf(OutcomeUnknownException.class, cause);
+        assertInstanceOf(java.io.IOException.class, cause.getCause(), "the storage error is the cause");
         assertTrue(cause.getMessage().contains("outcome unknown"), cause.getMessage());
         assertFalse(group(l).isLeader(), "a group that cannot roll back must step down");
         assertTrue(nodes.get(l).failedClosed(GROUP), "failed-closed state must be visible for health");
@@ -380,7 +426,7 @@ class BatchAtomicityTest {
         var cause = assertThrows(ExecutionException.class,
                 () -> inFlight.get(10, java.util.concurrent.TimeUnit.SECONDS)).getCause();
         assertFalse(cause instanceof NotLeaderException, "an in-log write may still commit; not-leader says it won't");
-        assertInstanceOf(UncheckedIOException.class, cause);
+        assertInstanceOf(OutcomeUnknownException.class, cause);
         assertTrue(cause.getMessage().contains("outcome unknown"), cause.getMessage());
         assertTrue(cause.getMessage().contains("index " + pendingLast), cause.getMessage());
     }
@@ -442,11 +488,14 @@ class BatchAtomicityTest {
         // (b) the pending change was already in the log: outcome unknown, same root cause as the batch.
         var changeError = assertThrows(ExecutionException.class, () -> change.get(10, TimeUnit.SECONDS)).getCause();
         assertFalse(changeError instanceof NotLeaderException, "an in-log config change may still commit");
-        assertInstanceOf(UncheckedIOException.class, changeError);
+        assertInstanceOf(OutcomeUnknownException.class, changeError);
         assertTrue(changeError.getMessage().contains("membership change"), changeError.getMessage());
         assertTrue(changeError.getMessage().contains("outcome unknown"), changeError.getMessage());
         assertSame(batchError.getCause(), changeError.getCause(), "the original storage error is the cause");
-        assertSame(batchError, changeError.getSuppressed()[0], "the fail-closed error rides along as suppressed");
+        assertInstanceOf(OutcomeUnknownException.class, batchError);
+        assertInstanceOf(UncheckedIOException.class, changeError.getSuppressed()[0]);
+        assertSame(batchError.getSuppressed()[0], changeError.getSuppressed()[0],
+                "the same fail-closed error rides along as suppressed");
 
         // A waiting read barrier fails with the fenced error.
         assertFenced(assertThrows(ExecutionException.class, () -> read.get(10, TimeUnit.SECONDS)).getCause());

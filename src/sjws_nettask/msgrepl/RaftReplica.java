@@ -30,18 +30,27 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
+import sjws_nettask.cluster.ApplyLagException;
+import sjws_nettask.cluster.BatchRolledBackException;
 import sjws_nettask.cluster.ClusterNode;
 import sjws_nettask.cluster.CommittedEntry;
+import sjws_nettask.cluster.CommittedNotAppliedException;
+import sjws_nettask.cluster.DurabilityUnavailableException;
+import sjws_nettask.cluster.GroupClosedException;
+import sjws_nettask.cluster.GroupFencedException;
 import sjws_nettask.cluster.GroupId;
 import sjws_nettask.cluster.GroupOptions;
 import sjws_nettask.cluster.NodeId;
 import sjws_nettask.cluster.NotLeaderException;
+import sjws_nettask.cluster.OutcomeUnknownException;
 import sjws_nettask.cluster.ReplicationGroup;
 import sjws_nettask.cluster.TermChangedException;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.LedgerWriter;
 import sjws_nettask.messaging.ledger.Replica;
+import sjws_nettask.messaging.ledger.WriteOutcomeUnknownException;
+import sjws_nettask.messaging.ledger.WriteRefusedException;
 
 /**
  * One partition's consensus group wrapping its local ledger (msg-replication-sketch phase A).
@@ -218,7 +227,7 @@ final class RaftReplica implements Replica {
         this.node.append(this.groupId, List.of(encode(records, m, term, this.self, seq)), cd, term).whenComplete((ci, err) -> {
             if (err != null) {
                 var p = this.pending.remove(seq);
-                if (p != null) p.completeExceptionally(map(err));
+                if (p != null) p.completeExceptionally(map(err, true));
             }
         });
         return acked;
@@ -268,7 +277,7 @@ final class RaftReplica implements Replica {
     public CompletableFuture<Void> leaderRead() {
         if (!leaderReady()) return CompletableFuture.failedFuture(unavailable("not the ready leader"));
         return this.group.readBarrier().handle((v, err) -> {
-            if (err != null) throw new CompletionException(map(err));
+            if (err != null) throw new CompletionException(map(err, false));
             return null;
         });
     }
@@ -277,16 +286,59 @@ final class RaftReplica implements Replica {
         return new LeaderUnavailableException(this.groupId.value() + ": " + why, term(), leaderName(), leaderUrl());
     }
 
-    private Throwable map(Throwable err) {
+    /**
+     * Consensus errors to messaging ones (#254). For a leader read ({@code write} false) only the leadership refusals
+     * are translated; anything else passes through, and HTTP answers a generic 503 (a read has no write outcome).
+     * For an append:
+     * <ul>
+     * <li>refused for leadership (not leader, term moved): {@link LeaderUnavailableException}, which HTTP may answer
+     * with a 307 that resends the body;
+     * <li>refused otherwise, nothing appended: {@link WriteRefusedException}, retryable for apply backpressure, too
+     * few STRICT data copies, a closed node and a storage error on a fenced group or a cleanly rolled-back batch,
+     * not retryable for argument errors (empty or oversized batch);
+     * <li>in the log, fate unknown (leadership lost, failed closed, closed, committed but not applied here):
+     * {@link WriteOutcomeUnknownException} with the leader hint, never a redirect: if it commits, a resent body
+     * would be a second entry;
+     * <li>anything unclassified passes through, and HTTP reports it as outcome unknown (the safe default).
+     * </ul>
+     * This is the one place where consensus errors become messaging errors: every append and leader-read failure
+     * passes through it, and messaging code never has to know a cluster type (MessagingClusterIsolationTest).
+     */
+    Throwable map(Throwable err, boolean write) {
         var c = err instanceof CompletionException && err.getCause() != null ? err.getCause() : err;
         if (c instanceof NotLeaderException) return unavailable("not leader");
-        return c instanceof TermChangedException ? unavailable("term moved") : c;
+        if (c instanceof TermChangedException) return unavailable("term moved");
+        if (!write) {
+            return c; // a leader read has no write outcome: never not-appended or outcome unknown; HTTP says 503
+        }
+        if (c instanceof OutcomeUnknownException u) {
+            var name = u.hint().map(NodeId::name).orElseGet(this::leaderName);
+            return outcomeUnknown(u.getMessage(), name, c);
+        }
+        if (c instanceof CommittedNotAppliedException) {
+            return outcomeUnknown(c.getMessage(), leaderName(), c);
+        }
+        if (c instanceof ApplyLagException || c instanceof DurabilityUnavailableException || c instanceof GroupClosedException
+                || c instanceof GroupFencedException || c instanceof BatchRolledBackException) {
+            return new WriteRefusedException(this.groupId.value() + ": not appended: " + c.getMessage(), true, c);
+        }
+        if (c instanceof IllegalArgumentException) {
+            return new WriteRefusedException(this.groupId.value() + ": not appended: " + c.getMessage(), false, c);
+        }
+        return c;
+    }
+
+    private WriteOutcomeUnknownException outcomeUnknown(String message, String leader, Throwable cause) {
+        var url = leader == null || leader.equals(this.node.self().name()) ? null : this.urls.get(leader);
+        return new WriteOutcomeUnknownException(message, term(), leader, url, cause);
     }
 
     @Override
     public void close() {
         this.node.openGroup(this.groupId, RaftReplicator.options(java.time.Duration.ofSeconds(1), java.time.Duration.ofMillis(100)), null);
-        var closed = unavailable("closed");
+        // Proposed and maybe in the log: the entry may still commit and be applied (on restart, or by the other
+        // replicas), so a resend could duplicate it; not "not leader" (#254).
+        var closed = outcomeUnknown(this.groupId.value() + ": closed before the append was acknowledged", leaderName(), null);
         this.pending.values().forEach(p -> p.completeExceptionally(closed));
         this.pending.clear();
         try {

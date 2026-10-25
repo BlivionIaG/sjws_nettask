@@ -2,6 +2,8 @@ package sjws_nettask.messaging.http;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.InetSocketAddress;
@@ -24,6 +26,7 @@ import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.FakeClock;
 import sjws_nettask.cluster.Member;
 import sjws_nettask.cluster.MemberState;
+import sjws_nettask.cluster.LogStorage;
 import sjws_nettask.cluster.MemoryLogStorage;
 import sjws_nettask.cluster.NodeId;
 import sjws_nettask.cluster.ReplicatedNode;
@@ -53,6 +56,29 @@ class MessagingReplicationTest {
     List<ReplicatedNode> nodes;
     List<LogTopics> topics;
     List<MessagingHttp> http;
+    List<MemoryLogStorage> stores;
+    /** Node index whose log storage fails appends and truncates of {@link #faultGroup}; -1 = none. */
+    volatile int faultyNode = -1;
+    volatile sjws_nettask.cluster.GroupId faultGroup;
+
+    /**
+     * Wraps {@code d} so appends and truncates of {@link #faultGroup} on node {@code i} fail while armed: the next
+     * batch cannot be written or rolled back, so that group fails closed (#245).
+     */
+    LogStorage faulty(int i, MemoryLogStorage d) {
+        return (LogStorage) java.lang.reflect.Proxy.newProxyInstance(LogStorage.class.getClassLoader(),
+                new Class<?>[] {LogStorage.class}, (proxy, m, args) -> {
+                    if (faultyNode == i && args != null && args.length > 0 && args[0].equals(faultGroup)
+                            && (m.getName().equals("append") || m.getName().equals("truncateSuffix"))) {
+                        throw new java.io.IOException("injected " + m.getName() + " failure on /var/lib/sjws/secret.log");
+                    }
+                    try {
+                        return m.invoke(d, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+    }
 
     void start() throws Exception {
         clock = new FakeClock(0L);
@@ -63,7 +89,12 @@ class MessagingReplicationTest {
         topics = new ArrayList<>();
         http = new ArrayList<>();
         var urls = Map.of("n1", "http://n1.test", "n2", "http://n2.test");
-        for (var m : members) nodes.add(ReplicatedNode.open(m.id(), voters, clock, new MemoryLogStorage(), net));
+        stores = new ArrayList<>();
+        for (var m : members) {
+            var store = new MemoryLogStorage();
+            stores.add(store);
+            nodes.add(ReplicatedNode.open(m.id(), voters, clock, faulty(stores.size() - 1, store), net));
+        }
         for (int i = 0; i < 2; i++) {
             var t = new LogTopics(dir.resolve("n" + (i + 1)), Durability.ASYNC);
             t.replication(new RaftReplicator(nodes.get(i), TOPICS, urls, dir.resolve("state" + (i + 1)), ELECTION, HEARTBEAT, clock::nanoTime));
@@ -194,6 +225,95 @@ class MessagingReplicationTest {
         assertEquals(200, call(() -> http.get(l).handle(post("t", "y", Map.of()))).status());
         assertEquals(307, http.get(1 - ol).handle(new Request("PUT", "/messaging/v1/topics/t/offsets/g", RequestHeaders.of(Map.of()))
                 .withBody(MessagingHttpTest.body("{\"offset\":0}".getBytes(StandardCharsets.UTF_8)))).status());
+    }
+
+    /**
+     * #254, next to the 307 above: once the leader has the batch in its log, losing leadership is not "not leader".
+     * The batch may still commit (here: under the node leadership went to), so the produce gets the typed
+     * outcome-unknown 503 with the new leader as a hint, never a 307 that would resend the body.
+     */
+    @Test
+    void leadershipLostWithTheBatchInTheLogIsOutcomeUnknownNot307() throws Exception {
+        start();
+        int l = leader("t");
+        int f = 1 - l;
+        var group = RaftReplicator.group("t");
+        long before = stores.get(l).lastIndex(group);
+        net.cut(nodes.get(l).self(), nodes.get(f).self());
+        net.cut(nodes.get(l).self(), nodes.get(2).self());
+        var pending = CompletableFuture.supplyAsync(() -> http.get(l).handle(post("t", "maybe", Map.of())),
+                r -> Thread.ofVirtual().start(r));
+        for (int k = 0; k < 10_000 && stores.get(l).lastIndex(group) == before && !pending.isDone(); k++) Thread.sleep(1);
+        assertTrue(stores.get(l).lastIndex(group) > before, "the batch never reached the leader's log");
+        assertFalse(pending.isDone(), "cut off, the leader cannot commit");
+        nodes.get(l).openGroup(group, RaftReplicator.options(ELECTION, HEARTBEAT), null).transferLeadership(nodes.get(f).self());
+
+        var r = pending.get(10, TimeUnit.SECONDS);
+        var body = LogOffsetsTest.text(r);
+        assertEquals(503, r.status(), body);
+        assertNull(r.headers().get("location"), "never a redirect for a write that may commit");
+        assertTrue(body.contains(MessagingHttp.OUTCOME_UNKNOWN_TYPE), body);
+        assertEquals("1", r.headers().get("retry-after"));
+        var target = "n" + (f + 1);
+        assertEquals(target, r.headers().get("sjws-leader"), "the hint is where leadership went");
+        assertTrue(body.contains("\"leaderUrl\":\"http://" + target + ".test/messaging/v1/topics/t/records\""), body);
+    }
+
+    /**
+     * #254: cluster and messaging each have an outcome-unknown type (messaging may not load cluster classes), joined at
+     * exactly one boundary, RaftReplica.map. Pin that both reach the same typed 503 problem body, never a 307.
+     */
+    @Test
+    void clusterAndMessagingOutcomeUnknownGiveTheSameTyped503() throws Exception {
+        start();
+        int l = leader("t");
+        int f = 1 - l;
+        var replica = topics.get(l).get("t", false).replica();
+        var target = "/messaging/v1/topics/t/records";
+        var hint = "n" + (f + 1);
+        var cluster = new sjws_nettask.cluster.OutcomeUnknownException(RaftReplicator.group("t"), "stopped leading",
+                java.util.Optional.of(nodes.get(f).self()), null);
+        var viaBoundary = MessagingHttp.failed(new java.util.concurrent.ExecutionException(
+                new java.util.concurrent.CompletionException(sjws_nettask.msgrepl.ReplicaErrors.map(replica, cluster))), target, true);
+        var messaging = MessagingHttp.failed(new java.util.concurrent.ExecutionException(
+                new sjws_nettask.messaging.ledger.WriteOutcomeUnknownException("other text", replica.term(), hint,
+                        "http://" + hint + ".test", null)), target, true);
+        for (var r : List.of(viaBoundary, messaging)) {
+            assertEquals(503, r.status());
+            assertNull(r.headers().get("location"), "never a redirect");
+            assertEquals("1", r.headers().get("retry-after"));
+            assertEquals(hint, r.headers().get("sjws-leader"));
+            assertEquals(Long.toString(replica.term()), r.headers().get("sjws-term"));
+        }
+        assertEquals(LogOffsetsTest.text(messaging), LogOffsetsTest.text(viaBoundary), "the same problem body");
+        assertTrue(LogOffsetsTest.text(viaBoundary).contains("\"type\":\"" + MessagingHttp.OUTCOME_UNKNOWN_TYPE + "\""));
+
+        // Were the cluster type ever to skip the boundary, it would still be the typed outcome-unknown 503, not a 307.
+        var raw = MessagingHttp.failed(new java.util.concurrent.ExecutionException(cluster), target, true);
+        assertEquals(503, raw.status());
+        assertNull(raw.headers().get("location"));
+        assertTrue(LogOffsetsTest.text(raw).contains(MessagingHttp.OUTCOME_UNKNOWN_TYPE));
+    }
+
+    /** #254 + #245 through the real handler: a batch the leader could neither write nor roll back. */
+    @Test
+    void produceOnAFailedClosedGroupIsOutcomeUnknownWithoutInternals() throws Exception {
+        start();
+        int l = leader("t");
+        faultGroup = RaftReplicator.group("t");
+        faultyNode = l;
+        var r = call(() -> http.get(l).handle(post("t", "torn", Map.of())));
+        var body = LogOffsetsTest.text(r);
+        assertTrue(nodes.get(l).failedClosed(faultGroup), "the group must fail closed");
+        assertEquals(503, r.status(), body);
+        assertNull(r.headers().get("location"), body);
+        assertTrue(body.contains(MessagingHttp.OUTCOME_UNKNOWN_TYPE), body);
+        assertFalse(body.contains("secret") || body.contains("/var/lib") || body.contains("IOException"), body);
+
+        // Later writes on the fenced node are refusals (nothing appended), never outcome unknown.
+        var again = http.get(l).handle(post("t", "again", Map.of()));
+        assertFalse(LogOffsetsTest.text(again).contains(MessagingHttp.OUTCOME_UNKNOWN_TYPE), LogOffsetsTest.text(again));
+        assertTrue(again.status() == 307 || again.status() == 503, LogOffsetsTest.text(again));
     }
 
     @Test
