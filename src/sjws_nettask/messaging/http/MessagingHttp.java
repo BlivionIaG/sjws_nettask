@@ -581,7 +581,7 @@ final class MessagingHttp implements Handler {
             var base = e.leaderUrl();
             h.set("location", (base.endsWith("/") ? base.substring(0, base.length() - 1) : base) + target);
         } else {
-            h.set("retry-after", "1");
+            h.set("retry-after", RETRY_AFTER_SECONDS);
         }
         return new Response(redirect ? 307 : 503, h, Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
     }
