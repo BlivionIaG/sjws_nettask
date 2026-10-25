@@ -57,6 +57,8 @@ class MsgReplClusterTest {
         final String name;
         final Set<String> acked = new LinkedHashSet<>();
         final Set<String> sent = new LinkedHashSet<>();
+        /** Ids resent after an uncertain answer whose read-back did not find them yet. */
+        final Set<String> resentAfterUncertain = new LinkedHashSet<>();
         int seq;
         int uncertain;
         int resent;
@@ -94,6 +96,7 @@ class MsgReplClusterTest {
                         return;
                     }
                     this.resent++;
+                    this.resentAfterUncertain.add(id);
                     maybeStored = false;
                 }
                 var target = this.c.leader().orElse(null);
@@ -130,7 +133,10 @@ class MsgReplClusterTest {
         }
     }
 
-    /** Every acked id once, nothing that was never sent, no id twice, in one order on every listed node. */
+    /**
+     * Every acked id once, nothing that was never sent, no id twice, acked ids in ack order (the producer is
+     * sequential), in one order on every listed node.
+     */
     static List<String> assertLog(MsgReplCluster c, Producer p, String... nodes) throws Exception {
         List<String> first = null;
         for (var node : nodes) {
@@ -140,12 +146,27 @@ class MsgReplClusterTest {
                 counts.merge(r, 1, Integer::sum);
             }
             var dups = counts.entrySet().stream().filter(e -> e.getValue() > 1).map(Map.Entry::getKey).toList();
-            assertTrue(dups.isEmpty(), node + " stored duplicates: " + dups);
+            if (!dups.isEmpty()) {
+                var late = dups.stream().filter(p.resentAfterUncertain::contains).toList();
+                fail(node + " stored duplicates: " + dups + (late.isEmpty() ? ""
+                        : "; of these " + late + " had an uncertain answer, were absent on the read-back and were"
+                                + " resent, so the first copy committed late (after the read-back)"));
+            }
             for (var id : p.acked) {
                 assertTrue(counts.containsKey(id), node + " lost acked record " + id);
             }
             for (var r : recs) {
                 assertTrue(p.sent.contains(r), node + " has a record nobody sent: " + r);
+            }
+            var inLog = recs.stream().filter(p.acked::contains).toList();
+            var ackOrder = List.copyOf(p.acked);
+            if (!inLog.equals(ackOrder)) {
+                int i = 0;
+                while (i < inLog.size() && inLog.get(i).equals(ackOrder.get(i))) {
+                    i++;
+                }
+                fail(node + " stores acked records out of ack order at position " + i + ": log has " + inLog.get(i)
+                        + ", acked order has " + ackOrder.get(i));
             }
             if (first == null) {
                 first = recs;
