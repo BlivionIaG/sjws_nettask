@@ -91,7 +91,8 @@ public final class TokenStreams {
                 throw new IllegalArgumentException("sjws.swarm.stream.sinkChunks 1..65536: " + sinkChunks);
             }
             if (credit && window > sinkChunks) { // #257 R2: held chunks (≤ window − 1) and the filler must fit the sink
-                throw new IllegalArgumentException("sjws.swarm.stream.window (" + window
+                // Refused, not IllegalArgumentException: the process must not start (a plain failure only skips the module)
+                throw new sjws_nettask.OptionalModule.Refused("sjws.swarm.stream.window (" + window
                         + ") must be at most sjws.swarm.stream.sinkChunks (" + sinkChunks
                         + ") when sjws.swarm.stream.credit.enabled is on: out-of-order chunks held for reordering would"
                         + " fill the sink and stall the stream; lower the window or raise sinkChunks");

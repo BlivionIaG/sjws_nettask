@@ -1028,11 +1028,12 @@ class StreamCreditTest {
 
     @Test
     void r2WithCreditOnAWindowLargerThanSinkChunksFailsAtStartupNamingBothValues() {
-        var e = assertThrows(IllegalArgumentException.class, () -> new TokenStreams.Config(1, 16, 8, true));
+        // OptionalModule.Refused: the process does not start (a plain exception would only skip the swarm module)
+        var e = assertThrows(sjws_nettask.OptionalModule.Refused.class, () -> new TokenStreams.Config(1, 16, 8, true));
         assertTrue(e.getMessage().contains("sjws.swarm.stream.window (16)"), e.getMessage());
         assertTrue(e.getMessage().contains("sjws.swarm.stream.sinkChunks (8)"), e.getMessage());
         assertTrue(e.getMessage().contains("sjws.swarm.stream.credit.enabled"), e.getMessage());
-        var from = assertThrows(IllegalArgumentException.class, () -> TokenStreams.Config.from(n -> switch (n) {
+        var from = assertThrows(sjws_nettask.OptionalModule.Refused.class, () -> TokenStreams.Config.from(n -> switch (n) {
             case "sjws.swarm.stream.credit.enabled" -> "true";
             case "sjws.swarm.stream.sinkChunks" -> "32"; // below the default window (64)
             default -> null;
@@ -1042,6 +1043,27 @@ class StreamCreditTest {
         assertEquals(8, new TokenStreams.Config(1, 8, 8, true).window());
         assertFalse(new TokenStreams.Config(1, 16, 8, false).credit());
         assertFalse(new TokenStreams.Config(1, 64, 2).credit());
+    }
+
+    @Test
+    void r2TheSwarmModuleRefusesToStartTheProcessWithAWindowLargerThanSinkChunks() {
+        System.setProperty("sjws.swarm.stream.credit.enabled", "true");
+        System.setProperty("sjws.swarm.stream.sinkChunks", "32"); // the default window is 64
+        try {
+            var other = Swarm.open(this.dir.resolve("module"), "m", 1, sjws_nettask.messaging.delivery.RetryPolicy.DEFAULT,
+                    System::currentTimeMillis, 600_000);
+            try {
+                var e = assertThrows(sjws_nettask.OptionalModule.Refused.class,
+                        () -> new SwarmModule(other, SwarmGate.DENY_ALL, false, true, null));
+                assertTrue(e.getMessage().contains("sjws.swarm.stream.window (64)")
+                        && e.getMessage().contains("sjws.swarm.stream.sinkChunks (32)"), e.getMessage());
+            } finally {
+                other.close();
+            }
+        } finally {
+            System.clearProperty("sjws.swarm.stream.credit.enabled");
+            System.clearProperty("sjws.swarm.stream.sinkChunks");
+        }
     }
 
     @Test
