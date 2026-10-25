@@ -198,6 +198,8 @@ class HaMessagingStartTest {
             var refused = assertThrows(OptionalModule.Refused.class,
                     () -> HaMessagingStart.install(witness, mod, System.err));
             assertTrue(refused.getMessage().contains("witness"), refused.getMessage());
+            OptionalModule other = () -> { };
+            assertSame(mod, HaMessagingStart.messaging(new OptionalModules.Both(mod, other)));
         } finally {
             mod.close();
         }
@@ -265,6 +267,23 @@ class HaMessagingStartTest {
                     s -> { });
             assertEquals(Sjws_nettask.EXIT_CANNOT_LISTEN, code, err.toString());
             assertTrue(err.toString().contains("Failed to start HA messaging"), err.toString());
+        }
+    }
+
+    @Test
+    void aBootstrapFailureThatIsNotARefusalIsAnIllegalState() throws Exception {
+        int[] raft = {freePort(), freePort(), freePort()};
+        int[] http = {freePort(), freePort(), freePort()};
+        var a = load("twice-a", cluster("a", raft, http, "on"), http[0]);
+        var b = load("twice-b", cluster("b", raft, http, "on"), http[1]);
+        var mod = messaging("twice");
+        var first = HaMessagingStart.install(a, mod, System.err);
+        try {
+            // the module already has replication installed: MessagingModule.replication refuses a second one
+            var e = assertThrows(IllegalStateException.class, () -> HaMessagingStart.install(b, mod, System.err));
+            assertTrue(e.getMessage().contains("HA messaging bootstrap failed"), e.getMessage());
+        } finally {
+            first.close();
         }
     }
 }
