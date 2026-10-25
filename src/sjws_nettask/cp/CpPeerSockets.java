@@ -48,7 +48,9 @@ import sjws_nettask.cluster.TcpTransport;
  * <li>Accepting: {@link #peerWire} maps the client certificate to its voter's wire id, so the transport drops any
  * frame on that connection that carries another sender wire ({@code TcpTransport.Reason.ORIGIN}).</li>
  * </ul>
- * Refusals are counted in {@link #identityRefused} and logged at most once a minute. {@code endpointIdentification}
+ * Refusals are counted in {@link #identityRefused} and logged at most once a minute. A TLS reload whose new
+ * certificate does not carry this voter's own pinned SAN is refused (the current material stays), counted in
+ * {@link #reloadRefused} and logged. {@code endpointIdentification}
  * stays unset: the pinned SAN, not the host name, is the identity.
  */
 final class CpPeerSockets implements TcpTransport.SocketFactory {
@@ -64,6 +66,7 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
     private final List<CpConfig.Peer> peers;
     private final CpConfig.Peer self;
     private final AtomicLong identityRefused = new AtomicLong();
+    private final AtomicLong reloadRefused = new AtomicLong();
     private final AtomicLong loggedNanos = new AtomicLong(System.nanoTime() - LOG_EVERY_NANOS);
 
     /**
@@ -94,12 +97,37 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
      * pinned voter, or the process refuses to start.
      */
     void checkOwnCertificate() throws IOException {
-        var own = tls.certificate();
-        var match = identify(own);
-        if (match == null || !match.equals(self)) {
-            throw new IOException("cp.tls.peerCert does not carry exactly this voter's pinned san " + self.san()
-                    + " (cp.peers id " + self.id() + "; URI or DNS SAN, no other voter's); refusing to start");
+        var problem = ownCertificateProblem(tls.certificate());
+        if (problem != null) {
+            throw new IOException(problem + "; refusing to start");
         }
+        tls.checkLeafOnReload(this::reloadedCertificateProblem);
+    }
+
+    /** Null when {@code leaf} names exactly this voter's pinned SAN (and no other voter's); else why not. */
+    String ownCertificateProblem(java.security.cert.X509Certificate leaf) {
+        var match = leaf == null ? null : identify(leaf);
+        if (match == null || !match.equals(self)) {
+            return "cp.tls.peerCert does not carry exactly this voter's pinned san " + self.san() + " (cp.peers id "
+                    + self.id() + "; URI or DNS SAN, no other voter's)";
+        }
+        return null;
+    }
+
+    /** The TLS reload check: a refused reload keeps the old material, is counted, and is logged. */
+    private String reloadedCertificateProblem(java.security.cert.X509Certificate leaf) {
+        var problem = ownCertificateProblem(leaf);
+        if (problem != null) {
+            reloadRefused.incrementAndGet();
+            LOG.log(System.Logger.Level.WARNING, "cp-peer: TLS reload refused, keeping the current material: {0}",
+                    problem);
+        }
+        return problem;
+    }
+
+    /** TLS reloads refused because the new certificate did not carry this voter's own pinned SAN. */
+    long reloadRefused() {
+        return reloadRefused.get();
     }
 
     /** Connections closed because the verified certificate did not name the expected pinned voter. */

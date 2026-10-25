@@ -242,7 +242,7 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | — | — | `cp.maxClockDriftRatio` | default 0.01 (1%), 0 to 0.5; rate error over one lease (HA) |
 | — | — | `cp.leaseSafetyMargin` | default 10 ms (needs a unit); fixed margin in the startup check (HA) |
 | `sjws.cp.nodeId` | `SJWS_CP_NODE_ID` | `cp.nodeId` | this voter |
-| — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`, `san`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter. `san` is the URI or DNS subject alternative name that voter's `cp-peer` certificate carries (exact match, for example `urn:sjws:node:cp-1`); required on every entry when `cp.tls` is set, unique across entries |
+| — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`, `san`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter. `san` is the URI or DNS subject alternative name that voter's `cp-peer` certificate carries (exact match, for example `urn:sjws:node:cp-1`; no `*`); required on every entry when `cp.tls` is set, unique across entries |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
 | `sjws.cp.admin.listen` | `SJWS_CP_ADMIN_LISTEN` | `cp.admin.listen` | AdminServer |
 | — | — | `cp.tls.{cert,key,ca,adminCa,revocations}` | owned by Security; watch and admin listeners |
@@ -270,7 +270,11 @@ subject alternative names count, by exact match; the subject CN is never used, a
 than one pinned voter identifies none. There is no host name check: the pinned SAN is the identity.
 
 - At startup, `cp.tls` with an entry that has no `san` is refused at config load, and this voter's own `peerCert`
-  must carry its own pinned SAN and no other voter's.
+  must carry its own pinned SAN and no other voter's. The same check runs on every TLS reload (SIGHUP): a new
+  certificate that fails it is refused, the current material stays in use, and the refusal is logged and counted
+  (`CpPeerSockets.reloadRefused`).
+- Matching is exact and case-sensitive: pin the exact spelling the CA issues. A pinned value may not contain `*`;
+  there are no wildcards.
 - Dialing: after the handshake, `CpPeerSockets.connect` requires the server certificate to name the voter pinned at
   the dialled address. Otherwise the socket is closed before any frame is written, and the refusal is counted
   (`CpPeerSockets.identityRefused`, a WARNING at most once a minute).

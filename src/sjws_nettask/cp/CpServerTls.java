@@ -33,6 +33,7 @@ public final class CpServerTls {
 
     private final CpListenerConfig config;
     private final AdminTls tls;
+    private volatile java.util.function.Function<java.security.cert.X509Certificate, String> leafCheck = leaf -> null;
 
     private CpServerTls(CpListenerConfig config, AdminTls tls) {
         this.config = config;
@@ -65,17 +66,17 @@ public final class CpServerTls {
         return CpTls.parameters(tls.context(), true);
     }
 
+    /** This listener's own leaf certificate, from the loaded material this context presents. */
+    java.security.cert.X509Certificate certificate() {
+        return tls.leaf();
+    }
+
     /**
-     * This listener's own leaf certificate, read from its {@code certPem} (the first certificate in the file).
-     *
-     * @throws IOException unreadable, or no certificate in the file
+     * A check every later {@link #reloadTls()} applies to the new leaf certificate before swapping it in: a non-null
+     * answer refuses the reload and keeps the current material.
      */
-    java.security.cert.X509Certificate certificate() throws IOException {
-        var certs = AdminTls.trustCertificates(config.certPem());
-        if (certs.length == 0) {
-            throw new IOException(config.name() + " certificate file holds no certificate");
-        }
-        return certs[0];
+    void checkLeafOnReload(java.util.function.Function<java.security.cert.X509Certificate, String> check) {
+        this.leafCheck = java.util.Objects.requireNonNull(check, "check");
     }
 
     /** Successful loads so far, starting at 1. */
@@ -85,13 +86,13 @@ public final class CpServerTls {
 
     /**
      * Builds the new material from disk (key owner/mode check first), then swaps it in one step.
-     * On any failure the current material stays in use.
+     * On any failure, including a refusal by the {@link #checkLeafOnReload} check, the current material stays in use.
      *
      * @throws CpKeyException why the reload was refused; the old material is still active
      */
     public void reloadTls() throws CpKeyException {
         checkKey(config);
-        var why = tls.reload();
+        var why = tls.reload(leafCheck);
         if (why != null) {
             throw new CpKeyException(config.name() + " TLS reload refused, keeping previous material: " + why);
         }

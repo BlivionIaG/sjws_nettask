@@ -69,8 +69,11 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         }
     }
 
-    /** A pinned SAN: printable ASCII without spaces, at most 255 characters. */
-    static final java.util.regex.Pattern SAN = java.util.regex.Pattern.compile("[\\x21-\\x7E]{1,255}");
+    /**
+     * A pinned SAN: printable ASCII without spaces or {@code *}, at most 255 characters. Matching is exact, so a
+     * {@code *} would never act as a wildcard; it is refused as a likely mistake.
+     */
+    static final java.util.regex.Pattern SAN = java.util.regex.Pattern.compile("[\\x21-\\x29\\x2B-\\x7E]{1,255}");
 
     public CpConfig {
         Objects.requireNonNull(nodeId, "nodeId");
@@ -274,7 +277,7 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
             String san = text(map.get("san"), where + ".san");
             if (san != null && !SAN.matcher(san).matches()) {
                 throw new IllegalArgumentException(where + ".san must be a URI or DNS name: printable ASCII, no"
-                        + " spaces, at most 255 characters");
+                        + " spaces or '*', at most 255 characters (matched exactly; no wildcards)");
             }
             out.add(new Peer(wire, id, address, witness, san));
         }

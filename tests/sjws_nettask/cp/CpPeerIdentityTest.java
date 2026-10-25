@@ -319,7 +319,7 @@ class CpPeerIdentityTest {
         var y = yaml("cp-1", ports(3), true);
         var config = CpConfig.parse(k -> null, Map.of(), y, null);
         assertEquals(CpTestCa.san("cp-2"), config.peers().get(1).san());
-        for (var bad : List.<Object>of("has space", "", 7, "x".repeat(256))) {
+        for (var bad : List.<Object>of("has space", "", 7, "x".repeat(256), "*.example", "urn:sjws:node:*")) {
             var peers = new ArrayList<Object>(peerList(ports(3), true));
             var entry = new HashMap<String, Object>(castMap(peers.get(1)));
             entry.put("san", bad);
@@ -337,6 +337,124 @@ class CpPeerIdentityTest {
         dup.put("peers", peers);
         var e = assertThrows(IllegalArgumentException.class, () -> CpConfig.parse(k -> null, Map.of(), dup, null));
         assertTrue(e.getMessage().contains("duplicate san"), e.getMessage());
+    }
+
+    private static java.security.cert.X509Certificate leaf(CpListenerConfig c) throws Exception {
+        return AdminTls.trustCertificates(c.certPem())[0];
+    }
+
+    private static long day() {
+        return System.currentTimeMillis() + 86_400_000L;
+    }
+
+    /** The acceptor refuses a client certificate that identifies the accepting voter itself. */
+    @Test
+    void anAcceptedCertificateNamingTheAcceptingVoterItselfIsRefused() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca"));
+        var peers = voters(ports(3));
+        var server = new CpPeerSockets(CpTls.serverContext(ca.peer("cp-2")), peers, "cp-2");
+        var clientTls = CpTls.serverContext(ca.peer("cp-2"));
+        try (var listener = server.listen((InetSocketAddress) peers.get(1).address())) {
+            var accept = CompletableFuture.supplyAsync(() -> {
+                try (var a = listener.accept()) {
+                    server.handshake(a, 5_000);
+                    return (Object) server.peerWire(a);
+                } catch (Exception e) {
+                    return e;
+                }
+            });
+            try (var s = (SSLSocket) clientTls.context().getSocketFactory().createSocket()) {
+                s.setSSLParameters(clientTls.parameters());
+                s.connect(peers.get(1).address(), 2_000);
+                s.startHandshake();
+                s.getOutputStream().write(1);
+            } catch (IOException ignored) {
+                // the acceptor may close first
+            }
+            assertInstanceOf(IllegalStateException.class, accept.get(10, TimeUnit.SECONDS));
+            assertEquals(1, server.identityRefused());
+        }
+    }
+
+    /** Matching is exact: one voter named twice identifies it; case variants, trailing dots, wildcards never match. */
+    @Test
+    void sanMatchingIsExact() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca"));
+        int[] p = ports(3);
+        var peers = List.of(
+                new CpConfig.Peer(1, "cp-1", new InetSocketAddress("127.0.0.1", p[0]), false, CpTestCa.san("cp-1")),
+                new CpConfig.Peer(2, "cp-2", new InetSocketAddress("127.0.0.1", p[1]), false, "cp-2.example"),
+                new CpConfig.Peer(3, "cp-3", new InetSocketAddress("127.0.0.1", p[2]), false, CpTestCa.san("cp-3")));
+        var me = new CpPeerSockets(CpTls.serverContext(ca.peer("cp-1")), peers, "cp-1");
+        var twice = me.identify(leaf(ca.listener("cp-peer", "cp-2", day(), null, "dns:cp-2.example",
+                "dns:cp-2.example", "urn:unpinned:thing")));
+        assertEquals(peers.get(1), twice, "the same voter named twice identifies it");
+        assertEquals(2, twice.wire());
+        var uriTwice = me.identify(leaf(ca.listener("cp-peer", "cp-3", day(), null, CpTestCa.san("cp-3"),
+                CpTestCa.san("cp-3"))));
+        assertEquals(peers.get(2), uriTwice);
+        for (var san : List.of("dns:CP-2.EXAMPLE", "dns:Cp-2.example", "dns:cp-2.example.", "dns:*.example",
+                "dns:*", "URN:SJWS:NODE:cp-3", "urn:sjws:node:CP-3", "urn:sjws:node:cp-3.", "urn:sjws:node:*")) {
+            assertNull(me.identify(leaf(ca.listener("cp-peer", "x", day(), null, san))), san);
+        }
+    }
+
+    /** Dialling an address that no cp.peers entry pins, or this voter's own address, fails before connecting. */
+    @Test
+    void dialingAnUnpinnedAddressOrItsOwnAddressFails() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca"));
+        var peers = voters(ports(3));
+        var me = new CpPeerSockets(CpTls.serverContext(ca.peer("cp-1")), peers, "cp-1");
+        try (var own = new ServerSocket()) {
+            own.bind(peers.get(0).address());
+            var unpinned = ports(1)[0];
+            var e = assertThrows(IOException.class, () -> me.connect(new InetSocketAddress("127.0.0.1", unpinned)));
+            assertTrue(e.getMessage().contains("no pinned voter"), e.getMessage());
+            var self = assertThrows(IOException.class, () -> me.connect((InetSocketAddress) peers.get(0).address()));
+            assertTrue(self.getMessage().contains("no pinned voter"), self.getMessage());
+            own.setSoTimeout(200);
+            assertThrows(java.net.SocketTimeoutException.class, own::accept, "nothing reached its own address");
+        }
+    }
+
+    /** A TLS reload to a certificate without this voter's own pinned SAN is refused and the old material kept. */
+    @Test
+    void aTlsReloadWithoutTheOwnPinnedSanIsRefusedAndKeepsTheCurrentMaterial() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca"));
+        var peers = voters(ports(3));
+        var current = ca.peer("cp-1");
+        var tls = CpTls.serverContext(current);
+        var pinned = new CpPeerSockets(tls, peers, "cp-1");
+        pinned.checkOwnCertificate();
+        var before = tls.certificate();
+        for (var bad : List.of(ca.listener("cp-peer", "cp-1"), ca.peer("cp-2"),
+                ca.listener("cp-peer", "cp-1", day(), null, CpTestCa.san("cp-1"), CpTestCa.san("cp-2")))) {
+            install(bad, current);
+            var e = assertThrows(CpKeyException.class, tls::reloadTls);
+            assertTrue(e.getMessage().contains("pinned san"), e.getMessage());
+            assertEquals(before, tls.certificate(), "the current material stays");
+            assertEquals(1, tls.generation());
+        }
+        assertEquals(3, pinned.reloadRefused());
+        install(ca.peer("cp-1"), current);
+        tls.reloadTls();
+        assertEquals(2, tls.generation());
+        assertNotEquals(before, tls.certificate());
+        assertEquals(3, pinned.reloadRefused());
+        // CpLaunch wires the same check into the voter transport's TLS.
+        var config = CpConfig.parse(k -> null, Map.of(), yaml("cp-1", ports(3), true), null);
+        var launched = CpTls.serverContext(current);
+        try (var t = CpLaunch.tcpTransport(config, launched, KEY, Clock.SYSTEM)) {
+            install(ca.listener("cp-peer", "cp-1"), current);
+            assertThrows(CpKeyException.class, launched::reloadTls);
+            assertEquals(1, launched.generation());
+        }
+    }
+
+    /** Overwrites {@code target}'s certificate and key files in place (keeping their permissions). */
+    private static void install(CpListenerConfig from, CpListenerConfig target) throws IOException {
+        java.nio.file.Files.write(target.certPem(), java.nio.file.Files.readAllBytes(from.certPem()));
+        java.nio.file.Files.write(target.keyPem(), java.nio.file.Files.readAllBytes(from.keyPem()));
     }
 
     @SuppressWarnings("unchecked")
