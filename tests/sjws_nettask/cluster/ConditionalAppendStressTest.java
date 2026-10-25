@@ -21,6 +21,11 @@ import org.junit.jupiter.api.Timeout;
  * Concurrent step-down stress for the conditional append (#235): appender threads race leader changes driven
  * on another thread. Every batch that commits carries the term its caller expected, and no replica ever
  * applies a user entry whose Raft term differs from the term the caller checked.
+ *
+ * <p>The schedule is paced by the appenders, not by wall-clock luck: each leader change waits (bounded) for a
+ * new append to be submitted, and after the storm the leader is left alone until an append sent in that stable
+ * term commits. Without that, the driver thread could finish all 200 changes (about 40 ms on CI) before the
+ * appenders got an append committed in any tenure, and the test failed with nothing committed.
  */
 @Timeout(120)
 class ConditionalAppendStressTest {
@@ -28,6 +33,11 @@ class ConditionalAppendStressTest {
     private static final GroupId GROUP = new GroupId("msg/cond-stress");
     private static final GroupOptions OPTS = new GroupOptions(Durability.RELAXED, 1 << 20, Duration.ofMillis(100),
             Duration.ofMillis(40), Long.MAX_VALUE);
+
+    /** Per leader change; 200 rounds stay well inside the class timeout even if every wait runs out. */
+    private static final Duration ROUND_PACING = Duration.ofMillis(100);
+    /** Wall-clock bound for an append to commit once leadership is stable; normally a few steps. */
+    private static final Duration SETTLE_DEADLINE = Duration.ofSeconds(30);
 
     private final FakeClock clock = new FakeClock(0L);
     private final SimTransport net = new SimTransport();
@@ -88,7 +98,11 @@ class ConditionalAppendStressTest {
         }
 
         int changes = 0;
+        int submitted = 0;
         for (int round = 0; round < 200; round++) {
+            // Pace the storm on the appenders: let at least one more append in before forcing the next change, so
+            // appends really race step-downs. Bounded, and not an assertion: a starved appender only weakens a round.
+            submitted = awaitMoreSent(sent, submitted, ROUND_PACING);
             int l = leader();
             if (l >= 0) {
                 int other = 1 - l;
@@ -107,6 +121,17 @@ class ConditionalAppendStressTest {
             }
             for (int k = 0; k < 5; k++) {
                 step();
+            }
+        }
+        // Settle: no more leader changes. Appenders keep sending in the now stable term until one of those appends
+        // commits, so "something committed" no longer depends on how fast the driver thread outran them.
+        boolean settled = false;
+        long deadline = System.nanoTime() + SETTLE_DEADLINE.toNanos();
+        while (!settled && System.nanoTime() - deadline < 0) {
+            step();
+            settled = sent.stream().anyMatch(s -> s.future().isDone() && !s.future().isCompletedExceptionally());
+            if (!settled) {
+                java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
             }
         }
         stop.set(true);
@@ -130,6 +155,7 @@ class ConditionalAppendStressTest {
             ok.incrementAndGet();
         }
         assertTrue(changes >= 100, "too few leader changes: " + changes);
+        assertTrue(settled, "no conditional append committed within " + SETTLE_DEADLINE + " of a stable leader");
         assertTrue(ok.get() > 0, "no conditional append ever committed");
 
         for (int i = 0; i < 2; i++) {
@@ -152,6 +178,17 @@ class ConditionalAppendStressTest {
             assertEquals(a.get(i).index(), b.get(i).index());
             assertEquals(a.get(i).term(), b.get(i).term());
         }
+    }
+
+    /** Waits until more than {@code seen} appends were submitted, or {@code max} passes; returns the new count. */
+    private static int awaitMoreSent(ConcurrentLinkedQueue<Sent> sent, int seen, Duration max) {
+        long deadline = System.nanoTime() + max.toNanos();
+        int now = sent.size();
+        while (now <= seen && System.nanoTime() - deadline < 0) {
+            java.util.concurrent.locks.LockSupport.parkNanos(100_000);
+            now = sent.size();
+        }
+        return now;
     }
 
     private void step() {
