@@ -176,6 +176,44 @@ class HaMessagingStartTest {
         }
     }
 
+    /**
+     * #274 MC-B1 on the production path: node a took 3 records on {@code orders} with HA off; restarting it with
+     * replication on is refused (OptionalModule.Refused, exit 64) instead of forking the topic's offsets.
+     */
+    @Test
+    @Timeout(60)
+    void replicationOnAnExistingLocalTopicIsRefused() throws Exception {
+        int httpPort = freePort();
+        var plain = load("pre", "# HA off\n", httpPort);
+        var mod = messaging("pre");
+        try (var server = SjwsServer.start(plain, OptionalModules.contributors(mod))) {
+            var client = HttpClient.newHttpClient();
+            for (int i = 0; i < 3; i++) {
+                var r = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + httpPort
+                        + "/messaging/v1/topics/orders/records")).POST(HttpRequest.BodyPublishers.ofByteArray(
+                                record("pre-" + i))).build(), HttpResponse.BodyHandlers.ofString());
+                assertEquals(200, r.statusCode(), r.body());
+            }
+        } finally {
+            mod.close();
+        }
+        int[] raft = {freePort(), freePort(), freePort()};
+        int[] http = {httpPort, freePort(), freePort()};
+        var on = load("pre", cluster("a", raft, http, "on"), httpPort);
+        var again = messaging("pre");
+        try {
+            var refused = assertThrows(OptionalModule.Refused.class, () -> HaMessagingStart.install(on, again, System.err));
+            assertTrue(refused.getMessage().contains("replicated topic orders already holds 3 local record(s)"),
+                    refused.getMessage());
+        } finally {
+            again.close();
+        }
+        // The Raft port was released with the refusal.
+        try (var s = new ServerSocket(raft[0], 1, java.net.InetAddress.getLoopbackAddress())) {
+            assertEquals(raft[0], s.getLocalPort());
+        }
+    }
+
     @Test
     void offAndNoMemberListReturnTheModulesUntouched() throws Exception {
         int[] p = {freePort(), freePort(), freePort()};
@@ -252,6 +290,33 @@ class HaMessagingStartTest {
                 root.toString()}, ENV, new PrintStream(out), new PrintStream(err), null, s -> { });
         assertEquals(64, code, err.toString());
         assertTrue(err.toString().contains("needs messaging enabled on a data node"), err.toString());
+    }
+
+    /** #274 MC N5: end to end, a member list plus the swarm stream flag exits 64 with the guard's words. */
+    @Test
+    void runRefusesTheSwarmStreamFlagWithAMemberList() throws Exception {
+        int[] p = {freePort(), freePort(), freePort()};
+        var file = dir.resolve("stream.yaml");
+        Files.writeString(file, "swarm:\n  enabled: true\n" + cluster("a", p, p, "off"));
+        var root = Files.createDirectories(dir.resolve("stream-html"));
+        var err = new ByteArrayOutputStream();
+        var old = System.getProperty("sjws.swarm.stream.enabled");
+        System.setProperty("sjws.swarm.stream.enabled", "true");
+        int code;
+        try {
+            code = Sjws_nettask.run(new String[] {"--config=" + file, "--state-dir=" + dir.resolve("stream-state"), "0",
+                    root.toString()}, ENV, new PrintStream(new ByteArrayOutputStream()), new PrintStream(err), null,
+                    s -> { });
+        } finally {
+            if (old == null) {
+                System.clearProperty("sjws.swarm.stream.enabled");
+            } else {
+                System.setProperty("sjws.swarm.stream.enabled", old);
+            }
+        }
+        assertEquals(64, code, err.toString());
+        assertTrue(err.toString().contains("needs a single-process deployment"), err.toString());
+        assertTrue(err.toString().contains("the config file lists ha.members (3 voters)"), err.toString());
     }
 
     @Test

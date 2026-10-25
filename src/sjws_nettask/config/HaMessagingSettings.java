@@ -41,9 +41,14 @@ import java.util.regex.Pattern;
  * <li>{@code auto}: replicates with a valid cluster; with no member list it stays single-node, silently.
  * </ul>
  * An invalid member list is refused in both {@code on} and {@code auto}, a bare pair of voters included.
+ *
+ * <p>The member links are authenticated but not encrypted (#277). As {@code CpLaunch} refuses plaintext CP voter
+ * links off loopback, a replicating node refuses (exit 64) a member list with any address that is not loopback,
+ * unless {@code ha.messaging_insecure_plaintext: true} accepts plaintext on a private network.
  */
 public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members, Duration electionTimeout,
-        Duration heartbeat, Path stateDir, Set<String> topics, boolean replicate, List<String> warnings) {
+        Duration heartbeat, Path stateDir, Set<String> topics, boolean insecurePlaintext, boolean replicate,
+        List<String> warnings) {
 
     /** {@code ha.messaging}. */
     public enum Mode {
@@ -75,9 +80,15 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
     /** Fixed margin in the startup timing check (as {@code CpTiming}). */
     static final Duration LEASE_MARGIN = Duration.ofMillis(10);
 
+    /** The explicit opt-in for plaintext member links off loopback (until #277). */
+    public static final String INSECURE_PLAINTEXT = "messaging_insecure_plaintext";
+    /** The issue tracking encryption and sender binding on the member links; a default-on gate. */
+    public static final String LINK_SECURITY_ISSUE = "#277";
+
     /** The {@code ha:} keys this class reads. */
     static final List<String> KEYS = List.of("messaging", "node_id", "members", "election_timeout", "heartbeat",
-            "state_dir", "topics");
+            "state_dir", "topics", INSECURE_PLAINTEXT);
+
 
     private static final List<String> MEMBER_KEYS = List.of("id", "address", "http_url", "witness", "wire");
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
@@ -86,7 +97,7 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
 
     /** No {@code ha.messaging} and no member list. */
     public static final HaMessagingSettings NONE = new HaMessagingSettings(DEFAULT_MODE, null, List.of(),
-            DEFAULT_ELECTION_TIMEOUT, DEFAULT_HEARTBEAT, null, Set.of(), false, List.of());
+            DEFAULT_ELECTION_TIMEOUT, DEFAULT_HEARTBEAT, null, Set.of(), false, false, List.of());
 
     public HaMessagingSettings {
         members = List.copyOf(members);
@@ -138,15 +149,29 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
             stateDir = path(ha.get("state_dir"), base);
         }
         var topics = topics(ha.get("topics"));
+        boolean plaintext = false;
+        if (ha.containsKey(INSECURE_PLAINTEXT)) {
+            if (!(ha.get(INSECURE_PLAINTEXT) instanceof Boolean b)) {
+                throw new ConfigException("ha." + INSECURE_PLAINTEXT + ": expected true or false");
+            }
+            plaintext = b;
+        }
         var warnings = new ArrayList<String>();
-        boolean replicate = decide(mode, haEnabled, nodeId, members, election, heartbeat, topics, warnings);
-        return new HaMessagingSettings(mode, nodeId, members, election, heartbeat, stateDir, topics, replicate,
+        boolean replicate = decide(mode, haEnabled, nodeId, members, election, heartbeat, topics, plaintext,
                 warnings);
+        return new HaMessagingSettings(mode, nodeId, members, election, heartbeat, stateDir, topics, plaintext,
+                replicate, warnings);
+    }
+
+    /** {@link #decide(Mode, boolean, String, List, Duration, Duration, Set, boolean, List)} without the opt-in. */
+    static boolean decide(Mode mode, boolean haEnabled, String nodeId, List<Member> members, Duration election,
+            Duration heartbeat, Set<String> topics, List<String> warnings) {
+        return decide(mode, haEnabled, nodeId, members, election, heartbeat, topics, false, warnings);
     }
 
     /** The startup decision; see the class doc. */
     static boolean decide(Mode mode, boolean haEnabled, String nodeId, List<Member> members, Duration election,
-            Duration heartbeat, Set<String> topics, List<String> warnings) {
+            Duration heartbeat, Set<String> topics, boolean insecurePlaintext, List<String> warnings) {
         if (mode == Mode.OFF) {
             return false;
         }
@@ -167,6 +192,7 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
             warnings.add("ha.members is set but ha.enabled is false: ha.messaging: auto stays single-node");
             return false;
         }
+        checkPlaintext(members, insecurePlaintext);
         if (topics.isEmpty()) {
             warnings.add("ha.topics is empty: only consumer offsets are replicated; producing to any topic is"
                     + " refused until it is listed");
@@ -209,6 +235,32 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
         }
         if (witnesses == 1 && data != 2) {
             throw new ConfigException("ha.members: a witness needs exactly 2 data nodes; got " + data);
+        }
+    }
+
+    /**
+     * Plaintext member links must be loopback (the {@code CpLaunch} rule for {@code cp.peers} without
+     * {@code cp.tls}) unless {@code ha.messaging_insecure_plaintext} is true. Only reached when the node replicates,
+     * so a single node resolves no address. A host that does not resolve counts as off loopback.
+     */
+    static void checkPlaintext(List<Member> members, boolean insecurePlaintext) {
+        if (insecurePlaintext) {
+            return;
+        }
+        for (var m : members) {
+            if (!loopback(m.host())) {
+                throw new ConfigException("ha.members: HA messaging member links are not encrypted ("
+                        + LINK_SECURITY_ISSUE + ") and must be loopback, not " + m.host() + ":" + m.port() + "; set ha." + INSECURE_PLAINTEXT
+                        + ": true to accept plaintext on a private member network; refusing to start");
+            }
+        }
+    }
+
+    static boolean loopback(String host) {
+        try {
+            return java.net.InetAddress.getByName(host).isLoopbackAddress();
+        } catch (java.net.UnknownHostException e) {
+            return false;
         }
     }
 

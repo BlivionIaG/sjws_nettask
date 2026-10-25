@@ -47,8 +47,13 @@ class HaMessagingTest {
     }
 
     static HaMessagingSettings settings(String self, List<Member> members, boolean replicate) {
+        return settings(self, members, false, replicate);
+    }
+
+    static HaMessagingSettings settings(String self, List<Member> members, boolean insecurePlaintext,
+            boolean replicate) {
         return new HaMessagingSettings(HaMessagingSettings.Mode.ON, self, members, Duration.ofMillis(500),
-                Duration.ofMillis(50), null, Set.of("t"), replicate, List.of());
+                Duration.ofMillis(50), null, Set.of("t"), insecurePlaintext, replicate, List.of());
     }
 
     @Test
@@ -75,17 +80,32 @@ class HaMessagingTest {
     }
 
     @Test
+    void plaintextOffLoopbackWithoutTheOptInIsRefusedBeforeAnythingOpens() throws Exception {
+        var members = List.of(new Member("a", 1, "192.0.2.1", 7101, "http://192.0.2.1", false),
+                new Member("b", 2, "127.0.0.1", freePort(), "http://b", false),
+                new Member("w", 3, "127.0.0.1", freePort(), null, true));
+        var refused = assertThrows(IllegalArgumentException.class, () -> HaMessaging.start(
+                settings("w", members, false, true), dir.resolve("w"), KEY, null, null, System.err));
+        assertTrue(refused.getMessage().contains("must be loopback, not a (/192.0.2.1:7101)"), refused.getMessage());
+        assertTrue(refused.getMessage().contains("ha.messaging_insecure_plaintext"), refused.getMessage());
+        assertFalse(java.nio.file.Files.exists(dir.resolve("w")), "nothing opened");
+    }
+
+    @Test
     void witnessStartsWarnsAboutPlaintextOffLoopbackAndCloses() throws Exception {
         var members = List.of(new Member("a", 1, "192.0.2.1", 7101, "http://192.0.2.1", false),
                 new Member("b", 2, "127.0.0.1", freePort(), "http://b", false),
                 new Member("w", 3, "127.0.0.1", freePort(), null, true));
         var err = new ByteArrayOutputStream();
-        var ha = HaMessaging.start(settings("w", members, true), dir.resolve("w"), KEY, KEY, null,
+        var ha = HaMessaging.start(settings("w", members, true, true), dir.resolve("w"), KEY, KEY, null,
                 new PrintStream(err, true, StandardCharsets.UTF_8));
         try {
             var text = err.toString(StandardCharsets.UTF_8);
             assertTrue(text.contains("node=w (witness)"), text);
             assertTrue(text.contains("authenticated (HMAC) but not encrypted"), text);
+            assertTrue(text.contains("ha.messaging_insecure_plaintext is set"), text);
+            assertTrue(text.contains("(#277)") && !text.contains("#175"), text);
+            assertFalse(text.contains(new String(KEY, StandardCharsets.US_ASCII)), text);
             assertTrue(ha.toString().contains("replication on"));
             assertEquals(new NodeId(3, "w"), ha.node().self());
         } finally {

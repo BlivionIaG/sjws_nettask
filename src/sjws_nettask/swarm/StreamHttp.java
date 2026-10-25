@@ -102,6 +102,50 @@ final class StreamHttp {
     static final long SWEEP_MS = 5_000;
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final HexFormat HEX = HexFormat.of();
+    /**
+     * #261 Q1: the {@code :claim} response header (stream flag on, and only when the batch has a stream task) that
+     * tells an HTTP worker, per {@code LEASE} in frame order, the stream id and attempt of a stream task, so it never
+     * parses the lease id.
+     */
+    static final String LEASE_STREAM_HEADER = "sjws-lease-stream";
+    /**
+     * #261 R1: sent with {@value #LEASE_STREAM_HEADER}: this node's reorder window ({@code sjws.swarm.stream.window}).
+     * The SDK keeps its issued seq span below min(its configured window, this value), or 1 when the header is absent.
+     */
+    static final String STREAM_WINDOW_HEADER = "sjws-stream-window";
+
+    /** The {@value #STREAM_WINDOW_HEADER} value, formatted once (the window is read once at startup). */
+    String windowHeader() {
+        return this.windowHeader;
+    }
+
+    /** A builder holding the {@code -,} entries of the {@code unary} unary leases that came before the first stream task. */
+    static StringBuilder leaseStreamPrefix(int unary) {
+        var b = new StringBuilder(2 * unary + 48);
+        for (int i = 0; i < unary; i++) {
+            b.append("-,");
+        }
+        return b;
+    }
+
+    /**
+     * Appends one {@value #LEASE_STREAM_HEADER} entry for {@code t}: {@code <32 lower-case hex of the correlation id>/<attempt
+     * as an unsigned decimal u32>} for a stream task ({@link TokenStreams#isStreamTask}), else {@code -}. The attempt is
+     * the lease's, the value the admit stamps on every chunk and CREDIT carries; never the lease id's shard suffix.
+     */
+    static StringBuilder appendLeaseStream(StringBuilder b, Task t) {
+        return appendLeaseStream(b, t, TokenStreams.isStreamTask(t.envelope()));
+    }
+
+    /** {@link #appendLeaseStream(StringBuilder, Task)} with the predicate already evaluated by the caller (one call per task). */
+    static StringBuilder appendLeaseStream(StringBuilder b, Task t, boolean stream) {
+        var env = t.envelope();
+        if (!stream) {
+            return b.append('-');
+        }
+        return b.append(HEX.toHexDigits(env.correlationHi())).append(HEX.toHexDigits(env.correlationLo())).append('/')
+                .append(Integer.toUnsignedLong(t.attempt()));
+    }
 
     private final Swarm swarm;
     private final TokenStreams streams;
@@ -116,6 +160,7 @@ final class StreamHttp {
      * loaded, no session carries credit state and {@code :chunk} answers exactly as before.
      */
     private final StreamCredit credit;
+    private final String windowHeader;
 
     StreamHttp(Swarm swarm, long producerId, AtomicLong seq, int maxPerAgent) {
         this.swarm = swarm;
@@ -126,8 +171,9 @@ final class StreamHttp {
         this.producerId = producerId;
         this.seq = seq;
         this.maxPerAgent = maxPerAgent;
-        this.credit = this.streams.config().credit() ? new StreamCredit(this.streams.config().sinkChunks(), RETAIN_BYTES)
-                : null;
+        this.windowHeader = Integer.toString(this.streams.config().window());
+        this.credit = this.streams.config().credit()
+                ? new StreamCredit(this.streams.config().sinkChunks(), RETAIN_BYTES, this.streams.budget()) : null;
         if (this.credit != null) {
             System.err.println("swarm: stream credit on, window=" + this.credit.sinkChunks + " chunks + "
                     + (RETAIN_BYTES >> 20) + " MiB");
@@ -187,6 +233,9 @@ final class StreamHttp {
     void periodicSweep() {
         this.sweeps.incrementAndGet();
         sweep();
+        if (this.credit != null && this.credit.budget.pressured()) {
+            pressureSweep(); // S2c PR 6b: reader-less sessions trim their read chunks too (#267 §4.3)
+        }
         this.streams.cancels().sweep(now());
         this.streams.purgeFences(now()); // idle fences leave here, off the worker thread (#234 review)
     }
@@ -258,6 +307,8 @@ final class StreamHttp {
             this.lock.lock();
             try {
                 var cr = this.credit; // null with the credit sub-flag off
+                // S2c PR 6b: residency is charged to the node budget, unless the session already left (closed)
+                var budget = cr == null || cr.closed ? null : cr.owner.budget;
                 StreamChunk c;
                 boolean any = false;
                 while ((c = this.sink.poll0()) != null) {
@@ -266,6 +317,9 @@ final class StreamHttp {
                         continue; // the terminal is in place: nothing may follow it
                     }
                     if (c.reset()) { // a newer attempt: drop the old window, readers get RESET
+                        if (budget != null) {
+                            budget.resident(cr, -this.retainedBytes); // the LAST ticket was rebooked by the sink
+                        }
                         this.retained.clear();
                         this.retainedBytes = 0;
                         this.trimmedThrough = -1;
@@ -286,6 +340,12 @@ final class StreamHttp {
                     if (cr != null) {
                         cr.appended(c.size(), this.maxSeq);
                     }
+                    if (budget != null) {
+                        budget.resident(cr, c.size());
+                        if (c.last()) {
+                            budget.convertLast(cr); // the LAST is resident: its ticket is released (#267 §3.4)
+                        }
+                    }
                     if (c.last()) {
                         this.last = c;
                     }
@@ -297,11 +357,61 @@ final class StreamHttp {
                         if (cr != null) {
                             cr.trimmed();
                         }
+                        if (budget != null) {
+                            budget.resident(cr, -old.size());
+                        }
                     }
                 }
                 if (any || this.sink.dropped()) {
                     this.grew.signalAll();
                 }
+            } finally {
+                this.lock.unlock();
+            }
+        }
+
+        /**
+         * S2c PR 6b pressure trim (#267 §4.3, Q5), under the session lock: drops the oldest retained chunks that are
+         * before {@code readNext} (read), keeping a resume tail of at least one read chunk and at least
+         * {@link StreamBudget#TRANSPORT_WINDOW} read bytes, so bytes handed to the transport survive a connection blip.
+         * Unread chunks are never trimmed. A reader resuming before the tail gets {@code gap … overflow}.
+         */
+        void trimRead(StreamCredit.State cr, long readNext) {
+            if (cr.closed) {
+                return;
+            }
+            var budget = cr.owner.budget;
+            StreamChunk f;
+            while (this.retained.size() > 1 && (f = this.retained.peekFirst()) != null && !f.last()
+                    && readNext - f.chunkSeq() >= 2) { // f is read, and so is at least one chunk after it
+                long readInRetained = cr.offsetOf(readNext, f.chunkSeq()) - cr.offsetOf(f.chunkSeq(), f.chunkSeq());
+                if (readInRetained - f.size() < StreamBudget.TRANSPORT_WINDOW) {
+                    return;
+                }
+                this.retained.removeFirst();
+                this.retainedBytes -= f.size();
+                this.trimmedThrough = f.chunkSeq();
+                cr.trimmed();
+                budget.resident(cr, -f.size());
+                budget.trimmed(f.size());
+            }
+        }
+
+        /**
+         * #272 review R1: before a node refusal, trims this session's read chunks down to the resume tail under the
+         * session lock, from the reader's published position (the {@link #pressureSweep} rule). True when anything was
+         * trimmed, so the refused chunk is worth re-admitting once.
+         */
+        boolean trimBeforeRefusal(StreamCredit.State cr) {
+            this.lock.lock();
+            try {
+                long ra = cr.readAttempt; // published last by the reader: then readNext belongs to it
+                if (ra < 0 || ra != this.attempt) {
+                    return false;
+                }
+                long before = this.retainedBytes;
+                trimRead(cr, cr.readNext);
+                return this.retainedBytes < before;
             } finally {
                 this.lock.unlock();
             }
@@ -329,6 +439,10 @@ final class StreamHttp {
             try {
                 if (attempt >= 0 && this.attempt >= 0 && attempt != this.attempt) {
                     return new Reset(this.attempt);
+                }
+                var cr = this.credit;
+                if (cr != null && cr.owner.budget.pressured()) {
+                    trimRead(cr, from); // S2c PR 6b: the reader trims its own read chunks under pressure (#267 §4.3)
                 }
                 if (from <= this.trimmedThrough) {
                     var first = this.retained.peekFirst();
@@ -452,9 +566,18 @@ final class StreamHttp {
             return SwarmHttp.problem(503, "too many streams", "at most " + this.maxPerAgent + " open sessions per agent")
                     .response();
         }
+        // S2c PR 6b (#267 §4.5): the session's LAST ticket; refused at the admit watermark before any other state exists
+        var budget = this.credit == null ? null : this.credit.budget;
+        if (budget != null && !budget.admitSession()) {
+            release(agent.id());
+            var r = SwarmHttp.problem(503, "too many streams", "stream memory budget").response();
+            r.headers().set("retry-after", "1");
+            return r;
+        }
         // #234 review 4: a stream always has cancel and deadline state; a full CancelSet refuses it loudly, before submit
         if (!this.streams.cancels().reserve()) {
             this.cancelRejections.incrementAndGet();
+            abandon(budget);
             release(agent.id());
             return SwarmHttp.problem(503, "too many streams", "cancel set limit " + CancelSet.MAX_ENTRIES + "; retry later")
                     .response();
@@ -463,6 +586,7 @@ final class StreamHttp {
         // #232: the final reply on reply.<node> is the router's, not late; refused past the router's cap
         if (!this.swarm.replies().registerStream(correlation, deadlineMs + GRACE_MS)) {
             this.streams.cancels().unreserve();
+            abandon(budget);
             release(agent.id());
             return SwarmHttp.problem(503, "too many streams", "reply router stream limit reached; retry later")
                     .response();
@@ -473,6 +597,7 @@ final class StreamHttp {
         } catch (RuntimeException e) {
             this.swarm.replies().clearStream(correlation);
             this.streams.cancels().unreserve();
+            abandon(budget);
             release(agent.id());
             throw e;
         }
@@ -522,6 +647,13 @@ final class StreamHttp {
         return r;
     }
 
+    /** A submit failed before its session took over the LAST ticket (S2c PR 6b); budget is null with credit off. */
+    private static void abandon(StreamBudget budget) {
+        if (budget != null) {
+            budget.abandonSession();
+        }
+    }
+
     private void release(String agent) {
         this.total.decrementAndGet();
         this.perAgent.computeIfPresent(agent, (k, v) -> v <= 1 ? null : v - 1);
@@ -547,6 +679,28 @@ final class StreamHttp {
     private void forget(Session s) {
         if (this.credit != null) {
             this.credit.unregister(s);
+            this.credit.budget.close(s); // S2c PR 6b: closed flag, then every residual charge released once
+        }
+    }
+
+    /** S2c PR 6b: under pressure, every session trims to its published read position (sweep thread). */
+    void pressureSweep() {
+        for (var s : this.sessions.values()) {
+            var cr = s.credit;
+            if (cr == null) {
+                continue;
+            }
+            // reader sessions too (#272 review, non-blocking): a waiting reader trims only when it wakes, and the
+            // published readNext counts only chunks already handed to the reader
+            s.lock.lock();
+            try {
+                long ra = cr.readAttempt; // published last by the reader: then readNext belongs to it
+                if (ra == s.attempt && ra >= 0) {
+                    s.trimRead(cr, cr.readNext);
+                }
+            } finally {
+                s.lock.unlock();
+            }
         }
     }
 
@@ -801,6 +955,14 @@ final class StreamHttp {
         } catch (IllegalArgumentException e) {
             throw new SwarmHttp.BadRequest("TOKEN payload: " + e.getMessage());
         }
+        if (c.last() && this.credit != null && c.size() > StreamBudget.LAST_MAX) {
+            // S2c PR 6b, L3 (#267 Q3), credit on only: checked before anything is written; the lease stays held, so the
+            // worker resends the data as ordinary chunks followed by a small LAST
+            var r = new SwarmHttp.Problem(413, "LAST too large", "with stream credit on a LAST chunk carries at most "
+                    + StreamBudget.LAST_MAX + " bytes; send the data as chunks, then a small LAST", StreamCredit.TYPE,
+                    "last-too-large").response();
+            return r;
+        }
         long deadline = held.envelope().deadlineMs();
         if (deadline != TaskEnvelope.NO_DEADLINE && now() > deadline) {
             return SwarmHttp.cancelled("deadline").response(); // the claim stays cached: the worker acks it
@@ -859,9 +1021,27 @@ final class StreamHttp {
         long la = held.attempt() & StreamChunk.MAX_ATTEMPT;
         long sa = s.attempt;
         boolean reservedOne = false;
+        long charged = 0;
         if (sa < 0 || la >= sa) { // an older attempt skips the check: the admit answers 409 STALE_ATTEMPT
-            if (!cr.reserve(s, st, la, c.chunkSeq(), c.size())) {
-                return refuse(cr, held, s, st, la, c);
+            int v = cr.reserveVerdict(s, st, la, c.chunkSeq(), c.size());
+            if (v == StreamCredit.REFUSE) {
+                return refuse(cr, held, s, st, la, c, false);
+            }
+            // S2c PR 6b (#267 §3.1, §4.4): the node budget after the session; the filler and a newer attempt are never
+            // refused; an out-of-order chunk that opens a gap also needs room for the gap ticket
+            boolean opensGap = v == StreamCredit.ADMIT && la == s.attempt && c.chunkSeq() > st.maxSeq + 1
+                    && st.heldChunks.get() == 0;
+            boolean exempt = v != StreamCredit.ADMIT;
+            charged = cr.budget.admit(st, c.size(), exempt, opensGap);
+            if (charged < 0 && s.trimBeforeRefusal(st)) {
+                // #272 review R1 (#267 §4.3, "trim … before refusing"): the session's own read chunks went first;
+                // re-admit once, with the same exemption as the first call (an exempt chunk is never refused, so this
+                // is only reached with exempt == false)
+                charged = cr.budget.admit(st, c.size(), exempt, opensGap);
+            }
+            if (charged < 0) {
+                cr.release(st, c.size());
+                return refuse(cr, held, s, st, la, c, true);
             }
             reservedOne = true;
         }
@@ -871,6 +1051,7 @@ final class StreamHttp {
         } finally {
             if (reservedOne) {
                 cr.release(st, c.size()); // exactly once, after the chunk was published or discarded (#248 r4 B2)
+                cr.budget.release(charged); // the same finally: request-scoped, released exactly once (#267 §3.1)
             }
         }
         var answer = admitted(r, held, release);
@@ -889,8 +1070,12 @@ final class StreamHttp {
         return SwarmHttp.leaseProblem(r).response();
     }
 
-    /** No credit: {@code 409} {@code cancelled} if the task is cancelled (lookup on the refusal path only), else 429. */
-    private Response refuse(StreamCredit cr, Task held, Session s, StreamCredit.State st, long la, StreamChunk c) {
+    /**
+     * No credit: {@code 409} {@code cancelled} if the task is cancelled (lookup on the refusal path only), else 429;
+     * {@code node} (S2c PR 6b) marks a refusal by the node budget: the same 429 with {@code "scope":"node"}.
+     */
+    private Response refuse(StreamCredit cr, Task held, Session s, StreamCredit.State st, long la, StreamChunk c,
+            boolean node) {
         var why = this.streams.cancels().reason(TaskService.topic(held.pool(), held.shard()), held.offset(), now());
         if (why != null) {
             return SwarmHttp.cancelled(why).response();
@@ -901,11 +1086,26 @@ final class StreamHttp {
             // (not 409 STALE_ATTEMPT); nothing is written, and the worker's next new chunk meets the fence.
             return creditFrame(cr.snapshot(s, st, c.streamHi(), c.streamLo(), la));
         }
+        if (node) {
+            cr.budget.nodeRefused();
+            return nodeRefusal();
+        }
         cr.refused();
         var r = new SwarmHttp.Problem(429, "no credit", "stream credit exhausted; retry the same chunk", StreamCredit.TYPE,
                 "credit").response();
         r.headers().set("retry-after", "1");
         return r;
+    }
+
+    /**
+     * S2c PR 6b (#267 Q4): a refusal by the node stream-memory budget: {@code 429} {@code problems/credit} with
+     * {@code "scope":"node"} and {@code Retry-After: 1}; session-scope refusals keep their shape (no scope member).
+     */
+    private static Response nodeRefusal() {
+        var json = "{\"type\":\"" + StreamCredit.TYPE + "\",\"title\":\"no credit\",\"status\":429,\"detail\":"
+                + "\"node stream memory budget exhausted; retry the same chunk\",\"reason\":\"credit\",\"scope\":\"node\"}";
+        return new Response(429, ResponseHeaders.of().set("content-type", "application/problem+json").set("retry-after", "1"),
+                Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static Response creditFrame(sjws_nettask.swarm.wire.Credit credit) {

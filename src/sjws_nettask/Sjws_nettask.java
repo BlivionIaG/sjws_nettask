@@ -515,7 +515,7 @@ public class Sjws_nettask {
     private static ServiceHooks loadServiceHooks(Path bootstrap, String expectedRole, long drainBudgetMs,
             sjws_nettask.config.ConfigLoader.Loaded loaded) throws IOException {
         return sjws_nettask.service.ServiceLaunch.prepare(bootstrap, expectedRole, drainBudgetMs, loaded.yamlCp(),
-                loaded.configBase());
+                loaded.configBase(), loaded.haClusterKey(), loaded.haClusterKeyPrevious());
     }
 
     /**
