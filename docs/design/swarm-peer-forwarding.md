@@ -1,0 +1,115 @@
+# Swarm peer forwarding (#236): as implemented
+
+Status: **PR 1 of 5** (peer transport, origin-keyed dedup, forwarded produce). No swarm topic family is forwarded
+yet: in production the owner side serves nothing (`PeerLink.Owner.NONE`), `SwarmModule` only runs the fail-closed
+startup checks and opens no listener, and the #234 stream guard still refuses `sjws.swarm.stream.enabled=true`
+when the peer map lists other nodes. The design is issue #236 (r4, option (a)); this page tracks what exists.
+
+## 1. Configuration
+
+| Setting (property / environment) | Meaning |
+|---|---|
+| `sjws.swarm.node` / `SJWS_SWARM_NODE` | This node's name; it must appear in the peer map. |
+| `sjws.swarm.peers` / `SJWS_SWARM_PEERS` | Comma-separated `node=wire@host:port[#san]`. `node` matches `[A-Za-z0-9._:-]{1,64}`; `wire` is 1..65535 and is the authenticated origin id; the pinned SAN defaults to `urn:sjws:node:<node>`. Duplicate names, wires, addresses or SANs are refused, and so is a map that does not list this node. |
+| `SJWS_SWARM_PEER_KEY`, `SJWS_SWARM_PEER_KEY_PREVIOUS` or `sjws.swarm.peer.keyFile`, `sjws.swarm.peer.keyFilePrevious` | The frame HMAC key (HKDF info `sjws-swarm-peer-frame-v1`) and its rotation predecessor. Setting a key both in the environment and as a file is refused. A key equal to any HA key (`WEB_SERVER_HA_CLUSTER_KEY[_PREVIOUS]`) or CP Raft key (`SJWS_CP_RAFT_KEY[_PREVIOUS]`) is refused (constant-time compare). |
+| `sjws.swarm.peer.tls.cert`, `.key`, `.ca`, optional `.revocations` (env `SJWS_SWARM_PEER_TLS_CERT` / `_KEY` / `_CA` / `_REVOCATIONS`) | mTLS 1.3 material, **mandatory with two or more nodes**. Loaded through Security's `CpTls.peerContext` (key file mode checked, revocations, reloadable). This node's certificate must carry its own pinned SAN. |
+
+Startup is fail closed: when any peer setting is present and a check fails, the swarm module refuses to start
+(`OptionalModule.Refused`, message without secrets). With no peer setting no `swarm.peer` class loads, and a
+single-node map opens no transport (tested in `swarm.ClassLoadTest`).
+
+## 2. Transport and identity
+
+`PeerLink` reuses `cluster.TcpTransport` in its own frame domain (label `sjws-swarm-peer-frame\0`, its own HKDF
+info and frame cap), so a Raft frame and a peer frame never verify under each other's domain even with an equal
+key. Frames carry HMAC-SHA256 tags with the existing replay checks (destination, member, epoch, sequence).
+
+The **origin is the certificate, not the header**: on accept, `PeerSockets.peerWire` maps the verified client
+certificate's single pinned SAN (URI or DNS) to a wire id, fixed for the connection. A certificate naming no pinned
+node, two pinned nodes, or this node is refused at accept. A frame whose header `from` differs from the pinned wire
+is a `Reason.ORIGIN` rejection: the connection is closed, `originMismatches` counts it, a WARNING alert is logged,
+and the identity is held off with a doubling backoff from 1 s to 60 s (`originHeldOff` counts refused reconnects).
+The dialer checks that the server presents the SAN pinned for the address it dialled (`identityRefused`).
+
+**Sending.** The peer transport is *direct*: frames are handed to `PeerLink` on the reader thread, and
+`TcpTransport.sendNow` lets a `produce()` caller write its frame on its own thread when nothing is queued for that
+peer (otherwise it queues behind the writer; seal order stays wire order). `produce()` assigns the seq and records
+the pending write under the stream lock, then releases the lock before sending, so a blocked socket write never
+holds a lock that `onAck` (reader threads) or the ticker needs. Two callers racing on one stream can then put their
+frames on the wire out of seq order; the owner answers `OUT_OF_ORDER` and go-back-N resends in order. Socket writes
+have no timeout of their own, so the peer domain sets a write-stall bound of `requestTimeoutMs`: a write that makes
+no progress for that long closes the connection (`writeStalls`) and go-back-N resends. Progress is timed per 64 KiB
+chunk, so a large frame on a slow but moving link is not cut. The watchdog aborts the connection it sampled, once;
+a reconnect gets a new connection that the old abort cannot touch. The close goes through the socket
+factory's abort handle: `PeerSockets` layers TLS over a plain socket and the transport closes that plain socket
+(linger 0), because an `SSLSocket`'s own `close()` waits for the TLS output lock the blocked writer holds. The
+watchdog hands each close to its own virtual thread, so no close can stop it bounding other peers. An inline write that fails is
+resent after a short backoff instead of after `requestTimeoutMs`. A failure to seal a frame (MAC) fails that send and
+drops the peer's MAC, not the writer.
+
+## 3. Forwarded produce and dedup
+
+`PeerLink.produce(owner, topic, payload, durability, budgetMs)` returns a future that never completes
+exceptionally. Each (owner, topic) is one stream with a random `producerId` and sequence numbers from 1. The
+owner applies the write with `Partition.produceFrom(origin = sender's pinned wire, producerId, seq, …)`; dedup is
+keyed on **(authenticated origin, producerId)**, so a peer cannot collide with another peer's producers.
+
+| Outcome | Meaning for the caller |
+|---|---|
+| `APPENDED` / `DUPLICATE` | Applied (exactly once); `offset` is the record's offset. |
+| `TOO_OLD` | The sequence fell out of the owner's 4096-entry window: **the maximum retry distance is 4096 writes**, after which the owner can no longer say whether it applied the write. Outcome unknown. |
+| `OUT_OF_ORDER` | A gap: the sender rewinds (go-back-N) and resends from the owner's expected sequence. Not surfaced unless the rewind budget runs out. |
+| `BUSY` | Local only: the stream already has 256 unanswered writes (`inflightPerProducer`, at most 1024, kept well under the 4096 window so an unapplied write cannot age out while it is retried). Not sent; retryable. An owner-side `BUSY` (per-peer inbound cap 2048, or over 1024 live producers per peer; producers idle 1 h may be evicted) is not surfaced: the sender backs off (10 ms to 1 s, jittered) and resends within the write's budget. |
+| `FORBIDDEN` | The owner does not serve the topic, or the record is over the cap (1 MiB default, 4 MiB maximum). Not applied. |
+| `FAILED` | The owner could not apply it (opening the partition failed, or its ledger writer refused it before apply); a fixed code, never the exception text. Not applied; retryable. |
+| `OUTCOME_UNKNOWN` | **Outcome unknown**: the owner applied the write but its durability failed afterwards (ledger writer failure), so it may or may not survive. Every write still pending behind it on the stream gets the same answer. Never reported as `FAILED`. |
+| `TIMEOUT` | **Outcome unknown**: no answer within the budget. The write may or may not have been applied; resending it as a new write can produce a second copy. |
+| `UNAVAILABLE` | Not sent: unknown peer, self, link closed before the write reached the socket, or the owner's breaker is open (5 timeouts, open 1 s). A write already handed to the socket when the link closes is `OUTCOME_UNKNOWN`. |
+| `LOST` | The owner answered with an expected sequence below what it already acknowledged (it restarted without the stream's history). Writes after the acknowledged ones are lost; the next write starts a fresh stream. |
+
+Any failure retires the stream and the next write starts a new stream at sequence 1, so a caller never sees a later
+write applied after an earlier one failed. The other pending writes are answered by what can be proved about them.
+The owner applies strictly in seq order, so a refusal (`FAILED`, `FORBIDDEN`) of seq N proves nothing about seqs below
+N: they get `OUTCOME_UNKNOWN`. The refusal is definite, and N and the later pending writes get it, only when it
+answers the current round and exactly one copy of N was ever sent (the wire does not carry the round, so after a
+resend the refusal may answer an earlier copy while another copy was applied); otherwise every pending write is
+`OUTCOME_UNKNOWN`. A refusal from a stale round (a copy sent before a rewind) is ignored. `TOO_OLD` and
+`OUTCOME_UNKNOWN` go to their own seq; every other pending write is `OUTCOME_UNKNOWN`. On the owner, the ledger writer
+fails a failing group's writes and waiters before it raises its fence, which narrows (for that group only) the window
+in which a refusal can be sent ahead of an earlier write's outcome-unknown; the sender rule above is the guarantee.
+A `produceFrom` that throws is `FAILED` only for the fenced-writer refusal (nothing applied); any other exception may
+come after the append, so it is `OUTCOME_UNKNOWN`.
+
+**Client-facing mapping** (`PeerLink.Result.problem()`, #258's problem types), for the edge that will answer
+forwarded produces in a later step:
+
+| Outcomes | HTTP |
+|---|---|
+| `APPENDED`, `DUPLICATE` | success |
+| `OUTCOME_UNKNOWN`, `TIMEOUT`, `TOO_OLD`, `LOST` | 503 `https://sjws.dev/problems/outcome-unknown`, not retryable as a new write; never a 307 |
+| `FAILED`, `BUSY`, `UNAVAILABLE`, `OUT_OF_ORDER` | 503 `https://sjws.dev/problems/not-appended`, retryable |
+| `FORBIDDEN` | 400 `https://sjws.dev/problems/not-appended` |
+
+`LOST` is outcome-unknown, not not-appended: the owner answered with an expected sequence below what it had
+acknowledged, so it lost state. A pending write may have been applied, and even delivered to a consumer, before that
+loss, and the owner can no longer prove it was not.
+
+No forwarded outcome is a not-leader: the forward hop has no leader, because the sender picks the owner. The
+forwarded partitions are single-owner delivery partitions (`Partition` with a local `LedgerWriter`), so Raft's
+`OutcomeUnknownException` and `WriteRefusedException` cannot reach this path. An edge keeps its own not-leader
+307/503 for its own leadership.
+
+## 4. Ledger format and downgrade
+
+A forwarded write is ledger entry type 8 (`ENQUEUE_FROM`: the type-1 layout preceded by the `u16` origin); local
+writes still write type 1 byte for byte. Snapshots stay version 1 unless remote producers exist, then version 2
+(appends the remote windows). An older binary refuses both: an unknown entry type fails ledger replay ("unknown
+ledger entry type"), and a version-2 snapshot is refused as corrupt, which falls back to an older snapshot or a
+full replay that then hits the type-8 entry. **Downgrading a node that has applied a forwarded write therefore
+refuses to open that partition** instead of misreading it (Security condition 4).
+
+## 5. Remaining slices
+
+See the PR 1 description for the slicing plan: stream chunk forwarding (PR 2, with the #247 `admitChunk` hook,
+optional `credit:u32` and `NO_CREDIT`), `tasks.*` forwarding (PR 3), `reply.*` forwarding (PR 4), clock-offset
+pings and the two-process suite (PR 5).

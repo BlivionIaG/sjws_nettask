@@ -334,6 +334,43 @@ class ShardClaimTest {
         assertEquals(LeaseResult.OK, t.ack(got.get(0)));
     }
 
+    /**
+     * The receipt refresh never extends a handed lease past the task's own deadline: a task due within the visibility
+     * window gets a lease ending at its deadline, and one already past its deadline on receipt keeps its poll-time
+     * lease (the handler sees the deadline). Both stay with the woken worker.
+     */
+    @Test
+    void theReceiptRefreshStopsAtTheTasksOwnDeadline() throws Exception {
+        var t = open(4, TimeUnit.SECONDS.toNanos(30));
+        long vis = 10_000;
+        long gap = 150;
+        t.afterHandoffPoll = () -> this.now.addAndGet(gap);
+        long seq = 0;
+        long[] dueIn = {gap + 1_000, gap / 2}; // after receipt: 1 s left (< vis), already past
+        for (long due : dueIn) {
+            var claim = CompletableFuture.supplyAsync(() -> t.claim("p", "w", 1, vis, TimeUnit.SECONDS.toNanos(20)));
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (t.pool("p").waiting.get() == 0 && System.nanoTime() < until) Thread.onSpinWait();
+            long polledAt = this.now.get();
+            long deadline = polledAt + due;
+            seq = seqFor(t, 2, seq);
+            t.submit("p", 1, seq, TaskServiceTest.env("x", "", deadline));
+            var got = claim.get(5, TimeUnit.SECONDS);
+            assertEquals(1, got.size(), "the handed task is kept, due in " + due);
+            long received = polledAt + gap;
+            long lease = got.get(0).leaseDeadlineMs();
+            if (deadline > received) {
+                assertEquals(deadline, lease, "refreshed to the task's deadline, not to receipt + " + vis);
+            } else {
+                assertTrue(lease <= polledAt + vis, "past its deadline: the poll-time lease is left as is: " + lease);
+            }
+            assertEquals(LeaseResult.OK, t.ack(got.get(0)));
+        }
+        t.afterHandoffPoll = TaskService.NO_HOOK;
+        assertEquals(2, t.handoffs());
+        assertEquals(2, t.handoffRefreshes(), "both receipts saw the clock move");
+    }
+
     @Test
     void aSubMillisecondHandoffDoesNotRewriteTheLease() throws Exception {
         var t = open(4, TimeUnit.SECONDS.toNanos(30));

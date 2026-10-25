@@ -17,7 +17,7 @@ Findings rated High or Critical stay generic here until their fix is merged.
 | F4 | Medium | Dependencies | Bouncy Castle 1.83 (pulled in by acme4j) has 6 advisories: CVE-2025-14813, CVE-2026-0636, CVE-2026-5588, CVE-2026-5598, CVE-2026-8763, CVE-2026-13506. Reachability is limited to the ACME client | Fixed (#48, Bouncy Castle 1.86) |
 | F5 | Medium | Proxy | Responses are buffered whole (`max_body`, default 16 MiB) per request. With 2048 HTTP/1 connections, slow clients fetching a large upstream resource can hold gigabytes of heap | Fixed: bodies stream with a bounded read-ahead and a 64 MiB global budget (`-Dsjws.proxy.maxInflightBytes`) |
 | F6 | Low | Filters | `RoutePattern` (middleware `route`) matches the raw percent-encoded target, while the file handler decodes it (`/%61dmin` is not `/admin`). No filter shipped today makes access decisions, but a future auth or IP filter scoped by route could be bypassed | Fixed: `RoutePattern` matches the decoded, normalised path |
-| F7 | Low | Repository | No code scanning, no Dependabot version updates, secret scanning disabled | CodeQL + Dependabot merged (#49). Secret scanning must be enabled in repo settings |
+| F7 | Low | Repository | No code scanning, no Dependabot version updates, secret scanning disabled | Fixed: CodeQL + Dependabot merged (#49); secret scanning and push protection enabled in the repository settings on 2026-10-25 |
 | F8 | Info | Tests | `Http2ServerTest.concurrentStreamsShareOneConnection` is flaky under load (REFUSED_STREAM from the 100 ms file-slot wait), about 1 failure in 3 on a loaded 8-core box | Open |
 
 ## Reviewed with no finding
@@ -38,9 +38,8 @@ Findings rated High or Critical stay generic here until their fix is merged.
 - **OSV-Scanner** (`osv-scanner scan source -r .`): 6 advisories, all Bouncy Castle 1.83 (F4). None after #48.
 - **Dependabot alerts**: 0 open.
 - **Code scanning**: there was no analysis before #49. CodeQL `security-extended` on #49 reports 0 alerts.
-- **Secret scanning**: disabled.
+- **Secret scanning**: enabled with push protection on 2026-10-25 (provider patterns; non-provider patterns and validity checks off). 0 alerts at 22:53 Europe/Paris on 2026-10-25, while the initial history scan may still be running.
 
 ## Follow-ups
 
-- Enable secret scanning and push protection in the repository settings.
 - Redaction of secrets in snapshots and logs. (mTLS between nodes, signed and versioned config snapshots and single-use join tokens have landed, see [SECURITY.md](../../SECURITY.md).)
