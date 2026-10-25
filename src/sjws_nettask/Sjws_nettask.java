@@ -116,10 +116,22 @@ public class Sjws_nettask {
         }
         OptionalModule modules;
         try {
-            modules = OptionalModules.start(loaded.yamlSwarmEnabled(), multiProcess(hooks, loaded.yamlCp()), err);
+            modules = OptionalModules.start(loaded.yamlSwarmEnabled(),
+                    multiProcess(hooks, loaded.yamlCp(), loaded.haMessaging()), err);
         } catch (OptionalModule.Refused e) {
             err.println("Error: " + e.getMessage());
             return EXIT_USAGE;
+        }
+        try {
+            modules = HaMessagingStart.install(loaded, modules, err);
+        } catch (OptionalModule.Refused e) {
+            modules.close();
+            err.println("Error: " + e.getMessage());
+            return EXIT_USAGE;
+        } catch (IOException | UncheckedIOException e) {
+            modules.close();
+            err.println("Failed to start HA messaging: " + e);
+            return EXIT_CANNOT_LISTEN;
         }
         SjwsServer server;
         try {
@@ -461,11 +473,23 @@ public class Sjws_nettask {
      * node (control or data role, joined to a control plane) or a config file whose {@code cp.peers} lists voters.
      */
     static String multiProcess(ServiceHooks hooks, java.util.Map<String, Object> yamlCp) {
+        return multiProcess(hooks, yamlCp, sjws_nettask.config.HaMessagingSettings.NONE);
+    }
+
+    /**
+     * As {@link #multiProcess(ServiceHooks, java.util.Map)}, and a config file whose {@code ha.members} lists the
+     * HA messaging cluster (#236): any member list counts, whatever {@code ha.messaging} resolves to.
+     */
+    static String multiProcess(ServiceHooks hooks, java.util.Map<String, Object> yamlCp,
+            sjws_nettask.config.HaMessagingSettings haMessaging) {
         if (hooks != null) {
             return "this node runs with --bootstrap (control/data role in a cluster)";
         }
         if (yamlCp != null && yamlCp.get("peers") instanceof java.util.Collection<?> peers && !peers.isEmpty()) {
             return "the config file lists cp.peers (" + peers.size() + " voters)";
+        }
+        if (!haMessaging.members().isEmpty()) {
+            return "the config file lists ha.members (" + haMessaging.members().size() + " voters)";
         }
         return null;
     }
