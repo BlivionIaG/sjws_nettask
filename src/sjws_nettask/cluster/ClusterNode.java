@@ -46,8 +46,12 @@ public interface ClusterNode extends AutoCloseable {
      * the group fails closed until restart. That failure says {@code outcome unknown}: part of the batch may
      * still commit after the restart, so treat it like a timeout and deduplicate on retry. Earlier
      * batches still pending when the group fails closed fail the same way, not with
-     * {@link NotLeaderException}. Every refusal (an empty batch, a null entry, a bad
-     * {@code expectedTerm}, a storage error) fails the future rather than throwing.
+     * {@link NotLeaderException}. A batch that was accepted but is still pending when this node stops
+     * leading (it steps down or transfers leadership) fails with {@link NotLeaderException} too; it is
+     * never reported committed by a node that no longer leads (#250). Its outcome is unknown as well: a
+     * follower may already hold it and the next leader may commit it, so deduplicate on retry. Every
+     * refusal (an empty batch, a null entry, a bad {@code expectedTerm}, a storage error) fails the future
+     * rather than throwing.
      */
     CompletableFuture<CommittedIndex> append(GroupId groupId, List<ByteBuffer> batch);
 
