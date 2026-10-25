@@ -1,0 +1,28 @@
+name: tmp-265-flake
+# Temporary: flake rate of the two #265 checks on ubuntu-26.04 after the fix. Removed before ready.
+on:
+  push:
+    branches: [fix/http1-sendfile-spin-265]
+permissions:
+  contents: read
+jobs:
+  flake:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with: {distribution: temurin, java-version: '25', cache: maven}
+      - run: uname -r; nproc; df -m /tmp | tail -1; java -version 2>&1 | head -1
+      - run: mvn -B -q -Djacoco.skip=true test-compile
+      - name: The two checks x20
+        run: |
+          fails=0
+          for i in $(seq 20); do
+            mvn -B -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test > out.txt 2>&1 || { fails=$((fails+1)); grep -E 'no spin|ERROR\]   ' out.txt | head -5; }
+          done
+          echo "FAILED_RUNS=$fails/20"
