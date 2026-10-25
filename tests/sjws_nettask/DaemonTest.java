@@ -11,12 +11,16 @@ import java.net.Socket;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -514,6 +518,198 @@ class DaemonTest {
         assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(fullDir, Duration.ofSeconds(1), out, err));
         assertTrue(Files.exists(fullDir), "a non-empty directory is not removed");
         assertTrue(err().contains("could not remove pid file"), err());
+    }
+
+    /**
+     * An empty directory's {@code st_size} is 4096 on ext4 and 40 on tmpfs. Staleness has to
+     * follow the file type on both, and the 512-byte cap has to apply only to regular files.
+     * {@code /dev/shm} is tmpfs; {@code /var/tmp} stays on disk when {@code /tmp} is a tmpfs.
+     */
+    @Test
+    void pidFileKindIsClassifiedWithoutUsingDirectorySize() throws Exception {
+        var stores = new ArrayList<Path>();
+        var kinds = new ArrayList<String>();
+        var described = new ArrayList<String>();
+        try {
+            addPidStore(stores, kinds, described, Path.of("/dev/shm"), true);
+            addPidStore(stores, kinds, described, Path.of("/var/tmp"), false);
+            boolean linux = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux");
+            if (linux) {
+                assertTrue(kinds.contains("tmpfs"), "tmpfs fixture missing: " + described);
+                assertTrue(kinds.contains("disk"), "disk fixture missing: " + described);
+            } else if (stores.isEmpty()) {
+                org.junit.jupiter.api.Assumptions.abort("no pid-file fixture directory");
+            }
+            var emptySizes = new HashMap<String, Long>();
+            for (int i = 0; i < stores.size(); i++) {
+                emptySizes.put(kinds.get(i), exercisePidStore(stores.get(i)));
+            }
+            if (emptySizes.containsKey("tmpfs") && emptySizes.containsKey("disk")) {
+                assertTrue(emptySizes.get("tmpfs") <= 512, emptySizes.toString());
+                assertTrue(emptySizes.get("disk") > 512, emptySizes.toString());
+            }
+            refuseDeviceNode();
+        } finally {
+            for (var store : stores) {
+                deleteTree(store);
+            }
+        }
+    }
+
+    private static void addPidStore(List<Path> stores, List<String> kinds, List<String> described, Path root,
+            boolean wantTmpfs) throws IOException {
+        if (!Files.isDirectory(root) || !Files.isWritable(root)) {
+            described.add(root + " unusable");
+            return;
+        }
+        String type = Files.getFileStore(root).type();
+        described.add(root + "=" + type);
+        if (wantTmpfs != "tmpfs".equals(type)) {
+            return;
+        }
+        stores.add(Files.createTempDirectory(root, "sjws-pid-"));
+        kinds.add(wantTmpfs ? "tmpfs" : "disk");
+    }
+
+    /** @return the empty directory's {@code st_size} on this store */
+    private long exercisePidStore(Path store) throws Exception {
+        var empty = Files.createDirectory(store.resolve("empty"));
+        long emptySize = Files.size(empty);
+        var emptySnap = PidFile.read(empty);
+        assertTrue(emptySnap.present() && emptySnap.stale(), "size=" + emptySize + " snap=" + emptySnap);
+        assertEquals(-1, emptySnap.pid());
+        var refused = assertThrows(IOException.class, () -> PidFile.claim(empty));
+        assertTrue(refused.getMessage().contains("not a regular file"), refused.getMessage());
+        assertTrue(Files.isDirectory(empty), "claim must not replace a directory");
+        reset();
+        assertEquals(Daemon.STATUS_STALE, Daemon.status(empty, out, err));
+        assertTrue(out().startsWith("stopped stale pid="), out());
+        reset();
+        assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(empty, Duration.ofSeconds(1), out, err));
+        assertFalse(Files.exists(empty), "empty directory removed (size " + emptySize + ")");
+
+        var full = Files.createDirectory(store.resolve("full"));
+        Files.writeString(full.resolve("kept"), "x");
+        reset();
+        assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(full, Duration.ofSeconds(1), out, err));
+        assertTrue(Files.isDirectory(full), "a non-empty directory is not removed");
+        assertEquals("x", Files.readString(full.resolve("kept")));
+        assertTrue(err().contains("could not remove pid file"), err());
+
+        var target = Files.writeString(store.resolve("target.pid"), "1\n1\n");
+        var link = store.resolve("link.pid");
+        Files.createSymbolicLink(link, target);
+        var linkEx = assertThrows(IOException.class, () -> PidFile.claim(link));
+        assertTrue(linkEx.getMessage().contains("symlink"), linkEx.getMessage());
+        assertFalse(linkEx.getMessage().contains("not a regular file"), linkEx.getMessage());
+        assertTrue(Files.isSymbolicLink(link));
+        assertEquals("1\n1\n", Files.readString(target));
+
+        var nested = Files.createDirectory(store.resolve("nested"));
+        var linkDir = store.resolve("link-dir.pid");
+        Files.createSymbolicLink(linkDir, nested.getFileName());
+        var linkDirSnap = PidFile.read(linkDir);
+        assertTrue(linkDirSnap.stale(), "symlink to a directory of size " + Files.size(nested));
+        var linkDirEx = assertThrows(IOException.class, () -> PidFile.claim(linkDir));
+        assertTrue(linkDirEx.getMessage().contains("symlink"), linkDirEx.getMessage());
+        reset();
+        assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(linkDir, Duration.ofSeconds(1), out, err));
+        assertFalse(Files.exists(linkDir), "symlink removed");
+        assertTrue(Files.isDirectory(nested), "symlink target kept");
+
+        var huge = store.resolve("huge.pid");
+        Files.writeString(huge, "x".repeat(600));
+        assertTrue(Files.size(huge) > 512);
+        assertTrue(PidFile.read(huge).stale());
+        var small = Files.writeString(store.resolve("small.pid"), "9\n8\n");
+        var smallSnap = PidFile.read(small);
+        assertEquals(9, smallSnap.pid());
+        assertEquals(8, smallSnap.startedMillis());
+
+        assertLongSymlinkReadsTheRegularTarget(store);
+
+        var fifo = store.resolve("fifo.pid");
+        var mkfifo = new ProcessBuilder("/usr/bin/mkfifo", fifo.toString()).redirectErrorStream(true).start();
+        var mkfifoOut = new String(mkfifo.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(0, mkfifo.waitFor(), mkfifoOut);
+        assertTrue(Files.size(fifo) <= 512, "fifo size " + Files.size(fifo));
+        assertTrue(PidFile.read(fifo).stale(), "a fifo is stale without being read");
+        var fifoEx = assertThrows(IOException.class, () -> PidFile.claim(fifo));
+        assertTrue(fifoEx.getMessage().contains("not a regular file"), fifoEx.getMessage());
+        assertTrue(Files.exists(fifo), "claim must not replace a fifo");
+        reset();
+        assertEquals(Sjws_nettask.EXIT_OK, Daemon.stop(fifo, Duration.ofSeconds(1), out, err));
+        assertFalse(Files.exists(fifo), "fifo removed without opening it");
+
+        var hidden = Files.writeString(store.resolve("hidden.pid"), "4\n5\n");
+        assertTrue(hidden.toFile().setReadable(false));
+        try {
+            boolean blocked;
+            try {
+                Files.readString(hidden);
+                blocked = false;
+            } catch (IOException e) {
+                blocked = true;
+            }
+            if (blocked) {
+                assertEquals(PidFile.Snapshot.ABSENT, PidFile.read(hidden));
+            }
+        } finally {
+            assertTrue(hidden.toFile().setReadable(true));
+        }
+
+        var broken = store.resolve("broken.pid");
+        Files.createSymbolicLink(broken, store.resolve("missing-target"));
+        assertEquals(PidFile.Snapshot.ABSENT, PidFile.read(broken));
+        return emptySize;
+    }
+
+    private static void assertLongSymlinkReadsTheRegularTarget(Path store) throws IOException {
+        var cursor = Files.createDirectory(store.resolve("long"));
+        var rel = new StringBuilder();
+        for (int i = 0; i < 7; i++) {
+            var name = "n" + i + "x".repeat(80);
+            cursor = Files.createDirectory(cursor.resolve(name));
+            if (rel.length() > 0) {
+                rel.append('/');
+            }
+            rel.append(name);
+        }
+        Files.writeString(cursor.resolve("pid"), "12\n34\n");
+        rel.append("/pid");
+        assertTrue(rel.length() > 512, "relative target length " + rel.length());
+        var link = store.resolve("long.pid");
+        Files.createSymbolicLink(link, Path.of("long").resolve(rel.toString()));
+        long linkSize = Files.readAttributes(link, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).size();
+        assertTrue(linkSize > 512, "symlink st_size " + linkSize);
+        var snap = PidFile.read(link);
+        assertEquals(12, snap.pid(), "size cap must apply to the regular target, not the link");
+        assertEquals(34, snap.startedMillis());
+    }
+
+    private void refuseDeviceNode() throws IOException {
+        var dev = Path.of("/dev/null");
+        if (!Files.exists(dev) || Files.isRegularFile(dev, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        long size = Files.size(dev);
+        assertTrue(size <= 512, "device size " + size);
+        var snap = PidFile.read(dev);
+        assertTrue(snap.present() && snap.stale(), "device size " + size + " snap=" + snap);
+        var ex = assertThrows(IOException.class, () -> PidFile.claim(dev));
+        assertTrue(ex.getMessage().contains("not a regular file"), ex.getMessage());
+        assertTrue(Files.exists(dev));
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        try (var walk = Files.walk(root)) {
+            for (var path : walk.sorted(Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(path);
+            }
+        }
     }
 
     @Test
