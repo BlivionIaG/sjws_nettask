@@ -34,6 +34,17 @@ import java.util.concurrent.locks.ReentrantLock;
  * One segment file per group. {@link #force} calls {@link FileChannel#force}. A truncate rewrites
  * the segment from the in-memory index into a temp file and renames it into place (see
  * {@link #rewrite}); the hot path only appends.
+ *
+ * <p><b>Rolling mode</b> ({@link #FileLogStorage(Path, long)} with a finite {@code rollBytes}, #270): once the active
+ * {@code <group>.log} reaches {@code rollBytes} it is fsynced and renamed to the sealed
+ * {@code <group>.<first index, 20 digits>.seg}, and a fresh {@code <group>.log} takes the appends. A prefix truncation
+ * then drops the entries from memory and unlinks the sealed files it covers wholly: no copy, and the lock is held only
+ * for the in-memory removal, so a snapshot truncation never stalls appends of any group for a rewrite. Unlinks are not
+ * directory-fsynced: after a crash a deleted file may come back, and loading keeps only the contiguous run of indexes
+ * that ends at the newest entry, so a resurrected older file is ignored (and anything it holds is covered by the
+ * durable snapshot that allowed the truncation). A suffix truncation (rare: a conflicting uncommitted tail) rewrites
+ * every kept entry into a new active file first and only then deletes the sealed files; loading treats the active file
+ * as authoritative from its first index on.
  */
 public final class FileLogStorage implements LogStorage {
 
@@ -43,10 +54,78 @@ public final class FileLogStorage implements LogStorage {
     private final Map<GroupId, FileChannel> channels = new ConcurrentHashMap<>();
     private final Map<GroupId, AtomicInteger> forceCounts = new ConcurrentHashMap<>();
     private final Map<GroupId, WitnessCursor> cursors = new ConcurrentHashMap<>();
+    /** Rolling mode: size at which the active file is sealed; {@link Long#MAX_VALUE} = one file per group. */
+    private final long rollBytes;
+    /** Rolling mode, per group: sealed files by first index (guarded by {@link #lock}). */
+    private final Map<GroupId, java.util.TreeMap<Long, Sealed>> sealed = new ConcurrentHashMap<>();
+
+    /** A sealed segment: its path and the index range it holds. */
+    private record Sealed(Path path, long first, long last) {
+    }
 
     public FileLogStorage(Path root) throws IOException {
+        this(root, Long.MAX_VALUE);
+    }
+
+    /**
+     * @param rollBytes seal the active file once it holds this many bytes (rolling mode, see the class doc);
+     *                  {@link Long#MAX_VALUE} keeps one file per group
+     */
+    public FileLogStorage(Path root, long rollBytes) throws IOException {
+        if (rollBytes < 1) {
+            throw new IllegalArgumentException("rollBytes");
+        }
         this.root = root;
+        this.rollBytes = rollBytes;
         Files.createDirectories(root);
+    }
+
+    private boolean rolling() {
+        return rollBytes != Long.MAX_VALUE;
+    }
+
+    private String safe(GroupId group) {
+        return group.value().replaceAll("[^A-Za-z0-9._-]", "_");
+    }
+
+    private Path sealedPath(GroupId group, long first) {
+        return root.resolve(safe(group) + "." + String.format("%020d", first) + ".seg");
+    }
+
+    /** Reads one file of {@code [index][term][len][data]} records; stops at a torn tail. */
+    private static java.util.TreeMap<Long, Rec> readRecords(Path path) throws IOException {
+        var out = new java.util.TreeMap<Long, Rec>();
+        if (!Files.exists(path) || Files.size(path) == 0) {
+            return out;
+        }
+        try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
+            var header = ByteBuffer.allocate(20);
+            while (in.position() < in.size()) {
+                header.clear();
+                if (in.read(header) != 20) {
+                    break;
+                }
+                header.flip();
+                long index = header.getLong();
+                long term = header.getLong();
+                int len = header.getInt();
+                if (len < 0 || len > in.size() - in.position()) {
+                    break; // torn tail
+                }
+                var data = new byte[len];
+                var body = ByteBuffer.wrap(data);
+                while (body.hasRemaining()) {
+                    if (in.read(body) < 0) {
+                        break;
+                    }
+                }
+                if (body.hasRemaining()) {
+                    break;
+                }
+                out.put(index, new Rec(term, data));
+            }
+        }
+        return out;
     }
 
     private NavigableMap<Long, Rec> log(GroupId group) throws IOException {
@@ -63,7 +142,9 @@ public final class FileLogStorage implements LogStorage {
             var loaded = new ConcurrentSkipListMap<Long, Rec>();
             var path = path(group);
             Files.deleteIfExists(rewritePath(group));
-            if (Files.exists(path) && Files.size(path) > 0) {
+            if (rolling()) {
+                loadRolling(group, loaded);
+            } else if (Files.exists(path) && Files.size(path) > 0) {
                 try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
                     var header = ByteBuffer.allocate(20);
                     while (in.position() < in.size()) {
@@ -122,6 +203,7 @@ public final class FileLogStorage implements LogStorage {
                 channel.write(header);
             }
             log.put(index, new Rec(term, copy));
+            maybeRoll(group, channel, log, index);
         } finally {
             lock.unlock();
         }
@@ -164,12 +246,57 @@ public final class FileLogStorage implements LogStorage {
 
     @Override
     public void truncateSuffix(GroupId group, long fromIndex) throws IOException {
-        rewrite(group, log(group).headMap(fromIndex, false));
+        var log = log(group);
+        if (!rolling()) {
+            rewrite(group, log.headMap(fromIndex, false));
+            return;
+        }
+        lock.lock();
+        try {
+            // Every kept entry into one new active file first; the sealed files go only after the rename.
+            rewrite(group, log.headMap(fromIndex, false));
+            var tracked = sealed.remove(group);
+            sealed.put(group, new java.util.TreeMap<>());
+            if (tracked != null) {
+                for (var s : tracked.values()) {
+                    Files.deleteIfExists(s.path);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
     }
 
     @Override
     public void truncatePrefix(GroupId group, long throughIndex) throws IOException {
-        rewrite(group, log(group).tailMap(throughIndex, false));
+        var log = log(group);
+        if (!rolling()) {
+            rewrite(group, log.tailMap(throughIndex, false));
+            return;
+        }
+        var drop = new java.util.ArrayList<Path>();
+        lock.lock();
+        try {
+            checkUsable();
+            logs.get(group).headMap(throughIndex, true).clear(); // the current map: a suffix rewrite may have swapped it
+            var tracked = sealed.get(group);
+            if (tracked != null) {
+                var it = tracked.values().iterator();
+                while (it.hasNext()) {
+                    var s = it.next();
+                    if (s.last > throughIndex) {
+                        break;
+                    }
+                    drop.add(s.path);
+                    it.remove();
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+        for (var p : drop) { // outside the lock: unlinking a large file is not free
+            Files.deleteIfExists(p);
+        }
     }
 
     /**
@@ -246,6 +373,112 @@ public final class FileLogStorage implements LogStorage {
         var failed = failedClosed;
         if (failed != null) {
             throw new IOException(failed.getMessage(), failed);
+        }
+    }
+
+    /**
+     * Rolling mode load: sealed files in first-index order, then the active file, which is authoritative from its first
+     * index on (a suffix truncation rewrote it before deleting sealed files). Keeps only the contiguous run of indexes
+     * ending at the newest entry; sealed files left with nothing in that run are deleted.
+     */
+    private void loadRolling(GroupId group, NavigableMap<Long, Rec> loaded) throws IOException {
+        var files = new java.util.TreeMap<Long, Path>();
+        var prefix = safe(group) + ".";
+        try (var list = Files.list(root)) {
+            for (var p : (Iterable<Path>) list::iterator) {
+                var name = p.getFileName().toString();
+                if (name.startsWith(prefix) && name.endsWith(".seg")) {
+                    var digits = name.substring(prefix.length(), name.length() - 4);
+                    if (digits.length() == 20 && digits.chars().allMatch(Character::isDigit)) {
+                        files.put(Long.parseLong(digits), p);
+                    }
+                }
+            }
+        }
+        var ranges = new java.util.TreeMap<Long, long[]>();
+        for (var f : files.entrySet()) {
+            var recs = readRecords(f.getValue());
+            if (!recs.isEmpty()) {
+                ranges.put(f.getKey(), new long[] {recs.firstKey(), recs.lastKey()});
+                loaded.putAll(recs);
+            }
+        }
+        var active = readRecords(path(group));
+        if (!active.isEmpty()) {
+            loaded.tailMap(active.firstKey(), true).clear();
+            loaded.putAll(active);
+        }
+        if (!loaded.isEmpty()) {
+            long expect = loaded.lastKey();
+            long keepFrom = expect;
+            for (long k : loaded.descendingKeySet()) {
+                if (k != expect) {
+                    break;
+                }
+                keepFrom = k;
+                expect--;
+            }
+            loaded.headMap(keepFrom, false).clear();
+        }
+        var tracked = new java.util.TreeMap<Long, Sealed>();
+        long activeFirst = active.isEmpty() ? Long.MAX_VALUE : active.firstKey();
+        for (var f : files.entrySet()) {
+            var r = ranges.get(f.getKey());
+            if (r == null || r[0] >= activeFirst || loaded.isEmpty() || r[1] < loaded.firstKey()) {
+                Files.deleteIfExists(f.getValue());
+                continue;
+            }
+            tracked.put(r[0], new Sealed(f.getValue(), r[0], Math.min(r[1], activeFirst - 1)));
+        }
+        sealed.put(group, tracked);
+    }
+
+    /** Rolling mode, under the lock: seal the active file once it reached {@link #rollBytes}. */
+    private void maybeRoll(GroupId group, FileChannel channel, NavigableMap<Long, Rec> log, long lastIndex)
+            throws IOException {
+        if (!rolling() || channel.size() < rollBytes) {
+            return;
+        }
+        var tracked = sealed.computeIfAbsent(group, g -> new java.util.TreeMap<>());
+        long first = tracked.isEmpty() ? log.firstKey() : tracked.lastEntry().getValue().last + 1;
+        channel.force(true); // every byte of the sealed file is durable before force() stops covering it
+        channel.close();
+        var target = sealedPath(group, first);
+        Files.move(path(group), target, StandardCopyOption.ATOMIC_MOVE);
+        try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
+            dir.force(true);
+        }
+        tracked.put(first, new Sealed(target, first, lastIndex));
+        channels.put(group, FileChannel.open(path(group), StandardOpenOption.CREATE, StandardOpenOption.READ,
+                StandardOpenOption.WRITE));
+    }
+
+    /** Rolling mode: sealed files of {@code group} (tests, disk accounting). */
+    int sealedFiles(GroupId group) {
+        lock.lock();
+        try {
+            var t = sealed.get(group);
+            return t == null ? 0 : t.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Bytes on disk for {@code group}'s entries: the active file plus every sealed one (disk accounting, tests). */
+    public long entryBytes(GroupId group) throws IOException {
+        log(group);
+        lock.lock();
+        try {
+            long n = Files.exists(path(group)) ? Files.size(path(group)) : 0;
+            var t = sealed.get(group);
+            if (t != null) {
+                for (var s : t.values()) {
+                    n += Files.exists(s.path) ? Files.size(s.path) : 0;
+                }
+            }
+            return n;
+        } finally {
+            lock.unlock();
         }
     }
 
