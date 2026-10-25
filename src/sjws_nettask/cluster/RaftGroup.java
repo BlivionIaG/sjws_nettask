@@ -346,7 +346,7 @@ final class RaftGroup {
                 case PRE_VOTE_RESP -> onPreVoteResp(body, now, after);
                 case APPEND -> onAppend(from, body, now, after);
                 case APPEND_RESP -> onAppendResp(from, body, now, after);
-                case TIMEOUT_NOW -> onTimeoutNow(body, now, after);
+                case TIMEOUT_NOW -> onTimeoutNow(from, body, now, after);
                 case SNAP_CHUNK -> onSnapChunk(from, body, now, after);
                 case SNAP_RESP -> onSnapResp(from, body, now, after);
                 default -> {
@@ -928,16 +928,17 @@ final class RaftGroup {
 
     /**
      * A leadership transfer handed to us: campaign now. Acted on only when it can still belong to a live transfer
-     * (#255): sent by another voter, not older than our term, and, at our own term, only while we follow and the
-     * sender is the leader we know (or we know none yet). Only the leader of a term sends TIMEOUT_NOW in it, so at
+     * (#255): sent by another voter, which must be the peer the frame came from, not older than our term, and, at
+     * our own term, only while we follow and the sender is the leader we know (or we know none yet). Only the leader of a term sends TIMEOUT_NOW in it, so at
      * our term a leader or a candidate can only be looking at a stale or forged one. A higher term is adopted
      * first, as from any frame; the sender led that term and chose us. Anything else is dropped without a reply,
      * so a TIMEOUT_NOW left over from an old transfer can no longer make a sitting leader start an election.
      */
-    private void onTimeoutNow(ByteBuffer body, long now, List<Runnable> after) {
+    private void onTimeoutNow(NodeId from, ByteBuffer body, long now, List<Runnable> after) {
         long theirTerm = body.getLong();
         var sender = byWire.apply(body.getInt());
-        if (witness || theirTerm < term || sender == null || sender.equals(self) || !isVoter(sender)) {
+        if (witness || theirTerm < term || sender == null || sender.equals(self) || !isVoter(sender)
+                || (from != null && !from.equals(sender))) { // the body's sender must be the peer it came from
             return;
         }
         if (theirTerm > term) {

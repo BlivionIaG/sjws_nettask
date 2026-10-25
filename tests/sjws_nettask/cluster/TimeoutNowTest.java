@@ -114,6 +114,7 @@ class TimeoutNowTest {
         group.handle(N3, timeoutNow(3, N3), clock.nanoTime()); // not the leader we follow
         group.handle(N2, timeoutNow(3, new NodeId(9, "n9")), clock.nanoTime()); // not a voter
         group.handle(N2, timeoutNow(3, N1), clock.nanoTime()); // claims to come from us
+        group.handle(N3, timeoutNow(3, N2), clock.nanoTime()); // from n3, claiming to be n2: the body lies
         assertEquals(3L, group.facade().term());
         assertFalse(group.campaigning());
         assertTrue(typesSent().isEmpty(), "every one of them ignored: " + typesSent());
@@ -123,6 +124,19 @@ class TimeoutNowTest {
         assertEquals(4L, group.facade().term());
         assertEquals(List.of(RaftGroup.VOTE, RaftGroup.VOTE), typesSent(), "a real election, no pre-vote");
         assertEquals(4L, ByteBuffer.wrap(sent.get(0).body()).getLong());
+    }
+
+    @Test
+    void aTimeoutNowWhoseBodyNamesAnotherPeerThanItsSenderIsIgnored() throws Exception {
+        group = node(new MemoryLogStorage());
+        group.handle(N2, append(3, N2), clock.nanoTime()); // follower of n2 in term 3
+        sent.clear();
+        group.handle(N3, timeoutNow(3, N2), clock.nanoTime()); // arrives from n3, claims to be the leader n2
+        group.handle(N3, timeoutNow(4, N2), clock.nanoTime()); // nor can a spoofed one raise our term
+        assertEquals(3L, group.facade().term());
+        assertFalse(group.campaigning());
+        assertEquals(Optional.of(N2), group.facade().leader());
+        assertTrue(typesSent().isEmpty(), typesSent().toString());
     }
 
     @Test
