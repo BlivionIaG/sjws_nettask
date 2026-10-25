@@ -346,7 +346,7 @@ final class RaftGroup {
                 case PRE_VOTE_RESP -> onPreVoteResp(body, now, after);
                 case APPEND -> onAppend(from, body, now, after);
                 case APPEND_RESP -> onAppendResp(from, body, now, after);
-                case TIMEOUT_NOW -> onTimeoutNow(body, now, after);
+                case TIMEOUT_NOW -> onTimeoutNow(from, body, now, after);
                 case SNAP_CHUNK -> onSnapChunk(from, body, now, after);
                 case SNAP_RESP -> onSnapResp(from, body, now, after);
                 default -> {
@@ -533,6 +533,12 @@ final class RaftGroup {
     }
 
     /**
+     * Set once by {@link #closeGroup()}, under {@link #lock}: the node closed. A closed group ignores ticks and frames,
+     * never campaigns (so it can never be elected again) and refuses new appends with {@link GroupClosedException}.
+     */
+    private boolean closed;
+
+    /**
      * Undo a leader batch from {@code first} on after a storage failure, so it is all-or-nothing. The rollback is
      * a {@link LogStorage#truncateSuffix}, which on {@link FileLogStorage} rewrites the kept records from memory
      * through a temp file, fsync, rename and directory fsync: it also drops any torn bytes the failed write left
@@ -544,12 +550,6 @@ final class RaftGroup {
      * (retry with its own dedup key). A batch rolled back cleanly fails with the storage error itself: nothing of it
      * is in the log, a refusal.
      */
-    /**
-     * Set once by {@link #closeGroup()}, under {@link #lock}: the node closed. A closed group ignores ticks and frames,
-     * never campaigns (so it can never be elected again) and refuses new appends with {@link GroupClosedException}.
-     */
-    private boolean closed;
-
     private Throwable rollBackBatch(long first, RuntimeException failed, List<Runnable> after) {
         var log = System.getLogger(RaftGroup.class.getName());
         try {
@@ -615,7 +615,10 @@ final class RaftGroup {
             return; // a closed node never campaigns, so it is never elected again (#254)
         }
         if (role == Role.LEADER) {
-            failPendingWrites(after); // onTimeoutNow does not check the sender's term: a stale one reaches a leader
+            // No caller campaigns as leader since #255 (tick and pre-vote only run off-leader, onTimeoutNow ignores
+            // a leader). Kept so a future caller still leaves leadership through the shared same-term demotion
+            // first: pending writes fail, leader is cleared and listeners hear it, even if the write below fails.
+            stepDown(term, after);
         }
         if (!saveHardState(term + 1, self)) {
             // Nothing changed in memory and nothing is sent; retry after a fresh timeout.
@@ -923,15 +926,27 @@ final class RaftGroup {
         }
     }
 
-    private void onTimeoutNow(ByteBuffer body, long now, List<Runnable> after) {
+    /**
+     * A leadership transfer handed to us: campaign now. Acted on only when it can still belong to a live transfer
+     * (#255): sent by another voter, which must be the peer the frame came from, not older than our term, and, at
+     * our own term, only while we follow and the sender is the leader we know (or we know none yet). Only the leader of a term sends TIMEOUT_NOW in it, so at
+     * our term a leader or a candidate can only be looking at a stale or forged one. A higher term is adopted
+     * first, as from any frame; the sender led that term and chose us. Anything else is dropped without a reply,
+     * so a TIMEOUT_NOW left over from an old transfer can no longer make a sitting leader start an election.
+     */
+    private void onTimeoutNow(NodeId from, ByteBuffer body, long now, List<Runnable> after) {
         long theirTerm = body.getLong();
-        if (witness) {
+        var sender = byWire.apply(body.getInt());
+        if (witness || theirTerm < term || sender == null || sender.equals(self) || !isVoter(sender)
+                || (from != null && !from.equals(sender))) { // the body's sender must be the peer it came from
             return;
         }
         if (theirTerm > term) {
             if (!stepDown(theirTerm, after)) {
                 return;
             }
+        } else if (role == Role.LEADER || role == Role.CANDIDATE || (leader != null && !leader.equals(sender))) {
+            return;
         }
         electionDeadline = now;
         startElection(now, after);
@@ -1561,10 +1576,18 @@ final class RaftGroup {
                         + " and sending nothing" + suppressed);
     }
 
-    /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
+    /**
+     * False when a higher term could not be made durable: term and vote are unchanged and the caller sends nothing.
+     * A leader or candidate in that case still steps down, at its own term (no write needed): it knows a later term
+     * exists, so a leader must stop reporting itself as leader and stop acking, and a candidate must not go on to
+     * win its stale term (#255). A leader's pending writes fail as outcome unknown.
+     */
     private boolean stepDown(long newTerm, List<Runnable> after) {
         if (newTerm > term && !saveHardState(newTerm, null)) {
             warnPersistFailed(newTerm);
+            if (role == Role.LEADER || role == Role.CANDIDATE) {
+                stepDown(term, after);
+            }
             return false;
         }
         boolean wasLeader = role == Role.LEADER;
@@ -1635,13 +1658,6 @@ final class RaftGroup {
     }
 
     /**
-     * {@link ReplicatedNode#close()}, after the Raft thread stopped and this group's deliveries closed: a permanent
-     * step-down (#254). It goes through the shared {@link #failPendingWrites} path, so pending appends and a pending
-     * membership change fail with {@link OutcomeUnknownException} (they are in the log) and waiting read barriers with
-     * {@link NotLeaderException}. Afterwards the group ignores ticks and frames and never campaigns, so it is never
-     * elected again; appends are refused with {@link GroupClosedException} (nothing appended). Idempotent.
-     */
-    /**
      * First step of {@link ReplicatedNode#close()}, before it waits for the Raft thread: from here the group never
      * campaigns, votes, acks or accepts an append, even if that thread is still running a tick (#254). Idempotent.
      */
@@ -1656,6 +1672,13 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * {@link ReplicatedNode#close()}, after the Raft thread stopped and this group's deliveries closed: a permanent
+     * step-down (#254). It goes through the shared {@link #failPendingWrites} path, so pending appends and a pending
+     * membership change fail with {@link OutcomeUnknownException} (they are in the log) and waiting read barriers with
+     * {@link NotLeaderException}. Afterwards the group ignores ticks and frames and never campaigns, so it is never
+     * elected again; appends are refused with {@link GroupClosedException} (nothing appended). Idempotent.
+     */
     void closeGroup() {
         var after = new ArrayList<Runnable>();
         lock.lock();
