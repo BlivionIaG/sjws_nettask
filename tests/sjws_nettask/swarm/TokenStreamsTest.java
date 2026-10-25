@@ -266,21 +266,45 @@ class TokenStreamsTest {
         this.streams = this.swarm.enableStreams(new TokenStreams.Config(2, 4, 2));
         var cid = submit(id(5));
         var t = claim(30_000);
+        var shard = this.swarm.topics().partitionWithoutDlq(this.streams.topicFor(42, 5));
         try (var sink = this.streams.open(cid)) {
+            // #234: the shard reader re-offers every ledger copy the sink lacks, on its own thread; each step waits until
+            // it has acked the shard, so its offers land at a known point (CI #248: seq 2 was re-offered after drain)
             for (int i = 0; i < 4; i++) {
                 this.swarm.tasks().streamChunk(t, 9, 10 + i, new StreamChunk(42, 5, i, 0, new byte[] {(byte) i}));
             }
-            assertEquals(2, this.streams.sinkDrops());
-            assertEquals(2, sink.drain().size());
+            awaitShardRead(shard);
+            assertEquals(4, this.streams.sinkDrops(), "seq 2 and 3 refused twice: the local push and the ledger copy");
+            assertEquals(java.util.List.of(0L, 1L), sink.drain().stream().map(StreamChunk::chunkSeq).toList());
             this.swarm.tasks().streamChunk(t, 9, 20, new StreamChunk(42, 5, 9, 0, new byte[0])); // beyond window: dropped
-            assertEquals(3, this.streams.sinkDrops());
+            awaitShardRead(shard);
+            assertEquals(6, this.streams.sinkDrops(), "seq 9 overflows the window on both paths");
             this.swarm.tasks().streamLast(t, 9, 21, new StreamChunk(42, 5, 1, Frame.LAST, new byte[0]), "x", new byte[0])
                     .get(5, TimeUnit.SECONDS);
-            assertEquals(1, sink.conflicts(), "LAST at a delivered seq");
-            assertNull(sink.poll(1, TimeUnit.MILLISECONDS));
+            awaitShardRead(shard);
+            assertEquals(1, sink.conflicts(), "LAST at a delivered seq; its ledger copy is a known seq, skipped");
+            assertNull(sink.poll0());
+            assertTrue(sink.dropped());
         }
         int s = TokenStream.shardOf(42, 5, 2);
         assertEquals("stream.n1#" + s, this.streams.topicFor(42, 5));
+    }
+
+    /**
+     * Waits until the shard reader has acked every chunk produced so far on {@code shard} (none enqueued or leased to
+     * its group); it acks a batch only after offering each chunk, so all its sink offers are done.
+     */
+    static void awaitShardRead(sjws_nettask.messaging.delivery.Partition shard) throws InterruptedException {
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (true) {
+            var c = shard.counts();
+            var g = c.groups().get(TokenStreams.READER_GROUP).counts();
+            if (g.enqueued() == 0 && g.inFlight() == 0) {
+                return;
+            }
+            assertTrue(System.nanoTime() < until, "shard reader did not catch up: " + c);
+            Thread.sleep(1);
+        }
     }
 
     @Test

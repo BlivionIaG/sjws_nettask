@@ -236,15 +236,26 @@ public class SwarmBench {
             keeper.start(5_000); // spread: one batched extend of LeaseKeeper.SLICE leases every 50 ms
         }
         var body = new byte[1024];
+        // There is no in-bench warmup knob: a gate that needs a longer warmup cuts it from persec. Fail closed if set.
+        if (System.getProperty("sjws.bench.hbWarmup") != null) throw new IllegalArgumentException("sjws.bench.hbWarmup is not supported: cut the warmup from persec");
         long warmEnd = System.nanoTime() + 2_000_000_000L, end = warmEnd + (long) (secs * 1e9);
         long done = 0, seq = 0;
+        // Opt-in (-Dsjws.bench.persec=true): completions per wall-clock second from the start of the 2 s warmup
+        // (s0-1 = warmup), so a gate can use a robust per-second estimator instead of the single mean (#234).
+        long t0 = warmEnd - 2_000_000_000L;
+        long[] perSec = Boolean.getBoolean("sjws.bench.persec") ? new long[(int) (secs + 3)] : null;
         while (true) {
             long now = System.nanoTime();
             if (now > end) break;
             t.submit("p", 1, ++seq, env(body));
             for (Task task : t.claim("p", "w", 1, 30_000)) t.ack(task);
             if (now >= warmEnd) done++;
+            if (perSec != null) {
+                int b = (int) ((now - t0) / 1_000_000_000L);
+                if (b < perSec.length) perSec[b]++;
+            }
         }
+        if (perSec != null) System.out.println("persec=" + Arrays.toString(perSec).replace(" ", ""));
         stop.set(true);
         String tick = "";
         if (keeper != null) {
