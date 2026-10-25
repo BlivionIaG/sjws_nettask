@@ -132,10 +132,12 @@ public final class PeerLink implements AutoCloseable {
         public static Problem of(Outcome outcome) {
             return switch (outcome) {
                 case APPENDED, DUPLICATE -> null;
-                // applied-not-durable, no answer in the budget, or past the owner's dedup window: may have landed
-                case OUTCOME_UNKNOWN, TIMEOUT, TOO_OLD -> new Problem(503, OUTCOME_UNKNOWN_TYPE, false);
+                // applied-not-durable, no answer in the budget, past the owner's dedup window, or the owner lost
+                // state it had acknowledged (a pending write may have been applied, even delivered, before that):
+                // may have landed
+                case OUTCOME_UNKNOWN, TIMEOUT, TOO_OLD, LOST -> new Problem(503, OUTCOME_UNKNOWN_TYPE, false);
                 // nothing landed and a later attempt can succeed (OUT_OF_ORDER only surfaces once rewinds ran out)
-                case FAILED, BUSY, UNAVAILABLE, LOST, OUT_OF_ORDER -> new Problem(503, NOT_APPENDED_TYPE, true);
+                case FAILED, BUSY, UNAVAILABLE, OUT_OF_ORDER -> new Problem(503, NOT_APPENDED_TYPE, true);
                 // the owner will never take this write here (topic not served to this node, or over the size limit)
                 case FORBIDDEN -> new Problem(400, NOT_APPENDED_TYPE, false);
             };
@@ -303,6 +305,7 @@ public final class PeerLink implements AutoCloseable {
                 }
                 p = new Pending(stream.nextSeq++, payload, durability, deadline);
                 p.round = stream.round;
+                p.copies = 1; // the inline send below; a rewind before it makes this 2
                 stream.pending.put(p.seq, p);
                 if (stream.pending.size() == 1) {
                     stream.progressNanos = now;
@@ -351,6 +354,7 @@ public final class PeerLink implements AutoCloseable {
 
     /** False when the transport dropped the frame (inline sends only report it; queued sends fail on timeout). */
     private boolean send(Stream stream, Pending p, boolean inline) {
+        p.handed = true; // before the transport call: close() then sees it (both sides are volatile)
         var body = ByteBuffer.allocate(PRODUCE_HEADER + p.payload.length).putLong(stream.producerId).putLong(p.seq)
                 .put((byte) (p.durability == null ? 0 : p.durability.ordinal() + 1)).put(p.payload).array();
         var frame = new SimTransport.Frame(new GroupId(stream.topic), PRODUCE, body);
@@ -387,6 +391,8 @@ public final class PeerLink implements AutoCloseable {
             answeredBy.success();
         }
         List<Pending> failed = null;
+        long refusedAt = -1;
+        boolean definite = false;
         stream.lock.lock();
         try {
             var p = stream.pending.get(seq);
@@ -395,6 +401,7 @@ public final class PeerLink implements AutoCloseable {
                     if (p != null) {
                         stream.pending.remove(seq);
                         stream.progressNanos = System.nanoTime();
+                        stream.busy = 0; // progress: the next BUSY backs off from the start again
                         p.future.complete(new Result(outcome, offset));
                     }
                 }
@@ -414,9 +421,19 @@ public final class PeerLink implements AutoCloseable {
                         stream.round++; // later answers of this round are stale; the ticker resends
                     }
                 }
+                case FAILED, FORBIDDEN -> {
+                    // B2: a refusal says "not applied" only for a copy of the current round. A stale one (a resend
+                    // is scheduled, p.round behind) is ignored: the resend's answer or the deadline decides.
+                    if (p != null && p.round == stream.round) {
+                        refusedAt = seq;
+                        definite = p.copies == 1; // no other copy of seq ever went out that the owner might apply
+                        failed = retire(stream);
+                    }
+                }
                 default -> {
                     if (p != null) {
-                        // TOO_OLD, FORBIDDEN, FAILED, OUTCOME_UNKNOWN: retire; everything behind gets the same answer
+                        // TOO_OLD, OUTCOME_UNKNOWN: retire; seq gets its answer, every other pending write is unknown
+                        refusedAt = seq;
                         failed = retire(stream);
                     }
                 }
@@ -426,9 +443,24 @@ public final class PeerLink implements AutoCloseable {
         }
         if (failed != null) {
             for (var f : failed) {
-                f.future.complete(new Result(outcome, -1));
+                f.future.complete(new Result(retiredAs(outcome, refusedAt, definite, f.seq), -1));
             }
         }
+    }
+
+    /**
+     * B2: what a pending write gets when its stream retires on {@code outcome} for {@code at}. A write below
+     * {@code at} may be applied and only waiting for durability (the owner answers those later), and so may any
+     * write when the refusal is not definite: OUTCOME_UNKNOWN. A definite refusal leaves {@code at} and everything
+     * after it unapplied, since the owner applies strictly in seq order. LOST ({@code at} = -1) keeps LOST, which is
+     * outcome-unknown at the edge.
+     */
+    static Outcome retiredAs(Outcome outcome, long at, boolean definite, long seq) {
+        return switch (outcome) {
+            case FAILED, FORBIDDEN -> definite && seq >= at ? outcome : Outcome.OUTCOME_UNKNOWN;
+            case LOST -> Outcome.LOST;
+            default -> seq == at ? outcome : Outcome.OUTCOME_UNKNOWN;
+        };
     }
 
     /** Lock held. Resends every unanswered write in seq order, as one new round. */
@@ -437,6 +469,7 @@ public final class PeerLink implements AutoCloseable {
         rewinds.incrementAndGet();
         for (var p : stream.pending.values()) {
             p.round = stream.round;
+            p.copies++;
             resent.incrementAndGet();
             send(stream, p, false); // reader or ticker thread: never block on a socket
         }
@@ -652,7 +685,8 @@ public final class PeerLink implements AutoCloseable {
                 stream.lock.unlock();
             }
             for (var f : failed) {
-                f.future.complete(new Result(Outcome.UNAVAILABLE, -1));
+                // B2: a write already handed to the transport may reach the owner and be applied
+                f.future.complete(new Result(f.handed ? Outcome.OUTCOME_UNKNOWN : Outcome.UNAVAILABLE, -1));
             }
         }
     }
@@ -667,6 +701,10 @@ public final class PeerLink implements AutoCloseable {
         final long deadlineNanos;
         final CompletableFuture<Result> future = new CompletableFuture<>();
         long round;
+        /** Copies sent or scheduled to send (lock held): a refusal proves "not applied" only when it is 1. */
+        int copies;
+        /** Set just before any copy is handed to the transport: close() may answer UNAVAILABLE only while false. */
+        volatile boolean handed;
 
         Pending(long seq, byte[] payload, Durability durability, long deadlineNanos) {
             this.seq = seq;

@@ -883,6 +883,127 @@ class PeerLinkTest {
         assertTrue(System.nanoTime() - t0 < 30_000_000_000L);
     }
 
+    // ---- HA re-review of #251 at 6278107, B2: a write that may be applied is never "not appended" ----
+
+    /** A scripted owner "a": {@code script} sees each PRODUCE (copy number per seq from 1) and may answer. */
+    interface Script {
+        /** The answers to send, in order; empty for none. */
+        List<Outcome> answer(long seq, int copy);
+    }
+
+    void scripted(String map, Script script) throws IOException {
+        var config = PeerConfig.parse(map, "a");
+        var raw = TcpTransport.open(config.self().id(), config.members(), KEY, sjws_nettask.cluster.Clock.SYSTEM, 64,
+                TcpTransport.SocketFactory.PLAIN, PeerLink.DOMAIN, true);
+        open.add(raw);
+        var rpc = new sjws_nettask.cluster.ClusterRpc[1];
+        var copies = new ConcurrentHashMap<Long, Integer>();
+        rpc[0] = raw.attach(config.self().id(), (from, f) -> {
+            if (f.type() != PeerLink.PRODUCE) {
+                return;
+            }
+            var in = java.nio.ByteBuffer.wrap(f.body());
+            long producerId = in.getLong();
+            long seq = in.getLong();
+            int copy = copies.merge(seq, 1, Integer::sum);
+            for (var code : script.answer(seq, copy)) {
+                var ack = java.nio.ByteBuffer.allocate(33).putLong(producerId).putLong(seq).put((byte) code.ordinal())
+                        .putLong(code == Outcome.APPENDED ? seq - 1 : -1).putLong(0).array();
+                rpc[0].send(from, new sjws_nettask.cluster.SimTransport.Frame(f.group(), PeerLink.ACK, ack));
+            }
+        });
+    }
+
+    @Test
+    void aRefusalOfALaterSeqLeavesAnEarlierWriteStillWaitingOnDurabilityUnknown() throws Exception {
+        var map = map(2);
+        // seq 1 is applied and waits on durability (no answer yet); seq 2 is refused at once
+        scripted(map, (seq, copy) -> seq == 2 ? List.of(Outcome.FAILED) : List.of());
+        var slow = new PeerLink.Limits(256, 2048, 1024, 3_600_000L, 5_000, 1 << 20, 1024, 5, 300);
+        var b = link(map, "b", TcpTransport.SocketFactory.PLAIN, PeerLink.Owner.NONE, slow);
+        var first = b.produce("a", "fwd.t", b("1"), Durability.GROUP, 10_000);
+        var second = b.produce("a", "fwd.t", b("2"), Durability.GROUP, 10_000);
+        assertEquals(Outcome.FAILED, get(second).outcome(), "the refused write itself is not appended");
+        var r = get(first);
+        assertEquals(Outcome.OUTCOME_UNKNOWN, r.outcome(), "an earlier write may be applied: never not-appended");
+        assertEquals(PeerLink.Problem.OUTCOME_UNKNOWN_TYPE, r.problem().type());
+    }
+
+    @Test
+    void aRefusalFromAStaleRoundIsIgnored() throws Exception {
+        var map = map(2);
+        // copy 1 of seq 1 is answered BUSY (its round is now stale) and then FAILED; copy 2, the resend, is APPENDED
+        scripted(map, (seq, copy) -> copy == 1 ? List.of(Outcome.BUSY, Outcome.FAILED) : List.of(Outcome.APPENDED));
+        var b = link(map, "b", TcpTransport.SocketFactory.PLAIN, PeerLink.Owner.NONE, FAST);
+        var r = get(b.produce("a", "fwd.t", b("1"), Durability.NONE, 10_000));
+        assertEquals(Outcome.APPENDED, r.outcome(), "a stale-round refusal does not retire the write");
+        assertEquals(1, b.answered(Outcome.FAILED), "the stale refusal arrived and was ignored");
+    }
+
+    @Test
+    void aRefusalOfAWriteResentAfterATimeoutIsUnknownNotRefused() throws Exception {
+        var map = map(2);
+        // copy 1 of seq 1 is never answered (it may still be applied); copy 2, sent after the progress timeout,
+        // is refused: that refusal cannot speak for copy 1
+        scripted(map, (seq, copy) -> copy == 1 ? List.of() : List.of(Outcome.FAILED));
+        var b = link(map, "b", TcpTransport.SocketFactory.PLAIN, PeerLink.Owner.NONE, FAST);
+        var r = get(b.produce("a", "fwd.t", b("1"), Durability.NONE, 10_000));
+        assertEquals(Outcome.OUTCOME_UNKNOWN, r.outcome());
+        assertTrue(b.rewinds.get() >= 1);
+    }
+
+    @Test
+    void closeAnswersWritesAlreadySentAsUnknownAndLaterWritesAsUnavailable() throws Exception {
+        var map = map(2);
+        var seen = new java.util.concurrent.atomic.AtomicInteger();
+        scripted(map, (seq, copy) -> {
+            seen.incrementAndGet();
+            return List.of(); // never answers: every write is on the wire, fate unknown
+        });
+        var b = PeerLink.open(PeerConfig.parse(map, "b"), KEY, TcpTransport.SocketFactory.PLAIN, PeerLink.Owner.NONE,
+                FAST);
+        var sent = List.of(b.produce("a", "fwd.t", b("1"), Durability.NONE, 30_000),
+                b.produce("a", "fwd.t", b("2"), Durability.NONE, 30_000));
+        await(() -> seen.get() >= 2, "both writes reached the owner");
+        b.close();
+        for (var f : sent) {
+            var r = get(f);
+            assertEquals(Outcome.OUTCOME_UNKNOWN, r.outcome(), "written to the socket: the owner may apply it");
+            assertEquals(PeerLink.Problem.OUTCOME_UNKNOWN_TYPE, r.problem().type());
+        }
+        var after = get(b.produce("a", "fwd.t", b("3"), Durability.NONE, 1_000));
+        assertEquals(Outcome.UNAVAILABLE, after.outcome(), "never sent: not appended");
+    }
+
+    @Test
+    void retiredWritesAreNotAppendedOnlyAtOrAfterADefiniteRefusal() {
+        assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.retiredAs(Outcome.FAILED, 5, true, 4));
+        assertEquals(Outcome.FAILED, PeerLink.retiredAs(Outcome.FAILED, 5, true, 5));
+        assertEquals(Outcome.FAILED, PeerLink.retiredAs(Outcome.FAILED, 5, true, 6));
+        assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.retiredAs(Outcome.FAILED, 5, false, 5));
+        assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.retiredAs(Outcome.FORBIDDEN, 5, false, 6));
+        assertEquals(Outcome.TOO_OLD, PeerLink.retiredAs(Outcome.TOO_OLD, 5, false, 5));
+        assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.retiredAs(Outcome.TOO_OLD, 5, false, 6));
+        assertEquals(Outcome.LOST, PeerLink.retiredAs(Outcome.LOST, -1, false, 7));
+    }
+
+    @Test
+    void aFailedInlineWriteIsResentAfterAShortBackoffNotTheRequestTimeout() throws Exception {
+        var map = map(2);
+        var cutter = new Cutter();
+        link(map, "a", TcpTransport.SocketFactory.PLAIN, owner("a"), FAST);
+        var slow = new PeerLink.Limits(256, 2048, 1024, 3_600_000L, 5_000, 1 << 20, 1024, 5, 300);
+        var b = link(map, "b", cutter, PeerLink.Owner.NONE, slow);
+        assertTrue(get(b.produce("a", "fwd.t", b("0"), Durability.NONE, 10_000)).ok()); // connected, idle
+        cutter.cut(); // the next inline write hits a closed socket
+        long t0 = System.nanoTime();
+        var r = get(b.produce("a", "fwd.t", b("1"), Durability.NONE, 10_000));
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        assertTrue(r.ok(), String.valueOf(r));
+        assertTrue(b.inlineFailures.get() >= 1, "the inline write failed and was counted");
+        assertTrue(ms < 2_000, "resent after a short backoff, not requestTimeoutMs (5 s): " + ms + " ms");
+    }
+
     static final class Cutter implements TcpTransport.SocketFactory {
         private final List<Socket> sockets = new CopyOnWriteArrayList<>();
 

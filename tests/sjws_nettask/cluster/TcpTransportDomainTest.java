@@ -470,7 +470,21 @@ class TcpTransportDomainTest {
         var deaf = new Deaf();
         open.add(deaf);
         var m = withDeafPeer(deaf);
-        var a = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 4096, TcpTransport.SocketFactory.PLAIN,
+        var tinySend = new TcpTransport.SocketFactory() {
+            @Override
+            public ServerSocket listen(InetSocketAddress bind) throws IOException {
+                return TcpTransport.SocketFactory.PLAIN.listen(bind);
+            }
+
+            @Override
+            public Socket connect(InetSocketAddress to) throws IOException {
+                var s = new Socket();
+                s.setSendBufferSize(4096); // the frame cannot hide in the kernel: the write blocks on the reader
+                s.connect(to, 2_000);
+                return s;
+            }
+        };
+        var a = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 4096, tinySend,
                 BIG.withWriteStallMillis(200), true));
         a.attach(m.get(0).id(), (from, f) -> { });
         var to = m.get(1).id();
@@ -541,5 +555,65 @@ class TcpTransportDomainTest {
         }
         await(() -> got.size() == 101, "frames still flow");
         assertTrue(a.inlineWrites() >= 100, "inline path still taken: " + a.inlineWrites());
+    }
+
+    @Test
+    void aLargeFrameOnASlowButMovingLinkIsNotCutByTheStallBound() throws Exception {
+        // the peer drains 32 KiB every 20 ms (about 1.6 MB/s): a 1 MiB frame takes ~0.65 s, over the 200 ms bound,
+        // but every 64 KiB chunk progresses well inside it
+        var server = new ServerSocket();
+        server.setReceiveBufferSize(4096);
+        server.bind(new InetSocketAddress("127.0.0.1", 0));
+        open.add(server);
+        var drained = new AtomicLong();
+        Thread.ofPlatform().daemon().start(() -> {
+            try (var s = server.accept(); var in = s.getInputStream()) {
+                var buf = new byte[32 << 10];
+                long sinceNap = 0;
+                while (true) {
+                    int n = in.read(buf);
+                    if (n <= 0) {
+                        return;
+                    }
+                    drained.addAndGet(n);
+                    if ((sinceNap += n) >= buf.length) {
+                        sinceNap = 0;
+                        Thread.sleep(20);
+                    }
+                }
+            } catch (IOException | InterruptedException done) {
+                // closed
+            }
+        });
+        var m = new ArrayList<>(members(2));
+        var old = m.get(1);
+        m.set(1, new Member(old.id(), old.site(), new InetSocketAddress("127.0.0.1", server.getLocalPort()),
+                old.incarnation(), old.state(), old.witness()));
+        var tinySend = new TcpTransport.SocketFactory() {
+            @Override
+            public ServerSocket listen(InetSocketAddress bind) throws IOException {
+                return TcpTransport.SocketFactory.PLAIN.listen(bind);
+            }
+
+            @Override
+            public Socket connect(InetSocketAddress to) throws IOException {
+                var s = new Socket();
+                s.setSendBufferSize(4096); // the frame cannot hide in the kernel: the write blocks on the reader
+                s.connect(to, 2_000);
+                return s;
+            }
+        };
+        var a = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 4096, tinySend,
+                BIG.withWriteStallMillis(200), true));
+        a.attach(m.get(0).id(), (from, f) -> { });
+        var to = m.get(1).id();
+        a.sendNow(to, new SimTransport.Frame(G, 1, new byte[8])); // the writer connects
+        await(() -> drained.get() > 0, "connected");
+        Thread.sleep(100);
+        long t0 = System.nanoTime();
+        assertTrue(a.sendNow(to, new SimTransport.Frame(G, 1, new byte[(1 << 20) - 1024])), "written inline, not cut");
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        assertTrue(ms > 400, "the write really was slower than the stall bound: " + ms + " ms");
+        assertEquals(0, a.writeStalls(), "a moving write is never a stall (took " + ms + " ms)");
     }
 }

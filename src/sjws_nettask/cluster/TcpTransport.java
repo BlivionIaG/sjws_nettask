@@ -139,8 +139,8 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
      * @param maxFrameBytes largest frame accepted or sealed, at most {@link #MAX_FRAME_BYTES}; a longer length prefix
      *        is refused before any body byte is buffered
      * @param writeStallMillis direct transports only, 0 to disable: a socket write (inline or by the writer thread)
-     *        still blocked after this long closes that connection ({@link #writeStalls}), so a peer that stops
-     *        reading cannot hold a sender forever; socket writes have no timeout of their own
+     *        that makes no progress (64 KiB) for this long closes that connection ({@link #writeStalls}), so a peer
+     *        that stops reading cannot hold a sender forever; socket writes have no timeout of their own
      */
     public record Domain(String name, String label, String hkdfInfo, int maxFrameBytes, long writeStallMillis) {
         public static final Domain RAFT = new Domain("raft", "sjws-raft-frame\0", "sjws-raft-frame-v1", MAX_FRAME_BYTES);
@@ -967,6 +967,8 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
         // ---- direct transports only (#236): the caller may write inline when nothing is queued ----
         static final int WRITTEN = 0, NOT_IDLE = 1, FAILED = 2;
+        /** Bytes between write-progress stamps for the stall watchdog. */
+        static final int PROGRESS_CHUNK = 64 << 10;
         /** Guards {@link #out} and the frame MAC on a direct transport; sealing under it keeps seq order = wire order. */
         private final ReentrantLock io = new ReentrantLock();
         /** Frames offered to {@link #queue} and not yet written (or dropped) by the writer. */
@@ -1046,11 +1048,11 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
         /** {@link #io} held. Returns false when the frame was dropped with the connection (counted). */
         private boolean writeLocked(SimTransport.Frame frame, boolean flush) {
-            if (directMac == null) {
-                directMac = mac(currentKey);
-            }
             byte[] bytes;
             try {
+                if (directMac == null) {
+                    directMac = mac(currentKey);
+                }
                 bytes = seal(directMac, HeartbeatAuthenticator.KEY_CURRENT, peerId(), bootEpoch,
                         sendSeq.incrementAndGet(), frame);
             } catch (FrameTooLargeException unsealable) {
@@ -1058,6 +1060,12 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 sendDrops.incrementAndGet();
                 // N1: frames already buffered must not wait for a later send
                 return !flush || out == null || flushLocked();
+            } catch (RuntimeException unsealable) {
+                // N3: a failure building the MAC or sealing drops this frame only; the writer and connection live on
+                writerErrors.incrementAndGet();
+                sendDrops.incrementAndGet();
+                directMac = null;
+                return false;
             }
             try {
                 if (out == null) {
@@ -1079,7 +1087,14 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 }
                 writing(System.nanoTime());
                 out.writeInt(bytes.length);
-                out.write(bytes);
+                // The stall bound times lack of progress, not the frame: the stamp moves on with every chunk, so a
+                // large frame on a slow but moving link is not cut.
+                for (int off = 0; off < bytes.length; off += PROGRESS_CHUNK) {
+                    if (off > 0) {
+                        writing(System.nanoTime());
+                    }
+                    out.write(bytes, off, Math.min(PROGRESS_CHUNK, bytes.length - off));
+                }
                 if (flush) {
                     out.flush();
                 }

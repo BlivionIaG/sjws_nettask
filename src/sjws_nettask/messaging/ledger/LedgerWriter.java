@@ -296,10 +296,12 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             // sleeping out the fsync floor (an unpark per write would turn the floor into a wake-up per write).
             if ((durability == Durability.ASYNC && !flooring) || !fsyncWaiters.isEmpty()) unparkSyncer();
         } catch (IOException | RuntimeException e) {
-            // The in-memory tail may disagree with disk: fence the writer; reopening recovers.
-            failure = e;
+            // The in-memory tail may disagree with disk: fence the writer; reopening recovers. Fail the writes that
+            // were already accepted (applied by the caller, fate unknown) before new appends see the fence and are
+            // refused: their failures are then reported first (#251, a refusal must not overtake an unknown fate).
             g.forEach(p -> p.done.completeExceptionally(e));
             failWaiters(e);
+            failure = e;
         }
     }
 

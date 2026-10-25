@@ -37,12 +37,15 @@ peer (otherwise it queues behind the writer; seal order stays wire order). `prod
 the pending write under the stream lock, then releases the lock before sending, so a blocked socket write never
 holds a lock that `onAck` (reader threads) or the ticker needs. Two callers racing on one stream can then put their
 frames on the wire out of seq order; the owner answers `OUT_OF_ORDER` and go-back-N resends in order. Socket writes
-have no timeout of their own, so the peer domain sets a write-stall bound of `requestTimeoutMs`: a write still
-blocked after that closes the connection (`writeStalls`) and go-back-N resends. The close goes through the socket
+have no timeout of their own, so the peer domain sets a write-stall bound of `requestTimeoutMs`: a write that makes
+no progress for that long closes the connection (`writeStalls`) and go-back-N resends. Progress is timed per 64 KiB
+chunk, so a large frame on a slow but moving link is not cut. The watchdog aborts the connection it sampled, once;
+a reconnect gets a new connection that the old abort cannot touch. The close goes through the socket
 factory's abort handle: `PeerSockets` layers TLS over a plain socket and the transport closes that plain socket
 (linger 0), because an `SSLSocket`'s own `close()` waits for the TLS output lock the blocked writer holds. The
 watchdog hands each close to its own virtual thread, so no close can stop it bounding other peers. An inline write that fails is
-resent after a short backoff instead of after `requestTimeoutMs`.
+resent after a short backoff instead of after `requestTimeoutMs`. A failure to seal a frame (MAC) fails that send and
+drops the peer's MAC, not the writer.
 
 ## 3. Forwarded produce and dedup
 
@@ -61,11 +64,19 @@ keyed on **(authenticated origin, producerId)**, so a peer cannot collide with a
 | `FAILED` | The owner could not apply it (opening the partition failed, or its ledger writer refused it before apply); a fixed code, never the exception text. Not applied; retryable. |
 | `OUTCOME_UNKNOWN` | **Outcome unknown**: the owner applied the write but its durability failed afterwards (ledger writer failure), so it may or may not survive. Every write still pending behind it on the stream gets the same answer. Never reported as `FAILED`. |
 | `TIMEOUT` | **Outcome unknown**: no answer within the budget. The write may or may not have been applied; resending it as a new write can produce a second copy. |
-| `UNAVAILABLE` | Not sent: unknown peer, self, link closed, or the owner's breaker is open (5 timeouts, open 1 s). |
+| `UNAVAILABLE` | Not sent: unknown peer, self, link closed before the write reached the socket, or the owner's breaker is open (5 timeouts, open 1 s). A write already handed to the socket when the link closes is `OUTCOME_UNKNOWN`. |
 | `LOST` | The owner answered with an expected sequence below what it already acknowledged (it restarted without the stream's history). Writes after the acknowledged ones are lost; the next write starts a fresh stream. |
 
-Any failure retires the stream: all writes queued behind it fail with the same outcome and the next write starts a
-new stream at sequence 1, so a caller never sees a later write applied after an earlier one failed.
+Any failure retires the stream and the next write starts a new stream at sequence 1, so a caller never sees a later
+write applied after an earlier one failed. The other pending writes are answered by what can be proved about them.
+The owner applies strictly in seq order, so a refusal (`FAILED`, `FORBIDDEN`) of seq N proves nothing about seqs below
+N: they get `OUTCOME_UNKNOWN`. The refusal is definite, and N and the later pending writes get it, only when it
+answers the current round and exactly one copy of N was ever sent (the wire does not carry the round, so after a
+resend the refusal may answer an earlier copy while another copy was applied); otherwise every pending write is
+`OUTCOME_UNKNOWN`. A refusal from a stale round (a copy sent before a rewind) is ignored. `TOO_OLD` and
+`OUTCOME_UNKNOWN` go to their own seq; every other pending write is `OUTCOME_UNKNOWN`. On the owner, the ledger writer
+fails the group's writes before it fails the waiters behind them, so a refusal never overtakes an earlier
+outcome-unknown on the wire.
 
 **Client-facing mapping** (`PeerLink.Result.problem()`, #258's problem types), for the edge that will answer
 forwarded produces in a later step:
@@ -75,9 +86,11 @@ forwarded produces in a later step:
 | `APPENDED`, `DUPLICATE` | success |
 | `OUTCOME_UNKNOWN`, `TIMEOUT`, `TOO_OLD`, `LOST` | 503 `https://sjws.dev/problems/outcome-unknown`, not retryable as a new write; never a 307 |
 | `FAILED`, `BUSY`, `UNAVAILABLE`, `OUT_OF_ORDER` | 503 `https://sjws.dev/problems/not-appended`, retryable |
-
-`LOST` is outcome-unknown, not not-appended: the owner answered with an expected sequence below what it had acknowledged, so it lost state. A pending write may have been applied, and even delivered to a consumer, before that loss, and the owner can no longer prove it was not.
 | `FORBIDDEN` | 400 `https://sjws.dev/problems/not-appended` |
+
+`LOST` is outcome-unknown, not not-appended: the owner answered with an expected sequence below what it had
+acknowledged, so it lost state. A pending write may have been applied, and even delivered to a consumer, before that
+loss, and the owner can no longer prove it was not.
 
 No forwarded outcome is a not-leader: the forward hop has no leader, because the sender picks the owner. The
 forwarded partitions are single-owner delivery partitions (`Partition` with a local `LedgerWriter`), so Raft's
