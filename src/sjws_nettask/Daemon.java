@@ -303,7 +303,11 @@ final class Daemon {
         return new PrintStream(new FileOutputStream(file.toFile(), true), true, StandardCharsets.UTF_8);
     }
 
-    /** Points {@link System#out} and {@link System#err} at {@code log}. The child JVM does this. */
+    /**
+     * Points {@link System#out} and {@link System#err} at {@code log}. Only the detached child
+     * JVM does this, from {@link Sjws_nettask#main(String[])}. In-process callers pass their own
+     * streams and must not replace the JVM globals.
+     */
     static void redirectStandardStreams(PrintStream log) {
         System.setOut(log);
         System.setErr(log);

@@ -23,7 +23,10 @@ import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -43,9 +46,15 @@ import static java.nio.file.StandardOpenOption.WRITE;
  * </pre>
  *
  * The file should live on a local, trusted directory ({@code /run}, not an untrusted shared
- * folder): the open follows a last-moment symlink swap.
+ * folder): the open follows a last-moment symlink swap. A directory, fifo, device or other
+ * non-regular file is stale by type. Its {@code st_size} is a filesystem detail (4096 on ext4,
+ * 40 on tmpfs) and is never treated as a content length. The size cap applies only to regular
+ * files. {@link #claim} still refuses a symlink, and refuses any other non-regular path.
  */
 final class PidFile implements AutoCloseable {
+
+    /** Regular pid files longer than this are garbage. Not applied to directories or symlinks. */
+    private static final long MAX_BYTES = 512;
 
     /** What {@link #read(Path)} found. {@code startedMillis} is -1 when the file omitted it. */
     record Snapshot(boolean present, long pid, long startedMillis, boolean running) {
@@ -77,21 +86,26 @@ final class PidFile implements AutoCloseable {
         return pid + "\n" + startedMillis + "\n";
     }
 
-    /** @return a snapshot; a missing file is {@link Snapshot#ABSENT}, never an exception */
+    /**
+     * @return a snapshot; a missing file is {@link Snapshot#ABSENT}, never an exception.
+     *         Attributes are read with {@link LinkOption#NOFOLLOW_LINKS}. A symlink is then
+     *         classified by its target; a directory or other non-regular file is stale garbage
+     *         without being opened.
+     */
     static Snapshot read(Path path) {
-        String raw;
+        BasicFileAttributes self;
         try {
-            if (Files.notExists(path)) {
-                return Snapshot.ABSENT;
-            }
-            if (Files.size(path) > 512) {
-                return new Snapshot(true, -1, -1, false);
-            }
-            raw = Files.readString(path, StandardCharsets.UTF_8);
+            self = selfAttributes(path);
         } catch (IOException e) {
             return Snapshot.ABSENT;
         }
-        return parse(raw);
+        if (self.isSymbolicLink()) {
+            return readFollowed(path);
+        }
+        if (!self.isRegularFile()) {
+            return garbage();
+        }
+        return readRegular(path, self.size());
     }
 
     /**
@@ -99,10 +113,21 @@ final class PidFile implements AutoCloseable {
      * file) when a live owner already holds it or another claim in this JVM holds the lock.
      * A file that names this process but not this process's start time is stale: the pid was
      * recycled onto us, and the previous owner is gone because this call holds the lock.
+     * A symlink is refused without being followed. A directory or other non-regular file is
+     * refused without being opened.
      */
     static Claim claim(Path path) throws IOException {
-        if (Files.isSymbolicLink(path)) {
+        BasicFileAttributes self;
+        try {
+            self = selfAttributes(path);
+        } catch (NoSuchFileException e) {
+            self = null;
+        }
+        if (self != null && self.isSymbolicLink()) {
             throw new IOException("pid file is a symlink");
+        }
+        if (self != null && !self.isRegularFile()) {
+            throw new IOException("pid file is not a regular file");
         }
         var parent = path.toAbsolutePath().getParent();
         if (parent != null) {
@@ -151,10 +176,15 @@ final class PidFile implements AutoCloseable {
      * A server that claimed the file between the caller's read and this call keeps its file.
      */
     static void removeIfSame(Snapshot snap, Path path) throws IOException {
-        if (Files.notExists(path)) {
+        BasicFileAttributes self;
+        try {
+            self = selfAttributes(path);
+        } catch (NoSuchFileException e) {
             return;
         }
-        if (Files.isSymbolicLink(path) || Files.isDirectory(path)) {
+        // Do not open a directory, symlink, fifo or device: a fifo blocks, and a directory
+        // is unlinked only when it is empty.
+        if (self.isSymbolicLink() || !self.isRegularFile()) {
             if (sameOwner(snap, read(path))) {
                 Files.deleteIfExists(path);
             }
@@ -262,9 +292,44 @@ final class PidFile implements AutoCloseable {
         channel.force(true);
     }
 
+    private static BasicFileAttributes selfAttributes(Path path) throws IOException {
+        return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+    }
+
+    /** Stale garbage: the path exists, but it is not a pid this process may signal. */
+    private static Snapshot garbage() {
+        return new Snapshot(true, -1, -1, false);
+    }
+
+    /** Follow a symlink and classify the final target. A broken link is absent. */
+    private static Snapshot readFollowed(Path path) {
+        BasicFileAttributes target;
+        try {
+            target = Files.readAttributes(path, BasicFileAttributes.class);
+        } catch (IOException e) {
+            return Snapshot.ABSENT;
+        }
+        if (!target.isRegularFile()) {
+            return garbage();
+        }
+        return readRegular(path, target.size());
+    }
+
+    /** {@code size} is the regular file's length, never a directory's {@code st_size}. */
+    private static Snapshot readRegular(Path path, long size) {
+        if (size > MAX_BYTES) {
+            return garbage();
+        }
+        try {
+            return parse(Files.readString(path, StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            return Snapshot.ABSENT;
+        }
+    }
+
     private static String readChannel(FileChannel channel) throws IOException {
         channel.position(0);
-        int len = (int) Math.min(channel.size(), 512);
+        int len = (int) Math.min(channel.size(), MAX_BYTES);
         var buf = ByteBuffer.allocate(len);
         while (buf.hasRemaining()) {
             if (channel.read(buf) < 0) {
