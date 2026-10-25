@@ -96,6 +96,40 @@ class TcpTransportDomainTest {
     }
 
     @Test
+    void sendNowWritesInlineWhenIdleAndKeepsOrderWithQueuedFrames() throws Exception {
+        var m = members(2);
+        var got = new CopyOnWriteArrayList<Integer>();
+        var a = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 4096, TcpTransport.SocketFactory.PLAIN,
+                OTHER, true));
+        var b = start(TcpTransport.open(m.get(1).id(), m, KEY, Clock.SYSTEM, 8, TcpTransport.SocketFactory.PLAIN, OTHER,
+                true));
+        var rpc = a.attach(m.get(0).id(), (from, f) -> { });
+        b.attach(m.get(1).id(), (from, f) -> got.add(java.nio.ByteBuffer.wrap(f.body()).getInt()));
+        var to = m.get(1).id();
+        a.sendNow(to, new SimTransport.Frame(G, 1, java.nio.ByteBuffer.allocate(4).putInt(0).array())); // not connected: queued
+        await(() -> got.size() == 1, "first frame connects through the writer");
+        for (int i = 1; i <= 2000; i++) {
+            var f = new SimTransport.Frame(G, 1, java.nio.ByteBuffer.allocate(4).putInt(i).array());
+            if (i % 3 == 0) {
+                rpc.send(to, f);
+            } else {
+                a.sendNow(to, f);
+            }
+        }
+        await(() -> got.size() == 2001, "every frame arrives, got " + got.size());
+        for (int i = 0; i <= 2000; i++) {
+            assertEquals(i, got.get(i), "wire order is send order");
+        }
+        assertEquals(0, b.rejected(TcpTransport.Reason.SEQ));
+        long drops = a.sendDrops();
+        a.sendNow(new NodeId(99, "nobody"), new SimTransport.Frame(G, 1, new byte[4]));
+        assertEquals(drops + 1, a.sendDrops(), "unknown peer counted as a drop");
+        var rm = members(2);
+        var raft = start(TcpTransport.open(rm.get(0).id(), rm, KEY, Clock.SYSTEM, 8));
+        assertThrows(IllegalStateException.class, () -> raft.sendNow(to, new SimTransport.Frame(G, 1, new byte[1])));
+    }
+
+    @Test
     void framesOfAnotherDomainFailTheTagCheckBothWays() throws Exception {
         var m = members(2);
         var raft = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 8));

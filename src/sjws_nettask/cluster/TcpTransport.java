@@ -353,10 +353,30 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         this.handler = Objects.requireNonNull(handler, "handler");
         return (to, frame) -> {
             var peer = peers.get(to);
-            if (peer == null || cut.contains(to) || !open || !peer.queue.offer(frame)) {
+            if (peer == null || cut.contains(to) || !open || !peer.enqueue(frame)) {
                 sendDrops.incrementAndGet();
             }
         };
+    }
+
+    /**
+     * Direct transports only (#236): sends {@code frame} like the attached {@link ClusterRpc}, but writes it on the
+     * calling thread when that connection is up and idle, saving the hand-off to its writer thread. The caller may
+     * then block while the socket's send buffer is full (back-pressure from that peer), so only callers that may
+     * block on that peer use it; everything else goes through the writer thread as before.
+     */
+    public void sendNow(NodeId to, SimTransport.Frame frame) {
+        if (!direct) {
+            throw new IllegalStateException("sendNow needs a direct transport");
+        }
+        var peer = peers.get(to);
+        if (peer == null || cut.contains(to) || !open) {
+            sendDrops.incrementAndGet();
+            return;
+        }
+        if (!peer.tryInline(frame) && !peer.enqueue(frame)) {
+            sendDrops.incrementAndGet();
+        }
     }
 
     @Override
@@ -496,7 +516,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 inboundSockets.remove(socket);
                 return;
             }
-            Thread.ofVirtual().name(domain.name() + "-admit-" + self.name()).start(() -> admit(socket));
+            thread("-admit-").start(() -> admit(socket));
         }
     }
 
@@ -543,6 +563,17 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             return;
         }
         read(socket, pinned);
+    }
+
+    /**
+     * Connection threads. Raft keeps virtual threads. A {@code direct} transport answers requests on its reader
+     * threads, so its readers and writers are platform daemons: a virtual thread blocked on a socket is woken
+     * through the JDK's read poller, an extra hand-off per frame that the per-hop budget (#236 G3) cannot afford.
+     * Their number stays bounded by the member list and the handshake cap.
+     */
+    private Thread.Builder thread(String role) {
+        var name = domain.name() + role + self.name();
+        return direct ? Thread.ofPlatform().daemon().name(name) : Thread.ofVirtual().name(name);
     }
 
     private boolean heldOff(int pinned) {
@@ -838,7 +869,106 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         private Peer(InetSocketAddress address, int capacity) {
             this.address = address;
             this.queue = new ArrayBlockingQueue<>(capacity);
-            this.writer = Thread.ofVirtual().name(domain.name() + "-write-" + self.name()).start(this::write);
+            this.writer = thread("-write-").start(direct ? this::writeDirect : this::write);
+        }
+
+        // ---- direct transports only (#236): the caller may write inline when nothing is queued ----
+        /** Guards {@link #out} and the frame MAC on a direct transport; sealing under it keeps seq order = wire order. */
+        private final ReentrantLock io = new ReentrantLock();
+        /** Frames offered to {@link #queue} and not yet written (or dropped) by the writer. */
+        private final AtomicInteger backlog = new AtomicInteger();
+        private Mac directMac;
+        private DataOutputStream out;
+
+        private boolean enqueue(SimTransport.Frame frame) {
+            if (!direct) {
+                return queue.offer(frame);
+            }
+            backlog.incrementAndGet();
+            if (!queue.offer(frame)) {
+                backlog.decrementAndGet();
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * Writes {@code frame} on the calling thread when the connection is up and no queued frame is ahead of it;
+         * false means nothing was written and the caller should queue it.
+         */
+        private boolean tryInline(SimTransport.Frame frame) {
+            if (backlog.get() != 0 || !io.tryLock()) {
+                return false;
+            }
+            try {
+                if (backlog.get() != 0 || out == null) {
+                    return false;
+                }
+                writeLocked(frame, true);
+                return true;
+            } finally {
+                io.unlock();
+            }
+        }
+
+        /** {@link #io} held. Returns false after a write failure (the connection is dropped). */
+        private boolean writeLocked(SimTransport.Frame frame, boolean flush) {
+            if (directMac == null) {
+                directMac = mac(currentKey);
+            }
+            byte[] bytes;
+            try {
+                bytes = seal(directMac, HeartbeatAuthenticator.KEY_CURRENT, peerId(), bootEpoch,
+                        sendSeq.incrementAndGet(), frame);
+            } catch (FrameTooLargeException unsealable) {
+                oversizeDrops.incrementAndGet();
+                sendDrops.incrementAndGet();
+                return true;
+            }
+            try {
+                if (out == null) {
+                    socket = sockets.connect(address);
+                    out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                }
+                out.writeInt(bytes.length);
+                out.write(bytes);
+                if (flush) {
+                    out.flush();
+                }
+                return true;
+            } catch (IOException failed) {
+                sendDrops.incrementAndGet();
+                closeQuietly(socket);
+                socket = null;
+                out = null;
+                return false;
+            }
+        }
+
+        private void writeDirect() {
+            while (open) {
+                SimTransport.Frame frame;
+                try {
+                    frame = queue.take();
+                } catch (InterruptedException interrupted) {
+                    return;
+                }
+                boolean ok;
+                io.lock();
+                try {
+                    ok = writeLocked(frame, queue.isEmpty());
+                } finally {
+                    io.unlock();
+                    backlog.decrementAndGet();
+                }
+                if (!ok) {
+                    try {
+                        Thread.sleep(RECONNECT_MILLIS);
+                    } catch (InterruptedException interrupted) {
+                        return;
+                    }
+                }
+            }
         }
 
         private void write() {

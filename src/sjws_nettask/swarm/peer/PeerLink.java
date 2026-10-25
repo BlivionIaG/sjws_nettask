@@ -259,7 +259,7 @@ public final class PeerLink implements AutoCloseable {
                     stream.progressNanos = now;
                 }
                 forwarded.incrementAndGet();
-                send(stream, p);
+                send(stream, p, true); // the caller may block on this owner: write inline, no hand-off
                 return p.future;
             } finally {
                 stream.lock.unlock();
@@ -275,10 +275,15 @@ public final class PeerLink implements AutoCloseable {
         return id;
     }
 
-    private void send(Stream stream, Pending p) {
+    private void send(Stream stream, Pending p, boolean inline) {
         var body = ByteBuffer.allocate(PRODUCE_HEADER + p.payload.length).putLong(stream.producerId).putLong(p.seq)
                 .put((byte) (p.durability == null ? 0 : p.durability.ordinal() + 1)).put(p.payload).array();
-        rpc.send(stream.owner, new SimTransport.Frame(new GroupId(stream.topic), PRODUCE, body));
+        var frame = new SimTransport.Frame(new GroupId(stream.topic), PRODUCE, body);
+        if (inline) {
+            transport.sendNow(stream.owner, frame);
+        } else {
+            rpc.send(stream.owner, frame);
+        }
     }
 
     private void onAck(NodeId from, String topic, byte[] body) {
@@ -357,7 +362,7 @@ public final class PeerLink implements AutoCloseable {
         for (var p : stream.pending.values()) {
             p.round = stream.round;
             resent.incrementAndGet();
-            send(stream, p);
+            send(stream, p, false); // reader or ticker thread: never block on a socket
         }
         stream.progressNanos = System.nanoTime();
     }

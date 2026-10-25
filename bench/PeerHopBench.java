@@ -37,7 +37,8 @@ import sjws_nettask.swarm.peer.PeerStartup;
 /**
  * #236 gate G3: the cost of one forwarded hop. Two {@link PeerLink}s in one JVM on loopback; node b forwards
  * closed-loop produces of {@code bytes} to node a, which applies them to a real {@link Partition} and answers.
- * The baseline is the same produce applied locally ({@code Partition.produce}); the hop cost is the difference.
+ * The baseline is the same produce applied locally and awaited the same way ({@code Partition.produce(...).durable()},
+ * i.e. until the ledger writer's write(2) for {@code NONE}); the hop cost is the difference.
  *
  * <pre>
  * java -XX:+UseZGC -Xms1g -Xmx1g -cp target/classes bench/PeerHopBench.java &lt;dir&gt; plain|tls &lt;ops&gt; &lt;bytes&gt; [certDir]
@@ -59,11 +60,11 @@ public class PeerHopBench {
         try (var local = Partition.open(dir.resolve("local"), "fwd.local", policy, System::currentTimeMillis)) {
             var lat = new long[ops];
             for (int i = 0; i < ops / 2; i++) {
-                local.produce(1, i + 1, payload, Durability.NONE);
+                local.produce(1, i + 1, payload, Durability.NONE).durable().join();
             }
             for (int i = 0; i < ops; i++) {
                 long t = System.nanoTime();
-                local.produce(1, ops + i + 1, payload, Durability.NONE);
+                local.produce(1, ops + i + 1, payload, Durability.NONE).durable().join();
                 lat[i] = System.nanoTime() - t;
             }
             report("local", lat);
