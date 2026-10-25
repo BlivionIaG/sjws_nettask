@@ -40,10 +40,16 @@ public final class CpServerTls {
     }
 
     static CpServerTls open(CpListenerConfig config, AdminTls.Audit audit) throws CpKeyException {
+        return open(config, audit, CpPeerSockets.LISTENER.equals(config.name()));
+    }
+
+    /** @param actsAsClient also dial with this context (peer links): same certificate, CA and revocations. */
+    static CpServerTls open(CpListenerConfig config, AdminTls.Audit audit, boolean actsAsClient)
+            throws CpKeyException {
         checkKey(config);
         try {
             return new CpServerTls(config, AdminTls.openListener(config.name(), config.certPem(), config.keyPem(), null,
-                    config.caPem(), config.revocations(), audit, CpPeerSockets.LISTENER.equals(config.name())));
+                    config.caPem(), config.revocations(), audit, actsAsClient));
         } catch (IOException | RuntimeException e) {
             throw new CpKeyException(config.name() + " TLS material refused: " + e.getMessage(), e);
         }

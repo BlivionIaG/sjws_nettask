@@ -57,7 +57,8 @@ import javax.crypto.spec.SecretKeySpec;
  * </pre>
  *
  * The tag input is {@code "sjws-raft-frame\0" || every byte before the tag}. The key is
- * HKDF-SHA256 of the {@link ClusterKey} with info {@code sjws-raft-frame-v1}, so it is not the
+ * HKDF-SHA256 of the {@link ClusterKey} with info {@code sjws-raft-frame-v1} (the {@link Domain#RAFT} domain;
+ * another {@link Domain} changes both, as the swarm peer links do), so it is not the
  * heartbeat key. A frame for another destination, from a non-member, with a bad tag, an older
  * epoch or a sequence already seen is dropped and counted by {@link Reason}.
  *
@@ -96,8 +97,11 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     /** A lower boot epoch is accepted only after the sender was silent this long. */
     public static final long EPOCH_SILENCE_MILLIS = AuthReplay.WINDOW_MILLIS;
     private static final int HEADER_BYTES = 1 + 1 + 2 + 2 + 8 + 8 + 4 + 2;
-    private static final byte[] LABEL = "sjws-raft-frame\0".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] HKDF_INFO = "sjws-raft-frame-v1".getBytes(StandardCharsets.US_ASCII);
+    private final byte[] label;
+    private final byte[] hkdfInfo;
+    private final Domain domain;
+    private final boolean direct;
+    private final int maxFrameBytes;
     private static final long RECONNECT_MILLIS = 50;
     private static final int CONNECT_TIMEOUT_MILLIS = 1_000;
     /** Default idle and whole-frame read deadline on accepted sockets. */
@@ -116,7 +120,37 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         EPOCH,
         SEQ,
         /** The whole-frame deadline passed after the first length-prefix byte (slow or stalled sender). */
-        TIMEOUT
+        TIMEOUT,
+        /**
+         * A correctly tagged frame whose sender wire id is not the one the connection's authenticated identity pins
+         * ({@link SocketFactory#peerWire}); the connection is closed. Never counted when the factory pins nothing.
+         */
+        ORIGIN
+    }
+
+    /**
+     * Which protocol a transport carries. The tag label and the HKDF info are domain-separated, so a frame sealed
+     * for one domain (Raft, the swarm peer links of #236) fails the tag check in every other one, even under the
+     * same key. {@link #RAFT} is the Raft transport's domain, unchanged.
+     *
+     * @param name thread-name prefix
+     * @param label tag-input prefix, ending in NUL
+     * @param hkdfInfo HKDF-SHA256 info for the frame key
+     * @param maxFrameBytes largest frame accepted or sealed, at most {@link #MAX_FRAME_BYTES}; a longer length prefix
+     *        is refused before any body byte is buffered
+     */
+    public record Domain(String name, String label, String hkdfInfo, int maxFrameBytes) {
+        public static final Domain RAFT = new Domain("raft", "sjws-raft-frame\0", "sjws-raft-frame-v1", MAX_FRAME_BYTES);
+
+        public Domain {
+            Objects.requireNonNull(name, "name");
+            if (maxFrameBytes < HEADER_BYTES + MAC_LENGTH + 1 || maxFrameBytes > MAX_FRAME_BYTES) {
+                throw new IllegalArgumentException("maxFrameBytes");
+            }
+            if (label == null || !label.endsWith("\0") || hkdfInfo == null || hkdfInfo.isEmpty()) {
+                throw new IllegalArgumentException("domain label must end in NUL and hkdfInfo must be set");
+            }
+        }
     }
 
     /** {@link #seal} refuses a body or group too large for the frame format. */
@@ -140,6 +174,18 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
          * Plain sockets have nothing to do.
          */
         default void handshake(Socket accepted, int totalMillis) throws IOException {
+        }
+
+        /**
+         * The wire id that {@code accepted}'s authenticated identity (the verified mTLS certificate, mapped through a
+         * pinned peer list) belongs to, called once after {@link #handshake}; -1 when this factory does not identify
+         * peers (plain sockets, the CP voter links). With a pinned wire, a frame on that connection whose sender wire
+         * differs is refused as {@link Reason#ORIGIN}, the connection is closed, and that identity's next
+         * connections are held off with a doubling backoff ({@link #originHeldOff}): the header wire id is
+         * authenticated by the shared key only, so it is never trusted as identity. Throwing refuses the connection.
+         */
+        default int peerWire(Socket accepted) {
+            return -1;
         }
 
         SocketFactory PLAIN = new SocketFactory() {
@@ -194,6 +240,14 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private final Thread acceptor;
     private volatile BiConsumer<NodeId, SimTransport.Frame> handler;
     private volatile boolean open = true;
+    private final AtomicLong originMismatches = new AtomicLong();
+    private final AtomicLong originHeldOff = new AtomicLong();
+    /** Pinned wire → {mismatches, held off until (nanoTime)}. Touched only on a mismatch or by a pinned accept. */
+    private final ConcurrentHashMap<Integer, long[]> originBackoff = new ConcurrentHashMap<>();
+    /** First hold-off after an origin mismatch; it doubles per further mismatch up to {@link #ORIGIN_BACKOFF_MAX_MILLIS}. */
+    public static final long ORIGIN_BACKOFF_MILLIS = 1_000;
+    public static final long ORIGIN_BACKOFF_MAX_MILLIS = 60_000;
+    private static final System.Logger LOG = System.getLogger(TcpTransport.class.getName());
 
     /**
      * Listens on {@code self}'s member address and dials the others.
@@ -207,18 +261,39 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
     public static TcpTransport open(NodeId self, List<Member> members, ClusterKey key, Clock clock,
             int queueCapacity, SocketFactory sockets) throws IOException {
-        return new TcpTransport(self, members, key, clock, queueCapacity, sockets, READ_TIMEOUT_MILLIS);
+        return new TcpTransport(self, members, key, clock, queueCapacity, sockets, READ_TIMEOUT_MILLIS, Domain.RAFT,
+                false);
+    }
+
+    /**
+     * A transport for another protocol than Raft, with every limit above unchanged.
+     *
+     * @param domain tag label and key derivation; frames of other domains fail the tag check
+     * @param direct true: each authenticated frame is handed to the attached handler on its connection's reader
+     *        thread as it arrives, in order, and {@link #deliver} does nothing (the handler must not block: it holds
+     *        up that peer's later frames); false: frames wait for {@link #deliver}, as for Raft
+     */
+    public static TcpTransport open(NodeId self, List<Member> members, ClusterKey key, Clock clock,
+            int queueCapacity, SocketFactory sockets, Domain domain, boolean direct) throws IOException {
+        return new TcpTransport(self, members, key, clock, queueCapacity, sockets, READ_TIMEOUT_MILLIS, domain,
+                direct);
     }
 
     /** Test seam for a shorter read deadline. */
     static TcpTransport open(NodeId self, List<Member> members, ClusterKey key, Clock clock, int queueCapacity,
             int readTimeoutMillis) throws IOException {
-        return new TcpTransport(self, members, key, clock, queueCapacity, SocketFactory.PLAIN, readTimeoutMillis);
+        return new TcpTransport(self, members, key, clock, queueCapacity, SocketFactory.PLAIN, readTimeoutMillis,
+                Domain.RAFT, false);
     }
 
     private TcpTransport(NodeId self, List<Member> members, ClusterKey key, Clock clock, int queueCapacity,
-            SocketFactory sockets, int readTimeoutMillis) throws IOException {
+            SocketFactory sockets, int readTimeoutMillis, Domain domain, boolean direct) throws IOException {
         this.self = Objects.requireNonNull(self, "self");
+        this.domain = Objects.requireNonNull(domain, "domain");
+        this.direct = direct;
+        this.maxFrameBytes = domain.maxFrameBytes();
+        this.label = domain.label().getBytes(StandardCharsets.US_ASCII);
+        this.hkdfInfo = domain.hkdfInfo().getBytes(StandardCharsets.US_ASCII);
         Objects.requireNonNull(key, "key");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.sockets = Objects.requireNonNull(sockets, "sockets");
@@ -264,7 +339,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         this.maxInbound = Math.max(2, 2 * peers.size());
         this.maxHandshakes = Math.max(8, HANDSHAKES_PER_PEER * peers.size());
         this.server = sockets.listen(bind);
-        this.acceptor = Thread.ofVirtual().name("raft-accept-" + self.name()).start(this::accept);
+        this.acceptor = Thread.ofVirtual().name(domain.name() + "-accept-" + self.name()).start(this::accept);
     }
 
     @Override
@@ -286,6 +361,9 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
     @Override
     public int deliver(int max) {
+        if (direct) {
+            return 0;
+        }
         var target = handler;
         int ran = 0;
         while (ran < max) {
@@ -418,7 +496,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 inboundSockets.remove(socket);
                 return;
             }
-            Thread.ofVirtual().name("raft-admit-" + self.name()).start(() -> admit(socket));
+            Thread.ofVirtual().name(domain.name() + "-admit-" + self.name()).start(() -> admit(socket));
         }
     }
 
@@ -433,6 +511,21 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             return;
         } finally {
             handshaking.decrementAndGet();
+        }
+        int pinned;
+        try {
+            pinned = sockets.peerWire(socket);
+        } catch (RuntimeException unidentified) {
+            handshakeFailures.incrementAndGet();
+            closeQuietly(socket);
+            inboundSockets.remove(socket);
+            return;
+        }
+        if (pinned >= 0 && heldOff(pinned)) {
+            originHeldOff.incrementAndGet();
+            closeQuietly(socket);
+            inboundSockets.remove(socket);
+            return;
         }
         if (inboundCount.incrementAndGet() > maxInbound) {
             inboundCount.decrementAndGet();
@@ -449,10 +542,49 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             inboundCount.decrementAndGet();
             return;
         }
-        read(socket);
+        read(socket, pinned);
     }
 
-    private void read(Socket socket) {
+    private boolean heldOff(int pinned) {
+        var b = originBackoff.get(pinned);
+        return b != null && System.nanoTime() - b[1] < 0;
+    }
+
+    /** An authenticated identity sent a frame as another wire: close, hold its reconnects off, and alert. */
+    private void originMismatch(int pinned, int claimed) {
+        originMismatches.incrementAndGet();
+        var b = originBackoff.compute(pinned, (k, old) -> {
+            long n = old == null ? 1 : old[0] + 1;
+            long ms = Math.min(ORIGIN_BACKOFF_MAX_MILLIS, ORIGIN_BACKOFF_MILLIS << Math.min(n - 1, 16));
+            return new long[] {n, System.nanoTime() + ms * 1_000_000L};
+        });
+        LOG.log(System.Logger.Level.WARNING, "{0} transport on {1}: peer wire {2} sent a frame as wire {3} "
+                + "(misconfiguration or a compromised peer); closed, mismatch {4}, its connections held off",
+                domain.name(), self.name(), pinned, claimed, b[0]);
+    }
+
+    /** Correctly tagged frames refused because their sender wire was not the connection's pinned identity. */
+    public long originMismatches() {
+        return originMismatches.get();
+    }
+
+    /** Authenticated connections closed at once because their identity is held off after an origin mismatch. */
+    public long originHeldOff() {
+        return originHeldOff.get();
+    }
+
+    /** Thrown inside {@link #open} on {@link Reason#ORIGIN}: the reader closes the connection. */
+    private static final class OriginMismatch extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        private final int claimed;
+
+        OriginMismatch(int claimed) {
+            super(null, null, false, false);
+            this.claimed = claimed;
+        }
+    }
+
+    private void read(Socket socket, int pinned) {
         try (socket; var in = new DataInputStream(new BufferedInputStream(socket.getInputStream()))) {
             var current = mac(currentKey);
             var previous = previousKey == null ? null : mac(previousKey);
@@ -471,7 +603,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                     return;
                 }
                 int length = ByteBuffer.wrap(prefix).getInt();
-                if (length < HEADER_BYTES + MAC_LENGTH || length > MAX_FRAME_BYTES) {
+                if (length < HEADER_BYTES + MAC_LENGTH || length > maxFrameBytes) {
                     drop(Reason.MALFORMED);
                     return;
                 }
@@ -479,8 +611,22 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 if (bytes == null) {
                     return; // whole-frame deadline passed: slowloris
                 }
-                var accepted = open(bytes, current, previous, clock.currentTimeMillis(), tag);
-                if (accepted != null && !cut.contains(accepted.from) && !inbound.offer(accepted)) {
+                Inbound accepted;
+                try {
+                    accepted = open(bytes, current, previous, clock.currentTimeMillis(), tag, pinned);
+                } catch (OriginMismatch spoofed) {
+                    originMismatch(pinned, spoofed.claimed);
+                    return;
+                }
+                if (accepted == null || cut.contains(accepted.from)) {
+                    continue;
+                }
+                if (direct) {
+                    var target = handler;
+                    if (target != null) {
+                        target.accept(accepted.from, accepted.frame);
+                    }
+                } else if (!inbound.offer(accepted)) {
                     inboundDrops.incrementAndGet();
                 }
             }
@@ -547,10 +693,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
     /** Checks one frame. Returns it, or null after counting why it was dropped. */
     Inbound open(byte[] bytes, Mac current, Mac previous, long nowMillis) {
-        return open(bytes, current, previous, nowMillis, new byte[MAC_LENGTH]);
+        return open(bytes, current, previous, nowMillis, new byte[MAC_LENGTH], -1);
     }
 
-    private Inbound open(byte[] bytes, Mac current, Mac previous, long nowMillis, byte[] tag) {
+    private Inbound open(byte[] bytes, Mac current, Mac previous, long nowMillis, byte[] tag, int pinned) {
         var buf = ByteBuffer.wrap(bytes);
         int version = buf.get();
         int keyId = buf.get();
@@ -562,6 +708,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             return drop(Reason.TAG);
         }
         int from = buf.getShort() & 0xFFFF;
+        if (pinned >= 0 && from != pinned) {
+            drop(Reason.ORIGIN);
+            throw new OriginMismatch(from);
+        }
         int dest = buf.getShort() & 0xFFFF;
         long epoch = buf.getLong();
         long seq = buf.getLong();
@@ -603,7 +753,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         var group = frame.group().value().getBytes(StandardCharsets.UTF_8);
         var body = frame.body();
         int length = HEADER_BYTES + group.length + body.length + MAC_LENGTH;
-        if (group.length > 0xFFFF || length > MAX_FRAME_BYTES) {
+        if (group.length > 0xFFFF || length > maxFrameBytes) {
             throw new FrameTooLargeException();
         }
         var bytes = new byte[length];
@@ -611,7 +761,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 .putShort((short) to.wire()).putLong(epoch).putLong(seq).putInt(frame.type())
                 .putShort((short) group.length).put(group).put(body);
         mac.reset();
-        mac.update(LABEL);
+        mac.update(label);
         mac.update(bytes, 0, length - MAC_LENGTH);
         try {
             mac.doFinal(bytes, length - MAC_LENGTH);
@@ -626,9 +776,9 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     }
 
     /** Constant-time tag check into a reused per-reader buffer; no allocation per frame. */
-    private static boolean tagMatches(Mac mac, byte[] bytes, byte[] tag) {
+    private boolean tagMatches(Mac mac, byte[] bytes, byte[] tag) {
         mac.reset();
-        mac.update(LABEL);
+        mac.update(label);
         int at = bytes.length - MAC_LENGTH;
         mac.update(bytes, 0, at);
         try {
@@ -658,10 +808,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         }
     }
 
-    private static byte[] derive(byte[] ikm) {
+    private byte[] derive(byte[] ikm) {
         try {
             var kdf = KDF.getInstance("HKDF-SHA256");
-            return kdf.deriveData(HKDFParameterSpec.ofExtract().addIKM(ikm).thenExpand(HKDF_INFO, MAC_LENGTH));
+            return kdf.deriveData(HKDFParameterSpec.ofExtract().addIKM(ikm).thenExpand(hkdfInfo, MAC_LENGTH));
         } catch (GeneralSecurityException failed) {
             throw new IllegalStateException(failed);
         }
@@ -688,7 +838,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         private Peer(InetSocketAddress address, int capacity) {
             this.address = address;
             this.queue = new ArrayBlockingQueue<>(capacity);
-            this.writer = Thread.ofVirtual().name("raft-write-" + self.name()).start(this::write);
+            this.writer = Thread.ofVirtual().name(domain.name() + "-write-" + self.name()).start(this::write);
         }
 
         private void write() {

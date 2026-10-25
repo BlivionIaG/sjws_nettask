@@ -81,6 +81,15 @@ public record CpTls(Path certPem, Path keyPem, Path caPem, Path revocations, Str
         return CpServerTls.open(config, audit);
     }
 
+    /**
+     * Like {@link #serverContext(CpListenerConfig)}, for a peer link that also dials with the context (#236 swarm
+     * peers): the client side presents the same certificate and checks the server's chain against the same CA and
+     * revocations. Identity pinning (which certificate is which peer) stays with the caller.
+     */
+    public static CpServerTls peerContext(CpListenerConfig config) throws CpKeyException {
+        return CpServerTls.open(config, (actor, action, target, outcome) -> { }, true);
+    }
+
     /** Reloadable, revocation-checked server context; refusals are audited as {@code cp-tls.handshake}. */
     AdminTls server(AdminTls.Audit audit) throws IOException {
         return AdminTls.openListener("cp-tls", certPem, keyPem, null, caPem, revocations, audit);

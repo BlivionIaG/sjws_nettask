@@ -59,7 +59,7 @@ acknowledged to the caller.
 ```
 Record types: `ENQUEUE(producerId,seq,ts,origin…,payload)`, `SUBSCRIBE(group,fromOffset)`,
 `DELIVER(group,offset,consumer,deadline,attempt)`, `EXTEND(group,deadline,offsets,attempts)`,
-`ACK(group,offset)`, `NACK(group,offset,notBefore)`, `DLQ(group,offset,reason)`. Messages and their state transitions share one ordered log, so the
+`ACK(group,offset)`, `NACK(group,offset,notBefore)`, `DLQ(group,offset,reason)`. `ENQUEUE_FROM(origin:u16,…)` (type 8, #236) is an `ENQUEUE` forwarded by a swarm peer: dedup is keyed on (origin, producerId), where origin is the peer's certificate-pinned wire id; an older binary refuses it (see [swarm-peer-forwarding.md](../design/swarm-peer-forwarding.md) §4). Messages and their state transitions share one ordered log, so the
 log defines the state exactly. Framing follows PR #16 T3: records are grouped in batches
 `[len:int][crc32c:int][baseOffset:long][count:int][timestampMs:long] count×([recLen:int][bytes])`;
 the CRC32C covers the batch. Batches are the unit of write, fsync, replication and fetch
