@@ -33,9 +33,15 @@ class SwarmBenchCleanupTest {
     @TempDir
     Path dir;
 
+    /** Runs the bench with ample free space injected, so the 10 GiB guard never depends on the host (CI /tmp). */
     private Process start(List<String> extra, String... args) throws Exception {
+        return start(Long.MAX_VALUE, extra, args);
+    }
+
+    private Process start(long freeBytes, List<String> extra, String... args) throws Exception {
         var cmd = new ArrayList<String>();
         cmd.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+        cmd.add("-Dsjws.bench.testFreeBytes=" + freeBytes);
         cmd.addAll(extra);
         cmd.add("-cp");
         cmd.add(Path.of("target", "classes").toAbsolutePath().toString());
@@ -160,11 +166,30 @@ class SwarmBenchCleanupTest {
 
     @Test
     void aNearlyFullDiskAbortsBeforeWriting() throws Exception {
-        var p = start(List.of("-Dsjws.bench.minFreeBytes=" + Long.MAX_VALUE), this.dir.toString(), "dispatch", "1", "1");
+        var p = start(1L << 40, List.of("-Dsjws.bench.minFreeBytes=" + Long.MAX_VALUE), this.dir.toString(), "dispatch", "1", "1");
         assertTrue(p.waitFor(120, TimeUnit.SECONDS));
         var out = Files.readString(this.dir.resolve("out.txt"));
         assertEquals(2, p.exitValue(), out);
         assertTrue(out.contains("ABORT:"), out);
         assertEquals(0, benchDirs());
+    }
+
+    @Test
+    void theDefaultGuardStillRefusesLessThan10GiB() throws Exception {
+        // no sjws.bench.minFreeBytes: the production default applies; one byte short of 10 GiB is refused
+        var p = start((10L << 30) - 1, List.of(), this.dir.toString(), "dispatch", "1", "0.5");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS));
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(2, p.exitValue(), out);
+        assertTrue(out.contains("has 10239 MiB free, below 10240 MiB (sjws.bench.minFreeBytes)"), out);
+        assertEquals(0, benchDirs(), "nothing written before the guard: " + out);
+
+        // exactly 10 GiB passes the default guard
+        var q = start(10L << 30, List.of(), this.dir.toString(), "dispatch", "1", "0.5");
+        assertTrue(q.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(0, q.exitValue(), out);
+        assertTrue(out.contains("dispatch workers=1"), out);
+        assertEquals(0, benchDirs(), out);
     }
 }
