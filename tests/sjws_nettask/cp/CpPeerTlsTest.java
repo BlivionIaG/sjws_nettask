@@ -97,6 +97,28 @@ class CpPeerTlsTest {
         fail(what + ": expected an SSLHandshakeException, got " + seen);
     }
 
+    /**
+     * The side that did not refuse sees the other end abort the handshake. Depending on timing that is the peer's
+     * alert (SSLHandshakeException) or, when the peer closed first, a write or read on a dead socket: broken pipe or
+     * connection reset. Either is a refusal. A completed handshake (null), a timeout, or any other error still fails.
+     */
+    private static void assertRefusedByPeer(Exception seen, String what) {
+        assertNotNull(seen, what + ": the handshake completed");
+        for (Throwable t = seen; t != null; t = t.getCause()) {
+            assertFalse(t instanceof java.net.SocketTimeoutException, what + ": timed out instead: " + seen);
+        }
+        for (Throwable t = seen; t != null; t = t.getCause()) {
+            if (t instanceof javax.net.ssl.SSLHandshakeException) {
+                return;
+            }
+            String message = String.valueOf(t.getMessage());
+            if (t instanceof IOException && (message.contains("Broken pipe") || message.contains("Connection reset"))) {
+                return;
+            }
+        }
+        fail(what + ": expected an SSLHandshakeException, broken pipe or connection reset, got " + seen);
+    }
+
     private Path denylist(String name, java.math.BigInteger... serials) throws IOException {
         var text = new StringBuilder("# test denylist\n");
         for (var serial : serials) {
@@ -121,7 +143,7 @@ class CpPeerTlsTest {
         var serverForeign = dial(CpTls.serverContext(other.listener("cp-peer", "a")),
                 CpTls.serverContext(ca.listener("cp-peer", "b")));
         assertRefused(serverForeign.client(), "dialer accepted a server cert from a foreign CA");
-        assertRefused(serverForeign.server(), "acceptor saw the dialer's refusal");
+        assertRefusedByPeer(serverForeign.server(), "acceptor saw the dialer's refusal");
         // The dialer's cert is from another CA: the acceptor refuses it.
         var clientForeign = dial(CpTls.serverContext(ca.listener("cp-peer", "c")),
                 CpTls.serverContext(other.listener("cp-peer", "d")));

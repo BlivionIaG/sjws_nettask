@@ -158,6 +158,34 @@ class ClassLoadTest {
     }
 
     @Test
+    void streamOnCreditOffLoadsNoCreditClass() throws Exception {
+        // S2c PR 6: the credit sub-flag is off by default; no credit state, no hook, no codec class
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true"), "Server started:", 401,
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.StreamHttp "), text);
+        assertFalse(text.contains("sjws_nettask.swarm.StreamCredit"), text);
+        assertFalse(text.contains("sjws_nettask.swarm.wire.Credit"), text);
+        assertFalse(text.contains("credit on"), text);
+    }
+
+    @Test
+    void creditFlagOnLoadsTheCreditClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+                "-Dsjws.swarm.stream.credit.enabled=true"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.StreamCredit "), text);
+        assertTrue(text.contains("swarm: stream credit on, window=256 chunks + 4 MiB"), text);
+    }
+
+    @Test
+    void creditFlagWithoutTheStreamFlagLoadsNoStreamClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.credit.enabled=true"), "Server started:",
+                401, "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertFalse(text.contains("sjws_nettask.swarm.TokenStreams"), text);
+        assertFalse(text.contains("sjws_nettask.swarm.StreamCredit"), text);
+    }
+
+    @Test
     void streamFlagWithoutSwarmLoadsNothing() throws Exception {
         var text = run(List.of("-Dsjws.swarm.stream.enabled=true"), "Server started:", 404, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml());
