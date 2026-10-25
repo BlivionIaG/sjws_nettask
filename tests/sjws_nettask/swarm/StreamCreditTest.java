@@ -1062,6 +1062,7 @@ class StreamCreditTest {
                         () -> new SwarmModule(other, SwarmGate.DENY_ALL, false, true, null));
                 assertTrue(e.getMessage().contains("sjws.swarm.stream.window (64)")
                         && e.getMessage().contains("sjws.swarm.stream.sinkChunks (32)"), e.getMessage());
+                assertThrows(IllegalStateException.class, () -> other.replies().registerStream(new byte[16], Long.MAX_VALUE));
             } finally {
                 other.close();
             }
@@ -1083,6 +1084,8 @@ class StreamCreditTest {
                         () -> new SwarmModule(other, SwarmGate.DENY_ALL, false, true, null));
                 assertTrue(e.getMessage().contains("sjws.swarm.stream.credit.enabled must be true or false")
                         && e.getMessage().contains("\"yes\""), e.getMessage());
+                // the module closed the swarm before refusing (#262 review nit)
+                assertThrows(IllegalStateException.class, () -> other.replies().registerStream(new byte[16], Long.MAX_VALUE));
             } finally {
                 other.close();
             }

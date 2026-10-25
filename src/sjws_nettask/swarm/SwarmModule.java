@@ -80,8 +80,17 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
         }
         if (stream) {
             // S2c, off by default: the only place TokenStreams is created; read once at startup (shards fixed)
-            var s = swarm.enableStreams(TokenStreams.Config.from(n -> setting(n, n.toUpperCase(java.util.Locale.ROOT)
-                    .replace('.', '_'), null)));
+            TokenStreams.Config config;
+            try {
+                config = TokenStreams.Config.from(n -> setting(n, n.toUpperCase(java.util.Locale.ROOT)
+                        .replace('.', '_'), null));
+            } catch (sjws_nettask.OptionalModule.Refused e) {
+                // a malformed stream setting (e.g. the credit sub-flag, #257 N-c) or window > sinkChunks (R2):
+                // close the swarm first, as the multi-process refusal above does
+                swarm.close();
+                throw e;
+            }
+            var s = swarm.enableStreams(config);
             System.err.println("swarm: token streaming on, shards=" + s.config().shards());
         }
         if (trace) {
