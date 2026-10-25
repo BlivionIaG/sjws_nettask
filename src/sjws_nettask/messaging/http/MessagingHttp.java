@@ -116,9 +116,9 @@ final class MessagingHttp implements Handler {
         } catch (BadRequest e) {
             return problem(400, "bad request", e.getMessage());
         } catch (IOException e) {
-            return problem(500, "log error", e.toString());
+            return logError(e, target);
         } catch (IllegalStateException e) {
-            return problem(503, "unavailable", e.getMessage());
+            return unavailable(e, target);
         }
     }
 
@@ -173,18 +173,18 @@ final class MessagingHttp implements Handler {
         } catch (BadRequest e) {
             return problem(400, "bad request", e.getMessage());
         } catch (IOException e) {
-            return problem(500, "log error", e.toString());
+            return logError(e, request.target());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return problem(503, "unavailable", "interrupted");
         } catch (TimeoutException e) {
             return problem(503, "unavailable", "offset commit not acknowledged in " + ACK_TIMEOUT_MS + " ms");
         } catch (ExecutionException e) {
-            return failed(e, request.target());
+            return failed(e, request.target(), true);
         } catch (LeaderUnavailableException e) {
             return notLeader(e, request.target());
         } catch (IllegalStateException e) {
-            return problem(503, "unavailable", e.getMessage());
+            return unavailable(e, request.target());
         }
     }
 
@@ -231,7 +231,7 @@ final class MessagingHttp implements Handler {
         } catch (TimeoutException e) {
             return problem(503, "unavailable", "append not acknowledged in " + ACK_TIMEOUT_MS + " ms");
         } catch (ExecutionException e) {
-            return failed(e, target);
+            return failed(e, target, true);
         } catch (LeaderUnavailableException e) {
             return notLeader(e, target);
         }
@@ -251,7 +251,7 @@ final class MessagingHttp implements Handler {
             } catch (TimeoutException e) {
                 return problem(503, "unavailable", "leader read not confirmed in " + ACK_TIMEOUT_MS + " ms");
             } catch (ExecutionException e) {
-                return failed(e, target);
+                return failed(e, target, false);
             } catch (LeaderUnavailableException e) {
                 return notLeader(e, target);
             }
@@ -458,11 +458,49 @@ final class MessagingHttp implements Handler {
         return null;
     }
 
-    private static Response failed(ExecutionException e, String target) {
+    /**
+     * A replicated write or leader read whose future failed for a reason other than leadership. The internal error
+     * (storage paths, group names, exception text) is logged here and never sent to the client (#246). A write gets
+     * the generic outcome-unknown problem: it may or may not commit (a group that failed closed, a lost leader), so
+     * the client retries it as after a timeout and deduplicates. A read has no outcome, so it is plain unavailable.
+     */
+    static Response failed(ExecutionException e, String target, boolean write) {
         Throwable c = e.getCause();
         while (c instanceof java.util.concurrent.CompletionException && c.getCause() != null) c = c.getCause();
         if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
-        return problem(503, "unavailable", String.valueOf(c));
+        LOG.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + target + " failed", c);
+        Response r;
+        if (write) {
+            var json = "{\"type\":\"" + OUTCOME_UNKNOWN_TYPE + "\",\"title\":\"outcome unknown\",\"status\":503,"
+                    + "\"detail\":\"the write may or may not have been committed; retry it as after a timeout\"}";
+            r = new Response(503, ResponseHeaders.of().set("content-type", "application/problem+json"),
+                    Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
+        } else {
+            r = problem(503, "unavailable", "leader read failed");
+        }
+        r.headers().set("retry-after", RETRY_AFTER_SECONDS);
+        return r;
+    }
+
+    static final String OUTCOME_UNKNOWN_TYPE = "https://sjws.dev/problems/outcome-unknown";
+
+    private static final System.Logger LOG = System.getLogger(MessagingHttp.class.getName());
+
+    /** A log I/O failure: 500 with a generic detail; the exception (paths, errno text) is logged, not sent (#246). */
+    static Response logError(IOException e, String target) {
+        LOG.log(System.Logger.Level.ERROR, "messaging log I/O failed on " + target, e);
+        return problem(500, "log error", "messaging log I/O failed");
+    }
+
+    /**
+     * The messaging log cannot serve this request (closed, or the topic is not set up for it on this node): 503 with
+     * a generic detail and Retry-After; the exception text is logged, not sent (#246).
+     */
+    static Response unavailable(IllegalStateException e, String target) {
+        LOG.log(System.Logger.Level.WARNING, "messaging log unavailable on " + target, e);
+        var r = problem(503, "unavailable", "messaging log unavailable");
+        r.headers().set("retry-after", RETRY_AFTER_SECONDS);
+        return r;
     }
 
     /** 307 to the leader when known (method and body preserved), else 503 + Retry-After; RFC 9457 type not-leader. */

@@ -18,6 +18,7 @@ package sjws_nettask.messaging.http;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
@@ -223,8 +224,15 @@ class MessagingHttpTest {
         assertEquals(400, h.handle(new Request("POST", "/messaging/v1/topics/t/records").withBody(endless)).status());
         assertEquals(400, h.handle(new Request("GET", "/messaging/v1/topics/./records")).status());
         topics.close();
-        assertEquals(503, post(h, "t", recs("c"), null).status());
-        assertEquals(503, h.handle(new Request("GET", "/messaging/v1/topics/t/records")).status());
+        // #246: the closed log is a generic 503 problem; the exception text ("closed") stays server-side.
+        for (var r : List.of(post(h, "t", recs("c"), null), h.handle(new Request("GET", "/messaging/v1/topics/t/records")))) {
+            assertEquals(503, r.status());
+            assertEquals("application/problem+json", r.headers().get("content-type"));
+            assertEquals(MessagingHttp.RETRY_AFTER_SECONDS, r.headers().get("retry-after"));
+            var json = new String(bytes(r), StandardCharsets.UTF_8);
+            assertTrue(json.contains("\"type\":\"about:blank\"") && json.contains("\"title\":\"unavailable\""), json);
+            assertFalse(json.contains("closed") || json.contains("IllegalStateException"), json);
+        }
     }
 
     @Test
