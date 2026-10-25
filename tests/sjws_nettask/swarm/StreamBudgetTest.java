@@ -577,7 +577,7 @@ class StreamBudgetTest {
             streams.add(stream("p" + i));
         }
         for (int i = 0; i < 3; i++) {
-            for (int seq = 0; seq < 4; seq++) {
+            for (int seq = 0; seq < (i < 2 ? 4 : 3); seq++) {
                 credit(chunk(streams.get(i), seq, MIB));
             }
         }
@@ -585,19 +585,22 @@ class StreamBudgetTest {
         var c = credit(chunk(s, 0, MIB));
         c = credit(chunk(s, 1, MIB));
         c = credit(chunk(s, 2, MIB));
-        long node = 16 * MIB - budget().charged();
-        assertTrue(node < 4 * MIB - 3 * MIB, "the node is the binding dimension");
+        // the node term leaves room for a gap ticket, since s could open a hole (#272 R2)
+        long node = 16 * MIB - budget().charged() - StreamBudget.GAP_TICKET;
+        assertTrue(node > 0 && node < 4 * MIB - 3 * MIB, "the node is the binding dimension");
         assertEquals(node, c.bytes(), "min(session, node)");
         assertEquals(200, chunk(s, 3, c.bytes()).status(), "exactly the advertised bytes are admitted");
         var after = this.http.streams().credit().snapshot(session(s), st(s), s.hi(), s.lo(), s.attempt());
         assertEquals(0, after.bytes());
-        assertNode429(chunk(s, 4, 1));
+        assertNode429(chunk(s, 5, 1)); // a hole opener: one byte plus the gap ticket does not fit
+        assertEquals(200, chunk(s, 4, 1).status()); // in order it does: advertising 0 is never more than admitted
         assertAccounting();
     }
 
     @Test
     void advertisedNodeBytesAreAlwaysAdmittedAndOneMoreIsNot() {
-        // property, single-threaded: random budget states; advertise() never exceeds what admit() takes
+        // property, single-threaded: random budget states; advertise() never exceeds what admit() takes, for an in-order
+        // chunk and for one that opens a gap (#272 R2: with no gap ticket booked, that one also needs GAP_TICKET)
         var rnd = new Random(267);
         for (int round = 0; round < 2_000; round++) {
             double soft = 0.1 + 0.9 * rnd.nextDouble();
@@ -613,19 +616,121 @@ class StreamBudgetTest {
             }
             for (var st : sts) {
                 b.resident(st, (long) (rnd.nextDouble() * b.budgetBytes() / n));
+                if (rnd.nextBoolean()) {
+                    b.bookGap(st);
+                }
             }
             for (var st : sts) {
                 long adv = b.advertise(st);
+                boolean opensGap = !st.gapTicket;
                 if (adv > 0) {
                     long got = b.admit(st, adv, false, false);
-                    assertTrue(got >= 0, "advertised " + adv + " must be admitted (round " + round + ")");
+                    assertTrue(got >= 0, "advertised " + adv + " must be admitted in order (round " + round + ")");
+                    b.release(got);
+                    got = b.admit(st, adv, false, opensGap);
+                    assertTrue(got >= 0, "advertised " + adv + " must be admitted opening a gap (round " + round + ")");
                     b.release(got);
                 }
-                long more = b.admit(st, adv + 1, false, false);
+                long more = b.admit(st, adv + 1, false, opensGap);
                 assertTrue(more < 0, "the advertisement is tight: one byte more is refused (round " + round + ")");
+            }
+            for (var st : sts) {
+                b.releaseGap(st);
             }
             assertEquals(0, b.budgetUnderflows());
         }
+    }
+
+    @Test
+    void aHoleOpeningChunkOfTheAdvertisedSizeIsAdmitted() throws Exception {
+        // #272 R2, Architecture's probe P2: at a nearly full budget the CREDIT frame advertised budget - charged (about
+        // 720 KB) and a hole-opening chunk of that size got 429 scope=node, because it also needs a gap ticket
+        on(cfg(16 * MIB, 1.0, 1.0));
+        var s = stream("s");
+        credit(chunk(s, 0, 10));
+        readAvailable(s);
+        for (var f : List.of(stream("x"), stream("y"), stream("z"))) {
+            for (int seq = 0; seq < 4; seq++) {
+                assertEquals(200, chunk(f, seq, MIB).status());
+            }
+        }
+        var w = stream("w"); // fill until about 300 KiB beyond one gap ticket is left
+        long target = StreamBudget.GAP_TICKET + 300 * KIB;
+        for (int seq = 0; budget().budgetBytes() - budget().charged() > target; seq++) {
+            long size = Math.min(MIB, budget().budgetBytes() - budget().charged() - target);
+            assertEquals(200, chunk(w, seq, Math.max(1, size)).status());
+        }
+        var c = credit(chunk(s, 1, 10));
+        long room = budget().budgetBytes() - budget().charged();
+        assertFalse(st(s).gapTicket);
+        assertEquals(room - StreamBudget.GAP_TICKET, c.bytes(), "the advertisement leaves room for the gap ticket");
+        long refusals = budget().nodeRefusals();
+        assertEquals(200, chunk(s, 3, c.bytes()).status(), "a hole opener of exactly the advertised size is admitted");
+        assertEquals(refusals, budget().nodeRefusals());
+        assertTrue(st(s).gapTicket);
+        assertEquals(0, budget().budgetBytes() - budget().charged(), "the hole opener and its ticket filled the room");
+        assertAccounting();
+    }
+
+    @Test
+    void aFullyReadSessionIsTrimmedBeforeItIsRefused() throws Exception {
+        // #272 R1, Architecture's probe P1: session a holds 3 MiB, all of it read; under pressure its next chunk was
+        // refused 429 scope=node until a reader call trimmed it. Now the :chunk path trims first and re-admits.
+        on(cfg(16 * MIB, 0.25, 0.9)); // soft 4 MiB
+        var a = stream("a");
+        int seq = 0;
+        for (int batch = 0; batch < 3; batch++) {
+            for (int i = 0; i < 16; i++) {
+                credit(chunk(a, seq++, 64 * KIB));
+            }
+            readAvailable(a);
+        }
+        assertEquals(3 * MIB, session(a).retainedBytes);
+        assertEquals(st(a).maxSeq + 1, st(a).readNext, "every chunk of a is read");
+        var others = new ArrayList<Stream>();
+        for (int i = 0; i < 4; i++) {
+            others.add(stream("o" + i));
+        }
+        var b = others.get(0);
+        for (int bs = 0; bs < 40; bs++) {
+            if (chunk(b, bs, 64 * KIB).status() != 200) {
+                break;
+            }
+        }
+        assertTrue(budget().pressured());
+        assertTrue(st(a).resident.get() + 64 * KIB > budget().fairShare(), "without the trim, a is over its fair share");
+        long refusals = budget().nodeRefusals();
+        long trims = budget().pressureTrimChunks();
+        var r = chunk(a, seq, 64 * KIB); // no reader call in between
+        assertEquals(200, r.status(), "trimmed to the resume tail, then admitted");
+        assertEquals(refusals, budget().nodeRefusals());
+        assertTrue(budget().pressureTrimChunks() > trims);
+        assertTrue(session(a).retainedBytes <= StreamBudget.TRANSPORT_WINDOW + 2 * 64 * KIB, "a kept only its tail");
+        assertAccounting();
+    }
+
+    @Test
+    void anUnreadSessionIsStillRefusedAfterTheTrimAttempt() throws Exception {
+        // R1 trims read chunks only: a reader-less session over its fair share keeps every chunk and gets 429 scope=node
+        on(cfg(16 * MIB, 0.25, 0.9));
+        var a = stream("a");
+        int seq = 0;
+        for (; seq < 48; seq++) {
+            if (chunk(a, seq, 64 * KIB).status() != 200) {
+                break;
+            }
+        }
+        var b = stream("b");
+        for (int bs = 0; bs < 40; bs++) {
+            if (chunk(b, bs, 64 * KIB).status() != 200) {
+                break;
+            }
+        }
+        assertEquals(48, seq, "a was admitted below the soft watermark");
+        long retained = session(a).retainedBytes;
+        assertNode429(chunk(a, seq, 64 * KIB));
+        assertEquals(retained, session(a).retainedBytes, "unread chunks are never trimmed");
+        assertAccounting();
     }
 
     // --- pressure trim (Q5)

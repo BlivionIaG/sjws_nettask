@@ -55,8 +55,12 @@ final class StreamBudget {
     static final long MIN_SHARE = 4096 + StreamChunk.HEADER;
     /**
      * The resume tail's byte target (#267 Q5: max(one chunk, the h2/h3 initial flow-control window)): RFC 9113 §6.9.2's
-     * default {@code SETTINGS_INITIAL_WINDOW_SIZE}, 65 535, which is above sjws's h3 {@code initial_max_stream_data}
-     * (16 KiB). At least one read chunk is always kept as well.
+     * default {@code SETTINGS_INITIAL_WINDOW_SIZE}, 65 535. At least one read chunk is always kept as well. Best effort
+     * (#272 review, R3): bytes written to the transport but not yet consumed by the client are bounded by the
+     * <i>client's</i> receive window (an h2 peer may advertise far more than the default; browsers about 6 MiB) plus the
+     * socket buffers (the only bound on HTTP/1.1), not by any sjws setting. A reader that resumes before the tail gets an
+     * explicit {@code gap … overflow}, never a silent loss, and the tail is trimmed only under pressure. Sizing it from the
+     * peer's actual window is a follow-up.
      */
     static final long TRANSPORT_WINDOW = 65_535;
     /** #262's corrected per-session worst case with credit on, before this budget. */
@@ -66,7 +70,9 @@ final class StreamBudget {
     /**
      * One session's non-evictable floor plus its tickets (#267 §3.4/§4.3): unread (the 4 MiB byte window, the filler,
      * one torn read and a {@code LAST}) plus the resume tail (at most {@link #TRANSPORT_WINDOW} plus one chunk), plus a
-     * gap ticket and a {@code LAST} ticket. A budget below this cannot run one full session.
+     * gap ticket and a {@code LAST} ticket. A budget below this cannot run one full session. Conservative by one
+     * {@link #LAST_TICKET} (65 562 B, #272 review point 5): an unread {@code LAST} and its ticket never coexist, so the
+     * exact floor is 8 523 825 B; this one is 8 589 387 B.
      */
     static final long FLOOR = StreamHttp.RETAIN_BYTES + 2L * SwarmHttp.MAX_REQUEST + LAST_TICKET
             + TRANSPORT_WINDOW + SwarmHttp.MAX_REQUEST + GAP_TICKET + LAST_TICKET;
@@ -272,11 +278,13 @@ final class StreamBudget {
     }
 
     /**
-     * The node part of the CREDIT frame's bytes: never more than {@link #admit} would take for an in-order chunk
-     * ({@code size ≤ budget − charged}, and below the soft watermark or within the fair share).
+     * The node part of the CREDIT frame's bytes: never more than {@link #admit} would take, for an in-order chunk and
+     * for one that opens a gap ({@code size ≤ budget − charged}, and below the soft watermark or within the fair
+     * share). With no gap ticket booked, a hole opener also charges {@link #GAP_TICKET}, so the budget and soft terms
+     * leave room for it (#272 review, R2); the fair-share term counts resident bytes only, which the ticket is not.
      */
     long advertise(StreamCredit.State st) {
-        long c = this.charged.get();
+        long c = this.charged.get() + (st.gapTicket ? 0 : GAP_TICKET);
         long fair = fairShare() - st.resident.get();
         return Math.max(0, Math.min(this.budget - c, Math.max(this.soft - c, fair)));
     }

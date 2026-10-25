@@ -351,6 +351,26 @@ final class StreamHttp {
             }
         }
 
+        /**
+         * #272 review R1: before a node refusal, trims this session's read chunks down to the resume tail under the
+         * session lock, from the reader's published position (the {@link #pressureSweep} rule). True when anything was
+         * trimmed, so the refused chunk is worth re-admitting once.
+         */
+        boolean trimBeforeRefusal(StreamCredit.State cr) {
+            this.lock.lock();
+            try {
+                long ra = cr.readAttempt; // published last by the reader: then readNext belongs to it
+                if (ra < 0 || ra != this.attempt) {
+                    return false;
+                }
+                long before = this.retainedBytes;
+                trimRead(cr, cr.readNext);
+                return this.retainedBytes < before;
+            } finally {
+                this.lock.unlock();
+            }
+        }
+
         /** Waits up to {@code ms} for the retained window to change. */
         void await(long ms) throws InterruptedException {
             this.lock.lock();
@@ -621,9 +641,11 @@ final class StreamHttp {
     void pressureSweep() {
         for (var s : this.sessions.values()) {
             var cr = s.credit;
-            if (cr == null || s.reading.get()) {
-                continue; // a reader trims its own session in at()
+            if (cr == null) {
+                continue;
             }
+            // reader sessions too (#272 review, non-blocking): a waiting reader trims only when it wakes, and the
+            // published readNext counts only chunks already handed to the reader
             s.lock.lock();
             try {
                 long ra = cr.readAttempt; // published last by the reader: then readNext belongs to it
@@ -964,6 +986,11 @@ final class StreamHttp {
             boolean opensGap = v == StreamCredit.ADMIT && la == s.attempt && c.chunkSeq() > st.maxSeq + 1
                     && st.heldChunks.get() == 0;
             charged = cr.budget.admit(st, c.size(), v != StreamCredit.ADMIT, opensGap);
+            if (charged < 0 && s.trimBeforeRefusal(st)) {
+                // #272 review R1 (#267 §4.3, "trim … before refusing"): the session's own read chunks went first;
+                // re-admit once
+                charged = cr.budget.admit(st, c.size(), false, opensGap);
+            }
             if (charged < 0) {
                 cr.release(st, c.size());
                 return refuse(cr, held, s, st, la, c, true);

@@ -290,8 +290,11 @@ final class StreamCredit {
          * becomes resident either in the sink's reorder buffer (sink lock) or in the retained window (session lock).
          */
         final java.util.concurrent.atomic.AtomicBoolean lastTicket = new java.util.concurrent.atomic.AtomicBoolean();
-        /** Guarded by the sink lock: a gap ticket is booked (the reorder buffer holds chunks). */
-        boolean gapTicket;
+        /**
+         * Written under the sink lock: a gap ticket is booked (the reorder buffer holds chunks). Volatile for the
+         * lock-free read in {@link StreamBudget#advertise} (advisory, like the rest of the snapshot).
+         */
+        volatile boolean gapTicket;
         // guarded by the session lock: the cumulative byte offset of each retained chunk, parallel to Session.retained
         private long[] offsets = new long[16];
         private int head;
