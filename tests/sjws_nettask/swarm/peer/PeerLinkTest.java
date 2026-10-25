@@ -263,7 +263,10 @@ class PeerLinkTest {
             assertTrue(get(b.produce("a", "fwd.t", b("m" + i), Durability.NONE, 5_000)).ok());
         }
         fresh.set(true); // the owner came back without the stream's history (NONE durability)
-        assertEquals(Outcome.LOST, get(b.produce("a", "fwd.t", b("m3"), Durability.NONE, 5_000)).outcome());
+        var lost = get(b.produce("a", "fwd.t", b("m3"), Durability.NONE, 5_000));
+        assertEquals(Outcome.LOST, lost.outcome());
+        // the owner lost state it had acknowledged: a pending write may have landed before that, so fate unknown
+        assertEquals(new PeerLink.Problem(503, PeerLink.Problem.OUTCOME_UNKNOWN_TYPE, false), lost.problem());
         assertEquals(Outcome.APPENDED, get(b.produce("a", "fwd.t", b("m4"), Durability.NONE, 5_000)).outcome(),
                 "a new stream starts at seq 1");
         for (var p : restarted.values()) {
@@ -761,6 +764,123 @@ class PeerLinkTest {
                 assertEquals(p.retryable() ? 503 : 400, p.status(), o.toString());
             }
         }
+    }
+
+    // ---- Security review of #251 at 6278107, B1: the write-stall bound over real mTLS ----
+
+    /** A pinned mTLS peer at {@code node}'s address that completes handshakes and never reads. */
+    static final class DeafTls implements AutoCloseable {
+        final javax.net.ssl.SSLServerSocket server;
+        final List<Socket> handshaken = new CopyOnWriteArrayList<>();
+
+        DeafTls(PeerTestCa ca, String node, int port) throws Exception {
+            var tls = CpTls.peerContext(ca.node(node));
+            server = (javax.net.ssl.SSLServerSocket) tls.context().getServerSocketFactory().createServerSocket();
+            server.setSSLParameters(tls.parameters());
+            server.setReuseAddress(true);
+            server.setReceiveBufferSize(4096);
+            server.bind(new InetSocketAddress("127.0.0.1", port));
+            Thread.ofPlatform().daemon().start(() -> {
+                while (true) {
+                    try {
+                        var s = (javax.net.ssl.SSLSocket) server.accept();
+                        Thread.ofPlatform().daemon().start(() -> {
+                            try {
+                                s.startHandshake();
+                                handshaken.add(s);
+                            } catch (IOException e) {
+                                // a refused or cut handshake
+                            }
+                        });
+                    } catch (IOException closed) {
+                        return;
+                    }
+                }
+            });
+        }
+
+        @Override
+        public void close() throws IOException {
+            server.close();
+            for (var s : handshaken) {
+                try {
+                    s.setSoLinger(true, 0);
+                } catch (IOException ignored) {
+                    // already closed
+                }
+                s.close();
+            }
+        }
+    }
+
+    /** Floods {@code owner} with 256 KiB writes from a fresh thread; records the longest produce() call. */
+    static Thread flood(PeerLink link, String owner, AtomicLong calls, AtomicLong longest, AtomicBoolean stop) {
+        var big = new byte[256 << 10];
+        return Thread.ofPlatform().daemon().start(() -> {
+            while (!stop.get()) {
+                long t0 = System.nanoTime();
+                link.produce(owner, "fwd.hung", big, Durability.NONE, 300);
+                longest.accumulateAndGet(System.nanoTime() - t0, Math::max);
+                calls.incrementAndGet();
+            }
+        });
+    }
+
+    @Test
+    void overMtlsAStalledWriteIsReleasedTheWatchdogKeepsBoundingAndCloseReturns() throws Exception {
+        var ca = new PeerTestCa(dir.resolve("ca"));
+        var map = map(3);
+        var deafA = new DeafTls(ca, "a", port(map, "a"));
+        var deafC = new DeafTls(ca, "c", port(map, "c"));
+        open.add(deafA);
+        open.add(deafC);
+        var config = PeerConfig.parse(map, "b");
+        var b = PeerLink.open(config, KEY, new PeerSockets(CpTls.peerContext(ca.node("b")), config),
+                PeerLink.Owner.NONE, FAST); // write-stall bound = requestTimeoutMs = 150 ms; closed by hand below
+        long boundNanos = FAST.requestTimeoutMs() * 1_000_000L;
+        b.produce("a", "fwd.hung", b("x"), Durability.NONE, 300);
+        b.produce("c", "fwd.hung", b("x"), Durability.NONE, 300);
+        await(() -> deafA.handshaken.size() == 1 && deafC.handshaken.size() == 1, "both mTLS connections up");
+        Thread.sleep(200);
+        var stop = new AtomicBoolean();
+        var callsA = new AtomicLong();
+        var longestA = new AtomicLong();
+        var floodA = flood(b, "a", callsA, longestA, stop);
+        // the first stall: the blocked TLS write to a must be cut within about the bound
+        long t0 = System.nanoTime();
+        await(() -> b.transport().writeStalls() >= 1, "a's stalled TLS write was cut");
+        long before = callsA.get();
+        long released = System.nanoTime();
+        while (callsA.get() == before && System.nanoTime() - released < 5_000_000_000L) {
+            Thread.sleep(5);
+        }
+        assertTrue(callsA.get() > before, "the stalled produce() to a returned after the stall close");
+        // the watchdog is not wedged: it still bounds a second peer
+        var callsC = new AtomicLong();
+        var longestC = new AtomicLong();
+        long stallsBefore = b.transport().writeStalls();
+        var floodC = flood(b, "c", callsC, longestC, stop);
+        await(() -> b.transport().writeStalls() > stallsBefore + 1, "the watchdog keeps cutting stalled writes");
+        stop.set(true);
+        floodA.join(10_000);
+        floodC.join(10_000);
+        assertFalse(floodA.isAlive() || floodC.isAlive(), "every produce() call returns");
+        // a call that blocks spans at most one bound plus the watchdog period (and some scheduling slack)
+        long limit = 20 * boundNanos;
+        assertTrue(longestA.get() < limit, "longest produce() to a " + longestA.get() / 1_000_000 + " ms");
+        assertTrue(longestC.get() < limit, "longest produce() to c " + longestC.get() / 1_000_000 + " ms");
+        // and close() returns even with writes blocked on both peers' full buffers
+        var stop2 = new AtomicBoolean();
+        floodA = flood(b, "a", new AtomicLong(), new AtomicLong(), stop2);
+        floodC = flood(b, "c", new AtomicLong(), new AtomicLong(), stop2);
+        Thread.sleep(100);
+        var closer = Thread.ofPlatform().start(() -> b.close());
+        closer.join(5_000);
+        stop2.set(true);
+        assertFalse(closer.isAlive(), "PeerLink.close() returned");
+        floodA.join(5_000);
+        floodC.join(5_000);
+        assertTrue(System.nanoTime() - t0 < 30_000_000_000L);
     }
 
     static final class Cutter implements TcpTransport.SocketFactory {

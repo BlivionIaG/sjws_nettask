@@ -90,11 +90,21 @@ final class PeerSockets implements TcpTransport.SocketFactory {
         if (expected == null || expected.equals(config.self())) {
             throw new IOException("no pinned swarm peer at " + to);
         }
-        var socket = (SSLSocket) tls.context().getSocketFactory().createSocket();
+        // TLS layered over a plain socket that this factory keeps as the abort handle: an SSLSocket's own close()
+        // waits for the TLS output lock a blocked writer holds, the plain socket's close() never does.
+        var plain = new Socket();
+        SSLSocket socket;
+        try {
+            plain.setTcpNoDelay(true);
+            plain.connect(to, CONNECT_TIMEOUT_MILLIS);
+            socket = (SSLSocket) tls.context().getSocketFactory().createSocket(plain, to.getHostString(), to.getPort(),
+                    true);
+        } catch (IOException | RuntimeException e) {
+            plain.close();
+            throw e;
+        }
         try {
             socket.setSSLParameters(tls.parameters());
-            socket.setTcpNoDelay(true);
-            socket.connect(to, CONNECT_TIMEOUT_MILLIS);
             socket.setSoTimeout(TcpTransport.HANDSHAKE_TIMEOUT_MILLIS);
             socket.startHandshake();
             socket.setSoTimeout(0);
@@ -104,10 +114,22 @@ final class PeerSockets implements TcpTransport.SocketFactory {
                 throw new IOException("swarm peer at " + to + " did not present the pinned identity of " + expected.name());
             }
         } catch (IOException | RuntimeException e) {
+            plain.close();
             socket.close();
             throw e;
         }
+        abortHandles.put(socket, plain);
         return socket;
+    }
+
+    /** The plain socket under a socket {@link #connect} returned; weak keys, so a dropped connection is not kept. */
+    private final java.util.Map<Socket, Socket> abortHandles =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    @Override
+    public Socket abortHandle(Socket connected) {
+        var plain = abortHandles.get(connected);
+        return plain != null ? plain : connected;
     }
 
     /** The accepted side's handshake under one total deadline (a watchdog closes a trickling client). */

@@ -38,7 +38,10 @@ the pending write under the stream lock, then releases the lock before sending, 
 holds a lock that `onAck` (reader threads) or the ticker needs. Two callers racing on one stream can then put their
 frames on the wire out of seq order; the owner answers `OUT_OF_ORDER` and go-back-N resends in order. Socket writes
 have no timeout of their own, so the peer domain sets a write-stall bound of `requestTimeoutMs`: a write still
-blocked after that closes the connection (`writeStalls`) and go-back-N resends. An inline write that fails is
+blocked after that closes the connection (`writeStalls`) and go-back-N resends. The close goes through the socket
+factory's abort handle: `PeerSockets` layers TLS over a plain socket and the transport closes that plain socket
+(linger 0), because an `SSLSocket`'s own `close()` waits for the TLS output lock the blocked writer holds. The
+watchdog hands each close to its own virtual thread, so no close can stop it bounding other peers. An inline write that fails is
 resent after a short backoff instead of after `requestTimeoutMs`.
 
 ## 3. Forwarded produce and dedup
@@ -70,8 +73,10 @@ forwarded produces in a later step:
 | Outcomes | HTTP |
 |---|---|
 | `APPENDED`, `DUPLICATE` | success |
-| `OUTCOME_UNKNOWN`, `TIMEOUT`, `TOO_OLD` | 503 `https://sjws.dev/problems/outcome-unknown`, not retryable as a new write; never a 307 |
-| `FAILED`, `BUSY`, `UNAVAILABLE`, `LOST`, `OUT_OF_ORDER` | 503 `https://sjws.dev/problems/not-appended`, retryable |
+| `OUTCOME_UNKNOWN`, `TIMEOUT`, `TOO_OLD`, `LOST` | 503 `https://sjws.dev/problems/outcome-unknown`, not retryable as a new write; never a 307 |
+| `FAILED`, `BUSY`, `UNAVAILABLE`, `OUT_OF_ORDER` | 503 `https://sjws.dev/problems/not-appended`, retryable |
+
+`LOST` is outcome-unknown, not not-appended: the owner answered with an expected sequence below what it had acknowledged, so it lost state. A pending write may have been applied, and even delivered to a consumer, before that loss, and the owner can no longer prove it was not.
 | `FORBIDDEN` | 400 `https://sjws.dev/problems/not-appended` |
 
 No forwarded outcome is a not-leader: the forward hop has no leader, because the sender picks the owner. The

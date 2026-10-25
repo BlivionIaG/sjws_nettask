@@ -204,6 +204,17 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             return -1;
         }
 
+        /**
+         * A socket whose {@code close()} never waits behind a blocked write on {@code connected}, used to abort a
+         * stalled connection ({@link Domain#writeStallMillis}) and on {@link TcpTransport#close}. A plain socket is
+         * its own handle. An {@code SSLSocket}'s {@code close()} sends close_notify under the TLS output lock that a
+         * blocked writer holds for its whole write, so a TLS factory layers TLS over a plain socket and returns that
+         * plain socket here; closing it fails the blocked write at once.
+         */
+        default Socket abortHandle(Socket connected) {
+            return connected;
+        }
+
         SocketFactory PLAIN = new SocketFactory() {
             @Override
             public ServerSocket listen(InetSocketAddress bind) throws IOException {
@@ -378,13 +389,16 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             }
             long now = System.nanoTime();
             for (var peer : peers.values()) {
-                long since = peer.writingSince;
-                var current = peer.socket;
-                if (since != 0 && now - since > bound && current != null) {
+                var c = peer.conn; // one snapshot: the stamp and the socket belong to the same connection
+                if (c == null) {
+                    continue;
+                }
+                long since = c.writingSince;
+                if (since != 0 && now - since > bound && c.aborted.compareAndSet(false, true)) {
                     writeStalls.incrementAndGet();
-                    LOG.log(System.Logger.Level.WARNING, "{0} transport on {1}: a write to {2} was blocked over {3} ms; "
-                            + "connection closed", domain.name(), self.name(), peer.address, domain.writeStallMillis());
-                    closeQuietly(current); // the blocked write fails with an IOException; go-back-N resends
+                    peer.logStall(now);
+                    // Never close on this thread: whatever a close might wait for, the next pass still runs.
+                    Thread.ofVirtual().name(domain.name() + "-stall-abort-" + self.name()).start(c::abort);
                 }
             }
         }
@@ -957,8 +971,25 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         private final ReentrantLock io = new ReentrantLock();
         /** Frames offered to {@link #queue} and not yet written (or dropped) by the writer. */
         private final AtomicInteger backlog = new AtomicInteger();
-        /** nanoTime when the current socket write started, 0 when none is in progress (for the stall watchdog). */
-        private volatile long writingSince;
+        /** The current outbound connection on a direct transport, null when none (read by the stall watchdog). */
+        private volatile Conn conn;
+        /** Stall warnings: at most one per {@link #STALL_LOG_NANOS} per peer, with the count suppressed meanwhile. */
+        private long lastStallLog;
+        private long stallsUnlogged;
+        private static final long STALL_LOG_NANOS = 60_000_000_000L;
+
+        /** Watchdog thread only. */
+        private void logStall(long now) {
+            if (lastStallLog != 0 && now - lastStallLog < STALL_LOG_NANOS) {
+                stallsUnlogged++;
+                return;
+            }
+            LOG.log(System.Logger.Level.WARNING, "{0} transport on {1}: a write to {2} was blocked over {3} ms; "
+                    + "connection closed ({4} more since the last warning)", domain.name(), self.name(), address,
+                    domain.writeStallMillis(), stallsUnlogged);
+            lastStallLog = now;
+            stallsUnlogged = 0;
+        }
         private Mac directMac;
         private DataOutputStream out;
         private boolean failing;
@@ -980,6 +1011,25 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
          * Writes {@code frame} on the calling thread when the connection is up and no queued frame is ahead of it.
          * {@link #NOT_IDLE}: nothing was written, queue it; {@link #FAILED}: it was dropped with the connection.
          */
+        private void writing(long since) {
+            var c = conn;
+            if (c != null) {
+                c.writingSince = since;
+            }
+        }
+
+        private void dropConn() {
+            var c = conn;
+            conn = null;
+            if (c != null) {
+                c.abort();
+            } else {
+                closeQuietly(socket);
+            }
+            socket = null;
+            out = null;
+        }
+
         private int tryInline(SimTransport.Frame frame) {
             if (backlog.get() != 0 || !io.tryLock()) {
                 return NOT_IDLE;
@@ -1016,27 +1066,28 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                         return false;
                     }
                     var fresh = sockets.connect(address);
+                    var c = new Conn(fresh, sockets.abortHandle(fresh));
                     socket = fresh;
+                    conn = c;
                     if (!open) {
                         // N2: close() ran while this connect was in progress; never keep a socket past close
-                        closeQuietly(fresh);
-                        socket = null;
+                        dropConn();
                         sendDrops.incrementAndGet();
                         return false;
                     }
                     out = new DataOutputStream(new BufferedOutputStream(fresh.getOutputStream()));
                 }
-                writingSince = System.nanoTime();
+                writing(System.nanoTime());
                 out.writeInt(bytes.length);
                 out.write(bytes);
                 if (flush) {
                     out.flush();
                 }
-                writingSince = 0;
+                writing(0);
                 failing = false;
                 return true;
             } catch (IOException | RuntimeException failed) {
-                writingSince = 0;
+                writing(0);
                 sendDrops.incrementAndGet();
                 if (failed instanceof RuntimeException) {
                     writerErrors.incrementAndGet();
@@ -1046,9 +1097,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                     LOG.log(System.Logger.Level.WARNING, "{0} transport on {1}: sending to {2} failed ({3}); "
                             + "reconnecting", domain.name(), self.name(), address, failed.getClass().getSimpleName());
                 }
-                closeQuietly(socket);
-                socket = null;
-                out = null;
+                dropConn();
                 return false;
             }
         }
@@ -1056,15 +1105,13 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         /** {@link #io} held. Flushes buffered frames; false drops the connection. */
         private boolean flushLocked() {
             try {
-                writingSince = System.nanoTime();
+                writing(System.nanoTime());
                 out.flush();
-                writingSince = 0;
+                writing(0);
                 return true;
             } catch (IOException failed) {
-                writingSince = 0;
-                closeQuietly(socket);
-                socket = null;
-                out = null;
+                writing(0);
+                dropConn();
                 return false;
             }
         }
@@ -1164,9 +1211,40 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
         private void close() {
             writer.interrupt();
+            var c = conn;
+            if (c != null) {
+                c.abort(); // the abort handle first: a plain close never waits behind a blocked (TLS) write
+            }
             var current = socket;
             if (current != null) {
                 closeQuietly(current);
+            }
+        }
+    }
+
+    /** One outbound connection of a direct transport: its socket, abort handle and write-in-progress stamp. */
+    private static final class Conn {
+        final Socket socket;
+        final Socket abort;
+        /** nanoTime when the current socket write started, 0 when none is in progress. */
+        volatile long writingSince;
+        final java.util.concurrent.atomic.AtomicBoolean aborted = new java.util.concurrent.atomic.AtomicBoolean();
+
+        Conn(Socket socket, Socket abort) {
+            this.socket = socket;
+            this.abort = abort;
+        }
+
+        /** Closes the abort handle with linger 0 (an immediate reset, no flush), then the socket. */
+        void abort() {
+            try {
+                abort.setSoLinger(true, 0);
+            } catch (IOException | RuntimeException ignored) {
+                // already closed
+            }
+            closeQuietly(abort);
+            if (socket != abort) {
+                closeQuietly(socket);
             }
         }
     }
