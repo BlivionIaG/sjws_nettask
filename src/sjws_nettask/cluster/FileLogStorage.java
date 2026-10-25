@@ -441,7 +441,11 @@ public final class FileLogStorage implements LogStorage {
         if (!rolling() || channel.size() < rollBytes) {
             return;
         }
-        var tracked = sealed.computeIfAbsent(group, g -> new java.util.TreeMap<>());
+        var tracked = sealed.get(group);
+        if (tracked == null) { // no computeIfAbsent (SourceGuardTest)
+            tracked = new java.util.TreeMap<>();
+            sealed.put(group, tracked);
+        }
         long first = tracked.isEmpty() ? log.firstKey() : tracked.lastEntry().getValue().last + 1;
         channel.force(true); // every byte of the sealed file is durable before force() stops covering it
         channel.close();

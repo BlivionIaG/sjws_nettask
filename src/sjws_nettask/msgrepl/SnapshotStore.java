@@ -88,7 +88,7 @@ final class SnapshotStore {
                             deleteTree(p);
                         } else if (name.chars().allMatch(Character::isDigit) && Files.isRegularFile(p.resolve(MANIFEST))) {
                             var m = Files.readAllBytes(p.resolve(MANIFEST));
-                            pins.computeIfAbsent(topic, k -> new TreeMap<>()).put(Long.parseLong(name), new Pin(topic, Long.parseLong(name), p, m));
+                            topicPins(topic).put(Long.parseLong(name), new Pin(topic, Long.parseLong(name), p, m));
                         }
                     }
                 }
@@ -202,7 +202,7 @@ final class SnapshotStore {
             done = true;
             lock.lock();
             try {
-                pins.computeIfAbsent(topic, k -> new TreeMap<>()).put(index, new Pin(topic, index, target, manifest));
+                topicPins(topic).put(index, new Pin(topic, index, target, manifest));
             } finally {
                 lock.unlock();
             }
@@ -211,6 +211,16 @@ final class SnapshotStore {
         } finally {
             if (!done) deleteTree(tmp);
         }
+    }
+
+    /** Under {@link #lock}: the pins of {@code topic}, created empty (no computeIfAbsent: SourceGuardTest). */
+    private TreeMap<Long, Pin> topicPins(String topic) {
+        var m = pins.get(topic);
+        if (m == null) {
+            m = new TreeMap<>();
+            pins.put(topic, m);
+        }
+        return m;
     }
 
     /** Drops pins beyond the newest {@link #KEEP} that no transfer reads, and digests of inodes no pin holds. */
@@ -272,7 +282,13 @@ final class SnapshotStore {
     byte[][] hash(Path file, long bytes, int chunkBytes) throws IOException {
         int n = MsgSnapshot.chunks(bytes, chunkBytes);
         var out = new byte[n][];
-        var cache = digests.computeIfAbsent(fileKey(file), k -> new ConcurrentHashMap<>());
+        var inode = fileKey(file);
+        var cache = digests.get(inode);
+        if (cache == null) {
+            cache = new ConcurrentHashMap<>();
+            var raced = digests.putIfAbsent(inode, cache);
+            if (raced != null) cache = raced;
+        }
         ByteBuffer buf = null;
         try (var ch = FileChannel.open(file, StandardOpenOption.READ)) {
             for (int i = 0; i < n; i++) {
