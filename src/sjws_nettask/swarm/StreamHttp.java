@@ -985,11 +985,13 @@ final class StreamHttp {
             // refused; an out-of-order chunk that opens a gap also needs room for the gap ticket
             boolean opensGap = v == StreamCredit.ADMIT && la == s.attempt && c.chunkSeq() > st.maxSeq + 1
                     && st.heldChunks.get() == 0;
-            charged = cr.budget.admit(st, c.size(), v != StreamCredit.ADMIT, opensGap);
+            boolean exempt = v != StreamCredit.ADMIT;
+            charged = cr.budget.admit(st, c.size(), exempt, opensGap);
             if (charged < 0 && s.trimBeforeRefusal(st)) {
                 // #272 review R1 (#267 §4.3, "trim … before refusing"): the session's own read chunks went first;
-                // re-admit once
-                charged = cr.budget.admit(st, c.size(), false, opensGap);
+                // re-admit once, with the same exemption as the first call (an exempt chunk is never refused, so this
+                // is only reached with exempt == false)
+                charged = cr.budget.admit(st, c.size(), exempt, opensGap);
             }
             if (charged < 0) {
                 cr.release(st, c.size());
