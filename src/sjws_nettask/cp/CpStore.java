@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import sjws_nettask.cluster.Clock;
 import sjws_nettask.cluster.ClusterTransport;
 import sjws_nettask.cluster.Durability;
@@ -36,6 +38,7 @@ import sjws_nettask.cluster.GroupOptions;
 import sjws_nettask.cluster.Member;
 import sjws_nettask.cluster.MemberState;
 import sjws_nettask.cluster.NodeId;
+import sjws_nettask.cluster.OutcomeUnknownException;
 import sjws_nettask.cluster.QuorumPolicy;
 import sjws_nettask.cluster.ReplicatedNode;
 import sjws_nettask.cluster.ReplicationGroup;
@@ -445,7 +448,7 @@ public final class CpStore implements AutoCloseable {
         if (staged == null || staged.version != version) {
             return Outcome.error(503, "propose did not commit");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public Outcome activate(long nowMillis, long ttlMillis) {
@@ -543,7 +546,7 @@ public final class CpStore implements AutoCloseable {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public Outcome revoke(String nodeId) {
@@ -568,7 +571,7 @@ public final class CpStore implements AutoCloseable {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public Outcome rollout(List<String> stages) {
@@ -593,7 +596,7 @@ public final class CpStore implements AutoCloseable {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public Outcome advance() {
@@ -619,7 +622,7 @@ public final class CpStore implements AutoCloseable {
             Thread.currentThread().interrupt();
             return Outcome.error(503, "log");
         }
-        return outcome;
+        return settled(key, fp, outcome);
     }
 
     public String healthJson() {
@@ -850,7 +853,7 @@ public final class CpStore implements AutoCloseable {
         if (current == null || current.version() != version) {
             return Outcome.error(503, "activate did not commit");
         }
-        return outcome;
+        return settled(key, fingerprint, outcome);
     }
 
     private void onCommitted(ByteBuffer entry) {
@@ -866,6 +869,14 @@ public final class CpStore implements AutoCloseable {
                 int status = body.getInt();
                 var response = readString(body);
                 var fp = readString(body);
+                if (replay.containsKey(idemKey)) {
+                    // This key was already applied (#254): skip this entry's change on every replica. Same fingerprint:
+                    // a retry that passed admission while the original was still uncommitted (both got appended).
+                    // Different fingerprint: a reused key that raced the same way; the first applied entry wins, and
+                    // its caller is answered 409 by settled(). Deterministic: every replica rebuilds `replay` from
+                    // the log in log order (the CP group has no Raft snapshot).
+                    return;
+                }
                 replay.put(idemKey, new Cached(fp, new Outcome(status, response, 0)));
             } catch (java.nio.BufferUnderflowException e) {
                 return; // a truncated marker must not stall apply
@@ -983,17 +994,42 @@ public final class CpStore implements AutoCloseable {
     static final String COMMITTED_NOT_APPLIED = "committed, not applied (node closing): the write landed;"
             + " do not retry without the same Idempotency-Key";
 
+    /** Reason text when the log accepted a write but its fate is unknown (#254). */
+    static final String OUTCOME_UNKNOWN = "outcome unknown: the write may still land;"
+            + " read back, or retry only with the same Idempotency-Key";
+
+    /** Upper bound on waiting for a control-plane write to commit and apply; past it the outcome is unknown. */
+    static final Duration APPEND_TIMEOUT = Duration.ofSeconds(30);
+
     /**
-     * {@code "log"} for a write that did not land (not leader, apply lag, IO). For
+     * {@code "log"} for a write that did not land (not leader, apply lag, a cleanly rolled-back IO error). For
      * {@link sjws_nettask.cluster.CommittedNotAppliedException} the entry is in the log and will be applied on
-     * every replica, so the caller must not treat it as failed: for a join token it is consumed.
+     * every replica, so the caller must not treat it as failed: for a join token it is consumed. For
+     * {@link OutcomeUnknownException} (leadership lost, failed closed, closed, or {@link #APPEND_TIMEOUT}) it may
+     * or may not commit: never reported as "did not land" (#254). CpStore itself never retries a failed append.
      */
     static String logFailure(ExecutionException e) {
-        return e.getCause() instanceof sjws_nettask.cluster.CommittedNotAppliedException ? COMMITTED_NOT_APPLIED : "log";
+        var c = e.getCause();
+        if (c instanceof sjws_nettask.cluster.CommittedNotAppliedException) return COMMITTED_NOT_APPLIED;
+        return c instanceof OutcomeUnknownException ? OUTCOME_UNKNOWN : "log";
     }
 
     private long append(ByteBuffer entry) throws InterruptedException, ExecutionException {
-        return node.append(GROUP, List.of(entry)).get().index();
+        return await(node.append(GROUP, List.of(entry)), APPEND_TIMEOUT).index();
+    }
+
+    /**
+     * Bounded wait on an append: a stalled group (no quorum, wedged leader) can no longer park the caller forever.
+     * A timeout is reported as {@link OutcomeUnknownException}, since the entry may already be in the log (#254).
+     */
+    static <T> T await(java.util.concurrent.CompletableFuture<T> f, Duration timeout)
+            throws InterruptedException, ExecutionException {
+        try {
+            return f.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            throw new ExecutionException(new OutcomeUnknownException(GROUP, "not committed within " + timeout,
+                    java.util.Optional.empty(), e));
+        }
     }
 
     private long append(ByteBuffer entry, String key, Outcome success, String fp)
@@ -1186,6 +1222,26 @@ public final class CpStore implements AutoCloseable {
 
     private static String readString(ByteBuffer body) {
         return new String(readBytes(body), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * After a keyed append committed and applied: the answer for {@code key}. Two entries with one key can both reach
+     * the log (a retry admitted while the original was uncommitted); only the first applied takes effect (see
+     * {@link #onCommitted}), so a later one answers with the first one's outcome (same fingerprint) or 409 (a
+     * different request under the same key), never with an outcome of its own that did not happen (#254).
+     */
+    private Outcome settled(String key, String fp, Outcome mine) {
+        if (key == null || key.isBlank()) {
+            return mine;
+        }
+        var cached = replay.get(key);
+        if (cached == null) {
+            return mine;
+        }
+        if (!cached.fingerprint.equals(fp)) {
+            return Outcome.error(409, "idempotency key reused");
+        }
+        return cached.outcome;
     }
 
     private Outcome replayed(String key, String fp) {

@@ -58,7 +58,7 @@ sequenceDiagram
     Note over H: body: 8 MiB at most, else 400. Up to 4 MiB it is<br/>staged in one messaging buffer, above that or with<br/>no length in a growing heap buffer
     H->>W: append(records, durability)<br/>on the topic's log, opened on first produce
     W-->>H: base offset, once the durability holds
-    Note over H: waits 30 s at most, then 503
+    Note over H: waits 30 s at most, then 503 outcome-unknown
     H-->>C: 200 with baseOffset, count and<br/>Durability-Effective
 ```
 
@@ -86,6 +86,21 @@ sequenceDiagram
 Module settings, each a JVM property or the matching `SJWS_MESSAGING_*` variable: `sjws.messaging.enabled`, `.dir`,
 `.segment.bytes`, `.retention.bytes`, `.retention.ms`, `.retention.check.ms`, `.durability` (the default for every topic)
 and `.durability.topics` (`topic:mode,...`).
+
+#### Write failures: problem types (#254, #256)
+
+With HA replication on, a failed produce or offset commit tells the client which of three things happened. Each is an RFC 9457
+`application/problem+json` body with one of these `type` URIs:
+
+| `type` | Status | Meaning | What the client may do |
+|---|---|---|---|
+| `https://sjws.dev/problems/not-leader` | 307 with `Location` (leader known), else 503 + `Retry-After` | Refused: this node does not lead, so **nothing was appended**. | Resend to the leader. The 307 does this for clients that follow redirects. |
+| `https://sjws.dev/problems/not-appended` | 503 + `Retry-After` (transient: backpressure, too few STRICT copies, a storage error that was rolled back or a fenced group, a closed node), or 400 (the batch itself is unacceptable) | Refused by the log: the write is **definitely not applied**. | Safe to retry the same body after `Retry-After` (503), or fix the request (400). A not-leader 307 or 503 is just as safe to resend: it is also a refusal. |
+| `https://sjws.dev/problems/outcome-unknown` | 503 + `Retry-After`, **never a 307** | The log accepted the write, but this node cannot tell whether it commits: leadership was lost, the group failed closed, the node closed, or no ack came within 30 s. | Do **not** assume either result: the write may be applied or not. Read back first (from the leader in the `sjws-leader` header or the body's `leaderUrl`), or retry only with your own deduplication. |
+
+Every 503 above carries `Retry-After`. A leader read (`GET` with `consistency=leader`) never gets `not-appended` or `outcome-unknown`, because both describe writes; when it cannot be confirmed it is a plain 503 `unavailable`. `outcome-unknown` also carries the leader hint (`sjws-term`, `sjws-leader`, and `term`,
+`leader`, `leaderUrl` in the body) but no `Location`, because a redirect resends the body. The `detail` text is generic; the
+server logs the cause.
 
 ### 2.3 Retention (G2)
 Add `maxBytes` and `maxAgeMs` to the log-level policy for **plain log topics** (topics with no delivery groups, i.e. the

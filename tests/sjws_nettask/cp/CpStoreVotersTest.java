@@ -106,6 +106,92 @@ class CpStoreVotersTest {
         }
     }
 
+    /**
+     * #254 (Security): Idempotency-Key is checked at admission against applied keys only, so a same-key retry that
+     * arrives while the original is uncommitted is appended too. Both entries commit; apply skips the second, on
+     * every replica, so a rollout ADVANCE moves one stage, not two. A same-key entry with a different request
+     * (fingerprint) is skipped the same way: the first applied entry wins and the late caller gets 409.
+     */
+    @Test
+    void sameKeyEntriesThatBothCommitApplyOnceOnEveryReplica() throws Exception {
+        var clock = new FakeClock(0);
+        var net = new SimTransport();
+        var stores = open(3, clock, net);
+        try {
+            clock.advance(Duration.ofMillis(100));
+            drive(stores);
+            var leader = leader(stores);
+            var rolled = new java.util.concurrent.atomic.AtomicReference<CpStore.Outcome>();
+            run(stores, () -> rolled.set(leader.rollout(List.of("edge", "core", "rest"))));
+            assertEquals(200, rolled.get().status(), rolled.get().body());
+            clock.advance(Duration.ofMillis(40));
+            drive(stores);
+
+            // Nothing commits until the voters are driven, so both requests pass admission and both are appended.
+            var first = blocked(() -> leader.advance("k-1"));
+            var retry = blocked(() -> leader.advance("k-1"));
+            settle(stores, first, retry);
+            assertEquals(200, first.result().status(), first.result().body());
+            assertEquals(200, retry.result().status(), retry.result().body());
+            assertEquals(first.result().body(), retry.result().body(), "the retry answers with the original outcome");
+            clock.advance(Duration.ofMillis(40));
+            drive(stores);
+            for (var store : stores) {
+                assertEquals(1, store.stage(), "two same-key ADVANCE entries moved " + id(store, stores) + " twice");
+            }
+
+            // Same key, different request: the first applied entry wins; the rollout is skipped and answered 409.
+            var advance = blocked(() -> leader.advance("k-2"));
+            var reused = blocked(() -> leader.rollout(List.of("only"), "k-2"));
+            settle(stores, advance, reused);
+            assertEquals(200, advance.result().status(), advance.result().body());
+            assertEquals(409, reused.result().status(), reused.result().body());
+            clock.advance(Duration.ofMillis(40));
+            drive(stores);
+            for (var store : stores) {
+                assertEquals(2, store.stage(), "the skipped rollout must not reset " + id(store, stores));
+            }
+            assertEquals(200, leader.advance("k-1").status(), "an applied key still replays");
+            assertEquals(2, leader.stage());
+        } finally {
+            for (var store : stores) {
+                store.close();
+            }
+        }
+    }
+
+    /** A write started on its own thread, parked in its commit wait (nothing drives the voters yet). */
+    private record Pending(Thread thread, java.util.concurrent.atomic.AtomicReference<CpStore.Outcome> out) {
+        CpStore.Outcome result() {
+            return out.get();
+        }
+    }
+
+    private static Pending blocked(java.util.function.Supplier<CpStore.Outcome> write) throws Exception {
+        var out = new java.util.concurrent.atomic.AtomicReference<CpStore.Outcome>();
+        var t = Thread.ofPlatform().start(() -> out.set(write.get()));
+        for (int i = 0; i < 5_000 && t.getState() != Thread.State.TIMED_WAITING; i++) {
+            Thread.sleep(1);
+        }
+        assertEquals(Thread.State.TIMED_WAITING, t.getState(), "the write never reached its commit wait");
+        return new Pending(t, out);
+    }
+
+    private static void settle(List<CpStore> stores, Pending... writes) throws Exception {
+        run(stores, () -> {
+            for (var w : writes) {
+                try {
+                    w.thread().join(10_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        for (var w : writes) {
+            assertNotNull(w.result(), "a write did not finish");
+        }
+    }
+
     @Test
     void onlyThreeOrFiveFullVotersAreAccepted() throws Exception {
         var keys = keys();

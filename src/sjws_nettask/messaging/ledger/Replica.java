@@ -24,7 +24,11 @@ import java.util.concurrent.CompletableFuture;
  *
  * <p>Messaging-side SPI only: implementations live outside the messaging packages and are installed by the HA bootstrap
  * through {@link PartitionReplicator}, so with HA off no consensus class loads (MessagingClusterIsolationTest).
- * Appends on a node that is not a ready leader fail with {@link LeaderUnavailableException}.
+ * Appends on a node that is not a ready leader fail with {@link LeaderUnavailableException} (nothing appended). An
+ * append the consensus log accepted but that this node could not see commit (leadership lost, failed closed, closed)
+ * fails with {@link WriteOutcomeUnknownException}: it may still commit, so it must not be resent as if refused.
+ * Any other refusal before the log (backpressure, durability, storage rolled back, bad batch) fails with
+ * {@link WriteRefusedException}: nothing was appended.
  */
 public interface Replica extends PartitionAppender, AutoCloseable {
 

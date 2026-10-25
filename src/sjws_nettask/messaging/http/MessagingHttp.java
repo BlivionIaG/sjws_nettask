@@ -40,6 +40,9 @@ import sjws_nettask.core.buf.PooledBuffer;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.RecordBatch;
+import sjws_nettask.messaging.ledger.Replica;
+import sjws_nettask.messaging.ledger.WriteOutcomeUnknownException;
+import sjws_nettask.messaging.ledger.WriteRefusedException;
 
 /**
  * Produce / fetch on plain log topics (docs/design/partition-log.md §2.2), mounted at {@code /messaging/v1}.
@@ -178,7 +181,8 @@ final class MessagingHttp implements Handler {
             Thread.currentThread().interrupt();
             return problem(503, "unavailable", "interrupted");
         } catch (TimeoutException e) {
-            return problem(503, "unavailable", "offset commit not acknowledged in " + ACK_TIMEOUT_MS + " ms");
+            // Like a produce timeout: the commit may still land (#254). Idempotent, but say so rather than "unavailable".
+            return outcomeUnknown(offsetsReplica(), request.target());
         } catch (ExecutionException e) {
             return failed(e, request.target(), true);
         } catch (LeaderUnavailableException e) {
@@ -211,6 +215,16 @@ final class MessagingHttp implements Handler {
         return out.toByteArray();
     }
 
+    /** The offsets topic's replica, for a leader hint; null when not replicated or not loadable. */
+    private Replica offsetsReplica() {
+        try {
+            var olog = this.topics.get(LogOffsets.TOPIC, false);
+            return olog == null ? null : olog.replica();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     private Response produce(String topic, Request request, String target) throws BadRequest, IOException {
         // A request may only strengthen the topic's policy: a weaker Durability header is clamped up to it.
         var durability = atLeast(durability(request.headers().values("durability")), this.topics.durability(topic));
@@ -229,7 +243,8 @@ final class MessagingHttp implements Handler {
             Thread.currentThread().interrupt();
             return problem(503, "unavailable", "interrupted");
         } catch (TimeoutException e) {
-            return problem(503, "unavailable", "append not acknowledged in " + ACK_TIMEOUT_MS + " ms");
+            // The append may still commit after we stop waiting: outcome unknown, never a redirect (#254).
+            return outcomeUnknown(log.replica(), target);
         } catch (ExecutionException e) {
             return failed(e, target, true);
         } catch (LeaderUnavailableException e) {
@@ -468,27 +483,79 @@ final class MessagingHttp implements Handler {
         Throwable c = e.getCause();
         while (c instanceof java.util.concurrent.CompletionException && c.getCause() != null) c = c.getCause();
         if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
-        LOG.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + target + " failed", c);
-        Response r;
-        if (write) {
-            var json = "{\"type\":\"" + OUTCOME_UNKNOWN_TYPE + "\",\"title\":\"outcome unknown\",\"status\":503,"
-                    + "\"detail\":\"the write may or may not have been committed; retry it as after a timeout\"}";
-            r = new Response(503, ResponseHeaders.of().set("content-type", "application/problem+json"),
-                    Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
-        } else {
-            r = problem(503, "unavailable", "leader read failed");
-        }
+        if (write && c instanceof WriteRefusedException r) return refused(r, target);
+        FAILURES.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + target + " failed", c);
+        if (write && c instanceof WriteOutcomeUnknownException u) return outcomeUnknown(u.term(), u.leaderName(), u.leaderUrl(), target);
+        if (write) return outcomeUnknown(-1, null, null, target);
+        var r = problem(503, "unavailable", "leader read failed");
         r.headers().set("retry-after", RETRY_AFTER_SECONDS);
         return r;
     }
 
     static final String OUTCOME_UNKNOWN_TYPE = "https://sjws.dev/problems/outcome-unknown";
 
+    /** Problem type for a write the log refused before appending: nothing landed, resending cannot duplicate. */
+    static final String NOT_APPENDED_TYPE = "https://sjws.dev/problems/not-appended";
+
+    /**
+     * A write refused before it entered the log (#254): a retryable refusal (backpressure, STRICT copies
+     * unreachable, storage error rolled back or group fenced) is 503 + Retry-After, an unacceptable batch 400; both
+     * with the not-appended type and a generic detail (the cause is logged one-line, not sent).
+     */
+    static Response refused(WriteRefusedException e, String target) {
+        LOG.log(System.Logger.Level.DEBUG, () -> "write on " + target + " refused: " + e.getMessage());
+        int status = e.retryable() ? 503 : 400;
+        var json = "{\"type\":\"" + NOT_APPENDED_TYPE + "\",\"title\":\"not appended\",\"status\":" + status
+                + ",\"detail\":\"" + (e.retryable() ? "the log refused the write for now and nothing was appended;"
+                        + " retry it" : "the log refused this batch and nothing was appended") + "\"}";
+        var h = ResponseHeaders.of().set("content-type", "application/problem+json");
+        if (e.retryable()) h.set("retry-after", RETRY_AFTER_SECONDS);
+        return new Response(status, h, Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /** {@link #outcomeUnknown(long, String, String, String)} with the partition's current leader as the hint. */
+    static Response outcomeUnknown(Replica rep, String target) {
+        if (rep == null) return outcomeUnknown(-1, null, null, target);
+        return outcomeUnknown(rep.term(), rep.leaderName(), rep.leaderUrl(), target);
+    }
+
+    /**
+     * A write the log accepted whose fate is unknown (leadership lost, failed closed, closed, or no ack in
+     * {@link #ACK_TIMEOUT_MS}): 503 + Retry-After with the outcome-unknown problem type and the leader as a hint
+     * ({@code sjws-leader}, {@code sjws-term}, and {@code leader}/{@code leaderUrl} in the body), <b>never</b> a 307.
+     * A redirect resends the body, and topic produce has no idempotency key, so a write that does commit would be
+     * stored twice (#254). The client reads back (from the leader) or retries with its own deduplication.
+     */
+    static Response outcomeUnknown(long term, String leaderName, String leaderUrl, String target) {
+        var json = new StringBuilder("{\"type\":\"").append(OUTCOME_UNKNOWN_TYPE).append("\",\"title\":\"outcome unknown\",")
+                .append("\"status\":503,\"detail\":\"the write may or may not have been committed; read back or retry it")
+                .append(" with deduplication, as after a timeout\"");
+        var h = ResponseHeaders.of().set("content-type", "application/problem+json").set("retry-after", RETRY_AFTER_SECONDS);
+        if (term >= 0) {
+            json.append(",\"term\":").append(term);
+            h.set("sjws-term", Long.toString(term));
+        }
+        if (leaderName != null) {
+            json.append(",\"leader\":").append(quote(leaderName));
+            h.set("sjws-leader", leaderName);
+        }
+        if (leaderUrl != null) {
+            var base = leaderUrl.endsWith("/") ? leaderUrl.substring(0, leaderUrl.length() - 1) : leaderUrl;
+            json.append(",\"leaderUrl\":").append(quote(base + target));
+        }
+        json.append('}');
+        return new Response(503, h, Body.Bytes.of(json.toString().getBytes(StandardCharsets.UTF_8)));
+    }
+
     private static final System.Logger LOG = System.getLogger(MessagingHttp.class.getName());
+
+    /** Per-request failure logs: a full trace once per {@link #TRACE_INTERVAL} per exception type, else one line. */
+    static final java.time.Duration TRACE_INTERVAL = java.time.Duration.ofSeconds(30);
+    private static final ThrottledLog FAILURES = new ThrottledLog(LOG, TRACE_INTERVAL);
 
     /** A log I/O failure: 500 with a generic detail; the exception (paths, errno text) is logged, not sent (#246). */
     static Response logError(IOException e, String target) {
-        LOG.log(System.Logger.Level.ERROR, "messaging log I/O failed on " + target, e);
+        FAILURES.log(System.Logger.Level.ERROR, "messaging log I/O failed on " + target, e);
         return problem(500, "log error", "messaging log I/O failed");
     }
 
@@ -497,7 +564,7 @@ final class MessagingHttp implements Handler {
      * a generic detail and Retry-After; the exception text is logged, not sent (#246).
      */
     static Response unavailable(IllegalStateException e, String target) {
-        LOG.log(System.Logger.Level.WARNING, "messaging log unavailable on " + target, e);
+        FAILURES.log(System.Logger.Level.WARNING, "messaging log unavailable on " + target, e);
         var r = problem(503, "unavailable", "messaging log unavailable");
         r.headers().set("retry-after", RETRY_AFTER_SECONDS);
         return r;
