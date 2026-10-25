@@ -116,9 +116,9 @@ final class MessagingHttp implements Handler {
         } catch (BadRequest e) {
             return problem(400, "bad request", e.getMessage());
         } catch (IOException e) {
-            return problem(500, "log error", e.toString());
+            return logError(e, target);
         } catch (IllegalStateException e) {
-            return problem(503, "unavailable", e.getMessage());
+            return unavailable(e, target);
         }
     }
 
@@ -173,7 +173,7 @@ final class MessagingHttp implements Handler {
         } catch (BadRequest e) {
             return problem(400, "bad request", e.getMessage());
         } catch (IOException e) {
-            return problem(500, "log error", e.toString());
+            return logError(e, request.target());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return problem(503, "unavailable", "interrupted");
@@ -184,7 +184,7 @@ final class MessagingHttp implements Handler {
         } catch (LeaderUnavailableException e) {
             return notLeader(e, request.target());
         } catch (IllegalStateException e) {
-            return problem(503, "unavailable", e.getMessage());
+            return unavailable(e, request.target());
         }
     }
 
@@ -468,8 +468,7 @@ final class MessagingHttp implements Handler {
         Throwable c = e.getCause();
         while (c instanceof java.util.concurrent.CompletionException && c.getCause() != null) c = c.getCause();
         if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
-        System.getLogger(MessagingHttp.class.getName()).log(System.Logger.Level.WARNING,
-                (write ? "write" : "leader read") + " on " + target + " failed", c);
+        LOG.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + target + " failed", c);
         Response r;
         if (write) {
             var json = "{\"type\":\"" + OUTCOME_UNKNOWN_TYPE + "\",\"title\":\"outcome unknown\",\"status\":503,"
@@ -484,6 +483,25 @@ final class MessagingHttp implements Handler {
     }
 
     static final String OUTCOME_UNKNOWN_TYPE = "https://sjws.dev/problems/outcome-unknown";
+
+    private static final System.Logger LOG = System.getLogger(MessagingHttp.class.getName());
+
+    /** A log I/O failure: 500 with a generic detail; the exception (paths, errno text) is logged, not sent (#246). */
+    static Response logError(IOException e, String target) {
+        LOG.log(System.Logger.Level.ERROR, "messaging log I/O failed on " + target, e);
+        return problem(500, "log error", "messaging log I/O failed");
+    }
+
+    /**
+     * The messaging log cannot serve this request (closed, or the topic is not set up for it on this node): 503 with
+     * a generic detail and Retry-After; the exception text is logged, not sent (#246).
+     */
+    static Response unavailable(IllegalStateException e, String target) {
+        LOG.log(System.Logger.Level.WARNING, "messaging log unavailable on " + target, e);
+        var r = problem(503, "unavailable", "messaging log unavailable");
+        r.headers().set("retry-after", RETRY_AFTER_SECONDS);
+        return r;
+    }
 
     /** 307 to the leader when known (method and body preserved), else 503 + Retry-After; RFC 9457 type not-leader. */
     static Response notLeader(LeaderUnavailableException e, String target) {

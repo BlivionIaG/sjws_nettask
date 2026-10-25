@@ -65,6 +65,37 @@ class MessagingHttpFailedTest {
     }
 
     @Test
+    void logIoErrorIsAGeneric500() {
+        var r = MessagingHttp.logError(new IOException(SECRET), "/messaging/v1/topics/t/records");
+        assertEquals(500, r.status());
+        var json = body(r);
+        assertTrue(json.contains("\"type\":\"about:blank\"") && json.contains("\"title\":\"log error\""), json);
+        assertFalse(json.contains("msg_p0") || json.contains("IOException") || json.contains("/var/lib"), json);
+    }
+
+    @Test
+    void unavailableLogIsAGeneric503WithRetryAfter() {
+        var r = MessagingHttp.unavailable(new IllegalStateException("topic " + SECRET + " is not replicated"),
+                "/messaging/v1/topics/t/records");
+        assertEquals(503, r.status());
+        assertEquals(MessagingHttp.RETRY_AFTER_SECONDS, r.headers().get("retry-after"));
+        var json = body(r);
+        assertTrue(json.contains("\"title\":\"unavailable\""), json);
+        assertFalse(json.contains("msg_p0") || json.contains("replicated") || json.contains("/var/lib"), json);
+    }
+
+    @Test
+    void leaderLossWithAKnownLeaderStillRedirects() {
+        var e = new ExecutionException(new CompletionException(
+                new LeaderUnavailableException("not leader", 9, "n2", "http://n2:8080/")));
+        var r = MessagingHttp.failed(e, "/messaging/v1/topics/t/records", true);
+        assertEquals(307, r.status());
+        assertEquals("http://n2:8080/messaging/v1/topics/t/records", r.headers().get("location"));
+        assertEquals("9", r.headers().get("sjws-term"));
+        assertTrue(body(r).contains(MessagingHttp.NOT_LEADER_TYPE));
+    }
+
+    @Test
     void leaderLossStillMapsToNotLeader() {
         var e = new ExecutionException(new LeaderUnavailableException("not leader", 7, "n2", null));
         var r = MessagingHttp.failed(e, "/messaging/v1/topics/t/records", true);
