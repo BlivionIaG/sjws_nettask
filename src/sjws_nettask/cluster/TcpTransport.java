@@ -138,12 +138,28 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
      * @param hkdfInfo HKDF-SHA256 info for the frame key
      * @param maxFrameBytes largest frame accepted or sealed, at most {@link #MAX_FRAME_BYTES}; a longer length prefix
      *        is refused before any body byte is buffered
+     * @param writeStallMillis direct transports only, 0 to disable: a socket write (inline or by the writer thread)
+     *        still blocked after this long closes that connection ({@link #writeStalls}), so a peer that stops
+     *        reading cannot hold a sender forever; socket writes have no timeout of their own
      */
-    public record Domain(String name, String label, String hkdfInfo, int maxFrameBytes) {
+    public record Domain(String name, String label, String hkdfInfo, int maxFrameBytes, long writeStallMillis) {
         public static final Domain RAFT = new Domain("raft", "sjws-raft-frame\0", "sjws-raft-frame-v1", MAX_FRAME_BYTES);
+
+        /** A domain without a write-stall watchdog. */
+        public Domain(String name, String label, String hkdfInfo, int maxFrameBytes) {
+            this(name, label, hkdfInfo, maxFrameBytes, 0);
+        }
+
+        /** This domain with {@code writeStallMillis} set (see the record component). */
+        public Domain withWriteStallMillis(long millis) {
+            return new Domain(name, label, hkdfInfo, maxFrameBytes, millis);
+        }
 
         public Domain {
             Objects.requireNonNull(name, "name");
+            if (writeStallMillis < 0) {
+                throw new IllegalArgumentException("writeStallMillis");
+            }
             if (maxFrameBytes < HEADER_BYTES + MAC_LENGTH + 1 || maxFrameBytes > MAX_FRAME_BYTES) {
                 throw new IllegalArgumentException("maxFrameBytes");
             }
@@ -238,6 +254,11 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private final AuthReplay replay = new AuthReplay();
     private final ServerSocket server;
     private final Thread acceptor;
+    /** Direct transports with a write-stall bound only; else null. */
+    private final Thread stallWatch;
+    private final AtomicLong writeStalls = new AtomicLong();
+    private final AtomicLong writerErrors = new AtomicLong();
+    private final AtomicLong inlineWrites = new AtomicLong();
     private volatile BiConsumer<NodeId, SimTransport.Frame> handler;
     private volatile boolean open = true;
     private final AtomicLong originMismatches = new AtomicLong();
@@ -340,6 +361,48 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         this.maxHandshakes = Math.max(8, HANDSHAKES_PER_PEER * peers.size());
         this.server = sockets.listen(bind);
         this.acceptor = Thread.ofVirtual().name(domain.name() + "-accept-" + self.name()).start(this::accept);
+        this.stallWatch = direct && domain.writeStallMillis() > 0
+                ? Thread.ofVirtual().name(domain.name() + "-stallwatch-" + self.name()).start(this::watchStalls)
+                : null;
+    }
+
+    /** Closes connections whose current socket write has been blocked longer than the domain's bound. */
+    private void watchStalls() {
+        long bound = domain.writeStallMillis() * 1_000_000L;
+        long period = Math.max(1, Math.min(50, domain.writeStallMillis() / 4));
+        while (open) {
+            try {
+                Thread.sleep(period);
+            } catch (InterruptedException closing) {
+                return;
+            }
+            long now = System.nanoTime();
+            for (var peer : peers.values()) {
+                long since = peer.writingSince;
+                var current = peer.socket;
+                if (since != 0 && now - since > bound && current != null) {
+                    writeStalls.incrementAndGet();
+                    LOG.log(System.Logger.Level.WARNING, "{0} transport on {1}: a write to {2} was blocked over {3} ms; "
+                            + "connection closed", domain.name(), self.name(), peer.address, domain.writeStallMillis());
+                    closeQuietly(current); // the blocked write fails with an IOException; go-back-N resends
+                }
+            }
+        }
+    }
+
+    /** Connections closed because a socket write stayed blocked past {@link Domain#writeStallMillis}. */
+    public long writeStalls() {
+        return writeStalls.get();
+    }
+
+    /** Frames {@link #sendNow} wrote on the caller's thread. */
+    public long inlineWrites() {
+        return inlineWrites.get();
+    }
+
+    /** Unexpected (unchecked) failures caught by a direct writer, which then backs off and keeps running. */
+    public long writerErrors() {
+        return writerErrors.get();
     }
 
     @Override
@@ -363,20 +426,33 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
      * Direct transports only (#236): sends {@code frame} like the attached {@link ClusterRpc}, but writes it on the
      * calling thread when that connection is up and idle, saving the hand-off to its writer thread. The caller may
      * then block while the socket's send buffer is full (back-pressure from that peer), so only callers that may
-     * block on that peer use it; everything else goes through the writer thread as before.
+     * block on that peer use it; everything else goes through the writer thread as before. The block is bounded by
+     * {@link Domain#writeStallMillis} when set. Returns false when the frame was dropped (counted in
+     * {@link #sendDrops}): the peer is unknown, cut or closed, its queue is full, or the inline write failed.
      */
-    public void sendNow(NodeId to, SimTransport.Frame frame) {
+    public boolean sendNow(NodeId to, SimTransport.Frame frame) {
+        Objects.requireNonNull(frame, "frame");
         if (!direct) {
             throw new IllegalStateException("sendNow needs a direct transport");
         }
         var peer = peers.get(to);
         if (peer == null || cut.contains(to) || !open) {
             sendDrops.incrementAndGet();
-            return;
+            return false;
         }
-        if (!peer.tryInline(frame) && !peer.enqueue(frame)) {
+        int inline = peer.tryInline(frame);
+        if (inline == Peer.WRITTEN) {
+            inlineWrites.incrementAndGet();
+            return true;
+        }
+        if (inline == Peer.FAILED) {
+            return false; // dropped and counted: the connection failed under this write
+        }
+        if (!peer.enqueue(frame)) {
             sendDrops.incrementAndGet();
+            return false;
         }
+        return true;
     }
 
     @Override
@@ -478,6 +554,9 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         open = false;
         closeQuietly(server);
         acceptor.interrupt();
+        if (stallWatch != null) {
+            stallWatch.interrupt();
+        }
         for (var peer : peers.values()) {
             peer.close();
         }
@@ -873,14 +952,19 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         }
 
         // ---- direct transports only (#236): the caller may write inline when nothing is queued ----
+        static final int WRITTEN = 0, NOT_IDLE = 1, FAILED = 2;
         /** Guards {@link #out} and the frame MAC on a direct transport; sealing under it keeps seq order = wire order. */
         private final ReentrantLock io = new ReentrantLock();
         /** Frames offered to {@link #queue} and not yet written (or dropped) by the writer. */
         private final AtomicInteger backlog = new AtomicInteger();
+        /** nanoTime when the current socket write started, 0 when none is in progress (for the stall watchdog). */
+        private volatile long writingSince;
         private Mac directMac;
         private DataOutputStream out;
+        private boolean failing;
 
         private boolean enqueue(SimTransport.Frame frame) {
+            Objects.requireNonNull(frame, "frame");
             if (!direct) {
                 return queue.offer(frame);
             }
@@ -893,25 +977,24 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         }
 
         /**
-         * Writes {@code frame} on the calling thread when the connection is up and no queued frame is ahead of it;
-         * false means nothing was written and the caller should queue it.
+         * Writes {@code frame} on the calling thread when the connection is up and no queued frame is ahead of it.
+         * {@link #NOT_IDLE}: nothing was written, queue it; {@link #FAILED}: it was dropped with the connection.
          */
-        private boolean tryInline(SimTransport.Frame frame) {
+        private int tryInline(SimTransport.Frame frame) {
             if (backlog.get() != 0 || !io.tryLock()) {
-                return false;
+                return NOT_IDLE;
             }
             try {
-                if (backlog.get() != 0 || out == null) {
-                    return false;
+                if (backlog.get() != 0 || out == null || !open) {
+                    return NOT_IDLE;
                 }
-                writeLocked(frame, true);
-                return true;
+                return writeLocked(frame, true) ? WRITTEN : FAILED;
             } finally {
                 io.unlock();
             }
         }
 
-        /** {@link #io} held. Returns false after a write failure (the connection is dropped). */
+        /** {@link #io} held. Returns false when the frame was dropped with the connection (counted). */
         private boolean writeLocked(SimTransport.Frame frame, boolean flush) {
             if (directMac == null) {
                 directMac = mac(currentKey);
@@ -923,21 +1006,62 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             } catch (FrameTooLargeException unsealable) {
                 oversizeDrops.incrementAndGet();
                 sendDrops.incrementAndGet();
-                return true;
+                // N1: frames already buffered must not wait for a later send
+                return !flush || out == null || flushLocked();
             }
             try {
                 if (out == null) {
-                    socket = sockets.connect(address);
-                    out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                    if (!open) {
+                        sendDrops.incrementAndGet();
+                        return false;
+                    }
+                    var fresh = sockets.connect(address);
+                    socket = fresh;
+                    if (!open) {
+                        // N2: close() ran while this connect was in progress; never keep a socket past close
+                        closeQuietly(fresh);
+                        socket = null;
+                        sendDrops.incrementAndGet();
+                        return false;
+                    }
+                    out = new DataOutputStream(new BufferedOutputStream(fresh.getOutputStream()));
                 }
+                writingSince = System.nanoTime();
                 out.writeInt(bytes.length);
                 out.write(bytes);
                 if (flush) {
                     out.flush();
                 }
+                writingSince = 0;
+                failing = false;
+                return true;
+            } catch (IOException | RuntimeException failed) {
+                writingSince = 0;
+                sendDrops.incrementAndGet();
+                if (failed instanceof RuntimeException) {
+                    writerErrors.incrementAndGet();
+                }
+                if (!failing && open) {
+                    failing = true;
+                    LOG.log(System.Logger.Level.WARNING, "{0} transport on {1}: sending to {2} failed ({3}); "
+                            + "reconnecting", domain.name(), self.name(), address, failed.getClass().getSimpleName());
+                }
+                closeQuietly(socket);
+                socket = null;
+                out = null;
+                return false;
+            }
+        }
+
+        /** {@link #io} held. Flushes buffered frames; false drops the connection. */
+        private boolean flushLocked() {
+            try {
+                writingSince = System.nanoTime();
+                out.flush();
+                writingSince = 0;
                 return true;
             } catch (IOException failed) {
-                sendDrops.incrementAndGet();
+                writingSince = 0;
                 closeQuietly(socket);
                 socket = null;
                 out = null;
@@ -956,12 +1080,13 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 boolean ok;
                 io.lock();
                 try {
+                    // N3: writeLocked catches unchecked failures too, so this thread never dies on one
                     ok = writeLocked(frame, queue.isEmpty());
                 } finally {
                     io.unlock();
                     backlog.decrementAndGet();
                 }
-                if (!ok) {
+                if (!ok && open) {
                     try {
                         Thread.sleep(RECONNECT_MILLIS);
                     } catch (InterruptedException interrupted) {
