@@ -11,7 +11,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -43,7 +42,9 @@ class ConditionalAppendStressTest {
     private final SimTransport net = new SimTransport();
     private final List<ReplicatedNode> nodes = new ArrayList<>();
     private final List<ReplicationGroup> groups = new ArrayList<>();
-    private final List<List<CommittedEntry>> applied = new ArrayList<>();
+    // O(1) adds: a CopyOnWriteArrayList copied the whole list per committed entry, and under CPU starvation the
+    // delivery thread fell so far behind that drive() spent its 5 s delivery wait on every call (class timeout).
+    private final List<ConcurrentLinkedQueue<CommittedEntry>> applied = new ArrayList<>();
 
     private record Sent(long expected, CompletableFuture<CommittedIndex> future) {
     }
@@ -53,7 +54,7 @@ class ConditionalAppendStressTest {
         var members = List.of(member(1, false), member(2, false), member(3, true));
         var voters = VoterSet.dataAndWitness(members.get(0), members.get(1), members.get(2));
         for (var m : members) {
-            var seen = new CopyOnWriteArrayList<CommittedEntry>();
+            var seen = new ConcurrentLinkedQueue<CommittedEntry>();
             var node = ReplicatedNode.open(m.id(), voters, clock, new MemoryLogStorage(), net);
             groups.add(node.openGroup(GROUP, OPTS, seen::add));
             nodes.add(node);
@@ -66,6 +67,8 @@ class ConditionalAppendStressTest {
 
         var stop = new AtomicBoolean();
         var sent = new ConcurrentLinkedQueue<Sent>();
+        var sentCount = new AtomicInteger(); // ConcurrentLinkedQueue.size() is O(n); the driver polls this
+        var anyCommitted = new AtomicBoolean();
         var threads = new ArrayList<Thread>();
         for (int t = 0; t < 4; t++) {
             int id = t;
@@ -90,7 +93,14 @@ class ConditionalAppendStressTest {
                     // A caller acts on a term it read a moment ago; the gap lets step-downs land in between.
                     java.util.concurrent.locks.LockSupport.parkNanos(
                             java.util.concurrent.ThreadLocalRandom.current().nextLong(2_000_000));
-                    sent.add(new Sent(expected, nodes.get(l).append(GROUP, batch, null, expected)));
+                    var future = nodes.get(l).append(GROUP, batch, null, expected);
+                    future.whenComplete((ci, error) -> {
+                        if (error == null) {
+                            anyCommitted.set(true);
+                        }
+                    });
+                    sent.add(new Sent(expected, future));
+                    sentCount.incrementAndGet();
                     java.util.concurrent.locks.LockSupport.parkNanos(200_000);
                 }
             });
@@ -102,7 +112,7 @@ class ConditionalAppendStressTest {
         for (int round = 0; round < 200; round++) {
             // Pace the storm on the appenders: let at least one more append in before forcing the next change, so
             // appends really race step-downs. Bounded, and not an assertion: a starved appender only weakens a round.
-            submitted = awaitMoreSent(sent, submitted, ROUND_PACING);
+            submitted = awaitMoreSent(sentCount, submitted, ROUND_PACING);
             int l = leader();
             if (l >= 0) {
                 int other = 1 - l;
@@ -129,7 +139,7 @@ class ConditionalAppendStressTest {
         long deadline = System.nanoTime() + SETTLE_DEADLINE.toNanos();
         while (!settled && System.nanoTime() - deadline < 0) {
             step();
-            settled = sent.stream().anyMatch(s -> s.future().isDone() && !s.future().isCompletedExceptionally());
+            settled = anyCommitted.get();
             if (!settled) {
                 java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
             }
@@ -172,8 +182,8 @@ class ConditionalAppendStressTest {
         }
         assertTrue(applied.get(0).size() + applied.get(1).size() > 0, "no replica applied anything");
         // Both data nodes applied the same committed sequence (one is a prefix of the other).
-        var a = applied.get(0);
-        var b = applied.get(1);
+        var a = List.copyOf(applied.get(0));
+        var b = List.copyOf(applied.get(1));
         for (int i = 0; i < Math.min(a.size(), b.size()); i++) {
             assertEquals(a.get(i).index(), b.get(i).index());
             assertEquals(a.get(i).term(), b.get(i).term());
@@ -181,12 +191,12 @@ class ConditionalAppendStressTest {
     }
 
     /** Waits until more than {@code seen} appends were submitted, or {@code max} passes; returns the new count. */
-    private static int awaitMoreSent(ConcurrentLinkedQueue<Sent> sent, int seen, Duration max) {
+    private static int awaitMoreSent(AtomicInteger sent, int seen, Duration max) {
         long deadline = System.nanoTime() + max.toNanos();
-        int now = sent.size();
+        int now = sent.get();
         while (now <= seen && System.nanoTime() - deadline < 0) {
             java.util.concurrent.locks.LockSupport.parkNanos(100_000);
-            now = sent.size();
+            now = sent.get();
         }
         return now;
     }

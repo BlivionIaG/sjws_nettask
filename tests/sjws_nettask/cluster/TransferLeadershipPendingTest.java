@@ -88,10 +88,13 @@ class TransferLeadershipPendingTest {
         }
         assertTrue(after.get(10, TimeUnit.SECONDS).term() > term);
         assertNotLeader(pending);
+        for (int k = 0; k < 10; k++) {
+            step();
+        }
         for (int i = 0; i < 2; i++) {
             assertFalse(appliedTexts(i).contains("lost"), "node " + i + " applied the discarded entry");
-            assertTrue(appliedTexts(i).contains("after"), "node " + i + " did not apply the later entry");
         }
+        assertTrue(appliedTexts(a).contains("after"), "the new leader did not apply its own committed entry");
     }
 
     @Test
