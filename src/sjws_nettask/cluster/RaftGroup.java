@@ -113,6 +113,11 @@ final class RaftGroup {
     private long snapIndex;
     private long snapTerm;
     private byte[] snapData = new byte[0];
+    /** The snapshot last made durable (index and the very image array): a truncation does not rewrite it again. */
+    private long persistedIndex = -1;
+    private byte[] persistedData;
+    /** Bumped on every snapshot save under the lock; {@code recordSnapshot} saves off-lock and re-checks it. */
+    private long persistEpoch;
     /** Snapshot images refused or skipped: a taker that threw, returned null or exceeded maxSnapshotBytes. */
     private long skippedSnapshots;
     private SnapshotTaker taker;
@@ -193,6 +198,8 @@ final class RaftGroup {
             this.snapIndex = restored.lastIncludedIndex();
             this.snapTerm = restored.lastIncludedTerm();
             this.snapData = restored.data();
+            this.persistedIndex = snapIndex;
+            this.persistedData = snapData;
             this.commitIndex = snapIndex;
             this.lastApplied = snapIndex;
             var image = restored;
@@ -1228,14 +1235,33 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * With a {@link TruncationBound} set the application keeps a log tail behind its snapshot (#270): {@code next} is
+     * served from the log when that entry and its predecessor's term are still stored. Without a bound, anything at or
+     * below the snapshot is sent as the snapshot, as before.
+     */
+    private boolean inLogTail(long next) {
+        if (truncationBound == null) {
+            return false;
+        }
+        try {
+            return storage.termAt(groupId, next) != 0 && (next == 1 || termAt(next - 1) != 0);
+        } catch (IOException | UncheckedIOException failed) {
+            return false;
+        }
+    }
+
     private void replicate() {
         for (var peer : peers) {
             long next = nextIndex.getOrDefault(peer, lastIndex() + 1);
-            if (next <= snapIndex && !witnesses.contains(peer)) {
+            if (next <= snapIndex && !witnesses.contains(peer) && !inLogTail(next)) {
                 sendSnapshotChunk(peer);
                 continue;
             }
-            if (next <= snapIndex) {
+            if (next <= snapIndex && !witnesses.contains(peer)) {
+                // #270: a data follower only briefly behind catches up from the log tail kept behind the snapshot.
+                snapSends.remove(peer);
+            } else if (next <= snapIndex) {
                 var body = ByteBuffer.allocate(8 + 4 + 8 + 8 + 8 + 4).order(java.nio.ByteOrder.BIG_ENDIAN);
                 body.putLong(term);
                 body.putInt(self.wire());
@@ -1867,7 +1893,13 @@ final class RaftGroup {
             throw new IllegalStateException("group " + groupId.value() + ": the log storage keeps no durable snapshot,"
                     + " so deleting the log prefix would lose committed state on restart; refused");
         }
+        if (persistedIndex == snapIndex && persistedData == snapData) {
+            return; // already durable (#270: recordSnapshot saved it, the truncation that follows need not)
+        }
         storage.saveSnapshot(groupId, new LogSnapshot(groupId, snapIndex, snapTerm, snapData));
+        persistedIndex = snapIndex;
+        persistedData = snapData;
+        persistEpoch++;
     }
 
     long skippedSnapshots() {
@@ -2318,6 +2350,88 @@ final class RaftGroup {
                 }
             } finally {
                 lock.unlock();
+            }
+        }
+
+        @Override
+        public void recordSnapshot(LogSnapshot snapshot) {
+            Objects.requireNonNull(snapshot, "snapshot");
+            if (!snapshot.groupId().equals(groupId)) {
+                throw new IllegalArgumentException("group");
+            }
+            if (snapshot.data().length > options.maxSnapshotBytes()) {
+                throw new IllegalArgumentException("snapshot image of " + snapshot.data().length
+                        + " bytes exceeds maxSnapshotBytes " + options.maxSnapshotBytes());
+            }
+            long epoch;
+            lock.lock();
+            try {
+                refuseIfFailedClosed();
+                checkRecordable(snapshot);
+                if (!storage.persistsSnapshots()) {
+                    throw new IllegalStateException("group " + groupId.value() + ": the log storage keeps no durable"
+                            + " snapshot");
+                }
+                epoch = persistEpoch;
+            } finally {
+                lock.unlock();
+            }
+            try {
+                // Off the lock: the fsyncs of the image never hold up this group's appends.
+                storage.saveSnapshot(groupId, snapshot);
+            } catch (IOException failed) {
+                throw new UncheckedIOException(failed);
+            }
+            lock.lock();
+            try {
+                refuseIfFailedClosed();
+                if (snapshot.lastIncludedIndex() <= snapIndex) {
+                    if (persistEpoch != epoch || persistedIndex != snapIndex) {
+                        persistedIndex = -1; // ours may have overwritten a newer image: make the current one durable
+                        try {
+                            persistSnapshotBeforePrefixDelete();
+                        } catch (IOException failed) {
+                            throw new UncheckedIOException(failed);
+                        }
+                    }
+                    throw new IllegalArgumentException("stale snapshot: index " + snapshot.lastIncludedIndex()
+                            + " does not advance past " + snapIndex);
+                }
+                checkRecordable(snapshot);
+                snapIndex = snapshot.lastIncludedIndex();
+                snapTerm = snapshot.lastIncludedTerm();
+                snapData = snapshot.data();
+                if (persistEpoch != epoch) {
+                    persistedIndex = -1;
+                    try {
+                        persistSnapshotBeforePrefixDelete();
+                    } catch (IOException failed) {
+                        throw new UncheckedIOException(failed);
+                    }
+                } else {
+                    persistedIndex = snapIndex;
+                    persistedData = snapData;
+                    persistEpoch++;
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /** Under the lock: an application image must advance the snapshot and describe an applied, agreeing entry. */
+        private void checkRecordable(LogSnapshot snapshot) {
+            long index = snapshot.lastIncludedIndex();
+            if (index <= snapIndex) {
+                throw new IllegalArgumentException("stale snapshot: index " + index + " does not advance past "
+                        + snapIndex);
+            }
+            if (index > lastApplied) {
+                throw new IllegalArgumentException("snapshot index " + index + " is past the applied index "
+                        + lastApplied);
+            }
+            if (termAt(index) != snapshot.lastIncludedTerm()) {
+                throw new IllegalArgumentException("snapshot term " + snapshot.lastIncludedTerm()
+                        + " does not match the log's term " + termAt(index) + " at index " + index);
             }
         }
 
