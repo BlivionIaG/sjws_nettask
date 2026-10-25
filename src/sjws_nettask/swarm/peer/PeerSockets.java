@@ -81,6 +81,11 @@ final class PeerSockets implements TcpTransport.SocketFactory {
 
     @Override
     public Socket connect(InetSocketAddress to) throws IOException {
+        return dial(to).socket();
+    }
+
+    @Override
+    public TcpTransport.SocketFactory.Connected dial(InetSocketAddress to) throws IOException {
         PeerConfig.Node expected = null;
         for (var n : config.nodes()) {
             if (n.address().equals(to)) {
@@ -90,7 +95,7 @@ final class PeerSockets implements TcpTransport.SocketFactory {
         if (expected == null || expected.equals(config.self())) {
             throw new IOException("no pinned swarm peer at " + to);
         }
-        // TLS layered over a plain socket that this factory keeps as the abort handle: an SSLSocket's own close()
+        // TLS layered over a plain socket that dial() returns as the abort handle: an SSLSocket's own close()
         // waits for the TLS output lock a blocked writer holds, the plain socket's close() never does.
         var plain = new Socket();
         SSLSocket socket;
@@ -118,18 +123,7 @@ final class PeerSockets implements TcpTransport.SocketFactory {
             socket.close();
             throw e;
         }
-        abortHandles.put(socket, plain);
-        return socket;
-    }
-
-    /** The plain socket under a socket {@link #connect} returned; weak keys, so a dropped connection is not kept. */
-    private final java.util.Map<Socket, Socket> abortHandles =
-            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
-
-    @Override
-    public Socket abortHandle(Socket connected) {
-        var plain = abortHandles.get(connected);
-        return plain != null ? plain : connected;
+        return new TcpTransport.SocketFactory.Connected(socket, plain);
     }
 
     /** The accepted side's handshake under one total deadline (a watchdog closes a trickling client). */

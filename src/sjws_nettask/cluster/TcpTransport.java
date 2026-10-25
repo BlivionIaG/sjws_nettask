@@ -205,14 +205,24 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         }
 
         /**
-         * A socket whose {@code close()} never waits behind a blocked write on {@code connected}, used to abort a
-         * stalled connection ({@link Domain#writeStallMillis}) and on {@link TcpTransport#close}. A plain socket is
-         * its own handle. An {@code SSLSocket}'s {@code close()} sends close_notify under the TLS output lock that a
-         * blocked writer holds for its whole write, so a TLS factory layers TLS over a plain socket and returns that
-         * plain socket here; closing it fails the blocked write at once.
+         * Connects like {@link #connect} and also returns the socket's abort handle: a socket whose {@code close()}
+         * never waits behind a blocked write, used to abort a stalled connection ({@link Domain#writeStallMillis}) and
+         * on {@link TcpTransport#close}. A plain socket is its own handle. An {@code SSLSocket}'s {@code close()} sends
+         * close_notify under the TLS output lock that a blocked writer holds for its whole write, so a TLS factory
+         * layers TLS over a plain socket and returns that plain socket as the handle; closing it fails the blocked
+         * write at once.
          */
-        default Socket abortHandle(Socket connected) {
-            return connected;
+        default Connected dial(InetSocketAddress to) throws IOException {
+            var socket = connect(to);
+            return new Connected(socket, socket);
+        }
+
+        /** A connected socket and the socket that aborts it ({@link #dial}). */
+        record Connected(Socket socket, Socket abort) {
+            public Connected {
+                java.util.Objects.requireNonNull(socket, "socket");
+                java.util.Objects.requireNonNull(abort, "abort");
+            }
         }
 
         SocketFactory PLAIN = new SocketFactory() {
@@ -1073,8 +1083,9 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                         sendDrops.incrementAndGet();
                         return false;
                     }
-                    var fresh = sockets.connect(address);
-                    var c = new Conn(fresh, sockets.abortHandle(fresh));
+                    var dialed = sockets.dial(address);
+                    var fresh = dialed.socket();
+                    var c = new Conn(fresh, dialed.abort());
                     socket = fresh;
                     conn = c;
                     if (!open) {

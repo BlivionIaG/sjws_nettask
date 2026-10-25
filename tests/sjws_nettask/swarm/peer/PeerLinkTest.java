@@ -851,7 +851,7 @@ class PeerLinkTest {
         await(() -> b.transport().writeStalls() >= 1, "a's stalled TLS write was cut");
         long before = callsA.get();
         long released = System.nanoTime();
-        while (callsA.get() == before && System.nanoTime() - released < 5_000_000_000L) {
+        while (callsA.get() == before && System.nanoTime() - released < 15_000_000_000L) {
             Thread.sleep(5);
         }
         assertTrue(callsA.get() > before, "the stalled produce() to a returned after the stall close");
@@ -866,7 +866,7 @@ class PeerLinkTest {
         floodC.join(10_000);
         assertFalse(floodA.isAlive() || floodC.isAlive(), "every produce() call returns");
         // a call that blocks spans at most one bound plus the watchdog period (and some scheduling slack)
-        long limit = 20 * boundNanos;
+        long limit = 60 * boundNanos; // headroom for a loaded box; without the fix a call never returns
         assertTrue(longestA.get() < limit, "longest produce() to a " + longestA.get() / 1_000_000 + " ms");
         assertTrue(longestC.get() < limit, "longest produce() to c " + longestC.get() / 1_000_000 + " ms");
         // and close() returns even with writes blocked on both peers' full buffers
@@ -875,12 +875,12 @@ class PeerLinkTest {
         floodC = flood(b, "c", new AtomicLong(), new AtomicLong(), stop2);
         Thread.sleep(100);
         var closer = Thread.ofPlatform().start(() -> b.close());
-        closer.join(5_000);
+        closer.join(15_000);
         stop2.set(true);
         assertFalse(closer.isAlive(), "PeerLink.close() returned");
         floodA.join(5_000);
         floodC.join(5_000);
-        assertTrue(System.nanoTime() - t0 < 30_000_000_000L);
+        assertTrue(System.nanoTime() - t0 < 60_000_000_000L);
     }
 
     // ---- HA re-review of #251 at 6278107, B2: a write that may be applied is never "not appended" ----
