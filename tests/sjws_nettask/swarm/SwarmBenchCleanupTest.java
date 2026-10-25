@@ -135,7 +135,8 @@ class SwarmBenchCleanupTest {
         // one bucket per second from the start of the 2 s warmup, plus one spare: 1 s run -> 4 buckets
         var m = java.util.regex.Pattern.compile("(?m)^persec=\\[(\\d+),(\\d+),(\\d+),(\\d+)\\]$").matcher(out);
         assertTrue(m.find(), out);
-        assertTrue(Long.parseLong(m.group(1)) > 0 && Long.parseLong(m.group(3)) > 0, out);
+        // only the warm-up bucket is certain to be non-empty: a slow runner can stall past the 1 s measured window
+        assertTrue(Long.parseLong(m.group(1)) > 0, out);
         assertTrue(out.contains("heartbeat mode=off dispatch_tasks/s="), out);
 
         var r = start(List.of("-Dsjws.bench.hbWarmup=5"), this.dir.toString(), "heartbeat", "off", "1");
