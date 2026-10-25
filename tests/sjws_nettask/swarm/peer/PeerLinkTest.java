@@ -660,6 +660,109 @@ class PeerLinkTest {
         }
     }
 
+    // ---- #258 outcomes over a forwarded hop: unknown fate stays unknown, refusals say not appended ----
+
+    /** A scripted owner "a": answers every PRODUCE with {@code code} for its topic, or not at all when absent. */
+    sjws_nettask.cluster.ClusterRpc scriptedOwner(String map, Map<String, Outcome> answers) throws IOException {
+        var config = PeerConfig.parse(map, "a");
+        var raw = TcpTransport.open(config.self().id(), config.members(), KEY, sjws_nettask.cluster.Clock.SYSTEM, 64,
+                TcpTransport.SocketFactory.PLAIN, PeerLink.DOMAIN, true);
+        open.add(raw);
+        var rpc = new sjws_nettask.cluster.ClusterRpc[1];
+        rpc[0] = raw.attach(config.self().id(), (from, f) -> {
+            var code = answers.get(f.group().value());
+            if (f.type() != PeerLink.PRODUCE || code == null) {
+                return;
+            }
+            var in = java.nio.ByteBuffer.wrap(f.body());
+            var ack = java.nio.ByteBuffer.allocate(33).putLong(in.getLong()).putLong(in.getLong())
+                    .put((byte) code.ordinal()).putLong(-1).putLong(0).array();
+            rpc[0].send(from, new sjws_nettask.cluster.SimTransport.Frame(f.group(), PeerLink.ACK, ack));
+        });
+        return rpc[0];
+    }
+
+    @Test
+    void eachForwardedOutcomeReachesTheCallerWithItsProblemType() throws Exception {
+        var map = map(2);
+        scriptedOwner(map, Map.of("fwd.unknown", Outcome.OUTCOME_UNKNOWN, "fwd.failed", Outcome.FAILED,
+                "fwd.forbidden", Outcome.FORBIDDEN));
+        var b = link(map, "b", TcpTransport.SocketFactory.PLAIN, PeerLink.Owner.NONE, FAST);
+
+        var unknown = get(b.produce("a", "fwd.unknown", b("x"), Durability.GROUP, 5_000));
+        assertEquals(Outcome.OUTCOME_UNKNOWN, unknown.outcome(), "never collapsed into FAILED");
+        assertEquals(new PeerLink.Problem(503, PeerLink.Problem.OUTCOME_UNKNOWN_TYPE, false), unknown.problem());
+
+        var failed = get(b.produce("a", "fwd.failed", b("x"), Durability.GROUP, 5_000));
+        assertEquals(Outcome.FAILED, failed.outcome());
+        assertEquals(new PeerLink.Problem(503, PeerLink.Problem.NOT_APPENDED_TYPE, true), failed.problem());
+
+        var forbidden = get(b.produce("a", "fwd.forbidden", b("x"), Durability.GROUP, 5_000));
+        assertEquals(Outcome.FORBIDDEN, forbidden.outcome());
+        assertEquals(new PeerLink.Problem(400, PeerLink.Problem.NOT_APPENDED_TYPE, false), forbidden.problem());
+
+        // no answer within the budget: the write may have landed
+        var silent = get(b.produce("a", "fwd.silent", b("x"), Durability.GROUP, 300));
+        assertEquals(Outcome.TIMEOUT, silent.outcome());
+        assertEquals(new PeerLink.Problem(503, PeerLink.Problem.OUTCOME_UNKNOWN_TYPE, false), silent.problem());
+        assertEquals(1, b.answered(Outcome.OUTCOME_UNKNOWN));
+    }
+
+    @Test
+    void writesBehindAnOutcomeUnknownAreUnknownToo() throws Exception {
+        var map = map(2);
+        // only the first write is answered; the rest wait behind it on the same stream
+        var answered = new java.util.concurrent.atomic.AtomicBoolean();
+        var config = PeerConfig.parse(map, "a");
+        var raw = TcpTransport.open(config.self().id(), config.members(), KEY, sjws_nettask.cluster.Clock.SYSTEM, 64,
+                TcpTransport.SocketFactory.PLAIN, PeerLink.DOMAIN, true);
+        open.add(raw);
+        var rpc = new sjws_nettask.cluster.ClusterRpc[1];
+        var seen = new java.util.concurrent.atomic.AtomicInteger();
+        rpc[0] = raw.attach(config.self().id(), (from, f) -> {
+            if (f.type() != PeerLink.PRODUCE || seen.incrementAndGet() < 3 || !answered.compareAndSet(false, true)) {
+                return; // answer once all three arrived, with seq 1's outcome
+            }
+            var ack = java.nio.ByteBuffer.allocate(33).putLong(java.nio.ByteBuffer.wrap(f.body()).getLong()).putLong(1)
+                    .put((byte) Outcome.OUTCOME_UNKNOWN.ordinal()).putLong(-1).putLong(0).array();
+            rpc[0].send(from, new sjws_nettask.cluster.SimTransport.Frame(f.group(), PeerLink.ACK, ack));
+        });
+        var b = link(map, "b", TcpTransport.SocketFactory.PLAIN, PeerLink.Owner.NONE, FAST);
+        var futures = List.of(b.produce("a", "fwd.t", b("1"), Durability.GROUP, 5_000),
+                b.produce("a", "fwd.t", b("2"), Durability.GROUP, 5_000),
+                b.produce("a", "fwd.t", b("3"), Durability.GROUP, 5_000));
+        for (var f : futures) {
+            assertEquals(Outcome.OUTCOME_UNKNOWN, get(f).outcome(), "applied writes may be behind it");
+        }
+    }
+
+    @Test
+    void anOwnerWhoseDurabilityFailsAfterApplyAnswersOutcomeUnknownNotFailed() {
+        assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.afterDurabilityFailure(Partition.ForwardOutcome.APPENDED));
+        assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.afterDurabilityFailure(Partition.ForwardOutcome.DUPLICATE));
+        assertEquals(Outcome.FAILED, PeerLink.afterDurabilityFailure(Partition.ForwardOutcome.BUSY));
+    }
+
+    @Test
+    void noForwardedOutcomeIsARedirectOrNotLeaderAndUnknownFateIsNeverRetryable() {
+        for (var o : Outcome.values()) {
+            var p = PeerLink.Problem.of(o);
+            if (o == Outcome.APPENDED || o == Outcome.DUPLICATE) {
+                assertNull(p);
+                continue;
+            }
+            assertTrue(p.status() == 503 || p.status() == 400, o + " " + p);
+            assertFalse(p.type().contains("not-leader"), o + " " + p);
+            if (p.type().equals(PeerLink.Problem.OUTCOME_UNKNOWN_TYPE)) {
+                assertEquals(503, p.status());
+                assertFalse(p.retryable(), o + ": a resend could duplicate it");
+            } else {
+                assertEquals(PeerLink.Problem.NOT_APPENDED_TYPE, p.type());
+                assertEquals(p.retryable() ? 503 : 400, p.status(), o.toString());
+            }
+        }
+    }
+
     static final class Cutter implements TcpTransport.SocketFactory {
         private final List<Socket> sockets = new CopyOnWriteArrayList<>();
 

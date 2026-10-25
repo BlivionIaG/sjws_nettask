@@ -79,13 +79,25 @@ public final class PeerLink implements AutoCloseable {
     private static final int PRODUCE_HEADER = 8 + 8 + 1;
     private static final int ACK_BYTES = 8 + 8 + 1 + 8 + 8;
 
-    /** What a forwarded write did. The first five are the owner's {@link Partition.ForwardOutcome}s. */
+    /**
+     * What a forwarded write did. The first five are the owner's {@link Partition.ForwardOutcome}s; APPENDED through
+     * OUTCOME_UNKNOWN are wire codes, the rest are decided by the sender.
+     */
     public enum Outcome {
         APPENDED, DUPLICATE, TOO_OLD, OUT_OF_ORDER, BUSY,
         /** The owner does not serve this topic to this node. */
         FORBIDDEN,
-        /** The owner failed to apply it (fixed code; details stay in the owner's log). */
+        /**
+         * Not appended: the owner could not apply it (opening the partition failed, or its ledger writer refused it
+         * before apply). Fixed code; details stay in the owner's log. Nothing landed, so it may be retried.
+         */
         FAILED,
+        /**
+         * The owner applied it but could not make it durable (its ledger writer failed after apply): it may or may
+         * not survive, so it must not be resent as a new write. Every write behind it on the stream gets the same
+         * answer (#258's outcome-unknown, never a refusal).
+         */
+        OUTCOME_UNKNOWN,
         /** Local: no answer within the write's budget; it may or may not have been applied. */
         TIMEOUT,
         /** Local: the owner's breaker is open, the owner is not a pinned peer, or the link is closed. */
@@ -98,6 +110,35 @@ public final class PeerLink implements AutoCloseable {
     public record Result(Outcome outcome, long offset) {
         public boolean ok() {
             return outcome == Outcome.APPENDED || outcome == Outcome.DUPLICATE;
+        }
+
+        /** The client-facing answer for this result; null when {@link #ok()}. See {@link Problem#of}. */
+        public Problem problem() {
+            return Problem.of(outcome);
+        }
+    }
+
+    /**
+     * How a failed forwarded write is reported to the client at the edge (#258's problem types). A write whose fate
+     * is unknown is a typed 503 outcome-unknown and never a redirect, refusal or not-leader; a write that certainly
+     * did not land is not-appended, 503 when it may be retried and 400 when it will never be accepted. No forwarded
+     * outcome is a not-leader: the forward hop has no leader (the owner is chosen by the sender), so an edge keeps
+     * its own not-leader 307/503 for its own leadership.
+     */
+    public record Problem(int status, String type, boolean retryable) {
+        public static final String OUTCOME_UNKNOWN_TYPE = "https://sjws.dev/problems/outcome-unknown";
+        public static final String NOT_APPENDED_TYPE = "https://sjws.dev/problems/not-appended";
+
+        public static Problem of(Outcome outcome) {
+            return switch (outcome) {
+                case APPENDED, DUPLICATE -> null;
+                // applied-not-durable, no answer in the budget, or past the owner's dedup window: may have landed
+                case OUTCOME_UNKNOWN, TIMEOUT, TOO_OLD -> new Problem(503, OUTCOME_UNKNOWN_TYPE, false);
+                // nothing landed and a later attempt can succeed (OUT_OF_ORDER only surfaces once rewinds ran out)
+                case FAILED, BUSY, UNAVAILABLE, LOST, OUT_OF_ORDER -> new Problem(503, NOT_APPENDED_TYPE, true);
+                // the owner will never take this write here (topic not served to this node, or over the size limit)
+                case FORBIDDEN -> new Problem(400, NOT_APPENDED_TYPE, false);
+            };
         }
     }
 
@@ -331,7 +372,7 @@ public final class PeerLink implements AutoCloseable {
         int code = b.get() & 0xFF;
         long offset = b.getLong();
         long expected = b.getLong();
-        if (code > Outcome.FAILED.ordinal()) {
+        if (code > Outcome.OUTCOME_UNKNOWN.ordinal()) {
             malformed.incrementAndGet();
             return;
         }
@@ -375,7 +416,8 @@ public final class PeerLink implements AutoCloseable {
                 }
                 default -> {
                     if (p != null) {
-                        failed = retire(stream); // TOO_OLD, FORBIDDEN, FAILED: nothing behind it can land
+                        // TOO_OLD, FORBIDDEN, FAILED, OUTCOME_UNKNOWN: retire; everything behind gets the same answer
+                        failed = retire(stream);
                     }
                 }
             }
@@ -548,13 +590,22 @@ public final class PeerLink implements AutoCloseable {
         });
     }
 
+    /**
+     * The answer when a write's durability failed. An APPENDED or DUPLICATE write is already applied on the owner
+     * (and visible to its consumers), so its fate is unknown, never a refusal (#258). Any other outcome never waited.
+     */
+    static Outcome afterDurabilityFailure(Partition.ForwardOutcome outcome) {
+        return outcome == Partition.ForwardOutcome.APPENDED || outcome == Partition.ForwardOutcome.DUPLICATE
+                ? Outcome.OUTCOME_UNKNOWN : Outcome.FAILED;
+    }
+
     /** A forwarded append still waiting for its durability (bounded by {@link Limits#inboundInflight} per peer). */
     private record Unsynced(int origin, String topic, long producerId, long seq) { }
 
     private void answerDurable(NodeId from, String topic, long producerId, long seq, Outcome outcome,
             Partition.ForwardedResult r, CompletableFuture<Long> durable) {
         if (durable.isCompletedExceptionally()) {
-            answer(from, topic, producerId, seq, Outcome.FAILED, -1, 0);
+            answer(from, topic, producerId, seq, afterDurabilityFailure(r.outcome()), -1, 0);
         } else {
             answer(from, topic, producerId, seq, outcome, r.offset(), r.expectedSeq());
         }

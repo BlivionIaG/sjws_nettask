@@ -55,13 +55,29 @@ keyed on **(authenticated origin, producerId)**, so a peer cannot collide with a
 | `OUT_OF_ORDER` | A gap: the sender rewinds (go-back-N) and resends from the owner's expected sequence. Not surfaced unless the rewind budget runs out. |
 | `BUSY` | Local only: the stream already has 256 unanswered writes (`inflightPerProducer`, at most 1024, kept well under the 4096 window so an unapplied write cannot age out while it is retried). Not sent; retryable. An owner-side `BUSY` (per-peer inbound cap 2048, or over 1024 live producers per peer; producers idle 1 h may be evicted) is not surfaced: the sender backs off (10 ms to 1 s, jittered) and resends within the write's budget. |
 | `FORBIDDEN` | The owner does not serve the topic, or the record is over the cap (1 MiB default, 4 MiB maximum). Not applied. |
-| `FAILED` | The owner failed while applying; a fixed code, never the exception text. Not applied. |
+| `FAILED` | The owner could not apply it (opening the partition failed, or its ledger writer refused it before apply); a fixed code, never the exception text. Not applied; retryable. |
+| `OUTCOME_UNKNOWN` | **Outcome unknown**: the owner applied the write but its durability failed afterwards (ledger writer failure), so it may or may not survive. Every write still pending behind it on the stream gets the same answer. Never reported as `FAILED`. |
 | `TIMEOUT` | **Outcome unknown**: no answer within the budget. The write may or may not have been applied; resending it as a new write can produce a second copy. |
 | `UNAVAILABLE` | Not sent: unknown peer, self, link closed, or the owner's breaker is open (5 timeouts, open 1 s). |
 | `LOST` | The owner answered with an expected sequence below what it already acknowledged (it restarted without the stream's history). Writes after the acknowledged ones are lost; the next write starts a fresh stream. |
 
 Any failure retires the stream: all writes queued behind it fail with the same outcome and the next write starts a
 new stream at sequence 1, so a caller never sees a later write applied after an earlier one failed.
+
+**Client-facing mapping** (`PeerLink.Result.problem()`, #258's problem types), for the edge that will answer
+forwarded produces in a later step:
+
+| Outcomes | HTTP |
+|---|---|
+| `APPENDED`, `DUPLICATE` | success |
+| `OUTCOME_UNKNOWN`, `TIMEOUT`, `TOO_OLD` | 503 `https://sjws.dev/problems/outcome-unknown`, not retryable as a new write; never a 307 |
+| `FAILED`, `BUSY`, `UNAVAILABLE`, `LOST`, `OUT_OF_ORDER` | 503 `https://sjws.dev/problems/not-appended`, retryable |
+| `FORBIDDEN` | 400 `https://sjws.dev/problems/not-appended` |
+
+No forwarded outcome is a not-leader: the forward hop has no leader, because the sender picks the owner. The
+forwarded partitions are single-owner delivery partitions (`Partition` with a local `LedgerWriter`), so Raft's
+`OutcomeUnknownException` and `WriteRefusedException` cannot reach this path. An edge keeps its own not-leader
+307/503 for its own leadership.
 
 ## 4. Ledger format and downgrade
 
