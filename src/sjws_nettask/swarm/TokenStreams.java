@@ -143,7 +143,11 @@ public final class TokenStreams {
                     fractionSetting(get, "budget.admitWatermark", ADMIT_WATERMARK));
         }
 
-        /** {@code true} or {@code false} (any case); anything else is refused (fail closed, never a silent default). */
+        /**
+         * {@code true} or {@code false} (any case; blank or unset is false); anything else stops the process
+         * ({@link sjws_nettask.OptionalModule.Refused}, as the window rule above): a typo must neither turn
+         * backpressure off silently nor start the node without the swarm module (#257 N-c).
+         */
         private static boolean boolSetting(Function<String, String> get, String name) {
             var v = get.apply("sjws.swarm.stream." + name);
             if (v == null || v.isBlank() || v.trim().equalsIgnoreCase("false")) {
@@ -152,7 +156,8 @@ public final class TokenStreams {
             if (v.trim().equalsIgnoreCase("true")) {
                 return true;
             }
-            throw new IllegalArgumentException("sjws.swarm.stream." + name + ": " + v);
+            throw new sjws_nettask.OptionalModule.Refused("sjws.swarm.stream." + name + " must be true or false (any case),"
+                    + " got \"" + v + "\"");
         }
 
         private static int intSetting(Function<String, String> get, String name, int dflt) {
