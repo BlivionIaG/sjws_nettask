@@ -377,6 +377,17 @@ public class Sjws_nettask {
      */
     static int run(String[] args, Map<String, String> env, PrintStream out, PrintStream err,
             Transport.Factory h3Factory, Consumer<SjwsServer> started) {
+        return run(args, env, out, err, h3Factory, started, null);
+    }
+
+    /**
+     * @param redirectGlobals invoked with the log stream when this process is the detached daemon
+     *        child. {@link #main(String[])} passes {@link Daemon#redirectStandardStreams}.
+     *        In-process callers pass null, so {@link System#out} and {@link System#err} stay put.
+     *        Server output still goes to {@code out} and {@code err} (the log file when one is set).
+     */
+    static int run(String[] args, Map<String, String> env, PrintStream out, PrintStream err,
+            Transport.Factory h3Factory, Consumer<SjwsServer> started, Consumer<PrintStream> redirectGlobals) {
         for (var arg : args) {
             if (arg.equals("-h") || arg.equals("--help")) {
                 out.print(usage());
@@ -438,8 +449,8 @@ public class Sjws_nettask {
                 logOut = log;
                 logErr = log;
                 ownLog = true;
-                if (child) {
-                    Daemon.redirectStandardStreams(log);
+                if (child && redirectGlobals != null) {
+                    redirectGlobals.accept(log);
                 }
             } catch (IOException e) {
                 err.println("Cannot write log file " + opt.logFile() + ": " + e.getMessage());
@@ -621,18 +632,28 @@ public class Sjws_nettask {
             if (code != 0) {
                 System.exit(code);
             }
-        });
+        }, Daemon::redirectStandardStreams);
     }
 
     /**
      * The body of {@link #main(String[])} with streams and the exit hook supplied by the caller.
      * A normal launch passes a hook that calls {@link System#exit(int)} only for a non-zero code.
      * Tests pass a hook that records the code, so {@code --help} can be checked in this JVM.
+     * This overload does not replace {@link System#out} or {@link System#err}.
      */
     static void main(String[] args, Map<String, String> env, PrintStream out, PrintStream err,
             Consumer<Integer> exit) {
+        main(args, env, out, err, exit, null);
+    }
+
+    /**
+     * @param redirectGlobals see {@link #run}; only {@link #main(String[])} passes
+     *        {@link Daemon#redirectStandardStreams}
+     */
+    static void main(String[] args, Map<String, String> env, PrintStream out, PrintStream err,
+            Consumer<Integer> exit, Consumer<PrintStream> redirectGlobals) {
         int code = run(args, env, out, err, H3Transports.defaultFactory(), server -> {
-        });
+        }, redirectGlobals);
         exit.accept(code);
     }
 }
