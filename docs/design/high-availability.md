@@ -338,9 +338,10 @@ receiver's own term only while it follows and the sender is the leader it knows 
 none yet). A higher term is adopted first, as from any frame. Anything else, such as one left
 over from an old transfer reaching a sitting leader, is dropped without a reply.
 
-One election, from the first deadline to the lease, as a voter set runs it. The Raft side runs in tests and in a
+One election, from the first deadline to the lease, as a voter set runs it. The Raft side runs in tests, in a
 control process (group `cp-config`: one voter sends no `PRE_VOTE` or `VOTE`, a set of voters from `cp.peers` runs
-this exchange over TCP), not yet in an HA pair:
+this exchange over TCP), and, opt-in, in an HA messaging cluster (`ha.messaging`, see
+[HA messaging bootstrap](#ha-messaging-bootstrap)):
 
 ```mermaid
 sequenceDiagram
@@ -389,8 +390,8 @@ node leads and the lease is outside the caller-supplied `releaseBefore` window.
 claims. The fence is not a substitute for the third vote. `isLeader` can stay true on a
 node that has not yet seen a higher term; the lease is what drops the claim.
 
-Raft election timeout and heartbeat are caller-supplied `GroupOptions`. They are not
-`ha:` keys. The one place that picks them today is `CpGroup.options()` (used by `CpStore` and
+Raft election timeout and heartbeat are caller-supplied `GroupOptions`. For the control plane they are not
+`ha:` keys; the place that picks them is `CpGroup.options()` (used by `CpStore` and
 `CpWitness`): `Durability.RELAXED`,
 max batch `1024 * 1024` bytes, election timeout 100 ms, heartbeat 40 ms, snapshot every
 `10_000` entries. The lease for that group is 80 ms. `ReplicatedNode` builds its
@@ -410,7 +411,9 @@ true is what makes readiness wait on quorum.
 `ha.cluster_key` or `WEB_SERVER_HA_CLUSTER_KEY`.
 
 `ConfigLoader` accepts only these `ha` keys: `enabled`, `cluster_key`,
-`cluster_key_previous`, `cluster_key_file`, `cluster_key_previous_file`. The key is not
+`cluster_key_previous`, `cluster_key_file`, `cluster_key_previous_file`, and the HA messaging keys
+(`messaging`, `node_id`, `members`, `election_timeout`, `heartbeat`, `state_dir`, `topics`; see
+[HA messaging bootstrap](#ha-messaging-bootstrap)). The key is not
 part of the canonical config document, so a last-good copy does not store it and startup
 logs do not print it. `ClusterKey.MIN_BYTES` is 16. A value is trimmed; `base64:` and
 `hex:` select those encodings; anything else is the UTF-8 of the trimmed text. A trailing
@@ -471,6 +474,55 @@ once every node is sending with the new one.
 The authentication timestamp is wall-clock milliseconds. It is a replay window, not the
 leader lease. Monotonic clocks are not comparable across hosts.
 
+## HA messaging bootstrap
+
+Messaging replication (msgrepl phase A: one Raft group `msg/<topic>` per replicated topic plus
+`msg/__offsets`, see `RaftReplicator`) has a production switch: `ha.messaging: off|on|auto`. **The default
+is `off`.** Turning the default to `auto` is a separate change, held until the gates in the default-on
+proposal (G1-G7) are met.
+
+| `ha.messaging` | Member list absent | Valid member list naming this node, `ha.enabled: true` | Invalid member list (bare pair, `node_id` not listed, ...) | Member list, `ha.enabled` false |
+|---|---|---|---|---|
+| `off` (default) | single node | single node | single node (syntax still checked) | single node |
+| `on` | refuses to start (exit 64) | replicates | refuses to start (exit 64) | refuses to start (exit 64) |
+| `auto` | single node, silently | replicates | refuses to start (exit 64) | single node, with a warning |
+
+A valid member list is two data nodes plus one witness, or three or more data nodes. A bare pair is refused
+with the `VoterSet` words (`two voters require a witness`), and `VoterSet.majority` refuses it again when
+the node opens. Every data node needs `http_url` (the 307 target when it leads). The timings must pass the
+`CpTiming` rule: `2 * ha.heartbeat * 1.01 + 10 ms < ha.election_timeout` (defaults 100 ms and 1 s).
+
+When the mode resolves to replication, the composition root (`HaMessagingStart`) loads
+`sjws_nettask.msgrepl.HaMessaging` by name, before the server mounts the messaging module:
+
+1. One `TcpTransport` on this member's `address`, HMAC-SHA256 per frame under `ha.cluster_key` (HKDF info
+   `sjws-raft-frame-v1`, so the key is not a heartbeat tag). Frames are authenticated, not encrypted; a
+   member off loopback logs a warning. Any key holder can act as any member until #175's cert-to-peer
+   binding covers this transport: keep the member network private.
+2. One `FileLogStorage` under `<state_dir>/raft` (default `<--state-dir>/msgrepl`), and one
+   `ReplicatedNode` with `VoterSet.dataAndWitness` (with a witness) or `VoterSet.majority`.
+3. A data node builds `RaftReplicator(node, ha.topics, data-node http_urls, <state_dir>/apply, ...)` and hands
+   it to `MessagingModule.replication`. Messaging must be enabled there (`sjws.messaging.enabled`), or the
+   process refuses to start. The witness must not run messaging; it calls `RaftReplicator.openForWitness`
+   with the same `ha.topics` and timings, so its groups match the data nodes' (#217 item 1).
+4. `ReplicatedNode.begin` (10 ms tick). One INFO line names the node, the voter count, the topics and the
+   timings. Shutdown closes the messaging module (and its replicas) first, then the node, the transport and the
+   log storage.
+
+Only `ha.topics` are replicated; producing to any other topic on a replicated node is refused (`LogTopics`).
+The settings are read once at startup; changing them needs a restart.
+
+Any `ha.members` list also marks the process as multi-process for the swarm stream guard
+(`Sjws_nettask.multiProcess`, #236), whatever `ha.messaging` resolves to.
+
+**Rollback.** `ha.messaging: off` (or removing `ha.members`) and a restart: each node serves its local applied
+ledger without consensus. The nodes no longer agree; keep one node writable and drain the others. The Raft
+state under `state_dir` stays; turning replication back on resumes from it if the directory is kept or wiped
+as a whole.
+
+Known limits (gates before any default change): msg groups never snapshot or truncate their consensus log
+(#270); no multi-process test yet (G3); torn last record (#241).
+
 ## Zero cost when HA is off
 
 `ha.enabled` false discards any key bytes and does not resolve `ClusterKey`.
@@ -484,6 +536,12 @@ returns the live file handler (or the non-HA override). `acceptPause` stays null
 accept loop does not sleep on a gate. `ClientManager` only reads `acceptPause` when it
 is non-null. Active/active installs no accept gate (`HaSettings.acceptPause` is null
 unless a caller sets one). The request path does not append to a Raft log.
+
+HA messaging decides at startup only. With `ha.messaging: off`, or with no `ha.members`, `HaMessagingStart`
+returns the modules untouched: `LogTopics.replicator` stays null, every topic opens with no replica, and no
+`sjws_nettask.msgrepl` class and none of `ReplicatedNode`, `RaftGroup`, `TcpTransport` or `FileLogStorage`
+load. `cp.ClassLoadTest.haMessagingOffAndNoMemberListLoadNoReplication` pins that on a real server process
+that produces and fetches.
 
 ## Clock drift
 
