@@ -154,13 +154,14 @@ public final class PeerLink implements AutoCloseable {
     final AtomicLong resent = new AtomicLong();
     final AtomicLong rewinds = new AtomicLong();
     final AtomicLong timeouts = new AtomicLong();
+    final AtomicLong inlineFailures = new AtomicLong();
     final AtomicLong served = new AtomicLong();
     final AtomicLong refused = new AtomicLong();
     final AtomicLong malformed = new AtomicLong();
     final AtomicLong[] answered = new AtomicLong[Outcome.values().length];
 
-    private PeerLink(PeerConfig config, ClusterKey key, TcpTransport.SocketFactory sockets, Owner owner, Limits limits)
-            throws IOException {
+    private PeerLink(PeerConfig config, ClusterKey key, TcpTransport.SocketFactory sockets, Owner owner, Limits limits,
+            long writeStallMillis) throws IOException {
         this.config = Objects.requireNonNull(config, "config");
         this.limits = Objects.requireNonNull(limits, "limits");
         this.owner = Objects.requireNonNull(owner, "owner");
@@ -178,7 +179,7 @@ public final class PeerLink implements AutoCloseable {
         this.breakers = Map.copyOf(b);
         this.inbound = Map.copyOf(in);
         this.transport = TcpTransport.open(config.self().id(), config.members(), key, sjws_nettask.cluster.Clock.SYSTEM,
-                limits.queue(), sockets, DOMAIN, true);
+                limits.queue(), sockets, DOMAIN.withWriteStallMillis(writeStallMillis), true);
         this.rpc = transport.attach(config.self().id(), this::onFrame);
         this.ticker = Thread.ofVirtual().name("swarm-peer-tick-" + config.self().name()).start(this::tick);
     }
@@ -190,7 +191,13 @@ public final class PeerLink implements AutoCloseable {
      */
     public static PeerLink open(PeerConfig config, ClusterKey key, TcpTransport.SocketFactory sockets, Owner owner,
             Limits limits) throws IOException {
-        return new PeerLink(config, key, sockets, owner, limits);
+        return new PeerLink(config, key, sockets, owner, limits, limits.requestTimeoutMs());
+    }
+
+    /** Tests: {@code writeStallMillis} 0 turns the transport's write-stall bound off. */
+    static PeerLink open(PeerConfig config, ClusterKey key, TcpTransport.SocketFactory sockets, Owner owner,
+            Limits limits, long writeStallMillis) throws IOException {
+        return new PeerLink(config, key, sockets, owner, limits, writeStallMillis);
     }
 
     public PeerConfig config() {
@@ -244,6 +251,7 @@ public final class PeerLink implements AutoCloseable {
                     stream = fresh;
                 }
             }
+            Pending p;
             stream.lock.lock();
             try {
                 if (stream.retired) {
@@ -252,18 +260,43 @@ public final class PeerLink implements AutoCloseable {
                 if (stream.pending.size() >= limits.inflightPerProducer()) {
                     return done(Outcome.BUSY);
                 }
-                var p = new Pending(stream.nextSeq++, payload, durability, deadline);
+                p = new Pending(stream.nextSeq++, payload, durability, deadline);
                 p.round = stream.round;
                 stream.pending.put(p.seq, p);
                 if (stream.pending.size() == 1) {
                     stream.progressNanos = now;
                 }
                 forwarded.incrementAndGet();
-                send(stream, p, true); // the caller may block on this owner: write inline, no hand-off
-                return p.future;
             } finally {
                 stream.lock.unlock();
             }
+            // B1: the inline write may block on this owner's socket, so it runs with no lock held. onAck (the
+            // owner's reader thread) and the ticker take stream.lock, and blocking under it could stall every stream
+            // or deadlock two nodes forwarding to each other. The socket write is bounded by the transport's
+            // write-stall watchdog (requestTimeoutMs). Two producers racing on one stream may now put their frames
+            // on the wire out of seq order; the owner answers OUT_OF_ORDER and the go-back-N rewind resends in order.
+            // A frame sent after its stream retired is harmless: every retirement leaves the owner refusing it
+            // (FORBIDDEN, OUT_OF_ORDER after LOST or FAILED), or the caller already has an outcome-unknown TIMEOUT.
+            if (!stream.retired && !send(stream, p, true)) {
+                failedFast(stream, p);
+            }
+            return p.future;
+        }
+    }
+
+    /** N4: an inline write the transport dropped is resent after a short backoff, not after requestTimeoutMs. */
+    private void failedFast(Stream stream, Pending p) {
+        stream.lock.lock();
+        try {
+            if (!stream.retired && stream.pending.get(p.seq) == p && stream.retryAtNanos == 0) {
+                long now = System.nanoTime();
+                stream.retryAtNanos = now + backoffNanos(++stream.busy);
+                stream.round++;
+                stream.progressNanos = now;
+                inlineFailures.incrementAndGet();
+            }
+        } finally {
+            stream.lock.unlock();
         }
     }
 
@@ -275,15 +308,16 @@ public final class PeerLink implements AutoCloseable {
         return id;
     }
 
-    private void send(Stream stream, Pending p, boolean inline) {
+    /** False when the transport dropped the frame (inline sends only report it; queued sends fail on timeout). */
+    private boolean send(Stream stream, Pending p, boolean inline) {
         var body = ByteBuffer.allocate(PRODUCE_HEADER + p.payload.length).putLong(stream.producerId).putLong(p.seq)
                 .put((byte) (p.durability == null ? 0 : p.durability.ordinal() + 1)).put(p.payload).array();
         var frame = new SimTransport.Frame(new GroupId(stream.topic), PRODUCE, body);
         if (inline) {
-            transport.sendNow(stream.owner, frame);
-        } else {
-            rpc.send(stream.owner, frame);
+            return transport.sendNow(stream.owner, frame);
         }
+        rpc.send(stream.owner, frame);
+        return true;
     }
 
     private void onAck(NodeId from, String topic, byte[] body) {
@@ -602,7 +636,7 @@ public final class PeerLink implements AutoCloseable {
         long progressNanos;
         long retryAtNanos;
         int busy;
-        boolean retired;
+        volatile boolean retired; // read without the lock before an inline send (B1)
 
         Stream(NodeId owner, String topic, long producerId) {
             this.owner = owner;

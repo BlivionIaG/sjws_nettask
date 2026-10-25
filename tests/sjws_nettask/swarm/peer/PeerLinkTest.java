@@ -31,6 +31,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -202,7 +204,8 @@ class PeerLinkTest {
         var a = link(map, "a", TcpTransport.SocketFactory.PLAIN, owner("a"), FAST);
         var b = link(map, "b", cutter, PeerLink.Owner.NONE, FAST);
         var futures = new ArrayList<CompletableFuture<PeerLink.Result>>();
-        for (int i = 0; i < 200; i++) {
+        assertTrue(get(b.produce("a", "fwd.t", b("m0"), Durability.NONE, 20_000)).ok()); // connected: cuts land
+        for (int i = 1; i < 200; i++) {
             futures.add(b.produce("a", "fwd.t", b("m" + i), Durability.NONE, 20_000));
             if (i % 40 == 20) {
                 cutter.cut(); // frames queued meanwhile are dropped; later ones get OUT_OF_ORDER or time out
@@ -469,6 +472,194 @@ class PeerLinkTest {
     }
 
     /** Plain sockets that a test can cut, to drop frames and force go-back-N. */
+    // ---- HA review of #251, B1: no socket write under a lock the readers or the ticker need ----
+
+    /** Binds {@code port} and accepts connections that are never read: a hung owner. */
+    static final class Deaf implements AutoCloseable {
+        final ServerSocket server;
+        final List<Socket> accepted = new CopyOnWriteArrayList<>();
+
+        Deaf(int port) throws IOException {
+            server = new ServerSocket();
+            server.setReuseAddress(true);
+            server.setReceiveBufferSize(4096);
+            server.bind(new InetSocketAddress("127.0.0.1", port));
+            Thread.ofPlatform().daemon().start(() -> {
+                while (true) {
+                    try {
+                        accepted.add(server.accept());
+                    } catch (IOException closed) {
+                        return;
+                    }
+                }
+            });
+        }
+
+        @Override
+        public void close() throws IOException {
+            server.close();
+            for (var s : accepted) {
+                s.close();
+            }
+        }
+    }
+
+    /** A link whose transport never cuts a blocked write: only the B1 fix keeps the ticker and readers going. */
+    PeerLink unbounded(String map, String self, PeerLink.Owner owner, PeerLink.Limits limits) throws IOException {
+        return unbounded(map, self, TcpTransport.SocketFactory.PLAIN, owner, limits);
+    }
+
+    PeerLink unbounded(String map, String self, TcpTransport.SocketFactory sockets, PeerLink.Owner owner,
+            PeerLink.Limits limits) throws IOException {
+        var l = PeerLink.open(PeerConfig.parse(map, self), KEY, sockets, owner, limits, 0);
+        open.add(l);
+        return l;
+    }
+
+    @Test
+    void aCallerBlockedForeverOnAHungOwnerHoldsNoLockTheTickerOrReadersNeed() throws Exception {
+        var map = map(3);
+        var deaf = new Deaf(port(map, "a"));
+        open.add(deaf);
+        var c = link(map, "c", TcpTransport.SocketFactory.PLAIN, owner("c"), FAST);
+        // requestTimeoutMs 2 s: no resend goes through the writer before the flooder is stuck in its inline write;
+        // at 2 s the ticker must take the hung stream's lock to rewind and then retire it
+        var slow = new PeerLink.Limits(256, 2048, 1024, 3_600_000L, 2_000, 1 << 20, 1024, 5, 300);
+        var b = unbounded(map, "b", PeerLink.Owner.NONE, slow);
+        var big = new byte[256 << 10];
+        var hung = new CopyOnWriteArrayList<CompletableFuture<PeerLink.Result>>();
+        hung.add(b.produce("a", "fwd.hung", b("x"), Durability.NONE, 300)); // through the writer, which connects
+        await(() -> deaf.accepted.size() == 1, "connected");
+        Thread.sleep(200); // the writer is idle again: from here every write is inline on the flooder's thread
+        var calls = new AtomicLong();
+        var flooder = Thread.ofPlatform().daemon().start(() -> {
+            while (true) {
+                hung.add(b.produce("a", "fwd.hung", big, Durability.NONE, 300));
+                calls.incrementAndGet();
+            }
+        });
+        long before;
+        do { // wait until the flooder is stuck inside one produce() call (a's buffers are full)
+            before = calls.get();
+            Thread.sleep(500);
+        } while (calls.get() != before || before == 0);
+        assertTrue(flooder.isAlive());
+        assertTrue(hung.size() < 256, "stuck before the inflight cap, not answering BUSY: " + hung.size());
+        // the ticker still walks every stream: the hung stream's returned writes get their TIMEOUT
+        for (var f : hung) {
+            assertEquals(Outcome.TIMEOUT, get(f).outcome());
+        }
+        // and another owner's ACKs, delivered on b's reader thread into onAck, still flow
+        for (int i = 0; i < 100; i++) {
+            assertTrue(get(b.produce("c", "fwd.ok", b("m" + i), Durability.NONE, 5_000)).ok());
+        }
+        assertEquals(calls.get(), before, "the flooder is still blocked in its socket write");
+        assertEquals(0, b.transport().writeStalls());
+        assertEquals(100, payloads("c", "fwd.ok").size());
+    }
+
+    static final TcpTransport.SocketFactory TINY_BUFFERS = new TcpTransport.SocketFactory() {
+        @Override
+        public ServerSocket listen(InetSocketAddress bind) throws IOException {
+            var server = new ServerSocket();
+            server.setReuseAddress(true);
+            server.setReceiveBufferSize(4096);
+            server.bind(bind);
+            return server;
+        }
+
+        @Override
+        public Socket connect(InetSocketAddress to) throws IOException {
+            var socket = new Socket();
+            socket.setTcpNoDelay(true);
+            socket.setSendBufferSize(4096);
+            socket.connect(to, 2_000);
+            return socket;
+        }
+    };
+
+    static int port(String map, String node) {
+        for (var e : map.split(",")) {
+            if (e.startsWith(node + "=")) {
+                return Integer.parseInt(e.substring(e.lastIndexOf(':') + 1));
+            }
+        }
+        throw new IllegalArgumentException(node);
+    }
+
+    @Test
+    void anOwnerThatNeverReadsStallsOnlyItsCallerWhileAcksAndTheTickerKeepFlowing() throws Exception {
+        var map = map(3);
+        var deaf = new Deaf(port(map, "a")); // "a" accepts and never reads
+        open.add(deaf);
+        var c = link(map, "c", TcpTransport.SocketFactory.PLAIN, owner("c"), FAST);
+        var b = link(map, "b", TcpTransport.SocketFactory.PLAIN, PeerLink.Owner.NONE, FAST);
+        var big = new byte[256 << 10];
+        var hung = new CopyOnWriteArrayList<CompletableFuture<PeerLink.Result>>();
+        var longestCallNanos = new AtomicLong();
+        var stop = new AtomicBoolean();
+        var flooder = Thread.ofPlatform().daemon().start(() -> {
+            while (!stop.get()) {
+                long t0 = System.nanoTime();
+                hung.add(b.produce("a", "fwd.hung", big, Durability.NONE, 400));
+                longestCallNanos.accumulateAndGet(System.nanoTime() - t0, Math::max);
+            }
+        });
+        // the flooder fills a's socket and blocks inside produce(); the write-stall bound must cut it
+        await(() -> b.transport().writeStalls() >= 1, "a write to the deaf owner was blocked and cut");
+        // meanwhile another owner's ACKs (b's reader for c, onAck) and the ticker keep working
+        for (int i = 0; i < 100; i++) {
+            assertTrue(get(b.produce("c", "fwd.ok", b("m" + i), Durability.NONE, 5_000)).ok());
+        }
+        await(() -> hung.stream().anyMatch(f -> f.isDone() && f.join().outcome() == Outcome.TIMEOUT),
+                "the ticker fires the hung stream's budget");
+        stop.set(true);
+        flooder.join(10_000);
+        assertFalse(flooder.isAlive(), "produce() to the deaf owner returns");
+        for (var f : hung) {
+            var r = get(f);
+            assertFalse(r.ok(), String.valueOf(r));
+        }
+        assertTrue(longestCallNanos.get() < 5_000_000_000L, "a blocked produce() is bounded: "
+                + longestCallNanos.get() / 1_000_000 + " ms");
+        assertEquals(100, payloads("c", "fwd.ok").size());
+    }
+
+    @Test
+    void twoLinksForwardingLargeRecordsToEachOtherDoNotDeadlock() throws Exception {
+        var map = map(2);
+        // no write-stall bound: nothing but the B1 fix can break a cycle of blocked writes
+        // 4 KiB socket buffers: an inline write of a large record blocks until the other side's reader drains it
+        var a = unbounded(map, "a", TINY_BUFFERS, owner("a"), FAST);
+        var b = unbounded(map, "b", TINY_BUFFERS, owner("b"), FAST);
+        int threads = 6;
+        int each = 30;
+        var record = new byte[900 << 10]; // a few records fill both directions' socket buffers at once
+        var futures = new CopyOnWriteArrayList<CompletableFuture<PeerLink.Result>>();
+        var workers = new ArrayList<Thread>();
+        for (var from : List.of(a, b)) {
+            String to = from == a ? "b" : "a";
+            for (int t = 0; t < threads; t++) {
+                String topic = "fwd.x"; // one stream per direction: every caller and onAck share its lock
+                workers.add(Thread.ofPlatform().start(() -> {
+                    for (int i = 0; i < each; i++) {
+                        futures.add(from.produce(to, topic, record, Durability.NONE, 30_000));
+                    }
+                }));
+            }
+        }
+        for (var w : workers) {
+            w.join(60_000);
+            assertFalse(w.isAlive(), "producers on both sides return");
+        }
+        for (var f : futures) {
+            assertTrue(get(f).ok(), String.valueOf(f.get()));
+        }
+        for (var node : List.of("a", "b")) {
+            assertEquals(threads * each, payloads(node, "fwd.x").size(), node + " exactly once");
+        }
+    }
+
     static final class Cutter implements TcpTransport.SocketFactory {
         private final List<Socket> sockets = new CopyOnWriteArrayList<>();
 

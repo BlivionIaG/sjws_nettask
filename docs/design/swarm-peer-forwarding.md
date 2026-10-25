@@ -31,6 +31,16 @@ is a `Reason.ORIGIN` rejection: the connection is closed, `originMismatches` cou
 and the identity is held off with a doubling backoff from 1 s to 60 s (`originHeldOff` counts refused reconnects).
 The dialer checks that the server presents the SAN pinned for the address it dialled (`identityRefused`).
 
+**Sending.** The peer transport is *direct*: frames are handed to `PeerLink` on the reader thread, and
+`TcpTransport.sendNow` lets a `produce()` caller write its frame on its own thread when nothing is queued for that
+peer (otherwise it queues behind the writer; seal order stays wire order). `produce()` assigns the seq and records
+the pending write under the stream lock, then releases the lock before sending, so a blocked socket write never
+holds a lock that `onAck` (reader threads) or the ticker needs. Two callers racing on one stream can then put their
+frames on the wire out of seq order; the owner answers `OUT_OF_ORDER` and go-back-N resends in order. Socket writes
+have no timeout of their own, so the peer domain sets a write-stall bound of `requestTimeoutMs`: a write still
+blocked after that closes the connection (`writeStalls`) and go-back-N resends. An inline write that fails is
+resent after a short backoff instead of after `requestTimeoutMs`.
+
 ## 3. Forwarded produce and dedup
 
 `PeerLink.produce(owner, topic, payload, durability, budgetMs)` returns a future that never completes
