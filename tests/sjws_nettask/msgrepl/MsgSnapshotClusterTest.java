@@ -221,7 +221,12 @@ class MsgSnapshotClusterTest {
         int nl = c.leader();
         c.awaitEnd(1 - nl, base + 1);
         c.awaitEnd(nl, base + 1);
-        assertTrue(c.data[l].snapshot(), "a later snapshot succeeds");
+        boolean later = false;
+        for (int k = 0; k < 2000 && !later; k++) { // the new entry's apply completes on the writer thread
+            later = c.data[l].snapshot();
+            if (!later) c.step();
+        }
+        assertTrue(later, "a later snapshot succeeds");
         assertEquals(c.checksum(0, 0), c.checksum(1, 0));
         assertTrue(c.data[l].dedup.duplicate("pid1", 40));
         try (var s = Files.list(c.data[l].root.resolve("msgrepl").resolve("snap").resolve("t"))) {

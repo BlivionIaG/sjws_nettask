@@ -522,6 +522,7 @@ final class RaftReplica implements Replica {
 
     /** Takes the snapshot at {@code a} now (also tests). */
     boolean snapshotAt(Applied a) throws IOException {
+        if (a.index() <= this.recordedIndex) return false; // nothing new since the last one (or the one restored)
         // Constraint 1: the snapshot point must be durable in the segments, not only applied.
         if (this.local.snapshot().durableOffset() < a.end()) {
             this.log.force();
