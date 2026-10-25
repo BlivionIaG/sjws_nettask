@@ -71,6 +71,8 @@ final class StreamCredit {
     volatile Runnable beforeReserve;
     /** Test hook (#248 r5 C3): runs after an offer's listener drain returned, before held is lowered. */
     volatile Runnable beforeHeldLowered;
+    /** Test hook (C3), run on the reader thread between its first and its remaining read-position stores. */
+    volatile Runnable midReadPublish;
 
     private record Key(long hi, long lo) { }
 
@@ -331,6 +333,10 @@ final class StreamCredit {
 
         void publishRead(long attempt, long bytes, long next) {
             this.readAttempt = attempt;
+            var hook = this.owner.midReadPublish;
+            if (hook != null) {
+                hook.run();
+            }
             this.readBytes = bytes;
             this.readNext = next;
         }

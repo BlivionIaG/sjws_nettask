@@ -71,7 +71,7 @@ class StreamCreditTest {
     }
 
     void on(int sinkChunks) {
-        on(new TokenStreams.Config(1, 64, sinkChunks, true));
+        on(new TokenStreams.Config(1, Math.min(64, sinkChunks), sinkChunks, true)); // window ≤ sinkChunks (#257 R2)
     }
 
     void on(TokenStreams.Config config) {
@@ -883,7 +883,7 @@ class StreamCreditTest {
         on(2);
         var b = Swarm.sharing(this.swarm, "nodeb", 7, ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
         try {
-            b.enableStreams(new TokenStreams.Config(1, 64, 2, true));
+            b.enableStreams(new TokenStreams.Config(1, 2, 2, true)); // window ≤ sinkChunks (#257 R2)
             var bHttp = new SwarmHttp(b, 8, StreamHttpTest.BY_HEADER);
             java.util.function.BiFunction<String, byte[], Response> onB = (target, body) -> bHttp.handle(new Request("POST",
                     target, RequestHeaders.of(Map.of("x-agent", List.of("w"))), null, false, null, SwarmHttpTest.body(body)));
@@ -951,5 +951,149 @@ class StreamCreditTest {
         assertThrows(IllegalArgumentException.class,
                 () -> TokenStreams.Config.from(Map.of("sjws.swarm.stream.credit.enabled", "yes")::get));
         assertFalse(new TokenStreams.Config(1, 64, 256).credit(), "the three-setting constructor keeps credit off");
+    }
+
+    // --- #257 review (Architecture R1–R3)
+
+    /** Every frame in {@code got} is a TOKEN (no gap ERROR) and their seqs are {@code first, first + 1, …}; returns the count. */
+    static int assertConsecutiveTokens(byte[] got, long first) {
+        var in = ByteBuffer.wrap(got);
+        int n = 0;
+        Frame f;
+        while ((f = Frame.decode(in)) != null) {
+            var fr = f;
+            assertEquals(Frame.Type.TOKEN, fr.type(), () -> "no gap: " + new String(fr.payload(), StandardCharsets.UTF_8));
+            assertEquals(first + n, StreamChunk.decode(f.payload()).chunkSeq());
+            n++;
+        }
+        return n;
+    }
+
+    long trimmedThrough(Stream s) {
+        var se = session(s);
+        se.lock.lock();
+        try {
+            return se.trimmedThrough;
+        } finally {
+            se.lock.unlock();
+        }
+    }
+
+    @Test
+    void r1AtDefaultsTheExemptFillerInTheBytesDimensionTrimsNoUnreadChunk() throws Exception {
+        // #257 R1: the default config (window 64, sinkChunks 256, 4 MiB); only the credit sub-flag is set
+        on(TokenStreams.Config.from(n -> n.equals("sjws.swarm.stream.credit.enabled") ? "true" : null));
+        assertEquals(256, tokens().config().sinkChunks());
+        var s = stream();
+        credit(chunk(s, 0, 10));
+        read(s, 1); // unreadIn == 0
+        for (int seq = 2; seq <= 5; seq++) {
+            credit(chunk(s, seq, (int) MIB)); // held: credit at zero in bytes
+        }
+        assertEquals(0, credit().snapshot(session(s), st(s), s.hi(), s.lo(), s.attempt()).bytes());
+        credit(chunk(s, 1, (int) MIB)); // exempt filler: unread is now 4 MiB + one chunk
+        assertEquals(5, st(s).maxSeq);
+        assertTrue(trimmedThrough(s) < st(s).readNext, "no unread chunk trimmed: trimmedThrough=" + trimmedThrough(s)
+                + " readNext=" + st(s).readNext);
+        var got = read(s, 5, "last-event-id", s.attempt() + ".0");
+        assertEquals(5, assertConsecutiveTokens(got, 1), "the reader gets chunks 1..5 with no gap");
+        assertEquals(6, st(s).readNext);
+        assertEquals(0, tokens().sinkDrops());
+        assertBaseline(st(s));
+    }
+
+    @Test
+    void r1InTheChunksDimensionHeldCanReachTheWindowAndNothingUnreadIsTrimmed() throws Exception {
+        // window == sinkChunks (the largest window credit allows, R2): held reaches window − 1, then the filler and LAST
+        on(new TokenStreams.Config(1, 8, 8, true));
+        var s = stream();
+        credit(chunk(s, 0, 10));
+        read(s, 1);
+        for (int seq = 2; seq <= 8; seq++) {
+            credit(chunk(s, seq, 10)); // held 1..7 = window − 1
+        }
+        assertEquals(7, st(s).heldChunks.get());
+        credit(chunk(s, 1, 10)); // the filler fits the sink: delivered, not dropped
+        assertEquals(8, st(s).maxSeq);
+        assertEquals(0, st(s).heldChunks.get());
+        assertFalse(sink(s).dropped());
+        assertEquals(0, tokens().sinkDrops());
+        assert429(chunk(s, 9, 10)); // 8 unread: the window is full
+        assertEquals(204, chunk(s, 9, Frame.LAST, new byte[0]).status()); // LAST is never refused
+        assertTrue(trimmedThrough(s) < st(s).readNext, "trimmedThrough=" + trimmedThrough(s));
+        var got = read(s, 9, "last-event-id", s.attempt() + ".0");
+        assertEquals(9, assertConsecutiveTokens(got, 1), "chunks 1..8 and LAST with no gap");
+        assertBaseline(st(s));
+    }
+
+    @Test
+    void r2WithCreditOnAWindowLargerThanSinkChunksFailsAtStartupNamingBothValues() {
+        var e = assertThrows(IllegalArgumentException.class, () -> new TokenStreams.Config(1, 16, 8, true));
+        assertTrue(e.getMessage().contains("sjws.swarm.stream.window (16)"), e.getMessage());
+        assertTrue(e.getMessage().contains("sjws.swarm.stream.sinkChunks (8)"), e.getMessage());
+        assertTrue(e.getMessage().contains("sjws.swarm.stream.credit.enabled"), e.getMessage());
+        var from = assertThrows(IllegalArgumentException.class, () -> TokenStreams.Config.from(n -> switch (n) {
+            case "sjws.swarm.stream.credit.enabled" -> "true";
+            case "sjws.swarm.stream.sinkChunks" -> "32"; // below the default window (64)
+            default -> null;
+        }));
+        assertTrue(from.getMessage().contains("(64)") && from.getMessage().contains("(32)"), from.getMessage());
+        // allowed: window == sinkChunks, and anything with credit off (unchanged)
+        assertEquals(8, new TokenStreams.Config(1, 8, 8, true).window());
+        assertFalse(new TokenStreams.Config(1, 16, 8, false).credit());
+        assertFalse(new TokenStreams.Config(1, 64, 2).credit());
+    }
+
+    @Test
+    void r3AReaderPausedMidResetNeverMakesTheCheckOverAdmit() throws Exception {
+        on(8);
+        var s = stream();
+        for (int seq = 0; seq < 40; seq++) { // the old attempt's reader gets far ahead of any new-attempt window
+            credit(chunk(s, seq, 10));
+            if (seq % 4 == 3) {
+                read(s, 4, "last-event-id", s.attempt() + "." + (seq - 4));
+            }
+        }
+        assertEquals(40, st(s).readNext);
+        assertEquals(s.attempt(), st(s).readAttempt);
+        var r = req("GET", s.session(), new byte[0], "accept", SwarmHttp.CONTENT_TYPE, "last-event-id",
+                s.attempt() + ".39");
+        assertEquals(200, r.status());
+        var paused = new java.util.concurrent.CountDownLatch(1);
+        var resume = new java.util.concurrent.CountDownLatch(1);
+        var pausedOnce = new java.util.concurrent.atomic.AtomicBoolean();
+        var out = new java.util.concurrent.atomic.AtomicReference<byte[]>();
+        var n = takeover(s);
+        credit().midReadPublish = () -> { // the reader is between its stores of the RESET's read position
+            if (pausedOnce.compareAndSet(false, true)) {
+                paused.countDown();
+                try {
+                    resume.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        var reader = Thread.ofPlatform().start(() -> {
+            try {
+                out.set(StreamHttpTest.drainBytesUntil(r, 1 + 8));
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+        credit(chunk(n, 0, 10)); // RESET: the reader wakes, publishes the new attempt's position and is paused mid-way
+        assertTrue(paused.await(10, java.util.concurrent.TimeUnit.SECONDS), "the reader reached the RESET publish");
+        for (int seq = 1; seq < 8; seq++) {
+            credit(chunk(n, seq, 10)); // fills the new attempt's window: 8 unread
+        }
+        try {
+            assert429(chunk(n, 8, 10)); // a torn read (old position, new attempt) would see an empty window
+        } finally {
+            credit().midReadPublish = null;
+            resume.countDown();
+            reader.join(10_000);
+        }
+        assertNotNull(out.get());
+        assertBaseline(st(n));
     }
 }
