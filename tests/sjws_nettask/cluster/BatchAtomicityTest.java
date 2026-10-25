@@ -3,6 +3,7 @@ package sjws_nettask.cluster;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -17,9 +18,11 @@ import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -380,6 +383,79 @@ class BatchAtomicityTest {
         assertInstanceOf(UncheckedIOException.class, cause);
         assertTrue(cause.getMessage().contains("outcome unknown"), cause.getMessage());
         assertTrue(cause.getMessage().contains("index " + pendingLast), cause.getMessage());
+    }
+
+    /** Cut the leader off from both peers, so nothing it appends or asks can reach a quorum. */
+    private void isolate(int l) {
+        net.cut(nodes.get(l).self(), nodes.get(1 - l).self());
+        net.cut(nodes.get(l).self(), nodes.get(2).self());
+    }
+
+    private Set<NodeId> allMembers() {
+        return Set.of(nodes.get(0).self(), nodes.get(1).self(), nodes.get(2).self());
+    }
+
+    @Test
+    void readBarrierWaitersFailWithNotLeaderOnStepDown() throws Exception {
+        start(Durability.RELAXED, false);
+        int l = leader();
+        int other = 1 - l;
+        settle(nodes.get(l).append(GROUP, batch("before", 1)));
+        isolate(l);
+        clock.advance(Duration.ofSeconds(10)); // past the lease, before any tick: still leader, so the read waits
+        var read = group(l).readBarrier();
+        assertFalse(read.isDone(), "a barrier past the lease must wait for a quorum round");
+        for (int k = 0; k < 60 && !group(other).isLeader(); k++) {
+            step();
+        }
+        assertTrue(group(other).isLeader(), "the other data node never took over");
+        net.heal(nodes.get(l).self(), nodes.get(other).self());
+        net.heal(nodes.get(l).self(), nodes.get(2).self());
+        for (int k = 0; k < 20 && !read.isDone(); k++) {
+            step();
+        }
+        assertFalse(group(l).isLeader());
+        var cause = assertThrows(ExecutionException.class, () -> read.get(10, TimeUnit.SECONDS)).getCause();
+        assertInstanceOf(NotLeaderException.class, cause);
+    }
+
+    @Test
+    void failingClosedFailsAPendingMembershipChangeAsOutcomeUnknownAndRefusesNewOnes() throws Exception {
+        start(Durability.RELAXED, false);
+        int l = leader();
+        var faulty = storages.get(l);
+        settle(nodes.get(l).append(GROUP, batch("before", 1)));
+        isolate(l);
+        var change = group(l).changeMembership(allMembers(), Set.of());
+        assertFalse(change.isDone(), "the joint config cannot commit without a quorum");
+        clock.advance(Duration.ofSeconds(10));
+        var read = group(l).readBarrier();
+        assertFalse(read.isDone());
+
+        faulty.failTruncate = true;
+        faulty.armAppend(1);
+        var failed = nodes.get(l).append(GROUP, batch("bad", 3));
+        var batchError = assertThrows(ExecutionException.class, failed::get).getCause();
+        assertTrue(batchError.getMessage().contains("outcome unknown"), batchError.getMessage());
+        assertTrue(nodes.get(l).failedClosed(GROUP));
+
+        // (b) the pending change was already in the log: outcome unknown, same root cause as the batch.
+        var changeError = assertThrows(ExecutionException.class, () -> change.get(10, TimeUnit.SECONDS)).getCause();
+        assertFalse(changeError instanceof NotLeaderException, "an in-log config change may still commit");
+        assertInstanceOf(UncheckedIOException.class, changeError);
+        assertTrue(changeError.getMessage().contains("membership change"), changeError.getMessage());
+        assertTrue(changeError.getMessage().contains("outcome unknown"), changeError.getMessage());
+        assertSame(batchError.getCause(), changeError.getCause(), "the original storage error is the cause");
+        assertSame(batchError, changeError.getSuppressed()[0], "the fail-closed error rides along as suppressed");
+
+        // A waiting read barrier fails with the fenced error.
+        assertFenced(assertThrows(ExecutionException.class, () -> read.get(10, TimeUnit.SECONDS)).getCause());
+
+        // (d) new calls after failing closed are refused as fenced, not as not-leader.
+        var again = group(l).changeMembership(allMembers(), Set.of());
+        assertFenced(assertThrows(ExecutionException.class, () -> again.get(10, TimeUnit.SECONDS)).getCause());
+        var barrier = group(l).readBarrier();
+        assertFenced(assertThrows(ExecutionException.class, () -> barrier.get(10, TimeUnit.SECONDS)).getCause());
     }
 
     private static void assertFenced(Throwable error) {

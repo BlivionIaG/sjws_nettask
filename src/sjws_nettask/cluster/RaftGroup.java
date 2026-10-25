@@ -433,6 +433,9 @@ final class RaftGroup {
             }
             long first = Math.max(lastIndex(), snapIndex) + 1;
             long last = first - 1;
+            // A failed batch still falls through to run(after) below: failing closed queues the step-down's
+            // leader-change callback and the pending membership change there (#246; returning early dropped them).
+            boolean rolledBack = false;
             try {
                 for (var copy : copies) {
                     last = appendRaw(user(copy, marked ? USER_STRICT : USER));
@@ -446,17 +449,19 @@ final class RaftGroup {
                 // The batch is all-or-nothing. Nothing of it has been replicated or counted yet (the lock is held
                 // throughout), so it is still safe to take back.
                 future.completeExceptionally(rollBackBatch(first, failed, after));
-                return future;
+                rolledBack = true;
             }
-            if (marked) {
-                long now = clock.nanoTime();
-                for (long index = first; index <= last; index++) {
-                    strictPending.put(index, now);
+            if (!rolledBack) {
+                if (marked) {
+                    long now = clock.nanoTime();
+                    for (long index = first; index <= last; index++) {
+                        strictPending.put(index, now);
+                    }
                 }
+                pending.put(last, future);
+                maybeCommit(after);
+                replicate();
             }
-            pending.put(last, future);
-            maybeCommit(after);
-            replicate();
         } finally {
             lock.unlock();
         }
@@ -556,6 +561,12 @@ final class RaftGroup {
                 var error = outcomeUnknown("a membership change");
                 after.add(() -> change.completeExceptionally(error));
             }
+            // A read barrier has no outcome to lose: it fails with the fenced error, like one issued from now on.
+            for (var read : reads) {
+                var error = fencedError();
+                after.add(() -> read.completeExceptionally(error));
+            }
+            reads.clear();
             stepDown(term, after); // same term: no hard-state write
             return storageFailed;
         }
@@ -1551,12 +1562,13 @@ final class RaftGroup {
     }
 
     /**
-     * Under the lock, on every way out of {@link Role#LEADER} (step-down, leadership transfer, a same-term
-     * demotion): fails this leader's pending appends and its pending membership change with
-     * {@link NotLeaderException}. That keeps {@link #pending} empty whenever this node does not lead, so the commit
-     * loop in {@link #apply} can never complete a leader-side future on a follower, where the entry at that index may
-     * since have been overwritten by another leader's (#250). The outcome is unknown, not refused: an entry already
-     * on a follower may still commit under the next leader, so callers deduplicate on retry.
+     * Under the lock, on every way out of {@link Role#LEADER} (step-down, leadership transfer, an election started
+     * as leader, a same-term demotion): fails this leader's pending appends, its pending membership change and its
+     * waiting read barriers with {@link NotLeaderException}. That keeps {@link #pending} empty whenever this node
+     * does not lead, so the commit loop in {@link #apply} can never complete a leader-side future on a follower,
+     * where the entry at that index may since have been overwritten by another leader's (#250). The outcome is
+     * unknown, not refused: an entry already on a follower may still commit under the next leader, so callers
+     * deduplicate on retry.
      */
     private void failPendingWrites(List<Runnable> after) {
         var error = notLeader();
@@ -1565,6 +1577,12 @@ final class RaftGroup {
             deliveries.submit(() -> future.completeExceptionally(error), future);
         }
         pending.clear();
+        // Read barriers waiting for a quorum round would otherwise hang (only a quorum ack as leader completed
+        // them), or complete later if this node led again (#246).
+        for (var read : reads) {
+            after.add(() -> read.completeExceptionally(error));
+        }
+        reads.clear();
         if (membershipChange != null) {
             var change = membershipChange;
             membershipChange = null;
@@ -2012,6 +2030,10 @@ final class RaftGroup {
             var future = new CompletableFuture<Void>();
             lock.lock();
             try {
+                if (storageFailed != null) {
+                    future.completeExceptionally(fencedError());
+                    return future;
+                }
                 if (role != Role.LEADER) {
                     future.completeExceptionally(notLeader());
                     return future;
@@ -2036,6 +2058,10 @@ final class RaftGroup {
             var after = new ArrayList<Runnable>();
             lock.lock();
             try {
+                if (storageFailed != null) {
+                    future.completeExceptionally(fencedError());
+                    return future;
+                }
                 if (role != Role.LEADER) {
                     future.completeExceptionally(notLeader());
                     return future;

@@ -110,6 +110,26 @@ class TransferLeadershipPendingTest {
         assertInstanceOf(NotLeaderException.class, cause);
     }
 
+    @Test
+    void readBarrierWaitingAtTransferFailsWithNotLeader() throws Exception {
+        int a = leader();
+        isolate(a);
+        clock.advance(Duration.ofSeconds(10)); // past the lease, before any tick: still leader, so the read waits
+        CompletableFuture<Void> read = groups.get(a).readBarrier();
+        assertFalse(read.isDone(), "a barrier past the lease must wait for a quorum round");
+
+        groups.get(a).transferLeadership(nodes.get(1 - a).self()); // #246 (a): through the shared step-down helper
+        var cause = assertThrows(ExecutionException.class, () -> read.get(10, TimeUnit.SECONDS)).getCause();
+        assertInstanceOf(NotLeaderException.class, cause);
+        heal(a);
+        for (int k = 0; k < 60; k++) {
+            step();
+        }
+        assertInstanceOf(NotLeaderException.class,
+                assertThrows(ExecutionException.class, () -> read.get(10, TimeUnit.SECONDS)).getCause(),
+                "a failed barrier stays failed whoever leads next");
+    }
+
     private static void assertNotLeader(CompletableFuture<CommittedIndex> future) {
         var cause = assertThrows(ExecutionException.class, () -> future.get(10, TimeUnit.SECONDS)).getCause();
         assertInstanceOf(NotLeaderException.class, cause);
