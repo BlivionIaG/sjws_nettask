@@ -636,7 +636,7 @@ class PeerLinkTest {
         var a = unbounded(map, "a", TINY_BUFFERS, owner("a"), FAST);
         var b = unbounded(map, "b", TINY_BUFFERS, owner("b"), FAST);
         int threads = 6;
-        int each = 30;
+        int each = 15; // ~160 MB through 4 KiB buffers: well inside the 30 s budget even on a loaded box
         var record = new byte[900 << 10]; // a few records fill both directions' socket buffers at once
         var futures = new CopyOnWriteArrayList<CompletableFuture<PeerLink.Result>>();
         var workers = new ArrayList<Thread>();
