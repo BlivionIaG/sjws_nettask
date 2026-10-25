@@ -305,6 +305,37 @@ class ConfigModelTest {
         assertTrue(ConfigValidator.validate(present).isEmpty());
     }
 
+    /** #274 MC N2: a SIGHUP reload never applies ha.messaging/topics/members, and says so. */
+    @Test
+    void reloadReportsHaMessagingChangesAsNeedingARestart() throws Exception {
+        var root = Files.createDirectory(dir.resolve("ha-html"));
+        var yaml = dir.resolve("ha.yaml");
+        var members = """
+                  node_id: a
+                  members:
+                    - { id: a, address: "127.0.0.1:7101", http_url: "http://127.0.0.1:8101" }
+                    - { id: b, address: "127.0.0.1:7102", http_url: "http://127.0.0.1:8102" }
+                    - { id: w, address: "127.0.0.1:7103", witness: true }
+                """;
+        var head = "version: 2\nserver:\n  port: 0\n  root: " + root.toAbsolutePath() + "\nha:\n  enabled: true\n";
+        Files.writeString(yaml, head + "  messaging: off\n  topics: [orders]\n" + members);
+        var env = Map.of("WEB_SERVER_HA_CLUSTER_KEY", "0123456789abcdef0123456789abcdef");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, env);
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var board = new ChallengeBoard();
+        var current = ConfigSnapshot.compile(loaded.document(), board, 1);
+        var reloader = new ConfigReloader(loaded);
+        assertTrue(reloader.reload(current, false, board).needsRestart().isEmpty(), "nothing changed");
+        Files.writeString(yaml, head + "  messaging: on\n  topics: [orders, audit]\n" + members.replace("7103", "7104"));
+        var r = reloader.reload(current, false, board);
+        assertTrue(r.applied(), r.errors().toString());
+        var notes = String.join("\n", r.needsRestart());
+        assertTrue(notes.contains("ha.messaging changed to on; still off (single node) until restart"), notes);
+        assertTrue(notes.contains("ha.topics changed; still [orders] until restart"), notes);
+        assertTrue(notes.contains("ha.members or ha.node_id changed"), notes);
+        assertFalse(notes.contains("0123456789abcdef"), notes);
+    }
+
     @Test
     void olderBundleIsRejectedAndApplyKeepsTheCurrentSnapshot() throws Exception {
         var root = Files.createDirectory(dir.resolve("html"));
