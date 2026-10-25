@@ -433,6 +433,9 @@ final class RaftGroup {
             }
             long first = Math.max(lastIndex(), snapIndex) + 1;
             long last = first - 1;
+            // A failed batch still falls through to run(after) below: failing closed queues the step-down's
+            // leader-change callback and the pending membership change there (#246; returning early dropped them).
+            boolean rolledBack = false;
             try {
                 for (var copy : copies) {
                     last = appendRaw(user(copy, marked ? USER_STRICT : USER));
@@ -446,17 +449,19 @@ final class RaftGroup {
                 // The batch is all-or-nothing. Nothing of it has been replicated or counted yet (the lock is held
                 // throughout), so it is still safe to take back.
                 future.completeExceptionally(rollBackBatch(first, failed, after));
-                return future;
+                rolledBack = true;
             }
-            if (marked) {
-                long now = clock.nanoTime();
-                for (long index = first; index <= last; index++) {
-                    strictPending.put(index, now);
+            if (!rolledBack) {
+                if (marked) {
+                    long now = clock.nanoTime();
+                    for (long index = first; index <= last; index++) {
+                        strictPending.put(index, now);
+                    }
                 }
+                pending.put(last, future);
+                maybeCommit(after);
+                replicate();
             }
-            pending.put(last, future);
-            maybeCommit(after);
-            replicate();
         } finally {
             lock.unlock();
         }
