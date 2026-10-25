@@ -59,10 +59,19 @@ public interface ReplicationGroup {
 
     long lastApplied();
 
-    /** Linearizable read. A lease read when this leader's lease is still valid. */
+    /**
+     * Linearizable read. A lease read when this leader's lease is still valid. Fails with
+     * {@link NotLeaderException} when this node does not lead or stops leading (or closes) before the read is
+     * confirmed: a read has no outcome to lose, so it can simply be retried at the leader.
+     */
     CompletableFuture<Void> readBarrier();
 
-    /** Joint consensus: old voters and the new set both have to commit, then only the new set. */
+    /**
+     * Joint consensus: old voters and the new set both have to commit, then only the new set. Refused with
+     * {@link NotLeaderException} when this node does not lead. Once the joint config is in the log, losing
+     * leadership, failing closed or closing fails it with {@link OutcomeUnknownException}: the change may still
+     * complete under the next leader, so read the membership back before retrying (#254).
+     */
     CompletableFuture<Void> changeMembership(Set<NodeId> voters, Set<NodeId> learners);
 
     void transferLeadership(NodeId target);

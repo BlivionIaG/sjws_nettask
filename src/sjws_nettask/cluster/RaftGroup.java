@@ -498,16 +498,20 @@ final class RaftGroup {
         }
     }
 
+    /** Per-batch storage failures: a full trace once per 30 s per exception type, one line otherwise (#254). */
+    private static final ThrottledLog WRITE_FAILURES = new ThrottledLog(System.getLogger(RaftGroup.class.getName()),
+            java.time.Duration.ofSeconds(30));
+
     /**
      * Under the lock, when failing closed: the error for writes that were already in the log and still pending.
      * They are not refused like a {@link NotLeaderException} would suggest: they may already be on a follower (or
-     * on this node's disk) and commit under a later leader, so their outcome is unknown. Same type as the failed
-     * batch's own error, so callers handle both as a timeout and deduplicate on retry.
+     * on this node's disk) and commit under a later leader, so their outcome is unknown. Same type and the same
+     * storage cause as the failed batch's own error (#254), so callers handle both as a timeout and deduplicate on
+     * retry; the fail-closed error rides along as suppressed.
      */
-    private UncheckedIOException outcomeUnknown(String what) {
-        var error = new UncheckedIOException("group " + groupId.value() + " failed closed after a log write it could"
-                + " not roll back; " + what + " was already in the log, outcome unknown: it may still commit",
-                storageFailed.getCause());
+    private OutcomeUnknownException outcomeUnknown(String what) {
+        var error = new OutcomeUnknownException(groupId, "failed closed after a log write it could not roll back; "
+                + what + " was already in the log", Optional.empty(), storageFailed.getCause());
         error.addSuppressed(storageFailed);
         return error;
     }
@@ -525,18 +529,20 @@ final class RaftGroup {
      * at the end of the segment, and re-syncs earlier entries whose fsync may have been lost with the failure.
      * If the rollback fails as well, the batch's fate on disk is unknown, so the group fails closed (see
      * {@link #storageFailed}). Returns the error for the batch's future. In that case part of the batch may
-     * still be on disk, and after a restart a leader may commit it like any uncommitted entry, so a caller
-     * must treat an {@code outcome unknown} failure like a timeout (retry with its own dedup key).
+     * still be on disk, and after a restart a leader may commit it like any uncommitted entry, so the batch fails
+     * with {@link OutcomeUnknownException} (the storage error is its cause): a caller must treat it like a timeout
+     * (retry with its own dedup key). A batch rolled back cleanly fails with the storage error itself: nothing of it
+     * is in the log, a refusal.
      */
-    private RuntimeException rollBackBatch(long first, RuntimeException failed, List<Runnable> after) {
+    private Throwable rollBackBatch(long first, RuntimeException failed, List<Runnable> after) {
         var log = System.getLogger(RaftGroup.class.getName());
         try {
             truncateSuffix(first);
             if (lastIndex() >= first) {
                 throw new IllegalStateException("log still ends at " + lastIndex() + " after truncating from " + first);
             }
-            log.log(System.Logger.Level.WARNING, "group " + groupId.value() + ": log write failed at index " + first
-                    + " or later; rolled the batch back, nothing of it stays in the log: " + failed);
+            WRITE_FAILURES.log(System.Logger.Level.WARNING, "group " + groupId.value() + ": log write failed at index "
+                    + first + " or later; rolled the batch back, nothing of it stays in the log", failed);
             return failed;
         } catch (RuntimeException rollback) {
             failed.addSuppressed(rollback);
@@ -552,7 +558,7 @@ final class RaftGroup {
             for (var entry : pending.entrySet()) {
                 var future = entry.getValue();
                 var error = outcomeUnknown("the append at index " + entry.getKey());
-                deliveries.submit(() -> future.completeExceptionally(error), future);
+                deliveries.fail(future, error);
             }
             pending.clear();
             if (membershipChange != null) {
@@ -568,7 +574,10 @@ final class RaftGroup {
             }
             reads.clear();
             stepDown(term, after); // same term: no hard-state write
-            return storageFailed;
+            var batch = new OutcomeUnknownException(groupId, "log write failed and the batch from index " + first
+                    + " could not be rolled back; the group failed closed", Optional.empty(), cause);
+            batch.addSuppressed(storageFailed);
+            return batch;
         }
     }
 
@@ -1563,31 +1572,76 @@ final class RaftGroup {
 
     /**
      * Under the lock, on every way out of {@link Role#LEADER} (step-down, leadership transfer, an election started
-     * as leader, a same-term demotion): fails this leader's pending appends, its pending membership change and its
-     * waiting read barriers with {@link NotLeaderException}. That keeps {@link #pending} empty whenever this node
-     * does not lead, so the commit loop in {@link #apply} can never complete a leader-side future on a follower,
-     * where the entry at that index may since have been overwritten by another leader's (#250). The outcome is
-     * unknown, not refused: an entry already on a follower may still commit under the next leader, so callers
-     * deduplicate on retry.
+     * as leader, a same-term demotion): fails this leader's pending appends and its pending membership change with
+     * {@link OutcomeUnknownException}, and its waiting read barriers with {@link NotLeaderException}. That keeps
+     * {@link #pending} empty whenever this node does not lead, so the commit loop in {@link #apply} can never
+     * complete a leader-side future on a follower, where the entry at that index may since have been overwritten by
+     * another leader's (#250). The writes are in the log, so their outcome is unknown, not refused: an entry already
+     * on a follower may still commit under the next leader, so callers deduplicate on retry (#254).
      */
     private void failPendingWrites(List<Runnable> after) {
-        var error = notLeader();
+        failPendingWrites(after, Optional.ofNullable(self.equals(leader) ? null : leader));
+    }
+
+    /** As {@link #failPendingWrites(List)}, naming {@code hint} as the leader to retry or read back at. */
+    private void failPendingWrites(List<Runnable> after, Optional<NodeId> hint) {
+        // Accepted writes: in the log, fate unknown (#254). Not NotLeaderException, which says "nothing appended".
+        var unknown = new OutcomeUnknownException(groupId, "this node stopped leading before the write committed",
+                hint, null);
         // Failed on the delivery thread too, after every callback already queued for earlier entries.
         for (var future : pending.values()) {
-            deliveries.submit(() -> future.completeExceptionally(error), future);
+            deliveries.fail(future, unknown);
         }
         pending.clear();
         // Read barriers waiting for a quorum round would otherwise hang (only a quorum ack as leader completed
-        // them), or complete later if this node led again (#246).
+        // them), or complete later if this node led again (#246). A read has no outcome to lose: not leader.
+        var refused = new NotLeaderException(groupId, hint);
         for (var read : reads) {
-            after.add(() -> read.completeExceptionally(error));
+            after.add(() -> read.completeExceptionally(refused));
         }
         reads.clear();
         if (membershipChange != null) {
             var change = membershipChange;
             membershipChange = null;
-            after.add(() -> change.completeExceptionally(error));
+            after.add(() -> change.completeExceptionally(unknown));
         }
+    }
+
+    /**
+     * {@link ReplicatedNode#close()}, after the Raft thread stopped and this group's deliveries closed: stops leading
+     * for good and fails every future still unresolved, so nothing waits on a closed node (#254). Pending appends and
+     * a pending membership change are in the log: {@link OutcomeUnknownException}. Waiting read barriers:
+     * {@link NotLeaderException}. Later calls are refused as not leader (role follower, never campaigns again).
+     * Completed directly here: the delivery executor is already closed. Idempotent.
+     */
+    void closeGroup() {
+        var failed = new ArrayList<Runnable>();
+        lock.lock();
+        try {
+            var hint = Optional.ofNullable(self.equals(leader) ? null : leader);
+            var unknown = new OutcomeUnknownException(groupId, "node closed before the write committed", hint, null);
+            var refused = new NotLeaderException(groupId, hint);
+            role = Role.FOLLOWER;
+            leader = null;
+            campaignNotBefore = Long.MAX_VALUE;
+            electionDeadline = Long.MAX_VALUE;
+            for (var future : pending.values()) {
+                failed.add(() -> future.completeExceptionally(unknown));
+            }
+            pending.clear();
+            if (membershipChange != null) {
+                var change = membershipChange;
+                membershipChange = null;
+                failed.add(() -> change.completeExceptionally(unknown));
+            }
+            for (var read : reads) {
+                failed.add(() -> read.completeExceptionally(refused));
+            }
+            reads.clear();
+        } finally {
+            lock.unlock();
+        }
+        run(failed);
     }
 
     private void fireLeader(List<Runnable> after) {
@@ -2098,8 +2152,8 @@ final class RaftGroup {
                 role = Role.FOLLOWER;
                 leader = null;
                 // Like stepDown: without this the futures stayed pending and a later commit at their index (another
-                // leader's entry) completed them as committed (#250).
-                failPendingWrites(after);
+                // leader's entry) completed them as committed (#250). The transfer target is the likely next leader.
+                failPendingWrites(after, Optional.of(target));
                 long now = clock.nanoTime();
                 long wait = options.leaseNanos() + options.electionTimeout().toNanos();
                 long failback = options.failbackHysteresis().toNanos();

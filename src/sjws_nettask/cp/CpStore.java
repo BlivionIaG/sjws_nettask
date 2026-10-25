@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import sjws_nettask.cluster.Clock;
 import sjws_nettask.cluster.ClusterTransport;
 import sjws_nettask.cluster.Durability;
@@ -36,6 +38,7 @@ import sjws_nettask.cluster.GroupOptions;
 import sjws_nettask.cluster.Member;
 import sjws_nettask.cluster.MemberState;
 import sjws_nettask.cluster.NodeId;
+import sjws_nettask.cluster.OutcomeUnknownException;
 import sjws_nettask.cluster.QuorumPolicy;
 import sjws_nettask.cluster.ReplicatedNode;
 import sjws_nettask.cluster.ReplicationGroup;
@@ -983,17 +986,42 @@ public final class CpStore implements AutoCloseable {
     static final String COMMITTED_NOT_APPLIED = "committed, not applied (node closing): the write landed;"
             + " do not retry without the same Idempotency-Key";
 
+    /** Reason text when the log accepted a write but its fate is unknown (#254). */
+    static final String OUTCOME_UNKNOWN = "outcome unknown: the write may still land;"
+            + " read back, or retry only with the same Idempotency-Key";
+
+    /** Upper bound on waiting for a control-plane write to commit and apply; past it the outcome is unknown. */
+    static final Duration APPEND_TIMEOUT = Duration.ofSeconds(30);
+
     /**
-     * {@code "log"} for a write that did not land (not leader, apply lag, IO). For
+     * {@code "log"} for a write that did not land (not leader, apply lag, a cleanly rolled-back IO error). For
      * {@link sjws_nettask.cluster.CommittedNotAppliedException} the entry is in the log and will be applied on
-     * every replica, so the caller must not treat it as failed: for a join token it is consumed.
+     * every replica, so the caller must not treat it as failed: for a join token it is consumed. For
+     * {@link OutcomeUnknownException} (leadership lost, failed closed, closed, or {@link #APPEND_TIMEOUT}) it may
+     * or may not commit: never reported as "did not land" (#254). CpStore itself never retries a failed append.
      */
     static String logFailure(ExecutionException e) {
-        return e.getCause() instanceof sjws_nettask.cluster.CommittedNotAppliedException ? COMMITTED_NOT_APPLIED : "log";
+        var c = e.getCause();
+        if (c instanceof sjws_nettask.cluster.CommittedNotAppliedException) return COMMITTED_NOT_APPLIED;
+        return c instanceof OutcomeUnknownException ? OUTCOME_UNKNOWN : "log";
     }
 
     private long append(ByteBuffer entry) throws InterruptedException, ExecutionException {
-        return node.append(GROUP, List.of(entry)).get().index();
+        return await(node.append(GROUP, List.of(entry)), APPEND_TIMEOUT).index();
+    }
+
+    /**
+     * Bounded wait on an append: a stalled group (no quorum, wedged leader) can no longer park the caller forever.
+     * A timeout is reported as {@link OutcomeUnknownException}, since the entry may already be in the log (#254).
+     */
+    static <T> T await(java.util.concurrent.CompletableFuture<T> f, Duration timeout)
+            throws InterruptedException, ExecutionException {
+        try {
+            return f.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            throw new ExecutionException(new OutcomeUnknownException(GROUP, "not committed within " + timeout,
+                    java.util.Optional.empty(), e));
+        }
     }
 
     private long append(ByteBuffer entry, String key, Outcome success, String fp)

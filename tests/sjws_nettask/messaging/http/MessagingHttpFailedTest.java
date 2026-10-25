@@ -95,6 +95,37 @@ class MessagingHttpFailedTest {
         assertTrue(body(r).contains(MessagingHttp.NOT_LEADER_TYPE));
     }
 
+    /** #254: an accepted write with an unknown fate keeps the leader hint but is a typed 503, never a 307. */
+    @Test
+    void outcomeUnknownWithAKnownLeaderIsATyped503NotARedirect() {
+        var e = new ExecutionException(new CompletionException(new sjws_nettask.messaging.ledger.WriteOutcomeUnknownException(
+                SECRET, 9, "n2", "http://n2:8080/", new UncheckedIOException(SECRET, new IOException(SECRET)))));
+        var r = MessagingHttp.failed(e, "/messaging/v1/topics/t/records", true);
+        assertEquals(503, r.status());
+        assertEquals(null, r.headers().get("location"));
+        assertEquals(MessagingHttp.RETRY_AFTER_SECONDS, r.headers().get("retry-after"));
+        assertEquals("9", r.headers().get("sjws-term"));
+        assertEquals("n2", r.headers().get("sjws-leader"));
+        var json = body(r);
+        assertTrue(json.contains("\"type\":\"" + MessagingHttp.OUTCOME_UNKNOWN_TYPE + "\""), json);
+        assertTrue(json.contains("\"leaderUrl\":\"http://n2:8080/messaging/v1/topics/t/records\""), json);
+        assertFalse(json.contains("msg_p0") || json.contains("IOException") || json.contains("/var/lib"), json);
+    }
+
+    /** #254: per-failure logs carry a full trace once per interval per exception type, one line otherwise. */
+    @Test
+    void failureLogsRateLimitStackTracesPerType() {
+        long[] now = {0};
+        var log = new ThrottledLog(System.getLogger("test.throttled"), java.time.Duration.ofSeconds(30), () -> now[0]);
+        assertTrue(log.claim(IOException.class, now[0]), "first trace of a type is logged in full");
+        assertFalse(log.claim(IOException.class, now[0] + 1), "then one-line");
+        assertTrue(log.claim(IllegalStateException.class, now[0] + 1), "per type");
+        now[0] += java.time.Duration.ofSeconds(30).toNanos();
+        assertTrue(log.claim(IOException.class, now[0]), "a full trace again after the interval");
+        for (int i = 0; i < ThrottledLog.MAX_TYPES + 5; i++) log.claim(Class.class, now[0]); // same key: no growth
+        log.log(System.Logger.Level.DEBUG, "smoke", new IOException("x"));
+    }
+
     @Test
     void leaderLossStillMapsToNotLeader() {
         var e = new ExecutionException(new LeaderUnavailableException("not leader", 7, "n2", null));

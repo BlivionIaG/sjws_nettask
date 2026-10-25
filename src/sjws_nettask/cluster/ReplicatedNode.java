@@ -319,6 +319,7 @@ public final class ReplicatedNode implements ClusterNode {
         }
         for (var group : groups.values()) {
             group.closeDeliveries(CLOSE_DRAIN);
+            group.closeGroup(); // fails what is still unresolved: appends, a membership change, read barriers (#254)
         }
         transport.detach(self);
     }

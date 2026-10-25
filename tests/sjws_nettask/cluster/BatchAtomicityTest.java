@@ -314,7 +314,8 @@ class BatchAtomicityTest {
         faulty.armAppend(2);
         var failed = nodes.get(l).append(GROUP, batch("bad", 4));
         var cause = assertThrows(ExecutionException.class, failed::get).getCause();
-        assertInstanceOf(UncheckedIOException.class, cause);
+        assertInstanceOf(OutcomeUnknownException.class, cause);
+        assertInstanceOf(java.io.IOException.class, cause.getCause(), "the storage error is the cause");
         assertTrue(cause.getMessage().contains("outcome unknown"), cause.getMessage());
         assertFalse(group(l).isLeader(), "a group that cannot roll back must step down");
         assertTrue(nodes.get(l).failedClosed(GROUP), "failed-closed state must be visible for health");
@@ -380,7 +381,7 @@ class BatchAtomicityTest {
         var cause = assertThrows(ExecutionException.class,
                 () -> inFlight.get(10, java.util.concurrent.TimeUnit.SECONDS)).getCause();
         assertFalse(cause instanceof NotLeaderException, "an in-log write may still commit; not-leader says it won't");
-        assertInstanceOf(UncheckedIOException.class, cause);
+        assertInstanceOf(OutcomeUnknownException.class, cause);
         assertTrue(cause.getMessage().contains("outcome unknown"), cause.getMessage());
         assertTrue(cause.getMessage().contains("index " + pendingLast), cause.getMessage());
     }
@@ -442,11 +443,14 @@ class BatchAtomicityTest {
         // (b) the pending change was already in the log: outcome unknown, same root cause as the batch.
         var changeError = assertThrows(ExecutionException.class, () -> change.get(10, TimeUnit.SECONDS)).getCause();
         assertFalse(changeError instanceof NotLeaderException, "an in-log config change may still commit");
-        assertInstanceOf(UncheckedIOException.class, changeError);
+        assertInstanceOf(OutcomeUnknownException.class, changeError);
         assertTrue(changeError.getMessage().contains("membership change"), changeError.getMessage());
         assertTrue(changeError.getMessage().contains("outcome unknown"), changeError.getMessage());
         assertSame(batchError.getCause(), changeError.getCause(), "the original storage error is the cause");
-        assertSame(batchError, changeError.getSuppressed()[0], "the fail-closed error rides along as suppressed");
+        assertInstanceOf(OutcomeUnknownException.class, batchError);
+        assertInstanceOf(UncheckedIOException.class, changeError.getSuppressed()[0]);
+        assertSame(batchError.getSuppressed()[0], changeError.getSuppressed()[0],
+                "the same fail-closed error rides along as suppressed");
 
         // A waiting read barrier fails with the fenced error.
         assertFenced(assertThrows(ExecutionException.class, () -> read.get(10, TimeUnit.SECONDS)).getCause());

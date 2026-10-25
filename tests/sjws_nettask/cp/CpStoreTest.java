@@ -320,5 +320,27 @@ class CpStoreTest {
         org.junit.jupiter.api.Assertions.assertEquals("log",
                 CpStore.logFailure(new java.util.concurrent.ExecutionException(new IllegalStateException("x"))));
     }
+
+    /** #254: a write whose fate is unknown is neither "did not land" nor "landed"; refusals stay "log". */
+    @Test
+    void anOutcomeUnknownWriteIsNotReportedAsLostOrRefused() {
+        var unknown = new java.util.concurrent.ExecutionException(new sjws_nettask.cluster.OutcomeUnknownException(
+                CpStore.GROUP, "stopped leading", java.util.Optional.empty(), null));
+        assertEquals(CpStore.OUTCOME_UNKNOWN, CpStore.logFailure(unknown));
+        var refused = new java.util.concurrent.ExecutionException(
+                new sjws_nettask.cluster.NotLeaderException(CpStore.GROUP, java.util.Optional.empty()));
+        assertEquals("log", CpStore.logFailure(refused));
+    }
+
+    /** #254: the append wait is bounded, and running out of time is outcome unknown, not a refusal. */
+    @Test
+    void aStalledAppendTimesOutAsOutcomeUnknown() throws Exception {
+        var never = new java.util.concurrent.CompletableFuture<Long>();
+        var e = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> CpStore.await(never, Duration.ofMillis(20)));
+        assertInstanceOf(sjws_nettask.cluster.OutcomeUnknownException.class, e.getCause());
+        assertEquals(CpStore.OUTCOME_UNKNOWN, CpStore.logFailure(e));
+        assertEquals(7L, CpStore.await(java.util.concurrent.CompletableFuture.completedFuture(7L), Duration.ofMillis(20)));
+    }
 }
 

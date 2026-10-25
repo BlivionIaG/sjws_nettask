@@ -36,10 +36,11 @@ final class DeliveryExecutor {
     static final int DEFAULT_LAG_LIMIT = 4096;
 
     /** {@code index}: log index of the committed entry this delivers, or -1 (not a committed entry). */
-    private record Item(Runnable task, CompletableFuture<?> future, long index) {
+    /** {@code error}: when non-null, the failure {@code task} delivers, kept as-is if the executor closes first. */
+    private record Item(Runnable task, CompletableFuture<?> future, long index, Throwable error) {
     }
 
-    private static final Item STOP = new Item(() -> { }, null, -1);
+    private static final Item STOP = new Item(() -> { }, null, -1, null);
 
     /**
      * Lag at which a WARN is logged once (re-armed when the queue empties). {@code append()} bounds leader-side
@@ -86,7 +87,19 @@ final class DeliveryExecutor {
      * (the entry is committed), else {@link IllegalStateException}. Never blocks.
      */
     void submit(Runnable task, CompletableFuture<?> future, long index) {
-        var item = new Item(task, future, index);
+        enqueue(new Item(task, future, index, null));
+    }
+
+    /**
+     * Fails {@code future} with {@code error} on the delivery thread, in order after earlier deliveries. If the
+     * executor closes first it is still failed with {@code error}, not a generic "closed": an outcome-unknown
+     * failure must not turn into something that reads as a refusal (#254).
+     */
+    void fail(CompletableFuture<?> future, Throwable error) {
+        enqueue(new Item(() -> future.completeExceptionally(error), future, -1, error));
+    }
+
+    private void enqueue(Item item) {
         state.lock();
         try {
             if (closed) {
@@ -296,7 +309,8 @@ final class DeliveryExecutor {
 
     private void abandon(Item item) {
         if (item.future() != null) {
-            item.future().completeExceptionally(item.index() >= 0 ? new CommittedNotAppliedException(name, item.index())
+            item.future().completeExceptionally(item.error() != null ? item.error()
+                    : item.index() >= 0 ? new CommittedNotAppliedException(name, item.index())
                     : new IllegalStateException("group closed before delivery"));
         }
     }

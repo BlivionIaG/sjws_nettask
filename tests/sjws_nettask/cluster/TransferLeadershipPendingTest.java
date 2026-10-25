@@ -1,5 +1,6 @@
 package sjws_nettask.cluster;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -65,7 +66,7 @@ class TransferLeadershipPendingTest {
         assertFalse(pending.isDone(), "no quorum can ack the append while the leader is cut off");
 
         groups.get(a).transferLeadership(nodes.get(b).self()); // the TIMEOUT_NOW is lost too
-        assertNotLeader(pending);
+        assertOutcomeUnknown(pending);
 
         // The rest of the original repro: b takes over and overwrites the index; a must not report it committed.
         for (int k = 0; k < 60 && !groups.get(b).isLeader(); k++) {
@@ -87,7 +88,7 @@ class TransferLeadershipPendingTest {
             step();
         }
         assertTrue(after.get(10, TimeUnit.SECONDS).term() > term);
-        assertNotLeader(pending);
+        assertOutcomeUnknown(pending);
         for (int k = 0; k < 10; k++) {
             step();
         }
@@ -107,7 +108,73 @@ class TransferLeadershipPendingTest {
 
         groups.get(a).transferLeadership(nodes.get(1 - a).self());
         var cause = assertThrows(ExecutionException.class, () -> change.get(10, TimeUnit.SECONDS)).getCause();
-        assertInstanceOf(NotLeaderException.class, cause);
+        assertInstanceOf(OutcomeUnknownException.class, cause, "the joint config is in the log: it may still commit");
+        assertEquals(nodes.get(1 - a).self(), ((OutcomeUnknownException) cause).hint().orElseThrow());
+    }
+
+    /**
+     * #254: OutcomeUnknown means "may still commit", and it does. The entry reaches b, a hands leadership to b
+     * before b's ack arrives, so a fails the write as outcome unknown; b then commits it (with its no-op), and every
+     * node applies it. NotLeaderException here would have told the client to resend: a duplicate.
+     */
+    @Test
+    void entryOnTheNewLeaderCommitsDespiteTheOldLeadersOutcomeUnknown() throws Exception {
+        int a = leader();
+        int b = 1 - a;
+        net.cut(nodes.get(a).self(), nodes.get(2).self()); // only b can ack, so the ack is the one thing to hold back
+        drain();
+        var pending = nodes.get(a).append(GROUP, List.of(text("maybe")), null, groups.get(a).leaderTerm());
+        assertEquals(1, net.deliver(1), "the append must reach b");
+        assertFalse(pending.isDone(), "b's ack is still queued");
+
+        groups.get(a).transferLeadership(nodes.get(b).self());
+        var cause = assertThrows(ExecutionException.class, () -> pending.get(10, TimeUnit.SECONDS)).getCause();
+        assertInstanceOf(OutcomeUnknownException.class, cause);
+        assertFalse(cause instanceof NotLeaderException);
+
+        for (int k = 0; k < 60 && !groups.get(b).isLeader(); k++) {
+            step();
+        }
+        assertTrue(groups.get(b).isLeader(), "b never took over");
+        net.heal(nodes.get(a).self(), nodes.get(2).self());
+        for (int k = 0; k < 20 && !(appliedTexts(a).contains("maybe") && appliedTexts(b).contains("maybe")); k++) {
+            step();
+        }
+        assertTrue(appliedTexts(b).contains("maybe"), "the new leader must commit the entry it already had");
+        assertTrue(appliedTexts(a).contains("maybe"), "and the old leader applies it too");
+        assertTrue(pending.isCompletedExceptionally(), "the old future stays failed");
+    }
+
+    /** #254: close() resolves every future it holds; nothing parks a caller (CpStore, RaftReplica) forever. */
+    @Test
+    void closeResolvesPendingAppendsMembershipChangesAndReads() throws Exception {
+        int a = leader();
+        isolate(a);
+        var append = nodes.get(a).append(GROUP, List.of(text("open")), null, groups.get(a).leaderTerm());
+        Set<NodeId> voters = Set.of(nodes.get(0).self(), nodes.get(1).self(), nodes.get(2).self());
+        CompletableFuture<Void> change = groups.get(a).changeMembership(voters, Set.of());
+        clock.advance(Duration.ofSeconds(10));
+        CompletableFuture<Void> read = groups.get(a).readBarrier();
+        assertFalse(append.isDone() || change.isDone() || read.isDone());
+
+        nodes.get(a).close();
+        assertInstanceOf(OutcomeUnknownException.class,
+                assertThrows(ExecutionException.class, () -> append.get(10, TimeUnit.SECONDS)).getCause());
+        assertInstanceOf(OutcomeUnknownException.class,
+                assertThrows(ExecutionException.class, () -> change.get(10, TimeUnit.SECONDS)).getCause());
+        assertInstanceOf(NotLeaderException.class,
+                assertThrows(ExecutionException.class, () -> read.get(10, TimeUnit.SECONDS)).getCause(),
+                "a read has no outcome to lose");
+        nodes.get(a).close(); // idempotent
+        var later = groups.get(a).readBarrier();
+        assertInstanceOf(NotLeaderException.class,
+                assertThrows(ExecutionException.class, () -> later.get(10, TimeUnit.SECONDS)).getCause());
+    }
+
+    private void drain() {
+        while (net.deliver(1_000) > 0) {
+            // flush heartbeats and their replies so the next frame queued is the one under test
+        }
     }
 
     @Test
@@ -130,9 +197,11 @@ class TransferLeadershipPendingTest {
                 "a failed barrier stays failed whoever leads next");
     }
 
-    private static void assertNotLeader(CompletableFuture<CommittedIndex> future) {
+    /** #254: the write was in the log, so not-leader (a refusal) would be a lie; it may still commit. */
+    private static void assertOutcomeUnknown(CompletableFuture<CommittedIndex> future) {
         var cause = assertThrows(ExecutionException.class, () -> future.get(10, TimeUnit.SECONDS)).getCause();
-        assertInstanceOf(NotLeaderException.class, cause);
+        assertInstanceOf(OutcomeUnknownException.class, cause);
+        assertFalse(cause instanceof NotLeaderException);
     }
 
     private void isolate(int i) {

@@ -1,6 +1,9 @@
 package sjws_nettask.msgrepl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.InetSocketAddress;
@@ -108,6 +111,45 @@ class RaftReplicaTest {
         var out = new ArrayList<byte[]>();
         for (var r : rs) out.add(r.getBytes(StandardCharsets.UTF_8));
         return out;
+    }
+
+    /**
+     * #254: the replica keeps "refused" and "unknown" apart. Not leader / term moved: LeaderUnavailable (HTTP may
+     * redirect). Other refusals before the log: WriteRefused (nothing appended). In the log, fate unknown:
+     * WriteOutcomeUnknown with the hint, never LeaderUnavailable. Unclassified errors pass through as they are.
+     */
+    @Test
+    void consensusErrorsMapToRefusedOrOutcomeUnknown() throws Exception {
+        try (var n = new Node()) {
+            var r = (RaftReplica) n.replica;
+            var g = RaftReplicator.group("t");
+            var n2 = new NodeId(2, "n2");
+            assertInstanceOf(sjws_nettask.messaging.ledger.LeaderUnavailableException.class,
+                    r.map(new sjws_nettask.cluster.NotLeaderException(g, java.util.Optional.of(n2))));
+            assertInstanceOf(sjws_nettask.messaging.ledger.LeaderUnavailableException.class,
+                    r.map(new java.util.concurrent.CompletionException(sjws_nettask.cluster.ClusterErrors.termChanged(g))));
+
+            var unknown = r.map(new java.util.concurrent.CompletionException(new sjws_nettask.cluster.OutcomeUnknownException(
+                    g, "stopped leading", java.util.Optional.of(n2), null)));
+            var u = assertInstanceOf(sjws_nettask.messaging.ledger.WriteOutcomeUnknownException.class, unknown);
+            assertEquals("n2", u.leaderName(), "the hint from consensus wins");
+            assertFalse(unknown instanceof sjws_nettask.messaging.ledger.LeaderUnavailableException);
+            assertInstanceOf(sjws_nettask.messaging.ledger.WriteOutcomeUnknownException.class,
+                    r.map(new sjws_nettask.cluster.CommittedNotAppliedException(g.value(), 7)));
+
+            var lag = assertInstanceOf(sjws_nettask.messaging.ledger.WriteRefusedException.class,
+                    r.map(sjws_nettask.cluster.ClusterErrors.applyLag(g)));
+            assertTrue(lag.retryable());
+            assertTrue(assertInstanceOf(sjws_nettask.messaging.ledger.WriteRefusedException.class,
+                    r.map(sjws_nettask.cluster.ClusterErrors.durabilityUnavailable(g))).retryable());
+            assertTrue(assertInstanceOf(sjws_nettask.messaging.ledger.WriteRefusedException.class,
+                    r.map(new java.io.UncheckedIOException(new java.io.IOException("rolled back")))).retryable());
+            assertFalse(assertInstanceOf(sjws_nettask.messaging.ledger.WriteRefusedException.class,
+                    r.map(new IllegalArgumentException("batch exceeds maxBatchBytes"))).retryable());
+
+            var other = new IllegalStateException("unclassified");
+            assertSame(other, r.map(other), "unclassified errors stay as they are (HTTP: outcome unknown)");
+        }
     }
 
     @Test
