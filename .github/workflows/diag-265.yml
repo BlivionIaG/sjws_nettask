@@ -46,7 +46,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-26.04]
-        ref: [8fdf93df282eeb82e6edf409c33c1f3a8f47e152]
+        ref: [4452ac19af6d64accef2d9cf9f20ccc717bdbc6e]
+        attempt: [1, 2]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -62,4 +63,6 @@ jobs:
           uname -r; nproc; git log -1 --oneline
           git apply ../diag/.github/diag265/diag265.patch
           mvn -B verify -Dmaven.test.failure.ignore=true > verify.txt 2>&1 || true
-          grep -E 'DIAG265|no spin|Tests run:.*Fail.*in |Total time' verify.txt | grep -vE 'Failures: 0, Errors: 0' | cut -c1-2000
+          grep -E 'Tests run:.*Fail.*in |Total time' verify.txt | grep -vE 'Failures: 0, Errors: 0' | cut -c1-300
+          echo '--- diag265.txt'; cat diag265.txt || true
+          echo '--- System.out redirect check'; grep -nE 'System\.set(Out|Err)' -r src tests | head

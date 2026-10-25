@@ -112,7 +112,7 @@ index 0000000..1282d5a
 +    }
 +}
 diff --git a/tests/sjws_nettask/Http1TransportTest.java b/tests/sjws_nettask/Http1TransportTest.java
-index 24fc788..1e83418 100644
+index 24fc788..9353204 100644
 --- a/tests/sjws_nettask/Http1TransportTest.java
 +++ b/tests/sjws_nettask/Http1TransportTest.java
 @@ -308,6 +308,8 @@ class Http1TransportTest {
@@ -124,15 +124,19 @@ index 24fc788..1e83418 100644
              long cpu0 = cpuNanos();
              long t0 = System.nanoTime();
              long got = 1024 * 1024;
-@@ -324,6 +326,7 @@ class Http1TransportTest {
+@@ -324,7 +326,10 @@ class Http1TransportTest {
              Thread.sleep(500); // a spinning sender would burn a core here
              long wall = System.nanoTime() - t0;
              long cpu = cpuNanos() - cpu0;
-+            System.out.println(diag.report("wall=" + wall / 1_000_000 + "ms got=" + got));
-             assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
+-            assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
++            String diagLine = diag.report("wall=" + wall / 1_000_000 + "ms got=" + got);
++            System.out.println(diagLine);
++            try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getProperty("user.dir"), "diag265.txt"), diagLine + "\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception ignored) { }
++            assertTrue(cpu < wall / 2, diagLine + " no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
          }
          assertEquals(0, manager.reaper().tracked());
-@@ -383,6 +386,8 @@ class Http1TransportTest {
+         assertEquals(0, manager.reaper().writeExpirations(), "ended by shrink detection, not by the deadline");
+@@ -383,6 +388,8 @@ class Http1TransportTest {
              try (var w = FileChannel.open(file, StandardOpenOption.WRITE)) {
                  w.truncate(from + 2 * 1024 * 1024); // inside the range
              }
@@ -141,11 +145,15 @@ index 24fc788..1e83418 100644
              long cpu0 = cpuNanos();
              long t0 = System.nanoTime();
              long got = first.length;
-@@ -399,6 +404,7 @@ class Http1TransportTest {
+@@ -399,7 +406,10 @@ class Http1TransportTest {
              Thread.sleep(500);
              long wall = System.nanoTime() - t0;
              long cpu = cpuNanos() - cpu0;
-+            System.out.println(diag.report("wall=" + wall / 1_000_000 + "ms got=" + got));
-             assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
+-            assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
++            String diagLine = diag.report("wall=" + wall / 1_000_000 + "ms got=" + got);
++            System.out.println(diagLine);
++            try { java.nio.file.Files.writeString(java.nio.file.Path.of(System.getProperty("user.dir"), "diag265.txt"), diagLine + "\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); } catch (Exception ignored) { }
++            assertTrue(cpu < wall / 2, diagLine + " no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
          }
          assertEquals(0, manager.reaper().writeExpirations(), "ended by shrink detection");
+     }
