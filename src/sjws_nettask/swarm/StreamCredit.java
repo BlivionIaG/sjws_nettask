@@ -64,6 +64,8 @@ final class StreamCredit {
 
     final int sinkChunks;
     final long windowBytes;
+    /** S2c PR 6b (#267): the node stream-memory budget; always present with credit on (no sub-flag). */
+    final StreamBudget budget;
     private final ConcurrentHashMap<Key, StreamHttp.Session> sessions = new ConcurrentHashMap<>();
     private final AtomicLong refusals = new AtomicLong();
     private final AtomicLong unknown = new AtomicLong();
@@ -77,9 +79,15 @@ final class StreamCredit {
 
     private record Key(long hi, long lo) { }
 
+    /** Unit tests only: an unbounded budget. */
     StreamCredit(int sinkChunks, long windowBytes) {
+        this(sinkChunks, windowBytes, StreamBudget.unbounded());
+    }
+
+    StreamCredit(int sinkChunks, long windowBytes, StreamBudget budget) {
         this.sinkChunks = sinkChunks;
         this.windowBytes = windowBytes;
+        this.budget = budget;
     }
 
     static long chunksOf(long packed) {
@@ -117,9 +125,13 @@ final class StreamCredit {
         this.unknown.incrementAndGet();
     }
 
-    /** Binds a new session's credit state; the session is found by its stream id (the task's correlation id). */
+    /**
+     * Binds a new session's credit state; the session is found by its stream id (the task's correlation id). The
+     * session takes over the {@code LAST} ticket its submit booked ({@link StreamBudget#admitSession}).
+     */
     State register(StreamHttp.Session s) {
         var st = new State(this);
+        st.lastTicket.set(true);
         s.credit = st;
         var b = java.nio.ByteBuffer.wrap(s.correlation);
         this.sessions.put(new Key(b.getLong(), b.getLong()), s);
@@ -186,7 +198,7 @@ final class StreamCredit {
         long unreadChunks = Math.max(0, ms - rn + 1) + hc + chunksOf(r);
         long unreadBytes = Math.max(0, ab - rb) + hb + bytesOf(r);
         long chunks = Math.max(0, this.sinkChunks - unreadChunks);
-        long bytes = Math.max(0, this.windowBytes - unreadBytes);
+        long bytes = Math.min(Math.max(0, this.windowBytes - unreadBytes), this.budget.advertise(st)); // #267 Q7
         return new Credit(streamHi, streamLo, la, Math.min(chunks, Credit.MAX_U32), Math.min(bytes, Credit.MAX_U32));
     }
 
@@ -197,12 +209,20 @@ final class StreamCredit {
      * {@link #release} exactly once; false when it was refused (nothing reserved, nothing written).
      */
     boolean reserve(StreamHttp.Session s, State st, long la, long seq, long size) {
+        return reserveVerdict(s, st, la, seq, size) != REFUSE;
+    }
+
+    /**
+     * {@link #reserve}, returning the validation's verdict ({@link #ADMIT}, {@link #EXEMPT} or {@link #NEWER}) when the
+     * request now holds a reservation, or {@link #REFUSE} (nothing reserved).
+     */
+    int reserveVerdict(StreamHttp.Session s, State st, long la, long seq, long size) {
         while (true) {
             long r = st.reserved.get();
             long c = chunksOf(r);
             long b = bytesOf(r);
             if (c >= CHUNKS_MAX || b + size > BYTES_MASK || verdict(s, st, r, la, seq, size) == REFUSE) {
-                return false; // the range guard is unreachable over HTTP (≤ window requests of ≤ 1 MiB); fail closed
+                return REFUSE; // the range guard is unreachable over HTTP (≤ window requests of ≤ 1 MiB); fail closed
             }
             var hook = this.beforeReserve;
             if (hook != null) {
@@ -214,11 +234,11 @@ final class StreamCredit {
         }
         long r2 = st.reserved.get(); // includes this request's own reservation: validate against the others'
         long others = pack(Math.max(0, chunksOf(r2) - 1), Math.max(0, bytesOf(r2) - size));
-        if (verdict(s, st, others, la, seq, size) == REFUSE) {
+        int v = verdict(s, st, others, la, seq, size);
+        if (v == REFUSE) {
             release(st, size);
-            return false;
         }
-        return true;
+        return v;
     }
 
     /** The single release of a reservation: a CAS loop that never takes a field below 0 (clamped and counted). */
@@ -258,6 +278,23 @@ final class StreamCredit {
         volatile long readAttempt = -1;
         /** Guarded by the sink lock: bytes of the chunks held in the sink's reorder buffer. */
         long heldBytesLocked;
+        /** S2c PR 6b: this session's resident bytes (retained plus held), moved by the budget's residency deltas. */
+        final AtomicLong resident = new AtomicLong();
+        /**
+         * S2c PR 6b late-offer flag (#267 §3.3): set once, under the session lock and then the sink lock, when the
+         * session leaves the table; a drain or offer that runs after it charges nothing (its release already ran).
+         */
+        volatile boolean closed;
+        /**
+         * The session still holds its {@code LAST} ticket (not yet converted); flipped by CAS, because a {@code LAST}
+         * becomes resident either in the sink's reorder buffer (sink lock) or in the retained window (session lock).
+         */
+        final java.util.concurrent.atomic.AtomicBoolean lastTicket = new java.util.concurrent.atomic.AtomicBoolean();
+        /**
+         * Written under the sink lock: a gap ticket is booked (the reorder buffer holds chunks). Volatile for the
+         * lock-free read in {@link StreamBudget#advertise} (advisory, like the rest of the snapshot).
+         */
+        volatile boolean gapTicket;
         // guarded by the session lock: the cumulative byte offset of each retained chunk, parallel to Session.retained
         private long[] offsets = new long[16];
         private int head;
@@ -280,6 +317,7 @@ final class StreamCredit {
             }
             if (b != 0) {
                 this.heldBytes.addAndGet(-b);
+                this.owner.budget.resident(this, -b); // always: these bytes already left heldBytesLocked (#267 §3.3)
             }
         }
 
