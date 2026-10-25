@@ -589,7 +589,7 @@ public final class PeerLink implements AutoCloseable {
         } catch (RuntimeException failed) {
             System.getLogger(PeerLink.class.getName()).log(System.Logger.Level.WARNING,
                     "swarm peer: produce to {0} from {1} failed: {2}", topic, from.name(), failed.toString());
-            answer(from, topic, producerId, seq, Outcome.FAILED, -1, 0);
+            answer(from, topic, producerId, seq, afterProduceFailure(failed), -1, 0);
             return;
         }
         served.incrementAndGet();
@@ -630,6 +630,16 @@ public final class PeerLink implements AutoCloseable {
     static Outcome afterDurabilityFailure(Partition.ForwardOutcome outcome) {
         return outcome == Partition.ForwardOutcome.APPENDED || outcome == Partition.ForwardOutcome.DUPLICATE
                 ? Outcome.OUTCOME_UNKNOWN : Outcome.FAILED;
+    }
+
+    /**
+     * The answer when {@code produceFrom} threw (#251 HA round 3). Only the fenced-writer refusal, a
+     * {@link java.util.concurrent.CompletionException} from the writer's failed future before anything is applied,
+     * proves the write was not applied: that is {@code FAILED}. Anything else may have been thrown after the append
+     * was handed to the ledger or applied, so its fate is unknown.
+     */
+    static Outcome afterProduceFailure(RuntimeException failed) {
+        return failed instanceof java.util.concurrent.CompletionException ? Outcome.FAILED : Outcome.OUTCOME_UNKNOWN;
     }
 
     /** A forwarded append still waiting for its durability (bounded by {@link Limits#inboundInflight} per peer). */

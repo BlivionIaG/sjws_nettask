@@ -75,8 +75,10 @@ answers the current round and exactly one copy of N was ever sent (the wire does
 resend the refusal may answer an earlier copy while another copy was applied); otherwise every pending write is
 `OUTCOME_UNKNOWN`. A refusal from a stale round (a copy sent before a rewind) is ignored. `TOO_OLD` and
 `OUTCOME_UNKNOWN` go to their own seq; every other pending write is `OUTCOME_UNKNOWN`. On the owner, the ledger writer
-fails the group's writes before it fails the waiters behind them, so a refusal never overtakes an earlier
-outcome-unknown on the wire.
+fails a failing group's writes and waiters before it raises its fence, which narrows (for that group only) the window
+in which a refusal can be sent ahead of an earlier write's outcome-unknown; the sender rule above is the guarantee.
+A `produceFrom` that throws is `FAILED` only for the fenced-writer refusal (nothing applied); any other exception may
+come after the append, so it is `OUTCOME_UNKNOWN`.
 
 **Client-facing mapping** (`PeerLink.Result.problem()`, #258's problem types), for the edge that will answer
 forwarded produces in a later step:

@@ -64,14 +64,55 @@ class PeerLinkTest {
     final Map<String, Partition> partitions = new ConcurrentHashMap<>();
     final List<Integer> origins = new CopyOnWriteArrayList<>();
 
+    /** Set at teardown: every thread a test starts with {@link #spawn} must check it and stop. */
+    final AtomicBoolean tornDown = new AtomicBoolean();
+    final List<Thread> spawned = new CopyOnWriteArrayList<>();
+
+    /** Starts a test thread that teardown joins; a loop in it must stop on {@link #tornDown} (#251 HA B3). */
+    Thread spawn(Runnable body) {
+        var t = Thread.ofPlatform().daemon().name("peerlinktest-worker").start(body);
+        spawned.add(t);
+        return t;
+    }
+
     @AfterEach
     void closeAll() throws Exception {
+        tornDown.set(true);
         for (int i = open.size() - 1; i >= 0; i--) {
             open.get(i).close();
         }
         for (var p : partitions.values()) {
             p.close();
         }
+        // HA B3: a test thread left running (a flooder spinning on UNAVAILABLE) burns CPU for the rest of the JVM
+        // and broke Http1TransportTest's no-spin checks. Every test thread, and every peer transport thread, ends here.
+        for (var t : spawned) {
+            t.join(10_000);
+            assertFalse(t.isAlive(), "a test thread is still running after teardown: " + t);
+        }
+        long end = System.nanoTime() + 10_000_000_000L;
+        List<String> left;
+        while (!(left = leftoverThreads()).isEmpty() && System.nanoTime() < end) {
+            Thread.sleep(10);
+        }
+        assertEquals(List.of(), left, "threads left after teardown");
+    }
+
+    /** Live platform threads this class or a peer transport started. */
+    static List<String> leftoverThreads() {
+        var names = new ArrayList<String>();
+        for (var t : Thread.getAllStackTraces().keySet()) {
+            var n = t.getName();
+            if (t.isAlive() && (n.startsWith("peerlinktest-") || n.startsWith(PeerLink.DOMAIN.name() + "-"))) {
+                names.add(n);
+            }
+        }
+        return names;
+    }
+
+    /** True once {@code f} is already answered UNAVAILABLE: the link is closed, a flooder must stop. */
+    static boolean unavailable(CompletableFuture<PeerLink.Result> f) {
+        return f.isDone() && f.join().outcome() == Outcome.UNAVAILABLE;
     }
 
     static String map(int n) throws IOException {
@@ -487,7 +528,7 @@ class PeerLinkTest {
             server.setReuseAddress(true);
             server.setReceiveBufferSize(4096);
             server.bind(new InetSocketAddress("127.0.0.1", port));
-            Thread.ofPlatform().daemon().start(() -> {
+            Thread.ofPlatform().daemon().name("peerlinktest-deaf").start(() -> {
                 while (true) {
                     try {
                         accepted.add(server.accept());
@@ -535,10 +576,15 @@ class PeerLinkTest {
         await(() -> deaf.accepted.size() == 1, "connected");
         Thread.sleep(200); // the writer is idle again: from here every write is inline on the flooder's thread
         var calls = new AtomicLong();
-        var flooder = Thread.ofPlatform().daemon().start(() -> {
-            while (true) {
-                hung.add(b.produce("a", "fwd.hung", big, Durability.NONE, 300));
+        var stop = new AtomicBoolean();
+        var flooder = spawn(() -> {
+            while (!stop.get() && !tornDown.get()) {
+                var f = b.produce("a", "fwd.hung", big, Durability.NONE, 300);
                 calls.incrementAndGet();
+                if (unavailable(f)) {
+                    return; // the link closed
+                }
+                hung.add(f);
             }
         });
         long before;
@@ -559,6 +605,11 @@ class PeerLinkTest {
         assertEquals(calls.get(), before, "the flooder is still blocked in its socket write");
         assertEquals(0, b.transport().writeStalls());
         assertEquals(100, payloads("c", "fwd.ok").size());
+        // B3: stop the flooder; closing b fails its blocked write, and the loop ends
+        stop.set(true);
+        b.close();
+        flooder.join(10_000);
+        assertFalse(flooder.isAlive(), "the flooder returned once b closed");
     }
 
     static final TcpTransport.SocketFactory TINY_BUFFERS = new TcpTransport.SocketFactory() {
@@ -601,11 +652,15 @@ class PeerLinkTest {
         var hung = new CopyOnWriteArrayList<CompletableFuture<PeerLink.Result>>();
         var longestCallNanos = new AtomicLong();
         var stop = new AtomicBoolean();
-        var flooder = Thread.ofPlatform().daemon().start(() -> {
-            while (!stop.get()) {
+        var flooder = spawn(() -> {
+            while (!stop.get() && !tornDown.get()) {
                 long t0 = System.nanoTime();
-                hung.add(b.produce("a", "fwd.hung", big, Durability.NONE, 400));
+                var f = b.produce("a", "fwd.hung", big, Durability.NONE, 400);
                 longestCallNanos.accumulateAndGet(System.nanoTime() - t0, Math::max);
+                if (unavailable(f)) {
+                    return;
+                }
+                hung.add(f);
             }
         });
         // the flooder fills a's socket and blocks inside produce(); the write-stall bound must cut it
@@ -644,7 +699,7 @@ class PeerLinkTest {
             String to = from == a ? "b" : "a";
             for (int t = 0; t < threads; t++) {
                 String topic = "fwd.x"; // one stream per direction: every caller and onAck share its lock
-                workers.add(Thread.ofPlatform().start(() -> {
+                workers.add(spawn(() -> {
                     for (int i = 0; i < each; i++) {
                         futures.add(from.produce(to, topic, record, Durability.NONE, 30_000));
                     }
@@ -744,6 +799,10 @@ class PeerLinkTest {
         assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.afterDurabilityFailure(Partition.ForwardOutcome.APPENDED));
         assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.afterDurabilityFailure(Partition.ForwardOutcome.DUPLICATE));
         assertEquals(Outcome.FAILED, PeerLink.afterDurabilityFailure(Partition.ForwardOutcome.BUSY));
+        // a throw from produceFrom is a refusal only when it is the fenced writer's (nothing applied)
+        assertEquals(Outcome.FAILED, PeerLink.afterProduceFailure(
+                new java.util.concurrent.CompletionException(new java.io.IOException("fenced"))));
+        assertEquals(Outcome.OUTCOME_UNKNOWN, PeerLink.afterProduceFailure(new IllegalStateException("after apply")));
     }
 
     @Test
@@ -780,11 +839,11 @@ class PeerLinkTest {
             server.setReuseAddress(true);
             server.setReceiveBufferSize(4096);
             server.bind(new InetSocketAddress("127.0.0.1", port));
-            Thread.ofPlatform().daemon().start(() -> {
+            Thread.ofPlatform().daemon().name("peerlinktest-deaftls").start(() -> {
                 while (true) {
                     try {
                         var s = (javax.net.ssl.SSLSocket) server.accept();
-                        Thread.ofPlatform().daemon().start(() -> {
+                        Thread.ofPlatform().daemon().name("peerlinktest-handshake").start(() -> {
                             try {
                                 s.startHandshake();
                                 handshaken.add(s);
@@ -814,14 +873,17 @@ class PeerLinkTest {
     }
 
     /** Floods {@code owner} with 256 KiB writes from a fresh thread; records the longest produce() call. */
-    static Thread flood(PeerLink link, String owner, AtomicLong calls, AtomicLong longest, AtomicBoolean stop) {
+    Thread flood(PeerLink link, String owner, AtomicLong calls, AtomicLong longest, AtomicBoolean stop) {
         var big = new byte[256 << 10];
-        return Thread.ofPlatform().daemon().start(() -> {
-            while (!stop.get()) {
+        return spawn(() -> {
+            while (!stop.get() && !tornDown.get()) {
                 long t0 = System.nanoTime();
-                link.produce(owner, "fwd.hung", big, Durability.NONE, 300);
+                var f = link.produce(owner, "fwd.hung", big, Durability.NONE, 300);
                 longest.accumulateAndGet(System.nanoTime() - t0, Math::max);
                 calls.incrementAndGet();
+                if (unavailable(f)) {
+                    return; // the link closed
+                }
             }
         });
     }
@@ -878,8 +940,9 @@ class PeerLinkTest {
         closer.join(15_000);
         stop2.set(true);
         assertFalse(closer.isAlive(), "PeerLink.close() returned");
-        floodA.join(5_000);
-        floodC.join(5_000);
+        floodA.join(10_000);
+        floodC.join(10_000);
+        assertFalse(floodA.isAlive() || floodC.isAlive(), "the flooders stop once the link is closed");
         assertTrue(System.nanoTime() - t0 < 60_000_000_000L);
     }
 
@@ -927,6 +990,23 @@ class PeerLinkTest {
         var r = get(first);
         assertEquals(Outcome.OUTCOME_UNKNOWN, r.outcome(), "an earlier write may be applied: never not-appended");
         assertEquals(PeerLink.Problem.OUTCOME_UNKNOWN_TYPE, r.problem().type());
+    }
+
+    @Test
+    void aBusyBackoffStartsOverAfterAnAppliedWrite() throws Exception {
+        var map = map(2);
+        // seq 1 is answered BUSY 8 times (the backoff reaches its 0.5-1 s cap), then APPENDED; seq 2 gets one BUSY
+        scripted(map, (seq, copy) -> seq == 1
+                ? List.of(copy <= 8 ? Outcome.BUSY : Outcome.APPENDED)
+                : List.of(copy == 1 ? Outcome.BUSY : Outcome.APPENDED));
+        var patient = new PeerLink.Limits(256, 2048, 1024, 3_600_000L, 5_000, 1 << 20, 1024, 5, 300);
+        var b = link(map, "b", TcpTransport.SocketFactory.PLAIN, PeerLink.Owner.NONE, patient);
+        assertEquals(Outcome.APPENDED, get(b.produce("a", "fwd.t", b("1"), Durability.NONE, 20_000)).outcome());
+        long t0 = System.nanoTime();
+        assertEquals(Outcome.APPENDED, get(b.produce("a", "fwd.t", b("2"), Durability.NONE, 20_000)).outcome());
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        // reset: the first BUSY after progress waits 5-10 ms; without it, it would wait the 0.5-1 s cap
+        assertTrue(ms < 400, "the BUSY backoff started over after seq 1 was applied: " + ms + " ms");
     }
 
     @Test

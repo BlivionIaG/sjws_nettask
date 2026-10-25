@@ -309,6 +309,8 @@ public final class Partition implements AutoCloseable {
      *
      * @param maxLiveProducers cap on live producers for {@code origin} here; beyond it a new producer gets BUSY unless
      *        one has been idle {@code producerIdleMs} and is evicted
+     * @throws java.util.concurrent.CompletionException when the ledger writer is fenced: nothing was applied. Any
+     *         other exception may come after the append was handed to the ledger, so the write's fate is unknown.
      */
     public ForwardedResult produceFrom(int origin, long producerId, long seq, byte[] payload, Durability durability,
             int maxLiveProducers, long producerIdleMs) {

@@ -296,9 +296,11 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             // sleeping out the fsync floor (an unpark per write would turn the floor into a wake-up per write).
             if ((durability == Durability.ASYNC && !flooring) || !fsyncWaiters.isEmpty()) unparkSyncer();
         } catch (IOException | RuntimeException e) {
-            // The in-memory tail may disagree with disk: fence the writer; reopening recovers. Fail the writes that
-            // were already accepted (applied by the caller, fate unknown) before new appends see the fence and are
-            // refused: their failures are then reported first (#251, a refusal must not overtake an unknown fate).
+            // The in-memory tail may disagree with disk: fence the writer; reopening recovers. This group's writes
+            // and the waiters are failed before the fence is raised, so an append refused by the fence cannot be
+            // reported ahead of them. That covers only this failing group, not the other fencing paths or writes
+            // still queued behind it; the forwarding sender's rule (#251 B2: a refusal of seq N makes every earlier
+            // pending seq outcome-unknown) is the guarantee, this ordering only narrows the window.
             g.forEach(p -> p.done.completeExceptionally(e));
             failWaiters(e);
             failure = e;
