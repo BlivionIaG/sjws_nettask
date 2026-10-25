@@ -122,6 +122,14 @@ final class RaftReplica implements Replica {
     private volatile long logStart;
     /** Latest applied batch whose records are written: the next snapshot point. */
     private volatile Applied lastApplied;
+    /**
+     * Restart with a {@link ReplicaHooks.ReplicatedState}: its image was restored at this index, so entries after it
+     * that are already in the ledger are fed to {@code onApplied} again (not to the ledger). MAX_VALUE: none.
+     */
+    private long stateFrom = Long.MAX_VALUE;
+    /** Set while the group opens when the restored snapshot needs an install; run once the group is open. */
+    private MsgSnapshot openInstall;
+    private volatile CompletableFuture<Void> installing;
     /** Consensus index of the last snapshot recorded or restored. */
     private volatile long recordedIndex;
     /** The last local append, so an install can wait for the writer to drain. */
@@ -190,6 +198,19 @@ final class RaftReplica implements Replica {
         };
         this.group = node.openGroup(groupId, options, listener);
         node.onNoopApplied(groupId, (term, index) -> this.readyTerm = term);
+        var owed = this.openInstall;
+        if (owed != null) {
+            this.openInstall = null;
+            var done = new CompletableFuture<Void>();
+            this.installing = done;
+            Thread.ofVirtual().name("msgrepl-install-" + this.topic).start(() -> {
+                try {
+                    install(owed);
+                } finally {
+                    done.complete(null);
+                }
+            });
+        }
         if (snaps != null) {
             long tail = snaps.settings.tailEntries();
             node.snapshots(groupId).setTruncationBound((g, snapIndex) -> Math.max(0, snapIndex - tail));
@@ -308,12 +329,41 @@ final class RaftReplica implements Replica {
         return b.flip();
     }
 
+    /** Feeds an entry already in the ledger to {@code onApplied}, after a state image restored at {@link #stateFrom}. */
+    private void replayState(CommittedEntry e) {
+        var b = e.entry().duplicate();
+        if (b.remaining() < HEADER || b.get() != MAGIC) return;
+        b.get();
+        long stamp = b.getLong();
+        b.getInt();
+        b.getLong();
+        int count = b.getInt();
+        if (stamp != e.term() || count < 0) return;
+        var records = new ArrayList<byte[]>(count);
+        for (int i = 0; i < count && b.remaining() >= 4; i++) {
+            int len = b.getInt();
+            if (len < 0 || len > b.remaining()) return;
+            var r = new byte[len];
+            b.get(r);
+            records.add(r);
+        }
+        this.onApplied.accept(records);
+    }
+
     static ByteBuffer encodeRetain(long offset, long term, int origin, long seq) {
         return ByteBuffer.allocate(RETAIN_BYTES).put(RETAIN).putLong(term).putInt(origin).putLong(seq).putLong(offset).flip();
     }
 
     private void onCommitted(CommittedEntry e) {
-        if (e.index() <= this.resumeIndex) return; // already in the ledger (restart replay or installed snapshot)
+        if (this.installPending) {
+            var f = this.installing;
+            if (f != null) f.join(); // the restart install: entries wait for the ledger they apply to
+            if (this.installPending) return; // a failed install: nothing applies until a restart redoes it
+        }
+        if (e.index() <= this.resumeIndex) { // already in the ledger (restart replay or installed snapshot)
+            if (e.index() > this.stateFrom) replayState(e);
+            return;
+        }
         var b = e.entry();
         if (b.remaining() == RETAIN_BYTES && b.get(b.position()) == RETAIN) {
             onRetain(e, b);
@@ -441,6 +491,14 @@ final class RaftReplica implements Replica {
         return this.snapshotsTaken.get();
     }
 
+    Applied lastAppliedForTest() {
+        return this.lastApplied;
+    }
+
+    boolean installPending() {
+        return this.installPending;
+    }
+
     long recordedIndex() {
         return this.recordedIndex;
     }
@@ -465,7 +523,10 @@ final class RaftReplica implements Replica {
     /** Takes the snapshot at {@code a} now (also tests). */
     boolean snapshotAt(Applied a) throws IOException {
         // Constraint 1: the snapshot point must be durable in the segments, not only applied.
-        if (this.local.snapshot().durableOffset() < a.end()) this.log.force();
+        if (this.local.snapshot().durableOffset() < a.end()) {
+            this.log.force();
+            if (this.log.nextOffset() < a.end()) return false; // not written yet (cannot happen: a is published after the write)
+        }
         var state = this.hooks != null && this.hooks.state() != null ? this.hooks.state().snapshotState() : null;
         var m = this.snaps.store.pin(this.topic, this.log, a.index(), a.term(), a.end(), this.logStart, state,
                 this.snaps.settings.chunkBytes());
@@ -517,6 +578,11 @@ final class RaftReplica implements Replica {
             return;
         }
         if (this.snaps != null && this.hooks != null && (this.installPending || this.local.snapshot().nextOffset() < m.endOffset())) {
+            if (this.group == null) { // restored while the group opens (restart): installed off the opening thread
+                this.installPending = true;
+                this.openInstall = m;
+                return;
+            }
             install(m);
             return;
         }
@@ -534,7 +600,10 @@ final class RaftReplica implements Replica {
         this.recordedIndex = Math.max(this.recordedIndex, m.index());
         this.appliedIndex = Math.max(this.appliedIndex, m.index());
         applied(m.index(), m.term(), m.endOffset());
-        if (this.hooks != null && this.hooks.state() != null && m.state().length > 0) this.hooks.state().restoreState(m.state());
+        if (this.hooks != null && this.hooks.state() != null) {
+            this.hooks.state().restoreState(m.state());
+            this.stateFrom = m.index();
+        }
     }
 
     /**

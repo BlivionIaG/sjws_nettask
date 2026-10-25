@@ -307,8 +307,12 @@ final class LogTopics implements AutoCloseable {
     private void applyPendingDrops() {
         for (var topic : java.util.List.copyOf(this.pendingDrops.keySet())) {
             Long x = this.pendingDrops.remove(topic);
-            var l = x == null ? null : this.logs.get(topic);
-            if (l == null) continue;
+            if (x == null) continue;
+            var l = this.logs.get(topic);
+            if (l == null) { // the replica is still opening (a cut recovered on restart): the next pass applies it
+                this.pendingDrops.merge(topic, x, Math::max);
+                continue;
+            }
             l.reads().writeLock().lock();
             try {
                 for (var seg : l.log().segments()) {
