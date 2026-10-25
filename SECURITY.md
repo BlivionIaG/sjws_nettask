@@ -118,6 +118,12 @@ What the code enforces today:
 
   With `cpTls` off, the interim credential is the join token, and the CP keeps only its SHA-256
   hash, compared in constant time.
+- **Control-plane voter links** (`cp.peers`) are mutual TLS 1.3 under `cp.tls.peerCert`, `peerKey` and `peerCa`,
+  with frames HMAC-authenticated under the CP-only `SJWS_CP_RAFT_KEY`. Each `cp.peers` entry pins the URI or DNS SAN
+  of that voter's certificate (`san`, required with `cp.tls`). A dialled voter must present the SAN pinned for its
+  address, an accepted connection may only send frames as the voter its certificate names, and a node whose own
+  certificate lacks its pinned SAN refuses to start. See
+  [control-plane hosting](docs/design/control-plane-hosting.md).
 - **Join tokens** are one-shot, and this is enforced. The control plane stores only a SHA-256
   hash of each token. A token must be issued before it can be used, and it expires after a TTL
   (default 1 hour, at most 24 hours). It is burned atomically, through the Raft-replicated CP log,

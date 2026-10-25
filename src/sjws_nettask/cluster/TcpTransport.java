@@ -116,7 +116,12 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         EPOCH,
         SEQ,
         /** The whole-frame deadline passed after the first length-prefix byte (slow or stalled sender). */
-        TIMEOUT
+        TIMEOUT,
+        /**
+         * A correctly tagged frame whose sender wire id is not the one the connection's authenticated identity pins
+         * ({@link SocketFactory#peerWire}); the connection is closed. Never counted when the factory pins nothing.
+         */
+        ORIGIN
     }
 
     /** {@link #seal} refuses a body or group too large for the frame format. */
@@ -140,6 +145,18 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
          * Plain sockets have nothing to do.
          */
         default void handshake(Socket accepted, int totalMillis) throws IOException {
+        }
+
+        /**
+         * The wire id that {@code accepted}'s authenticated identity (the verified mTLS certificate, mapped through a
+         * pinned member list) belongs to, called once after {@link #handshake}; -1 when this factory does not
+         * identify peers (plain sockets). With a pinned wire, a frame on that connection whose sender wire differs
+         * is dropped as {@link Reason#ORIGIN} before it is queued, and the connection is closed: the sender wire in
+         * the header is covered by the group-wide frame key only, so it is checked against the connection's
+         * identity. Throwing refuses the connection (counted in {@link TcpTransport#handshakeFailures}).
+         */
+        default int peerWire(Socket accepted) {
+            return -1;
         }
 
         SocketFactory PLAIN = new SocketFactory() {
@@ -194,6 +211,11 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
     private final Thread acceptor;
     private volatile BiConsumer<NodeId, SimTransport.Frame> handler;
     private volatile boolean open = true;
+    private final AtomicLong originMismatches = new AtomicLong();
+    private final AtomicLong originLoggedNanos = new AtomicLong(System.nanoTime() - ORIGIN_LOG_EVERY_NANOS);
+    /** At most one WARNING per this interval for {@link Reason#ORIGIN} closes; every one is counted. */
+    static final long ORIGIN_LOG_EVERY_NANOS = 60_000_000_000L;
+    private static final System.Logger LOG = System.getLogger(TcpTransport.class.getName());
 
     /**
      * Listens on {@code self}'s member address and dials the others.
@@ -434,6 +456,15 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         } finally {
             handshaking.decrementAndGet();
         }
+        int pinned;
+        try {
+            pinned = sockets.peerWire(socket);
+        } catch (RuntimeException unidentified) {
+            handshakeFailures.incrementAndGet();
+            closeQuietly(socket);
+            inboundSockets.remove(socket);
+            return;
+        }
         if (inboundCount.incrementAndGet() > maxInbound) {
             inboundCount.decrementAndGet();
             inboundRefused.incrementAndGet();
@@ -449,10 +480,37 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             inboundCount.decrementAndGet();
             return;
         }
-        read(socket);
+        read(socket, pinned);
     }
 
-    private void read(Socket socket) {
+    /** Correctly tagged frames dropped because their sender wire was not the connection's pinned identity. */
+    public long originMismatches() {
+        return originMismatches.get();
+    }
+
+    /** A connection's authenticated identity sent a frame as another wire: count, close, and log (rate-limited). */
+    private void originMismatch(int pinned, int claimed) {
+        long n = originMismatches.incrementAndGet();
+        long now = System.nanoTime();
+        long last = originLoggedNanos.get();
+        if (now - last >= ORIGIN_LOG_EVERY_NANOS && originLoggedNanos.compareAndSet(last, now)) {
+            LOG.log(System.Logger.Level.WARNING, "transport on {0}: connection identified as wire {1} sent a frame"
+                    + " as wire {2}; connection closed ({3} so far)", self.name(), pinned, claimed, n);
+        }
+    }
+
+    /** Thrown inside {@link #open} on {@link Reason#ORIGIN}: the reader closes the connection. */
+    private static final class OriginMismatch extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        private final int claimed;
+
+        OriginMismatch(int claimed) {
+            super(null, null, false, false);
+            this.claimed = claimed;
+        }
+    }
+
+    private void read(Socket socket, int pinned) {
         try (socket; var in = new DataInputStream(new BufferedInputStream(socket.getInputStream()))) {
             var current = mac(currentKey);
             var previous = previousKey == null ? null : mac(previousKey);
@@ -479,7 +537,13 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                 if (bytes == null) {
                     return; // whole-frame deadline passed: slowloris
                 }
-                var accepted = open(bytes, current, previous, clock.currentTimeMillis(), tag);
+                Inbound accepted;
+                try {
+                    accepted = open(bytes, current, previous, clock.currentTimeMillis(), tag, pinned);
+                } catch (OriginMismatch mismatch) {
+                    originMismatch(pinned, mismatch.claimed);
+                    return;
+                }
                 if (accepted != null && !cut.contains(accepted.from) && !inbound.offer(accepted)) {
                     inboundDrops.incrementAndGet();
                 }
@@ -547,10 +611,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
     /** Checks one frame. Returns it, or null after counting why it was dropped. */
     Inbound open(byte[] bytes, Mac current, Mac previous, long nowMillis) {
-        return open(bytes, current, previous, nowMillis, new byte[MAC_LENGTH]);
+        return open(bytes, current, previous, nowMillis, new byte[MAC_LENGTH], -1);
     }
 
-    private Inbound open(byte[] bytes, Mac current, Mac previous, long nowMillis, byte[] tag) {
+    private Inbound open(byte[] bytes, Mac current, Mac previous, long nowMillis, byte[] tag, int pinned) {
         var buf = ByteBuffer.wrap(bytes);
         int version = buf.get();
         int keyId = buf.get();
@@ -562,6 +626,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             return drop(Reason.TAG);
         }
         int from = buf.getShort() & 0xFFFF;
+        if (pinned >= 0 && from != pinned) {
+            drop(Reason.ORIGIN);
+            throw new OriginMismatch(from);
+        }
         int dest = buf.getShort() & 0xFFFF;
         long epoch = buf.getLong();
         long seq = buf.getLong();

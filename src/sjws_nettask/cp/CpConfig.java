@@ -50,8 +50,11 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
     /**
      * One voter. {@code wire} is the Raft wire id and must be the same on every voter; it defaults to the
      * 1-based position in {@code cp.peers}, so list the peers in the same order everywhere or set it.
+     * {@code san} is the certificate identity (a URI or DNS subject alternative name, exact match) this voter's
+     * {@code cp-peer} certificate must carry; required for every entry when {@code cp.tls} is set (#175), null
+     * otherwise.
      */
-    public record Peer(int wire, String id, InetSocketAddress address, boolean witness) {
+    public record Peer(int wire, String id, InetSocketAddress address, boolean witness, String san) {
         public Peer {
             Objects.requireNonNull(id, "id");
             Objects.requireNonNull(address, "address");
@@ -59,7 +62,15 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
                 throw new IllegalArgumentException("cp.peers wire must be positive");
             }
         }
+
+        /** A voter with no pinned certificate identity (loopback development links only). */
+        public Peer(int wire, String id, InetSocketAddress address, boolean witness) {
+            this(wire, id, address, witness, null);
+        }
     }
+
+    /** A pinned SAN: printable ASCII without spaces, at most 255 characters. */
+    static final java.util.regex.Pattern SAN = java.util.regex.Pattern.compile("[\\x21-\\x7E]{1,255}");
 
     public CpConfig {
         Objects.requireNonNull(nodeId, "nodeId");
@@ -159,6 +170,9 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         }
         var peers = peers(y.get("peers"));
         validateVoters(nodeId, peers, warnings);
+        if (y.get("tls") != null) {
+            requirePinnedSans(peers);
+        }
         var keys = new CpKeyConfig(keyDir, rootPub, stateDir, pin, insecure, minSerial);
         return new CpConfig(nodeId, peers, watch, admin, keys, ratio, margin, warnings);
     }
@@ -174,6 +188,7 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         }
         var ids = new HashSet<String>();
         var wires = new HashSet<Integer>();
+        var sans = new HashSet<String>();
         int full = 0;
         int witnesses = 0;
         boolean selfListed = false;
@@ -183,6 +198,9 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
             }
             if (!wires.add(peer.wire())) {
                 throw new IllegalArgumentException("cp.peers: duplicate wire " + peer.wire());
+            }
+            if (peer.san() != null && !sans.add(peer.san())) {
+                throw new IllegalArgumentException("cp.peers: duplicate san " + peer.san());
             }
             if (peer.witness()) {
                 witnesses++;
@@ -198,6 +216,20 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         if (!ok) {
             throw new IllegalArgumentException("cp.peers needs 3 or 5 voters, or 2 voters plus 1 witness; got " + full
                     + " voter(s) and " + witnesses + " witness(es)");
+        }
+    }
+
+    /**
+     * With {@code cp.tls} set, every {@code cp.peers} entry must pin its certificate identity ({@code san}): the
+     * voter links bind each certificate to exactly one {@code cp.peers} id (#175).
+     */
+    static void requirePinnedSans(List<Peer> peers) {
+        for (int i = 0; i < peers.size(); i++) {
+            if (peers.get(i).san() == null) {
+                throw new IllegalArgumentException("cp.peers[" + i + "].san is required with cp.tls: each voter's"
+                        + " cp-peer certificate is bound to its cp.peers id (URI or DNS SAN, e.g. urn:sjws:node:"
+                        + peers.get(i).id() + ")");
+            }
         }
     }
 
@@ -217,7 +249,7 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
                 throw new IllegalArgumentException(where + " must be a mapping");
             }
             for (var key : map.keySet()) {
-                if (!Set.of("id", "address", "witness", "wire").contains(key)) {
+                if (!Set.of("id", "address", "witness", "wire", "san").contains(key)) {
                     throw new IllegalArgumentException("Unknown key " + where + "." + key);
                 }
             }
@@ -239,7 +271,12 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
                 }
                 wire = (int) w;
             }
-            out.add(new Peer(wire, id, address, witness));
+            String san = text(map.get("san"), where + ".san");
+            if (san != null && !SAN.matcher(san).matches()) {
+                throw new IllegalArgumentException(where + ".san must be a URI or DNS name: printable ASCII, no"
+                        + " spaces, at most 255 characters");
+            }
+            out.add(new Peer(wire, id, address, witness, san));
         }
         return out;
     }

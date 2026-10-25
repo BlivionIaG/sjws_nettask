@@ -242,7 +242,7 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | — | — | `cp.maxClockDriftRatio` | default 0.01 (1%), 0 to 0.5; rate error over one lease (HA) |
 | — | — | `cp.leaseSafetyMargin` | default 10 ms (needs a unit); fixed margin in the startup check (HA) |
 | `sjws.cp.nodeId` | `SJWS_CP_NODE_ID` | `cp.nodeId` | this voter |
-| — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter |
+| — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`, `san`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter. `san` is the URI or DNS subject alternative name that voter's `cp-peer` certificate carries (exact match, for example `urn:sjws:node:cp-1`); required on every entry when `cp.tls` is set, unique across entries |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
 | `sjws.cp.admin.listen` | `SJWS_CP_ADMIN_LISTEN` | `cp.admin.listen` | AdminServer |
 | — | — | `cp.tls.{cert,key,ca,adminCa,revocations}` | owned by Security; watch and admin listeners |
@@ -263,9 +263,24 @@ before it takes an inbound slot, and non-member source addresses are refused at 
 `CpHost.reload()` reloads the `cp-peer` material with the other listeners, all or nothing (2.4 says when it runs).
 Without TLS material the start fails closed; only the test seam (`CpHostDeps.serverTls` returning null) allows
 plain links, and only when every peer is loopback. A CONTROL role with no `cp` settings at all refuses to start
-(exit 64, before any listener). Gap: there is no hostname check and peer certificates are not yet bound to the
-`cp.peers` id (any certificate from `peerCa` passes TLS, and the Raft key is shared by the group); tracked as a
-follow-up issue that must land before CP is on by default or multi-host CP is documented.
+(exit 64, before any listener).
+
+**Voter certificates are bound to `cp.peers` ids (#175).** Each `cp.peers` entry pins a `san`. Only URI and DNS
+subject alternative names count, by exact match; the subject CN is never used, and a certificate that names more
+than one pinned voter identifies none. There is no host name check: the pinned SAN is the identity.
+
+- At startup, `cp.tls` with an entry that has no `san` is refused at config load, and this voter's own `peerCert`
+  must carry its own pinned SAN and no other voter's.
+- Dialing: after the handshake, `CpPeerSockets.connect` requires the server certificate to name the voter pinned at
+  the dialled address. Otherwise the socket is closed before any frame is written, and the refusal is counted
+  (`CpPeerSockets.identityRefused`, a WARNING at most once a minute).
+- Accepting: `CpPeerSockets.peerWire` maps the client certificate to its voter's wire id (a certificate naming no
+  other pinned voter is refused, counted in `handshakeFailures`). `TcpTransport` then drops any frame on that
+  connection whose sender wire differs, as `ORIGIN`, before it is queued for Raft, and closes the connection
+  (`originMismatches`).
+
+Certificates for the voter links therefore look like `URI:urn:sjws:node:<id>` (or a DNS name), issued by `peerCa`
+and matching the `san` of that voter's `cp.peers` entry on every voter.
 
 What one inbound voter-link connection goes through, in order (`TcpTransport`; `peers` is the number of other
 voters in `cp.peers`). Every refusal closes the socket and is counted:
@@ -278,10 +293,12 @@ flowchart TD
     s2 -->|no| r2["Closed, counted<br/>handshakesRefused"]
     s2 -->|yes| s3["mTLS handshake: TLS 1.3,<br/>a client certificate from<br/>cp.tls.peerCa, 5 s in total.<br/>No inbound slot is held yet"]
     s3 -->|"fails or is late"| r3["Closed, counted<br/>handshakeFailures"]
-    s3 --> s4{{"Fewer than 2 x peers<br/>inbound connections?"}}
+    s3 --> sp{{"Client certificate names<br/>exactly one other pinned<br/>voter (URI or DNS SAN)?"}}
+    sp -->|no| r3
+    sp -->|yes| s4{{"Fewer than 2 x peers<br/>inbound connections?"}}
     s4 -->|no| r4["Closed, counted<br/>inboundRefused"]
     s4 -->|yes| s5["Read frames. Idle for 10 s:<br/>closed. A frame still<br/>incomplete 10 s after its first<br/>byte: closed, counted TIMEOUT"]
-    s5 --> s6["Each frame: length and<br/>version (MALFORMED),<br/>HMAC under the Raft key<br/>(TAG), destination (DEST),<br/>sender is a member<br/>(MEMBER), boot epoch<br/>(EPOCH), sequence (SEQ).<br/>A drop is counted by<br/>its reason"]
+    s5 --> s6["Each frame: length and<br/>version (MALFORMED),<br/>HMAC under the Raft key<br/>(TAG), destination (DEST),<br/>sender is a member<br/>(MEMBER), boot epoch<br/>(EPOCH), sequence (SEQ),<br/>sender is the voter the<br/>certificate names (ORIGIN,<br/>also closes). A drop is<br/>counted by its reason"]
     s6 --> s7["Queued for the Raft<br/>thread. A full queue<br/>counts an inbound drop"]
 ```
 

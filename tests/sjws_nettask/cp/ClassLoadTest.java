@@ -57,6 +57,11 @@ class ClassLoadTest {
             }
             assertFalse(text.contains("sjws_nettask.cluster."), text);
             assertFalse(text.contains("sjws_nettask.cluster.TcpTransport"), text);
+            // #175 voter certificate binding: the pinned-identity sockets and the ORIGIN path stay unloaded.
+            for (var name : new String[] {"sjws_nettask.cp.CpPeerSockets ", "sjws_nettask.cp.CpConfig$Peer ",
+                    "sjws_nettask.cluster.TcpTransport$OriginMismatch "}) {
+                assertFalse(text.contains(name), name.strip() + " loaded by a standalone start");
+            }
             assertFalse(text.contains("sjws_nettask.service."), text);
         } finally {
             process.destroy();
@@ -134,7 +139,8 @@ class ClassLoadTest {
                 "sjws_nettask.cp.CpHostDeps ", "sjws_nettask.cp.CpWitness", "sjws_nettask.cp.CpStore ",
                 "sjws_nettask.cp.WatchServer ", "sjws_nettask.cp.AdminServer ", "sjws_nettask.cp.KeyRing ",
                 "sjws_nettask.cp.KeyRingLoader ", "sjws_nettask.cp.CpServerTls ", "sjws_nettask.cp.CpPeerSockets ",
-                "sjws_nettask.cp.CpConfig ", "sjws_nettask.cluster.TcpTransport ", "sjws_nettask.cluster.RaftGroup ",
+                "sjws_nettask.cp.CpConfig ", "sjws_nettask.cp.CpConfig$Peer ", "sjws_nettask.cluster.TcpTransport ",
+                "sjws_nettask.cluster.TcpTransport$OriginMismatch ", "sjws_nettask.cluster.RaftGroup ",
                 "sjws_nettask.cluster.ReplicatedNode ")) {
             assertFalse(text.contains(name), name.strip() + " loaded by a data-role start");
         }

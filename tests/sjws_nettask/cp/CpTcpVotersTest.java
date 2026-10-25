@@ -99,7 +99,8 @@ class CpTcpVotersTest {
         y.put("admin", Map.of("listen", "127.0.0.1:0"));
         var peers = new ArrayList<Object>();
         for (int i = 1; i <= ports.length; i++) {
-            peers.add(Map.of("id", "cp-" + i, "address", "127.0.0.1:" + ports[i - 1], "witness", i > full));
+            peers.add(Map.of("id", "cp-" + i, "address", "127.0.0.1:" + ports[i - 1], "witness", i > full, "san",
+                    CpTestCa.san("cp-" + i)));
         }
         y.put("peers", peers);
         return y;
@@ -113,7 +114,7 @@ class CpTcpVotersTest {
         }
         var all = new ArrayList<TcpDeps>();
         for (int i = 1; i <= voters; i++) {
-            var deps = new TcpDeps(CpTls.serverContext(ca.listener("cp-peer", "cp-" + i)));
+            var deps = new TcpDeps(CpTls.serverContext(ca.peer("cp-" + i)));
             all.add(deps);
             hosts.add(CpLaunch.start(CpConfig.parse(k -> null, Map.of(), yaml("cp-" + i, ports, full), null), deps,
                     err));
@@ -177,7 +178,7 @@ class CpTcpVotersTest {
         int port = freePort();
         var config = CpConfig.parse(k -> null, Map.of(), yaml("cp-1", new int[] {port, freePort(), freePort()}, 3),
                 null);
-        try (var t = CpLaunch.tcpTransport(config, CpTls.serverContext(ca.listener("cp-peer", "cp-1")), KEY,
+        try (var t = CpLaunch.tcpTransport(config, CpTls.serverContext(ca.peer("cp-1")), KEY,
                 Clock.SYSTEM)) {
             assertThrows(IOException.class, () -> handshakeWithoutClientCert(port, ca.caPem()));
             // Plain TCP: the TLS server never accepts it as frames.

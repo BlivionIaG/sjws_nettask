@@ -586,7 +586,7 @@ Node certificates last 24 hours. The node renews by CSR at two thirds of that li
 
 A peer that fails verification closes the watch or the admin connection. The data node keeps last-good. Content connections are unaffected.
 
-Voter-to-voter mTLS is a ship blocker for every deployment except a single-node lab. A group with more than one voter refuses to start until voter mTLS is on (`cp.tls.peerCert`, `peerKey`, `peerCa`). Its frames also carry an HMAC under a CP-only key (`SJWS_CP_RAFT_KEY`) that must not equal the HA cluster key, and plain links exist only behind a test seam, on loopback. The watch and the admin API are mTLS in every role, including the lab.
+Voter-to-voter mTLS is a ship blocker for every deployment except a single-node lab. A group with more than one voter refuses to start until voter mTLS is on (`cp.tls.peerCert`, `peerKey`, `peerCa`), and each voter's certificate is bound to its `cp.peers` id by a pinned URI or DNS SAN (`cp.peers[].san`, #175; see control-plane-hosting.md §4). Its frames also carry an HMAC under a CP-only key (`SJWS_CP_RAFT_KEY`) that must not equal the HA cluster key, and plain links exist only behind a test seam, on loopback. The watch and the admin API are mTLS in every role, including the lab.
 
 ### 12.3 Keys, signatures, freshness, and anti-replay
 

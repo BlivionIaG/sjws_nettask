@@ -59,6 +59,19 @@ public final class CpServerTls {
         return CpTls.parameters(tls.context(), true);
     }
 
+    /**
+     * This listener's own leaf certificate, read from its {@code certPem} (the first certificate in the file).
+     *
+     * @throws IOException unreadable, or no certificate in the file
+     */
+    java.security.cert.X509Certificate certificate() throws IOException {
+        var certs = AdminTls.trustCertificates(config.certPem());
+        if (certs.length == 0) {
+            throw new IOException(config.name() + " certificate file holds no certificate");
+        }
+        return certs[0];
+    }
+
     /** Successful loads so far, starting at 1. */
     public long generation() {
         return tls.generation();

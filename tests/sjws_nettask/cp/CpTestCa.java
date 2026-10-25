@@ -72,13 +72,47 @@ final class CpTestCa {
      * @param revocations denylist file for this listener, or null
      */
     CpListenerConfig listener(String listener, String node, long notAfter, Path revocations) throws Exception {
+        return listener(listener, node, notAfter, revocations, new String[0]);
+    }
+
+    /**
+     * A {@code cp-peer} certificate for {@code node} carrying the voter SAN {@code urn:sjws:node:<node>} (#175).
+     */
+    CpListenerConfig peer(String node) throws Exception {
+        return listener("cp-peer", node, System.currentTimeMillis() + 86_400_000L, null, san(node));
+    }
+
+    /** The pinned voter SAN the tests use for {@code node}. */
+    static String san(String node) {
+        return "urn:sjws:node:" + node;
+    }
+
+    /**
+     * @param sans subject alternative names: {@code dns:<name>} is a DNS SAN, anything else a URI SAN; none
+     *        gives a CN-only certificate
+     */
+    CpListenerConfig listener(String listener, String node, long notAfter, Path revocations, String... sans)
+            throws Exception {
         var leafKeys = ec();
         var b = new JcaX509v3CertificateBuilder(caName, BigInteger.valueOf(serial++),
                 new Date(Math.min(notAfter, System.currentTimeMillis()) - 3_600_000L), new Date(notAfter),
                 new X500Name("CN=" + node), leafKeys.getPublic());
+        if (sans.length > 0) {
+            var names = new org.bouncycastle.asn1.x509.GeneralName[sans.length];
+            for (int i = 0; i < sans.length; i++) {
+                names[i] = sans[i].startsWith("dns:")
+                        ? new org.bouncycastle.asn1.x509.GeneralName(org.bouncycastle.asn1.x509.GeneralName.dNSName,
+                                sans[i].substring(4))
+                        : new org.bouncycastle.asn1.x509.GeneralName(
+                                org.bouncycastle.asn1.x509.GeneralName.uniformResourceIdentifier, sans[i]);
+            }
+            b.addExtension(Extension.subjectAlternativeName, false,
+                    new org.bouncycastle.asn1.x509.GeneralNames(names));
+        }
         var leaf = sign(b);
-        var certPem = pem(dir.resolve(node + "-" + listener + ".pem"), leaf, ca);
-        var keyPem = dir.resolve(node + "-" + listener + ".key");
+        var file = node + "-" + listener + (sans.length > 0 ? "-" + serial : "");
+        var certPem = pem(dir.resolve(file + ".pem"), leaf, ca);
+        var keyPem = dir.resolve(file + ".key");
         Files.writeString(keyPem, "-----BEGIN PRIVATE KEY-----\n"
                 + Base64.getMimeEncoder().encodeToString(leafKeys.getPrivate().getEncoded())
                 + "\n-----END PRIVATE KEY-----\n");
