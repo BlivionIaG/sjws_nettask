@@ -99,7 +99,9 @@ class MessagingReplicationTest {
             var t = new LogTopics(dir.resolve("n" + (i + 1)), Durability.ASYNC);
             t.replication(new RaftReplicator(nodes.get(i), TOPICS, urls, dir.resolve("state" + (i + 1)), ELECTION, HEARTBEAT, clock::nanoTime));
             topics.add(t);
-            http.add(new MessagingHttp(t));
+            var h = new MessagingHttp(t);
+            h.producerDedup(true);
+            http.add(h);
         }
         RaftReplicator.openForWitness(nodes.get(2), TOPICS, ELECTION, HEARTBEAT);
         clock.advance(ELECTION);
@@ -390,6 +392,160 @@ class MessagingReplicationTest {
         awaitEnd(l, "t", acked.size());
         assertEquals(acked, records(http.get(l).handle(fetch("t", "", Map.of()))));
         assertArrayEquals(acked.toArray(), records(http.get(f).handle(fetch("t", "", Map.of()))).toArray());
+    }
+
+    static Map<String, List<String>> producer(long id, long seq) {
+        return producer(id, seq, "group");
+    }
+
+    static Map<String, List<String>> producer(long id, long seq, String durability) {
+        return Map.of("producer-id", List.of(Long.toString(id)), "producer-seq", List.of(Long.toString(seq)),
+                "durability", List.of(durability));
+    }
+
+    static String ack(long base) {
+        return "{\"baseOffset\":" + base + ",\"count\":1}";
+    }
+
+    /** Drives until some data node is the ready leader of {@code topic}. */
+    int awaitLeader(String topic) throws Exception {
+        for (int k = 0; k < 200; k++) {
+            int l = leader(topic);
+            if (l >= 0) return l;
+            clock.advance(Duration.ofMillis(50));
+            drive();
+            Thread.sleep(1);
+        }
+        throw new AssertionError("no ready leader for " + topic);
+    }
+
+    void assertSameProducerTables() throws Exception {
+        assertArrayEquals(sjws_nettask.msgrepl.RaftReplicator.producerTable(topics.get(0).get("t", false).replica()),
+                sjws_nettask.msgrepl.RaftReplicator.producerTable(topics.get(1).get("t", false).replica()),
+                "every replica builds the same producer table");
+    }
+
+    /** M2: a batch acked by the old leader and retried on the new one is acknowledged with its offset, not appended again. */
+    @Test
+    void producerRetryAfterFailoverIsAppendedOnce() throws Exception {
+        start();
+        int l = leader("t");
+        int f = 1 - l;
+        for (int s = 1; s <= 2; s++) {
+            long seq = s;
+            var r = call(() -> http.get(l).handle(post("t", "p" + seq, producer(7, seq))));
+            assertEquals(ack(seq - 1), LogOffsetsTest.text(r));
+        }
+        awaitEnd(f, "t", 2); // the follower holds both: the witness votes only for a candidate that is up to date
+        net.cut(nodes.get(l).self(), nodes.get(f).self());
+        net.cut(nodes.get(l).self(), nodes.get(2).self());
+        for (int k = 0; k < 40 && !topics.get(f).get("t", false).replica().leaderReady(); k++) {
+            clock.advance(Duration.ofMillis(100));
+            drive();
+        }
+        assertTrue(topics.get(f).get("t", false).replica().leaderReady(), "follower did not take over");
+        // async: with the old leader cut off, a STRICT (group) write would be refused for lack of a second copy.
+        var retry = call(() -> http.get(f).handle(post("t", "p2", producer(7, 2, "async"))));
+        assertEquals(200, retry.status(), LogOffsetsTest.text(retry));
+        assertEquals(ack(1), LogOffsetsTest.text(retry), "the new leader knows the producer: original offset");
+        assertEquals(ack(2), LogOffsetsTest.text(call(() -> http.get(f).handle(post("t", "p3", producer(7, 3, "async"))))));
+        net.heal(nodes.get(l).self(), nodes.get(f).self());
+        net.heal(nodes.get(l).self(), nodes.get(2).self());
+        awaitEnd(l, "t", 3);
+        for (int i = 0; i < 2; i++) assertEquals(List.of("p1", "p2", "p3"), records(http.get(i).handle(fetch("t", "", Map.of()))));
+        assertSameProducerTables();
+    }
+
+    /**
+     * M2 + #254: after an outcome-unknown 503 the client retries the same seq. Whether or not the first attempt
+     * committed, the record is in the log exactly once and the retry is acknowledged with its offset.
+     */
+    @Test
+    void producerRetryAfterOutcomeUnknownIsAppendedOnce() throws Exception {
+        start();
+        int l = leader("t");
+        int f = 1 - l;
+        var group = RaftReplicator.group("t");
+        long before = stores.get(l).lastIndex(group);
+        net.cut(nodes.get(l).self(), nodes.get(f).self());
+        net.cut(nodes.get(l).self(), nodes.get(2).self());
+        var pending = CompletableFuture.supplyAsync(() -> http.get(l).handle(post("t", "maybe", producer(5, 1))),
+                r -> Thread.ofVirtual().start(r));
+        for (int k = 0; k < 10_000 && stores.get(l).lastIndex(group) == before && !pending.isDone(); k++) Thread.sleep(1);
+        assertTrue(stores.get(l).lastIndex(group) > before, "the batch never reached the leader's log");
+        // The replica's own group handle: openGroup(..., null) would replace its listener and stop the applies on l.
+        var handle = topics.get(l).get("t", false).replica().getClass().getDeclaredField("group");
+        handle.setAccessible(true);
+        ((sjws_nettask.cluster.ReplicationGroup) handle.get(topics.get(l).get("t", false).replica()))
+                .transferLeadership(nodes.get(f).self());
+        var first = pending.get(10, TimeUnit.SECONDS);
+        assertEquals(503, first.status(), LogOffsetsTest.text(first));
+        assertTrue(LogOffsetsTest.text(first).contains(MessagingHttp.OUTCOME_UNKNOWN_TYPE));
+
+        net.heal(nodes.get(l).self(), nodes.get(f).self());
+        net.heal(nodes.get(l).self(), nodes.get(2).self());
+        int now = awaitLeader("t");
+        var retry = call(() -> http.get(now).handle(post("t", "maybe", producer(5, 1))));
+        assertEquals(ack(0), LogOffsetsTest.text(retry));
+        var again = call(() -> http.get(now).handle(post("t", "maybe", producer(5, 1))));
+        assertEquals(ack(0), LogOffsetsTest.text(again), "and every later retry");
+        assertEquals(ack(1), LogOffsetsTest.text(call(() -> http.get(now).handle(post("t", "next", producer(5, 2))))));
+        for (int i = 0; i < 2; i++) {
+            awaitEnd(i, "t", 2);
+            assertEquals(List.of("maybe", "next"), records(http.get(i).handle(fetch("t", "", Map.of()))));
+        }
+        assertSameProducerTables();
+    }
+
+    /** M2 problem types: sequence errors are 400 not-appended with the next seq, an old duplicate is 409. */
+    @Test
+    void producerSequenceErrorsAreTypedProblems() throws Exception {
+        start();
+        int l = leader("t");
+        var h = http.get(l);
+        assertEquals(200, call(() -> h.handle(post("t", "a", producer(3, 1)))).status());
+        var gap = call(() -> h.handle(post("t", "b", producer(3, 3))));
+        var gapBody = LogOffsetsTest.text(gap);
+        assertEquals(400, gap.status(), gapBody);
+        assertTrue(gapBody.contains(MessagingHttp.NOT_APPENDED_TYPE) && gapBody.contains("\"reason\":\"out_of_order\"")
+                && gapBody.contains("\"expectedSeq\":2"), gapBody);
+        assertEquals("2", gap.headers().get("producer-expected-seq"));
+        var reused = call(() -> h.handle(new Request("POST", "/messaging/v1/topics/t/records", RequestHeaders.of(producer(3, 1)))
+                .withBody(MessagingHttpTest.body(MessagingHttpTest.recs("a", "a2")))));
+        assertEquals(400, reused.status(), LogOffsetsTest.text(reused));
+        assertTrue(LogOffsetsTest.text(reused).contains("\"reason\":\"seq_reused\""), LogOffsetsTest.text(reused));
+        for (int s = 2; s <= 1 + sjws_nettask.msgrepl.ProducerTable.WINDOW; s++) {
+            long seq = s;
+            assertEquals(200, call(() -> h.handle(post("t", "w" + seq, producer(3, seq)))).status());
+        }
+        var old = call(() -> h.handle(post("t", "a", producer(3, 1))));
+        assertEquals(409, old.status(), LogOffsetsTest.text(old));
+        assertTrue(LogOffsetsTest.text(old).contains(MessagingHttp.DUPLICATE_TYPE), LogOffsetsTest.text(old));
+
+        for (var bad : List.of(Map.of("producer-id", List.of("0"), "producer-seq", List.of("1")),
+                Map.of("producer-id", List.of("x"), "producer-seq", List.of("1")),
+                Map.of("producer-id", List.of("4")),
+                Map.of("producer-id", List.of("4"), "producer-seq", List.of("0")),
+                Map.of("producer-id", List.of("-1"), "producer-seq", List.of("1")))) {
+            assertEquals(400, h.handle(post("t", "bad", bad)).status(), bad.toString());
+        }
+        h.producerDedup(false);
+        var off = h.handle(post("t", "off", producer(4, 1)));
+        assertEquals(400, off.status());
+        assertTrue(LogOffsetsTest.text(off).contains("not enabled"), LogOffsetsTest.text(off));
+        long end = 1 + sjws_nettask.msgrepl.ProducerTable.WINDOW;
+        awaitEnd(l, "t", end);
+        assertEquals(end, topics.get(l).get("t", false).writer().snapshot().nextOffset(), "nothing refused was appended");
+
+        // A local (not replicated) topic cannot dedup: refused, never a silent at-least-once.
+        try (var local = new LogTopics(dir.resolve("local"), Durability.ASYNC)) {
+            var lh = new MessagingHttp(local);
+            lh.producerDedup(true);
+            var r = lh.handle(post("t", "x", producer(1, 1)));
+            assertEquals(400, r.status());
+            assertTrue(LogOffsetsTest.text(r).contains("replicated"), LogOffsetsTest.text(r));
+            assertEquals(200, lh.handle(post("t", "x", Map.of())).status());
+        }
     }
 
     static Member member(int wire, boolean witness) {

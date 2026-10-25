@@ -45,7 +45,9 @@ import sjws_nettask.messaging.ledger.Replica;
  *
  * <p>Known limitation while HA PR-3/4/5 (snapshot taker, truncation bound, chunked install) are open: msg groups never
  * snapshot or truncate their consensus log ({@code snapshotEveryEntries = Long.MAX_VALUE}), so it grows with the
- * produced data and a node that falls behind catches up by log replay only.
+ * produced data and a node that falls behind catches up by log replay only. Producer dedup state (M2,
+ * {@link ProducerTable}) relies on that replay; the snapshot taker that lifts this limitation (#270) must carry the
+ * table's {@link ProducerTable#write} bytes and restore them with {@link ProducerTable#read}.
  */
 public final class RaftReplicator implements PartitionReplicator {
 
@@ -84,6 +86,22 @@ public final class RaftReplicator implements PartitionReplicator {
         this.stateDir = Files.createDirectories(stateDir);
         // Group default RELAXED; group/each appends ask STRICT per append (sketch §2; RELAXED is crash-safe since #202).
         this.options = options(electionTimeout, heartbeat);
+    }
+
+    /**
+     * The producer dedup table of {@code replica} ({@link ProducerTable#write} encoding), or null when it is not a
+     * Raft replica. For tests and diagnostics on a quiescent group: the table belongs to the delivery thread. A #270
+     * snapshot takes the same bytes on the delivery thread, at the snapshot's index.
+     */
+    public static byte[] producerTable(sjws_nettask.messaging.ledger.Replica replica) {
+        if (!(replica instanceof RaftReplica r)) return null;
+        var out = new java.io.ByteArrayOutputStream();
+        try (var d = new java.io.DataOutputStream(out)) {
+            r.producers().write(d);
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+        return out.toByteArray();
     }
 
     /** Group options for msg groups: RELAXED default, no snapshot or truncation (see class doc). */

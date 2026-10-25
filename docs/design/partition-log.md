@@ -40,8 +40,8 @@ returns sub-batch slices.
 - Errors are RFC 9457 problems, like `SwarmHttp`.
 - Access goes through the existing rights or filters chain; no new auth.
 
-As built (`MessagingHttp`, `LogTopics`), it differs from the plan above in four places. There are no `Producer-Id`
-or `Producer-Seq` headers. `Durability` takes `none`, `async` or `group` and is never weaker than the topic's writer
+As built (`MessagingHttp`, `LogTopics`), it differs from the plan above in four places. `Producer-Id` and
+`Producer-Seq` exist only on replicated topics, behind a flag (see Producer dedup below). `Durability` takes `none`, `async` or `group` and is never weaker than the topic's writer
 default. Fetch decodes the batches and re-encodes them into a pooled buffer instead of using `transferTo`. The
 responses carry more: produce answers `{baseOffset, count}` with a `Durability-Effective` header, and fetch adds
 `Next-Offset` and `Log-End-Offset`. Produce:
@@ -96,11 +96,57 @@ With HA replication on, a failed produce or offset commit tells the client which
 |---|---|---|---|
 | `https://sjws.dev/problems/not-leader` | 307 with `Location` (leader known), else 503 + `Retry-After` | Refused: this node does not lead, so **nothing was appended**. | Resend to the leader. The 307 does this for clients that follow redirects. |
 | `https://sjws.dev/problems/not-appended` | 503 + `Retry-After` (transient: backpressure, too few STRICT copies, a storage error that was rolled back or a fenced group, a closed node), or 400 (the batch itself is unacceptable) | Refused by the log: the write is **definitely not applied**. | Safe to retry the same body after `Retry-After` (503), or fix the request (400). A not-leader 307 or 503 is just as safe to resend: it is also a refusal. |
+| `https://sjws.dev/problems/duplicate` | 409 | Producer dedup only: this `Producer-Seq` was appended already, too long ago (more than 16 batches back) to report its offset. It is in the log once and will not be appended again. | Do not resend; the batch is in the log. |
 | `https://sjws.dev/problems/outcome-unknown` | 503 + `Retry-After`, **never a 307** | The log accepted the write, but this node cannot tell whether it commits: leadership was lost, the group failed closed, the node closed, or no ack came within 30 s. | Do **not** assume either result: the write may be applied or not. Read back first (from the leader in the `sjws-leader` header or the body's `leaderUrl`), or retry only with your own deduplication. |
 
 Every 503 above carries `Retry-After`. A leader read (`GET` with `consistency=leader`) never gets `not-appended` or `outcome-unknown`, because both describe writes; when it cannot be confirmed it is a plain 503 `unavailable`. `outcome-unknown` also carries the leader hint (`sjws-term`, `sjws-leader`, and `term`,
 `leader`, `leaderUrl` in the body) but no `Location`, because a redirect resends the body. The `detail` text is generic; the
 server logs the cause.
+
+#### Producer dedup on replicated topics (M2)
+
+Without a producer id, produce is at-least-once: a client that retries after `outcome-unknown` or a lost response may
+append the batch twice, also across a leader change. With one, a retry is acknowledged with the original offset and
+never appended again.
+
+- **Headers.** `Producer-Id`: 1 to 2^63-1, chosen by the client, unique per producer per topic. `Producer-Seq`:
+  the batch's number, 1 for the producer's first batch, +1 for each next one, the same for every retry of a batch.
+  There is no epoch: a producer that loses its seq (a restart without state) uses a new `Producer-Id`. `Producer-Id`
+  absent means no dedup (at-least-once, unchanged); `Producer-Id: 0`, a missing or bad `Producer-Seq` are 400.
+- **Flag.** `sjws.messaging.producer.dedup` / `SJWS_MESSAGING_PRODUCER_DEDUP`, default `false`. Off, a request with a
+  `Producer-Id` is 400 rather than a silent at-least-once; a topic that is not replicated is 400 the same way. **Upgrade:**
+  turn it on only once every node runs a build with M2. An older node skips the producer entries it cannot read and its
+  ledger would diverge.
+- **Where it is decided.** The batch goes into the topic's Raft log with its `(origin, Producer-Id, Producer-Seq)` and
+  is classified when it is applied, on every replica, from a table that is a pure function of the applied entries
+  (`msgrepl.ProducerTable`). The leader is not special: a new leader has the same table, and a restart rebuilds it by
+  replaying the log. `origin` is 0 for HTTP today (messaging has no authenticated principal) and is the key's
+  namespace for one later.
+- **Outcomes**, per producer, strictly in order:
+
+  | Seq | Result |
+  |---|---|
+  | next (1 for an unknown producer) | appended, 200 |
+  | one of the last 16 applied, same record count | 200 with the **original** `baseOffset`; nothing appended |
+  | one of the last 16, another record count | 400 `not-appended`, `reason: seq_reused` |
+  | older than the last 16 | 409 `duplicate` |
+  | a gap, or anything else | 400 `not-appended`, `reason: out_of_order` |
+
+  Every 400 carries `expectedSeq` (also the `Producer-Expected-Seq` header), the seq the log expects next. Refused and
+  duplicate batches take no offsets. Since the order is strict, a producer should have **one batch in flight**:
+  pipelined batches reordered on the way are refused as out of order (safe to resend, nothing appended).
+- **After `outcome-unknown`.** Resend the same body with the same `Producer-Seq`, to the leader. Whether or not the
+  first attempt committed, the batch is in the log once and the answer is its offset. A duplicate's 200 is sent once
+  the retry's own entry commits (STRICT for `group`) and the local ledger holds the original.
+- **Memory and eviction.** 16 batches per producer, at most 4096 producers per topic (about 1 MB), least recently
+  *appended* first. Lookups and refused batches never refresh a producer, and both limits are constants of the state
+  machine, so every replica evicts the same producer at the same entry. An evicted producer is unknown again: its next
+  seq is refused as out of order with `expectedSeq: 1`, and it should switch to a new `Producer-Id`. Dedup holds while a
+  producer is among the last 4096 to write the topic.
+- **Snapshots (#270).** Msg groups do not snapshot yet, so the table is always rebuilt from the log. When they do, the
+  snapshot at index `i` must carry `ProducerTable.write` of the table as applied through `i` (the same bytes as
+  `RaftReplicator.producerTable`), and an install must `ProducerTable.read` it before applying `i + 1`. The encoding is
+  versioned and keeps the eviction order.
 
 ### 2.3 Retention (G2)
 Add `maxBytes` and `maxAgeMs` to the log-level policy for **plain log topics** (topics with no delivery groups, i.e. the

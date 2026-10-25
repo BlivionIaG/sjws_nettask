@@ -48,6 +48,7 @@ import sjws_nettask.cluster.TermChangedException;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.LedgerWriter;
+import sjws_nettask.messaging.ledger.ProducerSequenceException;
 import sjws_nettask.messaging.ledger.Replica;
 import sjws_nettask.messaging.ledger.WriteOutcomeUnknownException;
 import sjws_nettask.messaging.ledger.WriteRefusedException;
@@ -64,11 +65,21 @@ import sjws_nettask.messaging.ledger.WriteRefusedException;
  * <p>{@code <topic>.applied} records {@code [index][term][baseOffset][count]} per applied batch (the per-batch term
  * stamp). The consensus log is replayed from its start on restart; this file plus the ledger end decide which entries
  * are already in the ledger, so replay never duplicates records.
+ *
+ * <p><b>Producer dedup (M2).</b> A batch sent with a producer id is entry {@code [P]...}: the same header as {@code [M]},
+ * then {@code [producerOrigin:int][producerId:long][producerSeq:long]}, then the records (a batch without one stays a
+ * byte-identical {@code [M]} entry). The {@link ProducerTable} decides each {@code P} entry when it is applied, on every
+ * node: the next seq is appended, a remembered retry is acknowledged with the original offset, anything else is refused
+ * with {@link ProducerSequenceException}; refused and duplicate entries take no offsets. Replay after a restart runs the
+ * same decisions from the first entry, including entries already in the ledger, so the table is rebuilt exactly.
  */
 final class RaftReplica implements Replica {
 
     private static final byte MAGIC = 'M';
+    /** A batch with a producer id (M2): {@link #MAGIC}'s layout plus {@link #PRODUCER} bytes before the records. */
+    private static final byte MAGIC_PRODUCER = 'P';
     private static final int HEADER = 1 + 1 + 8 + 4 + 8 + 4;
+    private static final int PRODUCER = 4 + 8 + 8;
     private static final int STAMP = 28;
 
     private final ClusterNode node;
@@ -89,7 +100,13 @@ final class RaftReplica implements Replica {
     private volatile long readyTerm = -1;
     // Delivery-thread state (one delivery thread per group).
     private long resumeIndex;
+    /** Next offset: from the stamp header's base, advanced by every batch applied, replayed ones included. */
     private long expected;
+    /** {@link #expected} once the replay reaches {@link #resumeIndex} (from the stamp file), as a cross-check. */
+    private long resumeExpected;
+    private final ProducerTable producers = new ProducerTable();
+    /** The last local ledger append: a duplicate is acknowledged once the ledger has reached it. */
+    private CompletableFuture<Long> lastLocal = CompletableFuture.completedFuture(-1L);
     private final long skipTo;
     private volatile long appliedIndex;
 
@@ -119,6 +136,7 @@ final class RaftReplica implements Replica {
             this.stamps.truncate(0);
             writeStamp(0, 0, ledgerEnd, 0);
             this.expected = ledgerEnd;
+            this.resumeExpected = ledgerEnd;
             return;
         }
         var buf = ByteBuffer.allocate((int) Math.min(size, (long) STAMP << 15));
@@ -132,11 +150,12 @@ final class RaftReplica implements Replica {
                 long index = buf.getLong(), term = buf.getLong(), base = buf.getLong();
                 int count = buf.getInt();
                 if (first) {
-                    this.expected = base;
+                    this.expected = base; // replay recomputes every offset from the header's base
+                    this.resumeExpected = base;
                     first = false;
                 } else if (base + count <= ledgerEnd) {
                     this.resumeIndex = index;
-                    this.expected = base + count;
+                    this.resumeExpected = base + count;
                     keep = pos + buf.position();
                 }
             }
@@ -160,18 +179,55 @@ final class RaftReplica implements Replica {
         return b.flip();
     }
 
+    /** A {@link #MAGIC_PRODUCER} entry: batch {@code producerSeq} of {@code (producerOrigin, producerId)}. */
+    static ByteBuffer encode(List<byte[]> records, Durability mode, long term, int origin, long seq, int producerOrigin,
+            long producerId, long producerSeq) {
+        int size = HEADER + PRODUCER;
+        for (var r : records) size += 4 + r.length;
+        var b = ByteBuffer.allocate(size).put(MAGIC_PRODUCER).put((byte) mode.ordinal()).putLong(term).putInt(origin)
+                .putLong(seq).putInt(records.size()).putInt(producerOrigin).putLong(producerId).putLong(producerSeq);
+        for (var r : records) b.putInt(r.length).put(r);
+        return b.flip();
+    }
+
     private void onCommitted(CommittedEntry e) {
-        if (e.index() <= this.resumeIndex) return; // already in the ledger (restart replay)
         var b = e.entry();
-        if (b.remaining() < HEADER || b.get() != MAGIC) return;
+        if (b.remaining() < HEADER) return;
+        byte magic = b.get();
+        if (magic != MAGIC && magic != MAGIC_PRODUCER) return;
+        boolean replayed = e.index() <= this.resumeIndex; // already in the ledger: only rebuild the state (restart replay)
         var mode = Durability.values()[b.get()];
         long stamp = b.getLong();
         int origin = b.getInt();
         long seq = b.getLong();
         int count = b.getInt();
-        var mine = origin == this.self ? this.pending.remove(seq) : null;
+        var mine = !replayed && origin == this.self ? this.pending.remove(seq) : null;
         if (stamp != e.term()) { // proposed in an older term, committed by a newer leader: fenced on every node
             if (mine != null) mine.completeExceptionally(unavailable("stale term " + stamp + " < " + e.term()));
+            return;
+        }
+        int pOrigin = 0;
+        long producerId = 0, producerSeq = 0;
+        if (magic == MAGIC_PRODUCER) {
+            if (b.remaining() < PRODUCER) return;
+            pOrigin = b.getInt();
+            producerId = b.getLong();
+            producerSeq = b.getLong();
+            long c = this.producers.check(pOrigin, producerId, producerSeq, count);
+            if (c != ProducerTable.NEW) { // decided identically on every node: takes no offsets
+                if (mine != null) answerProducer(mine, c, pOrigin, producerId, producerSeq);
+                return;
+            }
+        }
+        long base = this.expected;
+        this.expected += count;
+        if (producerId != 0) this.producers.apply(pOrigin, producerId, producerSeq, base, count);
+        if (replayed) {
+            if (e.index() == this.resumeIndex && this.expected != this.resumeExpected) {
+                System.err.println("WARN: " + this.groupId.value() + ": replay reached offset " + this.expected
+                        + " at index " + e.index() + ", the stamp file says " + this.resumeExpected);
+                this.expected = this.resumeExpected;
+            }
             return;
         }
         var records = new ArrayList<byte[]>(count);
@@ -180,8 +236,6 @@ final class RaftReplica implements Replica {
             b.get(r);
             records.add(r);
         }
-        long base = this.expected;
-        this.expected += count;
         try {
             writeStamp(e.index(), e.term(), base, count);
             if (base + count <= this.skipTo) { // in the ledger already: a crash lost the stamp, not the records
@@ -190,6 +244,7 @@ final class RaftReplica implements Replica {
                 return;
             }
             var f = this.local.append(records, mode);
+            this.lastLocal = f;
             long index = e.index();
             f.whenComplete((at, err) -> {
                 if (err == null) {
@@ -208,6 +263,26 @@ final class RaftReplica implements Replica {
         }
     }
 
+    /**
+     * This node's own producer batch that the table did not append: a duplicate completes with the original base
+     * offset once the local ledger has caught up to the last append (it holds the original then), else a refusal.
+     */
+    private void answerProducer(CompletableFuture<Long> mine, long c, int pOrigin, long producerId, long producerSeq) {
+        if (c >= 0) {
+            this.lastLocal.whenComplete((at, err) -> {
+                if (err == null) mine.complete(c);
+                else mine.completeExceptionally(err);
+            });
+            return;
+        }
+        long next = this.producers.expectedSeq(pOrigin, producerId);
+        var kind = c == ProducerTable.SEQ_REUSED ? ProducerSequenceException.Kind.SEQ_REUSED
+                : c == ProducerTable.OUT_OF_WINDOW ? ProducerSequenceException.Kind.DUPLICATE_OUT_OF_WINDOW
+                : ProducerSequenceException.Kind.OUT_OF_ORDER;
+        mine.completeExceptionally(new ProducerSequenceException(kind, next, this.groupId.value() + ": producer "
+                + producerId + " seq " + producerSeq + " " + kind + ", next seq " + next));
+    }
+
     @Override
     public CompletableFuture<Long> append(List<byte[]> records, Durability mode) {
         return appendNoWait(records, mode);
@@ -215,6 +290,18 @@ final class RaftReplica implements Replica {
 
     @Override
     public CompletableFuture<Long> appendNoWait(List<byte[]> records, Durability mode) {
+        return propose(records, mode, 0, 0, 0);
+    }
+
+    @Override
+    public CompletableFuture<Long> appendDeduplicated(List<byte[]> records, Durability mode, int producerOrigin,
+            long producerId, long producerSeq) {
+        if (producerId != 0 && producerSeq < 1) throw new IllegalArgumentException("producer seq must be at least 1");
+        return propose(records, mode, producerOrigin, producerId, producerSeq); // id 0: no dedup, at-least-once
+    }
+
+    private CompletableFuture<Long> propose(List<byte[]> records, Durability mode, int producerOrigin, long producerId,
+            long producerSeq) {
         var m = mode == null ? this.defaultMode : mode;
         long term = this.group.leaderTerm();
         if (!leaderReady(term)) return CompletableFuture.failedFuture(unavailable("not the ready leader"));
@@ -222,15 +309,22 @@ final class RaftReplica implements Replica {
         var acked = new CompletableFuture<Long>();
         this.pending.put(seq, acked);
         var cd = m == Durability.GROUP || m == Durability.EACH ? sjws_nettask.cluster.Durability.STRICT : null;
+        var entry = producerId == 0 ? encode(records, m, term, this.self, seq)
+                : encode(records, m, term, this.self, seq, producerOrigin, producerId, producerSeq);
         // Conditional on the term just checked: a step-down and re-election between the check and the
         // log write fails the append instead of proposing under the old term's readiness.
-        this.node.append(this.groupId, List.of(encode(records, m, term, this.self, seq)), cd, term).whenComplete((ci, err) -> {
+        this.node.append(this.groupId, List.of(entry), cd, term).whenComplete((ci, err) -> {
             if (err != null) {
                 var p = this.pending.remove(seq);
                 if (p != null) p.completeExceptionally(map(err, true));
             }
         });
         return acked;
+    }
+
+    /** The producer table: owned by the delivery thread; for tests and the #270 snapshot seam. */
+    ProducerTable producers() {
+        return this.producers;
     }
 
     @Override

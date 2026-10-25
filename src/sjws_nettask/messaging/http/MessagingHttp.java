@@ -43,6 +43,7 @@ import sjws_nettask.messaging.ledger.RecordBatch;
 import sjws_nettask.messaging.ledger.Replica;
 import sjws_nettask.messaging.ledger.WriteOutcomeUnknownException;
 import sjws_nettask.messaging.ledger.WriteRefusedException;
+import sjws_nettask.messaging.ledger.ProducerSequenceException;
 
 /**
  * Produce / fetch on plain log topics (docs/design/partition-log.md §2.2), mounted at {@code /messaging/v1}.
@@ -72,6 +73,8 @@ final class MessagingHttp implements Handler {
     private final LogTopics topics;
     private final BufferBudget budget;
     private volatile MessagingHooks hooks = MessagingHooks.NONE;
+    /** M2: {@code Producer-Id}/{@code Producer-Seq} accepted on replicated topics; off, they are refused (400). */
+    private volatile boolean producerDedup;
 
     MessagingHttp(LogTopics topics) {
         this(topics, BufferPool.shared().budget(BufferPool.MESSAGING));
@@ -84,6 +87,10 @@ final class MessagingHttp implements Handler {
 
     void hooks(MessagingHooks h) {
         this.hooks = java.util.Objects.requireNonNull(h);
+    }
+
+    void producerDedup(boolean on) {
+        this.producerDedup = on;
     }
 
     @Override
@@ -228,12 +235,21 @@ final class MessagingHttp implements Handler {
     private Response produce(String topic, Request request, String target) throws BadRequest, IOException {
         // A request may only strengthen the topic's policy: a weaker Durability header is clamped up to it.
         var durability = atLeast(durability(request.headers().values("durability")), this.topics.durability(topic));
+        long producerId = producerId(request);
+        long producerSeq = producerId == 0 ? 0 : producerSeq(request);
         var records = records(request);
         var log = this.topics.get(topic, true);
+        if (producerId != 0 && (!this.producerDedup || log.replica() == null)) {
+            // Never a silent at-least-once for a client that asked for dedup.
+            throw new BadRequest(this.producerDedup ? "Producer-Id needs a replicated topic"
+                    : "Producer-Id is not enabled on this server (" + MessagingModule.PRODUCER_DEDUP_PROPERTY + ")");
+        }
         var fenced = fence(log, request, target);
         if (fenced != null) return fenced;
         try {
-            long base = log.appender().append(records, durability).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            var appended = producerId == 0 ? log.appender().append(records, durability)
+                    : log.replica().appendDeduplicated(records, durability, 0, producerId, producerSeq);
+            long base = appended.get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             var json = "{\"baseOffset\":" + base + ",\"count\":" + records.size() + "}";
             var effective = durability != null ? durability : this.topics.durability(topic);
             var h = ResponseHeaders.of().set("content-type", "application/json")
@@ -249,6 +265,33 @@ final class MessagingHttp implements Handler {
             return failed(e, target, true);
         } catch (LeaderUnavailableException e) {
             return notLeader(e, target);
+        }
+    }
+
+    /** {@code Producer-Id}: 0 when absent; else 1 to 2^63-1 (M2). */
+    static long producerId(Request request) throws BadRequest {
+        var v = request.headers().values("producer-id");
+        if (v.isEmpty()) return 0;
+        long id = headerNumber(v, "Producer-Id");
+        if (id < 1) throw new BadRequest("Producer-Id must be 1 to " + Long.MAX_VALUE);
+        return id;
+    }
+
+    /** {@code Producer-Seq}, required with a {@code Producer-Id}: the batch's seq, from 1. */
+    static long producerSeq(Request request) throws BadRequest {
+        var v = request.headers().values("producer-seq");
+        if (v.isEmpty()) throw new BadRequest("Producer-Seq is required with Producer-Id");
+        long seq = headerNumber(v, "Producer-Seq");
+        if (seq < 1) throw new BadRequest("Producer-Seq must be 1 to " + Long.MAX_VALUE);
+        return seq;
+    }
+
+    private static long headerNumber(List<String> v, String name) throws BadRequest {
+        if (v.size() != 1) throw new BadRequest(name + " must appear once");
+        try {
+            return Long.parseLong(v.get(0).trim());
+        } catch (NumberFormatException e) {
+            throw new BadRequest(name + " must be a number");
         }
     }
 
@@ -484,6 +527,7 @@ final class MessagingHttp implements Handler {
         while (c instanceof java.util.concurrent.CompletionException && c.getCause() != null) c = c.getCause();
         if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
         if (write && c instanceof WriteRefusedException r) return refused(r, target);
+        if (write && c instanceof ProducerSequenceException p) return producerSequence(p);
         FAILURES.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + target + " failed", c);
         if (write && c instanceof WriteOutcomeUnknownException u) return outcomeUnknown(u.term(), u.leaderName(), u.leaderUrl(), target);
         if (write) return outcomeUnknown(-1, null, null, target);
@@ -510,6 +554,31 @@ final class MessagingHttp implements Handler {
                         + " retry it" : "the log refused this batch and nothing was appended") + "\"}";
         var h = ResponseHeaders.of().set("content-type", "application/problem+json");
         if (e.retryable()) h.set("retry-after", RETRY_AFTER_SECONDS);
+        return new Response(status, h, Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /** Problem type for a batch whose producer seq was already appended but is out of the dedup window (409). */
+    static final String DUPLICATE_TYPE = "https://sjws.dev/problems/duplicate";
+
+    /**
+     * A producer batch the log decided from its producer table (M2), never retryable as is: a gap or reordered seq, or a
+     * seq reused for another batch, is 400 not-appended with the seq to send next; a seq applied too long ago to
+     * remember its offset is 409 duplicate (it is in the log once, and will not be appended again).
+     */
+    static Response producerSequence(ProducerSequenceException e) {
+        boolean dup = e.kind() == ProducerSequenceException.Kind.DUPLICATE_OUT_OF_WINDOW;
+        int status = dup ? 409 : 400;
+        var detail = switch (e.kind()) {
+            case OUT_OF_ORDER -> "the batch is not this producer's next seq and nothing was appended";
+            case SEQ_REUSED -> "this seq was already appended with another batch and nothing was appended";
+            case DUPLICATE_OUT_OF_WINDOW -> "this seq was already appended, too long ago to report its offset";
+        };
+        var json = "{\"type\":\"" + (dup ? DUPLICATE_TYPE : NOT_APPENDED_TYPE) + "\",\"title\":\""
+                + (dup ? "duplicate" : "not appended") + "\",\"status\":" + status + ",\"detail\":\"" + detail
+                + "\",\"reason\":\"" + e.kind().name().toLowerCase(java.util.Locale.ROOT) + "\",\"expectedSeq\":"
+                + e.expectedSeq() + "}";
+        var h = ResponseHeaders.of().set("content-type", "application/problem+json")
+                .set("producer-expected-seq", Long.toString(e.expectedSeq()));
         return new Response(status, h, Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
     }
 

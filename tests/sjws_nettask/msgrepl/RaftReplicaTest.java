@@ -1,6 +1,8 @@
 package sjws_nettask.msgrepl;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -35,6 +37,7 @@ import sjws_nettask.cluster.SimTransport;
 import sjws_nettask.cluster.SiteId;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LedgerWriter;
+import sjws_nettask.messaging.ledger.ProducerSequenceException;
 import sjws_nettask.messaging.ledger.Replica;
 import sjws_nettask.messaging.ledger.SegmentedLog;
 
@@ -90,6 +93,24 @@ class RaftReplicaTest {
                 last = now;
             }
             return writer.snapshot().nextOffset();
+        }
+
+        /** The refusal of producer batch {@code f}, decided when it is applied. */
+        ProducerSequenceException refused(CompletableFuture<Long> f) throws Exception {
+            for (int k = 0; k < 2000 && !f.isDone(); k++) {
+                step();
+                Thread.sleep(1);
+            }
+            var e = assertThrows(java.util.concurrent.ExecutionException.class, () -> f.get(5, TimeUnit.SECONDS));
+            return assertInstanceOf(ProducerSequenceException.class, e.getCause());
+        }
+
+        long produce(long pid, long seq, String... rs) throws Exception {
+            return await(replica.appendDeduplicated(recs(rs), Durability.GROUP, 0, pid, seq));
+        }
+
+        byte[] table() {
+            return RaftReplicator.producerTable(replica);
         }
 
         List<String> records() throws Exception {
@@ -198,6 +219,74 @@ class RaftReplicaTest {
             assertEquals(1, n.settle());
             assertEquals(1, n.await(n.replica.appendNoWait(recs("b"), Durability.GROUP)));
             assertEquals(List.of("a", "b"), n.records());
+        }
+    }
+
+    /**
+     * M2: a retried producer batch is acknowledged with its original offset and appended once; a gap or a reused seq
+     * is refused with the seq to send next; a seq older than the window is a duplicate it can no longer place.
+     * Producer id 0 is no dedup at all.
+     */
+    @Test
+    void producerRetryIsAppendedOnceAndSequenceErrorsAreRefused() throws Exception {
+        try (var n = new Node()) {
+            assertEquals(0, n.produce(7, 1, "a", "b"));
+            assertEquals(0, n.produce(7, 1, "a", "b"), "retry: the original offset");
+            var gap = n.refused(n.replica.appendDeduplicated(recs("z"), Durability.GROUP, 0, 7, 3));
+            assertEquals(ProducerSequenceException.Kind.OUT_OF_ORDER, gap.kind());
+            assertEquals(2, gap.expectedSeq());
+            var reused = n.refused(n.replica.appendDeduplicated(recs("z"), Durability.GROUP, 0, 7, 1));
+            assertEquals(ProducerSequenceException.Kind.SEQ_REUSED, reused.kind());
+            assertEquals(2, n.produce(7, 2, "c"));
+            assertEquals(ProducerSequenceException.Kind.OUT_OF_ORDER,
+                    n.refused(n.replica.appendDeduplicated(recs("z"), null, 0, 8, 2)).kind(), "a new producer starts at 1");
+            assertEquals(3, n.produce(8, 1, "d"), "producers are independent");
+
+            // Producer id 0: at-least-once, every send appended.
+            assertEquals(4, n.produce(0, 1, "x"));
+            assertEquals(5, n.produce(0, 1, "x"));
+            assertThrows(IllegalArgumentException.class, () -> n.replica.appendDeduplicated(recs("z"), null, 0, 7, 0));
+
+            for (int s = 3; s <= 2 + ProducerTable.WINDOW; s++) n.produce(7, s, "w" + s);
+            var old = n.refused(n.replica.appendDeduplicated(recs("c"), Durability.GROUP, 0, 7, 2));
+            assertEquals(ProducerSequenceException.Kind.DUPLICATE_OUT_OF_WINDOW, old.kind());
+            assertEquals(3 + ProducerTable.WINDOW, old.expectedSeq());
+            var rs = n.records();
+            assertEquals(List.of("a", "b", "c", "d", "x", "x"), rs.subList(0, 6));
+            assertEquals(6 + ProducerTable.WINDOW, rs.size(), "refused and duplicate batches take no offsets");
+        }
+    }
+
+    /** M2: restart replay rebuilds the producer table exactly, with the stamp file and without it. */
+    @Test
+    void restartRebuildsTheProducerTable() throws Exception {
+        byte[] before;
+        try (var n = new Node()) {
+            assertEquals(0, n.produce(7, 1, "a"));
+            assertEquals(1, n.produce(0, 0, "plain"));
+            assertEquals(2, n.produce(7, 2, "b", "c"));
+            n.refused(n.replica.appendDeduplicated(recs("z"), null, 0, 7, 9));
+            assertEquals(4, n.produce(9, 1, "d"));
+            n.settle();
+            before = n.table();
+        }
+        try (var n = new Node()) {
+            assertEquals(5, n.settle());
+            assertArrayEquals(before, n.table(), "replay rebuilt the same table");
+            assertEquals(2, n.produce(7, 2, "b", "c"), "a retry after a restart still dedups");
+            assertEquals(5, n.produce(7, 3, "e"));
+            n.settle();
+            before = n.table();
+        }
+        try (var ch = FileChannel.open(dir.resolve("state/t.applied"), StandardOpenOption.WRITE)) {
+            ch.truncate(28); // stamps lost: only the header is left
+        }
+        try (var n = new Node()) {
+            assertEquals(6, n.settle());
+            assertArrayEquals(before, n.table());
+            assertEquals(5, n.produce(7, 3, "e"));
+            assertEquals(4, n.produce(9, 1, "d"));
+            assertEquals(List.of("a", "plain", "b", "c", "d", "e"), n.records());
         }
     }
 }
