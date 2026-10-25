@@ -46,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-26.04]
-        ref: [8fdf93df, 4452ac19af6d64accef2d9cf9f20ccc717bdbc6e]
+        ref: [8fdf93df282eeb82e6edf409c33c1f3a8f47e152]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
