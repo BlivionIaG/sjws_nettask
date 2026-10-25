@@ -556,6 +556,12 @@ final class RaftGroup {
                 var error = outcomeUnknown("a membership change");
                 after.add(() -> change.completeExceptionally(error));
             }
+            // A read barrier has no outcome to lose: it fails with the fenced error, like one issued from now on.
+            for (var read : reads) {
+                var error = fencedError();
+                after.add(() -> read.completeExceptionally(error));
+            }
+            reads.clear();
             stepDown(term, after); // same term: no hard-state write
             return storageFailed;
         }
@@ -1541,6 +1547,12 @@ final class RaftGroup {
                 deliveries.submit(() -> future.completeExceptionally(error), future);
             }
             pending.clear();
+            // Read barriers waiting for a quorum round would otherwise hang (only a quorum ack as leader
+            // completed them), or complete later if this node led again (#246).
+            for (var read : reads) {
+                after.add(() -> read.completeExceptionally(error));
+            }
+            reads.clear();
             if (membershipChange != null) {
                 var change = membershipChange;
                 membershipChange = null;
@@ -1991,6 +2003,10 @@ final class RaftGroup {
             var future = new CompletableFuture<Void>();
             lock.lock();
             try {
+                if (storageFailed != null) {
+                    future.completeExceptionally(fencedError());
+                    return future;
+                }
                 if (role != Role.LEADER) {
                     future.completeExceptionally(notLeader());
                     return future;
@@ -2015,6 +2031,10 @@ final class RaftGroup {
             var after = new ArrayList<Runnable>();
             lock.lock();
             try {
+                if (storageFailed != null) {
+                    future.completeExceptionally(fencedError());
+                    return future;
+                }
                 if (role != Role.LEADER) {
                     future.completeExceptionally(notLeader());
                     return future;

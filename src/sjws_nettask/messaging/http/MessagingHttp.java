@@ -180,7 +180,7 @@ final class MessagingHttp implements Handler {
         } catch (TimeoutException e) {
             return problem(503, "unavailable", "offset commit not acknowledged in " + ACK_TIMEOUT_MS + " ms");
         } catch (ExecutionException e) {
-            return failed(e, request.target());
+            return failed(e, request.target(), true);
         } catch (LeaderUnavailableException e) {
             return notLeader(e, request.target());
         } catch (IllegalStateException e) {
@@ -231,7 +231,7 @@ final class MessagingHttp implements Handler {
         } catch (TimeoutException e) {
             return problem(503, "unavailable", "append not acknowledged in " + ACK_TIMEOUT_MS + " ms");
         } catch (ExecutionException e) {
-            return failed(e, target);
+            return failed(e, target, true);
         } catch (LeaderUnavailableException e) {
             return notLeader(e, target);
         }
@@ -251,7 +251,7 @@ final class MessagingHttp implements Handler {
             } catch (TimeoutException e) {
                 return problem(503, "unavailable", "leader read not confirmed in " + ACK_TIMEOUT_MS + " ms");
             } catch (ExecutionException e) {
-                return failed(e, target);
+                return failed(e, target, false);
             } catch (LeaderUnavailableException e) {
                 return notLeader(e, target);
             }
@@ -458,12 +458,32 @@ final class MessagingHttp implements Handler {
         return null;
     }
 
-    private static Response failed(ExecutionException e, String target) {
+    /**
+     * A replicated write or leader read whose future failed for a reason other than leadership. The internal error
+     * (storage paths, group names, exception text) is logged here and never sent to the client (#246). A write gets
+     * the generic outcome-unknown problem: it may or may not commit (a group that failed closed, a lost leader), so
+     * the client retries it as after a timeout and deduplicates. A read has no outcome, so it is plain unavailable.
+     */
+    static Response failed(ExecutionException e, String target, boolean write) {
         Throwable c = e.getCause();
         while (c instanceof java.util.concurrent.CompletionException && c.getCause() != null) c = c.getCause();
         if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
-        return problem(503, "unavailable", String.valueOf(c));
+        System.getLogger(MessagingHttp.class.getName()).log(System.Logger.Level.WARNING,
+                (write ? "write" : "leader read") + " on " + target + " failed", c);
+        Response r;
+        if (write) {
+            var json = "{\"type\":\"" + OUTCOME_UNKNOWN_TYPE + "\",\"title\":\"outcome unknown\",\"status\":503,"
+                    + "\"detail\":\"the write may or may not have been committed; retry it as after a timeout\"}";
+            r = new Response(503, ResponseHeaders.of().set("content-type", "application/problem+json"),
+                    Body.Bytes.of(json.getBytes(StandardCharsets.UTF_8)));
+        } else {
+            r = problem(503, "unavailable", "leader read failed");
+        }
+        r.headers().set("retry-after", RETRY_AFTER_SECONDS);
+        return r;
     }
+
+    static final String OUTCOME_UNKNOWN_TYPE = "https://sjws.dev/problems/outcome-unknown";
 
     /** 307 to the leader when known (method and body preserved), else 503 + Retry-After; RFC 9457 type not-leader. */
     static Response notLeader(LeaderUnavailableException e, String target) {
