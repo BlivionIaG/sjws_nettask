@@ -1,0 +1,16 @@
+# sjws-lease-stream :claim response header (agent-swarm.md §5.2 HTTP leg, §11.2; #261 Q1). Sent only with
+# sjws.swarm.stream.enabled on, on a 200 :claim: one comma-separated entry per LEASE frame, in frame order. An entry is
+# <32 lower-case hex of the task's correlationId (= the chunk streamId)>/<lease attempt, unsigned decimal u32> for a
+# stream task (one submitted through :stream), or "-" for a unary task. No spaces; one header field, never several.
+# A batch with no stream task sends no sjws-lease-stream (and no sjws-stream-window) at all (#261 R2), so every header
+# vector below has at least one stream entry. Shared by the Java server and the Python SDK (S2c PR 7).
+# name correlationId-hex attempt entry   (correlationId "-" = a unary task)
+stream-a1 0123456789abcdeffedcba9876543210 1 0123456789abcdeffedcba9876543210/1
+zero-id 00000000000000000000000000000000 0 00000000000000000000000000000000/0
+u32-max ffffffffffffffffffffffffffffffff 4294967295 ffffffffffffffffffffffffffffffff/4294967295
+attempt-7 000102030405060708090a0b0c0d0e0f 7 000102030405060708090a0b0c0d0e0f/7
+unary - - -
+# Header vectors: name ! entry-names (comma-separated) header-value
+single ! stream-a1 0123456789abcdeffedcba9876543210/1
+unary-first ! unary,stream-a1 -,0123456789abcdeffedcba9876543210/1
+mixed ! stream-a1,unary,attempt-7,unary,u32-max 0123456789abcdeffedcba9876543210/1,-,000102030405060708090a0b0c0d0e0f/7,-,ffffffffffffffffffffffffffffffff/4294967295
