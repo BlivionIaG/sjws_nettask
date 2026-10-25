@@ -70,6 +70,12 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
         this.swarm = swarm;
         this.gate = gate;
         this.trace = trace;
+        try {
+            checkPeers(System::getProperty, System.getenv());
+        } catch (sjws_nettask.OptionalModule.Refused refused) {
+            swarm.close();
+            throw refused;
+        }
         if (stream && multiProcess != null) {
             // until Messaging Core's remote write path lands, chunks reach readers only through this process's
             // ledger: a stream whose worker or submitter is another process would lose its chunks (§5.2, §12)
@@ -99,6 +105,46 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
         }
     }
 
+    /**
+     * #236 PR 1: when a swarm peer map or peer key is set, run the peer startup checks and refuse to start on any
+     * failure (fail closed). Only then does a {@code swarm.peer} class load, so a node without peers pays nothing.
+     * Returns the one-line summary that was printed, or null when no peer setting is present.
+     */
+    static String checkPeers(java.util.function.Function<String, String> props, java.util.Map<String, String> env) {
+        if (!peersConfigured(props, env)) {
+            return null;
+        }
+        String self = props.apply(NODE_PROPERTY);
+        if (self == null || self.isBlank()) {
+            self = env.get(NODE_ENV);
+        }
+        try {
+            var checked = sjws_nettask.swarm.peer.PeerStartup.check(props, env, self);
+            var line = "swarm: " + checked.describe();
+            System.err.println(line);
+            return line;
+        } catch (IllegalArgumentException refused) {
+            throw new sjws_nettask.OptionalModule.Refused(refused.getMessage());
+        }
+    }
+
+    /** A swarm peer map or peer key is set (#236): the peer startup checks run, fail closed. */
+    static boolean peersConfigured(java.util.function.Function<String, String> props, java.util.Map<String, String> env) {
+        for (var name : new String[] {"sjws.swarm.peers", "sjws.swarm.peer.keyFile", "sjws.swarm.peer.keyFilePrevious"}) {
+            var v = props.apply(name);
+            if (v != null && !v.isBlank()) {
+                return true;
+            }
+        }
+        for (var name : new String[] {"SJWS_SWARM_PEERS", "SJWS_SWARM_PEER_KEY", "SJWS_SWARM_PEER_KEY_PREVIOUS"}) {
+            var v = env.get(name);
+            if (v != null && !v.isBlank()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Messaging Core's tracking issue for cross-process stream delivery. */
     static final String STREAM_TRACKING = "#236";
 
@@ -111,6 +157,14 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
             String launch) {
         if (launch != null) {
             return launch;
+        }
+        // #236 PR 1 forwards no swarm family yet, so a peer map with other nodes is a multi-process deployment
+        var peers = props.apply("sjws.swarm.peers");
+        if (peers == null || peers.isBlank()) {
+            peers = env.get("SJWS_SWARM_PEERS");
+        }
+        if (peers != null && peers.contains(",")) {
+            return "sjws.swarm.peers lists other nodes";
         }
         for (var name : new String[] {"sjws.cp.nodeId", "sjws.cp.peers"}) {
             var v = props.apply(name);

@@ -40,6 +40,7 @@ How this is enforced is in §3.3.
 |---|---|---|
 | `sjws_nettask.swarm` | Built (S1): `SwarmModule` (bootstrap), `Swarm`, `Topics`, `TaskService`, `Task`, `TaskEnvelope`, `LeaseKeeper`, `ReplyRouter`, `SwarmHttp`, `SwarmGate`, `TokenGate`. Planned: `TokenStream`, `AgentDirectory`, `BudgetLedger`, `TraceContext`, `LlmGateway` | Built: `core`, `messaging.delivery`, `messaging.ledger`, `config.SecureKeyFile`, `swarm.wire`. Planned: `controlplane`, `cp` (read-only views), `routing` (`GcraTable`, `Resilience`, `discovery.*`, `WeightedHandler`, `ProxyHandler`), `observe` |
 | `sjws_nettask.swarm.wire` (new) | Frame codec for the swarm wire protocol (§11.2) | `core` only |
+| `sjws_nettask.swarm.peer` (#236 PR 1) | Cross-process peer links: `PeerConfig`, `PeerKeys`, `PeerStartup`, `PeerSockets` (pinned-SAN mTLS), `PeerLink` (forwarded produce). See [swarm-peer-forwarding.md](swarm-peer-forwarding.md) | `cluster.TcpTransport`, `cp.CpTls`, `config.SecureKeyFile`, `messaging.delivery` |
 | `sdk/python/sjws_swarm` (new, outside `src/`) | Thin client (§11.1) | — |
 
 ### 3.2 Direction

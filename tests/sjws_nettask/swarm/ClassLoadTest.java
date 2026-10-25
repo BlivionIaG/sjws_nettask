@@ -83,6 +83,16 @@ class ClassLoadTest {
         var text = run(List.of("-Dsjws.swarm.enabled=true"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml());
         assertTrue(text.contains("sjws_nettask.swarm.SwarmModule"), text);
+        assertFalse(text.contains("sjws_nettask.swarm.peer."), "no peer setting: no #236 peer class loads");
+    }
+
+    @Test
+    void aSingleNodePeerMapOpensNoPeerTransport() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.node=a", "-Dsjws.swarm.peers=a=1@127.0.0.1:1"),
+                "Server started:", 401, "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.peer.PeerStartup"), text);
+        assertFalse(text.contains("sjws_nettask.swarm.peer.PeerLink"), text);
+        assertFalse(text.contains("sjws_nettask.cluster.TcpTransport "), "single node: zero transport cost");
     }
 
     @Test

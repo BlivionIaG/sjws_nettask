@@ -39,6 +39,18 @@ final class DeliveryState {
 
     static final int DEDUP_WINDOW = 4096;
 
+    record RemoteKey(int origin, long producerId) { }
+
+    /** One forwarded producer: seqs are applied strictly in order 1, 2, 3, ... so the window is contiguous. */
+    static final class RemoteProducer {
+        final LinkedHashMap<Long, Long> window = new LinkedHashMap<>();
+        long highest;
+        long lastMs;
+    }
+
+    /** {@link #checkRemote} results below zero; {@code >= 0} is the offset of the earlier identical write. */
+    static final long REMOTE_NEW = -1, REMOTE_TOO_OLD = -2, REMOTE_OUT_OF_ORDER = -3, REMOTE_BUSY = -4;
+
     final class Group {
         final String name;
         final long startOffset;
@@ -82,6 +94,14 @@ final class DeliveryState {
     /** producerId → (seq → offset) window, plus the highest seq seen. */
     final Map<Long, LinkedHashMap<Long, Long>> dedup = new HashMap<>();
     final Map<Long, Long> highestSeq = new HashMap<>();
+    /**
+     * Forwarded producers (#236): {@code (origin wire, producerId)} → seq window. Kept apart from {@link #dedup} so a
+     * peer reusing another node's producerId lands under its own key, and so the local produce path is unchanged.
+     * Empty unless something calls {@link Partition#produceFrom}.
+     */
+    final Map<RemoteKey, RemoteProducer> remote = new HashMap<>();
+    /** Live forwarded producers per origin wire, for the per-peer cap. */
+    final Map<Integer, Integer> remoteLive = new HashMap<>();
     /** DLQ topics: "group@offset" of every origin message already copied in. */
     final Set<String> origins = new HashSet<>();
     long nextOffset;
@@ -105,7 +125,63 @@ final class DeliveryState {
         return -1;
     }
 
+    /**
+     * Classifies a forwarded {@code (origin, producerId, seq)}: the earlier offset for a seq still in the window, or
+     * {@link #REMOTE_NEW} for exactly the next seq (1 for an unknown producer), {@link #REMOTE_TOO_OLD} for one that
+     * fell out of the 4096 window, {@link #REMOTE_OUT_OF_ORDER} for anything later than the next seq (the expected
+     * seq is {@link #expectedSeq}), and {@link #REMOTE_BUSY} for a new producer while {@code origin} already has
+     * {@code maxLive} on this partition and none has been idle {@code idleMs} (an idle one is evicted to make room;
+     * eviction is in memory only, so replay may bring it back until the cap is hit again).
+     */
+    long checkRemote(int origin, long producerId, long seq, long nowMs, int maxLive, long idleMs) {
+        var p = remote.get(new RemoteKey(origin, producerId));
+        if (p == null) {
+            if (seq != 1) return REMOTE_OUT_OF_ORDER;
+            if (remoteLive.getOrDefault(origin, 0) >= maxLive && !evictIdle(origin, nowMs, idleMs)) return REMOTE_BUSY;
+            return REMOTE_NEW;
+        }
+        if (seq == p.highest + 1) return REMOTE_NEW;
+        if (seq > p.highest) return REMOTE_OUT_OF_ORDER;
+        Long o = p.window.get(seq);
+        return o != null ? o : REMOTE_TOO_OLD;
+    }
+
+    /** The seq a forwarded producer must send next: 1 when unknown. */
+    long expectedSeq(int origin, long producerId) {
+        var p = remote.get(new RemoteKey(origin, producerId));
+        return p == null ? 1 : p.highest + 1;
+    }
+
+    private boolean evictIdle(int origin, long nowMs, long idleMs) {
+        RemoteKey oldest = null;
+        long oldestMs = Long.MAX_VALUE;
+        for (var e : remote.entrySet()) {
+            if (e.getKey().origin() == origin && e.getValue().lastMs < oldestMs) {
+                oldest = e.getKey();
+                oldestMs = e.getValue().lastMs;
+            }
+        }
+        if (oldest == null || nowMs - oldestMs < idleMs) return false;
+        remote.remove(oldest);
+        remoteLive.merge(origin, -1, Integer::sum);
+        return true;
+    }
+
     boolean hasOrigin(String group, long offset) { return origins.contains(group + "@" + offset); }
+
+    private void applyRemote(LedgerEntry.Enqueue x, long offset) {
+        var key = new RemoteKey(x.origin(), x.producerId());
+        var p = remote.get(key);
+        if (p == null) {
+            p = new RemoteProducer();
+            remote.put(key, p);
+            remoteLive.merge(x.origin(), 1, Integer::sum);
+        }
+        p.window.put(x.seq(), offset);
+        if (p.window.size() > DEDUP_WINDOW) p.window.remove(p.window.keySet().iterator().next());
+        p.highest = Math.max(p.highest, x.seq());
+        p.lastMs = Math.max(p.lastMs, x.timestampMs());
+    }
 
     // ---- application ----
 
@@ -117,7 +193,9 @@ final class DeliveryState {
                         x.originGroup(), x.originOffset(), x.originAttempts(), x.originReason()));
                 enqueued++;
                 for (var g : groups.values()) g.freshCount++;
-                if (x.producerId() != 0) {
+                if (x.origin() != 0) {
+                    applyRemote(x, offset);
+                } else if (x.producerId() != 0) {
                     var w = dedup.get(x.producerId());
                     if (w == null) { w = new LinkedHashMap<>(); dedup.put(x.producerId(), w); }
                     w.put(x.seq(), offset);
@@ -297,6 +375,16 @@ final class DeliveryState {
               .append("\n  dead=").append(g.dead).append("\n  resolved=").append(g.resolvedAbove).append("\n  due=").append(g.due).append('\n');
         }
         sb.append("dedup=").append(new TreeMap<>(highestSeq)).append(" origins=").append(new TreeSet<>(origins));
+        if (!remote.isEmpty()) {
+            var keys = new java.util.ArrayList<>(remote.keySet());
+            keys.sort(java.util.Comparator.comparingInt(RemoteKey::origin).thenComparingLong(RemoteKey::producerId));
+            sb.append(" remote=");
+            for (var k : keys) {
+                var p = remote.get(k);
+                sb.append(k.origin()).append('/').append(k.producerId()).append(':').append(p.highest).append('@')
+                  .append(p.lastMs).append(p.window.keySet()).append(' ');
+            }
+        }
         return sb.toString();
     }
 
@@ -304,6 +392,8 @@ final class DeliveryState {
 
     static final int SNAP_MAGIC = 0x534a5353; // "SJSS"
     static final int SNAP_VERSION = 1;
+    /** Written only when {@link #remote} is non-empty, so a partition never used for forwarding stays version 1. */
+    static final int SNAP_VERSION_REMOTE = 2;
 
     /** Serializes the full state (no payloads) as of {@link #nextOffset}, with a trailing CRC32C. */
     /** Entries {@link #serialize} writes (messages, per-group lists, dedup windows, origins): its cost, O(groups + producers). */
@@ -311,6 +401,7 @@ final class DeliveryState {
         long n = messages.size() + origins.size();
         for (var g : groups.values()) n += g.inFlight.size() + g.retry.size() + g.dead.size() + g.resolvedAbove.size() + g.due.size();
         for (var w : dedup.values()) n += w.size();
+        for (var p : remote.values()) n += p.window.size();
         return n;
     }
 
@@ -318,7 +409,7 @@ final class DeliveryState {
         try {
             var bo = new java.io.ByteArrayOutputStream(64 + messages.size() * 48);
             var o = new java.io.DataOutputStream(bo);
-            o.writeInt(SNAP_MAGIC); o.writeInt(SNAP_VERSION);
+            o.writeInt(SNAP_MAGIC); o.writeInt(remote.isEmpty() ? SNAP_VERSION : SNAP_VERSION_REMOTE);
             o.writeLong(nextOffset); o.writeLong(enqueued); o.writeLong(version);
             o.writeInt(messages.size());
             for (var m : messages.values()) {
@@ -348,6 +439,17 @@ final class DeliveryState {
             }
             o.writeInt(origins.size());
             for (var x : new TreeSet<>(origins)) o.writeUTF(x);
+            if (!remote.isEmpty()) {
+                o.writeInt(remote.size());
+                var keys = new java.util.ArrayList<>(remote.keySet());
+                keys.sort(java.util.Comparator.comparingInt(RemoteKey::origin).thenComparingLong(RemoteKey::producerId));
+                for (var k : keys) {
+                    var p = remote.get(k);
+                    o.writeShort(k.origin()); o.writeLong(k.producerId()); o.writeLong(p.highest); o.writeLong(p.lastMs);
+                    o.writeInt(p.window.size());
+                    for (var w : p.window.entrySet()) { o.writeLong(w.getKey()); o.writeLong(w.getValue()); }
+                }
+            }
             o.flush();
             var body = bo.toByteArray();
             var c = new java.util.zip.CRC32C();
@@ -366,7 +468,9 @@ final class DeliveryState {
         if ((int) c.getValue() != java.nio.ByteBuffer.wrap(raw, raw.length - 4, 4).getInt()) throw new IllegalArgumentException("snapshot crc");
         try {
             var in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(raw, 0, raw.length - 4));
-            if (in.readInt() != SNAP_MAGIC || in.readInt() != SNAP_VERSION) throw new IllegalArgumentException("snapshot format");
+            if (in.readInt() != SNAP_MAGIC) throw new IllegalArgumentException("snapshot format");
+            int version = in.readInt();
+            if (version != SNAP_VERSION && version != SNAP_VERSION_REMOTE) throw new IllegalArgumentException("snapshot format");
             var st = new DeliveryState(policy);
             st.nextOffset = in.readLong(); st.enqueued = in.readLong(); st.version = in.readLong();
             for (int i = in.readInt(); i > 0; i--) {
@@ -394,6 +498,17 @@ final class DeliveryState {
                 st.dedup.put(pid, w);
             }
             for (int i = in.readInt(); i > 0; i--) st.origins.add(in.readUTF());
+            if (version == SNAP_VERSION_REMOTE) {
+                for (int i = in.readInt(); i > 0; i--) {
+                    int origin = in.readUnsignedShort();
+                    var p = new RemoteProducer();
+                    long pid = in.readLong();
+                    p.highest = in.readLong(); p.lastMs = in.readLong();
+                    for (int k = in.readInt(); k > 0; k--) p.window.put(in.readLong(), in.readLong());
+                    if (origin == 0 || st.remote.put(new RemoteKey(origin, pid), p) != null) throw new IllegalArgumentException("snapshot remote producer");
+                    st.remoteLive.merge(origin, 1, Integer::sum);
+                }
+            }
             if (in.available() != 0) throw new IllegalArgumentException("trailing snapshot bytes");
             return st;
         } catch (java.io.IOException e) {
