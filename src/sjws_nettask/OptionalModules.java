@@ -128,10 +128,42 @@ final class OptionalModules {
         }
     }
 
+    /** Why this process runs alongside other processes, or null; see {@link OptionalModule.Launch}. */
+    static String multiProcess() {
+        return OptionalModule.Launch.multiProcess();
+    }
+
+    static void multiProcess(String reason) {
+        OptionalModule.Launch.multiProcess(reason);
+    }
+
+    /**
+     * As {@link #start(Boolean, PrintStream)}, with {@link #multiProcess()} set to {@code multiProcessReason} while the
+     * modules are constructed (and cleared after, so it never leaks into a later start in the same JVM).
+     */
+    static OptionalModule start(Boolean yaml, String multiProcessReason, PrintStream err) {
+        multiProcess(multiProcessReason);
+        try {
+            return start(yaml, err);
+        } finally {
+            multiProcess(null);
+        }
+    }
+
+    /**
+     * Loads a module. A module that fails to load is logged and skipped, except one that throws
+     * {@link OptionalModule.Refused}: that is rethrown so the process does not start.
+     */
     static OptionalModule load(String className, PrintStream err) {
         try {
             var type = Class.forName(className).asSubclass(OptionalModule.class);
             return type.getDeclaredConstructor().newInstance();
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            if (e.getCause() instanceof OptionalModule.Refused r) {
+                throw r;
+            }
+            err.println("WARN: optional module " + className + " not started: " + e);
+            return NONE;
         } catch (ReflectiveOperationException | ClassCastException | LinkageError e) {
             err.println("WARN: optional module " + className + " not started: " + e);
             return NONE;

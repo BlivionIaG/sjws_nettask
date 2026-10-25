@@ -44,6 +44,17 @@ public final class Topics implements AutoCloseable {
         this.clockMs = clockMs;
     }
 
+    /**
+     * S2c PR 5: the {@code CancelProbe} for each task topic ({@code tasks.*}), or null (the default, and always with
+     * {@code sjws.swarm.stream.enabled} off: task partitions then open exactly as before, without a probe).
+     */
+    private volatile java.util.function.Function<String, sjws_nettask.messaging.delivery.CancelProbe> probes;
+
+    /** Installs the cancel probes; call at startup, before any task partition opens. */
+    void installProbes(java.util.function.Function<String, sjws_nettask.messaging.delivery.CancelProbe> probes) {
+        this.probes = probes;
+    }
+
     public LongSupplier clock() {
         return this.clockMs;
     }
@@ -65,7 +76,13 @@ public final class Topics implements AutoCloseable {
             // close(String) removes and closes under this lock, so a partition seen here is never closing or closed
             p = this.open.get(topic);
             if (p == null) {
-                p = Partition.open(this.dir, topic, this.policy, this.clockMs);
+                var pr = this.probes;
+                p = pr == null || !topic.startsWith(TaskService.TOPIC_PREFIX)
+                        || topic.endsWith(Partition.DLQ_SUFFIX)
+                        ? Partition.open(this.dir, topic, this.policy, this.clockMs)
+                        : Partition.open(this.dir, topic, this.policy, this.clockMs,
+                                sjws_nettask.messaging.ledger.Durability.ASYNC,
+                                sjws_nettask.messaging.ledger.SegmentedLog.DEFAULT_SEGMENT_BYTES, true, pr.apply(topic));
                 this.open.put(topic, p);
             }
             return p;
@@ -105,6 +122,10 @@ public final class Topics implements AutoCloseable {
         } finally {
             this.opening.unlock();
         }
+    }
+
+    public boolean closed() {
+        return this.closed;
     }
 
     public boolean isOpen(String topic) {

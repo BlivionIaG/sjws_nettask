@@ -177,6 +177,20 @@ public final class TokenGate implements SwarmGate {
         return false;
     }
 
+    /** An agent granted every pool ({@code *}) is the interim admin (S2c PR 5 cancel); S2d makes it a role. */
+    @Override
+    public boolean isAdmin(Agent agent) {
+        if (agent == null) {
+            return false;
+        }
+        for (var e : this.entries) {
+            if (e.agent().equals(agent)) {
+                return e.pools().contains("*");
+            }
+        }
+        return false;
+    }
+
     @Override
     public long maxRequestBytes() {
         return this.maxRequestBytes;

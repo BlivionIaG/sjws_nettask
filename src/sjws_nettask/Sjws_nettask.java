@@ -114,7 +114,13 @@ public class Sjws_nettask {
                 return EXIT_CANNOT_LISTEN;
             }
         }
-        var modules = OptionalModules.start(loaded.yamlSwarmEnabled(), err);
+        OptionalModule modules;
+        try {
+            modules = OptionalModules.start(loaded.yamlSwarmEnabled(), multiProcess(hooks, loaded.yamlCp()), err);
+        } catch (OptionalModule.Refused e) {
+            err.println("Error: " + e.getMessage());
+            return EXIT_USAGE;
+        }
         SjwsServer server;
         try {
             server = SjwsServer.start(loaded, h3Factory, bindContent, OptionalModules.contributors(modules));
@@ -448,6 +454,20 @@ public class Sjws_nettask {
                 logOut.close();
             }
         }
+    }
+
+    /**
+     * Why this process is configured to run with other processes, or null when it is standalone: a {@code --bootstrap}
+     * node (control or data role, joined to a control plane) or a config file whose {@code cp.peers} lists voters.
+     */
+    static String multiProcess(ServiceHooks hooks, java.util.Map<String, Object> yamlCp) {
+        if (hooks != null) {
+            return "this node runs with --bootstrap (control/data role in a cluster)";
+        }
+        if (yamlCp != null && yamlCp.get("peers") instanceof java.util.Collection<?> peers && !peers.isEmpty()) {
+            return "the config file lists cp.peers (" + peers.size() + " voters)";
+        }
+        return null;
     }
 
     /**
