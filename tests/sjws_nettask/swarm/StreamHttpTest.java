@@ -53,6 +53,11 @@ class StreamHttpTest {
     /** The agent is the {@code x-agent} header: lets tests act as two agents. */
     static final SwarmGate BY_HEADER = new SwarmGate() {
         @Override
+        public boolean isAdmin(Agent agent) {
+            return false;
+        }
+
+        @Override
         public Agent authenticate(Request request) {
             var v = request.headers().values("x-agent");
             return new Agent(v.isEmpty() ? "a" : v.get(0));
@@ -147,6 +152,26 @@ class StreamHttpTest {
         return new String(drainBytes(r), StandardCharsets.UTF_8);
     }
 
+    /** Reads the first {@code frames} binary frames, then closes the reader (the stream need not have ended). */
+    static byte[] drainBytesUntil(Response r, int frames) throws Exception {
+        var src = ((Body.Stream) r.body()).source();
+        var out = new ByteArrayOutputStream();
+        try (src) {
+            int n = 0;
+            while (n < frames) {
+                var b = src.next();
+                if (b == null) {
+                    break;
+                }
+                var a = new byte[b.remaining()];
+                b.get(a);
+                out.write(a);
+                n++;
+            }
+        }
+        return out.toByteArray();
+    }
+
     static byte[] drainBytes(Response r) throws Exception {
         var src = ((Body.Stream) r.body()).source();
         var out = new ByteArrayOutputStream();
@@ -177,29 +202,29 @@ class StreamHttpTest {
         assertEquals("""
                 retry: 1000
 
-                id: 0
+                id: 1.0
                 event: chunk
                 data: hel
 
-                id: 1
+                id: 1.1
                 event: chunk
                 data: lo
                 data: wor
                 data: ld
 
-                id: 2
+                id: 1.2
                 event: chunk
                 data: !
 
-                id: 2
+                id: 1.2
                 event: end
                 data: ok
 
                 """, drain(r));
         // resume: Last-Event-ID n -> from n + 1; ?from=n -> from n
-        var resumed = drain(req("GET", "a", session, new byte[0], "last-event-id", "1"));
-        assertTrue(resumed.startsWith("retry: 1000\n\nid: 2\n"), resumed);
-        assertTrue(drain(req("GET", "a", session + "?from=1", new byte[0])).startsWith("retry: 1000\n\nid: 1\n"));
+        var resumed = drain(req("GET", "a", session, new byte[0], "last-event-id", "1.1"));
+        assertTrue(resumed.startsWith("retry: 1000\n\nid: 1.2\n"), resumed);
+        assertTrue(drain(req("GET", "a", session + "?from=1", new byte[0])).startsWith("retry: 1000\n\nid: 1.1\n"));
         assertEquals(409, chunk(c, 3, 0, "late").status(), "the lease is settled after LAST");
         // #232: the stream's final reply on reply.<node> is consumed by the router without counting late
         long until = System.nanoTime() + 5_000_000_000L;
@@ -323,13 +348,13 @@ class StreamHttpTest {
     void sseEncodingEdges() {
         var empty = new String(StreamHttp.sse(new StreamChunk(1, 1, 4, Frame.LAST | Frame.CANCELLED, new byte[0])),
                 StandardCharsets.UTF_8);
-        assertEquals("id: 4\nevent: end\ndata: cancelled\n\n", empty);
+        assertEquals("id: 0.4\nevent: end\ndata: cancelled\n\n", empty);
         var err = new String(StreamHttp.sse(new StreamChunk(1, 1, 5, Frame.LAST | Frame.ERROR, new byte[0])),
                 StandardCharsets.UTF_8);
         assertTrue(err.endsWith("data: error\n\n"));
         var cr = new String(StreamHttp.sse(new StreamChunk(1, 1, 0, 0, "a\rb\n".getBytes(StandardCharsets.UTF_8))),
                 StandardCharsets.UTF_8);
-        assertEquals("id: 0\nevent: chunk\ndata: a\ndata: b\ndata: \n\n", cr);
+        assertEquals("id: 0.0\nevent: chunk\ndata: a\ndata: b\ndata: \n\n", cr);
     }
 
     /** inceptor (1): chunks before the first GET are retained up to the bound; beyond it the reader gets a gap. */
@@ -347,7 +372,7 @@ class StreamHttpTest {
         var text = drain(req("GET", "a", session, new byte[0]));
         assertEquals("retry: 1000\n\nevent: gap\ndata: 0 6 overflow\n\nevent: end\ndata: error\n\n", text);
         var tail = drain(req("GET", "a", session + "?from=7", new byte[0]));
-        assertTrue(tail.contains("id: 9\nevent: chunk\ndata: c9\n") && tail.endsWith("id: 10\nevent: end\ndata: ok\n\n"),
+        assertTrue(tail.contains("id: 1.9\nevent: chunk\ndata: c9\n") && tail.endsWith("id: 1.10\nevent: end\ndata: ok\n\n"),
                 tail);
         var bin = ByteBuffer.wrap(drainBytes(req("GET", "a", session, new byte[0], "accept", SwarmHttp.CONTENT_TYPE)));
         var f = Frame.decode(bin);
@@ -365,7 +390,7 @@ class StreamHttpTest {
         assertEquals(204, chunk(c, 0, StreamChunk.FIRST, "a").status());
         assertEquals(204, chunk(c, 50, 0, "far").status()); // beyond the reorder window: dropped
         var text = drain(req("GET", "a", session, new byte[0]));
-        assertEquals("retry: 1000\n\nid: 0\nevent: chunk\ndata: a\n\nevent: gap\ndata: 1 ? overflow\n\nevent: end\ndata: error\n\n",
+        assertEquals("retry: 1000\n\nid: 1.0\nevent: chunk\ndata: a\n\nevent: gap\ndata: 1 ? overflow\n\nevent: end\ndata: error\n\n",
                 text);
     }
 
@@ -380,8 +405,8 @@ class StreamHttpTest {
         chunk(c, 1, Frame.LAST | Frame.ERROR, "");
         drain(req("GET", "a", session, new byte[0]));
         long t0 = System.nanoTime();
-        assertEquals("retry: 1000\n\nid: 1\nevent: end\ndata: error\n\n",
-                drain(req("GET", "a", session, new byte[0], "last-event-id", "1")));
+        assertEquals("retry: 1000\n\nid: 1.1\nevent: end\ndata: error\n\n",
+                drain(req("GET", "a", session, new byte[0], "last-event-id", "1.1")));
         var bin = ByteBuffer.wrap(drainBytes(req("GET", "a", session + "?from=2", new byte[0], "accept", SwarmHttp.CONTENT_TYPE)));
         var last = StreamChunk.decode(Frame.decode(bin).payload());
         assertTrue(last.last() && last.chunkSeq() == 1 && last.size() == 0, last.toString());

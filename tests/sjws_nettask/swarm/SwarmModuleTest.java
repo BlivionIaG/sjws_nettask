@@ -82,4 +82,46 @@ class SwarmModuleTest {
             System.clearProperty("sjws.swarm.test.x");
         }
     }
+
+    @org.junit.jupiter.api.io.TempDir
+    java.nio.file.Path dir;
+
+    @Test
+    void streamingRefusesToStartWhenMoreThanOneProcessIsConfigured() {
+        var swarm = Swarm.open(this.dir, "n1", 1, sjws_nettask.messaging.delivery.RetryPolicy.DEFAULT,
+                System::currentTimeMillis, 600_000);
+        var e = org.junit.jupiter.api.Assertions.assertThrows(sjws_nettask.OptionalModule.Refused.class,
+                () -> new SwarmModule(swarm, SwarmGate.DENY_ALL, false, true, "sjws.cp.nodeId is set"));
+        assertTrue(e.getMessage().contains("sjws.swarm.stream.enabled=true needs a single-process deployment"),
+                e.getMessage());
+        assertTrue(e.getMessage().contains("sjws.cp.nodeId is set"), e.getMessage());
+        assertTrue(e.getMessage().contains(SwarmModule.STREAM_TRACKING), e.getMessage());
+        // the same deployment with the flag off starts, and a standalone process may stream
+        var off = new SwarmModule(Swarm.open(this.dir.resolve("off"), "n1", 1,
+                sjws_nettask.messaging.delivery.RetryPolicy.DEFAULT, System::currentTimeMillis, 600_000),
+                SwarmGate.DENY_ALL, false, false, "sjws.cp.nodeId is set");
+        assertEquals(null, off.swarm().tasks().streams());
+        off.close();
+        var on = new SwarmModule(Swarm.open(this.dir.resolve("on"), "n1", 1,
+                sjws_nettask.messaging.delivery.RetryPolicy.DEFAULT, System::currentTimeMillis, 600_000),
+                SwarmGate.DENY_ALL, false, true, null);
+        assertTrue(on.swarm().tasks().streams() != null);
+        on.close();
+    }
+
+    @Test
+    void multiProcessReasonComesFromTheLaunchThenCpPropertiesThenCpEnvironment() {
+        java.util.function.Function<String, String> none = k -> null;
+        assertEquals(null, SwarmModule.multiProcessReason(none, java.util.Map.of(), null));
+        assertEquals("boot", SwarmModule.multiProcessReason(k -> "x", java.util.Map.of(), "boot"));
+        assertEquals("sjws.cp.nodeId is set", SwarmModule.multiProcessReason(
+                k -> k.equals("sjws.cp.nodeId") ? "c1" : null, java.util.Map.of(), null));
+        assertEquals("sjws.cp.peers is set", SwarmModule.multiProcessReason(
+                k -> k.equals("sjws.cp.peers") ? "a,b,c" : k.equals("sjws.cp.nodeId") ? " " : null, java.util.Map.of(),
+                null));
+        assertEquals("SJWS_CP_NODE_ID is set", SwarmModule.multiProcessReason(none,
+                java.util.Map.of("SJWS_CP_NODE_ID", "c1"), null));
+        assertEquals("SJWS_CP_PEERS is set", SwarmModule.multiProcessReason(none,
+                java.util.Map.of("SJWS_CP_PEERS", "a", "SJWS_CP_NODE_ID", ""), null));
+    }
 }

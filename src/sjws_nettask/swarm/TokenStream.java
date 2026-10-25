@@ -243,6 +243,18 @@ public final class TokenStream {
             return Offer.DELIVERED;
         }
 
+        /** True when {@code seq} was already delivered or is buffered (a re-offer would be a duplicate). */
+        public boolean has(long seq) {
+            if (seq < this.next) {
+                return true;
+            }
+            if (this.ring == null || seq - this.next >= this.ring.length) {
+                return false;
+            }
+            var h = this.ring[(int) (seq % this.ring.length)];
+            return h != null && h.chunkSeq() == seq;
+        }
+
         private void grow(long need) {
             // need <= window <= 65536 (checked by the OVERFLOW test before the call), so the long counter never overflows
             long n = this.ring.length;
