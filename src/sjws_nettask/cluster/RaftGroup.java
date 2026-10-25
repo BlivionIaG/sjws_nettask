@@ -586,6 +586,9 @@ final class RaftGroup {
     }
 
     private void startElection(long now, List<Runnable> after) {
+        if (role == Role.LEADER) {
+            failPendingWrites(after); // onTimeoutNow does not check the sender's term: a stale one reaches a leader
+        }
         if (!saveHardState(term + 1, self)) {
             // Nothing changed in memory and nothing is sent; retry after a fresh timeout.
             role = Role.FOLLOWER;
@@ -799,6 +802,9 @@ final class RaftGroup {
             }
         }
         if (role == Role.CANDIDATE || role == Role.PRE_CANDIDATE || role == Role.LEADER) {
+            if (role == Role.LEADER) {
+                failPendingWrites(after); // two leaders in one term cannot happen; keep pending empty regardless
+            }
             role = Role.FOLLOWER;
         }
         var newLeader = byWire.apply(leaderWire);
@@ -968,6 +974,9 @@ final class RaftGroup {
             }
         }
         if (role == Role.CANDIDATE || role == Role.PRE_CANDIDATE || role == Role.LEADER) {
+            if (role == Role.LEADER) {
+                failPendingWrites(after); // two leaders in one term cannot happen; keep pending empty regardless
+            }
             role = Role.FOLLOWER;
         }
         var newLeader = byWire.apply(leaderWire);
@@ -1546,26 +1555,39 @@ final class RaftGroup {
                 }
             }
             leader = null;
-            var error = notLeader();
-            // Failed on the delivery thread too, after every callback already queued for earlier entries.
-            for (var future : pending.values()) {
-                deliveries.submit(() -> future.completeExceptionally(error), future);
-            }
-            pending.clear();
-            // Read barriers waiting for a quorum round would otherwise hang (only a quorum ack as leader
-            // completed them), or complete later if this node led again (#246).
-            for (var read : reads) {
-                after.add(() -> read.completeExceptionally(error));
-            }
-            reads.clear();
-            if (membershipChange != null) {
-                var change = membershipChange;
-                membershipChange = null;
-                after.add(() -> change.completeExceptionally(error));
-            }
+            failPendingWrites(after);
             fireLeader(after);
         }
         return true;
+    }
+
+    /**
+     * Under the lock, on every way out of {@link Role#LEADER} (step-down, leadership transfer, an election started
+     * as leader, a same-term demotion): fails this leader's pending appends, its pending membership change and its
+     * waiting read barriers with {@link NotLeaderException}. That keeps {@link #pending} empty whenever this node
+     * does not lead, so the commit loop in {@link #apply} can never complete a leader-side future on a follower,
+     * where the entry at that index may since have been overwritten by another leader's (#250). The outcome is
+     * unknown, not refused: an entry already on a follower may still commit under the next leader, so callers
+     * deduplicate on retry.
+     */
+    private void failPendingWrites(List<Runnable> after) {
+        var error = notLeader();
+        // Failed on the delivery thread too, after every callback already queued for earlier entries.
+        for (var future : pending.values()) {
+            deliveries.submit(() -> future.completeExceptionally(error), future);
+        }
+        pending.clear();
+        // Read barriers waiting for a quorum round would otherwise hang (only a quorum ack as leader completed
+        // them), or complete later if this node led again (#246).
+        for (var read : reads) {
+            after.add(() -> read.completeExceptionally(error));
+        }
+        reads.clear();
+        if (membershipChange != null) {
+            var change = membershipChange;
+            membershipChange = null;
+            after.add(() -> change.completeExceptionally(error));
+        }
     }
 
     private void fireLeader(List<Runnable> after) {
@@ -2075,6 +2097,9 @@ final class RaftGroup {
                 rpc.send(target, new SimTransport.Frame(groupId, TIMEOUT_NOW, body.array()));
                 role = Role.FOLLOWER;
                 leader = null;
+                // Like stepDown: without this the futures stayed pending and a later commit at their index (another
+                // leader's entry) completed them as committed (#250).
+                failPendingWrites(after);
                 long now = clock.nanoTime();
                 long wait = options.leaseNanos() + options.electionTimeout().toNanos();
                 long failback = options.failbackHysteresis().toNanos();
