@@ -1,0 +1,65 @@
+name: diag-265
+# Temporary diagnostics for issue #265 (sendfile CPU-spin checks). Not for merge.
+on:
+  push:
+    branches: ['diag/265-**']
+permissions:
+  contents: read
+jobs:
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with: {distribution: temurin, java-version: '25', cache: maven}
+      - name: Environment
+        run: |
+          uname -a; head -3 /etc/os-release; nproc; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Hypervisor' || true
+          cat /sys/fs/cgroup/cpu.max 2>/dev/null || true; cat /proc/self/cgroup; java -version 2>&1
+          sysctl net.ipv4.tcp_wmem net.ipv4.tcp_rmem net.core.wmem_max net.core.rmem_max || true
+          free -m; df -m /tmp
+      - name: Apply diag patch and compile
+        run: git apply .github/diag265/diag265.patch && mvn -B -q -Djacoco.skip=true test-compile
+      - name: The two spin checks x30 (no extra load)
+        run: |
+          fails=0
+          for i in $(seq 30); do
+            mvn -B -o -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test > out.txt 2>&1 || fails=$((fails+1))
+            grep -E 'DIAG265|no spin' out.txt | cut -c1-600
+          done
+          echo "FAILED_RUNS=$fails/30"
+      - name: Same with one unrelated busy thread in the JVM (expected to fail)
+        run: |
+          DIAG265_HOG=1 mvn -B -o -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test 2>&1 | grep -E 'DIAG265|no spin|Tests run' | cut -c1-600 || true
+      - name: strace sendfile/splice syscalls over both tests
+        run: |
+          sudo apt-get install -y -q strace >/dev/null 2>&1 || true
+          strace -f -c -e trace=sendfile,splice,pread64,write,writev -o strace.txt mvn -B -o -Djacoco.skip=true -Dtest='Http1TransportTest#fileShrinking*' surefire:test > out.txt 2>&1 || true
+          grep -E 'DIAG265|no spin|Tests run' out.txt | cut -c1-600; cat strace.txt
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+        ref: [8fdf93df, 4452ac19af6d64accef2d9cf9f20ccc717bdbc6e]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with: {path: diag}
+      - uses: actions/checkout@v7
+        with: {path: src, ref: '${{ matrix.ref }}', fetch-depth: 0}
+      - uses: actions/setup-java@v6
+        with: {distribution: temurin, java-version: '25', cache: maven, cache-dependency-path: src/pom.xml}
+      - name: Full verify with diagnostics (failures ignored; read the DIAG265 lines)
+        working-directory: src
+        run: |
+          uname -r; nproc; git log -1 --oneline
+          git apply ../diag/.github/diag265/diag265.patch
+          mvn -B verify -Dmaven.test.failure.ignore=true > verify.txt 2>&1 || true
+          grep -E 'DIAG265|no spin|Tests run:.*Fail.*in |Total time' verify.txt | grep -vE 'Failures: 0, Errors: 0' | cut -c1-2000

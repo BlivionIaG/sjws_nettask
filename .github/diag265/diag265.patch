@@ -1,0 +1,151 @@
+diff --git a/src/sjws_nettask/ChannelOutput.java b/src/sjws_nettask/ChannelOutput.java
+index 426b732..601f215 100644
+--- a/src/sjws_nettask/ChannelOutput.java
++++ b/src/sjws_nettask/ChannelOutput.java
+@@ -51,6 +51,14 @@ final class ChannelOutput extends OutputStream implements Http1Writer.FileSink,
+     /** Zero-byte file reads in a row (not expected on a regular file) before giving up. */
+     static final int MAX_STALLS = 3;
+ 
++    // #265 diagnostics only
++    static final java.util.concurrent.atomic.LongAdder D_CALLS = new java.util.concurrent.atomic.LongAdder();
++    static final java.util.concurrent.atomic.LongAdder D_ZERO = new java.util.concurrent.atomic.LongAdder();
++    static final java.util.concurrent.atomic.LongAdder D_SLICES = new java.util.concurrent.atomic.LongAdder();
++    static final java.util.concurrent.atomic.LongAdder D_SHRANK = new java.util.concurrent.atomic.LongAdder();
++    static void diagReset() { D_CALLS.reset(); D_ZERO.reset(); D_SLICES.reset(); D_SHRANK.reset(); }
++    static String diag() { return "transferTo=" + D_CALLS.sum() + " zeroReturns=" + D_ZERO.sum() + " slices=" + D_SLICES.sum() + " shrank=" + D_SHRANK.sum(); }
++
+     private final SocketChannel channel;
+     private final ConnectionReaper.Timer timer;
+ 
+@@ -145,12 +153,15 @@ final class ChannelOutput extends OutputStream implements Http1Writer.FileSink,
+         while (pos < end) {
+             this.timer.writing();
+             long n = source.transferTo(pos, Math.min(TRANSFER_CHUNK, end - pos), this.channel);
++            D_CALLS.increment();
+             if (n > 0) {
+                 pos += n;
+                 stalls = 0;
+                 continue;
+             }
++            D_ZERO.increment();
+             if (source.size() <= pos) {
++                D_SHRANK.increment();
+                 throw shrank(pos - position, count);
+             }
+             if (slice == null) {
+@@ -168,6 +179,7 @@ final class ChannelOutput extends OutputStream implements Http1Writer.FileSink,
+                 continue;
+             }
+             slice.flip();
++            D_SLICES.increment();
+             while (slice.hasRemaining()) {
+                 this.timer.writing();
+                 this.channel.write(slice); // parks until the socket is writable
+diff --git a/tests/sjws_nettask/DiagCpu.java b/tests/sjws_nettask/DiagCpu.java
+new file mode 100644
+index 0000000..1282d5a
+--- /dev/null
++++ b/tests/sjws_nettask/DiagCpu.java
+@@ -0,0 +1,64 @@
++package sjws_nettask;
++
++import java.lang.management.ManagementFactory;
++import java.util.HashMap;
++import java.util.Map;
++
++/** Issue #265 diagnostics: per-thread CPU deltas over a window (platform threads only). */
++final class DiagCpu {
++    private final Map<Long, Long> start = new HashMap<>();
++    private final Map<Long, String> names = new HashMap<>();
++    private final long proc0;
++
++    private static volatile boolean hogsStarted;
++    static volatile long sink;
++
++    /** -Ddiag265.hog=N: N busy daemon threads, standing in for unrelated CPU load in the shared test JVM. */
++    private static synchronized void hogs() {
++        String e = System.getenv("DIAG265_HOG"); int n = e == null ? Integer.getInteger("diag265.hog", 0) : Integer.parseInt(e);
++        if (hogsStarted || n <= 0) return;
++        hogsStarted = true;
++        for (int i = 0; i < n; i++) {
++            var t = new Thread(() -> { long x = 0; while (true) { x++; if ((x & 0xffffff) == 0) sink = x; } }, "diag-hog-" + i);
++            t.setDaemon(true);
++            t.start();
++        }
++    }
++
++    DiagCpu() {
++        hogs();
++        var mx = ManagementFactory.getThreadMXBean();
++        for (var info : mx.dumpAllThreads(false, false)) {
++            start.put(info.getThreadId(), mx.getThreadCpuTime(info.getThreadId()));
++            names.put(info.getThreadId(), info.getThreadName());
++        }
++        proc0 = ((com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean()).getProcessCpuTime();
++    }
++
++    String report(String label) {
++        var mx = ManagementFactory.getThreadMXBean();
++        long proc = ((com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean()).getProcessCpuTime() - proc0;
++        var sb = new StringBuilder("DIAG265 ").append(label).append(" proc=").append(proc / 1_000_000).append("ms");
++        long sum = 0;
++        var rows = new java.util.ArrayList<String>();
++        var groups = new java.util.TreeMap<String, Long>();
++        for (var info : mx.dumpAllThreads(false, false)) {
++            long id = info.getThreadId();
++            long now = mx.getThreadCpuTime(id);
++            if (now < 0) continue;
++            long d = now - start.getOrDefault(id, 0L);
++            sum += d;
++            String g = info.getThreadName().replaceAll("[0-9]+", "#");
++            groups.merge(g, d, Long::sum);
++            if (d > 5_000_000) rows.add(String.format("%s=%dms", info.getThreadName(), d / 1_000_000));
++        }
++        sb.append(" javaThreads=").append(sum / 1_000_000).append("ms (rest = GC/JIT/VM threads)");
++        sb.append(" threadCount=").append(mx.getThreadCount());
++        sb.append(" top=").append(rows);
++        var g = new java.util.ArrayList<>(groups.entrySet());
++        g.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
++        sb.append(" groups=").append(g.subList(0, Math.min(8, g.size())));
++        sb.append(" ").append(ChannelOutput.diag());
++        return sb.toString();
++    }
++}
+diff --git a/tests/sjws_nettask/Http1TransportTest.java b/tests/sjws_nettask/Http1TransportTest.java
+index 24fc788..1e83418 100644
+--- a/tests/sjws_nettask/Http1TransportTest.java
++++ b/tests/sjws_nettask/Http1TransportTest.java
+@@ -308,6 +308,8 @@ class Http1TransportTest {
+             try (var w = FileChannel.open(file, StandardOpenOption.WRITE)) {
+                 w.truncate(1024 * 1024);
+             }
++            var diag = new DiagCpu();
++            ChannelOutput.diagReset();
+             long cpu0 = cpuNanos();
+             long t0 = System.nanoTime();
+             long got = 1024 * 1024;
+@@ -324,6 +326,7 @@ class Http1TransportTest {
+             Thread.sleep(500); // a spinning sender would burn a core here
+             long wall = System.nanoTime() - t0;
+             long cpu = cpuNanos() - cpu0;
++            System.out.println(diag.report("wall=" + wall / 1_000_000 + "ms got=" + got));
+             assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
+         }
+         assertEquals(0, manager.reaper().tracked());
+@@ -383,6 +386,8 @@ class Http1TransportTest {
+             try (var w = FileChannel.open(file, StandardOpenOption.WRITE)) {
+                 w.truncate(from + 2 * 1024 * 1024); // inside the range
+             }
++            var diag = new DiagCpu();
++            ChannelOutput.diagReset();
+             long cpu0 = cpuNanos();
+             long t0 = System.nanoTime();
+             long got = first.length;
+@@ -399,6 +404,7 @@ class Http1TransportTest {
+             Thread.sleep(500);
+             long wall = System.nanoTime() - t0;
+             long cpu = cpuNanos() - cpu0;
++            System.out.println(diag.report("wall=" + wall / 1_000_000 + "ms got=" + got));
+             assertTrue(cpu < wall / 2, "no spin: cpu " + cpu / 1_000_000 + " ms over " + wall / 1_000_000 + " ms");
+         }
+         assertEquals(0, manager.reaper().writeExpirations(), "ended by shrink detection");
