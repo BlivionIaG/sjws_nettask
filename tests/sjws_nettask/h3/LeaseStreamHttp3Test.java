@@ -111,9 +111,10 @@ class LeaseStreamHttp3Test {
             for (int i = 0; i < 256; i++) { // at most 64 open sessions per agent
                 assertEquals(201, mount.submit("gen", true, "a" + i / 64));
             }
-            var quic = client.connect(new InetSocketAddress("127.0.0.1", server.udpPort()));
+            // the answer's field section is about 9 KiB: above Netty's 8 KiB client default, so advertise 64 KiB
+            var quic = client.connect(new InetSocketAddress("127.0.0.1", server.udpPort()), 64 * 1024);
             var r = post(quic, "/swarm/v1/tasks/gen:claim?visibilityMs=60000&max=256", new byte[0]);
-            assertEquals(200, r.status());
+            assertEquals(200, r.status(), () -> "reset=" + r.reset() + " error=" + r.error());
             assertEquals(256, leaseIds(r.body()).size());
             assertEquals(1, r.headerNames().stream().filter("sjws-lease-stream"::equals).count(), "one field");
             var v = r.header("sjws-lease-stream");

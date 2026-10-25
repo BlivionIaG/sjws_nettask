@@ -110,6 +110,20 @@ final class H3TestClient implements AutoCloseable {
         return quic;
     }
 
+    /**
+     * Like {@link #connect(InetSocketAddress)}, advertising SETTINGS_MAX_FIELD_SECTION_SIZE = {@code maxFieldSection}
+     * (Netty's client default is 8 KiB, below a {@code max=256} claim's {@code sjws-lease-stream}).
+     */
+    QuicChannel connect(InetSocketAddress server, long maxFieldSection) throws Exception {
+        var settings = new io.netty.handler.codec.http3.DefaultHttp3SettingsFrame();
+        settings.put(io.netty.handler.codec.http3.Http3SettingsFrame.HTTP3_SETTINGS_MAX_FIELD_SECTION_SIZE, maxFieldSection);
+        var quic = QuicChannel.newBootstrap(this.datagram)
+                .handler(new Http3ClientConnectionHandler(null, null, null, settings, true))
+                .remoteAddress(server).localAddress(this.datagram.localAddress()).connect().get(10, TimeUnit.SECONDS);
+        this.connections.add(quic);
+        return quic;
+    }
+
     QuicChannel connect(InetSocketAddress server) throws Exception {
         var quic = QuicChannel.newBootstrap(this.datagram).handler(new Http3ClientConnectionHandler())
                 .remoteAddress(server).localAddress(this.datagram.localAddress()).connect().get(10, TimeUnit.SECONDS);
