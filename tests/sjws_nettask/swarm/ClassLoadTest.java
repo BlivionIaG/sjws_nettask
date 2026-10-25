@@ -176,6 +176,54 @@ class ClassLoadTest {
     }
 
     @Test
+    void streamOnCreditOffLoadsNoBudgetClass() throws Exception {
+        // S2c PR 6b (#267 §8): the node budget exists only under credit; budget settings are not even read
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+                "-Dsjws.swarm.stream.budget.bytes=not-a-number"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.StreamHttp "), text);
+        assertFalse(text.contains("sjws_nettask.swarm.StreamBudget"), text);
+        assertFalse(text.contains("stream budget"), text);
+    }
+
+    @Test
+    void creditFlagWithoutTheStreamFlagLoadsNoBudgetClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.credit.enabled=true"), "Server started:",
+                401, "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertFalse(text.contains("sjws_nettask.swarm.StreamBudget"), text);
+        assertFalse(text.contains("stream budget"), text);
+    }
+
+    @Test
+    void creditOnLoadsTheBudgetAndLogsItsSize() throws Exception {
+        // #267 Q1: budget = min(bytes, 0.25 x maxMemory), one log line; G1 reports maxMemory == -Xmx
+        var text = run(List.of("-Xmx256m", "-XX:+UseG1GC", "-Dsjws.swarm.enabled=true",
+                "-Dsjws.swarm.stream.enabled=true", "-Dsjws.swarm.stream.credit.enabled=true"), "Server started:", 401,
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.StreamBudget "), text);
+        assertTrue(text.contains("swarm: stream budget 64 MiB (0.25 of heap 256 MiB), soft 0.75, admit 0.9"), text);
+    }
+
+    @Test
+    void creditOnWithABudgetBelowTheFloorRefusesToStart() throws Exception {
+        // #267 Q1: below one session's floor plus tickets the process does not start (OptionalModule.Refused)
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+                "-Dsjws.swarm.stream.credit.enabled=true", "-Dsjws.swarm.stream.budget.bytes=1048576"), "Error:",
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("is below one session's floor"), text);
+        assertFalse(text.contains("Server started:"), text);
+    }
+
+    @Test
+    void creditOnWithAMalformedBudgetRefusesToStart() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+                "-Dsjws.swarm.stream.credit.enabled=true", "-Dsjws.swarm.stream.budget.heapFraction=1.5"), "Error:",
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws.swarm.stream.budget.heapFraction"), text);
+        assertFalse(text.contains("Server started:"), text);
+    }
+
+    @Test
     void streamFlagWithoutSwarmLoadsNothing() throws Exception {
         var text = run(List.of("-Dsjws.swarm.stream.enabled=true"), "Server started:", 404, "sjws_nettask.Sjws_nettask",
                 "--config=" + yaml());
