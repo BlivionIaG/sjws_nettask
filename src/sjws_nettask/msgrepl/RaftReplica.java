@@ -127,6 +127,9 @@ final class RaftReplica implements Replica {
      * that are already in the ledger are fed to {@code onApplied} again (not to the ledger). MAX_VALUE: none.
      */
     private long stateFrom = Long.MAX_VALUE;
+    /** A {@link ReplicaHooks.ReplicatedState} is attached: applies and its capture share {@link #applyLock}. */
+    private final boolean stateful;
+    private final java.util.concurrent.locks.ReentrantLock applyLock = new java.util.concurrent.locks.ReentrantLock();
     /** Set while the group opens when the restored snapshot needs an install; run once the group is open. */
     private MsgSnapshot openInstall;
     private volatile CompletableFuture<Void> installing;
@@ -169,6 +172,7 @@ final class RaftReplica implements Replica {
         this.log = local.log();
         this.defaultMode = defaultMode;
         this.hooks = hooks;
+        this.stateful = hooks != null && hooks.state() != null;
         this.onApplied = hooks != null ? hooks.onApplied() : onApplied;
         this.urls = urls;
         this.snaps = snaps;
@@ -347,7 +351,12 @@ final class RaftReplica implements Replica {
             b.get(r);
             records.add(r);
         }
-        this.onApplied.accept(records);
+        this.applyLock.lock();
+        try {
+            this.onApplied.accept(records);
+        } finally {
+            this.applyLock.unlock();
+        }
     }
 
     static ByteBuffer encodeRetain(long offset, long term, int origin, long seq) {
@@ -393,7 +402,17 @@ final class RaftReplica implements Replica {
             long index = e.index(), term = e.term();
             if (base + count <= this.skipTo) { // in the ledger already: a crash lost the stamp, not the records
                 this.appliedIndex = index;
-                applied(index, term, base + count);
+                if (this.stateful) {
+                    this.applyLock.lock();
+                    try {
+                        this.onApplied.accept(records); // the state must see it again; the ledger has it already
+                        applied(index, term, base + count);
+                    } finally {
+                        this.applyLock.unlock();
+                    }
+                } else {
+                    applied(index, term, base + count);
+                }
                 if (mine != null) mine.complete(base);
                 return;
             }
@@ -402,8 +421,18 @@ final class RaftReplica implements Replica {
             f.whenComplete((at, err) -> {
                 if (err == null) {
                     this.appliedIndex = index;
-                    this.onApplied.accept(records);
-                    applied(index, term, at + count);
+                    if (this.stateful) { // the state image and its index are read together under this lock
+                        this.applyLock.lock();
+                        try {
+                            this.onApplied.accept(records);
+                            applied(index, term, at + count);
+                        } finally {
+                            this.applyLock.unlock();
+                        }
+                    } else {
+                        this.onApplied.accept(records);
+                        applied(index, term, at + count);
+                    }
                     if (mine != null) mine.complete(at);
                 } else if (mine != null) {
                     mine.completeExceptionally(err);
@@ -520,16 +549,35 @@ final class RaftReplica implements Replica {
         }
     }
 
-    /** Takes the snapshot at {@code a} now (also tests). */
-    boolean snapshotAt(Applied a) throws IOException {
+    /**
+     * Takes a snapshot now at the newest applied point (at or past {@code seen}; also tests). With a replicated state,
+     * the point and the state image are read together under the apply lock, so the image is the state right after
+     * the point's batch, never one with later batches in it (#278's constraint).
+     */
+    boolean snapshotAt(Applied seen) throws IOException {
+        Applied a;
+        List<MsgSnapshot.Section> sections = List.of();
+        if (this.stateful) {
+            this.applyLock.lock();
+            try {
+                a = this.lastApplied;
+                if (a == null || a.index() <= this.recordedIndex) return false;
+                var st = this.hooks.state();
+                sections = List.of(new MsgSnapshot.Section(st.section(), 0, st.snapshotState()));
+            } finally {
+                this.applyLock.unlock();
+            }
+        } else {
+            a = this.lastApplied;
+            if (a == null) a = seen;
+        }
         if (a.index() <= this.recordedIndex) return false; // nothing new since the last one (or the one restored)
         // Constraint 1: the snapshot point must be durable in the segments, not only applied.
         if (this.local.snapshot().durableOffset() < a.end()) {
             this.log.force();
             if (this.log.nextOffset() < a.end()) return false; // not written yet (cannot happen: a is published after the write)
         }
-        var state = this.hooks != null && this.hooks.state() != null ? this.hooks.state().snapshotState() : null;
-        var m = this.snaps.store.pin(this.topic, this.log, a.index(), a.term(), a.end(), this.logStart, state,
+        var m = this.snaps.store.pin(this.topic, this.log, a.index(), a.term(), a.end(), this.logStart, sections,
                 this.snaps.settings.chunkBytes());
         if (m == null) return false;
         fault("snapshot-pinned");
@@ -602,7 +650,7 @@ final class RaftReplica implements Replica {
         this.appliedIndex = Math.max(this.appliedIndex, m.index());
         applied(m.index(), m.term(), m.endOffset());
         if (this.hooks != null && this.hooks.state() != null) {
-            this.hooks.state().restoreState(m.state());
+            restoreState(m);
             this.stateFrom = m.index();
         }
     }
@@ -665,7 +713,7 @@ final class RaftReplica implements Replica {
             this.appliedIndex = Math.max(this.appliedIndex, got.index());
             this.lastApplied = new Applied(got.index(), got.term(), got.endOffset());
             resetStamps(got.index(), got.term(), got.endOffset(), Long.MAX_VALUE);
-            if (this.hooks.state() != null) this.hooks.state().restoreState(got.state());
+            if (this.hooks.state() != null) restoreState(got);
             this.hooks.reloaded().run();
             Files.deleteIfExists(this.installMarker);
             SnapshotStore.deleteTree(this.staging);
@@ -677,6 +725,18 @@ final class RaftReplica implements Replica {
             this.installPending = true;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Restores the state's section of {@code m} (empty when the snapshot has none: a state that did not exist then). */
+    private void restoreState(MsgSnapshot m) {
+        var st = this.hooks.state();
+        var d = m.section(st.section());
+        this.applyLock.lock();
+        try {
+            st.restoreState(d == null ? new byte[0] : d);
+        } finally {
+            this.applyLock.unlock();
         }
     }
 

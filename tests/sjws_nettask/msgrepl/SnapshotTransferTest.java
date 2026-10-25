@@ -58,7 +58,8 @@ class SnapshotTransferTest {
         for (int i = 0; i < batches; i++) log.append(List.of(("r" + i + "-" + "y".repeat(200)).getBytes(StandardCharsets.UTF_8)), i);
         log.force();
         store = new SnapshotStore(dir.resolve("snap"));
-        pinned = store.pin("t", log, 7, 2, log.nextOffset(), 0, "state".getBytes(StandardCharsets.UTF_8), MsgSnapshot.MIN_CHUNK);
+        pinned = store.pin("t", log, 7, 2, log.nextOffset(), 0,
+                List.of(new MsgSnapshot.Section(MsgSnapshot.APP_STATE, 0, "state".getBytes(StandardCharsets.UTF_8))), MsgSnapshot.MIN_CHUNK);
         assertNotNull(pinned);
         server = new SnapshotTransfer.Server(new InetSocketAddress("127.0.0.1", 0), KEY, previous, store, bytesPerSecond, now::get);
     }
@@ -160,7 +161,7 @@ class SnapshotTransferTest {
         }
         assertEquals(k, server.refused.get());
         assertThrows(IllegalArgumentException.class, () -> MsgSnapshot.decode(new MsgSnapshot("../x", 1, 1, 0, 0,
-                MsgSnapshot.MIN_CHUNK, null, List.of(new MsgSnapshot.Seg(0, 0, 0, -1, new byte[0][]))).encode()));
+                MsgSnapshot.MIN_CHUNK, new byte[0], List.of(new MsgSnapshot.Seg(0, 0, 0, -1, new byte[0][]))).encode()));
     }
 
     @Test

@@ -534,8 +534,8 @@ files). Classes: `msgrepl.RaftReplica` (taker, install, retention), `MsgSnapshot
 
 **What the snapshot is.** The consensus image is a small `MsgSnapshot` manifest, recorded with
 `SnapshotControl.recordSnapshot` (the group's own taker stays off). It names the snapshot point
-`(index, term)`, the ledger offset `endOffset` right after it, the replicated log start, an optional
-application-state section, and for each segment file from the log start to `endOffset` its byte length at the
+`(index, term)`, the ledger offset `endOffset` right after it, the replicated log start, a list of typed state
+sections, and for each segment file from the log start to `endOffset` its byte length at the
 point, its compaction marker and one SHA-256 per chunk. The data stays in the topic's segments; nothing is
 copied into the Raft log.
 
@@ -604,9 +604,15 @@ point.
 
 **Producer dedup and offsets (constraint 2).** Consumer offsets live in `__offsets`, whose segments are
 snapshotted and installed like any topic; `LogOffsets.reload` rebuilds the map from them after an install.
-Producer dedup state for replicated topics does not exist yet (M2). The manifest carries its
-`ReplicaHooks.ReplicatedState` section (`snapshotState` / `restoreState`), and the tests use a dedup table
-through it: a duplicate is still recognised after truncation, a restart, or an install.
+Producer dedup state for replicated topics is not on master yet (Messaging Core's `ProducerTable`, #278). The
+manifest format is versioned (`"MSN1"`, version byte 1) and carries a list of sections `(id:u16, flags:u8,
+len:int, bytes)`: id 1 is the replica's `ReplicaHooks.ReplicatedState`, id 2 is reserved for the producer table
+in its own versioned `ProducerTable.write/read` encoding. A decoder skips a section it does not know unless the
+section is flagged REQUIRED, in which case it refuses the snapshot. A section is captured at the snapshot index
+exactly: the replica runs `onApplied` and the capture under one apply lock (only when a state is attached), and
+restores the section before the next entry applies (on restart before the tail replays, on install before the
+first entry after the snapshot). The tests use a dedup table through section 1: a duplicate is still recognised
+after truncation, a restart, or an install. The #278 integration is a `ReplicatedState` whose `section()` is 2.
 
 **Witness (constraint 6).** Unchanged: it stores no entries, never receives snapshots (the leader never
 sends one to a witness), and keeps only its hard state (term, vote) and its vote cursor (index and term of the

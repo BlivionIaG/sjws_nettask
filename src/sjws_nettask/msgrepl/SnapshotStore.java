@@ -142,7 +142,7 @@ final class SnapshotStore {
      * only once all of it is durable. Null when the log no longer holds what the snapshot needs (a segment was deleted
      * meanwhile): the caller tries again later.
      */
-    MsgSnapshot pin(String topic, SegmentedLog log, long index, long term, long endOffset, long logStart, byte[] state,
+    MsgSnapshot pin(String topic, SegmentedLog log, long index, long term, long endOffset, long logStart, List<MsgSnapshot.Section> sections,
             int chunkBytes) throws IOException {
         var dir = root.resolve(topic);
         Files.createDirectories(dir);
@@ -187,7 +187,7 @@ final class SnapshotStore {
                 Files.createFile(tmp.resolve(name(endOffset)));
                 segs.add(new MsgSnapshot.Seg(endOffset, endOffset, 0, -1, new byte[0][]));
             }
-            var snap = new MsgSnapshot(topic, index, term, endOffset, Math.min(logStart, endOffset), chunkBytes, state, segs);
+            var snap = new MsgSnapshot(topic, index, term, endOffset, Math.min(logStart, endOffset), chunkBytes, sections, segs);
             var manifest = snap.encode();
             try (var ch = FileChannel.open(tmp.resolve(MANIFEST), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
                 var b = ByteBuffer.wrap(manifest);

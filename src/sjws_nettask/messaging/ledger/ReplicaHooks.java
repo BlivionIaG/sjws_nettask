@@ -46,13 +46,25 @@ public record ReplicaHooks(Consumer<List<byte[]>> onApplied, LongConsumer dropBe
 
     /**
      * State a partition keeps outside its records that a snapshot must carry once the consensus log behind it is
-     * truncated (constraint 2 of #270): producer dedup (producerId, epoch, last seq). The replica captures it right
-     * after an applied batch and restores it with a snapshot; entries after the capture point are then applied again,
-     * so {@link #restoreState} plus re-applying them must give the same state (true of a last-seq-per-producer table).
+     * truncated (constraint 2 of #270): producer dedup (producerId, epoch, last seq). The replica calls
+     * {@code onApplied} and captures this state under one apply lock, so an image is exactly the state after the
+     * snapshot index's batch; it is restored before the next entry applies (restart, or install). On restart, entries
+     * after the snapshot that are already in the ledger are fed to {@code onApplied} again, so
+     * {@link #restoreState} plus re-applying them must give the same state (true of a last-seq-per-producer table).
      */
     public interface ReplicatedState {
 
-        /** The current state, serialized. Called on the thread that applies batches. */
+        /** Snapshot section for the replica's general application state. */
+        int APP_STATE = 1;
+        /** Snapshot section reserved for the producer dedup table (#278, its own versioned encoding). */
+        int PRODUCERS = 2;
+
+        /** The snapshot section this state is stored in: {@link #APP_STATE} unless overridden. */
+        default int section() {
+            return APP_STATE;
+        }
+
+        /** The current state, serialized. Called under the replica's apply lock: keep it fast (it delays applies). */
         byte[] snapshotState();
 
         /** Replace the state with a {@link #snapshotState} image (snapshot restore or install). */

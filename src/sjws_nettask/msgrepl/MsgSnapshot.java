@@ -34,19 +34,75 @@ import java.util.regex.Pattern;
  * after that entry, fsynced on the node that took it (constraint 1: the fsynced point, not the applied one). This
  * (index, term) to offset mapping is the durable one: it travels in the consensus snapshot file.
  * <li>{@code logStart}: the replicated log start (constraint 3); an installing follower keeps nothing below it.
- * <li>{@code state}: application state that must survive truncation (constraint 2: producer dedup), or empty.
+ * <li>{@code sections}: application state that must survive truncation (constraint 2), as a list of typed sections
+ * captured at {@code index} exactly and restored before the entry after it applies. {@link #APP_STATE} is the
+ * replica's {@code ReplicatedState}; {@link #PRODUCERS} is reserved for Messaging Core's producer table (#278, its
+ * own versioned encoding). A section a decoder does not know is skipped, unless it is marked {@link #REQUIRED}: then
+ * the snapshot is refused rather than installed without it.
  * <li>{@code segments}: the segment files from the one holding {@code logStart} to the one holding {@code endOffset},
  * each with its byte length at the snapshot point, its compaction marker, and a SHA-256 per {@code chunkBytes} chunk.
  * A compacted file ships as the leader has it (constraint 4); the receiver checks each chunk against these digests,
  * never against its own files.
  * </ul>
  *
- * Wire layout (big-endian): {@code "MSN1" topic(len:u8, utf8) index term endOffset logStart chunkBytes:int
- * state(len:int, bytes) segments:int (base next bytes markerNext digests:int sha256*)}. Decoding bounds every count and
+ * Wire layout (big-endian): {@code "MSN1" version:u8(=1) topic(len:u8, utf8) index term endOffset logStart
+ * chunkBytes:int sections:int (id:u16 flags:u8 len:int bytes)* segments:int (base next bytes markerNext digests:int
+ * sha256*)}. A later version may append fields; a decoder refuses a version it does not know. Decoding bounds every count and
  * length before allocating, and rejects a topic name that is not a plain topic name.
  */
-record MsgSnapshot(String topic, long index, long term, long endOffset, long logStart, int chunkBytes, byte[] state,
-        List<Seg> segments) {
+record MsgSnapshot(String topic, long index, long term, long endOffset, long logStart, int chunkBytes,
+        List<Section> sections, List<Seg> segments) {
+
+    static final byte VERSION = 1;
+    /** Section id: the replica's {@code ReplicaHooks.ReplicatedState} image. */
+    static final int APP_STATE = 1;
+    /** Section id reserved for the producer dedup table (Messaging Core, #278). */
+    static final int PRODUCERS = 2;
+    /** Section flag: a decoder that does not know the id must refuse the snapshot. */
+    static final int REQUIRED = 1;
+    static final int MAX_SECTIONS = 64;
+
+    /** One typed state section; ids are unique within a snapshot. */
+    record Section(int id, int flags, byte[] data) {
+        Section {
+            if (id < 1 || id > 0xFFFF || flags < 0 || flags > 0xFF) throw new IllegalArgumentException("bad section " + id);
+            data = data == null ? new byte[0] : data;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Section x && id == x.id && flags == x.flags && Arrays.equals(data, x.data);
+        }
+
+        @Override
+        public int hashCode() {
+            return id * 31 + Arrays.hashCode(data);
+        }
+    }
+
+    /** Ids this build understands. */
+    static boolean known(int id) {
+        return id == APP_STATE || id == PRODUCERS;
+    }
+
+    /** With {@code state} as the {@link #APP_STATE} section (none when null or empty). */
+    MsgSnapshot(String topic, long index, long term, long endOffset, long logStart, int chunkBytes, byte[] state,
+            List<Seg> segments) {
+        this(topic, index, term, endOffset, logStart, chunkBytes,
+                state == null || state.length == 0 ? List.of() : List.of(new Section(APP_STATE, 0, state)), segments);
+    }
+
+    /** The section's bytes, or null when absent. */
+    byte[] section(int id) {
+        for (var x : sections) if (x.id() == id) return x.data();
+        return null;
+    }
+
+    /** The {@link #APP_STATE} section, or empty. */
+    byte[] state() {
+        var d = section(APP_STATE);
+        return d == null ? new byte[0] : d;
+    }
 
     static final int MAGIC = 0x4D534E31; // "MSN1"
     static final int SHA = 32;
@@ -81,8 +137,14 @@ record MsgSnapshot(String topic, long index, long term, long endOffset, long log
 
     MsgSnapshot {
         Objects.requireNonNull(topic, "topic");
-        state = state == null ? new byte[0] : state;
+        sections = List.copyOf(sections);
         segments = List.copyOf(segments);
+        if (sections.size() > MAX_SECTIONS) throw new IllegalArgumentException("too many sections");
+        for (int i = 0; i < sections.size(); i++) {
+            for (int k = 0; k < i; k++) {
+                if (sections.get(k).id() == sections.get(i).id()) throw new IllegalArgumentException("duplicate section " + sections.get(i).id());
+            }
+        }
     }
 
     static int chunks(long bytes, int chunkBytes) {
@@ -91,12 +153,15 @@ record MsgSnapshot(String topic, long index, long term, long endOffset, long log
 
     byte[] encode() {
         var t = topic.getBytes(StandardCharsets.UTF_8);
-        long size = 4 + 1 + t.length + 8 * 4 + 4 + 4 + state.length + 4;
+        long size = 4 + 1 + 1 + t.length + 8 * 4 + 4 + 4 + 4;
+        for (var x : sections) size += 2 + 1 + 4 + x.data().length;
         for (var s : segments) size += 8 * 4 + 4 + (long) SHA * s.digests.length;
         if (size > Integer.MAX_VALUE - 8) throw new IllegalStateException("snapshot image too large");
         var b = ByteBuffer.allocate((int) size);
-        b.putInt(MAGIC).put((byte) t.length).put(t).putLong(index).putLong(term).putLong(endOffset).putLong(logStart)
-                .putInt(chunkBytes).putInt(state.length).put(state).putInt(segments.size());
+        b.putInt(MAGIC).put(VERSION).put((byte) t.length).put(t).putLong(index).putLong(term).putLong(endOffset)
+                .putLong(logStart).putInt(chunkBytes).putInt(sections.size());
+        for (var x : sections) b.putShort((short) x.id()).put((byte) x.flags()).putInt(x.data().length).put(x.data());
+        b.putInt(segments.size());
         for (var s : segments) {
             b.putLong(s.base).putLong(s.next).putLong(s.bytes).putLong(s.markerNext).putInt(s.digests.length);
             for (var d : s.digests) b.put(d);
@@ -109,6 +174,8 @@ record MsgSnapshot(String topic, long index, long term, long endOffset, long log
         try {
             var b = ByteBuffer.wrap(image);
             if (b.getInt() != MAGIC) throw new IllegalArgumentException("not a messaging snapshot");
+            int version = b.get();
+            if (version != VERSION) throw new IllegalArgumentException("unknown snapshot version " + version);
             int tl = b.get() & 0xFF;
             var tb = new byte[tl];
             b.get(tb);
@@ -120,10 +187,25 @@ record MsgSnapshot(String topic, long index, long term, long endOffset, long log
             int chunk = b.getInt();
             if (index < 0 || term < 0 || end < 0 || start < 0 || start > end) throw new IllegalArgumentException("bad snapshot point");
             if (chunk < MIN_CHUNK || chunk > MAX_CHUNK) throw new IllegalArgumentException("bad chunk size " + chunk);
-            int sl = b.getInt();
-            if (sl < 0 || sl > MAX_STATE || sl > b.remaining()) throw new IllegalArgumentException("bad state length");
-            var state = new byte[sl];
-            b.get(state);
+            int ns = b.getInt();
+            if (ns < 0 || ns > MAX_SECTIONS) throw new IllegalArgumentException("bad section count");
+            var sections = new ArrayList<Section>(ns);
+            long total = 0;
+            for (int i = 0; i < ns; i++) {
+                int id = b.getShort() & 0xFFFF, flags = b.get() & 0xFF, len = b.getInt();
+                total += Math.max(0, len);
+                if (len < 0 || len > MAX_STATE || total > MAX_STATE || len > b.remaining()) {
+                    throw new IllegalArgumentException("bad state length in section " + id);
+                }
+                var data = new byte[len];
+                b.get(data);
+                if (!known(id)) {
+                    if ((flags & REQUIRED) != 0) throw new IllegalArgumentException("unknown required section " + id);
+                    continue; // a newer writer's optional state: skipped
+                }
+                for (var x : sections) if (x.id() == id) throw new IllegalArgumentException("duplicate section " + id);
+                sections.add(new Section(id, flags, data));
+            }
             int n = b.getInt();
             if (n < 1 || n > MAX_SEGMENTS || (long) n * 36 > b.remaining()) throw new IllegalArgumentException("bad segment count");
             var segs = new ArrayList<Seg>(n);
@@ -148,7 +230,7 @@ record MsgSnapshot(String topic, long index, long term, long endOffset, long log
             if (segs.getFirst().base > start || segs.getLast().next != end) {
                 throw new IllegalArgumentException("segments do not cover [logStart, endOffset)");
             }
-            return new MsgSnapshot(topic, index, term, end, start, chunk, state, segs);
+            return new MsgSnapshot(topic, index, term, end, start, chunk, sections, segs);
         } catch (BufferUnderflowException e) {
             throw new IllegalArgumentException("truncated snapshot", e);
         }
