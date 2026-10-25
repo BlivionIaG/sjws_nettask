@@ -67,6 +67,7 @@ java -cp target/classes bench/SwarmBench.java /tmp/sb reqreply-mw 4x10000 10 # s
 ```
 
 - **Comparisons.** Compare `heartbeat off` and `heartbeat keeper` with 5 alternating runs pinned with `taskset`.
+- **Per-second counts (opt-in).** `-Dsjws.bench.persec=true` makes `heartbeat` also print `persec=[c0,c1,...]`: completions in each wall-clock second from the start of the 2 s warm-up (`c0`-`c1` are warm-up; the last bucket is a spare and is usually 0). The default output is unchanged. The #234 heartbeat gate used it with a 20% trimmed mean over s7-31 of 30 s runs; any longer warm-up is cut from `persec` (`-Dsjws.bench.hbWarmup` is refused).
 - **Request/reply latency.** It is measured from each call's scheduled send time, so a stall also counts against the calls queued behind it.
 - **Results.** The S1 PR body has the numbers measured on the dev box.
 

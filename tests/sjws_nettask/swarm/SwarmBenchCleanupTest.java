@@ -120,6 +120,32 @@ class SwarmBenchCleanupTest {
     }
 
     @Test
+    void heartbeatPerSecondCountsAreOptIn() throws Exception {
+        var p = start(List.of(), this.dir.toString(), "heartbeat", "off", "1");
+        assertTrue(p.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        var out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(0, p.exitValue(), out);
+        assertTrue(out.contains("heartbeat mode=off dispatch_tasks/s="), out);
+        assertTrue(!out.contains("persec="), "off by default: " + out);
+
+        var q = start(List.of("-Dsjws.bench.persec=true"), this.dir.toString(), "heartbeat", "off", "1");
+        assertTrue(q.waitFor(120, TimeUnit.SECONDS), "bench finished");
+        out = Files.readString(this.dir.resolve("out.txt"));
+        assertEquals(0, q.exitValue(), out);
+        // one bucket per second from the start of the 2 s warmup, plus one spare: 1 s run -> 4 buckets
+        var m = java.util.regex.Pattern.compile("(?m)^persec=\\[(\\d+),(\\d+),(\\d+),(\\d+)\\]$").matcher(out);
+        assertTrue(m.find(), out);
+        assertTrue(Long.parseLong(m.group(1)) > 0 && Long.parseLong(m.group(3)) > 0, out);
+        assertTrue(out.contains("heartbeat mode=off dispatch_tasks/s="), out);
+
+        var r = start(List.of("-Dsjws.bench.hbWarmup=5"), this.dir.toString(), "heartbeat", "off", "1");
+        assertTrue(r.waitFor(120, TimeUnit.SECONDS));
+        assertTrue(r.exitValue() != 0);
+        assertTrue(Files.readString(this.dir.resolve("out.txt")).contains("sjws.bench.hbWarmup is not supported"));
+        assertEquals(0, benchDirs());
+    }
+
+    @Test
     void theTempDirectoryIsDeletedWhenTheRunIsKilled() throws Exception {
         var p = start(List.of(), this.dir.toString(), "dispatch", "1", "600");
         long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
