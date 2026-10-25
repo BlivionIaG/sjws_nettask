@@ -20,7 +20,7 @@ concurrency:
 jobs:
   cluster:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'cluster-tests')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # Pinned for #265: unpin once all three failing tests pass on 26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
