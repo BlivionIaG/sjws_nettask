@@ -158,6 +158,7 @@ public class Sjws_nettask {
         var task = new Shutdown(server, pid, out, err);
         var hook = new Thread(task, "shutdown");
         task.bind(hook);
+        task.awaitModulesOnSignal(Duration.ofSeconds(20));
         Runtime.getRuntime().addShutdownHook(hook);
         try {
             if (pidFile != null) {
@@ -214,7 +215,11 @@ public class Sjws_nettask {
         } finally {
             task.run();
             removeHook(hook);
-            modules.close();
+            try {
+                modules.close();
+            } finally {
+                task.modulesClosed();
+            }
         }
     }
 
@@ -238,6 +243,13 @@ public class Sjws_nettask {
         private volatile ServiceHooks hooks;
         /** How long a signal hook waits for the main thread to log termination before logging it. */
         private Duration reportWait = Duration.ofSeconds(5);
+        /**
+         * Set when the main thread closes optional modules after serving: a signal hook waits for that close, or the
+         * JVM halts in the middle of it (HA messaging writes its clean-stop marker there).
+         */
+        private volatile CountDownLatch modulesClosed;
+        /** How long a signal hook waits for the modules to close. */
+        private Duration closeWait = Duration.ofSeconds(20);
 
         Shutdown(SjwsServer server, AtomicReference<PidFile> pid, PrintStream out, PrintStream err) {
             this.server = server;
@@ -261,6 +273,19 @@ public class Sjws_nettask {
 
         void markServing() {
             this.serving.set(true);
+        }
+
+        /** The main thread will close modules after serving and call {@link #modulesClosed()}. */
+        void awaitModulesOnSignal(Duration timeout) {
+            this.closeWait = timeout;
+            this.modulesClosed = new CountDownLatch(1);
+        }
+
+        void modulesClosed() {
+            var latch = this.modulesClosed;
+            if (latch != null) {
+                latch.countDown();
+            }
         }
 
         /** Logs termination once. Unblocks a signal hook waiting in {@link #run()}. */
@@ -290,6 +315,17 @@ public class Sjws_nettask {
                     }
                     if (!mainLogged) {
                         reportTerminated();
+                    }
+                    var latch = this.modulesClosed;
+                    if (mainLogged && latch != null) { // the main thread is on its way out: let it close
+                        try {
+                            if (!latch.await(this.closeWait.toMillis(), TimeUnit.MILLISECONDS)) {
+                                this.err.println("WARN: modules still closing after " + this.closeWait.toMillis()
+                                        + " ms; exiting");
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
                 }
             } finally {
