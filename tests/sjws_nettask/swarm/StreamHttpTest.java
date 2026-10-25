@@ -28,7 +28,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -122,25 +121,14 @@ class StreamHttpTest {
     record Claimed(String lease, long hi, long lo) { }
 
     Claimed claim() {
-        var ls = SwarmHttpTest.leases(post("/swarm/v1/tasks/gen:claim?visibilityMs=60000", new byte[0]));
+        var r = post("/swarm/v1/tasks/gen:claim?visibilityMs=60000", new byte[0]);
+        var ls = SwarmHttpTest.leases(r);
         assertEquals(1, ls.size());
-        var lease = ls.get(0).id();
-        // the stream id is the correlation id (from the held envelope)
-        var held = heldEnvelope(ls.get(0).id());
-        var b = ByteBuffer.wrap(held);
-        return new Claimed(lease, b.getLong(), b.getLong());
-    }
-
-    byte[] heldEnvelope(String lease) {
-        try {
-            var f = SwarmHttp.class.getDeclaredField("claimed");
-            f.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            var m = (Map<String, Task>) f.get(this.http);
-            return m.get(lease).envelope().correlationId();
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError(e);
-        }
+        // the stream id is the correlation id, read from sjws-lease-stream (#261 Q1) as an HTTP worker does
+        var entry = r.headers().get(StreamHttp.LEASE_STREAM_HEADER);
+        assertTrue(entry != null && entry.length() > 33 && entry.charAt(32) == '/', String.valueOf(entry));
+        var id = ByteBuffer.wrap(java.util.HexFormat.of().parseHex(entry, 0, 32));
+        return new Claimed(ls.get(0).id(), id.getLong(), id.getLong());
     }
 
     Response chunk(Claimed c, long seq, int flags, String text) {

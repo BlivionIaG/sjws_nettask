@@ -42,7 +42,11 @@ import sjws_nettask.swarm.wire.Frame;
  * <li>{@code POST /swarm/v1/tasks/{pool}:call}: request/reply. Body one {@code TASK} frame. Waits for the reply
  * up to {@code ?deadlineMs=} (relative, default 30 000). 200 with a {@code RESULT} frame, or 504.</li>
  * <li>{@code POST /swarm/v1/tasks/{pool}:claim?max=&visibilityMs=&waitMs=}: 200 with one {@code LEASE} frame per
- * claimed task, or 204. {@code LEASE} payload: {@code [idLen:u16][leaseId UTF-8][leaseDeadlineMs:i64][body]}.</li>
+ * claimed task, or 204. {@code LEASE} payload: {@code [idLen:u16][leaseId UTF-8][leaseDeadlineMs:i64][body]}. With
+ * {@code sjws.swarm.stream.enabled} on, the 200 also carries {@code sjws-lease-stream}: one entry per {@code LEASE} in
+ * frame order, {@code <32-hex correlationId>/<attempt>} for a stream task or {@code -} for a unary one, and
+ * {@code sjws-stream-window: <n>}, the reorder window; both only when the batch has a stream task (#261 Q1, R1, R2;
+ * {@link StreamHttp#appendLeaseStream}).</li>
  * <li>{@code POST /swarm/v1/leases/{leaseId}:ack|nack|reject|extend|reply}: fenced settles. {@code nack}
  * takes {@code ?delayMs=}, {@code reject} {@code ?reason=}, {@code extend} {@code ?visibilityMs=}; {@code reply}
  * takes a {@code RESULT} frame, writes it ASYNC and acks once it is durable (§4.4). 204 on OK; 409 when the
@@ -237,6 +241,11 @@ final class SwarmHttp implements Handler {
         }
         var out = new java.io.ByteArrayOutputStream();
         StringBuilder spans = this.trace ? new StringBuilder() : null;
+        // #261 Q1 (stream flag on only): the stream id and attempt an HTTP worker puts in its :chunk frames; built
+        // lazily at the first stream task, so a batch with none sends neither header (R2) and allocates nothing
+        var streamLeg = this.streams;
+        StringBuilder streamIds = null;
+        int unaryBefore = 0;
         for (var t : got) {
             if (spans != null) {
                 // a child span per claim; the cached envelope carries it, so :reply propagates it
@@ -246,6 +255,16 @@ final class SwarmHttp implements Handler {
                             t.envelope().withTraceparent(child), t.shard());
                 }
                 spans.append(spans.isEmpty() ? "" : ",").append(child.isEmpty() ? "-" : child);
+            }
+            if (streamLeg != null) {
+                if (streamIds != null) {
+                    StreamHttp.appendLeaseStream(streamIds.append(','), t);
+                } else if (TokenStreams.isStreamTask(t.envelope())) {
+                    streamIds = StreamHttp.leaseStreamPrefix(unaryBefore);
+                    StreamHttp.appendLeaseStream(streamIds, t);
+                } else {
+                    unaryBefore++;
+                }
             }
             var key = leaseId(t);
             this.claimed.put(key, t);
@@ -258,6 +277,10 @@ final class SwarmHttp implements Handler {
         var ok = bytes(200, out.toByteArray());
         if (spans != null) {
             ok.headers().set(sjws_nettask.swarm.trace.SwarmTrace.LEASE_HEADER, spans.toString());
+        }
+        if (streamIds != null) { // one field each (set, never add)
+            ok.headers().set(StreamHttp.LEASE_STREAM_HEADER, streamIds.toString());
+            ok.headers().set(StreamHttp.STREAM_WINDOW_HEADER, streamLeg.windowHeader());
         }
         return ok;
     }

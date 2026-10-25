@@ -232,6 +232,30 @@ public final class TokenStreams {
         return this.invalidShardStamps.get();
     }
 
+    /**
+     * True when {@code env} carries the {@value #SHARDS_MEMBER} {@code tracestate} member, which every {@code :stream}
+     * submit stamps (#261 Q1). The one stream-task predicate, shared with {@link #submitterShards}: it matches the member
+     * name only, so a malformed value still marks a stream task (its chunks are refused there). Unary HTTP submits always
+     * have an empty {@code tracestate}, the fast path.
+     */
+    static boolean isStreamTask(TaskEnvelope env) {
+        return shardsMember(env.tracestate()) != null;
+    }
+
+    /** The value of the {@value #SHARDS_MEMBER} member of {@code tracestate}, or null when it has none. */
+    private static String shardsMember(String ts) {
+        if (ts == null || ts.isEmpty()) {
+            return null;
+        }
+        for (var member : ts.split(",")) {
+            var m = member.trim();
+            if (m.indexOf('=') == SHARDS_MEMBER.length() && m.startsWith(SHARDS_MEMBER)) {
+                return m.substring(SHARDS_MEMBER.length() + 1);
+            }
+        }
+        return null;
+    }
+
     /** The {@code tracestate} a submitter puts on a stream task: its own {@code sjws.swarm.stream.shards}. */
     String shardsTracestate() {
         return SHARDS_MEMBER + "=" + SHARDS_VALUE + this.config.shards();
@@ -243,32 +267,23 @@ public final class TokenStreams {
      * malformed or out-of-range value is refused, never clamped: a guessed count would pick a shard no reader polls.
      */
     int submitterShards(TaskEnvelope env) {
-        var ts = env.tracestate();
-        if (ts == null || ts.isEmpty()) {
+        var v = shardsMember(env.tracestate());
+        if (v == null) {
             return this.config.shards();
         }
-        for (var member : ts.split(",")) {
-            var m = member.trim();
-            int eq = m.indexOf('=');
-            if (eq < 0 || !m.substring(0, eq).equals(SHARDS_MEMBER)) {
-                continue;
+        int n = -1;
+        if (v.startsWith(SHARDS_VALUE) && v.length() > SHARDS_VALUE.length() && v.length() <= SHARDS_VALUE.length() + 2) {
+            try {
+                n = Integer.parseInt(v.substring(SHARDS_VALUE.length()));
+            } catch (NumberFormatException e) {
+                n = -1;
             }
-            var v = m.substring(eq + 1);
-            int n = -1;
-            if (v.startsWith(SHARDS_VALUE) && v.length() > SHARDS_VALUE.length() && v.length() <= SHARDS_VALUE.length() + 2) {
-                try {
-                    n = Integer.parseInt(v.substring(SHARDS_VALUE.length()));
-                } catch (NumberFormatException e) {
-                    n = -1;
-                }
-            }
-            if (n < 1 || n > 64) {
-                this.invalidShardStamps.incrementAndGet();
-                throw new IllegalArgumentException("stream task has an invalid shard stamp: " + v);
-            }
-            return n;
         }
-        return this.config.shards();
+        if (n < 1 || n > 64) {
+            this.invalidShardStamps.incrementAndGet();
+            throw new IllegalArgumentException("stream task has an invalid shard stamp: " + v);
+        }
+        return n;
     }
 
     /** The submitter's shard partition for the chunks of {@code env}'s stream, opened lazily (no DLQ). */
