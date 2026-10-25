@@ -615,7 +615,10 @@ final class RaftGroup {
             return; // a closed node never campaigns, so it is never elected again (#254)
         }
         if (role == Role.LEADER) {
-            failPendingWrites(after); // onTimeoutNow does not check the sender's term: a stale one reaches a leader
+            // No caller campaigns as leader since #255 (tick and pre-vote only run off-leader, onTimeoutNow ignores
+            // a leader). Kept so a future caller still leaves leadership through the shared same-term demotion
+            // first: pending writes fail, leader is cleared and listeners hear it, even if the write below fails.
+            stepDown(term, after);
         }
         if (!saveHardState(term + 1, self)) {
             // Nothing changed in memory and nothing is sent; retry after a fresh timeout.
@@ -923,15 +926,26 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * A leadership transfer handed to us: campaign now. Acted on only when it can still belong to a live transfer
+     * (#255): sent by another voter, not older than our term, and, at our own term, only while we follow and the
+     * sender is the leader we know (or we know none yet). Only the leader of a term sends TIMEOUT_NOW in it, so at
+     * our term a leader or a candidate can only be looking at a stale or forged one. A higher term is adopted
+     * first, as from any frame; the sender led that term and chose us. Anything else is dropped without a reply,
+     * so a TIMEOUT_NOW left over from an old transfer can no longer make a sitting leader start an election.
+     */
     private void onTimeoutNow(ByteBuffer body, long now, List<Runnable> after) {
         long theirTerm = body.getLong();
-        if (witness) {
+        var sender = byWire.apply(body.getInt());
+        if (witness || theirTerm < term || sender == null || sender.equals(self) || !isVoter(sender)) {
             return;
         }
         if (theirTerm > term) {
             if (!stepDown(theirTerm, after)) {
                 return;
             }
+        } else if (role == Role.LEADER || role == Role.CANDIDATE || (leader != null && !leader.equals(sender))) {
+            return;
         }
         electionDeadline = now;
         startElection(now, after);
@@ -1561,10 +1575,17 @@ final class RaftGroup {
                         + " and sending nothing" + suppressed);
     }
 
-    /** False when a higher term could not be made durable: memory is unchanged and the caller sends nothing. */
+    /**
+     * False when a higher term could not be made durable: term and vote are unchanged and the caller sends nothing.
+     * A leader in that case still steps down, at its own term (no write needed): it knows a later term exists, so
+     * it must stop reporting itself as leader and stop acking (#255). Its pending writes fail as outcome unknown.
+     */
     private boolean stepDown(long newTerm, List<Runnable> after) {
         if (newTerm > term && !saveHardState(newTerm, null)) {
             warnPersistFailed(newTerm);
+            if (role == Role.LEADER) {
+                stepDown(term, after);
+            }
             return false;
         }
         boolean wasLeader = role == Role.LEADER;

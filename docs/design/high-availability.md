@@ -242,7 +242,9 @@ What a voter keeps across a crash:
   succeeds (`startElection`, stepping down to a higher term, a vote grant). A failed write leaves
   term and vote as they were, sends nothing, and the node stays a follower (a node in any role that
   cannot persist a higher term it has seen logs a WARNING, at most one per group per 10 s with a
-  count of the suppressed ones, and stays in its old term); a failed grant is a
+  count of the suppressed ones, and stays in its old term); a leader in that case also steps down
+  at its own term, which needs no write, so it stops reporting itself as leader and acking, and
+  its pending writes fail as outcome unknown (#255); a failed grant is a
   refusal. Messages only ever carry the durable term (a pre-vote reply carries the responder's own
   term, and the pre-candidate accepts a grant at a term at or below its own).
   `FileLogStorage` writes `{group}.vote`: 24 bytes big-endian, magic `SJVT`, version 1, term,
@@ -329,7 +331,11 @@ That is what keeps the partition row above from splitting. The data node that ca
 hear the leader still reaches the witness, but the witness has a fresh leader and
 refuses the pre-vote, so the term does not move and the leader that holds the witness
 stays leader. `onTimeoutNow` (leadership transfer) still starts a real election; it does
-not go through the pre-vote.
+not go through the pre-vote. It acts only on a `TIMEOUT_NOW` that can still belong to a live
+transfer (#255): from another voter, at a term no older than the receiver's, and at the
+receiver's own term only while it follows and the sender is the leader it knows (or it knows
+none yet). A higher term is adopted first, as from any frame. Anything else, such as one left
+over from an old transfer reaching a sitting leader, is dropped without a reply.
 
 One election, from the first deadline to the lease, as a voter set runs it. The Raft side runs in tests and in a
 control process (group `cp-config`: one voter sends no `PRE_VOTE` or `VOTE`, a set of voters from `cp.peers` runs
