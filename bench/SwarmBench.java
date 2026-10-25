@@ -53,6 +53,15 @@ public class SwarmBench {
     /** Minimum usable space on the bench directory's file system (override: -Dsjws.bench.minFreeBytes). */
     static final long MIN_FREE = Long.getLong("sjws.bench.minFreeBytes", 10L << 30);
 
+    /**
+     * Usable bytes on {@code dir}'s file system. Test seam: -Dsjws.bench.testFreeBytes replaces the measurement, so
+     * SwarmBenchCleanupTest doesn't depend on the host's free space. Unset (every real run), the file store is asked.
+     */
+    static long freeBytes(Path dir) throws java.io.IOException {
+        Long injected = Long.getLong("sjws.bench.testFreeBytes");
+        return injected != null ? injected : Files.getFileStore(dir).getUsableSpace();
+    }
+
     static void deleteTree(Path dir) {
         if (!Files.exists(dir)) return;
         try (var walk = Files.walk(dir)) {
@@ -68,7 +77,7 @@ public class SwarmBench {
     static volatile boolean invalid;
 
     public static void main(String[] a) throws Exception {
-        long free = Files.getFileStore(Path.of(a[0])).getUsableSpace();
+        long free = freeBytes(Path.of(a[0]));
         if (free < MIN_FREE) {
             System.err.printf("ABORT: %s has %d MiB free, below %d MiB (sjws.bench.minFreeBytes); the box disk is shared%n",
                     a[0], free >> 20, MIN_FREE >> 20);
