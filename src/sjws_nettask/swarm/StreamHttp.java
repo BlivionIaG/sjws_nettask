@@ -102,6 +102,50 @@ final class StreamHttp {
     static final long SWEEP_MS = 5_000;
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final HexFormat HEX = HexFormat.of();
+    /**
+     * #261 Q1: the {@code :claim} response header (stream flag on, and only when the batch has a stream task) that
+     * tells an HTTP worker, per {@code LEASE} in frame order, the stream id and attempt of a stream task, so it never
+     * parses the lease id.
+     */
+    static final String LEASE_STREAM_HEADER = "sjws-lease-stream";
+    /**
+     * #261 R1: sent with {@value #LEASE_STREAM_HEADER}: this node's reorder window ({@code sjws.swarm.stream.window}).
+     * The SDK keeps its issued seq span below min(its configured window, this value), or 1 when the header is absent.
+     */
+    static final String STREAM_WINDOW_HEADER = "sjws-stream-window";
+
+    /** The {@value #STREAM_WINDOW_HEADER} value, formatted once (the window is read once at startup). */
+    String windowHeader() {
+        return this.windowHeader;
+    }
+
+    /** A builder holding the {@code -,} entries of the {@code unary} unary leases that came before the first stream task. */
+    static StringBuilder leaseStreamPrefix(int unary) {
+        var b = new StringBuilder(2 * unary + 48);
+        for (int i = 0; i < unary; i++) {
+            b.append("-,");
+        }
+        return b;
+    }
+
+    /**
+     * Appends one {@value #LEASE_STREAM_HEADER} entry for {@code t}: {@code <32 lower-case hex of the correlation id>/<attempt
+     * as an unsigned decimal u32>} for a stream task ({@link TokenStreams#isStreamTask}), else {@code -}. The attempt is
+     * the lease's, the value the admit stamps on every chunk and CREDIT carries; never the lease id's shard suffix.
+     */
+    static StringBuilder appendLeaseStream(StringBuilder b, Task t) {
+        return appendLeaseStream(b, t, TokenStreams.isStreamTask(t.envelope()));
+    }
+
+    /** {@link #appendLeaseStream(StringBuilder, Task)} with the predicate already evaluated by the caller (one call per task). */
+    static StringBuilder appendLeaseStream(StringBuilder b, Task t, boolean stream) {
+        var env = t.envelope();
+        if (!stream) {
+            return b.append('-');
+        }
+        return b.append(HEX.toHexDigits(env.correlationHi())).append(HEX.toHexDigits(env.correlationLo())).append('/')
+                .append(Integer.toUnsignedLong(t.attempt()));
+    }
 
     private final Swarm swarm;
     private final TokenStreams streams;
@@ -116,6 +160,7 @@ final class StreamHttp {
      * loaded, no session carries credit state and {@code :chunk} answers exactly as before.
      */
     private final StreamCredit credit;
+    private final String windowHeader;
 
     StreamHttp(Swarm swarm, long producerId, AtomicLong seq, int maxPerAgent) {
         this.swarm = swarm;
@@ -126,6 +171,7 @@ final class StreamHttp {
         this.producerId = producerId;
         this.seq = seq;
         this.maxPerAgent = maxPerAgent;
+        this.windowHeader = Integer.toString(this.streams.config().window());
         this.credit = this.streams.config().credit()
                 ? new StreamCredit(this.streams.config().sinkChunks(), RETAIN_BYTES, this.streams.budget()) : null;
         if (this.credit != null) {
