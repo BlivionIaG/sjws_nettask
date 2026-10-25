@@ -50,6 +50,8 @@ public final class FileLogStorage implements LogStorage {
 
     private final Path root;
     private final ReentrantLock lock = new ReentrantLock();
+    /** Serializes snapshot file writes; separate from {@link #lock} so appends never wait for them. */
+    private final ReentrantLock snapLock = new ReentrantLock();
     private final Map<GroupId, NavigableMap<Long, Rec>> logs = new ConcurrentHashMap<>();
     private final Map<GroupId, FileChannel> channels = new ConcurrentHashMap<>();
     private final Map<GroupId, AtomicInteger> forceCounts = new ConcurrentHashMap<>();
@@ -772,7 +774,7 @@ public final class FileLogStorage implements LogStorage {
         buf.flip();
         var target = snapPath(group);
         var tmp = root.resolve(target.getFileName() + ".tmp");
-        lock.lock();
+        snapLock.lock(); // not the append lock: a snapshot's fsyncs never hold up appends of any group (#270)
         try {
             Files.deleteIfExists(tmp);
             var attrs = new java.util.ArrayList<java.nio.file.attribute.FileAttribute<?>>();
@@ -793,7 +795,7 @@ public final class FileLogStorage implements LogStorage {
                 dir.force(true);
             }
         } finally {
-            lock.unlock();
+            snapLock.unlock();
         }
     }
 

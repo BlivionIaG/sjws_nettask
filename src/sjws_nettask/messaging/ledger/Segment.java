@@ -241,6 +241,33 @@ final class Segment implements AutoCloseable {
         return c;
     }
 
+    /**
+     * File position of the frame whose base offset is {@code offset}, {@link #size()} when {@code offset} is
+     * {@link #nextOffset()}, or -1 when no frame starts there (#270 snapshot export: a cut must fall on a frame
+     * boundary). Reads only frame headers from the sparse-index floor.
+     */
+    long positionOf(long offset) throws IOException {
+        long end = size;
+        if (offset == nextOffset) return end;
+        if (offset < baseOffset || offset > nextOffset) return -1;
+        int n = idxLen;
+        long[] o = idxOff, p = idxPos;
+        int i = Arrays.binarySearch(o, 0, n, offset);
+        long pos = i >= 0 ? p[i] : (i == -1 ? 0 : p[-i - 2]);
+        var head = ByteBuffer.allocate(20);
+        while (pos + 20 <= end) {
+            head.clear();
+            while (head.hasRemaining()) if (ch.read(head, pos + head.position()) <= 0) throw new IOException("short read " + logPath);
+            int len = head.getInt(0);
+            long fb = head.getLong(8);
+            if (len < RecordBatch.HEADER_BYTES - 4 || len > RecordBatch.MAX_FRAME_BYTES) throw new IOException("corrupt committed batch at " + logPath + ":" + pos);
+            if (fb == offset) return pos;
+            if (fb > offset) return -1;
+            pos += 4 + len;
+        }
+        return -1;
+    }
+
     /** Calls {@code sink} for every batch in file order (replay, compaction). */
     void scan(java.util.function.Consumer<RecordBatch> sink) throws IOException { scan(Long.MIN_VALUE, sink); }
 

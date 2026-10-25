@@ -212,6 +212,72 @@ public final class SegmentedLog implements AutoCloseable {
         segments.set(i, seg);
     }
 
+    /**
+     * One segment's file for a snapshot export (#270; narrow API for the HA replication layer, Messaging Core owns the
+     * format): {@code [baseOffset, nextOffset)} of {@code file}, the segment's {@code .compacted} marker value or -1.
+     */
+    public record SegmentFile(long baseOffset, long nextOffset, Path file, Path marker, boolean active) { }
+
+    /** The segment files in offset order (#270 snapshot export). Names only; the caller links or reads them. */
+    public List<SegmentFile> segmentFiles() {
+        var out = new ArrayList<SegmentFile>();
+        var act = active;
+        for (var seg : segments) out.add(new SegmentFile(seg.baseOffset, seg.nextOffset(), seg.logPath, seg.markerPath, seg == act));
+        return out;
+    }
+
+    /**
+     * File position in the segment starting at {@code base} of the frame whose base offset is {@code offset} (or the
+     * segment size when {@code offset} is its next offset); -1 when no frame starts there or no such segment exists.
+     */
+    public long positionOf(long base, long offset) throws IOException {
+        for (var seg : segments) if (seg.baseOffset == base) return seg.positionOf(offset);
+        return -1;
+    }
+
+    /**
+     * #270 snapshot install (narrow API for the HA replication layer): replaces every segment of this log with the
+     * {@code <base>.log} files (and {@code <base>.compacted} markers) in {@code staged}, hard-linked in (copied where the
+     * file system has no links), then reopens them, recovering and validating every frame as on open. The caller
+     * guarantees that no append is in flight and excludes readers; the writer must then {@link LedgerWriter#reload}.
+     * Not atomic: the caller keeps {@code staged} and a marker until it returns, and redoes it after a crash.
+     */
+    public void replaceWith(Path staged) throws IOException {
+        for (var s : segments) s.close();
+        try (var list = Files.list(dir)) {
+            for (var p : (Iterable<Path>) list::iterator) {
+                var n = p.getFileName().toString();
+                if (n.length() > 20 && n.substring(0, 20).chars().allMatch(Character::isDigit)
+                        && (n.endsWith(".log") || n.endsWith(".index") || n.endsWith(".compacted") || n.endsWith(".cmp")
+                                || n.endsWith(".compacted.tmp") || n.endsWith(".index.tmp"))) {
+                    Files.delete(p);
+                }
+            }
+        }
+        try (var list = Files.list(staged)) {
+            for (var p : (Iterable<Path>) list::iterator) {
+                var n = p.getFileName().toString();
+                if (!(n.endsWith(".log") || n.endsWith(".compacted")) || n.length() < 21
+                        || !n.substring(0, 20).chars().allMatch(Character::isDigit)) continue;
+                var target = dir.resolve(n);
+                try {
+                    Files.createLink(target, p);
+                } catch (UnsupportedOperationException | IOException e) {
+                    Files.copy(p, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+        try (var d = java.nio.channels.FileChannel.open(dir, java.nio.file.StandardOpenOption.READ)) {
+            d.force(true);
+        } catch (IOException ignored) {
+            // some file systems refuse a directory fsync; the caller's marker covers a crash here
+        }
+        var fresh = openLocked(dir, segmentBytes);
+        segments.clear();
+        segments.addAll(fresh.segments);
+        active = segments.getLast();
+    }
+
     @Override public void close() throws IOException {
         IOException first = null;
         for (var s : segments) try { s.close(); } catch (IOException e) { if (first == null) first = e; }

@@ -126,6 +126,22 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         thread.start();
     }
 
+    /**
+     * #270: after {@link SegmentedLog#replaceWith} (no append in flight): the log end and durable offset restart at the
+     * replaced log's end, which is durable (the caller fsynced every staged file before the swap).
+     */
+    public void reload() {
+        if (!queue.isEmpty()) throw new IllegalStateException("reload with appends queued");
+        lock.lock();
+        try {
+            written = log.nextOffset();
+            durable = written;
+        } finally {
+            lock.unlock();
+        }
+        publish();
+    }
+
     /** The latest published state; one volatile read. */
     public LedgerSnapshot snapshot() { return snapshot.get(); }
 

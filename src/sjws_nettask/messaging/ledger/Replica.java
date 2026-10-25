@@ -51,6 +51,20 @@ public interface Replica extends PartitionAppender, AutoCloseable {
      */
     CompletableFuture<Void> leaderRead();
 
+    /**
+     * Proposes the replicated retention decision "advance the log start to {@code offset}" (#270): every replica deletes
+     * its sealed segments that end at or below it when the entry applies, so no replica deletes by its own clock. Only a
+     * ready leader proposes; the default refuses (a replica without snapshots keeps local retention).
+     */
+    default CompletableFuture<Void> advanceLogStart(long offset) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException("replicated retention"));
+    }
+
+    /** The replicated log start (the last applied {@link #advanceLogStart} or installed snapshot's), or 0. */
+    default long logStartOffset() {
+        return 0;
+    }
+
     @Override
     void close();
 }
