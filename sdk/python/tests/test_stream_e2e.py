@@ -36,7 +36,7 @@ class _E2E:
     def tearDownClass(cls):
         cls.server.close()
 
-    def worker(self, pool, n, result=b"", window=8, size=100, out=None, **kw):
+    def worker(self, pool, n, result=b"", window=8, size=100, out=None, pace=0.0, **kw):
         out = {} if out is None else out
 
         def run():
@@ -47,6 +47,8 @@ class _E2E:
                     out["writer"] = w
                     for i in range(n):
                         w.send(b"%06d" % i + b"." * (size - 6))
+                        if pace:
+                            time.sleep(pace)
                     w.finish(result)
             except BaseException as e:  # noqa: BLE001 - reported by the test
                 out["error"] = e
@@ -91,14 +93,16 @@ class _E2E:
         pool = "resume-sse" if sse else "resume-bin"
         got = []
         with self.client.stream(pool, b"p", deadline=60, sse=sse) as s:
-            t, out = self.worker(pool, 120)
+            t, out = self.worker(pool, 120, pace=0.003)
             for e in s:
                 got.append(e)
                 if len(got) in (10, 60):  # the connection breaks mid-stream; the reader resumes after the last chunk
                     s._http._conn.sock.shutdown(socket.SHUT_RDWR)
         t.join(30)
         self.assertNotIn("error", out)
-        self.assertGreaterEqual(s.reconnects, 2)  # plus any 409 "session busy" while the old reader detaches
+        # at least one break hits a live connection (the second may find the rest already buffered); 409 "session
+        # busy" retries while the old reader detaches count too
+        self.assertGreaterEqual(s.reconnects, 1)
         self.assertEqual(list(range(120)), [e.seq for e in got])
         self.assertEqual(self.expect(120), b"".join(e.data for e in got))
 
