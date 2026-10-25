@@ -637,7 +637,7 @@ final class StreamHttp {
         }
     }
 
-    /** S2c PR 6b: under pressure, sessions without a reader trim to the published read position (sweep thread). */
+    /** S2c PR 6b: under pressure, every session trims to its published read position (sweep thread). */
     void pressureSweep() {
         for (var s : this.sessions.values()) {
             var cr = s.credit;
