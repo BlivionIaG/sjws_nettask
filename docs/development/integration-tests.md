@@ -175,9 +175,10 @@ The rest of the suite:
   reports request errors or zero throughput. The 30 s comparison is local; see
   `bench/README.md`. macOS CI (manual dispatch only) skips that step.
 
-- Job `verify-canary (ubuntu-26.04, non-gating)`: the same steps on Ubuntu 26.04 with
-  `continue-on-error: true`, so it never blocks a merge. It tracks the three tests that fail
-  there (#265). Once it is green, lift the pins.
+- Workflow `.github/workflows/canary-ubuntu-2604.yml`, job `verify-canary (ubuntu-26.04, non-gating)`:
+  the `verify` steps on Ubuntu 26.04, daily (04:17 UTC), on push to `master` and on
+  `workflow_dispatch`, never on pull requests. It tracks the three tests that fail there (#265) and
+  writes the failing tests to the job summary. Lift the pins after 3 consecutive green runs.
 
 - Job `mutation` (cron or `workflow_dispatch` only): `ubuntu-24.04` (#265 pin), timeout
   120 minutes, PIT via `mvn -B -P pitest test-compile org.pitest:pitest-maven:mutationCoverage`.
