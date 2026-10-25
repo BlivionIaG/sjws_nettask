@@ -533,6 +533,12 @@ final class RaftGroup {
     }
 
     /**
+     * Set once by {@link #closeGroup()}, under {@link #lock}: the node closed. A closed group ignores ticks and frames,
+     * never campaigns (so it can never be elected again) and refuses new appends with {@link GroupClosedException}.
+     */
+    private boolean closed;
+
+    /**
      * Undo a leader batch from {@code first} on after a storage failure, so it is all-or-nothing. The rollback is
      * a {@link LogStorage#truncateSuffix}, which on {@link FileLogStorage} rewrites the kept records from memory
      * through a temp file, fsync, rename and directory fsync: it also drops any torn bytes the failed write left
@@ -544,12 +550,6 @@ final class RaftGroup {
      * (retry with its own dedup key). A batch rolled back cleanly fails with the storage error itself: nothing of it
      * is in the log, a refusal.
      */
-    /**
-     * Set once by {@link #closeGroup()}, under {@link #lock}: the node closed. A closed group ignores ticks and frames,
-     * never campaigns (so it can never be elected again) and refuses new appends with {@link GroupClosedException}.
-     */
-    private boolean closed;
-
     private Throwable rollBackBatch(long first, RuntimeException failed, List<Runnable> after) {
         var log = System.getLogger(RaftGroup.class.getName());
         try {
@@ -1656,13 +1656,6 @@ final class RaftGroup {
     }
 
     /**
-     * {@link ReplicatedNode#close()}, after the Raft thread stopped and this group's deliveries closed: a permanent
-     * step-down (#254). It goes through the shared {@link #failPendingWrites} path, so pending appends and a pending
-     * membership change fail with {@link OutcomeUnknownException} (they are in the log) and waiting read barriers with
-     * {@link NotLeaderException}. Afterwards the group ignores ticks and frames and never campaigns, so it is never
-     * elected again; appends are refused with {@link GroupClosedException} (nothing appended). Idempotent.
-     */
-    /**
      * First step of {@link ReplicatedNode#close()}, before it waits for the Raft thread: from here the group never
      * campaigns, votes, acks or accepts an append, even if that thread is still running a tick (#254). Idempotent.
      */
@@ -1677,6 +1670,13 @@ final class RaftGroup {
         }
     }
 
+    /**
+     * {@link ReplicatedNode#close()}, after the Raft thread stopped and this group's deliveries closed: a permanent
+     * step-down (#254). It goes through the shared {@link #failPendingWrites} path, so pending appends and a pending
+     * membership change fail with {@link OutcomeUnknownException} (they are in the log) and waiting read barriers with
+     * {@link NotLeaderException}. Afterwards the group ignores ticks and frames and never campaigns, so it is never
+     * elected again; appends are refused with {@link GroupClosedException} (nothing appended). Idempotent.
+     */
     void closeGroup() {
         var after = new ArrayList<Runnable>();
         lock.lock();
