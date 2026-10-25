@@ -1,0 +1,117 @@
+name: Canary (Ubuntu 26.04)
+
+# Non-gating canary for #265 (https://github.com/BlivionIaG/sjws_nettask/issues/265).
+# Runs the `verify` steps of ci.yml on Ubuntu 26.04 while the gating jobs stay pinned to
+# ubuntu-24.04. It tracks the three tests that fail there: SwarmBenchCleanupTest,
+# DaemonTest.symlinkPidFileIsRefusedAndGarbageIsStale and the Http1TransportTest sendfile
+# CPU-spin checks. Lift the pins after 3 consecutive green runs of this workflow.
+# Not on pull_request, so it never shows as a PR check. Keep the steps in sync with ci.yml.
+on:
+  schedule:
+    - cron: '17 4 * * *' # daily 04:17 UTC
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: canary-ubuntu-2604-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-canary:
+    name: verify-canary (ubuntu-26.04, non-gating)
+    runs-on: ubuntu-26.04
+    # A red canary must not turn the workflow (or master) red; the job result is the signal.
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Install Prometheus
+        if: runner.os == 'Linux'
+        run: |
+          ver=3.15.0
+          curl -fsSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz"
+          tar -C /tmp -xzf /tmp/prometheus.tar.gz
+          echo "PROMTOOL=/tmp/prometheus-${ver}.linux-amd64/promtool" >> "$GITHUB_ENV"
+          echo "PROMETHEUS=/tmp/prometheus-${ver}.linux-amd64/prometheus" >> "$GITHUB_ENV"
+      - name: Unit and integration tests, package, coverage gate
+        if: ${{ !cancelled() }}
+        run: mvn -B verify
+      - name: Keep surefire reports (verify)
+        if: ${{ !cancelled() }}
+        run: mkdir -p canary-reports/verify && cp target/surefire-reports/TEST-*.xml canary-reports/verify/ 2>/dev/null || true; rm -rf target/surefire-reports
+      - name: HTTP/1 tests with the buffer pool on (debug pool, NoBufferLeaks)
+        if: ${{ !cancelled() }}
+        run: mvn -B -Djacoco.skip=true -DargLine="-Dsjws.buf.pool=on -Dsjws.buf.debug=true" -Dtest='ClientManagerFaultTest,Http1*Test,sjws_nettask.http1.*Test' -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Keep surefire reports (buffer-pool)
+        if: ${{ !cancelled() }}
+        run: mkdir -p canary-reports/buffer-pool && cp target/surefire-reports/TEST-*.xml canary-reports/buffer-pool/ 2>/dev/null || true; rm -rf target/surefire-reports
+      - name: Python SDK conformance and end-to-end (golden frames; Java server + Python unary client)
+        if: ${{ !cancelled() }}
+        run: SJWS_JAR="$(ls target/sjws_nettask-*.jar | head -1)" python3 -B -m unittest discover -s sdk/python/tests -v
+      - name: End-to-end file serving (real listener, temp docroot, HTTP client)
+        if: ${{ !cancelled() }}
+        run: mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Keep surefire reports (e2e)
+        if: ${{ !cancelled() }}
+        run: mkdir -p canary-reports/e2e && cp target/surefire-reports/TEST-*.xml canary-reports/e2e/ 2>/dev/null || true; rm -rf target/surefire-reports
+      - name: Multi-node cluster harness (live scenarios)
+        if: ${{ !cancelled() }}
+        run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Keep surefire reports (cluster)
+        if: ${{ !cancelled() }}
+        run: mkdir -p canary-reports/cluster && cp target/surefire-reports/TEST-*.xml canary-reports/cluster/ 2>/dev/null || true; rm -rf target/surefire-reports
+      - name: Install wrk
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wrk
+      - name: wrk standalone vs gateway-off
+        if: ${{ !cancelled() }}
+        run: GATEWAY_BENCH_WARMUP=1s GATEWAY_BENCH_DURATION=3s tools/gateway-bench.sh
+      - name: Failing tests summary
+        if: always()
+        shell: python3 {0}
+        run: |
+          import glob, os, xml.etree.ElementTree as ET
+          rows, total = [], 0
+          for step in sorted(glob.glob("canary-reports/*")):
+              for f in sorted(glob.glob(step + "/TEST-*.xml")):
+                  try:
+                      root = ET.parse(f).getroot()
+                  except ET.ParseError:
+                      continue
+                  for tc in root.iter("testcase"):
+                      total += 1
+                      bad = tc.find("failure")
+                      if bad is None:
+                          bad = tc.find("error")
+                      if bad is not None:
+                          msg = (bad.get("message") or bad.get("type") or "").splitlines()
+                          msg = (msg[0] if msg else "")[:160].replace("|", "\\|")
+                          rows.append((os.path.basename(step), tc.get("classname", "?"), tc.get("name", "?"), msg))
+          out = ["## Ubuntu 26.04 canary (#265)", ""]
+          if rows:
+              out += [f"**{len(rows)} failing test(s)** of {total} run:", "",
+                      "| Step | Class | Test | Message |", "|---|---|---|---|"]
+              out += [f"| {s} | `{c}` | `{n}` | {m} |" for s, c, n, m in rows]
+          else:
+              out.append(f"No failing tests ({total} run)." if total else "No surefire reports were produced.")
+          out += ["", "Tracked in [#265](https://github.com/BlivionIaG/sjws_nettask/issues/265). "
+                  "Unpinning `ubuntu-24.04` needs **3 consecutive green canary runs**."]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(out) + "\n")
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: canary-ubuntu-26.04-reports
+          path: |
+            canary-reports/
+            target/site/jacoco/
+          if-no-files-found: ignore
