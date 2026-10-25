@@ -103,7 +103,7 @@ final class RaftReplica implements Replica {
     private final long skipTo;
     private volatile long appliedIndex;
     /** Guards the delivery-thread state against {@link #close}; never contended while open. */
-    private final Object applyLock = new Object();
+    private final java.util.concurrent.locks.ReentrantLock applyLock = new java.util.concurrent.locks.ReentrantLock();
     private boolean closed;
     /** The latest local append of a committed batch (close waits for it before the clean marker). */
     private CompletableFuture<Long> lastApply = CompletableFuture.completedFuture(0L);
@@ -221,9 +221,12 @@ final class RaftReplica implements Replica {
     }
 
     private void onCommitted(CommittedEntry e) {
-        synchronized (this.applyLock) {
+        this.applyLock.lock();
+        try {
             if (this.closed) return; // close() recorded the ledger end; the entry is replayed on restart
             apply(e);
+        } finally {
+            this.applyLock.unlock();
         }
     }
 
@@ -411,10 +414,13 @@ final class RaftReplica implements Replica {
         this.pending.clear();
         CompletableFuture<Long> inFlight;
         long end;
-        synchronized (this.applyLock) {
+        this.applyLock.lock();
+        try {
             this.closed = true;
             inFlight = this.lastApply;
             end = this.expected;
+        } finally {
+            this.applyLock.unlock();
         }
         try {
             inFlight.get(5, java.util.concurrent.TimeUnit.SECONDS);
