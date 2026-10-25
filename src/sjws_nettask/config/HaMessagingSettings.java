@@ -200,15 +200,15 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
             throw new ConfigException("ha.members: two voters require a witness (a bare pair cannot lose a node and"
                     + " still commit)");
         }
+        if (members.size() < 3) {
+            throw new ConfigException("ha.members needs 3 or more voters, or 2 data nodes plus a witness; got "
+                    + members.size());
+        }
         if (witnesses > 1) {
             throw new ConfigException("ha.members: at most one witness");
         }
         if (witnesses == 1 && data != 2) {
             throw new ConfigException("ha.members: a witness needs exactly 2 data nodes; got " + data);
-        }
-        if (members.size() < 3) {
-            throw new ConfigException("ha.members needs 3 or more voters, or 2 data nodes plus a witness; got "
-                    + members.size());
         }
     }
 
