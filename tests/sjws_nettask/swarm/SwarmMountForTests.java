@@ -40,6 +40,18 @@ public final class SwarmMountForTests implements AutoCloseable {
         return new SwarmMountForTests(swarm, new SwarmHttp(swarm, 4, StreamHttpTest.BY_HEADER));
     }
 
+    /**
+     * Submits one task in-process through the mounted handler: a stream task ({@code :stream}) or a unary one. HTTP/3
+     * ignores request bodies today (see {@code Http3RequestHandler}), so transport tests submit here and claim over the
+     * wire ({@code :claim} has no body). Returns the HTTP status.
+     */
+    public int submit(String pool, boolean stream) {
+        var r = this.http.handle(new sjws_nettask.core.Request("POST", "/swarm/v1/tasks/" + pool + (stream ? ":stream" : ""),
+                sjws_nettask.core.RequestHeaders.NONE, null, false, null,
+                SwarmHttpTest.body(SwarmHttpTest.task("x").encode())));
+        return r.status();
+    }
+
     public HandlerContributor contributor() {
         return mounts -> mounts.mount("/swarm/v1", this.http);
     }

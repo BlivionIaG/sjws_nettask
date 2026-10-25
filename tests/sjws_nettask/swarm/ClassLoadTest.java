@@ -143,14 +143,14 @@ class ClassLoadTest {
      */
     @Test
     void claimWithStreamOffLoadsNoStreamClassAndSendsNoLeaseStreamHeader() throws Exception {
-        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.dir=" + this.dir.resolve("swarm-off"),
+        var text = runChecked(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.dir=" + this.dir.resolve("swarm-off"),
                 "-Dsjws.swarm.tokens.file=" + tokens()), "Server started:",
                 port -> assertFalse(submitAndClaim(port, false).contains("sjws-lease-stream"), "flag off: no header"),
                 "sjws_nettask.Sjws_nettask", "--config=" + yaml());
         assertTrue(text.contains("sjws_nettask.swarm.SwarmHttp "), text);
         assertFalse(text.contains("sjws_nettask.swarm.StreamHttp"), text);
         assertFalse(text.contains("sjws_nettask.swarm.TokenStreams"), text);
-        var on = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+        var on = runChecked(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
                 "-Dsjws.swarm.dir=" + this.dir.resolve("swarm-on"), "-Dsjws.swarm.tokens.file=" + tokens()), "Server started:",
                 port -> {
                     assertFalse(submitAndClaim(port, false).contains("sjws-lease-stream"), "flag on, unary only: none");
@@ -268,7 +268,7 @@ class ClassLoadTest {
 
     /** {@code swarmStatus} is the HTTP status of {@code GET /swarm/v1/tasks}, checked while the process is up. */
     private String run(List<String> jvmFlags, String ready, Integer swarmStatus, String... main) throws Exception {
-        return run(jvmFlags, ready, swarmStatus == null ? null : port -> assertEquals(swarmStatus.intValue(),
+        return runChecked(jvmFlags, ready, swarmStatus == null ? null : port -> assertEquals(swarmStatus.intValue(),
                 swarmHttpStatus(port)), main);
     }
 
@@ -277,7 +277,7 @@ class ClassLoadTest {
         void check(int port) throws Exception;
     }
 
-    private String run(List<String> jvmFlags, String ready, PortCheck check, String... main) throws Exception {
+    private String runChecked(List<String> jvmFlags, String ready, PortCheck check, String... main) throws Exception {
         var log = this.dir.resolve("classes-" + System.nanoTime() + ".log");
         var cmd = new ArrayList<String>();
         cmd.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
