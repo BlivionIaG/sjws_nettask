@@ -515,9 +515,9 @@ class StreamCreditTest {
 
     @Test
     void nConcurrentChunksAtCreditOneAdmitExactlyOne() throws Exception {
-        on(8);
+        on(64); // window 64 (≤ sinkChunks, #257 R2): every concurrent seq lies inside the reorder window
         for (int round = 0; round < 10; round++) {
-            var s = filled(7, 10); // credit 1, no reader
+            var s = filled(63, 10); // credit 1, no reader
             assertEquals(1, creditChunks(s));
             var writes = new AtomicInteger();
             tokens().beforeWrite = writes::incrementAndGet;
@@ -531,7 +531,7 @@ class StreamCreditTest {
             }
             var threads = new ArrayList<Thread>();
             for (int i = 0; i < n; i++) {
-                long chunkSeq = 7 + i; // distinct seqs of the current attempt
+                long chunkSeq = 63 + i; // distinct seqs of the current attempt
                 threads.add(Thread.ofPlatform().start(() -> {
                     try {
                         go.await();
@@ -1050,7 +1050,9 @@ class StreamCreditTest {
         var s = stream();
         for (int seq = 0; seq < 40; seq++) { // the old attempt's reader gets far ahead of any new-attempt window
             credit(chunk(s, seq, 10));
-            if (seq % 4 == 3) {
+            if (seq == 3) {
+                read(s, 4);
+            } else if (seq % 4 == 3) {
                 read(s, 4, "last-event-id", s.attempt() + "." + (seq - 4));
             }
         }

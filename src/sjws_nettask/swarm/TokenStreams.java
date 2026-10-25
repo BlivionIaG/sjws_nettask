@@ -90,6 +90,12 @@ public final class TokenStreams {
             if (sinkChunks < 1 || sinkChunks > 65_536) {
                 throw new IllegalArgumentException("sjws.swarm.stream.sinkChunks 1..65536: " + sinkChunks);
             }
+            if (credit && window > sinkChunks) { // #257 R2: held chunks (≤ window − 1) and the filler must fit the sink
+                throw new IllegalArgumentException("sjws.swarm.stream.window (" + window
+                        + ") must be at most sjws.swarm.stream.sinkChunks (" + sinkChunks
+                        + ") when sjws.swarm.stream.credit.enabled is on: out-of-order chunks held for reordering would"
+                        + " fill the sink and stall the stream; lower the window or raise sinkChunks");
+            }
         }
 
         public static final Config DEFAULT = new Config(1, TokenStream.Reorder.DEFAULT_WINDOW, 256);

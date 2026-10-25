@@ -38,9 +38,10 @@ import sjws_nettask.swarm.wire.Credit;
  * {@code bytes} in the low 40; fields are always extracted unsigned and the packed value is never compared). A check
  * claims its chunk with a CAS, re-reads and re-validates with the same test (ABA), and releases exactly once in the
  * request's {@code finally}; the release CAS never goes below zero and counts {@link #reserveUnderflows()}.</li>
- * <li><b>Read order</b> (sources before destinations): {@code reserved}; {@code readNext}, {@code readBytes},
- * {@code readAttempt}; {@code heldChunks}, {@code heldBytes}; {@code attempt}, {@code maxSeq}, {@code appendedBytes}.
- * Writers publish destinations first: the reader writes {@code readAttempt → readBytes → readNext}; the drain writes
+ * <li><b>Read order</b> (sources before destinations): {@code reserved}; {@code readAttempt}, {@code readNext},
+ * {@code readBytes}; {@code heldChunks}, {@code heldBytes}; {@code attempt}, {@code maxSeq}, {@code appendedBytes}.
+ * Writers publish the attempt last: the reader writes {@code readBytes → readNext → readAttempt} (#257 R3, so a
+ * position of one attempt is never read under another's {@code readAttempt}); the drain writes
  * {@code appendedBytes → maxSeq} and, on a RESET, {@code attempt} last; held chunks are lowered only after the drain
  * returns (as deltas, never stored).</li>
  * </ul>
@@ -71,7 +72,7 @@ final class StreamCredit {
     volatile Runnable beforeReserve;
     /** Test hook (#248 r5 C3): runs after an offer's listener drain returned, before held is lowered. */
     volatile Runnable beforeHeldLowered;
-    /** Test hook (C3), run on the reader thread between its first and its remaining read-position stores. */
+    /** Test hook (C3, #257 R3): runs on the reader thread inside {@code publishRead}, before {@code readAttempt}. */
     volatile Runnable midReadPublish;
 
     private record Key(long hi, long lo) { }
@@ -141,9 +142,9 @@ final class StreamCredit {
      * spec's order; O(1), no lock, no walk.
      */
     int verdict(StreamHttp.Session s, State st, long reserved, long la, long seq, long size) {
+        long ra = st.readAttempt; // first (#257 R3): the reader publishes it last
         long rn = st.readNext;
         long rb = st.readBytes;
-        long ra = st.readAttempt;
         long hc = Math.max(0, st.heldChunks.get());
         long hb = Math.max(0, st.heldBytes.get());
         long a = s.attempt;
@@ -170,9 +171,9 @@ final class StreamCredit {
     /** The advisory snapshot sent in the CREDIT frame: the same reads, other requests' reservations included. */
     Credit snapshot(StreamHttp.Session s, State st, long streamHi, long streamLo, long la) {
         long r = st.reserved.get();
+        long ra = st.readAttempt; // first (#257 R3): the reader publishes it last
         long rn = st.readNext;
         long rb = st.readBytes;
-        long ra = st.readAttempt;
         long hc = Math.max(0, st.heldChunks.get());
         long hb = Math.max(0, st.heldBytes.get());
         long a = s.attempt;
@@ -332,13 +333,17 @@ final class StreamCredit {
         // --- reader side, written only by the session's single reader
 
         void publishRead(long attempt, long bytes, long next) {
-            this.readAttempt = attempt;
+            // #257 R3: the attempt is published last (as the drain does), the check reads it first: a check that sees
+            // the new readAttempt then reads the new attempt's position; one that sees the old readAttempt with a
+            // new position also sees the new Session.attempt (published by the drain before the reader learns of it),
+            // so the mismatch rule counts nothing read. Within one attempt readBytes goes before readNext.
+            this.readBytes = bytes;
             var hook = this.owner.midReadPublish;
             if (hook != null) {
                 hook.run();
             }
-            this.readBytes = bytes;
             this.readNext = next;
+            this.readAttempt = attempt;
         }
     }
 }

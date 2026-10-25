@@ -93,6 +93,12 @@ final class StreamHttp {
     static final int MAX_SESSIONS_PER_AGENT = 64;
     static final int MAX_SESSIONS = 4096;
     static final long RETAIN_BYTES = 4L << 20;
+    /**
+     * #257 R1, credit on only: chunks the session retains beyond the credit window (sinkChunks, {@link #RETAIN_BYTES}).
+     * Checked chunks overshoot the window by at most two (the liveness exemption and one torn read, §5.2), and a
+     * {@code LAST} is never refused; with this much room the retain trim only ever removes chunks already read.
+     */
+    static final int CREDIT_RETAIN_SLACK = 3;
     static final long SWEEP_MS = 5_000;
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final HexFormat HEX = HexFormat.of();
@@ -473,7 +479,10 @@ final class StreamHttp {
         var sid = new byte[16];
         RANDOM.nextBytes(sid);
         var key = HEX.formatHex(sid);
-        var s = new Session(agent.id(), correlation, sink, deadlineMs, this.streams.config().sinkChunks(), RETAIN_BYTES);
+        int sinkChunks = this.streams.config().sinkChunks();
+        var s = this.credit == null ? new Session(agent.id(), correlation, sink, deadlineMs, sinkChunks, RETAIN_BYTES)
+                : new Session(agent.id(), correlation, sink, deadlineMs, sinkChunks + CREDIT_RETAIN_SLACK,
+                        RETAIN_BYTES + CREDIT_RETAIN_SLACK * (long) SwarmHttp.MAX_REQUEST); // #257 R1: retain ⊇ window + 3
         sink.onOffer(s::drain); // retain chunks produced before the first GET
         if (this.credit != null) {
             sink.credit = this.credit.register(s); // before the task exists, so before its first chunk
@@ -632,7 +641,7 @@ final class StreamHttp {
         /** S2c PR 6: chunk {@code c} was handed to the transport; it counts as read. */
         private void read(StreamHttp.Session s, StreamCredit.State cr, StreamChunk c) {
             long bytes;
-            if (c.attempt() == cr.readAttempt) {
+            if (c.attempt() == cr.readAttempt && c.chunkSeq() == cr.readNext) {
                 bytes = cr.readBytes + c.size(); // the reader advances one chunk at a time: offset(c) + size(c)
             } else {
                 s.lock.lock();
@@ -887,7 +896,9 @@ final class StreamHttp {
             return SwarmHttp.cancelled(why).response();
         }
         if (la == s.attempt && c.chunkSeq() <= st.maxSeq) {
-            // #248 r5 C2: a retry of a chunk already accepted in this attempt; nothing to admit, the snapshot answers
+            // #248 r5 C2: a retry of a chunk already accepted in this attempt; nothing to admit, the snapshot answers.
+            // #257 N3: this skips the fence, so a duplicate of a fence-retired same-numbered attempt also gets 200 here
+            // (not 409 STALE_ATTEMPT); nothing is written, and the worker's next new chunk meets the fence.
             return creditFrame(cr.snapshot(s, st, c.streamHi(), c.streamLo(), la));
         }
         cr.refused();
