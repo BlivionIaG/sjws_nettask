@@ -271,6 +271,76 @@ public final class Partition implements AutoCloseable {
         }
     }
 
+    /** What a forwarded produce did (#236, {@link #produceFrom}). */
+    public enum ForwardOutcome {
+        /** Appended at {@code offset}. */
+        APPENDED,
+        /** Already appended at {@code offset}: a retry. */
+        DUPLICATE,
+        /** The seq fell out of the 4096-seq window: it may never have been applied, so this is a failure, not success. */
+        TOO_OLD,
+        /** Not the next seq for this producer: resend from {@code expectedSeq} (go-back-N). */
+        OUT_OF_ORDER,
+        /** A new producer while its origin already has the maximum live producers here: retry later. */
+        BUSY
+    }
+
+    /**
+     * Result of {@link #produceFrom}.
+     *
+     * @param offset the new offset (APPENDED) or the original one (DUPLICATE), else -1
+     * @param expectedSeq for OUT_OF_ORDER, the seq this partition accepts next from the producer; else 0
+     * @param durable APPENDED: completes with {@code offset} once durable per the requested durability; otherwise
+     *        already complete
+     */
+    public record ForwardedResult(ForwardOutcome outcome, long offset, long expectedSeq, CompletableFuture<Long> durable) { }
+
+    /** Default cap on live forwarded producers per origin per partition. */
+    public static final int DEFAULT_LIVE_PRODUCERS = 1024;
+    /** Default idle time after which a forwarded producer may be evicted to make room for a new one. */
+    public static final long DEFAULT_PRODUCER_IDLE_MS = 3_600_000L;
+
+    /**
+     * Appends a message forwarded by another node (#236 option (a)). {@code origin} is the authenticated sending
+     * node's wire id, never a payload value; dedup is keyed by {@code (origin, producerId)}, apart from local
+     * producers. Each forwarded producer's seqs are applied strictly in order starting at 1: a repeat inside the
+     * window is DUPLICATE, a seq older than the window is TOO_OLD, and a gap is OUT_OF_ORDER with the expected seq.
+     * {@link #produce} is unchanged.
+     *
+     * @param maxLiveProducers cap on live producers for {@code origin} here; beyond it a new producer gets BUSY unless
+     *        one has been idle {@code producerIdleMs} and is evicted
+     * @throws java.util.concurrent.CompletionException when the ledger writer is fenced: nothing was applied. Any
+     *         other exception may come after the append was handed to the ledger, so the write's fate is unknown.
+     */
+    public ForwardedResult produceFrom(int origin, long producerId, long seq, byte[] payload, Durability durability,
+            int maxLiveProducers, long producerIdleMs) {
+        if (origin < 1 || origin > 0xFFFF) throw new IllegalArgumentException("origin " + origin);
+        if (producerId == 0 || seq < 1) throw new IllegalArgumentException("forwarded producer and seq");
+        if (maxLiveProducers < 1 || producerIdleMs < 0) throw new IllegalArgumentException("producer limits");
+        long ts = clockMs.getAsLong();
+        var entry = new LedgerEntry.Enqueue(producerId, seq, ts, "", -1, 0, "", payload, origin);
+        var enc = List.of(LedgerEntry.encode(entry));
+        lockForAppend();
+        try {
+            long c = state.checkRemote(origin, producerId, seq, ts, maxLiveProducers, producerIdleMs);
+            if (c >= 0) return new ForwardedResult(ForwardOutcome.DUPLICATE, c, 0, CompletableFuture.completedFuture(c));
+            if (c == DeliveryState.REMOTE_TOO_OLD) return refused(ForwardOutcome.TOO_OLD, 0);
+            if (c == DeliveryState.REMOTE_OUT_OF_ORDER) {
+                return refused(ForwardOutcome.OUT_OF_ORDER, state.expectedSeq(origin, producerId));
+            }
+            if (c == DeliveryState.REMOTE_BUSY) return refused(ForwardOutcome.BUSY, 0);
+            long o = state.nextOffset;
+            var f = appendEncoded(entry, enc, durability);
+            return new ForwardedResult(ForwardOutcome.APPENDED, o, 0, f);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static ForwardedResult refused(ForwardOutcome outcome, long expected) {
+        return new ForwardedResult(outcome, -1, expected, CompletableFuture.completedFuture(-1L));
+    }
+
     // ---- consumer groups ----
 
     /** Creates {@code group} if absent: from the oldest retained message, or from the next new one. Idempotent. */

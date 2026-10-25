@@ -423,6 +423,92 @@ class StreamHttpTest {
         producer.join();
     }
 
+    /**
+     * A reader that caught up parks on the session (one or more 250 ms poll steps, no heartbeat before 15 s) and
+     * returns the next chunk once it arrives. Unlike {@link #liveReaderSeesChunksAsTheyArrive}, the producer only
+     * writes after the reader is seen parked, so the wait path runs on every run (it was timing-dependent before).
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(20)
+    void aParkedSseReaderReturnsTheNextChunk() throws Exception {
+        streamsOn();
+        var session = startStream("");
+        var c = claim();
+        var src = ((Body.Stream) req("GET", "a", session, new byte[0]).body()).source();
+        assertEquals("retry: 1000\n\n", StandardCharsets.UTF_8.decode(src.next()).toString());
+        var got = parkedNext(src, () -> assertEquals(204, chunk(c, 0, StreamChunk.FIRST, "late").status()));
+        assertEquals("id: 1.0\nevent: chunk\ndata: late\n\n", StandardCharsets.UTF_8.decode(got).toString(),
+                "the chunk, not a heartbeat comment");
+        chunk(c, 1, Frame.LAST, "");
+        assertTrue(StandardCharsets.UTF_8.decode(src.next()).toString().contains("data: ok"));
+        assertNull(src.next());
+        src.close();
+    }
+
+    /** The same wait on a binary reader (no SSE heartbeat to consider): the parked reader gets the TOKEN frame. */
+    @Test
+    @org.junit.jupiter.api.Timeout(20)
+    void aParkedBinaryReaderReturnsTheNextFrame() throws Exception {
+        streamsOn();
+        var session = startStream("");
+        var c = claim();
+        var src = ((Body.Stream) req("GET", "a", session, new byte[0], "accept", SwarmHttp.CONTENT_TYPE).body()).source();
+        var got = parkedNext(src, () -> assertEquals(204, chunk(c, 0, StreamChunk.FIRST | Frame.LAST, "bin").status()));
+        var f = Frame.decode(got);
+        assertEquals(Frame.Type.TOKEN, f.type());
+        var sc = StreamChunk.decode(f.payload());
+        assertArrayEquals("bin".getBytes(StandardCharsets.UTF_8), sc.bytes());
+        assertTrue(sc.last());
+        assertNull(src.next());
+        src.close();
+    }
+
+    /** A binary reader past the deadline gets one ERROR|LAST "deadline" frame and the stream ends. */
+    @Test
+    void deadlineEndsABinaryReaderWithAnErrorFrame() throws Exception {
+        streamsOn();
+        var session = startStream("?deadlineMs=1000");
+        var c = claim();
+        assertEquals(204, chunk(c, 0, StreamChunk.FIRST, "x").status());
+        this.now.addAndGet(2_000);
+        var in = ByteBuffer.wrap(drainBytes(req("GET", "a", session, new byte[0], "accept", SwarmHttp.CONTENT_TYPE)));
+        assertEquals(Frame.Type.TOKEN, Frame.decode(in).type());
+        var end = Frame.decode(in);
+        assertEquals(Frame.Type.ERROR, end.type());
+        assertTrue((end.flags() & Frame.LAST) != 0);
+        assertEquals("deadline", new String(end.payload(), StandardCharsets.UTF_8));
+        assertNull(Frame.decode(in));
+    }
+
+    /**
+     * Calls {@code src.next()} on another thread, waits until that thread is parked in the session wait and has
+     * been through at least one 250 ms poll step, then runs {@code produce} and returns what the reader got.
+     */
+    static ByteBuffer parkedNext(Body.Stream.Source src, Runnable produce) throws Exception {
+        var out = new java.util.concurrent.atomic.AtomicReference<ByteBuffer>();
+        var err = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var reader = new Thread(() -> {
+            try {
+                out.set(src.next());
+            } catch (Throwable e) {
+                err.set(e);
+            }
+        }, "parked-reader");
+        reader.start();
+        long until = System.nanoTime() + 10_000_000_000L;
+        while (reader.getState() != Thread.State.TIMED_WAITING) {
+            assertTrue(reader.isAlive() && System.nanoTime() < until, "reader never parked: " + err.get());
+            Thread.sleep(5);
+        }
+        Thread.sleep(400); // past one await(250) timeout: the reader loops back to Wait instead of returning
+        assertTrue(reader.isAlive(), "the reader returned before any chunk: " + out.get());
+        produce.run();
+        reader.join(10_000);
+        assertNull(err.get());
+        assertTrue(out.get() != null, "the parked reader returned the chunk");
+        return out.get();
+    }
+
     @Test
     void sweepDropsExpiredUnreadSessions() {
         streamsOn();

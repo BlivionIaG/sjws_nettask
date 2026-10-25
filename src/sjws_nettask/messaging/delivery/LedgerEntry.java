@@ -10,12 +10,24 @@ import java.nio.charset.StandardCharsets;
  */
 public sealed interface LedgerEntry {
 
-    byte ENQUEUE_T = 1, SUBSCRIBE_T = 2, DELIVER_T = 3, ACK_T = 4, NACK_T = 5, DLQ_T = 6, EXTEND_T = 7;
+    byte ENQUEUE_T = 1, SUBSCRIBE_T = 2, DELIVER_T = 3, ACK_T = 4, NACK_T = 5, DLQ_T = 6, EXTEND_T = 7, ENQUEUE_FROM_T = 8;
 
-    /** A message. {@code producerId == 0} disables dedup. {@code originGroup} is non-empty only in a DLQ topic. */
+    /**
+     * A message. {@code producerId == 0} disables dedup. {@code originGroup} is non-empty only in a DLQ topic.
+     * {@code origin} is 0 for a local produce (encoded as type 1, unchanged) and the authenticated sending node's wire
+     * id (1..65535) for a forwarded one (#236): those are encoded as type 8, which a build without it refuses at replay
+     * ("unknown ledger entry type") rather than misreading, and their dedup is keyed by {@code (origin, producerId)}.
+     */
     record Enqueue(long producerId, long seq, long timestampMs, String originGroup, long originOffset, int originAttempts,
-            String originReason, byte[] payload) implements LedgerEntry {
-        public Enqueue { payload = payload.clone(); }
+            String originReason, byte[] payload, int origin) implements LedgerEntry {
+        public Enqueue {
+            if (origin < 0 || origin > 0xFFFF) throw new IllegalArgumentException("origin " + origin);
+            payload = payload.clone();
+        }
+        public Enqueue(long producerId, long seq, long timestampMs, String originGroup, long originOffset,
+                int originAttempts, String originReason, byte[] payload) {
+            this(producerId, seq, timestampMs, originGroup, originOffset, originAttempts, originReason, payload, 0);
+        }
         @Override public byte[] payload() { return payload.clone(); }
         byte[] payloadRef() { return payload; }
     }
@@ -55,7 +67,8 @@ public sealed interface LedgerEntry {
         var b = ByteBuffer.allocate(size(e));
         switch (e) {
             case Enqueue x -> {
-                b.put(ENQUEUE_T).putLong(x.producerId).putLong(x.seq).putLong(x.timestampMs);
+                if (x.origin == 0) b.put(ENQUEUE_T); else b.put(ENQUEUE_FROM_T).putShort((short) x.origin);
+                b.putLong(x.producerId).putLong(x.seq).putLong(x.timestampMs);
                 str(b, x.originGroup);
                 b.putLong(x.originOffset).putInt(x.originAttempts);
                 str(b, x.originReason);
@@ -79,7 +92,7 @@ public sealed interface LedgerEntry {
 
     private static int size(LedgerEntry e) {
         return 1 + switch (e) {
-            case Enqueue x -> 24 + ss(x.originGroup) + 12 + ss(x.originReason) + 4 + x.payload.length;
+            case Enqueue x -> (x.origin == 0 ? 0 : 2) + 24 + ss(x.originGroup) + 12 + ss(x.originReason) + 4 + x.payload.length;
             case Subscribe x -> ss(x.group) + 8;
             case Deliver x -> ss(x.group) + 8 + ss(x.consumer) + 12;
             case Ack x -> ss(x.group) + 8;
@@ -92,8 +105,11 @@ public sealed interface LedgerEntry {
     static LedgerEntry decode(byte[] raw) {
         var b = ByteBuffer.wrap(raw);
         try {
-            LedgerEntry e = switch (b.get()) {
-                case ENQUEUE_T -> {
+            byte type = b.get();
+            LedgerEntry e = switch (type) {
+                case ENQUEUE_T, ENQUEUE_FROM_T -> {
+                    int origin = type == ENQUEUE_T ? 0 : b.getShort() & 0xFFFF;
+                    if (type == ENQUEUE_FROM_T && origin == 0) throw new IllegalArgumentException("forwarded enqueue without origin");
                     long pid = b.getLong(), seq = b.getLong(), ts = b.getLong();
                     String og = str(b);
                     long oo = b.getLong();
@@ -101,7 +117,7 @@ public sealed interface LedgerEntry {
                     String or = str(b);
                     var p = new byte[b.getInt()];
                     b.get(p);
-                    yield new Enqueue(pid, seq, ts, og, oo, oa, or, p);
+                    yield new Enqueue(pid, seq, ts, og, oo, oa, or, p, origin);
                 }
                 case SUBSCRIBE_T -> new Subscribe(str(b), b.getLong());
                 case DELIVER_T -> new Deliver(str(b), b.getLong(), str(b), b.getLong(), b.getInt());
