@@ -54,6 +54,9 @@ class FakeServer(http.server.ThreadingHTTPServer):
         self.on_post = None  # (path, body) -> (status, headers, body) for anything else
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
+    def handle_error(self, request, client_address):
+        pass  # clients dropping keep-alive or streaming connections is part of the tests
+
     @property
     def url(self):
         return f"http://127.0.0.1:{self.server_address[1]}"
