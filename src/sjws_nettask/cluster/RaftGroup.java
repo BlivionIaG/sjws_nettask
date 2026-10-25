@@ -468,6 +468,11 @@ final class RaftGroup {
      * Set when a failed batch could not be rolled back. The group then fails closed until the process restarts:
      * it has stepped down, refuses appends, ignores every frame and does not campaign, because its log may hold
      * part of a batch whose future already failed.
+     *
+     * <p>Guarded by {@link #lock}: written once (null to non-null, never back) in {@link #rollBackBatch} under the
+     * lock, and every read (append, tick, handle, the snapshot and truncation calls, {@link #failedClosed()},
+     * {@link #fencedError()}) happens under the lock too, so it needs no {@code volatile}. Keep it that way: a
+     * read outside the lock could miss the write and let a fenced group touch storage.
      */
     private UncheckedIOException storageFailed;
 
@@ -486,6 +491,20 @@ final class RaftGroup {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Under the lock, when failing closed: the error for writes that were already in the log and still pending.
+     * They are not refused like a {@link NotLeaderException} would suggest: they may already be on a follower (or
+     * on this node's disk) and commit under a later leader, so their outcome is unknown. Same type as the failed
+     * batch's own error, so callers handle both as a timeout and deduplicate on retry.
+     */
+    private UncheckedIOException outcomeUnknown(String what) {
+        var error = new UncheckedIOException("group " + groupId.value() + " failed closed after a log write it could"
+                + " not roll back; " + what + " was already in the log, outcome unknown: it may still commit",
+                storageFailed.getCause());
+        error.addSuppressed(storageFailed);
+        return error;
     }
 
     private UncheckedIOException fencedError() {
@@ -522,7 +541,22 @@ final class RaftGroup {
                     + " from index " + first + " could not be rolled back; outcome unknown, failing closed", cause);
             storageFailed.addSuppressed(rollback);
             log.log(System.Logger.Level.ERROR, storageFailed.getMessage(), storageFailed);
-            stepDown(term, after); // same term: no hard-state write; fails the other pending futures
+            // Writes appended before this batch may still commit (they can already be on a follower), so they fail
+            // as outcome unknown, not as not-leader. Done before stepDown, which would otherwise fail them as
+            // NotLeaderException; it then finds nothing pending. Same delivery-thread ordering as stepDown.
+            for (var entry : pending.entrySet()) {
+                var future = entry.getValue();
+                var error = outcomeUnknown("the append at index " + entry.getKey());
+                deliveries.submit(() -> future.completeExceptionally(error), future);
+            }
+            pending.clear();
+            if (membershipChange != null) {
+                var change = membershipChange;
+                membershipChange = null;
+                var error = outcomeUnknown("a membership change");
+                after.add(() -> change.completeExceptionally(error));
+            }
+            stepDown(term, after); // same term: no hard-state write
             return storageFailed;
         }
     }
