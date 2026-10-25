@@ -151,7 +151,8 @@ The rest of the suite:
   weekly cron (`0 3 * * 1`) for mutation only.
 - `permissions: contents: read`. Concurrency group `ci-<workflow>-<ref>`,
   cancel in progress on pull requests.
-- Job `verify` (not on the cron): Temurin 25, `ubuntu-latest`. `macos-latest` is
+- Job `verify` (not on the cron): Temurin 25, `ubuntu-24.04` (pinned for
+  [#265](https://github.com/BlivionIaG/sjws_nettask/issues/265)). `macos-latest` is
   added only for `workflow_dispatch`. Timeout 45 minutes. Steps: checkout,
   `actions/setup-java` with the Maven cache, then the steps in the diagram below, then
   upload `target/site/jacoco/`.
@@ -174,7 +175,11 @@ The rest of the suite:
   reports request errors or zero throughput. The 30 s comparison is local; see
   `bench/README.md`. macOS CI (manual dispatch only) skips that step.
 
-- Job `mutation` (cron or `workflow_dispatch` only): `ubuntu-latest`, timeout
+- Job `verify-canary (ubuntu-26.04, non-gating)`: the same steps on Ubuntu 26.04 with
+  `continue-on-error: true`, so it never blocks a merge. It tracks the three tests that fail
+  there (#265). Once it is green, lift the pins.
+
+- Job `mutation` (cron or `workflow_dispatch` only): `ubuntu-24.04` (#265 pin), timeout
   120 minutes, PIT via `mvn -B -P pitest test-compile org.pitest:pitest-maven:mutationCoverage`.
   Not part of a pull request.
 
@@ -191,7 +196,7 @@ flowchart TB
         v0["Linux only: install<br/>Prometheus 3.15.0, which<br/>PrometheusScrapeTest<br/>requires on Linux CI"] --> v1["mvn -B verify<br/>tests, jar tests,<br/>JaCoCo gate"] --> v1b["HTTP/1 tests again with<br/>the buffer pool on<br/>(-Dsjws.buf.pool=on,<br/>debug mode)"] --> v1c["Python SDK tests against<br/>the jar that verify built"] --> v2["mvn -B -Dgroups=e2e test<br/>fails if no e2e test<br/>matched"] --> v3["mvn -B -Dgroups=cluster<br/>test: live multi-node<br/>scenarios"] --> v4["Linux only: install wrk,<br/>then<br/>tools/gateway-bench.sh<br/>standalone vs<br/>gateway-off"] --> v5["Upload target/site/jacoco/"]
     end
 
-    subgraph mut["Job mutation: ubuntu-latest"]
+    subgraph mut["Job mutation: ubuntu-24.04"]
         direction TB
         m1["PIT mutation coverage<br/>never on a pull request"] --> m2["Upload target/pit-reports/"]
     end

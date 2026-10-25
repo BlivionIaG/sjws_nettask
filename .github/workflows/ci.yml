@@ -27,7 +27,7 @@ jobs:
         os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-24.04","macos-latest"]' || '["ubuntu-24.04"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    steps:
+    steps: &verify-steps
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
         with:
@@ -64,6 +64,22 @@ jobs:
           name: jacoco-${{ matrix.os }}
           path: target/site/jacoco/
           if-no-files-found: ignore
+
+  # Non-gating canary for #265: the same steps as `verify` on Ubuntu 26.04. It tracks the three
+  # tests that fail there (SwarmBenchCleanupTest, DaemonTest.symlinkPidFileIsRefusedAndGarbageIsStale,
+  # the Http1TransportTest sendfile CPU-spin checks). Once this leg is green, lift the
+  # ubuntu-24.04 pins and fold 26.04 into `verify`. Artifacts are jacoco-ubuntu-26.04.
+  verify-canary:
+    name: verify-canary (${{ matrix.os }}, non-gating)
+    if: github.event_name != 'schedule'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps: *verify-steps
 
   mutation:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
