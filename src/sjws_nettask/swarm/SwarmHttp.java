@@ -257,11 +257,12 @@ final class SwarmHttp implements Handler {
                 spans.append(spans.isEmpty() ? "" : ",").append(child.isEmpty() ? "-" : child);
             }
             if (streamLeg != null) {
+                boolean stream = TokenStreams.isStreamTask(t.envelope()); // once per task (#263 N3)
                 if (streamIds != null) {
-                    StreamHttp.appendLeaseStream(streamIds.append(','), t);
-                } else if (TokenStreams.isStreamTask(t.envelope())) {
+                    StreamHttp.appendLeaseStream(streamIds.append(','), t, stream);
+                } else if (stream) {
                     streamIds = StreamHttp.leaseStreamPrefix(unaryBefore);
-                    StreamHttp.appendLeaseStream(streamIds, t);
+                    StreamHttp.appendLeaseStream(streamIds, t, true);
                 } else {
                     unaryBefore++;
                 }

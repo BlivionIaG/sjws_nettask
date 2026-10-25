@@ -92,6 +92,40 @@ class LeaseStreamHttp3Test {
         }
     }
 
+    /** #263 R1: a {@code max=256} claim over QUIC carries the full 8,959 B {@code sjws-lease-stream} (QPACK, H3 client). */
+    @org.junit.jupiter.api.Test
+    void claimOf256StreamTasksOverHttp3() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(Http3Server.isAvailable(),
+                () -> "native QUIC unavailable: " + Http3Server.unavailabilityCause());
+        var tls = TlsMaterial.selfSigned("localhost");
+        var cert = Files.writeString(this.root.resolve("cert.pem"),
+                SjwsServerHttp3Test.pem("CERTIFICATE", tls.certificate().getEncoded()));
+        var key = Files.writeString(this.root.resolve("key.pem"),
+                SjwsServerHttp3Test.pem("PRIVATE KEY", tls.key().getEncoded()));
+        var config = ServerConfig.builder(this.root).port(0).h3Enabled(true).h3Port(0).h3Host("127.0.0.1")
+                .tlsCert(cert).tlsKey(key).build();
+        try (var mount = SwarmMountForTests.streaming(this.root.resolve("swarm"), 64, 256, false);
+                var server = SjwsServer.start(config, RequestFilters.create(), null, List.of(mount.contributor()));
+                var client = new H3TestClient(tls.certificate())) {
+            assertNull(server.h3Failure());
+            for (int i = 0; i < 256; i++) { // at most 64 open sessions per agent
+                assertEquals(201, mount.submit("gen", true, "a" + i / 64));
+            }
+            var quic = client.connect(new InetSocketAddress("127.0.0.1", server.udpPort()));
+            var r = post(quic, "/swarm/v1/tasks/gen:claim?visibilityMs=60000&max=256", new byte[0]);
+            assertEquals(200, r.status());
+            assertEquals(256, leaseIds(r.body()).size());
+            assertEquals(1, r.headerNames().stream().filter("sjws-lease-stream"::equals).count(), "one field");
+            var v = r.header("sjws-lease-stream");
+            assertEquals(256 * 34 + 255, v.length(), "8,959 B at attempt 1");
+            for (var e : v.split(",", -1)) {
+                assertTrue(e.matches("[0-9a-f]{32}/1"), e);
+            }
+            assertEquals(256, java.util.Arrays.stream(v.split(",")).distinct().count(), "distinct streams");
+            assertEquals("64", r.header("sjws-stream-window"));
+        }
+    }
+
     private static H3TestClient.H3Response post(io.netty.handler.codec.quic.QuicChannel quic, String path, byte[] body)
             throws Exception {
         var r = H3TestClient.request(quic, "POST", path,

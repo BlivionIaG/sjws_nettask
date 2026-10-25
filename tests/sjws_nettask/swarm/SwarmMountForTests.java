@@ -46,8 +46,15 @@ public final class SwarmMountForTests implements AutoCloseable {
      * wire ({@code :claim} has no body). Returns the HTTP status.
      */
     public int submit(String pool, boolean stream) {
+        return submit(pool, stream, null);
+    }
+
+    /** As {@link #submit(String, boolean)}, as agent {@code agent} (the {@code x-agent} header; null for the default). */
+    public int submit(String pool, boolean stream, String agent) {
+        var headers = agent == null ? sjws_nettask.core.RequestHeaders.NONE
+                : sjws_nettask.core.RequestHeaders.of(java.util.Map.of("x-agent", java.util.List.of(agent)));
         var r = this.http.handle(new sjws_nettask.core.Request("POST", "/swarm/v1/tasks/" + pool + (stream ? ":stream" : ""),
-                sjws_nettask.core.RequestHeaders.NONE, null, false, null,
+                headers, null, false, null,
                 SwarmHttpTest.body(SwarmHttpTest.task("x").encode())));
         return r.status();
     }

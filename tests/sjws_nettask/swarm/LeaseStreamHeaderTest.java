@@ -70,8 +70,16 @@ class LeaseStreamHeaderTest {
     }
 
     Response post(String target, byte[] body) {
+        return post("a", null, target, body);
+    }
+
+    /** As {@code agent}, with an optional ingress {@code traceparent}. */
+    Response post(String agent, String traceparent, String target, byte[] body) {
         var fields = new HashMap<String, List<String>>();
-        fields.put("x-agent", List.of("a"));
+        fields.put("x-agent", List.of(agent));
+        if (traceparent != null) {
+            fields.put(sjws_nettask.swarm.trace.SwarmTrace.HEADER, List.of(traceparent));
+        }
         return this.http.handle(new Request("POST", target, RequestHeaders.of(fields), null, false, null,
                 SwarmHttpTest.body(body)));
     }
@@ -309,6 +317,78 @@ class LeaseStreamHeaderTest {
         var c = new StreamChunk(id.getLong(), id.getLong(), Long.parseLong(e2.substring(33)), 0, StreamChunk.FIRST,
                 "tok".getBytes(java.nio.charset.StandardCharsets.UTF_8));
         assertEquals(204, post("/swarm/v1/leases/" + lease2 + ":chunk", c.toFrame().encode()).status());
+    }
+
+    /** Spec §5.2 sizes at {@code max=256}: one entry is 32 hex + '/' + the attempt's digits, joined by 255 commas. */
+    static final int SIZE_256_ATTEMPT_1 = 256 * 34 + 255;
+    static final int SIZE_256_ATTEMPT_MAX = 256 * 43 + 255;
+    static final int TRACE_SIZE_256 = 256 * 55 + 255;
+
+    /** Submits {@code n} stream tasks spread over agents (at most 64 open sessions per agent). */
+    void submitStreams(int n, String traceparent) {
+        for (int i = 0; i < n; i++) {
+            var r = post("a" + i / 64, traceparent, "/swarm/v1/tasks/gen:stream", SwarmHttpTest.task("p" + i).encode());
+            assertEquals(201, r.status(), SwarmHttpTest.text(r));
+        }
+    }
+
+    @Test
+    void claimOf256StreamTasksPinsTheHeaderSize() throws Exception {
+        streamsOn();
+        submitStreams(256, null);
+        var r = claim(256);
+        var ls = SwarmHttpTest.leases(r);
+        assertEquals(256, ls.size());
+        var got = single(r, 256);
+        for (int i = 0; i < 256; i++) {
+            assertEquals(expected(ls.get(i).id()), got[i], "entry " + i);
+        }
+        assertEquals(8_959, SIZE_256_ATTEMPT_1);
+        assertEquals(SIZE_256_ATTEMPT_1,
+                r.headers().get(StreamHttp.LEASE_STREAM_HEADER).getBytes(java.nio.charset.StandardCharsets.US_ASCII).length,
+                "max=256 at attempt 1");
+    }
+
+    @Test
+    void headerAt256LeasesAndTheMaximumAttempt() {
+        var t = task("0123456789abcdef0123456789abcdef", 0xffff_ffffL);
+        var b = StreamHttp.appendLeaseStream(StreamHttp.leaseStreamPrefix(0), t);
+        for (int i = 1; i < 256; i++) {
+            StreamHttp.appendLeaseStream(b.append(','), t);
+        }
+        assertEquals(11_263, SIZE_256_ATTEMPT_MAX);
+        assertEquals(SIZE_256_ATTEMPT_MAX, b.length(), "max=256 at attempt 4294967295");
+        assertTrue(b.toString().startsWith("0123456789abcdef0123456789abcdef/4294967295,"), b.substring(0, 50));
+    }
+
+    @Test
+    void claimOf256TracedStreamTasksPinsBothHeaderSizes() throws Exception {
+        this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        this.http = new SwarmHttp(this.swarm, 4, StreamHttpTest.BY_HEADER, true);
+        submitStreams(256, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+        var r = claim(256);
+        assertEquals(256, SwarmHttpTest.leases(r).size());
+        single(r, 256);
+        assertEquals(SIZE_256_ATTEMPT_1, r.headers().get(StreamHttp.LEASE_STREAM_HEADER).length());
+        var trace = r.headers().get(sjws_nettask.swarm.trace.SwarmTrace.LEASE_HEADER);
+        assertEquals(256, trace.split(",", -1).length);
+        assertEquals(14_335, TRACE_SIZE_256);
+        assertEquals(TRACE_SIZE_256, trace.length(), "sjws-lease-traceparent at max=256");
+    }
+
+    @Test
+    void longPollClaimCarriesTheHeader() throws Exception {
+        streamsOn();
+        var claim = java.util.concurrent.CompletableFuture
+                .supplyAsync(() -> post("/swarm/v1/tasks/gen:claim?visibilityMs=60000&waitMs=10000", new byte[0]));
+        Thread.sleep(100);
+        assertFalse(claim.isDone(), "the claim is waiting");
+        submitStream();
+        var r = claim.get(10, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals(200, r.status(), SwarmHttpTest.text(r));
+        var got = single(r, 1)[0];
+        assertEquals(expected(SwarmHttpTest.leases(r).get(0).id()), got);
+        assertEquals("64", r.headers().get(StreamHttp.STREAM_WINDOW_HEADER));
     }
 
     @Test

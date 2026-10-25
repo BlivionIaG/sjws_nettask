@@ -134,8 +134,13 @@ final class StreamHttp {
      * the lease's, the value the admit stamps on every chunk and CREDIT carries; never the lease id's shard suffix.
      */
     static StringBuilder appendLeaseStream(StringBuilder b, Task t) {
+        return appendLeaseStream(b, t, TokenStreams.isStreamTask(t.envelope()));
+    }
+
+    /** {@link #appendLeaseStream(StringBuilder, Task)} with the predicate already evaluated by the caller (one call per task). */
+    static StringBuilder appendLeaseStream(StringBuilder b, Task t, boolean stream) {
         var env = t.envelope();
-        if (!TokenStreams.isStreamTask(env)) {
+        if (!stream) {
             return b.append('-');
         }
         return b.append(HEX.toHexDigits(env.correlationHi())).append(HEX.toHexDigits(env.correlationLo())).append('/')
