@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -43,7 +44,44 @@ import java.util.regex.Pattern;
  * An invalid member list is refused in both {@code on} and {@code auto}, a bare pair of voters included.
  */
 public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members, Duration electionTimeout,
-        Duration heartbeat, Path stateDir, Set<String> topics, boolean replicate, List<String> warnings) {
+        Duration heartbeat, Path stateDir, Set<String> topics, boolean replicate, List<String> warnings,
+        Snapshot snapshot) {
+
+    /**
+     * {@code ha.snapshot} (#270): when each msg group snapshots its ledger and truncates its consensus log, and how a
+     * lagging follower installs a peer's segments.
+     *
+     * @param everyEntries     applied entries between snapshots
+     * @param logTailEntries   consensus entries kept behind a snapshot, so a briefly lagging follower catches up
+     *                         from the log instead of an install
+     * @param chunkBytes       install chunk size (each chunk has its own SHA-256)
+     * @param installRate      install bytes per second each sending node allows, all sessions together
+     * @param portOffset       the install listener's port is the member's Raft port plus this
+     * @param logSegmentBytes  the consensus log rolls into a new file at this size, so truncation frees whole files
+     */
+    public record Snapshot(long everyEntries, long logTailEntries, int chunkBytes, long installRate, int portOffset,
+            long logSegmentBytes) {
+
+        /** Defaults: every 10 000 entries, 1 000 kept, 1 MiB chunks, 64 MiB/s, port + 1, 16 MiB log files. */
+        public static final Snapshot DEFAULT = new Snapshot(10_000, 1_000, 1 << 20, 64L << 20, 1, 16L << 20);
+
+        public Snapshot {
+            if (everyEntries < 1) throw new ConfigException("ha.snapshot.every_entries: expected at least 1");
+            if (logTailEntries < 0) throw new ConfigException("ha.snapshot.log_tail_entries: expected at least 0");
+            if (chunkBytes < 4096 || chunkBytes > 16 << 20) {
+                throw new ConfigException("ha.snapshot.chunk_bytes: expected 4k to 16m");
+            }
+            if (installRate < 4096) throw new ConfigException("ha.snapshot.install_rate: expected at least 4k");
+            if (portOffset < 1 || portOffset > 1000) throw new ConfigException("ha.snapshot.port_offset: expected 1 to 1000");
+            if (logSegmentBytes < 4096) throw new ConfigException("ha.snapshot.log_segment_bytes: expected at least 4k");
+        }
+    }
+
+    /** As the canonical constructor with {@link Snapshot#DEFAULT}. */
+    public HaMessagingSettings(Mode mode, String nodeId, List<Member> members, Duration electionTimeout,
+            Duration heartbeat, Path stateDir, Set<String> topics, boolean replicate, List<String> warnings) {
+        this(mode, nodeId, members, electionTimeout, heartbeat, stateDir, topics, replicate, warnings, Snapshot.DEFAULT);
+    }
 
     /** {@code ha.messaging}. */
     public enum Mode {
@@ -77,7 +115,10 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
 
     /** The {@code ha:} keys this class reads. */
     static final List<String> KEYS = List.of("messaging", "node_id", "members", "election_timeout", "heartbeat",
-            "state_dir", "topics");
+            "state_dir", "topics", "snapshot");
+
+    private static final List<String> SNAPSHOT_KEYS = List.of("every_entries", "log_tail_entries", "chunk_bytes",
+            "install_rate", "port_offset", "log_segment_bytes");
 
     private static final List<String> MEMBER_KEYS = List.of("id", "address", "http_url", "witness", "wire");
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
@@ -90,6 +131,7 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
 
     public HaMessagingSettings {
         members = List.copyOf(members);
+        Objects.requireNonNull(snapshot, "snapshot");
         topics = Set.copyOf(topics);
         warnings = List.copyOf(warnings);
     }
@@ -140,8 +182,39 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
         var topics = topics(ha.get("topics"));
         var warnings = new ArrayList<String>();
         boolean replicate = decide(mode, haEnabled, nodeId, members, election, heartbeat, topics, warnings);
+        var snapshot = snapshot(ha.get("snapshot"));
         return new HaMessagingSettings(mode, nodeId, members, election, heartbeat, stateDir, topics, replicate,
-                warnings);
+                warnings, snapshot);
+    }
+
+    private static Snapshot snapshot(Object raw) {
+        if (raw == null) {
+            return Snapshot.DEFAULT;
+        }
+        var map = YamlValues.mapping(raw, "ha.snapshot");
+        YamlValues.knownKeys(map, SNAPSHOT_KEYS, "ha.snapshot");
+        var d = Snapshot.DEFAULT;
+        return new Snapshot(
+                map.containsKey("every_entries") ? count(map.get("every_entries"), "ha.snapshot.every_entries") : d.everyEntries(),
+                map.containsKey("log_tail_entries") ? count(map.get("log_tail_entries"), "ha.snapshot.log_tail_entries") : d.logTailEntries(),
+                map.containsKey("chunk_bytes") ? (int) Math.min(Integer.MAX_VALUE, size(map.get("chunk_bytes"), "ha.snapshot.chunk_bytes")) : d.chunkBytes(),
+                map.containsKey("install_rate") ? size(map.get("install_rate"), "ha.snapshot.install_rate") : d.installRate(),
+                map.containsKey("port_offset") ? (int) Math.min(Integer.MAX_VALUE, count(map.get("port_offset"), "ha.snapshot.port_offset")) : d.portOffset(),
+                map.containsKey("log_segment_bytes") ? size(map.get("log_segment_bytes"), "ha.snapshot.log_segment_bytes") : d.logSegmentBytes());
+    }
+
+    private static long count(Object raw, String path) {
+        if (!(raw instanceof Number n) || n.doubleValue() != n.longValue() || n.longValue() < 0) {
+            throw new ConfigException(path + ": expected a non-negative integer");
+        }
+        return n.longValue();
+    }
+
+    private static long size(Object raw, String path) {
+        if (raw instanceof Number n) {
+            return count(n, path);
+        }
+        return Sizes.parse(string(raw, path), Long.MAX_VALUE, path);
     }
 
     /** The startup decision; see the class doc. */

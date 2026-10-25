@@ -26,20 +26,22 @@ import java.util.function.LongConsumer;
  * What a replicated topic gives its {@link Replica} beyond the writer (#270 snapshots). Built by the messaging module
  * only when HA replication is installed, so with HA off this type never loads.
  *
- * @param onApplied    every applied batch in log order, after it is in the local writer; after a snapshot install the
- *                     replica replays the whole installed log through it, in order (consumer offsets rebuild that way)
+ * @param onApplied    every applied batch in log order, after it is in the local writer
  * @param dropBelow    a replicated "advance log start" decision: delete whole sealed segments that end at or below the
  *                     offset (called on every replica in log order, never from a local clock)
  * @param readersOut   excludes fetches while the replica swaps the local log for an installed snapshot
+ * @param reloaded     after a snapshot install replaced the local log: rebuild anything derived from it (consumer
+ *                     offsets re-read {@code __offsets})
  * @param state        application state that must survive log truncation (producer dedup, M2), or null
  */
-public record ReplicaHooks(Consumer<List<byte[]>> onApplied, LongConsumer dropBelow, Lock readersOut,
+public record ReplicaHooks(Consumer<List<byte[]>> onApplied, LongConsumer dropBelow, Lock readersOut, Runnable reloaded,
         ReplicatedState state) {
 
     public ReplicaHooks {
         Objects.requireNonNull(onApplied, "onApplied");
         Objects.requireNonNull(dropBelow, "dropBelow");
         Objects.requireNonNull(readersOut, "readersOut");
+        Objects.requireNonNull(reloaded, "reloaded");
     }
 
     /**

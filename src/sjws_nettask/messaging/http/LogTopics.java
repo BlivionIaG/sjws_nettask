@@ -279,7 +279,9 @@ final class LogTopics implements AutoCloseable {
     private sjws_nettask.messaging.ledger.Replica openReplica(sjws_nettask.messaging.ledger.PartitionReplicator rep, String topic,
             SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantReadWriteLock reads) throws IOException {
         java.util.function.Consumer<java.util.List<byte[]>> applied = LogOffsets.TOPIC.equals(topic) ? this.offsets::applied : recs -> { };
-        var hooks = new sjws_nettask.messaging.ledger.ReplicaHooks(applied, x -> dropBelow(topic, log, reads, x), reads.writeLock(), null);
+        Runnable reloaded = LogOffsets.TOPIC.equals(topic) ? this.offsets::reload : () -> { };
+        var hooks = new sjws_nettask.messaging.ledger.ReplicaHooks(applied, x -> dropBelow(topic, log, reads, x), reads.writeLock(),
+                reloaded, null);
         return rep.open(topic, writer, durability(topic), hooks);
     }
 

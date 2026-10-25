@@ -142,6 +142,9 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         publish();
     }
 
+    /** The log this writer appends to (#270: the snapshot export and install read and replace its segments). */
+    public SegmentedLog log() { return log; }
+
     /** The latest published state; one volatile read. */
     public LedgerSnapshot snapshot() { return snapshot.get(); }
 
