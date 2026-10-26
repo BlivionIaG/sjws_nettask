@@ -242,7 +242,7 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | — | — | `cp.maxClockDriftRatio` | default 0.01 (1%), 0 to 0.5; rate error over one lease (HA) |
 | — | — | `cp.leaseSafetyMargin` | default 10 ms (needs a unit); fixed margin in the startup check (HA) |
 | `sjws.cp.nodeId` | `SJWS_CP_NODE_ID` | `cp.nodeId` | this voter |
-| — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`, `san`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter. `san` is the URI or DNS subject alternative name that voter's `cp-peer` certificate carries (exact match, for example `urn:sjws:node:cp-1`; no `*`); required on every entry when `cp.tls` is set, unique across entries |
+| — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`, `san`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter. `san` is the typed subject alternative name that voter's `cp-peer` certificate carries: `uri:<URI SAN>` or `dns:<DNS name>`, for example `uri:urn:sjws:node:cp-1` (exact, case-sensitive match against SANs of that type only; no `*`); required on every entry whenever `cp.tls` is present (even if it only configures watch or admin), unique across entries, and ignored with a warning without `cp.tls`. Addresses must be unique too |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
 | `sjws.cp.admin.listen` | `SJWS_CP_ADMIN_LISTEN` | `cp.admin.listen` | AdminServer |
 | — | — | `cp.tls.{cert,key,ca,adminCa,revocations}` | owned by Security; watch and admin listeners |
@@ -265,16 +265,17 @@ Without TLS material the start fails closed; only the test seam (`CpHostDeps.ser
 plain links, and only when every peer is loopback. A CONTROL role with no `cp` settings at all refuses to start
 (exit 64, before any listener).
 
-**Voter certificates are bound to `cp.peers` ids (#175).** Each `cp.peers` entry pins a `san`. Only URI and DNS
-subject alternative names count, by exact match; the subject CN is never used, and a certificate that names more
-than one pinned voter identifies none. There is no host name check: the pinned SAN is the identity.
+**Voter certificates are bound to `cp.peers` ids (#175).** Each `cp.peers` entry pins a typed `san`:
+`uri:<value>` matches only a URI SAN with exactly that value, and `dns:<value>` only a DNS SAN. An untyped or
+unknown-type pin is refused at config load (exit 64). The subject CN is never used, and a certificate that names
+more than one pinned voter identifies none. There is no host name check: the pinned SAN is the identity.
 
 - At startup, `cp.tls` with an entry that has no `san` is refused at config load, and this voter's own `peerCert`
   must carry its own pinned SAN and no other voter's. The same check runs on every TLS reload (SIGHUP): a new
   certificate that fails it is refused, the current material stays in use, and the refusal is logged and counted
   (`CpPeerSockets.reloadRefused`).
-- Matching is exact and case-sensitive: pin the exact spelling the CA issues. A pinned value may not contain `*`;
-  there are no wildcards.
+- Matching is exact and case-sensitive, DNS names included (stricter than DNS, and it fails closed): pin the exact
+  spelling the CA issues, with no trailing dot. A pinned value may not contain `*`; there are no wildcards.
 - Dialing: after the handshake, `CpPeerSockets.connect` requires the server certificate to name the voter pinned at
   the dialled address. Otherwise the socket is closed before any frame is written, and the refusal is counted
   (`CpPeerSockets.identityRefused`, a WARNING at most once a minute).
@@ -283,8 +284,9 @@ than one pinned voter identifies none. There is no host name check: the pinned S
   connection whose sender wire differs, as `ORIGIN`, before it is queued for Raft, and closes the connection
   (`originMismatches`).
 
-Certificates for the voter links therefore look like `URI:urn:sjws:node:<id>` (or a DNS name), issued by `peerCa`
-and matching the `san` of that voter's `cp.peers` entry on every voter.
+Certificates for the voter links therefore look like `URI:urn:sjws:node:<id>` (pinned as
+`san: uri:urn:sjws:node:<id>`) or carry a DNS name (pinned as `san: dns:<name>`), issued by `peerCa` and matching the
+`san` of that voter's `cp.peers` entry on every voter.
 
 What one inbound voter-link connection goes through, in order (`TcpTransport`; `peers` is the number of other
 voters in `cp.peers`). Every refusal closes the socket and is counted:
@@ -297,7 +299,7 @@ flowchart TD
     s2 -->|no| r2["Closed, counted<br/>handshakesRefused"]
     s2 -->|yes| s3["mTLS handshake: TLS 1.3,<br/>a client certificate from<br/>cp.tls.peerCa, 5 s in total.<br/>No inbound slot is held yet"]
     s3 -->|"fails or is late"| r3["Closed, counted<br/>handshakeFailures"]
-    s3 --> sp{{"Client certificate names<br/>exactly one other pinned<br/>voter (URI or DNS SAN)?"}}
+    s3 --> sp{{"Client certificate names<br/>exactly one other pinned<br/>voter (typed URI or DNS SAN)?"}}
     sp -->|no| r3
     sp -->|yes| s4{{"Fewer than 2 x peers<br/>inbound connections?"}}
     s4 -->|no| r4["Closed, counted<br/>inboundRefused"]

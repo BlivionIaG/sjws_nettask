@@ -83,12 +83,14 @@ final class CpTestCa {
     }
 
     /** The pinned voter SAN the tests use for {@code node}. */
+    /** The typed {@code cp.peers} pin for {@code node}; {@link #listener} issues it as a URI SAN. */
     static String san(String node) {
-        return "urn:sjws:node:" + node;
+        return "uri:urn:sjws:node:" + node;
     }
 
     /**
-     * @param sans subject alternative names: {@code dns:<name>} is a DNS SAN, anything else a URI SAN; none
+     * @param sans subject alternative names: {@code dns:<name>} is a DNS SAN, {@code uri:<value>} or anything else
+     *        a URI SAN; none
      *        gives a CN-only certificate
      */
     CpListenerConfig listener(String listener, String node, long notAfter, Path revocations, String... sans)
@@ -104,7 +106,8 @@ final class CpTestCa {
                         ? new org.bouncycastle.asn1.x509.GeneralName(org.bouncycastle.asn1.x509.GeneralName.dNSName,
                                 sans[i].substring(4))
                         : new org.bouncycastle.asn1.x509.GeneralName(
-                                org.bouncycastle.asn1.x509.GeneralName.uniformResourceIdentifier, sans[i]);
+                                org.bouncycastle.asn1.x509.GeneralName.uniformResourceIdentifier,
+                                sans[i].startsWith("uri:") ? sans[i].substring(4) : sans[i]);
             }
             b.addExtension(Extension.subjectAlternativeName, false,
                     new org.bouncycastle.asn1.x509.GeneralNames(names));

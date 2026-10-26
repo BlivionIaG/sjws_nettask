@@ -40,7 +40,8 @@ import sjws_nettask.cluster.TcpTransport;
  * stay HMAC-authenticated on top with the CP-only Raft key.
  *
  * <p><b>Certificates are bound to {@code cp.peers} ids (#175).</b> Every {@code cp.peers} entry pins a
- * {@code san}; only URI and DNS subject alternative names count (exact match, no CN fallback), and a certificate
+ * typed {@code san} ({@code uri:<value>} or {@code dns:<value>}); only URI and DNS subject alternative names count,
+ * each matched exactly and only against pins of its own type (no CN fallback), and a certificate
  * that names more than one pinned voter identifies none.
  * <ul>
  * <li>Dialing: after the handshake, the server certificate must name exactly the voter pinned at the dialled
@@ -267,7 +268,10 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         return found;
     }
 
-    /** URI (6) and DNS (2) subject alternative names; never the subject CN. */
+    /**
+     * URI (6) and DNS (2) subject alternative names, typed as {@code uri:<value>} and {@code dns:<value>} like the
+     * {@code cp.peers} pins, so a pin only ever matches a SAN of its own type; never the subject CN.
+     */
     static List<String> sans(X509Certificate cert) {
         var out = new ArrayList<String>();
         try {
@@ -276,7 +280,7 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
                 for (var san : all) {
                     if (san.size() >= 2 && san.get(1) instanceof String value && san.get(0) instanceof Integer type
                             && (type == 6 || type == 2)) {
-                        out.add(value);
+                        out.add((type == 6 ? "uri:" : "dns:") + value);
                     }
                 }
             }

@@ -70,10 +70,12 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
     }
 
     /**
-     * A pinned SAN: printable ASCII without spaces or {@code *}, at most 255 characters. Matching is exact, so a
+     * A pinned SAN, typed: {@code uri:<URI SAN>} or {@code dns:<DNS SAN>}. The value is printable ASCII without
+     * spaces or {@code *}, at most 255 characters. Matching is exact and only against SANs of the pinned type, so a
      * {@code *} would never act as a wildcard; it is refused as a likely mistake.
      */
-    static final java.util.regex.Pattern SAN = java.util.regex.Pattern.compile("[\\x21-\\x29\\x2B-\\x7E]{1,255}");
+    static final java.util.regex.Pattern SAN =
+            java.util.regex.Pattern.compile("(uri|dns):[\\x21-\\x29\\x2B-\\x7E]{1,255}");
 
     public CpConfig {
         Objects.requireNonNull(nodeId, "nodeId");
@@ -175,6 +177,9 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         validateVoters(nodeId, peers, warnings);
         if (y.get("tls") != null) {
             requirePinnedSans(peers);
+        } else if (peers.stream().anyMatch(p -> p.san() != null)) {
+            warnings.add("WARN: cp.peers[].san is ignored without cp.tls: the plaintext loopback voter links bind no"
+                    + " certificate.");
         }
         var keys = new CpKeyConfig(keyDir, rootPub, stateDir, pin, insecure, minSerial);
         return new CpConfig(nodeId, peers, watch, admin, keys, ratio, margin, warnings);
@@ -192,6 +197,7 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         var ids = new HashSet<String>();
         var wires = new HashSet<Integer>();
         var sans = new HashSet<String>();
+        var addresses = new HashSet<String>();
         int full = 0;
         int witnesses = 0;
         boolean selfListed = false;
@@ -204,6 +210,10 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
             }
             if (peer.san() != null && !sans.add(peer.san())) {
                 throw new IllegalArgumentException("cp.peers: duplicate san " + peer.san());
+            }
+            var address = peer.address().getHostString() + ":" + peer.address().getPort();
+            if (!addresses.add(address)) {
+                throw new IllegalArgumentException("cp.peers: duplicate address " + address);
             }
             if (peer.witness()) {
                 witnesses++;
@@ -230,8 +240,9 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         for (int i = 0; i < peers.size(); i++) {
             if (peers.get(i).san() == null) {
                 throw new IllegalArgumentException("cp.peers[" + i + "].san is required with cp.tls: each voter's"
-                        + " cp-peer certificate is bound to its cp.peers id (URI or DNS SAN, e.g. urn:sjws:node:"
-                        + peers.get(i).id() + ")");
+                        + " cp-peer certificate is bound to its cp.peers id (uri:<URI SAN> or dns:<DNS name>, e.g."
+                        + " uri:urn:sjws:node:" + peers.get(i).id() + "). This applies whenever cp.tls is present,"
+                        + " even if it only configures the watch or admin listener");
             }
         }
     }
@@ -276,8 +287,9 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
             }
             String san = text(map.get("san"), where + ".san");
             if (san != null && !SAN.matcher(san).matches()) {
-                throw new IllegalArgumentException(where + ".san must be a URI or DNS name: printable ASCII, no"
-                        + " spaces or '*', at most 255 characters (matched exactly; no wildcards)");
+                throw new IllegalArgumentException(where + ".san must be uri:<URI SAN> or dns:<DNS name> (for"
+                        + " example uri:urn:sjws:node:<id>); the value is printable ASCII, no spaces or '*', at most"
+                        + " 255 characters, matched exactly against SANs of that type only");
             }
             out.add(new Peer(wire, id, address, witness, san));
         }

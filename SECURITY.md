@@ -119,8 +119,9 @@ What the code enforces today:
   With `cpTls` off, the interim credential is the join token, and the CP keeps only its SHA-256
   hash, compared in constant time.
 - **Control-plane voter links** (`cp.peers`) are mutual TLS 1.3 under `cp.tls.peerCert`, `peerKey` and `peerCa`,
-  with frames HMAC-authenticated under the CP-only `SJWS_CP_RAFT_KEY`. Each `cp.peers` entry pins the URI or DNS SAN
-  of that voter's certificate (`san`, required with `cp.tls`). A dialled voter must present the SAN pinned for its
+  with frames HMAC-authenticated under the CP-only `SJWS_CP_RAFT_KEY`. Each `cp.peers` entry pins the typed SAN of
+  that voter's certificate (`san: uri:<value>` or `dns:<value>`, required with `cp.tls`; exact match against SANs of
+  that type only). A dialled voter must present the SAN pinned for its
   address, an accepted connection may only send frames as the voter its certificate names, and a node whose own
   certificate lacks its pinned SAN refuses to start (a TLS reload to such a certificate is refused, keeping the
   current material). See

@@ -168,7 +168,7 @@ class CpPeerIdentityTest {
         var peers = voters(ports(3));
         var dialer = new CpPeerSockets(CpTls.serverContext(ca.peer("cp-1")), peers, "cp-1");
         // CN=urn:sjws:node:cp-2 and no SAN: the CN is never used.
-        var cnOnly = ca.listener("cp-peer", CpTestCa.san("cp-2"));
+        var cnOnly = ca.listener("cp-peer", CpTestCa.san("cp-2").substring("uri:".length()));
         var out = dialCp2(dialer, cnOnly, peers);
         assertInstanceOf(IOException.class, out.client(), "a CN-only server certificate is refused");
         assertEquals(1, dialer.identityRefused());
@@ -185,7 +185,7 @@ class CpPeerIdentityTest {
         var ca = new CpTestCa(dir.resolve("ca"));
         var p = ports(3);
         var peers = new ArrayList<>(voters(p));
-        peers.set(1, new CpConfig.Peer(2, "cp-2", peers.get(1).address(), false, "cp-2.voters.example"));
+        peers.set(1, new CpConfig.Peer(2, "cp-2", peers.get(1).address(), false, "dns:cp-2.voters.example"));
         var cert = ca.listener("cp-peer", "x", System.currentTimeMillis() + 86_400_000L, null,
                 "dns:cp-2.voters.example", "urn:example:unpinned");
         var acceptor = new CpPeerSockets(CpTls.serverContext(ca.peer("cp-1")), peers, "cp-1");
@@ -197,6 +197,43 @@ class CpPeerIdentityTest {
         // Dialing an address no voter is pinned at, or this voter's own address, is refused before connecting.
         assertThrows(IOException.class, () -> acceptor.connect(new InetSocketAddress("127.0.0.1", 1)));
         assertThrows(IOException.class, () -> acceptor.connect((InetSocketAddress) peers.get(0).address()));
+    }
+
+    /**
+     * Pins are typed: a DNS SAN whose text equals a URI pin, or a URI SAN whose text equals a DNS pin, names no
+     * voter, on the dial side and on the accept side.
+     */
+    @Test
+    void aSanOfTheOtherTypeNeverMatchesAPin() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca"));
+        var p = ports(3);
+        // cp-2 pinned as uri:urn:sjws:node:cp-2; a DNS SAN with that text.
+        var uriPinned = voters(p);
+        var dnsSanUriText = ca.listener("cp-peer", "x", day(), null, "dns:urn:sjws:node:cp-2");
+        // cp-2 pinned as dns:cp-2.voters.example; a URI SAN with that text.
+        var dnsPinned = new ArrayList<>(voters(p));
+        dnsPinned.set(1, new CpConfig.Peer(2, "cp-2", dnsPinned.get(1).address(), false, "dns:cp-2.voters.example"));
+        var uriSanDnsText = ca.listener("cp-peer", "y", day(), null, "uri:cp-2.voters.example");
+        for (var c : new Object[][] {{uriPinned, dnsSanUriText, ca.peer("cp-2")},
+                {dnsPinned, uriSanDnsText, ca.listener("cp-peer", "z", day(), null, "dns:cp-2.voters.example")}}) {
+            @SuppressWarnings("unchecked")
+            var peers = (List<CpConfig.Peer>) c[0];
+            var wrongType = (CpListenerConfig) c[1];
+            var rightType = (CpListenerConfig) c[2];
+            var cp1 = new CpPeerSockets(CpTls.serverContext(ca.peer("cp-1")), peers, "cp-1");
+            assertNull(cp1.identify(leaf(wrongType)), peers.get(1).san());
+            assertEquals(peers.get(1), cp1.identify(leaf(rightType)), peers.get(1).san());
+            // Accept side: a client presenting the other type is refused; the pinned type maps to wire 2.
+            assertInstanceOf(IllegalStateException.class,
+                    acceptedPeerWire(cp1, peers.get(0), CpTls.serverContext(wrongType)), peers.get(1).san());
+            assertEquals(2, acceptedPeerWire(cp1, peers.get(0), CpTls.serverContext(rightType)));
+            // Dial side: cp-2's address presenting the other type is refused before any byte.
+            var refused = dialCp2(cp1, wrongType, peers);
+            assertInstanceOf(IOException.class, refused.client(), peers.get(1).san());
+            assertEquals(0, refused.bytesAtServer());
+            var accepted = dialCp2(cp1, rightType, peers);
+            assertNull(accepted.client(), String.valueOf(accepted.client()));
+        }
     }
 
     /**
@@ -319,7 +356,8 @@ class CpPeerIdentityTest {
         var y = yaml("cp-1", ports(3), true);
         var config = CpConfig.parse(k -> null, Map.of(), y, null);
         assertEquals(CpTestCa.san("cp-2"), config.peers().get(1).san());
-        for (var bad : List.<Object>of("has space", "", 7, "x".repeat(256), "*.example", "urn:sjws:node:*")) {
+        for (var bad : List.<Object>of("has space", "", 7, "uri:" + "x".repeat(256), "dns:*.example", "uri:urn:sjws:node:*",
+                "urn:sjws:node:cp-2", "cp-2.example", "URI:urn:sjws:node:cp-2", "ip:127.0.0.1", "uri:", "dns:")) {
             var peers = new ArrayList<Object>(peerList(ports(3), true));
             var entry = new HashMap<String, Object>(castMap(peers.get(1)));
             entry.put("san", bad);
@@ -337,6 +375,20 @@ class CpPeerIdentityTest {
         dup.put("peers", peers);
         var e = assertThrows(IllegalArgumentException.class, () -> CpConfig.parse(k -> null, Map.of(), dup, null));
         assertTrue(e.getMessage().contains("duplicate san"), e.getMessage());
+    }
+
+    /** Two cp.peers entries at one address are refused; a san without cp.tls is ignored with a warning. */
+    @Test
+    void duplicateAddressesAreRefusedAndUnusedSansWarn() throws Exception {
+        var p = ports(3);
+        var dup = yaml("cp-1", new int[] {p[0], p[1], p[1]}, true);
+        var e = assertThrows(IllegalArgumentException.class, () -> CpConfig.parse(k -> null, Map.of(), dup, null));
+        assertTrue(e.getMessage().contains("duplicate address 127.0.0.1:" + p[1]), e.getMessage());
+        var plain = CpConfig.parse(k -> null, Map.of(), yaml("cp-1", p, true), null);
+        assertTrue(plain.warnings().stream().anyMatch(w -> w.contains("san is ignored without cp.tls")),
+                plain.warnings().toString());
+        var none = CpConfig.parse(k -> null, Map.of(), yaml("cp-1", p, false), null);
+        assertTrue(none.warnings().stream().noneMatch(w -> w.contains("san")), none.warnings().toString());
     }
 
     private static java.security.cert.X509Certificate leaf(CpListenerConfig c) throws Exception {
@@ -383,7 +435,7 @@ class CpPeerIdentityTest {
         int[] p = ports(3);
         var peers = List.of(
                 new CpConfig.Peer(1, "cp-1", new InetSocketAddress("127.0.0.1", p[0]), false, CpTestCa.san("cp-1")),
-                new CpConfig.Peer(2, "cp-2", new InetSocketAddress("127.0.0.1", p[1]), false, "cp-2.example"),
+                new CpConfig.Peer(2, "cp-2", new InetSocketAddress("127.0.0.1", p[1]), false, "dns:cp-2.example"),
                 new CpConfig.Peer(3, "cp-3", new InetSocketAddress("127.0.0.1", p[2]), false, CpTestCa.san("cp-3")));
         var me = new CpPeerSockets(CpTls.serverContext(ca.peer("cp-1")), peers, "cp-1");
         var twice = me.identify(leaf(ca.listener("cp-peer", "cp-2", day(), null, "dns:cp-2.example",
@@ -394,7 +446,9 @@ class CpPeerIdentityTest {
                 CpTestCa.san("cp-3"))));
         assertEquals(peers.get(2), uriTwice);
         for (var san : List.of("dns:CP-2.EXAMPLE", "dns:Cp-2.example", "dns:cp-2.example.", "dns:*.example",
-                "dns:*", "URN:SJWS:NODE:cp-3", "urn:sjws:node:CP-3", "urn:sjws:node:cp-3.", "urn:sjws:node:*")) {
+                "dns:*", "dns:cp-2.example.org", "dns:x.cp-2.example", "dns:cp-2.exampl", "URN:SJWS:NODE:cp-3",
+                "urn:sjws:node:CP-3", "urn:sjws:node:cp-3.", "urn:sjws:node:cp-3x", "xurn:sjws:node:cp-3",
+                "urn:sjws:node:cp-", "urn:sjws:node:*")) {
             assertNull(me.identify(leaf(ca.listener("cp-peer", "x", day(), null, san))), san);
         }
     }
