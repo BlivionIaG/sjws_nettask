@@ -114,6 +114,9 @@ public class RaftPublishBench {
         } else {
             overload(lead, payload, producers, secs, lag, maxLag, applied);
         }
+        if (System.getProperty("bench.cpPeerTls") != null) {
+            printCounters(transports);
+        }
         for (var node : nodes) {
             node.close();
         }
@@ -292,7 +295,7 @@ public class RaftPublishBench {
             var peers = new ArrayList<Object>();
             for (var m : members) {
                 peers.add(peerCtor.newInstance(m.id().wire(), m.id().name(), m.address(), false,
-                        "urn:sjws:node:" + m.id().name()));
+                        "uri:urn:sjws:node:" + m.id().name()));
             }
             ctor.setAccessible(true);
             sockets = ctor.newInstance(tls, peers, self.id().name());
@@ -303,7 +306,53 @@ public class RaftPublishBench {
             sockets = ctor.newInstance(tls);
             System.err.println("bench: cp-peer mTLS, no pinning in this build");
         }
-        return (TcpTransport.SocketFactory) sockets;
+        PEER_SOCKETS.add(sockets);
+        var delegate = (TcpTransport.SocketFactory) sockets;
+        // Counts outbound dials (TcpTransport calls dial or connect once per outbound connection attempt).
+        return (TcpTransport.SocketFactory) java.lang.reflect.Proxy.newProxyInstance(
+                TcpTransport.SocketFactory.class.getClassLoader(), new Class<?>[] {TcpTransport.SocketFactory.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("dial") || method.getName().equals("connect")) {
+                        DIALS.incrementAndGet();
+                    }
+                    try {
+                        return method.invoke(delegate, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+    }
+
+    static final List<Object> PEER_SOCKETS = new java.util.concurrent.CopyOnWriteArrayList<>();
+    static final AtomicLong DIALS = new AtomicLong();
+
+    /**
+     * One line of identity and connection counters, summed over the voters: all expected 0 except dials, which is
+     * one per outbound link (6 for 3 voters) plus any reconnects or dials retried while the peers start.
+     */
+    static void printCounters(List<TcpTransport> transports) {
+        long mismatches = 0, heldOff = 0, handshakeFailures = 0;
+        for (var t : transports) {
+            mismatches += t.originMismatches();
+            heldOff += t.originHeldOff();
+            handshakeFailures += t.handshakeFailures();
+        }
+        String refused = "n/a";
+        try {
+            long r = 0;
+            for (var s : PEER_SOCKETS) {
+                var m = s.getClass().getDeclaredMethod("identityRefused");
+                m.setAccessible(true);
+                r += (long) m.invoke(s);
+            }
+            refused = String.valueOf(r);
+        } catch (ReflectiveOperationException absent) {
+            // a build without #175 has no identityRefused counter
+        }
+        long links = (long) transports.size() * (transports.size() - 1);
+        System.out.printf("counters: originMismatches=%d originHeldOff=%d identityRefused=%s handshakeFailures=%d"
+                + " dials=%d reconnects=%d%n", mismatches, heldOff, refused, handshakeFailures, DIALS.get(),
+                DIALS.get() - links);
     }
 
     static int freePort() throws Exception {
