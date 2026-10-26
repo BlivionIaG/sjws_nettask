@@ -163,6 +163,7 @@ public class ReplicatedProduceBench {
         var errors = new AtomicLong();
         var ts = new ArrayList<Thread>();
         long t0 = System.nanoTime();
+        if (report) ERROR_KINDS.clear(); // the warm-up's failures are not the measured run's
         var dur = mode.name().toLowerCase();
         for (int p = 0; p < producers; p++) {
             int id = p;
@@ -176,6 +177,7 @@ public class ReplicatedProduceBench {
                     var r = h.handle(new Request("POST", "/messaging/v1/topics/t/records", RequestHeaders.of(hs)).withBody(body(body)));
                     if (r.status() != 200) {
                         errors.incrementAndGet();
+                        ERROR_KINDS.computeIfAbsent("http" + r.status(), k -> new java.util.concurrent.atomic.LongAdder()).increment();
                         continue; // a retry resends the same seq
                     }
                     seq++;
@@ -188,6 +190,10 @@ public class ReplicatedProduceBench {
         if (report) report("http" + (dedup ? "-dedup" : ""), mode, producers, lats, counts, errors.get(), (System.nanoTime() - t0) / 1e9);
     }
 
+    /** Failed attempts by exception class (replica paths) or HTTP status, measured run only (#278 HA N5). */
+    static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.LongAdder> ERROR_KINDS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     static void report(String path, Durability mode, int producers, long[][] lats, int[] counts, long errors, double took) {
         int n = 0;
         for (int c : counts) n += c;
@@ -198,8 +204,11 @@ public class ReplicatedProduceBench {
             o += counts[p];
         }
         Arrays.sort(all);
-        System.out.printf("replicated path=%s mode=%s producers=%d ops=%d ops/s=%.0f p50=%.1fus p99=%.1fus errors=%d%n",
-                path, mode.name().toLowerCase(), producers, n, n / took, pct(all, 0.50), pct(all, 0.99), errors);
+        var kinds = new java.util.TreeMap<String, Long>();
+        ERROR_KINDS.forEach((k, v) -> kinds.put(k, v.sum()));
+        System.out.printf("replicated path=%s mode=%s producers=%d ops=%d ops/s=%.0f p50=%.1fus p99=%.1fus errors=%d errkinds=%s%n",
+                path, mode.name().toLowerCase(), producers, n, n / took, pct(all, 0.50), pct(all, 0.99), errors,
+                kinds.toString().replace(" ", ""));
     }
 
     static void run(Replica lead, List<byte[]> rec, Durability mode, int producers, double secs, boolean report,
@@ -210,6 +219,7 @@ public class ReplicatedProduceBench {
         var errors = new AtomicLong();
         var ts = new ArrayList<Thread>();
         long t0 = System.nanoTime();
+        if (report) ERROR_KINDS.clear(); // the warm-up's failures are not the measured run's
         for (int p = 0; p < producers; p++) {
             int id = p;
             lats[id] = new long[1 << 16];
@@ -222,6 +232,10 @@ public class ReplicatedProduceBench {
                         else ((java.util.concurrent.CompletableFuture<?>) dedup.invoke(lead, rec, mode, 0, idBase + id, seq + 1)).get(5, TimeUnit.SECONDS);
                     } catch (Exception e) {
                         errors.incrementAndGet();
+                        Throwable c = e;
+                        while ((c instanceof java.util.concurrent.ExecutionException
+                                || c instanceof java.lang.reflect.InvocationTargetException) && c.getCause() != null) c = c.getCause();
+                        ERROR_KINDS.computeIfAbsent(c.getClass().getSimpleName(), k -> new java.util.concurrent.atomic.LongAdder()).increment();
                         continue; // a retry resends the same seq
                     }
                     seq++;
