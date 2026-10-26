@@ -353,6 +353,11 @@ class RequestBodyHttp3Test {
             var whole = H3TestClient.get(large, "/big-head");
             assertEquals(200, whole.status(), () -> "reset=" + whole.reset() + " error=" + whole.error());
             assertEquals(big, whole.header("x-big"));
+            // a limit even the error page exceeds: the stream is reset, the connection still survives
+            var tiny = client.connect(server.localAddress(), 64);
+            var reset = H3TestClient.get(tiny, "/f.txt");
+            assertTrue(reset.reset(), "reset, not a field section the client refuses");
+            assertTrue(tiny.isActive());
         } finally {
             server.close();
         }
