@@ -67,6 +67,8 @@ class CpTcpVotersTest {
     private static final class TcpDeps extends CpTestDeps {
         final CpServerTls peerTls;
         final List<ClusterTransport> transports = new ArrayList<>();
+        CpListenerConfig peerConfig;
+        int[] ports;
 
         TcpDeps(CpServerTls peerTls) {
             this.peerTls = peerTls;
@@ -106,15 +108,21 @@ class CpTcpVotersTest {
         return y;
     }
 
+    private CpTestCa ca;
+
     private List<TcpDeps> start(int voters, int full) throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
+        this.ca = ca;
         var ports = new int[voters];
         for (int i = 0; i < voters; i++) {
             ports[i] = freePort();
         }
         var all = new ArrayList<TcpDeps>();
         for (int i = 1; i <= voters; i++) {
-            var deps = new TcpDeps(CpTls.serverContext(ca.peer("cp-" + i)));
+            var peerConfig = ca.peer("cp-" + i);
+            var deps = new TcpDeps(CpTls.serverContext(peerConfig));
+            deps.peerConfig = peerConfig;
+            deps.ports = ports;
             all.add(deps);
             hosts.add(CpLaunch.start(CpConfig.parse(k -> null, Map.of(), yaml("cp-" + i, ports, full), null), deps,
                     err));
@@ -170,6 +178,47 @@ class CpTcpVotersTest {
         var first = leader();
         first.close();
         await(() -> leader() != null && leader() != first, "the other data voter wins with the witness's vote");
+    }
+
+    /**
+     * SIGHUP on a data voter (CpHost) and on the witness (CpWitnessHost): a new cp-peer certificate without the
+     * voter's own pinned SAN is refused, the reload reports the failure, the current material keeps serving, and
+     * the peers still accept this voter's new connections.
+     */
+    @Test
+    void aSighupToACertificateWithoutTheOwnPinnedSanIsRefusedOnBothHosts() throws Exception {
+        var deps = start(3, 2);
+        assertInstanceOf(CpHost.class, hosts.get(0));
+        assertInstanceOf(CpWitnessHost.class, hosts.get(2));
+        await(() -> leader() != null && leader().ready(), "data leader ready");
+        for (int i : new int[] {0, 2}) {
+            var d = deps.get(i);
+            var self = "cp-" + (i + 1);
+            var other = i == 0 ? 1 : 0;
+            long generation = d.peerTls.generation();
+            var before = d.peerTls.certificate();
+            for (var bad : List.of(ca.listener("cp-peer", self), ca.peer("cp-" + (other + 1)))) {
+                java.nio.file.Files.write(d.peerConfig.certPem(), java.nio.file.Files.readAllBytes(bad.certPem()));
+                java.nio.file.Files.write(d.peerConfig.keyPem(), java.nio.file.Files.readAllBytes(bad.keyPem()));
+                var failed = hosts.get(i).reload();
+                assertNotNull(failed, self + " accepted a certificate without its pinned SAN");
+                assertTrue(failed.contains("reload failed") && failed.contains("pinned san"), failed);
+                assertEquals(generation, d.peerTls.generation(), "the current material stays");
+                assertEquals(before, d.peerTls.certificate());
+            }
+            // The material still in use is accepted by a peer: a fresh dial with it is identified on both sides.
+            var peerTransport = (sjws_nettask.cluster.TcpTransport) deps.get(other).transports.get(0);
+            long failures = peerTransport.handshakeFailures();
+            var peers = CpConfig.parse(k -> null, Map.of(), yaml(self, d.ports, 2), null).peers();
+            try (var s = new CpPeerSockets(d.peerTls, peers, self).connect(
+                    new InetSocketAddress("127.0.0.1", d.ports[other]))) {
+                s.getOutputStream().write(0);
+                s.getOutputStream().flush();
+                Thread.sleep(200);
+            }
+            assertEquals(failures, peerTransport.handshakeFailures(), "the peer accepted " + self);
+        }
+        assertEquals(200, leader().store().propose("schema: 1\nserver:\n  port: 0\n").status());
     }
 
     @Test
