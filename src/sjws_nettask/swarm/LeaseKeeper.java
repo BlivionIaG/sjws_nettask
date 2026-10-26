@@ -203,9 +203,21 @@ public final class LeaseKeeper implements AutoCloseable {
         return this;
     }
 
+    private volatile Runnable onClose;
+
+    /** Run once by {@link #close} (the swarm forgets a keeper its caller closed). */
+    void onClose(Runnable r) {
+        this.onClose = r;
+    }
+
     @Override
     public void close() {
         this.closed = true;
+        var hook = this.onClose;
+        this.onClose = null;
+        if (hook != null) {
+            hook.run();
+        }
         var t = this.thread;
         if (t != null) {
             LockSupport.unpark(t);
