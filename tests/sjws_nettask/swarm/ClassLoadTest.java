@@ -147,6 +147,42 @@ class ClassLoadTest {
         assertFalse(text.contains("token streaming on"), text);
     }
 
+    /**
+     * #261 Q1: with the stream flag off, an authenticated submit and {@code :claim} over HTTP load no stream class and
+     * the claim answer has no {@code sjws-lease-stream} header; with it on, the header is there (positive control).
+     */
+    @Test
+    void claimWithStreamOffLoadsNoStreamClassAndSendsNoLeaseStreamHeader() throws Exception {
+        var text = runChecked(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.dir=" + this.dir.resolve("swarm-off"),
+                "-Dsjws.swarm.tokens.file=" + tokens()), "Server started:",
+                port -> assertFalse(submitAndClaim(port, false).contains("sjws-lease-stream"), "flag off: no header"),
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.SwarmHttp "), text);
+        assertFalse(text.contains("sjws_nettask.swarm.StreamHttp"), text);
+        assertFalse(text.contains("sjws_nettask.swarm.TokenStreams"), text);
+        var on = runChecked(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+                "-Dsjws.swarm.dir=" + this.dir.resolve("swarm-on"), "-Dsjws.swarm.tokens.file=" + tokens()), "Server started:",
+                port -> {
+                    assertFalse(submitAndClaim(port, false).contains("sjws-lease-stream"), "flag on, unary only: none");
+                    var claim = submitAndClaim(port, true);
+                    assertTrue(claim.matches("(?s).*\r\nsjws-lease-stream: [0-9a-f]{32}/1\r\n.*"), claim);
+                    assertTrue(claim.contains("\r\nsjws-stream-window: 64"), claim);
+                },
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(on.contains("sjws_nettask.swarm.StreamHttp "), on);
+    }
+
+    /** Submits one task to pool {@code p} (a stream or a unary one) and claims it; returns the claim's head. */
+    private static String submitAndClaim(int port, boolean stream) throws Exception {
+        var auth = "Authorization: Bearer " + SECRET + "\r\nContent-Type: application/vnd.sjws.swarm.v1\r\n";
+        var submit = exchange(port, "POST /swarm/v1/tasks/p" + (stream ? ":stream" : "") + " HTTP/1.1\r\n" + auth,
+                new byte[] {1, 1, 0, 0, 0, 1, 'x'});
+        assertTrue(submit.startsWith(stream ? "http/1.1 201" : "http/1.1 202"), submit);
+        var claim = exchange(port, "POST /swarm/v1/tasks/p:claim HTTP/1.1\r\n" + auth, new byte[0]);
+        assertTrue(claim.startsWith("http/1.1 200"), claim);
+        return claim;
+    }
+
     @Test
     void streamFlagOnLoadsTokenStreams() throws Exception {
         var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true"), "Server started:", 401,
@@ -183,6 +219,54 @@ class ClassLoadTest {
                 401, "sjws_nettask.Sjws_nettask", "--config=" + yaml());
         assertFalse(text.contains("sjws_nettask.swarm.TokenStreams"), text);
         assertFalse(text.contains("sjws_nettask.swarm.StreamCredit"), text);
+    }
+
+    @Test
+    void streamOnCreditOffLoadsNoBudgetClass() throws Exception {
+        // S2c PR 6b (#267 §8): the node budget exists only under credit; budget settings are not even read
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+                "-Dsjws.swarm.stream.budget.bytes=not-a-number"), "Server started:", 401, "sjws_nettask.Sjws_nettask",
+                "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.StreamHttp "), text);
+        assertFalse(text.contains("sjws_nettask.swarm.StreamBudget"), text);
+        assertFalse(text.contains("stream budget"), text);
+    }
+
+    @Test
+    void creditFlagWithoutTheStreamFlagLoadsNoBudgetClass() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.credit.enabled=true"), "Server started:",
+                401, "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertFalse(text.contains("sjws_nettask.swarm.StreamBudget"), text);
+        assertFalse(text.contains("stream budget"), text);
+    }
+
+    @Test
+    void creditOnLoadsTheBudgetAndLogsItsSize() throws Exception {
+        // #267 Q1: budget = min(bytes, 0.25 x maxMemory), one log line; G1 reports maxMemory == -Xmx
+        var text = run(List.of("-Xmx256m", "-XX:+UseG1GC", "-Dsjws.swarm.enabled=true",
+                "-Dsjws.swarm.stream.enabled=true", "-Dsjws.swarm.stream.credit.enabled=true"), "Server started:", 401,
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws_nettask.swarm.StreamBudget "), text);
+        assertTrue(text.contains("swarm: stream budget 64 MiB (0.25 of heap 256 MiB), soft 0.75, admit 0.9"), text);
+    }
+
+    @Test
+    void creditOnWithABudgetBelowTheFloorRefusesToStart() throws Exception {
+        // #267 Q1: below one session's floor plus tickets the process does not start (OptionalModule.Refused)
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+                "-Dsjws.swarm.stream.credit.enabled=true", "-Dsjws.swarm.stream.budget.bytes=1048576"), "Error:",
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("is below one session's floor"), text);
+        assertFalse(text.contains("Server started:"), text);
+    }
+
+    @Test
+    void creditOnWithAMalformedBudgetRefusesToStart() throws Exception {
+        var text = run(List.of("-Dsjws.swarm.enabled=true", "-Dsjws.swarm.stream.enabled=true",
+                "-Dsjws.swarm.stream.credit.enabled=true", "-Dsjws.swarm.stream.budget.heapFraction=1.5"), "Error:",
+                "sjws_nettask.Sjws_nettask", "--config=" + yaml());
+        assertTrue(text.contains("sjws.swarm.stream.budget.heapFraction"), text);
+        assertFalse(text.contains("Server started:"), text);
     }
 
     @Test
@@ -242,6 +326,16 @@ class ClassLoadTest {
 
     /** {@code swarmStatus} is the HTTP status of {@code GET /swarm/v1/tasks}, checked while the process is up. */
     private String run(List<String> jvmFlags, String ready, Integer swarmStatus, String... main) throws Exception {
+        return runChecked(jvmFlags, ready, swarmStatus == null ? null : port -> assertEquals(swarmStatus.intValue(),
+                swarmHttpStatus(port)), main);
+    }
+
+    /** Checks run against the listener's port while the process is up; the class log is read after them. */
+    interface PortCheck {
+        void check(int port) throws Exception;
+    }
+
+    private String runChecked(List<String> jvmFlags, String ready, PortCheck check, String... main) throws Exception {
         var log = this.dir.resolve("classes-" + System.nanoTime() + ".log");
         var cmd = new ArrayList<String>();
         cmd.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
@@ -270,8 +364,10 @@ class ClassLoadTest {
             Thread.sleep(300);
             text = Files.readString(log);
             assertTrue(text.contains(ready), text);
-            if (swarmStatus != null) {
-                assertEquals(swarmStatus.intValue(), swarmHttpStatus(text));
+            if (check != null) {
+                check.check(port(text));
+                Thread.sleep(100);
+                text = Files.readString(log);
             }
             return text;
         } finally {
@@ -281,10 +377,28 @@ class ClassLoadTest {
         }
     }
 
-    private static int swarmHttpStatus(String log) throws Exception {
+    private static int port(String log) {
         var matcher = Pattern.compile("HTTP/1.1 on tcp/(\\d+)").matcher(log);
         assertTrue(matcher.find(), log);
-        int port = Integer.parseInt(matcher.group(1));
+        return Integer.parseInt(matcher.group(1));
+    }
+
+    /** One HTTP/1.1 request on its own connection; returns the status line and headers, lower-cased, and the body. */
+    private static String exchange(int port, String head, byte[] body) throws Exception {
+        try (var socket = new Socket()) {
+            socket.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+            socket.setSoTimeout(5000);
+            var out = socket.getOutputStream();
+            out.write((head + "Host: localhost\r\nConnection: close\r\nContent-Length: " + body.length + "\r\n\r\n")
+                    .getBytes(StandardCharsets.US_ASCII));
+            out.write(body);
+            var raw = new String(socket.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
+            int end = raw.indexOf("\r\n\r\n");
+            return end < 0 ? raw.toLowerCase(java.util.Locale.ROOT) : raw.substring(0, end).toLowerCase(java.util.Locale.ROOT);
+        }
+    }
+
+    private static int swarmHttpStatus(int port) throws Exception {
         try (var socket = new Socket()) {
             socket.connect(new InetSocketAddress("127.0.0.1", port), 2000);
             socket.setSoTimeout(2000);

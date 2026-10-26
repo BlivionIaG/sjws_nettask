@@ -72,12 +72,26 @@ public final class TokenStreams {
 
     /**
      * Startup settings; {@code sjws.swarm.stream.*} system properties or {@code SJWS_SWARM_STREAM_*} env. {@code credit}
-     * is {@code sjws.swarm.stream.credit.enabled} (S2c PR 6, off by default): with it off no credit state exists.
+     * is {@code sjws.swarm.stream.credit.enabled} (S2c PR 6, off by default): with it off no credit state exists. The
+     * node stream-memory budget (S2c PR 6b, #267) is read only with credit on: {@code budgetBytes}
+     * ({@code sjws.swarm.stream.budget.bytes}, 0 = unset), {@code heapFraction} ({@code budget.heapFraction}, 0.25),
+     * {@code softWatermark} ({@code budget.softWatermark}, 0.75) and {@code admitWatermark}
+     * ({@code budget.admitWatermark}, 0.90); a malformed value stops the process ({@code OptionalModule.Refused}).
      */
-    public record Config(int shards, int window, int sinkChunks, boolean credit) {
+    public record Config(int shards, int window, int sinkChunks, boolean credit, long budgetBytes, double heapFraction,
+            double softWatermark, double admitWatermark) {
+        public static final double HEAP_FRACTION = 0.25;
+        public static final double SOFT_WATERMARK = 0.75;
+        public static final double ADMIT_WATERMARK = 0.90;
+
         /** Credit off. */
         public Config(int shards, int window, int sinkChunks) {
             this(shards, window, sinkChunks, false);
+        }
+
+        /** The budget at its defaults (bytes unset, 0.25 of the heap, watermarks 0.75 and 0.90). */
+        public Config(int shards, int window, int sinkChunks, boolean credit) {
+            this(shards, window, sinkChunks, credit, 0, HEAP_FRACTION, SOFT_WATERMARK, ADMIT_WATERMARK);
         }
 
         public Config {
@@ -97,14 +111,36 @@ public final class TokenStreams {
                         + ") when sjws.swarm.stream.credit.enabled is on: out-of-order chunks held for reordering would"
                         + " fill the sink and stall the stream; lower the window or raise sinkChunks");
             }
+            if (credit) { // S2c PR 6b: the budget settings exist only under credit; out of range stops the process
+                if (budgetBytes < 0) {
+                    throw new sjws_nettask.OptionalModule.Refused("sjws.swarm.stream.budget.bytes must be positive: "
+                            + budgetBytes);
+                }
+                if (!(heapFraction > 0 && heapFraction <= 1)) {
+                    throw new sjws_nettask.OptionalModule.Refused("sjws.swarm.stream.budget.heapFraction must be in (0, 1]: "
+                            + heapFraction);
+                }
+                if (!(softWatermark > 0 && softWatermark <= admitWatermark && admitWatermark <= 1)) {
+                    throw new sjws_nettask.OptionalModule.Refused("sjws.swarm.stream.budget watermarks need 0 < softWatermark"
+                            + " (" + softWatermark + ") <= admitWatermark (" + admitWatermark + ") <= 1");
+                }
+            }
         }
 
         public static final Config DEFAULT = new Config(1, TokenStream.Reorder.DEFAULT_WINDOW, 256);
 
         /** {@code get} maps a property name ({@code sjws.swarm.stream.shards}) to its value or null. */
         public static Config from(Function<String, String> get) {
-            return new Config(intSetting(get, "shards", 1), intSetting(get, "window", TokenStream.Reorder.DEFAULT_WINDOW),
-                    intSetting(get, "sinkChunks", 256), boolSetting(get, "credit.enabled"));
+            int shards = intSetting(get, "shards", 1);
+            int window = intSetting(get, "window", TokenStream.Reorder.DEFAULT_WINDOW);
+            int sinkChunks = intSetting(get, "sinkChunks", 256);
+            if (!boolSetting(get, "credit.enabled")) {
+                return new Config(shards, window, sinkChunks, false); // the budget settings are not read
+            }
+            return new Config(shards, window, sinkChunks, true, budgetSetting(get, "budget.bytes"),
+                    fractionSetting(get, "budget.heapFraction", HEAP_FRACTION),
+                    fractionSetting(get, "budget.softWatermark", SOFT_WATERMARK),
+                    fractionSetting(get, "budget.admitWatermark", ADMIT_WATERMARK));
         }
 
         /**
@@ -135,6 +171,42 @@ public final class TokenStreams {
                 throw new IllegalArgumentException("sjws.swarm.stream." + name + ": " + v, e);
             }
         }
+
+        /** S2c PR 6b: a positive byte count, or 0 when unset; anything else stops the process. */
+        private static long budgetSetting(Function<String, String> get, String name) {
+            var v = get.apply("sjws.swarm.stream." + name);
+            if (v == null || v.isBlank()) {
+                return 0;
+            }
+            try {
+                long n = Long.parseLong(v.trim());
+                if (n > 0) {
+                    return n;
+                }
+            } catch (NumberFormatException e) {
+                // refused below
+            }
+            throw new sjws_nettask.OptionalModule.Refused("sjws.swarm.stream." + name + " must be a positive byte count,"
+                    + " got \"" + v + "\"");
+        }
+
+        /** S2c PR 6b: a decimal fraction; malformed stops the process (the range is checked by the constructor). */
+        private static double fractionSetting(Function<String, String> get, String name, double dflt) {
+            var v = get.apply("sjws.swarm.stream." + name);
+            if (v == null || v.isBlank()) {
+                return dflt;
+            }
+            try {
+                double d = Double.parseDouble(v.trim());
+                if (Double.isFinite(d)) {
+                    return d;
+                }
+            } catch (NumberFormatException e) {
+                // refused below
+            }
+            throw new sjws_nettask.OptionalModule.Refused("sjws.swarm.stream." + name + " must be a decimal fraction, got \""
+                    + v + "\"");
+        }
     }
 
     private record FenceKey(String pool, int shard, long offset) { }
@@ -164,12 +236,26 @@ public final class TokenStreams {
 
     /** S2c PR 5 cancel state: cancelled and deadline-bound stream tasks (swarm memory only, never in messaging). */
     private final CancelSet cancels;
+    /**
+     * S2c PR 6b node stream-memory budget (#267), resolved at startup with credit on (a bad budget stops the process
+     * here, in the module's constructor); null with credit off, when {@link StreamBudget} is never loaded.
+     */
+    private final StreamBudget budget;
 
     public TokenStreams(Topics topics, String node, Config config) {
         this.topics = topics;
         this.node = node;
         this.config = config;
         this.cancels = new CancelSet(topics.clock());
+        this.budget = config.credit() ? StreamBudget.resolve(config, Runtime.getRuntime().maxMemory()) : null;
+        if (this.budget != null) {
+            System.err.println(this.budget.describe());
+        }
+    }
+
+    /** The node stream-memory budget; null with credit off. */
+    StreamBudget budget() {
+        return this.budget;
     }
 
     public CancelSet cancels() {
@@ -237,6 +323,30 @@ public final class TokenStreams {
         return this.invalidShardStamps.get();
     }
 
+    /**
+     * True when {@code env} carries the {@value #SHARDS_MEMBER} {@code tracestate} member, which every {@code :stream}
+     * submit stamps (#261 Q1). The one stream-task predicate, shared with {@link #submitterShards}: it matches the member
+     * name only, so a malformed value still marks a stream task (its chunks are refused there). Unary HTTP submits always
+     * have an empty {@code tracestate}, the fast path.
+     */
+    static boolean isStreamTask(TaskEnvelope env) {
+        return shardsMember(env.tracestate()) != null;
+    }
+
+    /** The value of the {@value #SHARDS_MEMBER} member of {@code tracestate}, or null when it has none. */
+    private static String shardsMember(String ts) {
+        if (ts == null || ts.isEmpty()) {
+            return null;
+        }
+        for (var member : ts.split(",")) {
+            var m = member.trim();
+            if (m.indexOf('=') == SHARDS_MEMBER.length() && m.startsWith(SHARDS_MEMBER)) {
+                return m.substring(SHARDS_MEMBER.length() + 1);
+            }
+        }
+        return null;
+    }
+
     /** The {@code tracestate} a submitter puts on a stream task: its own {@code sjws.swarm.stream.shards}. */
     String shardsTracestate() {
         return SHARDS_MEMBER + "=" + SHARDS_VALUE + this.config.shards();
@@ -248,32 +358,23 @@ public final class TokenStreams {
      * malformed or out-of-range value is refused, never clamped: a guessed count would pick a shard no reader polls.
      */
     int submitterShards(TaskEnvelope env) {
-        var ts = env.tracestate();
-        if (ts == null || ts.isEmpty()) {
+        var v = shardsMember(env.tracestate());
+        if (v == null) {
             return this.config.shards();
         }
-        for (var member : ts.split(",")) {
-            var m = member.trim();
-            int eq = m.indexOf('=');
-            if (eq < 0 || !m.substring(0, eq).equals(SHARDS_MEMBER)) {
-                continue;
+        int n = -1;
+        if (v.startsWith(SHARDS_VALUE) && v.length() > SHARDS_VALUE.length() && v.length() <= SHARDS_VALUE.length() + 2) {
+            try {
+                n = Integer.parseInt(v.substring(SHARDS_VALUE.length()));
+            } catch (NumberFormatException e) {
+                n = -1;
             }
-            var v = m.substring(eq + 1);
-            int n = -1;
-            if (v.startsWith(SHARDS_VALUE) && v.length() > SHARDS_VALUE.length() && v.length() <= SHARDS_VALUE.length() + 2) {
-                try {
-                    n = Integer.parseInt(v.substring(SHARDS_VALUE.length()));
-                } catch (NumberFormatException e) {
-                    n = -1;
-                }
-            }
-            if (n < 1 || n > 64) {
-                this.invalidShardStamps.incrementAndGet();
-                throw new IllegalArgumentException("stream task has an invalid shard stamp: " + v);
-            }
-            return n;
         }
-        return this.config.shards();
+        if (n < 1 || n > 64) {
+            this.invalidShardStamps.incrementAndGet();
+            throw new IllegalArgumentException("stream task has an invalid shard stamp: " + v);
+        }
+        return n;
     }
 
     /** The submitter's shard partition for the chunks of {@code env}'s stream, opened lazily (no DLQ). */
@@ -651,6 +752,9 @@ public final class TokenStreams {
         long offer(StreamChunk c, StreamCredit.State credit) {
             this.lock.lock();
             try {
+                if (credit != null && credit.closed) {
+                    credit = null; // S2c PR 6b: the session left and released everything; a late offer charges nothing
+                }
                 long lower = 0;
                 if (c.streamHi() == this.key.hi() && c.streamLo() == this.key.lo()) {
                     if (this.attempt < 0) {
@@ -662,6 +766,8 @@ public final class TokenStreams {
                         if (credit != null) { // the discarded attempt's held chunks, subtracted after the drain
                             lower = (long) this.reorder.held() << 40 | credit.heldBytesLocked;
                             credit.heldBytesLocked = 0;
+                            credit.owner.budget.releaseGap(credit); // held is 0 now (#267 §3.4)
+                            credit.owner.budget.rebookLast(credit); // the new attempt's LAST needs room again
                         }
                         this.queue.clear();
                         this.reorder = new TokenStream.Reorder(this.key.hi(), this.key.lo(), this.config.window());
@@ -686,6 +792,12 @@ public final class TokenStreams {
                         credit.heldChunks.incrementAndGet();
                         credit.heldBytes.addAndGet(c.size());
                         credit.heldBytesLocked += c.size();
+                        var budget = credit.owner.budget; // S2c PR 6b: held bytes are resident; a gap needs its ticket
+                        budget.resident(credit, c.size());
+                        budget.bookGap(credit);
+                        if (c.last()) {
+                            budget.convertLast(credit); // an out-of-order LAST is resident from here
+                        }
                     } else if (out.size() > 1) { // out[0] is c; the rest left the reorder buffer
                         long b = 0;
                         for (int i = 1; i < out.size(); i++) {
@@ -693,6 +805,9 @@ public final class TokenStreams {
                         }
                         credit.heldBytesLocked -= b;
                         lower += (long) (out.size() - 1) << 40 | b;
+                        if (this.reorder.held() == 0) {
+                            credit.owner.budget.releaseGap(credit); // the hole filled: the filler is charged as retained
+                        }
                     }
                 }
                 this.queue.addAll(out);
@@ -790,6 +905,16 @@ public final class TokenStreams {
             this.lock.lock();
             try {
                 return this.attempt;
+            } finally {
+                this.lock.unlock();
+            }
+        }
+
+        /** Runs {@code r} under this sink's lock (S2c PR 6b: the budget's close sets {@code closed} under it). */
+        void locked(Runnable r) {
+            this.lock.lock();
+            try {
+                r.run();
             } finally {
                 this.lock.unlock();
             }
