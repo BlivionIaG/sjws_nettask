@@ -173,8 +173,14 @@ image a taker returns and the built-in image: a larger one is skipped and counte
 
 Msg groups (`msgrepl`) do not take snapshots yet (#270). Their applied state includes the producer dedup table
 (M2, `msgrepl.ProducerTable`; see partition-log.md "Producer dedup"), which is rebuilt by replaying the log today. A msg
-snapshot taker must put `ProducerTable.write` at the snapshot index in the image, and `onSnapshotRestored` must
-`ProducerTable.read` it, or a restored follower would accept a retried batch twice.
+snapshot taker must put `ProducerTable.write` at the snapshot index in the image together with the next offset at that
+index, and `onSnapshotRestored` must `ProducerTable.read` it into `RaftReplica.restoreProducers` and restore the next
+offset, or a restored follower would accept a retried batch twice.
+
+Msg groups also advertise a feature bit in their append responses (`ReplicationGroup.advertiseFeatures`, read by the
+leader with `votersHaveFeatures`): a leader proposes the first producer entry only when every voter applies it (#278).
+Groups that advertise nothing (control plane, swarm) send byte-identical responses, and an older leader ignores the
+trailing bytes.
 
 ### Snapshot transfer to followers
 
