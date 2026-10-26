@@ -923,8 +923,4 @@ public final class TaskService {
             }
         }
     }
-
-    boolean ackerTerminated() {
-        return this.acker.isTerminated();
-    }
 }

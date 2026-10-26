@@ -55,7 +55,8 @@ public final class Swarm implements AutoCloseable {
 
     /**
      * Another node on the same ledger as {@code other} (its own task service, reply router, streams and CancelSet;
-     * shared topics). For multi-node tests; close it with {@code replies().close()}, the topics belong to {@code other}.
+     * shared topics). For multi-node tests; close it with {@code replies().close()} and {@code tasks().close()}, the
+     * topics belong to {@code other}.
      */
     static Swarm sharing(Swarm other, String id, long producerId, long idleCloseMs) {
         return new Swarm(other.topics, id, producerId, idleCloseMs);
