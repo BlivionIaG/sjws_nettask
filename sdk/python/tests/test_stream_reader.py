@@ -160,6 +160,18 @@ class SseTest(Base):
         with self.assertRaises(StreamError):
             self.read(sse=True)
 
+    def test_error_text_fills_stream_error_message(self):
+        """#279 C2: the server sends LAST|ERROR text as a chunk event with the end event's id."""
+        self.serve([b"retry: 1000\n\n", b"id: 1.0\nevent: chunk\ndata: tok\n\n",
+                    b"id: 1.1\nevent: chunk\ndata: model crashed\n\nid: 1.1\nevent: end\ndata: error\n\n"])
+        s = self.c.open_stream(SESSION, sse=True)
+        got = []
+        with self.assertRaises(StreamError) as e:
+            for ev in s:
+                got.append(ev.data)
+        self.assertEqual(b"model crashed", e.exception.message)
+        self.assertEqual([b"tok", b"model crashed"], got)  # SSE also yields it (server behaviour)
+
     def test_resume_uses_last_event_id(self):
         self.serve(([b"retry: 1000\n\n", b"id: 1.0\nevent: chunk\ndata: a\n\n"], True),
                    [b"retry: 1000\n\n", b"id: 1.1\nevent: chunk\ndata: b\n\nid: 1.1\nevent: end\ndata: ok\n\n"])

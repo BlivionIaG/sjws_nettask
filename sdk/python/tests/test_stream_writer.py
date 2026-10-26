@@ -1,14 +1,17 @@
 """ChunkWriter (worker side) against the stdlib fake: window, seq span, credit, 429, LAST, cancel, heartbeat
 (#261 Q6–Q15, P1, R1; #267 Q3, Q4). Run: python3 -m unittest discover sdk/python/tests"""
+import json
 import logging
 import threading
 import time
 import unittest
+from unittest import mock
 
 from stream_fake import NO_CONTENT, SID, FakeServer, credit, problem
 
 from sjws_swarm.chunks import FIRST
-from sjws_swarm.client import LeaseLost, StreamCancelled
+from sjws_swarm import stream
+from sjws_swarm.client import LeaseLost, StreamCancelled, SwarmError
 from sjws_swarm.frames import CANCELLED, ERROR, LAST
 from sjws_swarm.stream import CHUNK_MAX, LAST_MAX, ChunkWriter
 
@@ -337,10 +340,9 @@ class LastTest(Base):
         result = bytes(range(256)) * 400 + b"tail"  # 102,404 B
         w.finish(result)
         (last,) = self.lasts()
-        self.assertLessEqual(len(last.data), LAST_MAX)
-        self.assertEqual(LAST_MAX, len(last.data))
+        self.assertEqual(b"", last.data, "over 64 KiB: everything streamed, an empty LAST (#279 C1)")
         body = b"".join(c.data for c in payloads(self.srv))
-        self.assertEqual(b"head" + result, body + last.data)
+        self.assertEqual(b"head" + result, body)
         self.assertEqual(last.chunk_seq, max(c.chunk_seq for c in self.srv.chunks))
 
     def test_last_capped_at_64k_with_credit_off(self):
@@ -352,10 +354,24 @@ class LastTest(Base):
     def test_large_final_data_splits_at_1mib(self):
         w = self.writer(window=8, window_adv=64)
         w.finish(b"q" * (2 * CHUNK_MAX + 100))
-        sizes = [len(c.data) for c in self.srv.chunks]
-        self.assertTrue(all(s <= CHUNK_MAX for s in sizes), sizes)
-        self.assertEqual(LAST_MAX, sizes[-1])
-        self.assertEqual(2 * CHUNK_MAX + 100, sum(sizes))
+        sizes = [len(c.data) for c in sorted(self.srv.chunks, key=lambda c: c.chunk_seq)]  # arrival order varies
+        self.assertEqual([CHUNK_MAX, CHUNK_MAX, 100, 0], sizes)
+
+    def test_a_json_reply_over_64k_round_trips_intact(self):
+        doc = {"items": ["x" * 100] * 1000, "end": True}
+        raw = json.dumps(doc).encode()
+        self.assertGreater(len(raw), LAST_MAX)
+        w = self.writer(window=8, window_adv=64)
+        w.finish(raw)
+        (last,) = self.lasts()
+        self.assertEqual(b"", last.data)
+        self.assertEqual(doc, json.loads(b"".join(c.data for c in payloads(self.srv))))
+
+    def test_a_result_of_exactly_64k_stays_the_reply(self):
+        w = self.writer(window=8, window_adv=64)
+        w.finish(b"j" * LAST_MAX)
+        self.assertEqual([LAST_MAX], [len(c.data) for c in self.srv.chunks])
+        self.assertEqual(LAST, self.srv.chunks[0].flags & ~FIRST)
 
     def test_last_waits_for_every_outstanding_chunk(self):
         released = threading.Event()
@@ -396,7 +412,64 @@ class LastTest(Base):
             w.finish(b"x")
         self.assertEqual("unknown", w.last_outcome)
 
+    def test_reset_then_retry_then_not_in_flight_is_success(self):
+        """#261 Q11 option B (a): a transport error leaves the outcome unknown, like 503/504."""
+        def reset():
+            raise ConnectionAbortedError("reset")
+
+        answers = iter([reset, problem(409, detail="NOT_IN_FLIGHT")])
+
+        def on_chunk(c, f):
+            if not c.flags & LAST:
+                return NO_CONTENT
+            a = next(answers)
+            return a() if callable(a) else a
+
+        self.srv.on_chunk = on_chunk
+        w = self.writer(window=8, window_adv=64)
+        with self.assertLogs("sjws_swarm.stream", logging.WARNING) as logs:
+            w.finish(b"x")
+        self.assertEqual("unknown", w.last_outcome)
+        self.assertIn("confirmed by NOT_IN_FLIGHT", logs.output[-1])
+        self.assertEqual(2, len(self.lasts()))
+        self.assertEqual(1, len({(c.chunk_seq, c.data) for c in self.lasts()}), "byte-identical retry")
+
+    def test_a_definite_4xx_in_between_restores_the_normal_handling(self):
+        """Option B: only when EVERY earlier attempt was a transport error, 503 or 504."""
+        def ra0(st):
+            status, h, b = st
+            h["Retry-After"] = "0"
+            return status, h, b
+
+        w = self.last_answers(problem(504), ra0(problem(429)), problem(409, detail="NOT_IN_FLIGHT"))
+        with self.assertRaises(LeaseLost):
+            w.finish(b"x")
+        self.assertEqual(3, len(self.lasts()))
+
+    def test_route_429_on_last_waits_retry_after_and_resends(self):
+        """#279 C3: a route or gateway 429 on LAST is retried after Retry-After, not raised."""
+        status, h, b = problem(429)
+        h["Retry-After"] = "1"
+        w = self.last_answers((status, h, b), NO_CONTENT)
+        w.finish(b"x")
+        self.assertEqual("ok", w.last_outcome)
+        t = [t for t, k, c in self.srv.events if k == "chunk" and c.flags & LAST]
+        self.assertGreaterEqual(t[1] - t[0], 0.95)
+        self.assertEqual(1, len({(c.chunk_seq, c.data) for c in self.lasts()}))
+
+    def test_the_5xx_retry_loop_on_last_is_bounded(self):
+        """#279 N1: never an unbounded loop; the outcome stays unknown when the bound is hit."""
+        self.srv.on_chunk = lambda c, f: problem(503) if c.flags & LAST else NO_CONTENT
+        w = self.writer(window=8, window_adv=64)
+        with mock.patch.object(stream, "LAST_RETRY_CAP", 3):
+            with self.assertRaises(SwarmError) as e:
+                w.finish(b"x")
+        self.assertEqual(503, e.exception.status)
+        self.assertEqual(4, len(self.lasts()))
+        self.assertEqual("unknown", w.last_outcome)
+
     def test_not_in_flight_without_a_5xx_raises(self):
+        """Option B (b): a fresh LAST with no prior attempt that meets NOT_IN_FLIGHT still raises."""
         w = self.last_answers(problem(409, detail="NOT_IN_FLIGHT"))
         with self.assertRaises(LeaseLost) as e:
             w.finish(b"x")
@@ -413,6 +486,24 @@ class LastTest(Base):
             w.finish(b"x")
         self.assertEqual("deadline", e.exception.reason)
         self.assertEqual(1, len(self.srv.kinds("ack")), "the cached claim is acked after a 409 cancelled")
+
+
+class ShortVisibilityTest(Base):
+    def test_one_time_warning_below_3000ms(self):
+        stream._warned_short_visibility = False
+        with self.assertLogs("sjws_swarm.stream", logging.WARNING) as logs:
+            w = ChunkWriter(self.srv.lease(window=64, visibility_ms=1500, deadline_in=1.5), coalesce=False)
+        self.assertIn("visibility_ms 1500 < 3000", logs.output[0])
+        w.close()
+        with self.assertNoLogs("sjws_swarm.stream", logging.WARNING):
+            ChunkWriter(self.srv.lease(window=64, visibility_ms=1500), coalesce=False).close()
+            ChunkWriter(self.srv.lease(window=64, visibility_ms=1000), coalesce=False, heartbeat=0).close()
+
+    def test_no_warning_at_3000ms_or_with_the_heartbeat_off(self):
+        stream._warned_short_visibility = False
+        with self.assertNoLogs("sjws_swarm.stream", logging.WARNING):
+            ChunkWriter(self.srv.lease(window=64, visibility_ms=3000), coalesce=False).close()
+            ChunkWriter(self.srv.lease(window=64, visibility_ms=1000), coalesce=False, heartbeat=0).close()
 
 
 class ExitTest(Base):

@@ -171,7 +171,8 @@ class Client:
         q = {"max": max, "visibilityMs": visibility_ms, "waitMs": int(wait * 1000)}
         status, data, headers = self._post("tasks/" + _seg(service) + ":claim", q, b"",
                                            timeout=max_(self.timeout, wait + 5))
-        spans = (headers.get(LEASE_TRACE_HEADER) or "").split(",") if headers.get(LEASE_TRACE_HEADER) else []
+        trace = headers.get_all(LEASE_TRACE_HEADER)
+        spans = ",".join(trace).split(",") if trace else []  # every field joined, as for sjws-lease-stream (N3)
         streams = headers.get_all(LEASE_STREAM_HEADER)
         out = []
         view = memoryview(data)

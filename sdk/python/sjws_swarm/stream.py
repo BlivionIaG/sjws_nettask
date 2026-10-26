@@ -29,15 +29,19 @@ Writer rules (each is a ruling; the PR body maps them to tests):
   after 5 ms doubling, ±20 % jitter, capped at ``Retry-After`` (1 s); any other ``429`` waits ``Retry-After`` exactly.
   No new chunk goes out while a ``429`` retry is pending.
 - ``LAST`` (Q10, #267 Q3): sent after every earlier chunk is accepted, with seq = the next seq, never throttled on
-  credit. Its data is always at most 64 KiB (``LAST_MAX``), credit or not: larger final data goes out as ordinary
-  chunks first, then a LAST carrying the last 64 KiB. ``504``/``503`` retry the same seq; a ``409 NOT_IN_FLIGHT`` on
-  such a retry counts as done, with ``last_outcome == "unknown"`` (Q11 limit); every other ``409`` raises.
+  credit. Its data is always at most 64 KiB (``LAST_MAX``), credit or not: a larger ``finish(result)`` goes out
+  entirely as ordinary chunks, then an empty LAST, so the reply is empty rather than a truncated tail (#279 C1).
+  Every retry is byte-identical at the same seq: transport errors, ``503``/``504`` and ``429`` (after ``Retry-After``,
+  #279 C3), bounded (#279 N1). Q11 option B: a ``409 NOT_IN_FLIGHT`` on a retry counts as done, with
+  ``last_outcome == "unknown"``, only when every earlier attempt was a transport error, ``503`` or ``504``; every
+  other ``409`` raises.
 - Cancel (Q10, Q11, Q15): a ``409 cancelled``/``deadline`` from ``:chunk`` or from the heartbeat's ``:extend`` sends
   ``LAST|CANCELLED`` at once and makes the next call raise ``StreamCancelled``.
 - Leaving the ``with`` block without ``finish()`` sends ``LAST|ERROR`` (normal exit: "writer closed without finish",
   logged as a warning), never a plain ``LAST`` (Q6).
 - Heartbeat on by default (Q15): ``:extend`` with the claim's ``visibility_ms`` every third of the lease time left
-  (at least 1 s); ``heartbeat=0`` turns it off; it stops once ``LAST`` is sent.
+  (at least 1 s); ``heartbeat=0`` turns it off; it stops once ``LAST`` is sent. Claim with ``visibility_ms >= 3000``
+  (one-time warning below that).
 
 Standard library only; HTTP/1.1 over ``http.client``.
 """
@@ -72,6 +76,9 @@ RETRY_FLOOR = 0.1  # #261 Q5: 0.1 s doubling to 2 s, 5 tries (reader reconnects;
 RETRY_CAP = 2.0
 RETRIES = 5
 NOT_IN_FLIGHT = "NOT_IN_FLIGHT"
+LAST_GRACE = 35.0  # past the lease's expected end, a LAST retry would only meet NOT_IN_FLIGHT (#279 N1)
+LAST_RETRY_CAP = 20
+_warned_short_visibility = False
 
 
 @dataclass(frozen=True)
@@ -162,8 +169,11 @@ class Stream:
     a transport error or an early EOF resumes from the last delivered ``(attempt, seq)``: binary
     ``?attempt=a&from=seq+1``, SSE ``Last-Event-ID: a.seq``; 5 tries, 0.1 s doubling to 2 s with jitter, bounded by the
     deadline; ``409 session busy`` is retried the same way. Over binary, ``result`` holds the ``LAST`` chunk's bytes
-    (also yielded as the final ``Chunk`` when not empty). SSE carries text: the server replaces invalid UTF-8 with
-    U+FFFD and line breaks arrive as ``\\n``.
+    (the task's reply), which are also yielded as the final ``Chunk`` when not empty: concatenating every ``Chunk`` is
+    the full output, so do not append ``result`` too. Over SSE ``result`` stays None. SSE carries text: the server
+    replaces invalid UTF-8 with U+FFFD and line breaks arrive as ``\\n``; a worker's ``LAST|ERROR`` text arrives as a
+    final chunk event (server behaviour) and also fills ``StreamError.message``; over binary it is only in
+    ``StreamError.message``.
     """
 
     def __init__(self, client, session_id: bytes, location: str | None = None, sse: bool = False,
@@ -188,6 +198,7 @@ class Stream:
         self._done = False
         self._pending_end = None  # a terminal to apply after yielding the final chunk
         self._sse_gap: str | None = None
+        self._sse_last_chunk: tuple[str | None, bytes] = (None, b"")
         self._rnd = _rnd or random.Random()
 
     def __enter__(self) -> "Stream":
@@ -347,8 +358,9 @@ class Stream:
                         self._deliver(int(a), int(s))
                 except ValueError:
                     pass
-            kind, event, data, eid = event or "message", "", [], None
+            this_id, kind, event, data, eid = eid, event or "message", "", [], None
             if kind == "chunk":
+                self._sse_last_chunk = (this_id, text.encode())
                 return Chunk(self._attempt or 0, self._seq, text.encode())
             if kind == "reset":
                 self._deliver(int(text), -1)
@@ -363,7 +375,9 @@ class Stream:
                     raise _Terminal(error=_end_error("deadline"))
                 if self._sse_gap is not None:
                     raise _Terminal(error=_end_error("gap " + self._sse_gap))
-                raise _Terminal(error=StreamError(b""))
+                # the server sends LAST|ERROR text as a chunk event with the end event's id (#279 C2)
+                last_id, last_text = self._sse_last_chunk
+                raise _Terminal(error=StreamError(last_text if this_id is not None and last_id == this_id else b""))
 
 
 def _end_error(text: str) -> SwarmError:
@@ -445,12 +459,21 @@ class ChunkWriter:
         self._closed = False
         self._threads: list[threading.Thread] = []
         self._idle = 0
-        self.last_outcome: str | None = None  # "ok", or "unknown" (409 NOT_IN_FLIGHT on a LAST retry after 504/503)
+        self.last_outcome: str | None = None  # "ok", or "unknown" (409 NOT_IN_FLIGHT on a LAST retry, Q11 option B)
         self.stats = collections.Counter()
         self._hb_stop = threading.Event()
         self._hb: threading.Thread | None = None
+        self._lease_until = time.monotonic() + min(
+            max(0.0, (lease.deadline_ms - time.time() * 1000) / 1000.0), lease.visibility_ms / 1000.0)
         if heartbeat != 0:
-            left = (lease.deadline_ms - time.time() * 1000) / 1000.0
+            global _warned_short_visibility
+            if lease.visibility_ms < 3000 and not _warned_short_visibility:
+                _warned_short_visibility = True
+                log.warning("visibility_ms %d < 3000: the stream heartbeat runs at most once per second, so the lease "
+                            "can expire between beats; claim stream tasks with visibility_ms >= 3000",
+                            lease.visibility_ms)
+            # the server's deadline against this clock moves with skew: never wait longer than the visibility (N2)
+            left = min((lease.deadline_ms - time.time() * 1000) / 1000.0, lease.visibility_ms / 1000.0)
             first = heartbeat if heartbeat else max(1.0, left / 3)
             self._hb = threading.Thread(target=self._heartbeat, args=(first, heartbeat), daemon=True,
                                         name="sjws-stream-heartbeat")
@@ -500,23 +523,25 @@ class ChunkWriter:
             self._kick()
 
     def flush(self) -> None:
-        """Closes the coalesced chunk now (it is queued; ``finish`` waits for acceptance)."""
+        """Closes the coalesced chunk now: queued, not accepted (``finish`` is the barrier that waits)."""
         with self._cv:
             self._check()
             self._close_buf(block=True)
             self._kick()
 
     def finish(self, result: bytes = b"") -> None:
-        """Sends ``LAST`` once every earlier chunk is accepted. Over 64 KiB, the head goes as ordinary chunks first
-        (#267 L3); the LAST carries the last 64 KiB, which is the task's reply body."""
+        """Sends ``LAST`` once every earlier chunk is accepted. ``result`` of at most 64 KiB rides on the LAST and is
+        the task's reply (``Stream.result``). Above 64 KiB (#267 L3, LAST always capped) all of it is streamed as
+        ordinary chunks and the LAST is empty, so the reply and ``Stream.result`` are empty: the output is the
+        concatenation of the chunks, never a truncated tail (#279 C1)."""
         result = bytes(result)
         if len(result) > LAST_MAX:
             with self._cv:
                 self._check()
                 self._close_buf(block=True)
-                self._enqueue_split(result[:-LAST_MAX])
+                self._enqueue_split(result)
                 self._kick()
-            result = result[-LAST_MAX:]
+            result = b""
         self._terminal(LAST, result)
 
     def fail(self, message: bytes = b"") -> None:
@@ -776,6 +801,8 @@ class ChunkWriter:
             if self._error is not None:
                 if not ignore_error:
                     raise self._error
+                # best effort: queued jobs already own their seqs, so a LAST|ERROR after dropping them lands above a
+                # hole and the reader may end by gap or deadline rather than "error" (#279 N4)
                 self._queue.clear()
                 self._retry.clear()
                 while self._out:  # in-flight requests still finish; LAST must come after them
@@ -794,21 +821,35 @@ class ChunkWriter:
                 self._cv.notify_all()
 
     def _send_last(self, seq: int, flags: int, data: bytes) -> None:
+        """Sends the LAST and retries the byte-identical body at the same seq (the server dedups it).
+
+        - ``503``/``504`` and transport errors (no status) leave the outcome unknown and are retried.
+        - A ``429`` (credit-typed or a route/gateway limiter) waits ``Retry-After`` and resends (#279 C3).
+        - #261 Q11 as re-ruled (option B): a ``409 NOT_IN_FLIGHT`` is success, ``last_outcome == "unknown"``, only
+          when every earlier attempt of this LAST failed with a transport error, 503 or 504. After any definite answer
+          (a 4xx such as 429) the normal handling applies and it raises ``LeaseLost``.
+        - Bounded (#279 N1): at most ``LAST_RETRY_CAP`` retries on 5xx/429 and ``RETRIES`` on transport errors, and
+          none past the lease's expected end plus ``LAST_GRACE``; then the last error is raised.
+        """
         if len(data) > LAST_MAX:
             raise ValueError(f"LAST {len(data)} B > {LAST_MAX}")
         conn = _Http(self.lease.client, max(self.lease.client.timeout, 35.0))
         c = StreamChunk(self.lease.stream_id, seq, flags | (FIRST if seq == 0 else 0), data, self.lease.attempt)
         body = Frame(FrameType.TOKEN, c.flags & 7, c.encode()).encode()
         path = "leases/" + _seg(self.lease.id) + ":chunk"
-        after_5xx = False
+        attempts = 0  # sends so far
+        only_unknown = True  # every earlier attempt failed with a transport error, 503 or 504
         tries = net_tries = 0
+        stop_at = self._lease_until + LAST_GRACE
         try:
             while True:
+                attempts += 1
                 try:
                     status, headers, raw = conn.request("POST", path, body, {"Content-Type": CONTENT_TYPE})
                 except (OSError, http.client.HTTPException):
                     self.stats["transport_errors"] += 1
-                    if net_tries >= RETRIES:
+                    if net_tries >= RETRIES or time.monotonic() > stop_at:
+                        self.last_outcome = "unknown"
                         raise
                     time.sleep(retry_backoff(net_tries, self._rnd))
                     net_tries += 1
@@ -818,19 +859,27 @@ class ChunkWriter:
                     self.last_outcome = "ok"
                     return
                 problem = parse_problem(raw)
-                if status in (503, 504):  # not durable yet: retry the same chunkSeq (deduplicated)
-                    after_5xx = True
+                if status in (503, 504, 429):
+                    if status == 429:
+                        only_unknown = False  # a definite refusal: this LAST did not land
+                        delay = _retry_after(headers)
+                        self.stats["last_429s"] += 1
+                    else:
+                        delay = retry_backoff(min(tries, 4), self._rnd)
                     self.stats["last_retries"] += 1
-                    time.sleep(retry_backoff(min(tries, 4), self._rnd))
+                    if tries >= LAST_RETRY_CAP or time.monotonic() + delay > stop_at:
+                        if status != 429:
+                            self.last_outcome = "unknown"
+                        raise _problem_error(status, problem)
+                    time.sleep(delay)
                     tries += 1
                     continue
                 err = _problem_error(status, problem)
-                if (status == 409 and after_5xx and type(err) is LeaseLost
+                if (status == 409 and attempts > 1 and only_unknown and type(err) is LeaseLost
                         and problem.get("detail") == NOT_IN_FLIGHT):
-                    # #261 Q11: only on a LAST retry after 504/503; acked, or expired and redelivered behind a RESET
                     self.last_outcome = "unknown"
-                    log.warning("lease %s: last_outcome_unknown (409 NOT_IN_FLIGHT on a LAST retry after %s)",
-                                self.lease.id, "504/503")
+                    log.warning("lease %s: last_outcome_unknown: outcome unknown, then confirmed by NOT_IN_FLIGHT "
+                                "(earlier attempts: transport error, 503 or 504)", self.lease.id)
                     return
                 if isinstance(err, StreamCancelled):
                     self._ack_quietly()  # the claim stays cached after a 409 cancelled: the worker acks it (§5.2)
@@ -874,7 +923,9 @@ class ChunkWriter:
         wait = first
         while not self._hb_stop.wait(wait):
             try:
+                t0 = time.monotonic()
                 self.lease.extend(self.lease.visibility_ms)
+                self._lease_until = t0 + self.lease.visibility_ms / 1000.0
                 self.stats["heartbeats"] += 1
             except StreamCancelled as e:
                 self._on_cancel(e)

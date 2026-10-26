@@ -8,6 +8,7 @@ client yet. ``LeaseStreamHttp3Test`` (Java) covers the ``:claim`` headers over H
 
 Needs the built jar: SJWS_JAR=target/sjws_nettask-<version>.jar (CI sets it after `mvn verify`). Skipped otherwise.
 """
+import json
 import socket
 import threading
 import time
@@ -15,7 +16,8 @@ import unittest
 
 from test_lease_stream_e2e import JAR, _Server
 
-from sjws_swarm import Client
+from sjws_swarm import Client, Frame, FrameType
+from sjws_swarm.chunks import FIRST, LAST, StreamChunk
 from sjws_swarm.client import StreamCancelled
 from sjws_swarm.stream import LAST_MAX, Chunk, Reset
 
@@ -73,12 +75,34 @@ class _E2E:
         self.assertTrue(all(isinstance(e, Chunk) and e.attempt == 1 for e in evs))
         self.assertEqual(list(range(len(evs))), [e.seq for e in evs])
         self.assertEqual(self.expect(300) + result, b"".join(e.data for e in evs))
-        self.assertEqual(("ok", result[-LAST_MAX:]), (s.state, s.result))
+        # over 64 KiB: every byte streamed as chunks, then an empty LAST (not yielded), so the reply is empty (#279 C1)
+        self.assertEqual(("ok", b""), (s.state, s.result))
         self.assertEqual(out["lease"].attempt, 1)
         if self.credit:
             self.assertEqual("credit", w._mode)
         else:
             self.assertEqual("none", w._mode)
+
+    def json_reply(self, pool, doc):
+        raw = json.dumps(doc).encode()
+        with self.client.stream(pool, b"p", deadline=60) as s:
+            t, out = self.worker(pool, 0, raw)
+            evs = list(s)
+        t.join(30)
+        self.assertNotIn("error", out)
+        self.assertEqual("ok", s.state)
+        self.assertEqual(doc, json.loads(b"".join(e.data for e in evs)))
+        return raw, s
+
+    def test_a_json_reply_over_64k_round_trips_intact(self):
+        raw, s = self.json_reply("json-big", {"items": [{"i": i, "pad": "x" * 200} for i in range(1000)]})
+        self.assertGreater(len(raw), LAST_MAX)
+        self.assertEqual(b"", s.result)  # never a 64 KiB tail
+
+    def test_a_json_reply_up_to_64k_is_the_result(self):
+        raw, s = self.json_reply("json-small", {"items": ["x" * 100] * 100})
+        self.assertLessEqual(len(raw), LAST_MAX)
+        self.assertEqual(raw, s.result)
 
     def test_sse_stream(self):
         with self.client.stream("sse", b"prompt", deadline=60, sse=True) as s:
@@ -217,6 +241,56 @@ class Defaults64x256CreditTest(_E2E, unittest.TestCase):
         self.assertEqual(64, w.effective_window)
         self.assertLess(w.stats["max_span"], 64)
         self.assertEqual(self.expect(1000) + b"end", b"".join(e.data for e in evs))
+
+    def test_last_over_64k_is_413_and_the_sdk_never_sends_one(self):
+        """#272: with credit on, a LAST over 65,536 B is refused 413 problems/credit. The SDK splits it (#279 C1)."""
+        with self.client.stream("last413", b"p", deadline=60) as s:
+            (lease,) = self.client.claim("last413", wait=10)
+
+            def last(n, seq):
+                c = StreamChunk(lease.stream_id, seq, FIRST | LAST, b"z" * n, lease.attempt)
+                return self.server.post("leases/" + lease.id + ":chunk", Frame(FrameType.TOKEN, 0, c.encode()).encode())
+
+            status, body, _ = last(LAST_MAX + 1, 0)
+            self.assertEqual(413, status)
+            self.assertIn(b"problems/credit", body)
+            self.assertEqual(204, last(LAST_MAX, 0)[0])
+            evs = list(s)
+        self.assertEqual([b"z" * LAST_MAX], [e.data for e in evs])
+        self.assertEqual(("ok", b"z" * LAST_MAX), (s.state, s.result))
+        # the SDK path with the same server: a 64 KiB + 1 result never meets the 413
+        with self.client.stream("last413-sdk", b"p", deadline=60) as s:
+            t, out = self.worker("last413-sdk", 0, b"y" * (LAST_MAX + 1))
+            data = b"".join(e.data for e in s)
+        t.join(30)
+        self.assertNotIn("error", out)
+        self.assertEqual(b"y" * (LAST_MAX + 1), data)
+        self.assertEqual(("ok", "ok", b""), (s.state, out["writer"].last_outcome, s.result))
+
+
+@unittest.skipUnless(JAR, "SJWS_JAR not set")
+class NodeBudgetTest(unittest.TestCase):
+    """#272 node budget at its floor (8,589,387 B) with a 0.25 soft watermark: a reader-less session that goes over its
+    fair share gets 429 "scope":"node"; the SDK backs off on the same (attempt, seq) and delivers everything in order."""
+    setUpClass = _E2E.__dict__["setUpClass"]
+    tearDownClass = _E2E.__dict__["tearDownClass"]
+    flags = CREDIT + ["-Dsjws.swarm.stream.budget.bytes=8589387", "-Dsjws.swarm.stream.budget.softWatermark=0.25"]
+    worker = _E2E.worker
+    expect = _E2E.expect
+
+    def test_node_scope_429_then_recovery(self):
+        n, size = 120, 100 * 1024
+        with self.client.stream("node", b"p", deadline=60) as s:
+            t, out = self.worker("node", n, size=size)
+            time.sleep(1.5)  # nobody reads: resident bytes pass the soft watermark (about 2 MiB)
+            evs = list(s)
+        t.join(30)
+        self.assertNotIn("error", out)
+        w = out["writer"]
+        self.assertGreater(w.stats["node_429s"], 0, dict(w.stats))
+        self.assertEqual(list(range(n)), [e.seq for e in evs])  # the empty LAST is not yielded
+        self.assertEqual(self.expect(n, size), b"".join(e.data for e in evs))
+        self.assertEqual("ok", s.state)
 
 
 @unittest.skipUnless(JAR, "SJWS_JAR not set")
