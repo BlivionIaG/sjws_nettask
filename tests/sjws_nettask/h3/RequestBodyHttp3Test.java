@@ -113,14 +113,19 @@ class RequestBodyHttp3Test {
     }
 
     private Http3Server echoServer() throws IOException {
+        return echoServer(ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0).build(),
+                (request, next) -> next.proceed(request));
+    }
+
+    /** {@code /echo} echoes; everything else goes to {@code other}, then the files. */
+    private Http3Server echoServer(ServerConfig config, sjws_nettask.core.RequestFilter other) throws IOException {
         var files = new StaticFileHandler(this.root);
         var chain = RequestFilters.create().add((request, next) -> {
             var response = next.proceed(request);
             response.headers().add("x-filter", "h3");
             return response;
         }).add((request, next) -> request.target().startsWith("/echo") ? echo(request) : next.proceed(request))
-                .build(files);
-        var config = ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0).build();
+                .add(other).build(files);
         var server = (Http3Server) H3Transports.defaultFactory().create(config, files, chain);
         server.start();
         return server;
@@ -161,6 +166,11 @@ class RequestBodyHttp3Test {
             assertEquals(200, u.status(), () -> "reset=" + u.reset() + " error=" + u.error());
             assertEquals("-1", u.header("x-declared"));
             assertEquals(sha256(unknown), u.header("x-sha256"));
+            // no content and no content-length (e.g. a bare POST): length 0, as on HTTP/1.1, not "unknown"
+            var bare = H3TestClient.request(quic, "POST", "/echo", Map.of()).get(30, TimeUnit.SECONDS);
+            assertEquals(200, bare.status());
+            assertEquals("0", bare.header("x-declared"));
+            assertEquals("0", bare.header("x-received"));
             // empty, declared 0
             var e = send(quic, "POST", "/echo", new byte[0], true);
             assertEquals(200, e.status());
@@ -191,6 +201,158 @@ class RequestBodyHttp3Test {
             var ok = send(quic, "POST", "/echo", "after".getBytes(StandardCharsets.UTF_8), true);
             assertEquals(200, ok.status(), () -> "reset=" + ok.reset() + " error=" + ok.error());
             assertEquals("after", new String(ok.body(), StandardCharsets.UTF_8));
+        } finally {
+            server.close();
+        }
+    }
+
+    /** A handler that doesn't read yet holds the client to the stream window: the server buffers a bounded amount. */
+    @Test
+    void anUnreadBodyIsHeldByFlowControlNotBuffered() throws Exception {
+        Assumptions.assumeTrue(Http3Server.isAvailable(),
+                () -> "native QUIC unavailable: " + Http3Server.unavailabilityCause());
+        var most = new java.util.concurrent.atomic.AtomicInteger();
+        var server = echoServer(ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0).build(),
+                (request, next) -> {
+                    if (!request.target().equals("/slow")) {
+                        return next.proceed(request);
+                    }
+                    var body = (Http3RequestBody) request.body();
+                    try {
+                        for (int i = 0; i < 20; i++) { // the client keeps sending meanwhile
+                            Thread.sleep(25);
+                            most.accumulateAndGet(body.buffered(), Math::max);
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return echo(request);
+                });
+        try (var client = new H3TestClient(server.tls().certificate())) {
+            var quic = client.connect(server.localAddress());
+            var data = new byte[4 << 20];
+            new Random(7).nextBytes(data);
+            var r = send(quic, "POST", "/slow", data, true);
+            assertEquals(200, r.status(), () -> "reset=" + r.reset() + " error=" + r.error());
+            assertEquals(sha256(data), r.header("x-sha256"), "every byte arrived once reading resumed");
+            assertTrue(most.get() > 0, "the client did send while the handler waited");
+            assertTrue(most.get() <= 2 * Http3RequestBody.HIGH + Http3Server.MAX_STREAM_DATA,
+                    "at most about HIGH + one stream window is buffered, was " + most.get());
+        } finally {
+            server.close();
+        }
+    }
+
+    /** A body that stops arriving, or a stream the client resets, ends the handler's read with an IOException. */
+    @Test
+    void aStalledOrResetBodyFailsTheRead() throws Exception {
+        Assumptions.assumeTrue(Http3Server.isAvailable(),
+                () -> "native QUIC unavailable: " + Http3Server.unavailabilityCause());
+        var failures = new java.util.concurrent.LinkedBlockingQueue<String>();
+        var config = ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0)
+                .writeTimeout(java.time.Duration.ofMillis(400)).build();
+        var server = echoServer(config, (request, next) -> {
+            if (!request.target().startsWith("/partial")) {
+                return next.proceed(request);
+            }
+            try {
+                readCapped(request, ECHO_CAP);
+                failures.add("no failure");
+            } catch (IOException e) {
+                failures.add(e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+            return StaticFileHandler.error(400, false);
+        });
+        try (var client = new H3TestClient(server.tls().certificate())) {
+            var quic = client.connect(server.localAddress());
+            // stalled: 1000 of 5000 declared bytes, then nothing (no FIN)
+            var stalled = openPartial(quic, "/partial-stall", 1000);
+            var stall = failures.poll(10, TimeUnit.SECONDS);
+            assertNotNull(stall);
+            assertTrue(stall.contains("no request body bytes for 400 ms"), stall);
+            stalled.close();
+            // reset by the client mid-body
+            var reset = openPartial(quic, "/partial-reset", 1000);
+            Thread.sleep(100);
+            reset.shutdown(0x10c); // H3_REQUEST_CANCELLED, both directions
+            var cut = failures.poll(10, TimeUnit.SECONDS);
+            assertNotNull(cut);
+            assertTrue(cut.startsWith("IOException") || cut.startsWith("InterruptedIOException"), cut);
+            // the connection carries the next request
+            var ok = send(quic, "POST", "/echo", "still".getBytes(StandardCharsets.UTF_8), true);
+            assertEquals(200, ok.status(), () -> "reset=" + ok.reset() + " error=" + ok.error());
+        } finally {
+            server.close();
+        }
+    }
+
+    /** Opens a request declaring 5000 body bytes and sends only {@code sent} of them, without FIN. */
+    private static io.netty.handler.codec.quic.QuicStreamChannel openPartial(QuicChannel quic, String path, int sent)
+            throws Exception {
+        var stream = io.netty.handler.codec.http3.Http3.newRequestStream(quic,
+                new io.netty.handler.codec.http3.Http3RequestStreamInboundHandler() {
+                    @Override
+                    protected void channelRead(io.netty.channel.ChannelHandlerContext ctx,
+                            io.netty.handler.codec.http3.Http3HeadersFrame frame) {
+                        io.netty.util.ReferenceCountUtil.release(frame);
+                    }
+
+                    @Override
+                    protected void channelRead(io.netty.channel.ChannelHandlerContext ctx,
+                            io.netty.handler.codec.http3.Http3DataFrame frame) {
+                        io.netty.util.ReferenceCountUtil.release(frame);
+                    }
+
+                    @Override
+                    protected void channelInputClosed(io.netty.channel.ChannelHandlerContext ctx) {
+                        ctx.close();
+                    }
+
+                    @Override
+                    public void exceptionCaught(io.netty.channel.ChannelHandlerContext ctx, Throwable cause) {
+                        ctx.close();
+                    }
+                }).get(10, TimeUnit.SECONDS);
+        var head = new io.netty.handler.codec.http3.DefaultHttp3HeadersFrame();
+        head.headers().method("POST").path(path).scheme("https").authority("localhost").add("content-length", "5000");
+        stream.write(head);
+        stream.writeAndFlush(new io.netty.handler.codec.http3.DefaultHttp3DataFrame(
+                io.netty.buffer.Unpooled.wrappedBuffer(new byte[sent]))).sync();
+        return stream;
+    }
+
+    /**
+     * A response whose field section exceeds the client's SETTINGS_MAX_FIELD_SECTION_SIZE (Netty's client default:
+     * 8 KiB) is replaced by a 500 on its stream instead of killing the client's connection; a client that advertises
+     * more gets it whole.
+     */
+    @Test
+    void aResponseHeaderSectionOverThePeersLimitIsA500NotAConnectionError() throws Exception {
+        Assumptions.assumeTrue(Http3Server.isAvailable(),
+                () -> "native QUIC unavailable: " + Http3Server.unavailabilityCause());
+        var big = "v".repeat(12_000);
+        var server = echoServer(ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0).build(),
+                (request, next) -> {
+                    if (!request.target().startsWith("/big-head")) {
+                        return next.proceed(request);
+                    }
+                    var h = ResponseHeaders.of();
+                    h.set("x-big", big);
+                    return new Response(200, h, new Body.Bytes(ByteBuffer.wrap("ok".getBytes(StandardCharsets.UTF_8))));
+                });
+        Files.writeString(this.root.resolve("f.txt"), "file");
+        try (var client = new H3TestClient(server.tls().certificate())) {
+            var small = client.connect(server.localAddress()); // Netty's default: 8 KiB
+            assertEquals(200, H3TestClient.get(small, "/f.txt").status()); // its SETTINGS have arrived by now
+            var refused = H3TestClient.get(small, "/big-head");
+            assertEquals(500, refused.status(), () -> "reset=" + refused.reset() + " error=" + refused.error());
+            assertTrue(small.isActive(), "the client's connection survives");
+            assertEquals("file", new String(H3TestClient.get(small, "/f.txt").body(), StandardCharsets.UTF_8));
+            var large = client.connect(server.localAddress(), 64 * 1024);
+            assertEquals(200, H3TestClient.get(large, "/f.txt").status());
+            var whole = H3TestClient.get(large, "/big-head");
+            assertEquals(200, whole.status(), () -> "reset=" + whole.reset() + " error=" + whole.error());
+            assertEquals(big, whole.header("x-big"));
         } finally {
             server.close();
         }

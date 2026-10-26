@@ -65,8 +65,22 @@ HTTP/3 (QUIC, UDP) is opt-in and runs next to HTTP/1.1, serving the same files.
   a connection with 16 or more in flight gets no more (fair share: a few connections can't take the
   whole cap). Files being sent = min(`--max-connections`, 1024), at most 16 per QUIC connection, waiting
   at most `--header-timeout` for a slot; 64 concurrent request streams and 16 KiB / 1 MiB receive
-  windows per stream / connection (request bodies are discarded); request field sections up to 16 KiB
-  (larger: 431).
+  windows per stream / connection; request field sections up to 16 KiB (larger: 431).
+* **Request bodies.** For methods other than GET and HEAD, DATA frames are handed to the handler as a
+  pull-style request body (the swarm's `:submit`, `:stream`, `:chunk`, `:reply`, the proxy). Size
+  limits are the handler's, as on HTTP/1.1: a declared `content-length` is the body's length (larger
+  than the handler's limit: 413 before anything is read); without one the length is unknown and the
+  handler stops at its cap. The server never buffers more than about 32 KiB per request: while the
+  handler is behind, the stream stops reading and the client waits on its flow-control window. Each
+  wait for body bytes is bounded by `--write-timeout`. What the handler does not read is dropped, and
+  the client is asked to stop sending (STOP_SENDING with `H3_NO_ERROR`). The static file handler
+  never reads bodies, so with no filter or other handler installed nothing is attached (zero cost).
+* **Response field sections.** A response is never sent with a field section larger than the
+  client's `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2): such a client would fail its whole
+  connection (Netty's client does, with its 8 KiB default). The server answers that request with a
+  500 instead, and the connection keeps working. Clients that expect large response fields (a swarm
+  `:claim` with a large `max`, see [agent-swarm](../design/agent-swarm.md) §5.2) must advertise a
+  larger value, e.g. 64 KiB.
 * **Handshakes.** A QUIC connection counts against `--h3-max-connections` and the per-address cap only
   once its handshake completes (its address is then validated). Until then it is *half-open*: at most
   256 at a time (more are dropped silently), and one not established within 5 s is dropped. No QUIC

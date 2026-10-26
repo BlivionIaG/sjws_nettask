@@ -350,8 +350,9 @@ handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
 idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
 HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
 response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
-streamed upstream (over `max_body` is 413). A chunked request body is 501 for now, as is a declared body that the
-transport did not attach (HTTP/1.1 is the only transport that attaches request bodies today); see
+streamed upstream (over `max_body` is 413); so are HTTP/3 request bodies with a `content-length`. A chunked request
+body (or an HTTP/3 body of unknown length) is 501 for now, as is a declared body that the transport did not attach
+(HTTP/2 attaches none today); see
 `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
 TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
