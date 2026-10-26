@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import sjws_nettask.cluster.Clock;
 import sjws_nettask.cluster.ClusterKey;
@@ -26,6 +27,7 @@ import sjws_nettask.cluster.VoterSet;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LedgerWriter;
 import sjws_nettask.messaging.ledger.Replica;
+import sjws_nettask.messaging.ledger.ReplicaHooks;
 import sjws_nettask.messaging.ledger.SegmentedLog;
 import sjws_nettask.msgrepl.RaftReplicator;
 import sjws_nettask.msgrepl.SnapshotTesting;
@@ -77,7 +79,8 @@ public class MsgSnapshotBench {
         var state = dir.resolve(m.id().name() + "/msgrepl");
         var snaps = SnapshotTesting.create(state, peers, m.id().name(), EVERY, TAIL, System::currentTimeMillis);
         var replica = snaps.replicator(node, Set.of("t"), Map.of(), state.resolve("apply"), ELECTION, HEARTBEAT, System::nanoTime)
-                .open("t", writer, Durability.ASYNC, r -> { });
+                .open("t", writer, Durability.ASYNC, new ReplicaHooks(r -> { }, x -> { },
+                        new ReentrantReadWriteLock().writeLock(), () -> { }, null));
         node.begin(Duration.ofMillis(1));
         return new Data(node, t, storage, log, writer, snaps, replica);
     }
@@ -208,7 +211,7 @@ public class MsgSnapshotBench {
                     try {
                         lead.append(rec, mode).get(5, TimeUnit.SECONDS);
                     } catch (Exception e) {
-                        errors.incrementAndGet();
+                        if (errors.incrementAndGet() == 1) System.err.println("first error: " + e);
                         continue;
                     }
                     if (counts[id] == lats[id].length) lats[id] = Arrays.copyOf(lats[id], counts[id] * 2);
