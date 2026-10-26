@@ -75,4 +75,23 @@ public interface ReplicationGroup {
     CompletableFuture<Void> changeMembership(Set<NodeId> voters, Set<NodeId> learners);
 
     void transferLeadership(NodeId target);
+
+    /**
+     * Feature bits this node advertises to the leader of this group, sent at the end of every append response
+     * (#278). The bits are the group owner's, opaque to consensus; once set they stay set for the node's lifetime.
+     * A group with none set sends byte-identical responses, and an older build ignores the extra bytes. The default
+     * advertises nothing.
+     */
+    default void advertiseFeatures(int bits) {
+    }
+
+    /**
+     * Leader only: whether every voter of the current configuration (joint configurations included) has every bit of
+     * {@code bits}, this node from {@link #advertiseFeatures} and each peer from its latest append response to this
+     * node. A peer this node has not heard from since it started counts as having none, and a peer that answers
+     * without the bits loses them. False when this node does not lead. The default is false: unknown fails closed.
+     */
+    default boolean votersHaveFeatures(int bits) {
+        return false;
+    }
 }
