@@ -54,8 +54,17 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String COMPACTION_TOPICS_ENV = "SJWS_MESSAGING_COMPACTION_TOPICS";
     /**
      * M2: accept {@code Producer-Id}/{@code Producer-Seq} on replicated topics ({@code true}/{@code false}, default
-     * false). Turn it on only once every node runs a build with producer dedup: an older node skips the producer
-     * entries it cannot read, and its ledger would diverge.
+     * false).
+     *
+     * <p><b>Producer ids are not scoped to a client yet.</b> Every client of a topic shares one producer id space and one
+     * table of 4096 producers: two clients that pick the same id interfere (refusals, lost dedup). Do not enable this
+     * for topics written by mutually untrusted clients until principal-scoped producers land
+     * (https://github.com/BlivionIaG/sjws_nettask/issues/283, which blocks turning this on by default).
+     *
+     * <p>Older builds: a leader proposes the first producer entry only once every voter has advertised that it applies
+     * them (an older node would skip them and its ledger would diverge); until then such a produce is 503
+     * producer-dedup-unavailable. Downgrading a node below M2, or adding an older voter, is unsupported once a producer
+     * entry has committed.
      */
     static final String PRODUCER_DEDUP_PROPERTY = "sjws.messaging.producer.dedup";
     static final String PRODUCER_DEDUP_ENV = "SJWS_MESSAGING_PRODUCER_DEDUP";

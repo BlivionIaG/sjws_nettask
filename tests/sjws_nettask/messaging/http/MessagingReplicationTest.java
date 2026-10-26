@@ -81,6 +81,11 @@ class MessagingReplicationTest {
     }
 
     void start() throws Exception {
+        start(false);
+    }
+
+    /** {@code legacyWitness}: the witness opens the msg groups as a build before M2 would, advertising no features. */
+    void start(boolean legacyWitness) throws Exception {
         clock = new FakeClock(0L);
         net = new SimTransport();
         var members = List.of(member(1, false), member(2, false), member(3, true));
@@ -103,7 +108,12 @@ class MessagingReplicationTest {
             h.producerDedup(true);
             http.add(h);
         }
-        RaftReplicator.openForWitness(nodes.get(2), TOPICS, ELECTION, HEARTBEAT);
+        if (legacyWitness) {
+            for (var t : TOPICS) nodes.get(2).openGroup(RaftReplicator.group(t), RaftReplicator.options(ELECTION, HEARTBEAT), null);
+            nodes.get(2).openGroup(RaftReplicator.group("__offsets"), RaftReplicator.options(ELECTION, HEARTBEAT), null);
+        } else {
+            RaftReplicator.openForWitness(nodes.get(2), TOPICS, ELECTION, HEARTBEAT);
+        }
         clock.advance(ELECTION);
         drive();
         clock.advance(HEARTBEAT);
@@ -407,6 +417,18 @@ class MessagingReplicationTest {
         return "{\"baseOffset\":" + base + ",\"count\":1}";
     }
 
+    /** #278 B1: a duplicate says so, in the body and in a header. */
+    static void assertDuplicate(long base, Response r) {
+        assertEquals(200, r.status(), LogOffsetsTest.text(r));
+        assertEquals("{\"baseOffset\":" + base + ",\"count\":1,\"duplicate\":true}", LogOffsetsTest.text(r));
+        assertEquals("true", r.headers().get("producer-duplicate"));
+    }
+
+    static void assertFresh(long base, Response r) {
+        assertEquals(ack(base), LogOffsetsTest.text(r));
+        assertNull(r.headers().get("producer-duplicate"), "a fresh append carries no duplicate marker");
+    }
+
     /** Drives until some data node is the ready leader of {@code topic}. */
     int awaitLeader(String topic) throws Exception {
         for (int k = 0; k < 200; k++) {
@@ -434,7 +456,7 @@ class MessagingReplicationTest {
         for (int s = 1; s <= 2; s++) {
             long seq = s;
             var r = call(() -> http.get(l).handle(post("t", "p" + seq, producer(7, seq))));
-            assertEquals(ack(seq - 1), LogOffsetsTest.text(r));
+            assertFresh(seq - 1, r);
         }
         awaitEnd(f, "t", 2); // the follower holds both: the witness votes only for a candidate that is up to date
         net.cut(nodes.get(l).self(), nodes.get(f).self());
@@ -446,9 +468,8 @@ class MessagingReplicationTest {
         assertTrue(topics.get(f).get("t", false).replica().leaderReady(), "follower did not take over");
         // async: with the old leader cut off, a STRICT (group) write would be refused for lack of a second copy.
         var retry = call(() -> http.get(f).handle(post("t", "p2", producer(7, 2, "async"))));
-        assertEquals(200, retry.status(), LogOffsetsTest.text(retry));
-        assertEquals(ack(1), LogOffsetsTest.text(retry), "the new leader knows the producer: original offset");
-        assertEquals(ack(2), LogOffsetsTest.text(call(() -> http.get(f).handle(post("t", "p3", producer(7, 3, "async"))))));
+        assertDuplicate(1, retry); // the new leader knows the producer: original offset, marked duplicate
+        assertFresh(2, call(() -> http.get(f).handle(post("t", "p3", producer(7, 3, "async")))));
         net.heal(nodes.get(l).self(), nodes.get(f).self());
         net.heal(nodes.get(l).self(), nodes.get(2).self());
         awaitEnd(l, "t", 3);
@@ -486,10 +507,10 @@ class MessagingReplicationTest {
         net.heal(nodes.get(l).self(), nodes.get(2).self());
         int now = awaitLeader("t");
         var retry = call(() -> http.get(now).handle(post("t", "maybe", producer(5, 1))));
-        assertEquals(ack(0), LogOffsetsTest.text(retry));
+        assertDuplicate(0, retry);
         var again = call(() -> http.get(now).handle(post("t", "maybe", producer(5, 1))));
-        assertEquals(ack(0), LogOffsetsTest.text(again), "and every later retry");
-        assertEquals(ack(1), LogOffsetsTest.text(call(() -> http.get(now).handle(post("t", "next", producer(5, 2))))));
+        assertDuplicate(0, again); // and every later retry
+        assertFresh(1, call(() -> http.get(now).handle(post("t", "next", producer(5, 2)))));
         for (int i = 0; i < 2; i++) {
             awaitEnd(i, "t", 2);
             assertEquals(List.of("maybe", "next"), records(http.get(i).handle(fetch("t", "", Map.of()))));
@@ -514,6 +535,11 @@ class MessagingReplicationTest {
                 .withBody(MessagingHttpTest.body(MessagingHttpTest.recs("a", "a2")))));
         assertEquals(400, reused.status(), LogOffsetsTest.text(reused));
         assertTrue(LogOffsetsTest.text(reused).contains("\"reason\":\"seq_reused\""), LogOffsetsTest.text(reused));
+        // #278 B2: same id, seq and record count, other records: refused, never acked as the first batch's duplicate
+        var sameCount = call(() -> h.handle(post("t", "not-a", producer(3, 1))));
+        assertEquals(400, sameCount.status(), LogOffsetsTest.text(sameCount));
+        assertTrue(LogOffsetsTest.text(sameCount).contains("\"reason\":\"seq_reused\"")
+                && LogOffsetsTest.text(sameCount).contains(MessagingHttp.NOT_APPENDED_TYPE), LogOffsetsTest.text(sameCount));
         for (int s = 2; s <= 1 + sjws_nettask.msgrepl.ProducerTable.WINDOW; s++) {
             long seq = s;
             assertEquals(200, call(() -> h.handle(post("t", "w" + seq, producer(3, seq)))).status());
@@ -526,9 +552,21 @@ class MessagingReplicationTest {
                 Map.of("producer-id", List.of("x"), "producer-seq", List.of("1")),
                 Map.of("producer-id", List.of("4")),
                 Map.of("producer-id", List.of("4"), "producer-seq", List.of("0")),
-                Map.of("producer-id", List.of("-1"), "producer-seq", List.of("1")))) {
-            assertEquals(400, h.handle(post("t", "bad", bad)).status(), bad.toString());
+                Map.of("producer-id", List.of("-1"), "producer-seq", List.of("1")),
+                // #278 N1: only 1 to 19 plain digits, within a long, once
+                Map.of("producer-id", List.of("+5"), "producer-seq", List.of("1")),
+                Map.of("producer-id", List.of("9223372036854775808"), "producer-seq", List.of("1")),
+                Map.of("producer-id", List.of("4"), "producer-seq", List.of("9223372036854775807")),
+                Map.of("producer-id", List.of("4"), "producer-seq", List.of("00000000000000000001")),
+                Map.of("producer-id", List.of("4", "4"), "producer-seq", List.of("1")),
+                Map.of("producer-id", List.of("4"), "producer-seq", List.of("1", "1")),
+                Map.of("producer-id", List.of("1 2"), "producer-seq", List.of("1")),
+                // #278 N2: a seq without an id is refused, not ignored
+                Map.of("producer-seq", List.of("1")))) {
+            var r = h.handle(post("t", "bad", bad));
+            assertEquals(400, r.status(), bad.toString());
         }
+        assertTrue(LogOffsetsTest.text(h.handle(post("t", "bad", Map.of("producer-seq", List.of("1"))))).contains("needs a Producer-Id"));
         h.producerDedup(false);
         var off = h.handle(post("t", "off", producer(4, 1)));
         assertEquals(400, off.status());
@@ -546,6 +584,65 @@ class MessagingReplicationTest {
             assertTrue(LogOffsetsTest.text(r).contains("replicated"), LogOffsetsTest.text(r));
             assertEquals(200, lh.handle(post("t", "x", Map.of())).status());
         }
+    }
+
+    /**
+     * #278 HA B2: a seq above 1 from a producer the log does not know (never seen or evicted) is 409 unknown-producer,
+     * never 400 not-appended: an earlier attempt of the batch may be in the log.
+     */
+    @Test
+    void anUnknownProducerIsNotReportedNotAppended() throws Exception {
+        start();
+        var h = http.get(leader("t"));
+        var r = call(() -> h.handle(post("t", "late", producer(42, 5))));
+        var body = LogOffsetsTest.text(r);
+        assertEquals(409, r.status(), body);
+        assertTrue(body.contains(MessagingHttp.UNKNOWN_PRODUCER_TYPE) && body.contains("\"reason\":\"unknown_producer\"")
+                && body.contains("read back"), body);
+        assertFalse(body.contains(MessagingHttp.NOT_APPENDED_TYPE), body);
+        assertEquals("1", r.headers().get("producer-expected-seq"));
+        assertFresh(0, call(() -> h.handle(post("t", "first", producer(43, 1)))));
+    }
+
+    /**
+     * #278 HA B1: a voter that does not advertise producer entries (a build before M2, which would skip them and
+     * diverge) keeps the leader from proposing any: 503 producer-dedup-unavailable, nothing appended, plain produce
+     * unaffected. Once every voter advertises them, the leader proposes producer entries.
+     */
+    @Test
+    void aVoterWithoutProducerEntriesKeepsTheLeaderFromProposingThem() throws Exception {
+        start(true);
+        int l = awaitLeader("t");
+        var h = http.get(l);
+        for (int k = 0; k < 3; k++) { // several heartbeats: every voter has answered this leader
+            clock.advance(HEARTBEAT);
+            drive();
+        }
+        var r = call(() -> h.handle(post("t", "dedup", producer(7, 1))));
+        var body = LogOffsetsTest.text(r);
+        assertEquals(503, r.status(), body);
+        assertTrue(body.contains(MessagingHttp.DEDUP_UNAVAILABLE_TYPE) && body.contains("nothing was appended"), body);
+        assertEquals(200, call(() -> h.handle(post("t", "plain", Map.of()))).status());
+        awaitEnd(1 - l, "t", 1);
+        assertEquals(List.of("plain"), records(h.handle(fetch("t", "", Map.of()))), "the producer batch was never proposed");
+
+        nodes.get(2).openGroup(RaftReplicator.group("t"), RaftReplicator.options(ELECTION, HEARTBEAT), null)
+                .advertiseFeatures(RaftReplicator.FEATURES); // the witness is upgraded
+        for (int k = 0; k < 3; k++) {
+            clock.advance(HEARTBEAT);
+            drive();
+        }
+        assertFresh(1, call(() -> h.handle(post("t", "dedup", producer(7, 1)))));
+    }
+
+    /** #278 HA N3: a follower redirects a producer request to the leader before it looks at its own flag. */
+    @Test
+    void aFollowerRedirectsAProducerRequestWhateverItsFlag() throws Exception {
+        start();
+        int f = 1 - leader("t");
+        http.get(f).producerDedup(false);
+        var r = http.get(f).handle(post("t", "x", producer(7, 1)));
+        assertEquals(307, r.status(), LogOffsetsTest.text(r));
     }
 
     static Member member(int wire, boolean witness) {

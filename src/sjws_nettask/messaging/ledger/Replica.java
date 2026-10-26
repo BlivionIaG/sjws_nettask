@@ -54,11 +54,13 @@ public interface Replica extends PartitionAppender, AutoCloseable {
     /**
      * Appends {@code records} as batch {@code seq} of producer {@code (origin, producerId)} (M2, {@code producerId != 0},
      * {@code seq >= 1}). The batch is checked against the topic's producer table when its entry is applied, on every
-     * replica: the next seq is appended; a retry of a batch still in the dedup window completes with the original base
-     * offset and is not appended again; anything else fails with {@link ProducerSequenceException}. Other failures are
-     * the same as {@link #appendNoWait}.
+     * replica: the next seq is appended ({@code duplicate} false); a retry of a batch still in the dedup window, with
+     * the same records, completes with the original base offset and {@code duplicate} true, and is not appended again;
+     * anything else fails with {@link ProducerSequenceException}, including when not every voter of the group can apply
+     * producer entries ({@code DEDUP_UNAVAILABLE}, nothing proposed). Other failures are the same as
+     * {@link #appendNoWait}.
      */
-    default java.util.concurrent.CompletableFuture<Long> appendDeduplicated(java.util.List<byte[]> records, Durability mode,
+    default java.util.concurrent.CompletableFuture<ProducerAppend> appendDeduplicated(java.util.List<byte[]> records, Durability mode,
             int origin, long producerId, long seq) {
         return java.util.concurrent.CompletableFuture.failedFuture(
                 new UnsupportedOperationException("this replica has no producer dedup"));

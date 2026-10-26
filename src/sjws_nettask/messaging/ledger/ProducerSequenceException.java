@@ -27,10 +27,24 @@ public final class ProducerSequenceException extends RuntimeException {
     public enum Kind {
         /** Not the producer's next seq (a gap, a reordered send, or an unknown producer not starting at 1). Nothing appended. */
         OUT_OF_ORDER,
-        /** The seq was already appended with a different record count: a seq names one batch. Nothing appended. */
+        /**
+         * The seq was already appended with another batch (a different record count or records digest): a seq names one
+         * batch. Nothing appended.
+         */
         SEQ_REUSED,
         /** Already appended, but too long ago for the dedup window to remember its offset. Not appended again. */
-        DUPLICATE_OUT_OF_WINDOW
+        DUPLICATE_OUT_OF_WINDOW,
+        /**
+         * The log does not know this producer (never seen, or evicted from the producer table) and the seq is not 1.
+         * This attempt appended nothing, but an earlier attempt of the same batch may be in the log: the table cannot
+         * tell. Reconcile by reading back before resending under a new producer id.
+         */
+        UNKNOWN_PRODUCER,
+        /**
+         * Producer dedup is not confirmed on every voter of the topic's group (one runs an older build, or has not
+         * answered this leader yet), so the batch was not proposed. Nothing appended; retry later.
+         */
+        DEDUP_UNAVAILABLE
     }
 
     private final Kind kind;

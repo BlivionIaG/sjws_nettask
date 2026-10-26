@@ -48,7 +48,7 @@ import sjws_nettask.cluster.TermChangedException;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.LedgerWriter;
-import sjws_nettask.messaging.ledger.ProducerSequenceException;
+import sjws_nettask.messaging.ledger.ProducerAppend;
 import sjws_nettask.messaging.ledger.Replica;
 import sjws_nettask.messaging.ledger.WriteOutcomeUnknownException;
 import sjws_nettask.messaging.ledger.WriteRefusedException;
@@ -70,8 +70,22 @@ import sjws_nettask.messaging.ledger.WriteRefusedException;
  * then {@code [producerOrigin:int][producerId:long][producerSeq:long]}, then the records (a batch without one stays a
  * byte-identical {@code [M]} entry). The {@link ProducerTable} decides each {@code P} entry when it is applied, on every
  * node: the next seq is appended, a remembered retry is acknowledged with the original offset, anything else is refused
- * with {@link ProducerSequenceException}; refused and duplicate entries take no offsets. Replay after a restart runs the
- * same decisions from the first entry, including entries already in the ledger, so the table is rebuilt exactly.
+ * with {@code ProducerSequenceException}; refused and duplicate entries take no offsets. Replay after a restart runs the
+ * same decisions from the first entry, including entries already in the ledger, so the table is rebuilt exactly. A
+ * duplicate is matched on the producer, the seq, the record count and a CRC32C of the encoded records, computed from
+ * the committed entry on every node.
+ *
+ * <p><b>Mixed versions (#278 HA B1).</b> Builds before M2 skip any entry that is not {@code M}, so a {@code P} entry
+ * would append on M2 nodes only and the ledgers would diverge with no error. Every msg group therefore advertises
+ * {@link #FEATURE_PRODUCER_ENTRIES} in its append responses, and the leader proposes a {@code P} entry only while every
+ * voter of the current configuration has advertised it to this leader (a voter it has not heard from since it started
+ * counts as an older build); otherwise the produce is refused before anything is proposed. The check gates the first
+ * producer entry: once one has committed (this node applied it, so its producer table exists), later ones are proposed
+ * without it, which keeps dedup available right after a failover, when the new leader may not have heard from the old
+ * one yet. From this build on, an
+ * entry this node cannot apply exactly as its peers do (an unknown magic, a malformed entry, a replay that disagrees
+ * with the stamp file) fails the replica closed instead of being skipped. Downgrading a node below M2, or adding a
+ * voter that runs an older build, is unsupported once any {@code P} entry has committed: the older build would skip it.
  */
 final class RaftReplica implements Replica {
 
@@ -81,6 +95,13 @@ final class RaftReplica implements Replica {
     private static final int HEADER = 1 + 1 + 8 + 4 + 8 + 4;
     private static final int PRODUCER = 4 + 8 + 8;
     private static final int STAMP = 28;
+    private static final Durability[] MODES = Durability.values();
+    /**
+     * Feature bit this build advertises on every msg group (#278 HA B1): it applies {@link #MAGIC_PRODUCER} entries and
+     * fails closed on any entry it cannot apply. The leader proposes a producer entry only when every voter has it,
+     * because an older build skips entries it does not know and its ledger would silently diverge.
+     */
+    static final int FEATURE_PRODUCER_ENTRIES = 1;
 
     private final ClusterNode node;
     private final GroupId groupId;
@@ -104,7 +125,14 @@ final class RaftReplica implements Replica {
     private long expected;
     /** {@link #expected} once the replay reaches {@link #resumeIndex} (from the stamp file), as a cross-check. */
     private long resumeExpected;
-    private final ProducerTable producers = new ProducerTable();
+    /**
+     * Producer dedup state, created by the first producer entry applied (#278 B4: a topic that never sees one never
+     * loads the class); null is the empty table. Replaced only by {@link #restoreProducers}. Written by the delivery
+     * thread only; volatile because the producer gate in {@link #appendDeduplicated} reads whether it exists.
+     */
+    private volatile ProducerTable producers;
+    /** Non-null once this replica failed closed (see {@link #fence}); volatile: read by producing threads. */
+    private volatile String fenced;
     /** The last local ledger append: a duplicate is acknowledged once the ledger has reached it. */
     private CompletableFuture<Long> lastLocal = CompletableFuture.completedFuture(-1L);
     private final long skipTo;
@@ -126,6 +154,7 @@ final class RaftReplica implements Replica {
         this.skipTo = ledgerEnd;
         recover(ledgerEnd);
         this.group = node.openGroup(groupId, options, this::onCommitted);
+        this.group.advertiseFeatures(FEATURE_PRODUCER_ENTRIES);
         node.onNoopApplied(groupId, (term, index) -> this.readyTerm = term);
     }
 
@@ -192,28 +221,61 @@ final class RaftReplica implements Replica {
 
     private void onCommitted(CommittedEntry e) {
         var b = e.entry();
-        if (b.remaining() < HEADER) return;
+        if (this.fenced != null) { // failed closed: applies nothing more; its own batches can no longer be acked here
+            failMine(b);
+            return;
+        }
+        if (b.remaining() < HEADER) {
+            fence(e, "entry of " + b.remaining() + " bytes is shorter than the header", null);
+            return;
+        }
         byte magic = b.get();
-        if (magic != MAGIC && magic != MAGIC_PRODUCER) return;
+        if (magic != MAGIC && magic != MAGIC_PRODUCER) { // a newer entry format: never skip it silently (#278 HA B1)
+            fence(e, "unknown entry magic 0x" + Integer.toHexString(magic & 0xff), null);
+            return;
+        }
         boolean replayed = e.index() <= this.resumeIndex; // already in the ledger: only rebuild the state (restart replay)
-        var mode = Durability.values()[b.get()];
+        int modeOrdinal = b.get();
         long stamp = b.getLong();
         int origin = b.getInt();
         long seq = b.getLong();
         int count = b.getInt();
         var mine = !replayed && origin == this.self ? this.pending.remove(seq) : null;
+        if (modeOrdinal < 0 || modeOrdinal >= MODES.length) {
+            fence(e, "unknown durability " + modeOrdinal, mine);
+            return;
+        }
+        var mode = MODES[modeOrdinal];
         if (stamp != e.term()) { // proposed in an older term, committed by a newer leader: fenced on every node
             if (mine != null) mine.completeExceptionally(unavailable("stale term " + stamp + " < " + e.term()));
             return;
         }
         int pOrigin = 0;
         long producerId = 0, producerSeq = 0;
+        int digest = 0;
         if (magic == MAGIC_PRODUCER) {
-            if (b.remaining() < PRODUCER) return;
+            if (b.remaining() < PRODUCER) {
+                fence(e, "producer entry of " + (b.remaining() + HEADER) + " bytes is shorter than its header", mine);
+                return;
+            }
             pOrigin = b.getInt();
             producerId = b.getLong();
             producerSeq = b.getLong();
-            long c = this.producers.check(pOrigin, producerId, producerSeq, count);
+            if (producerId == 0 || producerSeq < 1) {
+                fence(e, "producer entry with id " + producerId + " seq " + producerSeq, mine);
+                return;
+            }
+        }
+        if (!wellFormed(b, count)) {
+            fence(e, "records region does not hold " + count + " records", mine);
+            return;
+        }
+        if (magic == MAGIC_PRODUCER) {
+            var crc = new java.util.zip.CRC32C();
+            crc.update(b.duplicate()); // the encoded records region: identical bytes, identical digest on every node
+            digest = (int) crc.getValue();
+            if (this.producers == null) this.producers = new ProducerTable(); // lazy: null is the empty table
+            long c = this.producers.check(pOrigin, producerId, producerSeq, count, digest);
             if (c != ProducerTable.NEW) { // decided identically on every node: takes no offsets
                 if (mine != null) answerProducer(mine, c, pOrigin, producerId, producerSeq);
                 return;
@@ -221,12 +283,13 @@ final class RaftReplica implements Replica {
         }
         long base = this.expected;
         this.expected += count;
-        if (producerId != 0) this.producers.apply(pOrigin, producerId, producerSeq, base, count);
+        if (producerId != 0) this.producers.apply(pOrigin, producerId, producerSeq, base, count, digest);
         if (replayed) {
             if (e.index() == this.resumeIndex && this.expected != this.resumeExpected) {
-                System.err.println("WARN: " + this.groupId.value() + ": replay reached offset " + this.expected
-                        + " at index " + e.index() + ", the stamp file says " + this.resumeExpected);
-                this.expected = this.resumeExpected;
+                // The replay did not reproduce the offsets this node wrote: the producer table built on the way holds
+                // the same wrong bases, so dedup acks would disagree with the ledger and the peers (#278 HA B3).
+                fence(e, "replay reached offset " + this.expected + " at index " + e.index()
+                        + ", the stamp file says " + this.resumeExpected, null);
             }
             return;
         }
@@ -263,24 +326,71 @@ final class RaftReplica implements Replica {
         }
     }
 
+    /** The records region holds exactly {@code count} length-prefixed records, nothing short and nothing after. */
+    private static boolean wellFormed(ByteBuffer b, int count) {
+        if (count < 0) return false;
+        int at = b.position(), end = b.limit();
+        for (int i = 0; i < count; i++) {
+            if (end - at < 4) return false;
+            int len = b.getInt(at);
+            at += 4;
+            if (len < 0 || len > end - at) return false;
+            at += len;
+        }
+        return at == end;
+    }
+
+    /**
+     * Fails closed (#278 HA B1, B3): an entry this build cannot apply exactly as its peers do (an unknown format, a
+     * malformed entry, a replay that disagrees with the stamp file). The group applies nothing more on this node,
+     * every batch of this node still waiting for its entry fails, and later appends are refused, rather than letting
+     * this ledger silently diverge from the others. An operator has to repair or replace the node (restart it with a
+     * build that understands the entry, or rebuild its state from a healthy peer).
+     */
+    private void fence(CommittedEntry e, String why, CompletableFuture<Long> mine) {
+        var reason = this.groupId.value() + ": failed closed at index " + e.index() + ": " + why;
+        this.fenced = reason;
+        System.err.println("ERROR: " + reason + "; this replica applies nothing more until it is repaired");
+        var err = outcomeUnknown(reason, leaderName(), null);
+        if (mine != null) mine.completeExceptionally(err);
+        this.pending.values().forEach(p -> p.completeExceptionally(err));
+        this.pending.clear();
+    }
+
+    /** After a fence: this node's own batch committed but will not be applied here; its outcome is unknown. */
+    private void failMine(ByteBuffer b) {
+        if (b.remaining() < HEADER) return;
+        int origin = b.getInt(b.position() + 10);
+        long seq = b.getLong(b.position() + 14);
+        var mine = origin == this.self ? this.pending.remove(seq) : null;
+        if (mine != null) mine.completeExceptionally(outcomeUnknown(this.fenced, leaderName(), null));
+    }
+
+    /** Non-null once this replica failed closed: why. */
+    String fenced() {
+        return this.fenced;
+    }
+
     /**
      * This node's own producer batch that the table did not append: a duplicate completes with the original base
-     * offset once the local ledger has caught up to the last append (it holds the original then), else a refusal.
+     * offset (encoded {@code -1 - base}, see {@link #appendDeduplicated}) once the local ledger has caught up to the
+     * last append, since it holds the original then; else a refusal.
+     *
+     * <p>{@link #lastLocal} is the latest append, which may be a later, unrelated batch. If that append fails, the
+     * duplicate's ack fails with it, and the client sees outcome unknown for a batch that is in the log. That is safe:
+     * its retry is a duplicate again and is acknowledged with the original offset once the ledger recovers (#278 HA N4).
      */
     private void answerProducer(CompletableFuture<Long> mine, long c, int pOrigin, long producerId, long producerSeq) {
         if (c >= 0) {
             this.lastLocal.whenComplete((at, err) -> {
-                if (err == null) mine.complete(c);
+                if (err == null) mine.complete(-1 - c);
                 else mine.completeExceptionally(err);
             });
             return;
         }
         long next = this.producers.expectedSeq(pOrigin, producerId);
-        var kind = c == ProducerTable.SEQ_REUSED ? ProducerSequenceException.Kind.SEQ_REUSED
-                : c == ProducerTable.OUT_OF_WINDOW ? ProducerSequenceException.Kind.DUPLICATE_OUT_OF_WINDOW
-                : ProducerSequenceException.Kind.OUT_OF_ORDER;
-        mine.completeExceptionally(new ProducerSequenceException(kind, next, this.groupId.value() + ": producer "
-                + producerId + " seq " + producerSeq + " " + kind + ", next seq " + next));
+        mine.completeExceptionally(ProducerTable.refusal(c, next, this.groupId.value() + ": producer " + producerId
+                + " seq " + producerSeq));
     }
 
     @Override
@@ -294,15 +404,31 @@ final class RaftReplica implements Replica {
     }
 
     @Override
-    public CompletableFuture<Long> appendDeduplicated(List<byte[]> records, Durability mode, int producerOrigin,
+    public CompletableFuture<ProducerAppend> appendDeduplicated(List<byte[]> records, Durability mode, int producerOrigin,
             long producerId, long producerSeq) {
-        if (producerId != 0 && producerSeq < 1) throw new IllegalArgumentException("producer seq must be at least 1");
-        return propose(records, mode, producerOrigin, producerId, producerSeq); // id 0: no dedup, at-least-once
+        if (producerId != 0 && (producerSeq < 1 || producerSeq > ProducerTable.MAX_SEQ)) {
+            throw new IllegalArgumentException("producer seq must be 1 to " + ProducerTable.MAX_SEQ);
+        }
+        if (producerId != 0 && this.producers == null && !this.group.votersHaveFeatures(FEATURE_PRODUCER_ENTRIES)) {
+            // An older voter would skip the entry and diverge; nothing proposed (#278 HA B1). Once a producer entry
+            // has committed and been applied here, the group is past the point of no return (older builds and
+            // downgrades are unsupported from then on), so a leader that has not heard from a peer since it started,
+            // e.g. right after a failover, can still take producer retries.
+            return CompletableFuture.failedFuture(ProducerTable.dedupUnavailable(this.groupId.value()
+                    + ": not every voter has confirmed it applies producer entries; nothing appended"));
+        }
+        // id 0: no dedup, at-least-once. A duplicate completes the proposal with -1 - base (answerProducer).
+        return propose(records, mode, producerOrigin, producerId, producerSeq)
+                .thenApply(v -> v < 0 ? new ProducerAppend(-1 - v, true) : new ProducerAppend(v, false));
     }
 
     private CompletableFuture<Long> propose(List<byte[]> records, Durability mode, int producerOrigin, long producerId,
             long producerSeq) {
         var m = mode == null ? this.defaultMode : mode;
+        var down = this.fenced;
+        if (down != null) {
+            return CompletableFuture.failedFuture(new WriteRefusedException(down + "; not appended", false, null));
+        }
         long term = this.group.leaderTerm();
         if (!leaderReady(term)) return CompletableFuture.failedFuture(unavailable("not the ready leader"));
         long seq = this.seqs.incrementAndGet();
@@ -322,9 +448,19 @@ final class RaftReplica implements Replica {
         return acked;
     }
 
-    /** The producer table: owned by the delivery thread; for tests and the #270 snapshot seam. */
+    /** The producer table, null while empty: owned by the delivery thread; for tests and the #270 snapshot seam. */
     ProducerTable producers() {
         return this.producers;
+    }
+
+    /**
+     * #270 install hook, delivery thread only: replaces the producer table with {@code table} as read from a snapshot
+     * ({@link ProducerTable#read}). A snapshot at index {@code i} must carry the producer table and the next offset
+     * ({@link #expected}) as applied through {@code i}, and restore both together before applying {@code i + 1}: once
+     * the consensus log is truncated, replay can no longer recompute either from the stamp header's base.
+     */
+    void restoreProducers(ProducerTable table) { // null: the snapshot predates any producer entry (keeps the gate)
+        this.producers = table;
     }
 
     @Override

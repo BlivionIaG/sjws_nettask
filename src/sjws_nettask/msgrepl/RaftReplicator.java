@@ -47,9 +47,16 @@ import sjws_nettask.messaging.ledger.Replica;
  * snapshot or truncate their consensus log ({@code snapshotEveryEntries = Long.MAX_VALUE}), so it grows with the
  * produced data and a node that falls behind catches up by log replay only. Producer dedup state (M2,
  * {@link ProducerTable}) relies on that replay; the snapshot taker that lifts this limitation (#270) must carry the
- * table's {@link ProducerTable#write} bytes and restore them with {@link ProducerTable#read}.
+ * table's {@link ProducerTable#write} bytes together with the next offset at the snapshot's index, and restore both
+ * before applying the next entry ({@link ProducerTable#read}, then {@code RaftReplica.restoreProducers}).
  */
 public final class RaftReplicator implements PartitionReplicator {
+
+    /**
+     * Feature bits this build advertises on every msg group it opens (#278): it applies producer entries and fails
+     * closed on entries it cannot apply. A leader proposes the first producer entry only once every voter has them.
+     */
+    public static final int FEATURES = RaftReplica.FEATURE_PRODUCER_ENTRIES;
 
     /** Group of a topic (and {@code msg/__offsets}). */
     public static GroupId group(String topic) {
@@ -97,7 +104,8 @@ public final class RaftReplicator implements PartitionReplicator {
         if (!(replica instanceof RaftReplica r)) return null;
         var out = new java.io.ByteArrayOutputStream();
         try (var d = new java.io.DataOutputStream(out)) {
-            r.producers().write(d);
+            var t = r.producers();
+            (t != null ? t : new ProducerTable()).write(d); // null: no producer entry applied yet, the empty table
         } catch (java.io.IOException e) {
             throw new java.io.UncheckedIOException(e);
         }
@@ -113,8 +121,10 @@ public final class RaftReplicator implements PartitionReplicator {
     /** A witness (or any node without messaging) must still open the groups to vote: no listener, nothing applied. */
     public static void openForWitness(ClusterNode node, Set<String> topics, Duration electionTimeout, Duration heartbeat) {
         var opts = options(electionTimeout, heartbeat);
-        for (var t : topics) node.openGroup(group(t), opts, null);
-        node.openGroup(group("__offsets"), opts, null);
+        // The witness stores no entries, but it is a voter: it advertises the build's msg-group features like the data
+        // nodes, so the leader's every-voter check (RaftReplica.FEATURE_PRODUCER_ENTRIES) covers the whole group.
+        for (var t : topics) node.openGroup(group(t), opts, null).advertiseFeatures(FEATURES);
+        node.openGroup(group("__offsets"), opts, null).advertiseFeatures(FEATURES);
     }
 
     @Override
