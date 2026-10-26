@@ -612,7 +612,10 @@ section is flagged REQUIRED, in which case it refuses the snapshot. A section is
 exactly: the replica runs `onApplied` and the capture under one apply lock (only when a state is attached), and
 restores the section before the next entry applies (on restart before the tail replays, on install before the
 first entry after the snapshot). The tests use a dedup table through section 1: a duplicate is still recognised
-after truncation, a restart, or an install. The #278 integration is a `ReplicatedState` whose `section()` is 2.
+after truncation, a restart, or an install. The #278 integration is a `ReplicatedState` whose `section()` is 2, registered with
+`RaftReplica.addState` in the constructor before the group opens (so a restart restores it before the tail
+replays). The next offset at the snapshot index (`expected`), which replay cannot recompute once the log is
+truncated, is the manifest's `endOffset`.
 
 **Witness (constraint 6).** Unchanged: it stores no entries, never receives snapshots (the leader never
 sends one to a witness), and keeps only its hard state (term, vote) and its vote cursor (index and term of the

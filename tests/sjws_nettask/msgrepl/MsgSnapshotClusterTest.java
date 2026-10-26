@@ -347,4 +347,40 @@ class MsgSnapshotClusterTest {
         }
         assertTrue(SnapshotCluster.dirBytes(wdir) < 8192, "a few cursors: " + SnapshotCluster.dirBytes(wdir));
     }
+
+    /** A second state section (the slot #278's producer table takes): captured at the index, restored on install. */
+    static final class Section2 implements sjws_nettask.messaging.ledger.ReplicaHooks.ReplicatedState {
+        final java.util.concurrent.atomic.AtomicLong applied = new java.util.concurrent.atomic.AtomicLong();
+        volatile byte[] restored;
+
+        @Override public int section() { return MsgSnapshot.PRODUCERS; }
+        @Override public byte[] snapshotState() { return Long.toString(applied.get()).getBytes(java.nio.charset.StandardCharsets.UTF_8); }
+        @Override public void restoreState(byte[] image) { restored = image; }
+    }
+
+    @Test
+    void extraStateSectionIsCapturedAtTheIndexAndRestoredOnInstall() throws Exception {
+        start(20, 5);
+        int l = c.leader(), f = 1 - l;
+        var lead = new Section2();
+        var follow = new Section2();
+        c.data[l].replica.addState(lead);
+        c.data[f].replica.addState(follow);
+        assertThrows(IllegalArgumentException.class, () -> c.data[l].replica.addState(new Section2()), "one state per section");
+        long end = produce("pid1", 0, 10);
+        c.awaitEnd(f, end);
+        c.cut(f);
+        end = produce("pid1", 10, 60);
+        lead.applied.set(4242);
+        assertTrue(c.data[l].snapshot());
+        var m = recorded(l);
+        assertEquals("4242", new String(m.section(MsgSnapshot.PRODUCERS), java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals(end, m.endOffset(), "the next offset at the index travels with the sections");
+        assertNotNull(m.section(MsgSnapshot.APP_STATE));
+        c.heal(f);
+        c.awaitEnd(f, end);
+        for (int k = 0; k < 2000 && follow.restored == null; k++) c.step();
+        assertEquals("4242", new String(follow.restored, java.nio.charset.StandardCharsets.UTF_8));
+        assertTrue(c.data[f].dedup.duplicate("pid1", 69), "section 1 restored alongside");
+    }
 }

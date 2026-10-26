@@ -127,8 +127,13 @@ final class RaftReplica implements Replica {
      * that are already in the ledger are fed to {@code onApplied} again (not to the ledger). MAX_VALUE: none.
      */
     private long stateFrom = Long.MAX_VALUE;
-    /** A {@link ReplicaHooks.ReplicatedState} is attached: applies and its capture share {@link #applyLock}. */
-    private final boolean stateful;
+    /**
+     * Snapshot state sections, one per {@link ReplicaHooks.ReplicatedState} (the hooks' own, plus any registered with
+     * {@link #addState} before the group opens: #278's producer table as section 2). Non-empty: applies and the
+     * capture share {@link #applyLock}, so every image is the state right after the snapshot index.
+     */
+    private final List<ReplicaHooks.ReplicatedState> states = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private volatile boolean stateful;
     private final java.util.concurrent.locks.ReentrantLock applyLock = new java.util.concurrent.locks.ReentrantLock();
     /** Set while the group opens when the restored snapshot needs an install; run once the group is open. */
     private MsgSnapshot openInstall;
@@ -172,7 +177,7 @@ final class RaftReplica implements Replica {
         this.log = local.log();
         this.defaultMode = defaultMode;
         this.hooks = hooks;
-        this.stateful = hooks != null && hooks.state() != null;
+        if (hooks != null && hooks.state() != null) addState(hooks.state());
         this.onApplied = hooks != null ? hooks.onApplied() : onApplied;
         this.urls = urls;
         this.snaps = snaps;
@@ -562,8 +567,9 @@ final class RaftReplica implements Replica {
             try {
                 a = this.lastApplied;
                 if (a == null || a.index() <= this.recordedIndex) return false;
-                var st = this.hooks.state();
-                sections = List.of(new MsgSnapshot.Section(st.section(), 0, st.snapshotState()));
+                var out = new ArrayList<MsgSnapshot.Section>(this.states.size());
+                for (var st : this.states) out.add(new MsgSnapshot.Section(st.section(), 0, st.snapshotState()));
+                sections = out;
             } finally {
                 this.applyLock.unlock();
             }
@@ -649,7 +655,7 @@ final class RaftReplica implements Replica {
         this.recordedIndex = Math.max(this.recordedIndex, m.index());
         this.appliedIndex = Math.max(this.appliedIndex, m.index());
         applied(m.index(), m.term(), m.endOffset());
-        if (this.hooks != null && this.hooks.state() != null) {
+        if (this.stateful) {
             restoreState(m);
             this.stateFrom = m.index();
         }
@@ -713,7 +719,7 @@ final class RaftReplica implements Replica {
             this.appliedIndex = Math.max(this.appliedIndex, got.index());
             this.lastApplied = new Applied(got.index(), got.term(), got.endOffset());
             resetStamps(got.index(), got.term(), got.endOffset(), Long.MAX_VALUE);
-            if (this.hooks.state() != null) restoreState(got);
+            if (this.stateful) restoreState(got);
             this.hooks.reloaded().run();
             Files.deleteIfExists(this.installMarker);
             SnapshotStore.deleteTree(this.staging);
@@ -730,14 +736,27 @@ final class RaftReplica implements Replica {
 
     /** Restores the state's section of {@code m} (empty when the snapshot has none: a state that did not exist then). */
     private void restoreState(MsgSnapshot m) {
-        var st = this.hooks.state();
-        var d = m.section(st.section());
         this.applyLock.lock();
         try {
-            st.restoreState(d == null ? new byte[0] : d);
+            for (var st : this.states) {
+                var d = m.section(st.section());
+                st.restoreState(d == null ? new byte[0] : d);
+            }
         } finally {
             this.applyLock.unlock();
         }
+    }
+
+    /**
+     * Registers a state section (#278: the producer table, section {@link MsgSnapshot#PRODUCERS}). Call from the
+     * constructor before the group opens, so the restored snapshot reaches it before the first entry applies.
+     */
+    void addState(ReplicaHooks.ReplicatedState state) {
+        for (var st : this.states) {
+            if (st.section() == state.section()) throw new IllegalArgumentException("section " + state.section() + " taken");
+        }
+        this.states.add(state);
+        this.stateful = true;
     }
 
     /** Data nodes to fetch from: the current leader first, then the others; never this node. */
