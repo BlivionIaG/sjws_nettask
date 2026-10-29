@@ -23,18 +23,25 @@ Params are strings, the same rule as every other document entry.
 
 ## api-key
 
-`keys` is required, a comma-separated list. Each key is hashed with SHA-256 when the filter is
-built; the raw key is not kept. A presented key is hashed once and compared with every stored
-hash. `header` defaults to `x-api-key`. `query`, when set, is read only if the header is absent
-(the value is not percent-decoded). A miss is 401 with `WWW-Authenticate: ApiKey`.
+`keys` (comma-separated) or `keys-file` (path to the same material) is required; set exactly
+one. Each key is hashed with SHA-256 when the filter is built; the raw key is not kept.
+`keys-file` is read with the same rules as other secret files (mode 0600 or 0400, owned by this
+process, leaf not a symlink). A control-plane proposal must use `keys-file`; inline `keys` is
+refused with 400. Local config may still use inline `keys` (a WARN points at the file form).
+`header` defaults to `x-api-key`. `query`, when set, is read only if the header is absent (the
+value is not percent-decoded). A miss is 401 with `WWW-Authenticate: ApiKey`.
 
 ## jwt
 
 Bearer JWT. `alg` is a comma-separated allow-list: `HS256`, `HS384`, `HS512`, `RS256`,
 `RS384`, `RS512`, `ES256`, `ES384`, `ES512`. `alg=none` is rejected even if someone puts it in
-the list. `hmac-keys`, `rsa-keys` and `ec-keys` are comma-separated `kid:base64` entries
-(base64url is accepted). A single key may omit the kid. HMAC material is the raw secret and
-must be at least as long as the hash. RSA and EC material is an X.509 SubjectPublicKeyInfo.
+the list. `hmac-keys` or `hmac-keys-file`, `rsa-keys` and `ec-keys` are comma-separated
+`kid:base64` entries (base64url is accepted). A single key may omit the kid. HMAC material is
+the raw secret and must be at least as long as the hash; `hmac-keys-file` is the node-local
+file form (same secret-file rules as `keys-file`). A control-plane proposal must use
+`hmac-keys-file` when HMAC is configured; inline `hmac-keys` is refused with 400. Local config
+may still use inline `hmac-keys` (WARN). RSA and EC material is an X.509 SubjectPublicKeyInfo
+and may stay inline (public).
 RSA keys shorter than 2048 bits are rejected. An HMAC secret that is the encoding of one of the
 configured public keys is rejected when the filter is built. Every allowed algorithm needs a
 usable key.
@@ -52,10 +59,13 @@ The header must not carry `crit`, `jku`, `jwk`, `x5u` or `x5c`. `typ`, when pres
 must name one. The signature is checked before the claims. A bad token is 401 with
 `WWW-Authenticate: Bearer`, not a 500. There is no remote key fetch.
 
-HMAC secrets and API keys are filter params. A control plane that puts them in the canonical
-document should seal that document to the node, or point the node at a `0600` file, rather than
-leaving the secret in a world-readable copy. Public JWT keys can travel with the projection.
-Publishing a new snapshot is the rotation: in-flight requests keep the previous filter.
+HMAC secrets and API keys must not sit in the control-plane canonical document. Use
+`keys-file` / `hmac-keys-file` so each node reads a local `0600` file; a proposal that still
+carries inline `keys` or `hmac-keys` is refused, and viewer reads mask those fields. Public JWT
+keys can travel with the projection. Publishing a new snapshot is the rotation: in-flight
+requests keep the previous filter. For clusters that still have inline secrets in older log
+entries or snapshots, see the operator note under middleware in
+[config-file.md](../user/config-file.md) (file refs, key rotation, snapshot and compaction).
 
 ## rate-limit
 

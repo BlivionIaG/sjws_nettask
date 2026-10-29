@@ -42,10 +42,11 @@ import sjws_nettask.core.StaticFileHandler;
 /**
  * JWT bearer check. HMAC (HS256/384/512), RSA (RS256/384/512) and ECDSA (ES256/384/512).
  * {@code exp}, {@code nbf}, {@code iss} and {@code aud} are checked after the signature.
- * Keys come from the filter params ({@code hmac-keys}, {@code rsa-keys}, {@code ec-keys}), each
- * a comma-separated list of {@code kid:base64}. There is no remote JWKS, {@code jku}, {@code jwk}
- * or {@code x5u}. {@code alg=none} is rejected even if listed. A bad token is 401; it does not
- * become a 500.
+ * Keys come from the filter params ({@code hmac-keys} or {@code hmac-keys-file}, {@code rsa-keys},
+ * {@code ec-keys}), each a comma-separated list of {@code kid:base64}. {@code hmac-keys-file} is
+ * the node-local file form of {@code hmac-keys} (see {@link sjws_nettask.config.MiddlewareSecrets}).
+ * There is no remote JWKS, {@code jku}, {@code jwk} or {@code x5u}. {@code alg=none} is rejected
+ * even if listed. A bad token is 401; it does not become a 500.
  * <p>
  * RSA and EC material is an X.509 SubjectPublicKeyInfo, base64 or base64url. HMAC material is
  * the raw secret, base64, at least as long as the hash. An HMAC secret that equals a configured
@@ -98,7 +99,7 @@ public final class JwtFilter implements RequestFilter {
                 throw new IllegalArgumentException("jwt alg is not supported: " + alg);
             }
         }
-        var hmac = hmacKeys(spec.option("hmac-keys"));
+        var hmac = hmacKeys(sjws_nettask.config.MiddlewareSecrets.resolveOptional(spec, "hmac-keys", "jwt"));
         var rsa = publicKeys(spec.option("rsa-keys"), "RSA");
         var ec = ecKeys(spec.option("ec-keys"));
         rejectSharedMaterial(hmac, rsa, ec);

@@ -56,6 +56,9 @@ class ClassLoadTest {
                 assertFalse(text.contains(name), name.strip() + " loaded by a standalone start");
             }
             assertFalse(text.contains("sjws_nettask.cp."), text);
+            // S1: gateway secret-ref helper stays unloaded until middleware or CP config touches it.
+            assertFalse(text.contains("sjws_nettask.config.MiddlewareSecrets "),
+                    "MiddlewareSecrets loaded by a standalone start");
             for (var cp : new String[] {"KeyRing", "KeyRingLoader", "TrustBundle", "TrustState", "CpKeyConfig",
                     "CpListenerConfig", "CpServerTls", "CpTls"}) {
                 assertFalse(text.contains("sjws_nettask.cp." + cp + " "), cp);
