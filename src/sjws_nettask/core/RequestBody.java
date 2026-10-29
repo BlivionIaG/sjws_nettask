@@ -23,7 +23,6 @@ import java.io.IOException;
  * from start to end; whatever a handler leaves unread is discarded by the transport (or the
  * connection is closed). HTTP/1.1 attaches one for {@code Content-Length} bodies of methods other
  * than GET/HEAD; HTTP/3 for every method other than GET/HEAD (length -1 when no {@code content-length}
- * than GET/HEAD; HTTP/3 for every method other than GET/HEAD (length -1 when no {@code content-length}
  * was sent and content follows); HTTP/2 attaches one the same way (#289).
  */
 public interface RequestBody {
