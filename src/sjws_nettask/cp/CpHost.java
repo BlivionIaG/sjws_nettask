@@ -100,6 +100,7 @@ public final class CpHost implements CpReloadable {
                     CpLaunch.nodeId(self), CpLaunch.voters(config), transport);
         }
         store.start();
+        store.warnInlineSecretsAtStartup();
         events.add("store");
         if (keys.insecurePermissions()) {
             startInsecureWarner();

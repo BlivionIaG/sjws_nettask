@@ -740,6 +740,9 @@ public final class SjwsServer implements AutoCloseable {
                     System.err.println("WARN: control-plane last-good was not saved: " + e.getMessage());
                 }
                 persistLastGood(published.snapshot().document());
+                var appliedMw = published.snapshot().document().middleware();
+                sjws_nettask.config.MiddlewareSecrets.logStartupWarn(
+                        System.getLogger(SjwsServer.class.getName()), appliedMw, null, null);
             }
             return published;
         } finally {
