@@ -107,6 +107,13 @@ final class RaftGroup {
     /** Leader view: when each peer last answered an append in this term (clock nanos). */
     private final Map<NodeId, Long> heardAt = new HashMap<>();
     private final Map<NodeId, Long> nextIndex = new HashMap<>();
+    /**
+     * Leader view: the feature bits each peer sent in its latest append response in a term this node led (#278). Kept
+     * across terms (a peer that is down keeps its last answer), replaced on every answer.
+     */
+    private final Map<NodeId, Integer> peerFeatures = new HashMap<>();
+    /** {@link ReplicationGroup#advertiseFeatures}: appended to this node's append responses when non-zero. */
+    private volatile int localFeatures;
     private final TreeMap<Long, CompletableFuture<CommittedIndex>> pending = new TreeMap<>();
     private final List<CompletableFuture<Void>> reads = new ArrayList<>();
     private CompletableFuture<Void> membershipChange;
@@ -916,6 +923,7 @@ final class RaftGroup {
             return;
         }
         heardAt.put(follower, now);
+        peerFeatures.put(follower, body.remaining() >= 4 ? body.getInt() : 0); // an older build sends none
         if (!success) {
             long next = nextIndex.getOrDefault(follower, lastIndex() + 1) - 1;
             nextIndex.put(follower, Math.max(snapIndex + 1, next));
@@ -1868,11 +1876,13 @@ final class RaftGroup {
     }
 
     private void ack(NodeId to, boolean success, long match) {
-        var body = ByteBuffer.allocate(8 + 4 + 1 + 8).order(java.nio.ByteOrder.BIG_ENDIAN);
+        int features = localFeatures;
+        var body = ByteBuffer.allocate(8 + 4 + 1 + 8 + (features != 0 ? 4 : 0)).order(java.nio.ByteOrder.BIG_ENDIAN);
         body.putLong(term);
         body.putInt(self.wire());
         body.put((byte) (success ? 1 : 0));
         body.putLong(match);
+        if (features != 0) body.putInt(features); // trailing: an older leader reads the fixed fields only
         rpc.send(to, new SimTransport.Frame(groupId, APPEND_RESP, body.array()));
     }
 
@@ -2123,6 +2133,42 @@ final class RaftGroup {
             lock.lock();
             try {
                 return role == Role.LEADER ? term : -1L;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public void advertiseFeatures(int bits) {
+            lock.lock();
+            try {
+                localFeatures |= bits;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public boolean votersHaveFeatures(int bits) {
+            lock.lock();
+            try {
+                if (role != Role.LEADER) {
+                    return false;
+                }
+                var all = new HashSet<NodeId>(voters);
+                if (jointOld != null) {
+                    all.addAll(jointOld);
+                }
+                if (jointNew != null) {
+                    all.addAll(jointNew);
+                }
+                for (var v : all) {
+                    int has = v.equals(self) ? localFeatures : peerFeatures.getOrDefault(v, 0);
+                    if ((has & bits) != bits) {
+                        return false;
+                    }
+                }
+                return true;
             } finally {
                 lock.unlock();
             }

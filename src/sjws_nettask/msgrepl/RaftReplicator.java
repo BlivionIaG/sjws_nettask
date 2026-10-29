@@ -48,9 +48,18 @@ import sjws_nettask.messaging.ledger.Replica;
  * a small {@link MsgSnapshot} manifest; the data stays in the topic's segments), truncates the consensus log behind
  * it, and installs a peer's segments when it falls behind the log. Without one (tests, or the pre-#270 constructors)
  * the consensus log is never truncated. The group's own snapshot taker stays off ({@code snapshotEveryEntries =
- * Long.MAX_VALUE}): the replica records snapshots itself, at points its ledger has made durable.
+ * Long.MAX_VALUE}): the replica records snapshots itself, at points its ledger has made durable. Producer dedup state
+ * (M2, {@link ProducerTable}) is carried as snapshot section {@link MsgSnapshot#PRODUCERS}: a snapshot at index
+ * {@code i} holds {@link ProducerTable#write} as applied through {@code i}, and install calls
+ * {@link RaftReplica#restoreProducers} before applying {@code i + 1}.
  */
 public final class RaftReplicator implements PartitionReplicator {
+
+    /**
+     * Feature bits this build advertises on every msg group it opens (#278): it applies producer entries and fails
+     * closed on entries it cannot apply. A leader proposes the first producer entry only once every voter has them.
+     */
+    public static final int FEATURES = RaftReplica.FEATURE_PRODUCER_ENTRIES;
 
     /** Group of a topic (and {@code msg/__offsets}). */
     public static GroupId group(String topic) {
@@ -97,7 +106,24 @@ public final class RaftReplicator implements PartitionReplicator {
         this.options = options(electionTimeout, heartbeat);
     }
 
-    /** Group options for msg groups: RELAXED default, the group's own snapshot taker off (see class doc). */
+    /**
+     * The producer dedup table of {@code replica} ({@link ProducerTable#write} encoding), or null when it is not a
+     * Raft replica. For tests and diagnostics on a quiescent group: the table belongs to the delivery thread. A #270
+     * snapshot takes the same bytes on the delivery thread, at the snapshot's index.
+     */
+    public static byte[] producerTable(sjws_nettask.messaging.ledger.Replica replica) {
+        if (!(replica instanceof RaftReplica r)) return null;
+        var out = new java.io.ByteArrayOutputStream();
+        try (var d = new java.io.DataOutputStream(out)) {
+            var t = r.producers();
+            (t != null ? t : new ProducerTable()).write(d); // null: no producer entry applied yet, the empty table
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+        return out.toByteArray();
+    }
+
+    /** Group options for msg groups: RELAXED default, the group\'s own snapshot taker off (see class doc). */
     public static GroupOptions options(Duration electionTimeout, Duration heartbeat) {
         return new GroupOptions(sjws_nettask.cluster.Durability.RELAXED, MAX_ENTRY_BYTES, electionTimeout, heartbeat,
                 Long.MAX_VALUE);
@@ -106,8 +132,10 @@ public final class RaftReplicator implements PartitionReplicator {
     /** A witness (or any node without messaging) must still open the groups to vote: no listener, nothing applied. */
     public static void openForWitness(ClusterNode node, Set<String> topics, Duration electionTimeout, Duration heartbeat) {
         var opts = options(electionTimeout, heartbeat);
-        for (var t : topics) node.openGroup(group(t), opts, null);
-        node.openGroup(group("__offsets"), opts, null);
+        // The witness stores no entries, but it is a voter: it advertises the build's msg-group features like the data
+        // nodes, so the leader's every-voter check (RaftReplica.FEATURE_PRODUCER_ENTRIES) covers the whole group.
+        for (var t : topics) node.openGroup(group(t), opts, null).advertiseFeatures(FEATURES);
+        node.openGroup(group("__offsets"), opts, null).advertiseFeatures(FEATURES);
     }
 
     @Override

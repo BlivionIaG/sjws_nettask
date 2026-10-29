@@ -117,14 +117,23 @@ public final class CpLaunch {
 
     /**
      * The voter links: {@link TcpTransport} on {@code self}'s {@code cp.peers} address, every socket from
-     * {@link CpPeerSockets} over {@code peerTls}. Without TLS every peer must be loopback (tests, local dev).
+     * {@link CpPeerSockets} over {@code peerTls}, which binds each certificate to its {@code cp.peers} id: every
+     * entry must pin a {@code san} and this voter's own certificate must carry its own, or the start is refused.
+     * Without TLS every peer must be loopback (tests, local dev).
      */
     static TcpTransport tcpTransport(CpConfig config, CpServerTls peerTls, ClusterKey key, Clock clock)
             throws IOException {
         var members = voters(config).members();
         TcpTransport.SocketFactory sockets;
         if (peerTls != null) {
-            sockets = new CpPeerSockets(peerTls);
+            try {
+                CpConfig.requirePinnedSans(config.peers());
+            } catch (IllegalArgumentException e) {
+                throw new IOException(e.getMessage(), e);
+            }
+            var pinned = new CpPeerSockets(peerTls, config.peers(), config.self().id());
+            pinned.checkOwnCertificate();
+            sockets = pinned;
         } else {
             for (var member : members) {
                 var host = member.address().getAddress();

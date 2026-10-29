@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -348,15 +349,6 @@ class MsgSnapshotClusterTest {
         assertTrue(SnapshotCluster.dirBytes(wdir) < 8192, "a few cursors: " + SnapshotCluster.dirBytes(wdir));
     }
 
-    /** A second state section (the slot #278's producer table takes): captured at the index, restored on install. */
-    static final class Section2 implements sjws_nettask.messaging.ledger.ReplicaHooks.ReplicatedState {
-        final java.util.concurrent.atomic.AtomicLong applied = new java.util.concurrent.atomic.AtomicLong();
-        volatile byte[] restored;
-
-        @Override public int section() { return MsgSnapshot.PRODUCERS; }
-        @Override public byte[] snapshotState() { return Long.toString(applied.get()).getBytes(java.nio.charset.StandardCharsets.UTF_8); }
-        @Override public void restoreState(byte[] image) { restored = image; }
-    }
 
 
     /**
@@ -460,29 +452,60 @@ class MsgSnapshotClusterTest {
         store.dropAboveForTest(topic, keep);
     }
 
+    /**
+     * #278/#270: after truncation, install restores ProducerTable from section 2 so dedup survives without log replay.
+     */
     @Test
-    void extraStateSectionIsCapturedAtTheIndexAndRestoredOnInstall() throws Exception {
+    void truncatedLogWithDedupRestoresProducerTableFromSection2() throws Exception {
         start(20, 5);
         int l = c.leader(), f = 1 - l;
-        var lead = new Section2();
-        var follow = new Section2();
-        c.data[l].replica.addState(lead);
-        c.data[f].replica.addState(follow);
-        assertThrows(IllegalArgumentException.class, () -> c.data[l].replica.addState(new Section2()), "one state per section");
-        long end = produce("pid1", 0, 10);
+        // One producer batch on the leader (origin 0, id 7, seq 1).
+        var rec = "p7:1:hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        var ap = c.await(c.data[l].replica.appendDeduplicated(java.util.List.of(rec),
+                sjws_nettask.messaging.ledger.Durability.ASYNC, 0, 7L, 1L));
+        assertFalse(ap.duplicate());
+        long end = ap.baseOffset() + 1;
         c.awaitEnd(f, end);
+        assertNotNull(c.data[l].replica.producers());
+        assertEquals(2L, c.data[l].replica.producers().expectedSeq(0, 7L));
         c.cut(f);
-        end = produce("pid1", 10, 60);
-        lead.applied.set(4242);
+        // More produce so a snapshot is due, then truncate the consensus prefix.
+        end = produce("pid1", 0, 40);
         assertTrue(c.data[l].snapshot());
         var m = recorded(l);
-        assertEquals("4242", new String(m.section(MsgSnapshot.PRODUCERS), java.nio.charset.StandardCharsets.UTF_8));
-        assertEquals(end, m.endOffset(), "the next offset at the index travels with the sections");
-        assertNotNull(m.section(MsgSnapshot.APP_STATE));
+        assertNotNull(m.section(MsgSnapshot.PRODUCERS), "section 2 present");
+        assertEquals(MsgSnapshot.REQUIRED, m.sections().stream().filter(s -> s.id() == MsgSnapshot.PRODUCERS)
+                .findFirst().orElseThrow().flags(), "PRODUCERS is REQUIRED");
         c.heal(f);
+        for (int k = 0; k < 4000 && c.data[f].replica.installs() == 0; k++) c.step();
+        assertTrue(c.data[f].replica.installs() > 0, "follower installed");
         c.awaitEnd(f, end);
-        for (int k = 0; k < 2000 && follow.restored == null; k++) c.step();
-        assertEquals("4242", new String(follow.restored, java.nio.charset.StandardCharsets.UTF_8));
-        assertTrue(c.data[f].dedup.duplicate("pid1", 69), "section 1 restored alongside");
+        assertNotNull(c.data[f].replica.producers(), "table restored from section 2");
+        assertEquals(2L, c.data[f].replica.producers().expectedSeq(0, 7L),
+                "dedup remembers producer 7 after install without replaying truncated entries");
+        // Retry of the same batch is a duplicate on the new leader side after catch-up.
+        int lead = c.leader();
+        var again = c.await(c.data[lead].replica.appendDeduplicated(java.util.List.of(rec),
+                sjws_nettask.messaging.ledger.Durability.ASYNC, 0, 7L, 1L));
+        assertTrue(again.duplicate(), "same seq+digest is a duplicate after restore");
+    }
+
+    /** #278/#270: a snapshot that omits section 2 fails closed when the PRODUCERS handler is registered. */
+    @Test
+    void missingProducersSectionFailsClosedOnRestore() throws Exception {
+        start(20, 5);
+        int l = c.leader();
+        long end = produce("pid1", 0, 30);
+        assertTrue(c.data[l].snapshot());
+        var m = recorded(l);
+        // Strip section 2 from a copy of the consensus image.
+        var stripped = new MsgSnapshot(m.topic(), m.index(), m.term(), m.endOffset(), m.logStart(), m.chunkBytes(),
+                m.sections().stream().filter(s -> s.id() != MsgSnapshot.PRODUCERS).toList(), m.segments());
+        assertNull(stripped.section(MsgSnapshot.PRODUCERS));
+        var err = assertThrows(IllegalStateException.class, () -> {
+            // Package-visible restore path used by install: call restoreState via a test hook.
+            c.data[l].replica.restoreStateForTest(stripped);
+        });
+        assertTrue(err.getMessage().contains("PRODUCERS"), err.getMessage());
     }
 }

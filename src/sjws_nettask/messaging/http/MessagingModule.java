@@ -52,9 +52,26 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     static final String OFFSETS_EXPIRY_MS_ENV = "SJWS_MESSAGING_OFFSETS_EXPIRY_MS";
     static final String COMPACTION_TOPICS_PROPERTY = "sjws.messaging.compaction.topics";
     static final String COMPACTION_TOPICS_ENV = "SJWS_MESSAGING_COMPACTION_TOPICS";
+    /**
+     * M2: accept {@code Producer-Id}/{@code Producer-Seq} on replicated topics ({@code true}/{@code false}, default
+     * false).
+     *
+     * <p><b>Producer ids are not scoped to a client yet.</b> Every client of a topic shares one producer id space and one
+     * table of 4096 producers: two clients that pick the same id interfere (refusals, lost dedup). Do not enable this
+     * for topics written by mutually untrusted clients until principal-scoped producers land
+     * (https://github.com/BlivionIaG/sjws_nettask/issues/283, which blocks turning this on by default).
+     *
+     * <p>Older builds: a leader proposes the first producer entry only once every voter has advertised that it applies
+     * them (an older node would skip them and its ledger would diverge); until then such a produce is 503
+     * producer-dedup-unavailable. Downgrading a node below M2, or adding an older voter, is unsupported once a producer
+     * entry has committed.
+     */
+    static final String PRODUCER_DEDUP_PROPERTY = "sjws.messaging.producer.dedup";
+    static final String PRODUCER_DEDUP_ENV = "SJWS_MESSAGING_PRODUCER_DEDUP";
 
     private final LogTopics topics;
     private volatile MessagingHooks hooks = MessagingHooks.NONE;
+    private volatile boolean producerDedup = flag(setting(PRODUCER_DEDUP_PROPERTY, PRODUCER_DEDUP_ENV, ""));
     /** Null unless a retention limit or a compacted topic is set: no thread when both are off. */
     private java.util.concurrent.ScheduledExecutorService retentionTimer;
     private final long checkMs;
@@ -72,6 +89,14 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
                 topicDurability(setting(TOPIC_DURABILITY_PROPERTY, TOPIC_DURABILITY_ENV, "")),
                 compactionTopics(setting(COMPACTION_TOPICS_PROPERTY, COMPACTION_TOPICS_ENV, "")),
                 Math.max(1, number(setting(OFFSETS_EXPIRY_MS_PROPERTY, OFFSETS_EXPIRY_MS_ENV, ""), LogOffsets.DEFAULT_EXPIRY_MS)));
+    }
+
+    /** {@code true} or {@code false} (any case, empty = false); anything else is logged and is false. */
+    static boolean flag(String v) {
+        if (v.isEmpty() || v.equalsIgnoreCase("false")) return false;
+        if (v.equalsIgnoreCase("true")) return true;
+        System.err.println("WARN: " + PRODUCER_DEDUP_PROPERTY + " must be true or false, got \"" + v + "\"; producer dedup stays off");
+        return false;
     }
 
     /** Topics with key compaction; a bad list is logged and ignored as a whole. */
@@ -197,6 +222,11 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         this.topics.replication(r);
     }
 
+    /** Overrides {@link #PRODUCER_DEDUP_PROPERTY}; call before the server mounts the module. */
+    public void producerDedup(boolean on) {
+        this.producerDedup = on;
+    }
+
     /** Installs the metrics hooks (see {@link MessagingHooks}); call before the server mounts the module. */
     public void hooks(MessagingHooks h) {
         this.hooks = java.util.Objects.requireNonNull(h);
@@ -206,6 +236,7 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
     public void contribute(HandlerMounts mounts) {
         var h = new MessagingHttp(this.topics);
         h.hooks(this.hooks);
+        h.producerDedup(this.producerDedup);
         mounts.mount("/messaging/v1", h);
     }
 

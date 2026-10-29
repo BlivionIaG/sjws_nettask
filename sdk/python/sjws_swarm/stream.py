@@ -171,9 +171,10 @@ class Stream:
     deadline; ``409 session busy`` is retried the same way. Over binary, ``result`` holds the ``LAST`` chunk's bytes
     (the task's reply), which are also yielded as the final ``Chunk`` when not empty: concatenating every ``Chunk`` is
     the full output, so do not append ``result`` too. Over SSE ``result`` stays None. SSE carries text: the server
-    replaces invalid UTF-8 with U+FFFD and line breaks arrive as ``\\n``; a worker's ``LAST|ERROR`` text arrives as a
-    final chunk event (server behaviour) and also fills ``StreamError.message``; over binary it is only in
-    ``StreamError.message``.
+    replaces invalid UTF-8 with U+FFFD and line breaks arrive as ``\\n``; a worker's ``LAST|ERROR`` text arrives as
+    ``event: failure`` (#282; never ``event: error``, which EventSource reserves) and fills ``StreamError.message``,
+    and is not yielded as a ``Chunk``. Older servers that still send the text as a chunk with the ``end`` event's id
+    (#279 C2) are handled as a fallback. Over binary the text is only in ``StreamError.message``.
     """
 
     def __init__(self, client, session_id: bytes, location: str | None = None, sse: bool = False,
@@ -199,6 +200,7 @@ class Stream:
         self._pending_end = None  # a terminal to apply after yielding the final chunk
         self._sse_gap: str | None = None
         self._sse_last_chunk: tuple[str | None, bytes] = (None, b"")
+        self._sse_failure: bytes | None = None  # #282 event: failure text
         self._rnd = _rnd or random.Random()
 
     def __enter__(self) -> "Stream":
@@ -362,6 +364,10 @@ class Stream:
             if kind == "chunk":
                 self._sse_last_chunk = (this_id, text.encode())
                 return Chunk(self._attempt or 0, self._seq, text.encode())
+            if kind == "failure":
+                # #282: LAST|ERROR text; never yield as a Chunk. Prefer this over the #279 C2 chunk fallback.
+                self._sse_failure = text.encode()
+                continue
             if kind == "reset":
                 self._deliver(int(text), -1)
                 return Reset(int(text))
@@ -375,7 +381,9 @@ class Stream:
                     raise _Terminal(error=_end_error("deadline"))
                 if self._sse_gap is not None:
                     raise _Terminal(error=_end_error("gap " + self._sse_gap))
-                # the server sends LAST|ERROR text as a chunk event with the end event's id (#279 C2)
+                if self._sse_failure is not None:
+                    raise _Terminal(error=StreamError(self._sse_failure))
+                # older servers: LAST|ERROR text as a chunk event with the end event's id (#279 C2 fallback)
                 last_id, last_text = self._sse_last_chunk
                 raise _Terminal(error=StreamError(last_text if this_id is not None and last_id == this_id else b""))
 
