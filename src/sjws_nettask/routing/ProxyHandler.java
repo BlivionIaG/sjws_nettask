@@ -170,6 +170,21 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         return this.pool.budget();
     }
 
+    /**
+     * 503 when this peer already holds its in-flight share (#78). Mid-stream backpressure still
+     * pauses reads; a new request fails fast instead of waiting on that peer's queue.
+     */
+    private Response peerBudgetRefused(Request request, boolean head) {
+        var budget = this.pool.budget();
+        if (budget.peerLimit() <= 0) {
+            return null;
+        }
+        if (budget.exhausted(budget.peerStripe(request.peer()))) {
+            return StaticFileHandler.error(503, head);
+        }
+        return null;
+    }
+
     public Settings settings() {
         return this.settings;
     }
@@ -202,6 +217,10 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         }
         if (length > this.settings.maxBody()) {
             return StaticFileHandler.error(413, head);
+        }
+        var refused = peerBudgetRefused(request, head);
+        if (refused != null) {
+            return refused;
         }
         HttpRequest out;
         try {
@@ -238,6 +257,10 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         }
         if (length > this.settings.maxBody()) {
             return StaticFileHandler.error(413, head);
+        }
+        var refused = peerBudgetRefused(request, head);
+        if (refused != null) {
+            return refused;
         }
         HttpRequest out;
         try {
@@ -359,7 +382,9 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             throws IOException, InterruptedException {
         var lease = this.pool.acquire();
         var ch = lease.channel();
-        var ex = new UpstreamPool.Exchange(ch, this.settings.idleReadTimeout(), this.pool.budget());
+        var budget = this.pool.budget();
+        var ex = new UpstreamPool.Exchange(ch, this.settings.idleReadTimeout(), budget,
+                budget.peerStripe(request.peer()));
         HttpResponse response;
         try {
             if (length > 0) {
