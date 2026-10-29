@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
@@ -262,6 +263,36 @@ class LedgerTest {
         // get() still proves the writer fails closed on the IO error.
         assertThrows(java.util.concurrent.ExecutionException.class,
                 () -> w.append(List.of(b("y"))).get(10, java.util.concurrent.TimeUnit.SECONDS));
+        w.close();
+    }
+
+    /**
+     * #251 (HA follow-up): a failing group's writes are failed before the fence is raised. An append made from the
+     * failure callback (the writer thread, before the fence) is queued, not refused ahead of the group it follows,
+     * and then fails with the same error. Reversing the order (fence first) makes it fail at once.
+     */
+    @Test
+    void failingGroupIsFailedBeforeTheFenceRefusesLaterAppends() throws Exception {
+        var log = SegmentedLog.open(dir);
+        // The linger holds the group long enough to register the callback before the write fails.
+        var w = new LedgerWriter(log, Durability.GROUP, 300_000_000L, 1024, 4 << 20);
+        log.close(); // the next write fails
+        var inCallback = new CompletableFuture<CompletableFuture<Long>>();
+        var doneInCallback = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var test = Thread.currentThread();
+        var first = w.appendNoWait(List.of(b("x")), null);
+        first.whenComplete((at, err) -> {
+            var f = w.appendNoWait(List.of(b("y")), null);
+            doneInCallback.set(f.isDone());
+            inCallback.complete(Thread.currentThread() == test ? null : f);
+        });
+        var cause = assertThrows(java.util.concurrent.ExecutionException.class, () -> first.get(10, TimeUnit.SECONDS)).getCause();
+        var later = inCallback.get(10, TimeUnit.SECONDS);
+        assertNotNull(later, "the callback must run on the writer thread (linger too short?)");
+        assertFalse(doneInCallback.get(), "refused before the failing group was reported");
+        var laterCause = assertThrows(java.util.concurrent.ExecutionException.class, () -> later.get(10, TimeUnit.SECONDS)).getCause();
+        assertSame(cause, laterCause, "the queued append fails with the group's error, after it");
+        assertTrue(w.appendNoWait(List.of(b("z")), null).isCompletedExceptionally(), "fenced now");
         w.close();
     }
 
