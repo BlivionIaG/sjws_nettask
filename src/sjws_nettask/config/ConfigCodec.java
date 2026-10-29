@@ -31,8 +31,8 @@ import sjws_nettask.core.MiddlewareSpec;
  * Canonical YAML of a {@link ConfigDocument}. Key order is fixed and maps are sorted, so the
  * SHA-256 does not change when the source file only reorders keys. The TLS key password is not
  * written: it is not a file field, and a diff or a last-good copy must not carry it. Inline
- * gateway secret options ({@code keys}, {@code hmac-keys}) are written as
- * {@link MiddlewareSecrets#MASK}; their {@code *-file} counterparts keep the path.
+ * gateway secret options keep their real values in {@link #text} so identity and reload see key
+ * rotations; {@link #viewerText} redacts them for GET/log/dump output.
  */
 public final class ConfigCodec {
 
@@ -296,6 +296,15 @@ public final class ConfigCodec {
                 + (m.value() == null ? "" : ", value: " + quote(m.value())) + " }";
     }
 
+    /**
+     * Same shape as {@link #text}, but inline {@code keys}/{@code hmac-keys} on {@code api-key}
+     * and {@code jwt} filters are redacted. Use for viewer bodies, logs and dumps — never for
+     * hashing or reload identity.
+     */
+    public static String viewerText(ConfigDocument document) {
+        return MiddlewareSecrets.maskYaml(text(document));
+    }
+
     private static void middleware(StringBuilder out, List<MiddlewareSpec> middleware) {
         if (middleware.isEmpty()) {
             return;
@@ -310,12 +319,9 @@ public final class ConfigCodec {
             if (!step.options().isEmpty()) {
                 out.append("    options:\n");
                 for (var key : sorted(step.options())) {
-                    var value = step.options().get(key);
-                    if (MiddlewareSecrets.INLINE.contains(key)) {
-                        value = MiddlewareSecrets.MASK;
-                    }
-                    out.append("      ").append(yamlKey(key)).append(": ").append(quote(value))
-                            .append('\n');
+                    // Identity encoding keeps real values so a local key rotation changes the hash.
+                    out.append("      ").append(yamlKey(key)).append(": ")
+                            .append(quote(step.options().get(key))).append('\n');
                 }
             }
         }

@@ -37,6 +37,9 @@ import sjws_nettask.config.AcmeSettings;
 import sjws_nettask.config.ConfigCodec;
 import sjws_nettask.config.ConfigDocument;
 import sjws_nettask.config.ConfigLoader;
+import sjws_nettask.config.ConfigSnapshot;
+import sjws_nettask.config.ConfigReloader;
+import sjws_nettask.acme.ChallengeBoard;
 import sjws_nettask.config.MiddlewareSecrets;
 import sjws_nettask.config.NodeSettings;
 import sjws_nettask.config.Routing;
@@ -165,10 +168,61 @@ class CpMiddlewareSecretsTest {
         var spec = MiddlewareSpec.of("api-key", 10, null, Map.of("keys", CANARY, "header", "x-api-key"));
         var document = ConfigDocument.of(ServerConfig.builder(dir).port(0).build(), AcmeSettings.disabled(),
                 Routing.disabled(), List.of(spec), AccessSettings.DEFAULT, NodeSettings.STANDALONE, 1, 1, null, null);
-        var encoded = ConfigCodec.text(document);
-        assertFalse(encoded.contains(CANARY), encoded);
-        assertTrue(encoded.contains(MiddlewareSecrets.MASK), encoded);
+        // Identity encoding keeps the real value so a key rotation changes the hash.
+        var identity = ConfigCodec.text(document);
+        assertTrue(identity.contains(CANARY), identity);
+        assertFalse(identity.contains(MiddlewareSecrets.MASK), identity);
+        var viewer = ConfigCodec.viewerText(document);
+        assertFalse(viewer.contains(CANARY), viewer);
+        assertTrue(viewer.contains(MiddlewareSecrets.MASK), viewer);
     }
+
+    @Test
+    void inlineKeyRotationChangesCanonicalHashAndReloadTakesEffect() throws Exception {
+        var root = Files.createDirectory(dir.resolve("rotate-html"));
+        var first = ConfigDocument.of(ServerConfig.builder(root).port(0).build(), AcmeSettings.disabled(),
+                Routing.disabled(),
+                List.of(MiddlewareSpec.of("api-key", 10, null, Map.of("keys", "alpha-key", "header", "x-api-key"))),
+                AccessSettings.DEFAULT, NodeSettings.STANDALONE, 1, 1, null, null);
+        var second = ConfigDocument.of(ServerConfig.builder(root).port(0).build(), AcmeSettings.disabled(),
+                Routing.disabled(),
+                List.of(MiddlewareSpec.of("api-key", 10, null, Map.of("keys", "beta-key-rotated", "header", "x-api-key"))),
+                AccessSettings.DEFAULT, NodeSettings.STANDALONE, 1, 2, null, null);
+        assertNotEquals(first.canonicalHash(), second.canonicalHash());
+        assertTrue(ConfigCodec.text(first).contains("alpha-key"));
+        assertTrue(ConfigCodec.text(second).contains("beta-key-rotated"));
+        assertFalse(ConfigCodec.viewerText(second).contains("beta-key-rotated"));
+        assertTrue(ConfigCodec.viewerText(second).contains(MiddlewareSecrets.MASK));
+
+        var yaml = dir.resolve("rotate.yaml");
+        Files.writeString(yaml, baseYaml(root) + """
+                version: 1
+                middleware:
+                  - name: api-key
+                    order: 10
+                    options:
+                      keys: "alpha-key"
+                      header: "x-api-key"
+                """);
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var board = new ChallengeBoard();
+        var current = ConfigSnapshot.compile(loaded.document(), board, 1);
+        var reloader = new ConfigReloader(loaded);
+        var rotated = ConfigDocument.of(loaded.document().server(), loaded.document().acme(),
+                loaded.document().routing(),
+                List.of(MiddlewareSpec.of("api-key", 10, null, Map.of("keys", "beta-key-rotated", "header", "x-api-key"))),
+                loaded.document().access(), loaded.document().node(), 1, 2, yaml);
+        var result = reloader.apply(current, rotated, false, board, true);
+        assertTrue(result.applied(), result.errors().toString());
+        assertNotEquals(current.generation(), result.generation());
+        assertEquals("beta-key-rotated", result.snapshot().document().middleware().get(0).option("keys"));
+        assertNotEquals(current.document().canonicalHash(), result.snapshot().document().canonicalHash());
+    }
+
+
+
+
 
     @Test
     void localInlineKeysStillLoadWithAWarning() throws Exception {
