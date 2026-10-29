@@ -66,6 +66,7 @@ import sjws_nettask.HandlerRef;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.Transport;
 import sjws_nettask.core.Handler;
+import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.core.PerIpLimit;
 import sjws_nettask.tls.TlsMaterial;
 
@@ -140,6 +141,14 @@ public final class Http2Server implements Transport {
         Handler live() {
             var published = this.armed.get();
             return published != null ? published : this.handler;
+        }
+
+        /**
+         * Attach request bodies and full header maps only when the live handler is not the static
+         * file handler alone (#289). Static-only keeps the zero-cost DATA release path.
+         */
+        boolean attachBodies() {
+            return !(live() instanceof StaticFileHandler);
         }
 
         /** @return the connection's budget, created on first use */
