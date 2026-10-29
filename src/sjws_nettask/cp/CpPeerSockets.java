@@ -20,6 +20,13 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.security.cert.CertificateParsingException;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
+import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLSocket;
 import sjws_nettask.cluster.TcpTransport;
@@ -32,9 +39,20 @@ import sjws_nettask.cluster.TcpTransport;
  * explicitly in {@link #handshake}, under a total deadline, before the connection takes an inbound slot; frames
  * stay HMAC-authenticated on top with the CP-only Raft key.
  *
- * <p><b>No hostname or id check:</b> {@code endpointIdentificationAlgorithm} is deliberately unset, so a peer is
- * accepted for any certificate chaining to {@code cp.tls.peerCa} (a CA that must issue only voter certificates).
- * Binding the certificate to the {@code cp.peers} id is a tracked follow-up; do not assume it is checked.
+ * <p><b>Certificates are bound to {@code cp.peers} ids (#175).</b> Every {@code cp.peers} entry pins a
+ * typed {@code san} ({@code uri:<value>} or {@code dns:<value>}); only URI and DNS subject alternative names count,
+ * each matched exactly and only against pins of its own type (no CN fallback), and a certificate
+ * that names more than one pinned voter identifies none.
+ * <ul>
+ * <li>Dialing: after the handshake, the server certificate must name exactly the voter pinned at the dialled
+ * address, or the socket is closed and {@link #connect} throws before any frame is written.</li>
+ * <li>Accepting: {@link #peerWire} maps the client certificate to its voter's wire id, so the transport drops any
+ * frame on that connection that carries another sender wire ({@code TcpTransport.Reason.ORIGIN}).</li>
+ * </ul>
+ * Refusals are counted in {@link #identityRefused} and logged at most once a minute. A TLS reload whose new
+ * certificate does not carry this voter's own pinned SAN is refused (the current material stays), counted in
+ * {@link #reloadRefused} and logged. {@code endpointIdentification}
+ * stays unset: the pinned SAN, not the host name, is the identity.
  */
 final class CpPeerSockets implements TcpTransport.SocketFactory {
 
@@ -42,11 +60,80 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
     static final String LISTENER = "cp-peer";
     static final int CONNECT_TIMEOUT_MILLIS = 1_000;
     static final int HANDSHAKE_TIMEOUT_MILLIS = TcpTransport.HANDSHAKE_TIMEOUT_MILLIS;
+    static final long LOG_EVERY_NANOS = 60_000_000_000L;
+    private static final System.Logger LOG = System.getLogger(CpPeerSockets.class.getName());
 
     private final CpServerTls tls;
+    private final List<CpConfig.Peer> peers;
+    private final CpConfig.Peer self;
+    private final AtomicLong identityRefused = new AtomicLong();
+    private final AtomicLong reloadRefused = new AtomicLong();
+    private final AtomicLong loggedNanos = new AtomicLong(System.nanoTime() - LOG_EVERY_NANOS);
 
-    CpPeerSockets(CpServerTls tls) {
-        this.tls = java.util.Objects.requireNonNull(tls, "tls");
+    /**
+     * @param peers every {@code cp.peers} entry, this voter included; each must pin a {@code san}
+     * @param selfId this voter's {@code cp.peers} id
+     * @throws IllegalArgumentException an entry without a pinned SAN, or {@code selfId} not listed
+     */
+    CpPeerSockets(CpServerTls tls, List<CpConfig.Peer> peers, String selfId) {
+        this.tls = Objects.requireNonNull(tls, "tls");
+        this.peers = List.copyOf(peers);
+        CpConfig.Peer found = null;
+        for (var peer : this.peers) {
+            if (peer.san() == null) {
+                throw new IllegalArgumentException("cp.peers entry " + peer.id() + " has no pinned san");
+            }
+            if (peer.id().equals(selfId)) {
+                found = peer;
+            }
+        }
+        if (found == null) {
+            throw new IllegalArgumentException("cp.peers does not list " + selfId);
+        }
+        this.self = found;
+    }
+
+    /**
+     * Startup check: this voter's own {@code cp-peer} certificate must carry its own pinned SAN and name no other
+     * pinned voter, or the process refuses to start.
+     */
+    void checkOwnCertificate() throws IOException {
+        var problem = ownCertificateProblem(tls.certificate());
+        if (problem != null) {
+            throw new IOException(problem + "; refusing to start");
+        }
+        tls.checkLeafOnReload(this::reloadedCertificateProblem);
+    }
+
+    /** Null when {@code leaf} names exactly this voter's pinned SAN (and no other voter's); else why not. */
+    String ownCertificateProblem(java.security.cert.X509Certificate leaf) {
+        var match = leaf == null ? null : identify(leaf);
+        if (match == null || !match.equals(self)) {
+            return "cp.tls.peerCert does not carry exactly this voter's pinned san " + self.san() + " (cp.peers id "
+                    + self.id() + "; URI or DNS SAN, no other voter's)";
+        }
+        return null;
+    }
+
+    /** The TLS reload check: a refused reload keeps the old material, is counted, and is logged. */
+    private String reloadedCertificateProblem(java.security.cert.X509Certificate leaf) {
+        var problem = ownCertificateProblem(leaf);
+        if (problem != null) {
+            reloadRefused.incrementAndGet();
+            LOG.log(System.Logger.Level.WARNING, "cp-peer: TLS reload refused, keeping the current material: {0}",
+                    problem);
+        }
+        return problem;
+    }
+
+    /** TLS reloads refused because the new certificate did not carry this voter's own pinned SAN. */
+    long reloadRefused() {
+        return reloadRefused.get();
+    }
+
+    /** Connections closed because the verified certificate did not name the expected pinned voter. */
+    long identityRefused() {
+        return identityRefused.get();
     }
 
     @Override
@@ -65,6 +152,10 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
 
     @Override
     public Socket connect(InetSocketAddress to) throws IOException {
+        var expected = at(to);
+        if (expected == null || expected.equals(self)) {
+            throw new IOException("cp-peer: no pinned voter at " + to);
+        }
         var socket = (SSLSocket) tls.context().getSocketFactory().createSocket();
         try {
             socket.setSSLParameters(tls.parameters());
@@ -73,6 +164,11 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
             socket.setSoTimeout(HANDSHAKE_TIMEOUT_MILLIS);
             socket.startHandshake();
             socket.setSoTimeout(0);
+            var named = identify(socket);
+            if (named == null || !named.equals(expected)) {
+                refused("the voter at " + to + " did not present the pinned san of " + expected.id());
+                throw new IOException("cp-peer at " + to + " did not present the pinned san of " + expected.id());
+            }
         } catch (IOException | RuntimeException e) {
             socket.close();
             throw e;
@@ -113,5 +209,84 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         if (ssl.isClosed()) {
             throw new IOException("cp-peer handshake missed its " + totalMillis + " ms deadline");
         }
+    }
+
+    /** The wire id of the one pinned voter (not this one) the verified client certificate names; else refused. */
+    @Override
+    public int peerWire(Socket accepted) {
+        var named = identify((SSLSocket) accepted);
+        if (named == null || named.equals(self)) {
+            refused("an accepted connection's certificate names no other pinned voter");
+            throw new IllegalStateException("cp-peer certificate names no other pinned voter");
+        }
+        return named.wire();
+    }
+
+    private void refused(String why) {
+        long n = identityRefused.incrementAndGet();
+        long now = System.nanoTime();
+        long last = loggedNanos.get();
+        if (now - last >= LOG_EVERY_NANOS && loggedNanos.compareAndSet(last, now)) {
+            LOG.log(System.Logger.Level.WARNING, "cp-peer: {0}; connection closed ({1} so far)", why, n);
+        }
+    }
+
+    /** The pinned voter at {@code to} (same host string and port), or null. */
+    private CpConfig.Peer at(InetSocketAddress to) {
+        for (var peer : peers) {
+            var a = peer.address();
+            if (a.getPort() == to.getPort() && a.getHostString().equals(to.getHostString())) {
+                return peer;
+            }
+        }
+        return null;
+    }
+
+    private CpConfig.Peer identify(SSLSocket socket) {
+        java.security.cert.Certificate[] chain;
+        try {
+            chain = socket.getSession().getPeerCertificates();
+        } catch (SSLPeerUnverifiedException e) {
+            return null;
+        }
+        return chain.length > 0 && chain[0] instanceof X509Certificate leaf ? identify(leaf) : null;
+    }
+
+    /** The single pinned voter {@code leaf} names by URI or DNS SAN, or null (none, or more than one). */
+    CpConfig.Peer identify(X509Certificate leaf) {
+        CpConfig.Peer found = null;
+        for (var san : sans(leaf)) {
+            for (var peer : peers) {
+                if (peer.san().equals(san)) {
+                    if (found != null && !found.equals(peer)) {
+                        return null; // names two pinned voters: identifies neither
+                    }
+                    found = peer;
+                }
+            }
+        }
+        return found;
+    }
+
+    /**
+     * URI (6) and DNS (2) subject alternative names, typed as {@code uri:<value>} and {@code dns:<value>} like the
+     * {@code cp.peers} pins, so a pin only ever matches a SAN of its own type; never the subject CN.
+     */
+    static List<String> sans(X509Certificate cert) {
+        var out = new ArrayList<String>();
+        try {
+            var all = cert.getSubjectAlternativeNames();
+            if (all != null) {
+                for (var san : all) {
+                    if (san.size() >= 2 && san.get(1) instanceof String value && san.get(0) instanceof Integer type
+                            && (type == 6 || type == 2)) {
+                        out.add((type == 6 ? "uri:" : "dns:") + value);
+                    }
+                }
+            }
+        } catch (CertificateParsingException e) {
+            return List.of();
+        }
+        return out;
     }
 }
