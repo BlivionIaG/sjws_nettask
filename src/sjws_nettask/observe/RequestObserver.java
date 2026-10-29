@@ -77,6 +77,7 @@ public final class RequestObserver implements AutoCloseable {
     private volatile Supplier<ClusterStatus> cluster;
     /** Read only while rendering {@code /metrics}. Null or {@link LabelSource#NONE} omits gateway families. */
     private volatile LabelSource labels;
+    private volatile java.util.function.Supplier<String> appendix;
 
     private RequestObserver(ServerMetrics metrics, AccessLog log, MetricsExposure exposure, boolean recording,
             boolean healthz) {
@@ -221,6 +222,13 @@ public final class RequestObserver implements AutoCloseable {
         }
     }
 
+    /** Extra Prometheus families for the next scrape. Null clears. {@link #NONE} ignores. */
+    void attachAppendix(java.util.function.Supplier<String> appendix) {
+        if (this != NONE) {
+            this.appendix = appendix;
+        }
+    }
+
     /** Process counters, plus cluster and gateway families when those sources are attached. */
     String exposition() {
         var sb = new StringBuilder(this.metrics.prometheus());
@@ -231,6 +239,13 @@ public final class RequestObserver implements AutoCloseable {
         var labels = this.labels;
         if (labels != null && labels != LabelSource.NONE) {
             MetricsText.appendGateway(sb, labels);
+        }
+        var appendix = this.appendix;
+        if (appendix != null) {
+            var extra = appendix.get();
+            if (extra != null && !extra.isEmpty()) {
+                sb.append(extra);
+            }
         }
         return sb.toString();
     }

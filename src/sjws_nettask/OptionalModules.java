@@ -122,6 +122,12 @@ final class OptionalModules {
     /** Two enabled modules; closes the second first. */
     record Both(OptionalModule first, OptionalModule second) implements OptionalModule {
         @Override
+        public void attachPrometheus(java.util.function.Consumer<java.util.function.Supplier<String>> sink) {
+            this.first.attachPrometheus(sink);
+            this.second.attachPrometheus(sink);
+        }
+
+        @Override
         public void close() {
             this.second.close();
             this.first.close();

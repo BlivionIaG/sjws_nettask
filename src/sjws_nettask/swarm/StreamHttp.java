@@ -189,6 +189,18 @@ final class StreamHttp {
         return this.credit;
     }
 
+    /**
+     * S2c PR 8 (N2): Prometheus text for the stream gate counters. Credit-off path does not mention
+     * {@link StreamBudget}/{@link StreamCredit}, so those classes stay unloaded ({@code ClassLoadTest}).
+     */
+    String statsText() {
+        if (this.credit == null) {
+            return StreamStats.prometheusCreditOff(this.streams.sinkDrops());
+        }
+        return StreamStats.prometheus(this.credit);
+    }
+
+
     /** One daemon thread for every StreamHttp of the process; created by the first one (stream flag on only). */
     private static java.util.concurrent.ScheduledExecutorService sweeper;
     private static final ReentrantLock SWEEPER_LOCK = new ReentrantLock();

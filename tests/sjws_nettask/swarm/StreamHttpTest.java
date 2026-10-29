@@ -28,6 +28,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -648,5 +649,29 @@ class StreamHttpTest {
         assertTrue(SwarmHttpTest.text(r).contains("reply router stream limit"), SwarmHttpTest.text(r));
         assertEquals(1, this.http.streams().sessionCount());
         assertEquals(1, this.swarm.replies().streams());
+    }
+
+    /** S2c PR 8 N2: {@code GET /swarm/v1/stream-stats} exports the gate counters. */
+    @Test
+    void streamStatsCreditOff() {
+        streamsOn();
+        var r = req("GET", "a", "/swarm/v1/stream-stats", new byte[0]);
+        assertEquals(200, r.status());
+        var body = SwarmHttpTest.text(r);
+        assertTrue(body.contains("sjws_swarm_stream_credit_enabled 0"), body);
+        assertTrue(body.contains("sjws_swarm_stream_sink_drops"), body);
+        assertTrue(!body.contains("node_refusals"), body);
+    }
+
+    @Test
+    void streamStatsCreditOn() {
+        streamsOn(TokenStreams.Config.from(Map.of("sjws.swarm.stream.credit.enabled", "true")::get));
+        var r = req("GET", "a", "/swarm/v1/stream-stats", new byte[0]);
+        assertEquals(200, r.status());
+        var body = SwarmHttpTest.text(r);
+        assertTrue(body.contains("sjws_swarm_stream_credit_enabled 1"), body);
+        assertTrue(body.contains("sjws_swarm_stream_node_refusals 0"), body);
+        assertTrue(body.contains("sjws_swarm_stream_budget_underflows 0"), body);
+        assertTrue(body.contains("sjws_swarm_stream_credit_refusals 0"), body);
     }
 }

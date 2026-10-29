@@ -1048,6 +1048,14 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     /**
+     * Appends a Prometheus-text supplier to {@code /metrics} (S2c PR 8 stream counters). Null clears.
+     * Read only while a scrape is rendered; does not install the observe filter.
+     */
+    public void attachMetricsAppendix(java.util.function.Supplier<String> appendix) {
+        this.slot.attachAppendix(appendix);
+    }
+
+    /**
      * Turns request counters on if they were off, then returns them. The admin TUI calls this
      * (through {@link #metricsSnapshot()}) when it draws a status view.
      * <p>

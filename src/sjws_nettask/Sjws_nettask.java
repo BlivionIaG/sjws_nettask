@@ -95,6 +95,7 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
+                attachSwarmMetrics(server, modules);
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true, modules);
     }
 
@@ -146,6 +147,7 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
+                attachSwarmMetrics(server, modules);
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
                 bindContent, modules);
     }
@@ -716,4 +718,9 @@ public class Sjws_nettask {
         }, redirectGlobals);
         exit.accept(code);
     }
+    /** S2c PR 8 N2: register stream counters on {@code /metrics} when the swarm module exposes them. */
+    private static void attachSwarmMetrics(SjwsServer server, OptionalModule modules) {
+        modules.attachPrometheus(server::attachMetricsAppendix);
+    }
+
 }

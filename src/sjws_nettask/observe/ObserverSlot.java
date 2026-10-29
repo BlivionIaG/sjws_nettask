@@ -44,6 +44,8 @@ public final class ObserverSlot {
     private volatile Supplier<ClusterStatus> cluster;
     /** Copied onto the recording observer. Not read by {@link #get()}. */
     private volatile LabelSource labels;
+    /** Extra Prometheus families (swarm stream stats). Not read by {@link #get()}. */
+    private volatile java.util.function.Supplier<String> appendix;
 
     public ObserverSlot(RequestObserver initial) {
         this.current = initial == null ? RequestObserver.NONE : initial;
@@ -78,6 +80,18 @@ public final class ObserverSlot {
         }
     }
 
+    /**
+     * Extra Prometheus text appended on scrape (S2c PR 8 stream counters). Null clears. Not read on the
+     * request path; {@link RequestObserver#NONE} ignores it.
+     */
+    public void attachAppendix(java.util.function.Supplier<String> appendix) {
+        this.appendix = appendix;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.attachAppendix(appendix);
+        }
+    }
+
     /** Replaces the observer. Used before the listeners accept. */
     public void set(RequestObserver observer) {
         var next = observer == null ? RequestObserver.NONE : observer;
@@ -91,6 +105,7 @@ public final class ObserverSlot {
         }
         observer.attachCluster(this.cluster);
         observer.attachLabels(this.labels);
+        observer.attachAppendix(this.appendix);
     }
 
     /**
