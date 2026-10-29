@@ -265,9 +265,12 @@ class SnapshotPersistenceTest {
             n.append("a");
             var failure = assertThrows(IllegalStateException.class, () -> n.snaps.take(n.group.commitIndex()));
             assertTrue(String.valueOf(failure.getCause()).contains("maxSnapshotBytes"), String.valueOf(failure));
-            assertEquals(1L, n.node.skippedSnapshots(GROUP));
             n.snaps.setSnapshotTaker((group, index) -> new byte[8]);
             assertEquals(8, n.snaps.take(n.group.commitIndex()).data().length, "at the limit is fine");
+            // The taker task fails take()'s future before it counts the skip under the group lock, so
+            // reading the counter straight after the throw races the delivery thread. Takers run in
+            // order on that one thread: once the second take() has returned, the first task is done.
+            assertEquals(1L, n.node.skippedSnapshots(GROUP), "the oversized image is counted, the good one is not");
         }
     }
 }
