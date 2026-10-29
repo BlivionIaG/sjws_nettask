@@ -39,7 +39,8 @@ class SingleNodeHotPathTest {
             assertNull(server.clientManager().drainSignal());
             for (var thread : Thread.getAllStackTraces().keySet()) {
                 var name = thread.getName();
-                assertTrue(!name.startsWith("ha-heartbeat") && !name.startsWith("raft-"), name);
+                assertTrue(!name.startsWith("ha-heartbeat") && !name.startsWith("raft-")
+                        && !name.startsWith("msgrepl-"), name);
             }
         }
     }

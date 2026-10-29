@@ -139,4 +139,92 @@ class ClassLoadTest {
             assertFalse(text.contains(name), name.strip() + " loaded by a data-role start");
         }
     }
+
+    /**
+     * Gate G1 (inceptor): {@code ha.messaging: off} with a member list, and {@code auto} with no member list, both cost
+     * nothing, as does {@code auto} with a member list but {@code ha.enabled: false}. A real server process with
+     * messaging on takes a produce and a fetch, and loads no {@code msgrepl} class
+     * and none of the Raft machinery ({@code ReplicatedNode}, {@code RaftGroup}, {@code TcpTransport}, the log storage).
+     * With {@code ha.enabled: true} only the key type ({@code ClusterKey}) may load, as before this gate.
+     */
+    @Test
+    void haMessagingOffAndNoMemberListLoadNoReplication() throws Exception {
+        var members = """
+                  node_id: a
+                  topics: [orders]
+                  members:
+                    - { id: a, address: "127.0.0.1:1", http_url: "http://127.0.0.1:2" }
+                    - { id: b, address: "127.0.0.1:3", http_url: "http://127.0.0.1:4" }
+                    - { id: w, address: "127.0.0.1:5", witness: true }
+                """;
+        var off = startAndProduce("off", "ha:\n  enabled: true\n  messaging: off\n" + members);
+        assertNoReplication(off, true);
+        var auto = startAndProduce("auto", "ha:\n  messaging: auto\n");
+        assertNoReplication(auto, false);
+        // auto with a member list but ha.enabled false: single node, with the warning, and no key resolved.
+        var autoMembers = startAndProduce("auto-members", "ha:\n  enabled: false\n  messaging: auto\n" + members);
+        assertNoReplication(autoMembers, false);
+        assertTrue(autoMembers.contains("ha.enabled is false: ha.messaging: auto stays single-node"), autoMembers);
+        var absent = startAndProduce("absent", "# no ha block\n");
+        assertNoReplication(absent, false);
+    }
+
+    private static void assertNoReplication(String text, boolean keyMayLoad) {
+        assertTrue(text.contains("sjws_nettask.messaging.http.MessagingModule "), "sanity: messaging is on");
+        assertFalse(text.contains("sjws_nettask.msgrepl."), "a msgrepl class loaded");
+        assertFalse(text.contains("ha messaging: replication on"), text);
+        text.lines().filter(l -> l.contains("sjws_nettask.cluster.")).forEach(l -> {
+            assertTrue(keyMayLoad && l.contains("sjws_nettask.cluster.ClusterKey"), "cluster class loaded: " + l);
+        });
+    }
+
+    /** Starts the server with messaging on and {@code yaml}, produces and fetches one record; returns the log. */
+    private String startAndProduce(String name, String yaml) throws Exception {
+        var root = Files.createDirectories(dir.resolve(name + "-html"));
+        var file = dir.resolve(name + ".yaml");
+        Files.writeString(file, yaml);
+        var log = dir.resolve(name + "-classes.log");
+        int port;
+        try (var probe = new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+            port = probe.getLocalPort();
+        }
+        var javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        var pb = new ProcessBuilder(javaBin, "-Xlog:class+load=info", "-Dsjws.messaging.enabled=true",
+                "-Dsjws.messaging.dir=" + dir.resolve(name + "-msg"), "-cp", System.getProperty("java.class.path"),
+                "sjws_nettask.Sjws_nettask", "--config=" + file, "--state-dir=" + dir.resolve(name + "-state"),
+                Integer.toString(port), root.toString()).redirectErrorStream(true).redirectOutput(log.toFile());
+        for (var env : new String[] {"WEB_SERVER_DIR", "WEB_SERVER_PORT", "WEB_SERVER_CONFIG", "SJWS_SWARM_ENABLED"}) {
+            pb.environment().remove(env);
+        }
+        pb.environment().put("WEB_SERVER_HA_CLUSTER_KEY", "0123456789abcdef0123456789abcdef");
+        var process = pb.start();
+        String text = "";
+        try {
+            var deadline = System.nanoTime() + java.time.Duration.ofSeconds(30).toNanos();
+            while (System.nanoTime() < deadline) {
+                text = Files.exists(log) ? Files.readString(log) : "";
+                if (text.contains("Server started:") || !process.isAlive()) {
+                    break;
+                }
+                Thread.sleep(50);
+            }
+            assertTrue(text.contains("Server started:"), text);
+            var client = java.net.http.HttpClient.newHttpClient();
+            var url = java.net.URI.create("http://127.0.0.1:" + port + "/messaging/v1/topics/orders/records");
+            var produce = client.send(java.net.http.HttpRequest.newBuilder(url)
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(new byte[] {0, 0, 0, 2, 'h', 'i'}))
+                    .build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, produce.statusCode(), produce.body());
+            var fetch = client.send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(url + "?offset=0")).build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, fetch.statusCode());
+            Thread.sleep(300); // anything loaded right after the requests lands in the log
+            text = Files.readString(log);
+        } finally {
+            process.destroy();
+            process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
+            process.destroyForcibly();
+        }
+        return text;
+    }
 }

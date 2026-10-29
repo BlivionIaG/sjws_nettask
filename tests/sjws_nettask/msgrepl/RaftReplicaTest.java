@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -66,8 +67,15 @@ class RaftReplicaTest {
                     new FileLogStorage(dir.resolve("raft")), new SimTransport());
             log = SegmentedLog.open(dir.resolve("ledger"));
             writer = new LedgerWriter(log, Durability.ASYNC);
-            replica = new RaftReplicator(node, Set.of("t"), Map.of(), dir.resolve("state"), ELECTION, HEARTBEAT, clock::nanoTime)
-                    .open("t", writer, Durability.ASYNC, r -> { });
+            try {
+                replica = new RaftReplicator(node, Set.of("t"), Map.of(), dir.resolve("state"), ELECTION, HEARTBEAT, clock::nanoTime)
+                        .open("t", writer, Durability.ASYNC, r -> { });
+            } catch (RuntimeException e) {
+                writer.close();
+                log.close();
+                node.close();
+                throw e;
+            }
             for (int k = 0; k < 200 && !replica.leaderReady(); k++) step();
             assertTrue(replica.leaderReady());
         }
@@ -222,6 +230,33 @@ class RaftReplicaTest {
             assertEquals(4, n.settle());
             assertEquals(List.of("a", "b", "c", "d"), n.records());
         }
+    }
+
+    /** #274 MC-B1: ledger and replication state must line up at open; a crash-shaped gap still recovers above. */
+    @Test
+    void aLedgerThatDoesNotLineUpIsRefusedAtOpen() throws Exception {
+        try (var n = new Node()) {
+            assertEquals(0, n.await(n.replica.appendNoWait(recs("a", "b"), Durability.GROUP)));
+            n.settle();
+        }
+        // A local write after a clean close (replication off): refused, naming the topic and both ends.
+        try (var log = SegmentedLog.open(dir.resolve("ledger")); var w = new LedgerWriter(log, Durability.ASYNC)) {
+            w.append(recs("local"), Durability.ASYNC).get(5, TimeUnit.SECONDS);
+        }
+        var moved = assertThrows(IllegalArgumentException.class, Node::new);
+        assertTrue(moved.getMessage().contains("replicated topic t ledger end is 3 but replication stopped cleanly at 2"),
+                moved.getMessage());
+        // The ledger wiped but its replication state kept: the first-start check (non-empty) does not apply, the
+        // stamps do: an empty ledger below a header that started at 2 is refused too.
+        try (var ch = FileChannel.open(dir.resolve("state/t.applied"), StandardOpenOption.WRITE)) {
+            ch.truncate(0);
+            ch.write(ByteBuffer.allocate(28).putLong(0).putLong(0).putLong(2).putInt(0).flip());
+        }
+        try (var walk = java.nio.file.Files.walk(dir.resolve("ledger"))) {
+            for (var p : walk.sorted(java.util.Comparator.reverseOrder()).toList()) java.nio.file.Files.delete(p);
+        }
+        var wiped = assertThrows(IllegalArgumentException.class, Node::new);
+        assertTrue(wiped.getMessage().contains("ledger end is 0 but replication started at offset 2"), wiped.getMessage());
     }
 
     @Test

@@ -150,7 +150,7 @@ final class MessagingHttp implements Handler {
             var log = this.topics.get(topic, false);
             if (log == null) return problem(404, "no such topic", topic);
             long end = log.writer().snapshot().nextOffset();
-            var o = this.topics.offsets();
+            var o = this.topics.offsets(topic);
             switch (request.method()) {
                 case "GET" -> {
                     long c = o.committed(topic, group);
@@ -165,9 +165,9 @@ final class MessagingHttp implements Handler {
                     long start = log.log().startOffset();
                     if (off < start) return problem(416, "offset out of range", "log starts at " + start);
                     if (off > end) return problem(400, "bad request", "offset " + off + " is past the log end " + end);
-                    var dflt = this.topics.durability(LogOffsets.TOPIC);
+                    var dflt = this.topics.durability(o.topic());
                     var d = atLeast(durability(request.headers().values("durability")), dflt);
-                    var olog = this.topics.get(LogOffsets.TOPIC, false);
+                    var olog = this.topics.get(o.topic(), false);
                     var fenced = olog == null ? null : fence(olog, request, request.target());
                     if (fenced != null) return fenced;
                     o.commit(topic, group, off, d).get(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
@@ -189,7 +189,7 @@ final class MessagingHttp implements Handler {
             return problem(503, "unavailable", "interrupted");
         } catch (TimeoutException e) {
             // Like a produce timeout: the commit may still land (#254). Idempotent, but say so rather than "unavailable".
-            return outcomeUnknown(offsetsReplica(), request.target());
+            return outcomeUnknown(offsetsReplica(topic), request.target());
         } catch (ExecutionException e) {
             return failed(e, request.target(), true);
         } catch (LeaderUnavailableException e) {
@@ -222,10 +222,10 @@ final class MessagingHttp implements Handler {
         return out.toByteArray();
     }
 
-    /** The offsets topic's replica, for a leader hint; null when not replicated or not loadable. */
-    private Replica offsetsReplica() {
+    /** The replica of the offsets topic holding {@code topic}'s commits, for a leader hint; null when local. */
+    private Replica offsetsReplica(String topic) {
         try {
-            var olog = this.topics.get(LogOffsets.TOPIC, false);
+            var olog = this.topics.get(this.topics.offsets(topic).topic(), false);
             return olog == null ? null : olog.replica();
         } catch (IOException e) {
             return null;
@@ -682,8 +682,8 @@ final class MessagingHttp implements Handler {
     }
 
     /**
-     * The messaging log cannot serve this request (closed, or the topic is not set up for it on this node): 503 with
-     * a generic detail and Retry-After; the exception text is logged, not sent (#246).
+     * The messaging log cannot serve this request (closed): 503 with a generic detail and Retry-After; the exception
+     * text is logged, not sent (#246). A topic outside {@code ha.topics} is never this: it stays local.
      */
     static Response unavailable(IllegalStateException e, String target) {
         FAILURES.log(System.Logger.Level.WARNING, "messaging log unavailable on " + target, e);

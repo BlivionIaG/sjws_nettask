@@ -102,7 +102,12 @@ class MessagingReplicationTest {
         }
         for (int i = 0; i < 2; i++) {
             var t = new LogTopics(dir.resolve("n" + (i + 1)), Durability.ASYNC);
-            t.replication(new RaftReplicator(nodes.get(i), TOPICS, urls, dir.resolve("state" + (i + 1)), ELECTION, HEARTBEAT, clock::nanoTime));
+            try {
+                t.replication(new RaftReplicator(nodes.get(i), TOPICS, urls, dir.resolve("state" + (i + 1)), ELECTION, HEARTBEAT, clock::nanoTime));
+            } catch (RuntimeException e) {
+                t.close();
+                throw e;
+            }
             topics.add(t);
             var h = new MessagingHttp(t);
             h.producerDedup(true);
@@ -124,6 +129,112 @@ class MessagingReplicationTest {
     void stop() {
         if (topics != null) topics.forEach(LogTopics::close);
         if (nodes != null) nodes.forEach(ReplicatedNode::close);
+        topics = null;
+        nodes = null;
+    }
+
+    /** Writes {@code data} to {@code topic} on node {@code i} with HA off (a plain local LogTopics), then closes it. */
+    void writeLocally(int i, String topic, String... data) throws Exception {
+        var t = new LogTopics(dir.resolve("n" + (i + 1)), Durability.ASYNC);
+        try {
+            var h = new MessagingHttp(t);
+            for (var d : data) assertEquals(200, h.handle(post(topic, d, Map.of())).status(), d);
+        } finally {
+            t.close();
+        }
+    }
+
+    /** Messaging Core's repro (#274 MC-B1): a has 3 records on t with HA off; turning replication on would fork. */
+    @Test
+    void firstReplicatedStartOnALocalTopicWithDataIsRefused() throws Exception {
+        writeLocally(0, "t", "pre-0", "pre-1", "pre-2");
+        var e = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, this::start);
+        assertTrue(e.getMessage().contains("replicated topic t already holds 3 local record(s)"), e.getMessage());
+        assertTrue(e.getMessage().contains("refusing to start") && e.getMessage().contains("empty log"), e.getMessage());
+        stop();
+        // Wiped (the supported migration: start replicated topics from empty logs), it starts, offsets from 0 on both.
+        try (var walk = java.nio.file.Files.walk(dir.resolve("n1/t"))) {
+            for (var p : walk.sorted(java.util.Comparator.reverseOrder()).toList()) java.nio.file.Files.delete(p);
+        }
+        start();
+        int l = leader("t");
+        var r = call(() -> http.get(l).handle(post("t", "repl-0", Map.of())));
+        assertEquals(200, r.status(), LogOffsetsTest.text(r));
+        assertTrue(LogOffsetsTest.text(r).contains("\"baseOffset\":0"), LogOffsetsTest.text(r));
+        awaitEnd(1 - l, "t", 1);
+        assertEquals(List.of("repl-0"), records(http.get(0).handle(fetch("t", "", Map.of()))));
+        assertEquals(List.of("repl-0"), records(http.get(1).handle(fetch("t", "", Map.of()))));
+    }
+
+    @Test
+    void firstReplicatedStartWithLocalConsumerOffsetsIsRefused() throws Exception {
+        var t = new LogTopics(dir.resolve("n2"), Durability.ASYNC);
+        try {
+            var h = new MessagingHttp(t);
+            assertEquals(200, h.handle(post("u", "x", Map.of())).status());
+            assertEquals(200, LogOffsetsTest.put(h, "u", "g", 1).status());
+        } finally {
+            t.close();
+        }
+        var e = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, this::start);
+        assertTrue(e.getMessage().contains("consumer offsets (__offsets"), e.getMessage());
+        assertTrue(e.getMessage().contains("already holds 1 local record(s)"), e.getMessage());
+    }
+
+    /** The rollback half (#274 MC-B1): on, clean stop, a local write with HA off, then on again must not fork. */
+    @Test
+    void reEnablingReplicationAfterALocalWriteIsRefused() throws Exception {
+        start();
+        int l = leader("t");
+        for (var d : List.of("r-0", "r-1")) assertEquals(200, call(() -> http.get(l).handle(post("t", d, Map.of()))).status());
+        awaitEnd(1 - l, "t", 2);
+        stop();
+        start(); // a clean stop and restart with nothing written in between lines up
+        stop();
+        writeLocally(0, "t", "local-after-rollback");
+        var e = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, this::start);
+        assertTrue(e.getMessage().contains("replicated topic t ledger end is 3 but replication stopped cleanly at 2"),
+                e.getMessage());
+        assertTrue(e.getMessage().contains("written while replication was off"), e.getMessage());
+    }
+
+    /**
+     * #274 MC-B2: a topic outside ha.topics keeps the plain local path on a replicating node: readable (existing
+     * data included) and writable on every node, never a 503, with its consumer offsets local too.
+     */
+    @Test
+    void topicsOutsideHaTopicsStayLocal() throws Exception {
+        writeLocally(0, "legacy", "old-0", "old-1");
+        start();
+        int l = leader("t");
+        int f = 1 - l;
+        var legacy = http.get(0).handle(fetch("legacy", "", Map.of()));
+        assertEquals(200, legacy.status());
+        assertEquals(List.of("old-0", "old-1"), records(legacy));
+        assertEquals(404, http.get(1).handle(fetch("legacy", "", Map.of())).status(), "local to n1");
+        var more = http.get(0).handle(post("legacy", "new-2", Map.of()));
+        assertEquals(200, more.status(), LogOffsetsTest.text(more));
+        assertTrue(LogOffsetsTest.text(more).contains("\"baseOffset\":2"), LogOffsetsTest.text(more));
+        for (int i : new int[] {l, f}) { // the follower too: no redirect, no Retry-After
+            var r = http.get(i).handle(post("other", "o-" + i, Map.of()));
+            assertEquals(200, r.status(), LogOffsetsTest.text(r));
+            assertNull(r.headers().get("retry-after"));
+            assertNull(topics.get(i).get("other", false).replica(), "not replicated");
+            awaitEnd(i, "other", 1);
+            assertEquals(List.of("o-" + i), records(http.get(i).handle(fetch("other", "", Map.of()))));
+        }
+        // Their commits stay local (a follower takes them), and never enter the replicated __offsets.
+        long replicatedEnd = topics.get(f).get(LogOffsets.TOPIC, false).writer().snapshot().nextOffset();
+        var put = http.get(f).handle(new Request("PUT", "/messaging/v1/topics/other/offsets/g", RequestHeaders.of(Map.of()))
+                .withBody(MessagingHttpTest.body("{\"offset\":1}".getBytes(StandardCharsets.UTF_8))));
+        assertEquals(200, put.status(), LogOffsetsTest.text(put));
+        assertEquals(1, topics.get(f).offsets("other").committed("other", "g"));
+        assertEquals(-1, topics.get(l).offsets("other").committed("other", "g"));
+        assertEquals(replicatedEnd, topics.get(f).get(LogOffsets.TOPIC, false).writer().snapshot().nextOffset());
+        assertNull(topics.get(f).get(LogOffsets.LOCAL_TOPIC, false).replica());
+        assertTrue(topics.get(f).offsets("t") == topics.get(f).offsets(), "replicated topics keep __offsets");
+        // Internal names stay refused.
+        assertEquals(400, http.get(f).handle(post(LogOffsets.LOCAL_TOPIC, "x", Map.of())).status());
     }
 
     void drive() {

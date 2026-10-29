@@ -86,6 +86,32 @@ class CpHostingEdgesTest {
     }
 
     @Test
+    void cpRaftKeyEqualToTheConfigFileHaClusterKeyIsRefused() throws Exception {
+        // ha.cluster_key / ha.cluster_key_file reach CpLaunch as resolved bytes, with no environment variable set.
+        var raft = CpLaunch.RAFT_KEY_ENV;
+        var secret = "0123456789abcdef0123";
+        var haKey = secret.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        var other = "ha-key-differs-012345".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        for (var c : List.of(
+                new Object[] {Map.of(raft, secret), haKey, null},
+                new Object[] {Map.of(raft, "hex:" + java.util.HexFormat.of().formatHex(haKey)), haKey, null},
+                new Object[] {Map.of(raft, secret), other, haKey},
+                new Object[] {Map.of(raft, "raft-key-differs-0123", CpLaunch.RAFT_KEY_PREVIOUS_ENV, secret), haKey,
+                        null})) {
+            @SuppressWarnings("unchecked")
+            var env = (Map<String, String>) c[0];
+            var same = assertThrows(IOException.class, () -> CpLaunch.peerKey(env, (byte[]) c[1], (byte[]) c[2]),
+                    env.keySet().toString());
+            assertTrue(same.getMessage().contains("must differ") && same.getMessage().contains("ha.cluster_key"),
+                    same.getMessage());
+            assertFalse(same.getMessage().contains(secret) || same.getMessage().contains("raft-key-differs"),
+                    same.getMessage());
+        }
+        assertNotNull(CpLaunch.peerKey(Map.of(raft, "raft-key-differs-0123"), haKey, other));
+        assertNotNull(CpLaunch.peerKey(Map.of(raft, "raft-key-differs-0123"), null, null));
+    }
+
+    @Test
     void productionDepsFailClosed() throws Exception {
         var y = base();
         y.put("tls", Map.of("cert", "c"));
