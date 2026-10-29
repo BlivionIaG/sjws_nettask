@@ -347,7 +347,7 @@ Phases 1 and 2 shipped (§12), and phase 3 as the gateway features B.1-B.4 (§13
   - h2 waits for writability before each chunk, and ends with an empty DATA frame carrying END_STREAM.
   - h3 shuts down the stream output at the end.
   - The h2 → HTTP/1.1 fallback sets chunked for an unknown length.
-- Request bodies: HTTP/1.1 requests with Content-Length are streamed through `Http1Connection.BodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. A chunked request body is not attached, and the proxy answers it with 501, as it did in phase 1; so does a declared body that the transport did not attach. Only HTTP/1.1 attaches request bodies today (§8).
+- Request bodies: HTTP/1.1 requests with Content-Length are streamed through `Http1Connection.BodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. A chunked request body is not attached, and the proxy answers it with 501, as it did in phase 1; so does a declared body that the transport did not attach. HTTP/1.1 and HTTP/3 (#281) attach request bodies; HTTP/2 does not yet (§8).
 
 **Client (`routing.UpstreamPool` + `ProxyHandler`).**
 - The pipeline is `HttpClientCodec` + `Relay`, with autoRead off.
