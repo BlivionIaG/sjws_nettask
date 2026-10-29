@@ -220,7 +220,49 @@ class CpMiddlewareSecretsTest {
         assertNotEquals(current.document().canonicalHash(), result.snapshot().document().canonicalHash());
     }
 
-
+    @Test
+    void maskYamlLeavesNonFilterKeysNodesIntact() throws Exception {
+        var root = Files.createDirectory(dir.resolve("keys-topic-html"));
+        var cfg = dir.resolve("keys-topic.yaml");
+        Files.writeString(cfg, baseYaml(root) + """
+                messaging:
+                  enabled: true
+                  topics:
+                    keys:
+                      partitions: 2
+                      replication: 1
+                      durability: async
+                    hmac-keys:
+                      partitions: 1
+                      replication: 1
+                      durability: async
+                middleware:
+                  - name: api-key
+                    order: 10
+                    options:
+                      keys: "%s"
+                  - name: access-log
+                    order: 0
+                    options:
+                      format: combined
+                """.formatted(CANARY));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + cfg}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        assertTrue(loaded.document().messaging().topics().containsKey("keys"));
+        assertTrue(loaded.document().messaging().topics().containsKey("hmac-keys"));
+        var masked = MiddlewareSecrets.maskYaml(loaded.document().canonicalText());
+        assertFalse(masked.contains(CANARY), masked);
+        assertTrue(masked.contains(MiddlewareSecrets.MASK), masked);
+        // Topic names stay map keys (a value-only mask would make this YAML invalid).
+        var maskedFile = dir.resolve("masked-roundtrip.yaml");
+        Files.writeString(maskedFile, masked);
+        var again = ConfigLoader.load(new String[] {"--config=" + maskedFile}, Map.of());
+        assertTrue(again.ok(), again.errors().toString());
+        assertTrue(again.document().messaging().topics().containsKey("keys"), again.errors().toString());
+        assertTrue(again.document().messaging().topics().containsKey("hmac-keys"));
+        assertEquals(MiddlewareSecrets.MASK, again.document().middleware().stream()
+                .filter(step -> "api-key".equals(step.name())).findFirst().orElseThrow().option("keys"));
+    }
 
 
 

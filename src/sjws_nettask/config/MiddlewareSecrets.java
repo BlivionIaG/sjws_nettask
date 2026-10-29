@@ -31,7 +31,8 @@ import sjws_nettask.core.MiddlewareSpec;
  * must not hold the secret bytes. Local (non-CP) config may still use the inline form.
  * <p>
  * Error text never echoes a secret value. {@link #MASK} is the stand-in written by
- * {@link ConfigCodec} and by {@link #maskYaml(String)} for viewer reads.
+ * {@link ConfigCodec#viewerText} and by {@link #maskYaml(String)} for viewer reads.
+ * Canonical identity encoding ({@link ConfigCodec#text}) keeps real values.
  */
 public final class MiddlewareSecrets {
 
@@ -43,6 +44,9 @@ public final class MiddlewareSecrets {
 
     /** File-reference option names that replace the matching inline form. */
     public static final Set<String> FILES = Set.of("keys-file", "hmac-keys-file");
+
+    /** Filter names whose options may carry {@link #INLINE} secrets. */
+    public static final Set<String> SECRET_FILTERS = Set.of("api-key", "jwt");
 
     /** Largest accepted secret file (same order as other SecureKeyFile caps). */
     public static final int MAX_FILE_BYTES = 1 << 16;
@@ -120,7 +124,8 @@ public final class MiddlewareSecrets {
     }
 
     /**
-     * Copy of {@code options} with inline secret values replaced by {@link #MASK}. File-reference
+     * Copy of filter {@code options} with inline secret values replaced by {@link #MASK}.
+     * Callers must pass options from a {@link #SECRET_FILTERS} entry only. File-reference
      * options are left unchanged (they are paths, not secrets).
      */
     public static Map<String, String> maskOptions(Map<String, String> options) {
@@ -135,10 +140,11 @@ public final class MiddlewareSecrets {
     }
 
     /**
-     * Defence in depth for viewer reads of a stored canonical YAML: replace values of known
-     * inline secret options. Lines that are not {@code keys:} / {@code hmac-keys:} under an
-     * options map are left alone. The secret value is never copied into the result beyond the
-     * scan needed to find the colon.
+     * Defence in depth for viewer reads of a stored canonical YAML: replace inline secret
+     * values only on {@link #SECRET_FILTERS} middleware entries ({@code api-key} / {@code jwt})
+     * under their {@code options} map. A messaging topic (or any other node) named
+     * {@code keys} / {@code hmac-keys} is left unchanged so the YAML stays valid. The secret
+     * value is never copied into the result beyond the scan needed to find the colon.
      */
     public static String maskYaml(String yaml) {
         if (yaml == null || yaml.isEmpty()) {
@@ -146,19 +152,74 @@ public final class MiddlewareSecrets {
         }
         var lines = yaml.split("\n", -1);
         var out = new StringBuilder(yaml.length());
+        boolean inMiddleware = false;
+        int middlewareIndent = -1;
+        boolean secretFilter = false;
+        boolean inOptions = false;
+        int optionsIndent = -1;
         for (int i = 0; i < lines.length; i++) {
             if (i > 0) {
                 out.append('\n');
             }
-            out.append(maskLine(lines[i]));
+            var line = lines[i];
+            int indent = leadingSpaces(line);
+            var trimmed = line.stripLeading();
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                out.append(line);
+                continue;
+            }
+            if (inMiddleware && indent <= middlewareIndent && !trimmed.startsWith("-")) {
+                inMiddleware = false;
+                secretFilter = false;
+                inOptions = false;
+            }
+            if (trimmed.equals("middleware:") || trimmed.startsWith("middleware:")) {
+                inMiddleware = true;
+                middlewareIndent = indent;
+                secretFilter = false;
+                inOptions = false;
+                out.append(line);
+                continue;
+            }
+            if (!inMiddleware) {
+                out.append(line);
+                continue;
+            }
+            if (trimmed.startsWith("- ")) {
+                secretFilter = false;
+                inOptions = false;
+                optionsIndent = -1;
+                var rest = trimmed.substring(2).strip();
+                secretFilter = nameDeclaresSecretFilter(rest);
+                out.append(line);
+                continue;
+            }
+            if (inOptions && indent <= optionsIndent) {
+                inOptions = false;
+            }
+            if (isKey(trimmed, "name")) {
+                secretFilter = secretFilterName(scalarAfterColon(trimmed));
+                out.append(line);
+                continue;
+            }
+            if (secretFilter && isKey(trimmed, "options")) {
+                inOptions = true;
+                optionsIndent = indent;
+                out.append(line);
+                continue;
+            }
+            if (inOptions && secretFilter) {
+                out.append(maskSecretOptionLine(line, trimmed));
+                continue;
+            }
+            out.append(line);
         }
         return out.toString();
     }
 
-    private static String maskLine(String line) {
-        var trimmed = line.stripLeading();
+    private static String maskSecretOptionLine(String line, String trimmed) {
         for (var key : INLINE) {
-            if (trimmed.startsWith(key + ":") || trimmed.startsWith(key + " :")) {
+            if (isKey(trimmed, key)) {
                 int colon = line.indexOf(':');
                 if (colon < 0) {
                     return line;
@@ -167,6 +228,41 @@ public final class MiddlewareSecrets {
             }
         }
         return line;
+    }
+
+    private static boolean isKey(String trimmed, String key) {
+        return trimmed.startsWith(key + ":") || trimmed.startsWith(key + " :");
+    }
+
+    private static boolean nameDeclaresSecretFilter(String rest) {
+        return isKey(rest, "name") && secretFilterName(scalarAfterColon(rest));
+    }
+
+    private static boolean secretFilterName(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        var name = raw.strip();
+        if ((name.startsWith("\"") && name.endsWith("\"")) || (name.startsWith("'") && name.endsWith("'"))) {
+            name = name.substring(1, name.length() - 1);
+        }
+        return SECRET_FILTERS.contains(name);
+    }
+
+    private static String scalarAfterColon(String trimmed) {
+        int colon = trimmed.indexOf(':');
+        if (colon < 0) {
+            return null;
+        }
+        return trimmed.substring(colon + 1).strip();
+    }
+
+    private static int leadingSpaces(String line) {
+        int n = 0;
+        while (n < line.length() && line.charAt(n) == ' ') {
+            n++;
+        }
+        return n;
     }
 
     /** True when {@code options} carries an inline secret (local WARN path). */
