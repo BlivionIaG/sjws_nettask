@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   image:
-    runs-on: ubuntu-24.04 # Pinned for #265: unpin once all three failing tests pass on 26.04
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
       IMAGE: sjws_nettask:ci
