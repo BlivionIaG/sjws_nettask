@@ -542,6 +542,8 @@ public final class TokenStreams {
 
     private final java.util.concurrent.locks.ReentrantLock readerLock = new java.util.concurrent.locks.ReentrantLock();
     private volatile Thread reader;
+    /** Set by {@link #close}: no reader starts again. */
+    private volatile boolean closed;
     private final AtomicLong ledgerChunks = new AtomicLong();
     private final AtomicLong ledgerUndecodable = new AtomicLong();
 
@@ -558,7 +560,7 @@ public final class TokenStreams {
     private void ensureReading() {
         this.readerLock.lock();
         try {
-            if (this.reader == null && !this.topics.closed()) {
+            if (this.reader == null && !this.closed && !this.topics.closed()) {
                 for (int i = 0; i < this.config.shards(); i++) {
                     this.topics.partitionWithoutDlq(shardTopic(i)).subscribe(READER_GROUP, false);
                 }
@@ -573,14 +575,14 @@ public final class TokenStreams {
         long lastActive = this.topics.clock().getAsLong();
         int shards = this.config.shards();
         long wait = Math.max(1, READER_WAIT_NS / shards);
-        while (!this.topics.closed()) {
+        while (!this.closed && !this.topics.closed()) {
             int n = 0;
             try {
                 for (int i = 0; i < shards; i++) {
                     n += readOnce(i, wait);
                 }
             } catch (RuntimeException e) {
-                if (this.topics.closed() || Thread.currentThread().isInterrupted()) {
+                if (this.closed || this.topics.closed() || Thread.currentThread().isInterrupted()) {
                     break;
                 }
                 System.err.println("WARN: swarm: stream shard reader: " + e);
@@ -602,6 +604,32 @@ public final class TokenStreams {
             this.readerLock.unlock();
         }
     }
+
+    /**
+     * Stops the shard reader for good and waits for it (bounded, {@value #CLOSE_JOIN_MS} ms); idempotent. Called by
+     * {@link Swarm#close} before the topics close (#181: the reader used to stop on its own only once it noticed the
+     * closed topics, with nobody waiting for it).
+     */
+    void close() {
+        Thread t;
+        this.readerLock.lock();
+        try {
+            this.closed = true;
+            t = this.reader;
+        } finally {
+            this.readerLock.unlock();
+        }
+        if (t != null && t != Thread.currentThread()) {
+            t.interrupt(); // ends a blocking poll at once; the loop then sees closed
+            try {
+                t.join(CLOSE_JOIN_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    static final long CLOSE_JOIN_MS = 2_000;
 
     /** Stops the reader if still idle; an {@link #open} racing in keeps it running. */
     private boolean idleStop() {
