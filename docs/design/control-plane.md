@@ -578,7 +578,7 @@ The content listener is outside the control-plane trust boundary. Compromise of 
 
 ### 12.2 mTLS, identity, and cert rotation
 
-TLS is 1.3 only. There is no fallback to 1.2, no 0-RTT early data, and no session-ticket resumption across an identity change (ticket keys rotate with the identity). Leaf keys are Ed25519 or ECDSA P-256. The URI SAN is exactly `urn:sjws:node:<nodeId>`. A verifier matches that SAN to the peer it expected: a voter checks a voter id, and a data node checks that the peer is a voter or learner id named by the trust bundle, not merely that the CA signed something. Today the voter links accept any certificate from the configured peer CA; binding it to the id is a tracked follow-up (see [control-plane hosting](control-plane-hosting.md) §4). Extended key usage splits `serverAuth` and `clientAuth`.
+TLS is 1.3 only. There is no fallback to 1.2, no 0-RTT early data, and no session-ticket resumption across an identity change (ticket keys rotate with the identity). Leaf keys are Ed25519 or ECDSA P-256. The URI SAN is exactly `urn:sjws:node:<nodeId>`. A verifier matches that SAN to the peer it expected: a voter checks a voter id, and a data node checks that the peer is a voter or learner id named by the trust bundle, not merely that the CA signed something. The voter links bind each certificate to its `cp.peers` id through a pinned, typed SAN (#175; see [control-plane hosting](control-plane-hosting.md) §4). Extended key usage splits `serverAuth` and `clientAuth`.
 
 Three intermediates, each signed by the offline root (§12.3): one for voters, one for data nodes, one for admin clients. A data-node certificate cannot authenticate as a voter or as an admin. The online intermediate private keys live on the control leader only while `leaderReady()`, mode `0600`. The root private key does not.
 
@@ -586,7 +586,7 @@ Node certificates last 24 hours. The node renews by CSR at two thirds of that li
 
 A peer that fails verification closes the watch or the admin connection. The data node keeps last-good. Content connections are unaffected.
 
-Voter-to-voter mTLS is a ship blocker for every deployment except a single-node lab. A group with more than one voter refuses to start until voter mTLS is on (`cp.tls.peerCert`, `peerKey`, `peerCa`). Its frames also carry an HMAC under a CP-only key (`SJWS_CP_RAFT_KEY`) that must not equal the HA cluster key, and plain links exist only behind a test seam, on loopback. The watch and the admin API are mTLS in every role, including the lab.
+Voter-to-voter mTLS is a ship blocker for every deployment except a single-node lab. A group with more than one voter refuses to start until voter mTLS is on (`cp.tls.peerCert`, `peerKey`, `peerCa`), and each voter's certificate is bound to its `cp.peers` id by a pinned, typed URI or DNS SAN (`cp.peers[].san`, #175; see control-plane-hosting.md §4). Its frames also carry an HMAC under a CP-only key (`SJWS_CP_RAFT_KEY`) that must not equal the HA cluster key, and plain links exist only behind a test seam, on loopback. The watch and the admin API are mTLS in every role, including the lab.
 
 ### 12.3 Keys, signatures, freshness, and anti-replay
 

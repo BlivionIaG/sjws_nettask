@@ -195,10 +195,11 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         /**
          * The wire id that {@code accepted}'s authenticated identity (the verified mTLS certificate, mapped through a
          * pinned peer list) belongs to, called once after {@link #handshake}; -1 when this factory does not identify
-         * peers (plain sockets, the CP voter links). With a pinned wire, a frame on that connection whose sender wire
-         * differs is refused as {@link Reason#ORIGIN}, the connection is closed, and that identity's next
-         * connections are held off with a doubling backoff ({@link #originHeldOff}): the header wire id is
-         * authenticated by the shared key only, so it is never trusted as identity. Throwing refuses the connection.
+         * peers (plain sockets); the CP voter links (#175) and the swarm peer links pin one. With a pinned wire, a
+         * frame on that connection whose sender wire differs is refused as {@link Reason#ORIGIN}, the connection is
+         * closed, and that identity's next connections are held off with a doubling backoff ({@link #originHeldOff}):
+         * the header wire id is authenticated by the shared key only, so it is never trusted as identity. Throwing
+         * refuses the connection.
          */
         default int peerWire(Socket accepted) {
             return -1;

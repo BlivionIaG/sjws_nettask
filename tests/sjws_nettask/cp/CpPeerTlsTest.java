@@ -68,11 +68,16 @@ class CpPeerTlsTest {
     private record Outcome(Side client, Side server) {
     }
 
+    /** Dialer is voter {@code b}, acceptor voter {@code a}; both pin {@code urn:sjws:node:<id>} (#175). */
     private Outcome dial(CpServerTls serverTls, CpServerTls clientTls) throws Exception {
-        var server = new CpPeerSockets(serverTls);
-        try (var listener = server.listen(new InetSocketAddress("127.0.0.1", 0))) {
+        int port = freePort();
+        var peers = List.of(
+                new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", port), false, CpTestCa.san("a")),
+                new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", 1), false, CpTestCa.san("b")));
+        var server = new CpPeerSockets(serverTls, peers, "a");
+        try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
             var serverSide = CompletableFuture.supplyAsync(() -> observeAccept(server, listener));
-            var client = observeDial(clientTls, new InetSocketAddress("127.0.0.1", listener.getLocalPort()));
+            var client = observeDial(clientTls, new InetSocketAddress("127.0.0.1", port));
             return new Outcome(client, serverSide.get(10, TimeUnit.SECONDS));
         }
     }
@@ -80,14 +85,17 @@ class CpPeerTlsTest {
     private static Side observeAccept(CpPeerSockets server, ServerSocket listener) {
         var completed = new AtomicBoolean();
         SSLSocket accepted = null;
+        boolean handshakeReturned = false;
         try {
             accepted = (SSLSocket) listener.accept();
             accepted.addHandshakeCompletedListener(event -> completed.set(true));
             server.handshake(accepted, 5_000);
+            handshakeReturned = true;
             awaitHandshakeSignal(completed, accepted);
+            assertEquals(2, server.peerWire(accepted));
             return new Side(null, true, completed.get(), peerVerified(accepted));
         } catch (Exception e) {
-            return new Side(e, false, completed.get(), peerVerified(accepted));
+            return new Side(e, handshakeReturned, completed.get(), peerVerified(accepted));
         } finally {
             if (accepted != null) {
                 try {
@@ -100,14 +108,17 @@ class CpPeerTlsTest {
     }
 
     /**
-     * Dial with the same TLS material as {@link CpPeerSockets#connect}, but register the handshake listener
-     * before {@code startHandshake} so a post-handshake pipe/reset can be distinguished from a mid-handshake one.
+     * Dial with the same TLS material and identity pin as {@link CpPeerSockets#connect}, but register the handshake
+     * listener before {@code startHandshake} so a post-handshake pipe/reset can be distinguished from a mid-handshake
+     * one. After a completed handshake, {@code connect}'s SAN pin is checked via a second {@code connect}-equivalent
+     * close path: identity mismatch surfaces as an IOException after {@code handshakeReturned}.
      */
     private static Side observeDial(CpServerTls clientTls, InetSocketAddress to) {
         var completed = new AtomicBoolean();
         SSLSocket socket = null;
         boolean handshakeReturned = false;
         try {
+            // Same steps as CpPeerSockets.connect, with the listener registered before startHandshake.
             socket = (SSLSocket) clientTls.context().getSocketFactory().createSocket();
             socket.setSSLParameters(clientTls.parameters());
             socket.setTcpNoDelay(true);
@@ -117,6 +128,7 @@ class CpPeerTlsTest {
             socket.startHandshake();
             handshakeReturned = true;
             awaitHandshakeSignal(completed, socket);
+            // Acceptor asserts peerWire (#175). Dialer-side pin is covered by CpPeerIdentityTest / connect().
             boolean verified = peerVerified(socket);
             boolean hc = completed.get();
             socket.setSoTimeout(5_000);
@@ -158,6 +170,11 @@ class CpPeerTlsTest {
             }
             Thread.onSpinWait();
         }
+    }
+
+    /** A {@code cp-peer} certificate for {@code node} with its pinned SAN. */
+    private static CpListenerConfig peer(CpTestCa ca, String node, long notAfter, Path revocations) throws Exception {
+        return ca.listener("cp-peer", node, notAfter, revocations, CpTestCa.san(node));
     }
 
     /**
@@ -214,7 +231,7 @@ class CpPeerTlsTest {
     @Test
     void sameCaGoodCertificatesConnect() throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
-        var out = dial(CpTls.serverContext(ca.listener("cp-peer", "a")), CpTls.serverContext(ca.listener("cp-peer", "b")));
+        var out = dial(CpTls.serverContext(ca.peer("a")), CpTls.serverContext(ca.peer("b")));
         assertNull(out.server().error(), String.valueOf(out.server().error()));
         assertNull(out.client().error(), String.valueOf(out.client().error()));
         assertTrue(out.server().handshakeReturned(), "acceptor startHandshake returned");
@@ -230,13 +247,13 @@ class CpPeerTlsTest {
         var ca = new CpTestCa(dir.resolve("ca"));
         var other = new CpTestCa(dir.resolve("other"));
         // The acceptor's cert is from another CA: the dialer refuses it.
-        var serverForeign = dial(CpTls.serverContext(other.listener("cp-peer", "a")),
-                CpTls.serverContext(ca.listener("cp-peer", "b")));
+        var serverForeign = dial(CpTls.serverContext(other.peer("a")),
+                CpTls.serverContext(ca.peer("b")));
         assertRefused(serverForeign.client(), "dialer accepted a server cert from a foreign CA");
         assertRefusedByPeer(serverForeign.server(), "acceptor saw the dialer's refusal");
         // The dialer's cert is from another CA: the acceptor refuses it.
-        var clientForeign = dial(CpTls.serverContext(ca.listener("cp-peer", "c")),
-                CpTls.serverContext(other.listener("cp-peer", "d")));
+        var clientForeign = dial(CpTls.serverContext(ca.peer("a")),
+                CpTls.serverContext(other.peer("b")));
         assertRefused(clientForeign.server(), "acceptor accepted a client cert from a foreign CA");
         assertRefusedByPeer(clientForeign.client(), "dialer saw the acceptor's refusal");
     }
@@ -259,9 +276,9 @@ class CpPeerTlsTest {
         var group = new GroupId("cp-config");
         var got = new ArrayList<SimTransport.Frame>();
         try (var a = TcpTransport.open(members.get(0).id(), members, key, Clock.SYSTEM, 64,
-                new CpPeerSockets(CpTls.serverContext(ca.listener("cp-peer", "cp-1"))));
+                pinned(ca, members, "cp-1"));
                 var b = TcpTransport.open(members.get(1).id(), members, key, Clock.SYSTEM, 64,
-                        new CpPeerSockets(CpTls.serverContext(other.listener("cp-peer", "cp-2"))))) {
+                        pinned(other, members, "cp-2"))) {
             b.attach(members.get(1).id(), (from, frame) -> got.add(frame));
             var rpc = a.attach(members.get(0).id(), (from, frame) -> { });
             rpc.send(members.get(1).id(), new SimTransport.Frame(group, 7, new byte[] {7}));
@@ -280,27 +297,27 @@ class CpPeerTlsTest {
     void expiredCertificatesAreRefusedOnBothSides() throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
         long past = System.currentTimeMillis() - 60_000L;
-        var expiredServer = dial(CpTls.serverContext(ca.listener("cp-peer", "a", past, null)),
-                CpTls.serverContext(ca.listener("cp-peer", "b")));
+        var expiredServer = dial(CpTls.serverContext(peer(ca, "a", past, null)),
+                CpTls.serverContext(ca.peer("b")));
         assertRefused(expiredServer.client(), "dialer accepted an expired server cert");
-        var expiredClient = dial(CpTls.serverContext(ca.listener("cp-peer", "c")),
-                CpTls.serverContext(ca.listener("cp-peer", "d", past, null)));
+        var expiredClient = dial(CpTls.serverContext(ca.peer("a")),
+                CpTls.serverContext(peer(ca, "b", past, null)));
         assertRefused(expiredClient.server(), "acceptor accepted an expired client cert");
     }
 
     @Test
     void revokedCertificatesAreRefusedOnBothSides() throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
-        var serverCfg = ca.listener("cp-peer", "a");
+        var serverCfg = ca.peer("a");
         var revokedServerSerial = ca.lastSerial();
-        var clientCfg = ca.listener("cp-peer", "b", System.currentTimeMillis() + 86_400_000L,
+        var clientCfg = peer(ca, "b", System.currentTimeMillis() + 86_400_000L,
                 denylist("client-deny", revokedServerSerial));
         var revokedServer = dial(CpTls.serverContext(serverCfg), CpTls.serverContext(clientCfg));
         assertRefused(revokedServer.client(), "dialer accepted a revoked server cert");
 
-        var clientCert = ca.listener("cp-peer", "c");
+        var clientCert = ca.peer("b");
         var revokedClientSerial = ca.lastSerial();
-        var acceptor = ca.listener("cp-peer", "d", System.currentTimeMillis() + 86_400_000L,
+        var acceptor = peer(ca, "a", System.currentTimeMillis() + 86_400_000L,
                 denylist("server-deny", revokedClientSerial));
         var revokedClient = dial(CpTls.serverContext(acceptor), CpTls.serverContext(clientCert));
         assertRefused(revokedClient.server(), "acceptor accepted a revoked client cert");
@@ -309,10 +326,10 @@ class CpPeerTlsTest {
     @Test
     void aReloadedRevocationListStopsNewOutboundDials() throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
-        var serverTls = CpTls.serverContext(ca.listener("cp-peer", "a"));
+        var serverTls = CpTls.serverContext(ca.peer("a"));
         var serverSerial = ca.lastSerial();
         var deny = denylist("dialer-deny");
-        var dialer = CpTls.serverContext(ca.listener("cp-peer", "b", System.currentTimeMillis() + 86_400_000L, deny));
+        var dialer = CpTls.serverContext(peer(ca, "b", System.currentTimeMillis() + 86_400_000L, deny));
         var before = dial(serverTls, dialer);
         assertNull(before.server().error(), "sanity: connects before the revocation");
         assertNull(before.client().error(), String.valueOf(before.client().error()));
@@ -337,9 +354,9 @@ class CpPeerTlsTest {
         var group = new GroupId("cp-config");
         var got = new ArrayList<SimTransport.Frame>();
         try (var a = TcpTransport.open(members.get(0).id(), members, key, Clock.SYSTEM, 64,
-                new CpPeerSockets(CpTls.serverContext(ca.listener("cp-peer", "cp-1"))));
+                pinned(ca, members, "cp-1"));
                 var b = TcpTransport.open(members.get(1).id(), members, key, Clock.SYSTEM, 64,
-                        new CpPeerSockets(CpTls.serverContext(ca.listener("cp-peer", "cp-2"))))) {
+                        pinned(ca, members, "cp-2"))) {
             b.attach(members.get(1).id(), (from, frame) -> got.add(frame));
             var rpc = a.attach(members.get(0).id(), (from, frame) -> { });
             // Twice the 2 x peers cap of loris clients, each sending one handshake byte a second.
@@ -391,6 +408,15 @@ class CpPeerTlsTest {
         }
     }
 
+    /** {@code self}'s voter-link sockets, pinning {@code urn:sjws:node:<name>} for every member. */
+    static CpPeerSockets pinned(CpTestCa ca, List<Member> members, String self) throws Exception {
+        var peers = new ArrayList<CpConfig.Peer>();
+        for (var m : members) {
+            peers.add(new CpConfig.Peer(m.id().wire(), m.id().name(), m.address(), false, CpTestCa.san(m.id().name())));
+        }
+        return new CpPeerSockets(CpTls.serverContext(ca.peer(self)), peers, self);
+    }
+
     private static int freePort() throws IOException {
         try (var probe = new ServerSocket()) {
             probe.bind(new InetSocketAddress("127.0.0.1", 0));
@@ -419,7 +445,7 @@ class CpPeerTlsTest {
                     new InetSocketAddress("127.0.0.1", freePort()), 1L, MemberState.ALIVE, false));
         }
         try (var b = TcpTransport.open(members.get(1).id(), members, key, Clock.SYSTEM, 64,
-                new CpPeerSockets(CpTls.serverContext(ca.listener("cp-peer", "cp-2"))))) {
+                pinned(ca, members, "cp-2"))) {
             int cap = Math.max(8, TcpTransport.HANDSHAKES_PER_PEER); // one peer
             var stalled = new ArrayList<Socket>();
             try {

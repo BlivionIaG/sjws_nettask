@@ -76,7 +76,8 @@ public final class AdminTls {
 
     /** One immutable generation of key, trust and revocation state. */
     record Material(X509ExtendedKeyManager keys, X509ExtendedTrustManager trust, X509Certificate[] anchors,
-            Set<String> fingerprints, Set<BigInteger> serials, List<X509CRL> crls, Stamp stamp, long gen) {
+            Set<String> fingerprints, Set<BigInteger> serials, List<X509CRL> crls, Stamp stamp, long gen,
+            X509Certificate leaf) {
 
         String revokedBy(X509Certificate cert) {
             if (fingerprints.isEmpty() && serials.isEmpty() && crls.isEmpty()) {
@@ -184,6 +185,11 @@ public final class AdminTls {
         return new Keys();
     }
 
+    /** The leaf certificate of the material in use (the one this context presents). */
+    X509Certificate leaf() {
+        return current.leaf();
+    }
+
     /** Number of successful loads, starting at 1. */
     public long generation() {
         return generation.get();
@@ -196,8 +202,20 @@ public final class AdminTls {
      * @return null on success, otherwise why the previous material was kept
      */
     public String reload() {
+        return reload(leaf -> null);
+    }
+
+    /**
+     * {@link #reload()}, but the new material is swapped in only if {@code acceptLeaf} returns null for its own leaf
+     * certificate; otherwise the previous material stays and the returned reason says why.
+     */
+    String reload(java.util.function.Function<X509Certificate, String> acceptLeaf) {
         try {
             var next = load(generation.get() + 1);
+            var refused = acceptLeaf.apply(next.leaf());
+            if (refused != null) {
+                throw new IOException(refused);
+            }
             previous = current;
             current = next;
             generation.set(next.gen());
@@ -287,7 +305,7 @@ public final class AdminTls {
                 readRevocations(revocations, anchors, fingerprints, serials, crls);
             }
             return new Material(keys, trust, anchors, Set.copyOf(fingerprints), Set.copyOf(serials),
-                    List.copyOf(crls), stamp, gen);
+                    List.copyOf(crls), stamp, gen, material.certificate());
         } catch (GeneralSecurityException e) {
             throw new IOException("admin mTLS material rejected: " + e.getMessage(), e);
         }
