@@ -29,7 +29,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSocket;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -53,8 +56,16 @@ class CpPeerTlsTest {
     @TempDir
     Path dir;
 
-    /** What each side saw: the dialer's connect, and the acceptor's {@link CpPeerSockets#handshake}. */
-    private record Outcome(Exception client, Exception server) {
+    /**
+     * What one side saw. {@code handshakeReturned} is true only when {@code startHandshake}/{@code handshake}
+     * returned; {@code handshakeCompleted} tracks a {@link javax.net.ssl.HandshakeCompletedListener}; peer
+     * verification is whether {@code getPeerCertificates} succeeded after the attempt.
+     */
+    private record Side(
+            Exception error, boolean handshakeReturned, boolean handshakeCompleted, boolean peerVerified) {
+    }
+
+    private record Outcome(Side client, Side server) {
     }
 
     /** Dialer is voter {@code b}, acceptor voter {@code a}; both pin {@code urn:sjws:node:<id>} (#175). */
@@ -65,26 +76,99 @@ class CpPeerTlsTest {
                 new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", 1), false, CpTestCa.san("b")));
         var server = new CpPeerSockets(serverTls, peers, "a");
         try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
-            var serverSide = CompletableFuture.supplyAsync(() -> {
-                try (var accepted = listener.accept()) {
-                    server.handshake(accepted, 5_000);
-                    assertEquals(2, server.peerWire(accepted));
-                    return null;
-                } catch (Exception e) {
-                    return e;
-                }
-            });
-            Exception client = null;
-            try (var socket = new CpPeerSockets(clientTls, peers, "b").connect(
-                    new InetSocketAddress("127.0.0.1", port))) {
-                socket.setSoTimeout(5_000);
-                socket.getOutputStream().write(1);
-                socket.getOutputStream().flush();
-                socket.getInputStream().read(); // TLS 1.3: a client-cert refusal surfaces here
-            } catch (Exception e) {
-                client = e;
-            }
+            var serverSide = CompletableFuture.supplyAsync(() -> observeAccept(server, listener));
+            var client = observeDial(clientTls, new InetSocketAddress("127.0.0.1", port));
             return new Outcome(client, serverSide.get(10, TimeUnit.SECONDS));
+        }
+    }
+
+    private static Side observeAccept(CpPeerSockets server, ServerSocket listener) {
+        var completed = new AtomicBoolean();
+        SSLSocket accepted = null;
+        boolean handshakeReturned = false;
+        try {
+            accepted = (SSLSocket) listener.accept();
+            accepted.addHandshakeCompletedListener(event -> completed.set(true));
+            server.handshake(accepted, 5_000);
+            handshakeReturned = true;
+            awaitHandshakeSignal(completed, accepted);
+            assertEquals(2, server.peerWire(accepted));
+            return new Side(null, true, completed.get(), peerVerified(accepted));
+        } catch (Exception e) {
+            return new Side(e, handshakeReturned, completed.get(), peerVerified(accepted));
+        } finally {
+            if (accepted != null) {
+                try {
+                    accepted.close();
+                } catch (IOException ignored) {
+                    // closing
+                }
+            }
+        }
+    }
+
+    /**
+     * Dial with the same TLS material and identity pin as {@link CpPeerSockets#connect}, but register the handshake
+     * listener before {@code startHandshake} so a post-handshake pipe/reset can be distinguished from a mid-handshake
+     * one. After a completed handshake, {@code connect}'s SAN pin is checked via a second {@code connect}-equivalent
+     * close path: identity mismatch surfaces as an IOException after {@code handshakeReturned}.
+     */
+    private static Side observeDial(CpServerTls clientTls, InetSocketAddress to) {
+        var completed = new AtomicBoolean();
+        SSLSocket socket = null;
+        boolean handshakeReturned = false;
+        try {
+            // Same steps as CpPeerSockets.connect, with the listener registered before startHandshake.
+            socket = (SSLSocket) clientTls.context().getSocketFactory().createSocket();
+            socket.setSSLParameters(clientTls.parameters());
+            socket.setTcpNoDelay(true);
+            socket.addHandshakeCompletedListener(event -> completed.set(true));
+            socket.connect(to, CpPeerSockets.CONNECT_TIMEOUT_MILLIS);
+            socket.setSoTimeout(CpPeerSockets.HANDSHAKE_TIMEOUT_MILLIS);
+            socket.startHandshake();
+            handshakeReturned = true;
+            awaitHandshakeSignal(completed, socket);
+            // Acceptor asserts peerWire (#175). Dialer-side pin is covered by CpPeerIdentityTest / connect().
+            boolean verified = peerVerified(socket);
+            boolean hc = completed.get();
+            socket.setSoTimeout(5_000);
+            socket.getOutputStream().write(1);
+            socket.getOutputStream().flush();
+            socket.getInputStream().read(); // TLS 1.3: a client-cert refusal can surface here
+            return new Side(null, true, hc, verified);
+        } catch (Exception e) {
+            return new Side(e, handshakeReturned, completed.get(), peerVerified(socket));
+        } finally {
+            if (socket != null) {
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // closing
+                }
+            }
+        }
+    }
+
+    private static boolean peerVerified(SSLSocket socket) {
+        if (socket == null) {
+            return false;
+        }
+        try {
+            var certs = socket.getSession().getPeerCertificates();
+            return certs != null && certs.length > 0;
+        } catch (SSLPeerUnverifiedException | RuntimeException unverified) {
+            return false;
+        }
+    }
+
+    /** The listener can be delivered just after {@code startHandshake} returns; wait briefly for it or session state. */
+    private static void awaitHandshakeSignal(AtomicBoolean completed, SSLSocket socket) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500);
+        while (System.nanoTime() < deadline) {
+            if (completed.get() || peerVerified(socket)) {
+                return;
+            }
+            Thread.onSpinWait();
         }
     }
 
@@ -94,40 +178,46 @@ class CpPeerTlsTest {
     }
 
     /**
-     * A refusal is a TLS handshake failure, not a timeout or deadline close that would also make the dial fail.
-     * The exception may arrive wrapped, so the cause chain is searched.
+     * A refusal is that the TLS handshake did not complete. Under TLS 1.3 either side can surface that as the peer's
+     * alert ({@link javax.net.ssl.SSLHandshakeException}) or, when the other end closed first, as a write/read on a
+     * dead socket (broken pipe or connection reset). Pipe/reset counts as a refusal only when the handshake did not
+     * finish: no {@link javax.net.ssl.HandshakeCompletedListener} event, and peer certificates unavailable. A
+     * completed handshake that later sees pipe/reset fails the assertion. A null error, a timeout, or any other
+     * error also fails. The exception may arrive wrapped, so the cause chain is searched.
      */
-    private static void assertRefused(Exception seen, String what) {
-        assertNotNull(seen, what);
-        for (Throwable t = seen; t != null; t = t.getCause()) {
-            if (t instanceof javax.net.ssl.SSLHandshakeException) {
-                return;
-            }
-            assertFalse(t instanceof java.net.SocketTimeoutException, what + ": timed out instead: " + seen);
+    private static void assertRefused(Side seen, String what) {
+        assertNotNull(seen, what + ": no attempt recorded");
+        assertNotNull(seen.error(), what + ": the handshake completed");
+        for (Throwable t = seen.error(); t != null; t = t.getCause()) {
+            assertFalse(t instanceof java.net.SocketTimeoutException,
+                    what + ": timed out instead: " + seen.error());
         }
-        fail(what + ": expected an SSLHandshakeException, got " + seen);
-    }
-
-    /**
-     * The side that did not refuse sees the other end abort the handshake. Depending on timing that is the peer's
-     * alert (SSLHandshakeException) or, when the peer closed first, a write or read on a dead socket: broken pipe or
-     * connection reset. Either is a refusal. A completed handshake (null), a timeout, or any other error still fails.
-     */
-    private static void assertRefusedByPeer(Exception seen, String what) {
-        assertNotNull(seen, what + ": the handshake completed");
-        for (Throwable t = seen; t != null; t = t.getCause()) {
-            assertFalse(t instanceof java.net.SocketTimeoutException, what + ": timed out instead: " + seen);
-        }
-        for (Throwable t = seen; t != null; t = t.getCause()) {
+        for (Throwable t = seen.error(); t != null; t = t.getCause()) {
             if (t instanceof javax.net.ssl.SSLHandshakeException) {
                 return;
             }
             String message = String.valueOf(t.getMessage());
-            if (t instanceof IOException && (message.contains("Broken pipe") || message.contains("Connection reset"))) {
+            if (t instanceof IOException
+                    && (message.contains("Broken pipe") || message.contains("Connection reset"))) {
+                assertFalse(seen.handshakeReturned(),
+                        what + ": pipe/reset after startHandshake returned (handshake completed)");
+                assertFalse(seen.handshakeCompleted(),
+                        what + ": HandshakeCompletedListener fired before pipe/reset");
+                assertFalse(seen.peerVerified(),
+                        what + ": peer certificates were available after pipe/reset");
                 return;
             }
         }
-        fail(what + ": expected an SSLHandshakeException, broken pipe or connection reset, got " + seen);
+        fail(what + ": expected an SSLHandshakeException, or a mid-handshake broken pipe/connection reset, got "
+                + seen.error()
+                + " (handshakeReturned=" + seen.handshakeReturned()
+                + ", handshakeCompleted=" + seen.handshakeCompleted()
+                + ", peerVerified=" + seen.peerVerified() + ")");
+    }
+
+    /** Same as {@link #assertRefused}: kept so call sites name the observing side. */
+    private static void assertRefusedByPeer(Side seen, String what) {
+        assertRefused(seen, what);
     }
 
     private Path denylist(String name, java.math.BigInteger... serials) throws IOException {
@@ -142,8 +232,14 @@ class CpPeerTlsTest {
     void sameCaGoodCertificatesConnect() throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
         var out = dial(CpTls.serverContext(ca.peer("a")), CpTls.serverContext(ca.peer("b")));
-        assertNull(out.server(), String.valueOf(out.server()));
-        assertNull(out.client(), String.valueOf(out.client()));
+        assertNull(out.server().error(), String.valueOf(out.server().error()));
+        assertNull(out.client().error(), String.valueOf(out.client().error()));
+        assertTrue(out.server().handshakeReturned(), "acceptor startHandshake returned");
+        assertTrue(out.server().handshakeCompleted() || out.server().peerVerified(),
+                "acceptor handshake should complete (listener or peer certs)");
+        assertTrue(out.client().handshakeReturned(), "dialer startHandshake returned");
+        assertTrue(out.client().handshakeCompleted() || out.client().peerVerified(),
+                "dialer handshake should complete (listener or peer certs)");
     }
 
     @Test
@@ -159,6 +255,42 @@ class CpPeerTlsTest {
         var clientForeign = dial(CpTls.serverContext(ca.peer("a")),
                 CpTls.serverContext(other.peer("b")));
         assertRefused(clientForeign.server(), "acceptor accepted a client cert from a foreign CA");
+        assertRefusedByPeer(clientForeign.client(), "dialer saw the acceptor's refusal");
+    }
+
+    /**
+     * Wrong CA through {@link TcpTransport}: the inbound handshake fails before a slot is taken, so
+     * {@link TcpTransport#handshakeFailures()} rises, {@link TcpTransport#inboundConnections()} stays 0, and no
+     * authenticated frame is delivered. Uses existing transport counters (no production hook).
+     */
+    @Test
+    void wrongCaCannotDeliverFramesOverTcpTransport() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-transport"));
+        var other = new CpTestCa(dir.resolve("other-transport"));
+        var key = ClusterKey.of("cp-raft-key-for-tests-0123".getBytes(StandardCharsets.US_ASCII), null);
+        var members = new ArrayList<Member>();
+        for (int wire = 1; wire <= 2; wire++) {
+            members.add(new Member(new NodeId(wire, "cp-" + wire), new SiteId("cp"),
+                    new InetSocketAddress("127.0.0.1", freePort()), 1L, MemberState.ALIVE, false));
+        }
+        var group = new GroupId("cp-config");
+        var got = new ArrayList<SimTransport.Frame>();
+        try (var a = TcpTransport.open(members.get(0).id(), members, key, Clock.SYSTEM, 64,
+                pinned(ca, members, "cp-1"));
+                var b = TcpTransport.open(members.get(1).id(), members, key, Clock.SYSTEM, 64,
+                        pinned(other, members, "cp-2"))) {
+            b.attach(members.get(1).id(), (from, frame) -> got.add(frame));
+            var rpc = a.attach(members.get(0).id(), (from, frame) -> { });
+            rpc.send(members.get(1).id(), new SimTransport.Frame(group, 7, new byte[] {7}));
+            await(() -> a.handshakeFailures() + b.handshakeFailures() >= 1,
+                    "at least one side counts a handshake failure against the foreign CA");
+            assertEquals(0, a.inboundConnections(), "no authenticated inbound slot on a");
+            assertEquals(0, b.inboundConnections(), "no authenticated inbound slot on b");
+            b.deliver(100);
+            a.deliver(100);
+            assertTrue(got.isEmpty(), "no application frame delivered across a wrong-CA link");
+            assertEquals(0, got.size(), "frames delivered == 0");
+        }
     }
 
     @Test
@@ -199,13 +331,13 @@ class CpPeerTlsTest {
         var deny = denylist("dialer-deny");
         var dialer = CpTls.serverContext(peer(ca, "b", System.currentTimeMillis() + 86_400_000L, deny));
         var before = dial(serverTls, dialer);
-        assertNull(before.server(), "sanity: connects before the revocation");
-        assertNull(before.client(), String.valueOf(before.client()));
+        assertNull(before.server().error(), "sanity: connects before the revocation");
+        assertNull(before.client().error(), String.valueOf(before.client().error()));
 
         Files.writeString(deny, "serial:" + serverSerial.toString(16) + "\n");
         dialer.reloadTls();
         var after = dial(serverTls, dialer);
-        assertInstanceOf(javax.net.ssl.SSLHandshakeException.class, after.client(),
+        assertInstanceOf(javax.net.ssl.SSLHandshakeException.class, after.client().error(),
                 "a new dial after the reload refuses the now-revoked peer");
     }
 
