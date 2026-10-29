@@ -78,6 +78,8 @@ final class Http3Writer {
     private boolean sending; // registered with the rate guard
     private long reported; // bytes reported to the rate guard
     private boolean answered; // the file couldn't be opened and an error response was sent instead
+    private final long peerMaxFieldSection; // the client's SETTINGS_MAX_FIELD_SECTION_SIZE
+    private boolean oversized; // the response was replaced because its field section exceeded that
 
     Http3Writer(QuicStreamChannel channel, Limits limits, Semaphore serverFiles, Http3Server.Connection connection) {
         this.channel = channel;
@@ -85,6 +87,25 @@ final class Http3Writer {
         this.serverFiles = serverFiles;
         this.connectionFiles = connection.files;
         this.rate = connection.rate;
+        this.peerMaxFieldSection = connection.peerMaxFieldSection;
+    }
+
+    /**
+     * RFC 9114 §4.2.2: a response field section larger than the client's SETTINGS_MAX_FIELD_SECTION_SIZE must not be
+     * sent. A client that receives one fails the whole connection (Netty: H3_EXCESSIVE_LOAD, its default limit 8 KiB),
+     * so such a response is replaced by a small 500 on its own stream (#281).
+     *
+     * @return true if {@code head} (name + value + 32 per field) fits the client's limit
+     */
+    static boolean fits(Http3HeadersFrame head, long peerMaxFieldSection) {
+        if (peerMaxFieldSection == Long.MAX_VALUE) {
+            return true;
+        }
+        long size = 0;
+        for (var e : head.headers()) {
+            size += e.getKey().length() + e.getValue().length() + 32;
+        }
+        return size <= peerMaxFieldSection;
     }
 
     static Http3HeadersFrame headersFrame(Response response, Instant now) {
@@ -137,11 +158,17 @@ final class Http3Writer {
     private Outcome send(Response response) throws IOException, InterruptedException {
         if (response.body() instanceof Body.Stream stream) {
             try (var source = stream.source()) { // closed even if the head cannot be built
-                return sendStream(headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now()), response, stream,
-                        source);
+                var head = headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now());
+                if (!fits(head, this.peerMaxFieldSection)) {
+                    return tooLargeForPeer(response);
+                }
+                return sendStream(head, response, stream, source);
             }
         }
         var head = headersFrame(response, sjws_nettask.core.DateClock.SYSTEM.now());
+        if (!fits(head, this.peerMaxFieldSection)) {
+            return tooLargeForPeer(response);
+        }
         boolean sendBody = response.sendsBody() && response.contentLength() > 0;
         if (sendBody && response.body() instanceof Body.FileBody file) {
             long deadline = System.nanoTime() + this.limits.slotWait().toNanos();
@@ -167,6 +194,15 @@ final class Http3Writer {
         }
         this.channel.writeAndFlush(head).addListener(QuicStreamChannel.SHUTDOWN_OUTPUT);
         return Outcome.COMPLETE;
+    }
+
+    /** A 500 instead of a response whose field section the client said it would not accept. */
+    private Outcome tooLargeForPeer(Response response) throws IOException, InterruptedException {
+        if (this.oversized) { // even the error page doesn't fit (an absurdly small limit): reset
+            return Outcome.FAILED;
+        }
+        this.oversized = true;
+        return send(StaticFileHandler.error(500, response.headOnly()));
     }
 
     private Outcome sendFile(Http3HeadersFrame head, Body.FileBody file) throws IOException, InterruptedException {

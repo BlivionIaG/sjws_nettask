@@ -41,9 +41,8 @@ public final class SwarmMountForTests implements AutoCloseable {
     }
 
     /**
-     * Submits one task in-process through the mounted handler: a stream task ({@code :stream}) or a unary one. HTTP/3
-     * ignores request bodies today (see {@code Http3RequestHandler}), so transport tests submit here and claim over the
-     * wire ({@code :claim} has no body). Returns the HTTP status.
+     * Submits one task in-process through the mounted handler: a stream task ({@code :stream}) or a unary one, for
+     * transport tests that only exercise {@code :claim} over the wire. Returns the HTTP status.
      */
     public int submit(String pool, boolean stream) {
         return submit(pool, stream, null);
