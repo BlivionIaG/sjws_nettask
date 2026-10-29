@@ -264,7 +264,34 @@ class CpMiddlewareSecretsTest {
                 .filter(step -> "api-key".equals(step.name())).findFirst().orElseThrow().option("keys"));
     }
 
+    @Test
+    void startupWarnNamesFilterNotSecretAndStaysQuietForFileRefs() {
+        MiddlewareSecrets.resetStartupWarnGateForTest();
+        var inline = List.of(MiddlewareSpec.of("api-key", 10, "/api/*", Map.of("keys", CANARY)));
+        var msg = MiddlewareSecrets.startupWarnMessage(inline, null, null);
+        assertNotNull(msg);
+        assertTrue(msg.contains("applied"), msg);
+        assertTrue(msg.contains("api-key"), msg);
+        assertTrue(msg.contains("keys"), msg);
+        assertTrue(msg.contains("/api/*") || msg.contains("route=/api/*"), msg);
+        assertTrue(msg.contains(MiddlewareSecrets.ROTATION_DOC), msg);
+        assertFalse(msg.contains(CANARY), msg);
+        assertFalse(msg.contains(Integer.toString(CANARY.length())), msg);
 
+        var fileOnly = List.of(MiddlewareSpec.of("api-key", 10, null, Map.of("keys-file", "/etc/sjws/api-keys")));
+        assertNull(MiddlewareSecrets.startupWarnMessage(null, fileOnly, fileOnly));
+        assertNull(MiddlewareSecrets.startupWarnMessage(fileOnly, fileOnly, fileOnly));
+
+        var activatedInline = MiddlewareSecrets.startupWarnMessage(null, inline, null);
+        assertNotNull(activatedInline);
+        assertTrue(activatedInline.contains("activated"), activatedInline);
+        assertFalse(activatedInline.contains(CANARY), activatedInline);
+
+        var lastGoodInline = MiddlewareSecrets.startupWarnMessage(null, null, inline);
+        assertNotNull(lastGoodInline);
+        assertTrue(lastGoodInline.contains("last-good"), lastGoodInline);
+        assertFalse(lastGoodInline.contains(CANARY), lastGoodInline);
+    }
 
     @Test
     void localInlineKeysStillLoadWithAWarning() throws Exception {

@@ -200,6 +200,15 @@ public final class ConfigLoader {
         if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
             document = document.withSignature(bootSignature);
         }
+        // Booted from last-good: leftover inline filter secrets are a CP operator step (file refs + rotate).
+        if (recoveredHash != null) {
+            var startup = MiddlewareSecrets.startupWarnMessage(document.middleware(), null, document.middleware());
+            if (startup != null) {
+                warnings.add(startup);
+                MiddlewareSecrets.logStartupWarn(System.getLogger(ConfigLoader.class.getName()), document.middleware(),
+                        null, document.middleware());
+            }
+        }
         return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm, haEnabled,
                 haKey, haPrevious, yamlCp, base, haMessaging);
     }

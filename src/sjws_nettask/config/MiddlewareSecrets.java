@@ -277,4 +277,83 @@ public final class MiddlewareSecrets {
         }
         return false;
     }
+
+    /**
+     * Operator doc pointer embedded in the CP startup WARN for leftover inline filter secrets.
+     * Matches the rotation note under middleware in {@code docs/user/config-file.md}.
+     */
+    public static final String ROTATION_DOC = "docs/user/config-file.md (middleware credential file refs)";
+
+    private static final java.util.concurrent.atomic.AtomicBoolean STARTUP_WARNED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Filter/option locations that still carry inline secrets. Names the filter index, name,
+     * optional route, and option key only — never a value, length, or hash. Empty when clean.
+     */
+    public static List<String> inlineLocations(List<MiddlewareSpec> middleware) {
+        if (middleware == null || middleware.isEmpty()) {
+            return List.of();
+        }
+        var out = new java.util.ArrayList<String>();
+        for (int i = 0; i < middleware.size(); i++) {
+            var step = middleware.get(i);
+            for (var key : INLINE) {
+                if (step.options().containsKey(key)) {
+                    var route = step.route() == null || step.route().isBlank() ? "" : " route=" + step.route();
+                    out.add("middleware[" + i + "] (" + step.name() + route + ") option '" + key + "'");
+                }
+            }
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * One WARN body covering applied, activated and last-good middleware that still hold inline
+     * {@code keys}/{@code hmac-keys}, or {@code null} when all three are clean. Never echoes a
+     * secret value, its length, or a hash. Points at {@link #ROTATION_DOC}.
+     */
+    public static String startupWarnMessage(List<MiddlewareSpec> applied, List<MiddlewareSpec> activated,
+            List<MiddlewareSpec> lastGood) {
+        var parts = new java.util.ArrayList<String>();
+        appendSource(parts, "applied", applied);
+        appendSource(parts, "activated", activated);
+        appendSource(parts, "last-good", lastGood);
+        if (parts.isEmpty()) {
+            return null;
+        }
+        return "control-plane config still holds inline gateway filter secrets in "
+                + String.join("; ", parts)
+                + "; move them to keys-file / hmac-keys-file, rotate the affected keys, then let a"
+                + " snapshot and compaction drop the old log entries — see " + ROTATION_DOC;
+    }
+
+    private static void appendSource(java.util.List<String> parts, String source, List<MiddlewareSpec> middleware) {
+        var locs = inlineLocations(middleware);
+        if (locs.isEmpty()) {
+            return;
+        }
+        parts.add(source + ": " + String.join(", ", locs));
+    }
+
+    /**
+     * Logs at most one WARNING per process for leftover inline secrets in applied / activated /
+     * last-good CP config. No-op when every source is clean. Safe on the CP-off path: callers must
+     * not invoke this unless CP config is being inspected.
+     */
+    public static void logStartupWarn(System.Logger log, List<MiddlewareSpec> applied,
+            List<MiddlewareSpec> activated, List<MiddlewareSpec> lastGood) {
+        var msg = startupWarnMessage(applied, activated, lastGood);
+        if (msg == null || log == null) {
+            return;
+        }
+        if (STARTUP_WARNED.compareAndSet(false, true)) {
+            log.log(System.Logger.Level.WARNING, msg);
+        }
+    }
+
+    /** Clears the once-per-process gate so tests can assert the WARN again. */
+    public static void resetStartupWarnGateForTest() {
+        STARTUP_WARNED.set(false);
+    }
 }

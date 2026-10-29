@@ -94,6 +94,9 @@ public final class CpStore implements AutoCloseable {
 
     /** Newest activated envelope, for watch threads; written only where {@code history} grows. */
     private volatile SignedSnapshot latest;
+    /** True after {@link #warnInlineSecretsAtStartup()} has inspected an activated document (or found none after a check with history). */
+    private final java.util.concurrent.atomic.AtomicBoolean inlineStartupChecked =
+            new java.util.concurrent.atomic.AtomicBoolean();
     /** Guards the watch wait and the state watch threads touch: {@code reported} and {@code joins}. */
     private final java.util.concurrent.locks.ReentrantLock watchLock = new java.util.concurrent.locks.ReentrantLock();
     private final java.util.concurrent.locks.Condition activatedChanged = watchLock.newCondition();
@@ -377,6 +380,25 @@ public final class CpStore implements AutoCloseable {
 
     public void start() {
         node.begin(Duration.ofMillis(50));
+    }
+
+    /**
+     * One WARN when the activated CP document still carries inline {@code keys}/{@code hmac-keys}.
+     * No-op until an activated document exists so Raft replay can land first; then at most once.
+     * Values are never logged.
+     */
+    public void warnInlineSecretsAtStartup() {
+        var snap = activated();
+        if (snap == null) {
+            return;
+        }
+        if (!inlineStartupChecked.compareAndSet(false, true)) {
+            return;
+        }
+        var doc = document(snap.version());
+        var middleware = doc == null ? null : doc.middleware();
+        sjws_nettask.config.MiddlewareSecrets.logStartupWarn(
+                System.getLogger(CpStore.class.getName()), null, middleware, null);
     }
 
     public boolean adminEnrolled() {
@@ -932,6 +954,7 @@ public final class CpStore implements AutoCloseable {
                 }
                 publishLatest(snapshot);
                 staged = null;
+                warnInlineSecretsAtStartup();
             }
             case RBAC -> {
                 var san = readString(body);

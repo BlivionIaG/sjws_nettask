@@ -63,7 +63,9 @@ HMAC secrets and API keys must not sit in the control-plane canonical document. 
 `keys-file` / `hmac-keys-file` so each node reads a local `0600` file; a proposal that still
 carries inline `keys` or `hmac-keys` is refused, and viewer reads mask those fields. Public JWT
 keys can travel with the projection. Publishing a new snapshot is the rotation: in-flight
-requests keep the previous filter.
+requests keep the previous filter. For clusters that still have inline secrets in older log
+entries or snapshots, see the operator note under middleware in
+[config-file.md](../user/config-file.md) (file refs, key rotation, snapshot and compaction).
 
 ## rate-limit
 
