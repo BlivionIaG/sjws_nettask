@@ -31,9 +31,11 @@ import sjws_nettask.core.StaticFileHandler;
  * with every stored hash, so the compare does not stop on the first match. The raw keys are not
  * retained.
  * <p>
- * Params: {@code keys} (comma-separated, required), {@code header} (default {@code x-api-key}),
- * {@code query} (optional query name; used only when the header is absent). Query values are not
- * percent-decoded.
+ * Params: {@code keys} (comma-separated) or {@code keys-file} (path to the same material, read
+ * with {@link sjws_nettask.config.SecureKeyFile}; exactly one is required), {@code header}
+ * (default {@code x-api-key}), {@code query} (optional query name; used only when the header is
+ * absent). Query values are not percent-decoded. A control-plane proposal must use
+ * {@code keys-file}; see {@link sjws_nettask.config.MiddlewareSecrets}.
  */
 public final class ApiKeyFilter implements RequestFilter {
 
@@ -48,8 +50,8 @@ public final class ApiKeyFilter implements RequestFilter {
     }
 
     public static RequestFilter create(MiddlewareSpec spec) {
-        var raw = spec.option("keys");
-        if (raw == null || raw.isBlank()) {
+        var raw = sjws_nettask.config.MiddlewareSecrets.resolve(spec, "keys", "api-key");
+        if (raw.isBlank()) {
             throw new IllegalArgumentException("api-key keys is required");
         }
         var parts = raw.split(",", -1);

@@ -581,7 +581,16 @@ middleware:
     options:
       upstream: http://127.0.0.1:9000
       preserve-host: "true"
+  - name: api-key
+    order: 10
+    options:
+      # keys: "alpha,beta"    # local only; WARN; refused in a CP proposal
+      keys-file: /etc/sjws/api-keys   # preferred; mode 0600/0400, owned by this process
 ```
+
+Gateway credential options (`api-key` `keys`, `jwt` `hmac-keys`) may be inline in a local
+file. Prefer `keys-file` / `hmac-keys-file`. A control-plane proposal that still carries the
+inline form is refused with 400; see [gateway filters](../development/gateway.md).
 
 `route` is `*`, `/exact`, or `/prefix/*` (and `/*` for every path that starts
 with `/`). Any other `*` is an error.

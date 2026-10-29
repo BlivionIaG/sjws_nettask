@@ -2,10 +2,14 @@ package sjws_nettask.gateway;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.SecureRandom;
@@ -17,9 +21,13 @@ import java.util.concurrent.atomic.AtomicLong;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.core.Request;
 
 class JwtFilterTest {
+
+    @TempDir
+    Path dir;
 
     private static final long NOW = 1_700_000_000L;
 
@@ -290,5 +298,21 @@ class JwtFilterTest {
             out[i] = (byte) (seed + i * 17);
         }
         return out;
+    }
+
+    @Test
+    void hmacKeysFileResolves() throws Exception {
+        var secret = bytes(32, 3);
+        var file = dir.resolve("hmac");
+        Files.writeString(file, "k:" + Encoding.base64Url(secret));
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+        var filter = JwtFilter.create(GatewayTestSupport.spec("jwt", Map.of(
+                "alg", "HS256",
+                "hmac-keys-file", file.toAbsolutePath().toString())));
+        assertNotNull(filter);
+        assertThrows(IllegalArgumentException.class, () -> JwtFilter.create(GatewayTestSupport.spec("jwt", Map.of(
+                "alg", "HS256",
+                "hmac-keys", Encoding.base64Url(secret),
+                "hmac-keys-file", file.toAbsolutePath().toString()))));
     }
 }

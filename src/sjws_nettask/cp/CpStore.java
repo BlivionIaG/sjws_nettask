@@ -425,6 +425,10 @@ public final class CpStore implements AutoCloseable {
         if (!errors.isEmpty()) {
             return Outcome.error(400, errors.get(0));
         }
+        var secret = sjws_nettask.config.MiddlewareSecrets.refuseInline(loaded.document().middleware());
+        if (secret != null) {
+            return Outcome.error(400, secret);
+        }
         if (!loaded.document().messaging().assignment().isEmpty()) {
             return Outcome.error(400, "assignment is computed by the control plane");
         }
@@ -720,6 +724,12 @@ public final class CpStore implements AutoCloseable {
         if (errors.isEmpty()) {
             errors.addAll(ConfigValidator.validate(loaded.document()));
         }
+        if (errors.isEmpty()) {
+            var secret = sjws_nettask.config.MiddlewareSecrets.refuseInline(loaded.document().middleware());
+            if (secret != null) {
+                errors.add(secret);
+            }
+        }
         if (errors.isEmpty() && !loaded.document().messaging().assignment().isEmpty()) {
             errors.add("assignment is computed by the control plane");
         }
@@ -968,9 +978,12 @@ public final class CpStore implements AutoCloseable {
     }
 
     private static String configBody(SignedSnapshot snapshot) {
+        // Mask inline gateway secrets before serving to viewers (defence in depth for any
+        // legacy snapshot that still carries them; new proposals refuse them outright).
+        var yaml = sjws_nettask.config.MiddlewareSecrets.maskYaml(snapshot.canonicalYaml());
         return "{\"version\":" + snapshot.version() + ",\"canonicalHash\":"
                 + LastGoodFiles.jsonString(snapshot.canonicalHashHex()) + ",\"yaml\":"
-                + LastGoodFiles.jsonString(snapshot.canonicalYaml()) + "}";
+                + LastGoodFiles.jsonString(yaml) + "}";
     }
 
     private static void nodeJson(StringBuilder json, String id, String role, Map<String, String> labels, String health,

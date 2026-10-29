@@ -30,7 +30,9 @@ import sjws_nettask.core.MiddlewareSpec;
 /**
  * Canonical YAML of a {@link ConfigDocument}. Key order is fixed and maps are sorted, so the
  * SHA-256 does not change when the source file only reorders keys. The TLS key password is not
- * written: it is not a file field, and a diff or a last-good copy must not carry it.
+ * written: it is not a file field, and a diff or a last-good copy must not carry it. Inline
+ * gateway secret options ({@code keys}, {@code hmac-keys}) are written as
+ * {@link MiddlewareSecrets#MASK}; their {@code *-file} counterparts keep the path.
  */
 public final class ConfigCodec {
 
@@ -308,7 +310,11 @@ public final class ConfigCodec {
             if (!step.options().isEmpty()) {
                 out.append("    options:\n");
                 for (var key : sorted(step.options())) {
-                    out.append("      ").append(yamlKey(key)).append(": ").append(quote(step.options().get(key)))
+                    var value = step.options().get(key);
+                    if (MiddlewareSecrets.INLINE.contains(key)) {
+                        value = MiddlewareSecrets.MASK;
+                    }
+                    out.append("      ").append(yamlKey(key)).append(": ").append(quote(value))
                             .append('\n');
                 }
             }

@@ -1096,6 +1096,10 @@ public final class ConfigLoader {
             } catch (IllegalArgumentException e) {
                 throw new ConfigException(path + ": " + e.getMessage());
             }
+            if (MiddlewareSecrets.hasInline(options)) {
+                warnings.add(path + ": inline keys/hmac-keys sit in the file in clear; prefer keys-file / "
+                        + "hmac-keys-file (required for control-plane proposals)");
+            }
         }
         if (!specs.isEmpty()) {
             warnings.add("middleware is stored but not applied");
