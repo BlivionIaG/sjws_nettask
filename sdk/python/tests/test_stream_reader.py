@@ -161,7 +161,7 @@ class SseTest(Base):
             self.read(sse=True)
 
     def test_error_text_fills_stream_error_message(self):
-        """#279 C2: the server sends LAST|ERROR text as a chunk event with the end event's id."""
+        """#279 C2 fallback: older servers send LAST|ERROR text as a chunk with the end event's id."""
         self.serve([b"retry: 1000\n\n", b"id: 1.0\nevent: chunk\ndata: tok\n\n",
                     b"id: 1.1\nevent: chunk\ndata: model crashed\n\nid: 1.1\nevent: end\ndata: error\n\n"])
         s = self.c.open_stream(SESSION, sse=True)
@@ -170,7 +170,32 @@ class SseTest(Base):
             for ev in s:
                 got.append(ev.data)
         self.assertEqual(b"model crashed", e.exception.message)
-        self.assertEqual([b"tok", b"model crashed"], got)  # SSE also yields it (server behaviour)
+        self.assertEqual([b"tok", b"model crashed"], got)  # old wire still yields the chunk
+
+    def test_failure_event_fills_stream_error_message(self):
+        """#282: event: failure carries LAST|ERROR text; it is not yielded as a Chunk."""
+        self.serve([b"retry: 1000\n\n", b"id: 1.0\nevent: chunk\ndata: tok\n\n",
+                    b"id: 1.1\nevent: failure\ndata: model crashed\n\nid: 1.1\nevent: end\ndata: error\n\n"])
+        s = self.c.open_stream(SESSION, sse=True)
+        got = []
+        with self.assertRaises(StreamError) as e:
+            for ev in s:
+                got.append(ev.data)
+        self.assertEqual(b"model crashed", e.exception.message)
+        self.assertEqual([b"tok"], got)
+
+    def test_failure_event_prefers_over_chunk_fallback(self):
+        """#282: when both failure and a same-id chunk appear, failure wins (should not happen on one server)."""
+        self.serve([b"retry: 1000\n\n",
+                    b"id: 1.1\nevent: chunk\ndata: old\n\n"
+                    b"id: 1.1\nevent: failure\ndata: new\n\nid: 1.1\nevent: end\ndata: error\n\n"])
+        s = self.c.open_stream(SESSION, sse=True)
+        got = []
+        with self.assertRaises(StreamError) as e:
+            for ev in s:
+                got.append(ev.data)
+        self.assertEqual(b"new", e.exception.message)
+        self.assertEqual([b"old"], got)
 
     def test_resume_uses_last_event_id(self):
         self.serve(([b"retry: 1000\n\n", b"id: 1.0\nevent: chunk\ndata: a\n\n"], True),

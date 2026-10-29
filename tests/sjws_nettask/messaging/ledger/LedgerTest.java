@@ -260,7 +260,8 @@ class LedgerTest {
         // fence (failure=), so a follow-up append can be enqueued while still pending.
         // isCompletedExceptionally() races that window (intermittent CI on ubuntu-latest).
         // get() still proves the writer fails closed on the IO error.
-        assertThrows(java.util.concurrent.ExecutionException.class, () -> w.append(List.of(b("y"))).get());
+        assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> w.append(List.of(b("y"))).get(10, java.util.concurrent.TimeUnit.SECONDS));
         w.close();
     }
 
