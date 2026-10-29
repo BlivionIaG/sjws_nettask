@@ -257,7 +257,11 @@ class LedgerTest {
         log.close(); // channel closed under the writer -> IOException on write
         var f = w.append(List.of(b("x")));
         assertThrows(java.util.concurrent.ExecutionException.class, f::get);
-        assertTrue(w.append(List.of(b("y"))).isCompletedExceptionally());
+        // Wait on get(): writeGroup fails the group futures before raising the volatile
+        // fence (failure=), so a follow-up append can be enqueued while still pending.
+        // isCompletedExceptionally() races that window (intermittent CI on ubuntu-latest).
+        // get() still proves the writer fails closed on the IO error.
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> w.append(List.of(b("y"))).get());
         w.close();
     }
 
