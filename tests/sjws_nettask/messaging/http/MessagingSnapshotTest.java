@@ -233,14 +233,16 @@ class MessagingSnapshotTest {
     /** #288 MC-B1: fetch uses max(physical start, replica.logStartOffset()), even when bytes remain on disk. */
     @Test
     void fetchBelowReplicatedLogStartIs416() throws Exception {
-        start(new LogRetention(64L << 20, java.time.Duration.ofDays(365))); // retention off for this test
+        start(new LogRetention(64L << 20, 0)); // age off; bytes high so retention does not cut for this test
         int l = leader("t");
         produce(l, 0, 80);
         var leadLog = topics.get(l).get("t", false);
         assertFalse(leadLog.log().segments().isEmpty());
         long cut = leadLog.log().segments().get(0).nextOffset();
         assertTrue(cut > 0, "need a sealed segment boundary to cut at");
-        leadLog.replica().advanceLogStart(cut).get(5, TimeUnit.SECONDS);
+        var adv = leadLog.replica().advanceLogStart(cut);
+        until(() -> { step(); return adv.isDone(); }, "advanceLogStart committed");
+        adv.get(5, TimeUnit.SECONDS);
         until(() -> leadLog.replica().logStartOffset() >= cut, "logStart advanced");
         long physical = leadLog.log().startOffset();
         long logical = leadLog.replica().logStartOffset();

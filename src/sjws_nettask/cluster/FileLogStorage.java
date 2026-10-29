@@ -780,6 +780,28 @@ public final class FileLogStorage implements LogStorage {
         var tmp = root.resolve(target.getFileName() + ".tmp");
         snapLock.lock(); // not the append lock: a snapshot's fsyncs never hold up appends of any group (#270)
         try {
+            // Reject a stale save before it replaces a newer durable image (#288 Codex P1).
+            // installFromLeader / another recordSnapshot may have published a higher index while we were off the group lock.
+            if (Files.exists(target, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                try (var existing = FileChannel.open(target, StandardOpenOption.READ,
+                        java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                    var hdr = ByteBuffer.allocate(16);
+                    while (hdr.hasRemaining()) {
+                        if (existing.read(hdr) < 0) break;
+                    }
+                    if (hdr.position() >= 16) {
+                        hdr.flip();
+                        int magic = hdr.getInt();
+                        int ver = hdr.getInt();
+                        long existingIndex = hdr.getLong();
+                        if (magic == SNAP_MAGIC && ver == SNAP_VERSION
+                                && existingIndex > snapshot.lastIncludedIndex()) {
+                            throw new IOException("stale snapshot save: index " + snapshot.lastIncludedIndex()
+                                    + " would replace durable index " + existingIndex);
+                        }
+                    }
+                }
+            }
             Files.deleteIfExists(tmp);
             var attrs = new java.util.ArrayList<java.nio.file.attribute.FileAttribute<?>>();
             if (root.getFileSystem().supportedFileAttributeViews().contains("posix")) {

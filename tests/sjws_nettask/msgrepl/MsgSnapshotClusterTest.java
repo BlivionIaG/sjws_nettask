@@ -413,7 +413,7 @@ class MsgSnapshotClusterTest {
         // Advance log start on the leader into the middle of history.
         long cut = c.data[l].log.segments().get(0).nextOffset();
         if (cut <= 0) cut = Math.max(1, end / 2);
-        c.data[l].replica.advanceLogStart(cut).get(5, java.util.concurrent.TimeUnit.SECONDS);
+        c.await(c.data[l].replica.advanceLogStart(cut));
         for (int k = 0; k < 2000 && c.data[l].replica.logStartOffset() < cut; k++) c.step();
         assertEquals(cut, c.data[l].replica.logStartOffset());
         c.cut(f);

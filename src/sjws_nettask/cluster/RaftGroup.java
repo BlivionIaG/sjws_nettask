@@ -2382,6 +2382,21 @@ final class RaftGroup {
             } finally {
                 lock.unlock();
             }
+            // Re-check under the lock right before the off-lock save so we do not start a write that
+            // FileLogStorage would then refuse (or, on a storage without the index guard, overwrite a
+            // newer install). A race after this unlock is still caught by the durable-index refuse in
+            // FileLogStorage and by the epoch / snapIndex repair below (#288 Codex P1).
+            lock.lock();
+            try {
+                refuseIfFailedClosed();
+                if (snapshot.lastIncludedIndex() <= snapIndex) {
+                    throw new IllegalArgumentException("stale snapshot: index " + snapshot.lastIncludedIndex()
+                            + " does not advance past " + snapIndex);
+                }
+                epoch = persistEpoch;
+            } finally {
+                lock.unlock();
+            }
             try {
                 // Off the lock: the fsyncs of the image never hold up this group's appends.
                 storage.saveSnapshot(groupId, snapshot);

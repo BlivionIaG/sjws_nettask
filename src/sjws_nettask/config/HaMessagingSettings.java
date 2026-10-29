@@ -121,6 +121,9 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
             "state_dir", "topics", INSECURE_PLAINTEXT, "snapshot");
 
 
+    private static final List<String> SNAPSHOT_KEYS = List.of("every_entries", "log_tail_entries", "chunk_bytes",
+            "install_rate", "port_offset", "log_segment_bytes", "max_install_bytes");
+
     private static final List<String> MEMBER_KEYS = List.of("id", "address", "http_url", "witness", "wire");
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
     /** Same rule as the messaging topic names ({@code LogTopics.NAME}). */

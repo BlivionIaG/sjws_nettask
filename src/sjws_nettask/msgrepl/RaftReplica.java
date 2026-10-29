@@ -160,6 +160,7 @@ final class RaftReplica implements Replica {
     volatile java.util.function.Consumer<String> faultHook;
 
     record Applied(long index, long term, long end) { }
+
     private final java.util.function.LongSupplier nanoClock;
     /** Single-member group: no peers renew the lease, and none can be elected instead. */
     private final boolean solo;
@@ -325,7 +326,7 @@ final class RaftReplica implements Replica {
         return new IllegalArgumentException("ha messaging: " + what + " " + why + "; refusing to start");
     }
 
-    private void writeStamp    private void writeStamp(long index, long term, long base, int count) throws IOException {
+    private void writeStamp(long index, long term, long base, int count) throws IOException {
         var b = ByteBuffer.allocate(STAMP).putLong(index).putLong(term).putLong(base).putInt(count).flip();
         this.stampLock.lock();
         try {
@@ -777,12 +778,19 @@ final class RaftReplica implements Replica {
             } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException ignored) {
                 // a failed append left nothing in flight either
             }
-            this.hooks.readersOut().lock();
+            // Pause the ledger syncer before replaceWith closes segment channels; an overlapping force would
+            // otherwise become a permanent ClosedChannelException writer failure (#288 Codex P1).
+            this.local.pauseSync();
             try {
-                this.log.replaceWith(this.staging);
-                this.local.reload();
+                this.hooks.readersOut().lock();
+                try {
+                    this.log.replaceWith(this.staging);
+                    this.local.reload();
+                } finally {
+                    this.hooks.readersOut().unlock();
+                }
             } finally {
-                this.hooks.readersOut().unlock();
+                this.local.resumeSync();
             }
             fault("install-swapped");
             // Always restore the consensus image m, never a peer-substituted pin (#288 Security B1).
@@ -809,6 +817,54 @@ final class RaftReplica implements Replica {
             this.installPending = true;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * True when {@code got} is the same consensus image as {@code m}: same index/term/endOffset/logStart/chunkBytes,
+     * same typed sections (id, flags, bytes), and the same per-segment digests. A peer pin at a higher index, or with
+     * any divergent section or chunk, is refused (#288 Security B1).
+     */
+    static boolean sameSnapshotImage(MsgSnapshot got, MsgSnapshot m) {
+        if (got.index() != m.index() || got.term() != m.term() || got.endOffset() != m.endOffset()
+                || got.logStart() != m.logStart() || got.chunkBytes() != m.chunkBytes()) {
+            return false;
+        }
+        if (!got.topic().equals(m.topic())) return false;
+        if (got.sections().size() != m.sections().size()) return false;
+        for (int i = 0; i < m.sections().size(); i++) {
+            var a = got.sections().get(i);
+            var b = m.sections().get(i);
+            if (a.id() != b.id() || a.flags() != b.flags() || !java.util.Arrays.equals(a.data(), b.data())) return false;
+        }
+        if (got.segments().size() != m.segments().size()) return false;
+        for (int i = 0; i < m.segments().size(); i++) {
+            var a = got.segments().get(i);
+            var b = m.segments().get(i);
+            if (a.base() != b.base() || a.next() != b.next() || a.bytes() != b.bytes() || a.markerNext() != b.markerNext()) {
+                return false;
+            }
+            if (a.digests().length != b.digests().length) return false;
+            for (int d = 0; d < a.digests().length; d++) {
+                if (!java.util.Arrays.equals(a.digests()[d], b.digests()[d])) return false;
+            }
+        }
+        return true;
+    }
+
+    /** Drops staging contents after a refused or failed fetch so the next peer starts clean. */
+    private void clearStaging() {
+        try {
+            if (!Files.isDirectory(this.staging)) return;
+            try (var stream = Files.list(this.staging)) {
+                stream.forEach(f -> {
+                    try {
+                        Files.deleteIfExists(f);
+                    } catch (IOException ignored) {
+                    }
+                });
+            }
+        } catch (IOException ignored) {
         }
     }
 
