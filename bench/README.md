@@ -99,5 +99,5 @@ java -cp target/classes bench/RaftPublishBench.java overload 4 10 200       # 20
 ## Swarm S2c stream gate (`bench/swarm-stream`)
 
 Credit-on producer→node→consumer over SSE and binary for the §13 token-streaming exit row (S2c PR 8).
-See [`bench/swarm-stream/README.md`](swarm-stream/README.md). Counters: `GET /swarm/v1/stream-stats`.
+See [`bench/swarm-stream/README.md`](swarm-stream/README.md). Counters: `/metrics` appendix (`sjws_swarm_stream_*`).
 

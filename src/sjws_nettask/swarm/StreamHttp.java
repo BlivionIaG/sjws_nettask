@@ -190,14 +190,14 @@ final class StreamHttp {
     }
 
     /**
-     * S2c PR 8 (N2): Prometheus text for the stream gate counters. Credit-off path does not mention
-     * {@link StreamBudget}/{@link StreamCredit}, so those classes stay unloaded ({@code ClassLoadTest}).
+     * S2c PR 8 (N2): Prometheus appendix for {@code /metrics}. Credit-off returns empty so flag-off
+     * emits nothing and does not load {@link StreamBudget}/{@link StreamCredit}.
      */
     String statsText() {
         if (this.credit == null) {
-            return StreamStats.prometheusCreditOff(this.streams.sinkDrops());
+            return StreamStats.prometheusCreditOff();
         }
-        return StreamStats.prometheus(this.credit);
+        return StreamStats.prometheus(this.credit, this.streams.sinkDrops());
     }
 
 

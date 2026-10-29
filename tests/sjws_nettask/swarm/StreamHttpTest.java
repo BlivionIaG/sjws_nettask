@@ -651,27 +651,31 @@ class StreamHttpTest {
         assertEquals(1, this.swarm.replies().streams());
     }
 
-    /** S2c PR 8 N2: {@code GET /swarm/v1/stream-stats} exports the gate counters. */
+    /** S2c PR 8 N2: credit-off {@code /metrics} appendix emits nothing (Observability review). */
     @Test
-    void streamStatsCreditOff() {
+    void streamStatsCreditOffEmitsNothing() {
         streamsOn();
-        var r = req("GET", "a", "/swarm/v1/stream-stats", new byte[0]);
-        assertEquals(200, r.status());
-        var body = SwarmHttpTest.text(r);
-        assertTrue(body.contains("sjws_swarm_stream_credit_enabled 0"), body);
-        assertTrue(body.contains("sjws_swarm_stream_sink_drops"), body);
-        assertTrue(!body.contains("node_refusals"), body);
+        var body = this.http.streams().statsText();
+        assertEquals("", body, "flag-off must emit no stream series");
     }
 
     @Test
-    void streamStatsCreditOn() {
+    void streamStatsCreditOnPrometheusNames() {
         streamsOn(TokenStreams.Config.from(Map.of("sjws.swarm.stream.credit.enabled", "true")::get));
-        var r = req("GET", "a", "/swarm/v1/stream-stats", new byte[0]);
-        assertEquals(200, r.status());
-        var body = SwarmHttpTest.text(r);
+        var body = this.http.streams().statsText();
+        assertTrue(body.contains("# TYPE sjws_swarm_stream_credit_enabled gauge"), body);
         assertTrue(body.contains("sjws_swarm_stream_credit_enabled 1"), body);
-        assertTrue(body.contains("sjws_swarm_stream_node_refusals 0"), body);
-        assertTrue(body.contains("sjws_swarm_stream_budget_underflows 0"), body);
-        assertTrue(body.contains("sjws_swarm_stream_credit_refusals 0"), body);
+        assertTrue(body.contains("# TYPE sjws_swarm_stream_node_refusals_total counter"), body);
+        assertTrue(body.contains("sjws_swarm_stream_node_refusals_total 0"), body);
+        assertTrue(body.contains("# TYPE sjws_swarm_stream_budget_underflows_total counter"), body);
+        assertTrue(body.contains("sjws_swarm_stream_budget_underflows_total 0"), body);
+        assertTrue(body.contains("# TYPE sjws_swarm_stream_credit_refusals_total counter"), body);
+        assertTrue(body.contains("sjws_swarm_stream_credit_refusals_total 0"), body);
+        assertTrue(body.contains("# HELP sjws_swarm_stream_credit_refusals_total session-scope 429s"), body);
+        assertTrue(body.contains("sjws_swarm_stream_gap_tickets_outstanding"), body);
+        assertTrue(body.contains("sjws_swarm_stream_last_tickets_outstanding"), body);
+        assertTrue(body.contains("sjws_swarm_stream_pressure_trim_bytes_total"), body);
+        assertTrue(body.contains("sjws_swarm_stream_sink_drops_total"), body);
+        assertTrue(body.contains("# HELP sjws_swarm_stream_peak_charged_bytes since start"), body);
     }
 }

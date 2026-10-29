@@ -6,13 +6,9 @@ Producer → node → consumer with **credit on**, over SSE and binary drains. A
 - report p50, p90, p99 and throughput
 - ≥ 20 s measure after 5 s warmup
 - A/A control block (same jar both arms) for the harness noise floor
-- ABBA with 3–6 valid blocks; invalid if load1 ≥ 4 at any pre-leg check or base p99 ≥ 500 µs
+- hard gate: ≥5 and ≤8 valid windows (inceptor amendment 2026-10-29 23:59); info ABBA 3–8 blocks; invalid if load1 ≥ 4 at any pre-leg check or base p99 ≥ 500 µs
 - FAIL only if sign-flip p < 0.05 **and** geomean(head/base) > 1.10
-- assert `sjws_swarm_stream_node_refusals == 0` (and report the other stream counters)
-
-**Open questions** that change pass/fail (ABBA arms, TTFT thresholds, “credit stall”, aggregation,
-1k-stream vs load1) live in `/workspace/s2c-pr8/questions.md`. Do **not** run `gate.sh` until those
-are answered.
+- assert `sjws_swarm_stream_node_refusals_total == 0` (and report the other stream counters)
 
 ## Quick start (after questions are resolved)
 
@@ -26,8 +22,16 @@ flock /tmp/sjws-bench.lock nice -n 10 \
 ```
 
 CPU pin: wrk / load gen on 0–1, server on 2–7. ZGC, `-Dsjws.swarm.pool.shards=4`, stream+credit on.
-Counters: `GET /swarm/v1/stream-stats` (Bearer token) or `/metrics` appendix when metrics are armed.
+Counters: `/metrics` appendix only (Observability-reviewed `sjws_swarm_stream_*` names).
 
 Off-mode class-load proof (credit / StreamStats stay unloaded when credit is off): see
 `ClassLoadTest` and, when new classes are added on the credit-off path, attach a
 `-Xlog:class+load` excerpt from a flag-off rr run to the PR body.
+
+## Agents
+
+`StreamHttp.MAX_SESSIONS_PER_AGENT` is 64, so the harness mints `NAGENTS` (default 20) bearer
+agents in `one.sh` and round-robins them in `drive.py` to reach 1k concurrent streams.
+
+Metric names follow the sjws Observability review (`sjws_swarm_stream_*`, counters with `_total`,
+flag-off emits nothing). Validate a scrape with `promtool check metrics`.

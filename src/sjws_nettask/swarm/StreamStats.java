@@ -17,10 +17,10 @@
 package sjws_nettask.swarm;
 
 /**
- * S2c PR 8 (N2): scrape view of the stream counters the §13 exit gate needs. Constructed only on the
- * credit-on path so {@link StreamBudget} / {@link StreamCredit} stay unloaded when credit is off
- * ({@code ClassLoadTest}). Served at {@code GET /swarm/v1/stream-stats} and as a {@code /metrics}
- * appendix when the swarm module attaches one.
+ * S2c PR 8 (N2): Prometheus appendix for the stream-gate counters. Built only on the credit-on path so
+ * {@link StreamBudget} / {@link StreamCredit} stay unloaded when credit is off ({@code ClassLoadTest}).
+ * Attached to {@code /metrics} only; names follow sjws Observability's review (counters get {@code _total},
+ * outstanding tickets are gauges, flag-off emits nothing).
  */
 final class StreamStats {
 
@@ -28,41 +28,55 @@ final class StreamStats {
     }
 
     /**
-     * Prometheus text for the credit-on counters. Names are stable for the gate; "credit stall" is
-     * reported as {@code sjws_swarm_stream_credit_refusals} (session-scope 429s) until inceptor names
-     * a distinct stall counter (see /workspace/s2c-pr8/questions.md Q3).
+     * Credit-on scrape. Metric names are under {@code sjws_swarm_stream_*} so Observability can rename
+     * them in one place.
      */
-    static String prometheus(StreamCredit credit) {
+    static String prometheus(StreamCredit credit, long sinkDrops) {
         var b = credit.budget;
-        var sb = new StringBuilder(512);
-        gauge(sb, "sjws_swarm_stream_credit_enabled", 1);
-        gauge(sb, "sjws_swarm_stream_budget_bytes", b.budgetBytes());
-        gauge(sb, "sjws_swarm_stream_charged_bytes", b.charged());
-        gauge(sb, "sjws_swarm_stream_peak_charged_bytes", b.peakCharged());
-        gauge(sb, "sjws_swarm_stream_open_sessions", b.openSessions());
-        gauge(sb, "sjws_swarm_stream_node_refusals", b.nodeRefusals());
-        gauge(sb, "sjws_swarm_stream_session_admit_refusals", b.sessionAdmitRefusals());
-        gauge(sb, "sjws_swarm_stream_budget_underflows", b.budgetUnderflows());
-        gauge(sb, "sjws_swarm_stream_pressure_trim_chunks", b.pressureTrimChunks());
-        gauge(sb, "sjws_swarm_stream_pressure_trim_bytes", b.pressureTrimBytes());
-        gauge(sb, "sjws_swarm_stream_gap_tickets", b.gapTicketsOutstanding());
-        gauge(sb, "sjws_swarm_stream_last_tickets", b.lastTicketsOutstanding());
-        gauge(sb, "sjws_swarm_stream_credit_refusals", credit.refusals());
-        gauge(sb, "sjws_swarm_stream_credit_unknown", credit.unknown());
-        gauge(sb, "sjws_swarm_stream_reserve_underflows", credit.reserveUnderflows());
+        var sb = new StringBuilder(1024);
+        gauge(sb, "sjws_swarm_stream_credit_enabled", "1 when stream credit is on", 1);
+        gauge(sb, "sjws_swarm_stream_budget_bytes", "configured node stream-memory budget in bytes", b.budgetBytes());
+        gauge(sb, "sjws_swarm_stream_charged_bytes", "bytes currently charged to the node stream budget", b.charged());
+        gauge(sb, "sjws_swarm_stream_peak_charged_bytes", "since start", b.peakCharged());
+        gauge(sb, "sjws_swarm_stream_open_sessions", "sessions holding a LAST ticket", b.openSessions());
+        gauge(sb, "sjws_swarm_stream_gap_tickets_outstanding", "gap tickets currently outstanding",
+                b.gapTicketsOutstanding());
+        gauge(sb, "sjws_swarm_stream_last_tickets_outstanding", "LAST tickets currently outstanding",
+                b.lastTicketsOutstanding());
+        counter(sb, "sjws_swarm_stream_node_refusals_total", "non-LAST chunks answered 429 with scope=node",
+                b.nodeRefusals());
+        counter(sb, "sjws_swarm_stream_session_admit_refusals_total",
+                "new sessions answered 503 at the admit watermark", b.sessionAdmitRefusals());
+        counter(sb, "sjws_swarm_stream_budget_underflows_total",
+                "releases that would have taken charged below 0 (bug counter)", b.budgetUnderflows());
+        counter(sb, "sjws_swarm_stream_pressure_trim_chunks_total", "chunks trimmed under node pressure",
+                b.pressureTrimChunks());
+        counter(sb, "sjws_swarm_stream_pressure_trim_bytes_total", "bytes trimmed under node pressure",
+                b.pressureTrimBytes());
+        counter(sb, "sjws_swarm_stream_credit_refusals_total", "session-scope 429s (credit window stalls)",
+                credit.refusals());
+        counter(sb, "sjws_swarm_stream_credit_unknown_total",
+                "non-LAST chunks answered 204 because the session is not on this node", credit.unknown());
+        counter(sb, "sjws_swarm_stream_reserve_underflows_total",
+                "releases that would have taken a reservation below 0 (bug counter)", credit.reserveUnderflows());
+        counter(sb, "sjws_swarm_stream_sink_drops_total", "chunks dropped at the sink (overflow / full)", sinkDrops);
         return sb.toString();
     }
 
-    /** Credit-off scrape: no budget/credit classes touched. */
-    static String prometheusCreditOff(long sinkDrops) {
-        var sb = new StringBuilder(128);
-        gauge(sb, "sjws_swarm_stream_credit_enabled", 0);
-        gauge(sb, "sjws_swarm_stream_sink_drops", sinkDrops);
-        return sb.toString();
+    /** Credit-off: emit nothing (AGENTS.md efficiency rule; Observability review). */
+    static String prometheusCreditOff() {
+        return "";
     }
 
-    private static void gauge(StringBuilder sb, String name, long value) {
+    private static void gauge(StringBuilder sb, String name, String help, long value) {
+        sb.append("# HELP ").append(name).append(' ').append(help).append('\n');
         sb.append("# TYPE ").append(name).append(" gauge\n");
+        sb.append(name).append(' ').append(value).append('\n');
+    }
+
+    private static void counter(StringBuilder sb, String name, String help, long value) {
+        sb.append("# HELP ").append(name).append(' ').append(help).append('\n');
+        sb.append("# TYPE ").append(name).append(" counter\n");
         sb.append(name).append(' ').append(value).append('\n');
     }
 }

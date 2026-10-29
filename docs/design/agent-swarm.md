@@ -562,11 +562,12 @@ These are the reference points for the targets below. Neither this PR nor the ta
 
 **PR 8 stream-gate harness (N4).** Scripts live under `bench/swarm-stream/` (see that README). Run under
 `flock /tmp/sjws-bench.lock`, `nice -n 10`, ZGC, `pool.shards=4`, load gen on CPUs 0–1 and server on 2–7,
-≥ 20 s measure after 5 s warmup, credit on. Counters: `GET /swarm/v1/stream-stats` (and the `/metrics`
-appendix when observability is armed). Assert `sjws_swarm_stream_node_refusals == 0`. Report p50, p90, p99
-and throughput; include an A/A noise-floor block; ABBA with 3–6 valid blocks (invalid if load1 ≥ 4 or base
-p99 ≥ 500 µs); relative FAIL only if sign-flip p < 0.05 and geomean > 1.10. Absolute §13 token-streaming
-row remains the hard S2c exit bar.
+≥ 20 s measure after 5 s warmup, credit on. Counters come from the `/metrics` appendix only
+(`sjws_swarm_stream_*`; Observability-reviewed names). Assert
+`sjws_swarm_stream_node_refusals_total == 0` (and the other hard-zero counters). Report p50, p90, p99
+and throughput; include an A/A noise-floor block; credit on vs off ABBA is information only (3–8 valid
+blocks; flag if sign-flip p < 0.05 and geomean > 1.10). Absolute §13 token-streaming row remains the
+hard S2c exit bar (median of ≥ 5 and ≤ 8 valid windows; inceptor amendment 2026-10-29 23:59).
 
 **S1c gate (decided 2026-10-14, inceptor).** The S1c latency gate is: claim p99 < 100 µs on the task-dispatch row, heartbeat loss < 2 %, and request/reply p99 < 500 µs. Dispatch is measured with **workers = the machine's vCPU count**, and every result states that core count. The reference box has 8 vCPU, so the gate is `SwarmBench dispatch 8`. The 16-worker run (16 on 8 vCPU) is reported as a **stress line, not the gate**: with more runnable workers than cores, a lock holder can be descheduled mid-section, so its p99 measures scheduling as much as code. The batched variant (`SwarmBench batched <W>x<B>`: claim up to `B` and settle with one batched fenced ack, `TaskService.ackAll`) is reported separately and is not the gate, because its claim latency is per batch, not per task. The §13 claim-1/ack-1 workload stays as it is.
 

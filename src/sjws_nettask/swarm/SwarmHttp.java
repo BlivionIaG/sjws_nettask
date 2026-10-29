@@ -345,27 +345,11 @@ final class SwarmHttp implements Handler {
         return leaseProblem(r).response();
     }
 
-    /** Non-POST requests: {@code GET stream-stats} / {@code GET replies/{session}} when streaming is on. */
+    /** Non-POST requests: {@code GET replies/{session}} when streaming is on; otherwise 404 there and 405 elsewhere. */
     private Response notPost(SwarmGate.Agent agent, Request request) {
         var target = request.target();
         int q = target.indexOf('?');
         var path = q < 0 ? target : target.substring(0, q);
-        if (PREFIX.length() + "stream-stats".length() == path.length() && path.endsWith("stream-stats")) {
-            if (this.streams == null) {
-                return problem(404, "not found", path).response();
-            }
-            if (!"GET".equals(request.method()) && !"HEAD".equals(request.method())) {
-                var r = problem(405, "method not allowed", "use GET").response();
-                r.headers().set("allow", "GET, HEAD");
-                return r;
-            }
-            // any authenticated agent may scrape; counters have no per-session secrets
-            byte[] body = this.streams.statsText().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            var h = ResponseHeaders.of().add("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                    .add("cache-control", "no-store");
-            return new Response(200, h, "HEAD".equals(request.method()) ? Body.Empty.INSTANCE : Body.Bytes.of(body),
-                    "HEAD".equals(request.method()));
-        }
         var replies = PREFIX + "replies/";
         if (!path.startsWith(replies) || path.length() == replies.length()) {
             return problem(405, "method not allowed", "use POST").withAllow();
