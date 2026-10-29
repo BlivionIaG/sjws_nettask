@@ -83,26 +83,12 @@ class CpPeerTlsTest {
     }
 
     /**
-     * A refusal is a TLS handshake failure, not a timeout or deadline close that would also make the dial fail.
-     * The exception may arrive wrapped, so the cause chain is searched.
+     * A refusal is that the TLS handshake did not complete. Under TLS 1.3 either side can surface that as the peer's
+     * alert ({@link javax.net.ssl.SSLHandshakeException}) or, when the other end closed first, as a write/read on a
+     * dead socket (broken pipe or connection reset). A completed handshake ({@code null}), a timeout, or any other
+     * error still fails. The exception may arrive wrapped, so the cause chain is searched.
      */
     private static void assertRefused(Exception seen, String what) {
-        assertNotNull(seen, what);
-        for (Throwable t = seen; t != null; t = t.getCause()) {
-            if (t instanceof javax.net.ssl.SSLHandshakeException) {
-                return;
-            }
-            assertFalse(t instanceof java.net.SocketTimeoutException, what + ": timed out instead: " + seen);
-        }
-        fail(what + ": expected an SSLHandshakeException, got " + seen);
-    }
-
-    /**
-     * The side that did not refuse sees the other end abort the handshake. Depending on timing that is the peer's
-     * alert (SSLHandshakeException) or, when the peer closed first, a write or read on a dead socket: broken pipe or
-     * connection reset. Either is a refusal. A completed handshake (null), a timeout, or any other error still fails.
-     */
-    private static void assertRefusedByPeer(Exception seen, String what) {
         assertNotNull(seen, what + ": the handshake completed");
         for (Throwable t = seen; t != null; t = t.getCause()) {
             assertFalse(t instanceof java.net.SocketTimeoutException, what + ": timed out instead: " + seen);
@@ -117,6 +103,11 @@ class CpPeerTlsTest {
             }
         }
         fail(what + ": expected an SSLHandshakeException, broken pipe or connection reset, got " + seen);
+    }
+
+    /** Same as {@link #assertRefused}: kept so call sites name the observing side. */
+    private static void assertRefusedByPeer(Exception seen, String what) {
+        assertRefused(seen, what);
     }
 
     private Path denylist(String name, java.math.BigInteger... serials) throws IOException {
@@ -148,6 +139,7 @@ class CpPeerTlsTest {
         var clientForeign = dial(CpTls.serverContext(ca.listener("cp-peer", "c")),
                 CpTls.serverContext(other.listener("cp-peer", "d")));
         assertRefused(clientForeign.server(), "acceptor accepted a client cert from a foreign CA");
+        assertRefusedByPeer(clientForeign.client(), "dialer saw the acceptor's refusal");
     }
 
     @Test
