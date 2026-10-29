@@ -23,8 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pinned for #265: unpin once all three failing tests pass on 26.04
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-24.04","macos-latest"]' || '["ubuntu-24.04"]') }}
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -67,7 +66,7 @@ jobs:
 
   mutation:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04 # Pinned for #265: unpin once all three failing tests pass on 26.04
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
