@@ -208,9 +208,20 @@ class HaMessagingStartTest {
         } finally {
             again.close();
         }
-        // The Raft port was released with the refusal.
-        try (var s = new ServerSocket(raft[0], 1, java.net.InetAddress.getLoopbackAddress())) {
-            assertEquals(raft[0], s.getLocalPort());
+        // The Raft port was released with the refusal (SO_REUSEADDR: the closed listener can sit in TIME_WAIT).
+        long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+        while (true) {
+            try (var s = new ServerSocket()) {
+                s.setReuseAddress(true);
+                s.bind(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), raft[0]), 1);
+                assertEquals(raft[0], s.getLocalPort());
+                break;
+            } catch (java.net.BindException e) {
+                if (System.nanoTime() >= deadline) {
+                    throw e;
+                }
+                Thread.sleep(50);
+            }
         }
     }
 
