@@ -98,10 +98,11 @@ def run_window(args) -> dict:
     ttft_us: list[float] = []
     inter_us: list[float] = []
     lock = threading.Lock()
-    pad = args.chunk_bytes - 8
-    if pad < 0:
-        raise SystemExit("chunk-bytes must be >= 8")
-    filler = b"\x00" * pad
+    # Emit time as 20-digit ASCII monotonic_ns + NUL pad. ASCII so SSE UTF-8
+    # replacement cannot corrupt the timestamp (binary Accept also fine).
+    if args.chunk_bytes < 21:
+        raise SystemExit("chunk-bytes must be >= 21")
+    pad = args.chunk_bytes - 20
 
     def producer(client: Client, pool: str):
         try:
@@ -110,7 +111,7 @@ def run_window(args) -> dict:
                 instrument_credit_waits(w, credit_waits)
                 while not stop.is_set():
                     emit = time.monotonic_ns()
-                    w.send(struct.pack(">Q", emit) + filler)
+                    w.send(f"{emit:020d}".encode("ascii") + (b"\x00" * pad))
                 w.finish(b"")
                 with lock:
                     writer_stats.update(w.stats)
@@ -128,10 +129,13 @@ def run_window(args) -> dict:
                 for ev in s:
                     if stop.is_set() and not first:
                         break
-                    if not isinstance(ev, Chunk) or len(ev.data) < 8:
+                    if not isinstance(ev, Chunk) or len(ev.data) < 20:
                         continue
                     recv = time.monotonic_ns()
-                    (emit,) = struct.unpack_from(">Q", ev.data, 0)
+                    try:
+                        emit = int(ev.data[:20].decode("ascii"))
+                    except ValueError:
+                        continue
                     d_us = (recv - emit) / 1e3
                     with lock:
                         lat_us.append(d_us)

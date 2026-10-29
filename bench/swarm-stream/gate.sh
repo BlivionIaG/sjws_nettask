@@ -11,7 +11,7 @@ fi
 BASE_JAR=$1; HEAD_JAR=$2; OUT=$3
 NVALID=${NVALID:-6}; CAP=${CAP:-8}; SECS=${SECS:-20}; WARMUP=${WARMUP:-5}
 STREAMS=${STREAMS:-1000}
-ACCEPT=${ACCEPT:-sse}
+ACCEPT=${ACCEPT:-binary}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 exec 9>>/tmp/sjws-bench.lock
@@ -78,6 +78,7 @@ done
 
 # --- Binary accept report-only window (Addition 1) ---
 run_one "$HEAD_JAR" head binary 0 "add1-binary" || true
+run_one "$HEAD_JAR" head sse 0 "add1-sse" || true
 
 # Aggregate + verdict
 python3 "$HERE/agg.py" "$OUT" | tee "$OUT/verdict.txt" | tee -a "$OUT/gate.log"
