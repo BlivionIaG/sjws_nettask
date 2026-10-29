@@ -35,27 +35,32 @@ import java.util.function.LongSupplier;
  * @param tailEntries   consensus log entries kept behind the snapshot point, so a briefly lagging follower catches up
  *                      from the log instead of a full install (constraint 5)
  * @param chunkBytes    digest and transfer unit of segment data
- * @param bytesPerSecond install-snapshot pacing on the sending node, shared by all its transfers (constraint 7)
- * @param check          how often each replica checks whether a snapshot is due (off the produce path)
+ * @param bytesPerSecond   install-snapshot pacing on the sending node, shared by all its transfers (constraint 7)
+ * @param check            how often each replica checks whether a snapshot is due (off the produce path)
+ * @param maxInstallBytes  optional upper bound on the sum of segment bytes in one install; {@code 0} leaves it off
  */
-record Snapshots(long everyEntries, long tailEntries, int chunkBytes, long bytesPerSecond, Duration check) {
+record Snapshots(long everyEntries, long tailEntries, int chunkBytes, long bytesPerSecond, Duration check,
+        long maxInstallBytes) {
 
     static final long DEFAULT_EVERY_ENTRIES = 10_000;
     static final long DEFAULT_TAIL_ENTRIES = 1_000;
     static final int DEFAULT_CHUNK_BYTES = 1 << 20;
     static final long DEFAULT_BYTES_PER_SECOND = 64L << 20;
     static final Duration DEFAULT_CHECK = Duration.ofMillis(200);
+    /** Off by default: the manifest size and per-chunk SHA-256 checks still bound each transfer. */
+    static final long DEFAULT_MAX_INSTALL_BYTES = 0;
 
     Snapshots {
         if (everyEntries < 1 || tailEntries < 0 || bytesPerSecond < 1) throw new IllegalArgumentException("snapshot settings");
         if (chunkBytes < MsgSnapshot.MIN_CHUNK || chunkBytes > MsgSnapshot.MAX_CHUNK) throw new IllegalArgumentException("chunk bytes");
         Objects.requireNonNull(check, "check");
         if (check.isNegative() || check.isZero()) throw new IllegalArgumentException("check interval");
+        if (maxInstallBytes < 0) throw new IllegalArgumentException("max install bytes");
     }
 
     static Snapshots defaults() {
         return new Snapshots(DEFAULT_EVERY_ENTRIES, DEFAULT_TAIL_ENTRIES, DEFAULT_CHUNK_BYTES, DEFAULT_BYTES_PER_SECOND,
-                DEFAULT_CHECK);
+                DEFAULT_CHECK, DEFAULT_MAX_INSTALL_BYTES);
     }
 
     /**

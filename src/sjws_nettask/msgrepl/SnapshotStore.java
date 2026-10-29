@@ -371,4 +371,46 @@ final class SnapshotStore {
             lock.unlock();
         }
     }
+
+    /** Test-only: publishes an already-written pin directory as the pin at {@code index}. */
+    void publishForTest(String topic, long index, Path dir, byte[] manifest) {
+        lock.lock();
+        try {
+            var t = pins.get(topic);
+            if (t == null) {
+                t = new java.util.TreeMap<>();
+                pins.put(topic, t);
+            }
+            t.put(index, new Pin(topic, index, dir, manifest));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Test-only: drops every pin of {@code topic} above {@code keepIndex}. */
+    void dropAboveForTest(String topic, long keepIndex) {
+        java.util.ArrayList<Pin> doomed = new java.util.ArrayList<>();
+        lock.lock();
+        try {
+            var t = pins.get(topic);
+            if (t == null) return;
+            var drop = new java.util.ArrayList<Long>();
+            for (var k : t.keySet()) if (k > keepIndex) drop.add(k);
+            for (var k : drop) {
+                var pin = t.remove(k);
+                if (pin != null) doomed.add(pin);
+            }
+        } finally {
+            lock.unlock();
+        }
+        for (var pin : doomed) {
+            try {
+                deleteTree(pin.dir);
+            } catch (IOException ignored) {
+            }
+        }
+        prune(topic);
+    }
+
+
 }

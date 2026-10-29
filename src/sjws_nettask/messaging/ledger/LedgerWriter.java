@@ -328,6 +328,14 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
 
     private long durableNow() { lock.lock(); try { return durable; } finally { lock.unlock(); } }
 
+    /**
+     * Fsyncs the log and advances {@link LedgerSnapshot#durableOffset} to the written end (#270 / #288 MC-N1).
+     * Prefer this over {@link SegmentedLog#force} when a snapshot must observe the durable point.
+     */
+    public void force() throws IOException {
+        forceInline();
+    }
+
     private void forceInline() throws IOException {
         log.force();
         lock.lock();

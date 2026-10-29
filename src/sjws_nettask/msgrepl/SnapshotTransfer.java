@@ -48,7 +48,7 @@ import javax.crypto.spec.SecretKeySpec;
  * {@link MsgSnapshot} manifest (sent as a chunked Raft snapshot, HMAC per frame); the segment bytes travel on this side
  * channel, one TCP connection per install, from any data node that holds a pin at or above the index asked for.
  *
- * <p><b>Trust (#175).</b> Every request is authenticated with HMAC-SHA256 under {@code HKDF-SHA256(ha.cluster_key,
+ * <p><b>Trust (#277).</b> Every request is authenticated with HMAC-SHA256 under {@code HKDF-SHA256(ha.cluster_key,
  * info "sjws-msg-snapshot-v1")} (the rotation key is accepted too), carries a fresh nonce and a timestamp checked within
  * {@link #SKEW_MS}, and a nonce seen before is refused. The server's manifest is MACed under the same key bound to both
  * nonces, so a client only trusts a manifest this cluster produced for this request. Segment bytes are not MACed: the
@@ -174,13 +174,33 @@ final class SnapshotTransfer {
 
         Server(InetSocketAddress bind, byte[] key, byte[] previous, SnapshotStore store, long bytesPerSecond,
                 LongSupplier clockMs) throws IOException {
+            this(bindChannel(bind), key, previous, store, bytesPerSecond, clockMs);
+        }
+
+        /**
+         * Uses a pre-bound {@code listener} (port already reserved). Callers that share the port map across nodes
+         * should bind with {@link ServerSocketChannel#bind} to port 0 and keep the channel until this ctor runs,
+         * so another process cannot steal the port between reservation and listen (#288 MC-N3).
+         */
+        Server(ServerSocketChannel listener, byte[] key, byte[] previous, SnapshotStore store, long bytesPerSecond,
+                LongSupplier clockMs) throws IOException {
             this.keys = new byte[][] {key, previous};
             this.store = store;
             this.limiter = new RateLimiter(bytesPerSecond);
             this.clockMs = clockMs;
-            this.listener = ServerSocketChannel.open();
-            this.listener.bind(bind, 16);
+            this.listener = listener;
             this.acceptor = Thread.ofPlatform().daemon().name("msgrepl-snapshot-server").start(this::acceptLoop);
+        }
+
+        private static ServerSocketChannel bindChannel(InetSocketAddress bind) throws IOException {
+            var ch = ServerSocketChannel.open();
+            try {
+                ch.bind(bind, 16);
+                return ch;
+            } catch (IOException e) {
+                closeQuietly(ch);
+                throw e;
+            }
         }
 
         InetSocketAddress address() throws IOException {

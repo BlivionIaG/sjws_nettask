@@ -1030,7 +1030,13 @@ final class RaftGroup {
             role = Role.FOLLOWER;
         }
         var newLeader = byWire.apply(leaderWire);
-        if (newLeader != null && !newLeader.equals(leader)) {
+        // Same sender bind as TIMEOUT_NOW / SNAP_RESP: the body's leader must be the peer this frame came from
+        // (#288 Security B2). When the transport cannot name a peer (PLAIN), from is null and the check is skipped
+        // until #277 binds the connection.
+        if (newLeader == null || (from != null && !from.equals(newLeader))) {
+            return;
+        }
+        if (!newLeader.equals(leader)) {
             leader = newLeader;
             fireLeader(after);
         }

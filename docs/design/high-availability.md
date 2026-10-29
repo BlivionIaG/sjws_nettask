@@ -503,7 +503,7 @@ When the mode resolves to replication, the composition root (`HaMessagingStart`)
 `sjws_nettask.msgrepl.HaMessaging` by name, before the server mounts the messaging module:
 
 1. One `TcpTransport` on this member's `address`, HMAC-SHA256 per frame under `ha.cluster_key`, in its own
-   frame domain `msgrepl` (tag label `sjws-msgrepl-frame `, HKDF info `sjws-msgrepl-frame-v1`), so the key
+   frame domain `msgrepl` (tag label `sjws-msgrepl-frame`, HKDF info `sjws-msgrepl-frame-v1`), so the key
    is not a heartbeat tag and a CP voter (`sjws-raft-frame-v1`) or swarm peer frame never opens here, nor the
    reverse, even under the same key. Frames are authenticated, not encrypted, and on these plain sockets the
    claimed sender is not bound to the connection: any key holder can act as any member until #277 covers this

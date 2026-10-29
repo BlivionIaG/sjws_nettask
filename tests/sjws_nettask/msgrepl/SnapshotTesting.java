@@ -26,7 +26,7 @@ public final class SnapshotTesting implements AutoCloseable {
     /** A runtime (timer off: snapshots are taken by the test) and its transfer server on {@code peers.get(self)}. */
     public static SnapshotTesting create(Path stateDir, Map<String, InetSocketAddress> peers, String self, long every, long tail,
             LongSupplier clockMs) throws IOException {
-        var settings = new Snapshots(every, tail, MsgSnapshot.MIN_CHUNK, 64L << 20, Duration.ofHours(1));
+        var settings = new Snapshots(every, tail, MsgSnapshot.MIN_CHUNK, 64L << 20, Duration.ofHours(1), 0);
         var rt = new Snapshots.Runtime(settings, stateDir, SnapshotCluster.KEY, peers, clockMs);
         var server = new SnapshotTransfer.Server(peers.get(self), SnapshotCluster.KEY, null, rt.store, settings.bytesPerSecond(), clockMs);
         return new SnapshotTesting(rt, server);

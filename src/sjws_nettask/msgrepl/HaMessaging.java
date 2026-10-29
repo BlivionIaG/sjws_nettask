@@ -150,7 +150,7 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
                 var tKey = SnapshotTransfer.deriveKey(key);
                 var tPrevious = previous == null ? null : SnapshotTransfer.deriveKey(previous);
                 var settingsS = new Snapshots(snap.everyEntries(), snap.logTailEntries(), snap.chunkBytes(),
-                        snap.installRate(), Snapshots.DEFAULT_CHECK);
+                        snap.installRate(), Snapshots.DEFAULT_CHECK, snap.maxInstallBytes());
                 runtime = new Snapshots.Runtime(settingsS, stateDir, tKey, peers, System::currentTimeMillis);
                 var me = settings.self();
                 server = new SnapshotTransfer.Server(new InetSocketAddress(me.host(), me.port() + snap.portOffset()),

@@ -636,7 +636,7 @@ final class RaftReplica implements Replica {
         if (a.index() <= this.recordedIndex) return false; // nothing new since the last one (or the one restored)
         // Constraint 1: the snapshot point must be durable in the segments, not only applied.
         if (this.local.snapshot().durableOffset() < a.end()) {
-            this.log.force();
+            this.local.force(); // advances durableOffset with the fsync (#288 MC-N1)
             if (this.log.nextOffset() < a.end()) return false; // not written yet (cannot happen: a is published after the write)
         }
         var m = this.snaps.store.pin(this.topic, this.log, a.index(), a.term(), a.end(), this.logStart, sections,
@@ -735,24 +735,42 @@ final class RaftReplica implements Replica {
                 this.installPending = true;
             }
             fault("install-marked");
-            MsgSnapshot got = null;
+            boolean fetched = false;
             long backoff = 20;
-            while (got == null && !this.closed) {
+            long maxBytes = this.snaps.settings.maxInstallBytes();
+            while (!fetched && !this.closed) {
                 for (var peer : peerOrder()) {
                     try {
-                        got = SnapshotTransfer.fetch(peer, this.snaps.key, this.topic, m.index(), this.staging,
+                        // Fetch the pin, then refuse unless it is exactly the consensus image m (#288 Security B1).
+                        var got = SnapshotTransfer.fetch(peer, this.snaps.key, this.topic, m.index(), this.staging,
                                 GroupOptions.DEFAULT_MAX_SNAPSHOT_BYTES, this.snaps.clockMs);
+                        if (!sameSnapshotImage(got, m)) {
+                            warn(this.groupId.value() + ": install from " + peer + ": pin at " + got.index()
+                                    + " does not match the consensus snapshot at " + m.index() + "; trying the next peer");
+                            clearStaging();
+                            continue;
+                        }
+                        if (maxBytes > 0) {
+                            long total = 0;
+                            for (var seg : m.segments()) total += seg.bytes();
+                            if (total > maxBytes) {
+                                throw new IOException("install of " + total + " bytes exceeds ha.snapshot.max_install_bytes "
+                                        + maxBytes);
+                            }
+                        }
+                        fetched = true;
                         break;
                     } catch (IOException e) {
+                        clearStaging();
                         warn(this.groupId.value() + ": install from " + peer + ": " + e.getMessage());
                     }
                 }
-                if (got == null) {
+                if (!fetched) {
                     Thread.sleep(backoff);
                     backoff = Math.min(2_000, backoff * 2);
                 }
             }
-            if (got == null) return;
+            if (!fetched) return;
             fault("install-fetched");
             try {
                 this.lastLocal.get(30, java.util.concurrent.TimeUnit.SECONDS); // the writer is drained: nothing in flight
@@ -767,15 +785,19 @@ final class RaftReplica implements Replica {
                 this.hooks.readersOut().unlock();
             }
             fault("install-swapped");
-            this.logStart = got.logStart();
-            this.resumeIndex = got.index();
-            this.expected = got.endOffset();
-            this.skipTo = got.endOffset();
-            this.recordedIndex = got.index();
-            this.appliedIndex = Math.max(this.appliedIndex, got.index());
-            this.lastApplied = new Applied(got.index(), got.term(), got.endOffset());
-            resetStamps(got.index(), got.term(), got.endOffset(), Long.MAX_VALUE);
-            if (this.stateful) restoreState(got);
+            // Always restore the consensus image m, never a peer-substituted pin (#288 Security B1).
+            this.logStart = m.logStart();
+            this.resumeIndex = m.index();
+            this.expected = m.endOffset();
+            this.skipTo = m.endOffset();
+            this.recordedIndex = m.index();
+            this.appliedIndex = Math.max(this.appliedIndex, m.index());
+            this.lastApplied = new Applied(m.index(), m.term(), m.endOffset());
+            resetStamps(m.index(), m.term(), m.endOffset(), Long.MAX_VALUE);
+            if (this.hooks != null && m.logStart() > 0) {
+                this.hooks.dropBelow().accept(m.logStart()); // constraint 3 / #288 MC-B1: same as the restart path
+            }
+            if (this.stateful) restoreState(m);
             this.hooks.reloaded().run();
             Files.deleteIfExists(this.installMarker);
             SnapshotStore.deleteTree(this.staging);
@@ -790,8 +812,20 @@ final class RaftReplica implements Replica {
         }
     }
 
-    /** Restores the state's section of {@code m} (empty when the snapshot has none: a state that did not exist then). */
+    /**
+     * Restores each registered state's section of {@code m} (empty when the snapshot has none). Refuses a non-empty
+     * {@link MsgSnapshot#PRODUCERS} section when no handler is registered for it (#288 MC-N2 / #278 seam).
+     */
     private void restoreState(MsgSnapshot m) {
+        var producers = m.section(MsgSnapshot.PRODUCERS);
+        if (producers != null && producers.length > 0) {
+            boolean have = false;
+            for (var st : this.states) if (st.section() == MsgSnapshot.PRODUCERS) { have = true; break; }
+            if (!have) {
+                throw new IllegalStateException(this.groupId.value()
+                        + ": snapshot carries a PRODUCERS section but no handler is registered");
+            }
+        }
         this.applyLock.lock();
         try {
             for (var st : this.states) {

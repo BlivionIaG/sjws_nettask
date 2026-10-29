@@ -3,6 +3,7 @@ package sjws_nettask.msgrepl;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.nio.channels.ServerSocketChannel;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -53,6 +54,8 @@ final class SnapshotCluster implements AutoCloseable {
     final List<Member> members;
     final VoterSet voters;
     final Map<String, InetSocketAddress> peers = new LinkedHashMap<>();
+    /** Held until each data node's {@link SnapshotTransfer.Server} takes over (#288 MC-N3). */
+    final Map<String, ServerSocketChannel> reserved = new LinkedHashMap<>();
     final DataNode[] data = new DataNode[2];
     ReplicatedNode witness;
     FileLogStorage witnessStorage;
@@ -64,7 +67,12 @@ final class SnapshotCluster implements AutoCloseable {
         this.ledgerSegmentBytes = ledgerSegmentBytes;
         this.members = List.of(member(1, false), member(2, false), member(3, true));
         this.voters = VoterSet.dataAndWitness(members.get(0), members.get(1), members.get(2));
-        for (int i = 0; i < 2; i++) peers.put("n" + (i + 1), new InetSocketAddress("127.0.0.1", freePort()));
+        for (int i = 0; i < 2; i++) {
+            var name = "n" + (i + 1);
+            var ch = reservePort();
+            reserved.put(name, ch);
+            peers.put(name, (InetSocketAddress) ch.getLocalAddress());
+        }
         for (int i = 0; i < 2; i++) data[i] = new DataNode(i);
         openWitness();
         for (int k = 0; k < 400 && leader() < 0; k++) step();
@@ -72,7 +80,7 @@ final class SnapshotCluster implements AutoCloseable {
     }
 
     static Snapshots settings(long every, long tail) {
-        return new Snapshots(every, tail, MsgSnapshot.MIN_CHUNK, 64L << 20, Duration.ofHours(1));
+        return new Snapshots(every, tail, MsgSnapshot.MIN_CHUNK, 64L << 20, Duration.ofHours(1), 0);
     }
 
     static Member member(int wire, boolean witness) {
@@ -80,6 +88,19 @@ final class SnapshotCluster implements AutoCloseable {
                 1L, MemberState.ALIVE, witness);
     }
 
+    /** Binds loopback:0 and returns the open channel (caller owns it). */
+    static ServerSocketChannel reservePort() throws IOException {
+        var ch = ServerSocketChannel.open();
+        try {
+            ch.bind(new InetSocketAddress("127.0.0.1", 0), 16);
+            return ch;
+        } catch (IOException e) {
+            ch.close();
+            throw e;
+        }
+    }
+
+    /** A free loopback port; prefers {@link #reservePort} when the socket must stay held. */
     static int freePort() throws IOException {
         try (var s = new ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
             return s.getLocalPort();
@@ -163,7 +184,13 @@ final class SnapshotCluster implements AutoCloseable {
             log = SegmentedLog.open(root.resolve("ledger"), ledgerSegmentBytes);
             writer = new LedgerWriter(log, Durability.ASYNC);
             runtime = new Snapshots.Runtime(settings, root.resolve("msgrepl"), KEY, peers, clock::currentTimeMillis);
-            server = new SnapshotTransfer.Server(peers.get(name()), KEY, null, runtime.store, settings.bytesPerSecond(), clock::currentTimeMillis);
+            var listen = reserved.remove(name());
+            if (listen == null) { // reopen after close: re-reserve
+                listen = reservePort();
+                peers.put(name(), (InetSocketAddress) listen.getLocalAddress());
+            }
+            server = new SnapshotTransfer.Server(listen, KEY, null, runtime.store, settings.bytesPerSecond(), clock::currentTimeMillis);
+            peers.put(name(), server.address()); // publish the bound address (same port)
             var hooks = new ReplicaHooks(dedup::applied, this::dropBelow, reads.writeLock(), () -> { }, dedup);
             var urls = Map.of("n1", "http://n1.test", "n2", "http://n2.test");
             replica = (RaftReplica) new RaftReplicator(node, Set.of("t"), urls, root.resolve("msgrepl").resolve("apply"),

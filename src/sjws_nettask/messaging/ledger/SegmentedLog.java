@@ -236,11 +236,13 @@ public final class SegmentedLog implements AutoCloseable {
     }
 
     /**
-     * #270 snapshot install (narrow API for the HA replication layer): replaces every segment of this log with the
-     * {@code <base>.log} files (and {@code <base>.compacted} markers) in {@code staged}, hard-linked in (copied where the
-     * file system has no links), then reopens them, recovering and validating every frame as on open. The caller
-     * guarantees that no append is in flight and excludes readers; the writer must then {@link LedgerWriter#reload}.
-     * Not atomic: the caller keeps {@code staged} and a marker until it returns, and redoes it after a crash.
+     * #270 snapshot install (narrow lasting export/import surface for the HA replication layer, with
+     * {@link #segmentFiles}, {@link #positionOf}, {@link #reload} and {@link #deleteSegment}): replaces every segment of
+     * this log with the {@code <base>.log} files (and {@code <base>.compacted} markers) in {@code staged}, hard-linked in
+     * (copied where the file system has no links), then reopens them, recovering and validating every frame as on open.
+     * The caller guarantees that no append is in flight and excludes readers; the writer must then
+     * {@link LedgerWriter#reload}. Not atomic by design: the caller keeps {@code staged} and an install marker until it
+     * returns, and redoes the swap after a crash (#288 MC-N5).
      */
     public void replaceWith(Path staged) throws IOException {
         for (var s : segments) s.close();

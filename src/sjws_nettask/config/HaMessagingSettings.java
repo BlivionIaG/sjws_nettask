@@ -98,10 +98,10 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
      * @param logSegmentBytes  the consensus log rolls into a new file at this size, so truncation frees whole files
      */
     public record Snapshot(long everyEntries, long logTailEntries, int chunkBytes, long installRate, int portOffset,
-            long logSegmentBytes) {
+            long logSegmentBytes, long maxInstallBytes) {
 
-        /** Defaults: every 10 000 entries, 1 000 kept, 1 MiB chunks, 64 MiB/s, port + 1, 16 MiB log files. */
-        public static final Snapshot DEFAULT = new Snapshot(10_000, 1_000, 1 << 20, 64L << 20, 1, 16L << 20);
+        /** Defaults: every 10 000 entries, 1 000 kept, 1 MiB chunks, 64 MiB/s, port + 1, 16 MiB log files, install size uncapped. */
+        public static final Snapshot DEFAULT = new Snapshot(10_000, 1_000, 1 << 20, 64L << 20, 1, 16L << 20, 0);
 
         public Snapshot {
             if (everyEntries < 1) throw new ConfigException("ha.snapshot.every_entries: expected at least 1");
@@ -112,6 +112,7 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
             if (installRate < 4096) throw new ConfigException("ha.snapshot.install_rate: expected at least 4k");
             if (portOffset < 1 || portOffset > 1000) throw new ConfigException("ha.snapshot.port_offset: expected 1 to 1000");
             if (logSegmentBytes < 4096) throw new ConfigException("ha.snapshot.log_segment_bytes: expected at least 4k");
+            if (maxInstallBytes < 0) throw new ConfigException("ha.snapshot.max_install_bytes: expected at least 0");
         }
     }
 
@@ -214,7 +215,8 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
                 map.containsKey("chunk_bytes") ? (int) Math.min(Integer.MAX_VALUE, size(map.get("chunk_bytes"), "ha.snapshot.chunk_bytes")) : d.chunkBytes(),
                 map.containsKey("install_rate") ? size(map.get("install_rate"), "ha.snapshot.install_rate") : d.installRate(),
                 map.containsKey("port_offset") ? (int) Math.min(Integer.MAX_VALUE, count(map.get("port_offset"), "ha.snapshot.port_offset")) : d.portOffset(),
-                map.containsKey("log_segment_bytes") ? size(map.get("log_segment_bytes"), "ha.snapshot.log_segment_bytes") : d.logSegmentBytes());
+                map.containsKey("log_segment_bytes") ? size(map.get("log_segment_bytes"), "ha.snapshot.log_segment_bytes") : d.logSegmentBytes(),
+                map.containsKey("max_install_bytes") ? size(map.get("max_install_bytes"), "ha.snapshot.max_install_bytes") : d.maxInstallBytes());
     }
 
 

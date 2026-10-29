@@ -1,6 +1,7 @@
 package sjws_nettask.messaging.http;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.InetSocketAddress;
@@ -29,6 +30,8 @@ import sjws_nettask.cluster.ReplicatedNode;
 import sjws_nettask.cluster.SimTransport;
 import sjws_nettask.cluster.SiteId;
 import sjws_nettask.cluster.VoterSet;
+import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.msgrepl.RaftReplicator;
@@ -225,5 +228,32 @@ class MessagingSnapshotTest {
             }
         }, "the same segments deleted on both");
         assertTrue(topics.get(l).get("t", false).log().totalBytes() <= 4096 + 2048);
+    }
+
+    /** #288 MC-B1: fetch uses max(physical start, replica.logStartOffset()), even when bytes remain on disk. */
+    @Test
+    void fetchBelowReplicatedLogStartIs416() throws Exception {
+        start(new LogRetention(64L << 20, java.time.Duration.ofDays(365))); // retention off for this test
+        int l = leader("t");
+        produce(l, 0, 80);
+        var leadLog = topics.get(l).get("t", false);
+        assertFalse(leadLog.log().segments().isEmpty());
+        long cut = leadLog.log().segments().get(0).nextOffset();
+        assertTrue(cut > 0, "need a sealed segment boundary to cut at");
+        leadLog.replica().advanceLogStart(cut).get(5, TimeUnit.SECONDS);
+        until(() -> leadLog.replica().logStartOffset() >= cut, "logStart advanced");
+        long physical = leadLog.log().startOffset();
+        long logical = leadLog.replica().logStartOffset();
+        assertEquals(cut, logical);
+        assertTrue(physical <= logical, "physical " + physical + " logical " + logical);
+        if (physical < logical) {
+            long below = physical;
+            var r = call(() -> http.get(l).handle(new Request("GET",
+                    "/messaging/v1/topics/t/records?offset=" + below + "&maxBytes=256", RequestHeaders.of(Map.of()))));
+            assertEquals(416, r.status(), "fetch below logical start: " + r);
+        }
+        var ok = call(() -> http.get(l).handle(new Request("GET",
+                "/messaging/v1/topics/t/records?offset=" + logical + "&maxBytes=256", RequestHeaders.of(Map.of()))));
+        assertTrue(ok.status() == 200 || ok.status() == 204, "fetch at logical start: " + ok.status());
     }
 }
