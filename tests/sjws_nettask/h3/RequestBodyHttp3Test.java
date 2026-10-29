@@ -49,6 +49,8 @@ import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.core.MiddlewareSpec;
+import sjws_nettask.gateway.RequestSizeFilter;
 import sjws_nettask.swarm.SwarmMountForTests;
 import sjws_nettask.swarm.wire.Frame;
 import sjws_nettask.swarm.wire.StreamChunk;
@@ -358,6 +360,69 @@ class RequestBodyHttp3Test {
             var reset = H3TestClient.get(tiny, "/f.txt");
             assertTrue(reset.reset(), "reset, not a field section the client refuses");
             assertTrue(tiny.isActive());
+        } finally {
+            server.close();
+        }
+    }
+
+    /** A filter that short-circuits never calls the terminal: the body is abandoned, the connection stays usable. */
+    @Test
+    void aShortCircuitFilterDoesNotLeakTheBody() throws Exception {
+        Assumptions.assumeTrue(Http3Server.isAvailable(),
+                () -> "native QUIC unavailable: " + Http3Server.unavailabilityCause());
+        var terminalHit = new java.util.concurrent.atomic.AtomicBoolean();
+        var server = echoServer(ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0).build(),
+                (request, next) -> {
+                    if (request.target().startsWith("/deny")) {
+                        return StaticFileHandler.error(403, request.headOnly()); // no proceed: body unread
+                    }
+                    terminalHit.set(true);
+                    return next.proceed(request);
+                });
+        try (var client = new H3TestClient(server.tls().certificate())) {
+            var quic = client.connect(server.localAddress());
+            var body = new byte[200_000];
+            new Random(9).nextBytes(body);
+            var denied = send(quic, "POST", "/deny", body, true);
+            assertEquals(403, denied.status(), () -> "reset=" + denied.reset() + " error=" + denied.error());
+            assertFalse(terminalHit.get(), "the terminal must not run");
+            // the same connection still accepts a body-carrying request
+            var ok = send(quic, "POST", "/echo", "alive".getBytes(StandardCharsets.UTF_8), true);
+            assertEquals(200, ok.status(), () -> "reset=" + ok.reset() + " error=" + ok.error());
+            assertEquals("alive", new String(ok.body(), StandardCharsets.UTF_8));
+        } finally {
+            server.close();
+        }
+    }
+
+    /** {@link RequestSizeFilter} over HTTP/3: a declared body over {@code max-bytes} is 413 before the terminal runs. */
+    @Test
+    void requestSizeFilterRejectsAnOversizedDeclaredBody() throws Exception {
+        Assumptions.assumeTrue(Http3Server.isAvailable(),
+                () -> "native QUIC unavailable: " + Http3Server.unavailabilityCause());
+        var size = RequestSizeFilter.create(MiddlewareSpec.of("request-size", 0, null, java.util.Map.of("max-bytes", "1024")));
+        var terminalHit = new java.util.concurrent.atomic.AtomicBoolean();
+        var files = new StaticFileHandler(this.root);
+        var chain = RequestFilters.create().add(size).add((request, next) -> {
+            if (request.target().startsWith("/echo")) {
+                terminalHit.set(true);
+                return echo(request);
+            }
+            return next.proceed(request);
+        }).build(files);
+        var config = ServerConfig.builder(this.root).h3Enabled(true).h3Host("127.0.0.1").h3Port(0).build();
+        var server = (Http3Server) H3Transports.defaultFactory().create(config, files, chain);
+        server.start();
+        try (var client = new H3TestClient(server.tls().certificate())) {
+            var quic = client.connect(server.localAddress());
+            var big = new byte[2048];
+            var refused = send(quic, "POST", "/echo", big, true);
+            assertEquals(413, refused.status(), () -> "reset=" + refused.reset() + " error=" + refused.error());
+            assertFalse(terminalHit.get(), "RequestSizeFilter must short-circuit before the terminal");
+            var ok = send(quic, "POST", "/echo", new byte[512], true);
+            assertEquals(200, ok.status(), () -> "reset=" + ok.reset() + " error=" + ok.error());
+            assertTrue(terminalHit.get());
+            assertEquals("512", ok.header("x-received"));
         } finally {
             server.close();
         }
