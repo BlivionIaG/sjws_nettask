@@ -211,7 +211,8 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         if (this.shared.attachBodies() && !request.headOnly() && !"GET".equals(request.method())) {
             long length = contentLength(headers);
             if (length != 0) {
-                this.body = new Http2RequestBody(stream, length, this.shared.writeTimeout().toNanos());
+                Runnable sendContinue = expectContinue(headers) ? () -> send100(stream) : null;
+                this.body = new Http2RequestBody(stream, length, this.shared.writeTimeout().toNanos(), sendContinue);
                 request = request.withBody(this.body);
                 if (endStream) {
                     this.body.end();
@@ -243,6 +244,24 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         } catch (NumberFormatException e) {
             return -1;
         }
+    }
+
+    /** RFC 9110 §10.1.1: only {@code 100-continue} is recognized (case-insensitive). */
+    static boolean expectContinue(Http2Headers headers) {
+        var value = headers.get("expect");
+        return value != null && value.toString().equalsIgnoreCase("100-continue");
+    }
+
+    /** Interim {@code :status: 100} without END_STREAM; safe to call from a request thread. */
+    static void send100(Http2StreamChannel stream) {
+        stream.eventLoop().execute(() -> {
+            if (!stream.isActive()) {
+                return;
+            }
+            var headers = new DefaultHttp2Headers();
+            headers.status("100");
+            stream.writeAndFlush(new DefaultHttp2HeadersFrame(headers, false));
+        });
     }
 
     @Override

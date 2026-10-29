@@ -84,7 +84,46 @@ class H2ConfigAndWiringTest {
     }
 
     /** Filters (access rules, routes, middleware) apply to HTTP/2 exactly as to HTTP/1.1. */
+    /**
+     * #289 P1: {@link SjwsServer#startH2} arms HTTP/2 with a live-snapshot lambda that is never a
+     * {@link sjws_nettask.core.StaticFileHandler}. Bodies must stay off for static-only production wiring.
+     */
     @Test
+    void productionStaticArmKeepsBodiesOff() throws Exception {
+        try (var server = SjwsServer.start(config())) {
+            var h2 = (Http2Server) server.h2();
+            assertNotNull(h2);
+            assertFalse(h2.attachBodies(),
+                    "production live-snapshot arm must not enable bodies on a static-only server");
+        }
+    }
+
+    /** A filter chain at startup needs bodies/fields (RequestSizeFilter, echo, etc.). */
+    @Test
+    void aFilterChainAtStartupEnablesBodies() throws Exception {
+        var filters = sjws_nettask.core.RequestFilters.create().add((request, next) -> next.proceed(request));
+        try (var server = SjwsServer.start(config(), filters)) {
+            assertTrue(((Http2Server) server.h2()).attachBodies());
+        }
+    }
+
+    /** Hot-swap style: arming a chain turns bodies on; re-arming the static live snapshot turns them off. */
+    @Test
+    void armHandlerHotSwapTogglesBodies() throws Exception {
+        try (var server = SjwsServer.start(config())) {
+            var h2 = (Http2Server) server.h2();
+            assertFalse(h2.attachBodies());
+            var chain = sjws_nettask.core.RequestFilters.create()
+                    .add((request, next) -> next.proceed(request))
+                    .build(request -> sjws_nettask.core.StaticFileHandler.error(404, false));
+            h2.armHandler(chain);
+            assertTrue(h2.attachBodies());
+            h2.armHandler(request -> server.handler().handle(request), false);
+            assertFalse(h2.attachBodies());
+        }
+    }
+
+        @Test
     void requestFiltersApplyOverHttp2() throws Exception {
         var filters = sjws_nettask.core.RequestFilters.create().add((request, next) ->
                 request.target().startsWith("/blocked")

@@ -399,11 +399,72 @@ class RequestBodyHttp2Test {
             }
         }
         var s = new String(hpack, StandardCharsets.ISO_8859_1);
-        for (int code : new int[] {200, 400, 403, 404, 413, 500}) {
+        for (int code : new int[] {100, 200, 400, 403, 404, 413, 500}) {
             if (s.contains(Integer.toString(code))) {
                 return code;
             }
         }
         return -1;
+    }
+
+    /**
+     * #289 P2: Expect: 100-continue must get an interim 100 before the client sends DATA; a rejecting
+     * filter must not send 100 (final response only).
+     */
+    @Test
+    void expectContinueReceives100BeforeBody() throws Exception {
+        startEcho();
+        try (var h2 = new RawH2(this.server.h2cPort(), 65535)) {
+            var body = "ping".getBytes(StandardCharsets.ISO_8859_1);
+            h2.frame(RawH2.HEADERS, RawH2.END_HEADERS, 1,
+                    RawH2.block("POST", "/echo", "content-length", Integer.toString(body.length), "expect",
+                            "100-continue"));
+            Integer interim = null;
+            for (RawH2.Frame f; (f = h2.read()) != null;) {
+                if (f.stream() == 1 && f.type() == RawH2.HEADERS) {
+                    interim = statusFrom(f.payload());
+                    break;
+                }
+            }
+            assertEquals(100, interim, "server must send 100 Continue before the body arrives");
+            h2.frame(RawH2.DATA, RawH2.END_STREAM, 1, body);
+            var finalResponse = readResponse(h2, 1);
+            assertEquals(200, finalResponse.status());
+            assertEquals("ping", new String(finalResponse.body(), StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    void expectContinueIsSkippedWhenAFilterRejectsWithoutReading() throws Exception {
+        var size = RequestSizeFilter.create(
+                MiddlewareSpec.of("request-size", 0, null, java.util.Map.of("max-bytes", "8")));
+        var files = new StaticFileHandler(this.root);
+        var chain = RequestFilters.create().add(size).add((request, next) -> {
+            if (request.target().startsWith("/echo")) {
+                return echo(request);
+            }
+            return next.proceed(request);
+        }).build(files);
+        var config = ServerConfig.builder(this.root).h2Enabled(true).h2Port(0).h2cPort(0).build();
+        this.server = new Http2Server(config, files, TLS, Http2Server.Limits.DEFAULT).start();
+        this.server.armHandler(chain);
+        try (var h2 = new RawH2(this.server.h2cPort(), 65535)) {
+            h2.frame(RawH2.HEADERS, RawH2.END_HEADERS, 1,
+                    RawH2.block("POST", "/echo", "content-length", "64", "expect", "100-continue"));
+            // no DATA: filter rejects on declared length
+            Integer first = null;
+            for (RawH2.Frame f; (f = h2.read()) != null;) {
+                if (f.stream() == 1 && f.type() == RawH2.HEADERS) {
+                    first = statusFrom(f.payload());
+                    if ((f.flags() & RawH2.END_STREAM) != 0 || first != 100) {
+                        break;
+                    }
+                }
+                if (f.stream() == 1 && f.type() == RawH2.RST_STREAM) {
+                    break;
+                }
+            }
+            assertEquals(413, first, "rejecting filter must answer 413 without a prior 100, got " + first);
+        }
     }
 }

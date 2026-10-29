@@ -23,6 +23,7 @@ import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2Exception;
 import java.time.Duration;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.HandlerRef;
@@ -46,7 +47,7 @@ class Http2SmallPartsTest {
         Handler armed = r -> null;
         var ref = new HandlerRef();
         var shared = new Http2Server.Shared(startup, null, new Semaphore(1), new Semaphore(1), Duration.ofSeconds(1),
-                new LongAdder(), Http2Server.Limits.DEFAULT, ref);
+                new LongAdder(), Http2Server.Limits.DEFAULT, ref, new AtomicBoolean(false));
         assertSame(startup, shared.live());
         ref.set(armed);
         assertSame(armed, shared.live());

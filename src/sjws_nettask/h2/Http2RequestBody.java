@@ -51,6 +51,7 @@ final class Http2RequestBody implements RequestBody {
     private final Http2StreamChannel stream;
     private final long length;
     private final long timeoutNanos;
+    private final Runnable sendContinue; // null when Expect: 100-continue was absent
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition changed = this.lock.newCondition();
     // guarded by lock
@@ -63,17 +64,26 @@ final class Http2RequestBody implements RequestBody {
     private boolean resumeQueued;
     private long received; // bytes handed to the reader
     private boolean sawData; // a non-empty DATA frame arrived
+    private boolean continueDue; // Expect: 100-continue; cleared on first length()/read
     private long resolved = UNRESOLVED; // length() without a content-length: 0 or -1 once decided
     private static final long UNRESOLVED = -2;
 
     /**
      * @param length the declared {@code content-length}, or -1
      * @param timeoutNanos how long one {@link #read} waits for bytes
+     * @param sendContinue send interim {@code :status: 100} on the event loop, or null
      */
-    Http2RequestBody(Http2StreamChannel stream, long length, long timeoutNanos) {
+    Http2RequestBody(Http2StreamChannel stream, long length, long timeoutNanos, Runnable sendContinue) {
         this.stream = stream;
         this.length = length;
         this.timeoutNanos = timeoutNanos;
+        this.sendContinue = sendContinue;
+        this.continueDue = sendContinue != null;
+    }
+
+    /** Test seam / call sites that never expect 100 Continue. */
+    Http2RequestBody(Http2StreamChannel stream, long length, long timeoutNanos) {
+        this(stream, length, timeoutNanos, null);
     }
 
     /**
@@ -81,10 +91,41 @@ final class Http2RequestBody implements RequestBody {
      * DATA frame or its end: a request that ends without content is 0 (as an absent body is on HTTP/1.1), one that
      * carries content is -1 (unknown). The answer is fixed once given.
      */
+    /** Sends 100 Continue once, before the handler blocks on the peer (mirrors HTTP/1.1 BodyReader). */
+    private void ensureContinue() {
+        boolean send;
+        this.lock.lock();
+        try {
+            send = this.continueDue && !this.abandoned;
+            this.continueDue = false;
+        } finally {
+            this.lock.unlock();
+        }
+        if (send) {
+            this.sendContinue.run();
+        }
+    }
+
     @Override
     public long length() {
         if (this.length >= 0) {
             return this.length;
+        }
+        boolean needContinue;
+        this.lock.lock();
+        try {
+            if (this.resolved != UNRESOLVED) {
+                return this.resolved;
+            }
+            needContinue = this.continueDue && !this.abandoned;
+            if (needContinue) {
+                this.continueDue = false;
+            }
+        } finally {
+            this.lock.unlock();
+        }
+        if (needContinue) {
+            this.sendContinue.run(); // peer may be waiting before the first DATA
         }
         this.lock.lock();
         try {
@@ -156,6 +197,7 @@ final class Http2RequestBody implements RequestBody {
     @Override
     public int read(byte[] into, int off, int len) throws IOException {
         Objects.checkFromIndexSize(off, len, into.length);
+        ensureContinue();
         boolean resume = false;
         int n;
         this.lock.lock();
@@ -230,6 +272,7 @@ final class Http2RequestBody implements RequestBody {
                 return;
             }
             this.abandoned = true;
+            this.continueDue = false;
             stopSending = !this.ended && !this.failed;
             ByteBuf b;
             while ((b = this.queue.poll()) != null) {

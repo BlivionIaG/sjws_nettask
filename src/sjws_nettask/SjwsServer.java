@@ -527,8 +527,9 @@ public final class SjwsServer implements AutoCloseable {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
             if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-                // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies
-                http2.armHandler(request -> this.live.handler().handle(request));
+                // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies.
+                // The wrapper is never a StaticFileHandler; keep bodies off until a chain/terminal is armed (#289 P1).
+                http2.armHandler(request -> this.live.handler().handle(request), false);
             }
             transport.start();
             this.h2 = transport;
