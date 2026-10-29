@@ -47,13 +47,26 @@ public final class CpLaunch {
     /** Called reflectively by {@code sjws_nettask.service.ServiceLaunch}. */
     public static CpReloadable launch(Map<String, Object> yamlCp, Path configBase, PrintStream err)
             throws IOException {
+        return launch(yamlCp, configBase, err, null, null);
+    }
+
+    /**
+     * As {@link #launch(Map, Path, PrintStream)}, with the HA cluster key this process resolved from its config
+     * ({@code ha.cluster_key}, {@code ha.cluster_key_file}, or the environment), so the CP Raft key can be refused
+     * when equal to it. Called reflectively by {@code sjws_nettask.service.ServiceLaunch}.
+     *
+     * @param haKey         the resolved HA cluster key, or null when {@code ha.enabled} is false
+     * @param haKeyPrevious its rotation key, or null
+     */
+    public static CpReloadable launch(Map<String, Object> yamlCp, Path configBase, PrintStream err, byte[] haKey,
+            byte[] haKeyPrevious) throws IOException {
         CpConfig config;
         try {
             config = CpConfig.fromSystem(yamlCp, configBase);
         } catch (IllegalArgumentException e) {
             throw new IOException("control role config: " + e.getMessage(), e);
         }
-        return start(config, production(yamlCp, configBase), err);
+        return start(config, production(yamlCp, configBase, haKey, haKeyPrevious), err);
     }
 
     public static CpReloadable start(CpConfig config, CpHostDeps deps, PrintStream err) throws IOException {
@@ -136,6 +149,16 @@ public final class CpLaunch {
      * to {@code WEB_SERVER_HA_CLUSTER_KEY} (or its previous key). No value is ever printed.
      */
     static ClusterKey peerKey(Map<String, String> env) throws IOException {
+        return peerKey(env, null, null);
+    }
+
+    /**
+     * As {@link #peerKey(Map)}, and also refused when equal to {@code haConfigKey} or {@code haConfigKeyPrevious}:
+     * the HA cluster key this process resolved from {@code ha.cluster_key} / {@code ha.cluster_key_file} in its config
+     * (the environment variables alone miss a key set only in the file). Null entries are skipped.
+     */
+    static ClusterKey peerKey(Map<String, String> env, byte[] haConfigKey, byte[] haConfigKeyPrevious)
+            throws IOException {
         var raw = env.get(RAFT_KEY_ENV);
         if (raw == null || raw.isBlank()) {
             throw new IOException("cp.peers needs the CP-only Raft frame key: set " + RAFT_KEY_ENV
@@ -172,6 +195,16 @@ public final class CpLaunch {
                         + ": data nodes hold the HA key; refusing to start");
             }
         }
+        for (var haKeyFromConfig : new byte[][] {haConfigKey, haConfigKeyPrevious}) {
+            if (haKeyFromConfig == null) {
+                continue;
+            }
+            if (java.security.MessageDigest.isEqual(haKeyFromConfig, current)
+                    || (previous != null && java.security.MessageDigest.isEqual(haKeyFromConfig, previous))) {
+                throw new IOException(RAFT_KEY_ENV + " must differ from the HA cluster key (ha.cluster_key):"
+                        + " data nodes hold the HA key; refusing to start");
+            }
+        }
         return ClusterKey.of(current, previous);
     }
 
@@ -180,6 +213,13 @@ public final class CpLaunch {
      * {@link TcpTransport} (#158) over the {@code cp-peer} listener TLS for {@code cp.peers}.
      */
     static CpHostDeps production(Map<String, Object> yamlCp, Path configBase) {
+        return production(yamlCp, configBase, null, null);
+    }
+
+    /** As {@link #production(Map, Path)}; the CP Raft key must also differ from {@code haKey}/{@code haKeyPrevious}. */
+    static CpHostDeps production(Map<String, Object> yamlCp, Path configBase, byte[] haKey, byte[] haKeyPrevious) {
+        var haCurrent = haKey == null ? null : haKey.clone();
+        var haPrevious = haKeyPrevious == null ? null : haKeyPrevious.clone();
         var tls = yamlCp == null ? null : yamlCp.get("tls");
         boolean insecure = yamlCp != null && Boolean.TRUE.equals(yamlCp.get("insecureSkipPermissionChecks"));
         return new CpHostDeps() {
@@ -190,7 +230,7 @@ public final class CpLaunch {
 
             @Override
             public ClusterTransport transport(CpConfig config, CpServerTls peerTls) throws IOException {
-                return tcpTransport(config, peerTls, peerKey(System.getenv()), Clock.SYSTEM);
+                return tcpTransport(config, peerTls, peerKey(System.getenv(), haCurrent, haPrevious), Clock.SYSTEM);
             }
 
             @Override

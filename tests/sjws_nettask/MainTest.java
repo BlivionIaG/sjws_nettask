@@ -131,6 +131,39 @@ class MainTest {
     }
 
     @Test
+    void signalHookWaitsForTheModulesToCloseOnceTheMainThreadReported() throws Exception {
+        var root = Files.createDirectory(this.root.resolve("modules"));
+        try (var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3)) {
+            var task = new Sjws_nettask.Shutdown(server, new AtomicReference<>(), out, err);
+            task.markServing();
+            task.awaitModulesOnSignal(Duration.ofSeconds(10));
+            var hook = new Thread(task, "shutdown");
+            task.bind(hook);
+            hook.start();
+            task.reportTerminated();
+            hook.join(300);
+            assertTrue(hook.isAlive(), "the hook returned (and the JVM would halt) while the modules were closing");
+            task.modulesClosed();
+            hook.join(5_000);
+            assertFalse(hook.isAlive());
+        }
+
+        outBytes.reset();
+        try (var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3)) {
+            var task = new Sjws_nettask.Shutdown(server, new AtomicReference<>(), out, err);
+            task.markServing();
+            task.awaitModulesOnSignal(Duration.ofMillis(50));
+            var hook = new Thread(task, "shutdown");
+            task.bind(hook);
+            hook.start();
+            task.reportTerminated();
+            hook.join(5_000);
+            assertFalse(hook.isAlive(), "bounded by the close wait");
+            assertTrue(err().contains("modules still closing"), err());
+        }
+    }
+
+    @Test
     void signalHookWaitsForTheTerminationLine() throws Exception {
         var root = Files.createDirectory(this.root.resolve("hook"));
         try (var server = SjwsServer.start(ServerConfig.builder(root).port(0).build(), NO_H3)) {

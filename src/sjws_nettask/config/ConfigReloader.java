@@ -35,8 +35,11 @@ public final class ConfigReloader {
     private final String[] args;
     private final java.util.Map<String, String> env;
     private final ServerConfig.PasswordFileReader passwords;
+    /** {@code ha.messaging} as the process started; read once, so a reload only reports a change. */
+    private final HaMessagingSettings haMessaging;
 
     public ConfigReloader(ConfigLoader.Loaded loaded) {
+        this.haMessaging = loaded.haMessaging();
         this.args = loaded.args();
         this.env = loaded.env();
         this.passwords = loaded.passwords();
@@ -54,7 +57,33 @@ public final class ConfigReloader {
                     : loaded.errors();
             return ReloadResult.rejected(current, errors);
         }
-        return apply(current, loaded.document(), http3Running, board, loaded.warnings(), false);
+        return apply(current, loaded.document(), http3Running, board, loaded.warnings(), false,
+                haRestart(this.haMessaging, loaded.haMessaging()));
+    }
+
+    /**
+     * {@code ha.messaging}, {@code ha.topics} and {@code ha.members} (and the other msg settings) are read once at
+     * startup: a reload that changes them applies nothing there, and says so instead of staying silent.
+     */
+    static List<String> haRestart(HaMessagingSettings running, HaMessagingSettings fresh) {
+        var out = new ArrayList<String>();
+        if (running.mode() != fresh.mode() || running.replicate() != fresh.replicate()) {
+            out.add("ha.messaging changed to " + fresh.mode().key() + "; still " + running.mode().key()
+                    + (running.replicate() ? " (replicating)" : " (single node)") + " until restart");
+        }
+        if (!running.topics().equals(fresh.topics())) {
+            out.add("ha.topics changed; still " + new java.util.TreeSet<>(running.topics()) + " until restart");
+        }
+        if (!running.members().equals(fresh.members()) || !Objects.equals(running.nodeId(), fresh.nodeId())) {
+            out.add("ha.members or ha.node_id changed; still the startup member list until restart");
+        }
+        if (!running.electionTimeout().equals(fresh.electionTimeout()) || !running.heartbeat().equals(fresh.heartbeat())
+                || !Objects.equals(running.stateDir(), fresh.stateDir())
+                || running.insecurePlaintext() != fresh.insecurePlaintext()) {
+            out.add("ha.election_timeout, ha.heartbeat, ha.state_dir or ha.messaging_insecure_plaintext changed;"
+                    + " still the startup values until restart");
+        }
+        return out;
     }
 
     /**
@@ -67,11 +96,11 @@ public final class ConfigReloader {
      */
     public ReloadResult apply(ConfigSnapshot current, ConfigDocument incoming, boolean http3Running,
             ChallengeBoard board, boolean keepLocalFile) {
-        return apply(current, incoming, http3Running, board, List.of(), keepLocalFile);
+        return apply(current, incoming, http3Running, board, List.of(), keepLocalFile, List.of());
     }
 
     private ReloadResult apply(ConfigSnapshot current, ConfigDocument incoming, boolean http3Running,
-            ChallengeBoard board, List<String> warnings, boolean keepLocalFile) {
+            ChallengeBoard board, List<String> warnings, boolean keepLocalFile, List<String> restartNotes) {
         var errors = ConfigValidator.validate(incoming);
         if (!errors.isEmpty()) {
             return ReloadResult.rejected(current, errors);
@@ -88,9 +117,10 @@ public final class ConfigReloader {
         if (!incoming.canonicalHash().isEmpty()
                 && incoming.canonicalHash().equals(current.document().canonicalHash())
                 && Objects.equals(incoming.server().tlsKeyPassword(), current.document().server().tlsKeyPassword())) {
-            return new ReloadResult(true, current.generation(), warnings, List.of(), List.of(), current, null);
+            return new ReloadResult(true, current.generation(), warnings, List.of(), List.copyOf(restartNotes), current,
+                    null);
         }
-        var restart = new ArrayList<String>();
+        var restart = new ArrayList<String>(restartNotes);
         var clamped = clamp(current.document().server(), incoming.server(), http3Running, restart);
         var node = incoming.node();
         if (current.document().node().mode() != node.mode()) {
