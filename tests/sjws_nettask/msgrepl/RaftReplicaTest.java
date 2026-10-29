@@ -325,7 +325,12 @@ class RaftReplicaTest {
         try (var n = new Node()) {
             assertEquals(5, n.settle());
             assertArrayEquals(before, n.table(), "replay rebuilt the same table");
-            assertEquals(2, n.produce(7, 2, "b", "c"), "a retry after a restart still dedups");
+            // #278 Security R1: assert the duplicate marker and seq_reused after reopen, not only the offset
+            assertEquals(new ProducerAppend(2, true), n.produceAck(7, 2, "b", "c"),
+                    "a retry after a restart is marked duplicate");
+            var reused = n.refused(n.replica.appendDeduplicated(recs("x", "y"), Durability.GROUP, 0, 7, 2));
+            assertEquals(ProducerSequenceException.Kind.SEQ_REUSED, reused.kind(),
+                    "same id, seq and count with other records after reopen");
             assertEquals(5, n.produce(7, 3, "e"));
             n.settle();
             before = n.table();
@@ -436,6 +441,28 @@ class RaftReplicaTest {
         }
     }
 
+    /**
+     * #278 HA N1: a restart-replay with no stamp-header base fails closed. {@code resumeIndex} says the entry is a
+     * replay, but {@code replayAt} was never set from a stamp header; the entry must not be applied. Equivalent to
+     * HA's local {@code aReplayWithNoStampHeaderBaseFailsClosed} probe.
+     */
+    @Test
+    void aReplayWithNoStampHeaderBaseFailsClosed() throws Exception {
+        try (var n = new Node()) {
+            assertEquals(0, n.produce(7, 1, "a"));
+            n.settle();
+            var r = (RaftReplica) n.replica;
+            setLong(r, "resumeIndex", Long.MAX_VALUE); // force the next commit onto the replay path
+            setLong(r, "replayAt", -1L); // as if recover never saw a stamp-header base
+            n.proposeRaw(header((byte) 'M', 0, n.replica.term(), 2, 1, 1, 5).putInt(1).put((byte) 'x').flip());
+            assertTrue(n.fenced() != null && n.fenced().contains("no stamp-header base"), String.valueOf(n.fenced()));
+            assertEquals(List.of("a"), n.records(), "the fenced entry is not applied");
+            assertThrows(java.util.concurrent.ExecutionException.class,
+                    () -> n.replica.appendNoWait(recs("b"), null).get(5, TimeUnit.SECONDS),
+                    "a failed-closed replica refuses further appends");
+        }
+    }
+
     /** #278 HA B3 / Security N4: a replay whose offsets disagree with the stamp file fails closed, never patched over. */
     @Test
     void aReplayThatDisagreesWithTheStampFileFailsClosed() throws Exception {
@@ -481,5 +508,11 @@ class RaftReplicaTest {
         var f = o.getClass().getDeclaredField(name);
         f.setAccessible(true);
         return f.get(o);
+    }
+
+    static void setLong(Object o, String name, long value) throws Exception {
+        var f = o.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        f.setLong(o, value);
     }
 }

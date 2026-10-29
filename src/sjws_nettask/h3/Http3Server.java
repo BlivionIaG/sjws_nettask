@@ -83,10 +83,10 @@ import sjws_nettask.tls.TlsMaterial;
 public final class Http3Server implements Transport {
 
     /**
-     * Receive flow-control windows (bytes) and concurrent request streams per connection. Requests are
-     * a HEADERS frame (a few KiB) and bodies are
-     * discarded, so the windows only need to fit that: they also bound what quiche must buffer for
-     * out-of-order data (security review S2).
+     * Receive flow-control windows (bytes) and concurrent request streams per connection. They bound what
+     * quiche must buffer for out-of-order data (security review S2). A request body is pulled by its
+     * handler: the stream stops reading while {@link Http3RequestBody#HIGH} bytes wait unread, so the
+     * client is held to the stream window instead of the server buffering (#281).
      */
     static final long MAX_DATA = 1024L * 1024;
     static final long MAX_STREAM_DATA = 16L * 1024;
@@ -264,6 +264,8 @@ public final class Http3Server implements Transport {
         final RateGuard rate;
         long nextStreamId; // lowest client request stream id not seen yet
         long goAwayId = -1; // -1 = no GOAWAY sent; else streams with id >= this are refused
+        /** The client's SETTINGS_MAX_FIELD_SECTION_SIZE; unlimited until its SETTINGS arrive (RFC 9114 §7.2.4.1). */
+        volatile long peerMaxFieldSection = Long.MAX_VALUE;
 
         Connection(Semaphore files) {
             this(files, new RateGuard(1, 0));
@@ -406,9 +408,43 @@ public final class Http3Server implements Transport {
             protected void initChannel(QuicStreamChannel stream) {
                 stream.pipeline().addLast(new Http3RequestHandler(Http3Server.this.shared, connection));
             }
-        }, null, null, new DefaultHttp3SettingsFrame(Http3Settings.defaultSettings()
+        }, new PeerSettings(connection), null, new DefaultHttp3SettingsFrame(Http3Settings.defaultSettings()
                 .maxFieldSectionSize(CODEC_MAX_FIELD_SECTION)), true));
         quic.pipeline().addLast(QuietErrors.INSTANCE);
+    }
+
+    /**
+     * On the client's control stream: records its SETTINGS_MAX_FIELD_SECTION_SIZE so {@link Http3Writer} never sends a
+     * response field section the client would treat as a connection error. Releases every control frame; the codec has
+     * already acted on them (and on any error, which it reports here too).
+     */
+    static final class PeerSettings extends io.netty.channel.ChannelInboundHandlerAdapter {
+
+        private final Connection connection;
+
+        PeerSettings(Connection connection) {
+            this.connection = connection;
+        }
+
+        @Override
+        public void channelRead(io.netty.channel.ChannelHandlerContext ctx, Object msg) {
+            try {
+                if (msg instanceof io.netty.handler.codec.http3.Http3SettingsFrame settings) {
+                    var max = settings.get(io.netty.handler.codec.http3.Http3SettingIdentifier
+                            .HTTP3_SETTINGS_MAX_FIELD_SECTION_SIZE.id());
+                    if (max != null && max >= 0) {
+                        this.connection.peerMaxFieldSection = max;
+                    }
+                }
+            } finally {
+                io.netty.util.ReferenceCountUtil.release(msg);
+            }
+        }
+
+        @Override
+        public void exceptionCaught(io.netty.channel.ChannelHandlerContext ctx, Throwable cause) {
+            // the codec already closed the connection; a remote client can trigger this at will (no log line)
+        }
     }
 
     /**

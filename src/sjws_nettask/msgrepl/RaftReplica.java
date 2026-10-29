@@ -187,8 +187,12 @@ final class RaftReplica implements Replica {
     /** {@link #expected} once the replay reaches {@link #resumeIndex} (from the stamp file), as a cross-check. */
     private long resumeExpected;
     /**
-     * Offset cursor while rebuilding the producer table from entries {@code <= resumeIndex}. Starts at the stamp
-     * header base; {@link #expected} itself is already the lined-up ledger end after {@link #recover}.
+     * Offset cursor while rebuilding the {@link ProducerTable} from entries {@code <= resumeIndex}. Starts at the
+     * stamp-header base set in {@link #recover}; duplicate, refused and stale-term entries do not advance it. At
+     * {@link #resumeIndex} it is cross-checked against {@link #resumeExpected} and then cleared. Lining up
+     * {@link #expected} without a raft replay does not rebuild the table: a snapshot that truncates the log past the
+     * stamps must call {@link #restoreProducers} (#288 / #270). {@code -1} means "no stamp-header base"; a replay in
+     * that state fails closed.
      */
     private long replayAt = -1;
     /**

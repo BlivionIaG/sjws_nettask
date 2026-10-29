@@ -41,8 +41,13 @@ import sjws_nettask.core.StaticFileHandler;
 
 /**
  * One instance per request stream. Maps the HEADERS frame to a core {@link Request} as soon as it
- * arrives (request bodies are ignored, like on HTTP/1), runs the shared {@link StaticFileHandler}
- * and the {@link Http3Writer} on a virtual thread, and releases every inbound DATA frame.
+ * arrives, runs the shared {@link StaticFileHandler} and the {@link Http3Writer} on a virtual thread.
+ * <p>
+ * Request content (#281): for a method other than GET and HEAD the DATA frames feed an
+ * {@link Http3RequestBody} attached to the request, which the handler pulls with backpressure (the
+ * stream stops reading while the handler is behind). Size limits are the handler's, as on HTTP/1.1
+ * ({@code content-length} is {@link sjws_nettask.core.RequestBody#length()}, -1 when absent). GET/HEAD
+ * content, trailers and whatever the handler leaves unread are released.
  * <p>
  * Each request takes one server-wide in-flight slot ({@link Limits#maxInflight()}), refused with
  * H3_REQUEST_REJECTED when none is free. The task is tied to the stream's lifetime: when the stream
@@ -55,6 +60,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
     private final Http3Server.Shared shared;
     private final Http3Server.Connection connection;
     private boolean started; // event loop only
+    private Http3RequestBody body; // event loop only; null when the request carries no content we keep
 
     Http3RequestHandler(Http3Server.Shared shared, Http3Server.Connection connection) {
         this.shared = shared;
@@ -157,7 +163,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
                 }
             }
             var request = toRequest(headers, peer(stream), this.shared.captureFields());
-            start(stream, request, refusal(headers, request));
+            start(stream, headers, request, refusal(headers, request));
         } finally {
             ReferenceCountUtil.release(frame);
         }
@@ -183,7 +189,7 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         return status == 0 ? null : StaticFileHandler.error(status, request.headOnly());
     }
 
-    private void start(QuicStreamChannel stream, Request request, Response refusal) {
+    private void start(QuicStreamChannel stream, Http3Headers headers, Request request, Response refusal) {
         var limits = this.shared.limits();
         // Under pressure each connection gets only its share, so a few connections (one address) can't
         // hold the whole in-flight cap (verification V1); without pressure a client may use every stream.
@@ -194,7 +200,15 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
             return;
         }
         this.connection.inflight.incrementAndGet();
-        var task = new Task(stream, request, refusal);
+        // Only a chain or another terminal can read content: the static handler alone never does (zero cost there).
+        if (refusal == null && this.shared.captureFields() && !request.headOnly() && !"GET".equals(request.method())) {
+            long length = contentLength(headers);
+            if (length != 0) {
+                this.body = new Http3RequestBody(stream, length, limits.writeTimeout().toNanos());
+                request = request.withBody(this.body);
+            }
+        }
+        var task = new Task(stream, request, refusal, this.body);
         try {
             this.shared.executor().execute(task);
         } catch (RejectedExecutionException e) { // shutting down
@@ -206,6 +220,23 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         // when the thread actually ends (not Future.cancel: JDK 21's thread-per-task executor then
         // forgets the thread at once, so neither the in-flight cap nor awaitTermination would see it).
         stream.closeFuture().addListener(f -> task.cancel());
+    }
+
+    /**
+     * @return the declared {@code content-length}, or -1 when there is none (the codec has already refused a
+     *         malformed or inconsistent one: RFC 9114 §4.1.2)
+     */
+    static long contentLength(Http3Headers headers) {
+        var value = headers.get("content-length");
+        if (value == null) {
+            return -1;
+        }
+        try {
+            long length = Long.parseLong(value.toString().trim());
+            return length < 0 ? -1 : length;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
     }
 
     private void reject(QuicStreamChannel stream) {
@@ -231,19 +262,24 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         private final QuicStreamChannel stream;
         private final Request request;
         private final Response refusal;
+        private final Http3RequestBody body; // or null
         private final AtomicBoolean finished = new AtomicBoolean();
         private volatile Thread thread;
         private volatile boolean cancelled;
 
-        Task(QuicStreamChannel stream, Request request, Response refusal) {
+        Task(QuicStreamChannel stream, Request request, Response refusal, Http3RequestBody body) {
             this.stream = stream;
             this.request = request;
             this.refusal = refusal;
+            this.body = body;
         }
 
         /** Interrupts the request's thread, or makes it return at once if it hasn't started yet. */
         void cancel() {
             this.cancelled = true;
+            if (this.body != null) {
+                this.body.fail();
+            }
             var t = this.thread;
             if (t != null) {
                 t.interrupt(); // harmless if the thread has already ended
@@ -270,6 +306,9 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
 
         void finish(Http3Writer.Outcome outcome) {
             if (this.finished.compareAndSet(false, true)) {
+                if (this.body != null) {
+                    this.body.abandon();
+                }
                 Http3RequestHandler.this.connection.inflight.decrementAndGet();
                 Http3RequestHandler.this.shared.inflight().release();
                 if (outcome != null) {
@@ -281,12 +320,21 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
 
     @Override
     protected void channelRead(ChannelHandlerContext ctx, Http3DataFrame frame) {
-        ReferenceCountUtil.release(frame);
+        try {
+            if (this.body != null) {
+                this.body.offer(frame.content());
+            }
+        } finally {
+            ReferenceCountUtil.release(frame);
+        }
     }
 
     @Override
     protected void channelInputClosed(ChannelHandlerContext ctx) {
-        // The response is written independently of the request's end.
+        // The response is written independently of the request's end; a body reader sees its end here.
+        if (this.body != null) {
+            this.body.end();
+        }
     }
 
     @Override

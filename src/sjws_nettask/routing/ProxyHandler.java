@@ -345,7 +345,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         }
     }
 
-    /** A body announced by Content-Length that the transport did not attach (HTTP/2, HTTP/3 today). */
+    /** A body announced by Content-Length that the transport did not attach (HTTP/2 today). */
     private static boolean hasDeclaredBody(Request request) {
         for (var v : request.headers().values("content-length")) {
             if (!v.equals("0")) {
