@@ -337,12 +337,41 @@ class StreamHttpTest {
         var empty = new String(StreamHttp.sse(new StreamChunk(1, 1, 4, Frame.LAST | Frame.CANCELLED, new byte[0])),
                 StandardCharsets.UTF_8);
         assertEquals("id: 0.4\nevent: end\ndata: cancelled\n\n", empty);
+        // #282: empty LAST|ERROR is end only (no failure event)
         var err = new String(StreamHttp.sse(new StreamChunk(1, 1, 5, Frame.LAST | Frame.ERROR, new byte[0])),
                 StandardCharsets.UTF_8);
-        assertTrue(err.endsWith("data: error\n\n"));
+        assertEquals("id: 0.5\nevent: end\ndata: error\n\n", err);
+        assertTrue(!err.contains("event: failure") && !err.contains("event: chunk"), err);
+        // #282: non-empty LAST|ERROR is event: failure (never error/chunk) then end, same id
+        var fail = new String(StreamHttp.sse(new StreamChunk(1, 1, 1, 7, Frame.LAST | Frame.ERROR,
+                "model crashed".getBytes(StandardCharsets.UTF_8))), StandardCharsets.UTF_8);
+        assertEquals("id: 1.7\nevent: failure\ndata: model crashed\n\nid: 1.7\nevent: end\ndata: error\n\n", fail);
         var cr = new String(StreamHttp.sse(new StreamChunk(1, 1, 0, 0, "a\rb\n".getBytes(StandardCharsets.UTF_8))),
                 StandardCharsets.UTF_8);
         assertEquals("id: 0.0\nevent: chunk\ndata: a\ndata: b\ndata: \n\n", cr);
+        // ok LAST with text stays byte-identical (#282)
+        var ok = new String(StreamHttp.sse(new StreamChunk(1, 1, 2, 3, Frame.LAST, "done".getBytes(StandardCharsets.UTF_8))),
+                StandardCharsets.UTF_8);
+        assertEquals("id: 2.3\nevent: chunk\ndata: done\n\nid: 2.3\nevent: end\ndata: ok\n\n", ok);
+    }
+
+    /** #282: failure event frames payload lines that look like SSE fields entirely inside data: lines. */
+    @Test
+    void sseFailureDataFieldInjection() {
+        var payload = "event: chunk\nid: 9.9\ndata: ok\rline\r\nmore".getBytes(StandardCharsets.UTF_8);
+        var out = new String(StreamHttp.sse(new StreamChunk(1, 1, 1, 2, Frame.LAST | Frame.ERROR, payload)),
+                StandardCharsets.UTF_8);
+        assertTrue(out.startsWith("id: 1.2\nevent: failure\n"), out);
+        assertTrue(out.contains("data: event: chunk\ndata: id: 9.9\ndata: data: ok\ndata: line\ndata: more\n\n"), out);
+        assertTrue(out.endsWith("id: 1.2\nevent: end\ndata: error\n\n"), out);
+        assertTrue(!out.contains("\nevent: chunk\n") && !out.contains("\nevent: error\n"), out);
+        // bare \r alone and a trailing newline
+        var bareCr = new String(StreamHttp.sse(new StreamChunk(1, 1, 0, 0, Frame.LAST | Frame.ERROR,
+                "a\r".getBytes(StandardCharsets.UTF_8))), StandardCharsets.UTF_8);
+        assertEquals("id: 0.0\nevent: failure\ndata: a\ndata: \n\nid: 0.0\nevent: end\ndata: error\n\n", bareCr);
+        var trailing = new String(StreamHttp.sse(new StreamChunk(1, 1, 0, 1, Frame.LAST | Frame.ERROR,
+                "x\n".getBytes(StandardCharsets.UTF_8))), StandardCharsets.UTF_8);
+        assertEquals("id: 0.1\nevent: failure\ndata: x\ndata: \n\nid: 0.1\nevent: end\ndata: error\n\n", trailing);
     }
 
     /** inceptor (1): chunks before the first GET are retained up to the bound; beyond it the reader gets a gap. */
@@ -399,6 +428,80 @@ class StreamHttpTest {
         var last = StreamChunk.decode(Frame.decode(bin).payload());
         assertTrue(last.last() && last.chunkSeq() == 1 && last.size() == 0, last.toString());
         assertTrue(System.nanoTime() - t0 < 2_000_000_000L);
+    }
+
+    /**
+     * #282: LAST|ERROR text is event: failure then end (no chunk); Last-Event-ID at the LAST id returns the terminal
+     * with no duplicate data chunk; binary reconnect restores the real bytes.
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(10)
+    void lastErrorOverSseIsFailureThenEnd() throws Exception {
+        streamsOn();
+        var session = startStream("");
+        var c = claim();
+        assertEquals(204, chunk(c, 0, StreamChunk.FIRST, "tok").status());
+        assertEquals(204, chunk(c, 1, Frame.LAST | Frame.ERROR, "model crashed").status());
+        var text = drain(req("GET", "a", session, new byte[0]));
+        assertEquals("""
+                retry: 1000
+
+                id: 1.0
+                event: chunk
+                data: tok
+
+                id: 1.1
+                event: failure
+                data: model crashed
+
+                id: 1.1
+                event: end
+                data: error
+
+                """, text);
+        assertTrue(!text.contains("event: chunk\ndata: model"), text);
+        assertTrue(!text.contains("event: error"), text);
+        // Last-Event-ID at the LAST id: terminal only, no duplicate data chunk
+        var resume = drain(req("GET", "a", session, new byte[0], "last-event-id", "1.1"));
+        assertEquals("retry: 1000\n\nid: 1.1\nevent: failure\ndata: model crashed\n\nid: 1.1\nevent: end\ndata: error\n\n",
+                resume);
+        assertTrue(!resume.contains("event: chunk"), resume);
+        // binary reconnect restores the real LAST|ERROR payload (#282 answer 4)
+        var bin = ByteBuffer.wrap(drainBytes(req("GET", "a", session + "?from=2", new byte[0], "accept",
+                SwarmHttp.CONTENT_TYPE)));
+        var last = StreamChunk.decode(Frame.decode(bin).payload());
+        assertTrue(last.last() && (last.flags() & Frame.ERROR) != 0 && last.chunkSeq() == 1, last.toString());
+        assertEquals("model crashed", new String(last.bytes(), StandardCharsets.UTF_8));
+    }
+
+    /**
+     * #282 answer 4: Ended(last) bytes stay charged to the #272 node budget until GRACE_MS sweep; reconnect re-emits
+     * them with no extra charge; after release charged is 0 and budgetUnderflows is 0.
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(15)
+    void reconnectAfterEndKeepsBudgetChargedUntilGrace() throws Exception {
+        streamsOn(new TokenStreams.Config(1, 64, 256, true, 64L * 1024 * 1024, TokenStreams.Config.HEAP_FRACTION,
+                TokenStreams.Config.SOFT_WATERMARK, TokenStreams.Config.ADMIT_WATERMARK));
+        var session = startStream("?deadlineMs=3600000");
+        var c = claim();
+        var msg = "x".repeat(1024);
+        assertEquals(204, chunk(c, 0, StreamChunk.FIRST | Frame.LAST | Frame.ERROR, msg).status());
+        var first = drain(req("GET", "a", session, new byte[0]));
+        assertTrue(first.contains("event: failure\ndata: " + msg), first);
+        var budget = this.http.streams().credit().budget;
+        long chargedAfterEnd = budget.charged();
+        assertTrue(chargedAfterEnd >= msg.length(), "LAST bytes still charged after end: " + chargedAfterEnd);
+        assertEquals(0, budget.budgetUnderflows());
+        var resume = drain(req("GET", "a", session, new byte[0], "last-event-id", "1.0"));
+        assertTrue(resume.contains("event: failure\ndata: " + msg) && resume.contains("event: end\ndata: error"), resume);
+        assertEquals(chargedAfterEnd, budget.charged(), "reconnect must not add an uncharged charge");
+        assertEquals(0, budget.budgetUnderflows());
+        this.now.addAndGet(StreamHttp.GRACE_MS + 1);
+        this.http.streams().sweep();
+        assertEquals(0, this.http.streams().sessionCount());
+        assertEquals(0, budget.charged(), "nothing left charged after grace release");
+        assertEquals(0, budget.budgetUnderflows());
     }
 
     /** A live reader is woken by the producer (no 250 ms poll step per chunk). */
