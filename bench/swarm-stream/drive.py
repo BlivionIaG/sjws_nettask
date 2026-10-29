@@ -105,7 +105,7 @@ def run_window(args) -> dict:
 
     def producer(client: Client, pool: str):
         try:
-            (lease,) = client.claim(pool, wait=60, visibility_ms=60_000)
+            (lease,) = client.claim(pool, wait=30, visibility_ms=60_000)
             with lease.stream(window=args.window, coalesce=False, heartbeat=0) as w:
                 instrument_credit_waits(w, credit_waits)
                 while not stop.is_set():
