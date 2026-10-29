@@ -200,6 +200,15 @@ public final class ConfigLoader {
         if (bootSignature != null && recoveredHash != null && recoveredHash.equals(document.canonicalHash())) {
             document = document.withSignature(bootSignature);
         }
+        // Booted from last-good: leftover inline filter secrets are a CP operator step (file refs + rotate).
+        if (recoveredHash != null) {
+            var startup = MiddlewareSecrets.startupWarnMessage(document.middleware(), null, document.middleware());
+            if (startup != null) {
+                warnings.add(startup);
+                MiddlewareSecrets.logStartupWarn(System.getLogger(ConfigLoader.class.getName()), document.middleware(),
+                        null, document.middleware());
+            }
+        }
         return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm, haEnabled,
                 haKey, haPrevious, yamlCp, base, haMessaging);
     }
@@ -1095,6 +1104,10 @@ public final class ConfigLoader {
                 specs.add(MiddlewareSpec.of(text(step.get("name"), path + ".name"), order, route, options));
             } catch (IllegalArgumentException e) {
                 throw new ConfigException(path + ": " + e.getMessage());
+            }
+            if (MiddlewareSecrets.hasInline(options)) {
+                warnings.add(path + ": inline keys/hmac-keys sit in the file in clear; prefer keys-file / "
+                        + "hmac-keys-file (required for control-plane proposals)");
             }
         }
         if (!specs.isEmpty()) {
