@@ -94,6 +94,11 @@ final class LogTopics implements AutoCloseable {
     private volatile boolean closed;
     /** Consumer offsets (durable-log-plan §2); lazily backed by the {@code __offsets} topic. */
     private final LogOffsets offsets;
+    /**
+     * With replication on: the commits of topics outside {@code ha.topics}, which stay local, in the local-only
+     * {@code __offsets_local} topic. Never opened with HA off or when no local topic commits.
+     */
+    private final LogOffsets localOffsets;
 
     LogTopics(Path dir, Durability durability) {
         this(dir, durability, SegmentedLog.DEFAULT_SEGMENT_BYTES, LogRetention.NONE, System::currentTimeMillis);
@@ -116,6 +121,7 @@ final class LogTopics implements AutoCloseable {
     LogTopics(Path dir, Durability durability, java.util.Map<String, Durability> topicDurability, long segmentBytes,
             LogRetention retention, java.util.Set<String> compacted, long offsetsExpiryMs, java.util.function.LongSupplier clockMs) {
         this.offsets = new LogOffsets(this, offsetsExpiryMs, clockMs);
+        this.localOffsets = new LogOffsets(this, LogOffsets.LOCAL_TOPIC, offsetsExpiryMs, clockMs);
         this.compacted = java.util.Set.copyOf(compacted);
         this.dir = dir;
         this.durability = java.util.Objects.requireNonNull(durability);
@@ -129,7 +135,7 @@ final class LogTopics implements AutoCloseable {
     Durability durability(String topic) {
         var d = this.topicDurability.get(topic);
         if (d != null) return d;
-        return LogOffsets.TOPIC.equals(topic) ? LogOffsets.DEFAULT_DURABILITY : this.durability;
+        return offsetsTopic(topic) ? LogOffsets.DEFAULT_DURABILITY : this.durability;
     }
 
     /**
@@ -171,7 +177,7 @@ final class LogTopics implements AutoCloseable {
         if (this.retention.unlimited()) return 0;
         this.maintenance.lock();
         try {
-            this.offsets.loadIfPresent();
+            loadOffsetsIfPresent();
             return enforceRetentionLocked();
         } finally {
             this.maintenance.unlock();
@@ -201,15 +207,34 @@ final class LogTopics implements AutoCloseable {
         return this.offsets;
     }
 
-    /** Whether {@code topic} is key-compacted: listed, or the internal {@code __offsets} topic. */
+    /**
+     * The offsets that hold {@code topic}'s commits: {@code __offsets}, except for a topic that stays local on a
+     * replicating node (outside {@code ha.topics}), whose commits stay local too ({@code __offsets_local}).
+     */
+    LogOffsets offsets(String topic) {
+        return local(topic) ? this.localOffsets : this.offsets;
+    }
+
+    /** Replication is on and {@code topic} is not replicated: it keeps the plain local path. */
+    private boolean local(String topic) {
+        var rep = this.replicator;
+        return rep != null && !LogOffsets.TOPIC.equals(topic) && !rep.topics().contains(topic);
+    }
+
+    static boolean offsetsTopic(String topic) {
+        return LogOffsets.TOPIC.equals(topic) || LogOffsets.LOCAL_TOPIC.equals(topic);
+    }
+
+    /** Whether {@code topic} is key-compacted: listed, or an internal offsets topic. */
     boolean isCompacted(String topic) {
-        return this.compacted.contains(topic) || LogOffsets.TOPIC.equals(topic);
+        return this.compacted.contains(topic) || offsetsTopic(topic);
     }
 
     /** Whether there is any maintenance work: retention, a compacted topic, or consumer offsets on disk or in use. */
     boolean maintenanceNeeded() {
         return !this.retention.unlimited() || !this.compacted.isEmpty() || this.logs.containsKey(LogOffsets.TOPIC)
-                || java.nio.file.Files.isDirectory(this.dir.resolve(LogOffsets.TOPIC));
+                || java.nio.file.Files.isDirectory(this.dir.resolve(LogOffsets.TOPIC))
+                || this.logs.containsKey(LogOffsets.LOCAL_TOPIC);
     }
 
     /**
@@ -218,15 +243,16 @@ final class LogTopics implements AutoCloseable {
      * so an in-flight fetch finishes on the old file first.
      */
     LogCompaction.Result compact() throws IOException {
-        if (this.compacted.isEmpty() && !this.logs.containsKey(LogOffsets.TOPIC)) return LogCompaction.Result.NONE;
+        if (this.compacted.isEmpty() && !this.logs.containsKey(LogOffsets.TOPIC)
+                && !this.logs.containsKey(LogOffsets.LOCAL_TOPIC)) return LogCompaction.Result.NONE;
         var total = LogCompaction.Result.NONE;
         this.maintenance.lock();
         try {
-            this.offsets.loadIfPresent();
+            loadOffsetsIfPresent();
             for (var e : this.logs.entrySet()) {
                 var l = e.getValue();
                 if (!l.topicCompacted()) continue;
-                var prepared = LogCompaction.prepare(l.log(), this.offsets.floor(e.getKey()));
+                var prepared = LogCompaction.prepare(l.log(), offsets(e.getKey()).floor(e.getKey()));
                 for (var p : prepared) {
                     l.reads().writeLock().lock();
                     try {
@@ -243,13 +269,19 @@ final class LogTopics implements AutoCloseable {
         return total;
     }
 
+    /** Both offsets stores; the local one only exists on a replicating node. */
+    private void loadOffsetsIfPresent() throws IOException {
+        this.offsets.loadIfPresent();
+        if (this.replicator != null) this.localOffsets.loadIfPresent();
+    }
+
     private int enforceRetentionLocked() throws IOException {
         int deleted = 0;
         long now = this.clockMs.getAsLong();
         for (var e : this.logs.entrySet()) {
-            if (LogOffsets.TOPIC.equals(e.getKey())) continue; // bounded by compaction; retention would lose commits
+            if (offsetsTopic(e.getKey())) continue; // bounded by compaction; retention would lose commits
             var l = e.getValue();
-            long floor = this.offsets.floor(e.getKey()); // a committed-but-unfetched group pins its history (§2)
+            long floor = offsets(e.getKey()).floor(e.getKey()); // a committed-but-unfetched group pins its history (§2)
             l.reads().writeLock().lock();
             try {
                 long total = l.log().totalBytes();
@@ -281,15 +313,28 @@ final class LogTopics implements AutoCloseable {
             l = this.logs.get(topic);
             if (l == null) {
                 var rep = this.replicator;
-                if (rep != null && !LogOffsets.TOPIC.equals(topic) && !rep.topics().contains(topic)) {
-                    throw new IllegalStateException("topic " + topic + " is not replicated on this cluster");
-                }
                 var log = SegmentedLog.open(this.dir.resolve(topic), this.segmentBytes);
                 var writer = new LedgerWriter(log, durability(topic));
                 sjws_nettask.messaging.ledger.Replica replica = null;
-                if (rep != null) {
+                // A topic outside ha.topics (and __offsets_local) keeps the plain local path: no replica, no 503.
+                if (rep != null && !local(topic)) {
                     java.util.function.Consumer<java.util.List<byte[]>> applied = LogOffsets.TOPIC.equals(topic) ? this.offsets::applied : recs -> { };
-                    replica = rep.open(topic, writer, durability(topic), applied);
+                    try {
+                        replica = rep.open(topic, writer, durability(topic), applied);
+                    } catch (IOException | RuntimeException e) {
+                        // Refused (HA startup checks): leave nothing open behind the refusal.
+                        try {
+                            writer.close();
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                        try {
+                            log.close();
+                        } catch (IOException closing) {
+                            e.addSuppressed(closing);
+                        }
+                        throw e;
+                    }
                 }
                 l = new Log(log, writer, new java.util.concurrent.locks.ReentrantReadWriteLock(), isCompacted(topic), replica);
                 this.logs.put(topic, l);

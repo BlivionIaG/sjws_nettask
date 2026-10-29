@@ -116,10 +116,22 @@ public class Sjws_nettask {
         }
         OptionalModule modules;
         try {
-            modules = OptionalModules.start(loaded.yamlSwarmEnabled(), multiProcess(hooks, loaded.yamlCp()), err);
+            modules = OptionalModules.start(loaded.yamlSwarmEnabled(),
+                    multiProcess(hooks, loaded.yamlCp(), loaded.haMessaging()), err);
         } catch (OptionalModule.Refused e) {
             err.println("Error: " + e.getMessage());
             return EXIT_USAGE;
+        }
+        try {
+            modules = HaMessagingStart.install(loaded, modules, err);
+        } catch (OptionalModule.Refused e) {
+            modules.close();
+            err.println("Error: " + e.getMessage());
+            return EXIT_USAGE;
+        } catch (IOException | UncheckedIOException e) {
+            modules.close();
+            err.println("Failed to start HA messaging: " + e);
+            return EXIT_CANNOT_LISTEN;
         }
         SjwsServer server;
         try {
@@ -146,6 +158,7 @@ public class Sjws_nettask {
         var task = new Shutdown(server, pid, out, err);
         var hook = new Thread(task, "shutdown");
         task.bind(hook);
+        task.awaitModulesOnSignal(Duration.ofSeconds(20));
         Runtime.getRuntime().addShutdownHook(hook);
         try {
             if (pidFile != null) {
@@ -202,7 +215,11 @@ public class Sjws_nettask {
         } finally {
             task.run();
             removeHook(hook);
-            modules.close();
+            try {
+                modules.close();
+            } finally {
+                task.modulesClosed();
+            }
         }
     }
 
@@ -226,6 +243,13 @@ public class Sjws_nettask {
         private volatile ServiceHooks hooks;
         /** How long a signal hook waits for the main thread to log termination before logging it. */
         private Duration reportWait = Duration.ofSeconds(5);
+        /**
+         * Set when the main thread closes optional modules after serving: a signal hook waits for that close, or the
+         * JVM halts in the middle of it (HA messaging writes its clean-stop marker there).
+         */
+        private volatile CountDownLatch modulesClosed;
+        /** How long a signal hook waits for the modules to close. */
+        private Duration closeWait = Duration.ofSeconds(20);
 
         Shutdown(SjwsServer server, AtomicReference<PidFile> pid, PrintStream out, PrintStream err) {
             this.server = server;
@@ -249,6 +273,19 @@ public class Sjws_nettask {
 
         void markServing() {
             this.serving.set(true);
+        }
+
+        /** The main thread will close modules after serving and call {@link #modulesClosed()}. */
+        void awaitModulesOnSignal(Duration timeout) {
+            this.closeWait = timeout;
+            this.modulesClosed = new CountDownLatch(1);
+        }
+
+        void modulesClosed() {
+            var latch = this.modulesClosed;
+            if (latch != null) {
+                latch.countDown();
+            }
         }
 
         /** Logs termination once. Unblocks a signal hook waiting in {@link #run()}. */
@@ -278,6 +315,17 @@ public class Sjws_nettask {
                     }
                     if (!mainLogged) {
                         reportTerminated();
+                    }
+                    var latch = this.modulesClosed;
+                    if (mainLogged && latch != null) { // the main thread is on its way out: let it close
+                        try {
+                            if (!latch.await(this.closeWait.toMillis(), TimeUnit.MILLISECONDS)) {
+                                this.err.println("WARN: modules still closing after " + this.closeWait.toMillis()
+                                        + " ms; exiting");
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
                 }
             } finally {
@@ -472,11 +520,23 @@ public class Sjws_nettask {
      * node (control or data role, joined to a control plane) or a config file whose {@code cp.peers} lists voters.
      */
     static String multiProcess(ServiceHooks hooks, java.util.Map<String, Object> yamlCp) {
+        return multiProcess(hooks, yamlCp, sjws_nettask.config.HaMessagingSettings.NONE);
+    }
+
+    /**
+     * As {@link #multiProcess(ServiceHooks, java.util.Map)}, and a config file whose {@code ha.members} lists the
+     * HA messaging cluster (#236): any member list counts, whatever {@code ha.messaging} resolves to.
+     */
+    static String multiProcess(ServiceHooks hooks, java.util.Map<String, Object> yamlCp,
+            sjws_nettask.config.HaMessagingSettings haMessaging) {
         if (hooks != null) {
             return "this node runs with --bootstrap (control/data role in a cluster)";
         }
         if (yamlCp != null && yamlCp.get("peers") instanceof java.util.Collection<?> peers && !peers.isEmpty()) {
             return "the config file lists cp.peers (" + peers.size() + " voters)";
+        }
+        if (!haMessaging.members().isEmpty()) {
+            return "the config file lists ha.members (" + haMessaging.members().size() + " voters)";
         }
         return null;
     }
@@ -491,7 +551,7 @@ public class Sjws_nettask {
     private static ServiceHooks loadServiceHooks(Path bootstrap, String expectedRole, long drainBudgetMs,
             sjws_nettask.config.ConfigLoader.Loaded loaded) throws IOException {
         return sjws_nettask.service.ServiceLaunch.prepare(bootstrap, expectedRole, drainBudgetMs, loaded.yamlCp(),
-                loaded.configBase());
+                loaded.configBase(), loaded.haClusterKey(), loaded.haClusterKeyPrevious());
     }
 
     /**
