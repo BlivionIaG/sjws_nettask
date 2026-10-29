@@ -395,26 +395,57 @@ class MsgSnapshotClusterTest {
         assertTrue(before < end, "follower was behind before install");
     }
 
-    /** #288 MC-B1: after install, sealed segments wholly below the leader's logStart are dropped. */
+    /**
+     * #288 MC-B1: install's {@code dropBelow(logStart)} removes sealed segments wholly below the cut.
+     * Pin+{@With already omit those segments, so this test plants one into staging after the fetch
+     * (at {@code install-fetched}) and asserts only dropBelow clears it. Without that call the planted
+     * segment survives (Messaging Core mutation on 492771d).
+     */
     @Test
     void installDropsSealedSegmentsBelowTheLeadersLogStart() throws Exception {
         start(20, 5);
         int l = c.leader(), f = 1 - l;
         long end = produce("pid1", 0, 40);
         c.awaitEnd(f, end);
-        // Advance log start on the leader into the middle of history.
+        // Partition the follower before the cut so it keeps early sealed segments the leader will retire.
+        c.cut(f);
         long cut = c.data[l].log.segments().get(0).nextOffset();
-        if (cut <= 0) cut = Math.max(1, end / 2);
+        assertTrue(cut > 0, "need a sealed segment boundary to cut at");
         c.await(c.data[l].replica.advanceLogStart(cut));
         for (int k = 0; k < 2000 && c.data[l].replica.logStartOffset() < cut; k++) c.step();
         assertEquals(cut, c.data[l].replica.logStartOffset());
-        c.cut(f);
         end = produce("pid1", 40, 80);
         assertTrue(c.data[l].snapshot());
         var m = recorded(l);
         assertTrue(m.logStart() >= cut, "manifest carries the logical start");
+        assertTrue(m.segments().stream().noneMatch(s -> s.next() <= m.logStart()),
+                "pin itself has no wholly-below segment");
+        var planted = new java.util.concurrent.atomic.AtomicBoolean();
+        c.data[f].replica.faultHook = at -> {
+            if (!"install-fetched".equals(at) || planted.get()) return;
+            try {
+                var staging = c.data[f].root.resolve("msgrepl").resolve("apply").resolve("t.staging");
+                var ledger = c.data[f].root.resolve("ledger");
+                // Follower still has pre-cut sealed files; copy the first wholly-below one into staging so
+                // replaceWith would keep it unless install dropBelow runs.
+                for (var seg : c.data[f].log.segments()) {
+                    if (seg.active() || seg.nextOffset() > m.logStart()) continue;
+                    var name = SnapshotStore.name(seg.baseOffset());
+                    var from = ledger.resolve(name);
+                    var to = staging.resolve(name);
+                    if (java.nio.file.Files.isRegularFile(from) && !java.nio.file.Files.exists(to)) {
+                        java.nio.file.Files.copy(from, to);
+                        planted.set(true);
+                        break;
+                    }
+                }
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
         c.heal(f);
         for (int k = 0; k < 4000 && c.data[f].replica.installs() == 0; k++) c.step();
+        assertTrue(planted.get(), "planted a wholly-below sealed segment into staging after fetch");
         assertTrue(c.data[f].replica.installs() > 0);
         c.awaitEnd(f, end);
         assertEquals(m.logStart(), c.data[f].replica.logStartOffset());

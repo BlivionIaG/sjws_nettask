@@ -23,12 +23,17 @@ public final class SnapshotTesting implements AutoCloseable {
         this.server = server;
     }
 
-    /** A runtime (timer off: snapshots are taken by the test) and its transfer server on {@code peers.get(self)}. */
+    /**
+     * A runtime (timer off: snapshots are taken by the test) and its transfer server. Binds loopback:0, records the
+     * bound address in {@code peers} under {@code self}, and keeps the channel until listen (#288 MC-N3).
+     */
     public static SnapshotTesting create(Path stateDir, Map<String, InetSocketAddress> peers, String self, long every, long tail,
             LongSupplier clockMs) throws IOException {
         var settings = new Snapshots(every, tail, MsgSnapshot.MIN_CHUNK, 64L << 20, Duration.ofHours(1), 0);
+        var listen = SnapshotCluster.reservePort();
+        peers.put(self, (InetSocketAddress) listen.getLocalAddress());
         var rt = new Snapshots.Runtime(settings, stateDir, SnapshotCluster.KEY, peers, clockMs);
-        var server = new SnapshotTransfer.Server(peers.get(self), SnapshotCluster.KEY, null, rt.store, settings.bytesPerSecond(), clockMs);
+        var server = new SnapshotTransfer.Server(listen, SnapshotCluster.KEY, null, rt.store, settings.bytesPerSecond(), clockMs);
         return new SnapshotTesting(rt, server);
     }
 

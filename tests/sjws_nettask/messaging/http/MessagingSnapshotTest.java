@@ -67,7 +67,6 @@ class MessagingSnapshotTest {
         members = List.of(member(1, false), member(2, false), member(3, true));
         var voters = VoterSet.dataAndWitness(members.get(0), members.get(1), members.get(2));
         var peers = new LinkedHashMap<String, InetSocketAddress>();
-        for (int i = 0; i < 2; i++) peers.put("n" + (i + 1), new InetSocketAddress("127.0.0.1", SnapshotTesting.freePort()));
         for (int i = 0; i < 3; i++) {
             var s = new FileLogStorage(dir.resolve("n" + (i + 1)).resolve("raft"), 2048);
             stores.add(s);
@@ -76,6 +75,7 @@ class MessagingSnapshotTest {
         var urls = Map.of("n1", "http://n1.test", "n2", "http://n2.test");
         for (int i = 0; i < 2; i++) {
             var root = dir.resolve("n" + (i + 1));
+            // SnapshotTesting.create reserves port 0 and records the bound address in peers (#288 MC-N3).
             var sn = SnapshotTesting.create(root.resolve("msgrepl"), peers, "n" + (i + 1), 20, 5, clock::currentTimeMillis);
             snaps.add(sn);
             var t = new LogTopics(root.resolve("msg"), Durability.ASYNC, Map.of(), 2048, retention, clock::currentTimeMillis);
@@ -237,9 +237,16 @@ class MessagingSnapshotTest {
         int l = leader("t");
         produce(l, 0, 80);
         var leadLog = topics.get(l).get("t", false);
-        assertFalse(leadLog.log().segments().isEmpty());
-        long cut = leadLog.log().segments().get(0).nextOffset();
-        assertTrue(cut > 0, "need a sealed segment boundary to cut at");
+        var segs = leadLog.log().segments();
+        assertFalse(segs.isEmpty());
+        var first = segs.get(0);
+        assertTrue(first.nextOffset() > first.baseOffset() + 1,
+                "need a sealed segment with room for a mid-segment cut");
+        // Mid-segment cut: dropBelow only deletes segments with nextOffset <= cut, so the first sealed
+        // file stays on disk and physical < logical. A boundary cut would make physical == logical and
+        // skip the 416 branch (Messaging Core mutation on 492771d).
+        long cut = first.baseOffset() + Math.max(1, (first.nextOffset() - first.baseOffset()) / 2);
+        assertTrue(cut < first.nextOffset(), "cut must stay inside the first sealed segment");
         var adv = leadLog.replica().advanceLogStart(cut);
         until(() -> { step(); return adv.isDone(); }, "advanceLogStart committed");
         adv.get(5, TimeUnit.SECONDS);
@@ -247,13 +254,11 @@ class MessagingSnapshotTest {
         long physical = leadLog.log().startOffset();
         long logical = leadLog.replica().logStartOffset();
         assertEquals(cut, logical);
-        assertTrue(physical <= logical, "physical " + physical + " logical " + logical);
-        if (physical < logical) {
-            long below = physical;
-            var r = call(() -> http.get(l).handle(new Request("GET",
-                    "/messaging/v1/topics/t/records?offset=" + below + "&maxBytes=256", RequestHeaders.of(Map.of()))));
-            assertEquals(416, r.status(), "fetch below logical start: " + r);
-        }
+        assertTrue(physical < logical,
+                "physical must stay below logical so the 416 branch runs: physical=" + physical + " logical=" + logical);
+        var r = call(() -> http.get(l).handle(new Request("GET",
+                "/messaging/v1/topics/t/records?offset=" + physical + "&maxBytes=256", RequestHeaders.of(Map.of()))));
+        assertEquals(416, r.status(), "fetch at physical start below logical: " + r);
         var ok = call(() -> http.get(l).handle(new Request("GET",
                 "/messaging/v1/topics/t/records?offset=" + logical + "&maxBytes=256", RequestHeaders.of(Map.of()))));
         assertTrue(ok.status() == 200 || ok.status() == 204, "fetch at logical start: " + ok.status());
