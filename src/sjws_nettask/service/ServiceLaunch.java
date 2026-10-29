@@ -49,11 +49,21 @@ public final class ServiceLaunch {
      */
     public static ServiceHooks prepare(Path bootstrapFile, String expectedRole, long drainBudgetMs,
             Map<String, Object> yamlCp, Path configBase) throws IOException {
+        return prepare(bootstrapFile, expectedRole, drainBudgetMs, yamlCp, configBase, null, null);
+    }
+
+    /**
+     * @param haKey         the HA cluster key this process resolved ({@code ha.cluster_key}, its file or the
+     *                      environment), or null; a CONTROL role refuses a CP Raft key equal to it or to
+     *                      {@code haKeyPrevious}
+     */
+    public static ServiceHooks prepare(Path bootstrapFile, String expectedRole, long drainBudgetMs,
+            Map<String, Object> yamlCp, Path configBase, byte[] haKey, byte[] haKeyPrevious) throws IOException {
         var bootstrap = Bootstrap.load(bootstrapFile, expectedRole);
         if (bootstrap.role() == NodeRole.CONTROL && !controlConfigured(yamlCp, System::getProperty, System.getenv())) {
             throw new IOException(CONTROL_UNCONFIGURED); // before any listener: exit 64
         }
-        return new Hooks(bootstrap, drainBudgetMs, yamlCp, configBase);
+        return new Hooks(bootstrap, drainBudgetMs, yamlCp, configBase, haKey, haKeyPrevious);
     }
 
     /** Why a CONTROL role without any {@code cp} settings refuses to start. */
@@ -77,10 +87,15 @@ public final class ServiceLaunch {
      * Any failure is an IOException, so the process exits non-zero (fail closed).
      */
     static CpReloadable launchControl(Map<String, Object> yamlCp, Path configBase) throws IOException {
+        return launchControl(yamlCp, configBase, null, null);
+    }
+
+    static CpReloadable launchControl(Map<String, Object> yamlCp, Path configBase, byte[] haKey,
+            byte[] haKeyPrevious) throws IOException {
         try {
             var launch = Class.forName(CONTROL_CLASS).getMethod("launch", Map.class, Path.class,
-                    java.io.PrintStream.class);
-            return (CpReloadable) launch.invoke(null, yamlCp, configBase, System.err);
+                    java.io.PrintStream.class, byte[].class, byte[].class);
+            return (CpReloadable) launch.invoke(null, yamlCp, configBase, System.err, haKey, haKeyPrevious);
         } catch (java.lang.reflect.InvocationTargetException e) {
             var cause = e.getCause();
             if (cause instanceof IOException io) {
@@ -97,17 +112,25 @@ public final class ServiceLaunch {
         private final long drainBudgetMs;
         private final Map<String, Object> yamlCp;
         private final Path configBase;
+        /** The resolved HA cluster key (and previous), only to refuse an equal CP Raft key; never printed. */
+        private final byte[] haKey;
+        private final byte[] haKeyPrevious;
         private NodeEnrollment enrollment;
         /** The CONTROL-role host; null on a data node. Its reload is the single CP SIGHUP hook. */
         private volatile CpReloadable control;
         /** A {@code sjws_nettask.cp.DataWatch} on a data node; typed loosely so this class names no cp type. */
         private AutoCloseable watch;
 
-        private Hooks(Bootstrap bootstrap, long drainBudgetMs, Map<String, Object> yamlCp, Path configBase) {
+        private Hooks(Bootstrap bootstrap, long drainBudgetMs, Map<String, Object> yamlCp, Path configBase,
+                byte[] haKey, byte[] haKeyPrevious) {
             this.bootstrap = bootstrap;
             this.drainBudgetMs = drainBudgetMs;
             this.yamlCp = yamlCp;
             this.configBase = configBase;
+            // Only a CONTROL role uses them; a data node keeps no extra copy.
+            boolean control = bootstrap.role() == NodeRole.CONTROL;
+            this.haKey = control && haKey != null ? haKey.clone() : null;
+            this.haKeyPrevious = control && haKeyPrevious != null ? haKeyPrevious.clone() : null;
         }
 
         @Override
@@ -128,7 +151,7 @@ public final class ServiceLaunch {
             }
             if (this.bootstrap.role() == NodeRole.CONTROL) {
                 // prepare() already refused a CONTROL role without cp settings.
-                this.control = launchControl(this.yamlCp, this.configBase);
+                this.control = launchControl(this.yamlCp, this.configBase, this.haKey, this.haKeyPrevious);
             }
         }
 

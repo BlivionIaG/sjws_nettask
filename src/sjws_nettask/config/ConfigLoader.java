@@ -109,6 +109,7 @@ public final class ConfigLoader {
         Boolean yamlBind = null;
         Boolean yamlSwarm = null;
         boolean haEnabled = false;
+        HaMessagingSettings haMessaging = HaMessagingSettings.NONE;
         byte[] haKey = null;
         byte[] haPrevious = null;
         byte[] bootSignature = null;
@@ -174,6 +175,9 @@ public final class ConfigLoader {
             haEnabled = ha.enabled();
             haKey = ha.current();
             haPrevious = ha.previous();
+            haMessaging = HaMessagingSettings.parse(
+                    root.get("ha") == null ? null : YamlValues.mapping(root.get("ha"), "ha"), haEnabled, base);
+            warnings.addAll(haMessaging.warnings());
         }
         var parsed = baseline == null
                 ? ServerConfig.parse(args, env, passwords)
@@ -197,7 +201,7 @@ public final class ConfigLoader {
             document = document.withSignature(bootSignature);
         }
         return new Loaded(document, warnings, List.of(), false, args, env, passwords, yamlBind, yamlSwarm, haEnabled,
-                haKey, haPrevious, yamlCp, base);
+                haKey, haPrevious, yamlCp, base, haMessaging);
     }
 
     /**
@@ -1139,8 +1143,10 @@ public final class ConfigLoader {
         String previousFile = null;
         if (root.get("ha") instanceof Object ha) {
             var map = YamlValues.mapping(ha, "ha");
-            YamlValues.knownKeys(map, List.of("enabled", "cluster_key", "cluster_key_previous", "cluster_key_file",
-                    "cluster_key_previous_file"), "ha");
+            var known = new java.util.ArrayList<>(List.of("enabled", "cluster_key", "cluster_key_previous",
+                    "cluster_key_file", "cluster_key_previous_file"));
+            known.addAll(HaMessagingSettings.KEYS);
+            YamlValues.knownKeys(map, known, "ha");
             if (map.containsKey("enabled")) {
                 enabled = bool(map.get("enabled"), "ha.enabled");
             }
@@ -1698,6 +1704,8 @@ public final class ConfigLoader {
         private final Map<String, Object> yamlCp;
         /** Directory of the config file, for relative {@code cp:} paths; null without a file. */
         private final Path configBase;
+        /** {@code ha.messaging} and the member list; {@link HaMessagingSettings#NONE} without them. */
+        private final HaMessagingSettings haMessaging;
 
         Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
@@ -1725,6 +1733,16 @@ public final class ConfigLoader {
                 String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
                 Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
                 byte[] haClusterKeyPrevious, Map<String, Object> yamlCp, Path configBase) {
+            this(document, warnings, errors, helpRequested, args, env, passwords, yamlBindContent, yamlSwarmEnabled,
+                    haEnabled, haClusterKey, haClusterKeyPrevious, yamlCp, configBase, HaMessagingSettings.NONE);
+        }
+
+        Loaded(ConfigDocument document, List<String> warnings, List<String> errors, boolean helpRequested,
+                String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+                Boolean yamlBindContent, Boolean yamlSwarmEnabled, boolean haEnabled, byte[] haClusterKey,
+                byte[] haClusterKeyPrevious, Map<String, Object> yamlCp, Path configBase,
+                HaMessagingSettings haMessaging) {
+            this.haMessaging = java.util.Objects.requireNonNull(haMessaging);
             this.yamlCp = yamlCp;
             this.configBase = configBase;
             this.document = document;
@@ -1745,7 +1763,12 @@ public final class ConfigLoader {
         public Loaded withDocument(ConfigDocument document) {
             return new Loaded(document, this.warnings, this.errors, this.helpRequested, this.args, this.env,
                     this.passwords, this.yamlBindContent, this.yamlSwarmEnabled, this.haEnabled, this.haClusterKey,
-                    this.haClusterKeyPrevious, this.yamlCp, this.configBase);
+                    this.haClusterKeyPrevious, this.yamlCp, this.configBase, this.haMessaging);
+        }
+
+        /** {@code ha.messaging}, the member list and the startup decision ({@link HaMessagingSettings#replicate()}). */
+        public HaMessagingSettings haMessaging() {
+            return this.haMessaging;
         }
 
         /** The raw {@code cp:} block from the file, or null when it has none. */

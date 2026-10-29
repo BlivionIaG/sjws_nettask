@@ -247,7 +247,7 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | `sjws.cp.admin.listen` | `SJWS_CP_ADMIN_LISTEN` | `cp.admin.listen` | AdminServer |
 | — | — | `cp.tls.{cert,key,ca,adminCa,revocations}` | owned by Security; watch and admin listeners |
 | — | — | `cp.tls.{peerCert,peerKey,peerCa}` | voter links; all three required with `cp.peers`, no fallback; `peerCa` must not be `ca` |
-| — | `SJWS_CP_RAFT_KEY` (`SJWS_CP_RAFT_KEY_PREVIOUS` during rotation) | — | CP-only Raft frame HMAC key, same on every voter; required with `cp.peers`; must differ from `WEB_SERVER_HA_CLUSTER_KEY` |
+| — | `SJWS_CP_RAFT_KEY` (`SJWS_CP_RAFT_KEY_PREVIOUS` during rotation) | — | CP-only Raft frame HMAC key, same on every voter; required with `cp.peers`; must differ from `WEB_SERVER_HA_CLUSTER_KEY` and the config-file `ha.cluster_key` |
 
 **Voter links (`cp.peers`).** Each voter (and the witness) opens one `cluster.TcpTransport` on its own
 `cp.peers` address. Every socket comes from `cp.CpPeerSockets`, a `TcpTransport.SocketFactory` over the
@@ -257,7 +257,8 @@ that issues voter certificates only: a data-node watch certificate (issued under
 `peerCa` equal to `ca` (same path, or a bundle that shares a CA public key with it) is refused, and `adminCa` equal to `ca` logs a WARN.
 Frames are HMAC-authenticated with `SJWS_CP_RAFT_KEY`, a CP-only secret: data nodes hold the HA cluster key,
 so the Raft key is never derived from it, and a start where it equals this process's `WEB_SERVER_HA_CLUSTER_KEY` or
-`_PREVIOUS` is refused (no value is printed; the YAML `ha:` key is not compared).
+`_PREVIOUS`, or the HA key it resolved from the config file (`ha.cluster_key`, `ha.cluster_key_file`, or their
+`_previous` forms, when `ha.enabled` is true), is refused (constant-time compare; no value is printed).
 An accepted socket must finish the mTLS handshake within `TcpTransport.HANDSHAKE_TIMEOUT_MILLIS` (5 s total)
 before it takes an inbound slot, and non-member source addresses are refused at accept in every mode.
 `CpHost.reload()` reloads the `cp-peer` material with the other listeners, all or nothing (2.4 says when it runs).
