@@ -71,7 +71,15 @@ import sjws_nettask.cluster.LogSnapshot;
  * stamp). The consensus log is replayed from its start on restart; this file plus the ledger end decide which entries
  * are already in the ledger, so replay never duplicates records. Its first record is the header: the snapshot point
  * {@code (index, term, endOffset)} the file starts after (index 0 and the ledger end when replication started). A
- * record with count -1 is a replicated retention decision: {@code base} is the new log start.
+ * record with count -1 is a replicated retention decision: {@code base} is the new log start. A clean {@link #close}
+ * appends a marker ({@code index = -1}, {@code baseOffset} = the ledger end) once every apply finished.
+ *
+ * <p>Offsets are assigned from the ledger end, so every node's ledger must hold exactly the replicated records. The
+ * open refuses ({@link IllegalArgumentException}, exit 64 at startup, naming the topic and both numbers) a ledger
+ * that does not line up: the first replicated open of a non-empty ledger (records from before replication), a ledger
+ * that moved past the end a clean close recorded (local writes while replication was off), and a ledger shorter
+ * than where replication started. A ledger past the stamps after a crash (stamps not on disk yet) is still recovered
+ * by replay, as before.
  *
  * <p><b>Snapshots (#270)</b>, with a {@link Snapshots.Runtime}. Off the produce path, the replicator's scheduler checks
  * each replica: once {@code everyEntries} entries were applied since the last snapshot, the latest applied entry is the
@@ -81,7 +89,9 @@ import sjws_nettask.cluster.LogSnapshot;
  * A follower the leader can no longer serve from the log receives the manifest as a consensus snapshot and, on its
  * delivery thread, fetches the segment data from a pin on any data node ({@link SnapshotTransfer}), swaps it in for
  * its whole ledger, restores the application state, and continues from the installed point. An install marker
- * ({@code <topic>.install}) makes a crash anywhere in that sequence redo it on restart.
+ * ({@code <topic>.install}) makes a crash anywhere in that sequence redo it on restart. After a successful fetch the
+ * image must match the consensus manifest {@code m} (index/term/endOffset/logStart/sections/per-chunk digests);
+ * anything else is refused and the next peer is tried.
  *
  * <p>Entry {@code [R][stampTerm][origin][seq][offset]}: "advance the log start to {@code offset}", proposed by the
  * leader's retention pass and applied on every replica (constraint 3).
@@ -93,6 +103,8 @@ final class RaftReplica implements Replica {
     private static final int HEADER = 1 + 1 + 8 + 4 + 8 + 4;
     private static final int RETAIN_BYTES = 1 + 8 + 4 + 8 + 8;
     private static final int STAMP = 28;
+    /** Stamp index of the clean-close marker. */
+    private static final long CLEAN = -1;
 
     private final ClusterNode node;
     private final GroupId groupId;
@@ -181,7 +193,8 @@ final class RaftReplica implements Replica {
         this.onApplied = hooks != null ? hooks.onApplied() : onApplied;
         this.urls = urls;
         this.snaps = snaps;
-        this.topic = groupId.value().substring("msg/".length());
+        var name = groupId.value();
+        this.topic = name.startsWith("msg/") ? name.substring(4) : name;
         this.self = node.self().wire();
         this.stampFile = stampFile;
         this.installMarker = stampFile.resolveSibling(this.topic + ".install");
@@ -191,7 +204,12 @@ final class RaftReplica implements Replica {
         this.installPending = Files.exists(this.installMarker);
         long ledgerEnd = local.snapshot().nextOffset();
         this.skipTo = ledgerEnd;
-        recover(ledgerEnd);
+        try {
+            recover(ledgerEnd);
+        } catch (IOException | RuntimeException e) {
+            this.stamps.close();
+            throw e;
+        }
         this.recordedIndex = this.resumeIndex;
         if (this.logStart > 0 && hooks != null) hooks.dropBelow().accept(this.logStart); // a crash may have kept them
         var listener = new GroupListener() {
@@ -231,11 +249,34 @@ final class RaftReplica implements Replica {
     /** Reads the stamp file: resume after the last batch wholly in the ledger; drops stamps past it. */
     private void recover(long ledgerEnd) throws IOException {
         long size = this.stamps.size() / STAMP * STAMP;
-        if (size == 0) { // header: the ledger end when replication started (pre-HA records are not in the group)
+        if (size == 0) { // header: the ledger end when replication started, which must be 0 (or an install will set it)
+            if (ledgerEnd != 0 && !this.installPending) {
+                throw refused("already holds " + ledgerEnd + " local record(s) (offsets 0.." + (ledgerEnd - 1)
+                        + ") from before replication, but replication starts every node at offset 0; start a"
+                        + " replicated topic from an empty log on every data node (see \"Migrating to HA"
+                        + " messaging\" in high-availability.md)");
+            }
             this.stamps.truncate(0);
             writeStamp(0, 0, ledgerEnd, 0);
+            this.stamps.force(false);
             this.expected = ledgerEnd;
             return;
+        }
+        if (size >= 2L * STAMP) { // a clean close left a marker: the ledger must not have moved since
+            var last = ByteBuffer.allocate(STAMP);
+            while (last.hasRemaining()) if (this.stamps.read(last, size - STAMP + last.position()) < 0) break;
+            last.flip();
+            if (last.getLong() == CLEAN) {
+                last.getLong();
+                long cleanEnd = last.getLong();
+                if (ledgerEnd > cleanEnd && !this.installPending) {
+                    throw refused("ledger end is " + ledgerEnd + " but replication stopped cleanly at " + cleanEnd
+                            + ": " + (ledgerEnd - cleanEnd) + " record(s) were written while replication was off,"
+                            + " and the other nodes do not have them; wipe this topic on every data node (or re-seed"
+                            + " it) before turning replication back on (see \"Rollback\" in high-availability.md)");
+                }
+                size -= STAMP; // dropped below with the rest of the tail
+            }
         }
         var buf = ByteBuffer.allocate((int) Math.min(size, (long) STAMP << 15));
         long pos = 0, keep = STAMP;
@@ -248,9 +289,16 @@ final class RaftReplica implements Replica {
                 long index = buf.getLong(), term = buf.getLong(), base = buf.getLong();
                 int count = buf.getInt();
                 if (first) {
+                    if (ledgerEnd < base && !this.installPending) {
+                        throw refused("ledger end is " + ledgerEnd + " but replication started at offset " + base
+                                + ": the ledger was wiped or truncated while its replication state was kept; wipe"
+                                + " both, or neither");
+                    }
                     this.expected = base;
                     this.resumeIndex = index; // the snapshot point the file starts after (0 before any snapshot)
                     first = false;
+                } else if (index == CLEAN) {
+                    break; // a marker before the end (should not happen): stop, keep what precedes it
                 } else if (gap) {
                     continue; // after the first batch not in the ledger: everything is re-applied
                 } else if (count < 0) { // replicated retention: base is the new log start
@@ -268,9 +316,16 @@ final class RaftReplica implements Replica {
             pos += buf.limit();
         }
         this.stamps.truncate(keep);
+        this.stamps.force(false); // the dropped marker must not come back after a crash
     }
 
-    private void writeStamp(long index, long term, long base, int count) throws IOException {
+    private IllegalArgumentException refused(String why) {
+        var what = "__offsets".equals(this.topic) ? "consumer offsets (__offsets, replicated with the topics)"
+                : "replicated topic " + this.topic;
+        return new IllegalArgumentException("ha messaging: " + what + " " + why + "; refusing to start");
+    }
+
+    private void writeStamp    private void writeStamp(long index, long term, long base, int count) throws IOException {
         var b = ByteBuffer.allocate(STAMP).putLong(index).putLong(term).putLong(base).putInt(count).flip();
         this.stampLock.lock();
         try {
@@ -369,6 +424,7 @@ final class RaftReplica implements Replica {
     }
 
     private void onCommitted(CommittedEntry e) {
+        if (this.closed) return; // close() recorded the ledger end; the entry is replayed on restart
         if (this.installPending) {
             var f = this.installing;
             if (f != null) f.join(); // the restart install: entries wait for the ledger they apply to
@@ -899,7 +955,6 @@ final class RaftReplica implements Replica {
 
     @Override
     public void close() {
-        this.closed = true;
         if (this.tick != null) this.tick.cancel(false);
         this.node.openGroup(this.groupId, RaftReplicator.options(java.time.Duration.ofSeconds(1), java.time.Duration.ofMillis(100)), null);
         // Proposed and maybe in the log: the entry may still commit and be applied (on restart, or by the other
@@ -907,6 +962,27 @@ final class RaftReplica implements Replica {
         var closed = outcomeUnknown(this.groupId.value() + ": closed before the append was acknowledged", leaderName(), null);
         this.pending.values().forEach(p -> p.completeExceptionally(closed));
         this.pending.clear();
+        CompletableFuture<?> inFlight;
+        long end;
+        this.applyLock.lock();
+        try {
+            this.closed = true;
+            inFlight = this.lastLocal;
+            end = this.expected;
+        } finally {
+            this.applyLock.unlock();
+        }
+        try {
+            inFlight.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            if (!this.installPending && this.local.snapshot().nextOffset() == end) {
+                writeStamp(CLEAN, CLEAN, end, 0);
+                this.stamps.force(false);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException | java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
+            // no marker: the next open recovers as after a crash
+        }
         this.stampLock.lock();
         try {
             this.stamps.close();

@@ -46,10 +46,13 @@ import sjws_nettask.messaging.http.MessagingModule;
  * Reached by class name from the composition root only when {@link HaMessagingSettings#replicate()} is true, so a
  * node with {@code ha.messaging: off} or no member list loads neither this package nor {@code sjws_nettask.cluster}.
  *
- * <p>One {@link ReplicatedNode} on one {@link TcpTransport} (HMAC per frame under {@code ha.cluster_key}, HKDF info
- * {@code sjws-raft-frame-v1}) and one {@link FileLogStorage} under {@code <state_dir>/raft}. A data node hands a
- * {@link RaftReplicator} to {@link MessagingModule#replication}; the witness opens the same groups, from the same
- * {@code ha.topics} with the same timings, through {@link RaftReplicator#openForWitness} (#217 item 1).
+ * <p>One {@link ReplicatedNode} on one {@link TcpTransport} in its own {@link #DOMAIN} (HMAC per frame under
+ * {@code ha.cluster_key}, tag label {@code sjws-msgrepl-frame}, HKDF info {@code sjws-msgrepl-frame-v1}, so a CP voter
+ * or swarm frame never opens here, nor the reverse, even under the same key) and one {@link FileLogStorage} under
+ * {@code <state_dir>/raft}. A data node hands a {@link RaftReplicator} to {@link MessagingModule#replication}; the
+ * witness opens the same groups, from the same {@code ha.topics} with the same timings, through
+ * {@link RaftReplicator#openForWitness} (#217 item 1). Plaintext links off loopback are refused unless
+ * {@code ha.messaging_insecure_plaintext} is set (#277).
  */
 public final class HaMessaging implements sjws_nettask.OptionalModule {
 
@@ -57,6 +60,9 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
     static final Duration TICK = Duration.ofMillis(10);
     /** Frames buffered per peer before a drop is counted (as the control plane's voter links). */
     static final int PEER_QUEUE = 1024;
+    /** Domain-separated frames of the HA messaging member links; never {@link TcpTransport.Domain#RAFT}. */
+    public static final TcpTransport.Domain DOMAIN = new TcpTransport.Domain("msgrepl", "sjws-msgrepl-frame\0",
+            "sjws-msgrepl-frame-v1", TcpTransport.MAX_FRAME_BYTES);
 
     private final ReplicatedNode node;
     private final TcpTransport transport;
@@ -100,12 +106,27 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
                     : "ha.messaging needs messaging enabled on a data node (sjws.messaging.enabled=true)");
         }
         var voters = voters(settings);
+        String offLoopback = null;
+        for (var m : voters.members()) {
+            var host = m.address().getAddress();
+            if (host == null || !host.isLoopbackAddress()) {
+                offLoopback = m.id().name() + " (" + m.address() + ")";
+                break;
+            }
+        }
+        if (offLoopback != null && !settings.insecurePlaintext()) {
+            // The settings already refused this; kept here too, as CpLaunch.tcpTransport does for cp.peers.
+            throw new IllegalArgumentException("ha.members: HA messaging member links are not encrypted ("
+                    + HaMessagingSettings.LINK_SECURITY_ISSUE + ") and must be loopback, not " + offLoopback
+                    + "; set ha." + HaMessagingSettings.INSECURE_PLAINTEXT + ": true to accept plaintext");
+        }
         var self = nodeId(settings.self());
         var clusterKey = ClusterKey.of(key, previous);
         var election = settings.electionTimeout();
         var heartbeat = settings.heartbeat();
         Files.createDirectories(stateDir);
-        var transport = TcpTransport.open(self, voters.members(), clusterKey, Clock.SYSTEM, PEER_QUEUE);
+        var transport = TcpTransport.open(self, voters.members(), clusterKey, Clock.SYSTEM, PEER_QUEUE,
+                TcpTransport.SocketFactory.PLAIN, DOMAIN, false);
         var snap = settings.snapshot();
         FileLogStorage storage = null;
         ReplicatedNode node = null;
@@ -147,13 +168,11 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
                 + ", voters=" + settings.members().size() + ", topics=" + settings.topics().size()
                 + ", election_timeout=" + election.toMillis() + "ms, heartbeat=" + heartbeat.toMillis() + "ms";
         err.println(line);
-        for (var m : voters.members()) {
-            var host = m.address().getAddress();
-            if (host == null || !host.isLoopbackAddress()) {
-                err.println("WARN: ha messaging: Raft frames to " + m.id().name() + " (" + m.address()
-                        + ") are authenticated (HMAC) but not encrypted; keep the member network private (#175)");
-                break;
-            }
+        if (offLoopback != null) {
+            err.println("WARN: ha messaging: ha." + HaMessagingSettings.INSECURE_PLAINTEXT + " is set: Raft frames to "
+                    + offLoopback + " are authenticated (HMAC) but not encrypted, and any ha.cluster_key holder can"
+                    + " act as any member; keep the member network private (" + HaMessagingSettings.LINK_SECURITY_ISSUE
+                    + ")");
         }
         if (!witness) {
             err.println("ha messaging: snapshots every " + snap.everyEntries() + " entries, " + snap.logTailEntries()

@@ -485,7 +485,14 @@ proposal (G1-G7) are met.
 |---|---|---|---|---|
 | `off` (default) | single node | single node | single node (syntax still checked) | single node |
 | `on` | refuses to start (exit 64) | replicates | refuses to start (exit 64) | refuses to start (exit 64) |
-| `auto` | single node, silently | replicates | refuses to start (exit 64) | single node, with a warning |
+| `auto` | single node, silently | replicates | refuses to start (exit 64), by design | single node, with a warning |
+
+`auto` with an invalid member list (fewer than 3 voters, a bare pair, ...) refuses rather than falling back to a
+single node: one node quietly running alone next to replicating peers would fork the data (option B as read in
+#274; inceptor to confirm).
+
+In `on` and `auto`, a replicating member list with any address off loopback also refuses to start (exit 64)
+unless `ha.messaging_insecure_plaintext: true` (#277); `off` and the single-node cases resolve no address.
 
 A valid member list is two data nodes plus one witness, or three or more data nodes. A bare pair is refused
 with the `VoterSet` words (`two voters require a witness`), and `VoterSet.majority` refuses it again when
@@ -495,12 +502,15 @@ the node opens. Every data node needs `http_url` (the 307 target when it leads).
 When the mode resolves to replication, the composition root (`HaMessagingStart`) loads
 `sjws_nettask.msgrepl.HaMessaging` by name, before the server mounts the messaging module:
 
-1. One `TcpTransport` on this member's `address`, HMAC-SHA256 per frame under `ha.cluster_key` (HKDF info
-   `sjws-raft-frame-v1`, so the key is not a heartbeat tag). Frames are authenticated, not encrypted; a
-   member off loopback logs a warning. Any key holder can act as any member until #175's cert-to-peer
-   binding covers this transport: keep the member network private.
+1. One `TcpTransport` on this member's `address`, HMAC-SHA256 per frame under `ha.cluster_key`, in its own
+   frame domain `msgrepl` (tag label `sjws-msgrepl-frame `, HKDF info `sjws-msgrepl-frame-v1`), so the key
+   is not a heartbeat tag and a CP voter (`sjws-raft-frame-v1`) or swarm peer frame never opens here, nor the
+   reverse, even under the same key. Frames are authenticated, not encrypted, and on these plain sockets the
+   claimed sender is not bound to the connection: any key holder can act as any member until #277 covers this
+   transport. A member off loopback needs `ha.messaging_insecure_plaintext: true` (startup WARN); keep the
+   member network private.
 2. One rolling `FileLogStorage` under `<state_dir>/raft` (default `<--state-dir>/msgrepl`; files of
-   `ha.snapshot.log_segment_bytes`), and one
+   `ha.snapshot.log_segment_bytes`, default 16 MiB) so prefix truncation after a snapshot unlinks sealed files.
    `ReplicatedNode` with `VoterSet.dataAndWitness` (with a witness) or `VoterSet.majority`.
 3. A data node opens the snapshot runtime (`<state_dir>/snap`, one scheduler thread) and the install
    listener (Raft port + `ha.snapshot.port_offset`), builds `RaftReplicator(node, ha.topics, data-node
@@ -511,18 +521,51 @@ When the mode resolves to replication, the composition root (`HaMessagingStart`)
    timings. Shutdown closes the messaging module (and its replicas) first, then the node, the transport and the
    log storage.
 
-Only `ha.topics` are replicated; producing to any other topic on a replicated node is refused (`LogTopics`).
+Only `ha.topics` (and their consumer offsets in `__offsets`) are replicated. Any other topic keeps the plain
+local path on a replicating node, exactly as with HA off: it is read and written on whichever node the client
+talks to, with no consensus, no redirect and no 503, and existing data in it stays readable. Its consumer
+offsets stay local too, in `__offsets_local` (same format, never replicated), so a replicated `__offsets`
+never holds offsets into one node's local data. Each node's copy of an unlisted topic is its own.
+
+### Migrating to HA messaging
+
+Replication assigns offsets from 0 on every node, so a replicated topic (and `__offsets`) must start from an
+empty log on every data node. At startup a node refuses (exit 64, naming the topic and both numbers):
+
+- a topic in `ha.topics`, or `__offsets`, that already holds local records and has no replication state yet
+  (data written with HA off, before the first replicated start);
+- a replicated topic whose ledger end moved past the end recorded at the last clean stop (local writes while
+  replication was off, see Rollback);
+- a ledger below the offset its replication state started at (the ledger wiped, its state kept).
+
+A ledger ahead of its replication state after a crash (the state not on disk yet) is still recovered from the
+consensus log, as before. The supported migration is: stop the nodes, move or delete the messaging directories
+of the topics that will be listed in `ha.topics`, and of `__offsets` (consumers re-commit), then start every
+node with replication on. Topics that stay out of `ha.topics` keep their data. A one-time import of an existing
+topic on one node (re-proposing its records through consensus) is not implemented.
 The settings are read once at startup; changing them needs a restart.
 
 Any `ha.members` list also marks the process as multi-process for the swarm stream guard
 (`Sjws_nettask.multiProcess`, #236), whatever `ha.messaging` resolves to.
 
-**Rollback.** `ha.messaging: off` (or removing `ha.members`) and a restart: each node serves its local applied
-ledger without consensus. The nodes no longer agree; keep one node writable and drain the others. The Raft
-state under `state_dir` stays; turning replication back on resumes from it if the directory is kept or wiped
-as a whole.
+**Rollback.** Stop every node cleanly (SIGTERM or `--stop`: the signal hook waits up to 20 s for the messaging
+module to close, which records each replicated topic's end), then `ha.messaging: off` (or remove `ha.members`) and restart: each node
+serves its local applied ledger without consensus. The nodes no longer agree; keep one node writable and drain
+the others. The Raft state under `state_dir` stays. Turning replication back on:
 
-Known limits (gates before any default change): no multi-process test yet (G3); torn last record (#241).
+- with no local write on any replicated topic since the stop, it resumes from the kept state (every node,
+  the state directory kept);
+- after any local write on a replicated topic, the node refuses to start (exit 64): the other nodes do not have
+  those records, and resuming would fork offsets. Re-enabling then needs those topics' messaging directories,
+  `__offsets`, and the whole `state_dir`, wiped on every data node (a fresh start, as in Migrating), or a
+  re-seed. The check relies on the clean stop; a node killed before the rollback has no record of where it
+  stopped, so wipe it as well.
+
+Known limits (gates before any default change): no multi-process test yet (G3); torn last record (#241); member links not encrypted and the sender not
+bound to its connection (#277: until it ships, `ha.messaging_insecure_plaintext` stays mandatory for members
+off loopback); members whose member lists or `ha.topics` differ are not detected (#217 item 2).
+`ha.messaging`, `ha.topics` and `ha.members` are read at startup only: a SIGHUP reload that changes them reports
+"until restart" and applies nothing.
 
 ### msg/* snapshots, truncation and install (#270)
 
@@ -584,7 +627,7 @@ On restart a node restores its own manifest: its ledger already holds `endOffset
 adopts the point and replays the kept tail. Entries already in the ledger are not appended again; with an
 application state, they are fed to `onApplied` again after the image is restored.
 
-**Install transfer and the #175 trust boundary.** One TCP listener per data node on the member's host at Raft
+**Install transfer and the #277 trust boundary.** One TCP listener per data node on the member's host at Raft
 port + `port_offset`. Requests are HMAC-SHA256 under `HKDF-SHA256(cluster key, "sjws-msg-snapshot-v1")` (the
 rotation key is accepted, and the reply uses the key the client proved), with a fresh 16-byte nonce (an LRU of
 8192 refuses replays) and a timestamp within 120 s. Anything that fails is closed without an answer and
@@ -623,7 +666,6 @@ last entry it acked, at or past the snapshot point). No segments, pins or manife
 
 **Zero cost when off.** Without `ha.messaging` replication none of this loads (`ReplicaHooks` and every
 msgrepl class stay unloaded; `cp.ClassLoadTest`). A `RaftReplicator` built without a runtime never snapshots.
-
 ## Zero cost when HA is off
 
 `ha.enabled` false discards any key bytes and does not resolve `ClusterKey`.

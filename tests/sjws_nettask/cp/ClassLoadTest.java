@@ -142,7 +142,8 @@ class ClassLoadTest {
 
     /**
      * Gate G1 (inceptor): {@code ha.messaging: off} with a member list, and {@code auto} with no member list, both cost
-     * nothing. A real server process with messaging on takes a produce and a fetch, and loads no {@code msgrepl} class
+     * nothing, as does {@code auto} with a member list but {@code ha.enabled: false}. A real server process with
+     * messaging on takes a produce and a fetch, and loads no {@code msgrepl} class
      * and none of the Raft machinery ({@code ReplicatedNode}, {@code RaftGroup}, {@code TcpTransport}, the log storage).
      * With {@code ha.enabled: true} only the key type ({@code ClusterKey}) may load, as before this gate. #270: neither
      * do the snapshot pieces ({@code ReplicaHooks}, the msgrepl snapshot store and transfer), with an
@@ -163,6 +164,10 @@ class ClassLoadTest {
         assertNoReplication(off, true);
         var auto = startAndProduce("auto", "ha:\n  messaging: auto\n");
         assertNoReplication(auto, false);
+        // auto with a member list but ha.enabled false: single node, with the warning, and no key resolved.
+        var autoMembers = startAndProduce("auto-members", "ha:\n  enabled: false\n  messaging: auto\n" + members);
+        assertNoReplication(autoMembers, false);
+        assertTrue(autoMembers.contains("ha.enabled is false: ha.messaging: auto stays single-node"), autoMembers);
         var absent = startAndProduce("absent", "# no ha block\n");
         assertNoReplication(absent, false);
     }

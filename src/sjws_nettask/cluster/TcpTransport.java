@@ -130,7 +130,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
 
     /**
      * Which protocol a transport carries. The tag label and the HKDF info are domain-separated, so a frame sealed
-     * for one domain (Raft, the swarm peer links of #236) fails the tag check in every other one, even under the
+     * for one domain (Raft, the swarm peer links of #236, the HA messaging member links) fails the tag check in every other one, even under the
      * same key. {@link #RAFT} is the Raft transport's domain, unchanged.
      *
      * @param name thread-name prefix

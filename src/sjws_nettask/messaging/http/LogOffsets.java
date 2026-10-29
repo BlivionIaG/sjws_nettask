@@ -37,10 +37,15 @@ import sjws_nettask.messaging.ledger.Durability;
  *
  * <p>Cost when unused: nothing is opened or replayed until the first commit or read, or until maintenance finds an
  * existing {@code __offsets} directory.
+ *
+ * <p>With HA replication on, {@link #TOPIC} is replicated and holds the commits of the replicated topics only; topics
+ * outside {@code ha.topics} stay local, and so do their commits, in the local-only {@link #LOCAL_TOPIC} (same format).
  */
 final class LogOffsets {
 
     static final String TOPIC = "__offsets";
+    /** Commits of the topics that stay local on a replicating node (never replicated, never used with HA off). */
+    static final String LOCAL_TOPIC = "__offsets_local";
     static final long DEFAULT_EXPIRY_MS = 7L * 24 * 3600 * 1000;
     static final Durability DEFAULT_DURABILITY = Durability.GROUP;
 
@@ -48,6 +53,8 @@ final class LogOffsets {
     record Commit(long offset, long commitMs, long seq) { }
 
     private final LogTopics topics;
+    /** The offsets topic this instance is backed by: {@link #TOPIC} or {@link #LOCAL_TOPIC}. */
+    private final String name;
     private final long expiryMs;
     private final java.util.function.LongSupplier clockMs;
     /** topic → group → latest commit. */
@@ -59,14 +66,24 @@ final class LogOffsets {
     private final ReentrantLock loading = new ReentrantLock();
 
     LogOffsets(LogTopics topics, long expiryMs, java.util.function.LongSupplier clockMs) {
+        this(topics, TOPIC, expiryMs, clockMs);
+    }
+
+    LogOffsets(LogTopics topics, String name, long expiryMs, java.util.function.LongSupplier clockMs) {
         if (expiryMs <= 0) throw new IllegalArgumentException("expiryMs must be > 0");
         this.topics = topics;
+        this.name = java.util.Objects.requireNonNull(name);
         this.expiryMs = expiryMs;
         this.clockMs = clockMs;
     }
 
     long expiryMs() {
         return this.expiryMs;
+    }
+
+    /** The offsets topic backing this instance. */
+    String topic() {
+        return this.name;
     }
 
     static byte[] key(String topic, String group) {
@@ -80,11 +97,11 @@ final class LogOffsets {
 
     /** Opens {@code __offsets} and replays it once; later calls are one volatile read. */
     private LogTopics.Log ensureLoaded(boolean create) throws IOException {
-        if (this.loaded) return this.topics.get(TOPIC, true);
+        if (this.loaded) return this.topics.get(this.name, true);
         this.loading.lock();
         try {
-            if (this.loaded) return this.topics.get(TOPIC, true);
-            var l = this.topics.get(TOPIC, create);
+            if (this.loaded) return this.topics.get(this.name, true);
+            var l = this.topics.get(this.name, create);
             if (l == null) return null;
             long committed = l.writer().snapshot().nextOffset();
             l.log().scanFrom(0, rb -> {

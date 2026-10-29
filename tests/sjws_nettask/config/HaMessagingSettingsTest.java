@@ -202,6 +202,54 @@ class HaMessagingSettingsTest {
         assertTrue(auto.warnings().stream().anyMatch(w -> w.contains("ha.enabled is false")), auto.warnings().toString());
     }
 
+    static final String OFF_LOOPBACK = """
+              node_id: a
+              members:
+                - { id: a, address: "127.0.0.1:7101", http_url: "http://127.0.0.1:8101" }
+                - { id: b, address: "192.0.2.2:7102", http_url: "http://192.0.2.2:8102" }
+                - { id: w, address: "127.0.0.1:7103", witness: true }
+              topics: [orders]
+            """;
+
+    @Test
+    void plaintextMembersOffLoopbackNeedTheExplicitOptIn() throws Exception {
+        // #274 B1: the CpLaunch rule (plaintext voter links must be loopback), with an explicit opt-in.
+        for (var mode : new String[] {"on", "auto"}) {
+            var refused = error("ha:\n  enabled: true\n  messaging: " + mode + "\n" + OFF_LOOPBACK);
+            assertTrue(refused.contains("must be loopback, not 192.0.2.2:7102"), refused);
+            assertTrue(refused.contains("ha.messaging_insecure_plaintext: true"), refused);
+            assertTrue(refused.contains("#277"), refused);
+            assertFalse(refused.contains(KEY), refused);
+            var optedIn = load("ha:\n  enabled: true\n  messaging: " + mode
+                    + "\n  messaging_insecure_plaintext: true\n" + OFF_LOOPBACK);
+            assertTrue(optedIn.ok(), optedIn.errors().toString());
+            assertTrue(optedIn.haMessaging().replicate(), mode);
+            assertTrue(optedIn.haMessaging().insecurePlaintext(), mode);
+            var optedOut = error("ha:\n  enabled: true\n  messaging: " + mode
+                    + "\n  messaging_insecure_plaintext: false\n" + OFF_LOOPBACK);
+            assertTrue(optedOut.contains("must be loopback"), optedOut);
+        }
+        // Nothing replicates, so nothing is checked or resolved: off, and auto without ha.enabled.
+        var off = load("ha:\n  enabled: true\n  messaging: off\n" + OFF_LOOPBACK);
+        assertTrue(off.ok(), off.errors().toString());
+        assertFalse(off.haMessaging().replicate());
+        var autoLocal = load("ha:\n  messaging: auto\n" + OFF_LOOPBACK);
+        assertTrue(autoLocal.ok(), autoLocal.errors().toString());
+        assertFalse(autoLocal.haMessaging().replicate());
+        // Loopback members need no opt-in, and the default is false.
+        var loop = load("ha:\n  enabled: true\n  messaging: on\n" + THREE);
+        assertTrue(loop.ok(), loop.errors().toString());
+        assertFalse(loop.haMessaging().insecurePlaintext());
+        assertFalse(HaMessagingSettings.NONE.insecurePlaintext());
+        assertTrue(error("ha:\n  enabled: true\n  messaging: on\n  messaging_insecure_plaintext: yes please\n"
+                + THREE).contains("ha.messaging_insecure_plaintext: expected true or false"));
+        assertTrue(HaMessagingSettings.loopback("127.0.0.1"));
+        assertTrue(HaMessagingSettings.loopback("::1"));
+        assertTrue(HaMessagingSettings.loopback("localhost"));
+        assertFalse(HaMessagingSettings.loopback("192.0.2.2"));
+        assertFalse(HaMessagingSettings.loopback("0.0.0.0"));
+    }
+
     @Test
     void badValuesAreRefused() throws Exception {
         String h = "ha:\n  enabled: true\n  messaging: off\n";
