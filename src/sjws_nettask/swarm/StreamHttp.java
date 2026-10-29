@@ -54,13 +54,16 @@ import sjws_nettask.swarm.wire.StreamChunk;
  * {@code Location: /swarm/v1/replies/{hex}}.</li>
  * <li>{@code GET /swarm/v1/replies/{session}}: the stream as {@code text/event-stream} (default) or {@code TOKEN}
  * frames ({@code Accept: application/vnd.sjws.swarm.v1}). SSE: {@code retry: 1000} once, then per chunk {@code id:
- * <chunkSeq>}, {@code event: chunk}, the bytes as UTF-8 (invalid UTF-8 is replaced with U+FFFD: SSE is for text, use
- * the binary type for bytes), one {@code data:} line per line. Terminal: {@code event: end} with {@code data:
- * ok|cancelled|error|deadline}. A missing range is never skipped: {@code event: gap} with {@code data: <from> <to>
- * <reason>} ({@code to} is {@code ?} when unknown), then {@code end: error}. Binary terminals are the {@code LAST}
- * {@code TOKEN} frame, or an {@code ERROR|LAST} frame whose payload is {@code deadline} or {@code gap <from> <to>
- * <reason>}. Resume: {@code Last-Event-ID: n} (from n + 1) or {@code ?from=n}; resuming after the end returns the
- * terminal at once.</li>
+ * <attempt>.<chunkSeq>}, {@code event: chunk}, the bytes as UTF-8 (invalid UTF-8 is replaced with U+FFFD: SSE is for
+ * text, use the binary type for bytes), one {@code data:} line per line. A worker {@code LAST|ERROR} with a non-empty
+ * payload is {@code event: failure} (never {@code error}: browsers reserve that for transport failures) carrying the
+ * text, then {@code event: end} / {@code data: error}; an empty {@code LAST|ERROR} is only {@code end}. A gap-induced
+ * {@code end: error} stays {@code event: gap} + {@code end}, with no {@code failure} event. Other terminals:
+ * {@code event: end} with {@code data: ok|cancelled|deadline}. Binary terminals are the {@code LAST} {@code TOKEN}
+ * frame (including its {@code LAST|ERROR} payload), or an {@code ERROR|LAST} frame whose payload is {@code deadline}
+ * or {@code gap <from> <to> <reason>}. Resume: {@code Last-Event-ID: <attempt>.n} (from n + 1) or {@code ?from=n};
+ * resuming after the end returns the terminal at once (SSE re-emits {@code failure} when non-empty, then {@code end};
+ * binary returns the real terminal bytes, which stay charged to the node budget until grace expiry).</li>
  * <li>{@code POST /swarm/v1/leases/{leaseId}:chunk}: body one {@code TOKEN} frame (StreamChunk v1 payload; the stream
  * id must be the task's correlation id). 204; 409 when the lease is stale, or {@code cancelled} with {@code
  * "reason":"deadline"} once the task's deadline has passed (the claim stays cached: ack it). A {@code LAST} chunk
@@ -844,12 +847,13 @@ final class StreamHttp {
                         }
                         return ByteBuffer.wrap(this.binary ? c.toFrame().encode() : sse(c));
                     }
-                    case Ended(var l) -> { // reconnect after the end: the terminal state at once
+                    case Ended(var l) -> { // reconnect after the end: the terminal state at once (#282)
                         end();
+                        // LAST bytes stay charged to the #272 node budget until GRACE_MS sweep, so re-emitting them
+                        // adds no uncharged residency (Architecture #282 answer 4)
                         return ByteBuffer.wrap(this.binary
-                                ? StreamChunk.owned(l.streamHi(), l.streamLo(), l.attempt(), l.chunkSeq(), l.flags(), new byte[0])
-                                        .toFrame().encode()
-                                : endEvent(l).getBytes(StandardCharsets.UTF_8));
+                                ? l.toFrame().encode()
+                                : terminalSse(l).getBytes(StandardCharsets.UTF_8));
                     }
                     case Gap g -> {
                         end();
@@ -907,23 +911,59 @@ final class StreamHttp {
         return "id: " + last.attempt() + "." + last.chunkSeq() + "\nevent: end\ndata: " + how + "\n\n";
     }
 
-    /** One SSE event: {@code id}, {@code event: chunk}, one {@code data:} line per line; {@code LAST} adds an end event. */
+    /**
+     * Appends one SSE event ({@code id}, {@code event: <name>}, one {@code data:} line per line). Used for ordinary
+     * {@code chunk} events and for {@code failure} (#282): the name {@code failure} is pinned so browsers do not treat
+     * the text as an EventSource transport {@code error}.
+     */
+    static void appendSseEvent(StringBuilder b, StreamChunk c, String event) {
+        b.append("id: ").append(c.attempt()).append('.').append(c.chunkSeq()).append("\nevent: ").append(event)
+                .append('\n');
+        var text = new String(c.bytes(), StandardCharsets.UTF_8);
+        int start = 0;
+        for (int i = 0; i <= text.length(); i++) {
+            if (i == text.length() || text.charAt(i) == '\n' || text.charAt(i) == '\r') {
+                b.append("data: ").append(text, start, i).append('\n');
+                if (i < text.length() && text.charAt(i) == '\r' && i + 1 < text.length() && text.charAt(i + 1) == '\n') {
+                    i++;
+                }
+                start = i + 1;
+            }
+        }
+        b.append('\n');
+    }
+
+    /**
+     * Reconnect-after-end SSE body (#282): {@code event: failure} (when {@code LAST|ERROR} and non-empty) then
+     * {@code endEvent}. Gap/cancelled/ok/deadline paths never call this with a failure payload.
+     */
+    static String terminalSse(StreamChunk last) {
+        if ((last.flags() & Frame.ERROR) != 0 && last.size() > 0) {
+            var b = new StringBuilder(last.size() + 64);
+            appendSseEvent(b, last, "failure");
+            b.append(endEvent(last));
+            return b.toString();
+        }
+        return endEvent(last);
+    }
+
+    /**
+     * One SSE event: {@code id}, {@code event: chunk}, one {@code data:} line per line; {@code LAST} adds an end
+     * event. A {@code LAST|ERROR} with a non-empty payload is {@code event: failure} then {@code end} (#282), never a
+     * {@code chunk}; an empty {@code LAST|ERROR} is only {@code end}.
+     */
     static byte[] sse(StreamChunk c) {
         var b = new StringBuilder(c.size() + 48);
-        if (c.size() > 0 || !c.last()) {
-            b.append("id: ").append(c.attempt()).append('.').append(c.chunkSeq()).append("\nevent: chunk\n");
-            var text = new String(c.bytes(), StandardCharsets.UTF_8);
-            int start = 0;
-            for (int i = 0; i <= text.length(); i++) {
-                if (i == text.length() || text.charAt(i) == '\n' || text.charAt(i) == '\r') {
-                    b.append("data: ").append(text, start, i).append('\n');
-                    if (i < text.length() && text.charAt(i) == '\r' && i + 1 < text.length() && text.charAt(i + 1) == '\n') {
-                        i++;
-                    }
-                    start = i + 1;
-                }
+        boolean errorLast = c.last() && (c.flags() & Frame.ERROR) != 0;
+        if (errorLast) {
+            if (c.size() > 0) {
+                appendSseEvent(b, c, "failure");
             }
-            b.append('\n');
+            b.append(endEvent(c));
+            return b.toString().getBytes(StandardCharsets.UTF_8);
+        }
+        if (c.size() > 0 || !c.last()) {
+            appendSseEvent(b, c, "chunk");
         }
         if (c.last()) {
             b.append(endEvent(c));
