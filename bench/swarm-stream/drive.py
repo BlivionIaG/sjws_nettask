@@ -179,10 +179,11 @@ def run_window(args) -> dict:
         lat_us.clear(); bytes_rx = 0; ttft_us.clear(); inter_us.clear()
         credit_waits.clear(); writer_stats.clear(); errors.clear()
 
-    # Measure
+    # Measure — throughput uses the configured window length (drain/joins excluded)
     t0 = time.monotonic()
     run_wave(args.streams, args.secs, "g")
-    elapsed = max(1e-6, time.monotonic() - t0)
+    wall = max(1e-6, time.monotonic() - t0)
+    elapsed = max(1e-6, float(args.secs))
     load1_post = float(open("/proc/loadavg").read().split()[0])
 
     lat_sorted = sorted(lat_us)
@@ -223,6 +224,7 @@ def run_window(args) -> dict:
         "streams": args.streams,
         "agents": len(clients),
         "elapsed_s": elapsed,
+        "wall_s": wall,
         "load1_pre": load1_pre,
         "load1_post": load1_post,
         "self_loaded": load1_post >= 4.0,
