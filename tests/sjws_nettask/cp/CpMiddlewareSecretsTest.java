@@ -102,6 +102,16 @@ class CpMiddlewareSecretsTest {
         var state = dir.resolve("cp");
         try (var store = CpStore.open(state, keys, clock)) {
             elect(store, clock);
+            // On master an inline canary is accepted and lands in the log; the fix refuses it first.
+            var inline = store.propose(baseYaml(root) + """
+                    middleware:
+                      - name: api-key
+                        order: 10
+                        options:
+                          keys: "%s"
+                    """.formatted(CANARY));
+            assertEquals(400, inline.status(), inline.body());
+            assertFalse(inline.body().contains(CANARY), inline.body());
             var yaml = baseYaml(root) + """
                     middleware:
                       - name: api-key
