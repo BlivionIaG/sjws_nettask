@@ -447,6 +447,9 @@ class RaftReplicaTest {
         var stamps = dir.resolve("state/t.applied");
         try (var ch = FileChannel.open(stamps, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             long last = ch.size() - 28;
+            var idx = ByteBuffer.allocate(8);
+            ch.read(idx, last);
+            if (idx.flip().getLong() == -1L) last -= 28; // skip the clean-close marker (#274)
             var count = ByteBuffer.allocate(4);
             ch.read(count, last + 24);
             assertEquals(2, count.flip().getInt(), "the last stamp is the two-record batch");

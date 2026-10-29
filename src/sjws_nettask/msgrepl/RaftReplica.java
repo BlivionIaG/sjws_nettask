@@ -131,10 +131,16 @@ final class RaftReplica implements Replica {
     private volatile long readyTerm = -1;
     // Delivery-thread state (one delivery thread per group).
     private long resumeIndex;
-    /** Next offset: from the stamp header's base, advanced by every batch applied, replayed ones included. */
+    /** Next offset for new applies: lined up from the stamp file in {@link #recover}, then advanced by each live batch. */
     private long expected;
     /** {@link #expected} once the replay reaches {@link #resumeIndex} (from the stamp file), as a cross-check. */
     private long resumeExpected;
+    /**
+     * Offset cursor while rebuilding the producer table from entries {@code <= resumeIndex}. Starts at the stamp
+     * header base; {@link #expected} itself is already the lined-up ledger end after {@link #recover}, so a clean
+     * {@link #close} works even when raft does not replay (fresh storage in tests, or a snapshot past the stamps).
+     */
+    private long replayAt = -1;
     /**
      * Producer dedup state, created by the first producer entry applied (#278 B4: a topic that never sees one never
      * loads the class); null is the empty table. Replaced only by {@link #restoreProducers}. Written by the delivery
@@ -194,6 +200,7 @@ final class RaftReplica implements Replica {
             this.stamps.force(false);
             this.expected = ledgerEnd;
             this.resumeExpected = ledgerEnd;
+            this.replayAt = -1;
             return;
         }
         if (size >= 2L * STAMP) { // a clean close left a marker: the ledger must not have moved since
@@ -228,14 +235,16 @@ final class RaftReplica implements Replica {
                                 + ": the ledger was wiped or truncated while its replication state was kept; wipe"
                                 + " both, or neither");
                     }
-                    this.expected = base; // replay recomputes every offset from the header's base
+                    this.expected = base;
                     this.resumeExpected = base;
+                    this.replayAt = base; // producer-table rebuild walks from here; expected advances with the stamps
                     first = false;
                 } else if (index == CLEAN) {
                     break; // a marker before the end (should not happen): stop, keep what precedes it
                 } else if (base + count <= ledgerEnd) {
                     this.resumeIndex = index;
                     this.resumeExpected = base + count;
+                    this.expected = base + count; // lined up: close() can write CLEAN without a raft replay
                     keep = pos + buf.position();
                 }
             }
@@ -349,18 +358,30 @@ final class RaftReplica implements Replica {
                 return;
             }
         }
-        long base = this.expected;
-        this.expected += count;
-        if (producerId != 0) this.producers.apply(pOrigin, producerId, producerSeq, base, count, digest);
+        long base;
         if (replayed) {
-            if (e.index() == this.resumeIndex && this.expected != this.resumeExpected) {
-                // The replay did not reproduce the offsets this node wrote: the producer table built on the way holds
-                // the same wrong bases, so dedup acks would disagree with the ledger and the peers (#278 HA B3).
-                fence(e, "replay reached offset " + this.expected + " at index " + e.index()
-                        + ", the stamp file says " + this.resumeExpected, null);
+            // expected already mirrors the stamp file (recover); replayAt rebuilds the producer table only
+            if (this.replayAt < 0) {
+                fence(e, "replay at index " + e.index() + " with no stamp-header base", null);
+                return;
+            }
+            base = this.replayAt;
+            this.replayAt += count;
+            if (producerId != 0) this.producers.apply(pOrigin, producerId, producerSeq, base, count, digest);
+            if (e.index() == this.resumeIndex) {
+                if (this.replayAt != this.resumeExpected) {
+                    // The replay did not reproduce the offsets this node wrote: the producer table built on the way holds
+                    // the same wrong bases, so dedup acks would disagree with the ledger and the peers (#278 HA B3).
+                    fence(e, "replay reached offset " + this.replayAt + " at index " + e.index()
+                            + ", the stamp file says " + this.resumeExpected, null);
+                }
+                this.replayAt = -1;
             }
             return;
         }
+        base = this.expected;
+        this.expected += count;
+        if (producerId != 0) this.producers.apply(pOrigin, producerId, producerSeq, base, count, digest);
         var records = new ArrayList<byte[]>(count);
         for (int i = 0; i < count; i++) {
             var r = new byte[b.getInt()];
