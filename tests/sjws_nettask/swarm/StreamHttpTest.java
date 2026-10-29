@@ -346,6 +346,10 @@ class StreamHttpTest {
         var fail = new String(StreamHttp.sse(new StreamChunk(1, 1, 1, 7, Frame.LAST | Frame.ERROR,
                 "model crashed".getBytes(StandardCharsets.UTF_8))), StandardCharsets.UTF_8);
         assertEquals("id: 1.7\nevent: failure\ndata: model crashed\n\nid: 1.7\nevent: end\ndata: error\n\n", fail);
+        // Architecture nit (#290 comment 6509116389): invalid UTF-8 → U+FFFD inside event: failure
+        var badUtf8 = new String(StreamHttp.sse(new StreamChunk(1, 1, 0, 8, Frame.LAST | Frame.ERROR,
+                new byte[]{(byte) 0xFF})), StandardCharsets.UTF_8);
+        assertEquals("id: 0.8\nevent: failure\ndata: \uFFFD\n\nid: 0.8\nevent: end\ndata: error\n\n", badUtf8);
         var cr = new String(StreamHttp.sse(new StreamChunk(1, 1, 0, 0, "a\rb\n".getBytes(StandardCharsets.UTF_8))),
                 StandardCharsets.UTF_8);
         assertEquals("id: 0.0\nevent: chunk\ndata: a\ndata: b\ndata: \n\n", cr);

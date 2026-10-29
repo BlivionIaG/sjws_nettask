@@ -40,9 +40,8 @@ import sjws_nettask.tls.TlsMaterial;
 /**
  * #261 Q1: over HTTP/3, {@code :claim} carries {@code sjws-lease-stream} and {@code sjws-stream-window} for a batch with
  * a stream task (once each, entry per LEASE), none for a unary-only batch. Run with the advertised window of a small config
- * and at the defaults (64/256). HTTP/3 ignores request bodies today ({@code Http3RequestHandler}), so the tasks are
- * submitted in-process and only the body-less {@code :claim} goes over QUIC; {@code :chunk} over HTTP/1.1 is covered by
- * {@code LeaseStreamHeaderTest} and the Python e2e.
+ * and at the defaults (64/256). The tasks are submitted in-process and only {@code :claim} goes over QUIC here;
+ * {@code RequestBodyHttp3Test} runs submit, {@code :chunk} and the session read over HTTP/3 (#281).
  */
 @Tag("h3")
 class LeaseStreamHttp3Test {
