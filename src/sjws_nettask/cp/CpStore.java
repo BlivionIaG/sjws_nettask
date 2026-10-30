@@ -94,6 +94,9 @@ public final class CpStore implements AutoCloseable {
 
     /** Newest activated envelope, for watch threads; written only where {@code history} grows. */
     private volatile SignedSnapshot latest;
+    /** True after {@link #warnInlineSecretsAtStartup()} has inspected an activated document (or found none after a check with history). */
+    private final java.util.concurrent.atomic.AtomicBoolean inlineStartupChecked =
+            new java.util.concurrent.atomic.AtomicBoolean();
     /** Guards the watch wait and the state watch threads touch: {@code reported} and {@code joins}. */
     private final java.util.concurrent.locks.ReentrantLock watchLock = new java.util.concurrent.locks.ReentrantLock();
     private final java.util.concurrent.locks.Condition activatedChanged = watchLock.newCondition();
@@ -379,6 +382,25 @@ public final class CpStore implements AutoCloseable {
         node.begin(Duration.ofMillis(50));
     }
 
+    /**
+     * One WARN when the activated CP document still carries inline {@code keys}/{@code hmac-keys}.
+     * No-op until an activated document exists so Raft replay can land first; then at most once.
+     * Values are never logged.
+     */
+    public void warnInlineSecretsAtStartup() {
+        var snap = activated();
+        if (snap == null) {
+            return;
+        }
+        if (!inlineStartupChecked.compareAndSet(false, true)) {
+            return;
+        }
+        var doc = document(snap.version());
+        var middleware = doc == null ? null : doc.middleware();
+        sjws_nettask.config.MiddlewareSecrets.logStartupWarn(
+                System.getLogger(CpStore.class.getName()), null, middleware, null);
+    }
+
     public boolean adminEnrolled() {
         return policy.containsValue(sjws_nettask.controlplane.Role.ADMIN);
     }
@@ -424,6 +446,10 @@ public final class CpStore implements AutoCloseable {
         var errors = ConfigValidator.validate(loaded.document());
         if (!errors.isEmpty()) {
             return Outcome.error(400, errors.get(0));
+        }
+        var secret = sjws_nettask.config.MiddlewareSecrets.refuseInline(loaded.document().middleware());
+        if (secret != null) {
+            return Outcome.error(400, secret);
         }
         if (!loaded.document().messaging().assignment().isEmpty()) {
             return Outcome.error(400, "assignment is computed by the control plane");
@@ -720,6 +746,12 @@ public final class CpStore implements AutoCloseable {
         if (errors.isEmpty()) {
             errors.addAll(ConfigValidator.validate(loaded.document()));
         }
+        if (errors.isEmpty()) {
+            var secret = sjws_nettask.config.MiddlewareSecrets.refuseInline(loaded.document().middleware());
+            if (secret != null) {
+                errors.add(secret);
+            }
+        }
         if (errors.isEmpty() && !loaded.document().messaging().assignment().isEmpty()) {
             errors.add("assignment is computed by the control plane");
         }
@@ -922,6 +954,7 @@ public final class CpStore implements AutoCloseable {
                 }
                 publishLatest(snapshot);
                 staged = null;
+                warnInlineSecretsAtStartup();
             }
             case RBAC -> {
                 var san = readString(body);
@@ -968,9 +1001,12 @@ public final class CpStore implements AutoCloseable {
     }
 
     private static String configBody(SignedSnapshot snapshot) {
+        // Mask inline gateway secrets before serving to viewers (defence in depth for any
+        // legacy snapshot that still carries them; new proposals refuse them outright).
+        var yaml = sjws_nettask.config.MiddlewareSecrets.maskYaml(snapshot.canonicalYaml());
         return "{\"version\":" + snapshot.version() + ",\"canonicalHash\":"
                 + LastGoodFiles.jsonString(snapshot.canonicalHashHex()) + ",\"yaml\":"
-                + LastGoodFiles.jsonString(snapshot.canonicalYaml()) + "}";
+                + LastGoodFiles.jsonString(yaml) + "}";
     }
 
     private static void nodeJson(StringBuilder json, String id, String role, Map<String, String> labels, String health,
