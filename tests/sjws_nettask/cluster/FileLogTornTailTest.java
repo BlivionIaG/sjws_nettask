@@ -182,7 +182,7 @@ class FileLogTornTailTest {
         assertEquals(ends.get(3), Files.size(logFile(root)));
     }
 
-    /** Non-contiguous indexes mid-file also fail closed (framing looks complete). */
+    /** Non-rolling: non-contiguous indexes mid-file fail closed (framing looks complete). */
     @Test
     void nonContiguousIndexInMiddleFailsClosed() throws Exception {
         var root = dir.resolve("mid-gap");
@@ -213,6 +213,30 @@ class FileLogTornTailTest {
         assertTrue(t.getMessage().contains("index 99") || t.getMessage().contains("refusing"),
                 "message=" + t.getMessage());
         assertEquals(ends.get(3), Files.size(logFile(root)));
+    }
+
+    /**
+     * Rolling mode: a snapshot prefix truncate clears memory but can leave the active file. A later
+     * append after the snapshot index then creates a gap in that file; reopen must keep the contiguous
+     * suffix (Codex P1 on #316), not refuse startup.
+     */
+    @Test
+    void rollingActiveFileGapAfterPrefixTruncateStillLoadsSuffix() throws Exception {
+        var root = dir.resolve("roll-gap");
+        Files.createDirectories(root);
+        var log = new FileLogStorage(root, 512);
+        log.append(GROUP, 1, 1, b("old"));
+        log.force(GROUP);
+        log.truncatePrefix(GROUP, Long.MAX_VALUE - 1);
+        log.append(GROUP, 101, 1, b("after-snap"));
+        log.force(GROUP);
+        assertEquals(101L, log.lastIndex(GROUP));
+        log.close();
+        var re = new FileLogStorage(root, 512);
+        assertEquals(101L, re.lastIndex(GROUP));
+        assertArrayEquals(b("after-snap"), re.read(GROUP, 101));
+        assertEquals(null, re.read(GROUP, 1), "pre-snapshot index dropped from the live run");
+        re.close();
     }
 
     /**
