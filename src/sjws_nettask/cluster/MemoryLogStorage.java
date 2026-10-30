@@ -169,6 +169,12 @@ public final class MemoryLogStorage implements LogStorage {
 
     @Override
     public void saveSnapshot(GroupId group, LogSnapshot snapshot) {
+        // Same rule as FileLogStorage: never replace a newer durable image with an older one (#288 Codex P1).
+        var existing = snapshots.get(group);
+        if (existing != null && existing.lastIncludedIndex() > snapshot.lastIncludedIndex()) {
+            throw new IllegalArgumentException("stale snapshot save: index " + snapshot.lastIncludedIndex()
+                    + " would replace durable index " + existing.lastIncludedIndex());
+        }
         snapshots.put(group, snapshot);
     }
 
