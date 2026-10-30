@@ -21,8 +21,11 @@ import static org.junit.jupiter.api.Assertions.*;
 import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import sjws_nettask.core.RequestHeaders;
+import java.net.InetAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.lang.ref.WeakReference;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
@@ -34,6 +37,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.routing.discovery.Endpoint;
 import sjws_nettask.routing.discovery.Endpoint.Health;
 import sjws_nettask.routing.discovery.LbPolicy;
@@ -302,4 +306,124 @@ class EndpointBalancerTest {
         assertThrows(NullPointerException.class, () -> new EndpointBalancer.Outlier(1, 50, 1, null, d, 50));
         assertThrows(NullPointerException.class, () -> new EndpointBalancer(null, e -> null, null, null));
     }
+
+    /**
+     * #78 / Codex P2: a peer-budget share refusal is local admission. Repeated 503s from that
+     * path must not eject the endpoint; a real upstream 503 still must.
+     */
+    @Test
+    void peerBudgetRefusalsDoNotEjectButUpstreamFailuresStillDo() throws Exception {
+        var budget = new ByteBudget(1 << 20, 64 * 1024);
+        var peer = new InetSocketAddress(InetAddress.getByAddress(new byte[] {10, 4, 5, 6}), 0);
+        budget.add(64 * 1024, budget.peerStripe(peer)); // peer already at its share
+        var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null), budget);
+        var src = new StaticUpstreamSource(set(1, null, ep(0, 1)));
+        var b = new EndpointBalancer(src, pools, null, o, Duration.ZERO, this.now::get);
+        this.balancers.add(b);
+        var req = new Request("GET", "/", RequestHeaders.of(Map.of()), peer, false);
+        for (int i = 0; i < 20; i++) {
+            var r = b.handle(req);
+            assertEquals(503, r.status(), "local peer-budget refusal");
+            assertTrue(ProxyHandler.isLocalRefusal(r));
+        }
+        var pool = b.poolOf(ep(0, 1).authority());
+        assertFalse(pool.health.ejected(), "share-exhaustion 503s must not mark the endpoint unhealthy");
+        assertEquals(0, b.ejectedCount());
+
+        // Real upstream 503s still count toward ejection.
+        this.failing.add("a");
+        var other = new Request("GET", "/"); // no peer → keyless stripe, not at share
+        for (int i = 0; i < 3; i++) {
+            assertEquals(503, b.handle(other).status());
+        }
+        assertTrue(pool.health.ejected(), "real upstream 503s must still eject");
+        assertEquals(1, b.ejectedCount());
+    }
+
+    /**
+     * Codex / inceptor P2 on #298: a local refusal on a half-open probe must release the probe
+     * without counting success or failure, so a later real request can probe and the endpoint
+     * recovers. With a second healthy endpoint, a stuck probe leaves the ejected one skipped
+     * forever (fails at 5f3d37c without {@code health.release()}).
+     */
+    @Test
+    void localRefusalReleasesHalfOpenProbe() throws Exception {
+        var budget = new ByteBudget(1 << 20, 64 * 1024);
+        var peer = new InetSocketAddress(InetAddress.getByAddress(new byte[] {10, 9, 9, 9}), 0);
+        budget.add(64 * 1024, budget.peerStripe(peer));
+        assertTrue(budget.exhausted(budget.peerStripe(peer)));
+        var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null), budget);
+        // Phase 1: only A, so the post-eject_for pick must take A's half-open probe.
+        var src = new StaticUpstreamSource(set(1, null, ep(0, 1)));
+        var b = new EndpointBalancer(src, pools, null, o, Duration.ZERO, this.now::get);
+        this.balancers.add(b);
+        var poolA = b.poolOf(ep(0, 1).authority());
+        this.failing.add("a");
+        for (int i = 0; i < 3; i++) {
+            assertEquals(503, b.handle(new Request("GET", "/")).status());
+        }
+        assertTrue(poolA.health.ejected());
+        this.failing.clear();
+        this.now.addAndGet(1_100_000_000L);
+        var refused = b.handle(new Request("GET", "/", RequestHeaders.of(Map.of()), peer, false));
+        assertEquals(503, refused.status(), "local peer-budget refusal on the recovery probe");
+        assertTrue(ProxyHandler.isLocalRefusal(refused));
+        assertTrue(poolA.health.ejected(), "local refusal must not count as success");
+        // Phase 2: add a healthy B. If the probe stayed reserved, A is skipped forever.
+        assertTrue(src.update(set(2, null, ep(0, 1), ep(1, 1))));
+        boolean recovered = false;
+        for (int i = 0; i < 80; i++) {
+            var r = b.handle(new Request("GET", "/"));
+            assertTrue(r.status() == 200 || r.status() == 503, "status=" + r.status());
+            if (!poolA.health.ejected()) {
+                recovered = true;
+                break;
+            }
+        }
+        assertTrue(recovered, "endpoint must accept a real probe and leave ejection after local refusal released the slot");
+        assertEquals(0, b.ejectedCount());
+    }
+
+
+    /**
+     * Codex / inceptor P1 on #298: local admission must not retain responses in a global set.
+     * Holds only weak refs across 10k refusals; after GC every referent must be gone. Fails when
+     * ProxyHandler keeps a strong static collection (5f3d37c).
+     */
+    @Test
+    void localRefusalMarkersDoNotPinResponsesForever() {
+        var refs = new java.util.ArrayList<WeakReference<sjws_nettask.core.Response>>(10_000);
+        for (int i = 0; i < 10_000; i++) {
+            var r = ProxyHandler.localRefusal(StaticFileHandler.error(503, false));
+            assertTrue(ProxyHandler.isLocalRefusal(r));
+            refs.add(new WeakReference<>(r));
+        }
+        boolean cleared = false;
+        for (int i = 0; i < 80; i++) {
+            System.gc();
+            System.runFinalization();
+            long live = refs.stream().filter(w -> w.get() != null).count();
+            if (live == 0) {
+                cleared = true;
+                break;
+            }
+            try {
+                Thread.sleep(25);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        long live = refs.stream().filter(w -> w.get() != null).count();
+        assertTrue(cleared && live == 0, "retained " + live + " / 10000 local-refusal responses");
+    }
+
+
+
 }

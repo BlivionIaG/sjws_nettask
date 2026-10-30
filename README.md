@@ -1,10 +1,14 @@
 # sjws_nettask
-Simple Java Web Server
+SJWS — Swarm Java Web Services
 
-A static file server on virtual threads: HTTP/1.0 and 1.1 over TCP, with opt-in HTTP/2 and HTTP/3
-(QUIC) served by the same protocol-neutral core.
+SJWS is a reliable, fast, low-latency message-oriented middleware that is also a web server:
+HTTP/1.x, HTTP/2 and HTTP/3, reverse proxy and gateway filters, a control plane, cluster HA
+(per-group Raft), a messaging core (partitions, durable ledger, produce/fetch at `/messaging/v1`),
+and an optional agent swarm. The repo name `sjws_nettask` and the acronym stay the same; packages
+and artifacts are not renamed.
 
-**Vision:** a reliable, fast, low-latency message-oriented middleware that is also a web server.
+Full messaging replication across the cluster (`ReplicatedLedger`) and the later swarm phases
+(S2/S3) are still planned — see the Status table.
 
 ## Status
 

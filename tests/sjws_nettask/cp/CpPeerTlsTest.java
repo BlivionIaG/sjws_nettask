@@ -37,6 +37,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.Clock;
+import sjws_nettask.clusterharness.EphemeralPorts;
 import sjws_nettask.cluster.ClusterKey;
 import sjws_nettask.cluster.GroupId;
 import sjws_nettask.cluster.Member;
@@ -70,7 +71,11 @@ class CpPeerTlsTest {
 
     /** Dialer is voter {@code b}, acceptor voter {@code a}; both pin {@code urn:sjws:node:<id>} (#175). */
     private Outcome dial(CpServerTls serverTls, CpServerTls clientTls) throws Exception {
-        int port = freePort();
+        return EphemeralPorts.withBindRetry("CpPeerTlsTest.dial", () -> dialOnce(serverTls, clientTls));
+    }
+
+    private Outcome dialOnce(CpServerTls serverTls, CpServerTls clientTls) throws Exception {
+        int port = EphemeralPorts.probe();
         var peers = List.of(
                 new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", port), false, CpTestCa.san("a")),
                 new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", 1), false, CpTestCa.san("b")));
@@ -268,10 +273,11 @@ class CpPeerTlsTest {
         var ca = new CpTestCa(dir.resolve("ca-transport"));
         var other = new CpTestCa(dir.resolve("other-transport"));
         var key = ClusterKey.of("cp-raft-key-for-tests-0123".getBytes(StandardCharsets.US_ASCII), null);
+        var ports = EphemeralPorts.probeDistinct(2);
         var members = new ArrayList<Member>();
         for (int wire = 1; wire <= 2; wire++) {
             members.add(new Member(new NodeId(wire, "cp-" + wire), new SiteId("cp"),
-                    new InetSocketAddress("127.0.0.1", freePort()), 1L, MemberState.ALIVE, false));
+                    new InetSocketAddress("127.0.0.1", ports[wire - 1]), 1L, MemberState.ALIVE, false));
         }
         var group = new GroupId("cp-config");
         var got = new ArrayList<SimTransport.Frame>();
@@ -346,10 +352,11 @@ class CpPeerTlsTest {
     void stalledHandshakesCannotStarveARealPeer() throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
         var key = ClusterKey.of("cp-raft-key-for-tests-0123".getBytes(StandardCharsets.US_ASCII), null);
+        var ports = EphemeralPorts.probeDistinct(3);
         var members = new ArrayList<Member>();
         for (int wire = 1; wire <= 3; wire++) {
             members.add(new Member(new NodeId(wire, "cp-" + wire), new SiteId("cp"),
-                    new InetSocketAddress("127.0.0.1", freePort()), 1L, MemberState.ALIVE, false));
+                    new InetSocketAddress("127.0.0.1", ports[wire - 1]), 1L, MemberState.ALIVE, false));
         }
         var group = new GroupId("cp-config");
         var got = new ArrayList<SimTransport.Frame>();
@@ -417,13 +424,6 @@ class CpPeerTlsTest {
         return new CpPeerSockets(CpTls.serverContext(ca.peer(self)), peers, self);
     }
 
-    private static int freePort() throws IOException {
-        try (var probe = new ServerSocket()) {
-            probe.bind(new InetSocketAddress("127.0.0.1", 0));
-            return probe.getLocalPort();
-        }
-    }
-
     private static void await(BooleanSupplier condition, String what) throws InterruptedException {
         long deadline = System.nanoTime() + 20_000_000_000L;
         while (!condition.getAsBoolean()) {
@@ -439,10 +439,11 @@ class CpPeerTlsTest {
     void inFlightHandshakesAreCapped() throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
         var key = ClusterKey.of("cp-raft-key-for-tests-0123".getBytes(StandardCharsets.US_ASCII), null);
+        var ports = EphemeralPorts.probeDistinct(2);
         var members = new ArrayList<Member>();
         for (int wire = 1; wire <= 2; wire++) {
             members.add(new Member(new NodeId(wire, "cp-" + wire), new SiteId("cp"),
-                    new InetSocketAddress("127.0.0.1", freePort()), 1L, MemberState.ALIVE, false));
+                    new InetSocketAddress("127.0.0.1", ports[wire - 1]), 1L, MemberState.ALIVE, false));
         }
         try (var b = TcpTransport.open(members.get(1).id(), members, key, Clock.SYSTEM, 64,
                 pinned(ca, members, "cp-2"))) {

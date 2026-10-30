@@ -48,7 +48,7 @@ import java.util.regex.Pattern;
  */
 public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members, Duration electionTimeout,
         Duration heartbeat, Path stateDir, Set<String> topics, boolean insecurePlaintext, boolean replicate,
-        List<String> warnings) {
+        List<String> warnings, Snapshot snapshot) {
 
     /** {@code ha.messaging}. */
     public enum Mode {
@@ -85,10 +85,47 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
     /** The issue tracking encryption and sender binding on the member links; a default-on gate. */
     public static final String LINK_SECURITY_ISSUE = "#277";
 
+    /**
+     * {@code ha.snapshot} (#270): when each msg group snapshots its ledger and truncates its consensus log, and how a
+     * lagging follower installs a peer's segments.
+     *
+     * @param everyEntries     applied entries between snapshots
+     * @param logTailEntries   consensus entries kept behind a snapshot, so a briefly lagging follower catches up
+     *                         from the log instead of an install
+     * @param chunkBytes       install chunk size (each chunk has its own SHA-256)
+     * @param installRate      install bytes per second each sending node allows, all sessions together
+     * @param portOffset       the install listener's port is the member's Raft port plus this
+     * @param logSegmentBytes  the consensus log rolls into a new file at this size, so truncation frees whole files
+     */
+    public record Snapshot(long everyEntries, long logTailEntries, int chunkBytes, long installRate, int portOffset,
+            long logSegmentBytes, long maxInstallBytes) {
+
+        /**
+         * Defaults: every 10 000 entries, 1 000 kept, 1 MiB chunks, 64 MiB/s, port + 1, 16 MiB log files, 4 GiB install
+         * bound (#295: four default 1 GiB ledger segments; {@code 0} is the explicit unlimited opt-in).
+         */
+        public static final Snapshot DEFAULT = new Snapshot(10_000, 1_000, 1 << 20, 64L << 20, 1, 16L << 20, 4L << 30);
+
+        public Snapshot {
+            if (everyEntries < 1) throw new ConfigException("ha.snapshot.every_entries: expected at least 1");
+            if (logTailEntries < 0) throw new ConfigException("ha.snapshot.log_tail_entries: expected at least 0");
+            if (chunkBytes < 4096 || chunkBytes > 16 << 20) {
+                throw new ConfigException("ha.snapshot.chunk_bytes: expected 4k to 16m");
+            }
+            if (installRate < 4096) throw new ConfigException("ha.snapshot.install_rate: expected at least 4k");
+            if (portOffset < 1 || portOffset > 1000) throw new ConfigException("ha.snapshot.port_offset: expected 1 to 1000");
+            if (logSegmentBytes < 4096) throw new ConfigException("ha.snapshot.log_segment_bytes: expected at least 4k");
+            if (maxInstallBytes < 0) throw new ConfigException("ha.snapshot.max_install_bytes: expected at least 0");
+        }
+    }
+
     /** The {@code ha:} keys this class reads. */
     static final List<String> KEYS = List.of("messaging", "node_id", "members", "election_timeout", "heartbeat",
-            "state_dir", "topics", INSECURE_PLAINTEXT);
+            "state_dir", "topics", INSECURE_PLAINTEXT, "snapshot");
 
+
+    private static final List<String> SNAPSHOT_KEYS = List.of("every_entries", "log_tail_entries", "chunk_bytes",
+            "install_rate", "port_offset", "log_segment_bytes", "max_install_bytes");
 
     private static final List<String> MEMBER_KEYS = List.of("id", "address", "http_url", "witness", "wire");
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
@@ -97,12 +134,19 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
 
     /** No {@code ha.messaging} and no member list. */
     public static final HaMessagingSettings NONE = new HaMessagingSettings(DEFAULT_MODE, null, List.of(),
-            DEFAULT_ELECTION_TIMEOUT, DEFAULT_HEARTBEAT, null, Set.of(), false, false, List.of());
+            DEFAULT_ELECTION_TIMEOUT, DEFAULT_HEARTBEAT, null, Set.of(), false, false, List.of(), Snapshot.DEFAULT);
 
     public HaMessagingSettings {
         members = List.copyOf(members);
         topics = Set.copyOf(topics);
         warnings = List.copyOf(warnings);
+    }
+
+    /** Without an explicit snapshot block (defaults) and with plaintext off. */
+    public HaMessagingSettings(Mode mode, String nodeId, List<Member> members, Duration electionTimeout,
+            Duration heartbeat, Path stateDir, Set<String> topics, boolean replicate, List<String> warnings) {
+        this(mode, nodeId, members, electionTimeout, heartbeat, stateDir, topics, false, replicate, warnings,
+                Snapshot.DEFAULT);
     }
 
     /** This node's entry, or null. */
@@ -159,9 +203,28 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
         var warnings = new ArrayList<String>();
         boolean replicate = decide(mode, haEnabled, nodeId, members, election, heartbeat, topics, plaintext,
                 warnings);
+        var snapshot = snapshot(ha.get("snapshot"));
         return new HaMessagingSettings(mode, nodeId, members, election, heartbeat, stateDir, topics, plaintext,
-                replicate, warnings);
+                replicate, warnings, snapshot);
     }
+
+    private static Snapshot snapshot(Object raw) {
+        if (raw == null) {
+            return Snapshot.DEFAULT;
+        }
+        var map = YamlValues.mapping(raw, "ha.snapshot");
+        YamlValues.knownKeys(map, SNAPSHOT_KEYS, "ha.snapshot");
+        var d = Snapshot.DEFAULT;
+        return new Snapshot(
+                map.containsKey("every_entries") ? count(map.get("every_entries"), "ha.snapshot.every_entries") : d.everyEntries(),
+                map.containsKey("log_tail_entries") ? count(map.get("log_tail_entries"), "ha.snapshot.log_tail_entries") : d.logTailEntries(),
+                map.containsKey("chunk_bytes") ? (int) Math.min(Integer.MAX_VALUE, size(map.get("chunk_bytes"), "ha.snapshot.chunk_bytes")) : d.chunkBytes(),
+                map.containsKey("install_rate") ? size(map.get("install_rate"), "ha.snapshot.install_rate") : d.installRate(),
+                map.containsKey("port_offset") ? (int) Math.min(Integer.MAX_VALUE, count(map.get("port_offset"), "ha.snapshot.port_offset")) : d.portOffset(),
+                map.containsKey("log_segment_bytes") ? size(map.get("log_segment_bytes"), "ha.snapshot.log_segment_bytes") : d.logSegmentBytes(),
+                map.containsKey("max_install_bytes") ? size(map.get("max_install_bytes"), "ha.snapshot.max_install_bytes") : d.maxInstallBytes());
+    }
+
 
     /** {@link #decide(Mode, boolean, String, List, Duration, Duration, Set, boolean, List)} without the opt-in. */
     static boolean decide(Mode mode, boolean haEnabled, String nodeId, List<Member> members, Duration election,
@@ -274,6 +337,20 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
                             + " ha.election_timeout %.1f ms; refusing to start",
                     lease / 1e6, needed / 1e6, election.toNanos() / 1e6));
         }
+    }
+
+    private static long count(Object raw, String path) {
+        if (!(raw instanceof Number n) || n.doubleValue() != n.longValue() || n.longValue() < 0) {
+            throw new ConfigException(path + ": expected a non-negative integer");
+        }
+        return n.longValue();
+    }
+
+    private static long size(Object raw, String path) {
+        if (raw instanceof Number n) {
+            return count(n, path);
+        }
+        return Sizes.parse(string(raw, path), Long.MAX_VALUE, path);
     }
 
     static Mode mode(Object raw) {

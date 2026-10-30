@@ -66,9 +66,15 @@ final class H3TestClient implements AutoCloseable {
     private final List<QuicChannel> connections = new ArrayList<>();
     private final long idleMillis;
 
-    /** Trusts exactly {@code trusted} (pinned), or anything if null. */
+    /**
+     * Trusts exactly {@code trusted} (pinned), or anything if null.
+     * Default idle is 60 s (was 15 s) so a multi-megabyte range under a loaded CI runner cannot
+     * idle the shared QUIC connection mid-transfer (rangeParity flake on #306: {@code stream was
+     * reset null} at ~15.08 s). The per-stream receive window stays 1 MiB: backpressure tests rely
+     * on filling it with {@code setAutoRead(false)} (#310).
+     */
     H3TestClient(X509Certificate trusted) throws InterruptedException {
-        this(trusted, 15_000, Http3.supportedApplicationProtocols());
+        this(trusted, 60_000, Http3.supportedApplicationProtocols());
     }
 
     H3TestClient(X509Certificate trusted, long idleMillis, String... alpn) throws InterruptedException {

@@ -5,7 +5,9 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.List;
 import java.util.regex.Pattern;
 
@@ -29,6 +31,18 @@ public final class SegmentedLog implements AutoCloseable {
     private volatile Segment active;
     /** Held from open to close: one process per ledger directory. */
     private DirectoryLock dirLock;
+    /**
+     * Bumped by {@link #replaceWith} so an in-flight {@link #prepareCompaction}/{@link #commitCompaction} pair
+     * cannot close or overwrite segments that installation just swapped in (#288 Codex P1).
+     */
+    private final AtomicLong epoch = new AtomicLong();
+    /** baseOffset → epoch observed when that compaction was prepared. */
+    private final ConcurrentHashMap<Long, Long> preparedAt = new ConcurrentHashMap<>();
+    /**
+     * Serializes {@link #prepareCompaction}/{@link #commitCompaction} against {@link #replaceWith} so a late
+     * {@code .compacted} marker from an overlapped preparation cannot attach to installed segments (#288 Codex P1).
+     */
+    private final java.util.concurrent.locks.ReentrantLock compactionGate = new java.util.concurrent.locks.ReentrantLock();
 
     private SegmentedLog(Path dir, long segmentBytes, long truncated) {
         this.dir = dir;
@@ -192,24 +206,130 @@ public final class SegmentedLog implements AutoCloseable {
     }
 
     /**
-     * Phase 1 of compaction (no lock needed, readers may continue): writes a copy of sealed segment {@code base} keeping only
-     * batches whose base offset {@code keep} accepts, fsynced, plus its marker. Returns the new size in bytes.
+     * Phase 1 of compaction (readers may continue; serialized against {@link #replaceWith} via {@code compactionGate}):
+     * writes a copy of sealed segment {@code base} keeping only batches whose base offset {@code keep} accepts, fsynced,
+     * plus its marker. Returns the new size in bytes.
      */
     public long prepareCompaction(long base, java.util.function.LongPredicate keep) throws IOException {
-        return sealedSegment(base).writeCompacted(keep);
+        compactionGate.lock();
+        try {
+            long at = epoch.get();
+            long size = sealedSegment(base).writeCompacted(keep);
+            preparedAt.put(base, at);
+            return size;
+        } finally {
+            compactionGate.unlock();
+        }
     }
 
     /** Phase 2 (callers exclude readers of this segment): swaps in the compacted file and persists its index. */
     public void commitCompaction(long base) throws IOException {
+        compactionGate.lock();
+        try {
+            commitCompactionLocked(base);
+        } finally {
+            compactionGate.unlock();
+        }
+    }
+
+    private void commitCompactionLocked(long base) throws IOException {
+        var cmp = dir.resolve(Segment.name(base, ".cmp"));
+        Long at = preparedAt.get(base);
+        // Installation may have replaced the ledger (and deleted .cmp) between prepare and commit: do not close
+        // the newly installed segment or rename a stale preparation over it (#288 Codex P1).
+        if (at == null || at != epoch.get() || !Files.isRegularFile(cmp)) {
+            preparedAt.remove(base);
+            Files.deleteIfExists(cmp);
+            return;
+        }
         var old = sealedSegment(base);
         int i = segments.indexOf(old);
         old.close();
-        var cmp = dir.resolve(Segment.name(base, ".cmp"));
         java.nio.file.Files.move(cmp, old.logPath, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         java.nio.file.Files.deleteIfExists(old.indexPath);
         var seg = Segment.open(dir, base, true, new long[1]);
         seg.seal();
         segments.set(i, seg);
+        preparedAt.remove(base);
+    }
+
+    /**
+     * One segment's file for a snapshot export (#270; narrow API for the HA replication layer, Messaging Core owns the
+     * format): {@code [baseOffset, nextOffset)} of {@code file}, the segment's {@code .compacted} marker value or -1.
+     */
+    public record SegmentFile(long baseOffset, long nextOffset, Path file, Path marker, boolean active) { }
+
+    /** The segment files in offset order (#270 snapshot export). Names only; the caller links or reads them. */
+    public List<SegmentFile> segmentFiles() {
+        var out = new ArrayList<SegmentFile>();
+        var act = active;
+        for (var seg : segments) out.add(new SegmentFile(seg.baseOffset, seg.nextOffset(), seg.logPath, seg.markerPath, seg == act));
+        return out;
+    }
+
+    /**
+     * File position in the segment starting at {@code base} of the frame whose base offset is {@code offset} (or the
+     * segment size when {@code offset} is its next offset); -1 when no frame starts there or no such segment exists.
+     */
+    public long positionOf(long base, long offset) throws IOException {
+        for (var seg : segments) if (seg.baseOffset == base) return seg.positionOf(offset);
+        return -1;
+    }
+
+    /**
+     * #270 snapshot install (narrow lasting export/import surface for the HA replication layer, with
+     * {@link #segmentFiles}, {@link #positionOf}, {@link #reload} and {@link #deleteSegment}): replaces every segment of
+     * this log with the {@code <base>.log} files (and {@code <base>.compacted} markers) in {@code staged}, hard-linked in
+     * (copied where the file system has no links), then reopens them, recovering and validating every frame as on open.
+     * The caller guarantees that no append is in flight and excludes readers; the writer must then
+     * {@link LedgerWriter#reload}. Not atomic by design: the caller keeps {@code staged} and an install marker until it
+     * returns, and redoes the swap after a crash (#288 MC-N5).
+     */
+    public void replaceWith(Path staged) throws IOException {
+        compactionGate.lock();
+        try {
+            replaceWithLocked(staged);
+        } finally {
+            compactionGate.unlock();
+        }
+    }
+
+    private void replaceWithLocked(Path staged) throws IOException {
+        epoch.incrementAndGet();
+        preparedAt.clear();
+        for (var s : segments) s.close();
+        try (var list = Files.list(dir)) {
+            for (var p : (Iterable<Path>) list::iterator) {
+                var n = p.getFileName().toString();
+                if (n.length() > 20 && n.substring(0, 20).chars().allMatch(Character::isDigit)
+                        && (n.endsWith(".log") || n.endsWith(".index") || n.endsWith(".compacted") || n.endsWith(".cmp")
+                                || n.endsWith(".compacted.tmp") || n.endsWith(".index.tmp"))) {
+                    Files.delete(p);
+                }
+            }
+        }
+        try (var list = Files.list(staged)) {
+            for (var p : (Iterable<Path>) list::iterator) {
+                var n = p.getFileName().toString();
+                if (!(n.endsWith(".log") || n.endsWith(".compacted")) || n.length() < 21
+                        || !n.substring(0, 20).chars().allMatch(Character::isDigit)) continue;
+                var target = dir.resolve(n);
+                try {
+                    Files.createLink(target, p);
+                } catch (UnsupportedOperationException | IOException e) {
+                    Files.copy(p, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+        try (var d = java.nio.channels.FileChannel.open(dir, java.nio.file.StandardOpenOption.READ)) {
+            d.force(true);
+        } catch (IOException ignored) {
+            // some file systems refuse a directory fsync; the caller's marker covers a crash here
+        }
+        var fresh = openLocked(dir, segmentBytes);
+        segments.clear();
+        segments.addAll(fresh.segments);
+        active = segments.getLast();
     }
 
     @Override public void close() throws IOException {

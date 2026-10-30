@@ -30,6 +30,10 @@ import java.nio.channels.ServerSocketChannel;
  * TOCTOU race: another process can bind that port before the test's server does. Prefer
  * {@link #reserve()} when the listener can take the already-bound socket, or retry the whole startup with a fresh
  * port set when the port must be written into a config first (multi-process HA messaging).
+ *
+ * <p>When a peer list needs several distinct ports, {@link #probeDistinct(int)} holds every probe socket open until
+ * all ports are chosen so the OS cannot hand the same port out twice (the {@code duplicate address} flake). The
+ * sockets are then closed; a later bind can still race, so combine with a bounded retry on address-in-use.
  */
 public final class EphemeralPorts {
 
@@ -44,6 +48,63 @@ public final class EphemeralPorts {
         try (var s = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             return s.getLocalPort();
         }
+    }
+
+    /**
+     * {@code n} distinct loopback ports. Holds every probe socket open until all are bound so the kernel cannot
+     * reassign a just-freed port to the next probe (which would make a peer list fail with
+     * {@code duplicate address}). The sockets are closed before this returns, so a later bind is still TOCTOU —
+     * pair with {@link #withBindRetry} when something listens on these ports.
+     */
+    public static int[] probeDistinct(int n) throws IOException {
+        if (n < 0) {
+            throw new IllegalArgumentException("n < 0");
+        }
+        var held = new ServerSocket[n];
+        var ports = new int[n];
+        try {
+            for (int i = 0; i < n; i++) {
+                held[i] = reserveSocket();
+                ports[i] = held[i].getLocalPort();
+            }
+            return ports;
+        } finally {
+            for (var s : held) {
+                if (s != null) {
+                    try {
+                        s.close();
+                    } catch (IOException ignored) {
+                        // best-effort cleanup of the other held probes
+                    }
+                }
+            }
+        }
+    }
+
+    /** One attempt that may fail with address-in-use after a closed {@link #probe()} / {@link #probeDistinct}. */
+    @FunctionalInterface
+    public interface BindAttempt<T> {
+        T run() throws Exception;
+    }
+
+    /**
+     * Runs {@code attempt} up to {@link #BIND_ATTEMPTS} times, retrying only when {@link #addressInUse(Throwable)}
+     * matches. The attempt itself must allocate fresh ports on each call.
+     */
+    public static <T> T withBindRetry(String who, BindAttempt<T> attempt) throws Exception {
+        Exception last = null;
+        for (int i = 1; i <= BIND_ATTEMPTS; i++) {
+            try {
+                return attempt.run();
+            } catch (Exception e) {
+                last = e;
+                if (!addressInUse(e) || i == BIND_ATTEMPTS) {
+                    throw e;
+                }
+                logRetry(who, i, e);
+            }
+        }
+        throw last;
     }
 
     /** Binds loopback:0 and returns the open channel; the caller owns it and must close it. */

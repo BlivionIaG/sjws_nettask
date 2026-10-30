@@ -281,6 +281,34 @@ class HaMessagingSettingsTest {
         assertTrue(error(h + "  state_dir: \"\"\n").contains("ha.state_dir: expected a string"));
     }
 
+    /** #270: {@code ha.snapshot} defaults, overrides with sizes, and refusals. */
+    @Test
+    void snapshotBlock() throws Exception {
+        var d = load("ha:\n  enabled: true\n  messaging: on\n" + THREE);
+        assertTrue(d.ok(), d.errors().toString());
+        assertEquals(HaMessagingSettings.Snapshot.DEFAULT, d.haMessaging().snapshot());
+        var s = load("ha:\n  enabled: true\n  messaging: on\n" + THREE + "  snapshot:\n    every_entries: 500\n"
+                + "    log_tail_entries: 0\n    chunk_bytes: 64k\n    install_rate: 8m\n    port_offset: 7\n"
+                + "    log_segment_bytes: 1m\n").haMessaging().snapshot();
+        assertEquals(new HaMessagingSettings.Snapshot(500, 0, 64 << 10, 8L << 20, 7, 1L << 20, 4L << 30), s);
+        String h = "ha:\n  enabled: true\n  messaging: off\n  snapshot:\n";
+        assertTrue(error(h + "    every: 1\n").contains("Unknown key ha.snapshot.every"));
+        assertTrue(error(h + "    every_entries: 0\n").contains("ha.snapshot.every_entries"));
+        assertTrue(error(h + "    every_entries: -3\n").contains("ha.snapshot.every_entries"));
+        assertTrue(error(h + "    chunk_bytes: 1k\n").contains("ha.snapshot.chunk_bytes"));
+        assertTrue(error(h + "    chunk_bytes: 17m\n").contains("ha.snapshot.chunk_bytes"));
+        assertTrue(error(h + "    install_rate: 100\n").contains("ha.snapshot.install_rate"));
+        assertTrue(error(h + "    port_offset: 0\n").contains("ha.snapshot.port_offset"));
+        assertTrue(error(h + "    log_segment_bytes: 10\n").contains("ha.snapshot.log_segment_bytes"));
+        assertTrue(error(h + "    max_install_bytes: -1\n").contains("ha.snapshot.max_install_bytes"));
+        // #295: 0 is the explicit unlimited opt-in; the default is 4 GiB.
+        var unlimited = load("ha:\n  enabled: true\n  messaging: on\n" + THREE
+                + "  snapshot:\n    max_install_bytes: 0\n").haMessaging().snapshot();
+        assertEquals(0, unlimited.maxInstallBytes());
+        assertEquals(4L << 30, HaMessagingSettings.Snapshot.DEFAULT.maxInstallBytes());
+        assertTrue(error("ha:\n  enabled: true\n  messaging: off\n  snapshot: 3\n").contains("ha.snapshot"));
+    }
+
     @Test
     void relativeStateDirNeedsABase() {
         var ex = assertThrows(ConfigException.class,

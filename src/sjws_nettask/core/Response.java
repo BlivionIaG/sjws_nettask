@@ -25,8 +25,11 @@ import java.util.Objects;
  * @param headers representation/semantic fields (no transport fields, see {@link ResponseHeaders})
  * @param body content; for HEAD it is still present so writers can advertise its length
  * @param headOnly the request was HEAD: send the head (with the body's length) but no body
+ * @param localAdmission produced by local proxy admission (e.g. peer-budget share) rather than an
+ *        upstream; balancers must not count these against endpoint health
  */
-public record Response(int status, ResponseHeaders headers, Body body, boolean headOnly) {
+public record Response(int status, ResponseHeaders headers, Body body, boolean headOnly,
+        boolean localAdmission) {
 
     public Response {
         if (status < 100 || status > 999) {
@@ -37,7 +40,16 @@ public record Response(int status, ResponseHeaders headers, Body body, boolean h
     }
 
     public Response(int status, ResponseHeaders headers, Body body) {
-        this(status, headers, body, false);
+        this(status, headers, body, false, false);
+    }
+
+    public Response(int status, ResponseHeaders headers, Body body, boolean headOnly) {
+        this(status, headers, body, headOnly, false);
+    }
+
+    /** Copy with {@link #localAdmission()} set; same instance if already marked. */
+    public Response asLocalAdmission() {
+        return this.localAdmission ? this : new Response(this.status, this.headers, this.body, this.headOnly, true);
     }
 
     public long contentLength() {

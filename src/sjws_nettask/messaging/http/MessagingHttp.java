@@ -163,7 +163,7 @@ final class MessagingHttp implements Handler {
                     if (!m.matches()) throw new BadRequest("body must be {\"offset\":n}");
                     long off;
                     try { off = Long.parseLong(m.group(1)); } catch (NumberFormatException e) { throw new BadRequest("offset too large"); }
-                    long start = log.log().startOffset();
+                    long start = logicalStart(log);
                     if (off < start) return problem(416, "offset out of range", "log starts at " + start);
                     if (off > end) return problem(400, "bad request", "offset " + off + " is past the log end " + end);
                     var dflt = this.topics.durability(o.topic());
@@ -335,7 +335,7 @@ final class MessagingHttp implements Handler {
             }
         }
         long committed = log.writer().snapshot().nextOffset();
-        long start = log.log().startOffset();
+        long start = logicalStart(log);
         if (offset < start) return problem(416, "offset out of range", "log starts at " + start);
         long next = offset;
         var batches = new ArrayList<RecordBatch>();
@@ -743,4 +743,13 @@ final class MessagingHttp implements Handler {
     static final class BadRequest extends Exception {
         BadRequest(String m) { super(m); }
     }
+
+    /** Physical floor and the replicated logical cut (#270 / #288 MC-B1): fetch below either is 416. */
+    private static long logicalStart(LogTopics.Log log) {
+        long start = log.log().startOffset();
+        var rep = log.replica();
+        if (rep != null) start = Math.max(start, rep.logStartOffset());
+        return start;
+    }
+
 }

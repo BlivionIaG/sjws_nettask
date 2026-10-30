@@ -144,6 +144,20 @@ final class LogOffsets {
         }
     }
 
+    /**
+     * #270: a snapshot install replaced the {@code __offsets} log under the replica: forget the map and re-read the log
+     * on next use (the installed log holds the latest commit of every key).
+     */
+    void reload() {
+        this.loading.lock();
+        try {
+            this.commits.clear();
+            this.loaded = false;
+        } finally {
+            this.loading.unlock();
+        }
+    }
+
     /** Loads existing offsets if {@code __offsets} exists (maintenance); never creates it. */
     void loadIfPresent() throws IOException {
         if (!this.loaded) ensureLoaded(false);

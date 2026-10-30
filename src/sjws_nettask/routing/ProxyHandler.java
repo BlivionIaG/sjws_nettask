@@ -33,10 +33,11 @@ import java.net.URI;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.Locale;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -142,6 +143,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     private final Resilience.RetryBudget retryBudget;
     private final Resilience.CircuitBreaker breaker;
 
+
     public ProxyHandler(Settings settings) {
         this(settings, ByteBudget.shared());
     }
@@ -169,6 +171,32 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     public ByteBudget budget() {
         return this.pool.budget();
     }
+
+    /**
+     * 503 when this peer already holds its in-flight share (#78). Mid-stream backpressure still
+     * pauses reads; a new request fails fast instead of waiting on that peer's queue.
+     */
+    private Response peerBudgetRefused(Request request, boolean head) {
+        var budget = this.pool.budget();
+        if (budget.peerLimit() <= 0) {
+            return null;
+        }
+        if (budget.exhausted(budget.peerStripe(request.peer()))) {
+            return localRefusal(StaticFileHandler.error(503, head));
+        }
+        return null;
+    }
+
+    /** Marks a response as a local admission refusal (not an upstream outcome). */
+    static Response localRefusal(Response response) {
+        return response.asLocalAdmission();
+    }
+
+    /** True when {@code response} was produced by local admission, not by an upstream. */
+    static boolean isLocalRefusal(Response response) {
+        return response != null && response.localAdmission();
+    }
+
 
     public Settings settings() {
         return this.settings;
@@ -202,6 +230,10 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         }
         if (length > this.settings.maxBody()) {
             return StaticFileHandler.error(413, head);
+        }
+        var refused = peerBudgetRefused(request, head);
+        if (refused != null) {
+            return refused;
         }
         HttpRequest out;
         try {
@@ -239,6 +271,10 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         if (length > this.settings.maxBody()) {
             return StaticFileHandler.error(413, head);
         }
+        var refused = peerBudgetRefused(request, head);
+        if (refused != null) {
+            return refused;
+        }
         HttpRequest out;
         try {
             out = buildRequest(request, length);
@@ -266,6 +302,17 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             case 504 -> Resilience.On.STATUS_504;
             default -> null;
         };
+    }
+
+    /**
+     * Classifies an attempt outcome for retry and passive health. Local admission refusals
+     * (peer-budget share) are not upstream failures.
+     */
+    static Resilience.On kind(Response response) {
+        if (isLocalRefusal(response)) {
+            return null;
+        }
+        return kind(response.status());
     }
 
     /** Methods a retry cannot duplicate the effect of (RFC 9110 §9.2.2). */
@@ -300,7 +347,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             int errorStatus = 0;
             try {
                 response = exchange(request, tries == 0 ? out : rebuild(out), length, true);
-                failed = kind(response.status());
+                failed = kind(response);
             } catch (IOException e) {
                 failed = kind(e);
                 errorStatus = status(e);
@@ -359,7 +406,9 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             throws IOException, InterruptedException {
         var lease = this.pool.acquire();
         var ch = lease.channel();
-        var ex = new UpstreamPool.Exchange(ch, this.settings.idleReadTimeout(), this.pool.budget());
+        var budget = this.pool.budget();
+        var ex = new UpstreamPool.Exchange(ch, this.settings.idleReadTimeout(), budget,
+                budget.peerStripe(request.peer()));
         HttpResponse response;
         try {
             if (length > 0) {
