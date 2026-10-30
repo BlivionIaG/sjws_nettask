@@ -196,8 +196,9 @@ public final class AdminTls {
     }
 
     /**
-     * Re-reads every file and swaps the material if all of it is valid. Cached sessions are
-     * invalidated so that resumed handshakes are re-checked. Never throws.
+     * Re-reads every file and swaps the material if all of it is valid. Cached sessions listed by
+     * the session context are invalidated. Peer links also re-check the presented chain after every
+     * handshake (see {@link #revalidatePeer}). Never throws.
      *
      * @return null on success, otherwise why the previous material was kept
      */
@@ -220,6 +221,11 @@ public final class AdminTls {
             current = next;
             generation.set(next.gen());
             invalidateSessions(context.getServerSessionContext());
+            // Peer links also dial with this context: drop cached client sessions so a dial after
+            // reload cannot reuse a pre-reload session against the new material.
+            if (actsAsClient) {
+                invalidateSessions(context.getClientSessionContext());
+            }
             audit.record("system", label + ".reload", String.valueOf(trustBundle), "ok");
             return null;
         } catch (IOException | RuntimeException e) {
@@ -399,8 +405,37 @@ public final class AdminTls {
         }
     }
 
-    private void checkRevoked(X509Certificate[] chain) throws CertificateException {
+    /**
+     * Re-run trust-anchor and revocation checks against one snapshot of the material currently in
+     * use. Peer links call this after every handshake (including resumed ones) and again when
+     * re-checking established connections after {@link #reload()}. On a fresh full handshake the
+     * JSSE trust manager has already run the same checks once; calling this again re-applies them
+     * (acceptable duplicate). {@code peerIsClient} is true when this side accepted the connection.
+     */
+    void revalidatePeer(X509Certificate[] chain, boolean peerIsClient) throws CertificateException {
+        if (chain == null || chain.length == 0) {
+            throw new CertificateException("no peer certificate");
+        }
+        // One snapshot: trust and revocation must not observe a reload mid-check.
         var m = current;
+        // TLS 1.3 handshakes report authType UNKNOWN to the trust manager; match that so a
+        // post-handshake re-check does not invent a key-exchange name the PKIX path rejects.
+        String auth = "UNKNOWN";
+        if (peerIsClient) {
+            m.trust().checkClientTrusted(chain, auth);
+        } else if (actsAsClient) {
+            m.trust().checkServerTrusted(chain, auth);
+        } else {
+            throw new CertificateException("admin listener does not act as a TLS client");
+        }
+        checkRevoked(m, chain);
+    }
+
+    private void checkRevoked(X509Certificate[] chain) throws CertificateException {
+        checkRevoked(current, chain);
+    }
+
+    private void checkRevoked(Material m, X509Certificate[] chain) throws CertificateException {
         for (var cert : chain) {
             var why = m.revokedBy(cert);
             if (why != null) {
@@ -408,7 +443,7 @@ public final class AdminTls {
                 audit.record(actor, label + ".handshake",
                         "serial:" + cert.getSerialNumber().toString(16) + " sha256:" + fingerprint(cert),
                         "denied: revoked (" + why + ")");
-                throw new CertificateException("client certificate is revoked");
+                throw new CertificateException("peer certificate is revoked");
             }
         }
     }
@@ -421,29 +456,33 @@ public final class AdminTls {
         @Override
         public void checkClientTrusted(X509Certificate[] chain, String authType, Socket socket)
                 throws CertificateException {
-            current.trust().checkClientTrusted(chain, authType, socket);
-            checkRevoked(chain);
+            var m = current;
+            m.trust().checkClientTrusted(chain, authType, socket);
+            checkRevoked(m, chain);
         }
 
         @Override
         public void checkClientTrusted(X509Certificate[] chain, String authType, SSLEngine engine)
                 throws CertificateException {
-            current.trust().checkClientTrusted(chain, authType, engine);
-            checkRevoked(chain);
+            var m = current;
+            m.trust().checkClientTrusted(chain, authType, engine);
+            checkRevoked(m, chain);
         }
 
         @Override
         public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-            current.trust().checkClientTrusted(chain, authType);
-            checkRevoked(chain);
+            var m = current;
+            m.trust().checkClientTrusted(chain, authType);
+            checkRevoked(m, chain);
         }
 
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String authType, Socket socket)
                 throws CertificateException {
             if (actsAsClient) {
-                current.trust().checkServerTrusted(chain, authType, socket);
-                checkRevoked(chain);
+                var m = current;
+                m.trust().checkServerTrusted(chain, authType, socket);
+                checkRevoked(m, chain);
                 return;
             }
             throw new CertificateException("admin listener does not act as a TLS client");
@@ -453,8 +492,9 @@ public final class AdminTls {
         public void checkServerTrusted(X509Certificate[] chain, String authType, SSLEngine engine)
                 throws CertificateException {
             if (actsAsClient) {
-                current.trust().checkServerTrusted(chain, authType, engine);
-                checkRevoked(chain);
+                var m = current;
+                m.trust().checkServerTrusted(chain, authType, engine);
+                checkRevoked(m, chain);
                 return;
             }
             throw new CertificateException("admin listener does not act as a TLS client");
@@ -463,8 +503,9 @@ public final class AdminTls {
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
             if (actsAsClient) {
-                current.trust().checkServerTrusted(chain, authType);
-                checkRevoked(chain);
+                var m = current;
+                m.trust().checkServerTrusted(chain, authType);
+                checkRevoked(m, chain);
                 return;
             }
             throw new CertificateException("admin listener does not act as a TLS client");

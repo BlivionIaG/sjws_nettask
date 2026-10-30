@@ -89,6 +89,11 @@ final class PeerTestCa {
         return node(node, PeerConfig.SAN_PREFIX + node);
     }
 
+    /** Serial of the last certificate {@link #node} issued. */
+    java.math.BigInteger lastSerial() {
+        return java.math.BigInteger.valueOf(serial - 1);
+    }
+
     private X509Certificate sign(JcaX509v3CertificateBuilder b) throws Exception {
         return new JcaX509CertificateConverter().getCertificate(
                 b.build(new JcaContentSignerBuilder("SHA256withECDSA").build(caKeys.getPrivate())));
