@@ -1,0 +1,62 @@
+OFFICIAL_START 2026-10-30T11:49:47+01:00 load=2.86 4.29 5.20 1/1520 2660030 head=984aaa3
+java1 pids server=2660069 client=2660132
+affinity_s=pid 2660069's current affinity mask: fc affinity_c=pid 2660132's current affinity mask: 3
+java1-official {'mib_s': 10.077978515625, 'p50_us': 96.116, 'p99_us': 186.771, 'chunk_samples': 206397, 'error_count': 0, 'client_cpu_pct_of_wall': 93.8671018379834, 'server_cpu_pct_of_wall': 118.08328590639239, 'self_loaded': False, 'generator_saturated': False, 'load1_pre': 2.86, 'load1_post': 2.5}
+hard {'sjws_swarm_stream_charged_bytes': 264192.0, 'sjws_swarm_stream_session_admit_refusals_total': 0.0, 'sjws_swarm_stream_reserve_underflows_total': 0.0, 'sjws_swarm_stream_node_refusals_total': 0.0, 'sjws_swarm_stream_budget_underflows_total': 0.0, 'sjws_swarm_stream_open_sessions': 1.0}
+VERDICT: OK_PROCEED
+SUMMARY_MEASURE {'server': {'n': 40, 'avg': 106.6, 'max': 203.8}, 'client': {'n': 40, 'avg': 84.5, 'max': 159.9}}
+CROSS_START 2026-10-30T11:51:02+01:00
+=== cross cc-py-1 loadgen=python streams=1 load=1.28 3.54 4.87 4/1654 2662909 ===
+{
+  "mib_s": 6.1486328125,
+  "chunk_samples": 125924,
+  "p50_us": 1107.584,
+  "p90_us": 1771.58,
+  "p99_us": 2602.444,
+  "load1_pre": 1.28,
+  "load1_post": 2.85,
+  "self_loaded": false,
+  "stall_flag": false,
+  "credit_stalls": 0,
+  "error_count": 0,
+  "teardown_error_count": 0,
+  "agents": 20,
+  "window": 8
+}
+one.sh wrote /workspace/s2c-pr8/gate-out/cross-check/cc-py-1/result.json
+=== cross cc-java-1 loadgen=java streams=1 load=1.56 3.25 4.67 1/1651 2664124 ===
+{"mib_s":9.8308,"chunk_samples":201334,"p50_us":98.884,"p99_us":185.708,"error_count":0,"teardown_error_count":0,"client_cpu_pct":92.2}
+one.sh wrote /workspace/s2c-pr8/gate-out/cross-check/cc-java-1/result.json
+=== cross cc-py-16 loadgen=python streams=16 load=1.31 2.87 4.43 2/1651 2665353 ===
+{
+  "mib_s": 5.187353515625,
+  "chunk_samples": 106237,
+  "p50_us": 18393.298,
+  "p90_us": 32580.18,
+  "p99_us": 49106.914,
+  "load1_pre": 1.31,
+  "load1_post": 3.78,
+  "self_loaded": false,
+  "stall_flag": false,
+  "credit_stalls": 0,
+  "error_count": 0,
+  "teardown_error_count": 0,
+  "agents": 20,
+  "window": 8
+}
+one.sh wrote /workspace/s2c-pr8/gate-out/cross-check/cc-py-16/result.json
+=== cross cc-java-16 loadgen=java streams=16 load=2.36 3.02 4.37 3/1749 2667564 ===
+{"mib_s":26.8666,"chunk_samples":550227,"p50_us":475.247,"p99_us":2782.268,"error_count":0,"teardown_error_count":0,"client_cpu_pct":173.3}
+one.sh wrote /workspace/s2c-pr8/gate-out/cross-check/cc-java-16/result.json
+| N | drive.py MiB/s | StreamLoad MiB/s | drive p99µs | Java p99µs | err py/java | refusals match | Java ≥ fast | ok |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 6.149 | 9.831 | 2602.444 | 185.708 | 0/0 | True | True | True |
+  hard_zeros py={'sjws_swarm_stream_node_refusals_total': 0.0, 'sjws_swarm_stream_session_admit_refusals_total': 0.0, 'sjws_swarm_stream_budget_underflows_total': 0.0, 'sjws_swarm_stream_reserve_underflows_total': 0.0, 'sjws_swarm_stream_charged_bytes': 264192.0, 'sjws_swarm_stream_open_sessions': 1.0}
+  hard_zeros ja={'sjws_swarm_stream_node_refusals_total': 0.0, 'sjws_swarm_stream_session_admit_refusals_total': 0.0, 'sjws_swarm_stream_budget_underflows_total': 0.0, 'sjws_swarm_stream_reserve_underflows_total': 0.0, 'sjws_swarm_stream_charged_bytes': 264192.0, 'sjws_swarm_stream_open_sessions': 1.0}
+  cpu py client/server=96.16074885188016/90.08042432508306  ja=92.17498333744803/119.6276091146089
+| 16 | 5.187 | 26.867 | 49106.914 | 2782.268 | 0/0 | True | True | True |
+  hard_zeros py={'sjws_swarm_stream_node_refusals_total': 0.0, 'sjws_swarm_stream_session_admit_refusals_total': 0.0, 'sjws_swarm_stream_budget_underflows_total': 0.0, 'sjws_swarm_stream_reserve_underflows_total': 0.0, 'sjws_swarm_stream_charged_bytes': 4227072.0, 'sjws_swarm_stream_open_sessions': 16.0}
+  hard_zeros ja={'sjws_swarm_stream_node_refusals_total': 0.0, 'sjws_swarm_stream_session_admit_refusals_total': 0.0, 'sjws_swarm_stream_budget_underflows_total': 0.0, 'sjws_swarm_stream_reserve_underflows_total': 0.0, 'sjws_swarm_stream_charged_bytes': 4227072.0, 'sjws_swarm_stream_open_sessions': 16.0}
+  cpu py client/server=94.80333718128527/75.65955530973513  ja=173.3322257636781/273.8707824333716
+CROSS_CHECK: PASS
+OFFICIAL_DONE 2026-10-30T11:56:03+01:00 load=2.86 3.22 4.35 1/1765 2671849

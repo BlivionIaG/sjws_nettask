@@ -1,0 +1,71 @@
+{
+  "ok": true,
+  "rows": [
+    {
+      "n": 1,
+      "py_mib": 6.1486328125,
+      "ja_mib": 9.83076171875,
+      "py_p99": 2602.444,
+      "ja_p99": 185.708,
+      "py_err": 0,
+      "ja_err": 0,
+      "py_hz": {
+        "sjws_swarm_stream_node_refusals_total": 0.0,
+        "sjws_swarm_stream_session_admit_refusals_total": 0.0,
+        "sjws_swarm_stream_budget_underflows_total": 0.0,
+        "sjws_swarm_stream_reserve_underflows_total": 0.0,
+        "sjws_swarm_stream_charged_bytes": 264192.0,
+        "sjws_swarm_stream_open_sessions": 1.0
+      },
+      "ja_hz": {
+        "sjws_swarm_stream_node_refusals_total": 0.0,
+        "sjws_swarm_stream_session_admit_refusals_total": 0.0,
+        "sjws_swarm_stream_budget_underflows_total": 0.0,
+        "sjws_swarm_stream_reserve_underflows_total": 0.0,
+        "sjws_swarm_stream_charged_bytes": 264192.0,
+        "sjws_swarm_stream_open_sessions": 1.0
+      },
+      "refuse_ok": true,
+      "faster": true,
+      "lat_ok": true,
+      "row_ok": true,
+      "py_client": 96.16074885188016,
+      "ja_client": 92.17498333744803,
+      "py_server": 90.08042432508306,
+      "ja_server": 119.6276091146089
+    },
+    {
+      "n": 16,
+      "py_mib": 5.187353515625,
+      "ja_mib": 26.866552734375,
+      "py_p99": 49106.914,
+      "ja_p99": 2782.268,
+      "py_err": 0,
+      "ja_err": 0,
+      "py_hz": {
+        "sjws_swarm_stream_node_refusals_total": 0.0,
+        "sjws_swarm_stream_session_admit_refusals_total": 0.0,
+        "sjws_swarm_stream_budget_underflows_total": 0.0,
+        "sjws_swarm_stream_reserve_underflows_total": 0.0,
+        "sjws_swarm_stream_charged_bytes": 4227072.0,
+        "sjws_swarm_stream_open_sessions": 16.0
+      },
+      "ja_hz": {
+        "sjws_swarm_stream_node_refusals_total": 0.0,
+        "sjws_swarm_stream_session_admit_refusals_total": 0.0,
+        "sjws_swarm_stream_budget_underflows_total": 0.0,
+        "sjws_swarm_stream_reserve_underflows_total": 0.0,
+        "sjws_swarm_stream_charged_bytes": 4227072.0,
+        "sjws_swarm_stream_open_sessions": 16.0
+      },
+      "refuse_ok": true,
+      "faster": true,
+      "lat_ok": true,
+      "row_ok": true,
+      "py_client": 94.80333718128527,
+      "ja_client": 173.3322257636781,
+      "py_server": 75.65955530973513,
+      "ja_server": 273.8707824333716
+    }
+  ]
+}
