@@ -27,6 +27,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -280,7 +281,7 @@ class H2BranchCoverageTest {
     private static Http2Server.Shared shared(ExecutorService executor, Semaphore inflight, Semaphore files) {
         return new Http2Server.Shared(request -> new Response(200, ResponseHeaders.of().add("connection", "close").add("x-trace", "1"),
                 Body.Bytes.of(new byte[] {'o'})), executor, inflight, files, Duration.ofMillis(200), new LongAdder(),
-                Http2Server.Limits.DEFAULT, new HandlerRef());
+                Http2Server.Limits.DEFAULT, new HandlerRef(), new AtomicBoolean(false));
     }
 
     private static ExecutorService holding(List<Runnable> held) {

@@ -66,6 +66,7 @@ import sjws_nettask.HandlerRef;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.Transport;
 import sjws_nettask.core.Handler;
+import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.core.PerIpLimit;
 import sjws_nettask.tls.TlsMaterial;
 
@@ -134,12 +135,23 @@ public final class Http2Server implements Transport {
      * {@code handler}, so a server that never arms calls the startup handler and nothing else.
      */
     record Shared(Handler handler, ExecutorService executor, Semaphore inflight, Semaphore files,
-            Duration writeTimeout, LongAdder refused, Limits limits, HandlerRef armed) {
+            Duration writeTimeout, LongAdder refused, Limits limits, HandlerRef armed,
+            AtomicBoolean attachBodiesFlag) {
 
         /** Startup handler, or the one published by a later metrics arm. */
         Handler live() {
             var published = this.armed.get();
             return published != null ? published : this.handler;
+        }
+
+        /**
+         * Attach request bodies and full header maps when the published configuration needs them
+         * (#289). Set from the constructor and {@link Http2Server#armHandler(Handler, boolean)};
+         * not inferred from {@link #live()}{@code SjwsServer} arms a lambda that is never a
+         * {@link StaticFileHandler}). Static-only keeps the zero-cost DATA release path.
+         */
+        boolean attachBodies() {
+            return this.attachBodiesFlag.get();
         }
 
         /** @return the connection's budget, created on first use */
@@ -162,6 +174,11 @@ public final class Http2Server implements Transport {
     private final Handler handler;
     /** Published by {@link #armHandler} after start. A null value keeps {@link #handler}. */
     private final HandlerRef armed = new HandlerRef();
+    /**
+     * Bodies/full field maps. False for a static-only publish (including the production
+     * {@code SjwsServer} live-snapshot lambda). True when a chain or non-static terminal is armed.
+     */
+    private final AtomicBoolean attachBodies = new AtomicBoolean();
     private final Limits limits;
     private TlsMaterial tls;
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -189,6 +206,7 @@ public final class Http2Server implements Transport {
         this.handler = Objects.requireNonNull(handler, "handler");
         this.tls = tls;
         this.limits = Objects.requireNonNull(limits, "limits");
+        this.attachBodies.set(!(handler instanceof StaticFileHandler));
     }
 
     @Override
@@ -202,7 +220,30 @@ public final class Http2Server implements Transport {
      */
     @Override
     public void armHandler(Handler handler) {
+        armHandler(handler, !(handler instanceof StaticFileHandler));
+    }
+
+    /**
+     * @param attachBodies when false, DATA is released and only the six typed headers are read
+     *        (static-only / production live-snapshot arm). When true, bodies and the full field map
+     *        are attached. Survives config hot-swaps: each arm republishes the flag.
+     */
+    public void armHandler(Handler handler, boolean attachBodies) {
         this.armed.set(Objects.requireNonNull(handler, "handler"));
+        this.attachBodies.set(attachBodies);
+    }
+
+    /** @return whether bodies and full field maps are attached (tests / diagnostics) */
+    boolean attachBodies() {
+        return this.attachBodies.get();
+    }
+
+    /**
+     * Refresh the bodies flag without replacing the armed handler (e.g. after a live-snapshot
+     * reload that turns routing on or off under the same live-snapshot lambda).
+     */
+    public void setAttachBodies(boolean attachBodies) {
+        this.attachBodies.set(attachBodies);
     }
 
     @Override
@@ -216,7 +257,7 @@ public final class Http2Server implements Transport {
             this.perIp = new PerIpLimit(Math.min(this.config.maxConnectionsPerIp(), this.limits.maxConnectionsPerIp()));
             this.shared = new Shared(this.handler, this.executor, new Semaphore(this.limits.maxInflight()),
                     new Semaphore(this.limits.maxOpenFiles()), this.config.writeTimeout(), this.refused, this.limits,
-                    this.armed);
+                    this.armed, this.attachBodies);
             this.boss = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             this.workers = new MultiThreadIoEventLoopGroup(0, NioIoHandler.newFactory());
             this.tlsChannel = bind(this.config.h2Port(), new ChannelInitializer<SocketChannel>() {

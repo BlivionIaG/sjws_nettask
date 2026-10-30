@@ -527,8 +527,10 @@ public final class SjwsServer implements AutoCloseable {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
             if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-                // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies
-                http2.armHandler(request -> this.live.handler().handle(request));
+                // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies.
+                // The wrapper is never a StaticFileHandler; derive bodies from the compiled live handler
+                // (static-only → false; YAML router / non-static → true) (#289 P1 / live-snapshot routes).
+                http2.armHandler(request -> this.live.handler().handle(request), liveNeedsBodies());
             }
             transport.start();
             this.h2 = transport;
@@ -833,11 +835,24 @@ public final class SjwsServer implements AutoCloseable {
             return ReloadResult.rejected(this.live.get(), java.util.List.of("HTTP-01 listener: " + e.getMessage()));
         }
         var replaced = this.live.get();
-        this.live.set(result.snapshot());
-        if (replaced != result.snapshot()) {
+        var next = result.snapshot();
+        // HTTP/2 attachBodies vs live swap (#289 Middleware Chain nit): enabling must happen
+        // before live.set so a new stream never sees a body-needing handler with bodies still
+        // off; disabling happens after the swap (brief extra attach is safe).
+        sjws_nettask.h2.Http2Server http2ForBodies = null;
+        boolean bodies = false;
+        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
+            http2ForBodies = http2;
+            bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null;
+            if (bodies) {
+                http2.setAttachBodies(true);
+            }
+        }
+        this.live.set(next);
+        if (replaced != next) {
             replaced.close(); // old upstream pools: idle connections now, in-flight ones when they finish
         }
-        var server = result.snapshot().document().server();
+        var server = next.document().server();
         if (this.manager != null && this.manager.reaper() != null) {
             this.manager.reaper().update(server.idleTimeout(), server.headerTimeout(), server.writeTimeout());
         }
@@ -846,6 +861,9 @@ public final class SjwsServer implements AutoCloseable {
             if (result.tls() != null) {
                 http3.replaceTls(result.tls());
             }
+        }
+        if (http2ForBodies != null) {
+            http2ForBodies.setAttachBodies(bodies);
         }
         if (closeOld && this.challengeHttp != null) {
             this.challengeHttp.close();
@@ -894,6 +912,16 @@ public final class SjwsServer implements AutoCloseable {
             return this.ha.handler();
         }
         return this.override != null ? this.override : this.live.handler();
+    }
+
+    /**
+     * Whether the live snapshot's compiled handler may need request bodies / full field maps.
+     * A bare {@link StaticFileHandler} does not; a router (YAML {@code routing.enabled}) or any
+     * other terminal does. Used for the HTTP/2 live-snapshot arm so production static-only stays
+     * zero-cost without disabling bodies for configured proxy routes (#289).
+     */
+    private boolean liveNeedsBodies() {
+        return !(this.live.handler() instanceof StaticFileHandler);
     }
 
     /** @return null when this server was started without {@link HaSettings} */
