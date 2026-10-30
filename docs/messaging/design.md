@@ -68,10 +68,14 @@ the CRC32C covers the batch. Batches are the unit of write, fsync, replication a
 ### 2.2 Group commit / fsync
 - One dedicated **platform thread** per partition writer (PR #16 T1: blocking file I/O must not pin
   virtual-thread carriers), fed by a bounded queue (65 536 entries, also the backpressure signal), drains pending
-  appends and writes them with one positional write. A **background syncer** thread issues
-  `force(false)` (fdatasync) continuously, off the ack path, and advances `durableOffset`. The ledger
-  therefore records **every** enqueued and undelivered message durably (lagging at most one fsync behind
-  the ack), without fsync latency on the default ack (decision by Blivion, 2026-10-12).
+  appends and writes them with one positional write. A **background syncer** (dedicated per writer, or a
+  shard of `SharedLedgerPool`) issues `force(false)` (fdatasync) **only when the writer is due**: an
+  `ASYNC` append has marked it dirty, or a `GROUP`/`EACH` append is waiting on fsync. `NONE` appends
+  never schedule a background force. After `force`, the syncer advances `durableOffset` to the
+  pre-force watermark `written` (whole-file fsync piggyback). Off the default ack path (decision by
+  Blivion, 2026-10-12). Shared shards sleep the fsync floor once per shard
+  (`T_force ≤ T_append + fsyncInterval + 1 shard floor`) so one member's floor cannot HOL-block a
+  sibling's due force.
 - A group closes at `maxGroupBytes` (4 MiB), after `lingerNanos` (0 by default) or on an idle queue, whichever comes first.
   Under load this amortizes fsync across thousands of records; when idle, latency is about one fsync.
   Measured in PR #16 §B2: one fsync ≈ 0.5 ms, so per-record fsync (`each`) caps at ~1.7k rec/s,
@@ -82,7 +86,9 @@ the CRC32C covers the batch. Batches are the unit of write, fsync, replication a
   - `async` (**default**): ack after write(2); background group fsync. PR #21 bench: 288k rec/s, p50 171 µs at 64 producers.
   - `group` (opt-in): ack after the fsync covering the record. 48.6k rec/s (PR #16) / 57.6k (PR #21) at 64 producers.
   - `each` (opt-in, compliance): one fsync per batch, ~1.2–1.7k rec/s.
-  - `none`: no fsync on the path at all (tests and caches only).
+  - `none`: no fsync on the path at all (tests and caches only). A `NONE` append on an `ASYNC`
+    writer does **not** mark the writer due and does not wake the syncer; residual dirty bytes are
+    still forced on close (or by a later `ASYNC`/`GROUP`/`EACH` force that covers `written`).
 - Cluster default: `replicated` = **ack on majority in-memory receipt** (as in PR #16 T3), with each
   replica fsyncing in the background. **Quorum + fsync (`strict`) is opt-in per topic or per producer**
   (§6, req. 2). See §2.6 for what each mode can lose.
@@ -122,7 +128,7 @@ sequenceDiagram
         Note over W,S: W fsyncs inline if its default is GROUP<br/>or EACH. Otherwise S does it
     end
     S->>L: force(false)
-    Note left of S: S runs when an ASYNC writer<br/>is dirty or an append waits for<br/>an fsync. W wakes it after every<br/>write, except on an EACH writer.<br/>Then durableOffset advances and<br/>a LedgerSnapshot is published
+    Note left of S: S runs when an ASYNC append<br/>marked the writer due, or an append<br/>waits for an fsync. NONE never wakes S.<br/>Shared shards floor once per shard<br/>(no per-member park). Force watermark<br/>is written; then durableOffset advances
 ```
 
 ### 2.3 In-memory state machine

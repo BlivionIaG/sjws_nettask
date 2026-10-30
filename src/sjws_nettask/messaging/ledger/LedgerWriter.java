@@ -25,7 +25,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * else the writer default):
  * <ul>
  *   <li>NONE / ASYNC: right after the write (page cache). ASYNC is the default; a background syncer
- *       thread fsyncs off the ack path and advances {@link LedgerSnapshot#durableOffset}.</li>
+ *       fsyncs off the ack path only for appends whose effective mode is {@link Durability#ASYNC}
+ *       (or stronger waiters), advancing {@link LedgerSnapshot#durableOffset}. NONE appends do not
+ *       schedule a background force; an ASYNC force still covers all earlier bytes in the file.</li>
  *   <li>GROUP: after the fsync covering it. Inline (one fsync per group) when GROUP is the writer
  *       default, otherwise by the syncer.</li>
  *   <li>EACH (writer default): one fsync per batch.</li>
@@ -43,6 +45,13 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      * after write(2). 1 ms coalesces those into at most 1000 fsyncs/s and adds at most 1 ms to the power-loss window.
      */
     public static final long DEFAULT_FSYNC_INTERVAL_NANOS = 1_000_000L;
+
+    /** {@link #sharedSyncSlice}: no background work. */
+    static final int SYNC_IDLE = 0;
+    /** {@link #sharedSyncSlice}: forced (or more work remains). */
+    static final int SYNC_BUSY = 1;
+    /** {@link #sharedSyncSlice}: due but inside the per-member floor; shard must wait (do not park here). */
+    static final int SYNC_FLOORED = 2;
 
     private record Pending(List<byte[]> records, long timestampMs, Durability mode, CompletableFuture<Long> done) { }
 
@@ -128,6 +137,13 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      *     so tests can prove (3) never covers records appended after the force returned.
      */
     private volatile long durable;
+    /**
+     * Exclusive high-water of offsets that need a background force because an {@link Durability#ASYNC}
+     * append committed (or a syncer-served GROUP/EACH waiter is pending via {@link #fsyncWaiters}).
+     * NONE appends leave this unchanged so they never schedule a syncer force. A force still uses
+     * {@code written} as the watermark, so earlier NONE bytes in the file are covered when ASYNC is due.
+     */
+    private volatile long asyncForceThrough;
 
     /** ASYNC writer with defaults. */
     public LedgerWriter(SegmentedLog log) { this(log, DEFAULT_DURABILITY); }
@@ -148,6 +164,15 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      */
     public LedgerWriter(SegmentedLog log, Durability durability, long lingerNanos, int queueCapacity, int maxGroupBytes,
             long fsyncIntervalNanos) {
+        this(log, durability, lingerNanos, queueCapacity, maxGroupBytes, fsyncIntervalNanos, SharedLedgerPool.sharedOrNull());
+    }
+
+    /**
+     * Package/test constructor: register on {@code pool} when non-null (dedicated syncer when null).
+     * Production callers use {@link #LedgerWriter(SegmentedLog, Durability, long, int, int, long)}.
+     */
+    LedgerWriter(SegmentedLog log, Durability durability, long lingerNanos, int queueCapacity, int maxGroupBytes,
+            long fsyncIntervalNanos, SharedLedgerPool pool) {
         this.log = log;
         this.durability = durability;
         this.lingerNanos = lingerNanos;
@@ -164,10 +189,10 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             if (ctorFault != null) throw ctorFault;
             this.written = log.nextOffset();
             this.durable = log.nextOffset(); // recovered data is treated as durable (it survived a restart)
+            this.asyncForceThrough = this.durable;
             publish();
             var name = log.dir().getFileName();
             this.thread = Thread.ofPlatform().name("ledger-writer-" + name).daemon().unstarted(this::run);
-            var pool = SharedLedgerPool.sharedOrNull();
             if (pool != null) {
                 this.sharedPool = pool;
                 this.syncer = null;
@@ -197,6 +222,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         try {
             written = log.nextOffset();
             durable = written;
+            asyncForceThrough = written;
         } finally {
             lock.unlock();
         }
@@ -221,7 +247,8 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     /** Allows background syncing again after {@link #pauseSync}. */
     public void resumeSync() {
         syncPaused = false;
-        if (syncer != null) java.util.concurrent.locks.LockSupport.unpark(syncer);
+        if (sharedPool != null) sharedPool.unparkSyncer(sharedShard);
+        else if (syncer != null) java.util.concurrent.locks.LockSupport.unpark(syncer);
     }
 
     /** The log this writer appends to (#270: the snapshot export and install read and replace its segments). */
@@ -323,37 +350,44 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         else LockSupport.unpark(syncer);
     }
 
-    boolean sharedSyncSlice() {
-        if (syncPaused) return false;
+    /**
+     * One shared-syncer slice. Does <em>not</em> park for the fsync floor: a floored member returns
+     * {@link #SYNC_FLOORED} so the shard can force siblings and sleep once at shard level.
+     * When {@link #stopSyncer} the floor is ignored so {@link #close} can drain.
+     */
+    int sharedSyncSlice() {
+        if (syncPaused) return SYNC_IDLE;
         long d0 = durable;
-        if (stopSyncer && (!ready || queue.isEmpty()) && fsyncWaiters.isEmpty() && written <= d0) return false;
+        if (stopSyncer && (!ready || queue.isEmpty()) && fsyncWaiters.isEmpty() && asyncForceThrough <= d0 && written <= d0) {
+            return SYNC_IDLE;
+        }
         Waiter w0;
         while ((w0 = fsyncWaiters.peek()) != null && w0.endOffset <= d0) { fsyncWaiters.poll(); w0.done.complete(w0.base); }
         long target = written;
-        boolean dirty = target > durable;
-        boolean wanted = dirty && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
-        if (!wanted) return false;
-        // Floor: leave the work for a later slice; shared syncer parks at shard level.
-        // Track flooring so writers skip unpark storms (same as dedicated syncLoop).
+        boolean wanted = asyncForceThrough > durable || !fsyncWaiters.isEmpty();
+        if (!wanted) {
+            flooring = false;
+            return SYNC_IDLE;
+        }
+        // Per-member floor without parking the shard (HOL fix). Mutation: parkNanos here again makes
+        // SyncerDirtinessTest.shardFloorDoesNotBlockSiblingDueForce fail.
         long wait = lastSharedFsync + fsyncIntervalNanos - System.nanoTime();
         if (wait > 0 && fsyncWaiters.isEmpty() && !stopSyncer) {
-            flooring = true;
-            LockSupport.parkNanos(wait); // same floor as dedicated syncLoop; holds this shard's syncer
-            flooring = false;
-            return true;
+            flooring = true; // writers skip unpark storms while we are inside the floor window
+            return SYNC_FLOORED;
         }
         flooring = false;
-        if (syncPaused) return false;
+        if (syncPaused) return SYNC_IDLE;
         syncInForce.incrementAndGet();
         try {
-            if (syncPaused) return false;
+            if (syncPaused) return SYNC_IDLE;
             try {
                 log.force();
             } catch (IOException | RuntimeException e) {
-                if (syncPaused) return false; // replaceWith closed channels under pause; not a writer failure
+                if (syncPaused) return SYNC_IDLE; // replaceWith closed channels under pause; not a writer failure
                 failure = e;
                 failWaiters(e);
-                return false;
+                return SYNC_IDLE;
             }
         } finally {
             syncInForce.decrementAndGet();
@@ -366,11 +400,20 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         publish();
         Waiter w;
         while ((w = fsyncWaiters.peek()) != null && w.endOffset <= target) { fsyncWaiters.poll(); w.done.complete(w.base); }
-        return written > durable || !fsyncWaiters.isEmpty();
+        return asyncForceThrough > durable || !fsyncWaiters.isEmpty() ? SYNC_BUSY : SYNC_IDLE;
+    }
+
+    /** Remaining floor nanos after {@link #SYNC_FLOORED}; 0 when eligible now. */
+    long sharedSyncFloorWaitNanos() {
+        long wait = lastSharedFsync + fsyncIntervalNanos - System.nanoTime();
+        return Math.max(0L, wait);
     }
 
     /** Last fsync time for {@link #sharedSyncSlice} (dedicated syncLoop keeps its own local). */
     private volatile long lastSharedFsync;
+
+    /** Test hook: exclusive high-water awaiting a background ASYNC force. */
+    long asyncForceThroughForTests() { return asyncForceThrough; }
 
     private void run() {
         var group = new ArrayList<Pending>();
@@ -420,17 +463,29 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         if (failure != null) { g.forEach(p -> p.done.completeExceptionally(failure)); return; }
         try {
             if (durability == Durability.EACH) {
+                boolean anyAsync = false;
                 for (var p : g) {
                     long base = write(List.of(p), RecordBatch.encodedSize(p.records));
                     if (p.mode.waitsForFsync()) forceInline(); else publish();
+                    if (p.mode == Durability.ASYNC) {
+                        anyAsync = true;
+                        noteAsyncForceThrough(written);
+                    }
                     p.done.complete(base);
                 }
+                // Mutation: unpark on every EACH group (including NONE-only) makes noneOnlyAppendsIssueNoBackgroundFsyncs fail.
+                if ((anyAsync && !flooring) || !fsyncWaiters.isEmpty()) unparkSyncer();
                 return;
             }
             long base = write(g, total);
             boolean anyWaits = false;
-            for (var p : g) anyWaits |= p.mode.waitsForFsync();
+            boolean anyAsync = false;
+            for (var p : g) {
+                anyWaits |= p.mode.waitsForFsync();
+                anyAsync |= p.mode == Durability.ASYNC;
+            }
             if (durability == Durability.GROUP && anyWaits) forceInline(); else publish();
+            if (anyAsync) noteAsyncForceThrough(written);
             long o = base;
             for (var p : g) {
                 long end = o + p.records.size();
@@ -438,9 +493,10 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
                 else fsyncWaiters.add(new Waiter(end, o, p.done));
                 o = end;
             }
-            // NONE/GROUP/EACH writers only need the syncer for fsync waiters (GROUP overrides); ASYNC unless it is already
-            // sleeping out the fsync floor (an unpark per write would turn the floor into a wake-up per write).
-            if ((durability == Durability.ASYNC && !flooring) || !fsyncWaiters.isEmpty()) unparkSyncer();
+            // Schedule the syncer only for ASYNC dirtiness or fsync waiters — never for NONE-only groups.
+            // Skip unpark while flooring so the floor is not turned into a wake-up per write.
+            // Mutation: unpark when durability==ASYNC regardless of append mode makes noneOnlyAppendsIssueNoBackgroundFsyncs fail.
+            if ((anyAsync && !flooring) || !fsyncWaiters.isEmpty()) unparkSyncer();
         } catch (LedgerBudgetExhaustedException e) {
             // Disk was never touched (acquireExtra / growth refusal before allocateDirect+appendFrames). Fail only
             // this batch — same as a materialize refusal on the caller thread — and do not fence the writer so a
@@ -461,6 +517,11 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
 
     /** Volatile read of {@link #durable}; kept as a method so call sites stay obvious in JFR. */
     private long durableNow() { return durable; }
+
+    /** Publishes that an ASYNC append needs a background force through {@code through} (exclusive). */
+    private void noteAsyncForceThrough(long through) {
+        if (through > asyncForceThrough) asyncForceThrough = through;
+    }
 
     /**
      * Test-only: runs after {@code log.force()} returns and before durable is published. Lets a test append
@@ -561,17 +622,16 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             Waiter w0;
             while ((w0 = fsyncWaiters.peek()) != null && w0.endOffset <= d0) { fsyncWaiters.poll(); w0.done.complete(w0.base); }
             long target = written;
-            boolean dirty = target > durableNow();
-            boolean wanted = dirty && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
+            boolean wanted = asyncForceThrough > durableNow() || !fsyncWaiters.isEmpty();
             if (syncPaused) {
+                if (stopSyncer) return;
                 LockSupport.parkNanos(this, 50_000);
                 continue;
             }
             if (!wanted) {
                 if (stopSyncer) return;
-                // Event-driven: the writer unparks this thread after every write (and close() does too), and an
-                // unpark that comes first leaves a permit, so nothing is missed. An idle partition (a DLQ, say) no
-                // longer wakes 1000x/s; the long timeout is only a backstop.
+                // Event-driven: the writer unparks this thread after ASYNC writes / waiters (and close() does too).
+                // NONE-only appends never wake the syncer. An idle partition no longer wakes 1000x/s.
                 LockSupport.parkNanos(this, IDLE_PARK_NANOS);
                 continue;
             }
@@ -642,11 +702,13 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             thread.join(TimeUnit.SECONDS.toMillis(30));
         }
         stopSyncer = true;
+        syncPaused = false; // close must drain even if pauseSync was left on
         if (sharedPool != null) {
             sharedPool.unregister(this, sharedShard);
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (System.nanoTime() < deadline && (written > durableNow() || !fsyncWaiters.isEmpty())) {
-                if (!sharedSyncSlice()) break;
+                // stopSyncer bypasses the floor inside sharedSyncSlice so close can drain.
+                if (sharedSyncSlice() == SYNC_IDLE) break;
             }
         } else if (syncer != null) {
             LockSupport.unpark(syncer);
