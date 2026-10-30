@@ -31,7 +31,9 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.HttpTestSupport;
@@ -242,6 +244,59 @@ class AccessTargetMaskTest {
             get(server, "/index.html?api_key=" + SECRET);
             var common = awaitLog(commonLog, "api_key=***");
             assertFalse(common.contains(SECRET), common);
+        }
+    }
+
+
+    /**
+     * A request that entered under a configured query name must stay masked even when a reload
+     * clears that name while the request is still inside the chain. Fails at 3757ae5 (live names
+     * at log time); passes when names are pinned at observe-filter entry.
+     */
+    @Test
+    void inFlightRequestKeepsPinnedMaskWhenReloadClearsNames() throws Exception {
+        Files.writeString(dir.resolve("index.html"), "ok");
+        var log = dir.resolve("inflight.log");
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (var server = SjwsServer.start(ServerConfig.builder(dir).port(0).accessLog(log.toString()).build())) {
+            var filters = GatewayFilters.install(RequestFilters.create()).factory("hold", spec -> (request, next) -> {
+                entered.countDown();
+                try {
+                    assertTrue(release.await(5, TimeUnit.SECONDS), "release");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+                return next.proceed(request);
+            });
+            var control = server.chainControl(filters, Set.of());
+            control.apply(FilterDocument.of(1, List.of(
+                    FilterDocument.FilterEntry.of("api-key", 0,
+                            Map.of("keys", SECRET, "query", "api_key"), FilterScope.all()),
+                    FilterDocument.FilterEntry.of("hold", 10, Map.of(), FilterScope.all()))));
+
+            var error = new AtomicReference<Throwable>();
+            var thread = new Thread(() -> {
+                try {
+                    get(server, "/index.html?api_key=" + SECRET + "&inflight=1");
+                } catch (Throwable t) {
+                    error.set(t);
+                }
+            }, "s2-inflight-mask");
+            thread.start();
+            assertTrue(entered.await(5, TimeUnit.SECONDS), "request entered hold");
+            control.apply(FilterDocument.empty(2));
+            release.countDown();
+            thread.join(5_000L);
+            assertFalse(thread.isAlive(), "request finished");
+            if (error.get() != null) {
+                throw new AssertionError(error.get());
+            }
+
+            var text = awaitLog(log, "inflight=1");
+            assertFalse(text.contains(SECRET), "in-flight request must stay masked after clear: " + text.trim());
+            assertTrue(text.contains("api_key=***"), text.trim());
         }
     }
 

@@ -173,15 +173,25 @@ public final class RequestObserver implements AutoCloseable {
 
     /** Counters plus one access-log line. Use this when {@link #logging()} is true. */
     public void complete(int status, int protocol, long bytes, long durationNanos, String remote, String method,
-            String target, String protocolName, String referer, String userAgent) {
+            String target, String protocolName, String referer, String userAgent, String[] pinnedCredentialQueryParams) {
         if (!this.recording) {
             return;
         }
         this.metrics.record(status, protocol, bytes, durationNanos);
         if (this.log != null) {
-            this.log.offer(remote, method, AccessTargetMask.mask(target, this.credentialQueryParams), protocolName,
+            this.log.offer(remote, method, AccessTargetMask.mask(target, pinnedCredentialQueryParams), protocolName,
                     status, bytes, durationNanos, referer, userAgent);
         }
+    }
+
+    /**
+     * Live api-key query names for the access-log mask. Callers that log after {@code proceed} must
+     * read this before entering the rest of the chain and pass that reference to
+     * {@link #complete(int, int, long, long, String, String, String, String, String, String, String[])}.
+     * Returns {@link AccessTargetMask#NONE} when unset (shared empty constant, no allocation).
+     */
+    String[] credentialQueryParams() {
+        return this.credentialQueryParams;
     }
 
     public static int protocolId(String version) {

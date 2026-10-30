@@ -59,6 +59,9 @@ public final class ObserveRequestFilter implements RequestFilter {
         if (active == RequestObserver.NONE) {
             return next.proceed(request);
         }
+        // Pin mask names at entry so a reload that clears/shrinks them cannot unmask this request
+        // when it logs after proceed. Expanding names stays published before the chain is armed.
+        var pinnedNames = active.logging() ? active.credentialQueryParams() : AccessTargetMask.NONE;
         long start = System.nanoTime();
         Response response;
         if (active.intercepts()) {
@@ -78,7 +81,7 @@ public final class ObserveRequestFilter implements RequestFilter {
                 agent = header(request, "user-agent");
             }
             active.complete(response.status(), protocol, bytes, nanos, remote(request), request.method(),
-                    request.target(), request.protocol(), referer, agent);
+                    request.target(), request.protocol(), referer, agent, pinnedNames);
         } else {
             active.complete(response.status(), protocol, bytes, nanos);
         }
