@@ -52,6 +52,28 @@ public interface Replica extends PartitionAppender, AutoCloseable {
     CompletableFuture<Void> leaderRead();
 
     /**
+     * Proposes the replicated retention decision "advance the log start to {@code offset}" (#270): every replica deletes
+     * its sealed segments that end at or below it when the entry applies, so no replica deletes by its own clock. Only a
+     * ready leader proposes; the default refuses (a replica without snapshots keeps local retention).
+     */
+    default CompletableFuture<Void> advanceLogStart(long offset) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException("replicated retention"));
+    }
+
+    /**
+     * True when this replica can propose and apply replicated retention cuts (#270). False keeps the caller's
+     * local retention path ({@link #advanceLogStart} default refuses).
+     */
+    default boolean replicatedRetention() {
+        return false;
+    }
+
+    /** The replicated log start (the last applied {@link #advanceLogStart} or installed snapshot's), or 0. */
+    default long logStartOffset() {
+        return 0;
+    }
+
+    /**
      * Appends {@code records} as batch {@code seq} of producer {@code (origin, producerId)} (M2, {@code producerId != 0},
      * {@code seq >= 1}). The batch is checked against the topic's producer table when its entry is applied, on every
      * replica: the next seq is appended ({@code duplicate} false); a retry of a batch still in the dedup window, with

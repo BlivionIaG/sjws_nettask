@@ -69,6 +69,10 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private final SharedLedgerPool sharedPool;
     private volatile boolean closed;
     private volatile boolean stopSyncer;
+    /** True while {@link #pauseSync} holds the syncer off {@code log.force} (snapshot install). */
+    private volatile boolean syncPaused;
+    /** Non-zero while a syncer thread is inside {@code log.force()}; install waits for zero. */
+    private final java.util.concurrent.atomic.AtomicInteger syncInForce = new java.util.concurrent.atomic.AtomicInteger();
     private volatile Throwable failure;
     /** Offset after the last write; read by the syncer. */
     private volatile long written;
@@ -125,6 +129,46 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         }
         thread.start();
     }
+
+    /**
+     * #270: after {@link SegmentedLog#replaceWith} (no append in flight): the log end and durable offset restart at the
+     * replaced log's end, which is durable (the caller fsynced every staged file before the swap).
+     */
+    public void reload() {
+        if (!queue.isEmpty()) throw new IllegalStateException("reload with appends queued");
+        lock.lock();
+        try {
+            written = log.nextOffset();
+            durable = written;
+        } finally {
+            lock.unlock();
+        }
+        publish();
+    }
+
+    /**
+     * Stops background {@code log.force()} until {@link #resumeSync()}. Call only with no append in flight
+     * (after draining the last local future). Dedicated and shared syncers both honor this; snapshot install
+     * uses it around {@link SegmentedLog#replaceWith} so a ClosedChannelException from closing segment
+     * channels cannot permanently fail the writer (#288 Codex P1).
+     */
+    public void pauseSync() {
+        syncPaused = true;
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+        while (syncInForce.get() > 0 && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+            java.util.concurrent.locks.LockSupport.parkNanos(50_000);
+        }
+    }
+
+    /** Allows background syncing again after {@link #pauseSync}. */
+    public void resumeSync() {
+        syncPaused = false;
+        if (syncer != null) java.util.concurrent.locks.LockSupport.unpark(syncer);
+    }
+
+    /** The log this writer appends to (#270: the snapshot export and install read and replace its segments). */
+    public SegmentedLog log() { return log; }
 
     /** The latest published state; one volatile read. */
     public LedgerSnapshot snapshot() { return snapshot.get(); }
@@ -183,12 +227,14 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
 
     /** Cheap check for the shared syncer's spin-then-park idle path. */
     boolean needsSharedSync() {
+        if (syncPaused) return false;
         if (stopSyncer && queue.isEmpty() && fsyncWaiters.isEmpty()) return false;
         long target = written;
         return target > durableNow() && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
     }
 
     boolean sharedSyncSlice() {
+        if (syncPaused) return false;
         if (stopSyncer && queue.isEmpty() && fsyncWaiters.isEmpty() && written <= durableNow()) return false;
         long d0 = durableNow();
         Waiter w0;
@@ -207,12 +253,20 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             return true;
         }
         flooring = false;
+        if (syncPaused) return false;
+        syncInForce.incrementAndGet();
         try {
-            log.force();
-        } catch (IOException | RuntimeException e) {
-            failure = e;
-            failWaiters(e);
-            return false;
+            if (syncPaused) return false;
+            try {
+                log.force();
+            } catch (IOException | RuntimeException e) {
+                if (syncPaused) return false; // replaceWith closed channels under pause; not a writer failure
+                failure = e;
+                failWaiters(e);
+                return false;
+            }
+        } finally {
+            syncInForce.decrementAndGet();
         }
         lastSharedFsync = System.nanoTime();
         lock.lock();
@@ -309,10 +363,35 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
 
     private long durableNow() { lock.lock(); try { return durable; } finally { lock.unlock(); } }
 
+    /**
+     * Test-only: runs after {@code log.force()} returns and before durable is published. Lets a test append
+     * between the fsync and the watermark publish to prove the durable offset never covers unsynced records
+     * (#288 Codex P1).
+     */
+    volatile Runnable afterLogForce;
+
+    /**
+     * Fsyncs the log and advances {@link LedgerSnapshot#durableOffset} to the watermark captured <em>before</em>
+     * that fsync (#270 / #288 MC-N1, Codex P1). Prefer this over {@link SegmentedLog#force} when a snapshot must
+     * observe the durable point: reading {@code written} after {@code log.force()} returns can include records the
+     * writer appended in between, which were never part of that fsync.
+     */
+    public void force() throws IOException {
+        forceInline();
+    }
+
     private void forceInline() throws IOException {
+        long watermark = written; // capture before fsync: only this prefix is covered
         log.force();
+        var hook = afterLogForce;
+        if (hook != null) hook.run();
         lock.lock();
-        try { fsyncs++; durable = written; } finally { lock.unlock(); }
+        try {
+            fsyncs++;
+            if (watermark > durable) durable = watermark;
+        } finally {
+            lock.unlock();
+        }
         publish();
     }
 
@@ -356,6 +435,10 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             long target = written;
             boolean dirty = target > durableNow();
             boolean wanted = dirty && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
+            if (syncPaused) {
+                LockSupport.parkNanos(this, 50_000);
+                continue;
+            }
             if (!wanted) {
                 if (stopSyncer) return;
                 // Event-driven: the writer unparks this thread after every write (and close() does too), and an
@@ -371,12 +454,20 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
                 flooring = false;
                 continue;
             }
+            if (syncPaused) continue;
+            syncInForce.incrementAndGet();
             try {
-                log.force();
-            } catch (IOException | RuntimeException e) {
-                failure = e;
-                failWaiters(e);
-                return;
+                if (syncPaused) continue;
+                try {
+                    log.force();
+                } catch (IOException | RuntimeException e) {
+                    if (syncPaused) continue; // replaceWith closed channels under pause; not a writer failure
+                    failure = e;
+                    failWaiters(e);
+                    return;
+                }
+            } finally {
+                syncInForce.decrementAndGet();
             }
             lastFsync = System.nanoTime();
             lock.lock();
