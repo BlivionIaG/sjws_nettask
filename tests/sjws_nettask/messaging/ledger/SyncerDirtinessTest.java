@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.lang.reflect.Field;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
@@ -129,43 +130,64 @@ class SyncerDirtinessTest {
     }
 
     /**
-     * Shard-level floor: a hot neighbour's floor must not delay a sibling's due ASYNC force beyond
-     * {@code fsyncInterval + one floor} (defaults: ≤ 2×{@link LedgerWriter#DEFAULT_FSYNC_INTERVAL_NANOS}).
-     * Mutation: park inside sharedSyncSlice on FLOORED (old HOL) → sibling waits ~interval of the hot member.
+     * Shard-level floor: a hot neighbour with a much larger floor must not delay a sibling's due
+     * ASYNC force beyond the sibling's {@code fsyncInterval + one shard floor}.
+     * <p>
+     * Dirty appends happen while both syncers are paused; pause flags are cleared without an unpark
+     * so the single shard unpark that starts the scan is consumed by the idle park, not by an
+     * in-slice {@code parkNanos}. Hot uses 50× the sibling interval. Restoring per-member
+     * {@code parkNanos} inside {@code sharedSyncSlice} then blocks the sibling for ~hotInterval.
+     * Mutation: park inside sharedSyncSlice on FLOORED → sibling blocked for ~hotInterval (5/5).
      */
     @Test
     void shardFloorDoesNotBlockSiblingDueForce() throws Exception {
-        long interval = 20_000_000L; // 20 ms — large enough to distinguish HOL vs shard floor
+        long dueInterval = 5_000_000L; // 5 ms
+        long hotInterval = dueInterval * 50; // 250 ms — HOL parks ~this; shard floor does not
         var pool = new SharedLedgerPool(1);
         try (var logHot = SegmentedLog.open(dir.resolve("hot"));
                 var logDue = SegmentedLog.open(dir.resolve("due"))) {
-            var hot = new LedgerWriter(logHot, Durability.ASYNC, 0, 64, 4 << 20, interval, pool);
-            var due = new LedgerWriter(logDue, Durability.ASYNC, 0, 64, 4 << 20, interval, pool);
+            // Register hot first so it is earlier in the CopyOnWriteArrayList scan (HOL starvation order).
+            var hot = new LedgerWriter(logHot, Durability.ASYNC, 0, 64, 4 << 20, hotInterval, pool);
+            var due = new LedgerWriter(logDue, Durability.ASYNC, 0, 64, 4 << 20, dueInterval, pool);
             try {
                 assertEquals(2, pool.memberCount(0), "both writers on the single shard");
-                // Establish hot's lastSharedFsync so it is inside its floor window.
                 hot.append(List.of(b("h")), Durability.ASYNC).get(5, TimeUnit.SECONDS);
-                long hotDeadline = System.nanoTime() + interval + interval + 200_000_000L;
+                long hotDeadline = System.nanoTime() + hotInterval + hotInterval + 200_000_000L;
                 while (hot.snapshot().durableOffset() < 1) {
                     assertTrue(System.nanoTime() < hotDeadline, "hot ASYNC never forced");
                     Thread.sleep(0, 100_000);
                 }
-                // Immediately append ASYNC on sibling while hot is still inside its floor (and keep hot dirty).
+                hot.pauseSync();
+                due.pauseSync();
                 hot.append(List.of(b("h2")), Durability.ASYNC).get(5, TimeUnit.SECONDS);
-                long t0 = System.nanoTime();
                 due.append(List.of(b("d")), Durability.ASYNC).get(5, TimeUnit.SECONDS);
-                long bound = interval + interval; // fsyncInterval + at most one shard floor
-                long deadline = t0 + bound + 100_000_000L; // +100 ms slack for scheduling
+                assertEquals(0, due.snapshot().durableOffset());
+                // Clear pause without unpark so the next unpark is consumed waking the idle syncer,
+                // not aborting an in-slice parkNanos (HOL mutant).
+                Field paused = LedgerWriter.class.getDeclaredField("syncPaused");
+                paused.setAccessible(true);
+                paused.setBoolean(hot, false);
+                paused.setBoolean(due, false);
+                Thread.sleep(20); // let shared syncer reach idle park after paused IDLE slices
+                long t0 = System.nanoTime();
+                pool.unparkSyncer(0);
+                long bound = dueInterval + dueInterval; // interval + one shard floor
+                long deadline = t0 + bound + 30_000_000L; // +30 ms scheduling slack only
                 while (due.snapshot().durableOffset() < 1) {
                     assertTrue(System.nanoTime() < deadline,
                             "sibling ASYNC blocked by neighbour floor (HOL); elapsed_ns="
-                                    + (System.nanoTime() - t0) + " bound_ns=" + bound);
-                    Thread.sleep(0, 100_000);
+                                    + (System.nanoTime() - t0) + " bound_ns=" + bound
+                                    + " hotInterval_ns=" + hotInterval);
+                    Thread.sleep(0, 50_000);
                 }
                 long elapsed = System.nanoTime() - t0;
-                assertTrue(elapsed <= bound + 50_000_000L,
-                        "elapsed_ns=" + elapsed + " must be ≤ interval+floor (" + bound + ") + slack");
+                assertTrue(elapsed <= bound + 30_000_000L,
+                        "elapsed_ns=" + elapsed + " must be ≤ dueInterval+floor (" + bound
+                                + ") + slack — per-member park on hot would wait ~hotInterval="
+                                + hotInterval);
             } finally {
+                due.resumeSync();
+                hot.resumeSync();
                 due.close();
                 hot.close();
             }
@@ -173,10 +195,11 @@ class SyncerDirtinessTest {
     }
 
     /**
-     * Mixed mode: NONE after a pending ASYNC gets no stronger guarantee (test must not assert NONE durable
-     * before an explicit force/close), while the earlier ASYNC is still forced. Force watermark covers the file.
-     * Mutation: treat NONE like ASYNC for dirty marking without changing ASYNC → still passes ASYNC half;
-     * mutation that skips noteAsyncForceThrough → ASYNC never forced.
+     * Mixed mode: NONE after a pending ASYNC gets no stronger guarantee at ack time (durable stays 0
+     * until the syncer runs), while the earlier ASYNC still schedules a force. After that force,
+     * the watermark is {@code written} (whole-file fsync piggyback), not {@code asyncForceThrough} alone.
+     * Mutation: set force target to {@code asyncForceThrough} instead of {@code written} → durable stops at 1.
+     * Mutation: skip {@code noteAsyncForceThrough} → ASYNC never forced (deadline).
      */
     @Test
     void mixedNoneAfterAsyncDoesNotPromiseNoneDurable() throws Exception {
@@ -191,7 +214,8 @@ class SyncerDirtinessTest {
                 assertEquals(0, w.snapshot().durableOffset());
                 w.append(List.of(b("n")), Durability.NONE).get(5, TimeUnit.SECONDS);
                 assertEquals(2, w.snapshot().nextOffset());
-                // Do NOT assert offset 1 is durable — NONE has no stronger guarantee than NONE.
+                assertEquals(1, w.asyncForceThroughForTests(), "NONE must not advance asyncForceThrough");
+                // No promise at ack: durable still 0 while syncer paused (NONE did not look durable).
                 assertEquals(0, w.snapshot().durableOffset(), "NONE must not look durable before syncer runs");
                 w.resumeSync();
                 long deadline = System.nanoTime() + 2_000_000_000L;
@@ -199,9 +223,10 @@ class SyncerDirtinessTest {
                     assertTrue(System.nanoTime() < deadline, "ASYNC prefix never forced");
                     Thread.sleep(0, 200_000);
                 }
-                // After the ASYNC-driven force, watermark is written, so BOTH offsets may be durable
-                // (piggyback). That is allowed; the guarantee for NONE is only that we never *promised* it.
-                assertTrue(w.snapshot().durableOffset() >= 1, "ASYNC must be covered");
+                // Force watermark is written (piggyback). Mutant that advances durable only to
+                // asyncForceThrough leaves durable at 1 while nextOffset is 2.
+                assertEquals(w.snapshot().nextOffset(), w.snapshot().durableOffset(),
+                        "ASYNC-driven force watermark must be written, not asyncForceThrough alone");
                 assertTrue(w.snapshot().fsyncs() >= 1);
             } finally {
                 w.close();
@@ -210,7 +235,60 @@ class SyncerDirtinessTest {
     }
 
     /**
-     * Recovery: reopened writer treats recovered bytes as durable (constructor durable = nextOffset).
+     * N=32 NONE appends then an ASYNC LAST in the same file: LAST is forced within
+     * {@code fsyncInterval + one floor}, and that force covers all preceding NONE bytes
+     * (durable watermark ≥ LAST end / {@code nextOffset}).
+     * Mutation: never {@code noteAsyncForceThrough} → LAST never forced.
+     * Mutation: force watermark = {@code asyncForceThrough} only → durable stops before NONE prefix
+     * if LAST end were somehow ahead; with single ASYNC at end, watermark-only-async still reaches
+     * LAST end — primary kill is skip-note; watermark mutant killed by {@link #mixedNoneAfterAsyncDoesNotPromiseNoneDurable}.
+     * Mutation: treat force target as durable-before-NONE (e.g. cap at offset before LAST) → durable &lt; nextOffset.
+     */
+    @Test
+    void nonePrefixThenAsyncLastForcedCoversAll() throws Exception {
+        long interval = 2_000_000L; // 2 ms
+        var pool = new SharedLedgerPool(1);
+        try (var log = SegmentedLog.open(dir.resolve("none-then-last"))) {
+            var w = new LedgerWriter(log, Durability.ASYNC, 0, 256, 4 << 20, interval, pool);
+            try {
+                w.pauseSync();
+                for (int i = 0; i < 32; i++) {
+                    w.append(List.of(b("n" + i)), Durability.NONE).get(5, TimeUnit.SECONDS);
+                }
+                assertEquals(32, w.snapshot().nextOffset());
+                assertEquals(0, w.snapshot().durableOffset());
+                assertEquals(0, w.asyncForceThroughForTests(), "NONE prefix must not schedule force");
+                w.append(List.of(b("LAST")), Durability.ASYNC).get(5, TimeUnit.SECONDS);
+                long lastEnd = w.snapshot().nextOffset();
+                assertEquals(33, lastEnd);
+                assertEquals(33, w.asyncForceThroughForTests());
+                assertEquals(0, w.snapshot().durableOffset(), "paused: nothing durable yet");
+                long t0 = System.nanoTime();
+                w.resumeSync();
+                long bound = interval + interval; // interval + one floor
+                long deadline = t0 + bound + 200_000_000L;
+                while (w.snapshot().durableOffset() < lastEnd) {
+                    assertTrue(System.nanoTime() < deadline,
+                            "ASYNC LAST not forced within interval+floor; durable="
+                                    + w.snapshot().durableOffset() + " need=" + lastEnd);
+                    Thread.sleep(0, 100_000);
+                }
+                assertEquals(lastEnd, w.snapshot().durableOffset(),
+                        "force covering LAST must piggyback all preceding NONE bytes");
+                assertTrue(w.snapshot().fsyncs() >= 1);
+                long elapsed = System.nanoTime() - t0;
+                assertTrue(elapsed <= bound + 100_000_000L,
+                        "elapsed_ns=" + elapsed + " bound=" + bound);
+            } finally {
+                w.close();
+            }
+        }
+    }
+
+    /**
+     * Recovery semantics unchanged from master: constructor sets {@code durable = log.nextOffset()},
+     * so a reopened writer reports the recovered prefix as durable (it survived a restart).
+     * Does not claim a stronger guarantee than master (no new fsync-on-open).
      * Mutation: leave durable at 0 on open → durableOffset &lt; nextOffset right after reopen with data.
      */
     @Test

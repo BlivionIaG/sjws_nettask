@@ -30,3 +30,8 @@
 - full mvn verify
 - ABBA 9 rounds + force/s probe under flock when load1<3
 - push + PR
+
+## Done
+- PR https://github.com/BlivionIaG/sjws_nettask/pull/342 @ 99926d6
+- verify PASS local + CI (verify still running on GH at last check; analyze/perf/image/CodeQL green)
+- ABBA G1; force NONE 64w 12155 → 0 fsyncs/s
