@@ -12,8 +12,8 @@ import java.util.concurrent.atomic.*;
 /**
  * java JdkH2Load.java url conns secs warm [bodyfile] — HTTP/2 GET or POST via JDK client.
  * HTTPS trusts only the PEM at {@code SJWS_BENCH_CA} (the bench self-signed cert from run-abba.sh).
- * Exits non-zero when the measured window yields no successes or too many request failures
- * (so a dead listener cannot look like a throughput regression).
+ * Counts transport failures and non-2xx responses as errors. Any error in the measured window
+ * invalidates the block (exit 2), so a 404/5xx workload cannot look like a clean sample.
  */
 public class JdkH2Load {
   public static void main(String[] a) throws Exception {
@@ -42,9 +42,10 @@ public class JdkH2Load {
     double el = (System.nanoTime() - t0) / 1e9;
     long err = errors.sum();
     long[] v = lat.stream().mapToLong(Long::longValue).sorted().toArray();
-    if (n == 0 || err * 10 > (n + err)) {
+    // Any error (transport or non-2xx) invalidates the block (Codex P2 / inceptor).
+    if (n == 0 || err > 0) {
       System.err.printf(Locale.ROOT,
-          "FAIL rps=%.0f p50=%.2fms p99=%.2fms n=%d errors=%d (listener down or >10%% failures)%n",
+          "FAIL rps=%.0f p50=%.2fms p99=%.2fms n=%d errors=%d (listener down, non-2xx, or transport failures)%n",
           el > 0 ? n / el : 0, pct(v, .5), pct(v, .99), n, err);
       System.exit(2);
     }
@@ -85,7 +86,16 @@ public class JdkH2Load {
           while (System.nanoTime() < end) {
             long t0 = System.nanoTime();
             try {
-              client.send(req, HttpResponse.BodyHandlers.discarding());
+              HttpResponse<Void> resp = client.send(req, HttpResponse.BodyHandlers.discarding());
+              int code = resp.statusCode();
+              if (code < 200 || code >= 300) {
+                if (errors != null) {
+                  errors.increment();
+                } else {
+                  break; // warm-up: stop this worker on first non-2xx
+                }
+                continue;
+              }
               if (lat != null) lat.add(System.nanoTime() - t0);
               count.increment();
             } catch (Exception e) {

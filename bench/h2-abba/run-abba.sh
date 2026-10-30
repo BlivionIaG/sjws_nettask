@@ -1,6 +1,8 @@
 #!/bin/bash
 # ABBA h1 wrk + h2/h2c static GET through SjwsServer main.
 # Takes flock itself (Architecture N2 / AGENTS.md); waits for load1 < 4 and records it.
+# EXIT/INT/TERM always stop srv and killports so a gate timeout cannot leave the
+# Java child holding the lock fd (Codex P1 / Architecture N2).
 set -uo pipefail
 exec 9>/tmp/sjws-bench.lock
 flock 9
@@ -12,6 +14,14 @@ H1=${H1:-32280}; H2C=${H2C:-32281}; H2=${H2:-32544}
 BEFORE_JAR=${1:?before jar dir (contains sjws_nettask-*.jar and lib/)}
 AFTER_JAR=${2:?after jar dir}
 WWW=${3:?docroot with 1k.bin}
+P=
+cleanup(){
+  local ec=$?
+  if [[ -n "${P:-}" ]]; then kill "$P" 2>/dev/null; wait "$P" 2>/dev/null || true; P=; fi
+  fuser -k ${H1}/tcp ${H2C}/tcp ${H2}/tcp 2>/dev/null || true
+  exit "$ec"
+}
+trap cleanup EXIT INT TERM
 gate(){ for _ in $(seq 1 90); do
   l=$(cut -d' ' -f1 /proc/loadavg)
   python3 -c "import sys; sys.exit(0 if float('$l') < 4 else 1)" && { echo "  [load1=$l]"; return 0; }
@@ -25,12 +35,13 @@ srv(){ killports
   local dir=$1
   local jar
   jar=$(ls "$dir"/sjws_nettask-*.jar | head -1)
+  # 9>&- : do not inherit the flock fd (Codex P1 — child would keep the lock after shell exit)
   $J -jar "$jar" $H1 "$WWW" --h2 --h2-port=$H2 --h2c-port=$H2C \
     --cert="$B/bench-cert.pem" --key="$B/bench-key.pem" \
-    >"$B/srv-$(basename "$dir").log" 2>&1 & P=$!
-  sleep 3; kill -0 $P || { echo "SERVER $dir FAILED"; cat "$B/srv-$(basename "$dir").log"; return 1; }
+    >"$B/srv-$(basename "$dir").log" 2>&1 9>&- & P=$!
+  sleep 3; kill -0 $P || { echo "SERVER $dir FAILED"; cat "$B/srv-$(basename "$dir").log"; P=; return 1; }
 }
-stop(){ kill $P 2>/dev/null; wait $P 2>/dev/null; sleep 1; }
+stop(){ if [[ -n "${P:-}" ]]; then kill $P 2>/dev/null; wait $P 2>/dev/null || true; P=; fi; sleep 1; }
 # One measured load: gate, run, record ending load, mark NOISY if load1>=4 (AGENTS.md / Codex P1).
 measure_h2(){
   local label=$1 slot=$2 kind=$3 url=$4
@@ -72,8 +83,9 @@ for i in 0 1 2 3; do
   gate || exit 2
   srv "${ORDER[$i]}" || continue
   # Gate each measurement independently (Codex P1): h2c then TLS, each with ending load.
-  measure_h2 "${LABELS[$i]}" "$i" "h2c-GET" "http://127.0.0.1:$H2C/1k.bin" || true
-  measure_h2 "${LABELS[$i]}" "$i" "h2-GET" "https://127.0.0.1:$H2/1k.bin" || true
+  # Architecture N1: a FAIL from measure_h2 fails the script (no || true).
+  measure_h2 "${LABELS[$i]}" "$i" "h2c-GET" "http://127.0.0.1:$H2C/1k.bin" || exit 1
+  measure_h2 "${LABELS[$i]}" "$i" "h2-GET" "https://127.0.0.1:$H2/1k.bin" || exit 1
   stop
 done
 echo DONE; uptime
