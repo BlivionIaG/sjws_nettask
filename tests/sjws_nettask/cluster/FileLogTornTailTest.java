@@ -18,12 +18,15 @@ package sjws_nettask.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.ReadableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -217,8 +220,8 @@ class FileLogTornTailTest {
 
     /**
      * Rolling mode: a snapshot prefix truncate clears memory but can leave the active file. A later
-     * append after the snapshot index then creates a gap in that file; reopen must keep the contiguous
-     * suffix (Codex P1 on #316), not refuse startup.
+     * append at {@code snapIndex + 1} then creates a gap in that file; reopen must keep the contiguous
+     * suffix bound to the durable snapshot (Codex P1 / Security B2 on #316), not refuse startup.
      */
     @Test
     void rollingActiveFileGapAfterPrefixTruncateStillLoadsSuffix() throws Exception {
@@ -227,6 +230,7 @@ class FileLogTornTailTest {
         var log = new FileLogStorage(root, 512);
         log.append(GROUP, 1, 1, b("old"));
         log.force(GROUP);
+        log.saveSnapshot(GROUP, new LogSnapshot(GROUP, 100, 1, new byte[] {9}));
         log.truncatePrefix(GROUP, Long.MAX_VALUE - 1);
         log.append(GROUP, 101, 1, b("after-snap"));
         log.force(GROUP);
@@ -236,6 +240,118 @@ class FileLogTornTailTest {
         assertEquals(101L, re.lastIndex(GROUP));
         assertArrayEquals(b("after-snap"), re.read(GROUP, 101));
         assertEquals(null, re.read(GROUP, 1), "pre-snapshot index dropped from the live run");
+        re.close();
+    }
+
+    /**
+     * Security B2: rolling keep-suffix that starts above {@code snapIndex + 1} drops an uncovered
+     * prefix — refuse to load.
+     */
+    @Test
+    void rollingSuffixStartingAboveSnapIndexPlusOneRefuses() throws Exception {
+        var root = dir.resolve("roll-gap-above");
+        Files.createDirectories(root);
+        var log = new FileLogStorage(root, 512);
+        log.append(GROUP, 1, 1, b("old"));
+        log.force(GROUP);
+        log.saveSnapshot(GROUP, new LogSnapshot(GROUP, 100, 1, new byte[] {9}));
+        log.truncatePrefix(GROUP, Long.MAX_VALUE - 1);
+        log.append(GROUP, 102, 1, b("hole")); // gap: expected 101
+        log.force(GROUP);
+        log.close();
+        var err = assertThrows(Exception.class, () -> {
+            var re = new FileLogStorage(root, 512);
+            try {
+                re.lastIndex(GROUP);
+            } finally {
+                try {
+                    re.close();
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        Throwable t = err;
+        while (t.getCause() != null) {
+            t = t.getCause();
+        }
+        assertTrue(t.getMessage().contains("live suffix starts at index 102")
+                        || t.getMessage().contains("expected first live index 101"),
+                "message=" + t.getMessage());
+    }
+
+    /**
+     * Security B2: a contiguous live run whose first index is ≤ {@code snapIndex} stays loadable
+     * (snapshot covers that prefix; existing semantics).
+     */
+    @Test
+    void rollingSuffixAtOrBelowSnapIndexLoads() throws Exception {
+        var root = dir.resolve("roll-gap-below");
+        Files.createDirectories(root);
+        var log = new FileLogStorage(root, 512);
+        for (int i = 1; i <= 3; i++) {
+            log.append(GROUP, i, 1, b("e" + i));
+        }
+        log.force(GROUP);
+        log.saveSnapshot(GROUP, new LogSnapshot(GROUP, 100, 1, new byte[] {9}));
+        log.close();
+        var re = new FileLogStorage(root, 512);
+        assertEquals(3L, re.lastIndex(GROUP));
+        assertArrayEquals(b("e1"), re.read(GROUP, 1));
+        assertArrayEquals(b("e3"), re.read(GROUP, 3));
+        re.close();
+    }
+
+    /**
+     * Security B1: a short mid-file {@code read} must not be classified as a torn tail. Loop until
+     * full or real EOF; the durable file must not be truncated and every complete record loads.
+     */
+    @Test
+    void shortMidFileReadsDoNotTruncateCompleteLog() throws Exception {
+        var root = dir.resolve("short-read");
+        Files.createDirectories(root);
+        writeComplete(root, 4);
+        Path log = logFile(root);
+        long size = Files.size(log);
+        try (var raw = FileChannel.open(log, StandardOpenOption.READ)) {
+            ReadableByteChannel shortReads = new ReadableByteChannel() {
+                @Override
+                public int read(ByteBuffer dst) throws IOException {
+                    if (!dst.hasRemaining()) {
+                        return 0;
+                    }
+                    int allow = Math.min(3, dst.remaining());
+                    var slice = dst.duplicate();
+                    slice.limit(slice.position() + allow);
+                    int n = raw.read(slice);
+                    if (n > 0) {
+                        dst.position(dst.position() + n);
+                    }
+                    return n;
+                }
+
+                @Override
+                public boolean isOpen() {
+                    return raw.isOpen();
+                }
+
+                @Override
+                public void close() {
+                    // raw closed by try-with-resources
+                }
+            };
+            var scan = FileLogStorage.scanRecords(shortReads, size, log);
+            assertFalse(scan.torn(), "short mid-file reads are not EOF");
+            assertEquals(size, scan.lastGoodPos());
+            assertEquals(4, scan.records().size());
+            assertEquals(java.util.Set.of(1L, 2L, 3L, 4L), scan.records().keySet());
+        }
+        assertEquals(size, Files.size(log), "scan must not truncate");
+        var re = new FileLogStorage(root);
+        assertEquals(4L, re.lastIndex(GROUP));
+        assertEquals(size, Files.size(log), "open must not truncate a complete log");
+        for (int i = 1; i <= 4; i++) {
+            assertArrayEquals(b("e" + i), re.read(GROUP, i));
+        }
         re.close();
     }
 

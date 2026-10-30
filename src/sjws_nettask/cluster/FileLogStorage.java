@@ -41,8 +41,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * then drops the entries from memory and unlinks the sealed files it covers wholly: no copy, and the lock is held only
  * for the in-memory removal, so a snapshot truncation never stalls appends of any group for a rewrite. Unlinks are not
  * directory-fsynced: after a crash a deleted file may come back, and loading keeps only the contiguous run of indexes
- * that ends at the newest entry, so a resurrected older file is ignored (and anything it holds is covered by the
- * durable snapshot that allowed the truncation). A suffix truncation (rare: a conflicting uncommitted tail) rewrites
+ * that ends at the newest entry when that run starts at {@code snapIndex + 1} (or at/below snapIndex); a suffix that
+ * starts above {@code snapIndex + 1} refuses to load. A resurrected older file outside the kept run is ignored when
+ * the durable snapshot covers it. A suffix truncation (rare: a conflicting uncommitted tail) rewrites
  * every kept entry into a new active file first and only then deletes the sealed files; loading treats the active file
  * as authoritative from its first index on.
  *
@@ -102,63 +103,88 @@ public final class FileLogStorage implements LogStorage {
     /**
      * One file scan: complete {@code [index][term][len][data]} records and the end offset of the last
      * one. A torn tail ({@code lastGoodPos < fileSize}) is truncated by the caller with an fsync of
-     * the file and directory (#241). A complete header with a negative length fails closed. Index
+     * the file and directory (#241). Header and body reads loop until full or EOF: a short mid-file
+     * read is never treated as torn. A complete header with a negative length fails closed. Index
      * gaps are mode-specific: non-rolling refuses them; rolling keeps the contiguous suffix ending
-     * at the newest entry (snapshot prefix truncations can leave a gap in the active file). Bit
-     * flips inside a well-framed record need per-record CRC32C (#207).
+     * at the newest entry when that suffix starts at {@code snapIndex + 1} (or at/below snapIndex).
+     * Bit flips inside a well-framed record need per-record CRC32C (#207).
      */
-    private record Scan(java.util.TreeMap<Long, Rec> records, long lastGoodPos, long fileSize) {
+    record Scan(java.util.TreeMap<Long, Rec> records, long lastGoodPos, long fileSize) {
         boolean torn() {
             return lastGoodPos < fileSize;
         }
     }
 
-    private static Scan scanRecords(Path path) throws IOException {
+    /**
+     * Fills {@code buf} by looping {@link java.nio.channels.ReadableByteChannel#read}. Returns the
+     * number of bytes read, or a short count when EOF is reached before the buffer is full (0 when
+     * EOF is hit with nothing read yet). A short mid-file {@code read} is retried until full or EOF.
+     */
+    static int readFullyOrEof(java.nio.channels.ReadableByteChannel in, ByteBuffer buf)
+            throws IOException {
+        int total = 0;
+        while (buf.hasRemaining()) {
+            int n = in.read(buf);
+            if (n < 0) {
+                return total;
+            }
+            total += n;
+        }
+        return total;
+    }
+
+    static Scan scanRecords(Path path) throws IOException {
         var out = new java.util.TreeMap<Long, Rec>();
         if (!Files.exists(path) || Files.size(path) == 0) {
             return new Scan(out, 0L, 0L);
         }
         long fileSize = Files.size(path);
-        long lastGood = 0L;
         try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
-            var header = ByteBuffer.allocate(20);
-            while (in.position() < fileSize) {
-                long recordStart = in.position();
-                header.clear();
-                int got = in.read(header);
-                if (got < 0) {
-                    break;
-                }
-                if (got != 20) {
-                    break; // incomplete header at EOF: torn tail
-                }
-                header.flip();
-                long index = header.getLong();
-                long term = header.getLong();
-                int len = header.getInt();
-                if (len < 0) {
-                    // A crash leaves an incomplete header, not a complete one with a negative length.
-                    throw new IOException("corrupt log record framing in " + path.getFileName()
-                            + " at offset " + recordStart + ": negative length " + len
-                            + "; refusing to start");
-                }
-                long remaining = fileSize - in.position();
-                if (len > remaining) {
-                    break; // body would run past EOF: torn tail
-                }
-                var data = new byte[len];
-                var body = ByteBuffer.wrap(data);
-                while (body.hasRemaining()) {
-                    if (in.read(body) < 0) {
-                        break;
-                    }
-                }
-                if (body.hasRemaining()) {
-                    break; // torn body at EOF
-                }
-                out.put(index, new Rec(term, data));
-                lastGood = in.position();
+            return scanRecords(in, fileSize, path);
+        }
+    }
+
+    /**
+     * Scans {@code in} as a Raft log of {@code fileSize} bytes. Package-visible so tests can inject
+     * a short-read {@link java.nio.channels.ReadableByteChannel} wrapper.
+     */
+    static Scan scanRecords(java.nio.channels.ReadableByteChannel in, long fileSize, Path path)
+            throws IOException {
+        var out = new java.util.TreeMap<Long, Rec>();
+        long lastGood = 0L;
+        long pos = 0L;
+        var header = ByteBuffer.allocate(20);
+        while (pos < fileSize) {
+            long recordStart = pos;
+            header.clear();
+            int got = readFullyOrEof(in, header);
+            if (got < 20) {
+                break; // real EOF before a complete header: torn tail
             }
+            pos += 20;
+            header.flip();
+            long index = header.getLong();
+            long term = header.getLong();
+            int len = header.getInt();
+            if (len < 0) {
+                // A crash leaves an incomplete header, not a complete one with a negative length.
+                throw new IOException("corrupt log record framing in " + path.getFileName()
+                        + " at offset " + recordStart + ": negative length " + len
+                        + "; refusing to start");
+            }
+            long remaining = fileSize - pos;
+            if (len > remaining) {
+                break; // body would run past EOF: torn tail
+            }
+            var data = new byte[len];
+            var body = ByteBuffer.wrap(data);
+            int bodyGot = readFullyOrEof(in, body);
+            if (bodyGot < len) {
+                break; // real EOF mid-body: torn tail
+            }
+            pos += len;
+            out.put(index, new Rec(term, data));
+            lastGood = pos;
         }
         return new Scan(out, lastGood, fileSize);
     }
@@ -452,7 +478,9 @@ public final class FileLogStorage implements LogStorage {
     /**
      * Rolling mode load: sealed files in first-index order, then the active file, which is authoritative from its first
      * index on (a suffix truncation rewrote it before deleting sealed files). Keeps only the contiguous run of indexes
-     * ending at the newest entry; sealed files left with nothing in that run are deleted.
+     * ending at the newest entry; sealed files left with nothing in that run are deleted. The kept suffix must start at
+     * {@code snapIndex + 1} (exact continuity after the durable snapshot) or at/below {@code snapIndex} (covered by the
+     * snapshot). A suffix that starts above {@code snapIndex + 1} refuses to load: the dropped prefix is not covered.
      */
     private void loadRolling(GroupId group, NavigableMap<Long, Rec> loaded) throws IOException {
         var files = new java.util.TreeMap<Long, Path>();
@@ -492,6 +520,7 @@ public final class FileLogStorage implements LogStorage {
                 expect--;
             }
             loaded.headMap(keepFrom, false).clear();
+            refuseUncoveredRollingSuffix(group, loaded);
         }
         var tracked = new java.util.TreeMap<Long, Sealed>();
         long activeFirst = active.isEmpty() ? Long.MAX_VALUE : active.firstKey();
@@ -504,6 +533,58 @@ public final class FileLogStorage implements LogStorage {
             tracked.put(r[0], new Sealed(f.getValue(), r[0], Math.min(r[1], activeFirst - 1)));
         }
         sealed.put(group, tracked);
+    }
+
+    /**
+     * After the rolling keep-suffix rule, the first live index must equal {@code snapIndex + 1} or be
+     * ≤ {@code snapIndex} (snapshot covers it). A hole that leaves the live suffix starting above
+     * {@code snapIndex + 1} would drop an uncovered prefix: refuse to start.
+     */
+    private void refuseUncoveredRollingSuffix(GroupId group, NavigableMap<Long, Rec> loaded)
+            throws IOException {
+        if (loaded.isEmpty()) {
+            return;
+        }
+        long snapIndex = durableSnapIndex(group);
+        long firstLive = loaded.firstKey();
+        if (firstLive > snapIndex + 1) {
+            throw new IOException("corrupt log record framing in " + path(group).getFileName()
+                    + ": live suffix starts at index " + firstLive + " but snapshot covers through "
+                    + snapIndex + " (expected first live index " + (snapIndex + 1)
+                    + "); refusing to start");
+        }
+    }
+
+    /**
+     * {@code lastIncludedIndex} of the durable snapshot for {@code group}, or {@code 0} when there is
+     * no snapshot file (matches {@link RaftGroup}'s default {@code snapIndex}). Only the snap header
+     * is read; full image validation remains {@link #loadSnapshot}'s job on group open.
+     */
+    private long durableSnapIndex(GroupId group) throws IOException {
+        var path = snapPath(group);
+        if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            return 0L;
+        }
+        try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
+            var buf = ByteBuffer.allocate(SNAP_HEADER_BYTES);
+            int got = readFullyOrEof(in, buf);
+            if (got < SNAP_HEADER_BYTES) {
+                throw new IOException("snapshot " + path + " is truncated; refusing to start");
+            }
+            buf.flip();
+            if (buf.getInt() != SNAP_MAGIC) {
+                throw new IOException("snapshot " + path + " has a bad magic; refusing to start");
+            }
+            if (buf.getInt() != SNAP_VERSION) {
+                throw new IOException("snapshot " + path + " has unsupported version " + buf.getInt(4)
+                        + "; refusing to start");
+            }
+            long index = buf.getLong();
+            if (index < 0) {
+                throw new IOException("snapshot " + path + " has a negative index; refusing to start");
+            }
+            return index;
+        }
     }
 
     /** Rolling mode, under the lock: seal the active file once it reached {@link #rollBytes}. */
