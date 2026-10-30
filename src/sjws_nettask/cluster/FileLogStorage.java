@@ -194,6 +194,26 @@ public final class FileLogStorage implements LogStorage {
                 path.getFileName(), fileSize, lastGoodPos);
     }
 
+    /**
+     * Non-rolling segments are rewritten on every truncate, so indexes in one file must be a
+     * contiguous run. A gap is mid-log corruption: refuse to start rather than silently drop a
+     * committed suffix. Rolling mode uses {@link #loadRolling}'s keep-suffix rule instead, because
+     * a snapshot prefix truncate can leave a gap in the active file on purpose.
+     */
+    private static void refuseNonContiguous(Path path, NavigableMap<Long, Rec> loaded) throws IOException {
+        if (loaded.size() < 2) {
+            return;
+        }
+        Long prev = null;
+        for (long index : loaded.keySet()) {
+            if (prev != null && index != prev + 1) {
+                throw new IOException("corrupt log record framing in " + path.getFileName()
+                        + ": index " + index + " after " + prev + "; refusing to start");
+            }
+            prev = index;
+        }
+    }
+
     private NavigableMap<Long, Rec> log(GroupId group) throws IOException {
         var existing = logs.get(group);
         if (existing != null) {
