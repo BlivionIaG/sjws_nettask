@@ -196,8 +196,9 @@ public final class AdminTls {
     }
 
     /**
-     * Re-reads every file and swaps the material if all of it is valid. Cached sessions are
-     * invalidated so that resumed handshakes are re-checked. Never throws.
+     * Re-reads every file and swaps the material if all of it is valid. Cached sessions listed by
+     * the session context are invalidated. Peer links also re-check the presented chain after every
+     * handshake (see {@link #revalidatePeer}). Never throws.
      *
      * @return null on success, otherwise why the previous material was kept
      */
@@ -220,6 +221,11 @@ public final class AdminTls {
             current = next;
             generation.set(next.gen());
             invalidateSessions(context.getServerSessionContext());
+            // Peer links also dial with this context: drop cached client sessions so a dial after
+            // reload cannot reuse a pre-reload session against the new material.
+            if (actsAsClient) {
+                invalidateSessions(context.getClientSessionContext());
+            }
             audit.record("system", label + ".reload", String.valueOf(trustBundle), "ok");
             return null;
         } catch (IOException | RuntimeException e) {
@@ -396,6 +402,25 @@ public final class AdminTls {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(cert.getEncoded()));
         } catch (NoSuchAlgorithmException | CertificateEncodingException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Re-run chain and revocation checks against the material currently in use. Peer links call this
+     * after every handshake so a resumed session still sees a reload that changed trust or
+     * revocations. {@code peerIsClient} is true when this side accepted the connection.
+     */
+    void revalidatePeer(X509Certificate[] chain, boolean peerIsClient) throws CertificateException {
+        if (chain == null || chain.length == 0) {
+            throw new CertificateException("no peer certificate");
+        }
+        // TLS 1.3 handshakes report authType UNKNOWN to the trust manager; match that so a
+        // post-handshake re-check does not invent a key-exchange name the PKIX path rejects.
+        String auth = "UNKNOWN";
+        if (peerIsClient) {
+            new Trust().checkClientTrusted(chain, auth);
+        } else {
+            new Trust().checkServerTrusted(chain, auth);
         }
     }
 

@@ -164,6 +164,7 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
             socket.setSoTimeout(HANDSHAKE_TIMEOUT_MILLIS);
             socket.startHandshake();
             socket.setSoTimeout(0);
+            tls.revalidatePeer(socket, false);
             var named = identify(socket);
             if (named == null || !named.equals(expected)) {
                 refused("the voter at " + to + " did not present the pinned san of " + expected.id());
@@ -202,6 +203,9 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         try {
             ssl.setSoTimeout(totalMillis);
             ssl.startHandshake();
+            if (!ssl.isClosed()) {
+                tls.revalidatePeer(ssl, true);
+            }
         } finally {
             done.set(true);
             watchdog.interrupt();

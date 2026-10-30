@@ -113,6 +113,7 @@ final class PeerSockets implements TcpTransport.SocketFactory {
             socket.setSoTimeout(TcpTransport.HANDSHAKE_TIMEOUT_MILLIS);
             socket.startHandshake();
             socket.setSoTimeout(0);
+            tls.revalidatePeer(socket, false);
             var node = identify(socket);
             if (node == null || !node.equals(expected)) {
                 identityRefused.incrementAndGet();
@@ -148,6 +149,9 @@ final class PeerSockets implements TcpTransport.SocketFactory {
         try {
             ssl.setSoTimeout(totalMillis);
             ssl.startHandshake();
+            if (!ssl.isClosed()) {
+                tls.revalidatePeer(ssl, true);
+            }
         } finally {
             done.set(true);
             watchdog.interrupt();

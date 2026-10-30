@@ -17,8 +17,12 @@
 package sjws_nettask.cp;
 
 import java.io.IOException;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSocket;
 import sjws_nettask.config.ConfigException;
 import sjws_nettask.config.SecureKeyFile;
 
@@ -82,6 +86,26 @@ public final class CpServerTls {
     /** Successful loads so far, starting at 1. */
     public long generation() {
         return tls.generation();
+    }
+
+    /**
+     * After a peer-link handshake (including a resumed one), re-check the peer's certificate chain
+     * against the material currently in use. {@code peerIsClient} is true when this side accepted.
+     */
+    public void revalidatePeer(SSLSocket socket, boolean peerIsClient) throws IOException {
+        try {
+            var presented = socket.getSession().getPeerCertificates();
+            var chain = new X509Certificate[presented.length];
+            for (int i = 0; i < presented.length; i++) {
+                if (!(presented[i] instanceof X509Certificate x509)) {
+                    throw new IOException(config.name() + " peer presented a non-X.509 certificate");
+                }
+                chain[i] = x509;
+            }
+            tls.revalidatePeer(chain, peerIsClient);
+        } catch (SSLPeerUnverifiedException | CertificateException e) {
+            throw new IOException(config.name() + " peer refused after handshake: " + e.getMessage(), e);
+        }
     }
 
     /**
