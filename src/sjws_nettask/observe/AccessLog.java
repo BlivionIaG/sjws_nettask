@@ -20,6 +20,7 @@ import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -66,9 +67,11 @@ final class AccessLog implements Runnable, AutoCloseable {
     }
 
     /**
-     * Opens {@code path} for append. A newly created file is mode {@code 0640}; a directory this
+     * Opens {@code path} for append. A newly created file is mode {@code 0640}; each directory this
      * process creates for it is {@code 0750}. An existing file keeps its mode; a world-readable
-     * existing file logs a WARN and is still appended.
+     * existing file logs a WARN and is still appended. A file rotated in by an external process
+     * keeps whatever mode that process gave it until this server reopens the path (AccessLog does
+     * not reopen on rename).
      */
     static OutputStream openFile(Path path) throws IOException {
         Path absolute = path.toAbsolutePath();
@@ -76,24 +79,48 @@ final class AccessLog implements Runnable, AutoCloseable {
         if (Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
             warnIfWorldReadable(absolute);
         } else {
-            createNew(absolute);
+            try {
+                createNew(absolute);
+            } catch (FileAlreadyExistsException e) {
+                // Raced with another creator; open the existing file and warn if needed.
+                warnIfWorldReadable(absolute);
+            }
         }
         return new FileOutputStream(absolute.toFile(), true);
     }
 
+    /**
+     * Creates each missing ancestor of {@code file} with mode {@code 0750}.
+     * {@link Files#createDirectories} would apply the attribute only to the last segment.
+     */
     private static void ensureParent(Path file) throws IOException {
         Path parent = file.getParent();
         if (parent == null || Files.isDirectory(parent, LinkOption.NOFOLLOW_LINKS)) {
             return;
         }
+        createAncestors(parent.toAbsolutePath().normalize());
+    }
+
+    private static void createAncestors(Path dir) throws IOException {
+        if (Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        Path parent = dir.getParent();
+        if (parent != null && !Files.isDirectory(parent, LinkOption.NOFOLLOW_LINKS)) {
+            createAncestors(parent);
+        }
         try {
-            if (posix(parent)) {
-                Files.createDirectories(parent, PosixFilePermissions.asFileAttribute(DIR_0750));
+            if (posix(dir)) {
+                Files.createDirectory(dir, PosixFilePermissions.asFileAttribute(DIR_0750));
             } else {
-                Files.createDirectories(parent);
+                Files.createDirectory(dir);
+            }
+        } catch (FileAlreadyExistsException e) {
+            if (!Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+                throw e;
             }
         } catch (UnsupportedOperationException e) {
-            Files.createDirectories(parent);
+            Files.createDirectory(dir);
         }
     }
 
