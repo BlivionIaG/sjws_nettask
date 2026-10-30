@@ -344,7 +344,7 @@ class ArmedFiltersSurviveReloadTest {
 
 
     private static void mintLocalhostPem(Path cert, Path key) throws Exception {
-        var pb = new ProcessBuilder("openssl", "req", "-x509", "-newkey", "rsa:2048",
+        var pb = new ProcessBuilder("/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048",
                 "-keyout", key.toString(), "-out", cert.toString(),
                 "-days", "1", "-nodes", "-subj", "/CN=localhost",
                 "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1");
