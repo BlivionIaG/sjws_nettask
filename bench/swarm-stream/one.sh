@@ -41,7 +41,7 @@ export PYTHONPATH="$(cd "$(dirname "$0")/../.." && pwd)/sdk/python${PYTHONPATH:+
 taskset -c 0-1 nice -n 10 python3 "$(dirname "$0")/drive.py" \
   --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
   --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
-  --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "${DRAIN_TIMEOUT:-75}"
+  --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "${DRAIN_TIMEOUT:-75}" --window "${WINDOW:-8}"
 curl -sf "http://127.0.0.1:$PORT/metrics" > "$WD/metrics.txt" || true
 # flag-off check: when CREDIT_OFF=1, stream series must be absent
 if [ "${CREDIT_OFF:-0}" = 1 ]; then
