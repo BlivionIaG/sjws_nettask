@@ -13,11 +13,26 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.CountDownLatch;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** #333: fail-closed writer memory budget and lazy queue/direct materialization. */
 class LedgerWriterBudgetTest {
+    /** #336: this suite asserts per-writer materialize charging; force dedicated writers. */
+    @BeforeAll
+    static void dedicatedWritersForBudgetSuite() {
+        System.setProperty(SharedLedgerPool.WRITER_THREADS_PROPERTY, "0");
+        SharedLedgerPool.resetWriterPoolForTests();
+    }
+
+    @AfterAll
+    static void restoreWriterPoolProperty() {
+        System.clearProperty(SharedLedgerPool.WRITER_THREADS_PROPERTY);
+        SharedLedgerPool.resetWriterPoolForTests();
+    }
+
 
     @TempDir Path dir;
 
@@ -331,7 +346,7 @@ class LedgerWriterBudgetTest {
         try (var log = SegmentedLog.open(dir.resolve("mat-rollback"))) {
             var w = new LedgerWriter(log, Durability.NONE, 0, 128, 1 << 16);
             try {
-                w.materializeFaultForTests = new RuntimeException("boom-after-acquire");
+                LedgerWriterFaults.setMaterializeFault(w, new RuntimeException("boom-after-acquire"));
                 assertEquals(LedgerWriterBudget.IDLE_COST_BYTES, LedgerWriterBudget.shared().charged());
                 var boom = assertThrows(RuntimeException.class,
                         () -> w.append(List.of(new byte[] {1}), null));
@@ -340,7 +355,7 @@ class LedgerWriterBudgetTest {
                 assertEquals(LedgerWriterBudget.IDLE_COST_BYTES, LedgerWriterBudget.shared().charged(),
                         "materialize delta must not stick after rollback");
             } finally {
-                w.materializeFaultForTests = null;
+                LedgerWriterFaults.setMaterializeFault(w, null);
                 w.close();
             }
         }
@@ -466,7 +481,7 @@ class LedgerWriterBudgetTest {
             try {
                 assertEquals(0L, w.append(List.of(new byte[] {1}), Durability.NONE).get(5, TimeUnit.SECONDS));
                 assertEquals(full, LedgerWriterBudget.shared().charged());
-                w.allocateDirectFaultForTests = new RuntimeException("boom-allocateDirect");
+                LedgerWriterFaults.setAllocateDirectFault(w, new RuntimeException("boom-allocateDirect"));
                 byte[] big = new byte[2 << 20];
                 try {
                     w.append(List.of(big), Durability.NONE).get(5, TimeUnit.SECONDS);
@@ -479,7 +494,7 @@ class LedgerWriterBudgetTest {
                 assertEquals(full, LedgerWriterBudget.shared().charged(),
                         "extra charge must roll back when allocateDirect fails after acquireExtra");
             } finally {
-                w.allocateDirectFaultForTests = null;
+                LedgerWriterFaults.setAllocateDirectFault(w, null);
                 w.close();
             }
         }

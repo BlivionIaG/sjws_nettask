@@ -31,6 +31,7 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [Messaging metrics (proposal)](design/messaging-metrics.md)
 - [Messaging config and broker apply (draft)](messaging/config.md)
 - [Durable partition log](design/partition-log.md) · [plan](design/durable-log-plan.md)
+- [Shared ledger pool (NONE/ASYNC writers)](design/shared-ledger-pool.md) — #336 / #337
 - [High availability, as implemented](design/high-availability.md)
 - [High availability (draft)](ha/design.md) · [two-node decision](design/two-node-ha-decision.md) · [upstream discovery](ha/discovery.md)
 - [Raft delivery executor](design/raft-delivery-executor.md)

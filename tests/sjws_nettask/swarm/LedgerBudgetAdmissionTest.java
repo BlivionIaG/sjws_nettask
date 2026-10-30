@@ -36,6 +36,10 @@ class LedgerBudgetAdmissionTest {
     @BeforeEach
     void open() {
         LedgerBudgetTestHooks.reset();
+        // Keep dedicated writers for this #333/#335 admission shape (2×fullCost ⇒ second pool 503).
+        // Pooled charging is covered by ledger pool tests; sharedWriterThreads=0 here avoids cross-talk.
+        System.setProperty(LedgerBudgetTestHooks.WRITER_THREADS_PROPERTY, "0");
+        LedgerBudgetTestHooks.resetWriterPool();
         // One pool opens task + dlq (2 writers) and must be able to materialize both; a second pool is refused.
         long one = LedgerWriterBudget.fullCostBytes(sjws_nettask.messaging.ledger.LedgerWriter.DEFAULT_QUEUE);
         LedgerBudgetTestHooks.install(LedgerWriterBudget.ofBytes(one * 2));
@@ -49,6 +53,8 @@ class LedgerBudgetAdmissionTest {
     void close() {
         if (this.swarm != null) this.swarm.close();
         LedgerBudgetTestHooks.reset();
+        System.clearProperty(LedgerBudgetTestHooks.WRITER_THREADS_PROPERTY);
+        LedgerBudgetTestHooks.resetWriterPool();
     }
 
     @Test

@@ -101,7 +101,9 @@ ledger:
   budget_heap_fraction: 0.25       # used when budget_bytes is omitted
 ```
 
-Or system properties `sjws.messaging.ledger.budget.bytes` / `sjws.messaging.ledger.budget.heapFraction` (properties win over YAML). Routing NONE/ASYNC partitions onto shared writer threads (beyond today's shared syncers) is a follow-up.
+Or system properties `sjws.messaging.ledger.budget.bytes` / `sjws.messaging.ledger.budget.heapFraction` (properties win over YAML).
+
+NONE/ASYNC partitions share a process-wide writer-thread pool (`sjws.messaging.ledger.sharedWriterThreads`, default `max(2, min(CPUs, 16))`); GROUP/EACH keep a dedicated writer. Syncer pooling uses `sjws.messaging.ledger.sharedSyncers` (CPU-sized by default). The older name `sjws.messaging.ledger.sharedWriters` is a deprecated alias of `sharedSyncers` for one release and logs a startup warning. See `docs/design/shared-ledger-pool.md` (#336).
 
 The local write path, as `messaging.ledger.LedgerWriter` implements it:
 

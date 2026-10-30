@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -77,19 +78,32 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private final ReentrantLock materializeLock = new ReentrantLock();
     /**
      * Test-only (per writer): when non-null, thrown after acquireMaterialize and before the queue is published.
-     * Instance field so faults cannot leak across writers or tests (#335 N3).
+     * Private so production code outside this package cannot reach the hooks (#336 Security nit); tests use
+     * {@link LedgerWriterFaults} / {@link LedgerBudgetTestHooks}.
      */
-    volatile RuntimeException materializeFaultForTests;
+    private volatile RuntimeException materializeFaultForTests;
     /**
-     * Test-only (per writer): when non-null, thrown after acquireExtra and before {@code allocateDirect}
-     * so N2 can prove the extra charge rolls back (#335 N2/N3).
+     * Test-only (per writer): when non-null, thrown after acquireExtra and before {@code allocateDirect}.
      */
-    volatile RuntimeException allocateDirectFaultForTests;
+    private volatile RuntimeException allocateDirectFaultForTests;
     /** Dedicated syncer, or null when using {@link SharedLedgerPool}. */
     private final Thread syncer;
     /** Syncer shard index, or -1 when this writer has a dedicated syncer. */
     private final int sharedShard;
     private final SharedLedgerPool sharedPool;
+    /**
+     * Shared writer pool for NONE/ASYNC when enabled; null means a dedicated {@link #thread}.
+     * GROUP/EACH never pool (#337 D6).
+     */
+    private final SharedLedgerPool.WriterPool writerPool;
+    /** Writer shard index, or -1 when this writer has a dedicated writer thread. */
+    private final int sharedWriterShard;
+    /** Canonical real path of {@link #log}'s dir (sticky hash input); null when dedicated. */
+    private final java.nio.file.Path realLogDir;
+    /** Pooled inbox (ConcurrentLinkedQueue); null when dedicated (uses {@link #queue}). */
+    private final ConcurrentLinkedQueue<Pending> pooledInbox;
+    /** Pending count for soft capacity / behind when pooled. */
+    private final AtomicInteger pooledPending;
     private final LedgerWriterBudget budget;
     /** Bytes charged on this writer (idle + optional materialize + direct growth); released in {@link #close}. */
     private long budgetCharged;
@@ -159,6 +173,15 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         // Hard bound stays 2x the soft one once materialized (appendNoWait slack under a caller's lock).
         this.budget = LedgerWriterBudget.shared();
         this.budgetCharged = this.budget.acquireIdle();
+        SharedLedgerPool.WriterPool wp = null;
+        int wshard = -1;
+        java.nio.file.Path real = null;
+        ConcurrentLinkedQueue<Pending> inbox = null;
+        AtomicInteger pending = null;
+        Thread writerThread = null;
+        SharedLedgerPool syncPool = null;
+        Thread dedicatedSyncer = null;
+        int syncShard = -1;
         try {
             var ctorFault = LedgerWriterFaults.CTOR.get();
             if (ctorFault != null) throw ctorFault;
@@ -166,25 +189,59 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             this.durable = log.nextOffset(); // recovered data is treated as durable (it survived a restart)
             publish();
             var name = log.dir().getFileName();
-            this.thread = Thread.ofPlatform().name("ledger-writer-" + name).daemon().unstarted(this::run);
-            var pool = SharedLedgerPool.sharedOrNull();
-            if (pool != null) {
-                this.sharedPool = pool;
-                this.syncer = null;
-                this.sharedShard = pool.register(this);
-            } else {
-                this.sharedPool = null;
-                this.sharedShard = -1;
-                this.syncer = Thread.ofPlatform().name("ledger-syncer-" + name).daemon().unstarted(this::syncLoop);
-                syncer.start();
+            // Writer pool for NONE/ASYNC only; GROUP/EACH stay dedicated (forceInline on writer thread).
+            boolean wantPool = !durability.waitsForFsync();
+            if (wantPool) {
+                var poolCand = SharedLedgerPool.writers();
+                if (poolCand != null && !poolCand.disabled()) {
+                    real = log.dir().toAbsolutePath().normalize();
+                    try {
+                        real = real.toRealPath();
+                    } catch (java.io.IOException ignored) {
+                        // Dir was just created by SegmentedLog.open; absolute+normalize is enough for sticky.
+                    }
+                    wshard = poolCand.register(this, real);
+                    if (wshard >= 0) {
+                        wp = poolCand;
+                        inbox = new ConcurrentLinkedQueue<>();
+                        pending = new AtomicInteger();
+                    } else {
+                        real = null;
+                        wshard = -1;
+                    }
+                }
             }
-            // Writer thread starts in materialize() with the queue.
+            if (wp == null) {
+                writerThread = Thread.ofPlatform().name("ledger-writer-" + name).daemon().unstarted(this::run);
+            }
+            syncPool = SharedLedgerPool.sharedOrNull();
+            if (syncPool != null) {
+                syncShard = syncPool.register(this);
+            } else {
+                dedicatedSyncer = Thread.ofPlatform().name("ledger-syncer-" + name).daemon().unstarted(this::syncLoop);
+                dedicatedSyncer.start();
+            }
         } catch (Throwable t) {
+            if (wp != null && wshard >= 0) wp.unregister(this, wshard);
+            if (syncPool != null && syncShard >= 0) syncPool.unregister(this, syncShard);
             long c = this.budgetCharged;
             this.budgetCharged = 0;
             this.budget.release(c);
             throw t;
         }
+        this.writerPool = wp;
+        this.sharedWriterShard = wshard;
+        this.realLogDir = real;
+        this.pooledInbox = inbox;
+        this.pooledPending = pending;
+        this.thread = writerThread;
+        this.sharedPool = syncPool;
+        this.syncer = dedicatedSyncer;
+        this.sharedShard = syncShard;
+        if (wp != null) {
+            this.ready = true; // inbox ready; shard buffer materializes on first Pending
+        }
+        // Dedicated writer thread starts in materialize() with the queue.
     }
 
     /**
@@ -192,7 +249,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      * replaced log's end, which is durable (the caller fsynced every staged file before the swap).
      */
     public void reload() {
-        if (ready && !queue.isEmpty()) throw new IllegalStateException("reload with appends queued");
+        if (ready && hasQueuedAppends()) throw new IllegalStateException("reload with appends queued");
         lock.lock();
         try {
             written = log.nextOffset();
@@ -254,6 +311,13 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     @Override
     public void awaitCapacity() throws InterruptedException {
         if (!behind || !ready) return;
+        if (pooledInbox != null) {
+            while (behind && pooledPending.get() >= capacity && !closed && failure == null) {
+                if (Thread.interrupted()) throw new InterruptedException();
+                LockSupport.parkNanos(this, 50_000);
+            }
+            return;
+        }
         var q = queue;
         while (behind && q.size() >= capacity && !closed && failure == null) {
             if (Thread.interrupted()) throw new InterruptedException();
@@ -267,10 +331,18 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         if (recs.isEmpty()) throw new IllegalArgumentException("empty batch");
         RecordBatch.encodedSize(recs); // validate size eagerly
         if (closed || failure != null) return CompletableFuture.failedFuture(failure != null ? failure : new IllegalStateException("closed"));
-        if (!ready) materialize(); // one-time; may throw LedgerBudgetExhaustedException
-        var q = queue; // plain after ready (volatile ready acquire published the write)
         var f = new CompletableFuture<Long>();
         var p = new Pending(List.copyOf(recs), System.currentTimeMillis(), mode == null ? durability : mode, f);
+        if (pooledInbox != null) {
+            // Pooled: offer to per-partition inbox (FIFO); shard drains. Soft capacity via pooledPending.
+            int n = pooledPending.incrementAndGet();
+            if (n >= capacity) behind = true;
+            pooledInbox.offer(p);
+            writerPool.unparkWriter(sharedWriterShard);
+            return f;
+        }
+        if (!ready) materialize(); // one-time; may throw LedgerBudgetExhaustedException
+        var q = queue; // plain after ready (volatile ready acquire published the write)
         if (!q.offer(p)) {
             // Only past 2x capacity, i.e. the writer stalled while every caller skipped awaitCapacity: block rather than
             // drop or reorder. Not reachable through Partition in practice (callers wait at the soft bound).
@@ -313,9 +385,144 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         }
     }
 
-    /** Test/ops: whether the queue and writer thread have been allocated. */
+    /** Test/ops: whether the queue and writer thread have been allocated (dedicated), or inbox is live (pooled). */
     public boolean materialized() {
         return ready;
+    }
+
+    /** True when this writer uses {@link SharedLedgerPool.WriterPool} (no dedicated writer thread). */
+    public boolean usesSharedWriter() {
+        return writerPool != null;
+    }
+
+    /** Writer shard index, or -1 when dedicated. */
+    public int sharedWriterShard() {
+        return sharedWriterShard;
+    }
+
+    boolean isClosed() {
+        return closed;
+    }
+
+    /** Approximate pending appends when pooled (0 when dedicated). */
+    int pooledPending() {
+        return pooledPending == null ? 0 : pooledPending.get();
+    }
+
+    /** True when any append is still queued (dedicated ABQ or pooled inbox). */
+    private boolean hasQueuedAppends() {
+        if (pooledInbox != null) return pooledPending.get() > 0 || !pooledInbox.isEmpty();
+        var q = queue;
+        return q != null && !q.isEmpty();
+    }
+
+    /** Package-private fault hooks (#336): keep fields private; tests go through {@link LedgerWriterFaults}. */
+    void setMaterializeFaultForTests(RuntimeException e) {
+        materializeFaultForTests = e;
+    }
+
+    void setAllocateDirectFaultForTests(RuntimeException e) {
+        allocateDirectFaultForTests = e;
+    }
+
+    /** Test-only: sleep this many ns at the start of each pooledDrainSlice (HOL proofs). */
+    volatile long drainDelayNanosForTests;
+
+    /**
+     * Called by the owning writer shard: drain one group from the pooled inbox using the shard buffer.
+     * Returns true if work was done. Budget refusal fails only that batch (never fences this writer or the shard).
+     * IO errors fence <em>this</em> partition only.
+     */
+    boolean pooledDrainSlice(SharedLedgerPool.WriterShard shard) {
+        if (pooledInbox == null) return false;
+        long delay = drainDelayNanosForTests;
+        if (delay > 0) LockSupport.parkNanos(delay);
+        if (failure != null) {
+            Pending x;
+            while ((x = pooledInbox.poll()) != null) {
+                pooledPending.decrementAndGet();
+                if (x.done != null) x.done.completeExceptionally(failure);
+            }
+            behind = false;
+            return false;
+        }
+        Pending first = pooledInbox.poll();
+        if (first == null) return false;
+        if (first == POISON) {
+            // Sentinel from close(); not counted in pooledPending. Leave it out; close waits on empty/poison-only.
+            // Re-offer so close's waiter can observe it, or just drop — close polls leftovers after unregister.
+            return false;
+        }
+        pooledPending.decrementAndGet();
+        var group = new java.util.ArrayList<Pending>();
+        group.add(first);
+        int total = RecordBatch.encodedSize(first.records);
+        // Group more from this partition only (FIFO); do not pull other partitions (T1).
+        while (total < maxGroupBytes) {
+            Pending n = pooledInbox.peek();
+            if (n == null || n == POISON) break;
+            int sz = RecordBatch.encodedSize(n.records);
+            if (group.size() > 0 && total + sz > maxGroupBytes) break;
+            pooledInbox.poll();
+            pooledPending.decrementAndGet();
+            group.add(n);
+            total += sz;
+            if (group.size() >= 1024) break;
+        }
+        behind = pooledPending.get() >= capacity;
+        // Reuse writeGroup; temporarily bind buf to shard buffer via writePooled.
+        writeGroupPooled(group, total, shard);
+        return true;
+    }
+
+    private void writeGroupPooled(java.util.List<Pending> g, int total, SharedLedgerPool.WriterShard shard) {
+        if (failure != null) { g.forEach(p -> p.done.completeExceptionally(failure)); return; }
+        try {
+            long base = writeWithBuffer(g, total, shard);
+            boolean anyWaits = false;
+            for (var p : g) anyWaits |= p.mode.waitsForFsync();
+            if (durability == Durability.GROUP && anyWaits) forceInline(); else publish();
+            long o = base;
+            for (var p : g) {
+                long end = o + p.records.size();
+                if (!p.mode.waitsForFsync() || durableNow() >= end) p.done.complete(o);
+                else fsyncWaiters.add(new Waiter(end, o, p.done));
+                o = end;
+            }
+            if ((durability == Durability.ASYNC && !flooring) || !fsyncWaiters.isEmpty()) unparkSyncer();
+        } catch (LedgerBudgetExhaustedException e) {
+            g.forEach(p -> p.done.completeExceptionally(e));
+        } catch (java.io.IOException | RuntimeException e) {
+            g.forEach(p -> p.done.completeExceptionally(e));
+            failWaiters(e);
+            failure = e;
+        }
+    }
+
+    /** Like {@link #write} but uses the shard-owned direct buffer (charged on the shard). */
+    private long writeWithBuffer(java.util.List<Pending> g, int total, SharedLedgerPool.WriterShard shard) throws java.io.IOException {
+        var b = shard.ensureCapacity(total);
+        b.clear();
+        long base = log.nextOffset(), o = base;
+        var offs = new long[g.size()];
+        var lens = new int[g.size()];
+        int recs = 0;
+        for (int k = 0; k < g.size(); k++) {
+            var p = g.get(k);
+            int start = b.position();
+            RecordBatch.encode(o, p.timestampMs, p.records, b);
+            offs[k] = o;
+            lens[k] = b.position() - start;
+            o += p.records.size();
+            recs += p.records.size();
+        }
+        b.flip();
+        int n = b.remaining();
+        log.appendFrames(b, offs, lens, g.size(), o);
+        lock.lock();
+        try { records += recs; bytes += n; batches += g.size(); } finally { lock.unlock(); }
+        written = o;
+        return base;
     }
 
     private void unparkSyncer() {
@@ -326,7 +533,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     boolean sharedSyncSlice() {
         if (syncPaused) return false;
         long d0 = durable;
-        if (stopSyncer && (!ready || queue.isEmpty()) && fsyncWaiters.isEmpty() && written <= d0) return false;
+        if (stopSyncer && (!ready || !hasQueuedAppends()) && fsyncWaiters.isEmpty() && written <= d0) return false;
         Waiter w0;
         while ((w0 = fsyncWaiters.peek()) != null && w0.endOffset <= d0) { fsyncWaiters.poll(); w0.done.complete(w0.base); }
         long target = written;
@@ -629,15 +836,40 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         // Set closed and snapshot the queue under materializeLock so a concurrent first-append
         // materialize cannot start the writer thread (and charge the budget) after we skip poison.
         BlockingQueue<Pending> toPoison = null;
+        boolean pooled;
         materializeLock.lock();
         try {
             if (closed) return;
             closed = true;
-            if (ready) toPoison = queue;
+            pooled = pooledInbox != null;
+            if (!pooled && ready) toPoison = queue;
         } finally {
             materializeLock.unlock();
         }
-        if (toPoison != null) {
+        if (writerPool != null && sharedWriterShard >= 0) {
+            // Drain while still registered (same contract as dedicated poison+join): Partition.produce
+            // returns the offset before the append is durable, so close must finish in-flight writes
+            // before unregistering or the reopen would lose them (DirectoryLockTest).
+            pooledInbox.offer(POISON);
+            // POISON is a sentinel, not a counted Pending — do not bump pooledPending.
+            writerPool.unparkWriter(sharedWriterShard);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (System.nanoTime() < deadline) {
+                // Wait until only POISON (or nothing) remains: real Pendings have done != null.
+                Pending peek = pooledInbox.peek();
+                boolean onlyPoisonOrEmpty = peek == null || (peek == POISON && pooledInbox.size() == 1);
+                if (onlyPoisonOrEmpty && pooledPending.get() <= 0) break;
+                if (peek == null && pooledPending.get() <= 0) break;
+                Thread.sleep(1);
+                writerPool.unparkWriter(sharedWriterShard);
+            }
+            writerPool.unregister(this, sharedWriterShard);
+            Pending left;
+            while ((left = pooledInbox.poll()) != null) {
+                if (left != POISON && left.done != null) left.done.completeExceptionally(new IllegalStateException("closed"));
+            }
+            pooledPending.set(0);
+        } else if (toPoison != null) {
             toPoison.put(POISON);
             thread.join(TimeUnit.SECONDS.toMillis(30));
         }
