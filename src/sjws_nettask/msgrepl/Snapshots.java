@@ -37,7 +37,8 @@ import java.util.function.LongSupplier;
  * @param chunkBytes    digest and transfer unit of segment data
  * @param bytesPerSecond   install-snapshot pacing on the sending node, shared by all its transfers (constraint 7)
  * @param check            how often each replica checks whether a snapshot is due (off the produce path)
- * @param maxInstallBytes  optional upper bound on the sum of segment bytes in one install; {@code 0} leaves it off
+ * @param maxInstallBytes  upper bound on the sum of segment bytes in one install; {@code 0} is the explicit unlimited
+ *                         opt-in (#295)
  */
 record Snapshots(long everyEntries, long tailEntries, int chunkBytes, long bytesPerSecond, Duration check,
         long maxInstallBytes) {
@@ -47,8 +48,15 @@ record Snapshots(long everyEntries, long tailEntries, int chunkBytes, long bytes
     static final int DEFAULT_CHUNK_BYTES = 1 << 20;
     static final long DEFAULT_BYTES_PER_SECOND = 64L << 20;
     static final Duration DEFAULT_CHECK = Duration.ofMillis(200);
-    /** Off by default: the manifest size and per-chunk SHA-256 checks still bound each transfer. */
-    static final long DEFAULT_MAX_INSTALL_BYTES = 0;
+    /**
+     * Default install size bound (#295): four default ledger segments
+     * ({@code 4 ×} {@link sjws_nettask.messaging.ledger.SegmentedLog#DEFAULT_SEGMENT_BYTES} = 4 GiB). Enough for a
+     * multi-segment catch-up under typical retention; operators raise it for larger windows or set {@code 0} for
+     * unlimited. Enforced while chunks stream, before disk writes.
+     */
+    static final long DEFAULT_MAX_INSTALL_BYTES = 4L << 30;
+    /** Peer-round budget for a divergent or unavailable pin before the install gives up (#295). */
+    static final int DEFAULT_MAX_INSTALL_PIN_ROUNDS = 16;
 
     Snapshots {
         if (everyEntries < 1 || tailEntries < 0 || bytesPerSecond < 1) throw new IllegalArgumentException("snapshot settings");

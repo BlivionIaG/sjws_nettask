@@ -130,7 +130,7 @@ ha:
     install_rate: 64m           # install bytes per second a node sends, all transfers together
     port_offset: 1              # install listener: each member's Raft port + this
     log_segment_bytes: 16m      # rolling Raft log file size (truncation frees whole files)
-    max_install_bytes: 0        # optional total install payload cap; 0 = off
+    max_install_bytes: 4g       # total install payload cap; 0 = unlimited (explicit opt-in)
   members:                      # 2 data nodes + 1 witness, or 3 or more data nodes; same list everywhere
     - { id: a, address: "10.0.0.1:7100", http_url: "http://10.0.0.1:8080" }
     - { id: b, address: "10.0.0.2:7100", http_url: "http://10.0.0.2:8080" }
@@ -152,7 +152,7 @@ ha:
 | `ha.snapshot.install_rate` | `64m` | Bytes per second a node sends for installs, all transfers together. |
 | `ha.snapshot.port_offset` | `1` | Install listener binds to each member's Raft port plus this. |
 | `ha.snapshot.log_segment_bytes` | `16m` | Rolling Raft log file size for msg groups. |
-| `ha.snapshot.max_install_bytes` | `0` (off) | Optional upper bound on the sum of segment bytes in one install. `0` leaves it off; the manifest size and per-chunk SHA-256 checks still apply. |
+| `ha.snapshot.max_install_bytes` | `4g` | Upper bound on the sum of segment bytes in one install, enforced while chunks stream (before disk writes). Default is four default ledger segments (4 × 1 GiB). `0` is the explicit unlimited opt-in; a negative value is refused. |
 
 An invalid member list is refused in `on` and `auto` (by design, never a silent single-node fallback): a bare
 pair (`two voters require a witness`), more than
@@ -415,8 +415,11 @@ body (or an HTTP/3 body of unknown length) is 501 for now, as is a declared body
 `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
 TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
-and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
-growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
+and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB), with a per-peer share
+(`-Dsjws.proxy.maxInflightBytesPerPeer`, default one eighth of the total, or `0` to disable)
+so one client address cannot hold the whole budget (#78). Slow clients wait on their own share
+instead of growing the heap (security finding F5); a new request from a peer already at its
+share is refused with 503. `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
 closes the replaced pools.
 
 Rate limits are local to this server and off unless configured. A route takes `rate_limit:`, and
