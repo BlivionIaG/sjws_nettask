@@ -79,7 +79,26 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private ByteBuffer buf = ByteBuffer.allocateDirect(1 << 20);
     private final ReentrantLock lock = new ReentrantLock();
     // Guarded by lock: counters shared by writer and syncer for snapshot publication.
-    private long batches, records, bytes, fsyncs, seq, durable;
+    private long batches, records, bytes, fsyncs, seq;
+    /**
+     * Durable offset (every record below this has been fsynced). Volatile so {@link #sharedSyncSlice} can read it without {@link #lock} (#329); updates still happen under
+     * the lock together with the counters that {@link #publish} snapshots.
+     *
+     * <p><b>Publish → durable happens-before.</b> After recovery, the only stores to this field are in
+     * {@link #forceInline}, {@link #sharedSyncSlice}, and the dedicated {@code syncLoop}. Each path:
+     * (1) captures {@code watermark}/{@code target = written} (the prefix about to be synced);
+     * (2) returns from {@code log.force()} so that prefix is on stable storage;
+     * (3) stores {@code durable = watermark} (this volatile write);
+     * (4) calls {@link #publish()} and completes any {@code fsyncWaiters} with {@code endOffset <= watermark}
+     *     (GROUP/EACH acks). Program order on the syncer/force thread is therefore
+     *     {@code data written ⊇ fsynced ⊇ durable store ⊇ ack completion}. A volatile read of
+     *     {@code durable} (via {@link #durableNow} or {@link LedgerSnapshot#durableOffset} after publish)
+     *     synchronizes-with that store, so an observer that sees {@code durable >= N} knows records
+     *     {@code [start, N)} were fsynced before the observation, and no fsync-waiting ack for those
+     *     records completed before the store either. {@link #afterLogForce} runs between (2) and (3) on {@link #forceInline} and {@link #sharedSyncSlice}
+     *     so tests can prove (3) never covers records appended after the force returned.
+     */
+    private volatile long durable;
 
     /** ASYNC writer with defaults. */
     public LedgerWriter(SegmentedLog log) { this(log, DEFAULT_DURABILITY); }
@@ -225,22 +244,14 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         else LockSupport.unpark(syncer);
     }
 
-    /** Cheap check for the shared syncer's spin-then-park idle path. */
-    boolean needsSharedSync() {
-        if (syncPaused) return false;
-        if (stopSyncer && queue.isEmpty() && fsyncWaiters.isEmpty()) return false;
-        long target = written;
-        return target > durableNow() && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
-    }
-
     boolean sharedSyncSlice() {
         if (syncPaused) return false;
-        if (stopSyncer && queue.isEmpty() && fsyncWaiters.isEmpty() && written <= durableNow()) return false;
-        long d0 = durableNow();
+        long d0 = durable;
+        if (stopSyncer && queue.isEmpty() && fsyncWaiters.isEmpty() && written <= d0) return false;
         Waiter w0;
         while ((w0 = fsyncWaiters.peek()) != null && w0.endOffset <= d0) { fsyncWaiters.poll(); w0.done.complete(w0.base); }
         long target = written;
-        boolean dirty = target > durableNow();
+        boolean dirty = target > durable;
         boolean wanted = dirty && (durability == Durability.ASYNC || !fsyncWaiters.isEmpty());
         if (!wanted) return false;
         // Floor: leave the work for a later slice; shared syncer parks at shard level.
@@ -268,13 +279,15 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         } finally {
             syncInForce.decrementAndGet();
         }
+        var hook = afterLogForce;
+        if (hook != null) hook.run();
         lastSharedFsync = System.nanoTime();
         lock.lock();
         try { fsyncs++; if (target > durable) durable = target; } finally { lock.unlock(); }
         publish();
         Waiter w;
         while ((w = fsyncWaiters.peek()) != null && w.endOffset <= target) { fsyncWaiters.poll(); w.done.complete(w.base); }
-        return written > durableNow() || !fsyncWaiters.isEmpty();
+        return written > durable || !fsyncWaiters.isEmpty();
     }
 
     /** Last fsync time for {@link #sharedSyncSlice} (dedicated syncLoop keeps its own local). */
@@ -361,7 +374,8 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         }
     }
 
-    private long durableNow() { lock.lock(); try { return durable; } finally { lock.unlock(); } }
+    /** Volatile read of {@link #durable}; kept as a method so call sites stay obvious in JFR. */
+    private long durableNow() { return durable; }
 
     /**
      * Test-only: runs after {@code log.force()} returns and before durable is published. Lets a test append
