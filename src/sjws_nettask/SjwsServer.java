@@ -1044,12 +1044,11 @@ public final class SjwsServer implements AutoCloseable {
 
     /**
      * Refresh access-log credential query names from the config {@code middleware} list when no
-     * filter document is live. A live {@link ChainControl} document owns the names via
-     * {@link #armSnapshot}.
+     * {@link ChainControl} is installed. Once {@link #chainControl} has been created it owns the
+     * names via {@link #armSnapshot} on every apply, including before the first document.
      */
     private void syncCredentialQueryParamsFromConfig(sjws_nettask.config.ConfigDocument document) {
-        var ctrl = this.control;
-        if (ctrl != null && ctrl.document() != null) {
+        if (this.control != null) {
             return;
         }
         this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
