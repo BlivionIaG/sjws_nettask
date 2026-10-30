@@ -189,9 +189,15 @@ final class StreamHttp {
         return this.credit;
     }
 
-    /** One daemon thread for every StreamHttp of the process; created by the first one (stream flag on only). */
+    /**
+     * One daemon thread for every live StreamHttp of the process (stream flag on only): created by the first one,
+     * shut down when the last one's swarm closes (#181: it used to outlive every close).
+     */
     private static java.util.concurrent.ScheduledExecutorService sweeper;
+    /** StreamHttps whose sweep is scheduled on {@link #sweeper}; guarded by {@link #SWEEPER_LOCK}. */
+    private static int sweeperUsers;
     private static final ReentrantLock SWEEPER_LOCK = new ReentrantLock();
+    static final String SWEEPER_THREAD = "sjws-stream-sweep";
     private final AtomicLong sweeps = new AtomicLong();
 
     long periodicSweeps() {
@@ -204,24 +210,32 @@ final class StreamHttp {
         try {
             if (sweeper == null) {
                 sweeper = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                    var t = new Thread(r, "sjws-stream-sweep");
+                    var t = new Thread(r, SWEEPER_THREAD);
                     t.setDaemon(true);
                     return t;
                 });
             }
             ex = sweeper;
+            sweeperUsers++;
         } finally {
             SWEEPER_LOCK.unlock();
         }
         var ref = new java.lang.ref.WeakReference<>(h);
         var self = new java.util.concurrent.atomic.AtomicReference<java.util.concurrent.ScheduledFuture<?>>();
-        self.set(ex.scheduleWithFixedDelay(() -> {
-            var o = ref.get();
-            if (o == null || o.swarm.topics().closed()) {
+        var released = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable release = () -> {
+            if (released.compareAndSet(false, true)) {
                 var f = self.get();
                 if (f != null) {
                     f.cancel(false);
                 }
+                releaseSweeper();
+            }
+        };
+        self.set(ex.scheduleWithFixedDelay(() -> {
+            var o = ref.get();
+            if (o == null || o.swarm.topics().closed()) {
+                release.run();
                 return;
             }
             try {
@@ -230,6 +244,32 @@ final class StreamHttp {
                 System.err.println("WARN: swarm: stream sweep: " + e);
             }
         }, SWEEP_MS, SWEEP_MS, TimeUnit.MILLISECONDS));
+        h.swarm.onClose(release);
+    }
+
+    /** One StreamHttp is done with the sweeper; the last one stops its thread (and waits for it, off that thread). */
+    private static void releaseSweeper() {
+        java.util.concurrent.ScheduledExecutorService stop = null;
+        SWEEPER_LOCK.lock();
+        try {
+            if (--sweeperUsers == 0) {
+                stop = sweeper;
+                sweeper = null;
+            }
+        } finally {
+            SWEEPER_LOCK.unlock();
+        }
+        if (stop == null) {
+            return;
+        }
+        stop.shutdownNow(); // only cancelled sweeps can be queued; a running one finishes
+        if (!Thread.currentThread().getName().equals(SWEEPER_THREAD)) {
+            try {
+                stop.awaitTermination(2, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /** The timer's pass: expired sessions, then cancel entries past their deadline + grace. */
