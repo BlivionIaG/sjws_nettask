@@ -148,10 +148,24 @@ class PeerSocketsSessionTest {
                 Thread.sleep(50); // let the write seat on the TLS lock / TCP window
                 Files.writeString(denyB, "serial:" + serialA.toString(16) + "\n");
                 long before = socketsB.policyDropped();
-                long start = System.nanoTime();
-                tlsB.reloadTls();
-                long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-                assertTrue(tookMs < 3_000, "reloadTls must not hang behind a blocked TLS write; took " + tookMs + " ms");
+                var reload = CompletableFuture.runAsync(() -> {
+                    try {
+                        tlsB.reloadTls();
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+                try {
+                    reload.get(3, TimeUnit.SECONDS);
+                } catch (Exception timedOut) {
+                    // Unblock the hung SSLSocket.close so the suite can finish; the assertion below fails the mutant.
+                    try {
+                        connected.abort().setSoLinger(true, 0);
+                        connected.abort().close();
+                    } catch (Exception ignored) {
+                    }
+                    fail("reloadTls must not hang behind a blocked TLS write: " + timedOut);
+                }
                 assertTrue(socketsB.policyDropped() > before, "dialer drops the blocked peer");
                 assertTrue(connected.socket().isClosed() || connected.abort().isClosed());
                 writer.join(3_000);

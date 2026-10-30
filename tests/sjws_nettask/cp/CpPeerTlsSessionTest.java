@@ -534,10 +534,23 @@ class CpPeerTlsSessionTest {
                 Thread.sleep(50);
                 Files.writeString(deny, "serial:" + serverSerial.toString(16) + "\n");
                 long before = dialer.policyDropped();
-                long start = System.nanoTime();
-                dialerTls.reloadTls();
-                long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-                assertTrue(tookMs < 3_000, "reloadTls must not hang behind a blocked TLS write; took " + tookMs + " ms");
+                var reload = CompletableFuture.runAsync(() -> {
+                    try {
+                        dialerTls.reloadTls();
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+                try {
+                    reload.get(3, TimeUnit.SECONDS);
+                } catch (Exception timedOut) {
+                    try {
+                        connected.abort().setSoLinger(true, 0);
+                        connected.abort().close();
+                    } catch (Exception ignored) {
+                    }
+                    fail("reloadTls must not hang behind a blocked TLS write: " + timedOut);
+                }
                 assertTrue(dialer.policyDropped() > before, "dialer drops the blocked peer");
                 writer.join(3_000);
                 assertFalse(writer.isAlive(), "blocked writer unblocked by abort");
