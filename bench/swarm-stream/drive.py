@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Credit-on producer→consumer stream drive for S2c PR 8.
 
-Each chunk payload is: 8-byte big-endian emit monotonic_ns + padding to --chunk-bytes.
-Chunk latency is emit→consumer receive (same host, one monotonic clock).
-Uses N agent tokens (StreamHttp.MAX_SESSIONS_PER_AGENT=64) so 1k streams fit.
+Payload: 20-digit ASCII monotonic_ns + NUL pad to --chunk-bytes (SSE-safe).
+Chunk latency: emit→consumer receive (one host, one monotonic clock).
+
+Harness notes (2026-10-30 diagnosis):
+- Orderly shutdown: producers finish(LAST) first, then consumers close; avoids ~2
+  BrokenPipe/RemoteDisconnected errors per stream at tear-down.
+- /metrics scrape waits until open_sessions==0 (LAST grace is 60s) so charged_bytes
+  hard-zero is meaningful.
+- 1k streams × window senders on CPUs 0–1 saturates CPython; treat abs FAIL as
+  harness-bound until a Java/async loadgen matches §13.
 """
 from __future__ import annotations
 
@@ -47,8 +54,25 @@ def fetch_metrics(url: str) -> dict[str, float]:
     return out
 
 
+def wait_metrics_drained(url: str, timeout_s: float = 75.0) -> dict[str, float]:
+    """Poll until open_sessions==0 or timeout (StreamHttp.GRACE_MS is 60s)."""
+    deadline = time.monotonic() + timeout_s
+    last = {}
+    while time.monotonic() < deadline:
+        try:
+            last = fetch_metrics(url)
+        except Exception as e:  # noqa: BLE001
+            last = {"_error": str(e)}
+            time.sleep(0.5)
+            continue
+        open_s = last.get("sjws_swarm_stream_open_sessions")
+        if open_s is None or open_s == 0:
+            return last
+        time.sleep(0.5)
+    return last
+
+
 def instrument_credit_waits(w: ChunkWriter, waits: list[float]):
-    """Accumulate seconds spent waiting on credit (Architecture Q3)."""
     orig = w._credit_allows
     state = {"blocked_since": None}
 
@@ -92,31 +116,36 @@ def run_window(args) -> dict:
     bytes_rx = 0
     credit_waits: list[float] = []
     writer_stats = Counter()
-    stop = threading.Event()
-    errors: list[str] = []
+    producers_stop = threading.Event()
+    consumers_stop = threading.Event()
+    measure_errors: list[str] = []
+    teardown_errors: list[str] = []
     ttft_us: list[float] = []
     inter_us: list[float] = []
     lock = threading.Lock()
-    # Emit time as 20-digit ASCII monotonic_ns + NUL pad. ASCII so SSE UTF-8
-    # replacement cannot corrupt the timestamp (binary Accept also fine).
+    in_teardown = threading.Event()
     if args.chunk_bytes < 21:
         raise SystemExit("chunk-bytes must be >= 21")
     pad = args.chunk_bytes - 20
+
+    def note_err(role_pool: str, e: BaseException):
+        msg = f"{role_pool}: {type(e).__name__}: {e}"
+        with lock:
+            (teardown_errors if in_teardown.is_set() else measure_errors).append(msg)
 
     def producer(client: Client, pool: str):
         try:
             (lease,) = client.claim(pool, wait=30, visibility_ms=60_000)
             with lease.stream(window=args.window, coalesce=False, heartbeat=0) as w:
                 instrument_credit_waits(w, credit_waits)
-                while not stop.is_set():
+                while not producers_stop.is_set():
                     emit = time.monotonic_ns()
                     w.send(f"{emit:020d}".encode("ascii") + (b"\x00" * pad))
                 w.finish(b"")
                 with lock:
                     writer_stats.update(w.stats)
         except BaseException as e:  # noqa: BLE001
-            with lock:
-                errors.append(f"producer {pool}: {type(e).__name__}: {e}")
+            note_err(f"producer {pool}", e)
 
     def consumer(client: Client, pool: str, accept: str):
         nonlocal bytes_rx
@@ -126,7 +155,7 @@ def run_window(args) -> dict:
                 prev_recv = None
                 start_ns = time.monotonic_ns()
                 for ev in s:
-                    if stop.is_set() and not first:
+                    if consumers_stop.is_set() and not first:
                         break
                     if not isinstance(ev, Chunk) or len(ev.data) < 20:
                         continue
@@ -146,13 +175,14 @@ def run_window(args) -> dict:
                             inter_us.append((recv - prev_recv) / 1e3)
                     prev_recv = recv
         except BaseException as e:  # noqa: BLE001
-            with lock:
-                errors.append(f"consumer {pool}: {type(e).__name__}: {e}")
+            note_err(f"consumer {pool}", e)
 
     def run_wave(n_streams: int, duration: float, label: str):
         nonlocal bytes_rx
         threads = []
-        stop.clear()
+        producers_stop.clear()
+        consumers_stop.clear()
+        in_teardown.clear()
         for i in range(n_streams):
             pool = f"{label}{i}"
             c = clients[i % len(clients)]
@@ -164,38 +194,45 @@ def run_window(args) -> dict:
                 time.sleep(0.01)
             t_p.start()
         time.sleep(duration)
-        stop.set()
-        # drain
-        time.sleep(3)
+        # Orderly: stop producers (they send LAST), wait, then stop consumers
+        in_teardown.set()
+        producers_stop.set()
+        time.sleep(2)
+        consumers_stop.set()
+        time.sleep(2)
         for t in threads:
-            t.join(20)
+            t.join(30)
 
     # Warmup
     with lock:
         lat_us.clear(); bytes_rx = 0; ttft_us.clear(); inter_us.clear()
-        credit_waits.clear(); writer_stats.clear(); errors.clear()
+        credit_waits.clear(); writer_stats.clear()
+        measure_errors.clear(); teardown_errors.clear()
     run_wave(min(32, args.streams), args.warmup, "w")
     with lock:
         lat_us.clear(); bytes_rx = 0; ttft_us.clear(); inter_us.clear()
-        credit_waits.clear(); writer_stats.clear(); errors.clear()
+        credit_waits.clear(); writer_stats.clear()
+        measure_errors.clear(); teardown_errors.clear()
 
-    # Measure — throughput uses the configured window length (drain/joins excluded)
     t0 = time.monotonic()
     run_wave(args.streams, args.secs, "g")
     wall = max(1e-6, time.monotonic() - t0)
     elapsed = max(1e-6, float(args.secs))
     load1_post = float(open("/proc/loadavg").read().split()[0])
 
+    # Metrics after grace / session exit
+    counters = wait_metrics_drained(args.metrics_url, timeout_s=float(args.drain_timeout))
+    try:
+        # also save raw scrape text path via one.sh; refresh once more
+        counters = fetch_metrics(args.metrics_url)
+    except Exception as e:  # noqa: BLE001
+        counters["_error"] = str(e)
+
     lat_sorted = sorted(lat_us)
     wait_sorted = sorted(credit_waits)
     inter_sorted = sorted(inter_us)
     ttft_sorted = sorted(ttft_us)
     mib_s = (bytes_rx / (1024 * 1024)) / elapsed
-    counters = {}
-    try:
-        counters = fetch_metrics(args.metrics_url)
-    except Exception as e:  # noqa: BLE001
-        counters = {"_error": str(e)}
 
     def pack(vals):
         s = sorted(vals)
@@ -217,12 +254,14 @@ def run_window(args) -> dict:
         "sjws_swarm_stream_budget_underflows_total": counters.get("sjws_swarm_stream_budget_underflows_total"),
         "sjws_swarm_stream_reserve_underflows_total": counters.get("sjws_swarm_stream_reserve_underflows_total"),
         "sjws_swarm_stream_charged_bytes": counters.get("sjws_swarm_stream_charged_bytes"),
+        "sjws_swarm_stream_open_sessions": counters.get("sjws_swarm_stream_open_sessions"),
     }
 
     out = {
         "mode": args.accept,
         "streams": args.streams,
         "agents": len(clients),
+        "window": args.window,
         "elapsed_s": elapsed,
         "wall_s": wall,
         "load1_pre": load1_pre,
@@ -246,8 +285,10 @@ def run_window(args) -> dict:
         "stall_flag": stall_pct > 1.0,
         "counters": counters,
         "hard_zeros": hard_zeros,
-        "errors": errors[:30],
-        "error_count": len(errors),
+        "errors": measure_errors[:30],
+        "error_count": len(measure_errors),
+        "teardown_errors": teardown_errors[:30],
+        "teardown_error_count": len(teardown_errors),
         "p50_us": pct(lat_sorted, 0.50),
         "p90_us": pct(lat_sorted, 0.90),
         "p99_us": pct(lat_sorted, 0.99),
@@ -256,7 +297,8 @@ def run_window(args) -> dict:
     Path(args.out).write_text(json.dumps(out, indent=2) + "\n")
     print(json.dumps({k: out[k] for k in (
         "mib_s", "chunk_samples", "p50_us", "p90_us", "p99_us", "load1_pre", "load1_post",
-        "self_loaded", "stall_flag", "credit_stalls", "error_count", "agents")}, indent=2))
+        "self_loaded", "stall_flag", "credit_stalls", "error_count", "teardown_error_count",
+        "agents", "window")}, indent=2))
     return out
 
 
@@ -271,6 +313,7 @@ def main():
     p.add_argument("--streams", type=int, default=1000)
     p.add_argument("--chunk-bytes", type=int, default=1024)
     p.add_argument("--window", type=int, default=8)
+    p.add_argument("--drain-timeout", type=float, default=75)
     p.add_argument("--out", required=True)
     p.add_argument("--metrics-url", required=True)
     args = p.parse_args()
