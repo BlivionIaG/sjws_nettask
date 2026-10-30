@@ -25,6 +25,7 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLServerSocket;
@@ -49,10 +50,12 @@ import sjws_nettask.cluster.TcpTransport;
  * <li>Accepting: {@link #peerWire} maps the client certificate to its voter's wire id, so the transport drops any
  * frame on that connection that carries another sender wire ({@code TcpTransport.Reason.ORIGIN}).</li>
  * </ul>
- * Refusals are counted in {@link #identityRefused} and logged at most once a minute. A TLS reload whose new
- * certificate does not carry this voter's own pinned SAN is refused (the current material stays), counted in
- * {@link #reloadRefused} and logged. {@code endpointIdentification}
- * stays unset: the pinned SAN, not the host name, is the identity.
+ * After every handshake (including a resumed one) the peer is re-checked against the current trust, revocation and
+ * pin policy before any application byte is read or written. A successful {@link CpServerTls#reloadTls()} re-checks
+ * established peer connections and closes any that no longer pass. Refusals are counted in {@link #identityRefused}
+ * and logged at most once a minute (subject and serial only). A TLS reload whose new certificate does not carry this
+ * voter's own pinned SAN is refused (the current material stays), counted in {@link #reloadRefused} and logged.
+ * {@code endpointIdentification} stays unset: the pinned SAN, not the host name, is the identity.
  */
 final class CpPeerSockets implements TcpTransport.SocketFactory {
 
@@ -63,12 +66,27 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
     static final long LOG_EVERY_NANOS = 60_000_000_000L;
     private static final System.Logger LOG = System.getLogger(CpPeerSockets.class.getName());
 
+    /** Pinned peer plus the abort handle that unblocks a stalled TLS write without waiting on SSLSocket.close. */
+    private record Live(CpConfig.Peer expected, Socket abort) {
+    }
+
     private final CpServerTls tls;
-    private final List<CpConfig.Peer> peers;
-    private final CpConfig.Peer self;
+    private volatile List<CpConfig.Peer> peers;
+    private volatile CpConfig.Peer self;
     private final AtomicLong identityRefused = new AtomicLong();
     private final AtomicLong reloadRefused = new AtomicLong();
+    private final AtomicLong policyDropped = new AtomicLong();
     private final AtomicLong loggedNanos = new AtomicLong(System.nanoTime() - LOG_EVERY_NANOS);
+    /** Bumped at the start of every {@link #dropPeersFailingPolicy} so registration cannot escape a concurrent reload. */
+    private final AtomicLong tlsEpoch = new AtomicLong();
+    /** Open peer sockets still subject to policy after reload; value holds the pin and the abort handle. */
+    private final ConcurrentHashMap<SSLSocket, Live> live = new ConcurrentHashMap<>();
+    /**
+     * Test hook: runs once after a successful policy check and before {@code live.put}, so a test can fire
+     * {@code reloadTls} in the handshake/register window.
+     */
+    volatile Runnable betweenValidateAndRegister = () -> {
+    };
 
     /**
      * @param peers every {@code cp.peers} entry, this voter included; each must pin a {@code san}
@@ -77,9 +95,14 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
      */
     CpPeerSockets(CpServerTls tls, List<CpConfig.Peer> peers, String selfId) {
         this.tls = Objects.requireNonNull(tls, "tls");
-        this.peers = List.copyOf(peers);
+        setPeers(peers, selfId);
+        tls.afterReload(this::dropPeersFailingPolicy);
+    }
+
+    private void setPeers(List<CpConfig.Peer> peers, String selfId) {
+        var copy = List.copyOf(peers);
         CpConfig.Peer found = null;
-        for (var peer : this.peers) {
+        for (var peer : copy) {
             if (peer.san() == null) {
                 throw new IllegalArgumentException("cp.peers entry " + peer.id() + " has no pinned san");
             }
@@ -90,7 +113,17 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         if (found == null) {
             throw new IllegalArgumentException("cp.peers does not list " + selfId);
         }
+        this.peers = copy;
         this.self = found;
+    }
+
+    /**
+     * Replaces the pin table (same self id). Established connections that no longer match are closed. Used when the
+     * operator changes {@code cp.peers} bindings; tests use it to exercise post-reload pin checks.
+     */
+    void replacePins(List<CpConfig.Peer> peers) {
+        setPeers(peers, self.id());
+        dropPeersFailingPolicy();
     }
 
     /**
@@ -136,6 +169,11 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         return identityRefused.get();
     }
 
+    /** Established connections closed because they failed policy after a TLS reload or pin change. */
+    long policyDropped() {
+        return policyDropped.get();
+    }
+
     @Override
     public ServerSocket listen(InetSocketAddress bind) throws IOException {
         var server = (SSLServerSocket) tls.context().getServerSocketFactory().createServerSocket();
@@ -152,34 +190,49 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
 
     @Override
     public Socket connect(InetSocketAddress to) throws IOException {
+        return dial(to).socket();
+    }
+
+    /**
+     * Dial with TLS layered over a plain abort handle: an {@code SSLSocket}'s own {@code close()} waits for the TLS
+     * output lock a blocked writer holds; the plain socket's {@code close()} never does.
+     */
+    @Override
+    public TcpTransport.SocketFactory.Connected dial(InetSocketAddress to) throws IOException {
         var expected = at(to);
         if (expected == null || expected.equals(self)) {
             throw new IOException("cp-peer: no pinned voter at " + to);
         }
-        var socket = (SSLSocket) tls.context().getSocketFactory().createSocket();
+        var plain = new Socket();
+        SSLSocket socket;
+        try {
+            plain.setTcpNoDelay(true);
+            plain.connect(to, CONNECT_TIMEOUT_MILLIS);
+            socket = (SSLSocket) tls.context().getSocketFactory().createSocket(plain, to.getHostString(), to.getPort(),
+                    true);
+        } catch (IOException | RuntimeException e) {
+            plain.close();
+            throw e;
+        }
         try {
             socket.setSSLParameters(tls.parameters());
-            socket.setTcpNoDelay(true);
-            socket.connect(to, CONNECT_TIMEOUT_MILLIS);
             socket.setSoTimeout(HANDSHAKE_TIMEOUT_MILLIS);
             socket.startHandshake();
             socket.setSoTimeout(0);
-            var named = identify(socket);
-            if (named == null || !named.equals(expected)) {
-                refused("the voter at " + to + " did not present the pinned san of " + expected.id());
-                throw new IOException("cp-peer at " + to + " did not present the pinned san of " + expected.id());
-            }
+            registerLive(socket, expected, plain, false);
         } catch (IOException | RuntimeException e) {
-            socket.close();
+            abortClose(plain);
+            closeQuietly(socket);
             throw e;
         }
-        return socket;
+        return new TcpTransport.SocketFactory.Connected(socket, plain);
     }
 
     /**
      * The accepted side's mTLS handshake under one total deadline: a watchdog closes the socket when it passes, so
      * a client trickling handshake bytes cannot stretch it with per-read timeouts. The transport counts the
-     * connection as an inbound slot only after this returns.
+     * connection as an inbound slot only after this returns. Policy (trust, revocation, pin) is enforced before
+     * return, so no application frame is read on a refused peer.
      */
     @Override
     public void handshake(Socket accepted, int totalMillis) throws IOException {
@@ -192,34 +245,144 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
                 return;
             }
             if (!done.get()) {
-                try {
-                    ssl.close();
-                } catch (IOException ignored) {
-                    // Closing a stalled handshake; nothing to report.
-                }
+                closeQuietly(ssl);
             }
         });
         try {
             ssl.setSoTimeout(totalMillis);
             ssl.startHandshake();
+            if (ssl.isClosed()) {
+                throw new IOException("cp-peer handshake missed its " + totalMillis + " ms deadline");
+            }
+            // Trust + revocation before any application byte; pin binding is peerWire (still before read).
+            try {
+                tls.revalidatePeer(ssl, true);
+            } catch (IOException e) {
+                warnPolicy(ssl, e.getMessage());
+                closeQuietly(ssl);
+                throw e;
+            }
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(ssl);
+            live.remove(ssl);
+            throw e;
         } finally {
             done.set(true);
             watchdog.interrupt();
-        }
-        if (ssl.isClosed()) {
-            throw new IOException("cp-peer handshake missed its " + totalMillis + " ms deadline");
         }
     }
 
     /** The wire id of the one pinned voter (not this one) the verified client certificate names; else refused. */
     @Override
     public int peerWire(Socket accepted) {
-        var named = identify((SSLSocket) accepted);
+        var ssl = (SSLSocket) accepted;
+        try {
+            // Accepted sockets have no separate plain abort handle; abort is the SSLSocket itself.
+            return registerLive(ssl, null, ssl, true).wire();
+        } catch (IOException e) {
+            closeQuietly(ssl);
+            throw new IllegalStateException("cp-peer certificate names no other pinned voter", e);
+        }
+    }
+
+    /**
+     * Revalidate and pin under the current TLS epoch, then put into {@link #live}. If a reload bumps the epoch
+     * between the check and the put, retry so the connection cannot escape both the new-policy check and the reload
+     * sweep.
+     */
+    private CpConfig.Peer registerLive(SSLSocket socket, CpConfig.Peer expected, Socket abort, boolean peerIsClient)
+            throws IOException {
+        CpConfig.Peer named;
+        long epoch;
+        do {
+            epoch = tlsEpoch.get();
+            named = enforcePolicy(socket, peerIsClient, expected);
+            var mid = betweenValidateAndRegister;
+            betweenValidateAndRegister = () -> {
+            };
+            mid.run();
+            live.put(socket, new Live(named, abort));
+        } while (tlsEpoch.get() != epoch);
+        return named;
+    }
+
+    /**
+     * Trust, revocation and pin binding against current policy. Closes nothing itself; callers close on failure.
+     * {@code expected} is required on the dialer; on the acceptor it is null and the peer must name exactly one
+     * other pinned voter (returned).
+     */
+    private CpConfig.Peer enforcePolicy(SSLSocket socket, boolean peerIsClient, CpConfig.Peer expected)
+            throws IOException {
+        try {
+            tls.revalidatePeer(socket, peerIsClient);
+        } catch (IOException e) {
+            warnPolicy(socket, e.getMessage());
+            throw e;
+        }
+        var named = identify(socket);
+        if (expected != null) {
+            if (named == null || !named.equals(expected)) {
+                refused("the peer did not present the pinned san of " + expected.id());
+                throw new IOException("cp-peer did not present the pinned san of " + expected.id());
+            }
+            return expected;
+        }
         if (named == null || named.equals(self)) {
             refused("an accepted connection's certificate names no other pinned voter");
-            throw new IllegalStateException("cp-peer certificate names no other pinned voter");
+            throw new IOException("cp-peer certificate names no other pinned voter");
         }
-        return named.wire();
+        return named;
+    }
+
+    /** After reload or pin change: close every live peer that fails current policy. */
+    void dropPeersFailingPolicy() {
+        tlsEpoch.incrementAndGet();
+        for (var entry : List.copyOf(live.entrySet())) {
+            var socket = entry.getKey();
+            var peer = entry.getValue();
+            if (socket.isClosed()) {
+                live.remove(socket, peer);
+                continue;
+            }
+            // Accepted sockets are server-mode; dialled sockets are client-mode.
+            boolean peerIsClient = !socket.getUseClientMode();
+            try {
+                // Silent here: we WARN once below with policyDropped.
+                tls.revalidatePeer(socket, peerIsClient);
+                var named = identify(socket);
+                if (named == null || !named.equals(peer.expected())) {
+                    throw new IOException("cp-peer no longer matches pinned san of " + peer.expected().id());
+                }
+            } catch (IOException | RuntimeException failed) {
+                policyDropped.incrementAndGet();
+                warnPolicy(socket, String.valueOf(failed.getMessage()));
+                // Abort handle first: SSLSocket.close waits on the TLS write lock a blocked writer holds.
+                abortClose(peer.abort());
+                if (peer.abort() != socket) {
+                    closeQuietly(socket);
+                }
+                live.remove(socket, peer);
+            }
+        }
+    }
+
+    private void warnPolicy(SSLSocket socket, String why) {
+        long n = identityRefused.incrementAndGet();
+        String who = "unknown";
+        try {
+            var certs = socket.getSession().getPeerCertificates();
+            if (certs.length > 0 && certs[0] instanceof X509Certificate leaf) {
+                who = CpServerTls.peerLogId(leaf);
+            }
+        } catch (SSLPeerUnverifiedException | RuntimeException ignored) {
+            // keep unknown
+        }
+        long now = System.nanoTime();
+        long last = loggedNanos.get();
+        if (now - last >= LOG_EVERY_NANOS && loggedNanos.compareAndSet(last, now)) {
+            LOG.log(System.Logger.Level.WARNING,
+                    "cp-peer: policy refused {0} ({1}); connection closed ({2} so far)", who, why, n);
+        }
     }
 
     private void refused(String why) {
@@ -228,6 +391,24 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         long last = loggedNanos.get();
         if (now - last >= LOG_EVERY_NANOS && loggedNanos.compareAndSet(last, now)) {
             LOG.log(System.Logger.Level.WARNING, "cp-peer: {0}; connection closed ({1} so far)", why, n);
+        }
+    }
+
+    /** Closes the abort handle with linger 0 (immediate reset), never waiting behind a blocked TLS write. */
+    private static void abortClose(Socket abort) {
+        try {
+            abort.setSoLinger(true, 0);
+        } catch (IOException | RuntimeException ignored) {
+            // closing
+        }
+        closeQuietly(abort);
+    }
+
+    private static void closeQuietly(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // closing
         }
     }
 

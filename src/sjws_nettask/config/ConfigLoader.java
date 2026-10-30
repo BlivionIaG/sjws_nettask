@@ -43,7 +43,7 @@ import sjws_nettask.core.RoutePattern;
 public final class ConfigLoader {
 
     private static final List<String> TOP = List.of("schema", "version", "node", "server", "http3", "tls", "acme",
-            "routing", "middleware", "access", "messaging", "swarm", "ha", "buffers", "cp");
+            "routing", "middleware", "access", "messaging", "swarm", "ha", "buffers", "ledger", "cp");
     private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile(
             "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
     private static final List<Integer> REDIRECT_STATUS = List.of(301, 302, 303, 307, 308);
@@ -171,6 +171,7 @@ public final class ConfigLoader {
             yamlSwarm = swarmSection(root);
             yamlCp = cpSection(root);
             buffersSection(root);
+            ledgerSection(root);
             var ha = haSection(root, env, base, readFrom, warnings);
             haEnabled = ha.enabled();
             haKey = ha.current();
@@ -1275,6 +1276,73 @@ public final class ConfigLoader {
     }
 
     static final String POOL_PROPERTY = "sjws.buf.pool";
+
+    /**
+     * Node-local {@code ledger:} (#333): process-wide {@link sjws_nettask.messaging.ledger.LedgerWriterBudget}.
+     * Maps to {@code sjws.messaging.ledger.budget.bytes} / {@code .heapFraction} when those properties are unset
+     * (command-line properties win). Not part of the signed messaging document.
+     * <pre>
+     * ledger:
+     *   budget_bytes: 1g          # or 0 / off / false / unlimited
+     *   budget_heap_fraction: 0.25  # used when budget_bytes is omitted
+     * </pre>
+     */
+    private static void ledgerSection(Map<String, Object> root) {
+        if (!(root.get("ledger") instanceof Object ledger)) {
+            return;
+        }
+        var map = YamlValues.mapping(ledger, "ledger");
+        YamlValues.knownKeys(map, List.of("budget_bytes", "budget_heap_fraction"), "ledger");
+        final String bytesProp = sjws_nettask.messaging.ledger.LedgerWriterBudget.BYTES_PROPERTY;
+        final String fracProp = sjws_nettask.messaging.ledger.LedgerWriterBudget.FRACTION_PROPERTY;
+        if (map.containsKey("budget_bytes")) {
+            var raw = map.get("budget_bytes");
+            String text;
+            if (raw instanceof String s) {
+                text = s.trim();
+            } else if (raw instanceof Number n) {
+                text = Long.toString(n.longValue());
+            } else {
+                throw new ConfigException("ledger.budget_bytes: expected a size or off");
+            }
+            if (text.equalsIgnoreCase("off") || text.equalsIgnoreCase("false")
+                    || text.equalsIgnoreCase("unlimited") || text.equals("0")) {
+                if (System.getProperty(bytesProp) == null) {
+                    System.setProperty(bytesProp, "0");
+                }
+            } else {
+                long bytes = Sizes.parse(text, Long.MAX_VALUE, "ledger.budget_bytes");
+                if (bytes > 0 && bytes < sjws_nettask.messaging.ledger.LedgerWriterBudget.IDLE_COST_BYTES) {
+                    throw new ConfigException("ledger.budget_bytes must be 0 (unlimited) or >="
+                            + sjws_nettask.messaging.ledger.LedgerWriterBudget.IDLE_COST_BYTES);
+                }
+                if (System.getProperty(bytesProp) == null) {
+                    System.setProperty(bytesProp, Long.toString(bytes));
+                }
+            }
+        }
+        if (map.containsKey("budget_heap_fraction")) {
+            double f;
+            var raw = map.get("budget_heap_fraction");
+            if (raw instanceof Number n) {
+                f = n.doubleValue();
+            } else if (raw instanceof String s) {
+                try {
+                    f = Double.parseDouble(s.trim());
+                } catch (NumberFormatException e) {
+                    throw new ConfigException("ledger.budget_heap_fraction: expected a double in (0, 1]");
+                }
+            } else {
+                throw new ConfigException("ledger.budget_heap_fraction: expected a double in (0, 1]");
+            }
+            if (!(f > 0.0d) || f > 1.0d) {
+                throw new ConfigException("ledger.budget_heap_fraction: must be in (0, 1]");
+            }
+            if (System.getProperty(fracProp) == null) {
+                System.setProperty(fracProp, Double.toString(f));
+            }
+        }
+    }
 
     private static AccessSettings accessSection(Map<String, Object> root, List<String> warnings) {
         if (!(root.get("access") instanceof Object access)) {

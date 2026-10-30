@@ -225,7 +225,15 @@ public final class Partition implements AutoCloseable {
             if (dlq != null) dlq.close();
             throw e;
         }
-        var p = new Partition(topic, log, new LedgerWriter(log, durability), st, dlq, clockMs, logDir, keep, fromSnap, replayed[0],
+        LedgerWriter writer;
+        try {
+            writer = new LedgerWriter(log, durability);
+        } catch (RuntimeException e) {
+            log.close();
+            if (dlq != null) dlq.close();
+            throw e;
+        }
+        var p = new Partition(topic, log, writer, st, dlq, clockMs, logDir, keep, fromSnap, replayed[0],
                 cancelProbe);
         p.pins = pinned;
         p.publish();

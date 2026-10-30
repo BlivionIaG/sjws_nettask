@@ -87,6 +87,22 @@ the CRC32C covers the batch. Batches are the unit of write, fsync, replication a
   replica fsyncing in the background. **Quorum + fsync (`strict`) is opt-in per topic or per producer**
   (§6, req. 2). See §2.6 for what each mode can lose.
 
+
+
+### Writer memory budget (#333)
+
+Each `LedgerWriter` sizes its `ArrayBlockingQueue` and 1 MiB direct write buffer **lazily** on the first append, so an idle partition pins kilobytes rather than ~1.5 MiB. Construction and materialization charge a process-wide `LedgerWriterBudget` (default **0.25 × max heap**). Over budget, open/materialize fails closed with `LedgerBudgetExhaustedException` → HTTP **503** + `Retry-After` (not an OOM).
+
+Node-local config (not part of the signed messaging document):
+
+```yaml
+ledger:
+  budget_bytes: 1g                 # or 0 / off / unlimited
+  budget_heap_fraction: 0.25       # used when budget_bytes is omitted
+```
+
+Or system properties `sjws.messaging.ledger.budget.bytes` / `sjws.messaging.ledger.budget.heapFraction` (properties win over YAML). Routing NONE/ASYNC partitions onto shared writer threads (beyond today's shared syncers) is a follow-up.
+
 The local write path, as `messaging.ledger.LedgerWriter` implements it:
 
 ```mermaid
@@ -136,6 +152,10 @@ every replica deletes the same whole segments when it applies (`LogTopics.propos
 Compaction stays local to each node; an installing follower takes the leader's compacted files as they are.
 Narrow ledger hooks for this (`SegmentedLog.segmentFiles`, `positionOf`, `replaceWith`, `LedgerWriter.reload`,
 `ReplicaHooks`) are owned by Messaging Core.
+From #328 onward, segment bases are a function of the record sequence (per-frame rolls), so a leader
+boundary cut reaches the same physical start on every replica. Bases written under the old group-roll
+behaviour (before that upgrade) can still diverge on a follower; those sealed segments stay on disk until
+a retention cut passes their end — at most about one extra segment per topic, cleared by later cuts.
 
 ### 2.6 Crash-loss window
 What an **acked** message can lose, by mode. "Unsynced window" W = records written but not yet fsynced
