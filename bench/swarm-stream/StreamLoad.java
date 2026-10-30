@@ -21,6 +21,29 @@ public class StreamLoad {
   static final int FRAME_HDR = 6, CHUNK_HDR = 26;
   static final int LAST = 0x01, FIRST = 0x08;
   static final int TYPE_TASK = 1, TYPE_LEASE = 3, TYPE_TOKEN = 6, TYPE_CREDIT = 9;
+  static final double CREDIT_FLOOR_S = 0.005; // #261 Q9: 5 ms doubling ±20%, cap Retry-After
+
+  /** Per-VT latency lists — avoids ConcurrentLinkedQueue CAS storms at 1k streams. */
+  static final class LatBag {
+    static final ThreadLocal<ArrayList<Double>> TL = ThreadLocal.withInitial(ArrayList::new);
+    static final ConcurrentLinkedQueue<ArrayList<Double>> ALL = new ConcurrentLinkedQueue<>();
+    static final ThreadLocal<Boolean> REG = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    static void add(double us) {
+      ArrayList<Double> a = TL.get();
+      if (!REG.get()) { ALL.add(a); REG.set(Boolean.TRUE); }
+      a.add(us);
+    }
+    static List<Double> drain() {
+      List<Double> out = new ArrayList<>();
+      for (ArrayList<Double> a : ALL) out.addAll(a);
+      ALL.clear();
+      return out;
+    }
+    static void clearAll() {
+      for (ArrayList<Double> a : ALL) a.clear();
+      ALL.clear();
+    }
+  }
 
   static final class Args {
     String base, tokensFile, out, accept = "binary";
@@ -48,8 +71,8 @@ public class StreamLoad {
         .build();
 
     LongAdder bytesRx = new LongAdder();
-    ConcurrentLinkedQueue<Double> latUs = new ConcurrentLinkedQueue<>();
     ConcurrentLinkedQueue<Double> creditWaits = new ConcurrentLinkedQueue<>();
+    LatBag.clearAll();
     ConcurrentLinkedQueue<String> measureErr = new ConcurrentLinkedQueue<>();
     ConcurrentLinkedQueue<String> teardownErr = new ConcurrentLinkedQueue<>();
     AtomicBoolean producersStop = new AtomicBoolean();
@@ -60,9 +83,9 @@ public class StreamLoad {
 
     // Warmup
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w",
-        producersStop, consumersStop, inTeardown, bytesRx, latUs, creditWaits,
+        producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429);
-    bytesRx.reset(); latUs.clear(); creditWaits.clear(); measureErr.clear(); teardownErr.clear();
+    bytesRx.reset(); LatBag.clearAll(); creditWaits.clear(); measureErr.clear(); teardownErr.clear();
     requests.set(0); credit429.set(0);
 
     // Measure + sample client (/proc/self) and server (/proc/<serverPid>) CPU over the window
@@ -95,7 +118,7 @@ public class StreamLoad {
 
     long t0 = System.nanoTime();
     wave(http, args, tokens, args.streams, args.secs, "g",
-        producersStop, consumersStop, inTeardown, bytesRx, latUs, creditWaits,
+        producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429);
     double wall = (System.nanoTime() - t0) / 1e9;
     cpuMon.join(2000);
@@ -112,7 +135,7 @@ public class StreamLoad {
     boolean genSat = !Double.isNaN(r.clientCpuPctOfWall) && r.clientCpuPctOfWall >= args.genSatPct;
     r.selfLoaded = load1Post >= 4.0 || genSat;
     r.generatorSaturated = genSat;
-    List<Double> lat = new ArrayList<>(latUs);
+    List<Double> lat = LatBag.drain();
     Collections.sort(lat);
     r.chunkSamples = lat.size();
     r.bytes = bytesRx.sum();
@@ -141,7 +164,7 @@ public class StreamLoad {
 
   static void wave(HttpClient http, Args args, List<String> tokens, int n, double duration, String label,
       AtomicBoolean producersStop, AtomicBoolean consumersStop, AtomicBoolean inTeardown,
-      LongAdder bytesRx, ConcurrentLinkedQueue<Double> latUs, ConcurrentLinkedQueue<Double> creditWaits,
+      LongAdder bytesRx, ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429) throws Exception {
     producersStop.set(false); consumersStop.set(false); inTeardown.set(false);
@@ -151,7 +174,7 @@ public class StreamLoad {
       String tok = tokens.get(i % tokens.size());
       int idx = i;
       threads.add(Thread.startVirtualThread(() -> {
-        try { consumer(http, args, tok, pool, consumersStop, inTeardown, bytesRx, latUs, measureErr, teardownErr); }
+        try { consumer(http, args, tok, pool, consumersStop, inTeardown, bytesRx, measureErr, teardownErr); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
       }));
       if (i % 32 == 0) Thread.sleep(10);
@@ -182,32 +205,123 @@ public class StreamLoad {
     int pad = args.chunkBytes - 20;
     if (pad < 0) throw new IllegalArgumentException("chunk-bytes");
     byte[] padBytes = new byte[pad];
-    // Fully synchronous POSTs on this virtual thread. Parallelism = N streams.
-    // Prior designs (unbounded enqueue / per-chunk VT / window fan-out) burned ~200% CPU at streams=1.
+    // Sync one-POST-at-a-time per stream (f9215f7). Match SDK #261 Q9 on 429:
+    // same (attempt,seq) retry after 5 ms × 2^tries ±20% jitter, capped at Retry-After.
+    // Apply CREDIT snapshots so we do not busy-spin into session 429s at 1k streams.
     byte[] payload = new byte[args.chunkBytes];
+    int mode = 0; // 0=unknown slow-start, 1=credit, 2=none (204)
+    int creditChunks = 0, creditBytes = 0;
+    int zeroTries = 0;
+    java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
     while (!stop.get()) {
+      // credit gate (sync ⇒ at most one in flight, so snap is remaining)
+      if (mode == 1 && creditChunks < 1) {
+        double wait = creditBackoffS(zeroTries++, 1.0, rnd);
+        creditWaits.add(wait);
+        Thread.sleep((long) Math.max(1, wait * 1000));
+        if (stop.get()) break;
+      }
       writeAsciiNs(payload, 0, System.nanoTime());
       System.arraycopy(padBytes, 0, payload, 20, pad);
       int flags = (seq == 0 ? FIRST : 0);
-      byte[] frame = tokenFrame(lease.streamHi, lease.streamLo, lease.attempt, seq++, flags, payload);
+      byte[] frame = tokenFrame(lease.streamHi, lease.streamLo, lease.attempt, seq, flags, payload);
       writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR, System.nanoTime());
-      try {
-        HttpResponse<byte[]> r = post(http, url, token, frame);
-        requests.incrementAndGet();
-        if (r.statusCode() == 429) {
-          credit429.incrementAndGet();
-          creditWaits.add(0.001); // nominal; real wait is server-side credit
-        } else if (r.statusCode() != 200 && r.statusCode() != 204)
-          throw new IOException("chunk " + r.statusCode());
-      } catch (Exception e) {
-        note(inTeardown, measureErr, teardownErr, "producer-send " + pool, e);
+      int tries = 0;
+      while (!stop.get()) {
+        try {
+          HttpResponse<byte[]> r = post(http, url, token, frame);
+          requests.incrementAndGet();
+          int sc = r.statusCode();
+          if (sc == 429) {
+            credit429.incrementAndGet();
+            double ra = retryAfterS(r);
+            double wait = creditBackoffS(tries, ra, rnd);
+            creditWaits.add(wait);
+            tries++;
+            Thread.sleep((long) Math.max(1, wait * 1000));
+            continue; // same seq
+          }
+          if (sc == 204) {
+            mode = 2; creditChunks = 0; creditBytes = 0; zeroTries = 0;
+            seq++;
+            break;
+          }
+          if (sc != 200) throw new IOException("chunk " + sc);
+          // 200: apply CREDIT if present
+          int[] snap = parseCreditChunksBytes(r.body());
+          if (snap != null) {
+            mode = 1;
+            creditChunks = snap[0];
+            creditBytes = snap[1];
+            zeroTries = 0;
+          }
+          seq++;
+          break;
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          return;
+        } catch (Exception e) {
+          note(inTeardown, measureErr, teardownErr, "producer-send " + pool, e);
+          try { Thread.sleep(5L << Math.min(tries, 6)); } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt(); return;
+          }
+          tries++;
+          // retry same seq
+        }
       }
     }
     byte[] last = tokenFrame(lease.streamHi, lease.streamLo, lease.attempt, seq, LAST, new byte[0]);
-    HttpResponse<byte[]> r = post(http, url, token, last);
-    requests.incrementAndGet();
-    if (r.statusCode() != 200 && r.statusCode() != 204 && r.statusCode() != 429)
-      note(inTeardown, measureErr, teardownErr, "producer-last " + pool, new IOException("last " + r.statusCode()));
+    for (int tries = 0; tries < 8; tries++) {
+      try {
+        HttpResponse<byte[]> r = post(http, url, token, last);
+        requests.incrementAndGet();
+        int sc = r.statusCode();
+        if (sc == 200 || sc == 204) break;
+        if (sc == 429) {
+          double wait = creditBackoffS(tries, retryAfterS(r), rnd);
+          Thread.sleep((long) Math.max(1, wait * 1000));
+          continue;
+        }
+        note(inTeardown, measureErr, teardownErr, "producer-last " + pool, new IOException("last " + sc));
+        break;
+      } catch (Exception e) {
+        note(inTeardown, measureErr, teardownErr, "producer-last " + pool, e);
+        break;
+      }
+    }
+  }
+
+  static double creditBackoffS(int tries, double retryAfter, java.util.concurrent.ThreadLocalRandom rnd) {
+    double base = CREDIT_FLOOR_S * (1L << Math.min(tries, 20));
+    return Math.min(retryAfter, base * (0.8 + 0.4 * rnd.nextDouble()));
+  }
+  static double retryAfterS(HttpResponse<?> r) {
+    return r.headers().firstValue("retry-after").map(v -> {
+      try { return Math.max(0.0, Double.parseDouble(v.trim())); }
+      catch (NumberFormatException e) { return 1.0; }
+    }).orElse(1.0);
+  }
+  /** @return int[]{chunks,bytes} or null if no CREDIT frame */
+  static int[] parseCreditChunksBytes(byte[] body) {
+    if (body == null || body.length < FRAME_HDR) return null;
+    try {
+      ByteBuffer buf = ByteBuffer.wrap(body);
+      while (buf.remaining() >= FRAME_HDR) {
+        int ver = buf.get() & 0xff, type = buf.get() & 0xff; buf.get(); // flags
+        int len = ((buf.get() & 0xff) << 16) | ((buf.get() & 0xff) << 8) | (buf.get() & 0xff);
+        if (buf.remaining() < len) return null;
+        if (type == TYPE_CREDIT && len == 29) {
+          int pos = buf.position();
+          if ((buf.get(pos) & 0xff) != 1) { buf.position(pos + len); continue; }
+          // version(1)+stream(16)+attempt(4)+chunks(4)+bytes(4)
+          int chunks = buf.getInt(pos + 1 + 16 + 4);
+          int nbytes = buf.getInt(pos + 1 + 16 + 4 + 4);
+          return new int[]{chunks, nbytes};
+        }
+        buf.position(buf.position() + len);
+      }
+    } catch (Exception ignored) {}
+    return null;
   }
 
   /** Write 20 ASCII decimal digits of {@code ns} into {@code dst[off..off+20)}. */
@@ -219,7 +333,7 @@ public class StreamLoad {
   }
 
   static void consumer(HttpClient http, Args args, String token, String pool,
-      AtomicBoolean stop, AtomicBoolean inTeardown, LongAdder bytesRx, ConcurrentLinkedQueue<Double> latUs,
+      AtomicBoolean stop, AtomicBoolean inTeardown, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr) throws Exception {
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(args.base + "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000"))
@@ -249,12 +363,12 @@ public class StreamLoad {
     HttpResponse<InputStream> get = http.send(gb.build(), HttpResponse.BodyHandlers.ofInputStream());
     if (get.statusCode() != 200) throw new IOException("replies " + get.statusCode());
     try (InputStream in = get.body()) {
-      if ("sse".equals(args.accept)) readSse(in, stop, bytesRx, latUs);
-      else readBinary(in, stop, bytesRx, latUs);
+      if ("sse".equals(args.accept)) readSse(in, stop, bytesRx);
+      else readBinary(in, stop, bytesRx);
     }
   }
 
-  static void readBinary(InputStream in, AtomicBoolean stop, LongAdder bytesRx, ConcurrentLinkedQueue<Double> latUs) throws IOException {
+  static void readBinary(InputStream in, AtomicBoolean stop, LongAdder bytesRx) throws IOException {
     byte[] hdr = new byte[FRAME_HDR];
     while (!stop.get()) {
       if (!readFully(in, hdr)) break;
@@ -269,19 +383,18 @@ public class StreamLoad {
       }
       long recv = System.nanoTime();
       // chunk v2: [2][hi8][lo8][attempt4][seq4][flags1][bytes]
-      byte[] data = Arrays.copyOfRange(payload, CHUNK_HDR, payload.length);
-      if (data.length >= 20) {
+      if (payload.length >= CHUNK_HDR + 20) {
         try {
-          long emit = Long.parseLong(new String(data, 0, 20, StandardCharsets.US_ASCII));
-          latUs.add((recv - emit) / 1e3);
-          bytesRx.add(data.length);
+          long emit = Long.parseLong(new String(payload, CHUNK_HDR, 20, StandardCharsets.US_ASCII));
+          LatBag.add((recv - emit) / 1e3);
+          bytesRx.add(payload.length - CHUNK_HDR);
         } catch (NumberFormatException ignored) {}
       }
       if ((payload[CHUNK_HDR - 1] & LAST) != 0 || (flags & LAST) != 0) break;
     }
   }
 
-  static void readSse(InputStream in, AtomicBoolean stop, LongAdder bytesRx, ConcurrentLinkedQueue<Double> latUs) throws IOException {
+  static void readSse(InputStream in, AtomicBoolean stop, LongAdder bytesRx) throws IOException {
     BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
     String line; StringBuilder data = new StringBuilder(); String event = "";
     while (!stop.get() && (line = br.readLine()) != null) {
@@ -295,7 +408,7 @@ public class StreamLoad {
             try {
               long emit = Long.parseLong(d.substring(0, 20).trim());
               long recv = System.nanoTime();
-              latUs.add((recv - emit) / 1e3);
+              LatBag.add((recv - emit) / 1e3);
               bytesRx.add(d.length());
             } catch (NumberFormatException ignored) {}
           }
