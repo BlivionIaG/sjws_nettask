@@ -23,7 +23,10 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
@@ -380,11 +383,20 @@ class AccessTargetMaskTest {
         Files.writeString(log, "");
         Files.setPosixFilePermissions(log, EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
                 PosixFilePermission.OTHERS_READ));
+        var captured = new ByteArrayOutputStream();
+        var saved = System.err;
+        System.setErr(new PrintStream(captured, true, StandardCharsets.UTF_8));
         try (var started = AccessLog.start(log.toString(), AccessLogFormat.COMMON)) {
             assertNotNull(started);
+        } finally {
+            System.setErr(saved);
         }
         var perms = Files.getPosixFilePermissions(log);
         assertTrue(perms.contains(PosixFilePermission.OTHERS_READ), perms.toString());
+        var err = captured.toString(StandardCharsets.UTF_8);
+        assertEquals(1, err.split("WARN: access log ", -1).length - 1, err);
+        assertTrue(err.contains("world-accessible"), err);
+        assertTrue(err.contains(log.toAbsolutePath().toString()) || err.contains(log.toString()), err);
     }
 
     private static void get(SjwsServer server, String target) throws IOException {

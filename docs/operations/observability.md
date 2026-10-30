@@ -51,7 +51,7 @@ flowchart TD
 
 **Credential query parameters.** When an `api-key` filter is configured with a `query` option, the access log replaces that parameter's value with `***` in the logged request-target (every format). Other query parameters are left unchanged. With no such filter configured, the logged target is unchanged and the hot path does not parse the query string. Names are taken from the live filter document (or the config `middleware` list) at load and on each apply or reload.
 
-**Log file mode.** A newly created access-log file is mode `0640`. A directory the server creates for that file is `0750`. An existing file keeps its mode; if it is world-accessible the server logs a WARN and still appends.
+**Log file mode.** A newly created access-log file is mode `0640`. Each directory the server creates for that file is `0750`. An existing file keeps its mode; if it is world-accessible the server logs a WARN and still appends. A file rotated in by an external process (rename/copy into the configured path) keeps the mode that process gave it until the server restarts or otherwise reopens the access log — `AccessLog` does not reopen on external rotation.
 
 **Access line.** Common and combined are the NCSA formats, with the duration in microseconds appended. A zero body is `-`. Combined adds the quoted Referer and User-Agent. JSON is one object per line: `time` (UTC), `remote`, `method`, `path` (the request-target), `protocol`, `status`, `bytes`, `duration_us`, `referer`, `user_agent`. Quotes and controls in a CLF field are replaced with `?`. The client address is the numeric IP captured at accept (no reverse DNS).
 
