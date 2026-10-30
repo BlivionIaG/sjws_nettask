@@ -149,8 +149,9 @@ public class StreamLoad {
     r.stallFlag = r.stallPct > 1.0;
     r.counters = counters;
     r.errorCount = measureErr.size(); r.teardownErrorCount = teardownErr.size();
-    r.errors = measureErr.stream().limit(30).toList();
-    r.teardownErrors = teardownErr.stream().limit(30).toList();
+    r.errors = measureErr.stream().limit(50).toList();
+    r.teardownErrors = teardownErr.stream().limit(50).toList();
+    // credit_stalls = every HTTP 429 on :chunk (counted before backoff; never suppressed)
     r.requests = requests.get();
     r.hardZeros = Map.of(
         "sjws_swarm_stream_node_refusals_total", counters.getOrDefault("sjws_swarm_stream_node_refusals_total", Double.NaN),
@@ -177,7 +178,7 @@ public class StreamLoad {
         try { consumer(http, args, tok, pool, consumersStop, inTeardown, bytesRx, measureErr, teardownErr); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
       }));
-      if (i % 32 == 0) Thread.sleep(10);
+      if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
       threads.add(Thread.startVirtualThread(() -> {
         try { producer(http, args, tok, pool, producersStop, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
@@ -336,36 +337,51 @@ public class StreamLoad {
       AtomicBoolean stop, AtomicBoolean inTeardown, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr) throws Exception {
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
-    HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(args.base + "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000"))
-        .timeout(Duration.ofSeconds(200))
-        .header("Authorization", "Bearer " + token)
-        .header("Content-Type", CT)
-        .POST(HttpRequest.BodyPublishers.ofByteArray(task));
-    if ("binary".equals(args.accept) || "chunked".equals(args.accept))
-      b.header("Accept", CT);
-    else
-      b.header("Accept", "text/event-stream");
-    HttpResponse<byte[]> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
-    if (resp.statusCode() != 201 && resp.statusCode() != 200)
-      throw new IOException("stream " + resp.statusCode());
-    String loc = resp.headers().firstValue("location").orElse(null);
-    if (loc == null) {
-      Frame f = decodeFrame(ByteBuffer.wrap(resp.body()));
-      loc = "/swarm/v1/replies/" + hex(f.payload);
+    Exception last = null;
+    for (int attempt = 0; attempt < 3 && !stop.get(); attempt++) {
+      try {
+        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(args.base + "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000"))
+            .timeout(Duration.ofSeconds(200))
+            .header("Authorization", "Bearer " + token)
+            .header("Content-Type", CT)
+            .POST(HttpRequest.BodyPublishers.ofByteArray(task));
+        if ("binary".equals(args.accept) || "chunked".equals(args.accept))
+          b.header("Accept", CT);
+        else
+          b.header("Accept", "text/event-stream");
+        HttpResponse<byte[]> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
+        if (resp.statusCode() != 201 && resp.statusCode() != 200)
+          throw new IOException("stream " + resp.statusCode());
+        String loc = resp.headers().firstValue("location").orElse(null);
+        if (loc == null) {
+          Frame f = decodeFrame(ByteBuffer.wrap(resp.body()));
+          loc = "/swarm/v1/replies/" + hex(f.payload);
+        }
+        if (!loc.startsWith("http")) loc = args.base + loc;
+        HttpRequest.Builder gb = HttpRequest.newBuilder(URI.create(loc))
+            .timeout(Duration.ofSeconds(200))
+            .header("Authorization", "Bearer " + token)
+            .GET();
+        if ("binary".equals(args.accept) || "chunked".equals(args.accept))
+          gb.header("Accept", CT);
+        HttpResponse<InputStream> get = http.send(gb.build(), HttpResponse.BodyHandlers.ofInputStream());
+        if (get.statusCode() != 200) throw new IOException("replies " + get.statusCode());
+        try (InputStream in = get.body()) {
+          if ("sse".equals(args.accept)) readSse(in, stop, bytesRx);
+          else readBinary(in, stop, bytesRx);
+        }
+        return;
+      } catch (Exception e) {
+        last = e;
+        if (attempt < 2 && !stop.get()) {
+          try { Thread.sleep(20L << attempt); } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt(); throw ie;
+          }
+          continue;
+        }
+      }
     }
-    if (!loc.startsWith("http")) loc = args.base + loc;
-    HttpRequest.Builder gb = HttpRequest.newBuilder(URI.create(loc))
-        .timeout(Duration.ofSeconds(200))
-        .header("Authorization", "Bearer " + token)
-        .GET();
-    if ("binary".equals(args.accept) || "chunked".equals(args.accept))
-      gb.header("Accept", CT);
-    HttpResponse<InputStream> get = http.send(gb.build(), HttpResponse.BodyHandlers.ofInputStream());
-    if (get.statusCode() != 200) throw new IOException("replies " + get.statusCode());
-    try (InputStream in = get.body()) {
-      if ("sse".equals(args.accept)) readSse(in, stop, bytesRx);
-      else readBinary(in, stop, bytesRx);
-    }
+    if (last != null) throw last;
   }
 
   static void readBinary(InputStream in, AtomicBoolean stop, LongAdder bytesRx) throws IOException {

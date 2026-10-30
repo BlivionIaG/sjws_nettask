@@ -25,7 +25,8 @@ HEAP=${HEAP:--Xms2g -Xmx2g}
 taskset -c 2-7 nice -n 10 java -XX:+UseZGC $HEAP \
   -Dsjws.swarm.enabled=true -Dsjws.swarm.stream.enabled=true \
   "${CREDIT_FLAGS[@]}" \
-  -Dsjws.swarm.pool.shards=4 -Dsjws.swarm.dir="$WD/swarm" -Dsjws.swarm.node=bench \
+  -Dsjws.swarm.pool.shards=4 -Dsjws.swarm.stream.shards=4 \
+  -Dsjws.swarm.dir="$WD/swarm" -Dsjws.swarm.node=bench \
   -Dsjws.swarm.tokens.file="$WD/tokens" \
   -jar "$JAR" --metrics=localhost "$PORT" "$WD/site" >"$LOG" 2>&1 &
 SPID=$!
