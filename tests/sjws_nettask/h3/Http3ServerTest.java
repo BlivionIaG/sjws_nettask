@@ -932,5 +932,40 @@ class Http3ServerTest {
                 good.dataFrames(), false, null);
         assertThrows(AssertionError.class,
                 () -> assertParity(this.handler, "GET", "/hello.txt", Map.of(), withConnection));
+        // #313: reset failures must name frames/bodyLen/elapsed so a mid-transfer idle is diagnosable
+        var reset = new H3TestClient.H3Response(206, good.headers(), good.headerNames(), new byte[100],
+                2, true, null, 15_080L, 12L, 980L);
+        var err = assertThrows(AssertionError.class,
+                () -> assertParity(this.handler, "GET", "/large.bin", Map.of("range", "bytes=1048575-3145728"), reset));
+        assertTrue(err.getMessage().contains("frames=2"), err.getMessage());
+        assertTrue(err.getMessage().contains("bodyLen=100"), err.getMessage());
+        assertTrue(err.getMessage().contains("elapsedMs=15080"), err.getMessage());
+        assertTrue(err.getMessage().contains("firstDataMs=12"), err.getMessage());
+        assertTrue(err.getMessage().contains("lastDataMs=980"), err.getMessage());
+    }
+
+    /**
+     * #313: the CI flake was {@code rangeParity[14]} ({@code bytes=1048575-3145728}, ~2 MiB) with a
+     * 1 MiB client stream window. After ~1 MiB the server correctly waits for {@code MAX_STREAM_DATA};
+     * with the default 60 s idle the transfer must complete (no reset, no STALLED). Guards a server
+     * that would spuriously reset while credit is still being returned.
+     */
+    @Test
+    void rangeLargerThanOneMiBStreamWindowCompletes() throws Exception {
+        // Exact flake range: inclusive length = 3145728 - 1048575 + 1 = 2_097_154
+        String range = "bytes=1048575-3145728";
+        int expectLen = 2_097_154;
+        try (var s = new Http3Server(config().writeTimeout(Duration.ofSeconds(30)).build(), this.handler, this.tls)
+                .start();
+                var c = new H3TestClient(this.tls.certificate(), 60_000, 1_000_000,
+                        io.netty.handler.codec.http3.Http3.supportedApplicationProtocols())) {
+            var q = c.connect(s.localAddress());
+            var r = H3TestClient.request(q, "GET", "/large.bin", Map.of("range", range)).get(60, TimeUnit.SECONDS);
+            assertFalse(r.reset(), "progress=" + r.progress());
+            assertEquals(206, r.status(), r.progress());
+            assertEquals(expectLen, r.body().length, r.progress());
+            assertEquals(0, s.responses(Http3Writer.Outcome.STALLED), "server must wait on credit, not STALLED");
+            assertParity(this.handler, "GET", "/large.bin", Map.of("range", range), r);
+        }
     }
 }

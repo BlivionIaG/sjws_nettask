@@ -52,12 +52,31 @@ import java.util.function.Consumer;
  */
 final class H3TestClient implements AutoCloseable {
 
-    /** One response. {@code reset} = the stream ended without FIN (RESET_STREAM / error). */
+    /**
+     * One response. {@code reset} = the stream ended without FIN (RESET_STREAM / error).
+     * Timing fields (ms since Collector start; -1 = never) diagnose mid-transfer stalls (#313).
+     */
     record H3Response(int status, Map<String, String> headers, List<String> headerNames, byte[] body, int dataFrames,
-            boolean reset, Throwable error) {
+            boolean reset, Throwable error, long elapsedMillis, long firstDataMillis, long lastDataMillis) {
+
+        /** Convenience for tests that build synthetic responses without timing. */
+        H3Response(int status, Map<String, String> headers, List<String> headerNames, byte[] body, int dataFrames,
+                boolean reset, Throwable error) {
+            this(status, headers, headerNames, body, dataFrames, reset, error, -1L, -1L, -1L);
+        }
 
         String header(String name) {
             return this.headers.get(name);
+        }
+
+        /** Compact progress for assert messages when a stream resets mid-transfer (#313). */
+        String progress() {
+            return String.format(java.util.Locale.ROOT,
+                    "frames=%d bodyLen=%d elapsedMs=%d firstDataMs=%s lastDataMs=%s err=%s",
+                    this.dataFrames, this.body.length, this.elapsedMillis,
+                    this.firstDataMillis < 0 ? "never" : Long.toString(this.firstDataMillis),
+                    this.lastDataMillis < 0 ? "never" : Long.toString(this.lastDataMillis),
+                    this.error);
         }
     }
 
@@ -219,6 +238,9 @@ final class H3TestClient implements AutoCloseable {
         private int status = -1;
         private int dataFrames;
         private Throwable error;
+        private final long startedNanos = System.nanoTime();
+        private long firstDataNanos = -1;
+        private long lastDataNanos = -1;
 
         Collector(CompletableFuture<H3Response> result) {
             this.result = result;
@@ -246,6 +268,11 @@ final class H3TestClient implements AutoCloseable {
         protected void channelRead(ChannelHandlerContext ctx, Http3DataFrame frame) {
             try {
                 this.dataFrames++;
+                long now = System.nanoTime();
+                if (this.firstDataNanos < 0) {
+                    this.firstDataNanos = now;
+                }
+                this.lastDataNanos = now;
                 var content = frame.content();
                 var bytes = new byte[content.readableBytes()];
                 content.readBytes(bytes);
@@ -269,8 +296,12 @@ final class H3TestClient implements AutoCloseable {
         }
 
         void finish(boolean reset) {
+            long now = System.nanoTime();
+            long elapsed = (now - this.startedNanos) / 1_000_000L;
+            long first = this.firstDataNanos < 0 ? -1L : (this.firstDataNanos - this.startedNanos) / 1_000_000L;
+            long last = this.lastDataNanos < 0 ? -1L : (this.lastDataNanos - this.startedNanos) / 1_000_000L;
             this.result.complete(new H3Response(this.status, Map.copyOf(this.headers), List.copyOf(this.names),
-                    this.body.toByteArray(), this.dataFrames, reset, this.error));
+                    this.body.toByteArray(), this.dataFrames, reset, this.error, elapsed, first, last));
         }
     }
 }

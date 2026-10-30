@@ -146,8 +146,57 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
+        attachMsgreplInstallMetrics(modules, server); // #315 N5: suppliers only; does not arm counters
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
                 bindContent, modules);
+    }
+
+    /**
+     * When HA messaging is on, publish its install counters on the server's {@link sjws_nettask.observe.ObserverSlot}
+     * (#315 N5 / B1). Detected by the {@code installPinExhausted}/{@code installOversizedAbandoned} getters so an
+     * {@code ha.messaging: off} process never loads {@code msgrepl}. Attaching stores the suppliers on the slot and
+     * never mutates {@link sjws_nettask.observe.RequestObserver#NONE}; a deferred {@link SjwsServer#armMetrics()}
+     * copies them onto the recording registry. Does not install the observe filter.
+     */
+    static void attachMsgreplInstallMetrics(OptionalModule modules, SjwsServer server) {
+        var ha = findHaMessaging(modules);
+        if (ha == null) {
+            return;
+        }
+        try {
+            var pin = ha.getClass().getMethod("installPinExhausted");
+            var oversized = ha.getClass().getMethod("installOversizedAbandoned");
+            server.attachMsgreplInstallCounters(() -> invokeLong(pin, ha), () -> invokeLong(oversized, ha));
+        } catch (ReflectiveOperationException ignored) {
+            // HA messaging binary without the #315 getters: leave counters at 0
+        }
+    }
+
+    /** Reflective long getter; 0 on failure so a scrape never throws. */
+    static long invokeLong(java.lang.reflect.Method method, Object target) {
+        try {
+            return (long) method.invoke(target);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return 0L;
+        }
+    }
+
+    /**
+     * The HA messaging module among {@code modules}, or null. Walks {@link OptionalModules.Both}; matches a module that
+     * exposes the #315 install counters. Does not load {@code msgrepl} when that module is absent.
+     */
+    static OptionalModule findHaMessaging(OptionalModule module) {
+        if (module instanceof OptionalModules.Both both) {
+            var first = findHaMessaging(both.first());
+            return first != null ? first : findHaMessaging(both.second());
+        }
+        try {
+            module.getClass().getMethod("installPinExhausted");
+            module.getClass().getMethod("installOversizedAbandoned");
+            return module;
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
     }
 
     private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,

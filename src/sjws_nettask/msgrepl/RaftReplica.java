@@ -171,6 +171,8 @@ final class RaftReplica implements Replica {
     private final AtomicLong snapshotsTaken = new AtomicLong();
     /** Times an install gave up after {@link #installPinRoundsLimit} divergent/unavailable peer rounds (#295). */
     private final AtomicLong installPinExhausted = new AtomicLong();
+    /** Times a consensus image was abandoned as oversized (#315 N2). */
+    private final AtomicLong installOversizedAbandoned = new AtomicLong();
     /**
      * Peer-round budget for one install before giving up (#295). Production uses
      * {@link Snapshots#DEFAULT_MAX_INSTALL_PIN_ROUNDS}; tests may lower it.
@@ -814,6 +816,21 @@ final class RaftReplica implements Replica {
         return this.installPinExhausted.get();
     }
 
+    /** @return times a consensus image was abandoned as oversized (#315 N2) */
+    long installOversizedAbandoned() {
+        return this.installOversizedAbandoned.get();
+    }
+
+    private void bumpInstallPinExhausted() {
+        this.installPinExhausted.incrementAndGet();
+        if (this.snaps != null) this.snaps.installPinExhausted.incrementAndGet();
+    }
+
+    private void bumpInstallOversizedAbandoned() {
+        this.installOversizedAbandoned.incrementAndGet();
+        if (this.snaps != null) this.snaps.installOversizedAbandoned.incrementAndGet();
+    }
+
     long snapshotsTaken() {
         return this.snapshotsTaken.get();
     }
@@ -1021,6 +1038,7 @@ final class RaftReplica implements Replica {
                 System.err.println("WARN: " + this.groupId.value() + ": install of " + m.dataBytes()
                         + " bytes exceeds ha.snapshot.max_install_bytes " + maxBytes
                         + "; abandoning install (marker kept for operator intervention)");
+                bumpInstallOversizedAbandoned();
                 return;
             }
             boolean fetched = false;
@@ -1056,7 +1074,7 @@ final class RaftReplica implements Replica {
                         System.err.println("WARN: " + this.groupId.value()
                                 + ": snapshot install gave up after " + rounds
                                 + " peer rounds with no matching pin; leaving install pending");
-                        this.installPinExhausted.incrementAndGet();
+                        bumpInstallPinExhausted();
                         return;
                     }
                     Thread.sleep(backoff);

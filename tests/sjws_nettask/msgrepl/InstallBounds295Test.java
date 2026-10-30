@@ -66,17 +66,21 @@ class InstallBounds295Test {
         assertTrue(pinned.dataBytes() > 1024, "fixture must exceed the tiny bound");
         long beforeChunks = server.chunksSent.get();
         var staging = dir.resolve("staging-over");
+        Files.createDirectories(staging);
+        // #315 N4: seed a leftover file so cleanup is asserted directly (not only via chunksSent).
+        var leftover = staging.resolve("leftover-from-prior-attempt.log");
+        Files.writeString(leftover, "junk");
         var e = assertThrows(SnapshotTransfer.Oversized.class,
                 () -> SnapshotTransfer.fetch(server.address(), KEY, "t", 7, staging, 1 << 20, now::get,
                         64L << 20, MsgSnapshot.MIN_CHUNK, 1024L, null));
         assertTrue(e.getMessage().contains("max_install_bytes"), e.getMessage());
         assertEquals(beforeChunks, server.chunksSent.get(), "no chunk body requested after oversized manifest");
         assertEquals(0, server.bytesSent.get(), "no segment bytes transferred");
-        if (Files.isDirectory(staging)) {
-            try (var stream = Files.list(staging)) {
-                assertEquals(0, stream.count(), "staging must not keep partial segment files");
-            }
+        assertTrue(Files.isDirectory(staging), "staging dir remains");
+        try (var stream = Files.list(staging)) {
+            assertEquals(0, stream.count(), "staging must be cleared after Oversized (#315 N4)");
         }
+        assertFalse(Files.exists(leftover), "seeded leftover must be deleted on Oversized abort");
     }
 
     /**

@@ -96,6 +96,8 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
      * @param installRate      install bytes per second each sending node allows, all sessions together
      * @param portOffset       the install listener's port is the member's Raft port plus this
      * @param logSegmentBytes  the consensus log rolls into a new file at this size, so truncation frees whole files
+     * @param maxInstallBytes  upper bound on bytes one follower install may write; {@code 0} is the explicit unlimited
+     *                         opt-in (#295 / #315)
      */
     public record Snapshot(long everyEntries, long logTailEntries, int chunkBytes, long installRate, int portOffset,
             long logSegmentBytes, long maxInstallBytes) {
@@ -203,18 +205,24 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
         var warnings = new ArrayList<String>();
         boolean replicate = decide(mode, haEnabled, nodeId, members, election, heartbeat, topics, plaintext,
                 warnings);
-        var snapshot = snapshot(ha.get("snapshot"));
+        var snapshot = snapshot(ha.get("snapshot"), warnings);
         return new HaMessagingSettings(mode, nodeId, members, election, heartbeat, stateDir, topics, plaintext,
                 replicate, warnings, snapshot);
     }
 
-    private static Snapshot snapshot(Object raw) {
+    private static Snapshot snapshot(Object raw, List<String> warnings) {
         if (raw == null) {
             return Snapshot.DEFAULT;
         }
         var map = YamlValues.mapping(raw, "ha.snapshot");
         YamlValues.knownKeys(map, SNAPSHOT_KEYS, "ha.snapshot");
         var d = Snapshot.DEFAULT;
+        long maxInstall = map.containsKey("max_install_bytes")
+                ? size(map.get("max_install_bytes"), "ha.snapshot.max_install_bytes") : d.maxInstallBytes();
+        // #315 N1: explicit 0 is unlimited — surface a startup WARN (default stays 4 GiB).
+        if (map.containsKey("max_install_bytes") && maxInstall == 0) {
+            warnings.add("ha.snapshot.max_install_bytes is 0 (unlimited): a follower will accept an install of any size");
+        }
         return new Snapshot(
                 map.containsKey("every_entries") ? count(map.get("every_entries"), "ha.snapshot.every_entries") : d.everyEntries(),
                 map.containsKey("log_tail_entries") ? count(map.get("log_tail_entries"), "ha.snapshot.log_tail_entries") : d.logTailEntries(),
@@ -222,7 +230,7 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
                 map.containsKey("install_rate") ? size(map.get("install_rate"), "ha.snapshot.install_rate") : d.installRate(),
                 map.containsKey("port_offset") ? (int) Math.min(Integer.MAX_VALUE, count(map.get("port_offset"), "ha.snapshot.port_offset")) : d.portOffset(),
                 map.containsKey("log_segment_bytes") ? size(map.get("log_segment_bytes"), "ha.snapshot.log_segment_bytes") : d.logSegmentBytes(),
-                map.containsKey("max_install_bytes") ? size(map.get("max_install_bytes"), "ha.snapshot.max_install_bytes") : d.maxInstallBytes());
+                maxInstall);
     }
 
 

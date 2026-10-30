@@ -70,6 +70,10 @@ public final class ServerMetrics {
     private volatile IntSupplier http1 = () -> 0;
     private volatile IntSupplier http3 = () -> 0;
     private volatile LongSupplier dropped = () -> 0;
+    /** #315: msgrepl install pin-round exhaustions; 0 until {@link #setMsgreplInstallCounters} attaches. */
+    private volatile LongSupplier msgreplInstallPinExhausted = () -> 0;
+    /** #315 N2: msgrepl oversized-install abandonments; 0 until attached. */
+    private volatile LongSupplier msgreplInstallOversizedAbandoned = () -> 0;
 
     public ServerMetrics() {
         for (int i = 0; i < this.byStatus.length; i++) {
@@ -94,6 +98,15 @@ public final class ServerMetrics {
 
     void setDropped(LongSupplier droppedLines) {
         this.dropped = droppedLines == null ? () -> 0 : droppedLines;
+    }
+
+    /**
+     * Attach msgrepl install counters (#315 N5). Suppliers are read only at snapshot/scrape time, never on the
+     * content request path. Null resets that series to 0. Attaching does not install the observe filter.
+     */
+    public void setMsgreplInstallCounters(LongSupplier pinExhausted, LongSupplier oversizedAbandoned) {
+        this.msgreplInstallPinExhausted = pinExhausted == null ? () -> 0 : pinExhausted;
+        this.msgreplInstallOversizedAbandoned = oversizedAbandoned == null ? () -> 0 : oversizedAbandoned;
     }
 
     /** Hot path: a handful of striped increments, no allocation. */
@@ -160,12 +173,17 @@ public final class ServerMetrics {
                         LATENCY_BOUNDS_NANOS, counts));
     }
 
-    /** Prometheus text exposition 0.0.4 of one {@link #snapshot()}. */
+    /** Prometheus text exposition 0.0.4 of one {@link #snapshot()}, plus attached msgrepl install counters (#315). */
     public String prometheus() {
-        return prometheus(snapshot());
+        return prometheus(snapshot(), this.msgreplInstallPinExhausted.getAsLong(),
+                this.msgreplInstallOversizedAbandoned.getAsLong());
     }
 
     static String prometheus(Snapshot snap) {
+        return prometheus(snap, 0L, 0L);
+    }
+
+    static String prometheus(Snapshot snap, long installPinExhausted, long installOversizedAbandoned) {
         var sb = new StringBuilder(1024);
         sb.append("# HELP sjws_http_requests_total Responses by status and protocol.\n");
         sb.append("# TYPE sjws_http_requests_total counter\n");
@@ -207,6 +225,13 @@ public final class ServerMetrics {
         sb.append("# HELP sjws_access_log_dropped_total Access-log lines dropped before they were written.\n");
         sb.append("# TYPE sjws_access_log_dropped_total counter\n");
         sb.append("sjws_access_log_dropped_total ").append(snap.accessLogDropped()).append('\n');
+        // #315 N5: msgrepl install observability (sibling style to access_log_dropped; always published, 0 until attached).
+        sb.append("# HELP sjws_msgrepl_install_pin_exhausted_total Snapshot installs that gave up after the divergent-pin round budget.\n");
+        sb.append("# TYPE sjws_msgrepl_install_pin_exhausted_total counter\n");
+        sb.append("sjws_msgrepl_install_pin_exhausted_total ").append(installPinExhausted).append('\n');
+        sb.append("# HELP sjws_msgrepl_install_oversized_abandoned_total Consensus snapshot installs abandoned because the image exceeded ha.snapshot.max_install_bytes.\n");
+        sb.append("# TYPE sjws_msgrepl_install_oversized_abandoned_total counter\n");
+        sb.append("sjws_msgrepl_install_oversized_abandoned_total ").append(installOversizedAbandoned).append('\n');
         return sb.toString();
     }
 }
