@@ -32,6 +32,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.ServerConfig;
+import sjws_nettask.core.Handler;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.security.cert.X509Certificate;
+import javax.net.ssl.X509TrustManager;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.SSLContext;
 import sjws_nettask.SjwsServer;
 import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.core.FilterDocument;
@@ -55,6 +63,9 @@ class ArmedFiltersSurviveReloadTest {
     @AfterEach
     void stop() {
         Http2StreamHandler.beforeDispatch = null;
+        Http2StreamHandler.afterHeadersCapture = null;
+        Http2StreamHandler.afterGenerationRead = null;
+        Http1FallbackHandler.beforeDispatch = null;
         if (this.server != null) {
             this.server.close();
             this.server = null;
@@ -173,6 +184,156 @@ class ArmedFiltersSurviveReloadTest {
         } finally {
             Http2StreamHandler.beforeDispatch = null;
         }
+    }
+
+
+    @Test
+    void apiKeySurvivesReloadOverH2Tls() throws Exception {
+        var www = Files.createDirectories(this.dir.resolve("www-tls"));
+        Files.writeString(www.resolve("hello.txt"), "hello");
+        var yaml = this.dir.resolve("sjws-tls.yaml");
+        writeStatic(yaml, www);
+
+        var loaded = ConfigLoader.load(new String[] {
+                "--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        this.server = SjwsServer.start(loaded);
+
+        var filters = RequestFilters.create();
+        GatewayFilters.install(filters);
+        var control = this.server.chainControl(filters, Set.of());
+        control.apply(FilterDocument.of(1, List.of(
+                FilterDocument.FilterEntry.of("api-key", 0, Map.of("keys", "secret", "header", "x-api-key"),
+                        FilterScope.all()))));
+
+        int h2 = ((Http2Server) this.server.h2()).port();
+        var client = trustAllH2Client();
+
+        assertEquals(401, getTls(client, h2, "/hello.txt", null).statusCode(), "api-key before reload (TLS)");
+        assertEquals(200, getTls(client, h2, "/hello.txt", "secret").statusCode());
+
+        var www2 = Files.createDirectories(this.dir.resolve("www-tls2"));
+        Files.writeString(www2.resolve("hello.txt"), "hello2");
+        writeStatic(yaml, www2);
+        assertTrue(this.server.reload().applied());
+
+        assertEquals(401, getTls(client, h2, "/hello.txt", null).statusCode(),
+                "api-key must still be enforced on h2 TLS after reload");
+        var after = getTls(client, h2, "/hello.txt", "secret");
+        assertEquals(200, after.statusCode());
+        assertEquals("hello2", after.body());
+    }
+
+    @Test
+    void apiKeySurvivesReloadWithStartupFilterOverride() throws Exception {
+        // Startup RequestFilters → override != null; publish must still armAround + defer close (B3).
+        var www = Files.createDirectories(this.dir.resolve("www-ov"));
+        Files.writeString(www.resolve("hello.txt"), "hello");
+        var yaml = this.dir.resolve("sjws-ov.yaml");
+        writeStatic(yaml, www);
+        var loaded = ConfigLoader.load(new String[] {
+                "--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var startup = RequestFilters.create().add((request, next) -> {
+            var response = next.proceed(request);
+            response.headers().set("x-startup", "1");
+            return response;
+        });
+        this.server = SjwsServer.start(loaded, startup);
+
+        var filters = RequestFilters.create();
+        GatewayFilters.install(filters);
+        var control = this.server.chainControl(filters, Set.of());
+        control.apply(FilterDocument.of(1, List.of(
+                FilterDocument.FilterEntry.of("api-key", 0, Map.of("keys", "secret", "header", "x-api-key"),
+                        FilterScope.all()))));
+
+        int h2c = ((Http2Server) this.server.h2()).h2cPort();
+        var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
+                .connectTimeout(Duration.ofSeconds(5)).build();
+
+        assertEquals(401, get(client, h2c, "/hello.txt", null).statusCode(),
+                "api-key with override before reload");
+        assertEquals(200, get(client, h2c, "/hello.txt", "secret").statusCode());
+
+        var www2 = Files.createDirectories(this.dir.resolve("www-ov2"));
+        Files.writeString(www2.resolve("hello.txt"), "hello2");
+        writeStatic(yaml, www2);
+        assertTrue(this.server.reload().applied());
+
+        assertEquals(401, get(client, h2c, "/hello.txt", null).statusCode(),
+                "api-key must survive reload when override != null (B3)");
+        var after = get(client, h2c, "/hello.txt", "secret");
+        assertEquals(200, after.statusCode());
+        assertEquals("hello2", after.body());
+    }
+
+    @Test
+    void http1FallbackPinsGenerationAcrossReload() throws Exception {
+        // B2: plain HTTP/1.1 on the h2c port uses Http1FallbackHandler enter/leave.
+        var www = Files.createDirectories(this.dir.resolve("www-fb"));
+        Files.writeString(www.resolve("hello.txt"), "hello");
+        var yaml = this.dir.resolve("sjws-fb.yaml");
+        writeStatic(yaml, www);
+        var loaded = ConfigLoader.load(new String[] {
+                "--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        this.server = SjwsServer.start(loaded);
+
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        Http1FallbackHandler.beforeDispatch = () -> {
+            entered.countDown();
+            try {
+                assertTrue(release.await(15, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        int h2c = ((Http2Server) this.server.h2()).h2cPort();
+        var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(Duration.ofSeconds(5)).build();
+
+        var future = client.sendAsync(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + h2c + "/hello.txt"))
+                        .timeout(Duration.ofSeconds(20)).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertTrue(entered.await(10, TimeUnit.SECONDS), "fallback Task must reach beforeDispatch");
+
+        var www2 = Files.createDirectories(this.dir.resolve("www-fb2"));
+        Files.writeString(www2.resolve("hello.txt"), "hello2");
+        writeStatic(yaml, www2);
+        assertTrue(this.server.reload().applied());
+
+        release.countDown();
+        var response = future.get(15, TimeUnit.SECONDS);
+        assertEquals(200, response.statusCode());
+        assertEquals(HttpClient.Version.HTTP_1_1, response.version());
+        assertEquals("hello", response.body(),
+                "Http1FallbackHandler must pin the pre-reload generation across publish (B2)");
+    }
+
+
+    private static HttpClient trustAllH2Client() throws Exception {
+        var tm = new X509TrustManager() {
+            public void checkClientTrusted(X509Certificate[] c, String a) {}
+            public void checkServerTrusted(X509Certificate[] c, String a) {}
+            public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+        };
+        var ctx = SSLContext.getInstance("TLS");
+        ctx.init(null, new TrustManager[] {tm}, null);
+        return HttpClient.newBuilder().version(HttpClient.Version.HTTP_2).sslContext(ctx)
+                .connectTimeout(Duration.ofSeconds(5)).build();
+    }
+
+    private static HttpResponse<String> getTls(HttpClient client, int port, String path, String apiKey)
+            throws Exception {
+        var b = HttpRequest.newBuilder(URI.create("https://127.0.0.1:" + port + path))
+                .timeout(Duration.ofSeconds(10)).GET();
+        if (apiKey != null) {
+            b.header("x-api-key", apiKey);
+        }
+        return client.send(b.build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private static void writeStatic(Path yaml, Path www) throws Exception {

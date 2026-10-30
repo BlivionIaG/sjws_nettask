@@ -40,16 +40,24 @@ class GenerationAndArmedAroundCoverageTest {
     }
 
     @Test
-    void generationWhenQuiescedRunsImmediatelyWhenIdleAndOnceOnLeave() {
+    void generationWhenQuiescedRunsImmediatelyWhenIdleAndRetires() {
         var g = new Http2Server.Generation(r -> null, false);
         var n = new AtomicInteger();
         g.whenQuiesced(n::incrementAndGet);
         assertEquals(1, n.get(), "idle generation fires whenQuiesced immediately");
+        assertTrue(g.retired());
+        assertFalse(g.tryEnter(), "retired generation rejects new pins (B1)");
+    }
 
-        g.enter();
+    @Test
+    void generationWhenQuiescedWaitsForInflightPinThenFiresOnLeave() {
+        var g = new Http2Server.Generation(r -> null, false);
+        assertTrue(g.tryEnter());
         var later = new AtomicInteger();
         g.whenQuiesced(later::incrementAndGet);
-        assertEquals(0, later.get());
+        assertEquals(0, later.get(), "inflight pin defers close");
+        assertTrue(g.retired());
+        assertFalse(g.tryEnter());
         g.leave();
         assertEquals(1, later.get());
     }

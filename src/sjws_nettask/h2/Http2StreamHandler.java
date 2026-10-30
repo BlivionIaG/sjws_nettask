@@ -80,6 +80,12 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
      */
     static volatile Runnable afterHeadersCapture;
 
+    /**
+     * Test-only: when non-null, runs after {@code generation()} and before {@link Http2Server.Generation#tryEnter}
+     * (B1 race). Production never sets it.
+     */
+    static volatile Runnable afterGenerationRead;
+
     static Request toRequest(Http2Headers h) {
         return toRequest(h, null, false, false);
     }
@@ -172,12 +178,24 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                     this.started = true;
                     var stream = (Http2StreamChannel) ctx.channel();
                     var headers = frame.headers();
-                    // One generation read for captureFields, body attach, enter, and Task (#301).
-                    var generation = this.shared.generation();
-                    var request = toRequest(headers, peer(stream), secure(stream), generation.attachBodies());
-                    var hook = afterHeadersCapture;
-                    if (hook != null) {
-                        hook.run();
+                    // Pin + captureFields from one Generation; retry if retired between read and tryEnter (B1).
+                    Http2Server.Generation generation;
+                    Request request;
+                    for (;;) {
+                        generation = this.shared.generation();
+                        var race = afterGenerationRead;
+                        if (race != null) {
+                            race.run();
+                        }
+                        if (!generation.tryEnter()) {
+                            continue;
+                        }
+                        request = toRequest(headers, peer(stream), secure(stream), generation.attachBodies());
+                        var hook = afterHeadersCapture;
+                        if (hook != null) {
+                            hook.run();
+                        }
+                        break;
                     }
                     start(stream, headers, request, frame.isEndStream(), generation);
                 } else if (frame.isEndStream() && this.body != null) {
@@ -217,18 +235,19 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
             Http2Server.Generation generation) {
         var budget = this.shared.budget(stream.parent());
         if (!budget.inflight().tryAcquire()) { // one connection can't take the whole server's share
+            generation.leave();
             this.shared.refused().increment();
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
             return;
         }
         if (!this.shared.inflight().tryAcquire()) {
             budget.inflight().release();
+            generation.leave();
             this.shared.refused().increment();
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
             return;
         }
-        // Same Generation instance captured in channelRead (not a second volatile read).
-        generation.enter();
+        // generation.tryEnter() already held in channelRead.
         // Only when bodies are enabled (chain / non-static terminal): static-only path stays zero-cost.
         if (generation.attachBodies() && !request.headOnly() && !"GET".equals(request.method())) {
             long length = contentLength(headers);

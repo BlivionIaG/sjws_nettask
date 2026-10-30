@@ -135,9 +135,13 @@ public final class Http2Server implements Transport {
      * {@link sjws_nettask.SjwsServer} can defer closing the previous snapshot's upstream pools (P2b).
      */
     public static final class Generation {
+        /** High bit: generation was replaced; new {@link #tryEnter} must fail and retry current. */
+        private static final int RETIRED = 1 << 31;
+
         private final Handler handler;
         private final boolean attachBodies;
-        private final AtomicInteger inflight = new AtomicInteger();
+        /** Low 31 bits = in-flight pins; {@link #RETIRED} set by {@link #whenQuiesced}. */
+        private final AtomicInteger state = new AtomicInteger();
         private final java.util.concurrent.atomic.AtomicReference<Runnable> onQuiesce =
                 new java.util.concurrent.atomic.AtomicReference<>();
 
@@ -154,22 +158,44 @@ public final class Http2Server implements Transport {
             return this.attachBodies;
         }
 
-        void enter() {
-            this.inflight.incrementAndGet();
+        /**
+         * Pin this generation for a Task. Fails when {@link #whenQuiesced} has retired it so a
+         * close cannot run while a stream has read this instance but not yet entered (B1).
+         */
+        boolean tryEnter() {
+            for (;;) {
+                int s = this.state.get();
+                if ((s & RETIRED) != 0) {
+                    return false;
+                }
+                if (this.state.compareAndSet(s, s + 1)) {
+                    return true;
+                }
+            }
         }
 
         void leave() {
-            if (this.inflight.decrementAndGet() == 0) {
+            int s = this.state.decrementAndGet();
+            if ((s & ~RETIRED) == 0) {
                 fireQuiesce();
             }
         }
 
-        /** Runs {@code action} once when in-flight Tasks drain (or immediately if already idle). */
+        /**
+         * Retires this generation (no new pins) and runs {@code action} once when in-flight pins
+         * drain (or immediately if already idle).
+         */
         public void whenQuiesced(Runnable action) {
             this.onQuiesce.set(Objects.requireNonNull(action, "action"));
-            if (this.inflight.get() == 0) {
+            int s = this.state.updateAndGet(v -> v | RETIRED);
+            if ((s & ~RETIRED) == 0) {
                 fireQuiesce();
             }
+        }
+
+        /** Test / diagnostics: whether {@link #whenQuiesced} has retired this generation. */
+        boolean retired() {
+            return (this.state.get() & RETIRED) != 0;
         }
 
         private void fireQuiesce() {
@@ -188,12 +214,15 @@ public final class Http2Server implements Transport {
     record Shared(Handler handler, ExecutorService executor, Semaphore inflight, Semaphore files,
             Duration writeTimeout, LongAdder refused, Limits limits,
             java.util.concurrent.atomic.AtomicReference<Generation> published,
-            boolean startupAttachBodies) {
+            Generation startup) {
 
-        /** Current generation, or a synthetic one from the startup handler. */
+        /**
+         * Current generation, or the stable startup generation (never allocate per call — enter/leave
+         * must track the same instance before the first {@link #armHandler}).
+         */
         Generation generation() {
             var g = this.published.get();
-            return g != null ? g : new Generation(this.handler, this.startupAttachBodies);
+            return g != null ? g : this.startup;
         }
 
         /** Startup handler, or the one published by a later arm. */
@@ -310,9 +339,10 @@ public final class Http2Server implements Transport {
             var ssl = sslContext(this.tls);
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h2-request-", 0).factory());
             this.perIp = new PerIpLimit(Math.min(this.config.maxConnectionsPerIp(), this.limits.maxConnectionsPerIp()));
-            this.shared = new Shared(this.handler, this.executor, new Semaphore(this.limits.maxInflight()),
+                        this.shared = new Shared(this.handler, this.executor, new Semaphore(this.limits.maxInflight()),
                     new Semaphore(this.limits.maxOpenFiles()), this.config.writeTimeout(), this.refused, this.limits,
-                    this.published, this.startupAttachBodies);
+                    this.published, new Generation(this.handler, this.startupAttachBodies));
+
             this.boss = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             this.workers = new MultiThreadIoEventLoopGroup(0, NioIoHandler.newFactory());
             this.tlsChannel = bind(this.config.h2Port(), new ChannelInitializer<SocketChannel>() {

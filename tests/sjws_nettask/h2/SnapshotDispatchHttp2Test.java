@@ -57,6 +57,7 @@ class SnapshotDispatchHttp2Test {
     void stop() {
         Http2StreamHandler.beforeDispatch = null;
         Http2StreamHandler.afterHeadersCapture = null;
+        Http2StreamHandler.afterGenerationRead = null;
         if (this.server != null) {
             this.server.close();
             this.server = null;

@@ -358,6 +358,11 @@ public final class SjwsServer implements AutoCloseable {
         return start(loaded, H3Transports.defaultFactory());
     }
 
+    /** Config-file startup with a startup {@link RequestFilters} chain ({@code override != null}). */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, RequestFilters filters) throws IOException {
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, filters, null, null);
+    }
+
     /**
      * Config-file startup with prefix mounts. Routing, when enabled, stays the fallback behind
      * the mounts. A null list still discovers {@link HandlerContributor} service providers.
@@ -526,11 +531,16 @@ public final class SjwsServer implements AutoCloseable {
         try {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
-            if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-                // Pin a fully armed generation (filters + metrics around the snapshot terminal) so
-                // each stream's Task captures one handler with its attachBodies decision (#301).
-                var pinned = this.live.handler();
-                http2.armHandler(armedAround(pinned), liveNeedsBodies());
+            if (transport instanceof sjws_nettask.h2.Http2Server http2) {
+                // Pin a fully armed generation (filters + metrics around the snapshot terminal, or
+                // around a frozen override) so each Task captures one handler (#301 / B3).
+                Handler pinned = this.override != null ? this.override : this.live.handler();
+                Handler armed = armedAround(pinned);
+                boolean bodies = liveNeedsBodies() || this.override != null;
+                http2.armHandler(armed, bodies);
+                if (this.armed.get() != null) {
+                    this.armed.set(armed);
+                }
             }
             transport.start();
             this.h2 = transport;
@@ -840,11 +850,13 @@ public final class SjwsServer implements AutoCloseable {
         // P1/P2a). In-flight Tasks keep the generation they captured; defer closing replaced pools
         // until those Tasks leave (P2b).
         sjws_nettask.h2.Http2Server.Generation previousH2 = null;
-        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-            Handler terminal = next.handler();
+        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
+            // Override path must also publish an armed generation and drain the previous one (B3).
+            Handler terminal = this.override != null ? this.override : next.handler();
             Handler armed = armedAround(terminal);
             // control.isLive always sets this.armed via armSnapshot.
-            boolean bodies = !(terminal instanceof StaticFileHandler) || this.armed.get() != null;
+            boolean bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null
+                    || this.override != null;
             previousH2 = http2.armHandler(armed, bodies);
             // Keep SjwsServer.armed aligned with the pinned generation when filters/metrics are on.
             if (this.armed.get() != null) {
@@ -948,6 +960,10 @@ public final class SjwsServer implements AutoCloseable {
     /**
      * After swapping away {@code previous}, close {@code replaced} when its pinned h2 Tasks drain,
      * with a bounded wait so close cannot hang forever (P2b).
+     *
+     * <p><b>Operator note:</b> in-flight proxy work pinned to a replaced generation can be cut after
+     * 30 seconds (forced drain). Errors from that path must stay free of secret material. Rapid
+     * reloads can retain several replaced generations (and their upstream pools) for up to 30 s each.
      */
     void deferSnapshotClose(sjws_nettask.h2.Http2Server.Generation previous,
             ConfigSnapshot replaced) {
@@ -973,6 +989,11 @@ public final class SjwsServer implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 return;
             }
+            if (once.get()) {
+                return;
+            }
+            System.err.println("WARN: forcing close of replaced config snapshot after 30s drain "
+                    + "(in-flight h2 work on the previous generation was cut; errors must not leak secrets)");
             close.run();
         });
     }

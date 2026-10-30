@@ -47,10 +47,14 @@ import sjws_nettask.http1.Http1Writer;
  * HTTP/1.1 on the HTTP/2 listener: TLS clients that don't offer h2 in ALPN, and h2c-port clients
  * that neither upgrade nor send the prior-knowledge preface. Requests on a connection are served one
  * at a time (reading pauses while a response is written), through the same core handler and
- * {@link ResponseWriter}. This is not the main HTTP/1.1 server ({@code Http1Connection}), which is
- * untouched by HTTP/2.
+ * {@link ResponseWriter}. Pins the published {@link Http2Server.Generation} with enter/leave so
+ * deferred snapshot close waits for fallback work too (B2 / #301). This is not the main HTTP/1.1
+ * server ({@code Http1Connection}), which is untouched by HTTP/2.
  */
 final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
+
+    /** Test-only: runs in {@link Task#run} before the handler (B2). Production never sets it. */
+    static volatile Runnable beforeDispatch;
 
     /** Pipelined requests decoded in the same read as one being served (they are answered in order). */
     static final int MAX_PIPELINED = 16;
@@ -107,7 +111,16 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
 
     private void run(Task task) {
         this.busy = true;
+        Http2Server.Generation generation;
+        for (;;) {
+            generation = this.shared.generation();
+            if (generation.tryEnter()) {
+                break;
+            }
+        }
+        task.generation = generation;
         if (!this.shared.inflight().tryAcquire()) { // the same server-wide cap as HTTP/2 streams
+            generation.leave();
             this.shared.refused().increment();
             task.channel.writeAndFlush(unavailable()).addListener(ChannelFutureListener.CLOSE);
             return;
@@ -116,6 +129,7 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
             this.shared.executor().execute(task);
         } catch (RejectedExecutionException e) {
             this.shared.inflight().release();
+            generation.leave();
             task.channel.close();
         }
     }
@@ -167,6 +181,8 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
         private final Request request;
         private final Response refusal;
         private final boolean keepAlive;
+        /** Set in {@link #run(Task)} after {@link Http2Server.Generation#tryEnter}. */
+        Http2Server.Generation generation;
 
         Task(Channel channel, Request request, Response refusal, boolean keepAlive) {
             this.channel = channel;
@@ -182,10 +198,14 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
             this.channel.closeFuture().addListener(interrupt);
             ResponseWriter.Outcome outcome = ResponseWriter.Outcome.FAILED;
             try {
+                var gate = beforeDispatch;
+                if (gate != null) {
+                    gate.run();
+                }
                 Response response;
                 try {
                     response = this.refusal != null ? this.refusal
-                            : Http1FallbackHandler.this.shared.live().handle(this.request);
+                            : this.generation.handler().handle(this.request);
                 } catch (RuntimeException e) {
                     response = StaticFileHandler.error(500, this.request.headOnly());
                 }
@@ -194,6 +214,9 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
                         shared.limits().fileWait(), shared.writeTimeout()).write(response);
             } finally {
                 Http1FallbackHandler.this.shared.inflight().release();
+                if (this.generation != null) {
+                    this.generation.leave();
+                }
                 this.channel.closeFuture().removeListener(interrupt);
                 if (outcome == ResponseWriter.Outcome.COMPLETE && this.keepAlive && this.refusal == null) {
                     this.channel.eventLoop().execute(() -> next(this.channel));
