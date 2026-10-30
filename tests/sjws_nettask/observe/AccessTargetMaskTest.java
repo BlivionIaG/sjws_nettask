@@ -262,6 +262,88 @@ class AccessTargetMaskTest {
         }
     }
 
+    /**
+     * After a live control document removes or adds {@code api-key}, a following config reload must
+     * not resurrect startup/middleware names or drop the document's names. Mask sync is keyed to
+     * {@code armSnapshot}/{@link FilterDocument}, not the startup override (#302 chainLeaf rebind).
+     */
+    @Test
+    void controlDocRemoveOrAddThenReloadKeepsDocumentOwnedNames() throws Exception {
+        Files.writeString(dir.resolve("index.html"), "ok");
+        var log = dir.resolve("cp-reload.log");
+        var yaml = dir.resolve("sjws-cp-reload.yaml");
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: %s
+                  access_log: %s
+                middleware:
+                  - name: api-key
+                    options:
+                      keys: %s
+                      query: from_mw
+                """.formatted(dir.toAbsolutePath(), log.toAbsolutePath(), SECRET));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded)) {
+            var control = server.chainControl(GatewayFilters.install(RequestFilters.create()), Set.of());
+
+            // Add via control document: masks from_doc, not from_mw.
+            control.apply(FilterDocument.of(1, List.of(
+                    FilterDocument.FilterEntry.of("api-key", 0,
+                            Map.of("keys", SECRET, "query", "from_doc"), FilterScope.all()))));
+            get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&add=1");
+            var added = lineContaining(awaitLog(log, "add=1"), "add=1");
+            assertTrue(added.contains("from_doc=***"), added);
+            assertTrue(added.contains("from_mw=" + SECRET), added);
+
+            // Reload still advertises from_mw in middleware; document names must stay.
+            Files.writeString(yaml, """
+                    server:
+                      port: 0
+                      root: %s
+                      access_log: %s
+                    middleware:
+                      - name: api-key
+                        options:
+                          keys: %s
+                          query: from_mw
+                    """.formatted(dir.toAbsolutePath(), log.toAbsolutePath(), SECRET));
+            assertTrue(server.reload().applied());
+            get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&after-add=1");
+            var afterAdd = lineContaining(awaitLog(log, "after-add=1"), "after-add=1");
+            assertTrue(afterAdd.contains("from_doc=***"), afterAdd);
+            assertFalse(afterAdd.contains("from_doc=" + SECRET), afterAdd);
+            assertTrue(afterAdd.contains("from_mw=" + SECRET), afterAdd);
+
+            // Remove via empty control document: no masking.
+            control.apply(FilterDocument.empty(2));
+            get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&cleared=1");
+            var cleared = lineContaining(awaitLog(log, "cleared=1"), "cleared=1");
+            assertTrue(cleared.contains("from_doc=" + SECRET), cleared);
+            assertTrue(cleared.contains("from_mw=" + SECRET), cleared);
+
+            // Reload must not resurrect from_mw (or any middleware query name) after the clear.
+            Files.writeString(yaml, """
+                    server:
+                      port: 0
+                      root: %s
+                      access_log: %s
+                    middleware:
+                      - name: api-key
+                        options:
+                          keys: %s
+                          query: from_mw
+                    """.formatted(dir.toAbsolutePath(), log.toAbsolutePath(), SECRET));
+            assertTrue(server.reload().applied());
+            get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&after-clear=1");
+            var afterClear = lineContaining(awaitLog(log, "after-clear=1"), "after-clear=1");
+            assertTrue(afterClear.contains("from_doc=" + SECRET), afterClear);
+            assertTrue(afterClear.contains("from_mw=" + SECRET), afterClear);
+            assertFalse(afterClear.contains("***"), afterClear);
+        }
+    }
+
     @Test
     void accessLogMasksQueryAcrossFormatsAndReloadClears() throws Exception {
         Files.writeString(dir.resolve("index.html"), "ok");
@@ -405,6 +487,15 @@ class AccessTargetMaskTest {
         // With api-key filter the header also works; without filter, 200 from static file.
         assertTrue(response.statusCode() == 200 || response.statusCode() == 401,
                 "status=" + response.statusCode());
+    }
+
+    private static String lineContaining(String text, String needle) {
+        for (var line : text.split("\n")) {
+            if (line.contains(needle)) {
+                return line;
+            }
+        }
+        return text;
     }
 
     private static String awaitLog(Path log, String needle) throws IOException {

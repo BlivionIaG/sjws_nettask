@@ -1043,12 +1043,16 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     /**
-     * Refresh access-log credential query names from the config {@code middleware} list when no
-     * {@link ChainControl} is installed. Once {@link #chainControl} has been created it owns the
-     * names via {@link #armSnapshot} on every apply, including before the first document.
+     * Refresh access-log credential query names from the config {@code middleware} list only while
+     * no live {@link ChainControl} document owns them. Once {@link #chainControl} has published
+     * (isLive), names come solely from {@link #armSnapshot} via the effective
+     * {@link sjws_nettask.core.FilterDocument} — never from the startup override or a later
+     * config middleware list — so a control-plane remove/add of {@code api-key} cannot leave
+     * stale names or resurrect ones the document cleared (#302 chainLeaf rebind).
      */
     private void syncCredentialQueryParamsFromConfig(sjws_nettask.config.ConfigDocument document) {
-        if (this.control != null) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
             return;
         }
         this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
@@ -1057,9 +1061,12 @@ public final class SjwsServer implements AutoCloseable {
     /**
      * Stores the compiled snapshot where every transport already reads its handler. One volatile
      * write per transport; the request path does not enter {@link ChainControl}.
+     * Credential query names are refreshed from {@code control.document()} (the FilterDocument
+     * just applied), not from startup middleware / override.
      */
     private void armSnapshot(Handler handler) {
-        // onPublish runs only after {@link #chainControl} assigned {@link #control}.
+        // onPublish runs only after {@link #chainControl} assigned {@link #control}, and after
+        // apply/pinOuter has written {@link ChainControl#document()}.
         this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromDocument(this.control.document()));
         this.armed.set(handler);
         if (this.h3 != null) {
