@@ -392,7 +392,17 @@ final class LogTopics implements AutoCloseable {
             if (l == null) {
                 var rep = this.replicator;
                 var log = SegmentedLog.open(this.dir.resolve(topic), this.segmentBytes);
-                var writer = new LedgerWriter(log, durability(topic));
+                LedgerWriter writer;
+                try {
+                    writer = new LedgerWriter(log, durability(topic));
+                } catch (RuntimeException e) {
+                    try {
+                        log.close();
+                    } catch (IOException closing) {
+                        e.addSuppressed(closing);
+                    }
+                    throw e;
+                }
                 var reads = new java.util.concurrent.locks.ReentrantReadWriteLock();
                 sjws_nettask.messaging.ledger.Replica replica = null;
                 // A topic outside ha.topics (and __offsets_local) keeps the plain local path: no replica, no 503.

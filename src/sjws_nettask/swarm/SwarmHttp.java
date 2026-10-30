@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import sjws_nettask.messaging.ledger.LedgerBudgetExhaustedException;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
@@ -55,6 +56,8 @@ import sjws_nettask.swarm.wire.Frame;
  * A lease id is {@code pool~offset~attempt}, so the attempt (the fencing token) always travels with it.
  */
 final class SwarmHttp implements Handler {
+
+    private static final System.Logger LOG = System.getLogger(SwarmHttp.class.getName());
 
     static final String PREFIX = "/swarm/v1/";
     static final String CONTENT_TYPE = "application/vnd.sjws.swarm.v1";
@@ -188,6 +191,12 @@ final class SwarmHttp implements Handler {
             return problem(400, "bad request", e.getMessage()).response();
         } catch (IllegalArgumentException e) {
             return problem(400, "bad request", e.getMessage()).response();
+        } catch (LedgerBudgetExhaustedException e) {
+            // #246 / #335 B2: generic detail; budget numbers only in the server log.
+            LOG.log(System.Logger.Level.DEBUG, () -> "ledger writer budget exhausted: " + e.getMessage());
+            var r = problem(503, "busy", "ledger writer budget exhausted").response();
+            r.headers().set("retry-after", "1");
+            return r;
         }
     }
 
