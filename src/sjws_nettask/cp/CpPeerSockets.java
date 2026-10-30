@@ -66,6 +66,10 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
     static final long LOG_EVERY_NANOS = 60_000_000_000L;
     private static final System.Logger LOG = System.getLogger(CpPeerSockets.class.getName());
 
+    /** Pinned peer plus the abort handle that unblocks a stalled TLS write without waiting on SSLSocket.close. */
+    private record Live(CpConfig.Peer expected, Socket abort) {
+    }
+
     private final CpServerTls tls;
     private volatile List<CpConfig.Peer> peers;
     private volatile CpConfig.Peer self;
@@ -73,8 +77,16 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
     private final AtomicLong reloadRefused = new AtomicLong();
     private final AtomicLong policyDropped = new AtomicLong();
     private final AtomicLong loggedNanos = new AtomicLong(System.nanoTime() - LOG_EVERY_NANOS);
-    /** Open peer sockets still subject to policy after reload; value is the pinned peer they must keep naming. */
-    private final ConcurrentHashMap<SSLSocket, CpConfig.Peer> live = new ConcurrentHashMap<>();
+    /** Bumped at the start of every {@link #dropPeersFailingPolicy} so registration cannot escape a concurrent reload. */
+    private final AtomicLong tlsEpoch = new AtomicLong();
+    /** Open peer sockets still subject to policy after reload; value holds the pin and the abort handle. */
+    private final ConcurrentHashMap<SSLSocket, Live> live = new ConcurrentHashMap<>();
+    /**
+     * Test hook: runs once after a successful policy check and before {@code live.put}, so a test can fire
+     * {@code reloadTls} in the handshake/register window.
+     */
+    volatile Runnable betweenValidateAndRegister = () -> {
+    };
 
     /**
      * @param peers every {@code cp.peers} entry, this voter included; each must pin a {@code san}
@@ -178,25 +190,42 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
 
     @Override
     public Socket connect(InetSocketAddress to) throws IOException {
+        return dial(to).socket();
+    }
+
+    /**
+     * Dial with TLS layered over a plain abort handle: an {@code SSLSocket}'s own {@code close()} waits for the TLS
+     * output lock a blocked writer holds; the plain socket's {@code close()} never does.
+     */
+    @Override
+    public TcpTransport.SocketFactory.Connected dial(InetSocketAddress to) throws IOException {
         var expected = at(to);
         if (expected == null || expected.equals(self)) {
             throw new IOException("cp-peer: no pinned voter at " + to);
         }
-        var socket = (SSLSocket) tls.context().getSocketFactory().createSocket();
+        var plain = new Socket();
+        SSLSocket socket;
+        try {
+            plain.setTcpNoDelay(true);
+            plain.connect(to, CONNECT_TIMEOUT_MILLIS);
+            socket = (SSLSocket) tls.context().getSocketFactory().createSocket(plain, to.getHostString(), to.getPort(),
+                    true);
+        } catch (IOException | RuntimeException e) {
+            plain.close();
+            throw e;
+        }
         try {
             socket.setSSLParameters(tls.parameters());
-            socket.setTcpNoDelay(true);
-            socket.connect(to, CONNECT_TIMEOUT_MILLIS);
             socket.setSoTimeout(HANDSHAKE_TIMEOUT_MILLIS);
             socket.startHandshake();
             socket.setSoTimeout(0);
-            enforcePolicy(socket, false, expected);
-            live.put(socket, expected);
+            registerLive(socket, expected, plain, false);
         } catch (IOException | RuntimeException e) {
+            abortClose(plain);
             closeQuietly(socket);
             throw e;
         }
-        return socket;
+        return new TcpTransport.SocketFactory.Connected(socket, plain);
     }
 
     /**
@@ -247,14 +276,34 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
     @Override
     public int peerWire(Socket accepted) {
         var ssl = (SSLSocket) accepted;
-        var named = identify(ssl);
-        if (named == null || named.equals(self)) {
-            refused("an accepted connection's certificate names no other pinned voter");
+        try {
+            // Accepted sockets have no separate plain abort handle; abort is the SSLSocket itself.
+            return registerLive(ssl, null, ssl, true).wire();
+        } catch (IOException e) {
             closeQuietly(ssl);
-            throw new IllegalStateException("cp-peer certificate names no other pinned voter");
+            throw new IllegalStateException("cp-peer certificate names no other pinned voter", e);
         }
-        live.put(ssl, named);
-        return named.wire();
+    }
+
+    /**
+     * Revalidate and pin under the current TLS epoch, then put into {@link #live}. If a reload bumps the epoch
+     * between the check and the put, retry so the connection cannot escape both the new-policy check and the reload
+     * sweep.
+     */
+    private CpConfig.Peer registerLive(SSLSocket socket, CpConfig.Peer expected, Socket abort, boolean peerIsClient)
+            throws IOException {
+        CpConfig.Peer named;
+        long epoch;
+        do {
+            epoch = tlsEpoch.get();
+            named = enforcePolicy(socket, peerIsClient, expected);
+            var mid = betweenValidateAndRegister;
+            betweenValidateAndRegister = () -> {
+            };
+            mid.run();
+            live.put(socket, new Live(named, abort));
+        } while (tlsEpoch.get() != epoch);
+        return named;
     }
 
     /**
@@ -287,11 +336,12 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
 
     /** After reload or pin change: close every live peer that fails current policy. */
     void dropPeersFailingPolicy() {
+        tlsEpoch.incrementAndGet();
         for (var entry : List.copyOf(live.entrySet())) {
             var socket = entry.getKey();
-            var expected = entry.getValue();
+            var peer = entry.getValue();
             if (socket.isClosed()) {
-                live.remove(socket, expected);
+                live.remove(socket, peer);
                 continue;
             }
             // Accepted sockets are server-mode; dialled sockets are client-mode.
@@ -300,14 +350,18 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
                 // Silent here: we WARN once below with policyDropped.
                 tls.revalidatePeer(socket, peerIsClient);
                 var named = identify(socket);
-                if (named == null || !named.equals(expected)) {
-                    throw new IOException("cp-peer no longer matches pinned san of " + expected.id());
+                if (named == null || !named.equals(peer.expected())) {
+                    throw new IOException("cp-peer no longer matches pinned san of " + peer.expected().id());
                 }
             } catch (IOException | RuntimeException failed) {
                 policyDropped.incrementAndGet();
                 warnPolicy(socket, String.valueOf(failed.getMessage()));
-                closeQuietly(socket);
-                live.remove(socket, expected);
+                // Abort handle first: SSLSocket.close waits on the TLS write lock a blocked writer holds.
+                abortClose(peer.abort());
+                if (peer.abort() != socket) {
+                    closeQuietly(socket);
+                }
+                live.remove(socket, peer);
             }
         }
     }
@@ -338,6 +392,16 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         if (now - last >= LOG_EVERY_NANOS && loggedNanos.compareAndSet(last, now)) {
             LOG.log(System.Logger.Level.WARNING, "cp-peer: {0}; connection closed ({1} so far)", why, n);
         }
+    }
+
+    /** Closes the abort handle with linger 0 (immediate reset), never waiting behind a blocked TLS write. */
+    private static void abortClose(Socket abort) {
+        try {
+            abort.setSoLinger(true, 0);
+        } catch (IOException | RuntimeException ignored) {
+            // closing
+        }
+        closeQuietly(abort);
     }
 
     private static void closeQuietly(Socket socket) {

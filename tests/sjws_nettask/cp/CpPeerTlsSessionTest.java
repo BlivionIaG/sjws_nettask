@@ -479,4 +479,136 @@ class CpPeerTlsSessionTest {
             assertTrue(got.isEmpty(), "no application frame accepted after a refused handshake");
         }
     }
+
+    /**
+     * A dialled CP peer blocked in a TLS write must not stall {@code reloadTls}: the live entry keeps the plain
+     * abort handle and closes it before the SSLSocket.
+     */
+    @Test
+    void reloadTlsDropsBlockedDialWriterWithoutHang() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-abort"));
+        var deny = denylist("abort-deny");
+        var serverTls = CpTls.peerContext(ca.peer("a"));
+        var serverSerial = ca.lastSerial();
+        var dialerTls = CpTls.peerContext(peer(ca, "b", deny));
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.abort", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(serverTls, port, "a");
+            var dialer = new CpPeerSockets(dialerTls, List.of(
+                    new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", port), false, CpTestCa.san("a")),
+                    new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", 1), false, CpTestCa.san("b"))), "b");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        server.handshake(ssl, 5_000);
+                        server.peerWire(ssl);
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var connected = dialer.dial(new InetSocketAddress("127.0.0.1", port));
+                var serverSsl = accepted.get(10, TimeUnit.SECONDS);
+                var blocked = new AtomicBoolean();
+                var writer = Thread.ofVirtual().name("cp-blocked-tls-write").start(() -> {
+                    try {
+                        var buf = new byte[64 * 1024];
+                        var out = connected.socket().getOutputStream();
+                        for (int i = 0; i < 256; i++) {
+                            blocked.set(true);
+                            out.write(buf);
+                            out.flush();
+                        }
+                    } catch (IOException expected) {
+                        // aborted
+                    }
+                });
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (!blocked.get() && System.nanoTime() < deadline) {
+                    Thread.onSpinWait();
+                }
+                assertTrue(blocked.get(), "writer reached a TLS write");
+                Thread.sleep(50);
+                Files.writeString(deny, "serial:" + serverSerial.toString(16) + "\n");
+                long before = dialer.policyDropped();
+                long start = System.nanoTime();
+                dialerTls.reloadTls();
+                long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                assertTrue(tookMs < 3_000, "reloadTls must not hang behind a blocked TLS write; took " + tookMs + " ms");
+                assertTrue(dialer.policyDropped() > before, "dialer drops the blocked peer");
+                writer.join(3_000);
+                assertFalse(writer.isAlive(), "blocked writer unblocked by abort");
+                serverSsl.close();
+            }
+            return null;
+        });
+    }
+
+    /**
+     * A reload between handshake revalidation and peerWire registration must still refuse the peer (epoch
+     * coordination).
+     */
+    @Test
+    void peerWireRefusesWhenReloadBetweenValidateAndRegister() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-toc"));
+        var deny = denylist("toc-deny");
+        var acceptorTls = CpTls.peerContext(peer(ca, "a", deny));
+        var clientCfg = ca.peer("b");
+        var clientSerial = ca.lastSerial();
+        var dialerTls = CpTls.peerContext(clientCfg);
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.toc", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(acceptorTls, port, "a");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var outcome = new CompletableFuture<Exception>();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        server.handshake(ssl, 5_000);
+                        server.betweenValidateAndRegister = () -> {
+                            try {
+                                Files.writeString(deny, "serial:" + clientSerial.toString(16) + "\n");
+                                acceptorTls.reloadTls();
+                            } catch (Exception e) {
+                                throw new RuntimeException(e);
+                            }
+                        };
+                        try {
+                            server.peerWire(ssl);
+                            outcome.complete(null);
+                        } catch (Exception e) {
+                            outcome.complete(e);
+                        } finally {
+                            try {
+                                ssl.close();
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    } catch (Exception e) {
+                        outcome.completeExceptionally(e);
+                    }
+                });
+                Exception dialErr = null;
+                try {
+                    var client = (SSLSocket) dialerTls.context().getSocketFactory().createSocket();
+                    client.setSSLParameters(dialerTls.parameters());
+                    client.connect(new InetSocketAddress("127.0.0.1", port), CpPeerSockets.CONNECT_TIMEOUT_MILLIS);
+                    client.startHandshake();
+                    // Brief wait so acceptor can run peerWire under the hook.
+                    Thread.sleep(200);
+                    client.close();
+                } catch (Exception e) {
+                    dialErr = e;
+                }
+                var err = outcome.get(15, TimeUnit.SECONDS);
+                assertNotNull(err, "peerWire must refuse when reloadTls revokes between validate and register"
+                        + (dialErr == null ? "" : "; dial also failed: " + dialErr));
+            }
+            return null;
+        });
+    }
 }

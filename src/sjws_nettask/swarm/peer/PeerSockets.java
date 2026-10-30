@@ -45,9 +45,11 @@ import sjws_nettask.cp.CpServerTls;
  * <li>dialing side: the server certificate must carry the SAN pinned for the node at the dialled address, or the
  * connection is closed before any frame is written.</li>
  * </ul>
- * After every handshake the peer is re-checked against the current trust, revocation and pin policy before any
- * application byte is read or written. A successful {@link CpServerTls#reloadTls()} re-checks established peer
- * connections and closes any that no longer pass. Only URI and DNS SANs count (no CN fallback).
+ * {@link PeerConfig} is fixed at construction: the pin table is never updated in place (the field is volatile only for
+ * safe publication); a swarm pin change needs a reconfig that builds a new {@code PeerSockets}. After every handshake
+ * the peer is re-checked against the current trust, revocation and pin policy before any application byte is read or
+ * written. A successful {@link CpServerTls#reloadTls()} re-checks established peer connections and closes any that no
+ * longer pass. Only URI and DNS SANs count (no CN fallback).
  */
 final class PeerSockets implements TcpTransport.SocketFactory {
 
@@ -56,12 +58,24 @@ final class PeerSockets implements TcpTransport.SocketFactory {
     private static final System.Logger LOG = System.getLogger(PeerSockets.class.getName());
     private static final long LOG_EVERY_NANOS = 60_000_000_000L;
 
+    /** Pinned node plus the abort handle that unblocks a stalled TLS write without waiting on SSLSocket.close. */
+    private record Live(PeerConfig.Node expected, Socket abort) {
+    }
+
     private final CpServerTls tls;
     private volatile PeerConfig config;
     private final AtomicLong identityRefused = new AtomicLong();
     private final AtomicLong policyDropped = new AtomicLong();
     private final AtomicLong loggedNanos = new AtomicLong(System.nanoTime() - LOG_EVERY_NANOS);
-    private final ConcurrentHashMap<SSLSocket, PeerConfig.Node> live = new ConcurrentHashMap<>();
+    /** Bumped at the start of every {@link #dropPeersFailingPolicy} so registration cannot escape a concurrent reload. */
+    private final AtomicLong tlsEpoch = new AtomicLong();
+    private final ConcurrentHashMap<SSLSocket, Live> live = new ConcurrentHashMap<>();
+    /**
+     * Test hook: runs once after a successful policy check and before {@code live.put}, so a test can fire
+     * {@code reloadTls} in the handshake/register window.
+     */
+    volatile Runnable betweenValidateAndRegister = () -> {
+    };
 
     PeerSockets(CpServerTls tls, PeerConfig config) {
         this.tls = Objects.requireNonNull(tls, "tls");
@@ -109,6 +123,8 @@ final class PeerSockets implements TcpTransport.SocketFactory {
         if (expected == null || expected.equals(config.self())) {
             throw new IOException("no pinned swarm peer at " + to);
         }
+        // TLS layered over a plain socket that dial() returns as the abort handle: an SSLSocket's own close()
+        // waits for the TLS output lock a blocked writer holds, the plain socket's close() never does.
         var plain = new Socket();
         SSLSocket socket;
         try {
@@ -125,10 +141,9 @@ final class PeerSockets implements TcpTransport.SocketFactory {
             socket.setSoTimeout(TcpTransport.HANDSHAKE_TIMEOUT_MILLIS);
             socket.startHandshake();
             socket.setSoTimeout(0);
-            enforcePolicy(socket, false, expected);
-            live.put(socket, expected);
+            registerLive(socket, expected, plain, false);
         } catch (IOException | RuntimeException e) {
-            plain.close();
+            abortClose(plain);
             closeQuietly(socket);
             throw e;
         }
@@ -176,19 +191,34 @@ final class PeerSockets implements TcpTransport.SocketFactory {
     @Override
     public int peerWire(Socket accepted) {
         var ssl = (SSLSocket) accepted;
-        PeerConfig.Node node;
         try {
-            node = identify(ssl);
-        } catch (IOException unverified) {
-            node = null;
-        }
-        if (node == null || node.equals(config.self())) {
-            identityRefused.incrementAndGet();
+            // Accepted sockets have no separate plain abort handle; abort is the SSLSocket itself.
+            return registerLive(ssl, null, ssl, true).wire();
+        } catch (IOException e) {
             closeQuietly(ssl);
-            throw new IllegalStateException("swarm peer certificate carries no pinned peer identity");
+            throw new IllegalStateException("swarm peer certificate carries no pinned peer identity", e);
         }
-        live.put(ssl, node);
-        return node.wire();
+    }
+
+    /**
+     * Revalidate and pin under the current TLS epoch, then put into {@link #live}. If a reload bumps the epoch
+     * between the check and the put, retry so the connection cannot escape both the new-policy check and the reload
+     * sweep.
+     */
+    private PeerConfig.Node registerLive(SSLSocket socket, PeerConfig.Node expected, Socket abort,
+            boolean peerIsClient) throws IOException {
+        PeerConfig.Node named;
+        long epoch;
+        do {
+            epoch = tlsEpoch.get();
+            named = enforcePolicy(socket, peerIsClient, expected);
+            var mid = betweenValidateAndRegister;
+            betweenValidateAndRegister = () -> {
+            };
+            mid.run();
+            live.put(socket, new Live(named, abort));
+        } while (tlsEpoch.get() != epoch);
+        return named;
     }
 
     private PeerConfig.Node enforcePolicy(SSLSocket socket, boolean peerIsClient, PeerConfig.Node expected)
@@ -215,25 +245,30 @@ final class PeerSockets implements TcpTransport.SocketFactory {
     }
 
     void dropPeersFailingPolicy() {
+        tlsEpoch.incrementAndGet();
         for (var entry : List.copyOf(live.entrySet())) {
             var socket = entry.getKey();
-            var expected = entry.getValue();
+            var peer = entry.getValue();
             if (socket.isClosed()) {
-                live.remove(socket, expected);
+                live.remove(socket, peer);
                 continue;
             }
             boolean peerIsClient = !socket.getUseClientMode();
             try {
                 tls.revalidatePeer(socket, peerIsClient);
                 var named = identify(socket);
-                if (named == null || !named.equals(expected)) {
-                    throw new IOException("swarm peer no longer matches pinned identity of " + expected.name());
+                if (named == null || !named.equals(peer.expected())) {
+                    throw new IOException("swarm peer no longer matches pinned identity of " + peer.expected().name());
                 }
             } catch (IOException | RuntimeException failed) {
                 policyDropped.incrementAndGet();
                 warnPolicy(socket, String.valueOf(failed.getMessage()));
-                closeQuietly(socket);
-                live.remove(socket, expected);
+                // Abort handle first: SSLSocket.close waits on the TLS write lock a blocked writer holds.
+                abortClose(peer.abort());
+                if (peer.abort() != socket) {
+                    closeQuietly(socket);
+                }
+                live.remove(socket, peer);
             }
         }
     }
@@ -255,6 +290,16 @@ final class PeerSockets implements TcpTransport.SocketFactory {
             LOG.log(System.Logger.Level.WARNING,
                     "swarm-peer: policy refused {0} ({1}); connection closed ({2} so far)", who, why, n);
         }
+    }
+
+    /** Closes the abort handle with linger 0 (immediate reset), never waiting behind a blocked TLS write. */
+    private static void abortClose(Socket abort) {
+        try {
+            abort.setSoLinger(true, 0);
+        } catch (IOException | RuntimeException ignored) {
+            // closing
+        }
+        closeQuietly(abort);
     }
 
     private static void closeQuietly(Socket socket) {
