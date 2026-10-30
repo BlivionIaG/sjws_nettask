@@ -195,4 +195,57 @@ class SnapshotPublishCoverageTest {
         assertTrue(this.server.metricsSnapshot().requests() > before);
     }
 
+
+    @Test
+    void armedAroundSkipsDoubleObserveWhenOverrideAndObserving() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        // recording at start (healthz) + startup RequestFilters → override embeds observe.
+        var startup = RequestFilters.create().add((request, next) -> {
+            var response = next.proceed(request);
+            response.headers().set("x-startup", "1");
+            return response;
+        });
+        this.server = SjwsServer.start(ServerConfig.builder(this.root).port(0).healthz(true)
+                .h2Enabled(true).h2Port(0).h2cPort(0).build(), startup);
+        Handler terminal = this.server.requestHandler(); // == override
+        Handler once = this.server.armedAround(terminal);
+        long before = this.server.metricsSnapshot().requests();
+        var resp = once.handle(new sjws_nettask.core.Request("GET", "/a.txt"));
+        assertEquals(200, resp.status());
+        assertNotNull(resp.headers());
+        long after = this.server.metricsSnapshot().requests();
+        assertEquals(before + 1, after, "observingAtStart+override must not double-count");
+    }
+
+
+
+    @Test
+    void deferSnapshotCloseWaitsForTrackedExtras() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        this.server = SjwsServer.start(ServerConfig.builder(this.root).port(0)
+                .h2Enabled(true).h2Port(0).h2cPort(0).build());
+        this.server.trackDrainingGeneration(null);
+        assertEquals(0, this.server.drainingGenerationCount());
+
+        var tryEnter = Http2Server.Generation.class.getDeclaredMethod("tryEnter");
+        tryEnter.setAccessible(true);
+        var leave = Http2Server.Generation.class.getDeclaredMethod("leave");
+        leave.setAccessible(true);
+
+        var held = new Http2Server.Generation(r -> null, false);
+        assertTrue((Boolean) tryEnter.invoke(held));
+        this.server.trackDrainingGeneration(held);
+
+        var previous = new Http2Server.Generation(r -> null, false);
+        assertTrue((Boolean) tryEnter.invoke(previous));
+        var snap = ConfigSnapshot.compile(
+                sjws_nettask.config.ConfigLoader.standalone(
+                        ServerConfig.builder(this.root).port(0).build()).document(),
+                null, 200);
+        this.server.deferSnapshotClose(previous, snap);
+        assertTrue(this.server.drainingGenerationCount() >= 1);
+        leave.invoke(held);
+        leave.invoke(previous);
+    }
+
 }
