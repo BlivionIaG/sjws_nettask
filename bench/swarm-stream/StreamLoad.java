@@ -262,12 +262,15 @@ public class StreamLoad {
           Thread.currentThread().interrupt();
           return;
         } catch (Exception e) {
-          note(inTeardown, measureErr, teardownErr, "producer-send " + pool, e);
+          if (tries >= 7) {
+            note(inTeardown, measureErr, teardownErr, "producer-send " + pool, e);
+            break; // give up this seq
+          }
           try { Thread.sleep(5L << Math.min(tries, 6)); } catch (InterruptedException ie) {
             Thread.currentThread().interrupt(); return;
           }
           tries++;
-          // retry same seq
+          // retry same seq; do not note until exhausted (avoids inflating measure error_count)
         }
       }
     }

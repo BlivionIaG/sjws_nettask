@@ -44,3 +44,21 @@ Top `sjws_nettask` execution samples (1705):
 4. `SwarmHttp.readFrame(Request) line: 455` — 45
 
 Chunks use `Durability.NONE`; `LAST`/task paths use `ASYNC`. Hot `durableNow` is lock traffic on the ledger syncer under 1k-stream admit/lease churn — leading server-side cost candidate when the client is not generator-saturated.
+
+
+## Abs-02 official (flock, load1_pre=3.26, head 6c49b7b, Europe/Paris 12:31)
+
+| | |
+|--|--|
+| mib_s | 27.21 |
+| p50 / p99 µs | 337.799 / 4010.147 |
+| samples | 557228 |
+| error_count / teardown | 14144 / 105 |
+| client / server CPU % | 169.8 / 365.6 |
+| gen_sat / self_loaded | False / True (load1_post=5.21) |
+| credit_stalls / stall_flag | 3 / False |
+| open_sessions after drain | 245.0 |
+
+Client **not** generator-saturated (169.8% < 180). Invalid: self_loaded (load1_post 5.21) + low mib/s + p99>1ms + measure errors.
+error_count inflated: producer noted every transport retry (fixed next commit — note only after tries exhausted).
+Server still hot: prior JFR `LedgerWriter.durableNow():310`, `Session.at():473`.
