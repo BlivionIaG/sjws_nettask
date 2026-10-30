@@ -124,12 +124,20 @@ class MessagingSnapshotTest {
         return f.get(10, TimeUnit.SECONDS);
     }
 
+    /**
+     * Steps the FakeClock cluster until {@code ok} is true. Evaluates {@code ok} at most once per iteration and
+     * asserts that last result — do not re-call {@code ok} after the loop. Retention's predicate must not
+     * call {@link LogTopics#enforceRetention()} (that can propose another cut); settle one cut, then propose.
+     * Wall-clock budget so loaded boxes are not limited by FakeClock step count alone.
+     */
     void until(java.util.function.BooleanSupplier ok, String what) throws Exception {
-        for (int k = 0; k < 20_000 && !ok.getAsBoolean(); k++) {
+        boolean ready = false;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (!(ready = ok.getAsBoolean()) && System.nanoTime() < deadline) {
             step();
             Thread.sleep(0, 100_000);
         }
-        assertTrue(ok.getAsBoolean(), what);
+        assertTrue(ready, what);
     }
 
     void cut(int i) {
@@ -244,6 +252,33 @@ class MessagingSnapshotTest {
         }
     }
 
+    /** Flushes {@code pendingDrops} without proposing a new cut (enforceRetention would). */
+    void flushPendingDrops(LogTopics t) throws Exception {
+        var maint = LogTopics.class.getDeclaredField("maintenance");
+        maint.setAccessible(true);
+        var lock = (java.util.concurrent.locks.ReentrantLock) maint.get(t);
+        var apply = LogTopics.class.getDeclaredMethod("applyPendingDrops");
+        apply.setAccessible(true);
+        lock.lock();
+        try {
+            apply.invoke(t);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    boolean pendingDropsEmpty(LogTopics t) throws Exception {
+        var f = LogTopics.class.getDeclaredField("pendingDrops");
+        f.setAccessible(true);
+        return ((java.util.concurrent.ConcurrentHashMap<?, ?>) f.get(t)).isEmpty();
+    }
+
+    /**
+     * One retention proposal at a time; settle the replicated logical cut (and drain pendingDrops) before
+     * the next. Physical equality after each cut is {@link #retentionPassPhysicalMatchesLogicalOnBoth()}
+     * (#328 per-frame rolls).
+     */
     @Test
     void retentionPassIsOneReplicatedCut() throws Exception {
         start(new LogRetention(4096, 0));
@@ -253,21 +288,74 @@ class MessagingSnapshotTest {
         final int foll = 1 - lead;
         until(() -> safeEnd(foll, "t") >= 120, "follower at 120");
         assertEquals(0, topics.get(foll).enforceRetention(), "a follower proposes nothing");
-        topics.get(lead).enforceRetention();
         var lr = topics.get(lead).get("t", false).replica();
         var fr = topics.get(foll).get("t", false).replica();
-        until(() -> lr.logStartOffset() > 0 && fr.logStartOffset() == lr.logStartOffset(), "the cut applied on both");
-        until(() -> {
-            try {
-                topics.get(foll).enforceRetention(); // applies any cut left pending behind a maintenance pass
-                topics.get(lead).enforceRetention();
-                return topics.get(lead).get("t", false).log().startOffset() == topics.get(foll).get("t", false).log().startOffset()
-                        && topics.get(lead).get("t", false).log().startOffset() > 0;
-            } catch (Exception e) {
-                return false;
-            }
-        }, "the same segments deleted on both");
-        assertTrue(topics.get(lead).get("t", false).log().totalBytes() <= 4096 + 2048);
+        // Each enforceRetention on the leader may propose another cut while bytes stay over the
+        // limit. Settle one logical cut fully before proposing the next (TOCTOU / leapfrog fix).
+        boolean within = false;
+        for (int round = 0; round < 30 && !within; round++) {
+            topics.get(lead).enforceRetention(); // at most one new proposal per round
+            flushPendingDrops(topics.get(lead));
+            flushPendingDrops(topics.get(foll));
+            until(() -> {
+                try {
+                    flushPendingDrops(topics.get(lead));
+                    flushPendingDrops(topics.get(foll));
+                    long ls = lr.logStartOffset(), fs = fr.logStartOffset();
+                    if (ls <= 0 || ls != fs) return false;
+                    return pendingDropsEmpty(topics.get(lead)) && pendingDropsEmpty(topics.get(foll));
+                } catch (Exception e) {
+                    return false;
+                }
+            }, "logical cut settled on both after retention round " + round);
+            within = topics.get(lead).get("t", false).log().totalBytes() <= 4096 + 2048;
+        }
+        assertTrue(within, "leader bytes within retention after settled cuts");
+        assertEquals(lr.logStartOffset(), fr.logStartOffset(), "the same logical cut on both");
+        assertTrue(lr.logStartOffset() > 0, "logical logStart advanced");
+        assertTrue(pendingDropsEmpty(topics.get(lead)) && pendingDropsEmpty(topics.get(foll)),
+                "pendingDrops drained on both");
+    }
+
+    /**
+     * Strict physical==logical-on-both after each settled cut (#328). Per-frame rolls make leader and
+     * follower segment bases match, so a leader boundary cut deletes the same prefix on both.
+     */
+    @Test
+    void retentionPassPhysicalMatchesLogicalOnBoth() throws Exception {
+        start(new LogRetention(4096, 0));
+        int elected = leader("t");
+        assertTrue(elected >= 0, "topic leader elected before produce");
+        final int lead = produce(elected, 0, 120);
+        final int foll = 1 - lead;
+        until(() -> safeEnd(foll, "t") >= 120, "follower at 120");
+        assertEquals(0, topics.get(foll).enforceRetention(), "a follower proposes nothing");
+        var lr = topics.get(lead).get("t", false).replica();
+        var fr = topics.get(foll).get("t", false).replica();
+        boolean within = false;
+        for (int round = 0; round < 30 && !within; round++) {
+            topics.get(lead).enforceRetention();
+            flushPendingDrops(topics.get(lead));
+            flushPendingDrops(topics.get(foll));
+            until(() -> {
+                try {
+                    flushPendingDrops(topics.get(lead));
+                    flushPendingDrops(topics.get(foll));
+                    long ls = lr.logStartOffset(), fs = fr.logStartOffset();
+                    if (ls <= 0 || ls != fs) return false;
+                    long lp = topics.get(lead).get("t", false).log().startOffset();
+                    long fp = topics.get(foll).get("t", false).log().startOffset();
+                    return lp == ls && fp == fs;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, "physical==logical on both after retention round " + round);
+            within = topics.get(lead).get("t", false).log().totalBytes() <= 4096 + 2048;
+        }
+        assertTrue(within, "leader bytes within retention after settled cuts");
+        assertEquals(topics.get(lead).get("t", false).log().startOffset(),
+                topics.get(foll).get("t", false).log().startOffset(), "the same segments deleted on both");
+        assertTrue(topics.get(lead).get("t", false).log().startOffset() > 0);
     }
 
     /** #288 MC-B1: fetch uses max(physical start, replica.logStartOffset()), even when bytes remain on disk. */
