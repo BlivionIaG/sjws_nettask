@@ -36,6 +36,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.routing.discovery.Endpoint;
 import sjws_nettask.routing.discovery.Endpoint.Health;
 import sjws_nettask.routing.discovery.LbPolicy;
@@ -340,5 +341,67 @@ class EndpointBalancerTest {
         assertTrue(pool.health.ejected(), "real upstream 503s must still eject");
         assertEquals(1, b.ejectedCount());
     }
+
+    /**
+     * Codex P2 on #298: a local peer-budget refusal on a half-open recovery probe must release
+     * the probe flag, otherwise the endpoint stays reserved and never re-enters rotation.
+     */
+    @Test
+    void localRefusalReleasesHalfOpenProbe() throws Exception {
+        var budget = new ByteBudget(1 << 20, 64 * 1024);
+        var peer = new InetSocketAddress(InetAddress.getByAddress(new byte[] {10, 9, 9, 9}), 0);
+        budget.add(64 * 1024, budget.peerStripe(peer));
+        assertTrue(budget.exhausted(budget.peerStripe(peer)));
+        var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null), budget);
+        // Single endpoint: after eject_for, pick() must take the half-open probe on it.
+        var src = new StaticUpstreamSource(set(1, null, ep(0, 1)));
+        var b = new EndpointBalancer(src, pools, null, o, Duration.ZERO, this.now::get);
+        this.balancers.add(b);
+        var poolA = b.poolOf(ep(0, 1).authority());
+        this.failing.add("a");
+        for (int i = 0; i < 3; i++) {
+            assertEquals(503, b.handle(new Request("GET", "/")).status());
+        }
+        assertTrue(poolA.health.ejected());
+        this.failing.clear();
+        this.now.addAndGet(1_100_000_000L); // eject_for elapsed → next pick takes the probe
+        var req = new Request("GET", "/", RequestHeaders.of(Map.of()), peer, false);
+        var r = b.handle(req);
+        assertEquals(503, r.status(), "local peer-budget refusal on the recovery probe");
+        assertTrue(ProxyHandler.isLocalRefusal(r));
+        // Without release(), available() would return false forever (probe stuck true).
+        assertTrue(poolA.health.available(this.now.get()), "half-open probe must be released after local refusal");
+        poolA.health.release();
+    }
+
+    /**
+     * Codex P1 on #298: local-refusal markers must not pin Response instances forever.
+     */
+    @Test
+    void localRefusalMarkersDoNotPinResponsesForever() {
+        int before = ProxyHandler.localRefusalRegistrySize();
+        for (int i = 0; i < 200; i++) {
+            var r = ProxyHandler.localRefusal(StaticFileHandler.error(503, false));
+            assertTrue(ProxyHandler.isLocalRefusal(r));
+            // drop strong ref each iteration
+        }
+        boolean cleared = false;
+        for (int i = 0; i < 50; i++) {
+            System.gc();
+            System.runFinalization();
+            if (ProxyHandler.localRefusalRegistrySize() <= before + 2) {
+                cleared = true;
+                break;
+            }
+            try { Thread.sleep(20); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+        assertTrue(cleared,
+                "weak local-refusal registry still held "
+                        + ProxyHandler.localRefusalRegistrySize() + " entries after GC");
+    }
+
 
 }

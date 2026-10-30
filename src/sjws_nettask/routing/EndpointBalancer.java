@@ -299,6 +299,8 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             }
             if (ProxyHandler.isLocalRefusal(response)) {
                 // Peer-budget (or other local) admission: never contacted the endpoint.
+                // Release any half-open probe reservation taken in pick() (Codex P2 on #298).
+                pool.health.release();
                 return response;
             }
             if (failed == null) {

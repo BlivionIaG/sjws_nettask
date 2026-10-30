@@ -35,7 +35,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Collections;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -147,7 +149,12 @@ public final class ProxyHandler implements Handler, AutoCloseable {
      * Responses produced by local admission (peer-budget share exhausted) rather than an upstream.
      * {@link EndpointBalancer} must not count these against endpoint health or retry them as 503s.
      */
-    private static final Set<Response> LOCAL_REFUSALS = ConcurrentHashMap.newKeySet();
+    /**
+     * Local-admission markers. Keys are weakly held so finished responses are reclaimable; the
+     * set must not retain every refusal for the life of the process (Codex P1 on #298).
+     */
+    private static final Set<Response> LOCAL_REFUSALS =
+            Collections.newSetFromMap(Collections.synchronizedMap(new WeakHashMap<>()));
 
     public ProxyHandler(Settings settings) {
         this(settings, ByteBudget.shared());
@@ -202,6 +209,11 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     static boolean isLocalRefusal(Response response) {
         return response != null && LOCAL_REFUSALS.contains(response);
     }
+    /** Visible for tests: how many local-refusal markers are still strongly reachable as keys. */
+    static int localRefusalRegistrySize() {
+        return LOCAL_REFUSALS.size();
+    }
+
 
     public Settings settings() {
         return this.settings;
