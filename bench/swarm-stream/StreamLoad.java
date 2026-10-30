@@ -89,11 +89,12 @@ public class StreamLoad {
     AtomicLong credit429 = new AtomicLong();
     AtomicLong producerTransportRetries = new AtomicLong();
     AtomicLong consumerConnectRetries = new AtomicLong();
+    AtomicLong groupOpenRefusals = new AtomicLong(); // claim/stream HTTP 503 (ledger budget) — not transport
 
     // Warmup (same group count; fewer streams)
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w",
         producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
-        measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries);
+        measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
     bytesRx.reset(); LatBag.clearAll(); creditWaits.clear(); measureErr.clear(); teardownErr.clear();
     requests.set(0); credit429.set(0);
     producerTransportRetries.set(0); consumerConnectRetries.set(0);
@@ -129,7 +130,7 @@ public class StreamLoad {
     long t0 = System.nanoTime();
     int[] streamToGroup = wave(http, args, tokens, args.streams, args.secs, "g",
         producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
-        measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries);
+        measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
     double wall = (System.nanoTime() - t0) / 1e9;
     cpuMon.join(2000);
     double load1Post = load1();
@@ -173,6 +174,8 @@ public class StreamLoad {
     // transport/connect retries counted on EVERY failure (not only exhausted) — never hide server EOFs
     r.producerTransportRetries = producerTransportRetries.get();
     r.consumerConnectRetries = consumerConnectRetries.get();
+    r.groupOpenRefusals = groupOpenRefusals.get();
+    // 503 group-open refusals are NOT transport retries (Messaging Core #335 / steering 16:34).
     r.transportRetryFlag = r.producerTransportRetries > 0 || r.consumerConnectRetries > 0;
     r.requests = requests.get();
     // Hard zeros read ONLY after drain (B1). refused_per_ip is a hard zero (A2 / Architecture).
@@ -195,7 +198,8 @@ public class StreamLoad {
       LongAdder bytesRx, ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429,
-      AtomicLong producerTransportRetries, AtomicLong consumerConnectRetries) throws Exception {
+      AtomicLong producerTransportRetries, AtomicLong consumerConnectRetries,
+      AtomicLong groupOpenRefusals) throws Exception {
     producersStop.set(false); consumersStop.set(false); inTeardown.set(false);
     int gCount = Math.max(1, Math.min(args.groups > 0 ? args.groups : n, n));
     int[] mapping = new int[n];
@@ -207,12 +211,12 @@ public class StreamLoad {
       String tok = tokens.get(i % tokens.size());
       int idx = i;
       threads.add(Thread.startVirtualThread(() -> {
-        try { consumer(http, args, tok, pool, consumersStop, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries); }
+        try { consumer(http, args, tok, pool, consumersStop, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
       threads.add(Thread.startVirtualThread(() -> {
-        try { producer(http, args, tok, pool, producersStop, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries); }
+        try { producer(http, args, tok, pool, producersStop, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
       }));
     }
@@ -229,10 +233,18 @@ public class StreamLoad {
   static void producer(HttpClient http, Args args, String token, String pool,
       AtomicBoolean stop, AtomicBoolean inTeardown, ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
-      AtomicLong requests, AtomicLong credit429, AtomicLong producerTransportRetries) throws Exception {
+      AtomicLong requests, AtomicLong credit429, AtomicLong producerTransportRetries,
+      AtomicLong groupOpenRefusals) throws Exception {
     HttpResponse<byte[]> claim = post(http, args.base + "/swarm/v1/tasks/" + enc(pool) + ":claim?visibilityMs=60000&waitMs=30000&max=1",
         token, new byte[0]);
-    if (claim.statusCode() != 200) throw new IOException("claim " + claim.statusCode());
+    int claimSc = claim.statusCode();
+    // #335 ledger budget: HTTP 503 on group open — group_open_refusals, never transport_retry.
+    if (claimSc == 503) {
+      groupOpenRefusals.incrementAndGet();
+      note(inTeardown, measureErr, teardownErr, "producer-claim-refused " + pool, new IOException("claim 503"));
+      return;
+    }
+    if (claimSc != 200) throw new IOException("claim " + claimSc);
     Lease lease = parseLease(claim);
     String url = args.base + "/swarm/v1/leases/" + enc(lease.id) + ":chunk";
     long seq = 0;
@@ -374,7 +386,7 @@ public class StreamLoad {
   static void consumer(HttpClient http, Args args, String token, String pool,
       AtomicBoolean stop, AtomicBoolean inTeardown, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
-      AtomicLong consumerConnectRetries) throws Exception {
+      AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals) throws Exception {
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     Exception last = null;
     for (int attempt = 0; attempt < 3 && !stop.get(); attempt++) {
@@ -389,8 +401,14 @@ public class StreamLoad {
         else
           b.header("Accept", "text/event-stream");
         HttpResponse<byte[]> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
-        if (resp.statusCode() != 201 && resp.statusCode() != 200)
-          throw new IOException("stream " + resp.statusCode());
+        int streamSc = resp.statusCode();
+        if (streamSc == 503) {
+          groupOpenRefusals.incrementAndGet();
+          note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool, new IOException("stream 503"));
+          return;
+        }
+        if (streamSc != 201 && streamSc != 200)
+          throw new IOException("stream " + streamSc);
         String loc = resp.headers().firstValue("location").orElse(null);
         if (loc == null) {
           Frame f = decodeFrame(ByteBuffer.wrap(resp.body()));
@@ -664,7 +682,7 @@ public class StreamLoad {
     String mode; int streams, agents, window, groups, chunkSamples, errorCount, teardownErrorCount, creditWaitN, writerCount;
     int[] streamToGroup; // measure-wave mapping stream index → group id
     String heapFlags;
-    long bytes, creditStalls, requests, producerTransportRetries, consumerConnectRetries, refusedPerIp, openSessionsAfterDrain;
+    long bytes, creditStalls, requests, producerTransportRetries, consumerConnectRetries, refusedPerIp, openSessionsAfterDrain, groupOpenRefusals;
     int maxConnectionsPerIp;
     double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall, serverCpuSec, serverCpuPctOfWall;
     Double p50, p90, p99, creditWaitP50, creditWaitP99;
@@ -707,6 +725,7 @@ public class StreamLoad {
       field(sb, "requests", requests, true);
       field(sb, "producer_transport_retries", producerTransportRetries, true);
       field(sb, "consumer_connect_retries", consumerConnectRetries, true);
+      field(sb, "group_open_refusals", groupOpenRefusals, true);
       field(sb, "transport_retry_flag", transportRetryFlag, true);
       field(sb, "max_connections_per_ip", maxConnectionsPerIp, true);
       field(sb, "refused_per_ip", refusedPerIp, true);
