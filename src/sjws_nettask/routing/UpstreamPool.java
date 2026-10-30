@@ -315,10 +315,17 @@ final class UpstreamPool implements AutoCloseable {
         private io.netty.util.concurrent.Future<?> timer;
 
         final ByteBudget budget;
+        /** Peer stripe for {@link ByteBudget} per-peer accounting (#78); keyless when unknown. */
+        final int peerStripe;
 
         Exchange(Channel channel, Duration idle, ByteBudget budget) {
+            this(channel, idle, budget, budget.keylessStripe());
+        }
+
+        Exchange(Channel channel, Duration idle, ByteBudget budget, int peerStripe) {
             this.channel = channel;
             this.budget = budget;
+            this.peerStripe = peerStripe;
             this.idleNanos = idle.toNanos();
         }
 
@@ -411,9 +418,9 @@ final class UpstreamPool implements AutoCloseable {
             var next = this.queue.take();
             if (next instanceof ByteBuf buf) {
                 int n = buf.readableBytes();
-                this.budget.release(n);
+                this.budget.release(n, this.peerStripe);
                 long left = this.queued.addAndGet(-n);
-                if (this.paused && (left == 0 || left < READ_AHEAD / 2 && !this.budget.exhausted())) {
+                if (this.paused && (left == 0 || left < READ_AHEAD / 2 && !this.budget.exhausted(this.peerStripe))) {
                     this.paused = false;
                     this.channel.read();
                 }
@@ -434,7 +441,7 @@ final class UpstreamPool implements AutoCloseable {
         void drain() {
             for (var o = this.queue.poll(); o != null; o = this.queue.poll()) {
                 if (o instanceof ByteBuf buf) {
-                    this.budget.release(buf.readableBytes());
+                    this.budget.release(buf.readableBytes(), this.peerStripe);
                     this.queued.addAndGet(-buf.readableBytes());
                 }
                 ReferenceCountUtil.release(o);
@@ -478,7 +485,7 @@ final class UpstreamPool implements AutoCloseable {
                 if (data.isReadable()) {
                     ex.lastRead = System.nanoTime();
                     ex.queued.addAndGet(data.readableBytes());
-                    ex.budget.add(data.readableBytes());
+                    ex.budget.add(data.readableBytes(), ex.peerStripe);
                     ex.queue.offer(data.retain());
                 }
                 if (content instanceof LastHttpContent) {
@@ -499,20 +506,20 @@ final class UpstreamPool implements AutoCloseable {
             if (ex == null || ex.abandoned || ex.complete) {
                 return;
             }
-            boolean pressure = ex.budget.pressured();
+            boolean pressure = ex.budget.pressured(ex.peerStripe);
             if (pressure != this.small // shrink reads under budget pressure: bounds the overshoot
                     && ctx.channel().unsafe().recvBufAllocHandle() instanceof Reads reads) {
                 this.small = pressure;
                 reads.small = pressure;
             }
             long q = ex.queued.get();
-            boolean full = q >= READ_AHEAD || q > 0 && ex.budget.exhausted(); // window, or the global F5 budget
+            boolean full = q >= READ_AHEAD || q > 0 && ex.budget.exhausted(ex.peerStripe); // window, global F5, or this peer's share
             if (!ex.head.isDone() || !full) {
                 ctx.read(); // read ahead while there is room, without waiting for the consumer
             } else {
                 ex.paused = true;
                 q = ex.queued.get();
-                if (q == 0 || q < READ_AHEAD / 2 && !ex.budget.exhausted()) { // drained between check and flag
+                if (q == 0 || q < READ_AHEAD / 2 && !ex.budget.exhausted(ex.peerStripe)) { // drained between check and flag
                     ex.paused = false;
                     ctx.read();
                 }

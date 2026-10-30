@@ -1,7 +1,8 @@
 # Installation and build
 
-Basic multi-threaded (virtual threads) static file server: HTTP/1.0 and 1.1 over TCP, plus opt-in
-HTTP/2 and HTTP/3 (QUIC), all served by the same protocol-neutral core. Requires Java 25+ (and Maven to build).
+**SJWS** (Swarm Java Web Services). Build and run the jar for a quick HTTP static-file listen; the
+full product is message-oriented middleware with HA, an optional agent swarm, proxy/gateway and
+HTTP/1.x–3 — see the [README](../../README.md) Status table. Requires Java 25+ (and Maven to build).
 
 Quick start:
 

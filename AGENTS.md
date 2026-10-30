@@ -5,11 +5,12 @@ Read this before working on the repo. Details live in [docs/](docs/index.md); hu
 
 ## Goal
 
-sjws_nettask is heading toward a **reliable, fast, low-latency message-oriented middleware that is
-also a web server**. Today it is a static file server (HTTP/1.x, HTTP/2, HTTP/3) with a reverse
-proxy/gateway, a cluster layer (per-group Raft), a control plane and a messaging core (partitions,
-ledger, delivery). The client messaging wire protocol is still in design
-([docs/messaging/design.md](docs/messaging/design.md)).
+**SJWS** (Swarm Java Web Services; repo `sjws_nettask`) is a **reliable, fast, low-latency
+message-oriented middleware that is also a web server**: HTTP/1.x, HTTP/2, HTTP/3, reverse
+proxy/gateway, control plane, cluster HA (per-group Raft), messaging (partitions, ledger,
+produce/fetch) and an optional agent swarm. Full cluster messaging replication (`ReplicatedLedger`)
+and the client messaging wire protocol beyond produce/fetch are still in design
+([docs/messaging/design.md](docs/messaging/design.md)); see the README Status table.
 
 ## Module map (`src/sjws_nettask/`, NetBeans layout; tests in `tests/sjws_nettask/`)
 
