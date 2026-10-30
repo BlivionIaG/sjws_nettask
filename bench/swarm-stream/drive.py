@@ -72,6 +72,19 @@ def wait_metrics_drained(url: str, timeout_s: float = 75.0) -> dict[str, float]:
     return last
 
 
+
+def stamp_at_wire(w: ChunkWriter):
+    """Refresh emit ns in payload when the TOKEN frame is built (Architecture: just before :chunk write)."""
+    orig = w._frame
+
+    def framed(j):
+        data = j.data
+        if len(data) >= 20:
+            j.data = f"{time.monotonic_ns():020d}".encode("ascii") + data[20:]
+        return orig(j)
+
+    w._frame = framed  # type: ignore[method-assign]
+
 def instrument_credit_waits(w: ChunkWriter, waits: list[float]):
     orig = w._credit_allows
     state = {"blocked_since": None}
@@ -138,6 +151,8 @@ def run_window(args) -> dict:
             (lease,) = client.claim(pool, wait=30, visibility_ms=60_000)
             with lease.stream(window=args.window, coalesce=False, heartbeat=0) as w:
                 instrument_credit_waits(w, credit_waits)
+                if args.stamp_at_wire:
+                    stamp_at_wire(w)
                 while not producers_stop.is_set():
                     emit = time.monotonic_ns()
                     w.send(f"{emit:020d}".encode("ascii") + (b"\x00" * pad))
@@ -314,6 +329,8 @@ def main():
     p.add_argument("--chunk-bytes", type=int, default=1024)
     p.add_argument("--window", type=int, default=8)
     p.add_argument("--drain-timeout", type=float, default=75)
+    p.add_argument("--stamp-at-wire", action="store_true", default=True)
+    p.add_argument("--no-stamp-at-wire", action="store_false", dest="stamp_at_wire")
     p.add_argument("--out", required=True)
     p.add_argument("--metrics-url", required=True)
     args = p.parse_args()
