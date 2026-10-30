@@ -21,9 +21,12 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
@@ -58,17 +61,57 @@ class HaMessagingDomainTest {
         }
     }
 
-    private static List<Member> members(int n) throws IOException {
-        var out = new ArrayList<Member>();
-        for (int i = 1; i <= n; i++) {
-            int port;
-            try (var s = new ServerSocket(0)) {
-                port = s.getLocalPort();
-            }
-            out.add(new Member(new NodeId(i, "n" + i), new SiteId("msg"), new InetSocketAddress("127.0.0.1", port), 1L,
-                    MemberState.ALIVE, false));
+    /**
+     * Members whose listen ports are already bound. {@link #factory} hands those sockets to
+     * {@link TcpTransport} so nothing races to steal the port between probe and listen.
+     */
+    private static final class Reserved implements AutoCloseable {
+        final List<Member> members;
+        final TcpTransport.SocketFactory factory;
+        private final Map<Integer, ServerSocket> held;
+
+        Reserved(List<Member> members, Map<Integer, ServerSocket> held, TcpTransport.SocketFactory factory) {
+            this.members = members;
+            this.held = held;
+            this.factory = factory;
         }
-        return out;
+
+        @Override
+        public void close() throws IOException {
+            for (var s : held.values()) {
+                s.close();
+            }
+            held.clear();
+        }
+    }
+
+    private static Reserved members(int n) throws IOException {
+        var out = new ArrayList<Member>();
+        var held = new LinkedHashMap<Integer, ServerSocket>();
+        for (int i = 1; i <= n; i++) {
+            var s = new ServerSocket();
+            s.setReuseAddress(true);
+            s.bind(new InetSocketAddress("127.0.0.1", 0), 16);
+            held.put(s.getLocalPort(), s);
+            out.add(new Member(new NodeId(i, "n" + i), new SiteId("msg"),
+                    new InetSocketAddress("127.0.0.1", s.getLocalPort()), 1L, MemberState.ALIVE, false));
+        }
+        TcpTransport.SocketFactory factory = new TcpTransport.SocketFactory() {
+            @Override
+            public ServerSocket listen(InetSocketAddress bind) throws IOException {
+                var s = held.remove(bind.getPort());
+                if (s == null) {
+                    throw new IOException("no reserved socket for " + bind);
+                }
+                return s;
+            }
+
+            @Override
+            public Socket connect(InetSocketAddress to) throws IOException {
+                return TcpTransport.SocketFactory.PLAIN.connect(to);
+            }
+        };
+        return new Reserved(out, held, factory);
     }
 
     private TcpTransport start(TcpTransport t) {
@@ -98,9 +141,11 @@ class HaMessagingDomainTest {
 
     @Test
     void cpRaftAndHaMessagingFramesFailTheTagCheckBothWaysUnderTheSameKey() throws Exception {
-        var m = members(2);
-        var cp = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 8));
-        var msg = start(TcpTransport.open(m.get(1).id(), m, KEY, Clock.SYSTEM, 8, TcpTransport.SocketFactory.PLAIN,
+        var reserved = members(2);
+        open.add(reserved);
+        var m = reserved.members;
+        var cp = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 8, reserved.factory));
+        var msg = start(TcpTransport.open(m.get(1).id(), m, KEY, Clock.SYSTEM, 8, reserved.factory,
                 HaMessaging.DOMAIN, false));
         var got = new CopyOnWriteArrayList<String>();
         var toMsg = cp.attach(m.get(0).id(), (from, f) -> got.add("cp got " + f.type()));
@@ -124,10 +169,12 @@ class HaMessagingDomainTest {
 
     @Test
     void twoHaMessagingTransportsStillTalk() throws Exception {
-        var m = members(2);
-        var a = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 8, TcpTransport.SocketFactory.PLAIN,
+        var reserved = members(2);
+        open.add(reserved);
+        var m = reserved.members;
+        var a = start(TcpTransport.open(m.get(0).id(), m, KEY, Clock.SYSTEM, 8, reserved.factory,
                 HaMessaging.DOMAIN, false));
-        var b = start(TcpTransport.open(m.get(1).id(), m, KEY, Clock.SYSTEM, 8, TcpTransport.SocketFactory.PLAIN,
+        var b = start(TcpTransport.open(m.get(1).id(), m, KEY, Clock.SYSTEM, 8, reserved.factory,
                 HaMessaging.DOMAIN, false));
         var got = new CopyOnWriteArrayList<Integer>();
         var rpc = a.attach(m.get(0).id(), (from, f) -> { });

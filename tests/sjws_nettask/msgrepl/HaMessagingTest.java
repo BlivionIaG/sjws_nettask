@@ -20,7 +20,6 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
-import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -29,6 +28,7 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.NodeId;
+import sjws_nettask.clusterharness.EphemeralPorts;
 import sjws_nettask.config.HaMessagingSettings;
 import sjws_nettask.config.HaMessagingSettings.Member;
 
@@ -41,9 +41,7 @@ class HaMessagingTest {
     Path dir;
 
     static int freePort() throws Exception {
-        try (var s = new ServerSocket(0)) {
-            return s.getLocalPort();
-        }
+        return EphemeralPorts.probe();
     }
 
     static HaMessagingSettings settings(String self, List<Member> members, boolean replicate) {
@@ -94,24 +92,38 @@ class HaMessagingTest {
 
     @Test
     void witnessStartsWarnsAboutPlaintextOffLoopbackAndCloses() throws Exception {
-        var members = List.of(new Member("a", 1, "192.0.2.1", 7101, "http://192.0.2.1", false),
-                new Member("b", 2, "127.0.0.1", freePort(), "http://b", false),
-                new Member("w", 3, "127.0.0.1", freePort(), null, true));
-        var err = new ByteArrayOutputStream();
-        var ha = HaMessaging.start(settings("w", members, true, true), dir.resolve("w"), KEY, KEY, null,
-                new PrintStream(err, true, StandardCharsets.UTF_8));
-        try {
-            var text = err.toString(StandardCharsets.UTF_8);
-            assertTrue(text.contains("node=w (witness)"), text);
-            assertTrue(text.contains("authenticated (HMAC) but not encrypted"), text);
-            assertTrue(text.contains("ha.messaging_insecure_plaintext is set"), text);
-            assertTrue(text.contains("(#277)") && !text.contains("#175"), text);
-            assertFalse(text.contains(new String(KEY, StandardCharsets.US_ASCII)), text);
-            assertTrue(ha.toString().contains("replication on"));
-            assertEquals(new NodeId(3, "w"), ha.node().self());
-        } finally {
-            ha.close();
+        Exception last = null;
+        for (int attempt = 1; attempt <= EphemeralPorts.BIND_ATTEMPTS; attempt++) {
+            var suffix = attempt == 1 ? "w" : ("w-" + attempt);
+            try {
+                var members = List.of(new Member("a", 1, "192.0.2.1", 7101, "http://192.0.2.1", false),
+                        new Member("b", 2, "127.0.0.1", freePort(), "http://b", false),
+                        new Member("w", 3, "127.0.0.1", freePort(), null, true));
+                var err = new ByteArrayOutputStream();
+                var ha = HaMessaging.start(settings("w", members, true, true), dir.resolve(suffix), KEY, KEY, null,
+                        new PrintStream(err, true, StandardCharsets.UTF_8));
+                try {
+                    var text = err.toString(StandardCharsets.UTF_8);
+                    assertTrue(text.contains("node=w (witness)"), text);
+                    assertTrue(text.contains("authenticated (HMAC) but not encrypted"), text);
+                    assertTrue(text.contains("ha.messaging_insecure_plaintext is set"), text);
+                    assertTrue(text.contains("(#277)") && !text.contains("#175"), text);
+                    assertFalse(text.contains(new String(KEY, StandardCharsets.US_ASCII)), text);
+                    assertTrue(ha.toString().contains("replication on"));
+                    assertEquals(new NodeId(3, "w"), ha.node().self());
+                } finally {
+                    ha.close();
+                }
+                assertTrue(java.nio.file.Files.isDirectory(dir.resolve(suffix + "/raft")));
+                return;
+            } catch (Exception e) {
+                last = e;
+                if (!EphemeralPorts.addressInUse(e) || attempt == EphemeralPorts.BIND_ATTEMPTS) {
+                    throw e;
+                }
+                EphemeralPorts.logRetry("HaMessagingTest.witnessStarts", attempt, e);
+            }
         }
-        assertTrue(java.nio.file.Files.isDirectory(dir.resolve("w/raft")));
+        throw last;
     }
 }
