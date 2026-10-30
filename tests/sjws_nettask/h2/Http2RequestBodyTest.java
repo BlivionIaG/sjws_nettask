@@ -24,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http2.DefaultHttp2HeadersFrame;
 import io.netty.handler.codec.http2.DefaultHttp2ResetFrame;
 import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2StreamChannel;
@@ -46,6 +47,7 @@ class Http2RequestBodyTest {
 
     private final EmbeddedChannel loop = new EmbeddedChannel();
     private final List<Object> resets = new ArrayList<>();
+    private final List<Object> continues = new ArrayList<>();
     private boolean active = true;
     private final List<ByteBuf> offered = new ArrayList<>();
 
@@ -56,7 +58,9 @@ class Http2RequestBodyTest {
             case "isActive" -> this.active;
             case "writeAndFlush" -> {
                 if (args != null && args.length >= 1) {
-                    this.resets.add(args[0]);
+                    var msg = args[0];
+                    this.resets.add(msg);
+                    this.continues.add(msg);
                 }
                 yield this.loop.newSucceededFuture();
             }
@@ -158,5 +162,39 @@ class Http2RequestBodyTest {
         var body = new Http2RequestBody(stream(), -1, TIMEOUT);
         body.end();
         assertEquals(0, body.length());
+    }
+
+    @Test
+    void expectContinueSends100OnFirstRead() throws Exception {
+        var sent = new java.util.concurrent.atomic.AtomicInteger();
+        var body = new Http2RequestBody(stream(), 3, TIMEOUT, () -> {
+            sent.incrementAndGet();
+            Http2StreamHandler.send100(stream());
+        });
+        offer(body, 3);
+        body.end();
+        assertEquals(3, body.read(new byte[8], 0, 8));
+        assertEquals(1, sent.get());
+        this.loop.runPendingTasks();
+        assertTrue(this.continues.stream().anyMatch(m -> m instanceof DefaultHttp2HeadersFrame h
+                && "100".contentEquals(h.headers().status())));
+    }
+
+    @Test
+    void abandonSkipsContinue() {
+        var sent = new java.util.concurrent.atomic.AtomicInteger();
+        var body = new Http2RequestBody(stream(), 10, TIMEOUT, sent::incrementAndGet);
+        body.abandon();
+        assertThrows(IOException.class, () -> body.read(new byte[1], 0, 1));
+        assertEquals(0, sent.get());
+    }
+
+    @Test
+    void expectContinueHelper() {
+        var h = new io.netty.handler.codec.http2.DefaultHttp2Headers();
+        h.method("POST").path("/").scheme("http").authority("localhost").add("expect", "100-continue");
+        assertTrue(Http2StreamHandler.expectContinue(h));
+        h.set("expect", "teapot");
+        assertFalse(Http2StreamHandler.expectContinue(h));
     }
 }
