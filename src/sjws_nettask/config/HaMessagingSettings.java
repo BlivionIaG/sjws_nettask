@@ -100,8 +100,11 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
     public record Snapshot(long everyEntries, long logTailEntries, int chunkBytes, long installRate, int portOffset,
             long logSegmentBytes, long maxInstallBytes) {
 
-        /** Defaults: every 10 000 entries, 1 000 kept, 1 MiB chunks, 64 MiB/s, port + 1, 16 MiB log files, install size uncapped. */
-        public static final Snapshot DEFAULT = new Snapshot(10_000, 1_000, 1 << 20, 64L << 20, 1, 16L << 20, 0);
+        /**
+         * Defaults: every 10 000 entries, 1 000 kept, 1 MiB chunks, 64 MiB/s, port + 1, 16 MiB log files, 4 GiB install
+         * bound (#295: four default 1 GiB ledger segments; {@code 0} is the explicit unlimited opt-in).
+         */
+        public static final Snapshot DEFAULT = new Snapshot(10_000, 1_000, 1 << 20, 64L << 20, 1, 16L << 20, 4L << 30);
 
         public Snapshot {
             if (everyEntries < 1) throw new ConfigException("ha.snapshot.every_entries: expected at least 1");

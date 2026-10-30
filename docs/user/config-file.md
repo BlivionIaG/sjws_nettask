@@ -130,7 +130,7 @@ ha:
     install_rate: 64m           # install bytes per second a node sends, all transfers together
     port_offset: 1              # install listener: each member's Raft port + this
     log_segment_bytes: 16m      # rolling Raft log file size (truncation frees whole files)
-    max_install_bytes: 0        # optional total install payload cap; 0 = off
+    max_install_bytes: 4g       # total install payload cap; 0 = unlimited (explicit opt-in)
   members:                      # 2 data nodes + 1 witness, or 3 or more data nodes; same list everywhere
     - { id: a, address: "10.0.0.1:7100", http_url: "http://10.0.0.1:8080" }
     - { id: b, address: "10.0.0.2:7100", http_url: "http://10.0.0.2:8080" }
@@ -152,7 +152,7 @@ ha:
 | `ha.snapshot.install_rate` | `64m` | Bytes per second a node sends for installs, all transfers together. |
 | `ha.snapshot.port_offset` | `1` | Install listener binds to each member's Raft port plus this. |
 | `ha.snapshot.log_segment_bytes` | `16m` | Rolling Raft log file size for msg groups. |
-| `ha.snapshot.max_install_bytes` | `0` (off) | Optional upper bound on the sum of segment bytes in one install. `0` leaves it off; the manifest size and per-chunk SHA-256 checks still apply. |
+| `ha.snapshot.max_install_bytes` | `4g` | Upper bound on the sum of segment bytes in one install, enforced while chunks stream (before disk writes). Default is four default ledger segments (4 × 1 GiB). `0` is the explicit unlimited opt-in; a negative value is refused. |
 
 An invalid member list is refused in `on` and `auto` (by design, never a silent single-node fallback): a bare
 pair (`two voters require a witness`), more than
