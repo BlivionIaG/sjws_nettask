@@ -174,4 +174,25 @@ class SnapshotPublishCoverageTest {
                 .handle(new sjws_nettask.core.Request("GET", "/a.txt")).status());
     }
 
+
+    @Test
+    void armMetricsAfterLiveControlPinsOuter() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        this.server = SjwsServer.start(ServerConfig.builder(this.root).port(0)
+                .h2Enabled(true).h2Port(0).h2cPort(0).build());
+        var filters = RequestFilters.create();
+        GatewayFilters.install(filters);
+        this.server.chainControl(filters, Set.of()).apply(FilterDocument.of(1, List.of(
+                FilterDocument.FilterEntry.of("api-key", 0, Map.of("keys", "secret", "header", "x-api-key"),
+                        FilterScope.all()))));
+        // publishArmed pinOuter path (control already live)
+        this.server.armMetrics();
+        assertEquals(401, this.server.filterChain().handle(
+                new sjws_nettask.core.Request("GET", "/a.txt")).status());
+        long before = this.server.metricsSnapshot().requests();
+        this.server.filterChain().handle(new sjws_nettask.core.Request("GET", "/a.txt",
+                sjws_nettask.core.RequestHeaders.of(Map.of("x-api-key", List.of("secret")))));
+        assertTrue(this.server.metricsSnapshot().requests() > before);
+    }
+
 }

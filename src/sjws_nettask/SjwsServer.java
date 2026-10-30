@@ -921,8 +921,8 @@ public final class SjwsServer implements AutoCloseable {
      * zero-cost without disabling bodies for configured proxy routes (#289).
      */
     boolean liveNeedsBodies() {
-        return !(this.live.handler() instanceof StaticFileHandler) || this.armed.get() != null
-                || (this.control != null && this.control.isLive());
+        // control.isLive() always arms via armSnapshot, so armed!=null covers that case.
+        return !(this.live.handler() instanceof StaticFileHandler) || this.armed.get() != null;
     }
 
     /**
@@ -938,7 +938,8 @@ public final class SjwsServer implements AutoCloseable {
         if (control != null && control.isLive()) {
             return control.compileAround(frozen);
         }
-        if (this.armed.get() != null || this.slot.get().recording() || this.observingAtStart) {
+        // observingAtStart implies a recording slot, so recording covers that case.
+        if (this.armed.get() != null || this.slot.get().recording()) {
             return sjws_nettask.observe.ObserveRequestFilter.chain(this.slot, frozen);
         }
         return frozen;
