@@ -197,23 +197,47 @@ class HaMessagingStartTest {
     /**
      * #274 MC-B1 on the production path: node a took 3 records on {@code orders} with HA off; restarting it with
      * replication on is refused (OptionalModule.Refused, exit 64) instead of forking the topic's offsets.
-     */
-    /**
-     * #297 covered {@link #threeVoterConfigStartsAndReplicates} with bind retries; this refusal path still
+     *
+     * <p>#297 covered {@link #threeVoterConfigStartsAndReplicates} with bind retries; this refusal path still
      * used TOCTOU {@link EphemeralPorts#probe()} and wrapped {@code HaMessagingStart.install} in
-     * {@code assertThrows(Refused)}, so a stolen Raft/HTTP port surfaced as the wrong exception type
-     * (verify1 on #316: expected Refused, was BindException). Retry the whole scenario with fresh ports.
+     * {@code assertThrows(Refused)}. {@code assertThrows} turns a stolen Raft port's {@code BindException} into
+     * {@code AssertionFailedError} (an Error), which {@link EphemeralPorts#withBindRetry} never catches — so the
+     * flake still failed on the first attempt. Catch {@link OptionalModule.Refused} yourself and let bind failures
+     * propagate; {@link #refusalRetriesWhenARaftPortIsOccupied} proves the retry with a held port.
      */
     @Test
     @Timeout(60)
     void replicationOnAnExistingLocalTopicIsRefused() throws Exception {
         EphemeralPorts.withBindRetry("HaMessagingStartTest.refusal", () -> {
-            replicationOnAnExistingLocalTopicIsRefusedOnce();
+            replicationOnAnExistingLocalTopicIsRefusedOnce(-1);
             return null;
         });
     }
 
-    private void replicationOnAnExistingLocalTopicIsRefusedOnce() throws Exception {
+    /**
+     * Occupies {@code a}'s Raft port on the first attempt so install throws {@link java.net.BindException}; the
+     * retry must still reach Refused. Mutation: restoring {@code assertThrows(Refused)} around install makes this
+     * fail (AssertionFailedError escapes withBindRetry).
+     */
+    @Test
+    @Timeout(60)
+    void refusalRetriesWhenARaftPortIsOccupied() throws Exception {
+        try (var hog = EphemeralPorts.reserveSocket()) {
+            var attempts = new java.util.concurrent.atomic.AtomicInteger();
+            EphemeralPorts.withBindRetry("HaMessagingStartTest.refusalOccupied", () -> {
+                int n = attempts.incrementAndGet();
+                replicationOnAnExistingLocalTopicIsRefusedOnce(n == 1 ? hog.getLocalPort() : -1);
+                return null;
+            });
+            assertTrue(attempts.get() >= 2, "occupied raft port must force at least one retry, got " + attempts.get());
+        }
+    }
+
+    /**
+     * @param forceRaft0 when {@code >= 0}, use that port as node {@code a}'s Raft address (for the occupied-port
+     *                   retry proof); otherwise probe a free port
+     */
+    private void replicationOnAnExistingLocalTopicIsRefusedOnce(int forceRaft0) throws Exception {
         // Fresh name each attempt so a prior bind failure does not leave topic state for the next try.
         var name = "pre-" + Long.toHexString(System.nanoTime());
         int httpPort = freePort();
@@ -230,14 +254,20 @@ class HaMessagingStartTest {
         } finally {
             mod.close();
         }
-        int[] raft = {freePort(), freePort(), freePort()};
+        int[] raft = {forceRaft0 >= 0 ? forceRaft0 : freePort(), freePort(), freePort()};
         int[] http = {httpPort, freePort(), freePort()};
         var on = load(name, cluster("a", raft, http, "on"), httpPort);
         var again = messaging(name);
         try {
-            var refused = assertThrows(OptionalModule.Refused.class, () -> HaMessagingStart.install(on, again, System.err));
-            assertTrue(refused.getMessage().contains("replicated topic orders already holds 3 local record(s)"),
-                    refused.getMessage());
+            // Do not use assertThrows(Refused): a BindException becomes AssertionFailedError (Error), which
+            // withBindRetry's catch (Exception) never sees. Catch Refused; let bind failures propagate.
+            try {
+                HaMessagingStart.install(on, again, System.err);
+                fail("expected Refused");
+            } catch (OptionalModule.Refused refused) {
+                assertTrue(refused.getMessage().contains("replicated topic orders already holds 3 local record(s)"),
+                        refused.getMessage());
+            }
         } finally {
             again.close();
         }
