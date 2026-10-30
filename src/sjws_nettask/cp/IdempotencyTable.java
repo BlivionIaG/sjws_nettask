@@ -63,6 +63,13 @@ public final class IdempotencyTable {
     public static final int MAX_KEYS = 100_000;
     /** Admission bound on the Idempotency-Key (UTF-8 byte length). */
     public static final int MAX_KEY_BYTES = 128;
+    /**
+     * Max UTF-8 bytes for a fingerprint on snapshot decode (#341 N3). Fingerprints store method/path/body
+     * (#258); 512 KiB covers large YAML proposals while refusing a hostile 1 MiB-per-string image.
+     */
+    public static final int MAX_FINGERPRINT_BYTES = 512 * 1024;
+    /** Max UTF-8 bytes for a recorded outcome body on snapshot decode (#341 N3). */
+    public static final int MAX_BODY_BYTES = 512 * 1024;
     /** Encoding version; bump when the on-disk layout changes. */
     static final int FORMAT = 1;
 
@@ -127,6 +134,11 @@ public final class IdempotencyTable {
         }
         if (appliedIndex < 1) {
             throw new IllegalArgumentException("appliedIndex " + appliedIndex);
+        }
+        // #341 N2: agree with admission and snapshot read — oversize keys are not stored, but eviction still runs.
+        if (key.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_BYTES) {
+            evictThrough(appliedIndex);
+            return;
         }
         if (entries.containsKey(key)) {
             evictThrough(appliedIndex);
@@ -213,10 +225,10 @@ public final class IdempotencyTable {
         }
         long prevIndex = 0;
         for (int k = 0; k < size; k++) {
-            var key = readString(in);
-            var fp = readString(in);
+            var key = readString(in, MAX_KEY_BYTES);
+            var fp = readString(in, MAX_FINGERPRINT_BYTES);
             int status = in.readInt();
-            var body = readString(in);
+            var body = readString(in, MAX_BODY_BYTES);
             long applied = in.readLong();
             if (key.isEmpty() || key.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_BYTES) {
                 throw new IOException("idempotency table: bad key");
@@ -238,10 +250,10 @@ public final class IdempotencyTable {
         out.write(raw);
     }
 
-    private static String readString(DataInput in) throws IOException {
+    private static String readString(DataInput in, int maxBytes) throws IOException {
         int len = in.readInt();
-        if (len < 0 || len > 1_048_576) {
-            throw new IOException("idempotency table: string length " + len);
+        if (len < 0 || len > maxBytes) {
+            throw new IOException("idempotency table: string length " + len + " (max " + maxBytes + ")");
         }
         var raw = new byte[len];
         in.readFully(raw);
