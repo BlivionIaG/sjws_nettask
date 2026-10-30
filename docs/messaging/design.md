@@ -5,7 +5,7 @@ Aligned with: docs/design/architecture.md "Target: message-oriented middleware" 
 specific it refines PR #16; it does not contradict it. Benchmark numbers quoted from PR #16 §B2.
 
 ## 0. Scope
-sjws is heading toward reliable, low-latency message-oriented middleware. **Messaging Core =
+**SJWS** (Swarm Java Web Services) is reliable, low-latency message-oriented middleware. **Messaging Core =
 the message queue/broker core**: partitions, a durable ledger, producers/consumers,
 acknowledgement, redelivery, dead-lettering, inspection, and replication through the
 cluster layer designed by the HA workstream (`docs/ha/design.md`).
