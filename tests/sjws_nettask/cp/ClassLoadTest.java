@@ -156,7 +156,7 @@ class ClassLoadTest {
      * and none of the Raft machinery ({@code ReplicatedNode}, {@code RaftGroup}, {@code TcpTransport}, the log storage).
      * With {@code ha.enabled: true} only the key type ({@code ClusterKey}) may load, as before this gate. #270: neither
      * do the snapshot pieces ({@code ReplicaHooks}, the msgrepl snapshot store and transfer), with an
-     * {@code ha.snapshot} block configured.
+     * {@code ha.snapshot} block configured (including {@code max_install_bytes}, #295).
      */
     @Test
     void haMessagingOffAndNoMemberListLoadNoReplication() throws Exception {
@@ -169,7 +169,7 @@ class ClassLoadTest {
                     - { id: w, address: "127.0.0.1:5", witness: true }
                 """;
         var off = startAndProduce("off", "ha:\n  enabled: true\n  messaging: off\n"
-                + "  snapshot: { every_entries: 100, log_tail_entries: 10 }\n" + members);
+                + "  snapshot: { every_entries: 100, log_tail_entries: 10, max_install_bytes: 4g }\n" + members);
         assertNoReplication(off, true);
         var auto = startAndProduce("auto", "ha:\n  messaging: auto\n");
         assertNoReplication(auto, false);

@@ -169,6 +169,13 @@ final class RaftReplica implements Replica {
     private volatile CompletableFuture<?> lastLocal = CompletableFuture.completedFuture(null);
     private final AtomicLong installs = new AtomicLong();
     private final AtomicLong snapshotsTaken = new AtomicLong();
+    /** Times an install gave up after {@link #installPinRoundsLimit} divergent/unavailable peer rounds (#295). */
+    private final AtomicLong installPinExhausted = new AtomicLong();
+    /**
+     * Peer-round budget for one install before giving up (#295). Production uses
+     * {@link Snapshots#DEFAULT_MAX_INSTALL_PIN_ROUNDS}; tests may lower it.
+     */
+    volatile int installPinRoundsLimit = Snapshots.DEFAULT_MAX_INSTALL_PIN_ROUNDS;
     /** Tests only: called at named points of a snapshot or an install to simulate a crash there. Null in production. */
     volatile java.util.function.Consumer<String> faultHook;
 
@@ -802,6 +809,11 @@ final class RaftReplica implements Replica {
         return this.installs.get();
     }
 
+    /** #295: how many times this replica exhausted its divergent-pin retry budget. */
+    long installPinExhausted() {
+        return this.installPinExhausted.get();
+    }
+
     long snapshotsTaken() {
         return this.snapshotsTaken.get();
     }
@@ -991,7 +1003,8 @@ final class RaftReplica implements Replica {
     /**
      * Fetches the newest pin at or above {@code m} from the data nodes (leader first), swaps it in for the whole local
      * ledger, and moves the apply point there. Blocks this group's delivery thread: no later entry may apply before
-     * the ledger it lands on. Retries until it succeeds or the replica closes; the marker makes a restart redo it.
+     * the ledger it lands on. Retries with backoff up to {@link #installPinRoundsLimit} peer-rounds (#295); the marker
+     * makes a restart redo it. An oversized consensus image is abandoned permanently (marker stays).
      */
     private void install(MsgSnapshot m) {
         try {
@@ -1002,38 +1015,51 @@ final class RaftReplica implements Replica {
                 this.installHandoff.unlock();
             }
             fault("install-marked");
+            long maxBytes = this.snaps.settings.maxInstallBytes();
+            // #295 / Security R3: a consensus image over the bound must not retry forever.
+            if (maxBytes > 0 && m.dataBytes() > maxBytes) {
+                System.err.println("WARN: " + this.groupId.value() + ": install of " + m.dataBytes()
+                        + " bytes exceeds ha.snapshot.max_install_bytes " + maxBytes
+                        + "; abandoning install (marker kept for operator intervention)");
+                this.installPinExhausted.incrementAndGet();
+                return;
+            }
             boolean fetched = false;
             long backoff = 20;
-            long maxBytes = this.snaps.settings.maxInstallBytes();
+            int rounds = 0;
+            int roundLimit = Math.max(1, this.installPinRoundsLimit);
             while (!fetched && !this.closed) {
                 for (var peer : peerOrder()) {
                     try {
-                        // Fetch the pin, then refuse unless it is exactly the consensus image m (#288 Security B1).
-                        var got = SnapshotTransfer.fetch(peer, this.snaps.key, this.topic, m.index(), this.staging,
+                        // #295 (c)/(a): compare the consensus image and the size bound before chunk bodies; #288 B1.
+                        SnapshotTransfer.fetch(peer, this.snaps.key, this.topic, m.index(), this.staging,
                                 GroupOptions.DEFAULT_MAX_SNAPSHOT_BYTES, this.snaps.clockMs,
-                                this.snaps.settings.bytesPerSecond(), this.snaps.settings.chunkBytes());
-                        if (!sameSnapshotImage(got, m)) {
-                            warn(this.groupId.value() + ": install from " + peer + ": pin at " + got.index()
-                                    + " does not match the consensus snapshot at " + m.index() + "; trying the next peer");
-                            clearStaging();
-                            continue;
-                        }
-                        if (maxBytes > 0) {
-                            long total = 0;
-                            for (var seg : m.segments()) total += seg.bytes();
-                            if (total > maxBytes) {
-                                throw new IOException("install of " + total + " bytes exceeds ha.snapshot.max_install_bytes "
-                                        + maxBytes);
-                            }
-                        }
+                                this.snaps.settings.bytesPerSecond(), this.snaps.settings.chunkBytes(),
+                                maxBytes, got -> sameSnapshotImage(got, m));
                         fetched = true;
                         break;
+                    } catch (SnapshotTransfer.Divergent e) {
+                        clearStaging();
+                        warn(this.groupId.value() + ": install from " + peer + ": " + e.getMessage()
+                                + "; trying the next peer");
+                    } catch (SnapshotTransfer.Oversized e) {
+                        clearStaging();
+                        warn(this.groupId.value() + ": install from " + peer + ": " + e.getMessage());
                     } catch (IOException e) {
                         clearStaging();
                         warn(this.groupId.value() + ": install from " + peer + ": " + e.getMessage());
                     }
                 }
                 if (!fetched) {
+                    rounds++;
+                    if (rounds >= roundLimit) {
+                        // Always log exhaustion (not rate-limited): operators need the signal (#295).
+                        System.err.println("WARN: " + this.groupId.value()
+                                + ": snapshot install gave up after " + rounds
+                                + " peer rounds with no matching pin; leaving install pending");
+                        this.installPinExhausted.incrementAndGet();
+                        return;
+                    }
                     Thread.sleep(backoff);
                     backoff = Math.min(2_000, backoff * 2);
                 }

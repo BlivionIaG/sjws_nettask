@@ -37,6 +37,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 
 import javax.crypto.KDF;
 import javax.crypto.Mac;
@@ -59,7 +60,10 @@ import javax.crypto.spec.SecretKeySpec;
  * <p><b>Bounds.</b> Topic names are plain topic names; files are only ever named from numeric segment bases; the
  * manifest is at most {@code maxManifest} bytes and a chunk at most {@link MsgSnapshot#MAX_CHUNK}; at most
  * {@link #MAX_SESSIONS} transfers run at once, each with a read timeout; the server paces all of them with one token
- * bucket ({@code bytesPerSecond}), so an install never takes the leader's whole disk or network.
+ * bucket ({@code bytesPerSecond}), so an install never takes the leader's whole disk or network. {@code maxInstallBytes}
+ * (default {@link Snapshots#DEFAULT_MAX_INSTALL_BYTES}, {@code 0} = unlimited) is checked on the authenticated
+ * manifest before any chunk is requested and again before each chunk is written (#295). An optional {@code accept}
+ * predicate compares the manifest to the consensus image before chunk bodies are fetched (#295).
  *
  * <p>Wire (big-endian). Hello: {@code "SJMS" v=1 nonceC[16] tsMs topicLen:u8 topic minIndex mac[32]}. Reply:
  * {@code status:u8 nonceS[16] pinIndex len:int manifest mac[32]} (status 1: no pin, then close). Chunk request:
@@ -378,17 +382,53 @@ final class SnapshotTransfer {
     }
 
     /**
+     * The peer's pin does not match the consensus snapshot image. Thrown after the authenticated manifest is read and
+     * before any chunk body is requested, so a divergent or superseded pin wastes no transfer bandwidth (#295).
+     */
+    static final class Divergent extends IOException {
+        Divergent(String m) {
+            super(m);
+        }
+    }
+
+    /**
+     * The install would exceed {@code ha.snapshot.max_install_bytes}. Thrown before writing the overflowing bytes
+     * (manifest check first, then per-chunk) so staging is not left with a partial oversized image (#295).
+     */
+    static final class Oversized extends IOException {
+        Oversized(String m) {
+            super(m);
+        }
+    }
+
+    /**
      * Fetches the newest pin of {@code topic} at or above {@code minIndex} from {@code peer} into {@code staging}
      * ({@code <base>.log} files and {@code <base>.compacted} markers, fsynced). Chunks already in {@code staging} whose
      * digest matches are kept, so a transfer cut short (or a crash) resumes. Returns the verified manifest.
      */
     static MsgSnapshot fetch(InetSocketAddress peer, byte[] key, String topic, long minIndex, Path staging, int maxManifest,
             LongSupplier clockMs) throws IOException {
-        return fetch(peer, key, topic, minIndex, staging, maxManifest, clockMs, 64L << 20, MsgSnapshot.MIN_CHUNK);
+        return fetch(peer, key, topic, minIndex, staging, maxManifest, clockMs, 64L << 20, MsgSnapshot.MIN_CHUNK, 0L, null);
     }
 
     static MsgSnapshot fetch(InetSocketAddress peer, byte[] key, String topic, long minIndex, Path staging, int maxManifest,
             LongSupplier clockMs, long bytesPerSecond, int chunkBytes) throws IOException {
+        return fetch(peer, key, topic, minIndex, staging, maxManifest, clockMs, bytesPerSecond, chunkBytes, 0L, null);
+    }
+
+    /**
+     * As {@link #fetch(InetSocketAddress, byte[], String, long, Path, int, LongSupplier, long, int)} with an install
+     * size bound and an optional consensus-image check (#295).
+     *
+     * @param maxInstallBytes  refuse when the manifest's {@link MsgSnapshot#dataBytes()} exceeds this, and again before
+     *                         writing any chunk that would push the received total over it; {@code 0} leaves it off
+     * @param accept           when non-null, the authenticated manifest must satisfy it before any chunk is requested;
+     *                         a refusal throws {@link Divergent} and downloads nothing
+     */
+    static MsgSnapshot fetch(InetSocketAddress peer, byte[] key, String topic, long minIndex, Path staging, int maxManifest,
+            LongSupplier clockMs, long bytesPerSecond, int chunkBytes, long maxInstallBytes, Predicate<MsgSnapshot> accept)
+            throws IOException {
+        if (maxInstallBytes < 0) throw new IllegalArgumentException("maxInstallBytes");
         Files.createDirectories(staging);
         int timeout = timeoutMs(bytesPerSecond, chunkBytes);
         try (var sc = SocketChannel.open()) {
@@ -424,44 +464,66 @@ final class SnapshotTransfer {
             if (!snap.topic().equals(topic) || snap.index() != pinIndex || snap.index() < minIndex) {
                 throw new IOException("snapshot manifest does not match the request");
             }
+            // #295 (c): compare the consensus image before requesting any chunk body.
+            if (accept != null && !accept.test(snap)) {
+                throw new Divergent("pin at " + snap.index() + " does not match the consensus snapshot");
+            }
+            // #295 (a): refuse on the authenticated manifest size before any chunk hits the wire or disk.
+            if (maxInstallBytes > 0 && snap.dataBytes() > maxInstallBytes) {
+                throw new Oversized("install of " + snap.dataBytes() + " bytes exceeds ha.snapshot.max_install_bytes "
+                        + maxInstallBytes);
+            }
             long seq = 0;
+            long received = 0;
             var buf = ByteBuffer.allocate(snap.chunkBytes());
-            for (var seg : snap.segments()) {
-                var file = staging.resolve(SnapshotStore.name(seg.base())); // named from the number only
-                try (var out = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-                    if (out.size() > seg.bytes()) out.truncate(seg.bytes());
-                    for (int c = 0; c < seg.digests().length; c++) {
-                        long pos = (long) c * snap.chunkBytes();
-                        int clen = (int) Math.min(snap.chunkBytes(), seg.bytes() - pos);
-                        if (out.size() >= pos + clen && MessageDigest.isEqual(SnapshotStore.digest(out, pos, clen, buf), seg.digests()[c])) {
-                            continue; // resumed: already here and intact
+            try {
+                for (var seg : snap.segments()) {
+                    var file = staging.resolve(SnapshotStore.name(seg.base())); // named from the number only
+                    try (var out = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                        if (out.size() > seg.bytes()) out.truncate(seg.bytes());
+                        for (int c = 0; c < seg.digests().length; c++) {
+                            long pos = (long) c * snap.chunkBytes();
+                            int clen = (int) Math.min(snap.chunkBytes(), seg.bytes() - pos);
+                            if (out.size() >= pos + clen && MessageDigest.isEqual(SnapshotStore.digest(out, pos, clen, buf), seg.digests()[c])) {
+                                received += clen;
+                                continue; // resumed: already here and intact
+                            }
+                            var req = ByteBuffer.allocate(20).putLong(++seq).putLong(seg.base()).putInt(c).array();
+                            write(sc, ByteBuffer.wrap(req), ByteBuffer.wrap(tag(key, new byte[] {'C'}, nonceS, req)));
+                            if (in.readByte() != 0) throw new IOException("peer refused chunk " + c + " of segment " + seg.base());
+                            int got = in.readInt();
+                            if (got != clen) throw new IOException("chunk of " + got + " bytes, expected " + clen);
+                            buf.clear().limit(clen);
+                            in.readFully(buf.array(), 0, clen);
+                            var md = SnapshotStore.sha256();
+                            md.update(buf.array(), 0, clen);
+                            if (!MessageDigest.isEqual(md.digest(), seg.digests()[c])) {
+                                throw new IOException("chunk " + c + " of segment " + seg.base() + " fails its SHA-256");
+                            }
+                            // #295 (a): bound before the write so an overflow leaves no new bytes on disk.
+                            if (maxInstallBytes > 0 && received + clen > maxInstallBytes) {
+                                throw new Oversized("install would exceed ha.snapshot.max_install_bytes " + maxInstallBytes
+                                        + " after " + received + " bytes");
+                            }
+                            while (buf.hasRemaining()) out.write(buf, pos + buf.position());
+                            received += clen;
                         }
-                        var req = ByteBuffer.allocate(20).putLong(++seq).putLong(seg.base()).putInt(c).array();
-                        write(sc, ByteBuffer.wrap(req), ByteBuffer.wrap(tag(key, new byte[] {'C'}, nonceS, req)));
-                        if (in.readByte() != 0) throw new IOException("peer refused chunk " + c + " of segment " + seg.base());
-                        int got = in.readInt();
-                        if (got != clen) throw new IOException("chunk of " + got + " bytes, expected " + clen);
-                        buf.clear().limit(clen);
-                        in.readFully(buf.array(), 0, clen);
-                        var md = SnapshotStore.sha256();
-                        md.update(buf.array(), 0, clen);
-                        if (!MessageDigest.isEqual(md.digest(), seg.digests()[c])) {
-                            throw new IOException("chunk " + c + " of segment " + seg.base() + " fails its SHA-256");
+                        if (out.size() != seg.bytes()) out.truncate(seg.bytes());
+                        out.force(true);
+                    }
+                    var marker = staging.resolve(String.format("%020d.compacted", seg.base()));
+                    if (seg.markerNext() >= 0) {
+                        Files.write(marker, ByteBuffer.allocate(8).putLong(seg.markerNext()).array());
+                        try (var m = FileChannel.open(marker, StandardOpenOption.WRITE)) {
+                            m.force(true);
                         }
-                        while (buf.hasRemaining()) out.write(buf, pos + buf.position());
+                    } else {
+                        Files.deleteIfExists(marker);
                     }
-                    if (out.size() != seg.bytes()) out.truncate(seg.bytes());
-                    out.force(true);
                 }
-                var marker = staging.resolve(String.format("%020d.compacted", seg.base()));
-                if (seg.markerNext() >= 0) {
-                    Files.write(marker, ByteBuffer.allocate(8).putLong(seg.markerNext()).array());
-                    try (var m = FileChannel.open(marker, StandardOpenOption.WRITE)) {
-                        m.force(true);
-                    }
-                } else {
-                    Files.deleteIfExists(marker);
-                }
+            } catch (Oversized e) {
+                clearStagingQuietly(staging);
+                throw e;
             }
             var end = ByteBuffer.allocate(20).putLong(++seq).putLong(-1).putInt(0).array();
             write(sc, ByteBuffer.wrap(end), ByteBuffer.wrap(tag(key, new byte[] {'C'}, nonceS, end)));
@@ -478,6 +540,22 @@ final class SnapshotTransfer {
             }
             SnapshotStore.fsyncDir(staging);
             return snap;
+        }
+    }
+
+    /** Drops staging contents after an oversized abort so no partial install remains (#295). */
+    private static void clearStagingQuietly(Path staging) {
+        try {
+            if (!Files.isDirectory(staging)) return;
+            try (var stream = Files.list(staging)) {
+                stream.forEach(f -> {
+                    try {
+                        Files.deleteIfExists(f);
+                    } catch (IOException ignored) {
+                    }
+                });
+            }
+        } catch (IOException ignored) {
         }
     }
 }
