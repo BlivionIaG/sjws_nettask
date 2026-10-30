@@ -98,6 +98,14 @@ public final class ServerMetrics {
         this.http3 = http3Connections == null ? () -> 0 : http3Connections;
     }
 
+    /**
+     * HTTP/1.1 accepts closed because {@code max_connections_per_ip} was hit. Read only at scrape time.
+     * Null resets to 0. Core connections family (not swarm-gated). Does not install the observe filter.
+     */
+    public void setRefusedPerIp(LongSupplier refused) {
+        this.refusedPerIp = refused == null ? () -> 0 : refused;
+    }
+
     void setDropped(LongSupplier droppedLines) {
         this.dropped = droppedLines == null ? () -> 0 : droppedLines;
     }
