@@ -408,7 +408,8 @@ public final class SjwsServer implements AutoCloseable {
         return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, null);
     }
 
-    private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
+    /** Package-visible so same-package tests can wire a custom {@code h2Factory} with a file-backed reload. */
+    static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal)
             throws IOException {
         return start(loaded, h3Factory, h2Factory, filters, terminal, null);
@@ -549,6 +550,8 @@ public final class SjwsServer implements AutoCloseable {
                     this.armed.set(armed);
                 }
             }
+            // Custom h2Factory: no start-time arm — chain-control apply, metrics, and publish call
+            // Transport.armHandler via armH2 / compilePublishArmed (Codex P2 4421410868).
             transport.start();
             this.h2 = transport;
         } catch (Exception | LinkageError e) {
@@ -857,33 +860,34 @@ public final class SjwsServer implements AutoCloseable {
         // P1/P2a). In-flight Tasks keep the generation they captured; defer closing replaced pools
         // until those Tasks leave (P2b).
         sjws_nettask.h2.Http2Server.Generation previousH2 = null;
-        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
-            // Override path must also publish an armed generation and drain the previous one (B3).
-            // When chain-control is live, rebind around chainLeaf (the same leaf apply() compiles
-            // against) — never this.override. override still holds the original startup filter
-            // chain and would resurrect filters the control document removed (Codex P2 4421015537).
-            // That wrong armed handler also feeds HTTP/1 via requestHandler() and HTTP/3 via the
-            // replaceHandler lambda after live.set.
-            var control = this.control;
-            Handler terminal = (control != null && control.isLive())
-                    ? this.chainLeaf
-                    : (this.override != null ? this.override : next.handler());
+        if (this.h2 != null) {
+            // Shared terminal/armed selection for Http2Server and custom h2Factory transports.
+            // Live chain-control rebinds around chainLeaf (Codex P2 4421015537); Http2Server keeps
+            // generation-aware armHandler(armed, bodies), others get Transport.armHandler (4421410868).
+            Handler terminal = publishTerminal(next);
             boolean bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null
                     || this.override != null;
-            if (control != null && control.isLive()) {
-                // Serialize compile + install with ChainControl.apply/pinOuter (Codex P1).
-                previousH2 = control.withPublishLock(() -> {
-                    Handler frozen = request -> terminal.handle(request);
-                    Handler armed = control.compileAroundUnlocked(frozen);
-                    var prev = http2.armHandler(armed, bodies);
+            if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
+                var control = this.control;
+                if (control != null && control.isLive()) {
+                    previousH2 = control.withPublishLock(() -> {
+                        Handler armed = compileAroundTerminal(terminal);
+                        var prev = http2.armHandler(armed, bodies);
+                        if (this.armed.get() != null) {
+                            this.armed.set(armed);
+                        }
+                        return prev;
+                    });
+                } else {
+                    Handler armed = armedAround(terminal);
+                    previousH2 = http2.armHandler(armed, bodies);
                     if (this.armed.get() != null) {
                         this.armed.set(armed);
                     }
-                    return prev;
-                });
+                }
             } else {
-                Handler armed = armedAround(terminal);
-                previousH2 = http2.armHandler(armed, bodies);
+                Handler armed = compilePublishArmed(terminal);
+                this.h2.armHandler(armed);
                 if (this.armed.get() != null) {
                     this.armed.set(armed);
                 }
@@ -1224,16 +1228,52 @@ public final class SjwsServer implements AutoCloseable {
      * Stores the compiled snapshot where every transport already reads its handler. One volatile
      * write per transport; the request path does not enter {@link ChainControl}.
      */
+
+    /**
+     * Publishes {@code handler} on the HTTP/2 transport. {@link sjws_nettask.h2.Http2Server} gets
+     * the generation-aware overload (bodies + drain tracking). Any other non-null {@link Transport}
+     * (custom {@code h2Factory}) gets {@link Transport#armHandler(Handler)} so chain-control and
+     * metrics arms still reach it (Codex P2 4421410868).
+     */
+
+    /** Terminal for a config publish: chainLeaf when control is live, else override or next.handler(). */
+    private Handler publishTerminal(ConfigSnapshot next) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return this.chainLeaf;
+        }
+        return this.override != null ? this.override : next.handler();
+    }
+
+    /** Armed chain for publish on a custom h2 Transport (lock when control is live). */
+    private Handler compilePublishArmed(Handler terminal) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return control.withPublishLock(() -> compileAroundTerminal(terminal));
+        }
+        return armedAround(terminal);
+    }
+
+    private Handler compileAroundTerminal(Handler terminal) {
+        var control = this.control;
+        Handler frozen = request -> terminal.handle(request);
+        return control.compileAroundUnlocked(frozen);
+    }
+
+    private void armH2(Handler handler, boolean bodies) {
+        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
+            trackDrainingGeneration(http2.armHandler(handler, bodies));
+        } else if (this.h2 != null) {
+            this.h2.armHandler(handler);
+        }
+    }
+
     private void armSnapshot(Handler handler) {
         this.armed.set(handler);
         if (this.h3 != null) {
             this.h3.armHandler(handler);
         }
-        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
-            // Filters need bodies; publish as one generation (P2a). Retain the previous generation
-            // so a later snapshot close waits for Tasks that pinned it (Codex P2 leases).
-            trackDrainingGeneration(http2.armHandler(handler, true));
-        }
+        armH2(handler, true);
     }
 
     /**
@@ -1304,9 +1344,7 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h3 != null) {
             this.h3.armHandler(chain);
         }
-        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
-            trackDrainingGeneration(http2.armHandler(chain, true));
-        }
+        armH2(chain, true);
     }
 
     /**
