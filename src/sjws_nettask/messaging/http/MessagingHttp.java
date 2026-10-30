@@ -43,6 +43,7 @@ import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.RecordBatch;
 import sjws_nettask.messaging.ledger.Replica;
 import sjws_nettask.messaging.ledger.WriteOutcomeUnknownException;
+import sjws_nettask.messaging.ledger.LedgerBudgetExhaustedException;
 import sjws_nettask.messaging.ledger.WriteRefusedException;
 import sjws_nettask.messaging.ledger.ProducerSequenceException;
 
@@ -128,6 +129,8 @@ final class MessagingHttp implements Handler {
             return problem(400, "bad request", e.getMessage());
         } catch (IOException e) {
             return logError(e, target);
+        } catch (LedgerBudgetExhaustedException e) {
+            return ledgerBudgetBusy(e);
         } catch (IllegalStateException e) {
             return unavailable(e, target);
         }
@@ -195,6 +198,8 @@ final class MessagingHttp implements Handler {
             return failed(e, request.target(), true);
         } catch (LeaderUnavailableException e) {
             return notLeader(e, request.target());
+        } catch (LedgerBudgetExhaustedException e) {
+            return ledgerBudgetBusy(e);
         } catch (IllegalStateException e) {
             return unavailable(e, request.target());
         }
@@ -368,6 +373,13 @@ final class MessagingHttp implements Handler {
             return r;
         }
         return new Response(200, h, new Body.Stream(total, new FrameSource(batches, buf)));
+    }
+
+    /** #333: opening or materializing a LedgerWriter would exceed the process ledger budget. */
+    static Response ledgerBudgetBusy(LedgerBudgetExhaustedException e) {
+        var r = problem(503, "busy", e.getMessage());
+        r.headers().set("retry-after", RETRY_AFTER_SECONDS);
+        return r;
     }
 
     /** Chunk size, sized from the frames: the largest frame (so one frame fits a chunk), or the batch total up to
@@ -547,6 +559,7 @@ final class MessagingHttp implements Handler {
         while (c instanceof java.util.concurrent.CompletionException && c.getCause() != null) c = c.getCause();
         if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
         if (write && c instanceof WriteRefusedException r) return refused(r, target);
+        if (c instanceof LedgerBudgetExhaustedException b) return ledgerBudgetBusy(b);
         if (write && c instanceof ProducerSequenceException p) return producerSequence(p);
         FAILURES.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + AccessTargetMask.maskPinned(target) + " failed", c);
         if (write && c instanceof WriteOutcomeUnknownException u) return outcomeUnknown(u.term(), u.leaderName(), u.leaderUrl(), target);

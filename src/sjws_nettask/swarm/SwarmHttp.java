@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import sjws_nettask.messaging.ledger.LedgerBudgetExhaustedException;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
@@ -188,6 +189,10 @@ final class SwarmHttp implements Handler {
             return problem(400, "bad request", e.getMessage()).response();
         } catch (IllegalArgumentException e) {
             return problem(400, "bad request", e.getMessage()).response();
+        } catch (LedgerBudgetExhaustedException e) {
+            var r = problem(503, "busy", e.getMessage()).response();
+            r.headers().set("retry-after", "1");
+            return r;
         }
     }
 
