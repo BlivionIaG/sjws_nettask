@@ -81,8 +81,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     // Guarded by lock: counters shared by writer and syncer for snapshot publication.
     private long batches, records, bytes, fsyncs, seq;
     /**
-     * Durable offset (every record below this has been fsynced). Volatile so {@link #needsSharedSync}
-     * / {@link #sharedSyncSlice} can read it without {@link #lock} (#329); updates still happen under
+     * Durable offset (every record below this has been fsynced). Volatile so {@link #sharedSyncSlice} can read it without {@link #lock} (#329); updates still happen under
      * the lock together with the counters that {@link #publish} snapshots.
      *
      * <p><b>Publish → durable happens-before.</b> After recovery, the only stores to this field are in
@@ -96,8 +95,8 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      *     {@code durable} (via {@link #durableNow} or {@link LedgerSnapshot#durableOffset} after publish)
      *     synchronizes-with that store, so an observer that sees {@code durable >= N} knows records
      *     {@code [start, N)} were fsynced before the observation, and no fsync-waiting ack for those
-     *     records completed before the store either. {@link #afterLogForce} runs between (2) and (3) so
-     *     tests can prove (3) never covers records appended after the force returned.
+     *     records completed before the store either. {@link #afterLogForce} runs between (2) and (3) on {@link #forceInline} and {@link #sharedSyncSlice}
+     *     so tests can prove (3) never covers records appended after the force returned.
      */
     private volatile long durable;
 
@@ -243,15 +242,6 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private void unparkSyncer() {
         if (sharedPool != null) sharedPool.unparkSyncer(sharedShard);
         else LockSupport.unpark(syncer);
-    }
-
-    /** Cheap check for the shared syncer's spin-then-park idle path. Lock-free (volatile durable). */
-    boolean needsSharedSync() {
-        if (syncPaused) return false;
-        if (stopSyncer && queue.isEmpty() && fsyncWaiters.isEmpty()) return false;
-        // Writer-default ASYNC (or any fsync waiter) is the only reason to sync; check before reading durable.
-        if (durability != Durability.ASYNC && fsyncWaiters.isEmpty()) return false;
-        return written > durable;
     }
 
     boolean sharedSyncSlice() {
@@ -493,8 +483,6 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             } finally {
                 syncInForce.decrementAndGet();
             }
-            var hook = afterLogForce;
-            if (hook != null) hook.run();
             lastFsync = System.nanoTime();
             lock.lock();
             try { fsyncs++; if (target > durable) durable = target; } finally { lock.unlock(); }

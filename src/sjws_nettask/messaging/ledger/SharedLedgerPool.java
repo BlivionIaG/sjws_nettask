@@ -173,7 +173,7 @@ public final class SharedLedgerPool {
                 if (busy) continue;
                 if (retire()) return;
                 // Brief spin so an unpark that races the idle check is not delayed by a long park.
-                // Watch {@link #pinged} instead of re-locking every member on each iteration (#durableNow hotspot).
+                // Watch {@link #pinged} instead of scanning every member on each iteration (#329 durableNow hotspot).
                 for (int i = 0; i < 256 && !pinged; i++) Thread.onSpinWait();
                 if (pinged) continue;
                 if (retire()) return;
