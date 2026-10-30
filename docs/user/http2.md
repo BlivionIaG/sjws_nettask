@@ -45,6 +45,13 @@ flowchart TB
   `--header-timeout`, idle connections closed after `--idle-timeout`, a stream whose peer window stays closed for 5 s is cancelled, and a write that makes no
   progress for `--write-timeout` is reset. File bodies are sent at the pace of the peer's
   flow-control windows, one 64 KiB chunk per stream in memory at most.
+* Connection receive window: after the peer SETTINGS exchange the server raises the
+  connection window to **1 MiB** (from the HTTP/2 default 64 KiB). That caps unconsumed
+  request `DATA` across all streams on one connection, so one paused unread body cannot
+  head-of-line-block siblings. Per-stream app buffering for a paused body stays about the
+  `Http2RequestBody` HIGH watermark (16 KiB) plus in-flight; with the default
+  `SETTINGS_MAX_CONCURRENT_STREAMS` of 100, a worst-case sketch is on the order of ~1 MiB
+  unconsumed + ≤100×HIGH app queues (~1.6 MiB) per connection — finite, not unbounded.
 * Quick check: `curl -k --http2 https://127.0.0.1:8443/` (h2), `curl --http2-prior-knowledge
   http://127.0.0.1:<h2c-port>/` (h2c).
 
