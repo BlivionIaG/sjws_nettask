@@ -38,7 +38,35 @@ public final class AccessTargetMask {
 
     static final String MASK = "***";
 
+    /** Per-request pinned credential query names for access-log and MessagingHttp target logs. */
+    private static final ThreadLocal<String[]> PINNED = new ThreadLocal<>();
+
     private AccessTargetMask() {
+    }
+
+    /**
+     * Pins {@code names} for this thread until {@link #clearPinned()}. ObserveRequestFilter sets
+     * this around {@code proceed} so MessagingHttp ERROR/WARN logs use the same snapshot as the
+     * access log.
+     */
+    public static void pin(String[] names) {
+        PINNED.set(names == null || names.length == 0 ? NONE : names);
+    }
+
+    /** Clears the per-request pin. Always call from a finally after {@link #pin}. */
+    public static void clearPinned() {
+        PINNED.remove();
+    }
+
+    /** Names pinned for this thread, or {@link #NONE} when unset. */
+    public static String[] pinned() {
+        var names = PINNED.get();
+        return names == null ? NONE : names;
+    }
+
+    /** Masks {@code target} with {@link #pinned()} names (MessagingHttp ERROR/WARN path). */
+    public static String maskPinned(String target) {
+        return mask(target, pinned());
     }
 
     /**
