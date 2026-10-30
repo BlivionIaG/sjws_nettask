@@ -456,6 +456,46 @@ class ArmedFiltersSurviveReloadTest {
     }
 
 
+
+    /**
+     * Jacoco: publish terminal when control is absent or not yet live must still use override
+     * (startup filters stay until the first apply). Complements the live-control resurrection fix.
+     */
+    @Test
+    void startupOverrideReloadWithoutLiveChainControl() throws Exception {
+        var www = Files.createDirectories(this.dir.resolve("www-ov-nl"));
+        Files.writeString(www.resolve("hello.txt"), "hello");
+        var yaml = this.dir.resolve("sjws-ov-nl.yaml");
+        writeStatic(yaml, www);
+        var startup = RequestFilters.create().add((request, next) -> {
+            var response = next.proceed(request);
+            response.headers().set("x-startup", "1");
+            return response;
+        });
+        var loaded = ConfigLoader.load(new String[] {
+                "--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        this.server = SjwsServer.start(loaded, startup);
+
+        // Open the slot but do not apply — isLive() stays false; publish must use override.
+        this.server.chainControl(startup, Set.of());
+
+        int h2c = ((Http2Server) this.server.h2()).h2cPort();
+        var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
+                .connectTimeout(Duration.ofSeconds(5)).build();
+        assertEquals("1", get(client, h2c, "/hello.txt", null).headers().firstValue("x-startup").orElse(null));
+
+        var www2 = Files.createDirectories(this.dir.resolve("www-ov-nl2"));
+        Files.writeString(www2.resolve("hello.txt"), "hello2");
+        writeStatic(yaml, www2);
+        assertTrue(this.server.reload().applied());
+
+        var after = get(client, h2c, "/hello.txt", null);
+        assertEquals("hello2", after.body());
+        assertEquals("1", after.headers().firstValue("x-startup").orElse(null),
+                "startup filters remain until the first control document (control not live)");
+    }
+
     private static void mintLocalhostPem(Path cert, Path key) throws Exception {
         var pb = new ProcessBuilder("/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048",
                 "-keyout", key.toString(), "-out", cert.toString(),
