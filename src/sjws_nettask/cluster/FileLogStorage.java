@@ -102,8 +102,10 @@ public final class FileLogStorage implements LogStorage {
     /**
      * One file scan: complete {@code [index][term][len][data]} records and the end offset of the last
      * one. A torn tail ({@code lastGoodPos < fileSize}) is truncated by the caller with an fsync of
-     * the file and directory (#241). Mid-log corruption (negative length or a non-contiguous index)
-     * fails closed. Bit flips inside a well-framed record need per-record CRC32C (#207).
+     * the file and directory (#241). A complete header with a negative length fails closed. Index
+     * gaps are mode-specific: non-rolling refuses them; rolling keeps the contiguous suffix ending
+     * at the newest entry (snapshot prefix truncations can leave a gap in the active file). Bit
+     * flips inside a well-framed record need per-record CRC32C (#207).
      */
     private record Scan(java.util.TreeMap<Long, Rec> records, long lastGoodPos, long fileSize) {
         boolean torn() {
@@ -118,7 +120,6 @@ public final class FileLogStorage implements LogStorage {
         }
         long fileSize = Files.size(path);
         long lastGood = 0L;
-        Long expect = null;
         try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
             var header = ByteBuffer.allocate(20);
             while (in.position() < fileSize) {
@@ -155,12 +156,6 @@ public final class FileLogStorage implements LogStorage {
                 if (body.hasRemaining()) {
                     break; // torn body at EOF
                 }
-                if (expect != null && index != expect) {
-                    throw new IOException("corrupt log record framing in " + path.getFileName()
-                            + " at offset " + recordStart + ": index " + index + " after "
-                            + (expect - 1) + "; refusing to start");
-                }
-                expect = index + 1;
                 out.put(index, new Rec(term, data));
                 lastGood = in.position();
             }
@@ -219,6 +214,7 @@ public final class FileLogStorage implements LogStorage {
             } else if (Files.exists(path) && Files.size(path) > 0) {
                 pendingTorn = scanRecords(path);
                 loaded.putAll(pendingTorn.records);
+                refuseNonContiguous(path, loaded);
             }
             var channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
                     StandardOpenOption.WRITE);
