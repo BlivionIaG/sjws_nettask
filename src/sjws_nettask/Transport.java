@@ -73,9 +73,10 @@ public interface Transport extends AutoCloseable {
     }
 
     /**
-     * Replaces the request handler after {@link #start()} so a late metrics arm is counted.
-     * The default ignores it. HTTP/2 and HTTP/3 install the chain. No effect when the observe filter
-     * was already compiled into the startup chain.
+     * Atomically replaces the request handler after {@link #start()}. Implementors own the swap
+     * (one volatile write / CAS), body-attach policy, and any request-size limits for the new
+     * handler; the default no-ops. HTTP/2 and HTTP/3 install the chain. No effect when the observe
+     * filter was already compiled into the startup chain.
      */
     default void armHandler(Handler handler) {
     }

@@ -61,10 +61,25 @@ public interface SnapshotControl {
     }
 
     /**
+     * Record an image the application built itself of state it has already applied through
+     * {@code snapshot.lastIncludedIndex()} (#270: a log built from durable application data, such as
+     * the messaging segments, snapshots at the point its own data is fsynced, which can trail the commit
+     * index). The image is made durable (written off the group lock, so appends are not held up) and
+     * becomes the snapshot sent to a follower behind the truncated prefix; nothing is truncated and the
+     * listener is not called. Refused (nothing changes) when the image exceeds
+     * {@link GroupOptions#maxSnapshotBytes()}, the index does not advance past the current snapshot, is
+     * past the applied index, or the log holds it with another term. The default refuses.
+     */
+    default void recordSnapshot(LogSnapshot snapshot) {
+        throw new UnsupportedOperationException("recordSnapshot");
+    }
+
+    /**
      * Use {@code bound} (null removes it) to limit prefix truncation: with a bound,
      * {@link #truncateAndCompact} never drops past it, and {@link #truncateToBound} truncates
      * through {@code min(snapshot index, bound)}. Automatic snapshots never truncate the log, with or
-     * without a bound. The default refuses.
+     * without a bound. With a bound set, a data follower whose next entry is still in the log (the tail
+     * the bound keeps behind the snapshot) is sent entries rather than the snapshot. The default refuses.
      */
     default void setTruncationBound(TruncationBound bound) {
         throw new UnsupportedOperationException("truncation bound");

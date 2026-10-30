@@ -8,12 +8,19 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import java.nio.file.Path;
 import sjws_nettask.core.Request;
 
 class ApiKeyFilterTest {
+
+    @TempDir
+    Path dir;
 
     @Test
     void headerAndQuery() {
@@ -76,5 +83,24 @@ class ApiKeyFilterTest {
         assertNull(ApiKeyFilter.query("/x?kk=a", "k"));
         assertEquals("", ApiKeyFilter.query("/x?k=", "k"));
         assertFalse(ApiKeyFilter.query("/x?k=a", "k").isBlank());
+        // '#' only truncates the matched value; scanning continues after '#…&'.
+        assertEquals("SECRET", ApiKeyFilter.query("/x?other=1#frag&k=SECRET", "k"));
+        assertEquals("SECRET", ApiKeyFilter.query("/x?keep=1#x&k=SECRET&y=2", "k"));
+        assertNull(ApiKeyFilter.query("/x?api%5Fkey=SECRET", "api_key"));
+        assertNull(ApiKeyFilter.query("/x?API_KEY=SECRET", "api_key"));
+        assertEquals("", ApiKeyFilter.query("/x?k=&k=SECRET", "k"));
+    }
+
+    @Test
+    void keysFileResolvesAndRejectsBothForms() throws Exception {
+        var file = dir.resolve("keys");
+        Files.writeString(file, "alpha, beta");
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+        var filter = ApiKeyFilter.create(GatewayTestSupport.spec("api-key",
+                Map.of("keys-file", file.toAbsolutePath().toString())));
+        assertEquals(200, GatewayTestSupport.call(filter, GatewayTestSupport.request("GET", "/",
+                Map.of("x-api-key", List.of("beta")))).status());
+        assertThrows(IllegalArgumentException.class, () -> ApiKeyFilter.create(GatewayTestSupport.spec("api-key",
+                Map.of("keys", "a", "keys-file", file.toAbsolutePath().toString()))));
     }
 }

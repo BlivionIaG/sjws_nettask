@@ -25,6 +25,7 @@ import io.netty.handler.codec.http2.DefaultHttp2DataFrame;
 import io.netty.handler.codec.http2.DefaultHttp2Headers;
 import io.netty.handler.codec.http2.DefaultHttp2HeadersFrame;
 import io.netty.handler.codec.http2.DefaultHttp2ResetFrame;
+import io.netty.handler.codec.http2.Http2DataFrame;
 import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2Stream;
 import io.netty.handler.codec.http2.Http2Headers;
@@ -32,9 +33,15 @@ import io.netty.handler.codec.http2.Http2HeadersFrame;
 import io.netty.handler.codec.http2.Http2StreamChannel;
 import io.netty.util.ReferenceCountUtil;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sjws_nettask.core.DateClock;
+import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.RequestRules;
@@ -45,36 +52,77 @@ import sjws_nettask.core.StaticFileHandler;
 /**
  * One instance per HTTP/2 stream (child channel of {@code Http2MultiplexHandler}). Maps the first
  * HEADERS frame to a core {@link Request}, runs the shared handler and the {@link ResponseWriter} on a
- * virtual thread, and drops request bodies (DATA is released; the multiplexer returns the window).
+ * virtual thread. Request content (#289): for a method other than GET/HEAD when bodies are enabled,
+ * DATA frames feed an {@link Http2RequestBody}; the stream stops reading while the handler is behind
+ * (flow-control window held). Size limits are the handler's. Trailers and unread content are released.
  * A stream closed by the peer (RST_STREAM) or by the connection interrupts its task.
  */
-final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
+class Http2StreamHandler extends ChannelInboundHandlerAdapter {
 
-    private final Http2Server.Shared shared;
+    final Http2Server.Shared shared;
     private boolean started;
+    private Http2RequestBody body; // event loop only; null when we keep no content
 
     Http2StreamHandler(Http2Server.Shared shared) {
         this.shared = shared;
     }
 
     /** Pseudo-headers and the fields the core understands; :authority wins over a host field. */
+
+
+
     static Request toRequest(Http2Headers h) {
-        return toRequest(h, null, false);
+        return toRequest(h, null, false, false);
     }
 
     /**
      * @param peer connection address, or null when it could not be read
      * @param secure true on the TLS listener
+     * @param captureFields copy every regular header into {@link RequestHeaders#fields()}
      */
     static Request toRequest(Http2Headers h, InetSocketAddress peer, boolean secure) {
+        return toRequest(h, peer, secure, false);
+    }
+
+    static Request toRequest(Http2Headers h, InetSocketAddress peer, boolean secure, boolean captureFields) {
         var method = h.method();
         var path = h.path();
         var authority = h.authority();
-        return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(),
-                new RequestHeaders(first(h, "if-none-match"), first(h, "if-modified-since"), first(h, "if-range"),
-                        first(h, "range"), first(h, "accept-encoding"),
-                        authority != null ? authority.toString() : first(h, "host")),
+        var auth = authority == null ? null : authority.toString();
+        var headers = captureFields
+                ? RequestHeaders.of(fieldMap(h), auth)
+                : new RequestHeaders(first(h, "if-none-match"), first(h, "if-modified-since"), first(h, "if-range"),
+                        first(h, "range"), first(h, "accept-encoding"), auth != null ? auth : first(h, "host"));
+        return new Request(method == null ? "" : method.toString(), path == null ? "" : path.toString(), headers,
                 peer, secure, "HTTP/2");
+    }
+
+    /** Lower-case name to values, first-seen order, pseudo-headers excluded. */
+    private static Map<String, List<String>> fieldMap(Http2Headers headers) {
+        LinkedHashMap<String, List<String>> fields = null;
+        for (var entry : headers) {
+            var raw = entry.getKey();
+            if (raw.length() > 0 && raw.charAt(0) == ':') {
+                continue;
+            }
+            if (fields == null) {
+                fields = new LinkedHashMap<>();
+            }
+            var name = raw.toString();
+            var values = fields.get(name);
+            if (values == null) {
+                values = new ArrayList<>(1);
+                fields.put(name, values);
+            }
+            values.add(entry.getValue().toString());
+        }
+        if (fields == null) {
+            return Map.of();
+        }
+        for (var entry : fields.entrySet()) {
+            entry.setValue(List.copyOf(entry.getValue()));
+        }
+        return Collections.unmodifiableMap(fields);
     }
 
     private static String first(Http2Headers h, String name) {
@@ -110,17 +158,55 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
         try {
-            if (msg instanceof Http2HeadersFrame frame && !this.started) {
-                this.started = true;
-                var stream = (Http2StreamChannel) ctx.channel();
-                start(stream, toRequest(frame.headers(), peer(stream), secure(stream)));
+            if (msg instanceof Http2HeadersFrame frame) {
+                if (!this.started) {
+                    this.started = true;
+                    var stream = (Http2StreamChannel) ctx.channel();
+                    var headers = frame.headers();
+                    captureAndStart(stream, headers, frame.isEndStream());
+                } else if (frame.isEndStream() && this.body != null) {
+                    // trailers end the request; field values are ignored
+                    this.body.end();
+                }
+                return;
+            }
+            if (msg instanceof Http2DataFrame data && this.body != null) {
+                if (data.content().isReadable()) {
+                    this.body.offer(data.content());
+                }
+                if (data.isEndStream()) {
+                    this.body.end();
+                }
             }
         } finally {
             ReferenceCountUtil.release(msg);
         }
     }
 
-    private static InetSocketAddress peer(Http2StreamChannel stream) {
+    /**
+     * Pin one {@link Http2Server.Generation} and start the Task. Overridden by
+     * {@link HookedHttp2StreamHandler} to insert test-only callbacks without touching this hot path.
+     */
+    void captureAndStart(Http2StreamChannel stream, Http2Headers headers, boolean endStream) {
+        Http2Server.Generation generation;
+        Request request;
+        for (;;) {
+            generation = this.shared.generation();
+            if (!generation.tryEnter()) {
+                continue;
+            }
+            request = toRequest(headers, peer(stream), secure(stream), generation.attachBodies());
+            break;
+        }
+        start(stream, headers, request, endStream, generation);
+    }
+
+    /** Submits the Task. Overridden by {@link HookedHttp2StreamHandler} for beforeDispatch. */
+    void executeTask(Runnable task) {
+        this.shared.executor().execute(task);
+    }
+
+    static InetSocketAddress peer(Http2StreamChannel stream) {
         var parent = stream.parent();
         if (parent == null) {
             return null;
@@ -129,33 +215,84 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         return remote instanceof InetSocketAddress inet ? inet : null;
     }
 
-    private static boolean secure(Http2StreamChannel stream) {
+    static boolean secure(Http2StreamChannel stream) {
         var parent = stream.parent();
         return parent != null && parent.pipeline().get(io.netty.handler.ssl.SslHandler.class) != null;
     }
 
-    private void start(Http2StreamChannel stream, Request request) {
+    void start(Http2StreamChannel stream, Http2Headers headers, Request request, boolean endStream,
+            Http2Server.Generation generation) {
         var budget = this.shared.budget(stream.parent());
         if (!budget.inflight().tryAcquire()) { // one connection can't take the whole server's share
+            generation.leave();
             this.shared.refused().increment();
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
             return;
         }
         if (!this.shared.inflight().tryAcquire()) {
             budget.inflight().release();
+            generation.leave();
             this.shared.refused().increment();
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
             return;
         }
-        var task = new Task(stream, request, budget);
+        // generation.tryEnter() already held in channelRead.
+        // Only when bodies are enabled (chain / non-static terminal): static-only path stays zero-cost.
+        if (generation.attachBodies() && !request.headOnly() && !"GET".equals(request.method())) {
+            long length = contentLength(headers);
+            if (length != 0) {
+                Runnable sendContinue = expectContinue(headers) ? () -> send100(stream) : null;
+                this.body = new Http2RequestBody(stream, length, this.shared.writeTimeout().toNanos(), sendContinue);
+                request = request.withBody(this.body);
+                if (endStream) {
+                    this.body.end();
+                }
+            }
+        } else if (endStream) {
+            // nothing to attach
+        }
+        // Pin the handler generation with the body-capture decision (#301).
+        var task = new Task(stream, request, budget, this.body, generation);
         try {
-            this.shared.executor().execute(task);
+            executeTask(task);
         } catch (RejectedExecutionException e) { // shutting down
             task.finish();
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
             return;
         }
         stream.closeFuture().addListener(f -> task.cancel());
+    }
+
+    /** @return declared content-length, or -1 when absent (codec already rejects malformed ones) */
+    static long contentLength(Http2Headers headers) {
+        var value = headers.get("content-length");
+        if (value == null) {
+            return -1;
+        }
+        try {
+            long length = Long.parseLong(value.toString().trim());
+            return length < 0 ? -1 : length;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** RFC 9110 §10.1.1: only {@code 100-continue} is recognized (case-insensitive). */
+    static boolean expectContinue(Http2Headers headers) {
+        var value = headers.get("expect");
+        return value != null && value.toString().equalsIgnoreCase("100-continue");
+    }
+
+    /** Interim {@code :status: 100} without END_STREAM; safe to call from a request thread. */
+    static void send100(Http2StreamChannel stream) {
+        stream.eventLoop().execute(() -> {
+            if (!stream.isActive()) {
+                return;
+            }
+            var headers = new DefaultHttp2Headers();
+            headers.status("100");
+            stream.writeAndFlush(new DefaultHttp2HeadersFrame(headers, false));
+        });
     }
 
     @Override
@@ -173,18 +310,27 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         private final Http2StreamChannel stream;
         private final Request request;
         private final Http2Server.Budget budget;
+        private final Http2RequestBody body; // or null
+        /** Generation (handler + attachBodies) captured at construction (#301 / P2a). */
+        private final Http2Server.Generation generation;
         private final AtomicBoolean finished = new AtomicBoolean();
         private volatile Thread thread;
         private volatile boolean cancelled;
 
-        Task(Http2StreamChannel stream, Request request, Http2Server.Budget budget) {
+        Task(Http2StreamChannel stream, Request request, Http2Server.Budget budget, Http2RequestBody body,
+                Http2Server.Generation generation) {
             this.stream = stream;
             this.request = request;
             this.budget = budget;
+            this.body = body;
+            this.generation = generation;
         }
 
         void cancel() {
             this.cancelled = true;
+            if (this.body != null) {
+                this.body.fail();
+            }
             var t = this.thread;
             if (t != null) {
                 t.interrupt();
@@ -201,8 +347,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                 var refusal = refusal(this.request);
                 Response response;
                 try {
-                    response = refusal != null ? refusal
-                            : Http2StreamHandler.this.shared.live().handle(this.request);
+                    response = refusal != null ? refusal : this.generation.handler().handle(this.request);
                 } catch (RuntimeException e) {
                     response = StaticFileHandler.error(500, this.request.headOnly());
                 }
@@ -220,11 +365,13 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         }
 
         /**
-         * The response is complete but the peer never ended its side (request body we don't read):
-         * RST_STREAM(NO_ERROR) as RFC 9113 §8.1 allows, so a half-open stream can't hold the
-         * connection's idle timer and a concurrency slot forever.
+         * The response is complete but the peer never ended its side: RST_STREAM(NO_ERROR) as RFC 9113
+         * §8.1 allows (also used by {@link Http2RequestBody#abandon} when content was attached).
          */
         private void endRequest() {
+            if (this.body != null) {
+                return; // abandon() in finish() sends the RST if needed
+            }
             var state = this.stream.stream().state();
             if (state == Http2Stream.State.OPEN || state == Http2Stream.State.HALF_CLOSED_LOCAL) {
                 this.stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.NO_ERROR));
@@ -233,8 +380,12 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
 
         void finish() {
             if (this.finished.compareAndSet(false, true)) {
+                if (this.body != null) {
+                    this.body.abandon();
+                }
                 Http2StreamHandler.this.shared.inflight().release();
                 this.budget.inflight().release();
+                this.generation.leave();
             }
         }
 

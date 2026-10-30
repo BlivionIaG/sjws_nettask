@@ -248,6 +248,7 @@ final class LogTopics implements AutoCloseable {
         var total = LogCompaction.Result.NONE;
         this.maintenance.lock();
         try {
+            applyPendingDrops();
             loadOffsetsIfPresent();
             for (var e : this.logs.entrySet()) {
                 var l = e.getValue();
@@ -278,10 +279,17 @@ final class LogTopics implements AutoCloseable {
     private int enforceRetentionLocked() throws IOException {
         int deleted = 0;
         long now = this.clockMs.getAsLong();
+        applyPendingDrops();
         for (var e : this.logs.entrySet()) {
             if (offsetsTopic(e.getKey())) continue; // bounded by compaction; retention would lose commits
             var l = e.getValue();
             long floor = offsets(e.getKey()).floor(e.getKey()); // a committed-but-unfetched group pins its history (§2)
+            // #270: replicated retention when the replica supports it; otherwise keep local retention
+            // (Replica.advanceLogStart default / RaftReplica without snapshot runtime).
+            if (l.replica() != null && l.replica().replicatedRetention()) {
+                proposeRetention(l, floor, now);
+                continue;
+            }
             l.reads().writeLock().lock();
             try {
                 long total = l.log().totalBytes();
@@ -296,6 +304,76 @@ final class LogTopics implements AutoCloseable {
             }
         }
         return deleted;
+    }
+
+    /**
+     * HA on only (so {@code ReplicaHooks} never loads with HA off): the replica of {@code topic} with its #270 hooks.
+     * Retention is replicated: {@link #dropBelow} runs on every replica when the leader's decision applies.
+     */
+    private sjws_nettask.messaging.ledger.Replica openReplica(sjws_nettask.messaging.ledger.PartitionReplicator rep, String topic,
+            SegmentedLog log, LedgerWriter writer, java.util.concurrent.locks.ReentrantReadWriteLock reads) throws IOException {
+        java.util.function.Consumer<java.util.List<byte[]>> applied = LogOffsets.TOPIC.equals(topic) ? this.offsets::applied : recs -> { };
+        Runnable reloaded = LogOffsets.TOPIC.equals(topic) ? this.offsets::reload : () -> { };
+        var hooks = new sjws_nettask.messaging.ledger.ReplicaHooks(applied, x -> dropBelow(topic, log, reads, x), reads.writeLock(),
+                reloaded, null);
+        return rep.open(topic, writer, durability(topic), hooks);
+    }
+
+    /** Replicated retention cuts not yet applied because a maintenance pass held the lock: topic to offset. */
+    private final ConcurrentHashMap<String, Long> pendingDrops = new ConcurrentHashMap<>();
+
+    /**
+     * A replicated "advance log start to {@code x}" (#270): deletes whole sealed segments ending at or below it, under
+     * the reads write lock. Runs on the replica's apply thread; when a maintenance pass holds the lock it is left for
+     * that pass (or the next cut) instead of waiting behind it.
+     */
+    private void dropBelow(String topic, SegmentedLog log, java.util.concurrent.locks.ReentrantReadWriteLock reads, long x) {
+        this.pendingDrops.merge(topic, x, Math::max);
+        if (!this.maintenance.tryLock()) return;
+        try {
+            applyPendingDrops();
+        } finally {
+            this.maintenance.unlock();
+        }
+    }
+
+    /** Under {@link #maintenance}: applies every pending replicated cut. */
+    private void applyPendingDrops() {
+        for (var topic : java.util.List.copyOf(this.pendingDrops.keySet())) {
+            Long x = this.pendingDrops.remove(topic);
+            if (x == null) continue;
+            var l = this.logs.get(topic);
+            if (l == null) { // the replica is still opening (a cut recovered on restart): the next pass applies it
+                this.pendingDrops.merge(topic, x, Math::max);
+                continue;
+            }
+            l.reads().writeLock().lock();
+            try {
+                for (var seg : l.log().segments()) {
+                    if (seg.active() || seg.nextOffset() > x) break;
+                    l.log().deleteSegment(seg.baseOffset());
+                }
+            } catch (IOException e) {
+                System.err.println("WARN: replicated retention of " + topic + " below " + x + ": " + e);
+            } finally {
+                l.reads().writeLock().unlock();
+            }
+        }
+    }
+
+    /** Leader of a replicated topic: the cut local retention would make, proposed as a replicated decision. */
+    private void proposeRetention(Log l, long floor, long now) throws IOException {
+        var rep = l.replica();
+        if (!rep.leaderReady()) return;
+        long total = l.log().totalBytes(), cut = -1;
+        for (var seg : l.log().segments()) {
+            if (seg.active() || seg.nextOffset() > floor || !this.retention.expired(total, seg.lastModifiedMs(), now)) break;
+            cut = seg.nextOffset();
+            total -= seg.bytes();
+        }
+        if (cut > rep.logStartOffset()) {
+            rep.advanceLogStart(cut).exceptionally(err -> null); // a lost proposal is retried by the next pass
+        }
     }
 
     static boolean validName(String topic) {
@@ -315,12 +393,12 @@ final class LogTopics implements AutoCloseable {
                 var rep = this.replicator;
                 var log = SegmentedLog.open(this.dir.resolve(topic), this.segmentBytes);
                 var writer = new LedgerWriter(log, durability(topic));
+                var reads = new java.util.concurrent.locks.ReentrantReadWriteLock();
                 sjws_nettask.messaging.ledger.Replica replica = null;
                 // A topic outside ha.topics (and __offsets_local) keeps the plain local path: no replica, no 503.
                 if (rep != null && !local(topic)) {
-                    java.util.function.Consumer<java.util.List<byte[]>> applied = LogOffsets.TOPIC.equals(topic) ? this.offsets::applied : recs -> { };
                     try {
-                        replica = rep.open(topic, writer, durability(topic), applied);
+                        replica = openReplica(rep, topic, log, writer, reads);
                     } catch (IOException | RuntimeException e) {
                         // Refused (HA startup checks): leave nothing open behind the refusal.
                         try {
@@ -336,7 +414,7 @@ final class LogTopics implements AutoCloseable {
                         throw e;
                     }
                 }
-                l = new Log(log, writer, new java.util.concurrent.locks.ReentrantReadWriteLock(), isCompacted(topic), replica);
+                l = new Log(log, writer, reads, isCompacted(topic), replica);
                 this.logs.put(topic, l);
             }
             return l;

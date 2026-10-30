@@ -35,7 +35,9 @@ import io.netty.handler.codec.http.HttpServerUpgradeHandler;
 import io.netty.handler.codec.http2.CleartextHttp2ServerUpgradeHandler;
 import io.netty.handler.codec.http2.Http2CodecUtil;
 import io.netty.handler.codec.http2.Http2FrameCodec;
+import io.netty.handler.codec.http2.DefaultHttp2WindowUpdateFrame;
 import io.netty.handler.codec.http2.Http2FrameCodecBuilder;
+import io.netty.handler.codec.http2.Http2SettingsFrame;
 import io.netty.handler.codec.http2.Http2MultiplexHandler;
 import io.netty.handler.codec.http2.Http2SecurityUtil;
 import io.netty.handler.codec.http2.Http2ServerUpgradeCodec;
@@ -62,10 +64,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
-import sjws_nettask.HandlerRef;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.Transport;
 import sjws_nettask.core.Handler;
+import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.core.PerIpLimit;
 import sjws_nettask.tls.TlsMaterial;
 
@@ -123,6 +125,15 @@ public final class Http2Server implements Transport {
     /** Unflushed PING/SETTINGS ACKs (and RSTs) allowed before the connection is closed. */
     static final int MAX_QUEUED_CONTROL_FRAMES = 1000;
 
+    /**
+     * HTTP/2 connection receive window after the preface boost (Architecture N1 / #296).
+     * Default is 64 KiB; one paused unread body can fill that and HOL sibling DATA. Boost to 1 MiB
+     * so several streams can each hold about {@link Http2RequestBody#HIGH}+one stream window without
+     * starving peers. Per-stream {@code HIGH}/{@code LOW} still caps what one stream buffers.
+     */
+    static final int CONNECTION_WINDOW = 1024 * 1024;
+    static final int DEFAULT_CONNECTION_WINDOW = 65535;
+
     /** One connection's share of the server-wide budgets. */
     record Budget(Semaphore inflight, Semaphore files) {
     }
@@ -130,16 +141,149 @@ public final class Http2Server implements Transport {
     static final io.netty.util.AttributeKey<Budget> BUDGET = io.netty.util.AttributeKey.valueOf("sjws-h2-budget");
 
     /**
-     * What every stream handler needs. {@link #live()} does one volatile read. A null value keeps
-     * {@code handler}, so a server that never arms calls the startup handler and nothing else.
+     * One published handler + body-capture flag (#301 / P2a). Swapped with a single volatile write
+     * so a stream never sees a mixed pair. {@link #enter}/{@link #leave} track in-flight Tasks so
+     * {@link sjws_nettask.SjwsServer} can defer closing the previous snapshot's upstream pools (P2b).
+     */
+    public static final class Generation {
+        /** High bit: generation was replaced; new {@link #tryEnter} must fail and retry current. */
+        private static final int RETIRED = 1 << 31;
+
+        private final Handler handler;
+        private final boolean attachBodies;
+        /** Low 31 bits = in-flight pins; {@link #RETIRED} set by {@link #whenQuiesced}. */
+        private final AtomicInteger state = new AtomicInteger();
+        private final java.util.concurrent.atomic.AtomicReference<Runnable> onQuiesce =
+                new java.util.concurrent.atomic.AtomicReference<>();
+
+        /**
+         * Test-only: runs after the quiesce listener is installed (and, once fixed, after
+         * {@code RETIRED}). Production leaves this null.
+         */
+        static volatile Runnable afterQuiesceInstall;
+
+        public Generation(Handler handler, boolean attachBodies) {
+            this.handler = Objects.requireNonNull(handler, "handler");
+            this.attachBodies = attachBodies;
+        }
+
+        public Handler handler() {
+            return this.handler;
+        }
+
+        public boolean attachBodies() {
+            return this.attachBodies;
+        }
+
+        /**
+         * Pin this generation for a Task. Fails when {@link #whenQuiesced} has retired it so a
+         * close cannot run while a stream has read this instance but not yet entered (B1).
+         */
+        public boolean tryEnter() {
+            for (;;) {
+                int s = this.state.get();
+                if ((s & RETIRED) != 0) {
+                    return false;
+                }
+                if (this.state.compareAndSet(s, s + 1)) {
+                    return true;
+                }
+            }
+        }
+
+        public void leave() {
+            int s = this.state.decrementAndGet();
+            // Fire only after retirement: a zero-pin leave before RETIRED must not run callbacks
+            // while tryEnter still accepts pins (Codex P2 4421811440).
+            if ((s & RETIRED) != 0 && (s & ~RETIRED) == 0) {
+                fireQuiesce();
+            }
+        }
+
+        /**
+         * Retires this generation (no new pins) and runs {@code action} once when in-flight pins
+         * drain (or immediately if already idle). {@code RETIRED} is set <em>before</em> the
+         * callback is installed so a racing {@link #leave} cannot fire while {@link #tryEnter}
+         * still succeeds (Codex P2 4421811440).
+         */
+        public void whenQuiesced(Runnable action) {
+            Objects.requireNonNull(action, "action");
+            // Retire first — tryEnter fails before any quiesce listener is visible.
+            this.state.updateAndGet(v -> v | RETIRED);
+            // Chain listeners so trackDrainingGeneration + deferSnapshotClose both run.
+            this.onQuiesce.updateAndGet(existing -> {
+                if (existing == null) {
+                    return action;
+                }
+                return () -> {
+                    existing.run();
+                    action.run();
+                };
+            });
+            // Test hook: after RETIRED + install (safe window) for latch-driven tests.
+            var probe = afterQuiesceInstall;
+            if (probe != null) {
+                probe.run();
+            }
+            // Re-check: leave may have drained to zero while the listener was still null.
+            int s = this.state.get();
+            if ((s & ~RETIRED) == 0) {
+                fireQuiesce();
+            }
+        }
+
+        /** Test / diagnostics: whether {@link #whenQuiesced} has retired this generation. */
+        boolean retired() {
+            return (this.state.get() & RETIRED) != 0;
+        }
+
+        /**
+         * Runs the quiesce action immediately (even with in-flight pins). Used when the draining
+         * generation cap is exceeded under rapid reload.
+         */
+        public void forceQuiesce() {
+            this.state.updateAndGet(v -> v | RETIRED);
+            fireQuiesce();
+        }
+
+        private void fireQuiesce() {
+            var r = this.onQuiesce.getAndSet(null);
+            if (r != null) {
+                r.run();
+            }
+        }
+    }
+
+    /**
+     * What every stream handler needs. {@link #generation()} is one volatile read of the handler and
+     * attachBodies pair. Before the first {@link #armHandler}, streams use {@code handler} with the
+     * constructor body flag.
      */
     record Shared(Handler handler, ExecutorService executor, Semaphore inflight, Semaphore files,
-            Duration writeTimeout, LongAdder refused, Limits limits, HandlerRef armed) {
+            Duration writeTimeout, LongAdder refused, Limits limits,
+            java.util.concurrent.atomic.AtomicReference<Generation> published,
+            Generation startup) {
 
-        /** Startup handler, or the one published by a later metrics arm. */
+        /**
+         * Current generation, or the stable startup generation (never allocate per call — enter/leave
+         * must track the same instance before the first {@link #armHandler}).
+         */
+        Generation generation() {
+            var g = this.published.get();
+            return g != null ? g : this.startup;
+        }
+
+        /** Startup handler, or the one published by a later arm. */
         Handler live() {
-            var published = this.armed.get();
-            return published != null ? published : this.handler;
+            return generation().handler();
+        }
+
+        /**
+         * Attach request bodies and full header maps when the published generation needs them
+         * (#289 / #301). Read with the handler from the same {@link Generation}.
+         */
+        boolean attachBodies() {
+            return generation().attachBodies();
         }
 
         /** @return the connection's budget, created on first use */
@@ -160,8 +304,13 @@ public final class Http2Server implements Transport {
 
     private final ServerConfig config;
     private final Handler handler;
-    /** Published by {@link #armHandler} after start. A null value keeps {@link #handler}. */
-    private final HandlerRef armed = new HandlerRef();
+    /**
+     * Published by {@link #armHandler}. Null keeps the constructor handler + startup body flag.
+     * One volatile generation so handler and attachBodies never diverge (P2a).
+     */
+    private final java.util.concurrent.atomic.AtomicReference<Generation> published =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    private final boolean startupAttachBodies;
     private final Limits limits;
     private TlsMaterial tls;
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -173,6 +322,12 @@ public final class Http2Server implements Transport {
             new io.netty.channel.group.DefaultChannelGroup(io.netty.util.concurrent.GlobalEventExecutor.INSTANCE);
     private PerIpLimit perIp;
     private Shared shared;
+    /** Production uses {@link Http2StreamHandler}; tests may install {@link HookedHttp2StreamHandler}. */
+    private volatile java.util.function.Function<Shared, io.netty.channel.ChannelHandler> streamHandlerFactory =
+            Http2StreamHandler::new;
+    private volatile java.util.function.Function<Shared, io.netty.channel.ChannelHandler> fallbackHandlerFactory =
+            Http1FallbackHandler::new;
+
     private EventLoopGroup boss;
     private EventLoopGroup workers;
     private ExecutorService executor;
@@ -189,6 +344,7 @@ public final class Http2Server implements Transport {
         this.handler = Objects.requireNonNull(handler, "handler");
         this.tls = tls;
         this.limits = Objects.requireNonNull(limits, "limits");
+        this.startupAttachBodies = !(handler instanceof StaticFileHandler);
     }
 
     @Override
@@ -202,8 +358,42 @@ public final class Http2Server implements Transport {
      */
     @Override
     public void armHandler(Handler handler) {
-        this.armed.set(Objects.requireNonNull(handler, "handler"));
+        armHandler(handler, !(handler instanceof StaticFileHandler));
     }
+
+    /**
+     * Publishes handler and attachBodies as one generation (P2a / #301). Returns the previous
+     * generation so the caller can defer closing its snapshot resources (P2b).
+     *
+     * @param attachBodies when false, DATA is released and only the six typed headers are read
+     *        (static-only). When true, bodies and the full field map are attached.
+     */
+    public Generation armHandler(Handler handler, boolean attachBodies) {
+        var next = new Generation(handler, attachBodies);
+        return this.published.getAndSet(next);
+    }
+
+    /** @return whether bodies and full field maps are attached (tests / diagnostics) */
+    boolean attachBodies() {
+        var g = this.published.get();
+        return g != null ? g.attachBodies() : this.startupAttachBodies;
+    }
+
+    /** Currently published generation, or null before the first {@link #armHandler}. */
+    Generation generation() {
+        return this.published.get();
+    }
+
+    /**
+     * Test-only: subsequent streams/fallback connections use hooked handlers so dispatch callbacks
+     * run without putting a hook check on the production {@link Http2StreamHandler} hot path.
+     */
+    void instrumentForTest(DispatchHooks hooks) {
+        var h = hooks == null ? DispatchHooks.NONE : hooks;
+        this.streamHandlerFactory = shared -> new HookedHttp2StreamHandler(shared, h);
+        this.fallbackHandlerFactory = shared -> new HookedHttp1FallbackHandler(shared, h);
+    }
+
 
     @Override
     public Http2Server start() throws Exception {
@@ -214,9 +404,10 @@ public final class Http2Server implements Transport {
             var ssl = sslContext(this.tls);
             this.executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("h2-request-", 0).factory());
             this.perIp = new PerIpLimit(Math.min(this.config.maxConnectionsPerIp(), this.limits.maxConnectionsPerIp()));
-            this.shared = new Shared(this.handler, this.executor, new Semaphore(this.limits.maxInflight()),
+                        this.shared = new Shared(this.handler, this.executor, new Semaphore(this.limits.maxInflight()),
                     new Semaphore(this.limits.maxOpenFiles()), this.config.writeTimeout(), this.refused, this.limits,
-                    this.armed);
+                    this.published, new Generation(this.handler, this.startupAttachBodies));
+
             this.boss = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             this.workers = new MultiThreadIoEventLoopGroup(0, NioIoHandler.newFactory());
             this.tlsChannel = bind(this.config.h2Port(), new ChannelInitializer<SocketChannel>() {
@@ -311,7 +502,7 @@ public final class Http2Server implements Transport {
         return new Http2MultiplexHandler(new ChannelInitializer<Http2StreamChannel>() {
             @Override
             protected void initChannel(Http2StreamChannel stream) {
-                stream.pipeline().addLast(new Http2StreamHandler(Http2Server.this.shared));
+                stream.pipeline().addLast(Http2Server.this.streamHandlerFactory.apply(Http2Server.this.shared));
             }
         });
     }
@@ -322,7 +513,9 @@ public final class Http2Server implements Transport {
 
     void http2(ChannelPipeline p) {
         var codec = frameCodec();
-        p.addLast(codec, streamIdle(codec), multiplexer(), Quiet.INSTANCE);
+        // Boost before the multiplexer so connection SETTINGS frames are visible.
+        p.addLast(codec, new ConnectionWindowBoost(CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW),
+                streamIdle(codec), multiplexer(), Quiet.INSTANCE);
     }
 
     void http1(ChannelPipeline p) {
@@ -330,7 +523,7 @@ public final class Http2Server implements Transport {
         p.addLast(deadline.front(), new HttpServerCodec(8192, this.limits.maxHeaderListSize(), 8192),
                 new HttpServerExpectContinueHandler(),
                 new HttpObjectAggregator(64 * 1024), deadline.back(),
-                new Http1FallbackHandler(this.shared), Quiet.INSTANCE);
+                this.fallbackHandlerFactory.apply(this.shared), Quiet.INSTANCE);
     }
 
     /** h2c port: prior knowledge, Upgrade: h2c, or plain HTTP/1.1. */
@@ -346,7 +539,9 @@ public final class Http2Server implements Transport {
                 // before the trailing handlers (Quiet must stay last)
                 var codec = frameCodec();
                 ch.pipeline().addBefore("expect-continue", "h2-codec", codec);
-                ch.pipeline().addAfter("h2-codec", "h2-idle", streamIdle(codec));
+                ch.pipeline().addAfter("h2-codec", "h2-window",
+                        new ConnectionWindowBoost(CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW));
+                ch.pipeline().addAfter("h2-window", "h2-idle", streamIdle(codec));
                 ch.pipeline().addAfter("h2-idle", "h2-multiplexer", multiplexer());
             }
         };
@@ -356,13 +551,15 @@ public final class Http2Server implements Transport {
         p.addLast("expect-continue", new HttpServerExpectContinueHandler());
         p.addLast("h1-aggregator", new HttpObjectAggregator(64 * 1024));
         p.addLast(deadline.back());
-        p.addLast("h1-fallback", new Http1FallbackHandler(this.shared));
+        p.addLast("h1-fallback", this.fallbackHandlerFactory.apply(this.shared));
         p.addLast(Quiet.INSTANCE);
     }
 
     private Http2ServerUpgradeCodec upgradeCodec() {
         var codec = frameCodec();
-        return new Http2ServerUpgradeCodec(codec, streamIdle(codec), multiplexer());
+        return new Http2ServerUpgradeCodec(codec,
+                new ConnectionWindowBoost(CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW),
+                streamIdle(codec), multiplexer());
     }
 
     private final class Alpn extends ApplicationProtocolNegotiationHandler {
@@ -398,6 +595,32 @@ public final class Http2Server implements Transport {
             } else {
                 super.userEventTriggered(ctx, evt);
             }
+        }
+    }
+
+    /**
+     * Raises the connection receive window to {@link #CONNECTION_WINDOW} after the peer SETTINGS
+     * (Architecture N1). Stream windows stay at the HTTP/2 default; {@link Http2RequestBody} still
+     * pauses each stream at {@code HIGH}.
+     */
+    static final class ConnectionWindowBoost extends ChannelInboundHandlerAdapter {
+        private final int extra;
+        private boolean sent;
+
+        ConnectionWindowBoost(int extra) {
+            this.extra = Math.max(0, extra);
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            if (!this.sent && this.extra > 0 && msg instanceof Http2SettingsFrame) {
+                this.sent = true;
+                // Connection-level WINDOW_UPDATE only: Http2FrameCodec.write calls
+                // incrementWindowSize on the local flow controller for stream 0, so an explicit
+                // increment here would double the target (Codex P2 / #303).
+                ctx.writeAndFlush(new DefaultHttp2WindowUpdateFrame(this.extra));
+            }
+            ctx.fireChannelRead(msg);
         }
     }
 

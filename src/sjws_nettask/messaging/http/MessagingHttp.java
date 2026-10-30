@@ -37,6 +37,7 @@ import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.buf.BufferBudget;
 import sjws_nettask.core.buf.BufferPool;
 import sjws_nettask.core.buf.PooledBuffer;
+import sjws_nettask.observe.AccessTargetMask;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.RecordBatch;
@@ -162,7 +163,7 @@ final class MessagingHttp implements Handler {
                     if (!m.matches()) throw new BadRequest("body must be {\"offset\":n}");
                     long off;
                     try { off = Long.parseLong(m.group(1)); } catch (NumberFormatException e) { throw new BadRequest("offset too large"); }
-                    long start = log.log().startOffset();
+                    long start = logicalStart(log);
                     if (off < start) return problem(416, "offset out of range", "log starts at " + start);
                     if (off > end) return problem(400, "bad request", "offset " + off + " is past the log end " + end);
                     var dflt = this.topics.durability(o.topic());
@@ -334,7 +335,7 @@ final class MessagingHttp implements Handler {
             }
         }
         long committed = log.writer().snapshot().nextOffset();
-        long start = log.log().startOffset();
+        long start = logicalStart(log);
         if (offset < start) return problem(416, "offset out of range", "log starts at " + start);
         long next = offset;
         var batches = new ArrayList<RecordBatch>();
@@ -547,7 +548,7 @@ final class MessagingHttp implements Handler {
         if (c instanceof LeaderUnavailableException l) return notLeader(l, target);
         if (write && c instanceof WriteRefusedException r) return refused(r, target);
         if (write && c instanceof ProducerSequenceException p) return producerSequence(p);
-        FAILURES.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + target + " failed", c);
+        FAILURES.log(System.Logger.Level.WARNING, (write ? "write" : "leader read") + " on " + AccessTargetMask.maskPinned(target) + " failed", c);
         if (write && c instanceof WriteOutcomeUnknownException u) return outcomeUnknown(u.term(), u.leaderName(), u.leaderUrl(), target);
         if (write) return outcomeUnknown(-1, null, null, target);
         var r = problem(503, "unavailable", "leader read failed");
@@ -677,7 +678,7 @@ final class MessagingHttp implements Handler {
 
     /** A log I/O failure: 500 with a generic detail; the exception (paths, errno text) is logged, not sent (#246). */
     static Response logError(IOException e, String target) {
-        FAILURES.log(System.Logger.Level.ERROR, "messaging log I/O failed on " + target, e);
+        FAILURES.log(System.Logger.Level.ERROR, "messaging log I/O failed on " + AccessTargetMask.maskPinned(target), e);
         return problem(500, "log error", "messaging log I/O failed");
     }
 
@@ -686,7 +687,7 @@ final class MessagingHttp implements Handler {
      * text is logged, not sent (#246). A topic outside {@code ha.topics} is never this: it stays local.
      */
     static Response unavailable(IllegalStateException e, String target) {
-        FAILURES.log(System.Logger.Level.WARNING, "messaging log unavailable on " + target, e);
+        FAILURES.log(System.Logger.Level.WARNING, "messaging log unavailable on " + AccessTargetMask.maskPinned(target), e);
         var r = problem(503, "unavailable", "messaging log unavailable");
         r.headers().set("retry-after", RETRY_AFTER_SECONDS);
         return r;
@@ -742,4 +743,13 @@ final class MessagingHttp implements Handler {
     static final class BadRequest extends Exception {
         BadRequest(String m) { super(m); }
     }
+
+    /** Physical floor and the replicated logical cut (#270 / #288 MC-B1): fetch below either is 416. */
+    private static long logicalStart(LogTopics.Log log) {
+        long start = log.log().startOffset();
+        var rep = log.replica();
+        if (rep != null) start = Math.max(start, rep.logStartOffset());
+        return start;
+    }
+
 }

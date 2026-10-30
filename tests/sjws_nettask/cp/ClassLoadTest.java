@@ -56,6 +56,9 @@ class ClassLoadTest {
                 assertFalse(text.contains(name), name.strip() + " loaded by a standalone start");
             }
             assertFalse(text.contains("sjws_nettask.cp."), text);
+            // S1: gateway secret-ref helper stays unloaded until middleware or CP config touches it.
+            assertFalse(text.contains("sjws_nettask.config.MiddlewareSecrets "),
+                    "MiddlewareSecrets loaded by a standalone start");
             for (var cp : new String[] {"KeyRing", "KeyRingLoader", "TrustBundle", "TrustState", "CpKeyConfig",
                     "CpListenerConfig", "CpServerTls", "CpTls"}) {
                 assertFalse(text.contains("sjws_nettask.cp." + cp + " "), cp);
@@ -151,7 +154,9 @@ class ClassLoadTest {
      * nothing, as does {@code auto} with a member list but {@code ha.enabled: false}. A real server process with
      * messaging on takes a produce and a fetch, and loads no {@code msgrepl} class
      * and none of the Raft machinery ({@code ReplicatedNode}, {@code RaftGroup}, {@code TcpTransport}, the log storage).
-     * With {@code ha.enabled: true} only the key type ({@code ClusterKey}) may load, as before this gate.
+     * With {@code ha.enabled: true} only the key type ({@code ClusterKey}) may load, as before this gate. #270: neither
+     * do the snapshot pieces ({@code ReplicaHooks}, the msgrepl snapshot store and transfer), with an
+     * {@code ha.snapshot} block configured (including {@code max_install_bytes}, #295).
      */
     @Test
     void haMessagingOffAndNoMemberListLoadNoReplication() throws Exception {
@@ -163,7 +168,8 @@ class ClassLoadTest {
                     - { id: b, address: "127.0.0.1:3", http_url: "http://127.0.0.1:4" }
                     - { id: w, address: "127.0.0.1:5", witness: true }
                 """;
-        var off = startAndProduce("off", "ha:\n  enabled: true\n  messaging: off\n" + members);
+        var off = startAndProduce("off", "ha:\n  enabled: true\n  messaging: off\n"
+                + "  snapshot: { every_entries: 100, log_tail_entries: 10, max_install_bytes: 4g }\n" + members);
         assertNoReplication(off, true);
         var auto = startAndProduce("auto", "ha:\n  messaging: auto\n");
         assertNoReplication(auto, false);
@@ -178,6 +184,8 @@ class ClassLoadTest {
     private static void assertNoReplication(String text, boolean keyMayLoad) {
         assertTrue(text.contains("sjws_nettask.messaging.http.MessagingModule "), "sanity: messaging is on");
         assertFalse(text.contains("sjws_nettask.msgrepl."), "a msgrepl class loaded");
+        // #270: the snapshot hooks and the replicated-state interface stay unloaded too.
+        assertFalse(text.contains("sjws_nettask.messaging.ledger.ReplicaHooks"), "ReplicaHooks loaded with HA off");
         assertFalse(text.contains("ha messaging: replication on"), text);
         text.lines().filter(l -> l.contains("sjws_nettask.cluster.")).forEach(l -> {
             assertTrue(keyMayLoad && l.contains("sjws_nettask.cluster.ClusterKey"), "cluster class loaded: " + l);

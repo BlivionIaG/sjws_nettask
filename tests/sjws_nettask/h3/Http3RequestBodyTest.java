@@ -51,6 +51,7 @@ class Http3RequestBodyTest {
 
     private final EmbeddedChannel loop = new EmbeddedChannel();
     private final List<Integer> stopSending = new ArrayList<>();
+    private final List<Object> continues = new ArrayList<>();
     private boolean active = true;
     private final List<ByteBuf> offered = new ArrayList<>();
 
@@ -65,6 +66,12 @@ class Http3RequestBodyTest {
                     this.stopSending.add(code);
                 }
                 yield null;
+            }
+            case "writeAndFlush" -> {
+                if (args != null && args.length >= 1) {
+                    this.continues.add(args[0]);
+                }
+                yield this.loop.newSucceededFuture();
             }
             case "hashCode" -> System.identityHashCode(proxy);
             case "equals" -> proxy == args[0];
@@ -274,5 +281,53 @@ class Http3RequestBodyTest {
         assertTrue(Http3Writer.fits(head, Long.MAX_VALUE));
         assertTrue(Http3Writer.fits(head, size));
         assertFalse(Http3Writer.fits(head, size - 1));
+    }
+
+    @Test
+    void expectContinueSends100OnFirstRead() throws Exception {
+        var sent = new java.util.concurrent.atomic.AtomicInteger();
+        var body = new Http3RequestBody(stream(), 4, TIMEOUT, () -> {
+            sent.incrementAndGet();
+            Http3RequestHandler.send100(stream());
+        });
+        assertEquals(0, sent.get());
+        offer(body, 4);
+        body.end();
+        var buf = new byte[4];
+        assertEquals(4, body.read(buf, 0, 4));
+        assertEquals(1, sent.get(), "100 Continue once on first read");
+        assertEquals(-1, body.read(buf, 0, 4));
+        assertEquals(1, sent.get(), "not again");
+        this.loop.runPendingTasks();
+        assertFalse(this.continues.isEmpty(), "interim HEADERS written");
+    }
+
+    @Test
+    void expectContinueOnUnknownLengthBeforeWait() {
+        var sent = new java.util.concurrent.atomic.AtomicInteger();
+        var body = new Http3RequestBody(stream(), -1, TIMEOUT, sent::incrementAndGet);
+        body.end(); // bare POST: length resolves to 0 after Continue
+        assertEquals(0, body.length());
+        assertEquals(1, sent.get());
+    }
+
+    @Test
+    void abandonBeforeReadSkipsContinue() {
+        var sent = new java.util.concurrent.atomic.AtomicInteger();
+        var body = new Http3RequestBody(stream(), 100, TIMEOUT, sent::incrementAndGet);
+        body.abandon();
+        assertThrows(IOException.class, () -> body.read(new byte[1], 0, 1));
+        assertEquals(0, sent.get(), "reject/abandon must not send 100");
+    }
+
+    @Test
+    void expectContinueHelperRecognizesOnly100Continue() {
+        var yes = new io.netty.handler.codec.http3.DefaultHttp3Headers();
+        yes.method("POST").path("/").scheme("https").authority("localhost").add("expect", "100-continue");
+        assertTrue(Http3RequestHandler.expectContinue(yes));
+        var no = new io.netty.handler.codec.http3.DefaultHttp3Headers();
+        no.method("POST").path("/").scheme("https").authority("localhost").add("expect", "teapot");
+        assertFalse(Http3RequestHandler.expectContinue(no));
+        assertFalse(Http3RequestHandler.expectContinue(new io.netty.handler.codec.http3.DefaultHttp3Headers()));
     }
 }

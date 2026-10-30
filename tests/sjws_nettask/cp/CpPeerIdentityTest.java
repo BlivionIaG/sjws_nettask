@@ -36,6 +36,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.Clock;
+import sjws_nettask.clusterharness.EphemeralPorts;
 import sjws_nettask.cluster.ClusterKey;
 import sjws_nettask.cluster.GroupId;
 import sjws_nettask.cluster.Member;
@@ -70,11 +71,7 @@ class CpPeerIdentityTest {
     }
 
     private static int[] ports(int n) throws IOException {
-        var out = new int[n];
-        for (int i = 0; i < n; i++) {
-            out[i] = freePort();
-        }
-        return out;
+        return EphemeralPorts.probeDistinct(n);
     }
 
     /** What a dial saw: the dialer's exception, and the application bytes the acceptor received before EOF. */
@@ -540,13 +537,6 @@ class CpPeerIdentityTest {
         y.put("admin", Map.of("listen", "127.0.0.1:0"));
         y.put("peers", peerList(ports, sans));
         return y;
-    }
-
-    private static int freePort() throws IOException {
-        try (var probe = new ServerSocket()) {
-            probe.bind(new InetSocketAddress("127.0.0.1", 0));
-            return probe.getLocalPort();
-        }
     }
 
     private static void await(BooleanSupplier condition, String what) throws InterruptedException {

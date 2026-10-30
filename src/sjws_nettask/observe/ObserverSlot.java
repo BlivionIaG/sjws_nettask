@@ -19,6 +19,7 @@ package sjws_nettask.observe;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
 
@@ -46,6 +47,12 @@ public final class ObserverSlot {
     private volatile LabelSource labels;
     /** Extra Prometheus families (swarm stream stats). Not read by {@link #get()}. */
     private volatile java.util.function.Supplier<String> appendix;
+    /** Copied onto the recording observer. Not read by {@link #get()}. */
+    private volatile String[] credentialQueryParams = AccessTargetMask.NONE;
+    /** Copied onto the recording observer's metrics. Not read by {@link #get()}. */
+    private volatile LongSupplier msgreplInstallPinExhausted;
+    /** Copied onto the recording observer's metrics. Not read by {@link #get()}. */
+    private volatile LongSupplier msgreplInstallOversizedAbandoned;
 
     public ObserverSlot(RequestObserver initial) {
         this.current = initial == null ? RequestObserver.NONE : initial;
@@ -92,6 +99,35 @@ public final class ObserverSlot {
         }
     }
 
+    /**
+     * Api-key query parameter names to mask in the access log. Null or empty clears masking.
+     * Does not install the observe filter.
+     */
+    public void attachCredentialQueryParams(String[] names) {
+        // Clone once here; RequestObserver.setCredentialQueryParams stores the reference.
+        var next = names == null || names.length == 0 ? AccessTargetMask.NONE : names.clone();
+        this.credentialQueryParams = next;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.setCredentialQueryParams(next);
+        }
+    }
+
+    /**
+     * Msgrepl install counters rendered into {@code /metrics} (#315 B1). Null resets that series to 0.
+     * Stored on the slot and copied onto a recording observer in {@link #arm(ServerConfig)} /
+     * {@link #set(RequestObserver)}; never mutates {@link RequestObserver#NONE}. Does not install the
+     * observe filter.
+     */
+    public void attachMsgreplInstallCounters(LongSupplier pinExhausted, LongSupplier oversizedAbandoned) {
+        this.msgreplInstallPinExhausted = pinExhausted;
+        this.msgreplInstallOversizedAbandoned = oversizedAbandoned;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.metrics().setMsgreplInstallCounters(pinExhausted, oversizedAbandoned);
+        }
+    }
+
     /** Replaces the observer. Used before the listeners accept. */
     public void set(RequestObserver observer) {
         var next = observer == null ? RequestObserver.NONE : observer;
@@ -106,6 +142,9 @@ public final class ObserverSlot {
         observer.attachCluster(this.cluster);
         observer.attachLabels(this.labels);
         observer.attachAppendix(this.appendix);
+        observer.setCredentialQueryParams(this.credentialQueryParams);
+        observer.metrics().setMsgreplInstallCounters(this.msgreplInstallPinExhausted,
+                this.msgreplInstallOversizedAbandoned);
     }
 
     /**

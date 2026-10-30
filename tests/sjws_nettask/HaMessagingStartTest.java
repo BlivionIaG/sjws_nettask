@@ -36,6 +36,7 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.clusterharness.EphemeralPorts;
 import sjws_nettask.config.ConfigLoader;
 
 /**
@@ -50,9 +51,7 @@ class HaMessagingStartTest {
     Path dir;
 
     static int freePort() throws Exception {
-        try (var s = new ServerSocket(0)) {
-            return s.getLocalPort();
-        }
+        return EphemeralPorts.probe();
     }
 
     private ConfigLoader.Loaded load(String name, String yaml, int httpPort) throws Exception {
@@ -104,18 +103,37 @@ class HaMessagingStartTest {
     @Test
     @Timeout(60)
     void threeVoterConfigStartsAndReplicates() throws Exception {
+        Exception last = null;
+        for (int attempt = 1; attempt <= EphemeralPorts.BIND_ATTEMPTS; attempt++) {
+            try {
+                threeVoterConfigStartsAndReplicatesOnce(attempt);
+                return;
+            } catch (Exception e) {
+                last = e;
+                if (!EphemeralPorts.addressInUse(e) || attempt == EphemeralPorts.BIND_ATTEMPTS) {
+                    throw e;
+                }
+                EphemeralPorts.logRetry("HaMessagingStartTest.threeVoter", attempt, e);
+            }
+        }
+        throw last;
+    }
+
+    private void threeVoterConfigStartsAndReplicatesOnce(int attempt) throws Exception {
         int[] raft = {freePort(), freePort(), freePort()};
         int[] http = {freePort(), freePort(), freePort()};
         var names = new String[] {"a", "b", "w"};
+        // Attempt-suffixed names so a failed bind does not leave raft/ledger state for the next try.
+        var tag = attempt == 1 ? "" : ("-" + attempt);
         var modules = new ArrayList<OptionalModule>();
         var servers = new ArrayList<SjwsServer>();
         var err = new ByteArrayOutputStream();
         var errOut = new PrintStream(err, true, StandardCharsets.UTF_8);
         try {
             for (int i = 0; i < 3; i++) {
-                var loaded = load(names[i], cluster(names[i], raft, http, i == 0 ? "on" : "auto"), http[i]);
+                var loaded = load(names[i] + tag, cluster(names[i], raft, http, i == 0 ? "on" : "auto"), http[i]);
                 assertTrue(loaded.haMessaging().replicate());
-                var base = i < 2 ? messaging(names[i]) : OptionalModules.NONE;
+                var base = i < 2 ? messaging(names[i] + tag) : OptionalModules.NONE;
                 var mods = HaMessagingStart.install(loaded, base, errOut);
                 assertNotSame(base, mods, "replication wraps the modules");
                 assertSame(base, HaMessagingStart.messaging(mods) == null ? OptionalModules.NONE
@@ -164,8 +182,8 @@ class HaMessagingStartTest {
                 Thread.sleep(50);
             }
             assertTrue(body.contains("hello-"), "follower " + names[follower] + " has the replicated record");
-            assertTrue(Files.isDirectory(dir.resolve("w-state/msgrepl/raft")), "witness keeps its vote state");
-            assertTrue(Files.isDirectory(dir.resolve(names[follower] + "-state/msgrepl/apply")));
+            assertTrue(Files.isDirectory(dir.resolve("w" + tag + "-state/msgrepl/raft")), "witness keeps its vote state");
+            assertTrue(Files.isDirectory(dir.resolve(names[follower] + tag + "-state/msgrepl/apply")));
         } finally {
             for (var s : servers) {
                 s.close();

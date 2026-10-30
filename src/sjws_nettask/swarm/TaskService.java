@@ -19,6 +19,7 @@ package sjws_nettask.swarm;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import sjws_nettask.messaging.delivery.LeaseResult;
 import sjws_nettask.messaging.delivery.Partition;
 import sjws_nettask.messaging.ledger.Durability;
@@ -49,14 +50,20 @@ public final class TaskService {
     private final java.util.concurrent.atomic.AtomicLong roundRobin = new java.util.concurrent.atomic.AtomicLong();
 
     /**
-     * Runs the post-durability acks of {@link #reply}/{@link #replyAll}. Without it the ack (which takes the
-     * pool partition's lock) ran on the reply topic's ledger-writer thread, stalling that writer behind the lock.
+     * Runs the post-durability acks of {@link #reply}/{@link #replyAll}/{@link #streamLast}. Without it the ack (which
+     * takes the pool partition's lock) ran on the reply topic's ledger-writer thread, stalling that writer behind the
+     * lock. Owned by this service (#181: it used to be static and outlived every close): its one thread starts with the
+     * first ack and ends in {@link #close}.
      */
-    private static final java.util.concurrent.Executor ACKER = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-        var th = new Thread(r, "sjws-reply-ack");
-        th.setDaemon(true);
-        return th;
-    });
+    private final java.util.concurrent.ThreadPoolExecutor acker = new java.util.concurrent.ThreadPoolExecutor(1, 1,
+            0L, TimeUnit.MILLISECONDS, new java.util.concurrent.LinkedBlockingQueue<>(), r -> {
+                var th = new Thread(r, ACKER_THREAD);
+                th.setDaemon(true);
+                return th;
+            });
+    static final String ACKER_THREAD = "sjws-reply-ack";
+    /** How long {@link #close} lets queued acks drain before it drops them. */
+    static final long CLOSE_DRAIN_MS = 2_000;
 
     public TaskService(Topics topics) {
         this(topics, Integer.getInteger("sjws.swarm.pool.shards", 1));
@@ -769,8 +776,7 @@ public final class TaskService {
                     reply.encode(), Durability.ASYNC).durable());
         }
         // Different reply topics are different logs, so wait for each topic's futures (normally one topic).
-        return CompletableFuture.allOf(durable.toArray(CompletableFuture[]::new))
-                .thenApplyAsync(x -> ackAll(tasks), ACKER); // one batched ack per shard (a claim may span shards)
+        return afterDurable(CompletableFuture.allOf(durable.toArray(CompletableFuture[]::new)), () -> ackAll(tasks)); // one batched ack per shard (a claim may span shards)
     }
 
     public CompletableFuture<LeaseResult> reply(Task t, long producerId, long seq, String contentType, byte[] body) {
@@ -781,7 +787,7 @@ public final class TaskService {
         var reply = t.envelope().reply(contentType, body);
         deliverLocal(to, reply); // before produce: RTT must not wait on the ledger hand-off
         var r = this.topics.partition(to).produce(producerId, seq, reply.encode(), Durability.ASYNC);
-        return r.durable().thenApplyAsync(off -> ack(t), ACKER);
+        return afterDurable(r.durable(), () -> ack(t));
     }
 
     /**
@@ -822,7 +828,7 @@ public final class TaskService {
         var reply = t.envelope().reply(contentType, body);
         deliverLocal(to, reply);
         var replyDurable = this.topics.partition(to).produce(producerId, seq + 1, reply.encode(), Durability.ASYNC).durable();
-        return CompletableFuture.allOf(lastDurable, replyDurable).thenApplyAsync(x -> {
+        return afterDurable(CompletableFuture.allOf(lastDurable, replyDurable), () -> {
             var a = ack(t);
             if (a == LeaseResult.OK) {
                 s.settle(t); // tombstone: a zombie older attempt cannot write after LAST
@@ -830,7 +836,7 @@ public final class TaskService {
                 s.retire(t); // this attempt lost its lease: refuse its later chunks
             }
             return a;
-        }, ACKER).whenComplete((a, e) -> {
+        }).whenComplete((a, e) -> {
             if (e != null) {
                 s.lastFailed(e);
             }
@@ -843,5 +849,87 @@ public final class TaskService {
             throw new IllegalStateException("streaming is off (sjws.swarm.stream.enabled)");
         }
         return s;
+    }
+
+    /**
+     * {@code ack} on the ack executor once {@code durable} completes: as {@code durable.thenApplyAsync(x -> ack.get(),
+     * acker)} (failures arrive wrapped in a {@link java.util.concurrent.CompletionException}), except that the returned
+     * future also fails, never hangs, when the service closes first (#181).
+     */
+    private <T> CompletableFuture<T> afterDurable(CompletableFuture<?> durable, java.util.function.Supplier<T> ack) {
+        var out = new CompletableFuture<T>();
+        durable.whenComplete((x, e) -> {
+            if (e != null) {
+                out.completeExceptionally(wrap(e));
+                return;
+            }
+            try {
+                this.acker.execute(new Ack<>(out, ack));
+            } catch (java.util.concurrent.RejectedExecutionException r) {
+                out.completeExceptionally(new java.util.concurrent.CompletionException(closedBeforeAck(r)));
+            }
+        });
+        return out;
+    }
+
+    private static Throwable wrap(Throwable e) {
+        return e instanceof java.util.concurrent.CompletionException ? e : new java.util.concurrent.CompletionException(e);
+    }
+
+    private static IllegalStateException closedBeforeAck(Throwable cause) {
+        return new IllegalStateException("swarm task service closed before the ack ran; the task is redelivered", cause);
+    }
+
+    /** One queued ack: {@link #close} fails the ones it drops. */
+    private record Ack<T>(CompletableFuture<T> out, java.util.function.Supplier<T> ack) implements Runnable {
+        @Override
+        public void run() {
+            try {
+                this.out.complete(this.ack.get());
+            } catch (Throwable e) {
+                this.out.completeExceptionally(wrap(e));
+            }
+        }
+    }
+
+    /**
+     * Stops the ack executor (#181); idempotent, and safe while replies are in flight. From now on no ack starts: an
+     * ack whose durability completes later fails its future, so the task is redelivered once its lease ends instead
+     * of being acked late. Acks already queued drain for up to {@link #CLOSE_DRAIN_MS} (the partitions are still
+     * open: {@link Swarm#close} closes them after this); past that the thread is interrupted and every ack still
+     * queued fails. Returns once the thread has ended, or after at most twice the bound.
+     */
+    public void close() {
+        this.acker.shutdown();
+        try {
+            if (this.acker.awaitTermination(CLOSE_DRAIN_MS, TimeUnit.MILLISECONDS)) {
+                return;
+            }
+            dropQueuedAcks();
+            if (!this.acker.awaitTermination(CLOSE_DRAIN_MS, TimeUnit.MILLISECONDS)) {
+                System.err.println("WARN: swarm: " + ACKER_THREAD + " still running " + 2 * CLOSE_DRAIN_MS + " ms after close");
+            }
+        } catch (InterruptedException e) {
+            dropQueuedAcks();
+            try {
+                // Same post-shutdownNow wait as the timeout path: topics must not close under a live acker.
+                if (!this.acker.awaitTermination(CLOSE_DRAIN_MS, TimeUnit.MILLISECONDS)) {
+                    System.err.println("WARN: swarm: " + ACKER_THREAD + " still running " + 2 * CLOSE_DRAIN_MS
+                            + " ms after close");
+                }
+            } catch (InterruptedException e2) {
+                // keep interrupted; restored below
+            }
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Interrupts the ack thread and fails every ack still queued. */
+    private void dropQueuedAcks() {
+        for (var r : this.acker.shutdownNow()) {
+            if (r instanceof Ack<?> a) {
+                a.out().completeExceptionally(new java.util.concurrent.CompletionException(closedBeforeAck(null)));
+            }
+        }
     }
 }

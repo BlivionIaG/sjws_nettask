@@ -5,7 +5,7 @@ Aligned with: docs/design/architecture.md "Target: message-oriented middleware" 
 specific it refines PR #16; it does not contradict it. Benchmark numbers quoted from PR #16 §B2.
 
 ## 0. Scope
-sjws is heading toward reliable, low-latency message-oriented middleware. **Messaging Core =
+**SJWS** (Swarm Java Web Services) is reliable, low-latency message-oriented middleware. **Messaging Core =
 the message queue/broker core**: partitions, a durable ledger, producers/consumers,
 acknowledgement, redelivery, dead-lettering, inspection, and replication through the
 cluster layer designed by the HA workstream (`docs/ha/design.md`).
@@ -131,6 +131,12 @@ tested by cutting the log at every byte, random tail corruption, and kill -9 of 
 - `Partition.maintain()` rewrites sealed segments that a snapshot covers but a few live messages pin, keeping only those records, and swaps them in through a `.cmp` file and a `.compacted` marker. Nothing schedules it yet.
 - The DLQ is a topic (`<topic>.dlq`) with the original offset, reason and attempts in the origin fields of its ENQUEUE record.
 
+With HA messaging (#270), a replicated topic's retention is not local: the leader's pass proposes the cut, and
+every replica deletes the same whole segments when it applies (`LogTopics.proposeRetention`, `dropBelow`).
+Compaction stays local to each node; an installing follower takes the leader's compacted files as they are.
+Narrow ledger hooks for this (`SegmentedLog.segmentFiles`, `positionOf`, `replaceWith`, `LedgerWriter.reload`,
+`ReplicaHooks`) are owned by Messaging Core.
+
 ### 2.6 Crash-loss window
 What an **acked** message can lose, by mode. "Unsynced window" W = records written but not yet fsynced
 on a node. With the background syncer, W ≤ the records written during one fsync plus `fsyncInterval`
@@ -245,7 +251,11 @@ log and the ledger may share segments (log index == ledger position), so each en
 4. **Multiplexing**: per-partition groups share one transport per node pair (shared heartbeats,
    batched cross-group frames), scaling to thousands of groups per node.
 5. **Snapshot + log truncation** past acked/snapshotted indexes; snapshot install for
-   lagging or new replicas; compaction-aware snapshots.
+   lagging or new replicas; compaction-aware snapshots. *Done for `msgrepl` (#270):* the consensus snapshot is a
+   manifest of the topic's own segment files at a fsynced offset; a lagging follower installs the leader's files
+   as they are (compacted or not), checked per chunk with SHA-256; retention is a replicated "advance log start"
+   entry the leader proposes, so every replica deletes at the same offset. See
+   [msg/* snapshots](../design/high-availability.md#msg-snapshots-truncation-and-install-270).
 6. **API** (as in `cluster.ClusterNode`):
    ```java
    CompletableFuture<CommittedIndex> append(GroupId g, List<ByteBuffer> batch);           // group default durability

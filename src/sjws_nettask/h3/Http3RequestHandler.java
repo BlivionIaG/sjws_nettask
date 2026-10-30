@@ -21,6 +21,7 @@ import io.netty.handler.codec.http3.Http3DataFrame;
 import io.netty.handler.codec.http3.Http3ErrorCode;
 import io.netty.handler.codec.http3.Http3Headers;
 import io.netty.handler.codec.http3.Http3HeadersValidationException;
+import io.netty.handler.codec.http3.DefaultHttp3HeadersFrame;
 import io.netty.handler.codec.http3.Http3HeadersFrame;
 import io.netty.handler.codec.http3.Http3RequestStreamInboundHandler;
 import io.netty.handler.codec.quic.QuicStreamChannel;
@@ -204,7 +205,8 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         if (refusal == null && this.shared.captureFields() && !request.headOnly() && !"GET".equals(request.method())) {
             long length = contentLength(headers);
             if (length != 0) {
-                this.body = new Http3RequestBody(stream, length, limits.writeTimeout().toNanos());
+                Runnable sendContinue = expectContinue(headers) ? () -> send100(stream) : null;
+                this.body = new Http3RequestBody(stream, length, limits.writeTimeout().toNanos(), sendContinue);
                 request = request.withBody(this.body);
             }
         }
@@ -237,6 +239,24 @@ final class Http3RequestHandler extends Http3RequestStreamInboundHandler {
         } catch (NumberFormatException e) {
             return -1;
         }
+    }
+
+    /** RFC 9110 §10.1.1: only {@code 100-continue} is recognized (case-insensitive). */
+    static boolean expectContinue(Http3Headers headers) {
+        var value = headers.get("expect");
+        return value != null && value.toString().equalsIgnoreCase("100-continue");
+    }
+
+    /** Interim {@code :status: 100} without finishing the stream; safe from a request thread. */
+    static void send100(QuicStreamChannel stream) {
+        stream.eventLoop().execute(() -> {
+            if (!stream.isActive()) {
+                return;
+            }
+            var frame = new DefaultHttp3HeadersFrame();
+            frame.headers().status("100");
+            stream.writeAndFlush(frame);
+        });
     }
 
     private void reject(QuicStreamChannel stream) {
