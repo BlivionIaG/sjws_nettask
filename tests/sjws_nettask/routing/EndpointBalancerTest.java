@@ -21,6 +21,8 @@ import static org.junit.jupiter.api.Assertions.*;
 import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import sjws_nettask.core.RequestHeaders;
+import java.net.InetAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -302,4 +304,41 @@ class EndpointBalancerTest {
         assertThrows(NullPointerException.class, () -> new EndpointBalancer.Outlier(1, 50, 1, null, d, 50));
         assertThrows(NullPointerException.class, () -> new EndpointBalancer(null, e -> null, null, null));
     }
+
+    /**
+     * #78 / Codex P2: a peer-budget share refusal is local admission. Repeated 503s from that
+     * path must not eject the endpoint; a real upstream 503 still must.
+     */
+    @Test
+    void peerBudgetRefusalsDoNotEjectButUpstreamFailuresStillDo() throws Exception {
+        var budget = new ByteBudget(1 << 20, 64 * 1024);
+        var peer = new InetSocketAddress(InetAddress.getByAddress(new byte[] {10, 4, 5, 6}), 0);
+        budget.add(64 * 1024, budget.peerStripe(peer)); // peer already at its share
+        var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null), budget);
+        var src = new StaticUpstreamSource(set(1, null, ep(0, 1)));
+        var b = new EndpointBalancer(src, pools, null, o, Duration.ZERO, this.now::get);
+        this.balancers.add(b);
+        var req = new Request("GET", "/", RequestHeaders.of(Map.of()), peer, false);
+        for (int i = 0; i < 20; i++) {
+            var r = b.handle(req);
+            assertEquals(503, r.status(), "local peer-budget refusal");
+            assertTrue(ProxyHandler.isLocalRefusal(r));
+        }
+        var pool = b.poolOf(ep(0, 1).authority());
+        assertFalse(pool.health.ejected(), "share-exhaustion 503s must not mark the endpoint unhealthy");
+        assertEquals(0, b.ejectedCount());
+
+        // Real upstream 503s still count toward ejection.
+        this.failing.add("a");
+        var other = new Request("GET", "/"); // no peer → keyless stripe, not at share
+        for (int i = 0; i < 3; i++) {
+            assertEquals(503, b.handle(other).status());
+        }
+        assertTrue(pool.health.ejected(), "real upstream 503s must still eject");
+        assertEquals(1, b.ejectedCount());
+    }
+
 }

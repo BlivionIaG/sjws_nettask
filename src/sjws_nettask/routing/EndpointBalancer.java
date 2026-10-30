@@ -286,7 +286,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             pool.inflight.incrementAndGet();
             try {
                 response = pool.proxy.attempt(request);
-                failed = ProxyHandler.kind(response.status());
+                failed = ProxyHandler.kind(response);
             } catch (IOException e) {
                 failed = ProxyHandler.kind(e);
                 errorStatus = ProxyHandler.status(e);
@@ -296,6 +296,10 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 return StaticFileHandler.error(502, head);
             } finally {
                 pool.inflight.decrementAndGet();
+            }
+            if (ProxyHandler.isLocalRefusal(response)) {
+                // Peer-budget (or other local) admission: never contacted the endpoint.
+                return response;
             }
             if (failed == null) {
                 pool.health.success(this.clock.getAsLong());

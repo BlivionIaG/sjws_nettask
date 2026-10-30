@@ -37,6 +37,7 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -142,6 +143,12 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     private final Resilience.RetryBudget retryBudget;
     private final Resilience.CircuitBreaker breaker;
 
+    /**
+     * Responses produced by local admission (peer-budget share exhausted) rather than an upstream.
+     * {@link EndpointBalancer} must not count these against endpoint health or retry them as 503s.
+     */
+    private static final Set<Response> LOCAL_REFUSALS = ConcurrentHashMap.newKeySet();
+
     public ProxyHandler(Settings settings) {
         this(settings, ByteBudget.shared());
     }
@@ -180,9 +187,20 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             return null;
         }
         if (budget.exhausted(budget.peerStripe(request.peer()))) {
-            return StaticFileHandler.error(503, head);
+            return localRefusal(StaticFileHandler.error(503, head));
         }
         return null;
+    }
+
+    /** Marks a response as a local admission refusal (not an upstream outcome). */
+    static Response localRefusal(Response response) {
+        LOCAL_REFUSALS.add(response);
+        return response;
+    }
+
+    /** True when {@code response} was produced by local admission, not by an upstream. */
+    static boolean isLocalRefusal(Response response) {
+        return response != null && LOCAL_REFUSALS.contains(response);
     }
 
     public Settings settings() {
@@ -291,6 +309,17 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         };
     }
 
+    /**
+     * Classifies an attempt outcome for retry and passive health. Local admission refusals
+     * (peer-budget share) are not upstream failures.
+     */
+    static Resilience.On kind(Response response) {
+        if (isLocalRefusal(response)) {
+            return null;
+        }
+        return kind(response.status());
+    }
+
     /** Methods a retry cannot duplicate the effect of (RFC 9110 §9.2.2). */
     static boolean idempotent(String method) {
         return switch (method) {
@@ -323,7 +352,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             int errorStatus = 0;
             try {
                 response = exchange(request, tries == 0 ? out : rebuild(out), length, true);
-                failed = kind(response.status());
+                failed = kind(response);
             } catch (IOException e) {
                 failed = kind(e);
                 errorStatus = status(e);
