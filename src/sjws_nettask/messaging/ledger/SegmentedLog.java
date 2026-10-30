@@ -110,6 +110,7 @@ public final class SegmentedLog implements AutoCloseable {
      * mid-group roll walks frame-by-frame so {@link LedgerWriter} coalescing cannot change bases.
      */
     void appendFrames(ByteBuffer frames, long[] frameOffsets, int[] frameLens, int n, long newNext) throws IOException {
+        if (n == 0) return; // empty group: do not index frameOffsets[0] (#330 N1)
         var active = segments.getLast();
         long total = frames.remaining();
         // Fast path: whole group fits — identical to one-by-one and to the pre-#328 single append.

@@ -654,7 +654,9 @@ ready leader computes the cut its retention pass would make and proposes `[R][te
 ("advance the log start to offset"). Every replica applies it in log order: it raises `logStartOffset`, stamps
 it (a restart keeps it), and deletes whole sealed segments ending at or below it under the reads write lock
 (left to the next maintenance pass when one is running). All replicas therefore delete at the same logical
-point.
+point. Ops note (#328 / #330): segment bases written before the per-frame roll upgrade can still diverge on a
+follower; those sealed segments stay until a cut passes their `nextOffset` (at most about one extra segment
+per topic), then later cuts clear them. New appends after every node is on that tip match.
 
 **Producer dedup and offsets (constraint 2).** Consumer offsets live in `__offsets`, whose segments are
 snapshotted and installed like any topic; `LogOffsets.reload` rebuilds the map from them after an install.

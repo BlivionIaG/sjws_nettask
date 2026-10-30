@@ -136,6 +136,10 @@ every replica deletes the same whole segments when it applies (`LogTopics.propos
 Compaction stays local to each node; an installing follower takes the leader's compacted files as they are.
 Narrow ledger hooks for this (`SegmentedLog.segmentFiles`, `positionOf`, `replaceWith`, `LedgerWriter.reload`,
 `ReplicaHooks`) are owned by Messaging Core.
+From #328 onward, segment bases are a function of the record sequence (per-frame rolls), so a leader
+boundary cut reaches the same physical start on every replica. Bases written under the old group-roll
+behaviour (before that upgrade) can still diverge on a follower; those sealed segments stay on disk until
+a retention cut passes their end — at most about one extra segment per topic, cleared by later cuts.
 
 ### 2.6 Crash-loss window
 What an **acked** message can lose, by mode. "Unsynced window" W = records written but not yet fsynced
