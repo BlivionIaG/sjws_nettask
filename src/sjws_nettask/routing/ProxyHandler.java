@@ -33,11 +33,9 @@ import java.net.URI;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.Locale;
 import java.util.Objects;
-import java.util.Collections;
-import java.util.Set;
-import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -145,16 +143,6 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     private final Resilience.RetryBudget retryBudget;
     private final Resilience.CircuitBreaker breaker;
 
-    /**
-     * Responses produced by local admission (peer-budget share exhausted) rather than an upstream.
-     * {@link EndpointBalancer} must not count these against endpoint health or retry them as 503s.
-     */
-    /**
-     * Local-admission markers. Keys are weakly held so finished responses are reclaimable; the
-     * set must not retain every refusal for the life of the process (Codex P1 on #298).
-     */
-    private static final Set<Response> LOCAL_REFUSALS =
-            Collections.newSetFromMap(Collections.synchronizedMap(new WeakHashMap<>()));
 
     public ProxyHandler(Settings settings) {
         this(settings, ByteBudget.shared());
@@ -201,17 +189,12 @@ public final class ProxyHandler implements Handler, AutoCloseable {
 
     /** Marks a response as a local admission refusal (not an upstream outcome). */
     static Response localRefusal(Response response) {
-        LOCAL_REFUSALS.add(response);
-        return response;
+        return response.asLocalAdmission();
     }
 
     /** True when {@code response} was produced by local admission, not by an upstream. */
     static boolean isLocalRefusal(Response response) {
-        return response != null && LOCAL_REFUSALS.contains(response);
-    }
-    /** Visible for tests: how many local-refusal markers are still strongly reachable as keys. */
-    static int localRefusalRegistrySize() {
-        return LOCAL_REFUSALS.size();
+        return response != null && response.localAdmission();
     }
 
 

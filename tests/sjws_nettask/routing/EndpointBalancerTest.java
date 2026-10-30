@@ -25,6 +25,7 @@ import sjws_nettask.core.RequestHeaders;
 import java.net.InetAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.lang.ref.WeakReference;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
@@ -378,30 +379,38 @@ class EndpointBalancerTest {
     }
 
     /**
-     * Codex P1 on #298: local-refusal markers must not pin Response instances forever.
+     * Codex / inceptor P1 on #298: local admission must not retain responses in a global set.
+     * Holds only weak refs across 10k refusals; after GC every referent must be gone. Fails when
+     * ProxyHandler keeps a strong static collection (5f3d37c).
      */
     @Test
     void localRefusalMarkersDoNotPinResponsesForever() {
-        int before = ProxyHandler.localRefusalRegistrySize();
-        for (int i = 0; i < 200; i++) {
+        var refs = new java.util.ArrayList<WeakReference<sjws_nettask.core.Response>>(10_000);
+        for (int i = 0; i < 10_000; i++) {
             var r = ProxyHandler.localRefusal(StaticFileHandler.error(503, false));
             assertTrue(ProxyHandler.isLocalRefusal(r));
-            // drop strong ref each iteration
+            refs.add(new WeakReference<>(r));
         }
         boolean cleared = false;
-        for (int i = 0; i < 50; i++) {
+        for (int i = 0; i < 80; i++) {
             System.gc();
             System.runFinalization();
-            if (ProxyHandler.localRefusalRegistrySize() <= before + 2) {
+            long live = refs.stream().filter(w -> w.get() != null).count();
+            if (live == 0) {
                 cleared = true;
                 break;
             }
-            try { Thread.sleep(20); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            try {
+                Thread.sleep(25);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
-        assertTrue(cleared,
-                "weak local-refusal registry still held "
-                        + ProxyHandler.localRefusalRegistrySize() + " entries after GC");
+        long live = refs.stream().filter(w -> w.get() != null).count();
+        assertTrue(cleared && live == 0, "retained " + live + " / 10000 local-refusal responses");
     }
+
 
 
 }
