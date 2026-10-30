@@ -17,7 +17,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -277,9 +276,8 @@ class MessagingSnapshotTest {
 
     /**
      * One retention proposal at a time; settle the replicated logical cut (and drain pendingDrops) before
-     * the next. Does not require physical == logical: under load follower segment bases can diverge from
-     * the leader so a cut lands mid-segment on the follower (#328). Physical equality is
-     * {@link #retentionPassPhysicalMatchesLogicalOnBoth()}.
+     * the next. Physical equality after each cut is {@link #retentionPassPhysicalMatchesLogicalOnBoth()}
+     * (#328 per-frame rolls).
      */
     @Test
     void retentionPassIsOneReplicatedCut() throws Exception {
@@ -320,12 +318,9 @@ class MessagingSnapshotTest {
     }
 
     /**
-     * Strict physical==logical-on-both after each settled cut. Disabled for #328: follower segment roll
-     * bases diverge from the leader under load, so a leader boundary cut can straddle the follower's
-     * first remaining segment and physical stays below logical forever. Re-enable when #328 lands; that
-     * PR must fail this test before the product fix and pass after.
+     * Strict physical==logical-on-both after each settled cut (#328). Per-frame rolls make leader and
+     * follower segment bases match, so a leader boundary cut deletes the same prefix on both.
      */
-    @Disabled("#328: follower segment straddles retention cut")
     @Test
     void retentionPassPhysicalMatchesLogicalOnBoth() throws Exception {
         start(new LogRetention(4096, 0));
