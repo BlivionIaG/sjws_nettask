@@ -85,6 +85,7 @@ public final class ObserverSlot {
      * Does not install the observe filter.
      */
     public void attachCredentialQueryParams(String[] names) {
+        // Clone once here; RequestObserver.setCredentialQueryParams stores the reference.
         var next = names == null || names.length == 0 ? AccessTargetMask.NONE : names.clone();
         this.credentialQueryParams = next;
         var obs = this.current;

@@ -246,7 +246,8 @@ public final class RequestObserver implements AutoCloseable {
         if (this == NONE) {
             return;
         }
-        this.credentialQueryParams = names == null || names.length == 0 ? AccessTargetMask.NONE : names.clone();
+        // Caller (ObserverSlot) clones once at the attach boundary; do not clone again.
+        this.credentialQueryParams = names == null || names.length == 0 ? AccessTargetMask.NONE : names;
     }
 
     /** Process counters, plus cluster and gateway families when those sources are attached. */
