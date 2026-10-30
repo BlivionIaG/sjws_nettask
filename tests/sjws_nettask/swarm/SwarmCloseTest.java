@@ -31,7 +31,9 @@ class SwarmCloseTest {
 
     @TempDir Path dir;
 
-    static final List<String> PREFIXES = List.of("sjws-reply-ack", "sjws-stream-", "swarm-");
+    /** Literal prefixes of threads a swarm starts (not the broad {@code swarm-}, which matches test helper threads). */
+    static final List<String> PREFIXES = List.of(
+            "sjws-reply-ack", "sjws-stream-", "swarm-lease-keeper", "swarm-reply.");
     static final byte[] BODY = "x".getBytes(StandardCharsets.UTF_8);
 
     /** Live threads named like the ones a swarm starts (literal names: the test also runs against the old code). */

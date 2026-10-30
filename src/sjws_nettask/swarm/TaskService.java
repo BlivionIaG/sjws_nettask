@@ -911,6 +911,15 @@ public final class TaskService {
             }
         } catch (InterruptedException e) {
             dropQueuedAcks();
+            try {
+                // Same post-shutdownNow wait as the timeout path: topics must not close under a live acker.
+                if (!this.acker.awaitTermination(CLOSE_DRAIN_MS, TimeUnit.MILLISECONDS)) {
+                    System.err.println("WARN: swarm: " + ACKER_THREAD + " still running " + 2 * CLOSE_DRAIN_MS
+                            + " ms after close");
+                }
+            } catch (InterruptedException e2) {
+                // keep interrupted; restored below
+            }
             Thread.currentThread().interrupt();
         }
     }

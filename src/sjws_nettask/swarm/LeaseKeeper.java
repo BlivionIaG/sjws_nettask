@@ -155,6 +155,9 @@ public final class LeaseKeeper implements AutoCloseable {
             this.lock.unlock();
         }
         for (var e : byPool.entrySet()) {
+            if (this.closed) {
+                return; // join timed out while we were in tick: do not extend after close
+            }
             var list = e.getValue();
             var offs = new long[list.size()];
             var atts = new int[list.size()];
@@ -222,7 +225,7 @@ public final class LeaseKeeper implements AutoCloseable {
         if (t != null) {
             LockSupport.unpark(t);
             try {
-                t.join(1_000);
+                t.join(2_000); // align with reader/acker/sweeper close bound
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

@@ -91,10 +91,19 @@ public final class Swarm implements AutoCloseable {
      */
     public TokenStreams enableStreams(TokenStreams.Config config) {
         var s = new TokenStreams(this.topics, this.replies.topic().substring("reply.".length()), config);
-        this.topics.installProbes(s.cancels()::probe); // S2c PR 5: extend answers CANCELLED for cancelled tasks
-        this.tasks.bindStreams(s);
-        this.streams = s;
-        return s;
+        this.lifecycle.lock();
+        try {
+            if (!this.closed) {
+                this.topics.installProbes(s.cancels()::probe); // S2c PR 5: extend answers CANCELLED for cancelled tasks
+                this.tasks.bindStreams(s);
+                this.streams = s;
+                return s;
+            }
+        } finally {
+            this.lifecycle.unlock();
+        }
+        s.close(); // raced Swarm.close: do not orphan a reader
+        throw new IllegalStateException("swarm closed");
     }
 
     /** Closed by its caller, or at the latest by {@link #close}. */
