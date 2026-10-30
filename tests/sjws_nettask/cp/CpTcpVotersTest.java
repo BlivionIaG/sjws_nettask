@@ -22,7 +22,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -36,6 +35,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.Clock;
+import sjws_nettask.clusterharness.EphemeralPorts;
 import sjws_nettask.cluster.ClusterKey;
 import sjws_nettask.cluster.ClusterTransport;
 import sjws_nettask.service.CpReloadable;
@@ -111,12 +111,18 @@ class CpTcpVotersTest {
     private CpTestCa ca;
 
     private List<TcpDeps> start(int voters, int full) throws Exception {
-        var ca = new CpTestCa(dir.resolve("ca"));
-        this.ca = ca;
-        var ports = new int[voters];
-        for (int i = 0; i < voters; i++) {
-            ports[i] = freePort();
+        return EphemeralPorts.withBindRetry("CpTcpVotersTest.start", () -> startOnce(voters, full));
+    }
+
+    private List<TcpDeps> startOnce(int voters, int full) throws Exception {
+        // A previous bind-retry attempt may have left partially-started hosts.
+        for (var h : hosts) {
+            h.close();
         }
+        hosts.clear();
+        var ca = new CpTestCa(dir.resolve("ca-" + System.nanoTime()));
+        this.ca = ca;
+        var ports = EphemeralPorts.probeDistinct(voters);
         var all = new ArrayList<TcpDeps>();
         for (int i = 1; i <= voters; i++) {
             var peerConfig = ca.peer("cp-" + i);
@@ -224,45 +230,52 @@ class CpTcpVotersTest {
     @Test
     void aPeerPortRefusesClientsWithoutACertificate() throws Exception {
         var ca = new CpTestCa(dir.resolve("ca"));
-        int port = freePort();
-        var config = CpConfig.parse(k -> null, Map.of(), yaml("cp-1", new int[] {port, freePort(), freePort()}, 3),
-                null);
-        try (var t = CpLaunch.tcpTransport(config, CpTls.serverContext(ca.peer("cp-1")), KEY,
-                Clock.SYSTEM)) {
-            assertThrows(IOException.class, () -> handshakeWithoutClientCert(port, ca.caPem()));
-            // Plain TCP: the TLS server never accepts it as frames.
-            try (var plain = new Socket("127.0.0.1", port)) {
-                plain.setSoTimeout(5_000);
-                plain.getOutputStream().write(new byte[] {0, 0, 0, 64, 1, 2, 3});
-                plain.getOutputStream().flush();
-                int got;
-                try {
-                    got = plain.getInputStream().read();
-                    while (got >= 0) {
+        EphemeralPorts.withBindRetry("CpTcpVotersTest.aPeerPortRefuses", () -> {
+            var ports = EphemeralPorts.probeDistinct(3);
+            int port = ports[0];
+            var config = CpConfig.parse(k -> null, Map.of(), yaml("cp-1", ports, 3), null);
+            try (var t = CpLaunch.tcpTransport(config, CpTls.serverContext(ca.peer("cp-1")), KEY,
+                    Clock.SYSTEM)) {
+                assertThrows(IOException.class, () -> handshakeWithoutClientCert(port, ca.caPem()));
+                // Plain TCP: the TLS server never accepts it as frames.
+                try (var plain = new Socket("127.0.0.1", port)) {
+                    plain.setSoTimeout(5_000);
+                    plain.getOutputStream().write(new byte[] {0, 0, 0, 64, 1, 2, 3});
+                    plain.getOutputStream().flush();
+                    int got;
+                    try {
                         got = plain.getInputStream().read();
+                        while (got >= 0) {
+                            got = plain.getInputStream().read();
+                        }
+                    } catch (IOException reset) {
+                        got = -1;
                     }
-                } catch (IOException reset) {
-                    got = -1;
+                    assertEquals(-1, got);
                 }
-                assertEquals(-1, got);
+                assertEquals(0, t.rejected(sjws_nettask.cluster.TcpTransport.Reason.TAG));
             }
-            assertEquals(0, t.rejected(sjws_nettask.cluster.TcpTransport.Reason.TAG));
-        }
+            return null;
+        });
     }
 
     @Test
     void withoutTlsVoterLinksMustBeLoopback() throws Exception {
-        var y = yaml("cp-1", new int[] {freePort(), freePort(), freePort()}, 3);
-        y.put("peers", List.of(Map.of("id", "cp-1", "address", "127.0.0.1:" + freePort()),
-                Map.of("id", "cp-2", "address", "192.0.2.10:7000"), Map.of("id", "cp-3", "address", "127.0.0.1:1")));
+        // Non-loopback peer: ports need not be free; only the address family is checked.
+        var y = yaml("cp-1", new int[] {1, 2, 3}, 3);
+        y.put("peers", List.of(Map.of("id", "cp-1", "address", "127.0.0.1:1"),
+                Map.of("id", "cp-2", "address", "192.0.2.10:7000"), Map.of("id", "cp-3", "address", "127.0.0.1:2")));
         var config = CpConfig.parse(k -> null, Map.of(), y, null);
         var e = assertThrows(IOException.class, () -> CpLaunch.tcpTransport(config, null, KEY, Clock.SYSTEM));
         assertTrue(e.getMessage().contains("must be loopback"), e.getMessage());
-        var loop = CpConfig.parse(k -> null, Map.of(), yaml("cp-1", new int[] {freePort(), freePort(), freePort()}, 3),
-                null);
-        try (var t = CpLaunch.tcpTransport(loop, null, KEY, Clock.SYSTEM)) {
-            assertTrue(t.localPort() > 0);
-        }
+        // Three distinct loopback peers, then bind: probeDistinct avoids duplicate-address; retry covers steal.
+        EphemeralPorts.withBindRetry("CpTcpVotersTest.withoutTlsLoopback", () -> {
+            var loop = CpConfig.parse(k -> null, Map.of(), yaml("cp-1", EphemeralPorts.probeDistinct(3), 3), null);
+            try (var t = CpLaunch.tcpTransport(loop, null, KEY, Clock.SYSTEM)) {
+                assertTrue(t.localPort() > 0);
+            }
+            return null;
+        });
     }
 
     @Test
@@ -346,13 +359,6 @@ class CpTcpVotersTest {
             if (socket.getInputStream().read() < 0) {
                 throw new java.io.EOFException("closed without a client certificate");
             }
-        }
-    }
-
-    private static int freePort() throws IOException {
-        try (var probe = new ServerSocket()) {
-            probe.bind(new InetSocketAddress("127.0.0.1", 0));
-            return probe.getLocalPort();
         }
     }
 
