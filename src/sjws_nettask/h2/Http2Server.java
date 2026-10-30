@@ -375,7 +375,7 @@ public final class Http2Server implements Transport {
     void http2(ChannelPipeline p) {
         var codec = frameCodec();
         // Boost before the multiplexer so connection SETTINGS frames are visible.
-        p.addLast(codec, new ConnectionWindowBoost(codec, CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW),
+        p.addLast(codec, new ConnectionWindowBoost(CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW),
                 streamIdle(codec), multiplexer(), Quiet.INSTANCE);
     }
 
@@ -401,7 +401,7 @@ public final class Http2Server implements Transport {
                 var codec = frameCodec();
                 ch.pipeline().addBefore("expect-continue", "h2-codec", codec);
                 ch.pipeline().addAfter("h2-codec", "h2-window",
-                        new ConnectionWindowBoost(codec, CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW));
+                        new ConnectionWindowBoost(CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW));
                 ch.pipeline().addAfter("h2-window", "h2-idle", streamIdle(codec));
                 ch.pipeline().addAfter("h2-idle", "h2-multiplexer", multiplexer());
             }
@@ -419,7 +419,7 @@ public final class Http2Server implements Transport {
     private Http2ServerUpgradeCodec upgradeCodec() {
         var codec = frameCodec();
         return new Http2ServerUpgradeCodec(codec,
-                new ConnectionWindowBoost(codec, CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW),
+                new ConnectionWindowBoost(CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW),
                 streamIdle(codec), multiplexer());
     }
 
@@ -465,12 +465,10 @@ public final class Http2Server implements Transport {
      * pauses each stream at {@code HIGH}.
      */
     static final class ConnectionWindowBoost extends ChannelInboundHandlerAdapter {
-        private final Http2FrameCodec codec;
         private final int extra;
         private boolean sent;
 
-        ConnectionWindowBoost(Http2FrameCodec codec, int extra) {
-            this.codec = codec;
+        ConnectionWindowBoost(int extra) {
             this.extra = Math.max(0, extra);
         }
 
@@ -478,14 +476,9 @@ public final class Http2Server implements Transport {
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             if (!this.sent && this.extra > 0 && msg instanceof Http2SettingsFrame) {
                 this.sent = true;
-                var connection = this.codec.connection();
-                try {
-                    connection.local().flowController()
-                            .incrementWindowSize(connection.connectionStream(), this.extra);
-                } catch (io.netty.handler.codec.http2.Http2Exception e) {
-                    throw new IllegalStateException(e);
-                }
-                // Connection-level WINDOW_UPDATE (no stream id): raises the peer's send window.
+                // Connection-level WINDOW_UPDATE only: Http2FrameCodec.write calls
+                // incrementWindowSize on the local flow controller for stream 0, so an explicit
+                // increment here would double the target (Codex P2 / #303).
                 ctx.writeAndFlush(new DefaultHttp2WindowUpdateFrame(this.extra));
             }
             ctx.fireChannelRead(msg);

@@ -105,28 +105,75 @@ class ConnWindowHolTest {
             // Drain preface SETTINGS (+ connection WINDOW_UPDATE boost) so our send window grows.
             long boostDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
             boolean sawBoost = false;
+            int connCredit = 65_535;
+            int streamCredit = 65_535;
             while (System.nanoTime() < boostDeadline && !sawBoost) {
                 var f = h2.read();
                 if (f == null) {
                     break;
                 }
-                if (f.type() == RawH2.WINDOW_UPDATE && f.stream() == 0) {
-                    sawBoost = true;
+                if (f.type() == RawH2.WINDOW_UPDATE && f.payload().length >= 4) {
+                    int inc = (((f.payload()[0] & 0xff) << 24) | ((f.payload()[1] & 0xff) << 16)
+                            | ((f.payload()[2] & 0xff) << 8) | (f.payload()[3] & 0xff)) & 0x7fff_ffff;
+                    if (f.stream() == 0) {
+                        connCredit += inc;
+                        sawBoost = true;
+                    } else if (f.stream() == 1) {
+                        streamCredit += inc;
+                    }
                 }
             }
             assertTrue(sawBoost, "server should WINDOW_UPDATE stream 0 after SETTINGS");
 
             h2.frame(RawH2.HEADERS, RawH2.END_HEADERS, 1,
                     RawH2.block("POST", "/hold", "content-length", Integer.toString(big.length)));
-            // HTTP/2 default max frame size is 16 KiB — chunk the body.
+            // HTTP/2 default stream window is 65,535 and max frame is 16 KiB. Track both stream and
+            // connection send credit; never exceed either (Codex P2 / #303). When the server pauses
+            // at HIGH it stops stream WINDOW_UPDATE — stop sending then (no END_STREAM) so /hold
+            // stays open with unread DATA; do not spin waiting for credit that will not come.
             int off = 0;
+            boolean holdReset = false;
+            int idleSpins = 0;
             while (off < big.length) {
-                int n = Math.min(16 * 1024, big.length - off);
+                h2.socket.setSoTimeout(50);
+                for (RawH2.Frame f; (f = h2.read()) != null;) {
+                    if (f.type() == RawH2.WINDOW_UPDATE && f.payload().length >= 4) {
+                        int inc = (((f.payload()[0] & 0xff) << 24) | ((f.payload()[1] & 0xff) << 16)
+                                | ((f.payload()[2] & 0xff) << 8) | (f.payload()[3] & 0xff)) & 0x7fff_ffff;
+                        if (f.stream() == 0) {
+                            connCredit += inc;
+                        } else if (f.stream() == 1) {
+                            streamCredit += inc;
+                        }
+                        idleSpins = 0;
+                    } else if (f.type() == RawH2.RST_STREAM && f.stream() == 1) {
+                        holdReset = true;
+                    }
+                }
+                h2.socket.setSoTimeout(10_000);
+                if (holdReset) {
+                    break;
+                }
+                int n = Math.min(16 * 1024, Math.min(big.length - off, Math.min(streamCredit, connCredit)));
+                if (n <= 0) {
+                    if (off >= 60 * 1024) {
+                        break; // stream window full; unread DATA holds connection credit
+                    }
+                    Thread.sleep(25);
+                    if (++idleSpins > 80) {
+                        break;
+                    }
+                    continue;
+                }
                 byte[] chunk = java.util.Arrays.copyOfRange(big, off, off + n);
                 off += n;
-                int flags = off == big.length ? RawH2.END_STREAM : 0;
-                h2.frame(RawH2.DATA, flags, 1, chunk);
+                streamCredit -= n;
+                connCredit -= n;
+                // No END_STREAM until after /ping: keep /hold open without needing more stream credit.
+                h2.frame(RawH2.DATA, 0, 1, chunk);
             }
+            assertTrue(!holdReset, "/hold must stay open (stream window respected)");
+            assertTrue(off >= 60 * 1024, "should fill about one default stream/connection window of unread DATA");
 
             assertTrue(holding.await(5, TimeUnit.SECONDS), "hold handler entered");
             Thread.sleep(300); // peer fills / pauses at HIGH
@@ -141,6 +188,9 @@ class ConnWindowHolTest {
             var decoder = new io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder();
             h2.socket.setSoTimeout(3000);
             for (RawH2.Frame f; (f = h2.read()) != null;) {
+                if (f.type() == RawH2.RST_STREAM && f.stream() == 1) {
+                    holdReset = true;
+                }
                 if (f.stream() == 3 && f.type() == RawH2.HEADERS) {
                     var headers = decoder.decodeHeaders(3, io.netty.buffer.Unpooled.wrappedBuffer(f.payload()));
                     status = headers.status().toString();
@@ -155,6 +205,7 @@ class ConnWindowHolTest {
                     break;
                 }
             }
+            assertTrue(!holdReset, "/hold must not be reset before sibling /ping completes");
             long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
             release.countDown();
             assertEquals("200", status, "sibling /ping must complete while /hold is unread (HOL at 64 KiB would stall)");

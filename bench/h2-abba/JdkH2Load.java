@@ -1,12 +1,19 @@
+import java.io.ByteArrayInputStream;
 import java.net.URI;
 import java.net.http.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyStore;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
-/** java JdkH2Load.java url conns secs warm [bodyfile] — HTTP/2 GET or POST via JDK client */
+/**
+ * java JdkH2Load.java url conns secs warm [bodyfile] — HTTP/2 GET or POST via JDK client.
+ * HTTPS trusts only the PEM at {@code SJWS_BENCH_CA} (the bench self-signed cert from run-abba.sh).
+ */
 public class JdkH2Load {
   public static void main(String[] a) throws Exception {
     URI uri = URI.create(a[0]);
@@ -15,14 +22,11 @@ public class JdkH2Load {
     HttpClient.Builder b = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
         .connectTimeout(Duration.ofSeconds(5));
     if ("https".equals(uri.getScheme())) {
-      var tm = new javax.net.ssl.X509TrustManager() {
-        public void checkClientTrusted(java.security.cert.X509Certificate[] c, String a2) {}
-        public void checkServerTrusted(java.security.cert.X509Certificate[] c, String a2) {}
-        public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[0]; }
-      };
-      var ctx = javax.net.ssl.SSLContext.getInstance("TLS");
-      ctx.init(null, new javax.net.ssl.TrustManager[]{tm}, null);
-      b.sslContext(ctx);
+      String ca = System.getenv("SJWS_BENCH_CA");
+      if (ca == null || ca.isBlank()) {
+        throw new IllegalStateException("SJWS_BENCH_CA must point at the bench PEM (no trust-all)");
+      }
+      b.sslContext(sslForPem(Path.of(ca)));
     }
     HttpClient client = b.build();
     HttpRequest.Builder rb = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(30));
@@ -36,6 +40,26 @@ public class JdkH2Load {
     double el = (System.nanoTime() - t0) / 1e9;
     long[] v = lat.stream().mapToLong(Long::longValue).sorted().toArray();
     System.out.printf("rps=%.0f p50=%.2fms p99=%.2fms n=%d%n", n / el, pct(v, .5), pct(v, .99), n);
+  }
+  static javax.net.ssl.SSLContext sslForPem(Path pem) throws Exception {
+    byte[] der = Files.readAllBytes(pem);
+    var certs = CertificateFactory.getInstance("X.509")
+        .generateCertificates(new ByteArrayInputStream(der));
+    if (certs.isEmpty()) {
+      throw new IllegalStateException("no certificates in " + pem);
+    }
+    var ks = KeyStore.getInstance(KeyStore.getDefaultType());
+    ks.load(null, null);
+    int i = 0;
+    for (var c : certs) {
+      ks.setCertificateEntry("bench-" + (i++), c);
+    }
+    var tmf = javax.net.ssl.TrustManagerFactory.getInstance(
+        javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+    tmf.init(ks);
+    var ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+    ctx.init(null, tmf.getTrustManagers(), null);
+    return ctx;
   }
   static double pct(long[] v, double q) {
     return v.length == 0 ? 0 : v[Math.min(v.length - 1, (int) (q * v.length))] / 1e6;

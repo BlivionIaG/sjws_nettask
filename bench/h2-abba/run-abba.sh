@@ -14,34 +14,43 @@ AFTER_JAR=${2:?after jar dir}
 WWW=${3:?docroot with 1k.bin}
 gate(){ for _ in $(seq 1 90); do
   l=$(cut -d' ' -f1 /proc/loadavg)
-  python3 -c "import sys; sys.exit(0 if float('$l') < 4 else 1)" && { echo "  [load1=$l]"; return; }
+  python3 -c "import sys; sys.exit(0 if float('$l') < 4 else 1)" && { echo "  [load1=$l]"; return 0; }
   sleep 5
-done; echo "  [load1=$(cut -d' ' -f1 /proc/loadavg) GATE TIMEOUT]"; }
+done
+  echo "  [load1=$(cut -d' ' -f1 /proc/loadavg) GATE TIMEOUT]" >&2
+  return 1
+}
 killports(){ fuser -k ${H1}/tcp ${H2C}/tcp ${H2}/tcp 2>/dev/null; sleep 1; }
 srv(){ killports
   local dir=$1
   local jar
   jar=$(ls "$dir"/sjws_nettask-*.jar | head -1)
-  $J -jar "$jar" $H1 "$WWW" --h2 --h2-port=$H2 --h2c-port=$H2C >"$B/srv-$(basename "$dir").log" 2>&1 & P=$!
+  $J -jar "$jar" $H1 "$WWW" --h2 --h2-port=$H2 --h2c-port=$H2C     --cert="$B/bench-cert.pem" --key="$B/bench-key.pem"     >"$B/srv-$(basename "$dir").log" 2>&1 & P=$!
   sleep 3; kill -0 $P || { echo "SERVER $dir FAILED"; cat "$B/srv-$(basename "$dir").log"; return 1; }
 }
 stop(){ kill $P 2>/dev/null; wait $P 2>/dev/null; sleep 1; }
-L(){ nice -n 10 $J "$SCRIPT_DIR/JdkH2Load.java" "$@" 2>/dev/null | grep rps=; }
+L(){ SJWS_BENCH_CA="$B/bench-cert.pem" nice -n 10 $J "$SCRIPT_DIR/JdkH2Load.java" "$@" 2>/dev/null | grep rps=; }
 mkdir -p "$B"
+# Bench-only self-signed cert (trusted by JdkH2Load via SJWS_BENCH_CA) — avoids trust-all.
+if [[ ! -f "$B/bench-cert.pem" || ! -f "$B/bench-key.pem" ]]; then
+  openssl req -x509 -newkey rsa:2048 -keyout "$B/bench-key.pem" -out "$B/bench-cert.pem"     -days 1 -nodes -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+fi
 echo "### ABBA h2 before=$(basename "$BEFORE_JAR") after=$(basename "$AFTER_JAR") (flock in script)"
 uptime
 ORDER=("$BEFORE_JAR" "$AFTER_JAR" "$AFTER_JAR" "$BEFORE_JAR")
 LABELS=(before after after before)
 echo "### h1 wrk -t4 -c64 -d10s --latency (ABBA)"
 for i in 0 1 2 3; do
-  gate; srv "${ORDER[$i]}" || continue
+  gate || exit 2
+  srv "${ORDER[$i]}" || continue
   wrk -t2 -c16 -d2s http://127.0.0.1:$H1/1k.bin >/dev/null
   echo "${LABELS[$i]} slot$i wrk: $(wrk -t4 -c64 -d10s --latency http://127.0.0.1:$H1/1k.bin | grep -E 'Requests/sec| 50%| 99%' | tr -s ' ' | tr '\n' ' ')"
   stop
 done
 echo "### h2/h2c GET static via SjwsServer main (ABBA)"
 for i in 0 1 2 3; do
-  gate; srv "${ORDER[$i]}" || continue
+  gate || exit 2
+  srv "${ORDER[$i]}" || continue
   echo "${LABELS[$i]} slot$i h2c-GET $(L http://127.0.0.1:$H2C/1k.bin 16 8 2)"
   echo "${LABELS[$i]} slot$i h2-GET  $(L https://127.0.0.1:$H2/1k.bin 16 8 2)"
   stop
