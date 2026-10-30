@@ -40,7 +40,7 @@ done
 LOADGEN=${LOADGEN:-python}
 HERE_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$LOADGEN" = java ]; then
-  taskset -c 0-1 nice -n 10 java -cp "$HERE_DIR" StreamLoad \
+  taskset -c 0-1 nice -n 10 java "$HERE_DIR/StreamLoad.java" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
     --out "$OUT" --drain-timeout "${DRAIN_TIMEOUT:-75}" --window "${WINDOW:-8}"
