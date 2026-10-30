@@ -340,13 +340,14 @@ public class StreamLoad {
     // stream from header
     String streamHdr = claim.headers().firstValue("sjws-lease-stream").orElse(
         String.join(",", claim.headers().allValues("sjws-lease-stream")));
-    // format: hex32.attempt or multiple
+    // format: hex32/attempt (Q1); accept '.' as legacy
     String entry = streamHdr.split(",")[0].trim();
     if (entry.isEmpty() || "-".equals(entry)) throw new IllegalArgumentException("no stream header: " + streamHdr);
-    int dot = entry.lastIndexOf('.');
-    String hex = dot < 0 ? entry : entry.substring(0, dot);
-    long attempt = dot < 0 ? 1 : Long.parseLong(entry.substring(dot + 1));
-    if (hex.length() != 32) throw new IllegalArgumentException("stream id " + hex);
+    int sep = entry.lastIndexOf('/');
+    if (sep < 0) sep = entry.lastIndexOf('.');
+    String hex = sep < 0 ? entry : entry.substring(0, sep);
+    long attempt = sep < 0 ? 1 : Long.parseLong(entry.substring(sep + 1));
+    if (hex.length() != 32) throw new IllegalArgumentException("stream id " + entry);
     long hi = Long.parseUnsignedLong(hex.substring(0, 16), 16);
     long lo = Long.parseUnsignedLong(hex.substring(16), 16);
     return new Lease(id, hi, lo, attempt);
@@ -378,8 +379,15 @@ public class StreamLoad {
     Map<String, Double> out = new LinkedHashMap<>();
     for (String line : r.body().split("\n")) {
       if (line.isEmpty() || line.startsWith("#")) continue;
-      String[] p = line.split("\\s+");
-      if (p.length >= 2) try { out.put(p[0], Double.parseDouble(p[1])); } catch (NumberFormatException ignored) {}
+      int sp = line.indexOf(' ');
+      if (sp < 0) sp = line.indexOf('\t');
+      if (sp < 0) continue;
+      String name = line.substring(0, sp);
+      // keep unlabeled (or strip labels) so result.json keys stay JSON-safe
+      int brace = name.indexOf('{');
+      if (brace >= 0) name = name.substring(0, brace);
+      try { out.put(name, Double.parseDouble(line.substring(sp + 1).trim())); }
+      catch (NumberFormatException ignored) {}
     }
     return out;
   }
@@ -398,7 +406,9 @@ public class StreamLoad {
     (teardown.get() ? t : m).add(msg);
   }
   static String enc(String s) {
-    return s.replace(" ", "%20");
+    try {
+      return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20");
+    } catch (Exception e) { return s; }
   }
   static String hex(byte[] b) {
     StringBuilder sb = new StringBuilder(b.length * 2);
@@ -517,7 +527,21 @@ public class StreamLoad {
       sb.append("  \"").append(k).append("\":").append(v instanceof String ? v : String.valueOf(v));
       sb.append(comma ? ",\n" : "\n");
     }
-    static String quote(String s) { return "\"" + s + "\""; }
+    static String quote(String s) {
+      StringBuilder sb = new StringBuilder(s.length() + 8);
+      sb.append('"');
+      for (int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        if (c == '"') sb.append("\\\"");
+        else if (c == '\\') sb.append("\\\\");
+        else if (c == '\n') sb.append("\\n");
+        else if (c == '\r') sb.append("\\r");
+        else if (c == '\t') sb.append("\\t");
+        else if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+        else sb.append(c);
+      }
+      return sb.append('"').toString();
+    }
     static String mapJson(Map<String, Double> m) {
       if (m == null) return "{}";
       StringBuilder sb = new StringBuilder("{");
