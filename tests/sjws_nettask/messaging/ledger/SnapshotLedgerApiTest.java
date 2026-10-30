@@ -11,6 +11,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -231,6 +234,86 @@ class SnapshotLedgerApiTest {
             assertEquals(want, all(log));
             // Installed segments stay open for reads (no ClosedChannelException).
             assertEquals(want.size(), log.nextOffset());
+        }
+    }
+
+    /**
+     * #288 Codex 4420265342: serialize prepareCompaction (including .compacted marker publish) against replaceWith.
+     * Pauses after .cmp fsync and before marker publish so install can interleave; without compactionGate the late
+     * marker + .cmp roll-forward on reopen shrinks the installed four-record image.
+     */
+    @Test
+    void replaceWithExcludesInFlightPreparationMarker() throws Exception {
+        var staged = Files.createDirectories(dir.resolve("prep-race-staged"));
+        List<String> want;
+        try (var src = SegmentedLog.open(dir.resolve("prep-race-src"), 512)) {
+            for (int i = 0; i < 4; i++) src.append(recs(i, 1), i);
+            src.force();
+            want = all(src);
+            assertEquals(4, src.nextOffset());
+            for (var f : src.segmentFiles()) {
+                Files.copy(f.file(), staged.resolve(f.file().getFileName()));
+                if (Files.exists(f.marker())) Files.copy(f.marker(), staged.resolve(f.marker().getFileName()));
+            }
+        }
+        var dst = dir.resolve("prep-race-dst");
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        Segment.beforeCompactedMarkerPublish = () -> {
+            entered.countDown();
+            try {
+                if (!release.await(20, TimeUnit.SECONDS)) throw new RuntimeException("release timeout");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        };
+        try {
+            try (var log = SegmentedLog.open(dst, 512)) {
+                for (int i = 0; i < 40; i++) log.append(recs(100 + i, 1), i);
+                log.force();
+                while (log.segmentFiles().size() < 2) {
+                    log.append(recs(500 + (int) log.nextOffset(), 1), 0);
+                    log.force();
+                }
+                long base = log.segmentFiles().getFirst().baseOffset();
+                var prepErr = new AtomicBoolean(false);
+                var prep = new Thread(() -> {
+                    try {
+                        log.prepareCompaction(base, o -> o % 2 == 0);
+                    } catch (Exception e) {
+                        prepErr.set(true);
+                        e.printStackTrace();
+                    }
+                }, "prep-race");
+                prep.start();
+                assertTrue(entered.await(20, TimeUnit.SECONDS), "prepare must reach pre-marker pause");
+                var install = new Thread(() -> {
+                    try {
+                        log.replaceWith(staged);
+                    } catch (Exception e) {
+                        prepErr.set(true);
+                        e.printStackTrace();
+                    }
+                }, "install-race");
+                install.start();
+                Thread.sleep(50);
+                release.countDown();
+                prep.join(20_000);
+                install.join(20_000);
+                assertFalse(prep.isAlive() || install.isAlive(), "both threads must finish");
+                assertFalse(prepErr.get());
+                log.commitCompaction(base);
+                assertEquals(want, all(log));
+                assertEquals(4, log.nextOffset());
+            }
+            try (var reopened = SegmentedLog.open(dst, 512)) {
+                assertEquals(4, reopened.nextOffset(), "installed four-record image must survive reopen");
+                assertEquals(want, all(reopened));
+            }
+        } finally {
+            Segment.beforeCompactedMarkerPublish = null;
+            release.countDown();
         }
     }
 }

@@ -39,6 +39,9 @@ final class Segment implements AutoCloseable {
     private long lastIndexedPos = -INDEX_INTERVAL;
     private volatile boolean compacted;
 
+    /** Test-only: run after .cmp is fsynced, before publishing {@code .compacted} (#288 Codex 4420265342). */
+    static volatile Runnable beforeCompactedMarkerPublish;
+
     private Segment(Path dir, long baseOffset) throws IOException {
         this.baseOffset = baseOffset;
         this.logPath = dir.resolve(name(baseOffset, ".log"));
@@ -320,6 +323,8 @@ final class Segment implements AutoCloseable {
             out.force(true);
             written = w[0];
         }
+        var hook = beforeCompactedMarkerPublish;
+        if (hook != null) hook.run();
         var tmp = markerPath.resolveSibling(markerPath.getFileName() + ".tmp");
         try (var m = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
             m.write(ByteBuffer.allocate(8).putLong(0, nextOffset));

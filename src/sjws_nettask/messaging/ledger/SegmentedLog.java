@@ -38,6 +38,11 @@ public final class SegmentedLog implements AutoCloseable {
     private final AtomicLong epoch = new AtomicLong();
     /** baseOffset → epoch observed when that compaction was prepared. */
     private final ConcurrentHashMap<Long, Long> preparedAt = new ConcurrentHashMap<>();
+    /**
+     * Serializes {@link #prepareCompaction}/{@link #commitCompaction} against {@link #replaceWith} so a late
+     * {@code .compacted} marker from an overlapped preparation cannot attach to installed segments (#288 Codex P1).
+     */
+    private final java.util.concurrent.locks.ReentrantLock compactionGate = new java.util.concurrent.locks.ReentrantLock();
 
     private SegmentedLog(Path dir, long segmentBytes, long truncated) {
         this.dir = dir;
@@ -201,18 +206,33 @@ public final class SegmentedLog implements AutoCloseable {
     }
 
     /**
-     * Phase 1 of compaction (no lock needed, readers may continue): writes a copy of sealed segment {@code base} keeping only
-     * batches whose base offset {@code keep} accepts, fsynced, plus its marker. Returns the new size in bytes.
+     * Phase 1 of compaction (readers may continue; serialized against {@link #replaceWith} via {@code compactionGate}):
+     * writes a copy of sealed segment {@code base} keeping only batches whose base offset {@code keep} accepts, fsynced,
+     * plus its marker. Returns the new size in bytes.
      */
     public long prepareCompaction(long base, java.util.function.LongPredicate keep) throws IOException {
-        long at = epoch.get();
-        long size = sealedSegment(base).writeCompacted(keep);
-        preparedAt.put(base, at);
-        return size;
+        compactionGate.lock();
+        try {
+            long at = epoch.get();
+            long size = sealedSegment(base).writeCompacted(keep);
+            preparedAt.put(base, at);
+            return size;
+        } finally {
+            compactionGate.unlock();
+        }
     }
 
     /** Phase 2 (callers exclude readers of this segment): swaps in the compacted file and persists its index. */
     public void commitCompaction(long base) throws IOException {
+        compactionGate.lock();
+        try {
+            commitCompactionLocked(base);
+        } finally {
+            compactionGate.unlock();
+        }
+    }
+
+    private void commitCompactionLocked(long base) throws IOException {
         var cmp = dir.resolve(Segment.name(base, ".cmp"));
         Long at = preparedAt.get(base);
         // Installation may have replaced the ledger (and deleted .cmp) between prepare and commit: do not close
@@ -266,6 +286,15 @@ public final class SegmentedLog implements AutoCloseable {
      * returns, and redoes the swap after a crash (#288 MC-N5).
      */
     public void replaceWith(Path staged) throws IOException {
+        compactionGate.lock();
+        try {
+            replaceWithLocked(staged);
+        } finally {
+            compactionGate.unlock();
+        }
+    }
+
+    private void replaceWithLocked(Path staged) throws IOException {
         epoch.incrementAndGet();
         preparedAt.clear();
         for (var s : segments) s.close();
