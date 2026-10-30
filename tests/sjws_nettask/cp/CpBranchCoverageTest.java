@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.cluster.CommittedEntry;
 import sjws_nettask.cluster.FakeClock;
 import sjws_nettask.controlplane.Permission;
 import sjws_nettask.controlplane.Rbac;
@@ -50,10 +51,12 @@ class CpBranchCoverageTest {
         }
     }
 
+    private static long nextIndex = 1;
+
     private static void commit(CpStore store, ByteBuffer entry) throws Exception {
-        Method method = CpStore.class.getDeclaredMethod("onCommitted", ByteBuffer.class);
+        Method method = CpStore.class.getDeclaredMethod("onCommitted", CommittedEntry.class);
         method.setAccessible(true);
-        method.invoke(store, entry);
+        method.invoke(store, new CommittedEntry(CpStore.GROUP, 1L, nextIndex++, entry.duplicate()));
     }
 
     private static ByteBuffer propose(String yaml) {

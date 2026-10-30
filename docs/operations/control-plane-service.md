@@ -136,6 +136,9 @@ This process does not implement that check. It holds the file until `tokenConsum
 `NodeEnrollment.current()` is null when this process is standalone. A pending or
 disconnected connection does not drain the process.
 
+Admin mutations with an `Idempotency-Key` are deduplicated for 100 000 applied `cp-config` log indexes (cap 100 000 keys). After eviction a retry is applied again; there is no `KeyExpired`. Details: [control-plane design §12.8.1](../design/control-plane.md).
+
+
 A control process with `cp` settings hosts the control plane (`sjws_nettask.cp.CpHost`: a
 Raft voter, the mTLS watch and admin listeners, a voter set over `cp.peers`); a data
 process starts the watch client. `SjwsServer.drain()` remains the only drain.

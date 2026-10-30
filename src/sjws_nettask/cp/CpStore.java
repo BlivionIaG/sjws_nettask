@@ -85,7 +85,8 @@ public final class CpStore implements AutoCloseable {
     private final List<String> selectors = new ArrayList<>();
     private final List<SignedSnapshot> history = new ArrayList<>();
     private final List<ConfigDocument> documents = new ArrayList<>();
-    private final Map<String, Cached> replay = new LinkedHashMap<>();
+    /** Bounded Idempotency-Key map (#259); eviction is a function of the applied index only. */
+    private IdempotencyTable idempotency = new IdempotencyTable();
     private final Map<String, Reported> reported = new LinkedHashMap<>();
     private final JoinTokens joins = new JoinTokens();
     private java.nio.file.Path auditFile;
@@ -168,7 +169,7 @@ public final class CpStore implements AutoCloseable {
         store.audit = new sjws_nettask.controlplane.AuditLog(store.auditFile, java.time.Clock.systemUTC(), false);
         store.policy.put(canonicalSan(adminSan), sjws_nettask.controlplane.Role.ADMIN);
         store.rebuildRights();
-        store.group = node.openGroup(GROUP, options, entry -> store.onCommitted(entry.entry()));
+        store.group = node.openGroup(GROUP, options, entry -> store.onCommitted(entry));
         store.leadership = ControlLeadership.attach(node, GROUP, store.group, id);
         return store;
     }
@@ -180,6 +181,57 @@ public final class CpStore implements AutoCloseable {
 
     public ControlLeadership leadership() {
         return leadership;
+    }
+
+    /** Entries dropped from the Idempotency-Key map by the window or the cap (#259). */
+    public long idempotencyEvictions() {
+        return idempotency.evictions();
+    }
+
+    /** Keys currently held for dedup (#259). */
+    public int idempotencySize() {
+        return idempotency.size();
+    }
+
+    /**
+     * Snapshot image of the Idempotency-Key table at the current applied state (#259). Carries WINDOW, MAX_KEYS and
+     * the surviving entries. Install with {@link #installIdempotencySnapshot}.
+     */
+    public byte[] snapshotIdempotency() {
+        try {
+            var out = new java.io.ByteArrayOutputStream();
+            try (var data = new java.io.DataOutputStream(out)) {
+                idempotency.write(data);
+            }
+            return out.toByteArray();
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("idempotency snapshot", e);
+        }
+    }
+
+    /**
+     * Replaces the Idempotency-Key table with a {@link #snapshotIdempotency} image (no merge). Refuses a window or
+     * cap that does not match this build (#259).
+     */
+    public void installIdempotencySnapshot(byte[] image) throws java.io.IOException {
+        var restored = IdempotencyTable.read(
+                new java.io.DataInputStream(new java.io.ByteArrayInputStream(image)),
+                idempotency.window(), idempotency.maxKeys());
+        idempotency.replaceWith(restored);
+    }
+
+    /**
+     * Test seam (#259): swap the table before any entry is applied. Production always uses the state-machine
+     * defaults; both replicas in a test must receive tables with the same window and cap.
+     */
+    void useIdempotencyTableForTest(IdempotencyTable table) {
+        if (table == null) {
+            throw new IllegalArgumentException("table");
+        }
+        if (idempotency.size() != 0 || (group != null && group.lastApplied() > 0)) {
+            throw new IllegalStateException("idempotency table already applied");
+        }
+        idempotency = table;
     }
 
     /** Status binding for {@link sjws_nettask.service.NodeEnrollment#attach}. systemd active is not readiness. */
@@ -888,7 +940,17 @@ public final class CpStore implements AutoCloseable {
         return settled(key, fingerprint, outcome);
     }
 
-    private void onCommitted(ByteBuffer entry) {
+    private void onCommitted(sjws_nettask.cluster.CommittedEntry committed) {
+        long appliedIndex = committed.index();
+        try {
+            applyCommitted(appliedIndex, committed.entry());
+        } finally {
+            // Every apply advances the eviction cursor (#259), including early returns and truncated markers.
+            idempotency.evictThrough(appliedIndex);
+        }
+    }
+
+    private void applyCommitted(long appliedIndex, ByteBuffer entry) {
         var body = entry.duplicate();
         body.order(java.nio.ByteOrder.BIG_ENDIAN);
         if (!body.hasRemaining()) {
@@ -901,15 +963,15 @@ public final class CpStore implements AutoCloseable {
                 int status = body.getInt();
                 var response = readString(body);
                 var fp = readString(body);
-                if (replay.containsKey(idemKey)) {
+                if (idempotency.contains(idemKey)) {
                     // This key was already applied (#254): skip this entry's change on every replica. Same fingerprint:
                     // a retry that passed admission while the original was still uncommitted (both got appended).
                     // Different fingerprint: a reused key that raced the same way; the first applied entry wins, and
-                    // its caller is answered 409 by settled(). Deterministic: every replica rebuilds `replay` from
-                    // the log in log order (the CP group has no Raft snapshot).
+                    // its caller is answered 409 by settled(). Deterministic: every replica rebuilds the table from
+                    // the log in log order (#259 also bounds it by applied index and a hard cap).
                     return;
                 }
-                replay.put(idemKey, new Cached(fp, new Outcome(status, response, 0)));
+                idempotency.remember(idemKey, fp, status, response, appliedIndex);
             } catch (java.nio.BufferUnderflowException e) {
                 return; // a truncated marker must not stall apply
             }
@@ -1270,31 +1332,34 @@ public final class CpStore implements AutoCloseable {
         if (key == null || key.isBlank()) {
             return mine;
         }
-        var cached = replay.get(key);
+        var cached = idempotency.get(key);
         if (cached == null) {
             return mine;
         }
-        if (!cached.fingerprint.equals(fp)) {
+        if (!cached.fingerprint().equals(fp)) {
             return Outcome.error(409, "idempotency key reused");
         }
-        return cached.outcome;
+        return new Outcome(cached.status(), cached.body(), 0);
     }
 
     private Outcome replayed(String key, String fp) {
         if (key == null || key.isBlank()) {
             return null;
         }
-        if (key.length() > 128 || key.indexOf('\n') >= 0 || key.indexOf('\r') >= 0) {
+        if (key.indexOf('\n') >= 0 || key.indexOf('\r') >= 0) {
             return Outcome.error(400, "idempotency key");
         }
-        var cached = replay.get(key);
+        if (key.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > IdempotencyTable.MAX_KEY_BYTES) {
+            return Outcome.error(400, "idempotency key");
+        }
+        var cached = idempotency.get(key);
         if (cached == null) {
             return null;
         }
-        if (!cached.fingerprint.equals(fp)) {
+        if (!cached.fingerprint().equals(fp)) {
             return Outcome.error(409, "idempotency key reused");
         }
-        return cached.outcome;
+        return new Outcome(cached.status(), cached.body(), 0);
     }
 
     private static String fingerprint(String method, String path, String body) {
@@ -1339,9 +1404,6 @@ public final class CpStore implements AutoCloseable {
     }
 
     private record Staged(long version, ConfigDocument document) {
-    }
-
-    private record Cached(String fingerprint, Outcome outcome) {
     }
 
     private record Reported(String id, Map<String, String> labels, String health, long applied) {

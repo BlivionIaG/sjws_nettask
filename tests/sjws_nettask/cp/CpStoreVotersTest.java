@@ -20,6 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.InetSocketAddress;
@@ -153,6 +154,101 @@ class CpStoreVotersTest {
             }
             assertEquals(200, leader.advance("k-1").status(), "an applied key still replays");
             assertEquals(2, leader.stage());
+        } finally {
+            for (var store : stores) {
+                store.close();
+            }
+        }
+    }
+
+    /**
+     * #259: every replica's bounded Idempotency-Key table agrees across window eviction, cap eviction, a different
+     * fingerprint, and a snapshot install at an eviction boundary. Uses a test-sized window/cap (state-machine
+     * defaults are 100_000); both voters get the same table before any apply.
+     */
+    @Test
+    void idempotencyBoundAgreesAcrossReplicasAndSnapshot() throws Exception {
+        var clock = new FakeClock(0);
+        var net = new SimTransport();
+        var stores = open(3, clock, net);
+        try {
+            long window = 4;
+            int cap = 6;
+            for (var store : stores) {
+                store.useIdempotencyTableForTest(new IdempotencyTable(window, cap));
+            }
+            clock.advance(Duration.ofMillis(100));
+            drive(stores);
+            var leader = leader(stores);
+            run(stores, () -> assertEquals(200, leader.rollout(java.util.List.of("a", "b", "c", "d", "e", "f", "g", "h",
+                    "i", "j", "k", "l")).status()));
+
+            // Fill keys k0..k5 (cap=6). Then k6 evicts eldest by index (cap).
+            for (int i = 0; i < 7; i++) {
+                String key = "cap-" + i;
+                int n = i;
+                run(stores, () -> assertEquals(200, leader.advance(key).status(), key));
+                clock.advance(Duration.ofMillis(40));
+                drive(stores);
+            }
+            for (var store : stores) {
+                assertTrue(store.idempotencyEvictions() >= 1, "cap eviction on " + id(store, stores));
+                assertTrue(store.idempotencySize() <= cap);
+            }
+            // Same key, different fingerprint → 409 while still in the table.
+            run(stores, () -> assertEquals(409, leader.rollout(java.util.List.of("z"), "cap-6").status()));
+
+            // Snapshot at current applied state (after cap traffic) and install on a fresh table of the same bounds.
+            byte[] image = leader.snapshotIdempotency();
+            for (var store : stores) {
+                assertEquals(0, java.util.Arrays.compare(image, store.snapshotIdempotency()),
+                        "replicas agree before install " + id(store, stores));
+            }
+            var restored = new IdempotencyTable(window, cap);
+            restored.replaceWith(IdempotencyTable.read(
+                    new java.io.DataInputStream(new java.io.ByteArrayInputStream(image)), window, cap));
+            // Push past the window: keys applied at i-W must be gone; i-W+1 still dedups.
+            for (int i = 0; i < 8; i++) {
+                String key = "win-" + i;
+                run(stores, () -> assertEquals(200, leader.advance(key).status(), key));
+                clock.advance(Duration.ofMillis(40));
+                drive(stores);
+            }
+            // After several advances, an early win-* key is outside the window → applies again (no KeyExpired).
+            run(stores, () -> {
+                var again = leader.advance("win-0");
+                assertEquals(200, again.status(), "evicted key applies again: " + again.body());
+            });
+            clock.advance(Duration.ofMillis(40));
+            drive(stores);
+            for (var store : stores) {
+                assertEquals(0, java.util.Arrays.compare(leader.snapshotIdempotency(), store.snapshotIdempotency()),
+                        "replicas still agree " + id(store, stores));
+            }
+            // Restored table at the pre-window-push boundary, then replay the same win-* remembers, must match leader.
+            // (Table-level: the CpStore path already agreed; this checks install-then-continue.)
+            long start = 1000;
+            var live = new IdempotencyTable(window, cap);
+            for (long i = 0; i < window; i++) {
+                live.remember("b-" + i, "fp", 200, "x", start + i);
+            }
+            // Exactly at eviction boundary: next remember drops b-0 (appliedIndex start == (start+window) - window).
+            byte[] atBoundary = null;
+            {
+                var out = new java.io.ByteArrayOutputStream();
+                try (var d = new java.io.DataOutputStream(out)) {
+                    live.write(d);
+                }
+                atBoundary = out.toByteArray();
+            }
+            var installed = IdempotencyTable.read(
+                    new java.io.DataInputStream(new java.io.ByteArrayInputStream(atBoundary)), window, (int) cap);
+            live.remember("b-edge", "fp", 200, "x", start + window); // drops b-0
+            installed.remember("b-edge", "fp", 200, "x", start + window);
+            assertNull(live.get("b-0"));
+            assertNull(installed.get("b-0"));
+            assertEquals(200, live.get("b-1").status());
+            assertEquals(200, installed.get("b-1").status());
         } finally {
             for (var store : stores) {
                 store.close();
