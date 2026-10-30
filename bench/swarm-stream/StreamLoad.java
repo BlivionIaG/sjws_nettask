@@ -80,13 +80,16 @@ public class StreamLoad {
     AtomicBoolean inTeardown = new AtomicBoolean();
     AtomicLong requests = new AtomicLong();
     AtomicLong credit429 = new AtomicLong();
+    AtomicLong producerTransportRetries = new AtomicLong();
+    AtomicLong consumerConnectRetries = new AtomicLong();
 
     // Warmup
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w",
         producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
-        measureErr, teardownErr, requests, credit429);
+        measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries);
     bytesRx.reset(); LatBag.clearAll(); creditWaits.clear(); measureErr.clear(); teardownErr.clear();
     requests.set(0); credit429.set(0);
+    producerTransportRetries.set(0); consumerConnectRetries.set(0);
 
     // Measure + sample client (/proc/self) and server (/proc/<serverPid>) CPU over the window
     AtomicReference<double[]> cpuSample = new AtomicReference<>(new double[]{0,0,0,0}); // clientSec, clientPct, serverSec, serverPct
@@ -119,7 +122,7 @@ public class StreamLoad {
     long t0 = System.nanoTime();
     wave(http, args, tokens, args.streams, args.secs, "g",
         producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
-        measureErr, teardownErr, requests, credit429);
+        measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries);
     double wall = (System.nanoTime() - t0) / 1e9;
     cpuMon.join(2000);
     double load1Post = load1();
@@ -152,6 +155,10 @@ public class StreamLoad {
     r.errors = measureErr.stream().limit(50).toList();
     r.teardownErrors = teardownErr.stream().limit(50).toList();
     // credit_stalls = every HTTP 429 on :chunk (counted before backoff; never suppressed)
+    // transport/connect retries counted on EVERY failure (not only exhausted) — never hide server EOFs
+    r.producerTransportRetries = producerTransportRetries.get();
+    r.consumerConnectRetries = consumerConnectRetries.get();
+    r.transportRetryFlag = r.producerTransportRetries > 0 || r.consumerConnectRetries > 0;
     r.requests = requests.get();
     r.hardZeros = Map.of(
         "sjws_swarm_stream_node_refusals_total", counters.getOrDefault("sjws_swarm_stream_node_refusals_total", Double.NaN),
@@ -167,7 +174,8 @@ public class StreamLoad {
       AtomicBoolean producersStop, AtomicBoolean consumersStop, AtomicBoolean inTeardown,
       LongAdder bytesRx, ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
-      AtomicLong requests, AtomicLong credit429) throws Exception {
+      AtomicLong requests, AtomicLong credit429,
+      AtomicLong producerTransportRetries, AtomicLong consumerConnectRetries) throws Exception {
     producersStop.set(false); consumersStop.set(false); inTeardown.set(false);
     List<Thread> threads = new ArrayList<>(n * 2);
     for (int i = 0; i < n; i++) {
@@ -175,12 +183,12 @@ public class StreamLoad {
       String tok = tokens.get(i % tokens.size());
       int idx = i;
       threads.add(Thread.startVirtualThread(() -> {
-        try { consumer(http, args, tok, pool, consumersStop, inTeardown, bytesRx, measureErr, teardownErr); }
+        try { consumer(http, args, tok, pool, consumersStop, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
       threads.add(Thread.startVirtualThread(() -> {
-        try { producer(http, args, tok, pool, producersStop, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429); }
+        try { producer(http, args, tok, pool, producersStop, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
       }));
     }
@@ -196,7 +204,7 @@ public class StreamLoad {
   static void producer(HttpClient http, Args args, String token, String pool,
       AtomicBoolean stop, AtomicBoolean inTeardown, ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
-      AtomicLong requests, AtomicLong credit429) throws Exception {
+      AtomicLong requests, AtomicLong credit429, AtomicLong producerTransportRetries) throws Exception {
     HttpResponse<byte[]> claim = post(http, args.base + "/swarm/v1/tasks/" + enc(pool) + ":claim?visibilityMs=60000&waitMs=30000&max=1",
         token, new byte[0]);
     if (claim.statusCode() != 200) throw new IOException("claim " + claim.statusCode());
@@ -262,6 +270,9 @@ public class StreamLoad {
           Thread.currentThread().interrupt();
           return;
         } catch (Exception e) {
+          // Count EVERY measure-phase transport failure (gate must not hide server EOFs).
+          // error_count still only records exhausted failures via note() below.
+          if (!inTeardown.get()) producerTransportRetries.incrementAndGet();
           if (tries >= 7) {
             note(inTeardown, measureErr, teardownErr, "producer-send " + pool, e);
             break; // give up this seq
@@ -270,7 +281,6 @@ public class StreamLoad {
             Thread.currentThread().interrupt(); return;
           }
           tries++;
-          // retry same seq; do not note until exhausted (avoids inflating measure error_count)
         }
       }
     }
@@ -338,7 +348,8 @@ public class StreamLoad {
 
   static void consumer(HttpClient http, Args args, String token, String pool,
       AtomicBoolean stop, AtomicBoolean inTeardown, LongAdder bytesRx,
-      ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr) throws Exception {
+      ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
+      AtomicLong consumerConnectRetries) throws Exception {
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     Exception last = null;
     for (int attempt = 0; attempt < 3 && !stop.get(); attempt++) {
@@ -376,6 +387,8 @@ public class StreamLoad {
         return;
       } catch (Exception e) {
         last = e;
+        // Count every failed connect/setup attempt (not only the final throw into error_count).
+        if (!inTeardown.get()) consumerConnectRetries.incrementAndGet();
         if (attempt < 2 && !stop.get()) {
           try { Thread.sleep(20L << attempt); } catch (InterruptedException ie) {
             Thread.currentThread().interrupt(); throw ie;
@@ -609,10 +622,10 @@ public class StreamLoad {
 
   static final class Result {
     String mode; int streams, agents, window, chunkSamples, errorCount, teardownErrorCount, creditWaitN;
-    long bytes, creditStalls, requests;
+    long bytes, creditStalls, requests, producerTransportRetries, consumerConnectRetries;
     double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall, serverCpuSec, serverCpuPctOfWall;
     Double p50, p90, p99, creditWaitP50, creditWaitP99;
-    boolean selfLoaded, stallFlag, generatorSaturated;
+    boolean selfLoaded, stallFlag, generatorSaturated, transportRetryFlag;
     Map<String, Double> counters, hardZeros;
     List<String> errors, teardownErrors;
     String summary() {
@@ -649,6 +662,9 @@ public class StreamLoad {
       field(sb, "server_cpu_pct_of_wall", Double.isNaN(serverCpuPctOfWall) ? null : serverCpuPctOfWall, true);
       field(sb, "generator_saturated", generatorSaturated, true);
       field(sb, "requests", requests, true);
+      field(sb, "producer_transport_retries", producerTransportRetries, true);
+      field(sb, "consumer_connect_retries", consumerConnectRetries, true);
+      field(sb, "transport_retry_flag", transportRetryFlag, true);
       sb.append("  \"credit_wait\":{")
         .append("\"n\":").append(creditWaitN)
         .append(",\"total_s\":").append(creditWaitTotal)

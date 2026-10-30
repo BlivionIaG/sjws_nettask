@@ -1,3 +1,5 @@
-dd61e7a961b254c687419aff9eef87bddbda884ce991e6c64b10d6f66bcf300a  bench/swarm-stream/StreamLoad.java
+b8fcf89c6ce379d4a345ba370272d70deb28021c90ad3f04a7dac8acd653248d  bench/swarm-stream/StreamLoad.java
 dc1180299e42558e57b22632bf4f71ff8b5385df8dd56c2b8f65dfcb09c322af  bench/swarm-stream/drive.py
 679ad4c2ce7d7bac065188bae4e033d085bf1d02ad22055e44c3050ebb00d596  bench/swarm-stream/one.sh
+2cfd1c4c6872bff2122d807e2541fc368d8f2ddc9a0c5e3aa613befba093d5d1  bench/swarm-stream/agg.py
+fcaba996ef472cf650ab4e37c63b2afd84ca267fa4d32d89e49d47f372018a7f  bench/swarm-stream/gate.sh

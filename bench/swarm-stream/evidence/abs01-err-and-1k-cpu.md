@@ -62,3 +62,14 @@ Chunks use `Durability.NONE`; `LAST`/task paths use `ASYNC`. Hot `durableNow` is
 Client **not** generator-saturated (169.8% < 180). Invalid: self_loaded (load1_post 5.21) + low mib/s + p99>1ms + measure errors.
 error_count inflated: producer noted every transport retry (fixed next commit — note only after tries exhausted).
 Server still hot: prior JFR `LedgerWriter.durableNow():310`, `Session.at():473`.
+
+## Correction (b80c474 review) — retries must not hide failures
+
+Harness now counts **every** measure-phase transport/connect failure in:
+- `producer_transport_retries`
+- `consumer_connect_retries`
+- `transport_retry_flag` (true if either > 0)
+
+`error_count` remains exhausted-failure count only. `agg.py` / `gate.sh` treat
+`transport_retry_flag` as a hard-zero-style non-clean-pass (same bar as self_loaded).
+

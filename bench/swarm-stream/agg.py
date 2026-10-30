@@ -33,7 +33,12 @@ def main():
         pre = r.get("load1_pre", 99)
         # Architecture 2026-10-30: self_loaded (incl. generator-CPU sat) does not count as a pass
         self_loaded = bool(r.get("self_loaded"))
-        valid = n >= 10000 and p99 is not None and pre < 4.0 and not self_loaded
+        # Transport/connect retries are hard-zero-style: nonzero ⇒ not a clean pass (do not hide server EOFs).
+        ptr = int(r.get("producer_transport_retries") or 0)
+        ccr = int(r.get("consumer_connect_retries") or 0)
+        transport_retry_flag = bool(r.get("transport_retry_flag")) or ptr > 0 or ccr > 0
+        valid = (n >= 10000 and p99 is not None and pre < 4.0 and not self_loaded
+                 and not transport_retry_flag)
         windows.append({
             "tag": p.parent.name,
             "valid": valid,
@@ -47,6 +52,9 @@ def main():
             "credit_stalls": r.get("credit_stalls"),
             "hard_zeros": r.get("hard_zeros"),
             "errors": r.get("error_count"),
+            "producer_transport_retries": ptr,
+            "consumer_connect_retries": ccr,
+            "transport_retry_flag": transport_retry_flag,
             "load1_pre": pre,
             "load1_post": r.get("load1_post"),
         })
@@ -56,7 +64,13 @@ def main():
     for w in windows:
         print(f"  {w['tag']}: valid={w['valid']} mib_s={w['mib_s']:.3f} p50={w['p50_us']} p99={w['p99_us']} "
               f"n={w['samples']} self_loaded={w['self_loaded']} stalls={w['credit_stalls']} "
-              f"stall_flag={w['stall_flag']} err={w['errors']} load={w['load1_pre']}→{w['load1_post']}")
+              f"stall_flag={w['stall_flag']} err={w['errors']} "
+              f"prod_tx_retry={w['producer_transport_retries']} cons_conn_retry={w['consumer_connect_retries']} "
+              f"tx_retry_flag={w['transport_retry_flag']} load={w['load1_pre']}→{w['load1_post']}")
+        if w['transport_retry_flag']:
+            print(f"  HARD_FLAG {w['tag']}: transport retries nonzero "
+                  f"(producer={w['producer_transport_retries']} consumer={w['consumer_connect_retries']}) "
+                  f"— not a clean pass")
 
     verdict = "FAIL"
     reason = []
@@ -79,8 +93,12 @@ def main():
             reason.append("median missed §13 (≥100 MiB/s and p99<1ms)")
         if not ok_floor:
             reason.append("a window below 80 MiB/s or p99>1.5ms")
-        # hard zeros across valid windows
+        # hard zeros across valid windows (+ transport-retry hard flag)
         for w in use:
+            if w.get("transport_retry_flag"):
+                reason.append(f"{w['tag']}: transport_retry_flag "
+                              f"(producer={w.get('producer_transport_retries')} "
+                              f"consumer={w.get('consumer_connect_retries')})")
             hz = w.get("hard_zeros") or {}
             for k, expect_zero in (
                 ("sjws_swarm_stream_node_refusals_total", True),
