@@ -1021,7 +1021,6 @@ final class RaftReplica implements Replica {
                 System.err.println("WARN: " + this.groupId.value() + ": install of " + m.dataBytes()
                         + " bytes exceeds ha.snapshot.max_install_bytes " + maxBytes
                         + "; abandoning install (marker kept for operator intervention)");
-                this.installPinExhausted.incrementAndGet();
                 return;
             }
             boolean fetched = false;
