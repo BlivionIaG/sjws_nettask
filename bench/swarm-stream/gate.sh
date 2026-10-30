@@ -11,7 +11,7 @@ fi
 BASE_JAR=$1; HEAD_JAR=$2; OUT=$3
 NVALID=${NVALID:-6}; CAP=${CAP:-8}; SECS=${SECS:-20}; WARMUP=${WARMUP:-5}
 STREAMS=${STREAMS:-1000}
-GROUPS=${GROUPS:-64}  # Architecture 2026-10-30 15:13 / inceptor 15:14
+GATE_GROUPS=${GATE_GROUPS:-64}  # Architecture 2026-10-30 15:13 / inceptor 15:14
 ACCEPT=${ACCEPT:-binary}
 PHASE=${PHASE:-all}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -20,7 +20,7 @@ if [ "${SKIP_FLOCK:-0}" != 1 ]; then
   exec 9>>/tmp/sjws-bench.lock
   flock 9
 fi
-echo "gate phase=$PHASE start $(date -Is) load=$(cat /proc/loadavg) streams=$STREAMS groups=$GROUPS" | tee -a "$OUT/gate.log"
+echo "gate phase=$PHASE start $(date -Is) load=$(cat /proc/loadavg) streams=$STREAMS groups=$GATE_GROUPS" | tee -a "$OUT/gate.log"
 LOAD_PRE=$(awk '{print $1}' /proc/loadavg)
 python3 -c "import sys; sys.exit(0 if float('$LOAD_PRE') < 4.0 else 1)" || {
   echo "gate: pre-start load1=$LOAD_PRE >= 4 — refuse" | tee -a "$OUT/gate.log"
@@ -32,7 +32,7 @@ run_one() {
   local wd="$OUT/$tag"
   mkdir -p "$wd"
   echo "=== $tag accept=$accept credit_off=$credit_off load=$(cat /proc/loadavg) ===" | tee -a "$OUT/gate.log"
-  CREDIT_OFF=$credit_off WARMUP=$WARMUP GROUPS=$GROUPS \
+  CREDIT_OFF=$credit_off WARMUP=$WARMUP GATE_GROUPS=$GATE_GROUPS \
     "$HERE/one.sh" "$jar" "$wd" "$accept" "$wd/result.json" "$SECS" "$STREAMS" \
     2>&1 | tee -a "$OUT/gate.log" || return $?
   sync "$wd/result.json" 2>/dev/null || true
