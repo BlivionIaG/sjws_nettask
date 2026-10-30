@@ -130,14 +130,104 @@ class LedgerWriterBudgetTest {
 
     @Test
     void resolveRejectsMalformedFraction() {
-        String prev = System.getProperty(LedgerWriterBudget.FRACTION_PROPERTY);
-        try {
-            System.setProperty(LedgerWriterBudget.FRACTION_PROPERTY, "2.5");
+        withProps(java.util.Map.of(LedgerWriterBudget.FRACTION_PROPERTY, "2.5"), () -> {
             LedgerWriterBudget.resetForTests();
             assertThrows(IllegalArgumentException.class, LedgerWriterBudget::shared);
+        });
+    }
+
+    @Test
+    void resolveBytesOffAndPositiveAndRejectsTiny() {
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, "off"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertTrue(LedgerWriterBudget.shared().unlimited());
+        });
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, "false"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertTrue(LedgerWriterBudget.shared().unlimited());
+        });
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, "unlimited"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertTrue(LedgerWriterBudget.shared().unlimited());
+        });
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, "0"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertTrue(LedgerWriterBudget.shared().unlimited());
+        });
+        long ok = LedgerWriterBudget.IDLE_COST_BYTES * 10;
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, Long.toString(ok)), () -> {
+            LedgerWriterBudget.resetForTests();
+            var b = LedgerWriterBudget.shared();
+            assertFalse(b.unlimited());
+            assertEquals(ok, b.budget());
+        });
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, "1"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertThrows(IllegalArgumentException.class, LedgerWriterBudget::shared);
+        });
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, "nope"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertThrows(IllegalArgumentException.class, LedgerWriterBudget::shared);
+        });
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, "-5"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertThrows(IllegalArgumentException.class, LedgerWriterBudget::shared);
+        });
+    }
+
+    @Test
+    void resolveFractionDefaultAndRejectsBad() {
+        withProps(java.util.Map.of(), () -> {
+            System.clearProperty(LedgerWriterBudget.BYTES_PROPERTY);
+            System.clearProperty(LedgerWriterBudget.FRACTION_PROPERTY);
+            LedgerWriterBudget.resetForTests();
+            var b = LedgerWriterBudget.shared();
+            assertFalse(b.unlimited());
+            assertTrue(b.budget() >= LedgerWriterBudget.IDLE_COST_BYTES);
+            assertTrue(b.source().contains("heapFraction"));
+        });
+        withProps(java.util.Map.of(LedgerWriterBudget.FRACTION_PROPERTY, "0"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertThrows(IllegalArgumentException.class, LedgerWriterBudget::shared);
+        });
+        withProps(java.util.Map.of(LedgerWriterBudget.FRACTION_PROPERTY, "not-a-double"), () -> {
+            LedgerWriterBudget.resetForTests();
+            assertThrows(IllegalArgumentException.class, LedgerWriterBudget::shared);
+        });
+    }
+
+    @Test
+    void ofBytesAndFullCostRejectBadArgs() {
+        assertThrows(IllegalArgumentException.class, () -> LedgerWriterBudget.ofBytes(-1));
+        assertThrows(IllegalArgumentException.class, () -> LedgerWriterBudget.fullCostBytes(0));
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(0));
+        assertThrows(IllegalArgumentException.class, () -> LedgerWriterBudget.shared().releaseBytes(-1));
+    }
+
+    @Test
+    void releaseBytesZeroIsNoOpAndInstallRoundTrip() {
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(0));
+        long before = LedgerWriterBudget.shared().charged();
+        LedgerWriterBudget.shared().releaseBytes(0);
+        assertEquals(before, LedgerWriterBudget.shared().charged());
+        var other = LedgerWriterBudget.ofBytes(LedgerWriterBudget.IDLE_COST_BYTES * 4);
+        LedgerWriterBudget.install(other);
+        assertSame(other, LedgerWriterBudget.shared());
+    }
+
+    private static void withProps(java.util.Map<String, String> set, Runnable body) {
+        var prevBytes = System.getProperty(LedgerWriterBudget.BYTES_PROPERTY);
+        var prevFrac = System.getProperty(LedgerWriterBudget.FRACTION_PROPERTY);
+        try {
+            System.clearProperty(LedgerWriterBudget.BYTES_PROPERTY);
+            System.clearProperty(LedgerWriterBudget.FRACTION_PROPERTY);
+            set.forEach(System::setProperty);
+            body.run();
         } finally {
-            if (prev == null) System.clearProperty(LedgerWriterBudget.FRACTION_PROPERTY);
-            else System.setProperty(LedgerWriterBudget.FRACTION_PROPERTY, prev);
+            if (prevBytes == null) System.clearProperty(LedgerWriterBudget.BYTES_PROPERTY);
+            else System.setProperty(LedgerWriterBudget.BYTES_PROPERTY, prevBytes);
+            if (prevFrac == null) System.clearProperty(LedgerWriterBudget.FRACTION_PROPERTY);
+            else System.setProperty(LedgerWriterBudget.FRACTION_PROPERTY, prevFrac);
             LedgerWriterBudget.resetForTests();
         }
     }
