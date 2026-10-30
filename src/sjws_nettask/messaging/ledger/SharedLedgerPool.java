@@ -94,6 +94,14 @@ public final class SharedLedgerPool {
         final CopyOnWriteArrayList<LedgerWriter> members = new CopyOnWriteArrayList<>();
         final ReentrantLock startLock = new ReentrantLock();
         volatile Thread syncer;
+        /**
+         * Set by {@link #unpark} before {@link LockSupport#unpark}; the idle spin watches this instead of
+         * locking every member (#329). No lost wakeup: {@code written} is published before the unpark,
+         * {@code unpark} sets {@code pinged} before {@code LockSupport.unpark}, and a signal that arrives
+         * after the {@code if (pinged)} check but before {@code parkNanos} leaves a park permit so the
+         * subsequent park returns immediately and the next loop iteration re-slices members.
+         */
+        volatile boolean pinged;
 
         Shard(int index) {
             this.index = index;
@@ -134,6 +142,7 @@ public final class SharedLedgerPool {
         }
 
         void unpark() {
+            pinged = true;
             var t = syncer;
             if (t != null) LockSupport.unpark(t);
         }
@@ -156,6 +165,7 @@ public final class SharedLedgerPool {
 
         private void syncLoop() {
             while (true) {
+                pinged = false;
                 boolean busy = false;
                 for (var w : members) {
                     if (w.sharedSyncSlice()) busy = true;
@@ -163,16 +173,9 @@ public final class SharedLedgerPool {
                 if (busy) continue;
                 if (retire()) return;
                 // Brief spin so an unpark that races the idle check is not delayed by a long park.
-                for (int i = 0; i < 256 && !busy; i++) {
-                    for (var w : members) {
-                        if (w.needsSharedSync()) {
-                            busy = true;
-                            break;
-                        }
-                    }
-                    if (!busy) Thread.onSpinWait();
-                }
-                if (busy) continue;
+                // Watch {@link #pinged} instead of re-locking every member on each iteration (#durableNow hotspot).
+                for (int i = 0; i < 256 && !pinged; i++) Thread.onSpinWait();
+                if (pinged) continue;
                 if (retire()) return;
                 LockSupport.parkNanos(this, LedgerWriter.IDLE_PARK_NANOS);
             }
