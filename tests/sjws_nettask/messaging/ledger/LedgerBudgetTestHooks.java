@@ -28,6 +28,13 @@ public final class LedgerBudgetTestHooks {
         LedgerWriterFaults.CTOR.remove();
     }
 
+    /** Resets the lazy writer pool so the next open re-resolves {@code sharedWriterThreads}. */
+    public static void resetWriterPool() {
+        SharedLedgerPool.resetWriterPoolForTests();
+    }
+
+    public static final String WRITER_THREADS_PROPERTY = SharedLedgerPool.WRITER_THREADS_PROPERTY;
+
     public static void setMaterializeFault(LedgerWriter w, RuntimeException fault) {
         LedgerWriterFaults.setMaterializeFault(w, fault);
     }

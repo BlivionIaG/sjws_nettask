@@ -48,7 +48,7 @@ public final class SharedLedgerPool {
     }
 
     /** Writer pool; null until first NONE/ASYNC registration (or permanently empty when size resolves to 0). */
-    private static final Object WRITER_LOCK = new Object();
+    private static final ReentrantLock WRITER_LOCK = new ReentrantLock();
     private static volatile WriterPool WRITERS;
     private static volatile boolean WRITERS_RESOLVED;
     private static volatile int WRITER_SIZE = -1;
@@ -71,7 +71,8 @@ public final class SharedLedgerPool {
     public static WriterPool writers() {
         var w = WRITERS;
         if (w != null) return w;
-        synchronized (WRITER_LOCK) {
+        WRITER_LOCK.lock();
+        try {
             if (WRITERS != null) return WRITERS;
             int n = resolveWriterThreads();
             WRITER_SIZE = n;
@@ -83,17 +84,22 @@ public final class SharedLedgerPool {
             WRITERS = new WriterPool(n);
             Runtime.getRuntime().addShutdownHook(Thread.ofPlatform().name("ledger-writer-pool-shutdown").unstarted(WRITERS::shutdown));
             return WRITERS;
+        } finally {
+            WRITER_LOCK.unlock();
         }
     }
 
     /** Test-only: clears the lazy writer pool so the next {@link #writers()} re-resolves. */
     static void resetWriterPoolForTests() {
-        synchronized (WRITER_LOCK) {
+        WRITER_LOCK.lock();
+        try {
             var w = WRITERS;
             WRITERS = null;
             WRITERS_RESOLVED = false;
             WRITER_SIZE = -1;
             if (w != null && w != WriterPool.DISABLED) w.shutdown();
+        } finally {
+            WRITER_LOCK.unlock();
         }
     }
 
@@ -347,7 +353,7 @@ public final class SharedLedgerPool {
             return shards[shard].memberCount();
         }
 
-        Thread writerThread(int shard) {
+        public Thread writerThread(int shard) {
             return shards[shard].writerThread();
         }
 
