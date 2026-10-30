@@ -15,8 +15,10 @@ ACCEPT=${ACCEPT:-binary}
 PHASE=${PHASE:-all}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
-exec 9>>/tmp/sjws-bench.lock
-flock 9
+if [ "${SKIP_FLOCK:-0}" != 1 ]; then
+  exec 9>>/tmp/sjws-bench.lock
+  flock 9
+fi
 echo "gate phase=$PHASE start $(date -Is) load=$(cat /proc/loadavg)" | tee -a "$OUT/gate.log"
 LOAD_PRE=$(awk '{print $1}' /proc/loadavg)
 python3 -c "import sys; sys.exit(0 if float('$LOAD_PRE') < 4.0 else 1)" || {
