@@ -66,7 +66,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private final ConcurrentLinkedQueue<Waiter> fsyncWaiters = new ConcurrentLinkedQueue<>();
     /** Dedicated writer thread; started on first materialize, not in the constructor. */
     private final Thread thread;
-    private final Object materializeLock = new Object();
+    private final ReentrantLock materializeLock = new ReentrantLock();
     /** Dedicated syncer, or null when using {@link SharedLedgerPool}. */
     private final Thread syncer;
     /** Syncer shard index, or -1 when this writer has a dedicated syncer. */
@@ -268,7 +268,8 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private BlockingQueue<Pending> materialize() {
         var q = queue;
         if (q != null) return q;
-        synchronized (materializeLock) {
+        materializeLock.lock();
+        try {
             q = queue;
             if (q != null) return q;
             if (closed) throw new IllegalStateException("closed");
@@ -286,6 +287,8 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
                 queue = null;
                 throw t;
             }
+        } finally {
+            materializeLock.unlock();
         }
     }
 
