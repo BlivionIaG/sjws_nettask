@@ -835,11 +835,24 @@ public final class SjwsServer implements AutoCloseable {
             return ReloadResult.rejected(this.live.get(), java.util.List.of("HTTP-01 listener: " + e.getMessage()));
         }
         var replaced = this.live.get();
-        this.live.set(result.snapshot());
-        if (replaced != result.snapshot()) {
+        var next = result.snapshot();
+        // HTTP/2 attachBodies vs live swap (#289 Middleware Chain nit): enabling must happen
+        // before live.set so a new stream never sees a body-needing handler with bodies still
+        // off; disabling happens after the swap (brief extra attach is safe).
+        sjws_nettask.h2.Http2Server http2ForBodies = null;
+        boolean bodies = false;
+        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
+            http2ForBodies = http2;
+            bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null;
+            if (bodies) {
+                http2.setAttachBodies(true);
+            }
+        }
+        this.live.set(next);
+        if (replaced != next) {
             replaced.close(); // old upstream pools: idle connections now, in-flight ones when they finish
         }
-        var server = result.snapshot().document().server();
+        var server = next.document().server();
         if (this.manager != null && this.manager.reaper() != null) {
             this.manager.reaper().update(server.idleTimeout(), server.headerTimeout(), server.writeTimeout());
         }
@@ -849,10 +862,8 @@ public final class SjwsServer implements AutoCloseable {
                 http3.replaceTls(result.tls());
             }
         }
-        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-            // Routing may appear or disappear on reload under the same live-snapshot lambda.
-            boolean bodies = liveNeedsBodies() || this.armed.get() != null;
-            http2.setAttachBodies(bodies);
+        if (http2ForBodies != null) {
+            http2ForBodies.setAttachBodies(bodies);
         }
         if (closeOld && this.challengeHttp != null) {
             this.challengeHttp.close();
