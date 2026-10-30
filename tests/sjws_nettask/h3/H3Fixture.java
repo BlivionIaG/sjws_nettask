@@ -103,7 +103,7 @@ final class H3Fixture {
             H3TestClient.H3Response h3) throws IOException {
         var h1 = http1(handler, method, path, headers);
         var what = method + " " + path + " " + headers;
-        assertFalse(h3.reset(), what + ": stream was reset " + h3.error());
+        assertFalse(h3.reset(), what + ": stream was reset " + h3.progress());
         assertEquals(h1.statusCode(), h3.status(), what);
         for (var e : h1.headers().entrySet()) {
             if (!TRANSPORT.contains(e.getKey())) {
