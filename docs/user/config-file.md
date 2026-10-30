@@ -415,8 +415,11 @@ body (or an HTTP/3 body of unknown length) is 501 for now, as is a declared body
 `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
 TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
-and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB); slow clients wait instead of
-growing the heap (security finding F5). `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
+and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB), with a per-peer share
+(`-Dsjws.proxy.maxInflightBytesPerPeer`, default one eighth of the total, or `0` to disable)
+so one client address cannot hold the whole budget (#78). Slow clients wait on their own share
+instead of growing the heap (security finding F5); a new request from a peer already at its
+share is refused with 503. `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
 closes the replaced pools.
 
 Rate limits are local to this server and off unless configured. A route takes `rate_limit:`, and
