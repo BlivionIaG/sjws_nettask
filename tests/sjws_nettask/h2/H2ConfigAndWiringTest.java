@@ -118,7 +118,73 @@ class H2ConfigAndWiringTest {
         }
     }
 
-        @Test
+    /**
+     * #289: publish/reload must refresh attachBodies from the live handler (and keep it on when
+     * an observe/chain-control handler is armed). Covers the publish-path branches jacoco gates.
+     */
+    @Test
+    void publishRefreshAttachBodiesOnReload() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        var yaml = this.root.resolve("sjws.yaml");
+        var rootAbs = this.root.toAbsolutePath();
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: "%s"
+                routing:
+                  enabled: true
+                  upstreams:
+                    loop: { url: "http://127.0.0.1:9" }
+                  routes:
+                    - { prefix: /api, proxy: loop }
+                """.formatted(rootAbs));
+        var loaded = sjws_nettask.config.ConfigLoader.load(
+                new String[] {"--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded)) {
+            var h2 = (Http2Server) server.h2();
+            assertTrue(h2.attachBodies(), "routing at start");
+            Files.writeString(yaml, """
+                    server:
+                      port: 0
+                      root: "%s"
+                      idle_timeout: 33s
+                    routing:
+                      enabled: true
+                      upstreams:
+                        loop: { url: "http://127.0.0.1:9" }
+                      routes:
+                        - { prefix: /api, proxy: loop }
+                    """.formatted(rootAbs));
+            assertTrue(server.reload().applied(), "routing reload must apply");
+            assertTrue(h2.attachBodies(), "publish keeps bodies on while live handler is a router");
+        }
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: "%s"
+                """.formatted(rootAbs));
+        loaded = sjws_nettask.config.ConfigLoader.load(
+                new String[] {"--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded)) {
+            var h2 = (Http2Server) server.h2();
+            assertFalse(h2.attachBodies());
+            server.armMetrics();
+            assertTrue(h2.attachBodies(), "armMetrics installs an observe chain that needs bodies");
+            Files.writeString(yaml, """
+                    server:
+                      port: 0
+                      root: "%s"
+                      idle_timeout: 34s
+                    """.formatted(rootAbs));
+            assertTrue(server.reload().applied());
+            assertTrue(h2.attachBodies(),
+                    "publish must keep bodies on when armed is non-null even if live handler is static");
+        }
+    }
+
+    @Test
     void productionStaticArmKeepsBodiesOff() throws Exception {
         try (var server = SjwsServer.start(config())) {
             var h2 = (Http2Server) server.h2();
@@ -153,7 +219,7 @@ class H2ConfigAndWiringTest {
         }
     }
 
-        @Test
+    @Test
     void requestFiltersApplyOverHttp2() throws Exception {
         var filters = sjws_nettask.core.RequestFilters.create().add((request, next) ->
                 request.target().startsWith("/blocked")
