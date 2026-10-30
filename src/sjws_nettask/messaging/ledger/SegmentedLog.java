@@ -105,17 +105,36 @@ public final class SegmentedLog implements AutoCloseable {
 
     /**
      * Appends a group of already-encoded frames starting at {@link #nextOffset}, rolling to a new
-     * segment first when the active one would exceed the segment size.
+     * segment before any frame that would make the active one exceed the segment size (#328).
+     * When the whole group fits, this is one {@link Segment#append} (same hot path as before); a
+     * mid-group roll walks frame-by-frame so {@link LedgerWriter} coalescing cannot change bases.
      */
     void appendFrames(ByteBuffer frames, long[] frameOffsets, int[] frameLens, int n, long newNext) throws IOException {
         var active = segments.getLast();
-        if (active.size() > 0 && active.size() + frames.remaining() > segmentBytes) {
-            active.seal();
-            active = Segment.create(dir, active.nextOffset());
-            segments.add(active);
-            this.active = active;
+        long total = frames.remaining();
+        // Fast path: whole group fits — identical to one-by-one and to the pre-#328 single append.
+        if (active.size() + total <= segmentBytes) {
+            active.append(frames, frameOffsets[0], frameOffsets, frameLens, n, newNext);
+            return;
         }
-        active.append(frames, frameOffsets[0], frameOffsets, frameLens, n, newNext);
+        // At least one roll (or an empty active with an oversize first frame). Emit frame-by-frame so
+        // the same record sequence yields the same bases regardless of how Pendings were grouped.
+        int bufPos = frames.position();
+        for (int i = 0; i < n; i++) {
+            active = segments.getLast();
+            int len = frameLens[i];
+            if (active.size() > 0 && active.size() + len > segmentBytes) {
+                active.seal();
+                active = Segment.create(dir, active.nextOffset());
+                segments.add(active);
+                this.active = active;
+            }
+            var slice = frames.duplicate().position(bufPos).limit(bufPos + len).slice();
+            long end = (i + 1 < n) ? frameOffsets[i + 1] : newNext;
+            active.append(slice, frameOffsets[i], new long[] { frameOffsets[i] }, new int[] { len }, 1, end);
+            bufPos += len;
+        }
+        frames.position(bufPos);
     }
 
     /** Convenience single-batch append (used by tests and tools); returns the base offset. Does not fsync. */
