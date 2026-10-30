@@ -152,9 +152,9 @@ public class Sjws_nettask {
     }
 
     /**
-     * When HA messaging is on, publish its install counters on {@link SjwsServer#metrics()} (#315 N5). Matched by
-     * class name so an {@code ha.messaging: off} process never loads {@code msgrepl}. Attaching does not install the
-     * observe filter.
+     * When HA messaging is on, publish its install counters on {@link SjwsServer#metrics()} (#315 N5). Detected by the
+     * {@code installPinExhausted}/{@code installOversizedAbandoned} getters so an {@code ha.messaging: off} process
+     * never loads {@code msgrepl}. Attaching does not install the observe filter.
      */
     static void attachMsgreplInstallMetrics(OptionalModule modules, SjwsServer server) {
         var ha = findHaMessaging(modules);
@@ -164,31 +164,37 @@ public class Sjws_nettask {
         try {
             var pin = ha.getClass().getMethod("installPinExhausted");
             var oversized = ha.getClass().getMethod("installOversizedAbandoned");
-            server.metrics().setMsgreplInstallCounters(() -> {
-                try {
-                    return (long) pin.invoke(ha);
-                } catch (ReflectiveOperationException e) {
-                    return 0L;
-                }
-            }, () -> {
-                try {
-                    return (long) oversized.invoke(ha);
-                } catch (ReflectiveOperationException e) {
-                    return 0L;
-                }
-            });
+            server.metrics().setMsgreplInstallCounters(() -> invokeLong(pin, ha), () -> invokeLong(oversized, ha));
         } catch (ReflectiveOperationException ignored) {
             // HA messaging binary without the #315 getters: leave counters at 0
         }
     }
 
-    /** The HA messaging module among {@code modules}, or null. Does not load {@code msgrepl} when absent. */
+    /** Reflective long getter; 0 on failure so a scrape never throws. */
+    static long invokeLong(java.lang.reflect.Method method, Object target) {
+        try {
+            return (long) method.invoke(target);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return 0L;
+        }
+    }
+
+    /**
+     * The HA messaging module among {@code modules}, or null. Walks {@link OptionalModules.Both}; matches a module that
+     * exposes the #315 install counters. Does not load {@code msgrepl} when that module is absent.
+     */
     static OptionalModule findHaMessaging(OptionalModule module) {
         if (module instanceof OptionalModules.Both both) {
             var first = findHaMessaging(both.first());
             return first != null ? first : findHaMessaging(both.second());
         }
-        return module.getClass().getName().equals(HaMessagingStart.CLASS) ? module : null;
+        try {
+            module.getClass().getMethod("installPinExhausted");
+            module.getClass().getMethod("installOversizedAbandoned");
+            return module;
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
     }
 
     private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,
