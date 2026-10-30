@@ -1,6 +1,7 @@
 # sjws_nettask documentation
 
-Back to the [README](../README.md) (quick start).
+**SJWS** (Swarm Java Web Services): message-oriented middleware with HA, an optional agent swarm, and a
+web server. Back to the [README](../README.md) (quick start and shipped/planned Status table).
 
 ## Using the server
 - [Installation and build](user/installation.md)

@@ -5,7 +5,7 @@ Base: master `b8055fe` (Java 25)
 
 ## 1. Context
 
-sjws_nettask is a Java 25 static file server. `Sjws_nettask.serve(ServerConfig)` checks the
+sjws_nettask (**SJWS**, Swarm Java Web Services) is a Java 25 message-oriented middleware and web server; the HA design below starts from the HTTP serve path. `Sjws_nettask.serve(ServerConfig)` checks the
 document root and calls `SjwsServer.start`, which binds a `ServerSocketChannel` (`SO_REUSEADDR`,
 configurable backlog) and runs `ClientManager` on the `accept-loop` platform thread. The accept
 loop is bounded by a `Semaphore` of `maxConnections` (further clients sit in the kernel backlog)
