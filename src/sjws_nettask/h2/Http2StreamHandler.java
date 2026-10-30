@@ -74,6 +74,12 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
      */
     static volatile Runnable beforeDispatch;
 
+    /**
+     * Test-only: when non-null, runs after the generation is captured for {@code toRequest} and
+     * before {@code start} uses that same instance (#301 Middleware Chain). Production never sets it.
+     */
+    static volatile Runnable afterHeadersCapture;
+
     static Request toRequest(Http2Headers h) {
         return toRequest(h, null, false, false);
     }
@@ -166,8 +172,14 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                     this.started = true;
                     var stream = (Http2StreamChannel) ctx.channel();
                     var headers = frame.headers();
-                    var request = toRequest(headers, peer(stream), secure(stream), this.shared.attachBodies());
-                    start(stream, headers, request, frame.isEndStream());
+                    // One generation read for captureFields, body attach, enter, and Task (#301).
+                    var generation = this.shared.generation();
+                    var request = toRequest(headers, peer(stream), secure(stream), generation.attachBodies());
+                    var hook = afterHeadersCapture;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                    start(stream, headers, request, frame.isEndStream(), generation);
                 } else if (frame.isEndStream() && this.body != null) {
                     // trailers end the request; field values are ignored
                     this.body.end();
@@ -201,7 +213,8 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         return parent != null && parent.pipeline().get(io.netty.handler.ssl.SslHandler.class) != null;
     }
 
-    private void start(Http2StreamChannel stream, Http2Headers headers, Request request, boolean endStream) {
+    private void start(Http2StreamChannel stream, Http2Headers headers, Request request, boolean endStream,
+            Http2Server.Generation generation) {
         var budget = this.shared.budget(stream.parent());
         if (!budget.inflight().tryAcquire()) { // one connection can't take the whole server's share
             this.shared.refused().increment();
@@ -214,8 +227,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
             return;
         }
-        // One generation read: handler + attachBodies (#301 / P2a).
-        var generation = this.shared.generation();
+        // Same Generation instance captured in channelRead (not a second volatile read).
         generation.enter();
         // Only when bodies are enabled (chain / non-static terminal): static-only path stays zero-cost.
         if (generation.attachBodies() && !request.headOnly() && !"GET".equals(request.method())) {
