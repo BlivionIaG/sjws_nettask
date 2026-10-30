@@ -294,7 +294,7 @@ class ServiceDaemonTest {
 
     @Test
     void aLargeDrainBudgetDoesNotDelayAProcessThatExitsOnSigterm() throws Exception {
-        var sleep = new ProcessBuilder("sleep", "30").start();
+        var sleep = new ProcessBuilder(TestCommands.resolve("sleep"), "30").start();
         var pid = tmp.resolve("sleep.pid");
         try {
             long started = sleep.info().startInstant().orElseThrow().toEpochMilli();
@@ -817,13 +817,13 @@ class ServiceDaemonTest {
             assertFalse(Files.readString(log).contains(SECRET));
             long child = Long.parseLong(status.replaceAll("(?s).*pid=([0-9]+).*", "$1"));
             if (Files.isExecutable(Path.of("/usr/bin/setsid"))) {
-                var ps = new ProcessBuilder("ps", "-o", "sid=", "-p", Long.toString(child)).start();
+                var ps = new ProcessBuilder(TestCommands.resolve("ps"), "-o", "sid=", "-p", Long.toString(child)).start();
                 String sid = new String(ps.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
                 assertEquals(0, ps.waitFor());
                 assertEquals(Long.toString(child), sid, "detached session survives terminal hangup");
             }
             boolean hangupIgnored = sighupIgnored();
-            var kill = new ProcessBuilder("kill", "-HUP", Long.toString(child)).start();
+            var kill = new ProcessBuilder(TestCommands.resolve("kill"), "-HUP", Long.toString(child)).start();
             assertEquals(0, kill.waitFor());
             Thread.sleep(300);
             assertTrue(ProcessHandle.of(child).orElseThrow().isAlive(), "SIGHUP must not kill the child");

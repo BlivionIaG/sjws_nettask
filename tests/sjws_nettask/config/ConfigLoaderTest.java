@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.TestCommands;
 import sjws_nettask.ServerConfig;
 
 class ConfigLoaderTest {
@@ -989,7 +990,7 @@ class ConfigLoaderTest {
     }
 
     private static void chown(Path path, String owner) throws Exception {
-        var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
+        var proc = new ProcessBuilder(TestCommands.resolve("sudo"), "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
         String out = new String(proc.getInputStream().readAllBytes());
         assertEquals(0, proc.waitFor(), out);
     }
