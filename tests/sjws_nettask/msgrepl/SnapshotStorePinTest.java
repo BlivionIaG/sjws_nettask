@@ -101,4 +101,27 @@ class SnapshotStorePinTest {
         }
     }
 
+
+    /** #288 Codex P1: pin must not publish a manifest that decode would reject after retention deletes a prefix. */
+    @Test
+    void pinReturnsNullWhenRetentionDropsCoverage() throws Exception {
+        try (var log = SegmentedLog.open(dir.resolve("cov"), 512)) {
+            for (int i = 0; i < 20; i++) {
+                log.append(List.of(("r" + i + "-" + "z".repeat(80)).getBytes(StandardCharsets.UTF_8)), i);
+            }
+            log.force();
+            while (log.segmentFiles().size() < 2) {
+                log.append(List.of(("pad-" + log.nextOffset() + "-" + "z".repeat(80)).getBytes(StandardCharsets.UTF_8)), 0);
+            }
+            log.force();
+            long logStart = 0;
+            long end = log.nextOffset();
+            // Delete the first sealed segment as retention would.
+            long base = log.segmentFiles().getFirst().baseOffset();
+            log.deleteSegment(base);
+            var store = new SnapshotStore(dir.resolve("cov-snap"));
+            assertEquals(null, store.pin("t", log, 1, 1, end, logStart, List.of(), MsgSnapshot.MIN_CHUNK),
+                    "incomplete coverage must not publish");
+        }
+    }
 }

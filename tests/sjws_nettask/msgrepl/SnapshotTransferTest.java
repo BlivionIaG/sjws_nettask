@@ -275,5 +275,27 @@ class SnapshotTransferTest {
         }
         assertEquals(1, readers, "pin.readers leaked after manifest write failure");
     }
-}
 
+    /** #288 Codex P2: long idle must not overflow the token refill into a negative bucket. */
+    @Test
+    void rateLimiterIdleDoesNotOverflowTokens() throws Exception {
+        var lim = new SnapshotTransfer.RateLimiter(64L << 20); // 64 MiB/s default
+        // Force last far in the past via reflection-free path: acquire once, then sleep is too slow;
+        // package-visible last field — use a test hook by acquiring after constructing and calling acquire.
+        // Directly set last through package access (same package).
+        var f = SnapshotTransfer.RateLimiter.class.getDeclaredField("last");
+        f.setAccessible(true);
+        f.setLong(lim, System.nanoTime() - 180_000_000_000L); // 180s ago
+        long t0 = System.nanoTime();
+        lim.acquire(4096);
+        assertTrue(System.nanoTime() - t0 < 2_000_000_000L, "4 KiB must not block for seconds after idle overflow");
+    }
+
+    /** #288 Codex P2: timeout scales with a slow install rate so one paced chunk fits. */
+    @Test
+    void timeoutMsCoversOnePacedChunk() {
+        int slow = SnapshotTransfer.timeoutMs(64 << 10, 1 << 20); // 64 KiB/s, 1 MiB chunk
+        assertTrue(slow > SnapshotTransfer.TIMEOUT_MS, "slow rate needs more than the 15s floor");
+        assertTrue(slow >= (1 << 20) * 1000L / (64 << 10), "at least one chunk's wall time");
+    }
+}

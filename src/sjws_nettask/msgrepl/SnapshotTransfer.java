@@ -74,6 +74,17 @@ final class SnapshotTransfer {
     static final long SKEW_MS = 120_000;
     static final int MAX_SESSIONS = 4;
     static final int TIMEOUT_MS = 15_000;
+
+    /**
+     * Socket read/connect deadline that stays ahead of one paced chunk at {@code bytesPerSecond}, with a floor of
+     * {@link #TIMEOUT_MS}. Slow {@code ha.snapshot.install_rate} must not time out a legitimate transfer (#288 Codex P2).
+     */
+    static int timeoutMs(long bytesPerSecond, int chunkBytes) {
+        if (bytesPerSecond < 1) bytesPerSecond = 1;
+        if (chunkBytes < 1) chunkBytes = MsgSnapshot.MIN_CHUNK;
+        long chunkMs = (chunkBytes * 1000L + bytesPerSecond - 1) / bytesPerSecond + 5_000L;
+        return (int) Math.min(Integer.MAX_VALUE, Math.max(TIMEOUT_MS, chunkMs));
+    }
     static final int NONCE = 16;
     static final int MAC = 32;
 
@@ -135,7 +146,10 @@ final class SnapshotTransfer {
                 lock.lock();
                 try {
                     long now = System.nanoTime();
-                    tokens = Math.min(bytesPerSecond, tokens + (now - last) * bytesPerSecond / 1_000_000_000L);
+                    // Cap elapsed before multiplying: a long idle at high bytesPerSecond overflows and
+                    // can leave tokens negative (#288 Codex P2).
+                    long elapsed = Math.min(now - last, 1_000_000_000L);
+                    tokens = Math.min(bytesPerSecond, tokens + elapsed * bytesPerSecond / 1_000_000_000L);
                     last = now;
                     if (tokens >= n || tokens == bytesPerSecond) {
                         tokens -= n;
@@ -157,6 +171,7 @@ final class SnapshotTransfer {
         private final byte[][] keys;
         private final SnapshotStore store;
         private final RateLimiter limiter;
+        private final long bytesPerSecond;
         private final LongSupplier clockMs;
         private final Semaphore sessions = new Semaphore(MAX_SESSIONS);
         private final Map<String, Boolean> nonces = new LinkedHashMap<>(1024, 0.75f, false) {
@@ -189,6 +204,7 @@ final class SnapshotTransfer {
             this.keys = new byte[][] {key, previous};
             this.store = store;
             this.limiter = new RateLimiter(bytesPerSecond);
+            this.bytesPerSecond = bytesPerSecond;
             this.clockMs = clockMs;
             this.listener = listener;
             this.acceptor = Thread.ofPlatform().daemon().name("msgrepl-snapshot-server").start(this::acceptLoop);
@@ -247,7 +263,7 @@ final class SnapshotTransfer {
         }
 
         private void serve(SocketChannel sc) throws IOException, InterruptedException {
-            sc.socket().setSoTimeout(TIMEOUT_MS);
+            sc.socket().setSoTimeout(timeoutMs(bytesPerSecond, MsgSnapshot.MAX_CHUNK));
             sc.socket().setTcpNoDelay(true);
             var in = new DataInputStream(sc.socket().getInputStream());
             var head = new byte[4 + 1 + NONCE + 8 + 1];
@@ -368,10 +384,16 @@ final class SnapshotTransfer {
      */
     static MsgSnapshot fetch(InetSocketAddress peer, byte[] key, String topic, long minIndex, Path staging, int maxManifest,
             LongSupplier clockMs) throws IOException {
+        return fetch(peer, key, topic, minIndex, staging, maxManifest, clockMs, 64L << 20, MsgSnapshot.MIN_CHUNK);
+    }
+
+    static MsgSnapshot fetch(InetSocketAddress peer, byte[] key, String topic, long minIndex, Path staging, int maxManifest,
+            LongSupplier clockMs, long bytesPerSecond, int chunkBytes) throws IOException {
         Files.createDirectories(staging);
+        int timeout = timeoutMs(bytesPerSecond, chunkBytes);
         try (var sc = SocketChannel.open()) {
-            sc.socket().connect(peer, TIMEOUT_MS);
-            sc.socket().setSoTimeout(TIMEOUT_MS);
+            sc.socket().connect(peer, timeout);
+            sc.socket().setSoTimeout(timeout);
             sc.socket().setTcpNoDelay(true);
             var in = new DataInputStream(sc.socket().getInputStream());
             var nonceC = new byte[NONCE];

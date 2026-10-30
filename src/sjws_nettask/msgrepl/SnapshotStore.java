@@ -190,7 +190,13 @@ final class SnapshotStore {
                 Files.createFile(tmp.resolve(name(endOffset)));
                 segs.add(new MsgSnapshot.Seg(endOffset, endOffset, 0, -1, new byte[0][]));
             }
-            var snap = new MsgSnapshot(topic, index, term, endOffset, Math.min(logStart, endOffset), chunkBytes, sections, segs);
+            long start = Math.min(logStart, endOffset);
+            // Retention may have deleted a segment after snapshotAt captured logStart; refuse an incomplete
+            // pin that decode would reject (#288 Codex P1).
+            if (segs.getFirst().base() > start || segs.getLast().next() != endOffset) {
+                return null;
+            }
+            var snap = new MsgSnapshot(topic, index, term, endOffset, start, chunkBytes, sections, segs);
             var manifest = snap.encode();
             try (var ch = FileChannel.open(tmp.resolve(MANIFEST), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
                 var b = ByteBuffer.wrap(manifest);

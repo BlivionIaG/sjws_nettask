@@ -287,19 +287,28 @@ final class RaftReplica implements Replica {
         // group is published under installHandoff so the callback and this handoff cannot disagree (#288 Codex P1).
         var opened = node.openGroup(groupId, options, listener);
         MsgSnapshot owed;
+        CompletableFuture<Void> installDone = null;
         this.installHandoff.lock();
         try {
             this.group = opened;
             owed = this.openInstall;
-            if (owed != null) this.openInstall = null;
+            if (owed != null) {
+                this.openInstall = null;
+                // Publish the future before releasing the handoff so onCommitted cannot see
+                // installPending without a joinable installing (#288 Codex P1).
+                installDone = this.installing;
+                if (installDone == null) {
+                    installDone = new CompletableFuture<>();
+                    this.installing = installDone;
+                }
+            }
         } finally {
             this.installHandoff.unlock();
         }
         this.group.advertiseFeatures(FEATURE_PRODUCER_ENTRIES);
         node.onNoopApplied(groupId, (term, index) -> this.readyTerm = term);
         if (owed != null) {
-            var done = new CompletableFuture<Void>();
-            this.installing = done;
+            var done = installDone;
             Thread.ofVirtual().name("msgrepl-install-" + this.topic).start(() -> {
                 try {
                     install(owed);
@@ -903,15 +912,26 @@ final class RaftReplica implements Replica {
             return;
         }
         if (this.snaps != null && this.hooks != null && (this.installPending || this.local.snapshot().nextOffset() < m.endOffset())) {
+            boolean defer;
             this.installHandoff.lock();
             try {
-                if (this.group == null) { // restored while the group opens (restart): installed off the opening thread
+                defer = this.group == null;
+                if (defer) { // restored while the group opens (restart): installed off the opening thread
                     this.installPending = true;
                     this.openInstall = m;
-                    return;
+                    if (this.installing == null) this.installing = new CompletableFuture<>();
                 }
             } finally {
                 this.installHandoff.unlock();
+            }
+            if (defer) {
+                try {
+                    writeInstallMarker(m); // durable before replaceWith can run (#288 Codex P1)
+                } catch (IOException e) {
+                    System.err.println("ERROR: " + this.groupId.value() + ": could not write install marker: " + e.getMessage());
+                    this.installPending = true;
+                }
+                return;
             }
             install(m);
             return;
@@ -943,22 +963,33 @@ final class RaftReplica implements Replica {
     }
 
     /**
+     * Persists the install marker if absent. Deferred startup installs must write it before {@code group} is
+     * published so a crash after {@link SegmentedLog#replaceWith} cannot leave an unmarked ledger (#288 Codex P1).
+     * Checks the durable file, not only {@link #installPending}.
+     */
+    private void writeInstallMarker(MsgSnapshot m) throws IOException {
+        if (Files.exists(this.installMarker)) {
+            this.installPending = true;
+            return;
+        }
+        var tmp = this.installMarker.resolveSibling(this.installMarker.getFileName() + ".tmp");
+        Files.write(tmp, m.encode());
+        try (var ch = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
+            ch.force(true);
+        }
+        Files.move(tmp, this.installMarker, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        SnapshotStore.fsyncDir(this.installMarker.getParent());
+        this.installPending = true;
+    }
+
+    /**
      * Fetches the newest pin at or above {@code m} from the data nodes (leader first), swaps it in for the whole local
      * ledger, and moves the apply point there. Blocks this group's delivery thread: no later entry may apply before
      * the ledger it lands on. Retries until it succeeds or the replica closes; the marker makes a restart redo it.
      */
     private void install(MsgSnapshot m) {
         try {
-            if (!this.installPending) {
-                var tmp = this.installMarker.resolveSibling(this.installMarker.getFileName() + ".tmp");
-                Files.write(tmp, m.encode());
-                try (var ch = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
-                    ch.force(true);
-                }
-                Files.move(tmp, this.installMarker, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                SnapshotStore.fsyncDir(this.installMarker.getParent());
-                this.installPending = true;
-            }
+            writeInstallMarker(m);
             fault("install-marked");
             boolean fetched = false;
             long backoff = 20;
@@ -968,7 +999,8 @@ final class RaftReplica implements Replica {
                     try {
                         // Fetch the pin, then refuse unless it is exactly the consensus image m (#288 Security B1).
                         var got = SnapshotTransfer.fetch(peer, this.snaps.key, this.topic, m.index(), this.staging,
-                                GroupOptions.DEFAULT_MAX_SNAPSHOT_BYTES, this.snaps.clockMs);
+                                GroupOptions.DEFAULT_MAX_SNAPSHOT_BYTES, this.snaps.clockMs,
+                                this.snaps.settings.bytesPerSecond(), this.snaps.settings.chunkBytes());
                         if (!sameSnapshotImage(got, m)) {
                             warn(this.groupId.value() + ": install from " + peer + ": pin at " + got.index()
                                     + " does not match the consensus snapshot at " + m.index() + "; trying the next peer");
