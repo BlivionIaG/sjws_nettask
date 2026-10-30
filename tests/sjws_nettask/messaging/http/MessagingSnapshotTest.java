@@ -195,41 +195,41 @@ class MessagingSnapshotTest {
         start(LogRetention.NONE);
         int l = leader("t");
         assertTrue(l >= 0);
-        l = produce(l, 0, 5);
-        int f = 1 - l;
+        final int lead = produce(l, 0, 5);
+        final int foll = 1 - lead;
         // Offsets are STRICT (two data copies in 2+1): committed while both data nodes are up.
         for (int g = 0; g < 30; g++) {
             int gg = g;
             Response put = null;
             for (int k = 0; k < 200 && (put == null || put.status() != 200); k++) { // __offsets may still be electing
-                put = call(() -> LogOffsetsTest.put(http.get(l), "t", "g" + (gg % 3), gg % 5));
+                put = call(() -> LogOffsetsTest.put(http.get(lead), "t", "g" + (gg % 3), gg % 5));
                 if (put.status() != 200) for (int s = 0; s < 10; s++) step();
             }
             assertEquals(200, put.status(), LogOffsetsTest.text(put));
         }
-        until(() -> safeEnd(f, "t") >= 5 && safeEnd(f, LogOffsets.TOPIC) >= 30, "follower in sync");
-        cut(f);
-        l = produce(l, 5, 60);
-        assertTrue(SnapshotTesting.snapshotNow(topics.get(l).get("t", false).replica()));
-        assertTrue(SnapshotTesting.snapshotNow(topics.get(l).get(LogOffsets.TOPIC, false).replica()));
-        heal(f);
-        long tEnd = end(l, "t"), oEnd = end(l, LogOffsets.TOPIC);
-        until(() -> safeEnd(f, "t") >= tEnd && safeEnd(f, LogOffsets.TOPIC) >= oEnd, "follower caught up");
-        assertEquals(1, SnapshotTesting.installs(topics.get(f).get("t", false).replica()));
-        assertEquals(0, SnapshotTesting.installs(topics.get(f).get(LogOffsets.TOPIC, false).replica()), "never behind: STRICT");
-        assertTrue(snaps.get(l).bytesSent() > 0);
-        var mine = MessagingReplicationTest.records(http.get(f).handle(MessagingReplicationTest.fetch("t", "&max_records=1000", Map.of())));
-        var theirs = MessagingReplicationTest.records(http.get(l).handle(MessagingReplicationTest.fetch("t", "&max_records=1000", Map.of())));
+        until(() -> safeEnd(foll, "t") >= 5 && safeEnd(foll, LogOffsets.TOPIC) >= 30, "follower in sync");
+        cut(foll);
+        final int leadAfter = produce(lead, 5, 60);
+        assertTrue(SnapshotTesting.snapshotNow(topics.get(leadAfter).get("t", false).replica()));
+        assertTrue(SnapshotTesting.snapshotNow(topics.get(leadAfter).get(LogOffsets.TOPIC, false).replica()));
+        heal(foll);
+        long tEnd = end(leadAfter, "t"), oEnd = end(leadAfter, LogOffsets.TOPIC);
+        until(() -> safeEnd(foll, "t") >= tEnd && safeEnd(foll, LogOffsets.TOPIC) >= oEnd, "follower caught up");
+        assertEquals(1, SnapshotTesting.installs(topics.get(foll).get("t", false).replica()));
+        assertEquals(0, SnapshotTesting.installs(topics.get(foll).get(LogOffsets.TOPIC, false).replica()), "never behind: STRICT");
+        assertTrue(snaps.get(leadAfter).bytesSent() > 0);
+        var mine = MessagingReplicationTest.records(http.get(foll).handle(MessagingReplicationTest.fetch("t", "&max_records=1000", Map.of())));
+        var theirs = MessagingReplicationTest.records(http.get(leadAfter).handle(MessagingReplicationTest.fetch("t", "&max_records=1000", Map.of())));
         assertEquals(theirs, mine);
         assertEquals(65, mine.size());
         // Group offsets survive the topic's install, and commits continue on both.
-        assertEquals(topics.get(l).offsets().committed("t", "g0"), topics.get(f).offsets().committed("t", "g0"));
-        assertEquals(topics.get(l).offsets().committed("t", "g2"), topics.get(f).offsets().committed("t", "g2"));
-        var put = call(() -> LogOffsetsTest.put(http.get(l), "t", "g1", 64));
+        assertEquals(topics.get(leadAfter).offsets().committed("t", "g0"), topics.get(foll).offsets().committed("t", "g0"));
+        assertEquals(topics.get(leadAfter).offsets().committed("t", "g2"), topics.get(foll).offsets().committed("t", "g2"));
+        var put = call(() -> LogOffsetsTest.put(http.get(leadAfter), "t", "g1", 64));
         assertEquals(200, put.status(), LogOffsetsTest.text(put));
         until(() -> {
             try {
-                return topics.get(f).offsets().committed("t", "g1") == 64;
+                return topics.get(foll).offsets().committed("t", "g1") == 64;
             } catch (java.io.IOException e) {
                 return false;
             }
@@ -247,37 +247,37 @@ class MessagingSnapshotTest {
     @Test
     void retentionPassIsOneReplicatedCut() throws Exception {
         start(new LogRetention(4096, 0));
-        int l = leader("t");
-        assertTrue(l >= 0, "topic leader elected before produce");
-        l = produce(l, 0, 120);
-        int f = 1 - l;
-        until(() -> safeEnd(f, "t") >= 120, "follower at 120");
-        assertEquals(0, topics.get(f).enforceRetention(), "a follower proposes nothing");
-        topics.get(l).enforceRetention();
-        var lr = topics.get(l).get("t", false).replica();
-        var fr = topics.get(f).get("t", false).replica();
+        int elected = leader("t");
+        assertTrue(elected >= 0, "topic leader elected before produce");
+        final int lead = produce(elected, 0, 120);
+        final int foll = 1 - lead;
+        until(() -> safeEnd(foll, "t") >= 120, "follower at 120");
+        assertEquals(0, topics.get(foll).enforceRetention(), "a follower proposes nothing");
+        topics.get(lead).enforceRetention();
+        var lr = topics.get(lead).get("t", false).replica();
+        var fr = topics.get(foll).get("t", false).replica();
         until(() -> lr.logStartOffset() > 0 && fr.logStartOffset() == lr.logStartOffset(), "the cut applied on both");
         until(() -> {
             try {
-                topics.get(f).enforceRetention(); // applies any cut left pending behind a maintenance pass
-                topics.get(l).enforceRetention();
-                return topics.get(l).get("t", false).log().startOffset() == topics.get(f).get("t", false).log().startOffset()
-                        && topics.get(l).get("t", false).log().startOffset() > 0;
+                topics.get(foll).enforceRetention(); // applies any cut left pending behind a maintenance pass
+                topics.get(lead).enforceRetention();
+                return topics.get(lead).get("t", false).log().startOffset() == topics.get(foll).get("t", false).log().startOffset()
+                        && topics.get(lead).get("t", false).log().startOffset() > 0;
             } catch (Exception e) {
                 return false;
             }
         }, "the same segments deleted on both");
-        assertTrue(topics.get(l).get("t", false).log().totalBytes() <= 4096 + 2048);
+        assertTrue(topics.get(lead).get("t", false).log().totalBytes() <= 4096 + 2048);
     }
 
     /** #288 MC-B1: fetch uses max(physical start, replica.logStartOffset()), even when bytes remain on disk. */
     @Test
     void fetchBelowReplicatedLogStartIs416() throws Exception {
         start(new LogRetention(64L << 20, 0)); // age off; bytes high so retention does not cut for this test
-        int l = leader("t");
-        assertTrue(l >= 0, "topic leader elected before produce");
-        l = produce(l, 0, 80);
-        var leadLog = topics.get(l).get("t", false);
+        int elected = leader("t");
+        assertTrue(elected >= 0, "topic leader elected before produce");
+        final int lead = produce(elected, 0, 80);
+        var leadLog = topics.get(lead).get("t", false);
         var segs = leadLog.log().segments();
         assertFalse(segs.isEmpty());
         var first = segs.get(0);
@@ -297,10 +297,10 @@ class MessagingSnapshotTest {
         assertEquals(cut, logical);
         assertTrue(physical < logical,
                 "physical must stay below logical so the 416 branch runs: physical=" + physical + " logical=" + logical);
-        var r = call(() -> http.get(l).handle(new Request("GET",
+        var r = call(() -> http.get(lead).handle(new Request("GET",
                 "/messaging/v1/topics/t/records?offset=" + physical + "&maxBytes=256", RequestHeaders.of(Map.of()))));
         assertEquals(416, r.status(), "fetch at physical start below logical: " + r);
-        var ok = call(() -> http.get(l).handle(new Request("GET",
+        var ok = call(() -> http.get(lead).handle(new Request("GET",
                 "/messaging/v1/topics/t/records?offset=" + logical + "&maxBytes=256", RequestHeaders.of(Map.of()))));
         assertTrue(ok.status() == 200 || ok.status() == 204, "fetch at logical start: " + ok.status());
     }
