@@ -309,28 +309,29 @@ class LedgerWriterBudgetTest {
     @Test
     void constructorFailureReleasesIdleCharge() throws Exception {
         LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(0));
-        LedgerWriter.ctorFaultForTests = new RuntimeException("boom-after-idle");
+        LedgerBudgetTestHooks.setCtorFault(new RuntimeException("boom-after-idle"));
         try (var log = SegmentedLog.open(dir.resolve("ctor-fail"))) {
             var boom = assertThrows(RuntimeException.class, () -> new LedgerWriter(log, Durability.NONE));
             assertEquals("boom-after-idle", boom.getMessage());
         } finally {
-            LedgerWriter.ctorFaultForTests = null;
+            LedgerBudgetTestHooks.clearCtorFault();
         }
         assertEquals(0, LedgerWriterBudget.shared().charged(), "idle charge must roll back on ctor failure");
         assertEquals(0, LedgerWriterBudget.shared().writers());
     }
 
     /**
-     * #335 N2: materialize that fails after acquireMaterialize must releaseBytes and leave the writer idle.
+     * Materialize that fails after acquireMaterialize must releaseBytes and leave the writer idle.
      * Mutation: drop {@code budget.releaseBytes(extra)} in the materialize catch → charged stays at full cost.
+     * Fault is per-writer (#335 N3), not a static that can leak across tests.
      */
     @Test
     void materializeFailureAfterAcquireRollsBackCharge() throws Exception {
         LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(0));
-        LedgerWriter.materializeFaultForTests = new RuntimeException("boom-after-acquire");
         try (var log = SegmentedLog.open(dir.resolve("mat-rollback"))) {
             var w = new LedgerWriter(log, Durability.NONE, 0, 128, 1 << 16);
             try {
+                w.materializeFaultForTests = new RuntimeException("boom-after-acquire");
                 assertEquals(LedgerWriterBudget.IDLE_COST_BYTES, LedgerWriterBudget.shared().charged());
                 var boom = assertThrows(RuntimeException.class,
                         () -> w.append(List.of(new byte[] {1}), null));
@@ -339,10 +340,9 @@ class LedgerWriterBudgetTest {
                 assertEquals(LedgerWriterBudget.IDLE_COST_BYTES, LedgerWriterBudget.shared().charged(),
                         "materialize delta must not stick after rollback");
             } finally {
+                w.materializeFaultForTests = null;
                 w.close();
             }
-        } finally {
-            LedgerWriter.materializeFaultForTests = null;
         }
         assertEquals(0, LedgerWriterBudget.shared().charged());
     }
@@ -415,5 +415,75 @@ class LedgerWriterBudgetTest {
         });
     }
 
+    /**
+     * #335 Security B1: a direct-growth budget refusal must fail only that batch (503), not fence the writer.
+     * Disk was never touched, matching materialize refusal. Mutation: catching LedgerBudgetExhaustedException
+     * in the generic writeGroup fence path (failure=e) makes the follow-up small append fail.
+     */
+    @Test
+    void growthRefusalDoesNotFenceWriter() throws Exception {
+        int q = 128;
+        long full = LedgerWriterBudget.fullCostBytes(q);
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(full)); // room for materialize, not +3 MiB growth
+        try (var log = SegmentedLog.open(dir.resolve("nofence"))) {
+            var w = new LedgerWriter(log, Durability.NONE, 0, q, 8 << 20);
+            try {
+                assertEquals(0L, w.append(List.of(new byte[] {1}), Durability.NONE).get(5, TimeUnit.SECONDS));
+                assertEquals(full, LedgerWriterBudget.shared().charged());
+                byte[] big = new byte[2 << 20];
+                try {
+                    w.append(List.of(big), Durability.NONE).get(5, TimeUnit.SECONDS);
+                    fail("expected ledger budget exhaustion on direct growth");
+                } catch (Exception e) {
+                    Throwable c = e;
+                    while (c.getCause() != null && !(c instanceof LedgerBudgetExhaustedException)) c = c.getCause();
+                    assertTrue(c instanceof LedgerBudgetExhaustedException, "got " + e);
+                }
+                // Still at full materialize charge — growth never stuck; writer not fenced.
+                assertEquals(full, LedgerWriterBudget.shared().charged());
+                long next = w.append(List.of(new byte[] {2}), Durability.NONE).get(5, TimeUnit.SECONDS);
+                assertEquals(1L, next, "small append after growth refusal must succeed (no fence)");
+                assertEquals(full, LedgerWriterBudget.shared().charged());
+            } finally {
+                w.close();
+            }
+        }
+        assertEquals(0, LedgerWriterBudget.shared().charged());
+    }
+
+    /**
+     * #335 N2: if allocateDirect fails after acquireExtra, the extra charge must roll back.
+     * Mutation: drop the releaseBytes in write()'s allocateDirect catch → charged stays above full.
+     */
+    @Test
+    void allocateDirectFailureReleasesExtraCharge() throws Exception {
+        int q = 128;
+        long full = LedgerWriterBudget.fullCostBytes(q);
+        long growth = 3L << 20;
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(full + growth));
+        try (var log = SegmentedLog.open(dir.resolve("alloc-fail"))) {
+            var w = new LedgerWriter(log, Durability.NONE, 0, q, 8 << 20);
+            try {
+                assertEquals(0L, w.append(List.of(new byte[] {1}), Durability.NONE).get(5, TimeUnit.SECONDS));
+                assertEquals(full, LedgerWriterBudget.shared().charged());
+                w.allocateDirectFaultForTests = new RuntimeException("boom-allocateDirect");
+                byte[] big = new byte[2 << 20];
+                try {
+                    w.append(List.of(big), Durability.NONE).get(5, TimeUnit.SECONDS);
+                    fail("expected allocateDirect fault");
+                } catch (Exception e) {
+                    Throwable c = e;
+                    while (c.getCause() != null && !"boom-allocateDirect".equals(c.getMessage())) c = c.getCause();
+                    assertEquals("boom-allocateDirect", c.getMessage(), "got " + e);
+                }
+                assertEquals(full, LedgerWriterBudget.shared().charged(),
+                        "extra charge must roll back when allocateDirect fails after acquireExtra");
+            } finally {
+                w.allocateDirectFaultForTests = null;
+                w.close();
+            }
+        }
+        assertEquals(0, LedgerWriterBudget.shared().charged());
+    }
 
 }

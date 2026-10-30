@@ -75,10 +75,16 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     /** Dedicated writer thread; started on first materialize, not in the constructor. */
     private final Thread thread;
     private final ReentrantLock materializeLock = new ReentrantLock();
-    /** Test-only: when non-null, thrown after acquireMaterialize and before the queue is published. */
-    static volatile RuntimeException materializeFaultForTests;
-    /** Test-only: when non-null, thrown in the constructor after idle acquire (N1 rollback). */
-    static volatile RuntimeException ctorFaultForTests;
+    /**
+     * Test-only (per writer): when non-null, thrown after acquireMaterialize and before the queue is published.
+     * Instance field so faults cannot leak across writers or tests (#335 N3).
+     */
+    volatile RuntimeException materializeFaultForTests;
+    /**
+     * Test-only (per writer): when non-null, thrown after acquireExtra and before {@code allocateDirect}
+     * so N2 can prove the extra charge rolls back (#335 N2/N3).
+     */
+    volatile RuntimeException allocateDirectFaultForTests;
     /** Dedicated syncer, or null when using {@link SharedLedgerPool}. */
     private final Thread syncer;
     /** Syncer shard index, or -1 when this writer has a dedicated syncer. */
@@ -154,7 +160,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         this.budget = LedgerWriterBudget.shared();
         this.budgetCharged = this.budget.acquireIdle();
         try {
-            var ctorFault = ctorFaultForTests;
+            var ctorFault = LedgerWriterFaults.CTOR.get();
             if (ctorFault != null) throw ctorFault;
             this.written = log.nextOffset();
             this.durable = log.nextOffset(); // recovered data is treated as durable (it survived a restart)
@@ -435,6 +441,12 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
             // NONE/GROUP/EACH writers only need the syncer for fsync waiters (GROUP overrides); ASYNC unless it is already
             // sleeping out the fsync floor (an unpark per write would turn the floor into a wake-up per write).
             if ((durability == Durability.ASYNC && !flooring) || !fsyncWaiters.isEmpty()) unparkSyncer();
+        } catch (LedgerBudgetExhaustedException e) {
+            // Disk was never touched (acquireExtra / growth refusal before allocateDirect+appendFrames). Fail only
+            // this batch — same as a materialize refusal on the caller thread — and do not fence the writer so a
+            // later small append can still succeed (#335 Security B1). Mutation: setting failure=e here again makes
+            // growthRefusalDoesNotFenceWriter fail.
+            g.forEach(p -> p.done.completeExceptionally(e));
         } catch (IOException | RuntimeException e) {
             // The in-memory tail may disagree with disk: fence the writer; reopening recovers. This group's writes
             // and the waiters are failed before the fence is raised, so an append refused by the fence cannot be
@@ -489,12 +501,28 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
                     : Integer.highestOneBit(total) << 1;
             // Materialize already charged DIRECT_BUF_BYTES; any larger (or grown) buffer must acquire the delta (#335 B3).
             long need = (long) cap - directAccounted;
+            int prevAccounted = directAccounted;
+            long got = 0;
             if (need > 0) {
-                long got = budget.acquireExtra(need, "LedgerWriter direct buffer growth");
+                got = budget.acquireExtra(need, "LedgerWriter direct buffer growth");
                 budgetCharged += got;
                 directAccounted = cap;
             }
-            b = ByteBuffer.allocateDirect(cap);
+            try {
+                var fault = allocateDirectFaultForTests;
+                if (fault != null) throw fault;
+                b = ByteBuffer.allocateDirect(cap);
+            } catch (Throwable t) {
+                // #335 N2: release the extra charge if allocateDirect (or a test fault) fails after acquireExtra.
+                if (got > 0) {
+                    budget.releaseBytes(got);
+                    budgetCharged -= got;
+                    directAccounted = prevAccounted;
+                }
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
+                throw new IOException(t);
+            }
             buf = b;
         }
         b.clear();
