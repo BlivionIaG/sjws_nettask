@@ -154,7 +154,7 @@ class DaemonTest {
 
     @Test
     void helpWinsOverStop() throws Exception {
-        var sleep = new ProcessBuilder("sleep", "30").start();
+        var sleep = new ProcessBuilder("/bin/sleep", "30").start();
         var pid = tmp.resolve("help.pid");
         try {
             Files.writeString(pid, PidFile.text(sleep.pid(), startMillis(sleep)));
@@ -486,7 +486,7 @@ class DaemonTest {
         assertTrue(out().contains("stopped stale pid=" + me), out());
         assertTrue(ProcessHandle.current().isAlive());
 
-        var dead = new ProcessBuilder("sleep", "0").start();
+        var dead = new ProcessBuilder("/bin/sleep", "0").start();
         assertTrue(dead.waitFor(5, TimeUnit.SECONDS));
         var stale = tmp.resolve("stale.pid");
         Files.writeString(stale, PidFile.text(dead.pid(), startMillis(dead)));
@@ -509,7 +509,7 @@ class DaemonTest {
 
     @Test
     void aLiveForeignPidIsLeftAlone() throws Exception {
-        var sleep = new ProcessBuilder("sleep", "60").start();
+        var sleep = new ProcessBuilder("/bin/sleep", "60").start();
         var pid = tmp.resolve("sleep.pid");
         try {
             Files.writeString(pid, PidFile.text(sleep.pid(), startMillis(sleep)));
@@ -671,7 +671,15 @@ class DaemonTest {
         assertLongSymlinkReadsTheRegularTarget(store);
 
         var fifo = store.resolve("fifo.pid");
-        var mkfifo = new ProcessBuilder("/usr/bin/mkfifo", fifo.toString()).redirectErrorStream(true).start();
+        final Process mkfifo;
+        if (Files.isExecutable(Path.of("/usr/bin/mkfifo"))) {
+            mkfifo = new ProcessBuilder("/usr/bin/mkfifo", fifo.toString()).redirectErrorStream(true).start();
+        } else if (Files.isExecutable(Path.of("/bin/mkfifo"))) {
+            mkfifo = new ProcessBuilder("/bin/mkfifo", fifo.toString()).redirectErrorStream(true).start();
+        } else {
+            org.junit.jupiter.api.Assumptions.abort("no mkfifo at /usr/bin/mkfifo or /bin/mkfifo");
+            throw new AssertionError("unreachable");
+        }
         var mkfifoOut = new String(mkfifo.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         assertEquals(0, mkfifo.waitFor(), mkfifoOut);
         assertTrue(Files.size(fifo) <= 512, "fifo size " + Files.size(fifo));
@@ -1152,7 +1160,7 @@ class DaemonTest {
         assertTrue(unit.contains("--shutdown-timeout=10"), unit);
 
         var dummy = Files.createFile(tmp.resolve("dummy.jar"));
-        var pb = new ProcessBuilder("sh", "contrib/sjws");
+        var pb = new ProcessBuilder("/bin/sh", "contrib/sjws");
         pb.environment().put("SJWS_JAR", dummy.toString());
         pb.redirectErrorStream(true);
         var process = pb.start();
@@ -1248,7 +1256,7 @@ class DaemonTest {
         assertTrue(kept.toFile().setWritable(true));
         assertEquals("1\n1\n", Files.readString(kept));
 
-        var sleep = new ProcessBuilder("sleep", "60").start();
+        var sleep = new ProcessBuilder("/bin/sleep", "60").start();
         var sleepPid = tmp.resolve("sleep-edge.pid");
         try {
             long start = startMillis(sleep);
@@ -1341,7 +1349,7 @@ class DaemonTest {
         PidFile.removeIfSame(linkSnap, link);
         assertTrue(Files.isSymbolicLink(link), "a changed symlink target is not removed");
 
-        var sleep = new ProcessBuilder("sleep", "60").start();
+        var sleep = new ProcessBuilder("/bin/sleep", "60").start();
         var pid = tmp.resolve("foreign.pid");
         try {
             long start = startMillis(sleep);

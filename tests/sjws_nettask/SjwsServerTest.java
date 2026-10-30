@@ -195,7 +195,7 @@ class SjwsServerTest {
         org.junit.jupiter.api.Assumptions.assumeTrue(Files.isExecutable(Path.of("/usr/bin/ss"))
                 || Files.isExecutable(Path.of("/bin/ss")), "needs ss (Linux)");
         server = SjwsServer.start(config(false).toBuilder().backlog(777).build(), (c, h) -> null);
-        var p = new ProcessBuilder("ss", "-ltnH", "sport = :" + server.tcpPort()).redirectErrorStream(true).start();
+        var p = new ProcessBuilder("/usr/bin/ss", "-ltnH", "sport = :" + server.tcpPort()).redirectErrorStream(true).start();
         var out = new String(p.getInputStream().readAllBytes());
         assertTrue(p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS));
         var cols = out.trim().split("\\s+");

@@ -438,7 +438,15 @@ class VerificationTest {
 
     boolean probeMkfifo() {
         try {
-            return new ProcessBuilder("mkfifo", "--version").start().waitFor(5, TimeUnit.SECONDS);
+            Process probe;
+            if (java.nio.file.Files.isExecutable(java.nio.file.Path.of("/usr/bin/mkfifo"))) {
+                probe = new ProcessBuilder("/usr/bin/mkfifo", "--version").start();
+            } else if (java.nio.file.Files.isExecutable(java.nio.file.Path.of("/bin/mkfifo"))) {
+                probe = new ProcessBuilder("/bin/mkfifo", "--version").start();
+            } else {
+                return false;
+            }
+            return probe.waitFor(5, TimeUnit.SECONDS);
         } catch (Exception e) {
             return false;
         }

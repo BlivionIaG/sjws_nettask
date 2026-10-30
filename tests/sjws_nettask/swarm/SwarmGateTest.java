@@ -273,7 +273,7 @@ class SwarmGateTest {
     /** Whether {@code sudo -n chown} works here (a no-op chown to the current owner). */
     private static boolean canChown(Path path, String owner) {
         try {
-            var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true)
+            var proc = new ProcessBuilder("/usr/bin/sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true)
                     .start();
             proc.getInputStream().readAllBytes();
             return proc.waitFor() == 0;
@@ -283,7 +283,7 @@ class SwarmGateTest {
     }
 
     private static void chown(Path path, String owner) throws Exception {
-        var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
+        var proc = new ProcessBuilder("/usr/bin/sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
         String out = new String(proc.getInputStream().readAllBytes());
         assertEquals(0, proc.waitFor(), out);
     }
