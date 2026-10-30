@@ -161,7 +161,7 @@ final class RaftReplica implements Replica {
     /** Set while the group opens when the restored snapshot needs an install; run once the group is open. */
     private MsgSnapshot openInstall;
     /** Coordinates constructor handoff with {@link #onSnapshotRestored} during {@code openGroup} (#288 Codex P1). */
-    private final Object installHandoff = new Object();
+    private final java.util.concurrent.locks.ReentrantLock installHandoff = new java.util.concurrent.locks.ReentrantLock();
     private volatile CompletableFuture<Void> installing;
     /** Consensus index of the last snapshot recorded or restored. */
     private volatile long recordedIndex;
@@ -287,10 +287,13 @@ final class RaftReplica implements Replica {
         // group is published under installHandoff so the callback and this handoff cannot disagree (#288 Codex P1).
         var opened = node.openGroup(groupId, options, listener);
         MsgSnapshot owed;
-        synchronized (this.installHandoff) {
+        this.installHandoff.lock();
+        try {
             this.group = opened;
             owed = this.openInstall;
             if (owed != null) this.openInstall = null;
+        } finally {
+            this.installHandoff.unlock();
         }
         this.group.advertiseFeatures(FEATURE_PRODUCER_ENTRIES);
         node.onNoopApplied(groupId, (term, index) -> this.readyTerm = term);
@@ -900,12 +903,15 @@ final class RaftReplica implements Replica {
             return;
         }
         if (this.snaps != null && this.hooks != null && (this.installPending || this.local.snapshot().nextOffset() < m.endOffset())) {
-            synchronized (this.installHandoff) {
+            this.installHandoff.lock();
+            try {
                 if (this.group == null) { // restored while the group opens (restart): installed off the opening thread
                     this.installPending = true;
                     this.openInstall = m;
                     return;
                 }
+            } finally {
+                this.installHandoff.unlock();
             }
             install(m);
             return;
