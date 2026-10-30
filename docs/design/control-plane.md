@@ -170,7 +170,7 @@ The state machine, applied in index order on the group's delivery thread (`raft-
 | `Audit` | One control-plane audit record (§12.10). Replicated so one voter cannot drop it. |
 | `CertReference` | ACME result: chain reference and envelope-encrypted key material (§5.7, §12.6). |
 
-As built, the log carries `Propose`, signed `Activate` and `Rollback`, `Rbac`, `Revoke`, rollout and advance entries, idempotency wrappers, and join issue and consume entries. Audit lines are written per voter to `<stateDir>/audit.jsonl` and are not replicated.
+As built, the log carries `Propose`, signed `Activate` and `Rollback`, `Rbac`, `Revoke`, rollout and advance entries, idempotency wrappers, and join issue and consume entries. The Idempotency-Key used-key map is bounded (#259, §12.8.1). Audit lines are written per voter to `<stateDir>/audit.jsonl` and are not replicated.
 
 Designed, not wired: `SnapshotControl.take` / `install` / `truncateAndCompact` compact the log to the latest activated snapshot plus the live registration table. Compaction runs off the request path, on the group's delivery thread, past an index that is both snapshotted and acked. The compactor keeps the latest value per key (current desired snapshot, denylist, registrations). History required for rollback is retained for a configured number of activated versions (default 8) inside the snapshot payload, then dropped. As built, `cp-config` keeps its whole log, and the history of 8 activated versions is held in `CpStore` memory.
 
@@ -721,6 +721,26 @@ Only `admin` appends an `Rbac` entry (`Rbac.putOperator` / `removeOperator`, whi
 | Join, CSR, and admin mutations | per-identity and per-source-address token buckets |
 
 The signature is verified before a payload is parsed or decompressed. Compile is bounded in time and output size. An unauthenticated join is rejected on the token check before any signing work.
+
+### 12.8.1 Idempotency-Key replay window (#259)
+
+Every admin mutation that carries an `Idempotency-Key` is wrapped in the log. On apply, `CpStore` records the key, the request fingerprint, and the outcome in a bounded table (`IdempotencyTable`). The table is a deterministic function of the applied log:
+
+| Bound | Default | Meaning |
+|---|---|---|
+| `WINDOW` | 100 000 log indexes | An entry applied at index `i` is dropped once the applied index reaches `i + WINDOW` (`appliedIndex <= i - WINDOW` under the documented `<=`). |
+| `MAX_KEYS` | 100 000 | Hard count cap; eldest by applied index first. |
+| Key length | 128 UTF-8 bytes | Refused at admission with 400 before any append. |
+
+**Retry after eviction.** A retry whose key has been dropped is unknown again and is **applied again**. The table cannot tell an evicted key from a new one, so there is no `KeyExpired` and no tombstone. Clients that need dedup must retry inside the window (or keep the key live with periodic writes).
+
+**Why a global cap.** IDEM log entries do not carry a principal or group, so a per-principal cap is not available without a wire change. The global cap is large; the index window is the primary bound.
+
+**Replicated bounds.** `WINDOW` and `MAX_KEYS` are constants of the state machine (like the messaging producer table), written into every versioned table snapshot. A snapshot with another window or cap is refused on install. They are not local startup properties: two replicas of the same build always agree.
+
+**Snapshot.** `CpStore.snapshotIdempotency` / `installIdempotencySnapshot` encode the surviving entries at the current applied index plus the bounds and the eviction counter. Install replaces the map; it does not merge. Full Raft `SnapshotTaker` compaction of all `CpStore` state remains designed, not wired (§4); the idempotency encoding is the seam that compaction will carry.
+
+**Metric.** `CpStore.idempotencyEvictions()` counts window and cap drops (Prometheus name `sjws_cp_idempotency_evicted_total` when attached to `ServerMetrics`).
 
 ### 12.9 Audit
 

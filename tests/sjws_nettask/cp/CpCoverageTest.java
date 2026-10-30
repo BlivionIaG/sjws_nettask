@@ -45,6 +45,7 @@ import javax.security.auth.x500.X500Principal;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.ServerConfig;
+import sjws_nettask.cluster.CommittedEntry;
 import sjws_nettask.cluster.FakeClock;
 import sjws_nettask.cluster.NodeId;
 import sjws_nettask.config.AppliedConfig;
@@ -184,12 +185,13 @@ class CpCoverageTest {
             onNoop.setAccessible(true);
             onNoop.invoke(store.leadership(), 999L, 1L);
             onNoop.invoke(store.leadership(), store.leadership().term(), 1L);
-            var committed = CpStore.class.getDeclaredMethod("onCommitted", ByteBuffer.class);
+            var committed = CpStore.class.getDeclaredMethod("onCommitted", CommittedEntry.class);
             committed.setAccessible(true);
-            committed.invoke(store, ByteBuffer.allocate(0));
-            committed.invoke(store, ByteBuffer.wrap(new byte[] {9}));
-            committed.invoke(store, propose("not: ["));
-            committed.invoke(store, signedAtIndexZero());
+            long idx = 10_000;
+            committed.invoke(store, new CommittedEntry(CpStore.GROUP, 1L, idx++, ByteBuffer.allocate(0)));
+            committed.invoke(store, new CommittedEntry(CpStore.GROUP, 1L, idx++, ByteBuffer.wrap(new byte[] {9})));
+            committed.invoke(store, new CommittedEntry(CpStore.GROUP, 1L, idx++, propose("not: [")));
+            committed.invoke(store, new CommittedEntry(CpStore.GROUP, 1L, idx++, signedAtIndexZero()));
         }
     }
 
