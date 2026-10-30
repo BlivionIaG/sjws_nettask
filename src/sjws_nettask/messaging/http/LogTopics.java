@@ -284,7 +284,9 @@ final class LogTopics implements AutoCloseable {
             if (offsetsTopic(e.getKey())) continue; // bounded by compaction; retention would lose commits
             var l = e.getValue();
             long floor = offsets(e.getKey()).floor(e.getKey()); // a committed-but-unfetched group pins its history (§2)
-            if (l.replica() != null) { // #270: only the leader decides, and every replica deletes when the cut applies
+            // #270: replicated retention when the replica supports it; otherwise keep local retention
+            // (Replica.advanceLogStart default / RaftReplica without snapshot runtime).
+            if (l.replica() != null && l.replica().replicatedRetention()) {
                 proposeRetention(l, floor, now);
                 continue;
             }

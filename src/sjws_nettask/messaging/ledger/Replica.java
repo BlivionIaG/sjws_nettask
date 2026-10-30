@@ -60,6 +60,14 @@ public interface Replica extends PartitionAppender, AutoCloseable {
         return CompletableFuture.failedFuture(new UnsupportedOperationException("replicated retention"));
     }
 
+    /**
+     * True when this replica can propose and apply replicated retention cuts (#270). False keeps the caller's
+     * local retention path ({@link #advanceLogStart} default refuses).
+     */
+    default boolean replicatedRetention() {
+        return false;
+    }
+
     /** The replicated log start (the last applied {@link #advanceLogStart} or installed snapshot's), or 0. */
     default long logStartOffset() {
         return 0;

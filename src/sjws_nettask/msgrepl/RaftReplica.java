@@ -772,6 +772,11 @@ final class RaftReplica implements Replica {
     }
 
     @Override
+    public boolean replicatedRetention() {
+        return this.snaps != null && this.hooks != null;
+    }
+
+    @Override
     public CompletableFuture<Void> advanceLogStart(long offset) {
         if (this.snaps == null || this.hooks == null) return Replica.super.advanceLogStart(offset);
         long term = this.group.leaderTerm();
@@ -920,19 +925,19 @@ final class RaftReplica implements Replica {
                     this.installPending = true;
                     this.openInstall = m;
                     if (this.installing == null) this.installing = new CompletableFuture<>();
+                    // Marker under the handoff lock so the constructor cannot start install() and race
+                    // the same .install.tmp (#288 Codex P1).
+                    try {
+                        writeInstallMarker(m);
+                    } catch (IOException e) {
+                        System.err.println("ERROR: " + this.groupId.value() + ": could not write install marker: " + e.getMessage());
+                        this.installPending = true;
+                    }
                 }
             } finally {
                 this.installHandoff.unlock();
             }
-            if (defer) {
-                try {
-                    writeInstallMarker(m); // durable before replaceWith can run (#288 Codex P1)
-                } catch (IOException e) {
-                    System.err.println("ERROR: " + this.groupId.value() + ": could not write install marker: " + e.getMessage());
-                    this.installPending = true;
-                }
-                return;
-            }
+            if (defer) return;
             install(m);
             return;
         }
@@ -967,6 +972,7 @@ final class RaftReplica implements Replica {
      * published so a crash after {@link SegmentedLog#replaceWith} cannot leave an unmarked ledger (#288 Codex P1).
      * Checks the durable file, not only {@link #installPending}.
      */
+    /** Caller must hold {@link #installHandoff}, or be the sole installer after handoff. */
     private void writeInstallMarker(MsgSnapshot m) throws IOException {
         if (Files.exists(this.installMarker)) {
             this.installPending = true;
@@ -989,7 +995,12 @@ final class RaftReplica implements Replica {
      */
     private void install(MsgSnapshot m) {
         try {
-            writeInstallMarker(m);
+            this.installHandoff.lock();
+            try {
+                writeInstallMarker(m);
+            } finally {
+                this.installHandoff.unlock();
+            }
             fault("install-marked");
             boolean fetched = false;
             long backoff = 20;
