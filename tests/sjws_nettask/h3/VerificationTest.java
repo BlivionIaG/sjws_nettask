@@ -54,6 +54,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import sjws_nettask.TestCommands;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
@@ -437,16 +438,12 @@ class VerificationTest {
     }
 
     boolean probeMkfifo() {
+        var mkfifo = TestCommands.find("mkfifo");
+        if (mkfifo == null) {
+            return false;
+        }
         try {
-            Process probe;
-            if (java.nio.file.Files.isExecutable(java.nio.file.Path.of("/usr/bin/mkfifo"))) {
-                probe = new ProcessBuilder("/usr/bin/mkfifo", "--version").start();
-            } else if (java.nio.file.Files.isExecutable(java.nio.file.Path.of("/bin/mkfifo"))) {
-                probe = new ProcessBuilder("/bin/mkfifo", "--version").start();
-            } else {
-                return false;
-            }
-            return probe.waitFor(5, TimeUnit.SECONDS);
+            return new ProcessBuilder(mkfifo, "--version").start().waitFor(5, TimeUnit.SECONDS);
         } catch (Exception e) {
             return false;
         }

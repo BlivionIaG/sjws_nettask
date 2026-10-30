@@ -44,6 +44,7 @@ import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.PBEParameterSpec;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.TestCommands;
 import sjws_nettask.ServerConfig;
 
 class TlsMaterialTest {
@@ -197,7 +198,7 @@ class TlsMaterialTest {
         var m = TlsMaterial.selfSigned("localhost");
         var files = writePem(this.tmp, m);
         var encrypted = this.tmp.resolve("enc.pem");
-        var p = new ProcessBuilder("/usr/bin/openssl", "pkcs8", "-topk8", "-v2", "aes-256-cbc", "-v2prf", "hmacWithSHA256",
+        var p = new ProcessBuilder(TestCommands.resolve("openssl"), "pkcs8", "-topk8", "-v2", "aes-256-cbc", "-v2prf", "hmacWithSHA256",
                 "-in", files[1].toString(), "-out", encrypted.toString(), "-passout", "pass:s3cret")
                 .redirectErrorStream(true).start();
         var out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -207,8 +208,12 @@ class TlsMaterialTest {
     }
 
     static boolean opensslAvailable() {
+        var openssl = TestCommands.find("openssl");
+        if (openssl == null) {
+            return false;
+        }
         try {
-            var p = new ProcessBuilder("/usr/bin/openssl", "version").redirectErrorStream(true).start();
+            var p = new ProcessBuilder(openssl, "version").redirectErrorStream(true).start();
             p.getInputStream().readAllBytes();
             return p.waitFor() == 0;
         } catch (IOException | InterruptedException e) {

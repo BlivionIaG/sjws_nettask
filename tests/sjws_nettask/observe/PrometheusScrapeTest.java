@@ -40,6 +40,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
+import sjws_nettask.TestCommands;
 import sjws_nettask.HttpTestSupport;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.ServerConfig.MetricsExposure;
@@ -336,7 +337,7 @@ class PrometheusScrapeTest {
         var config = Path.of("contrib/grafana/prometheus.yml");
         assertTrue(Files.isRegularFile(json), json.toAbsolutePath().toString());
         assertTrue(Files.isRegularFile(config));
-        var py = new ProcessBuilder("/usr/bin/python3", "-c", """
+        var py = new ProcessBuilder(TestCommands.resolve("python3"), "-c", """
                 import json, sys
                 d = json.load(open(sys.argv[1]))
                 assert d["title"] == "sjws" and d["uid"] == "sjws-observe"

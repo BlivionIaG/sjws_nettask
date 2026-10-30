@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import sjws_nettask.TestCommands;
 import sjws_nettask.http1.Http1Writer;
 
 /**
@@ -237,14 +238,7 @@ public class VerificationRegressionTest {
     public static void mkfifo(Path p) throws Exception {
         Process mk;
         try {
-            if (Files.isExecutable(Path.of("/usr/bin/mkfifo"))) {
-                mk = new ProcessBuilder("/usr/bin/mkfifo", p.toString()).start();
-            } else if (Files.isExecutable(Path.of("/bin/mkfifo"))) {
-                mk = new ProcessBuilder("/bin/mkfifo", p.toString()).start();
-            } else {
-                Assumptions.abort("no mkfifo at /usr/bin/mkfifo or /bin/mkfifo");
-                return;
-            }
+            mk = new ProcessBuilder(TestCommands.resolve("mkfifo"), p.toString()).start();
         } catch (IOException e) {
             Assumptions.abort("no mkfifo: " + e);
             return;
