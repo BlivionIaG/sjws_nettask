@@ -156,20 +156,26 @@ class ProxyPeerBudgetTest {
                 var stripe = budget.peerStripe(peer);
                 var charged = new CountDownLatch(1);
                 budget.setChangeObserver((s, peerBytes, global) -> {
-                    if (s == stripe && peerBytes > 0) {
+                    if (s == stripe && peerBytes > 0 && global > 0) {
                         charged.countDown();
                     }
                 });
                 try {
                     var stream = (Body.Stream) p.handle(request("GET", "/drop", peer)).body();
                     var src = stream.source();
-                    assertNotNull(src.next());
-                    if (budget.peerInFlight(stripe) > 0) {
+                    // Do not take from the source first: next()/take() releases the chunk and can
+                    // drain peerInFlight to 0 before the assert (latch already counted down on the
+                    // earlier charge; async refill has not yet restored it).
+                    if (budget.peerInFlight(stripe) > 0 && budget.inFlight() > 0) {
                         charged.countDown();
                     }
                     assertTrue(charged.await(10, TimeUnit.SECONDS),
-                            "peer never charged; held=" + budget.peerInFlight(stripe));
-                    assertTrue(budget.peerInFlight(stripe) > 0);
+                            "peer never charged; held=" + budget.peerInFlight(stripe)
+                                    + " global=" + budget.inFlight());
+                    assertTrue(budget.peerInFlight(stripe) > 0,
+                            "peer must still hold after charge; held=" + budget.peerInFlight(stripe));
+                    assertTrue(budget.inFlight() > 0,
+                            "global must still hold after charge; inFlight=" + budget.inFlight());
                     src.close();
                 } finally {
                     budget.setChangeObserver(null);
@@ -216,11 +222,12 @@ class ProxyPeerBudgetTest {
             }
         });
         try {
-            if (budget.inFlight() == 0) {
-                return;
+            // Check after arming so a release that raced the install still counts:
+            // either inFlight is already 0, or the observer will see the transition.
+            if (budget.inFlight() != 0) {
+                assertTrue(done.await(10, TimeUnit.SECONDS),
+                        "budget not drained; inFlight=" + budget.inFlight());
             }
-            assertTrue(done.await(10, TimeUnit.SECONDS),
-                    "budget not drained; inFlight=" + budget.inFlight());
         } finally {
             budget.setChangeObserver(null);
         }
