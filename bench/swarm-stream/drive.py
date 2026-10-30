@@ -199,8 +199,12 @@ def run_window(args) -> dict:
         producers_stop.clear()
         consumers_stop.clear()
         in_teardown.clear()
+        g_count = max(1, min(int(getattr(args, "groups", n_streams) or n_streams), n_streams))
+        mapping = []
         for i in range(n_streams):
-            pool = f"{label}{i}"
+            gid = i % g_count
+            mapping.append(gid)
+            pool = f"{label}{gid}"  # Architecture 2026-10-30 15:13
             c = clients[i % len(clients)]
             t_c = threading.Thread(target=consumer, args=(c, pool, args.accept), daemon=True)
             t_p = threading.Thread(target=producer, args=(c, pool), daemon=True)
@@ -296,6 +300,11 @@ def run_window(args) -> dict:
     out = {
         "mode": args.accept,
         "streams": args.streams,
+        "groups": int(args.groups),
+        "streams_per_group_approx": (float(args.streams) / float(args.groups)) if args.groups else 0.0,
+        "stream_to_group": [i % int(args.groups) for i in range(args.streams)],
+        "writer_count": -1,
+        "heap_flags": None,
         "agents": len(clients),
         "window": args.window,
         "elapsed_s": elapsed,
@@ -352,6 +361,8 @@ def main():
     p.add_argument("--warmup", type=float, default=5)
     p.add_argument("--secs", type=float, default=20)
     p.add_argument("--streams", type=int, default=1000)
+    p.add_argument("--groups", type=int, default=0,
+                   help="Task groups; streams map round-robin (0=one group per stream). Architecture 2026-10-30 15:13")
     p.add_argument("--chunk-bytes", type=int, default=1024)
     p.add_argument("--window", type=int, default=8)
     p.add_argument("--drain-timeout", type=float, default=75)
@@ -362,6 +373,10 @@ def main():
     args = p.parse_args()
     if args.accept == "chunked":
         args.accept = "binary"
+    if not args.groups or args.groups <= 0:
+        args.groups = args.streams
+    if args.groups > args.streams:
+        args.groups = args.streams
     run_window(args)
 
 

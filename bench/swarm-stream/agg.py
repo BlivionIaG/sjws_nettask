@@ -196,9 +196,35 @@ def main():
         print(f"Addition1 binary (report-only): mib_s={b.get('mib_s')} p99_us={b.get('p99_us')} "
               f"ttft={b.get('ttft')} inter={b.get('inter_token')}")
 
+
+    # Architecture 2026-10-30 15:13: group-count sweep is report-only (never fails the verdict).
+    sweep_rows = []
+    for p in sorted(out.glob("sweep-*/result.json")):
+        r = load(p)
+        if not r:
+            continue
+        sweep_rows.append({
+            "tag": p.parent.name,
+            "groups": r.get("groups"),
+            "streams": r.get("streams"),
+            "mib_s": r.get("mib_s"),
+            "p99_us": r.get("p99_us"),
+            "writer_count": r.get("writer_count"),
+            "heap_after_gc": r.get("heap_after_gc"),
+            "zallocation_stalls": r.get("zallocation_stalls"),
+            "oom": r.get("oom") or r.get("server_oom"),
+            "heap_flags": r.get("heap_flags"),
+        })
+    if sweep_rows:
+        print("Group sweep (info-only, Architecture 2026-10-30 15:13):")
+        for row in sweep_rows:
+            print(f"  {row['tag']}: groups={row['groups']} mib_s={row['mib_s']} p99_us={row['p99_us']} "
+                  f"writers={row['writer_count']} zstall={row['zallocation_stalls']} oom={row['oom']}")
+
     print(f"VERDICT: {verdict}" + (f" ({'; '.join(reason)})" if reason else ""))
     (out / "agg-summary.json").write_text(json.dumps({
         "verdict": verdict, "reason": reason, "windows": windows, "valid_n": len(valid),
+        "sweep_info_only": sweep_rows,
     }, indent=2) + "\n")
 
 

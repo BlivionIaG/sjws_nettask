@@ -2,6 +2,10 @@
 # one.sh <jar> <workdir> <accept:sse|binary> <out.json> [secs=20] [streams=1000]
 set -euo pipefail
 JAR=$1; WD=$2; ACCEPT=$3; OUT=$4; SECS=${5:-20}; STREAMS=${6:-1000}
+GROUPS=${GROUPS:-$STREAMS}  # Architecture 2026-10-30 15:13; gate default 64
+HEAP_FLAGS=${HEAP:--Xms2g -Xmx2g}
+HEAP=$HEAP_FLAGS
+export HEAP
 WARMUP=${WARMUP:-5}
 NAGENTS=${NAGENTS:-20}
 export JAVA_HOME=${JAVA_HOME:-$HOME/jdk25/jdk-25.0.4.1+1}
@@ -60,6 +64,7 @@ if [ "$LOADGEN" = java ]; then
   taskset -c 0-1 nice -n 10 java "$HERE_DIR/StreamLoad.java" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
+    --groups "$GROUPS" \
     --out "$OUT" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
     --server-pid "$SPID" \
     --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}"
@@ -69,7 +74,13 @@ else
   taskset -c 0-1 nice -n 10 python3 "$HERE_DIR/drive.py" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
+    --groups "$GROUPS" \
     --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}"
+fi
+
+# Architecture 2026-10-30 15:13: writer_count + heap_flags into result.json
+if [ -f "$OUT" ]; then
+  python3 "$HERE_DIR/amend-result.py" "$OUT" "$WD/swarm" "$HEAP_FLAGS" "$GROUPS" || true
 fi
 curl -sf "http://127.0.0.1:$PORT/metrics" > "$WD/metrics.txt" || true
 # flag-off check: when CREDIT_OFF=1, stream series must be absent

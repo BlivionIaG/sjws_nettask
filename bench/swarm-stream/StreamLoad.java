@@ -52,8 +52,11 @@ public class StreamLoad {
     String base, tokensFile, out, accept = "binary";
     double warmup = 5, secs = 20, drainTimeout = 75;
     int streams = 1000, chunkBytes = 1024, window = 8;
+    /** Task groups for round-robin stream mapping; 0 ⇒ one group per stream (legacy). Architecture 2026-10-30 15:13. */
+    int groups = 0;
     int serverPid = 0; // optional: sample server CPU from /proc/<pid>/stat
     int maxConnectionsPerIp = 0; // A1: recorded from gate harness (0 = unset)
+    String heapFlags = ""; // inceptor 2026-10-30 15:14: record, never retune
     /** Generator CPUs saturated if client %CPU of wall >= this (2 pinned CPUs → 200% = full). */
     double genSatPct = 180.0;
   }
@@ -87,7 +90,7 @@ public class StreamLoad {
     AtomicLong producerTransportRetries = new AtomicLong();
     AtomicLong consumerConnectRetries = new AtomicLong();
 
-    // Warmup
+    // Warmup (same group count; fewer streams)
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w",
         producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries);
@@ -124,7 +127,7 @@ public class StreamLoad {
     });
 
     long t0 = System.nanoTime();
-    wave(http, args, tokens, args.streams, args.secs, "g",
+    int[] streamToGroup = wave(http, args, tokens, args.streams, args.secs, "g",
         producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries);
     double wall = (System.nanoTime() - t0) / 1e9;
@@ -135,6 +138,10 @@ public class StreamLoad {
     Map<String, Double> counters = drain.counters;
     Result r = new Result();
     r.mode = args.accept; r.streams = args.streams; r.agents = tokens.size(); r.window = args.window;
+    r.groups = Math.max(1, Math.min(args.groups > 0 ? args.groups : args.streams, args.streams));
+    r.streamToGroup = streamToGroup;
+    r.writerCount = -1; // one.sh fills from swarm dir listing when known
+    r.heapFlags = args.heapFlags;
     r.maxConnectionsPerIp = args.maxConnectionsPerIp;
     r.drainTimedOut = drain.timedOut;
     r.refusedPerIp = counters.getOrDefault("sjws_connections_refused_per_ip_total", 0.0).longValue();
@@ -183,16 +190,20 @@ public class StreamLoad {
     return r;
   }
 
-  static void wave(HttpClient http, Args args, List<String> tokens, int n, double duration, String label,
+  static int[] wave(HttpClient http, Args args, List<String> tokens, int n, double duration, String label,
       AtomicBoolean producersStop, AtomicBoolean consumersStop, AtomicBoolean inTeardown,
       LongAdder bytesRx, ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429,
       AtomicLong producerTransportRetries, AtomicLong consumerConnectRetries) throws Exception {
     producersStop.set(false); consumersStop.set(false); inTeardown.set(false);
+    int gCount = Math.max(1, Math.min(args.groups > 0 ? args.groups : n, n));
+    int[] mapping = new int[n];
     List<Thread> threads = new ArrayList<>(n * 2);
     for (int i = 0; i < n; i++) {
-      String pool = label + i;
+      int gid = i % gCount;
+      mapping[i] = gid;
+      String pool = label + gid; // Architecture 2026-10-30 15:13: G groups, streams round-robin
       String tok = tokens.get(i % tokens.size());
       int idx = i;
       threads.add(Thread.startVirtualThread(() -> {
@@ -212,6 +223,7 @@ public class StreamLoad {
     consumersStop.set(true);
     Thread.sleep(2000);
     for (Thread t : threads) t.join(30_000);
+    return mapping;
   }
 
   static void producer(HttpClient http, Args args, String token, String pool,
@@ -624,6 +636,7 @@ public class StreamLoad {
         case "--warmup" -> args.warmup = Double.parseDouble(a[++i]);
         case "--secs" -> args.secs = Double.parseDouble(a[++i]);
         case "--streams" -> args.streams = Integer.parseInt(a[++i]);
+        case "--groups" -> args.groups = Integer.parseInt(a[++i]);
         case "--chunk-bytes" -> args.chunkBytes = Integer.parseInt(a[++i]);
         case "--window" -> args.window = Integer.parseInt(a[++i]);
         case "--drain-timeout" -> args.drainTimeout = Double.parseDouble(a[++i]);
@@ -635,6 +648,11 @@ public class StreamLoad {
     }
     if (args.base == null || args.tokensFile == null || args.out == null) throw new IllegalArgumentException("need --base --tokens-file --out");
     if ("chunked".equals(args.accept)) args.accept = "binary";
+    if (args.groups <= 0) args.groups = args.streams; // 1:1 legacy
+    if (args.groups > args.streams) args.groups = args.streams;
+    String heapEnv = System.getenv("HEAP");
+    if (heapEnv == null || heapEnv.isBlank()) heapEnv = System.getenv("HEAP_FLAGS");
+    args.heapFlags = heapEnv == null ? "" : heapEnv.trim();
     if (args.serverPid <= 0) {
       String env = System.getenv("SERVER_PID");
       if (env != null && !env.isBlank()) args.serverPid = Integer.parseInt(env.trim());
@@ -643,7 +661,9 @@ public class StreamLoad {
   }
 
   static final class Result {
-    String mode; int streams, agents, window, chunkSamples, errorCount, teardownErrorCount, creditWaitN;
+    String mode; int streams, agents, window, groups, chunkSamples, errorCount, teardownErrorCount, creditWaitN, writerCount;
+    int[] streamToGroup; // measure-wave mapping stream index → group id
+    String heapFlags;
     long bytes, creditStalls, requests, producerTransportRetries, consumerConnectRetries, refusedPerIp, openSessionsAfterDrain;
     int maxConnectionsPerIp;
     double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall, serverCpuSec, serverCpuPctOfWall;
@@ -692,6 +712,21 @@ public class StreamLoad {
       field(sb, "refused_per_ip", refusedPerIp, true);
       field(sb, "drain_timed_out", drainTimedOut, true);
       field(sb, "open_sessions_after_drain", openSessionsAfterDrain, true);
+      field(sb, "groups", groups, true);
+      field(sb, "streams_per_group_approx", streams > 0 && groups > 0 ? (double) streams / groups : 0, true);
+      field(sb, "writer_count", writerCount, true);
+      field(sb, "heap_flags", quote(heapFlags == null ? "" : heapFlags), true);
+      sb.append("  \"stream_to_group\":");
+      if (streamToGroup == null) sb.append("[]");
+      else {
+        sb.append("[");
+        for (int i = 0; i < streamToGroup.length; i++) {
+          if (i > 0) sb.append(",");
+          sb.append(streamToGroup[i]);
+        }
+        sb.append("]");
+      }
+      sb.append(",\n");
       sb.append("  \"credit_wait\":{")
         .append("\"n\":").append(creditWaitN)
         .append(",\"total_s\":").append(creditWaitTotal)
