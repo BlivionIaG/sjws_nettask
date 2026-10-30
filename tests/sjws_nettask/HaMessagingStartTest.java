@@ -198,12 +198,27 @@ class HaMessagingStartTest {
      * #274 MC-B1 on the production path: node a took 3 records on {@code orders} with HA off; restarting it with
      * replication on is refused (OptionalModule.Refused, exit 64) instead of forking the topic's offsets.
      */
+    /**
+     * #297 covered {@link #threeVoterConfigStartsAndReplicates} with bind retries; this refusal path still
+     * used TOCTOU {@link EphemeralPorts#probe()} and wrapped {@code HaMessagingStart.install} in
+     * {@code assertThrows(Refused)}, so a stolen Raft/HTTP port surfaced as the wrong exception type
+     * (verify1 on #316: expected Refused, was BindException). Retry the whole scenario with fresh ports.
+     */
     @Test
     @Timeout(60)
     void replicationOnAnExistingLocalTopicIsRefused() throws Exception {
+        EphemeralPorts.withBindRetry("HaMessagingStartTest.refusal", () -> {
+            replicationOnAnExistingLocalTopicIsRefusedOnce();
+            return null;
+        });
+    }
+
+    private void replicationOnAnExistingLocalTopicIsRefusedOnce() throws Exception {
+        // Fresh name each attempt so a prior bind failure does not leave topic state for the next try.
+        var name = "pre-" + Long.toHexString(System.nanoTime());
         int httpPort = freePort();
-        var plain = load("pre", "# HA off\n", httpPort);
-        var mod = messaging("pre");
+        var plain = load(name, "# HA off\n", httpPort);
+        var mod = messaging(name);
         try (var server = SjwsServer.start(plain, OptionalModules.contributors(mod))) {
             var client = HttpClient.newHttpClient();
             for (int i = 0; i < 3; i++) {
@@ -217,8 +232,8 @@ class HaMessagingStartTest {
         }
         int[] raft = {freePort(), freePort(), freePort()};
         int[] http = {httpPort, freePort(), freePort()};
-        var on = load("pre", cluster("a", raft, http, "on"), httpPort);
-        var again = messaging("pre");
+        var on = load(name, cluster("a", raft, http, "on"), httpPort);
+        var again = messaging(name);
         try {
             var refused = assertThrows(OptionalModule.Refused.class, () -> HaMessagingStart.install(on, again, System.err));
             assertTrue(refused.getMessage().contains("replicated topic orders already holds 3 local record(s)"),
