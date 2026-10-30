@@ -72,6 +72,11 @@ class AccessTargetMaskTest {
         assertEquals("/x?API_KEY=" + SECRET, AccessTargetMask.mask("/x?API_KEY=" + SECRET, names));
         assertEquals("/x?api_key=***", AccessTargetMask.mask("/x?api_key=", names));
         assertEquals("/no-query", AccessTargetMask.mask("/no-query", names));
+        // Fragment ends the query; a later &-pair is not scanned (URI rules).
+        assertEquals("/x?api_key=***#frag&api_key=" + SECRET,
+                AccessTargetMask.mask("/x?api_key=one#frag&api_key=" + SECRET, names));
+        assertEquals("/x?z=1&api_key=***&z=2", AccessTargetMask.mask("/x?z=1&api_key=one&z=2", names));
+        assertSame("/x?only", AccessTargetMask.mask("/x?only", names)); // no '=' value
     }
 
     @Test
@@ -143,6 +148,55 @@ class AccessTargetMaskTest {
             get(server, "/index.html?api_key=" + SECRET + "&after=1");
             var after = awaitLog(log, "after=1");
             assertTrue(after.contains("api_key=" + SECRET), after);
+        }
+    }
+
+    @Test
+    void configReloadLeavesLiveFilterDocumentNames() throws Exception {
+        Files.writeString(dir.resolve("index.html"), "ok");
+        var log = dir.resolve("live-doc.log");
+        var yaml = dir.resolve("sjws-live.yaml");
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: %s
+                  access_log: %s
+                middleware:
+                  - name: api-key
+                    options:
+                      keys: %s
+                      query: from_mw
+                """.formatted(dir.toAbsolutePath(), log.toAbsolutePath(), SECRET));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded)) {
+            var control = server.chainControl(GatewayFilters.install(RequestFilters.create()), Set.of());
+            control.apply(FilterDocument.of(1, List.of(
+                    FilterDocument.FilterEntry.of("api-key", 0,
+                            Map.of("keys", SECRET, "query", "from_doc"), FilterScope.all()))));
+            get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET);
+            var text = awaitLog(log, "from_doc=***");
+            assertTrue(text.contains("from_doc=***"), text);
+            assertTrue(text.contains("from_mw=" + SECRET), text);
+
+            // Config still advertises from_mw; the live filter document must keep owning the names.
+            Files.writeString(yaml, """
+                    server:
+                      port: 0
+                      root: %s
+                      access_log: %s
+                    middleware:
+                      - name: api-key
+                        options:
+                          keys: %s
+                          query: from_mw
+                    """.formatted(dir.toAbsolutePath(), log.toAbsolutePath(), SECRET));
+            var reloaded = server.reload();
+            assertTrue(reloaded.applied(), reloaded.errors().toString());
+            get(server, "/index.html?from_doc=" + SECRET + "&after=1");
+            var after = awaitLog(log, "after=1");
+            assertTrue(after.contains("from_doc=***"), after);
+            assertFalse(after.contains("from_doc=" + SECRET), after);
         }
     }
 
