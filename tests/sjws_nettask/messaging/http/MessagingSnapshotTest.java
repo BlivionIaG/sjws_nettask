@@ -145,11 +145,12 @@ class MessagingSnapshotTest {
     }
 
     /**
-     * Posts {@code n} unique records starting at {@code from}. Re-resolves the ready leader and retries transient
-     * 503/307 (not-leader / not-ready / installing) the way clients must: those refuse before the append. Does not
-     * retry outcome-unknown (that write may already be committed; these posts have no producer id).
+     * Posts {@code n} unique records starting at {@code from}. Prefers {@code preferred} while it is the ready
+     * leader; on transient 503/307 (not-leader / not-ready / installing) re-resolves, retries with a bound, and
+     * steps between attempts (same idea as the __offsets electing loop). Does not retry outcome-unknown. Returns the
+     * node index that last accepted a record so callers can refresh follower = 1 - leader.
      */
-    void produce(int preferred, int from, int n) throws Exception {
+    int produce(int preferred, int from, int n) throws Exception {
         for (int k = from; k < from + n; k++) {
             int kk = k;
             Response r = null;
@@ -186,6 +187,7 @@ class MessagingSnapshotTest {
             }
             assertEquals(200, r.status());
         }
+        return preferred;
     }
 
     @Test
@@ -193,8 +195,8 @@ class MessagingSnapshotTest {
         start(LogRetention.NONE);
         int l = leader("t");
         assertTrue(l >= 0);
+        l = produce(l, 0, 5);
         int f = 1 - l;
-        produce(l, 0, 5);
         // Offsets are STRICT (two data copies in 2+1): committed while both data nodes are up.
         for (int g = 0; g < 30; g++) {
             int gg = g;
@@ -207,7 +209,7 @@ class MessagingSnapshotTest {
         }
         until(() -> safeEnd(f, "t") >= 5 && safeEnd(f, LogOffsets.TOPIC) >= 30, "follower in sync");
         cut(f);
-        produce(l, 5, 60);
+        l = produce(l, 5, 60);
         assertTrue(SnapshotTesting.snapshotNow(topics.get(l).get("t", false).replica()));
         assertTrue(SnapshotTesting.snapshotNow(topics.get(l).get(LogOffsets.TOPIC, false).replica()));
         heal(f);
@@ -245,8 +247,10 @@ class MessagingSnapshotTest {
     @Test
     void retentionPassIsOneReplicatedCut() throws Exception {
         start(new LogRetention(4096, 0));
-        int l = leader("t"), f = 1 - l;
-        produce(l, 0, 120);
+        int l = leader("t");
+        assertTrue(l >= 0, "topic leader elected before produce");
+        l = produce(l, 0, 120);
+        int f = 1 - l;
         until(() -> safeEnd(f, "t") >= 120, "follower at 120");
         assertEquals(0, topics.get(f).enforceRetention(), "a follower proposes nothing");
         topics.get(l).enforceRetention();
@@ -272,7 +276,7 @@ class MessagingSnapshotTest {
         start(new LogRetention(64L << 20, 0)); // age off; bytes high so retention does not cut for this test
         int l = leader("t");
         assertTrue(l >= 0, "topic leader elected before produce");
-        produce(l, 0, 80);
+        l = produce(l, 0, 80);
         var leadLog = topics.get(l).get("t", false);
         var segs = leadLog.log().segments();
         assertFalse(segs.isEmpty());
