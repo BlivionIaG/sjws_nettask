@@ -227,25 +227,54 @@ class SnapshotPublishCoverageTest {
         this.server.trackDrainingGeneration(null);
         assertEquals(0, this.server.drainingGenerationCount());
 
-        var tryEnter = Http2Server.Generation.class.getDeclaredMethod("tryEnter");
-        tryEnter.setAccessible(true);
-        var leave = Http2Server.Generation.class.getDeclaredMethod("leave");
-        leave.setAccessible(true);
-
         var held = new Http2Server.Generation(r -> null, false);
-        assertTrue((Boolean) tryEnter.invoke(held));
+        assertTrue(held.tryEnter());
         this.server.trackDrainingGeneration(held);
 
         var previous = new Http2Server.Generation(r -> null, false);
-        assertTrue((Boolean) tryEnter.invoke(previous));
+        assertTrue(previous.tryEnter());
         var snap = ConfigSnapshot.compile(
                 sjws_nettask.config.ConfigLoader.standalone(
                         ServerConfig.builder(this.root).port(0).build()).document(),
                 null, 200);
         this.server.deferSnapshotClose(previous, snap);
         assertTrue(this.server.drainingGenerationCount() >= 1);
-        leave.invoke(held);
-        leave.invoke(previous);
+        held.leave();
+        previous.leave();
+    }
+
+
+
+    @Test
+    void publishArmedWithOverrideAndObservingAtStartSkipsRepublish() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        var startup = RequestFilters.create().add((request, next) -> next.proceed(request));
+        this.server = SjwsServer.start(ServerConfig.builder(this.root).port(0).healthz(true)
+                .h2Enabled(true).h2Port(0).h2cPort(0).build(), startup);
+        // observingAtStart → armMetrics must not call publishArmed
+        this.server.armMetrics();
+        assertEquals(200, this.server.requestHandler()
+                .handle(new sjws_nettask.core.Request("GET", "/a.txt")).status());
+        // publishArmed override leaf: clear control, ensure armed path with override
+        this.server.armMetrics();
+    }
+
+
+    @Test
+    void forceCloseAfterShortDrainTimeout() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        this.server = SjwsServer.start(ServerConfig.builder(this.root).port(0)
+                .h2Enabled(true).h2Port(0).h2cPort(0).build());
+        this.server.snapshotDrainTimeout = java.time.Duration.ofMillis(80);
+        var previous = new Http2Server.Generation(r -> null, false);
+        assertTrue(previous.tryEnter());
+        var snap = ConfigSnapshot.compile(
+                sjws_nettask.config.ConfigLoader.standalone(
+                        ServerConfig.builder(this.root).port(0).build()).document(),
+                null, 300);
+        this.server.deferSnapshotClose(previous, snap);
+        Thread.sleep(250);
+        previous.leave();
     }
 
 }

@@ -115,6 +115,8 @@ public final class SjwsServer implements AutoCloseable {
             new java.util.ArrayDeque<>();
     private final ReentrantLock drainLock = new ReentrantLock();
     private static final int MAX_DRAINING_GENERATIONS = 4;
+    /** Bound for deferred snapshot close; shortened in tests to cover the force path. */
+    volatile java.time.Duration snapshotDrainTimeout = java.time.Duration.ofSeconds(30);
     /** Set only by a data-role bootstrap. The field type is {@code Object} so standalone does not name {@code cp}. */
     private Object controlPlane;
     /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
@@ -1036,9 +1038,10 @@ public final class SjwsServer implements AutoCloseable {
             g.whenQuiesced(release);
         }
         release.run(); // drop registration barrier
+        var drainTimeout = this.snapshotDrainTimeout;
         Thread.ofVirtual().name("sjws-snapshot-close").start(() -> {
             try {
-                Thread.sleep(java.time.Duration.ofSeconds(30));
+                Thread.sleep(drainTimeout);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -1046,7 +1049,7 @@ public final class SjwsServer implements AutoCloseable {
             if (once.get()) {
                 return;
             }
-            System.err.println("WARN: forcing close of replaced config snapshot after 30s drain "
+            System.err.println("WARN: forcing close of replaced config snapshot after drain timeout "
                     + "(in-flight h2 work on the previous generation was cut; errors must not leak secrets)");
             close.run();
         });

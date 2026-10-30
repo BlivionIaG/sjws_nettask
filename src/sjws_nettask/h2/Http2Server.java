@@ -162,7 +162,7 @@ public final class Http2Server implements Transport {
          * Pin this generation for a Task. Fails when {@link #whenQuiesced} has retired it so a
          * close cannot run while a stream has read this instance but not yet entered (B1).
          */
-        boolean tryEnter() {
+        public boolean tryEnter() {
             for (;;) {
                 int s = this.state.get();
                 if ((s & RETIRED) != 0) {
@@ -174,7 +174,7 @@ public final class Http2Server implements Transport {
             }
         }
 
-        void leave() {
+        public void leave() {
             int s = this.state.decrementAndGet();
             if ((s & ~RETIRED) == 0) {
                 fireQuiesce();
