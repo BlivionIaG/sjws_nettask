@@ -130,4 +130,48 @@ class SnapshotPublishCoverageTest {
         Handler h = this.server.armedAround(this.server.handler());
         assertEquals(200, h.handle(new sjws_nettask.core.Request("GET", "/a.txt")).status());
     }
+
+    @Test
+    void armSnapshotAndMetricsWithoutH2() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        // No HTTP/2: armSnapshot / publishArmed take the non-Http2Server branches.
+        this.server = SjwsServer.start(ServerConfig.builder(this.root).port(0).build());
+        this.server.armMetrics();
+        assertTrue(this.server.metricsSnapshot().requests() >= 0);
+        var filters = RequestFilters.create();
+        GatewayFilters.install(filters);
+        this.server.chainControl(filters, Set.of()).apply(FilterDocument.of(1, List.of(
+                FilterDocument.FilterEntry.of("api-key", 0, Map.of("keys", "k", "header", "x-api-key"),
+                        FilterScope.all()))));
+        assertEquals(401, this.server.filterChain().handle(
+                new sjws_nettask.core.Request("GET", "/a.txt")).status());
+    }
+
+    @Test
+    void observingAtStartArmedAround() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        this.server = SjwsServer.start(ServerConfig.builder(this.root).port(0).healthz(true)
+                .h2Enabled(true).h2Port(0).h2cPort(0).build());
+        Handler wrapped = this.server.armedAround(this.server.handler());
+        assertEquals(200, wrapped.handle(new sjws_nettask.core.Request("GET", "/a.txt")).status());
+        assertEquals(200, this.server.requestHandler().handle(
+                new sjws_nettask.core.Request("GET", "/healthz")).status());
+    }
+
+    @Test
+    void liveNeedsBodiesWhenControlLiveEvenIfArmedClearedPath() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        this.server = SjwsServer.start(ServerConfig.builder(this.root).port(0)
+                .h2Enabled(true).h2Port(0).h2cPort(0).build());
+        var filters = RequestFilters.create();
+        GatewayFilters.install(filters);
+        // Apply without prior armMetrics — control.isLive alone
+        this.server.chainControl(filters, Set.of()).apply(FilterDocument.of(1, List.of(
+                FilterDocument.FilterEntry.of("api-key", 0, Map.of("keys", "k", "header", "x-api-key"),
+                        FilterScope.all()))));
+        assertTrue(this.server.liveNeedsBodies());
+        assertEquals(401, this.server.armedAround(this.server.handler())
+                .handle(new sjws_nettask.core.Request("GET", "/a.txt")).status());
+    }
+
 }
