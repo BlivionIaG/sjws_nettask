@@ -24,6 +24,7 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.LongSupplier;
 
@@ -82,6 +83,10 @@ record Snapshots(long everyEntries, long tailEntries, int chunkBytes, long bytes
         final Map<String, InetSocketAddress> peers;
         final ScheduledExecutorService exec;
         final LongSupplier clockMs;
+        /** Node-wide (#315): installs that gave up after the pin-round budget. */
+        final AtomicLong installPinExhausted = new AtomicLong();
+        /** Node-wide (#315 N2): consensus images abandoned as oversized. */
+        final AtomicLong installOversizedAbandoned = new AtomicLong();
 
         Runtime(Snapshots settings, Path stateDir, byte[] key, Map<String, InetSocketAddress> peers, LongSupplier clockMs)
                 throws IOException {

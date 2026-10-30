@@ -470,6 +470,7 @@ final class SnapshotTransfer {
             }
             // #295 (a): refuse on the authenticated manifest size before any chunk hits the wire or disk.
             if (maxInstallBytes > 0 && snap.dataBytes() > maxInstallBytes) {
+                clearStagingQuietly(staging); // #315 N4: drop anything left from a prior attempt
                 throw new Oversized("install of " + snap.dataBytes() + " bytes exceeds ha.snapshot.max_install_bytes "
                         + maxInstallBytes);
             }

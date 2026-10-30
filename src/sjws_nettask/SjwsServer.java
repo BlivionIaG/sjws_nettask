@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.IntSupplier;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import sjws_nettask.ha.HaRuntime;
 import sjws_nettask.ha.HaSettings;
@@ -1336,6 +1337,15 @@ public final class SjwsServer implements AutoCloseable {
      */
     public void attachCredentialQueryParams(String[] names) {
         this.slot.attachCredentialQueryParams(names);
+    }
+
+    /**
+     * Attach msgrepl install counters (#315 B1 / N5). Suppliers are stored on the {@link ObserverSlot}
+     * and copied onto a recording observer when observation arms; {@link RequestObserver#NONE} is never
+     * mutated. Null resets that series to 0. Does not install the observe filter.
+     */
+    public void attachMsgreplInstallCounters(LongSupplier pinExhausted, LongSupplier oversizedAbandoned) {
+        this.slot.attachMsgreplInstallCounters(pinExhausted, oversizedAbandoned);
     }
 
     /**

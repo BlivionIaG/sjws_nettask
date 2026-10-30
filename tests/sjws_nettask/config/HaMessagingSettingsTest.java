@@ -302,10 +302,17 @@ class HaMessagingSettingsTest {
         assertTrue(error(h + "    log_segment_bytes: 10\n").contains("ha.snapshot.log_segment_bytes"));
         assertTrue(error(h + "    max_install_bytes: -1\n").contains("ha.snapshot.max_install_bytes"));
         // #295: 0 is the explicit unlimited opt-in; the default is 4 GiB.
-        var unlimited = load("ha:\n  enabled: true\n  messaging: on\n" + THREE
-                + "  snapshot:\n    max_install_bytes: 0\n").haMessaging().snapshot();
-        assertEquals(0, unlimited.maxInstallBytes());
+        // #315 N1: explicit 0 emits a startup WARN; omitting the key does not.
+        var unlimitedLoaded = load("ha:\n  enabled: true\n  messaging: on\n" + THREE
+                + "  snapshot:\n    max_install_bytes: 0\n");
+        assertEquals(0, unlimitedLoaded.haMessaging().snapshot().maxInstallBytes());
+        assertTrue(unlimitedLoaded.warnings().stream().anyMatch(w -> w.contains("max_install_bytes is 0")
+                && w.contains("unlimited")), unlimitedLoaded.warnings().toString());
         assertEquals(4L << 30, HaMessagingSettings.Snapshot.DEFAULT.maxInstallBytes());
+        var defaultCap = load("ha:\n  enabled: true\n  messaging: on\n" + THREE + "  snapshot:\n    every_entries: 100\n");
+        assertEquals(4L << 30, defaultCap.haMessaging().snapshot().maxInstallBytes());
+        assertTrue(defaultCap.warnings().stream().noneMatch(w -> w.contains("max_install_bytes is 0")),
+                defaultCap.warnings().toString());
         assertTrue(error("ha:\n  enabled: true\n  messaging: off\n  snapshot: 3\n").contains("ha.snapshot"));
     }
 
