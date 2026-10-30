@@ -3,6 +3,7 @@ package sjws_nettask.swarm;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -11,6 +12,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.Test;
@@ -147,4 +149,62 @@ class SwarmCloseTest {
         left.removeAll(before);
         assertEquals(List.of(), stillAlive(left), "a thread outlived close");
     }
+
+    /**
+     * Codex P2: deregistration must not use tryLock. Holding {@code lifecycle} (as register or close does)
+     * while the caller closes a keeper used to skip the remove; the closed keeper stayed in {@code onClose}
+     * until swarm close. Asserts the hook is gone and the keeper thread is dead even under that contention.
+     */
+    @Test
+    void keeperCloseDeregistersEvenWhenLifecycleLockIsHeld() throws Exception {
+        var before = swarmThreads();
+        var s = Swarm.open(this.dir, "n-p2", 1);
+        var k = s.leaseKeeper(5_000, (t, r) -> { }).start(1_000);
+        assertTrue(closeHookCount(s) >= 1, "keeper registered a close hook");
+
+        var lifecycle = lifecycleLock(s);
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var holder = Thread.ofPlatform().name("swarmclosetest-hold-lifecycle").start(() -> {
+            lifecycle.lock();
+            try {
+                held.countDown();
+                assertTrue(release.await(30, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                lifecycle.unlock();
+            }
+        });
+        assertTrue(held.await(10, TimeUnit.SECONDS), "holder took lifecycle");
+
+        k.close(); // removeOnClose must succeed even though lifecycle is held
+        assertEquals(0, closeHookCount(s), "closed keeper must leave onClose even under lifecycle contention");
+        var keeperThreads = swarmThreads().stream()
+                .filter(t -> t.getName().startsWith("swarm-lease-keeper"))
+                .filter(t -> !before.contains(t))
+                .collect(Collectors.toSet());
+        assertEquals(List.of(), stillAlive(keeperThreads), "keeper thread must end on close");
+
+        release.countDown();
+        holder.join(10_000);
+        assertTrue(!holder.isAlive());
+        s.close();
+        var left = swarmThreads();
+        left.removeAll(before);
+        assertEquals(List.of(), stillAlive(left), "threads left after Swarm.close()");
+    }
+
+    static ReentrantLock lifecycleLock(Swarm s) throws Exception {
+        Field f = Swarm.class.getDeclaredField("lifecycle");
+        f.setAccessible(true);
+        return (ReentrantLock) f.get(s);
+    }
+
+    static int closeHookCount(Swarm s) throws Exception {
+        Field f = Swarm.class.getDeclaredField("onClose");
+        f.setAccessible(true);
+        return ((java.util.Set<?>) f.get(s)).size();
+    }
+
 }

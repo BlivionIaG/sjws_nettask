@@ -38,8 +38,13 @@ public final class Swarm implements AutoCloseable {
     private final java.util.concurrent.locks.ReentrantLock lifecycle = new java.util.concurrent.locks.ReentrantLock();
     /** Guarded by {@link #lifecycle}. */
     private boolean closed;
-    /** Close hooks of components started on this swarm (keepers, the stream sweep); guarded by {@link #lifecycle}. */
-    private final java.util.LinkedHashSet<Runnable> onClose = new java.util.LinkedHashSet<>();
+    /**
+     * Close hooks of components started on this swarm (keepers, the stream sweep).
+     * Concurrent so a keeper can deregister while {@link #close} holds {@link #lifecycle} (or while another
+     * register races): a {@code tryLock} skip would leak the closed keeper until swarm close (#181 / Codex P2).
+     * Adds still go through {@link #lifecycle} with the {@code closed} check.
+     */
+    private final java.util.Set<Runnable> onClose = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private Swarm(Topics topics, String id, long producerId, long idleCloseMs) {
         this.topics = topics;
@@ -116,13 +121,7 @@ public final class Swarm implements AutoCloseable {
     }
 
     private void removeOnClose(Runnable hook) {
-        if (this.lifecycle.tryLock()) { // close holds it while it runs the hooks: nothing to remove then
-            try {
-                this.onClose.remove(hook);
-            } finally {
-                this.lifecycle.unlock();
-            }
-        }
+        this.onClose.remove(hook); // lock-free: must not wait on lifecycle (close holds it while running hooks)
     }
 
     @Override
