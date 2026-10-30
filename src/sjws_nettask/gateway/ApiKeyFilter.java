@@ -21,6 +21,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import sjws_nettask.core.MiddlewareSpec;
+import sjws_nettask.core.QueryPairs;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestFilter;
 import sjws_nettask.core.Response;
@@ -98,30 +99,18 @@ public final class ApiKeyFilter implements RequestFilter {
     }
 
     static String query(String target, String name) {
-        int q = target.indexOf('?');
-        if (q < 0) {
+        if (target == null || name == null) {
             return null;
         }
-        int i = q + 1;
-        int n = target.length();
-        while (i < n) {
-            int amp = target.indexOf('&', i);
-            int end = amp < 0 ? n : amp;
-            int eq = target.indexOf('=', i);
-            if (eq >= i && eq < end && eq - i == name.length() && target.regionMatches(i, name, 0, name.length())) {
-                int hash = target.indexOf('#', eq + 1);
-                int valueEnd = end;
-                if (hash >= 0 && hash < valueEnd) {
-                    valueEnd = hash;
-                }
-                return target.substring(eq + 1, valueEnd);
+        final String[] found = {null};
+        QueryPairs.scan(target, (t, nameStart, nameEnd, valueStart, valueEnd) -> {
+            if (nameEnd - nameStart == name.length() && t.regionMatches(nameStart, name, 0, name.length())) {
+                found[0] = t.substring(valueStart, valueEnd);
+                return true;
             }
-            if (amp < 0) {
-                return null;
-            }
-            i = amp + 1;
-        }
-        return null;
+            return false;
+        });
+        return found[0];
     }
 
     private static boolean matches(byte[][] hashes, byte[] presented) {

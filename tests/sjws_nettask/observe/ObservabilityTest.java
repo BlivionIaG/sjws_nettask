@@ -338,7 +338,7 @@ class ObservabilityTest {
         assertNull(RequestObserver.NONE.intercept("GET", "/healthz", true));
         var before = RequestObserver.NONE.metrics().snapshot().requests();
         RequestObserver.NONE.complete(200, RequestObserver.HTTP_1_1, 1, 1);
-        RequestObserver.NONE.complete(200, RequestObserver.HTTP_1_1, 1, 1, "r", "GET", "/", "HTTP/1.1", "-", "-");
+        RequestObserver.NONE.complete(200, RequestObserver.HTTP_1_1, 1, 1, "r", "GET", "/", "HTTP/1.1", "-", "-", AccessTargetMask.NONE);
         assertEquals(before, RequestObserver.NONE.metrics().snapshot().requests());
         assertFalse(RequestObserver.NONE.logging());
         assertFalse(RequestObserver.NONE.logHeaders());

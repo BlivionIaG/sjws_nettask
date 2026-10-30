@@ -62,6 +62,7 @@ import sjws_nettask.h3.Http3Server;
 import sjws_nettask.observe.ClusterStatus;
 import sjws_nettask.observe.LabelSource;
 import sjws_nettask.observe.ObserveRequestFilter;
+import sjws_nettask.observe.AccessTargetMask;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.observe.ServerMetrics;
@@ -157,6 +158,7 @@ public final class SjwsServer implements AutoCloseable {
             initial = RequestObserver.open(config);
         }
         this.slot = new ObserverSlot(initial);
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(snapshot.document().middleware()));
         this.observingAtStart = initial.recording();
         FilterChain built;
         Handler selected;
@@ -694,6 +696,7 @@ public final class SjwsServer implements AutoCloseable {
         }
         if (write) {
             persistLastGood(result.snapshot().document());
+            syncCredentialQueryParamsFromConfig(result.snapshot().document());
         }
         return result;
     }
@@ -762,6 +765,7 @@ public final class SjwsServer implements AutoCloseable {
                 }
                 persistLastGood(published.snapshot().document());
                 var appliedMw = published.snapshot().document().middleware();
+                syncCredentialQueryParamsFromConfig(published.snapshot().document());
                 sjws_nettask.config.MiddlewareSecrets.logStartupWarn(
                         System.getLogger(SjwsServer.class.getName()), appliedMw, null, null);
             }
@@ -1252,6 +1256,22 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     /**
+     * Refresh access-log credential query names from the config {@code middleware} list only while
+     * no live {@link ChainControl} document owns them. Once {@link #chainControl} has published
+     * (isLive), names come solely from {@link #armSnapshot} via the effective
+     * {@link sjws_nettask.core.FilterDocument} — never from the startup override or a later
+     * config middleware list — so a control-plane remove/add of {@code api-key} cannot leave
+     * stale names or resurrect ones the document cleared (#302 chainLeaf rebind).
+     */
+    private void syncCredentialQueryParamsFromConfig(sjws_nettask.config.ConfigDocument document) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return;
+        }
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
+    }
+
+    /**
      * Publishes {@code handler} on the HTTP/2 transport. {@link sjws_nettask.h2.Http2Server} gets
      * the generation-aware overload ({@code bodies} + drain tracking). Any other non-null
      * {@link Transport} (custom {@code h2Factory}) gets {@link Transport#armHandler(Handler)} so
@@ -1265,7 +1285,17 @@ public final class SjwsServer implements AutoCloseable {
         }
     }
 
+    /**
+     * Stores the compiled snapshot where every transport already reads its handler. One volatile
+     * write per transport; the request path does not enter {@link ChainControl}.
+     * Credential query names are refreshed from {@code control.document()} (the FilterDocument
+     * just applied), not from startup middleware / override. HTTP/2 publish goes through
+     * {@link #armH2} (generation + custom factory).
+     */
     private void armSnapshot(Handler handler) {
+        // onPublish runs only after {@link #chainControl} assigned {@link #control}, and after
+        // apply/pinOuter has written {@link ChainControl#document()}.
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromDocument(this.control.document()));
         this.armed.set(handler);
         if (this.h3 != null) {
             this.h3.armHandler(handler);
@@ -1297,6 +1327,15 @@ public final class SjwsServer implements AutoCloseable {
      */
     public void attachGatewayMetrics(LabelSource labels) {
         this.slot.attachLabels(labels);
+    }
+
+    /**
+     * Sets the api-key query parameter names whose values are masked in the access log.
+     * Null or empty clears masking. Does not install the observe filter. Prefer letting
+     * {@link #chainControl} refresh these from each applied filter document.
+     */
+    public void attachCredentialQueryParams(String[] names) {
+        this.slot.attachCredentialQueryParams(names);
     }
 
     /**

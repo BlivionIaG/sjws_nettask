@@ -59,30 +59,39 @@ public final class ObserveRequestFilter implements RequestFilter {
         if (active == RequestObserver.NONE) {
             return next.proceed(request);
         }
-        long start = System.nanoTime();
-        Response response;
-        if (active.intercepts()) {
-            var special = active.intercept(request.method(), request.target(), loopback(request));
-            response = special != null ? special : next.proceed(request);
-        } else {
-            response = next.proceed(request);
-        }
-        long nanos = System.nanoTime() - start;
-        int protocol = RequestObserver.protocolId(request.protocol());
-        long bytes = response.sendsBody() ? Math.max(0L, response.contentLength()) : 0L;
-        if (active.logging()) {
-            String referer = "-";
-            String agent = "-";
-            if (active.logHeaders()) {
-                referer = header(request, "referer");
-                agent = header(request, "user-agent");
+        // Pin mask names at entry so a reload that clears/shrinks them cannot unmask this request
+        // when it logs after proceed. Also publish on this thread for MessagingHttp ERROR/WARN.
+        // Expanding names stays published before the chain is armed.
+        var pinnedNames = active.credentialQueryParams();
+        AccessTargetMask.pin(pinnedNames);
+        try {
+            long start = System.nanoTime();
+            Response response;
+            if (active.intercepts()) {
+                var special = active.intercept(request.method(), request.target(), loopback(request));
+                response = special != null ? special : next.proceed(request);
+            } else {
+                response = next.proceed(request);
             }
-            active.complete(response.status(), protocol, bytes, nanos, remote(request), request.method(),
-                    request.target(), request.protocol(), referer, agent);
-        } else {
-            active.complete(response.status(), protocol, bytes, nanos);
+            long nanos = System.nanoTime() - start;
+            int protocol = RequestObserver.protocolId(request.protocol());
+            long bytes = response.sendsBody() ? Math.max(0L, response.contentLength()) : 0L;
+            if (active.logging()) {
+                String referer = "-";
+                String agent = "-";
+                if (active.logHeaders()) {
+                    referer = header(request, "referer");
+                    agent = header(request, "user-agent");
+                }
+                active.complete(response.status(), protocol, bytes, nanos, remote(request), request.method(),
+                        request.target(), request.protocol(), referer, agent, pinnedNames);
+            } else {
+                active.complete(response.status(), protocol, bytes, nanos);
+            }
+            return response;
+        } finally {
+            AccessTargetMask.clearPinned();
         }
-        return response;
     }
 
     private static boolean loopback(Request request) {
