@@ -45,12 +45,13 @@ class Http2SmallPartsTest {
     void sharedPrefersThePublishedHandlerAndReusesTheBudget() {
         Handler startup = r -> null;
         Handler armed = r -> null;
-        var ref = new HandlerRef();
+        var published = new java.util.concurrent.atomic.AtomicReference<Http2Server.Generation>();
         var shared = new Http2Server.Shared(startup, null, new Semaphore(1), new Semaphore(1), Duration.ofSeconds(1),
-                new LongAdder(), Http2Server.Limits.DEFAULT, ref, new AtomicBoolean(false));
+                new LongAdder(), Http2Server.Limits.DEFAULT, published, new Http2Server.Generation(startup, false));
         assertSame(startup, shared.live());
-        ref.set(armed);
+        published.set(new Http2Server.Generation(armed, true));
         assertSame(armed, shared.live());
+        assertTrue(shared.attachBodies());
         var ch = new EmbeddedChannel();
         assertSame(shared.budget(ch), shared.budget(ch));
         ch.close();

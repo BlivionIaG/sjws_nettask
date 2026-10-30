@@ -83,6 +83,12 @@ class ApiKeyFilterTest {
         assertNull(ApiKeyFilter.query("/x?kk=a", "k"));
         assertEquals("", ApiKeyFilter.query("/x?k=", "k"));
         assertFalse(ApiKeyFilter.query("/x?k=a", "k").isBlank());
+        // '#' only truncates the matched value; scanning continues after '#…&'.
+        assertEquals("SECRET", ApiKeyFilter.query("/x?other=1#frag&k=SECRET", "k"));
+        assertEquals("SECRET", ApiKeyFilter.query("/x?keep=1#x&k=SECRET&y=2", "k"));
+        assertNull(ApiKeyFilter.query("/x?api%5Fkey=SECRET", "api_key"));
+        assertNull(ApiKeyFilter.query("/x?API_KEY=SECRET", "api_key"));
+        assertEquals("", ApiKeyFilter.query("/x?k=&k=SECRET", "k"));
     }
 
     @Test

@@ -70,6 +70,26 @@ public final class FilterChain implements Handler {
         }
     }
 
+    /**
+     * New chain spine ending at {@code terminal}, reusing the same {@link RequestFilter} instances
+     * (so rate-limit quotas and other stateful filters survive an unrelated config reload).
+     */
+    public FilterChain withTerminal(Handler terminal) {
+        Objects.requireNonNull(terminal, "terminal");
+        return new FilterChain(rebind(this.head, terminal));
+    }
+
+    private static RequestFilter.Chain rebind(RequestFilter.Chain node, Handler terminal) {
+        if (node instanceof TerminalNode) {
+            return new TerminalNode(terminal);
+        }
+        if (node instanceof FilterNode filter) {
+            return new FilterNode(filter.name, filter.filter, rebind(filter.next, terminal));
+        }
+        throw new IllegalStateException("unknown chain node " + node);
+    }
+
+
     /** Rejects a second {@code proceed} of this node on the thread already inside the chain. */
     private static void enter(RequestFilter.Chain node) {
         var guard = GUARDS.get();
@@ -147,9 +167,9 @@ public final class FilterChain implements Handler {
     /** One registered filter. Catches its failures so the connection stays up. */
     static final class FilterNode implements RequestFilter.Chain {
 
-        private final String name;
-        private final RequestFilter filter;
-        private final RequestFilter.Chain next;
+        final String name;
+        final RequestFilter filter;
+        final RequestFilter.Chain next;
 
         FilterNode(String name, RequestFilter filter, RequestFilter.Chain next) {
             this.name = name;
