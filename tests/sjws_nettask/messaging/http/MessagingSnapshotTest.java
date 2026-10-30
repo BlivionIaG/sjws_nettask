@@ -144,10 +144,46 @@ class MessagingSnapshotTest {
         return topics.get(i).get(topic, true).writer().snapshot().nextOffset();
     }
 
-    void produce(int l, int from, int n) throws Exception {
+    /**
+     * Posts {@code n} unique records starting at {@code from}. Re-resolves the ready leader and retries transient
+     * 503/307 (not-leader / not-ready / installing) the way clients must: those refuse before the append. Does not
+     * retry outcome-unknown (that write may already be committed; these posts have no producer id).
+     */
+    void produce(int preferred, int from, int n) throws Exception {
         for (int k = from; k < from + n; k++) {
             int kk = k;
-            var r = call(() -> http.get(l).handle(MessagingReplicationTest.post("t", "v" + kk + "-" + "z".repeat(80), Map.of())));
+            Response r = null;
+            for (int attempt = 1; attempt <= 200; attempt++) {
+                int target = (preferred >= 0 && topics.get(preferred).get("t", true).replica().leaderReady())
+                        ? preferred : leader("t");
+                if (target < 0) {
+                    System.err.println("MessagingSnapshotTest.produce: no ready leader for v" + kk + " attempt "
+                            + attempt + "; stepping");
+                    for (int s = 0; s < 10; s++) {
+                        step();
+                    }
+                    continue;
+                }
+                // preferred may have lost readiness under FakeClock advance inside call(); follow the ready one
+                final int tl = target;
+                r = call(() -> http.get(tl).handle(
+                        MessagingReplicationTest.post("t", "v" + kk + "-" + "z".repeat(80), Map.of())));
+                if (r.status() == 200) {
+                    preferred = tl; // stick to whoever acked under FakeClock churn
+                    break;
+                }
+                var body = LogOffsetsTest.text(r);
+                boolean retryable = r.status() == 307 || (r.status() == 503 && !body.contains("outcome-unknown")
+                        && !body.contains("outcome unknown"));
+                System.err.println("MessagingSnapshotTest.produce: v" + kk + " attempt " + attempt + " got "
+                        + r.status() + (retryable ? "; retrying" : "") + " " + body);
+                if (!retryable || attempt == 200) {
+                    assertEquals(200, r.status(), "produce v" + kk + " attempt " + attempt + ": " + body);
+                }
+                for (int s = 0; s < 10; s++) {
+                    step();
+                }
+            }
             assertEquals(200, r.status());
         }
     }
@@ -235,6 +271,7 @@ class MessagingSnapshotTest {
     void fetchBelowReplicatedLogStartIs416() throws Exception {
         start(new LogRetention(64L << 20, 0)); // age off; bytes high so retention does not cut for this test
         int l = leader("t");
+        assertTrue(l >= 0, "topic leader elected before produce");
         produce(l, 0, 80);
         var leadLog = topics.get(l).get("t", false);
         var segs = leadLog.log().segments();
