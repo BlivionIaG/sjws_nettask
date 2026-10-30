@@ -145,6 +145,12 @@ public final class Http2Server implements Transport {
         private final java.util.concurrent.atomic.AtomicReference<Runnable> onQuiesce =
                 new java.util.concurrent.atomic.AtomicReference<>();
 
+        /**
+         * Test-only: runs after the quiesce listener is installed (and, once fixed, after
+         * {@code RETIRED}). Production leaves this null.
+         */
+        static volatile Runnable afterQuiesceInstall;
+
         public Generation(Handler handler, boolean attachBodies) {
             this.handler = Objects.requireNonNull(handler, "handler");
             this.attachBodies = attachBodies;
@@ -176,17 +182,23 @@ public final class Http2Server implements Transport {
 
         public void leave() {
             int s = this.state.decrementAndGet();
-            if ((s & ~RETIRED) == 0) {
+            // Fire only after retirement: a zero-pin leave before RETIRED must not run callbacks
+            // while tryEnter still accepts pins (Codex P2 4421811440).
+            if ((s & RETIRED) != 0 && (s & ~RETIRED) == 0) {
                 fireQuiesce();
             }
         }
 
         /**
          * Retires this generation (no new pins) and runs {@code action} once when in-flight pins
-         * drain (or immediately if already idle).
+         * drain (or immediately if already idle). {@code RETIRED} is set <em>before</em> the
+         * callback is installed so a racing {@link #leave} cannot fire while {@link #tryEnter}
+         * still succeeds (Codex P2 4421811440).
          */
         public void whenQuiesced(Runnable action) {
             Objects.requireNonNull(action, "action");
+            // Retire first — tryEnter fails before any quiesce listener is visible.
+            this.state.updateAndGet(v -> v | RETIRED);
             // Chain listeners so trackDrainingGeneration + deferSnapshotClose both run.
             this.onQuiesce.updateAndGet(existing -> {
                 if (existing == null) {
@@ -197,7 +209,13 @@ public final class Http2Server implements Transport {
                     action.run();
                 };
             });
-            int s = this.state.updateAndGet(v -> v | RETIRED);
+            // Test hook: after RETIRED + install (safe window) for latch-driven tests.
+            var probe = afterQuiesceInstall;
+            if (probe != null) {
+                probe.run();
+            }
+            // Re-check: leave may have drained to zero while the listener was still null.
+            int s = this.state.get();
             if ((s & ~RETIRED) == 0) {
                 fireQuiesce();
             }

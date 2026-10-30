@@ -551,7 +551,7 @@ public final class SjwsServer implements AutoCloseable {
                 }
             }
             // Custom h2Factory: no start-time arm — chain-control apply, metrics, and publish call
-            // Transport.armHandler via armH2 / compilePublishArmed (Codex P2 4421410868).
+            // Transport.armHandler via armH2 (Codex P2 4421410868).
             transport.start();
             this.h2 = transport;
         } catch (Exception | LinkageError e) {
@@ -873,9 +873,8 @@ public final class SjwsServer implements AutoCloseable {
                     previousH2 = control.withPublishLock(() -> {
                         Handler armed = compileAroundTerminal(terminal);
                         var prev = http2.armHandler(armed, bodies);
-                        if (this.armed.get() != null) {
-                            this.armed.set(armed);
-                        }
+                        // Live control always publishes through armed (armSnapshot on apply).
+                        this.armed.set(armed);
                         return prev;
                     });
                 } else {
@@ -886,10 +885,23 @@ public final class SjwsServer implements AutoCloseable {
                     }
                 }
             } else {
-                Handler armed = compilePublishArmed(terminal);
-                this.h2.armHandler(armed);
-                if (this.armed.get() != null) {
-                    this.armed.set(armed);
+                // Custom h2Factory: same lock span as Http2Server — compile + arm + armed.set
+                // (Middleware Chain on #302). No I/O under the lock; armHandler is a volatile swap.
+                var control = this.control;
+                if (control != null && control.isLive()) {
+                    control.withPublishLock(() -> {
+                        Handler armed = compileAroundTerminal(terminal);
+                        this.h2.armHandler(armed);
+                        // Live control always publishes through armed (armSnapshot on apply).
+                        this.armed.set(armed);
+                        return null;
+                    });
+                } else {
+                    Handler armed = armedAround(terminal);
+                    this.h2.armHandler(armed);
+                    if (this.armed.get() != null) {
+                        this.armed.set(armed);
+                    }
                 }
             }
         }
@@ -1224,18 +1236,6 @@ public final class SjwsServer implements AutoCloseable {
         return created;
     }
 
-    /**
-     * Stores the compiled snapshot where every transport already reads its handler. One volatile
-     * write per transport; the request path does not enter {@link ChainControl}.
-     */
-
-    /**
-     * Publishes {@code handler} on the HTTP/2 transport. {@link sjws_nettask.h2.Http2Server} gets
-     * the generation-aware overload (bodies + drain tracking). Any other non-null {@link Transport}
-     * (custom {@code h2Factory}) gets {@link Transport#armHandler(Handler)} so chain-control and
-     * metrics arms still reach it (Codex P2 4421410868).
-     */
-
     /** Terminal for a config publish: chainLeaf when control is live, else override or next.handler(). */
     private Handler publishTerminal(ConfigSnapshot next) {
         var control = this.control;
@@ -1245,21 +1245,18 @@ public final class SjwsServer implements AutoCloseable {
         return this.override != null ? this.override : next.handler();
     }
 
-    /** Armed chain for publish on a custom h2 Transport (lock when control is live). */
-    private Handler compilePublishArmed(Handler terminal) {
-        var control = this.control;
-        if (control != null && control.isLive()) {
-            return control.withPublishLock(() -> compileAroundTerminal(terminal));
-        }
-        return armedAround(terminal);
-    }
-
     private Handler compileAroundTerminal(Handler terminal) {
         var control = this.control;
         Handler frozen = request -> terminal.handle(request);
         return control.compileAroundUnlocked(frozen);
     }
 
+    /**
+     * Publishes {@code handler} on the HTTP/2 transport. {@link sjws_nettask.h2.Http2Server} gets
+     * the generation-aware overload ({@code bodies} + drain tracking). Any other non-null
+     * {@link Transport} (custom {@code h2Factory}) gets {@link Transport#armHandler(Handler)} so
+     * chain-control and metrics arms still reach it (Codex P2 4421410868).
+     */
     private void armH2(Handler handler, boolean bodies) {
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
             trackDrainingGeneration(http2.armHandler(handler, bodies));

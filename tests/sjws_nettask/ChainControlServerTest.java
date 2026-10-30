@@ -13,6 +13,11 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
@@ -307,6 +312,85 @@ class ChainControlServerTest {
         assertTrue(armCalls.get() > before, "publish arms custom h2 when control is not live");
         assertEquals("1", HttpTestSupport.get(this.server.tcpPort(), "/plain.txt", 4000).headers().get("x-startup"));
         assertEquals("plain2", HttpTestSupport.get(this.server.tcpPort(), "/plain.txt", 4000).bodyText());
+    }
+
+
+    /**
+     * Middleware Chain on #302: custom publish must hold withPublishLock across compile +
+     * armHandler + armed.set so a concurrent apply cannot lose to a stale publish arm.
+     */
+    @Test
+    void customH2PublishHoldsLockAcrossArm() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        var yaml = root.resolve("sjws-lock.yaml");
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: "%s"
+                """.formatted(root.toAbsolutePath()));
+        var loaded = ConfigLoader.load(new String[] {
+                "--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+
+        var enteredArm = new CountDownLatch(1);
+        var releaseArm = new CountDownLatch(1);
+        var lastArmed = new AtomicReference<Handler>();
+        var armCalls = new AtomicInteger();
+        Transport fakeH2 = new Transport() {
+            @Override public String name() { return "fake-h2"; }
+            @Override public Transport start() { return this; }
+            @Override public int port() { return 9445; }
+            @Override public void close() {}
+            @Override
+            public void armHandler(Handler handler) {
+                int n = armCalls.incrementAndGet();
+                if (n == 2) { // first post-apply publish arm
+                    enteredArm.countDown();
+                    try {
+                        assertTrue(releaseArm.await(15, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(e);
+                    }
+                }
+                lastArmed.set(handler);
+            }
+        };
+        Transport.Factory h3Unused = (c, h) -> { throw new AssertionError("no h3"); };
+        this.server = SjwsServer.start(loaded, h3Unused, (c, h) -> fakeH2, registry(), null);
+        var control = this.server.chainControl(registry(), Set.of());
+        control.apply(doc(1, "one", FilterScope.all()));
+        assertEquals(1, armCalls.get());
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> reload = pool.submit(() -> {
+                try {
+                    var www2 = Files.createDirectories(root.resolve("www-lock2"));
+                    Files.writeString(www2.resolve("hello.txt"), "hello2");
+                    Files.writeString(yaml, """
+                            server:
+                              port: 0
+                              root: "%s"
+                            """.formatted(www2.toAbsolutePath()));
+                    assertTrue(this.server.reload().applied());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            assertTrue(enteredArm.await(15, TimeUnit.SECONDS), "reload must reach custom armHandler");
+            Future<?> apply = pool.submit(() -> control.apply(doc(2, "two", FilterScope.all())));
+            Thread.sleep(200);
+            releaseArm.countDown();
+            reload.get(20, TimeUnit.SECONDS);
+            apply.get(20, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertSame(control.published(), lastArmed.get(),
+                "final custom arm must be the last compile (apply doc=two), not a stale publish chain");
+        assertEquals("two", HttpTestSupport.get(this.server.tcpPort(), "/hello.txt", 4000).headers().get("x-mark"));
     }
 
     private SjwsServer stopAndStart(ServerConfig config, RequestFilters filters) throws Exception {

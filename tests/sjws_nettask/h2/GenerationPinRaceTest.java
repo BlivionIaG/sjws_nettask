@@ -148,4 +148,76 @@ class GenerationPinRaceTest {
         }
         return fields;
     }
+
+    /**
+     * Codex P2 4421811440: RETIRED must be set before onQuiesce is visible. With the test hook
+     * parked after install, leave() drains pins; tryEnter in the callback must still fail.
+     * Fail-before at 7a02a6d (install-then-RETIRED): callback successfully pinned (see
+     * /workspace/bench-301-final/fail-before-gen-retire.txt).
+     */
+    @Test
+    void quiesceCallbackCannotPinBeforeRetirement() throws Exception {
+        var g = new Http2Server.Generation(r -> null, false);
+        assertTrue(g.tryEnter());
+        var enteredHook = new CountDownLatch(1);
+        var releaseHook = new CountDownLatch(1);
+        var pinnedInCallback = new AtomicBoolean(false);
+        var prev = Http2Server.Generation.afterQuiesceInstall;
+        Http2Server.Generation.afterQuiesceInstall = () -> {
+            enteredHook.countDown();
+            try {
+                assertTrue(releaseHook.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        };
+        try {
+            var done = new CountDownLatch(1);
+            Thread retirer = new Thread(() -> {
+                try {
+                    g.whenQuiesced(() -> {
+                        if (g.tryEnter()) {
+                            pinnedInCallback.set(true);
+                            g.leave();
+                        }
+                    });
+                } finally {
+                    done.countDown();
+                }
+            }, "retire");
+            retirer.start();
+            assertTrue(enteredHook.await(10, TimeUnit.SECONDS), "hook after quiesce install");
+            // Drain the pin while parked after listener install. Fixed: RETIRED already set.
+            g.leave();
+            releaseHook.countDown();
+            assertTrue(done.await(10, TimeUnit.SECONDS));
+            retirer.join(2000);
+        } finally {
+            Http2Server.Generation.afterQuiesceInstall = prev;
+        }
+        assertFalse(pinnedInCallback.get(),
+                "quiesce callback must not pin: RETIRED precedes listener exposure");
+        assertTrue(g.retired());
+        assertFalse(g.tryEnter());
+    }
+
+
+
+    /** leave() with pins==0 before RETIRED must not fire (Codex P2 4421811440). */
+    @Test
+    void leaveBeforeRetireDoesNotFireQuiesce() {
+        var g = new Http2Server.Generation(r -> null, false);
+        var fired = new AtomicInteger();
+        // Install listener without retiring via force path — use whenQuiesced after leave.
+        assertTrue(g.tryEnter());
+        g.leave(); // pins -> 0, not retired → must not fire (no listener yet anyway)
+        assertEquals(0, fired.get());
+        g.whenQuiesced(fired::incrementAndGet); // idle + retired → fires once
+        assertEquals(1, fired.get());
+        g.whenQuiesced(fired::incrementAndGet); // already idle; chains and fires again via getAndSet
+        // second whenQuiesced: RETIRED already set, pins 0, installs new chain, fires
+        assertEquals(2, fired.get());
+    }
+
 }
