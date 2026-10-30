@@ -859,10 +859,17 @@ public final class SjwsServer implements AutoCloseable {
         sjws_nettask.h2.Http2Server.Generation previousH2 = null;
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
             // Override path must also publish an armed generation and drain the previous one (B3).
-            Handler terminal = this.override != null ? this.override : next.handler();
+            // When chain-control is live, rebind around chainLeaf (the same leaf apply() compiles
+            // against) — never this.override. override still holds the original startup filter
+            // chain and would resurrect filters the control document removed (Codex P2 4421015537).
+            // That wrong armed handler also feeds HTTP/1 via requestHandler() and HTTP/3 via the
+            // replaceHandler lambda after live.set.
+            var control = this.control;
+            Handler terminal = (control != null && control.isLive())
+                    ? this.chainLeaf
+                    : (this.override != null ? this.override : next.handler());
             boolean bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null
                     || this.override != null;
-            var control = this.control;
             if (control != null && control.isLive()) {
                 // Serialize compile + install with ChainControl.apply/pinOuter (Codex P1).
                 previousH2 = control.withPublishLock(() -> {
