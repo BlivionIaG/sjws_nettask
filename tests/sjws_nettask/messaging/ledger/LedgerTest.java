@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
@@ -441,4 +442,59 @@ class LedgerTest {
             assertEquals(last + 1, w.snapshot().durableOffset());
         }
     }
+
+    /** #328: grouping must not change segment bases; a leader-style cut then drops the same physical on both. */
+    @Test
+    void groupedAppendFramesMatchOneByOneBases() throws Exception {
+        byte[] rec = ("v-" + "z".repeat(80)).getBytes(StandardCharsets.UTF_8);
+        long segBytes = 2048;
+        int n = 120;
+        try (var one = SegmentedLog.open(dir.resolve("one"), segBytes);
+             var grp = SegmentedLog.open(dir.resolve("grp"), segBytes)) {
+            for (int i = 0; i < n; i++) one.append(List.of(rec), 0L);
+            for (int i = 0; i < n; ) {
+                int g = Math.min(3, n - i);
+                long base = grp.nextOffset();
+                long[] offs = new long[g];
+                int[] lens = new int[g];
+                int total = 0;
+                for (int j = 0; j < g; j++) total += RecordBatch.encodedSize(List.of(rec));
+                var buf = ByteBuffer.allocate(total);
+                long o = base;
+                for (int j = 0; j < g; j++) {
+                    offs[j] = o;
+                    int before = buf.position();
+                    RecordBatch.encode(o, 0L, List.of(rec), buf);
+                    lens[j] = buf.position() - before;
+                    o += 1;
+                }
+                buf.flip();
+                grp.appendFrames(buf, offs, lens, g, o);
+                i += g;
+            }
+            var a = one.segments();
+            var b = grp.segments();
+            assertEquals(a.size(), b.size(), "segment count");
+            for (int i = 0; i < a.size(); i++) {
+                assertEquals(a.get(i).baseOffset(), b.get(i).baseOffset(), "base " + i);
+                assertEquals(a.get(i).nextOffset(), b.get(i).nextOffset(), "next " + i);
+            }
+            long cut = -1;
+            for (var s : a) if (!s.active()) { cut = s.nextOffset(); break; }
+            assertTrue(cut > 0, "need a sealed segment");
+            while (true) {
+                var segs = one.segments();
+                if (segs.isEmpty() || segs.get(0).active() || segs.get(0).nextOffset() > cut) break;
+                one.deleteSegment(segs.get(0).baseOffset());
+            }
+            while (true) {
+                var segs = grp.segments();
+                if (segs.isEmpty() || segs.get(0).active() || segs.get(0).nextOffset() > cut) break;
+                grp.deleteSegment(segs.get(0).baseOffset());
+            }
+            assertEquals(cut, one.startOffset());
+            assertEquals(cut, grp.startOffset());
+        }
+    }
+
 }
