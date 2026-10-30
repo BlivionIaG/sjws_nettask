@@ -554,6 +554,39 @@ class MsgSnapshotClusterTest {
         }
     }
 
+
+    /**
+     * #295 (b): divergent-pin retries are bounded. With only a divergent pin available and a low round limit, the
+     * install gives up, increments {@code installPinExhausted}, and leaves the marker pending. Mutation: remove the
+     * round-limit check in {@link RaftReplica#install} — this test times out or never sees the exhausted counter.
+     */
+    @Test
+    void divergentPinRetriesAreBoundedAndSurfaced() throws Exception {
+        start(20, 5);
+        int l = c.leader(), f = 1 - l;
+        long end = produce("pid1", 0, 20);
+        c.awaitEnd(f, end);
+        c.cut(f);
+        end = produce("pid1", 20, 60);
+        assertTrue(c.data[l].snapshot());
+        var m = recorded(l);
+        var store = c.data[l].runtime.store;
+        var divergentSections = List.of(new MsgSnapshot.Section(MsgSnapshot.APP_STATE, 0,
+                "DIV".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        var divergent = new MsgSnapshot(m.topic(), m.index() + 1, m.term(), m.endOffset(), m.logStart(), m.chunkBytes(),
+                divergentSections, m.segments());
+        // Newest pin wins acquire: plant a divergent image above the consensus index so every fetch misses m.
+        publishPin(store, divergent);
+        assertTrue(store.newest(m.topic()) > m.index());
+        c.data[f].replica.installPinRoundsLimit = 2;
+        long before = c.data[f].replica.installPinExhausted();
+        c.heal(f);
+        for (int k = 0; k < 4000 && c.data[f].replica.installPinExhausted() == before; k++) c.step();
+        assertTrue(c.data[f].replica.installPinExhausted() > before, "exhausted counter must tick");
+        assertEquals(0, c.data[f].replica.installs(), "no successful install with only a divergent pin");
+        assertTrue(c.data[f].replica.installPending(), "marker stays for a later good pin / restart");
+    }
+
     private static void publishPin(SnapshotStore store, MsgSnapshot m) throws Exception {
         var dir = store.root().resolve(m.topic()).resolve(Long.toString(m.index()));
         java.nio.file.Files.createDirectories(dir);
