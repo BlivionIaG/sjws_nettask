@@ -5,6 +5,12 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.CountDownLatch;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -231,5 +237,183 @@ class LedgerWriterBudgetTest {
             LedgerWriterBudget.resetForTests();
         }
     }
+
+
+    /**
+     * #335 Agent Swarm: {@code close} must not race first-append {@code materialize} — that orphaned the
+     * writer thread and leaked the materialize budget charge. Mutation: flipping {@code closed} outside
+     * {@code materializeLock} again makes this fail (live {@code ledger-writer-*} threads or charged &gt; 0).
+     */
+    @Test
+    void closeRacesFirstAppendDoesNotLeakThreadOrBudget() throws Exception {
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(0));
+        // Dedicated syncer per writer so close joins it; shared pool is out of scope for this race.
+        int iters = 3_000;
+        var appendWins = new AtomicInteger();
+        var closedWins = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try {
+            for (int i = 0; i < iters; i++) {
+                Path d = dir.resolve("race-" + i);
+                var log = SegmentedLog.open(d);
+                var w = new LedgerWriter(log, Durability.NONE, 0, 64, 1 << 16);
+                var gate = new CyclicBarrier(2);
+                var done = new CountDownLatch(2);
+                pool.execute(() -> {
+                    try {
+                        gate.await(5, TimeUnit.SECONDS);
+                        var f = w.appendNoWait(List.of(new byte[] {1}), Durability.NONE);
+                        try {
+                            f.get(5, TimeUnit.SECONDS);
+                            appendWins.incrementAndGet();
+                        } catch (Exception ex) {
+                            closedWins.incrementAndGet(); // closed / rejected after race
+                        }
+                    } catch (IllegalStateException e) {
+                        closedWins.incrementAndGet(); // materialize saw closed
+                    } catch (Exception e) {
+                        closedWins.incrementAndGet();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                pool.execute(() -> {
+                    try {
+                        gate.await(5, TimeUnit.SECONDS);
+                        w.close();
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                assertTrue(done.await(60, TimeUnit.SECONDS), "iter " + i + " timed out");
+                try { w.close(); } catch (Exception ignored) {}
+                try { log.close(); } catch (Exception ignored) {}
+            }
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS));
+        }
+        long liveWriters = Thread.getAllStackTraces().keySet().stream()
+                .filter(th -> th.isAlive() && th.getName() != null && th.getName().startsWith("ledger-writer-race-"))
+                .count();
+        assertEquals(0, liveWriters, "orphaned ledger-writer threads after close∥first-append stress");
+        assertEquals(0, LedgerWriterBudget.shared().charged(), "budget charge leaked");
+        assertEquals(0, LedgerWriterBudget.shared().writers(), "writer count leaked");
+        assertTrue(appendWins.get() + closedWins.get() >= iters, "stress made no progress");
+    }
+
+
+    /** #335 N1: ctor failure after idle acquire must release the charge. */
+    @Test
+    void constructorFailureReleasesIdleCharge() throws Exception {
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(0));
+        LedgerWriter.ctorFaultForTests = new RuntimeException("boom-after-idle");
+        try (var log = SegmentedLog.open(dir.resolve("ctor-fail"))) {
+            var boom = assertThrows(RuntimeException.class, () -> new LedgerWriter(log, Durability.NONE));
+            assertEquals("boom-after-idle", boom.getMessage());
+        } finally {
+            LedgerWriter.ctorFaultForTests = null;
+        }
+        assertEquals(0, LedgerWriterBudget.shared().charged(), "idle charge must roll back on ctor failure");
+        assertEquals(0, LedgerWriterBudget.shared().writers());
+    }
+
+    /**
+     * #335 N2: materialize that fails after acquireMaterialize must releaseBytes and leave the writer idle.
+     * Mutation: drop {@code budget.releaseBytes(extra)} in the materialize catch → charged stays at full cost.
+     */
+    @Test
+    void materializeFailureAfterAcquireRollsBackCharge() throws Exception {
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(0));
+        LedgerWriter.materializeFaultForTests = new RuntimeException("boom-after-acquire");
+        try (var log = SegmentedLog.open(dir.resolve("mat-rollback"))) {
+            var w = new LedgerWriter(log, Durability.NONE, 0, 128, 1 << 16);
+            try {
+                assertEquals(LedgerWriterBudget.IDLE_COST_BYTES, LedgerWriterBudget.shared().charged());
+                var boom = assertThrows(RuntimeException.class,
+                        () -> w.append(List.of(new byte[] {1}), null));
+                assertEquals("boom-after-acquire", boom.getMessage());
+                assertFalse(w.materialized());
+                assertEquals(LedgerWriterBudget.IDLE_COST_BYTES, LedgerWriterBudget.shared().charged(),
+                        "materialize delta must not stick after rollback");
+            } finally {
+                w.close();
+            }
+        } finally {
+            LedgerWriter.materializeFaultForTests = null;
+        }
+        assertEquals(0, LedgerWriterBudget.shared().charged());
+    }
+
+    /**
+     * #335 B3: growing the direct buffer past the materialize charge must acquire the delta (fail-closed).
+     * Mutation: skip {@code budget.acquireExtra} before allocateDirect → charged stays at full while capacity &gt; 1 MiB.
+     */
+    @Test
+    void directBufferGrowthChargesBudgetFailClosed() throws Exception {
+        int q = 128;
+        long full = LedgerWriterBudget.fullCostBytes(q);
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(full)); // no room for +3 MiB growth
+        try (var log = SegmentedLog.open(dir.resolve("direct-grow"))) {
+            var w = new LedgerWriter(log, Durability.NONE, 0, q, 8 << 20);
+            try {
+                byte[] big = new byte[2 << 20];
+                try {
+                    w.append(List.of(big), Durability.NONE).get(5, TimeUnit.SECONDS);
+                    fail("expected ledger budget exhaustion on direct growth");
+                } catch (Exception e) {
+                    Throwable c = e;
+                    while (c.getCause() != null && !(c instanceof LedgerBudgetExhaustedException)) c = c.getCause();
+                    assertTrue(c instanceof LedgerBudgetExhaustedException, "got " + e);
+                    assertTrue(c.getMessage().contains("direct buffer growth")
+                            || c.getMessage().contains("exhausted"), c.getMessage());
+                }
+                // Charge must not include an uncharged 4 MiB buffer — either still at full (failed before grow
+                // completed) or idle+partial; never silent over-allocate without acquire.
+                assertTrue(LedgerWriterBudget.shared().charged() <= full + LedgerWriterBudget.DIRECT_BUF_BYTES,
+                        "charged=" + LedgerWriterBudget.shared().charged());
+            } finally {
+                w.close();
+            }
+        }
+        assertEquals(0, LedgerWriterBudget.shared().charged());
+    }
+
+    /**
+     * #335 B3 positive path: with room in the budget, a 2 MiB payload grows the direct buffer and charges the delta.
+     */
+    @Test
+    void directBufferGrowthChargesDeltaWhenBudgetAllows() throws Exception {
+        int q = 128;
+        long full = LedgerWriterBudget.fullCostBytes(q);
+        long growth = 3L << 20; // 4 MiB cap - 1 MiB baseline
+        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(full + growth));
+        try (var log = SegmentedLog.open(dir.resolve("direct-ok"))) {
+            var w = new LedgerWriter(log, Durability.NONE, 0, q, 8 << 20);
+            try {
+                byte[] big = new byte[2 << 20];
+                long base = w.append(List.of(big), Durability.NONE).get(5, TimeUnit.SECONDS);
+                assertEquals(0, base);
+                assertEquals(full + growth, LedgerWriterBudget.shared().charged());
+            } finally {
+                w.close();
+            }
+        }
+        assertEquals(0, LedgerWriterBudget.shared().charged());
+    }
+
+    /** #335 N5: {@code budget.bytes=off} resolves unlimited at first class use / shared(). */
+    @Test
+    void offPropertyResolvesUnlimitedBudget() {
+        withProps(java.util.Map.of(LedgerWriterBudget.BYTES_PROPERTY, "off"), () -> {
+            LedgerWriterBudget.resetForTests();
+            var b = LedgerWriterBudget.shared();
+            assertTrue(b.unlimited());
+            assertEquals(0, b.budget());
+        });
+    }
+
 
 }

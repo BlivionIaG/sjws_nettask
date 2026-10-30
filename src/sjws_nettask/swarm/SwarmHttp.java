@@ -57,6 +57,8 @@ import sjws_nettask.swarm.wire.Frame;
  */
 final class SwarmHttp implements Handler {
 
+    private static final System.Logger LOG = System.getLogger(SwarmHttp.class.getName());
+
     static final String PREFIX = "/swarm/v1/";
     static final String CONTENT_TYPE = "application/vnd.sjws.swarm.v1";
     /** One frame of the 1 MiB inline limit plus its header and a little slack. */
@@ -190,7 +192,9 @@ final class SwarmHttp implements Handler {
         } catch (IllegalArgumentException e) {
             return problem(400, "bad request", e.getMessage()).response();
         } catch (LedgerBudgetExhaustedException e) {
-            var r = problem(503, "busy", e.getMessage()).response();
+            // #246 / #335 B2: generic detail; budget numbers only in the server log.
+            LOG.log(System.Logger.Level.DEBUG, () -> "ledger writer budget exhausted: " + e.getMessage());
+            var r = problem(503, "busy", "ledger writer budget exhausted").response();
             r.headers().set("retry-after", "1");
             return r;
         }

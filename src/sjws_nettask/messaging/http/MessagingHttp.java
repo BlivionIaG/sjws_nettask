@@ -377,7 +377,9 @@ final class MessagingHttp implements Handler {
 
     /** #333: opening or materializing a LedgerWriter would exceed the process ledger budget. */
     static Response ledgerBudgetBusy(LedgerBudgetExhaustedException e) {
-        var r = problem(503, "busy", e.getMessage());
+        // #246 / #335 B2: generic detail to the client; charged/budget/source stay in the server log.
+        LOG.log(System.Logger.Level.DEBUG, () -> "ledger writer budget exhausted: " + e.getMessage());
+        var r = problem(503, "busy", "ledger writer budget exhausted");
         r.headers().set("retry-after", RETRY_AFTER_SECONDS);
         return r;
     }

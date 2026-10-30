@@ -69,17 +69,17 @@ public final class LedgerWriterBudget {
         return INSTANCE.get();
     }
 
-    /** Replaces the process budget (does not rewind charges already taken). */
-    public static void install(LedgerWriterBudget budget) {
+    /** Replaces the process budget (does not rewind charges already taken). Tests / same-package only. */
+    static void install(LedgerWriterBudget budget) {
         INSTANCE.set(java.util.Objects.requireNonNull(budget));
     }
 
-    /** Clears the cached instance so the next {@link #shared} re-reads properties (tests). */
-    public static void resetForTests() {
+    /** Clears the cached instance so the next {@link #shared} re-reads properties (tests / same-package). */
+    static void resetForTests() {
         INSTANCE.set(null);
     }
 
-    /** Test hook: a fresh budget of {@code budgetBytes} (0 = unlimited). */
+    /** A fresh budget of {@code budgetBytes} (0 = unlimited). */
     public static LedgerWriterBudget ofBytes(long budgetBytes) {
         if (budgetBytes < 0) throw new IllegalArgumentException("budgetBytes >= 0: " + budgetBytes);
         return new LedgerWriterBudget(budgetBytes, budgetBytes == 0 ? "unlimited" : "test:" + budgetBytes);
@@ -184,6 +184,15 @@ public final class LedgerWriterBudget {
     /** Reserves the materialize delta; throws when the budget cannot take it (queue not allocated). */
     public long acquireMaterialize(int queueCapacity) {
         return acquire(materializeCostBytes(queueCapacity), "LedgerWriter queue/direct buffer");
+    }
+
+    /**
+     * Reserves extra direct-buffer bytes when {@link LedgerWriter} grows past the 1 MiB charged at materialize
+     * (#335 B3). Fail-closed: throws {@link LedgerBudgetExhaustedException} instead of an uncharged allocateDirect.
+     */
+    public long acquireExtra(long bytes, String what) {
+        if (bytes <= 0) throw new IllegalArgumentException("bytes");
+        return acquire(bytes, what);
     }
 
     private long acquire(long cost, String what) {

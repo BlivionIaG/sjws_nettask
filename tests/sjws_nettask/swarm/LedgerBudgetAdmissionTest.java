@@ -1,6 +1,7 @@
 package sjws_nettask.swarm;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -14,6 +15,7 @@ import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestBody;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
+import sjws_nettask.messaging.ledger.LedgerBudgetTestHooks;
 import sjws_nettask.messaging.ledger.LedgerWriterBudget;
 import sjws_nettask.swarm.wire.Frame;
 
@@ -33,10 +35,10 @@ class LedgerBudgetAdmissionTest {
 
     @BeforeEach
     void open() {
-        LedgerWriterBudget.resetForTests();
+        LedgerBudgetTestHooks.reset();
         // One pool opens task + dlq (2 writers) and must be able to materialize both; a second pool is refused.
         long one = LedgerWriterBudget.fullCostBytes(sjws_nettask.messaging.ledger.LedgerWriter.DEFAULT_QUEUE);
-        LedgerWriterBudget.install(LedgerWriterBudget.ofBytes(one * 2));
+        LedgerBudgetTestHooks.install(LedgerWriterBudget.ofBytes(one * 2));
         this.swarm = Swarm.open(this.dir, "budget-test", 3,
                 new sjws_nettask.messaging.delivery.RetryPolicy(5, 0, 0), System::currentTimeMillis,
                 ReplyRouter.DEFAULT_IDLE_CLOSE_MS);
@@ -46,7 +48,7 @@ class LedgerBudgetAdmissionTest {
     @AfterEach
     void close() {
         if (this.swarm != null) this.swarm.close();
-        LedgerWriterBudget.resetForTests();
+        LedgerBudgetTestHooks.reset();
     }
 
     @Test
@@ -56,7 +58,12 @@ class LedgerBudgetAdmissionTest {
 
         var refused = post("/swarm/v1/tasks/pool-b", task("nope"));
         assertEquals(503, refused.status(), text(refused));
-        assertTrue(text(refused).contains("exhausted") || text(refused).toLowerCase().contains("busy"), text(refused));
+        // #335 B2/N4: fixed generic detail — no charged/budget/source from e.getMessage().
+        var body = text(refused);
+        assertTrue(body.toLowerCase().contains("busy") || body.contains("ledger writer budget exhausted"), body);
+        assertFalse(body.contains("charged"), body);
+        assertFalse(body.contains("heapFraction"), body);
+        assertFalse(body.contains("need "), body);
         var retry = refused.headers().get("retry-after");
         if (retry == null) retry = refused.headers().get("Retry-After");
         assertTrue(retry != null && !retry.isBlank(), "Retry-After required");

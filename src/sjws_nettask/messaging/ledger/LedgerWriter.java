@@ -75,14 +75,20 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     /** Dedicated writer thread; started on first materialize, not in the constructor. */
     private final Thread thread;
     private final ReentrantLock materializeLock = new ReentrantLock();
+    /** Test-only: when non-null, thrown after acquireMaterialize and before the queue is published. */
+    static volatile RuntimeException materializeFaultForTests;
+    /** Test-only: when non-null, thrown in the constructor after idle acquire (N1 rollback). */
+    static volatile RuntimeException ctorFaultForTests;
     /** Dedicated syncer, or null when using {@link SharedLedgerPool}. */
     private final Thread syncer;
     /** Syncer shard index, or -1 when this writer has a dedicated syncer. */
     private final int sharedShard;
     private final SharedLedgerPool sharedPool;
     private final LedgerWriterBudget budget;
-    /** Bytes charged on this writer (idle + optional materialize); released in {@link #close}. */
+    /** Bytes charged on this writer (idle + optional materialize + direct growth); released in {@link #close}. */
     private long budgetCharged;
+    /** Direct-buffer bytes already covered by {@link #budgetCharged} (materialize includes {@link LedgerWriterBudget#DIRECT_BUF_BYTES}). */
+    private int directAccounted;
     private volatile boolean closed;
     private volatile boolean stopSyncer;
     /** True while {@link #pauseSync} holds the syncer off {@code log.force} (snapshot install). */
@@ -148,6 +154,8 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         this.budget = LedgerWriterBudget.shared();
         this.budgetCharged = this.budget.acquireIdle();
         try {
+            var ctorFault = ctorFaultForTests;
+            if (ctorFault != null) throw ctorFault;
             this.written = log.nextOffset();
             this.durable = log.nextOffset(); // recovered data is treated as durable (it survived a restart)
             publish();
@@ -275,15 +283,19 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         materializeLock.lock();
         try {
             if (ready) return;
+            // Under the same lock close() uses: refuse after close so we never start a thread or take a charge.
             if (closed) throw new IllegalStateException("closed");
             long extra = budget.acquireMaterialize(capacity);
             try {
+                var fault = materializeFaultForTests;
+                if (fault != null) throw fault;
                 // Hard bound 2x the soft one: ArrayBlockingQueue keeps the one-lock, allocation-free hand-off
                 // (a LinkedBlockingQueue cost ~0.7 us of claim p50 at 16 workers).
                 var q = new ArrayBlockingQueue<Pending>((int) Math.min(Integer.MAX_VALUE - 8, 2L * capacity));
                 queue = q;
                 thread.start();
                 budgetCharged += extra;
+                directAccounted = LedgerWriterBudget.DIRECT_BUF_BYTES; // materialize cost covers the 1 MiB baseline
                 ready = true; // publish queue + started thread to appenders
             } catch (Throwable t) {
                 budget.releaseBytes(extra);
@@ -475,6 +487,13 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         if (b == null || b.capacity() < total) {
             int cap = b == null ? Math.max(LedgerWriterBudget.DIRECT_BUF_BYTES, Integer.highestOneBit(Math.max(1, total)) << 1)
                     : Integer.highestOneBit(total) << 1;
+            // Materialize already charged DIRECT_BUF_BYTES; any larger (or grown) buffer must acquire the delta (#335 B3).
+            long need = (long) cap - directAccounted;
+            if (need > 0) {
+                long got = budget.acquireExtra(need, "LedgerWriter direct buffer growth");
+                budgetCharged += got;
+                directAccounted = cap;
+            }
             b = ByteBuffer.allocateDirect(cap);
             buf = b;
         }
@@ -579,10 +598,19 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      * (a clean shutdown loses nothing). Does not close the log.
      */
     @Override public void close() throws InterruptedException {
-        if (closed) return;
-        closed = true;
-        if (ready) {
-            queue.put(POISON);
+        // Set closed and snapshot the queue under materializeLock so a concurrent first-append
+        // materialize cannot start the writer thread (and charge the budget) after we skip poison.
+        BlockingQueue<Pending> toPoison = null;
+        materializeLock.lock();
+        try {
+            if (closed) return;
+            closed = true;
+            if (ready) toPoison = queue;
+        } finally {
+            materializeLock.unlock();
+        }
+        if (toPoison != null) {
+            toPoison.put(POISON);
             thread.join(TimeUnit.SECONDS.toMillis(30));
         }
         stopSyncer = true;
