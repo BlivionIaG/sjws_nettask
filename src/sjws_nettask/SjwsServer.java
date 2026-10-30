@@ -1412,6 +1412,7 @@ public final class SjwsServer implements AutoCloseable {
     private void attachGauges(ServerMetrics metrics) {
         metrics.setConnectionGauges(this.manager::activeConnections,
                 () -> this.h3 == null ? 0 : this.h3.connections());
+        metrics.setRefusedPerIp(this.manager::refusedPerIp);
     }
 
     public AltSvc altSvc() {

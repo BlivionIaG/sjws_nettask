@@ -5,7 +5,7 @@ set -euo pipefail
 JAR=$1; OUT=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
-export DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-40}
+export DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
 export WARMUP=${WARMUP:-5}
 SECS=${SECS:-20}
 

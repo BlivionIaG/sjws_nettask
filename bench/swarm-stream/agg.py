@@ -33,12 +33,34 @@ def main():
         pre = r.get("load1_pre", 99)
         # Architecture 2026-10-30: self_loaded (incl. generator-CPU sat) does not count as a pass
         self_loaded = bool(r.get("self_loaded"))
-        # Transport/connect retries are hard-zero-style: nonzero ⇒ not a clean pass (do not hide server EOFs).
+        # Any retry or refused connection ⇒ INVALID (inceptor+Architecture; stricter wins).
         ptr = int(r.get("producer_transport_retries") or 0)
         ccr = int(r.get("consumer_connect_retries") or 0)
+        refused = int(r.get("refused_per_ip") or 0)
+        hz = r.get("hard_zeros") or {}
+        if refused == 0:
+            try:
+                refused = int(float(hz.get("sjws_connections_refused_per_ip_total") or 0))
+            except (TypeError, ValueError):
+                refused = 0
+        open_after = r.get("open_sessions_after_drain")
+        if open_after is None:
+            try:
+                open_after = hz.get("sjws_swarm_stream_open_sessions")
+            except Exception:
+                open_after = None
+        try:
+            open_after_n = int(float(open_after)) if open_after is not None else -1
+        except (TypeError, ValueError):
+            open_after_n = -1
+        drain_timed_out = bool(r.get("drain_timed_out"))
         transport_retry_flag = bool(r.get("transport_retry_flag")) or ptr > 0 or ccr > 0
+        refused_flag = refused > 0
+        open_flag = open_after_n != 0  # must be exactly 0 after drain
+        # valid only when all hard conditions hold
         valid = (n >= 10000 and p99 is not None and pre < 4.0 and not self_loaded
-                 and not transport_retry_flag)
+                 and not transport_retry_flag and not refused_flag
+                 and not drain_timed_out and not open_flag)
         windows.append({
             "tag": p.parent.name,
             "valid": valid,
@@ -55,6 +77,10 @@ def main():
             "producer_transport_retries": ptr,
             "consumer_connect_retries": ccr,
             "transport_retry_flag": transport_retry_flag,
+            "refused_per_ip": refused,
+            "drain_timed_out": drain_timed_out,
+            "open_sessions_after_drain": open_after_n,
+            "max_connections_per_ip": r.get("max_connections_per_ip"),
             "load1_pre": pre,
             "load1_post": r.get("load1_post"),
         })
@@ -66,11 +92,13 @@ def main():
               f"n={w['samples']} self_loaded={w['self_loaded']} stalls={w['credit_stalls']} "
               f"stall_flag={w['stall_flag']} err={w['errors']} "
               f"prod_tx_retry={w['producer_transport_retries']} cons_conn_retry={w['consumer_connect_retries']} "
-              f"tx_retry_flag={w['transport_retry_flag']} load={w['load1_pre']}→{w['load1_post']}")
-        if w['transport_retry_flag']:
-            print(f"  HARD_FLAG {w['tag']}: transport retries nonzero "
-                  f"(producer={w['producer_transport_retries']} consumer={w['consumer_connect_retries']}) "
-                  f"— not a clean pass")
+              f"refused_per_ip={w['refused_per_ip']} drain_to={w['drain_timed_out']} "
+              f"open_after={w['open_sessions_after_drain']} max_per_ip={w.get('max_connections_per_ip')} "
+              f"load={w['load1_pre']}→{w['load1_post']}")
+        if w['transport_retry_flag'] or w['refused_per_ip'] or w['drain_timed_out'] or w['open_sessions_after_drain'] != 0:
+            print(f"  INVALID {w['tag']}: tx_retry={w['transport_retry_flag']} "
+                  f"refused_per_ip={w['refused_per_ip']} drain_timed_out={w['drain_timed_out']} "
+                  f"open_sessions_after_drain={w['open_sessions_after_drain']}")
 
     verdict = "FAIL"
     reason = []
@@ -93,18 +121,24 @@ def main():
             reason.append("median missed §13 (≥100 MiB/s and p99<1ms)")
         if not ok_floor:
             reason.append("a window below 80 MiB/s or p99>1.5ms")
-        # hard zeros across valid windows (+ transport-retry hard flag)
+        # hard zeros across valid windows (retries/refused/open already exclude from valid)
         for w in use:
             if w.get("transport_retry_flag"):
-                reason.append(f"{w['tag']}: transport_retry_flag "
-                              f"(producer={w.get('producer_transport_retries')} "
-                              f"consumer={w.get('consumer_connect_retries')})")
+                reason.append(f"{w['tag']}: transport_retry_flag")
+            if w.get("refused_per_ip"):
+                reason.append(f"{w['tag']}: refused_per_ip={w['refused_per_ip']}")
+            if w.get("drain_timed_out"):
+                reason.append(f"{w['tag']}: drain_timed_out")
+            if w.get("open_sessions_after_drain") not in (0, None):
+                reason.append(f"{w['tag']}: open_sessions_after_drain={w.get('open_sessions_after_drain')}")
             hz = w.get("hard_zeros") or {}
             for k, expect_zero in (
                 ("sjws_swarm_stream_node_refusals_total", True),
                 ("sjws_swarm_stream_session_admit_refusals_total", True),
                 ("sjws_swarm_stream_budget_underflows_total", True),
                 ("sjws_swarm_stream_reserve_underflows_total", True),
+                ("sjws_connections_refused_per_ip_total", True),
+                ("sjws_swarm_stream_open_sessions", True),
             ):
                 v = hz.get(k)
                 if v is None:

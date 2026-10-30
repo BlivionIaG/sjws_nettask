@@ -8,6 +8,19 @@ export JAVA_HOME=${JAVA_HOME:-$HOME/jdk25/jdk-25.0.4.1+1}
 export PATH=$JAVA_HOME/bin:${PATH:-}
 mkdir -p "$WD/site" "$WD/swarm"
 echo hi > "$WD/site/hello.txt"
+# A1 fallback (Architecture 2026-10-30 13:12): HttpClient has no local-bind API, so raise
+# max_connections_per_ip only in this bench config — never change ServerConfig defaults.
+# Preferred multi-loopback bind remains awkward with java.net.http.HttpClient.
+GATE_MAX_CONN_PER_IP=${GATE_MAX_CONN_PER_IP:-4096}
+GATE_MAX_CONN=${GATE_MAX_CONN:-4096}
+GATE_BACKLOG=${GATE_BACKLOG:-2048}
+cat > "$WD/gate-server.yaml" <<YML
+server:
+  max_connections: ${GATE_MAX_CONN}
+  max_connections_per_ip: ${GATE_MAX_CONN_PER_IP}
+  backlog: ${GATE_BACKLOG}
+YML
+export GATE_MAX_CONN_PER_IP GATE_MAX_CONN
 : > "$WD/tokens"
 for i in $(seq 0 $((NAGENTS - 1))); do
   tok=$(openssl rand -hex 24)
@@ -28,7 +41,7 @@ taskset -c 2-7 nice -n 10 java -XX:+UseZGC $HEAP \
   -Dsjws.swarm.pool.shards=4 -Dsjws.swarm.stream.shards=4 \
   -Dsjws.swarm.dir="$WD/swarm" -Dsjws.swarm.node=bench \
   -Dsjws.swarm.tokens.file="$WD/tokens" \
-  -jar "$JAR" --metrics=localhost "$PORT" "$WD/site" >"$LOG" 2>&1 &
+  -jar "$JAR" --config="$WD/gate-server.yaml" --metrics=localhost "$PORT" "$WD/site" >"$LOG" 2>&1 &
 SPID=$!
 export SERVER_PID=$SPID
 cleanup(){ kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true; }
@@ -42,17 +55,21 @@ done
 LOADGEN=${LOADGEN:-python}
 HERE_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$LOADGEN" = java ]; then
+  # B1: drain timeout ≥ GRACE_MS + 15s (StreamHttp.GRACE_MS=60000 → ≥75s). Do not use 40.
+  DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
   taskset -c 0-1 nice -n 10 java "$HERE_DIR/StreamLoad.java" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
-    --out "$OUT" --drain-timeout "${DRAIN_TIMEOUT:-75}" --window "${WINDOW:-8}" \
-    --server-pid "$SPID"
+    --out "$OUT" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
+    --server-pid "$SPID" \
+    --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}"
 else
   export PYTHONPATH="$(cd "$(dirname "$0")/../.." && pwd)/sdk/python${PYTHONPATH:+:$PYTHONPATH}"
+  DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
   taskset -c 0-1 nice -n 10 python3 "$HERE_DIR/drive.py" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
-    --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "${DRAIN_TIMEOUT:-75}" --window "${WINDOW:-8}"
+    --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}"
 fi
 curl -sf "http://127.0.0.1:$PORT/metrics" > "$WD/metrics.txt" || true
 # flag-off check: when CREDIT_OFF=1, stream series must be absent

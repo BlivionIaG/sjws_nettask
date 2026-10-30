@@ -22,6 +22,9 @@ public class StreamLoad {
   static final int LAST = 0x01, FIRST = 0x08;
   static final int TYPE_TASK = 1, TYPE_LEASE = 3, TYPE_TOKEN = 6, TYPE_CREDIT = 9;
   static final double CREDIT_FLOOR_S = 0.005; // #261 Q9: 5 ms doubling ±20%, cap Retry-After
+  /** Match StreamHttp.GRACE_MS — drain timeout is derived, never a bare 75. */
+  static final long GRACE_MS = 60_000L;
+  static final long DRAIN_SLACK_MS = 15_000L;
 
   /** Per-VT latency lists — avoids ConcurrentLinkedQueue CAS storms at 1k streams. */
   static final class LatBag {
@@ -50,6 +53,7 @@ public class StreamLoad {
     double warmup = 5, secs = 20, drainTimeout = 75;
     int streams = 1000, chunkBytes = 1024, window = 8;
     int serverPid = 0; // optional: sample server CPU from /proc/<pid>/stat
+    int maxConnectionsPerIp = 0; // A1: recorded from gate harness (0 = unset)
     /** Generator CPUs saturated if client %CPU of wall >= this (2 pinned CPUs → 200% = full). */
     double genSatPct = 180.0;
   }
@@ -127,9 +131,13 @@ public class StreamLoad {
     cpuMon.join(2000);
     double load1Post = load1();
 
-    Map<String, Double> counters = waitDrained(http, args.base + "/metrics", args.drainTimeout);
+    DrainOutcome drain = waitDrained(http, args.base + "/metrics", args.drainTimeout);
+    Map<String, Double> counters = drain.counters;
     Result r = new Result();
     r.mode = args.accept; r.streams = args.streams; r.agents = tokens.size(); r.window = args.window;
+    r.maxConnectionsPerIp = args.maxConnectionsPerIp;
+    r.drainTimedOut = drain.timedOut;
+    r.refusedPerIp = counters.getOrDefault("sjws_connections_refused_per_ip_total", 0.0).longValue();
     r.elapsedS = args.secs; r.wallS = wall; r.load1Pre = load1Pre; r.load1Post = load1Post;
     double[] cpu = cpuSample.get();
     r.clientCpuSec = cpu[0]; r.clientCpuPctOfWall = cpu[1];
@@ -160,13 +168,18 @@ public class StreamLoad {
     r.consumerConnectRetries = consumerConnectRetries.get();
     r.transportRetryFlag = r.producerTransportRetries > 0 || r.consumerConnectRetries > 0;
     r.requests = requests.get();
-    r.hardZeros = Map.of(
-        "sjws_swarm_stream_node_refusals_total", counters.getOrDefault("sjws_swarm_stream_node_refusals_total", Double.NaN),
-        "sjws_swarm_stream_session_admit_refusals_total", counters.getOrDefault("sjws_swarm_stream_session_admit_refusals_total", Double.NaN),
-        "sjws_swarm_stream_budget_underflows_total", counters.getOrDefault("sjws_swarm_stream_budget_underflows_total", Double.NaN),
-        "sjws_swarm_stream_reserve_underflows_total", counters.getOrDefault("sjws_swarm_stream_reserve_underflows_total", Double.NaN),
-        "sjws_swarm_stream_charged_bytes", counters.getOrDefault("sjws_swarm_stream_charged_bytes", Double.NaN),
-        "sjws_swarm_stream_open_sessions", counters.getOrDefault("sjws_swarm_stream_open_sessions", Double.NaN));
+    // Hard zeros read ONLY after drain (B1). refused_per_ip is a hard zero (A2 / Architecture).
+    Map<String, Double> hz = new LinkedHashMap<>();
+    hz.put("sjws_swarm_stream_node_refusals_total", counters.getOrDefault("sjws_swarm_stream_node_refusals_total", Double.NaN));
+    hz.put("sjws_swarm_stream_session_admit_refusals_total", counters.getOrDefault("sjws_swarm_stream_session_admit_refusals_total", Double.NaN));
+    hz.put("sjws_swarm_stream_budget_underflows_total", counters.getOrDefault("sjws_swarm_stream_budget_underflows_total", Double.NaN));
+    hz.put("sjws_swarm_stream_reserve_underflows_total", counters.getOrDefault("sjws_swarm_stream_reserve_underflows_total", Double.NaN));
+    hz.put("sjws_swarm_stream_charged_bytes", counters.getOrDefault("sjws_swarm_stream_charged_bytes", Double.NaN));
+    hz.put("sjws_swarm_stream_open_sessions", counters.getOrDefault("sjws_swarm_stream_open_sessions", Double.NaN));
+    hz.put("sjws_connections_refused_per_ip_total", (double) r.refusedPerIp);
+    r.hardZeros = hz;
+    Double open = counters.get("sjws_swarm_stream_open_sessions");
+    r.openSessionsAfterDrain = open == null ? -1 : open.longValue();
     return r;
   }
 
@@ -510,17 +523,25 @@ public class StreamLoad {
     return http.send(req, HttpResponse.BodyHandlers.ofByteArray());
   }
 
-  static Map<String, Double> waitDrained(HttpClient http, String metricsUrl, double timeoutS) throws Exception {
-    long deadline = System.nanoTime() + (long)(timeoutS * 1e9);
+  /**
+   * B1 (Architecture 2026-10-30): drain until open_sessions==0, timeout = max(args, GRACE_MS+15s).
+   * Hard zeros are read only from the post-drain scrape. Timeout ⇒ drainTimedOut (window invalid).
+   */
+  static DrainOutcome waitDrained(HttpClient http, String metricsUrl, double timeoutS) throws Exception {
+    long timeoutMs = Math.max((long)(timeoutS * 1000), GRACE_MS + DRAIN_SLACK_MS);
+    long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
     Map<String, Double> last = Map.of();
     while (System.nanoTime() < deadline) {
       last = fetchMetrics(http, metricsUrl);
       Double open = last.get("sjws_swarm_stream_open_sessions");
-      if (open == null || open == 0.0) return last;
+      if (open == null || open == 0.0)
+        return new DrainOutcome(last, false);
       Thread.sleep(500);
     }
-    return last;
+    last = fetchMetrics(http, metricsUrl);
+    return new DrainOutcome(last, true);
   }
+  record DrainOutcome(Map<String, Double> counters, boolean timedOut) {}
   static Map<String, Double> fetchMetrics(HttpClient http, String url) throws Exception {
     HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(url)).GET().build(), HttpResponse.BodyHandlers.ofString());
     Map<String, Double> out = new LinkedHashMap<>();
@@ -607,6 +628,7 @@ public class StreamLoad {
         case "--window" -> args.window = Integer.parseInt(a[++i]);
         case "--drain-timeout" -> args.drainTimeout = Double.parseDouble(a[++i]);
         case "--server-pid" -> args.serverPid = Integer.parseInt(a[++i]);
+        case "--max-connections-per-ip" -> args.maxConnectionsPerIp = Integer.parseInt(a[++i]);
         case "--gen-sat-pct" -> args.genSatPct = Double.parseDouble(a[++i]);
         default -> throw new IllegalArgumentException(a[i]);
       }
@@ -622,10 +644,11 @@ public class StreamLoad {
 
   static final class Result {
     String mode; int streams, agents, window, chunkSamples, errorCount, teardownErrorCount, creditWaitN;
-    long bytes, creditStalls, requests, producerTransportRetries, consumerConnectRetries;
+    long bytes, creditStalls, requests, producerTransportRetries, consumerConnectRetries, refusedPerIp, openSessionsAfterDrain;
+    int maxConnectionsPerIp;
     double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall, serverCpuSec, serverCpuPctOfWall;
     Double p50, p90, p99, creditWaitP50, creditWaitP99;
-    boolean selfLoaded, stallFlag, generatorSaturated, transportRetryFlag;
+    boolean selfLoaded, stallFlag, generatorSaturated, transportRetryFlag, drainTimedOut;
     Map<String, Double> counters, hardZeros;
     List<String> errors, teardownErrors;
     String summary() {
@@ -665,6 +688,10 @@ public class StreamLoad {
       field(sb, "producer_transport_retries", producerTransportRetries, true);
       field(sb, "consumer_connect_retries", consumerConnectRetries, true);
       field(sb, "transport_retry_flag", transportRetryFlag, true);
+      field(sb, "max_connections_per_ip", maxConnectionsPerIp, true);
+      field(sb, "refused_per_ip", refusedPerIp, true);
+      field(sb, "drain_timed_out", drainTimedOut, true);
+      field(sb, "open_sessions_after_drain", openSessionsAfterDrain, true);
       sb.append("  \"credit_wait\":{")
         .append("\"n\":").append(creditWaitN)
         .append(",\"total_s\":").append(creditWaitTotal)

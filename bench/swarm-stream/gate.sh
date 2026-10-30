@@ -47,8 +47,19 @@ r=json.load(open(sys.argv[1]))
 n=r.get("chunk_samples") or 0
 p99=r.get("p99_us")
 pre=r.get("load1_pre", 99)
-ptr=int(r.get("producer_transport_retries") or 0); ccr=int(r.get("consumer_connect_retries") or 0); tx=bool(r.get("transport_retry_flag")) or ptr>0 or ccr>0
-print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx else "0")
+ptr=int(r.get("producer_transport_retries") or 0); ccr=int(r.get("consumer_connect_retries") or 0)
+tx=bool(r.get("transport_retry_flag")) or ptr>0 or ccr>0
+refused=int(r.get("refused_per_ip") or 0)
+hz=r.get("hard_zeros") or {}
+if refused==0:
+  try: refused=int(float(hz.get("sjws_connections_refused_per_ip_total") or 0))
+  except Exception: refused=0
+open_after=r.get("open_sessions_after_drain")
+if open_after is None: open_after=hz.get("sjws_swarm_stream_open_sessions")
+try: open_n=int(float(open_after)) if open_after is not None else -1
+except Exception: open_n=-1
+drain_to=bool(r.get("drain_timed_out"))
+print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 else "0")
 PY2
 )
     [ "$ok" = 1 ] && valid=$((valid + 1))
@@ -80,8 +91,19 @@ r=json.load(open(sys.argv[1]))
 n=r.get("chunk_samples") or 0
 p99=r.get("p99_us")
 pre=r.get("load1_pre", 99)
-ptr=int(r.get("producer_transport_retries") or 0); ccr=int(r.get("consumer_connect_retries") or 0); tx=bool(r.get("transport_retry_flag")) or ptr>0 or ccr>0
-print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx else "0")
+ptr=int(r.get("producer_transport_retries") or 0); ccr=int(r.get("consumer_connect_retries") or 0)
+tx=bool(r.get("transport_retry_flag")) or ptr>0 or ccr>0
+refused=int(r.get("refused_per_ip") or 0)
+hz=r.get("hard_zeros") or {}
+if refused==0:
+  try: refused=int(float(hz.get("sjws_connections_refused_per_ip_total") or 0))
+  except Exception: refused=0
+open_after=r.get("open_sessions_after_drain")
+if open_after is None: open_after=hz.get("sjws_swarm_stream_open_sessions")
+try: open_n=int(float(open_after)) if open_after is not None else -1
+except Exception: open_n=-1
+drain_to=bool(r.get("drain_timed_out"))
+print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 else "0")
 PY2
 )
     if [ "$ok" = 1 ]; then
