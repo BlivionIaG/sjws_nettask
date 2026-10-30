@@ -299,6 +299,9 @@ class ObservabilityTest {
         assertTrue(text.contains("sjws_connections_active{protocol=\"HTTP/1.1\"} 2"), text);
         assertTrue(text.contains("sjws_connections_active{protocol=\"HTTP/3\"} 1"), text);
         assertTrue(text.contains("sjws_access_log_dropped_total 4\n"), text);
+        // #315 N5: msgrepl install counters always published (0 until attached).
+        assertTrue(text.contains("sjws_msgrepl_install_pin_exhausted_total 0\n"), text);
+        assertTrue(text.contains("sjws_msgrepl_install_oversized_abandoned_total 0\n"), text);
         assertEquals(0, ServerMetrics.bucket(0));
         assertEquals(ServerMetrics.LATENCY_BOUNDS_NANOS.length - 1, ServerMetrics.bucket(Long.MAX_VALUE));
         assertLatencyContract(text);

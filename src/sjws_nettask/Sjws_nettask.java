@@ -146,8 +146,49 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
+        attachMsgreplInstallMetrics(modules, server); // #315 N5: suppliers only; does not arm counters
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
                 bindContent, modules);
+    }
+
+    /**
+     * When HA messaging is on, publish its install counters on {@link SjwsServer#metrics()} (#315 N5). Matched by
+     * class name so an {@code ha.messaging: off} process never loads {@code msgrepl}. Attaching does not install the
+     * observe filter.
+     */
+    static void attachMsgreplInstallMetrics(OptionalModule modules, SjwsServer server) {
+        var ha = findHaMessaging(modules);
+        if (ha == null) {
+            return;
+        }
+        try {
+            var pin = ha.getClass().getMethod("installPinExhausted");
+            var oversized = ha.getClass().getMethod("installOversizedAbandoned");
+            server.metrics().setMsgreplInstallCounters(() -> {
+                try {
+                    return (long) pin.invoke(ha);
+                } catch (ReflectiveOperationException e) {
+                    return 0L;
+                }
+            }, () -> {
+                try {
+                    return (long) oversized.invoke(ha);
+                } catch (ReflectiveOperationException e) {
+                    return 0L;
+                }
+            });
+        } catch (ReflectiveOperationException ignored) {
+            // HA messaging binary without the #315 getters: leave counters at 0
+        }
+    }
+
+    /** The HA messaging module among {@code modules}, or null. Does not load {@code msgrepl} when absent. */
+    static OptionalModule findHaMessaging(OptionalModule module) {
+        if (module instanceof OptionalModules.Both both) {
+            var first = findHaMessaging(both.first());
+            return first != null ? first : findHaMessaging(both.second());
+        }
+        return module.getClass().getName().equals(HaMessagingStart.CLASS) ? module : null;
     }
 
     private static int awaitServing(SjwsServer server, ServerConfig config, PrintStream out, PrintStream err,

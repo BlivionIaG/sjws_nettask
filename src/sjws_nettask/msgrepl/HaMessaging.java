@@ -217,6 +217,16 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
         return this.describe;
     }
 
+    /** Node-wide install pin-round exhaustions (#315). Zero on a witness (no snapshot runtime). */
+    public long installPinExhausted() {
+        return this.snapshots == null ? 0L : this.snapshots.installPinExhausted.get();
+    }
+
+    /** Node-wide oversized-install abandonments (#315 N2). Zero on a witness. */
+    public long installOversizedAbandoned() {
+        return this.snapshots == null ? 0L : this.snapshots.installOversizedAbandoned.get();
+    }
+
     /** Stops the node, then the transport and the log storage. The messaging module closes its replicas first. */
     @Override
     public void close() {

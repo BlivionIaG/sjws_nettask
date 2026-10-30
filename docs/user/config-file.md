@@ -152,7 +152,7 @@ ha:
 | `ha.snapshot.install_rate` | `64m` | Bytes per second a node sends for installs, all transfers together. |
 | `ha.snapshot.port_offset` | `1` | Install listener binds to each member's Raft port plus this. |
 | `ha.snapshot.log_segment_bytes` | `16m` | Rolling Raft log file size for msg groups. |
-| `ha.snapshot.max_install_bytes` | `4g` | Upper bound on the sum of segment bytes in one install, enforced while chunks stream (before disk writes). Default is four default ledger segments (4 × 1 GiB). `0` is the explicit unlimited opt-in; a negative value is refused. |
+| `ha.snapshot.max_install_bytes` | `4g` | Upper bound on the sum of segment bytes in one install, enforced while chunks stream (before disk writes). Default is four default ledger segments (4 × 1 GiB). `0` is the explicit unlimited opt-in (startup WARN, #315); a negative value is refused. |
 
 An invalid member list is refused in `on` and `auto` (by design, never a silent single-node fallback): a bare
 pair (`two voters require a witness`), more than
