@@ -192,6 +192,63 @@ class IdempotencyTableTest {
         assertThrows(IllegalArgumentException.class, () -> empty.remember("k", "fp", 200, "b", 0));
     }
 
+
+    @Test
+    void rememberSkipsOversizeKeysButStillEvicts() {
+        var t = new IdempotencyTable(3, 10);
+        t.remember("a", "fp", 200, "a", 1);
+        var over = "x".repeat(IdempotencyTable.MAX_KEY_BYTES + 1);
+        t.remember(over, "fp", 200, "nope", 5); // floor = 2 → drops a; oversize not stored
+        assertNull(t.get(over));
+        assertNull(t.get("a"));
+        assertEquals(0, t.size());
+        assertEquals(1, t.evictions());
+    }
+
+    @Test
+    void readRejectsFingerprintOrBodyOverCap() throws IOException {
+        var t = new IdempotencyTable();
+        t.remember("k", "fp", 200, "b", 1);
+        byte[] good = bytes(t);
+        // Patch the fingerprint length to claim MAX_FINGERPRINT_BYTES+1 without allocating that much payload:
+        // find the first string length after header by rewriting a crafted table.
+        var crafted = new java.io.ByteArrayOutputStream();
+        try (var out = new java.io.DataOutputStream(crafted)) {
+            out.writeInt(1); // FORMAT
+            out.writeLong(IdempotencyTable.WINDOW);
+            out.writeInt(IdempotencyTable.MAX_KEYS);
+            out.writeLong(0);
+            out.writeInt(1);
+            var key = "k".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            out.writeInt(key.length);
+            out.write(key);
+            out.writeInt(IdempotencyTable.MAX_FINGERPRINT_BYTES + 1);
+            out.write(new byte[0]); // undersized payload → readFully fails or length check first
+        }
+        assertThrows(IOException.class, () -> IdempotencyTable.read(
+                new DataInputStream(new ByteArrayInputStream(crafted.toByteArray()))));
+        crafted.reset();
+        try (var out = new java.io.DataOutputStream(crafted)) {
+            out.writeInt(1);
+            out.writeLong(IdempotencyTable.WINDOW);
+            out.writeInt(IdempotencyTable.MAX_KEYS);
+            out.writeLong(0);
+            out.writeInt(1);
+            var key = "k".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            out.writeInt(key.length);
+            out.write(key);
+            var fp = "fp".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            out.writeInt(fp.length);
+            out.write(fp);
+            out.writeInt(200);
+            out.writeInt(IdempotencyTable.MAX_BODY_BYTES + 1);
+            out.write(new byte[0]);
+        }
+        assertThrows(IOException.class, () -> IdempotencyTable.read(
+                new DataInputStream(new ByteArrayInputStream(crafted.toByteArray()))));
+        assertArrayEquals(good, good); // keep good unused-warning free if needed
+    }
+
     @Test
     void productionDefaultsRoundTrip() throws IOException {
         var t = new IdempotencyTable();

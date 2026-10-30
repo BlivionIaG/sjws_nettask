@@ -17,6 +17,7 @@
 package sjws_nettask.cp;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -34,6 +35,9 @@ import sjws_nettask.cluster.ClusterTransport;
 import sjws_nettask.cluster.Durability;
 import sjws_nettask.cluster.FileLogStorage;
 import sjws_nettask.cluster.GroupId;
+import sjws_nettask.cluster.GroupListener;
+import sjws_nettask.cluster.LogSnapshot;
+import sjws_nettask.cluster.SnapshotControl;
 import sjws_nettask.cluster.GroupOptions;
 import sjws_nettask.cluster.Member;
 import sjws_nettask.cluster.MemberState;
@@ -91,7 +95,13 @@ public final class CpStore implements AutoCloseable {
     private final JoinTokens joins = new JoinTokens();
     private java.nio.file.Path auditFile;
     private Staged staged;
+    /** YAML that produced {@link #staged}; carried in the Raft snapshot (#341). */
+    private String stagedYaml;
     private int stage;
+    /** Leader-only compaction loop (#341); null when CP not {@link #start}ed. */
+    private volatile Thread compactTick;
+    private volatile long lastCompacted;
+    private volatile boolean closed;
 
     /** Newest activated envelope, for watch threads; written only where {@code history} grows. */
     private volatile SignedSnapshot latest;
@@ -123,7 +133,9 @@ public final class CpStore implements AutoCloseable {
         var storage = new FileLogStorage(stateDir.resolve("cp-config"));
         var node = ReplicatedNode.open(id, List.of(member), Set.of(id), QuorumPolicy.majority(), clock, storage,
                 new SimTransport());
-        return attach(node, id, stateDir, keys, adminSan);
+        var store = attach(node, id, stateDir, keys, adminSan);
+        store.ownedStorage = storage;
+        return store;
     }
 
     /**
@@ -169,7 +181,20 @@ public final class CpStore implements AutoCloseable {
         store.audit = new sjws_nettask.controlplane.AuditLog(store.auditFile, java.time.Clock.systemUTC(), false);
         store.policy.put(canonicalSan(adminSan), sjws_nettask.controlplane.Role.ADMIN);
         store.rebuildRights();
-        store.group = node.openGroup(GROUP, options, entry -> store.onCommitted(entry));
+        // openGroup may deliver onSnapshotRestored before returning (#341): listener must be ready.
+        var listener = new GroupListener() {
+            @Override
+            public void onCommitted(sjws_nettask.cluster.CommittedEntry entry) {
+                store.onCommitted(entry);
+            }
+
+            @Override
+            public void onSnapshotRestored(LogSnapshot snapshot) {
+                store.onSnapshotRestored(snapshot);
+            }
+        };
+        store.group = node.openGroup(GROUP, options, listener);
+        node.snapshots(GROUP).setSnapshotTaker((g, index) -> store.snapshotBytes());
         store.leadership = ControlLeadership.attach(node, GROUP, store.group, id);
         return store;
     }
@@ -218,6 +243,135 @@ public final class CpStore implements AutoCloseable {
                 new java.io.DataInputStream(new java.io.ByteArrayInputStream(image)),
                 idempotency.window(), idempotency.maxKeys());
         idempotency.replaceWith(restored);
+    }
+
+    /**
+     * Full applied-state image for the Raft {@code SnapshotTaker} (#341). Carries history, staged proposal,
+     * policy, revokes, rollout, joins and the idempotency table.
+     */
+    byte[] snapshotBytes() {
+        try {
+            return CpStateSnapshot.write(this);
+        } catch (IOException e) {
+            throw new IllegalStateException("cp state snapshot", e);
+        }
+    }
+
+    /**
+     * Delivery thread: replace applied state from a Raft snapshot (#341). Fail closed on a bad image (leave
+     * prior state untouched when decode throws before mutation starts; after clear, a mid-install failure
+     * fails the group via the thrown exception from the listener).
+     */
+    private void onSnapshotRestored(LogSnapshot snapshot) {
+        try {
+            installStateImage(CpStateSnapshot.read(snapshot.data()));
+        } catch (IOException e) {
+            throw new UncheckedIOException("cp snapshot install refused: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Compact the {@code cp-config} log through {@code through} after ensuring a covering application
+     * snapshot (#341). Persists via {@code persistSnapshotBeforePrefixDelete} before prefix delete.
+     * Must not run on the delivery thread. Identity compactor: the taker image is already the latest
+     * values (history capped, idempotency windowed).
+     */
+    public java.util.concurrent.CompletableFuture<Void> compactThrough(long through) {
+        SnapshotControl snaps = node.snapshots(GROUP);
+        long commit = group.commitIndex();
+        if (through > commit) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalArgumentException("through " + through + " > commit " + commit));
+        }
+        if (through > 0) {
+            snaps.take(commit); // with taker: only commitIndex; advances snap when needed
+        }
+        long acked = Math.min(through, group.commitIndex());
+        // take may have moved snap to commit; truncate through min(acked, snap) — require snap >= acked
+        return snaps.truncateAndCompact(acked, image -> null).whenComplete((ok, err) -> {
+            if (err == null) {
+                lastCompacted = Math.max(lastCompacted, acked);
+            }
+        });
+    }
+
+    /** Package write for {@link CpStateSnapshot#write}. */
+    void writeStateSnapshot(java.io.DataOutputStream out) throws IOException {
+        out.writeInt(history.size());
+        for (var snap : history) {
+            CpStateSnapshot.writeSigned(out, snap);
+        }
+        if (staged == null) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            out.writeLong(staged.version());
+            // Staged document: re-serialize via the same YAML the proposal carried when possible.
+            // ConfigDocument has no canonicalYaml; store empty and refuse empty staged on read if needed.
+            // Prefer the last proposed yaml held only as ConfigDocument — use toString fallback refused.
+            // We keep staged yaml by capturing it on PROPOSE apply (see stagedYaml field).
+            CpStateSnapshot.writeBounded(out, stagedYaml == null ? "" : stagedYaml);
+        }
+        out.writeInt(policy.size());
+        for (var e : policy.entrySet()) {
+            CpStateSnapshot.writeBounded(out, e.getKey());
+            out.writeInt(e.getValue().ordinal());
+        }
+        out.writeInt(revoked.size());
+        for (var r : revoked) {
+            CpStateSnapshot.writeBounded(out, r);
+        }
+        out.writeInt(selectors.size());
+        for (var s : selectors) {
+            CpStateSnapshot.writeBounded(out, s);
+        }
+        out.writeInt(stage);
+        joins.writeSnapshot(out);
+        idempotency.write(out);
+    }
+
+    private void installStateImage(CpStateSnapshot.Image image) throws IOException {
+        var docs = new ArrayList<ConfigDocument>();
+        for (var snap : image.history) {
+            var loaded = parse(snap.canonicalYaml());
+            if (!loaded.ok() || loaded.document() == null) {
+                throw new IOException("cp snapshot: history document rejected");
+            }
+            docs.add(loaded.document());
+        }
+        Staged nextStaged = null;
+        String nextStagedYaml = null;
+        if (image.stagedVersion != null) {
+            var loaded = parse(image.stagedYaml == null ? "" : image.stagedYaml);
+            if (!loaded.ok() || loaded.document() == null) {
+                throw new IOException("cp snapshot: staged document rejected");
+            }
+            nextStaged = new Staged(image.stagedVersion, loaded.document());
+            nextStagedYaml = image.stagedYaml;
+        }
+        // Replace (not merge) after validation succeeds.
+        history.clear();
+        history.addAll(image.history);
+        documents.clear();
+        documents.addAll(docs);
+        staged = nextStaged;
+        stagedYaml = nextStagedYaml;
+        policy.clear();
+        policy.putAll(image.policy);
+        rebuildRights();
+        revoked.clear();
+        revoked.addAll(image.revoked);
+        selectors.clear();
+        selectors.addAll(image.selectors);
+        stage = image.stage;
+        joins.replaceWith(image.joins);
+        idempotency.replaceWith(image.idempotency);
+        if (history.isEmpty()) {
+            publishLatest(null);
+        } else {
+            publishLatest(history.get(history.size() - 1));
+        }
+        warnInlineSecretsAtStartup();
     }
 
     /**
@@ -430,8 +584,51 @@ public final class CpStore implements AutoCloseable {
         node.drive();
     }
 
+    /** Raft commit index for the {@code cp-config} group (#341 tests / compact). */
+    long groupCommitIndex() {
+        return group.commitIndex();
+    }
+
+
     public void start() {
         node.begin(Duration.ofMillis(50));
+        if (compactTick == null) {
+            compactTick = Thread.ofVirtual().name("cp-compact").start(this::compactLoop);
+        }
+    }
+
+    /**
+     * Leader tick (#341): when the commit index has advanced by {@link CpGroup#SNAPSHOT_EVERY_ENTRIES}
+     * since the last successful compact, take a covering snapshot and {@code truncateAndCompact}.
+     * Off the request path; no-op for followers and when CP was never {@link #start}ed.
+     */
+    private void compactLoop() {
+        while (!closed) {
+            try {
+                Thread.sleep(Duration.ofSeconds(30));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            maybeCompact();
+        }
+    }
+
+    void maybeCompact() {
+        if (closed || leadership == null || !leadership.leaderReady()) {
+            return;
+        }
+        long commit = group.commitIndex();
+        if (commit - lastCompacted < CpGroup.SNAPSHOT_EVERY_ENTRIES) {
+            return;
+        }
+        try {
+            compactThrough(commit).get(60, TimeUnit.SECONDS);
+            lastCompacted = commit;
+        } catch (Exception e) {
+            System.getLogger(CpStore.class.getName()).log(System.Logger.Level.WARNING,
+                    "cp compactThrough(" + commit + ") deferred: " + e.getMessage());
+        }
     }
 
     /**
@@ -901,6 +1098,11 @@ public final class CpStore implements AutoCloseable {
 
     @Override
     public void close() {
+        closed = true;
+        var tick = compactTick;
+        if (tick != null) {
+            tick.interrupt();
+        }
         node.close();
         if (ownedStorage != null) {
             try {
@@ -992,6 +1194,7 @@ public final class CpStore implements AutoCloseable {
                 }
                 if (loaded.ok() && loaded.document() != null) {
                     staged = new Staged(version, loaded.document());
+                    stagedYaml = yaml;
                 }
             }
             case SIGNED -> {
@@ -1016,6 +1219,7 @@ public final class CpStore implements AutoCloseable {
                 }
                 publishLatest(snapshot);
                 staged = null;
+                stagedYaml = null;
                 warnInlineSecretsAtStartup();
             }
             case RBAC -> {

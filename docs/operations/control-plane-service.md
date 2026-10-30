@@ -138,6 +138,8 @@ disconnected connection does not drain the process.
 
 Admin mutations with an `Idempotency-Key` are deduplicated for 100 000 applied `cp-config` log indexes (cap 100 000 keys). After eviction a retry is applied again; there is no `KeyExpired`. Details: [control-plane design §12.8.1](../design/control-plane.md).
 
+The `cp-config` group takes application Raft snapshots every 10 000 entries (`CpStore` SnapshotTaker, #341). `compactThrough` truncates the log after a durable snapshot (`persistSnapshotBeforePrefixDelete`). A restarted or lagging replica installs the image via the real Raft snapshot path and then applies the suffix; duplicate Idempotency-Key verdicts match a full replay.
+
 
 A control process with `cp` settings hosts the control plane (`sjws_nettask.cp.CpHost`: a
 Raft voter, the mTLS watch and admin listeners, a voter set over `cp.peers`); a data
