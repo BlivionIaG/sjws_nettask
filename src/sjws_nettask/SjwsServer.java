@@ -62,6 +62,7 @@ import sjws_nettask.h3.Http3Server;
 import sjws_nettask.observe.ClusterStatus;
 import sjws_nettask.observe.LabelSource;
 import sjws_nettask.observe.ObserveRequestFilter;
+import sjws_nettask.observe.AccessTargetMask;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.observe.ServerMetrics;
@@ -110,6 +111,13 @@ public final class SjwsServer implements AutoCloseable {
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final ReentrantLock reloadLock = new ReentrantLock();
+    /** Generations awaiting quiesce before their snapshot close; capped to bound memory. */
+    private final java.util.ArrayDeque<sjws_nettask.h2.Http2Server.Generation> drainingGenerations =
+            new java.util.ArrayDeque<>();
+    private final ReentrantLock drainLock = new ReentrantLock();
+    private static final int MAX_DRAINING_GENERATIONS = 4;
+    /** Bound for deferred snapshot close; shortened in tests to cover the force path. */
+    volatile java.time.Duration snapshotDrainTimeout = java.time.Duration.ofSeconds(30);
     /** Set only by a data-role bootstrap. The field type is {@code Object} so standalone does not name {@code cp}. */
     private Object controlPlane;
     /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
@@ -150,6 +158,7 @@ public final class SjwsServer implements AutoCloseable {
             initial = RequestObserver.open(config);
         }
         this.slot = new ObserverSlot(initial);
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(snapshot.document().middleware()));
         this.observingAtStart = initial.recording();
         FilterChain built;
         Handler selected;
@@ -358,6 +367,11 @@ public final class SjwsServer implements AutoCloseable {
         return start(loaded, H3Transports.defaultFactory());
     }
 
+    /** Config-file startup with a startup {@link RequestFilters} chain ({@code override != null}). */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, RequestFilters filters) throws IOException {
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, filters, null, null);
+    }
+
     /**
      * Config-file startup with prefix mounts. Routing, when enabled, stays the fallback behind
      * the mounts. A null list still discovers {@link HandlerContributor} service providers.
@@ -396,7 +410,8 @@ public final class SjwsServer implements AutoCloseable {
         return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, null);
     }
 
-    private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
+    /** Package-visible so same-package tests can wire a custom {@code h2Factory} with a file-backed reload. */
+    static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal)
             throws IOException {
         return start(loaded, h3Factory, h2Factory, filters, terminal, null);
@@ -526,12 +541,19 @@ public final class SjwsServer implements AutoCloseable {
         try {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
-            if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-                // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies.
-                // The wrapper is never a StaticFileHandler; derive bodies from the compiled live handler
-                // (static-only → false; YAML router / non-static → true) (#289 P1 / live-snapshot routes).
-                http2.armHandler(request -> this.live.handler().handle(request), liveNeedsBodies());
+            if (transport instanceof sjws_nettask.h2.Http2Server http2) {
+                // Pin a fully armed generation (filters + metrics around the snapshot terminal, or
+                // around a frozen override) so each Task captures one handler (#301 / B3).
+                Handler pinned = this.override != null ? this.override : this.live.handler();
+                Handler armed = armedAround(pinned);
+                boolean bodies = liveNeedsBodies() || this.override != null;
+                http2.armHandler(armed, bodies);
+                if (this.armed.get() != null) {
+                    this.armed.set(armed);
+                }
             }
+            // Custom h2Factory: no start-time arm — chain-control apply, metrics, and publish call
+            // Transport.armHandler via armH2 (Codex P2 4421410868).
             transport.start();
             this.h2 = transport;
         } catch (Exception | LinkageError e) {
@@ -674,6 +696,7 @@ public final class SjwsServer implements AutoCloseable {
         }
         if (write) {
             persistLastGood(result.snapshot().document());
+            syncCredentialQueryParamsFromConfig(result.snapshot().document());
         }
         return result;
     }
@@ -742,6 +765,7 @@ public final class SjwsServer implements AutoCloseable {
                 }
                 persistLastGood(published.snapshot().document());
                 var appliedMw = published.snapshot().document().middleware();
+                syncCredentialQueryParamsFromConfig(published.snapshot().document());
                 sjws_nettask.config.MiddlewareSecrets.logStartupWarn(
                         System.getLogger(SjwsServer.class.getName()), appliedMw, null, null);
             }
@@ -836,21 +860,58 @@ public final class SjwsServer implements AutoCloseable {
         }
         var replaced = this.live.get();
         var next = result.snapshot();
-        // HTTP/2 attachBodies vs live swap (#289 Middleware Chain nit): enabling must happen
-        // before live.set so a new stream never sees a body-needing handler with bodies still
-        // off; disabling happens after the swap (brief extra attach is safe).
-        sjws_nettask.h2.Http2Server http2ForBodies = null;
-        boolean bodies = false;
-        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-            http2ForBodies = http2;
-            bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null;
-            if (bodies) {
-                http2.setAttachBodies(true);
+        // HTTP/2: one atomic generation = fully armed chain (filters/metrics) + attachBodies (#301
+        // P1/P2a). In-flight Tasks keep the generation they captured; defer closing replaced pools
+        // until those Tasks leave (P2b).
+        sjws_nettask.h2.Http2Server.Generation previousH2 = null;
+        if (this.h2 != null) {
+            // Shared terminal/armed selection for Http2Server and custom h2Factory transports.
+            // Live chain-control rebinds around chainLeaf (Codex P2 4421015537); Http2Server keeps
+            // generation-aware armHandler(armed, bodies), others get Transport.armHandler (4421410868).
+            Handler terminal = publishTerminal(next);
+            boolean bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null
+                    || this.override != null;
+            if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
+                var control = this.control;
+                if (control != null && control.isLive()) {
+                    previousH2 = control.withPublishLock(() -> {
+                        Handler armed = compileAroundTerminal(terminal);
+                        var prev = http2.armHandler(armed, bodies);
+                        // Live control always publishes through armed (armSnapshot on apply).
+                        this.armed.set(armed);
+                        return prev;
+                    });
+                } else {
+                    Handler armed = armedAround(terminal);
+                    previousH2 = http2.armHandler(armed, bodies);
+                    if (this.armed.get() != null) {
+                        this.armed.set(armed);
+                    }
+                }
+            } else {
+                // Custom h2Factory: same lock span as Http2Server — compile + arm + armed.set
+                // (Middleware Chain on #302). No I/O under the lock; armHandler is a volatile swap.
+                var control = this.control;
+                if (control != null && control.isLive()) {
+                    control.withPublishLock(() -> {
+                        Handler armed = compileAroundTerminal(terminal);
+                        this.h2.armHandler(armed);
+                        // Live control always publishes through armed (armSnapshot on apply).
+                        this.armed.set(armed);
+                        return null;
+                    });
+                } else {
+                    Handler armed = armedAround(terminal);
+                    this.h2.armHandler(armed);
+                    if (this.armed.get() != null) {
+                        this.armed.set(armed);
+                    }
+                }
             }
         }
         this.live.set(next);
         if (replaced != next) {
-            replaced.close(); // old upstream pools: idle connections now, in-flight ones when they finish
+            deferSnapshotClose(previousH2, replaced);
         }
         var server = next.document().server();
         if (this.manager != null && this.manager.reaper() != null) {
@@ -861,9 +922,6 @@ public final class SjwsServer implements AutoCloseable {
             if (result.tls() != null) {
                 http3.replaceTls(result.tls());
             }
-        }
-        if (http2ForBodies != null) {
-            http2ForBodies.setAttachBodies(bodies);
         }
         if (closeOld && this.challengeHttp != null) {
             this.challengeHttp.close();
@@ -920,8 +978,152 @@ public final class SjwsServer implements AutoCloseable {
      * other terminal does. Used for the HTTP/2 live-snapshot arm so production static-only stays
      * zero-cost without disabling bodies for configured proxy routes (#289).
      */
-    private boolean liveNeedsBodies() {
-        return !(this.live.handler() instanceof StaticFileHandler);
+    boolean liveNeedsBodies() {
+        // control.isLive() always arms via armSnapshot, so armed!=null covers that case.
+        return !(this.live.handler() instanceof StaticFileHandler) || this.armed.get() != null;
+    }
+
+    /**
+     * Fully armed handler for one pinned snapshot terminal: control-plane filters (API-key etc.)
+     * and the observe/metrics outer filter, compiled around {@code terminal} so HTTP/2 does not
+     * re-read {@link #live} under the chain (#301 P1). Without a live chain control, keeps an
+     * already-armed observe chain or returns the terminal.
+     */
+    Handler armedAround(Handler terminal) {
+        Objects.requireNonNull(terminal, "terminal");
+        Handler frozen = request -> terminal.handle(request);
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return control.compileAround(frozen);
+        }
+        // Startup observe is already inside override; do not wrap it again (Codex P2).
+        if (this.observingAtStart && terminal == this.override) {
+            return frozen;
+        }
+        // observingAtStart implies a recording slot, so recording covers that case.
+        if (this.armed.get() != null || this.slot.get().recording()) {
+            return sjws_nettask.observe.ObserveRequestFilter.chain(this.slot, frozen);
+        }
+        return frozen;
+    }
+
+    /**
+     * After swapping away {@code previous}, close {@code replaced} when its pinned h2 Tasks drain,
+     * with a bounded wait so close cannot hang forever (P2b).
+     *
+     * <p><b>Operator note:</b> in-flight proxy work pinned to a replaced generation can be cut after
+     * 30 seconds (forced drain). Errors from that path must stay free of secret material. Rapid
+     * reloads can retain several replaced generations (and their upstream pools) for up to 30 s each.
+     */
+    void deferSnapshotClose(sjws_nettask.h2.Http2Server.Generation previous,
+            ConfigSnapshot replaced) {
+        if (replaced == null) {
+            return;
+        }
+        trackDrainingGeneration(previous);
+        var once = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable close = () -> {
+            if (once.compareAndSet(false, true)) {
+                replaced.close();
+            }
+        };
+        this.drainLock.lock();
+        boolean emptyDrain;
+        try {
+            emptyDrain = this.drainingGenerations.isEmpty();
+        } finally {
+            this.drainLock.unlock();
+        }
+        if (previous == null && emptyDrain) {
+            close.run();
+            return;
+        }
+        // Close when the swap generation and any other tracked gens for this epoch drain.
+        var pending = new java.util.concurrent.atomic.AtomicInteger(1); // barrier until registration done
+        Runnable release = () -> {
+            if (pending.decrementAndGet() == 0) {
+                close.run();
+            }
+        };
+        if (previous != null) {
+            pending.incrementAndGet();
+            previous.whenQuiesced(release);
+        }
+        // Also wait for any still-tracked gens from prior rearms under this snapshot (Codex P2).
+        java.util.List<sjws_nettask.h2.Http2Server.Generation> extras;
+        this.drainLock.lock();
+        try {
+            extras = new java.util.ArrayList<>(this.drainingGenerations);
+        } finally {
+            this.drainLock.unlock();
+        }
+        for (var g : extras) {
+            if (g == previous) {
+                continue;
+            }
+            pending.incrementAndGet();
+            g.whenQuiesced(release);
+        }
+        release.run(); // drop registration barrier
+        var drainTimeout = this.snapshotDrainTimeout;
+        Thread.ofVirtual().name("sjws-snapshot-close").start(() -> {
+            try {
+                Thread.sleep(drainTimeout);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (once.get()) {
+                return;
+            }
+            System.err.println("WARN: forcing close of replaced config snapshot after drain timeout "
+                    + "(in-flight h2 work on the previous generation was cut; errors must not leak secrets)");
+            close.run();
+        });
+    }
+
+    /**
+     * Remembers a replaced generation until it quiesces. Caps concurrent drains at
+     * {@link #MAX_DRAINING_GENERATIONS}: the oldest is force-retired so rapid reloads cannot retain
+     * unbounded pools (Security nit).
+     */
+    public void trackDrainingGeneration(sjws_nettask.h2.Http2Server.Generation generation) {
+        if (generation == null) {
+            return;
+        }
+        sjws_nettask.h2.Http2Server.Generation evicted = null;
+        this.drainLock.lock();
+        try {
+            this.drainingGenerations.addLast(generation);
+            while (this.drainingGenerations.size() > MAX_DRAINING_GENERATIONS) {
+                evicted = this.drainingGenerations.removeFirst();
+            }
+        } finally {
+            this.drainLock.unlock();
+        }
+        generation.whenQuiesced(() -> {
+            this.drainLock.lock();
+            try {
+                this.drainingGenerations.remove(generation);
+            } finally {
+                this.drainLock.unlock();
+            }
+        });
+        if (evicted != null && evicted != generation) {
+            System.err.println("WARN: forcing quiesce of oldest draining h2 generation "
+                    + "(cap " + MAX_DRAINING_GENERATIONS + " under rapid reload)");
+            evicted.forceQuiesce();
+        }
+    }
+
+    /** Package-visible for tests. */
+    public int drainingGenerationCount() {
+        this.drainLock.lock();
+        try {
+            return this.drainingGenerations.size();
+        } finally {
+            this.drainLock.unlock();
+        }
     }
 
     /** @return null when this server was started without {@link HaSettings} */
@@ -1038,18 +1240,67 @@ public final class SjwsServer implements AutoCloseable {
         return created;
     }
 
+    /** Terminal for a config publish: chainLeaf when control is live, else override or next.handler(). */
+    private Handler publishTerminal(ConfigSnapshot next) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return this.chainLeaf;
+        }
+        return this.override != null ? this.override : next.handler();
+    }
+
+    private Handler compileAroundTerminal(Handler terminal) {
+        var control = this.control;
+        Handler frozen = request -> terminal.handle(request);
+        return control.compileAroundUnlocked(frozen);
+    }
+
+    /**
+     * Refresh access-log credential query names from the config {@code middleware} list only while
+     * no live {@link ChainControl} document owns them. Once {@link #chainControl} has published
+     * (isLive), names come solely from {@link #armSnapshot} via the effective
+     * {@link sjws_nettask.core.FilterDocument} — never from the startup override or a later
+     * config middleware list — so a control-plane remove/add of {@code api-key} cannot leave
+     * stale names or resurrect ones the document cleared (#302 chainLeaf rebind).
+     */
+    private void syncCredentialQueryParamsFromConfig(sjws_nettask.config.ConfigDocument document) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return;
+        }
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
+    }
+
+    /**
+     * Publishes {@code handler} on the HTTP/2 transport. {@link sjws_nettask.h2.Http2Server} gets
+     * the generation-aware overload ({@code bodies} + drain tracking). Any other non-null
+     * {@link Transport} (custom {@code h2Factory}) gets {@link Transport#armHandler(Handler)} so
+     * chain-control and metrics arms still reach it (Codex P2 4421410868).
+     */
+    private void armH2(Handler handler, boolean bodies) {
+        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
+            trackDrainingGeneration(http2.armHandler(handler, bodies));
+        } else if (this.h2 != null) {
+            this.h2.armHandler(handler);
+        }
+    }
+
     /**
      * Stores the compiled snapshot where every transport already reads its handler. One volatile
      * write per transport; the request path does not enter {@link ChainControl}.
+     * Credential query names are refreshed from {@code control.document()} (the FilterDocument
+     * just applied), not from startup middleware / override. HTTP/2 publish goes through
+     * {@link #armH2} (generation + custom factory).
      */
     private void armSnapshot(Handler handler) {
+        // onPublish runs only after {@link #chainControl} assigned {@link #control}, and after
+        // apply/pinOuter has written {@link ChainControl#document()}.
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromDocument(this.control.document()));
         this.armed.set(handler);
         if (this.h3 != null) {
             this.h3.armHandler(handler);
         }
-        if (this.h2 != null) {
-            this.h2.armHandler(handler);
-        }
+        armH2(handler, true);
     }
 
     /**
@@ -1076,6 +1327,15 @@ public final class SjwsServer implements AutoCloseable {
      */
     public void attachGatewayMetrics(LabelSource labels) {
         this.slot.attachLabels(labels);
+    }
+
+    /**
+     * Sets the api-key query parameter names whose values are masked in the access log.
+     * Null or empty clears masking. Does not install the observe filter. Prefer letting
+     * {@link #chainControl} refresh these from each applied filter document.
+     */
+    public void attachCredentialQueryParams(String[] names) {
+        this.slot.attachCredentialQueryParams(names);
     }
 
     /**
@@ -1120,9 +1380,7 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h3 != null) {
             this.h3.armHandler(chain);
         }
-        if (this.h2 != null) {
-            this.h2.armHandler(chain);
-        }
+        armH2(chain, true);
     }
 
     /**

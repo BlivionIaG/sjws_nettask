@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import sjws_nettask.TestCommands;
 import sjws_nettask.http1.Http1Writer;
 
 /**
@@ -237,7 +238,7 @@ public class VerificationRegressionTest {
     public static void mkfifo(Path p) throws Exception {
         Process mk;
         try {
-            mk = new ProcessBuilder("mkfifo", p.toString()).start();
+            mk = new ProcessBuilder(TestCommands.resolve("mkfifo"), p.toString()).start();
         } catch (IOException e) {
             Assumptions.abort("no mkfifo: " + e);
             return;
@@ -245,10 +246,12 @@ public class VerificationRegressionTest {
         Assumptions.assumeTrue(mk.waitFor(5, TimeUnit.SECONDS) && mk.exitValue() == 0, "mkfifo failed");
     }
 
-    /** Opens the FIFO for writing, which unblocks any reader stuck in open(); a no-op if none. */
+    /** Opens the FIFO RDWR (POSIX non-blocking open trick), which unblocks any reader stuck in open(); a no-op if none. */
     public static void unblock(Path fifo) {
-        try {
-            new ProcessBuilder("sh", "-c", "exec 3<>'" + fifo + "'").start().waitFor(2, TimeUnit.SECONDS);
+        try (var ignored = java.nio.channels.FileChannel.open(fifo,
+                java.nio.file.StandardOpenOption.READ,
+                java.nio.file.StandardOpenOption.WRITE)) {
+            // open alone is enough
         } catch (Exception e) {
             // best effort
         }

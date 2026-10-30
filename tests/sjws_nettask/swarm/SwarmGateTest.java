@@ -38,6 +38,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.TestCommands;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestBody;
 import sjws_nettask.core.RequestHeaders;
@@ -272,8 +273,12 @@ class SwarmGateTest {
 
     /** Whether {@code sudo -n chown} works here (a no-op chown to the current owner). */
     private static boolean canChown(Path path, String owner) {
+        var sudo = TestCommands.find("sudo");
+        if (sudo == null) {
+            return false;
+        }
         try {
-            var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true)
+            var proc = new ProcessBuilder(sudo, "-n", "chown", owner, path.toString()).redirectErrorStream(true)
                     .start();
             proc.getInputStream().readAllBytes();
             return proc.waitFor() == 0;
@@ -283,7 +288,7 @@ class SwarmGateTest {
     }
 
     private static void chown(Path path, String owner) throws Exception {
-        var proc = new ProcessBuilder("sudo", "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
+        var proc = new ProcessBuilder(TestCommands.resolve("sudo"), "-n", "chown", owner, path.toString()).redirectErrorStream(true).start();
         String out = new String(proc.getInputStream().readAllBytes());
         assertEquals(0, proc.waitFor(), out);
     }

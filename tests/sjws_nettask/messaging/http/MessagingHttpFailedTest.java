@@ -18,16 +18,23 @@ package sjws_nettask.messaging.http;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.core.Response;
+import sjws_nettask.observe.AccessTargetMask;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 
 /** #246 (c): a failed replicated write or leader read never sends internal error text to the client. */
@@ -181,4 +188,53 @@ class MessagingHttpFailedTest {
         assertTrue(body(r).contains(MessagingHttp.NOT_LEADER_TYPE));
         assertEquals("7", r.headers().get("sjws-term"));
     }
+
+    /**
+     * MessagingHttp ERROR/WARN paths must mask pinned credential query values the same way as the
+     * access log, so a failure line cannot leak an api-key query param.
+     */
+    @Test
+    void errorAndWarnLogTargetsUsePinnedMask() {
+        var secret = "S2-MSG-DUMMY-KEY";
+        var target = "/messaging/v1/topics/t/records?api_key=" + secret + "&x=1";
+        var records = new ArrayList<LogRecord>();
+        var jul = Logger.getLogger(MessagingHttp.class.getName());
+        var handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        var previous = jul.getLevel();
+        jul.addHandler(handler);
+        jul.setLevel(Level.ALL);
+        AccessTargetMask.pin(new String[] {"api_key"});
+        try {
+            MessagingHttp.logError(new IOException("disk"), target);
+            MessagingHttp.unavailable(new IllegalStateException("closed"), target);
+            MessagingHttp.failed(internal(), target, true);
+        } finally {
+            AccessTargetMask.clearPinned();
+            jul.removeHandler(handler);
+            jul.setLevel(previous);
+        }
+        assertFalse(records.isEmpty(), "expected JUL records from MessagingHttp logger");
+        for (var record : records) {
+            var msg = record.getMessage();
+            assertNotNull(msg);
+            assertFalse(msg.contains(secret), msg);
+            assertTrue(msg.contains("api_key=***") || !msg.contains("api_key="), msg);
+        }
+        assertTrue(records.stream().anyMatch(r -> r.getMessage().contains("api_key=***")),
+                records.stream().map(LogRecord::getMessage).toList().toString());
+    }
+
 }
