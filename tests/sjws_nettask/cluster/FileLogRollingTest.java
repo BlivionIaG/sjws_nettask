@@ -49,6 +49,8 @@ class FileLogRollingTest {
         var s = fill(200);
         assertTrue(s.sealedFiles(G) > 5, "rolled into several sealed files");
         long before = s.entryBytes(G);
+        // Durable snapshot must cover the truncated prefix so reopen's keep-suffix is bound to snapIndex+1 (#316 B2).
+        s.saveSnapshot(G, new LogSnapshot(G, 150, 1 + 150 / 50, new byte[] {1}));
         s.truncatePrefix(G, 150);
         assertTrue(s.entryBytes(G) < before / 2, "sealed files wholly below the cut are gone");
         assertNull(s.read(G, 150));
@@ -69,6 +71,7 @@ class FileLogRollingTest {
         var s = fill(200);
         var first = Files.list(dir).filter(p -> p.toString().endsWith(".seg")).sorted().findFirst().orElseThrow();
         var copy = Files.readAllBytes(first);
+        s.saveSnapshot(G, new LogSnapshot(G, 150, 1 + 150 / 50, new byte[] {1}));
         s.truncatePrefix(G, 150);
         s.close();
         Files.write(first, copy); // the unlink did not survive a crash
