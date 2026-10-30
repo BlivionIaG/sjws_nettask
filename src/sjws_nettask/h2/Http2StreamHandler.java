@@ -214,8 +214,11 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
             return;
         }
+        // One generation read: handler + attachBodies (#301 / P2a).
+        var generation = this.shared.generation();
+        generation.enter();
         // Only when bodies are enabled (chain / non-static terminal): static-only path stays zero-cost.
-        if (this.shared.attachBodies() && !request.headOnly() && !"GET".equals(request.method())) {
+        if (generation.attachBodies() && !request.headOnly() && !"GET".equals(request.method())) {
             long length = contentLength(headers);
             if (length != 0) {
                 Runnable sendContinue = expectContinue(headers) ? () -> send100(stream) : null;
@@ -229,7 +232,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
             // nothing to attach
         }
         // Pin the handler generation with the body-capture decision (#301).
-        var task = new Task(stream, request, budget, this.body, this.shared.live());
+        var task = new Task(stream, request, budget, this.body, generation);
         try {
             this.shared.executor().execute(task);
         } catch (RejectedExecutionException e) { // shutting down
@@ -288,14 +291,14 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         private final Request request;
         private final Http2Server.Budget budget;
         private final Http2RequestBody body; // or null
-        /** Handler (and thus config generation) chosen with {@code attachBodies} (#301). */
-        private final Handler generation;
+        /** Generation (handler + attachBodies) captured at construction (#301 / P2a). */
+        private final Http2Server.Generation generation;
         private final AtomicBoolean finished = new AtomicBoolean();
         private volatile Thread thread;
         private volatile boolean cancelled;
 
         Task(Http2StreamChannel stream, Request request, Http2Server.Budget budget, Http2RequestBody body,
-                Handler generation) {
+                Http2Server.Generation generation) {
             this.stream = stream;
             this.request = request;
             this.budget = budget;
@@ -328,7 +331,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                 var refusal = refusal(this.request);
                 Response response;
                 try {
-                    response = refusal != null ? refusal : this.generation.handle(this.request);
+                    response = refusal != null ? refusal : this.generation.handler().handle(this.request);
                 } catch (RuntimeException e) {
                     response = StaticFileHandler.error(500, this.request.headOnly());
                 }
@@ -366,6 +369,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                 }
                 Http2StreamHandler.this.shared.inflight().release();
                 this.budget.inflight().release();
+                this.generation.leave();
             }
         }
 

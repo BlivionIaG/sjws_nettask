@@ -527,11 +527,10 @@ public final class SjwsServer implements AutoCloseable {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
             if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-                // Pin the compiled snapshot handler (not a re-reading lambda) so each stream's Task
-                // can capture one generation with its attachBodies decision (#301). publish() re-arms
-                // on reload so root / access / routing changes still apply to new streams.
+                // Pin a fully armed generation (filters + metrics around the snapshot terminal) so
+                // each stream's Task captures one handler with its attachBodies decision (#301).
                 var pinned = this.live.handler();
-                http2.armHandler(request -> pinned.handle(request), liveNeedsBodies());
+                http2.armHandler(armedAround(pinned), liveNeedsBodies());
             }
             transport.start();
             this.h2 = transport;
@@ -837,24 +836,24 @@ public final class SjwsServer implements AutoCloseable {
         }
         var replaced = this.live.get();
         var next = result.snapshot();
-        // HTTP/2: pin snapshot handler + attachBodies as one generation (#301). Enabling bodies
-        // (and the new handler) before live.set avoids under-attach; disabling after the swap is
-        // safe (brief extra attach). In-flight Tasks keep the handler they captured at start.
-        sjws_nettask.h2.Http2Server http2ForBodies = null;
-        Handler pinned = null;
-        boolean bodies = false;
+        // HTTP/2: one atomic generation = fully armed chain (filters/metrics) + attachBodies (#301
+        // P1/P2a). In-flight Tasks keep the generation they captured; defer closing replaced pools
+        // until those Tasks leave (P2b).
+        sjws_nettask.h2.Http2Server.Generation previousH2 = null;
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-            http2ForBodies = http2;
-            pinned = next.handler();
-            bodies = !(pinned instanceof StaticFileHandler) || this.armed.get() != null;
-            if (bodies) {
-                Handler enable = pinned;
-                http2.armHandler(request -> enable.handle(request), true);
+            Handler terminal = next.handler();
+            Handler armed = armedAround(terminal);
+            boolean bodies = !(terminal instanceof StaticFileHandler) || this.armed.get() != null
+                    || (this.control != null && this.control.isLive());
+            previousH2 = http2.armHandler(armed, bodies);
+            // Keep SjwsServer.armed aligned with the pinned generation when filters/metrics are on.
+            if (this.armed.get() != null || (this.control != null && this.control.isLive())) {
+                this.armed.set(armed);
             }
         }
         this.live.set(next);
         if (replaced != next) {
-            replaced.close(); // old upstream pools: idle connections now, in-flight ones when they finish
+            deferSnapshotClose(previousH2, replaced);
         }
         var server = next.document().server();
         if (this.manager != null && this.manager.reaper() != null) {
@@ -865,10 +864,6 @@ public final class SjwsServer implements AutoCloseable {
             if (result.tls() != null) {
                 http3.replaceTls(result.tls());
             }
-        }
-        if (http2ForBodies != null) {
-            Handler finalPinned = pinned;
-            http2ForBodies.armHandler(request -> finalPinned.handle(request), bodies);
         }
         if (closeOld && this.challengeHttp != null) {
             this.challengeHttp.close();
@@ -926,7 +921,59 @@ public final class SjwsServer implements AutoCloseable {
      * zero-cost without disabling bodies for configured proxy routes (#289).
      */
     private boolean liveNeedsBodies() {
-        return !(this.live.handler() instanceof StaticFileHandler);
+        return !(this.live.handler() instanceof StaticFileHandler) || this.armed.get() != null
+                || (this.control != null && this.control.isLive());
+    }
+
+    /**
+     * Fully armed handler for one pinned snapshot terminal: control-plane filters (API-key etc.)
+     * and the observe/metrics outer filter, compiled around {@code terminal} so HTTP/2 does not
+     * re-read {@link #live} under the chain (#301 P1). Without a live chain control, keeps an
+     * already-armed observe chain or returns the terminal.
+     */
+    private Handler armedAround(Handler terminal) {
+        Objects.requireNonNull(terminal, "terminal");
+        Handler frozen = request -> terminal.handle(request);
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return control.compileAround(frozen);
+        }
+        if (this.armed.get() != null || this.slot.get().recording() || this.observingAtStart) {
+            return sjws_nettask.observe.ObserveRequestFilter.chain(this.slot, frozen);
+        }
+        return frozen;
+    }
+
+    /**
+     * After swapping away {@code previous}, close {@code replaced} when its pinned h2 Tasks drain,
+     * with a bounded wait so close cannot hang forever (P2b).
+     */
+    private void deferSnapshotClose(sjws_nettask.h2.Http2Server.Generation previous,
+            ConfigSnapshot replaced) {
+        if (replaced == null) {
+            return;
+        }
+        var once = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable close = () -> {
+            if (once.compareAndSet(false, true)) {
+                replaced.close();
+            }
+        };
+        if (previous == null) {
+            close.run();
+            return;
+        }
+        previous.whenQuiesced(close);
+        // Bounded drain: force-close if Tasks never finish (client stall / bug).
+        Thread.ofVirtual().name("sjws-snapshot-close").start(() -> {
+            try {
+                Thread.sleep(java.time.Duration.ofSeconds(30));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            close.run();
+        });
     }
 
     /** @return null when this server was started without {@link HaSettings} */
@@ -1052,7 +1099,10 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h3 != null) {
             this.h3.armHandler(handler);
         }
-        if (this.h2 != null) {
+        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
+            // Filters need bodies; publish as one generation (P2a).
+            http2.armHandler(handler, true);
+        } else if (this.h2 != null) {
             this.h2.armHandler(handler);
         }
     }
@@ -1125,7 +1175,9 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h3 != null) {
             this.h3.armHandler(chain);
         }
-        if (this.h2 != null) {
+        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
+            http2.armHandler(chain, true);
+        } else if (this.h2 != null) {
             this.h2.armHandler(chain);
         }
     }

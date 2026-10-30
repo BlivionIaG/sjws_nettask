@@ -214,6 +214,30 @@ public final class ChainControl implements Handler {
         return new Snapshot(document.version(), chain == null ? this.terminal : chain);
     }
 
+    /**
+     * Compiles the live document around {@code terminal} without publishing. Used by
+     * {@code SjwsServer} to pin a fully armed chain (filters + outer observe) to one config
+     * snapshot on HTTP/2 so reload cannot drop API-key / metrics filters (#301 P1).
+     */
+    public Handler compileAround(Handler terminal) {
+        Objects.requireNonNull(terminal, "terminal");
+        this.publish.lock();
+        try {
+            var doc = this.document;
+            if (doc == null) {
+                var outer = outerFilter();
+                if (outer == null) {
+                    return terminal;
+                }
+                return this.registry.compile(FilterDocument.empty(0), this.nodeLabels, terminal, outer);
+            }
+            var chain = this.registry.compile(doc, this.nodeLabels, terminal, outerFilter());
+            return chain == null ? terminal : chain;
+        } finally {
+            this.publish.unlock();
+        }
+    }
+
     /** Hands the compiled handler to the server. Not called from {@link #handle}. */
     private void notifyPublished(Snapshot snapshot) {
         if (this.onPublish != null) {

@@ -62,7 +62,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
-import sjws_nettask.HandlerRef;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.Transport;
 import sjws_nettask.core.Handler;
@@ -131,27 +130,83 @@ public final class Http2Server implements Transport {
     static final io.netty.util.AttributeKey<Budget> BUDGET = io.netty.util.AttributeKey.valueOf("sjws-h2-budget");
 
     /**
-     * What every stream handler needs. {@link #live()} does one volatile read. A null value keeps
-     * {@code handler}, so a server that never arms calls the startup handler and nothing else.
+     * One published handler + body-capture flag (#301 / P2a). Swapped with a single volatile write
+     * so a stream never sees a mixed pair. {@link #enter}/{@link #leave} track in-flight Tasks so
+     * {@link sjws_nettask.SjwsServer} can defer closing the previous snapshot's upstream pools (P2b).
+     */
+    public static final class Generation {
+        private final Handler handler;
+        private final boolean attachBodies;
+        private final AtomicInteger inflight = new AtomicInteger();
+        private final java.util.concurrent.atomic.AtomicReference<Runnable> onQuiesce =
+                new java.util.concurrent.atomic.AtomicReference<>();
+
+        public Generation(Handler handler, boolean attachBodies) {
+            this.handler = Objects.requireNonNull(handler, "handler");
+            this.attachBodies = attachBodies;
+        }
+
+        public Handler handler() {
+            return this.handler;
+        }
+
+        public boolean attachBodies() {
+            return this.attachBodies;
+        }
+
+        void enter() {
+            this.inflight.incrementAndGet();
+        }
+
+        void leave() {
+            if (this.inflight.decrementAndGet() == 0) {
+                fireQuiesce();
+            }
+        }
+
+        /** Runs {@code action} once when in-flight Tasks drain (or immediately if already idle). */
+        public void whenQuiesced(Runnable action) {
+            this.onQuiesce.set(Objects.requireNonNull(action, "action"));
+            if (this.inflight.get() == 0) {
+                fireQuiesce();
+            }
+        }
+
+        private void fireQuiesce() {
+            var r = this.onQuiesce.getAndSet(null);
+            if (r != null) {
+                r.run();
+            }
+        }
+    }
+
+    /**
+     * What every stream handler needs. {@link #generation()} is one volatile read of the handler and
+     * attachBodies pair. Before the first {@link #armHandler}, streams use {@code handler} with the
+     * constructor body flag.
      */
     record Shared(Handler handler, ExecutorService executor, Semaphore inflight, Semaphore files,
-            Duration writeTimeout, LongAdder refused, Limits limits, HandlerRef armed,
-            AtomicBoolean attachBodiesFlag) {
+            Duration writeTimeout, LongAdder refused, Limits limits,
+            java.util.concurrent.atomic.AtomicReference<Generation> published,
+            boolean startupAttachBodies) {
 
-        /** Startup handler, or the one published by a later metrics arm. */
+        /** Current generation, or a synthetic one from the startup handler. */
+        Generation generation() {
+            var g = this.published.get();
+            return g != null ? g : new Generation(this.handler, this.startupAttachBodies);
+        }
+
+        /** Startup handler, or the one published by a later arm. */
         Handler live() {
-            var published = this.armed.get();
-            return published != null ? published : this.handler;
+            return generation().handler();
         }
 
         /**
-         * Attach request bodies and full header maps when the published configuration needs them
-         * (#289). Set from the constructor and {@link Http2Server#armHandler(Handler, boolean)};
-         * not inferred from {@link #live()}{@code SjwsServer} arms a lambda that is never a
-         * {@link StaticFileHandler}). Static-only keeps the zero-cost DATA release path.
+         * Attach request bodies and full header maps when the published generation needs them
+         * (#289 / #301). Read with the handler from the same {@link Generation}.
          */
         boolean attachBodies() {
-            return this.attachBodiesFlag.get();
+            return generation().attachBodies();
         }
 
         /** @return the connection's budget, created on first use */
@@ -172,13 +227,13 @@ public final class Http2Server implements Transport {
 
     private final ServerConfig config;
     private final Handler handler;
-    /** Published by {@link #armHandler} after start. A null value keeps {@link #handler}. */
-    private final HandlerRef armed = new HandlerRef();
     /**
-     * Bodies/full field maps. False for a static-only publish (including the production
-     * {@code SjwsServer} live-snapshot lambda). True when a chain or non-static terminal is armed.
+     * Published by {@link #armHandler}. Null keeps the constructor handler + startup body flag.
+     * One volatile generation so handler and attachBodies never diverge (P2a).
      */
-    private final AtomicBoolean attachBodies = new AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicReference<Generation> published =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    private final boolean startupAttachBodies;
     private final Limits limits;
     private TlsMaterial tls;
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -206,7 +261,7 @@ public final class Http2Server implements Transport {
         this.handler = Objects.requireNonNull(handler, "handler");
         this.tls = tls;
         this.limits = Objects.requireNonNull(limits, "limits");
-        this.attachBodies.set(!(handler instanceof StaticFileHandler));
+        this.startupAttachBodies = !(handler instanceof StaticFileHandler);
     }
 
     @Override
@@ -224,26 +279,26 @@ public final class Http2Server implements Transport {
     }
 
     /**
+     * Publishes handler and attachBodies as one generation (P2a / #301). Returns the previous
+     * generation so the caller can defer closing its snapshot resources (P2b).
+     *
      * @param attachBodies when false, DATA is released and only the six typed headers are read
-     *        (static-only / production live-snapshot arm). When true, bodies and the full field map
-     *        are attached. Survives config hot-swaps: each arm republishes the flag.
+     *        (static-only). When true, bodies and the full field map are attached.
      */
-    public void armHandler(Handler handler, boolean attachBodies) {
-        this.armed.set(Objects.requireNonNull(handler, "handler"));
-        this.attachBodies.set(attachBodies);
+    public Generation armHandler(Handler handler, boolean attachBodies) {
+        var next = new Generation(handler, attachBodies);
+        return this.published.getAndSet(next);
     }
 
     /** @return whether bodies and full field maps are attached (tests / diagnostics) */
     boolean attachBodies() {
-        return this.attachBodies.get();
+        var g = this.published.get();
+        return g != null ? g.attachBodies() : this.startupAttachBodies;
     }
 
-    /**
-     * Refresh the bodies flag without replacing the armed handler (e.g. after a live-snapshot
-     * reload that turns routing on or off under the same live-snapshot lambda).
-     */
-    public void setAttachBodies(boolean attachBodies) {
-        this.attachBodies.set(attachBodies);
+    /** Currently published generation, or null before the first {@link #armHandler}. */
+    Generation generation() {
+        return this.published.get();
     }
 
     @Override
@@ -257,7 +312,7 @@ public final class Http2Server implements Transport {
             this.perIp = new PerIpLimit(Math.min(this.config.maxConnectionsPerIp(), this.limits.maxConnectionsPerIp()));
             this.shared = new Shared(this.handler, this.executor, new Semaphore(this.limits.maxInflight()),
                     new Semaphore(this.limits.maxOpenFiles()), this.config.writeTimeout(), this.refused, this.limits,
-                    this.armed, this.attachBodies);
+                    this.published, this.startupAttachBodies);
             this.boss = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             this.workers = new MultiThreadIoEventLoopGroup(0, NioIoHandler.newFactory());
             this.tlsChannel = bind(this.config.h2Port(), new ChannelInitializer<SocketChannel>() {

@@ -281,7 +281,7 @@ class H2BranchCoverageTest {
     private static Http2Server.Shared shared(ExecutorService executor, Semaphore inflight, Semaphore files) {
         return new Http2Server.Shared(request -> new Response(200, ResponseHeaders.of().add("connection", "close").add("x-trace", "1"),
                 Body.Bytes.of(new byte[] {'o'})), executor, inflight, files, Duration.ofMillis(200), new LongAdder(),
-                Http2Server.Limits.DEFAULT, new HandlerRef(), new AtomicBoolean(false));
+                Http2Server.Limits.DEFAULT, new java.util.concurrent.atomic.AtomicReference<>(), false);
     }
 
     private static ExecutorService holding(List<Runnable> held) {
