@@ -59,7 +59,9 @@ if [ "$PHASE" = all ] || [ "$PHASE" = abs ]; then
   valid=$(abs_valid_count)
   echo "abs resume: $valid already valid" | tee -a "$OUT/gate.log"
   attempt=0
-  while [ "$valid" -lt "$NVALID" ] && [ "$attempt" -lt "$CAP" ]; do
+  created=0
+  MAX_NEW=${MAX_NEW:-999}
+  while [ "$valid" -lt "$NVALID" ] && [ "$attempt" -lt "$CAP" ] && [ "$created" -lt "$MAX_NEW" ]; do
     attempt=$((attempt + 1))
     tag=$(printf 'abs-%02d' "$attempt")
     if [ -f "$OUT/$tag/result.json" ]; then
@@ -70,6 +72,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = abs ]; then
       echo "window $tag: one.sh failed" | tee -a "$OUT/gate.log"
       continue
     fi
+    created=$((created + 1))
     ok=$(python3 - "$OUT/$tag/result.json" <<'PY2'
 import json,sys
 r=json.load(open(sys.argv[1]))
