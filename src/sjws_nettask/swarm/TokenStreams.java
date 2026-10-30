@@ -546,10 +546,16 @@ public final class TokenStreams {
     private volatile boolean closed;
     private final AtomicLong ledgerChunks = new AtomicLong();
     private final AtomicLong ledgerUndecodable = new AtomicLong();
+    private final AtomicLong ledgerSkipped = new AtomicLong();
 
     /** Chunks the shard reader handed to a sink (a remote worker's, or not yet pushed in-process). */
     public long ledgerChunks() {
         return this.ledgerChunks.get();
+    }
+
+    /** Ledger copies the shard reader skipped (already held, older attempt, or wrong stream). */
+    public long ledgerSkipped() {
+        return this.ledgerSkipped.get();
     }
 
     boolean reading() {
@@ -648,8 +654,10 @@ public final class TokenStreams {
     /** One poll of local shard {@code shard}: offers every chunk to its sink and acks the batch. Returns chunks read. */
     int readOnce(int shard, long waitNanos) {
         var p = this.topics.partitionWithoutDlq(shardTopic(shard));
-        var got = waitNanos > 0 ? p.poll(READER_GROUP, this.node, 256, 30_000, waitNanos)
-                : p.poll(READER_GROUP, this.node, 256, 30_000);
+        // Stream-partition reader Deliver/Ack are NONE: read watermark not crash-durable (§5.2 / #236 revisit).
+        var got = waitNanos > 0
+                ? p.poll(READER_GROUP, this.node, 256, 30_000, waitNanos, Durability.NONE)
+                : p.poll(READER_GROUP, this.node, 256, 30_000, Durability.NONE);
         int n = got.size();
         if (n == 0) {
             return 0;
@@ -683,10 +691,12 @@ public final class TokenStreams {
                             credit.lowerHeld(lower); // only after the drain published the flushed chunks (#248 r4 B3)
                         }
                     }
+                } else {
+                    this.ledgerSkipped.incrementAndGet();
                 }
             }
         }
-        p.ack(READER_GROUP, offs, atts, null);
+        p.ack(READER_GROUP, offs, atts, Durability.NONE);
         return n;
     }
 
