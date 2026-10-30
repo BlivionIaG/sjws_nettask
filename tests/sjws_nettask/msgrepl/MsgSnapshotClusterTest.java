@@ -581,7 +581,11 @@ class MsgSnapshotClusterTest {
         c.data[f].replica.installPinRoundsLimit = 2;
         long before = c.data[f].replica.installPinExhausted();
         c.heal(f);
-        for (int k = 0; k < 4000 && c.data[f].replica.installPinExhausted() == before; k++) c.step();
+        // Install backs off with real Thread.sleep; pump the sim and give the delivery thread wall time.
+        for (int k = 0; k < 20_000 && c.data[f].replica.installPinExhausted() == before; k++) {
+            c.step();
+            Thread.sleep(0, 100_000);
+        }
         assertTrue(c.data[f].replica.installPinExhausted() > before, "exhausted counter must tick");
         assertEquals(0, c.data[f].replica.installs(), "no successful install with only a divergent pin");
         assertTrue(c.data[f].replica.installPending(), "marker stays for a later good pin / restart");
