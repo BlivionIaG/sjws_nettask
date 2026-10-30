@@ -572,7 +572,7 @@ the others. The Raft state under `state_dir` stays. Turning replication back on:
   re-seed. The check relies on the clean stop; a node killed before the rollback has no record of where it
   stopped, so wipe it as well.
 
-Known limits (gates before any default change): no multi-process test yet (G3); torn last record (#241); member links not encrypted and the sender not
+Known limits (gates before any default change): no multi-process test yet (G3); member links not encrypted and the sender not
 bound to its connection (#277: until it ships, `ha.messaging_insecure_plaintext` stays mandatory for members
 off loopback); members whose member lists or `ha.topics` differ are not detected (#217 item 2).
 `ha.messaging`, `ha.topics` and `ha.members` are read at startup only: a SIGHUP reload that changes them reports

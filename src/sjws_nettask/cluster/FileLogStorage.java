@@ -45,6 +45,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * durable snapshot that allowed the truncation). A suffix truncation (rare: a conflicting uncommitted tail) rewrites
  * every kept entry into a new active file first and only then deletes the sealed files; loading treats the active file
  * as authoritative from its first index on.
+ *
+ * <p>On open, a torn (half-written) last record is detected by length/framing, truncated, and the file and directory
+ * are fsynced (#241). Mid-log framing corruption fails closed. Per-record CRC32C for bit flips inside a well-framed
+ * record is #207 and is not required to drop a crash torn tail.
  */
 public final class FileLogStorage implements LogStorage {
 
@@ -52,6 +56,7 @@ public final class FileLogStorage implements LogStorage {
     private final ReentrantLock lock = new ReentrantLock();
     /** Serializes snapshot file writes; separate from {@link #lock} so appends never wait for them. */
     private final ReentrantLock snapLock = new ReentrantLock();
+    private static final System.Logger LOG = System.getLogger(FileLogStorage.class.getName());
     private final Map<GroupId, NavigableMap<Long, Rec>> logs = new ConcurrentHashMap<>();
     private final Map<GroupId, FileChannel> channels = new ConcurrentHashMap<>();
     private final Map<GroupId, AtomicInteger> forceCounts = new ConcurrentHashMap<>();
@@ -94,25 +99,51 @@ public final class FileLogStorage implements LogStorage {
         return root.resolve(safe(group) + "." + String.format("%020d", first) + ".seg");
     }
 
-    /** Reads one file of {@code [index][term][len][data]} records; stops at a torn tail. */
-    private static java.util.TreeMap<Long, Rec> readRecords(Path path) throws IOException {
+    /**
+     * One file scan: complete {@code [index][term][len][data]} records and the end offset of the last
+     * one. A torn tail ({@code lastGoodPos < fileSize}) is truncated by the caller with an fsync of
+     * the file and directory (#241). Mid-log corruption (negative length or a non-contiguous index)
+     * fails closed. Bit flips inside a well-framed record need per-record CRC32C (#207).
+     */
+    private record Scan(java.util.TreeMap<Long, Rec> records, long lastGoodPos, long fileSize) {
+        boolean torn() {
+            return lastGoodPos < fileSize;
+        }
+    }
+
+    private static Scan scanRecords(Path path) throws IOException {
         var out = new java.util.TreeMap<Long, Rec>();
         if (!Files.exists(path) || Files.size(path) == 0) {
-            return out;
+            return new Scan(out, 0L, 0L);
         }
+        long fileSize = Files.size(path);
+        long lastGood = 0L;
+        Long expect = null;
         try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
             var header = ByteBuffer.allocate(20);
-            while (in.position() < in.size()) {
+            while (in.position() < fileSize) {
+                long recordStart = in.position();
                 header.clear();
-                if (in.read(header) != 20) {
+                int got = in.read(header);
+                if (got < 0) {
                     break;
+                }
+                if (got != 20) {
+                    break; // incomplete header at EOF: torn tail
                 }
                 header.flip();
                 long index = header.getLong();
                 long term = header.getLong();
                 int len = header.getInt();
-                if (len < 0 || len > in.size() - in.position()) {
-                    break; // torn tail
+                if (len < 0) {
+                    // A crash leaves an incomplete header, not a complete one with a negative length.
+                    throw new IOException("corrupt log record framing in " + path.getFileName()
+                            + " at offset " + recordStart + ": negative length " + len
+                            + "; refusing to start");
+                }
+                long remaining = fileSize - in.position();
+                if (len > remaining) {
+                    break; // body would run past EOF: torn tail
                 }
                 var data = new byte[len];
                 var body = ByteBuffer.wrap(data);
@@ -122,12 +153,50 @@ public final class FileLogStorage implements LogStorage {
                     }
                 }
                 if (body.hasRemaining()) {
-                    break;
+                    break; // torn body at EOF
                 }
+                if (expect != null && index != expect) {
+                    throw new IOException("corrupt log record framing in " + path.getFileName()
+                            + " at offset " + recordStart + ": index " + index + " after "
+                            + (expect - 1) + "; refusing to start");
+                }
+                expect = index + 1;
                 out.put(index, new Rec(term, data));
+                lastGood = in.position();
             }
         }
-        return out;
+        return new Scan(out, lastGood, fileSize);
+    }
+
+    /** Scans {@code path} and, when the tail is torn, truncates it and fsyncs the file and directory. */
+    private java.util.TreeMap<Long, Rec> readRecords(Path path) throws IOException {
+        var scan = scanRecords(path);
+        if (scan.torn()) {
+            truncateTornTail(path, null, scan.lastGoodPos, scan.fileSize);
+        }
+        return scan.records;
+    }
+
+    /**
+     * Truncates a torn tail to {@code lastGoodPos}. Pass an open writable {@code channel} when the
+     * caller already holds one for {@code path}; otherwise a channel is opened for the truncate.
+     */
+    private void truncateTornTail(Path path, FileChannel channel, long lastGoodPos, long fileSize)
+            throws IOException {
+        if (channel != null) {
+            channel.truncate(lastGoodPos);
+            channel.force(true);
+        } else {
+            try (var ch = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                ch.truncate(lastGoodPos);
+                ch.force(true);
+            }
+        }
+        try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
+            dir.force(true);
+        }
+        LOG.log(System.Logger.Level.WARNING, "truncated torn Raft log tail of {0}: {1} -> {2} bytes",
+                path.getFileName(), fileSize, lastGoodPos);
     }
 
     private NavigableMap<Long, Rec> log(GroupId group) throws IOException {
@@ -144,34 +213,20 @@ public final class FileLogStorage implements LogStorage {
             var loaded = new ConcurrentSkipListMap<Long, Rec>();
             var path = path(group);
             Files.deleteIfExists(rewritePath(group));
+            Scan pendingTorn = null;
             if (rolling()) {
                 loadRolling(group, loaded);
             } else if (Files.exists(path) && Files.size(path) > 0) {
-                try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
-                    var header = ByteBuffer.allocate(20);
-                    while (in.position() < in.size()) {
-                        header.clear();
-                        if (in.read(header) != 20) {
-                            break;
-                        }
-                        header.flip();
-                        long index = header.getLong();
-                        long term = header.getLong();
-                        int len = header.getInt();
-                        var data = new byte[len];
-                        var body = ByteBuffer.wrap(data);
-                        while (body.hasRemaining()) {
-                            if (in.read(body) < 0) {
-                                break;
-                            }
-                        }
-                        loaded.put(index, new Rec(term, data));
-                    }
-                }
+                pendingTorn = scanRecords(path);
+                loaded.putAll(pendingTorn.records);
             }
-            channels.put(group, FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
-                    StandardOpenOption.WRITE));
+            var channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
+                    StandardOpenOption.WRITE);
+            channels.put(group, channel);
             logs.put(group, loaded);
+            if (pendingTorn != null && pendingTorn.torn()) {
+                truncateTornTail(path, channel, pendingTorn.lastGoodPos, pendingTorn.fileSize);
+            }
             return loaded;
         } finally {
             lock.unlock();
