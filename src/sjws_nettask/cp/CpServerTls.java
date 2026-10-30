@@ -19,10 +19,13 @@ package sjws_nettask.cp;
 import java.io.IOException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.util.Objects;
+import java.util.function.Function;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLSocket;
+import javax.security.auth.x500.X500Principal;
 import sjws_nettask.config.ConfigException;
 import sjws_nettask.config.SecureKeyFile;
 
@@ -37,7 +40,8 @@ public final class CpServerTls {
 
     private final CpListenerConfig config;
     private final AdminTls tls;
-    private volatile java.util.function.Function<java.security.cert.X509Certificate, String> leafCheck = leaf -> null;
+    private volatile Function<X509Certificate, String> leafCheck = leaf -> null;
+    private volatile Runnable afterReload = () -> { };
 
     private CpServerTls(CpListenerConfig config, AdminTls tls) {
         this.config = config;
@@ -79,8 +83,13 @@ public final class CpServerTls {
      * A check every later {@link #reloadTls()} applies to the new leaf certificate before swapping it in: a non-null
      * answer refuses the reload and keeps the current material.
      */
-    void checkLeafOnReload(java.util.function.Function<java.security.cert.X509Certificate, String> check) {
-        this.leafCheck = java.util.Objects.requireNonNull(check, "check");
+    void checkLeafOnReload(Function<X509Certificate, String> check) {
+        this.leafCheck = Objects.requireNonNull(check, "check");
+    }
+
+    /** Runs after a successful {@link #reloadTls()} (peer links use this to drop connections that fail policy). */
+    public void afterReload(Runnable hook) {
+        this.afterReload = Objects.requireNonNull(hook, "hook");
     }
 
     /** Successful loads so far, starting at 1. */
@@ -89,8 +98,10 @@ public final class CpServerTls {
     }
 
     /**
-     * After a peer-link handshake (including a resumed one), re-check the peer's certificate chain
-     * against the material currently in use. {@code peerIsClient} is true when this side accepted.
+     * After a peer-link handshake (including a resumed one), or when re-checking an established peer
+     * after reload, re-apply trust-anchor and revocation checks against the current material.
+     * {@code peerIsClient} is true when this side accepted. Identity (SAN) binding is checked by the
+     * peer socket layer after this returns.
      */
     public void revalidatePeer(SSLSocket socket, boolean peerIsClient) throws IOException {
         try {
@@ -120,6 +131,16 @@ public final class CpServerTls {
         if (why != null) {
             throw new CpKeyException(config.name() + " TLS reload refused, keeping previous material: " + why);
         }
+        afterReload.run();
+    }
+
+    /** Subject and serial only, for WARN lines when a peer is refused (no fingerprint or PEM). */
+    public static String peerLogId(X509Certificate leaf) {
+        if (leaf == null) {
+            return "unknown";
+        }
+        return leaf.getSubjectX500Principal().getName(X500Principal.RFC2253)
+                + " serial:" + leaf.getSerialNumber().toString(16);
     }
 
     private static void checkKey(CpListenerConfig config) throws CpKeyException {

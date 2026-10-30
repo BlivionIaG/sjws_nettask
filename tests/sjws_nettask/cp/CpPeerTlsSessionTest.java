@@ -200,6 +200,10 @@ class CpPeerTlsSessionTest {
             if (t instanceof java.security.cert.CertificateException) {
                 return;
             }
+            if (t instanceof IllegalStateException
+                    && String.valueOf(t.getMessage()).contains("pinned")) {
+                return;
+            }
             String message = String.valueOf(t.getMessage());
             // Peer-link post-handshake material re-check (session handling).
             if (t instanceof IOException && message.contains("refused after handshake")) {
@@ -316,4 +320,163 @@ class CpPeerTlsSessionTest {
         });
     }
 
+
+    /**
+     * Peer cert stays trusted, but after the pin table no longer binds it to that voter the resumed
+     * reconnect is refused on both the listener and the dialer.
+     */
+    @Test
+    void resumedPeerRefusedAfterPinUnbind() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-unbind"));
+        var acceptorTls = CpTls.peerContext(ca.peer("a"));
+        var dialerTls = CpTls.peerContext(ca.peer("b"));
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.unbind", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(acceptorTls, port, "a");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var first = exchange(server, listener, dialerTls);
+                assertConnected(first, "first dial");
+                var warm = exchange(server, listener, dialerTls);
+                assertConnected(warm, "warm dial");
+                assertTrue(resumed(first.client(), warm.client()), "warm dial must resume");
+
+                // Same addresses; b's pin now expects a SAN the certificate does not carry.
+                var rebound = List.of(
+                        new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", port), false, CpTestCa.san("a")),
+                        new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", 1), false,
+                                "uri:urn:sjws:node:b-rebound"));
+                server.replacePins(rebound);
+                var after = exchange(server, listener, dialerTls);
+                assertRefused(after.server(),
+                        "acceptor must refuse a resumed peer whose pin no longer binds");
+                assertRefused(after.client(),
+                        "dialer must see the acceptor's refusal after pin unbind");
+
+                // Dialer-side: pin for the server address no longer matches the server's cert SAN.
+                var dialerRebound = List.of(
+                        new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", port), false,
+                                "uri:urn:sjws:node:a-rebound"),
+                        new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", 1), false, CpTestCa.san("b")));
+                var dialerSockets = new CpPeerSockets(dialerTls, dialerRebound, "b");
+                var acceptAgain = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        try {
+                            server.handshake(ssl, 5_000);
+                        } finally {
+                            ssl.close();
+                        }
+                        return null;
+                    } catch (Exception e) {
+                        return e;
+                    }
+                });
+                Exception dialErr = null;
+                try {
+                    dialerSockets.connect(new InetSocketAddress("127.0.0.1", port)).close();
+                } catch (Exception e) {
+                    dialErr = e;
+                }
+                acceptAgain.get(10, TimeUnit.SECONDS);
+                assertNotNull(dialErr, "dialer connect must refuse when the peer pin no longer binds");
+            }
+            return null;
+        });
+    }
+
+    /** An established connection is closed when reloadTls revokes its peer. */
+    @Test
+    void reloadTlsDropsEstablishedPeer() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-drop"));
+        var deny = denylist("drop-deny");
+        var acceptorTls = CpTls.peerContext(peer(ca, "a", deny));
+        var clientCfg = ca.peer("b");
+        var clientSerial = ca.lastSerial();
+        var dialerTls = CpTls.peerContext(clientCfg);
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.drop", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(acceptorTls, port, "a");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                var acceptor = CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        server.handshake(ssl, 5_000);
+                        assertEquals(2, server.peerWire(ssl));
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var client = (SSLSocket) dialerTls.context().getSocketFactory().createSocket();
+                client.setSSLParameters(dialerTls.parameters());
+                client.connect(new InetSocketAddress("127.0.0.1", port), CpPeerSockets.CONNECT_TIMEOUT_MILLIS);
+                client.startHandshake();
+                // Dialer-side policy + track via CpPeerSockets.connect path is separate; here the acceptor tracks.
+                var live = accepted.get(10, TimeUnit.SECONDS);
+                assertFalse(live.isClosed(), "established before reload");
+                assertTrue(server.policyDropped() == 0);
+
+                Files.writeString(deny, "serial:" + clientSerial.toString(16) + "\n");
+                long before = server.policyDropped();
+                acceptorTls.reloadTls();
+                assertTrue(server.policyDropped() > before, "reload must drop the established peer");
+                assertTrue(live.isClosed(), "established socket closed after reload");
+                acceptor.join();
+                client.close();
+            }
+            return null;
+        });
+    }
+
+    /**
+     * A peer refused during handshake never has an application frame accepted: the transport handler
+     * sees nothing even when the dialer writes a frame immediately after its own handshake.
+     */
+    @Test
+    void refusedHandshakeAcceptsNoFrame() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-frame"));
+        var serverCfg = ca.peer("a");
+        var clientCfg = ca.peer("b");
+        var clientSerial = ca.lastSerial();
+        var deny = denylist("frame-deny", clientSerial);
+        var key = sjws_nettask.cluster.ClusterKey.of("cp-raft-key-for-tests-0123".getBytes(java.nio.charset.StandardCharsets.US_ASCII), null);
+        var ports = EphemeralPorts.probeDistinct(2);
+        var members = new java.util.ArrayList<sjws_nettask.cluster.Member>();
+        for (int wire = 1; wire <= 2; wire++) {
+            members.add(new sjws_nettask.cluster.Member(new sjws_nettask.cluster.NodeId(wire, "cp-" + wire),
+                    new sjws_nettask.cluster.SiteId("cp"),
+                    new InetSocketAddress("127.0.0.1", ports[wire - 1]), 1L, sjws_nettask.cluster.MemberState.ALIVE,
+                    false));
+        }
+        var got = new java.util.ArrayList<sjws_nettask.cluster.SimTransport.Frame>();
+        var group = new sjws_nettask.cluster.GroupId("cp-config");
+        // Acceptor revokes the dialer's cert from the start.
+        var acceptorSockets = new CpPeerSockets(CpTls.peerContext(peer(ca, "a", deny)), List.of(
+                new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", ports[0]), false, CpTestCa.san("a")),
+                new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", ports[1]), false, CpTestCa.san("b"))), "a");
+        var dialerSockets = new CpPeerSockets(CpTls.peerContext(clientCfg), List.of(
+                new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", ports[0]), false, CpTestCa.san("a")),
+                new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", ports[1]), false, CpTestCa.san("b"))), "b");
+        try (var a = sjws_nettask.cluster.TcpTransport.open(members.get(0).id(), members, key,
+                sjws_nettask.cluster.Clock.SYSTEM, 64, acceptorSockets);
+                var b = sjws_nettask.cluster.TcpTransport.open(members.get(1).id(), members, key,
+                        sjws_nettask.cluster.Clock.SYSTEM, 64, dialerSockets)) {
+            a.attach(members.get(0).id(), (from, frame) -> got.add(frame));
+            var rpc = b.attach(members.get(1).id(), (from, frame) -> { });
+            rpc.send(members.get(0).id(), new sjws_nettask.cluster.SimTransport.Frame(group, 7, new byte[] {7}));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (System.nanoTime() < deadline && a.handshakeFailures() < 1) {
+                a.deliver(50);
+                b.deliver(50);
+                Thread.sleep(10);
+            }
+            assertTrue(a.handshakeFailures() >= 1, "acceptor counted a handshake failure");
+            assertEquals(0, a.inboundConnections(), "no authenticated inbound slot");
+            a.deliver(100);
+            assertTrue(got.isEmpty(), "no application frame accepted after a refused handshake");
+        }
+    }
 }
