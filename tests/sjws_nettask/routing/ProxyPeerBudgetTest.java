@@ -27,6 +27,8 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import sjws_nettask.core.Body;
@@ -36,6 +38,9 @@ import sjws_nettask.core.RequestHeaders;
 /**
  * #78: a per-peer share of the in-flight body budget. Meant to fail on master (no per-peer
  * constructor, no peer stripes, one client can hold the whole global budget).
+ *
+ * <p>Waits on {@link ByteBudget#setChangeObserver} rather than sleeping / spinning on budget
+ * state (#298 follow-up).
  */
 class ProxyPeerBudgetTest {
 
@@ -57,25 +62,38 @@ class ProxyPeerBudgetTest {
                 var peerB = addr(10, 0, 0, 2);
                 assertNotEquals(budget.peerStripe(peerA), budget.peerStripe(peerB));
 
-                var slow = (Body.Stream) p.handle(request("GET", "/a", peerA)).body();
-                var src = slow.source();
-                assertNotNull(src.next());
-                for (int i = 0; i < 300 && !budget.exhausted(budget.peerStripe(peerA)); i++) {
-                    Thread.sleep(10);
-                }
-                assertTrue(budget.exhausted(budget.peerStripe(peerA))
-                                || budget.peerInFlight(budget.peerStripe(peerA)) >= PER_PEER / 2,
-                        "peer A held=" + budget.peerInFlight(budget.peerStripe(peerA)));
-
-                long got = 0;
-                var fast = (Body.Stream) p.handle(request("GET", "/b", peerB)).body();
-                try (var sb = fast.source()) {
-                    for (var buf = sb.next(); buf != null; buf = sb.next()) {
-                        got += buf.remaining();
+                int stripeA = budget.peerStripe(peerA);
+                var held = new CountDownLatch(1);
+                budget.setChangeObserver((stripe, peer, global) -> {
+                    if (stripe == stripeA && (budget.exhausted(stripeA) || peer >= PER_PEER / 2)) {
+                        held.countDown();
                     }
+                });
+                try {
+                    var slow = (Body.Stream) p.handle(request("GET", "/a", peerA)).body();
+                    var src = slow.source();
+                    assertNotNull(src.next());
+                    if (budget.exhausted(stripeA) || budget.peerInFlight(stripeA) >= PER_PEER / 2) {
+                        held.countDown();
+                    }
+                    assertTrue(held.await(10, TimeUnit.SECONDS),
+                            "peer A held=" + budget.peerInFlight(stripeA));
+                    assertTrue(budget.exhausted(stripeA)
+                                    || budget.peerInFlight(stripeA) >= PER_PEER / 2,
+                            "peer A held=" + budget.peerInFlight(stripeA));
+
+                    long got = 0;
+                    var fast = (Body.Stream) p.handle(request("GET", "/b", peerB)).body();
+                    try (var sb = fast.source()) {
+                        for (var buf = sb.next(); buf != null; buf = sb.next()) {
+                            got += buf.remaining();
+                        }
+                    }
+                    assertEquals(SIZE, got, "peer B must complete while A holds its share");
+                    src.close();
+                } finally {
+                    budget.setChangeObserver(null);
                 }
-                assertEquals(SIZE, got, "peer B must complete while A holds its share");
-                src.close();
                 awaitZero(budget);
             }
         }
@@ -93,22 +111,31 @@ class ProxyPeerBudgetTest {
                     false, 4), budget)) {
                 var peer = addr(10, 1, 2, 3);
                 var stripe = budget.peerStripe(peer);
-                var stream = (Body.Stream) p.handle(request("GET", "/hold", peer)).body();
-                var src = stream.source();
-                // Do not take from the source first: next() releases bytes and races the fill.
-                // Wait on the budget condition until the peer stripe is at its share.
-                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
-                while (!budget.exhausted(stripe) && System.nanoTime() < deadline) {
-                    Thread.onSpinWait();
-                    if (budget.peerInFlight(stripe) == 0) {
-                        Thread.sleep(1); // upstream has not charged yet
+                var exhausted = new CountDownLatch(1);
+                budget.setChangeObserver((s, peerBytes, global) -> {
+                    if (s == stripe && budget.exhausted(stripe)) {
+                        exhausted.countDown();
                     }
+                });
+                try {
+                    var stream = (Body.Stream) p.handle(request("GET", "/hold", peer)).body();
+                    var src = stream.source();
+                    // Do not take from the source first: next() releases bytes and races the fill.
+                    if (budget.exhausted(stripe)) {
+                        exhausted.countDown();
+                    }
+                    assertTrue(exhausted.await(10, TimeUnit.SECONDS),
+                            "peer must hit its share; held=" + budget.peerInFlight(stripe)
+                                    + " limit=" + PER_PEER);
+                    assertTrue(budget.exhausted(stripe),
+                            "peer must hit its share; held=" + budget.peerInFlight(stripe)
+                                    + " limit=" + PER_PEER);
+                    assertEquals(503, p.handle(request("GET", "/again", peer)).status());
+                    assertNotNull(src.next());
+                    src.close();
+                } finally {
+                    budget.setChangeObserver(null);
                 }
-                assertTrue(budget.exhausted(stripe),
-                        "peer must hit its share; held=" + budget.peerInFlight(stripe) + " limit=" + PER_PEER);
-                assertEquals(503, p.handle(request("GET", "/again", peer)).status());
-                assertNotNull(src.next());
-                src.close();
                 awaitZero(budget);
                 assertEquals(0, budget.peerInFlight(stripe));
             }
@@ -127,14 +154,26 @@ class ProxyPeerBudgetTest {
                     false, 4), budget)) {
                 var peer = addr(10, 9, 8, 7);
                 var stripe = budget.peerStripe(peer);
-                var stream = (Body.Stream) p.handle(request("GET", "/drop", peer)).body();
-                var src = stream.source();
-                assertNotNull(src.next());
-                for (int i = 0; i < 100 && budget.peerInFlight(stripe) == 0; i++) {
-                    Thread.sleep(10);
+                var charged = new CountDownLatch(1);
+                budget.setChangeObserver((s, peerBytes, global) -> {
+                    if (s == stripe && peerBytes > 0) {
+                        charged.countDown();
+                    }
+                });
+                try {
+                    var stream = (Body.Stream) p.handle(request("GET", "/drop", peer)).body();
+                    var src = stream.source();
+                    assertNotNull(src.next());
+                    if (budget.peerInFlight(stripe) > 0) {
+                        charged.countDown();
+                    }
+                    assertTrue(charged.await(10, TimeUnit.SECONDS),
+                            "peer never charged; held=" + budget.peerInFlight(stripe));
+                    assertTrue(budget.peerInFlight(stripe) > 0);
+                    src.close();
+                } finally {
+                    budget.setChangeObserver(null);
                 }
-                assertTrue(budget.peerInFlight(stripe) > 0);
-                src.close();
                 awaitZero(budget);
                 assertEquals(0, budget.peerInFlight(stripe));
             }
@@ -168,9 +207,22 @@ class ProxyPeerBudgetTest {
         assertThrows(IllegalArgumentException.class, () -> new ByteBudget(1 << 20, -1));
     }
 
+    /** Wait for the global counter to return to zero via the change observer (no sleep loop). */
     private static void awaitZero(ByteBudget budget) throws InterruptedException {
-        for (int i = 0; i < 200 && budget.inFlight() != 0; i++) {
-            Thread.sleep(10);
+        var done = new CountDownLatch(1);
+        budget.setChangeObserver((stripe, peer, global) -> {
+            if (global == 0) {
+                done.countDown();
+            }
+        });
+        try {
+            if (budget.inFlight() == 0) {
+                return;
+            }
+            assertTrue(done.await(10, TimeUnit.SECONDS),
+                    "budget not drained; inFlight=" + budget.inFlight());
+        } finally {
+            budget.setChangeObserver(null);
         }
         assertEquals(0, budget.inFlight());
     }

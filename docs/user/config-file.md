@@ -417,9 +417,11 @@ TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (de
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
 and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB), with a per-peer share
 (`-Dsjws.proxy.maxInflightBytesPerPeer`, default one eighth of the total, or `0` to disable)
-so one client address cannot hold the whole budget (#78). Slow clients wait on their own share
-instead of growing the heap (security finding F5); a new request from a peer already at its
-share is refused with 503. `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
+so one client address cannot hold the whole budget (#78). Peers are keyed on the remote socket
+address only, never on `X-Forwarded-For` or `Forwarded` (including when the peer is in
+`trusted_proxies`), so the share cannot be spoofed by a client header. Slow clients wait on their
+own share instead of growing the heap (security finding F5); a new request from a peer already at
+its share is refused with 503. `preserve_host: true` forwards the client's `Host` instead of the upstream's. A reload or stop
 closes the replaced pools.
 
 Rate limits are local to this server and off unless configured. A route takes `rate_limit:`, and

@@ -48,9 +48,10 @@ import java.util.concurrent.atomic.AtomicLongArray;
  *
  * <p>The default global limit is 64 MiB, or {@code -Dsjws.proxy.maxInflightBytes=<bytes>}. The
  * per-peer share defaults to one eighth of that, or
- * {@code -Dsjws.proxy.maxInflightBytesPerPeer=<bytes>} ({@code 0} disables the table). Peers are
- * indexed by a fixed-size striped {@link AtomicLongArray} hashed from the remote address (not
- * {@code X-Forwarded-For}); collisions only make the cap stricter. One instance is shared by all
+ * {@code -Dsjws.proxy.maxInflightBytesPerPeer=<bytes>} ({@code 0} disables the table). Peers are keyed on the remote socket address only ({@link java.net.InetSocketAddress} /
+ * {@link java.net.InetAddress} bytes hashed into a fixed-size striped {@link AtomicLongArray}),
+ * never on {@code X-Forwarded-For} or {@code Forwarded} — including when that peer is listed in
+ * {@code trusted_proxies}. Collisions only make the cap stricter. One instance is shared by all
  * upstream pools in the process ({@link #shared()}). Tests make their own; the single-argument
  * constructor leaves the per-peer table off.
  */
@@ -66,6 +67,25 @@ public final class ByteBudget {
     /** Null when per-peer accounting is off (zero cost on the add/release path). */
     private final AtomicLongArray peers;
     private final int peerMask;
+    /**
+     * Test-only observer. Production leaves this {@code null}; {@link #add} / {@link #release}
+     * pay only a volatile null check when unset (no allocation, no call).
+     */
+    private volatile ChangeObserver changeObserver;
+
+    /**
+     * Optional callback fired after each charge or release. Used by fairness tests to wait on
+     * stripe state without polling. Package-private; production never installs one.
+     */
+    @FunctionalInterface
+    interface ChangeObserver {
+        void onChange(int stripe, long peerBytes, long globalBytes);
+    }
+
+    /** Install or clear ({@code null}) the test change observer. */
+    void setChangeObserver(ChangeObserver observer) {
+        this.changeObserver = observer;
+    }
 
     public ByteBudget(long limit) {
         this(limit, 0L);
@@ -123,7 +143,10 @@ public final class ByteBudget {
         return this.peers == null ? 0L : this.peers.get(stripe);
     }
 
-    /** Stripe for a client address; the keyless slot when the peer is unknown. */
+    /**
+     * Stripe for a client address (connection remote); the keyless slot when the peer is
+     * unknown. Never derived from {@code X-Forwarded-For}.
+     */
     public int peerStripe(InetSocketAddress peer) {
         if (this.peers == null) {
             return 0;
@@ -134,7 +157,7 @@ public final class ByteBudget {
         return peerStripe(peer.getAddress());
     }
 
-    /** Stripe for a resolved address. */
+    /** Stripe for a resolved remote address (never {@code X-Forwarded-For}). */
     public int peerStripe(InetAddress address) {
         if (this.peers == null) {
             return 0;
@@ -180,9 +203,14 @@ public final class ByteBudget {
     }
 
     void add(long bytes, int stripe) {
-        this.inFlight.addAndGet(bytes);
+        long global = this.inFlight.addAndGet(bytes);
+        long peer = 0L;
         if (this.peers != null) {
-            this.peers.addAndGet(stripe, bytes);
+            peer = this.peers.addAndGet(stripe, bytes);
+        }
+        var o = this.changeObserver;
+        if (o != null) {
+            o.onChange(stripe, peer, global);
         }
     }
 
@@ -191,9 +219,14 @@ public final class ByteBudget {
     }
 
     void release(long bytes, int stripe) {
-        this.inFlight.addAndGet(-bytes);
+        long global = this.inFlight.addAndGet(-bytes);
+        long peer = 0L;
         if (this.peers != null) {
-            this.peers.addAndGet(stripe, -bytes);
+            peer = this.peers.addAndGet(stripe, -bytes);
+        }
+        var o = this.changeObserver;
+        if (o != null) {
+            o.onChange(stripe, peer, global);
         }
     }
 
