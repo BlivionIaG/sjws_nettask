@@ -10,6 +10,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -313,6 +316,100 @@ class MsgSnapshotClusterTest {
         assertEquals(c.data[l].log.startOffset(), c.data[f].log.startOffset());
         assertTrue(c.data[f].log.startOffset() >= cut2 - 30, "nothing far below the leader's log start is kept");
         assertEquals(c.checksum(l, 0), c.checksum(f, 0));
+    }
+
+    /**
+     * #288 Codex P1: recovery replay of a retention entry must not append another retention stamp after
+     * newer batch stamps. Without the guard, a second reopen moves {@code resumeIndex} backward and the
+     * post-retention batches are appended again (ledger end grows 24 → 28 in the reviewer's harness).
+     */
+    @Test
+    void reopenTwiceAfterRetentionDoesNotReappendBatches() throws Exception {
+        c = new SnapshotCluster(dir, SnapshotCluster.settings(20, 5), 2048, 512);
+        int l = c.leader(), f = 1 - l;
+        long end = produce("pid1", 0, 20);
+        c.awaitEnd(f, end);
+        var segs = c.data[l].log.segments();
+        assertTrue(segs.size() >= 2, "need a sealed segment to retain: " + segs.size());
+        long cut = segs.get(0).nextOffset();
+        c.await(c.data[l].replica.advanceLogStart(cut));
+        for (int k = 0; k < 2000 && c.data[f].replica.logStartOffset() < cut; k++) c.step();
+        assertEquals(cut, c.data[f].replica.logStartOffset());
+        end = produce("pid1", 20, 4);
+        c.awaitEnd(f, end);
+        long stable = end;
+        var stampPath = c.data[f].root.resolve("msgrepl").resolve("apply").resolve("t.applied");
+        long stampsBefore = Files.size(stampPath);
+        for (int pass = 0; pass < 2; pass++) {
+            c.data[f].close();
+            c.data[f].open();
+            for (int k = 0; k < 400 && c.leader() < 0; k++) c.step();
+            for (int k = 0; k < 2000; k++) c.step(); // finish restart replay
+            c.awaitEnd(f, stable);
+            assertNull(c.data[f].replica.fenced(), "pass " + pass + ": " + c.data[f].replica.fenced());
+            assertEquals(stable, c.data[f].end(), "pass " + pass + ": ledger must not grow on reopen");
+        }
+        assertTrue(Files.size(stampPath) <= stampsBefore + 28, // at most a clean-close marker, not another retention
+                "recovery replay must not keep appending retention stamps");
+        assertEquals(c.checksum(l, cut), c.checksum(f, cut));
+    }
+
+    /**
+     * #288 Codex P1: batches that land after snapshot capture and before {@code resetStamps()} leave the
+     * stamp-header {@code replayAt} behind the restored snapshot end. Reopening must rebase that cursor
+     * or replay fences ({@code replay reached offset 4 ... stamp file says 24}).
+     */
+    @Test
+    void reopenAfterBatchesBetweenSnapshotCaptureAndResetStampsDoesNotFence() throws Exception {
+        start(20, 5);
+        int l = c.leader(), f = 1 - l;
+        long end = produce("pid1", 0, 20);
+        c.awaitEnd(f, end);
+        var pinned = new CountDownLatch(1);
+        var resume = new CountDownLatch(1);
+        var crash = new AtomicReference<Exception>();
+        c.data[l].replica.faultHook = at -> {
+            if (at.equals("snapshot-pinned")) {
+                pinned.countDown();
+                try {
+                    if (!resume.await(30, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("timed out waiting to resume snapshot");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+            }
+            if (at.equals("snapshot-recorded")) {
+                throw new IllegalStateException("crash");
+            }
+        };
+        var snap = new Thread(() -> {
+            try {
+                c.data[l].snapshot();
+            } catch (Exception e) {
+                crash.set(e);
+            }
+        }, "snap-race");
+        snap.start();
+        assertTrue(pinned.await(30, TimeUnit.SECONDS), "snapshot reached pin");
+        end = produce("pid1", 20, 4); // land after capture, before resetStamps
+        c.awaitEnd(f, end);
+        resume.countDown();
+        snap.join(30_000);
+        assertNotNull(crash.get(), "snapshot-recorded fault must fire");
+        long stable = end;
+        var before = c.checksum(l, 0);
+        c.data[l].close();
+        c.data[l].open();
+        for (int k = 0; k < 400 && c.leader() < 0; k++) c.step();
+        assertNull(c.data[l].replica.fenced(), String.valueOf(c.data[l].replica.fenced()));
+        assertEquals(stable, c.data[l].end(), "reopen must not re-append the post-capture batches");
+        assertEquals(before, c.checksum(l, 0));
+        long base = c.produce("pid1", 24, "after");
+        assertEquals(stable, base, "offsets continue where they were");
+        c.awaitEnd(0, base + 1);
+        c.awaitEnd(1, base + 1);
     }
 
     List<Long> segBases(int i) throws IOException {

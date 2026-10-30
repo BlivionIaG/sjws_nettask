@@ -729,7 +729,11 @@ final class RaftReplica implements Replica {
             return;
         }
         try {
-            writeStamp(e.index(), e.term(), offset, -1);
+            // #288 Codex P1: recovery replay must not append another retention stamp after newer batch
+            // stamps; recover() would then move resumeIndex backward and re-append those batches.
+            if (e.index() > this.resumeIndex) {
+                writeStamp(e.index(), e.term(), offset, -1);
+            }
         } catch (IOException ex) {
             System.err.println("WARN: " + this.groupId.value() + ": retention stamp: " + ex);
         }
@@ -900,6 +904,12 @@ final class RaftReplica implements Replica {
             this.resumeIndex = m.index();
             this.expected = m.endOffset();
         }
+        // #288 Codex P1: batches may land after capture and before resetStamps(); recover() then keeps
+        // the stamp-header replay cursor while Raft restores the newer durable snapshot. Rebase the
+        // cursor to the restored end; keep the stamp-derived resume watermark for the cross-check.
+        if (this.replayAt >= 0 && this.replayAt < m.endOffset()) {
+            this.replayAt = m.endOffset();
+        }
         this.logStart = Math.max(this.logStart, m.logStart());
         this.recordedIndex = Math.max(this.recordedIndex, m.index());
         this.appliedIndex = Math.max(this.appliedIndex, m.index());
@@ -974,12 +984,14 @@ final class RaftReplica implements Replica {
             // otherwise become a permanent ClosedChannelException writer failure (#288 Codex P1).
             this.local.pauseSync();
             try {
-                this.hooks.readersOut().lock();
+                // Local binding so lock/unlock are visibly the same Lock (CodeQL java/unreleased-lock).
+                var readers = this.hooks.readersOut();
+                readers.lock();
                 try {
                     this.log.replaceWith(this.staging);
                     this.local.reload();
                 } finally {
-                    this.hooks.readersOut().unlock();
+                    readers.unlock();
                 }
             } finally {
                 this.local.resumeSync();
