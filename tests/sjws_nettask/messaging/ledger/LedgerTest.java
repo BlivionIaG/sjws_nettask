@@ -443,6 +443,20 @@ class LedgerTest {
         }
     }
 
+    /** #330 N1: n==0 must not index frameOffsets[0] (AIOOBE on the fast path). */
+    @Test
+    void appendFramesEmptyIsNoOp() throws Exception {
+        try (var log = SegmentedLog.open(dir.resolve("empty-n"))) {
+            long next = log.nextOffset();
+            assertEquals(0, next);
+            // Empty arrays: without the early return the fast path reads frameOffsets[0].
+            log.appendFrames(ByteBuffer.allocate(0), new long[0], new int[0], 0, next);
+            assertEquals(0, log.nextOffset());
+            assertEquals(1, log.segmentCount());
+            assertEquals(0, log.startOffset());
+        }
+    }
+
     /** #328: grouping must not change segment bases; a leader-style cut then drops the same physical on both. */
     @Test
     void groupedAppendFramesMatchOneByOneBases() throws Exception {
