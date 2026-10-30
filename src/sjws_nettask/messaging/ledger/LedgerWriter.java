@@ -17,8 +17,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * Single writer for one {@link SegmentedLog}. Appends go through a bounded queue (backpressure); a
  * dedicated writer thread drains groups with one positional write each ({@code take} wake). The queue
  * and the 1 MiB direct write buffer are allocated on the first append (#333), so an idle partition
- * pins only the writer object and its thread bookkeeping; once materialized the hand-off stays an
- * {@link ArrayBlockingQueue} (same produce path as before). Construction and materialization charge
+ * pins only the writer object and its thread bookkeeping; once materialized {@code ready} publishes a plain queue and the hand-off stays an
+ * {@link ArrayBlockingQueue} with no volatile queue load (same produce path as before). Construction and materialization charge
  * {@link LedgerWriterBudget}. By default the background syncer is shared via {@link SharedLedgerPool}
  * (CPU-sized); set {@link SharedLedgerPool#PROPERTY} to {@code 0} for a dedicated syncer per writer.
  * When a future completes depends on the append's effective {@link Durability} (per-append override,
@@ -55,8 +55,16 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private final long lingerNanos;
     private final long fsyncIntervalNanos;
     private final int maxGroupBytes;
-    /** Soft-bound queue; null until the first append materializes it (#333). */
-    private volatile BlockingQueue<Pending> queue;
+    /**
+     * Soft-bound queue; null until the first append materializes it (#333). Plain after {@link #ready}:
+     * the volatile ready store publishes this write so the append hot path needs no volatile queue load.
+     */
+    private BlockingQueue<Pending> queue;
+    /**
+     * True once {@link #queue} and the writer thread are live. Acquire-load on every append; after the first
+     * materialize the branch is predicted taken and the path matches a final-queue writer (no budget, no lock).
+     */
+    private volatile boolean ready;
     private final int capacity;
     /** Set by the writer after each drain when the backlog is at the soft capacity; one volatile read on the fast path. */
     private volatile boolean behind;
@@ -170,8 +178,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      * replaced log's end, which is durable (the caller fsynced every staged file before the swap).
      */
     public void reload() {
-        var q0 = queue;
-        if (q0 != null && !q0.isEmpty()) throw new IllegalStateException("reload with appends queued");
+        if (ready && !queue.isEmpty()) throw new IllegalStateException("reload with appends queued");
         lock.lock();
         try {
             written = log.nextOffset();
@@ -232,14 +239,11 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
      */
     @Override
     public void awaitCapacity() throws InterruptedException {
-        if (!behind) return;
+        if (!behind || !ready) return;
         var q = queue;
-        if (q == null) return;
         while (behind && q.size() >= capacity && !closed && failure == null) {
             if (Thread.interrupted()) throw new InterruptedException();
             LockSupport.parkNanos(this, 50_000);
-            q = queue;
-            if (q == null) return;
         }
     }
 
@@ -249,7 +253,8 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
         if (recs.isEmpty()) throw new IllegalArgumentException("empty batch");
         RecordBatch.encodedSize(recs); // validate size eagerly
         if (closed || failure != null) return CompletableFuture.failedFuture(failure != null ? failure : new IllegalStateException("closed"));
-        var q = materialize(); // allocates queue + starts writer; may throw LedgerBudgetExhaustedException
+        if (!ready) materialize(); // one-time; may throw LedgerBudgetExhaustedException
+        var q = queue; // plain after ready (volatile ready acquire published the write)
         var f = new CompletableFuture<Long>();
         var p = new Pending(List.copyOf(recs), System.currentTimeMillis(), mode == null ? durability : mode, f);
         if (!q.offer(p)) {
@@ -262,26 +267,24 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     }
 
     /**
-     * Ensures the bounded queue and writer thread exist. Idle writers skip this; the hot path after the first
-     * append is a volatile read of a non-null queue (same {@link ArrayBlockingQueue} as before #333).
+     * Ensures the bounded queue and writer thread exist. Idle writers skip this. After the first call, {@link #ready}
+     * is true and {@link #appendNoWait} uses a plain queue read (same ArrayBlockingQueue hand-off as a final field).
      */
-    private BlockingQueue<Pending> materialize() {
-        var q = queue;
-        if (q != null) return q;
+    private void materialize() {
+        if (ready) return;
         materializeLock.lock();
         try {
-            q = queue;
-            if (q != null) return q;
+            if (ready) return;
             if (closed) throw new IllegalStateException("closed");
             long extra = budget.acquireMaterialize(capacity);
             try {
                 // Hard bound 2x the soft one: ArrayBlockingQueue keeps the one-lock, allocation-free hand-off
                 // (a LinkedBlockingQueue cost ~0.7 us of claim p50 at 16 workers).
-                q = new ArrayBlockingQueue<>((int) Math.min(Integer.MAX_VALUE - 8, 2L * capacity));
+                var q = new ArrayBlockingQueue<Pending>((int) Math.min(Integer.MAX_VALUE - 8, 2L * capacity));
                 queue = q;
                 thread.start();
                 budgetCharged += extra;
-                return q;
+                ready = true; // publish queue + started thread to appenders
             } catch (Throwable t) {
                 budget.releaseBytes(extra);
                 queue = null;
@@ -294,7 +297,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
 
     /** Test/ops: whether the queue and writer thread have been allocated. */
     public boolean materialized() {
-        return queue != null;
+        return ready;
     }
 
     private void unparkSyncer() {
@@ -305,8 +308,7 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     boolean sharedSyncSlice() {
         if (syncPaused) return false;
         long d0 = durable;
-        var qIdle = queue;
-        if (stopSyncer && (qIdle == null || qIdle.isEmpty()) && fsyncWaiters.isEmpty() && written <= d0) return false;
+        if (stopSyncer && (!ready || queue.isEmpty()) && fsyncWaiters.isEmpty() && written <= d0) return false;
         Waiter w0;
         while ((w0 = fsyncWaiters.peek()) != null && w0.endOffset <= d0) { fsyncWaiters.poll(); w0.done.complete(w0.base); }
         long target = written;
@@ -579,9 +581,8 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     @Override public void close() throws InterruptedException {
         if (closed) return;
         closed = true;
-        var q = queue;
-        if (q != null) {
-            q.put(POISON);
+        if (ready) {
+            queue.put(POISON);
             thread.join(TimeUnit.SECONDS.toMillis(30));
         }
         stopSyncer = true;
