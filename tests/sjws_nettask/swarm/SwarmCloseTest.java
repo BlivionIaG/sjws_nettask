@@ -102,7 +102,12 @@ class SwarmCloseTest {
         assertEquals(List.of(), stillAlive(after), "threads left after 100 open/close cycles");
     }
 
-    /** Acks racing close: every reply future completes or fails, none hangs; a second, concurrent close is safe. */
+    /**
+     * Acks racing close: every reply future completes or fails, none hangs; a second, concurrent close is safe.
+     * Wait until at least one ack has actually succeeded before starting close (#308): {@code reply()} returns as
+     * soon as an ASYNC produce is queued, so counting submitted futures (the old {@code n/4} latch) did not mean any
+     * ack had run — under load, close could win first and {@code ok == 0} flaked while hang-freedom still held.
+     */
     @Test
     void acksInFlightAtCloseCompleteOrFail() throws Exception {
         var before = swarmThreads();
@@ -116,21 +121,24 @@ class SwarmCloseTest {
             tasks.addAll(s.tasks().claim("p", "w", 256, 60_000));
         }
         var futures = new java.util.concurrent.ConcurrentLinkedQueue<CompletableFuture<LeaseResult>>();
-        var half = new CountDownLatch(1);
+        var someOk = new CountDownLatch(1);
         var replier = Thread.ofPlatform().name("swarmclosetest-replier").start(() -> {
             long seq = 1;
             for (var t : tasks) {
                 try {
-                    futures.add(s.tasks().reply(t, 9, seq++, "text/plain", BODY));
+                    var f = s.tasks().reply(t, 9, seq++, "text/plain", BODY);
+                    f.whenComplete((r, e) -> {
+                        if (e == null) {
+                            someOk.countDown();
+                        }
+                    });
+                    futures.add(f);
                 } catch (RuntimeException e) {
                     futures.add(CompletableFuture.failedFuture(e)); // refused synchronously: the swarm is closing
                 }
-                if (futures.size() == n / 4) {
-                    half.countDown();
-                }
             }
         });
-        assertTrue(half.await(30, TimeUnit.SECONDS));
+        assertTrue(someOk.await(30, TimeUnit.SECONDS), "some acks completed before close");
         var second = Thread.ofPlatform().name("swarmclosetest-closer").start(s::close);
         s.close();
         second.join(30_000);
