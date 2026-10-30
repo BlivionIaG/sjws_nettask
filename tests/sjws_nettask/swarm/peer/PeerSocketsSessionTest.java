@@ -23,7 +23,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLSession;
@@ -90,7 +89,8 @@ class PeerSocketsSessionTest {
 
     /**
      * A dialled peer blocked in a TLS write must not stall {@code reloadTls}: the live entry keeps the plain abort
-     * handle and closes it before the SSLSocket.
+     * handle and closes it before the SSLSocket. The writer is latched in the SSL write (stack + state) before
+     * reload so an SSLSocket-only close cannot race past an unparked writer.
      */
     @Test
     void reloadTlsDropsBlockedDialWriterWithoutHang() throws Exception {
@@ -112,6 +112,11 @@ class PeerSocketsSessionTest {
 
         EphemeralPorts.withBindRetry("PeerSocketsSessionTest.abort", () -> {
             try (var listener = socketsA.listen(configA.self().address())) {
+                try {
+                    listener.setReceiveBufferSize(4 * 1024);
+                } catch (IOException ignored) {
+                    // best-effort: smaller window fills faster
+                }
                 var accepted = new CompletableFuture<SSLSocket>();
                 CompletableFuture.runAsync(() -> {
                     try {
@@ -125,27 +130,26 @@ class PeerSocketsSessionTest {
                 });
                 var connected = socketsB.dial(configA.self().address());
                 var serverSsl = accepted.get(10, TimeUnit.SECONDS);
-                // Stop reading on the acceptor so the dialer's TLS write blocks on the output lock.
-                var blocked = new AtomicBoolean();
-                var writer = Thread.ofVirtual().name("blocked-tls-write").start(() -> {
+                // Non-reading peer + tiny buffers so the dialer's TLS write parks on the output lock / TCP window.
+                try {
+                    serverSsl.setReceiveBufferSize(4 * 1024);
+                    connected.abort().setSendBufferSize(4 * 1024);
+                    connected.socket().setSendBufferSize(4 * 1024);
+                } catch (IOException ignored) {
+                    // best-effort
+                }
+                var writer = Thread.ofPlatform().daemon().name("blocked-tls-write").start(() -> {
                     try {
                         var buf = new byte[64 * 1024];
                         var out = connected.socket().getOutputStream();
-                        for (int i = 0; i < 256; i++) {
-                            blocked.set(true);
+                        while (!Thread.currentThread().isInterrupted()) {
                             out.write(buf);
-                            out.flush();
                         }
                     } catch (IOException expected) {
                         // aborted
                     }
                 });
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-                while (!blocked.get() && System.nanoTime() < deadline) {
-                    Thread.onSpinWait();
-                }
-                assertTrue(blocked.get(), "writer reached a TLS write");
-                Thread.sleep(50); // let the write seat on the TLS lock / TCP window
+                awaitParkedInSslWrite(writer, 10_000);
                 Files.writeString(denyB, "serial:" + serialA.toString(16) + "\n");
                 long before = socketsB.policyDropped();
                 var reload = CompletableFuture.runAsync(() -> {
@@ -174,6 +178,48 @@ class PeerSocketsSessionTest {
             }
             return null;
         });
+    }
+
+    /**
+     * Wait until {@code writer} is parked inside an SSL/socket write. Accepts BLOCKED/WAITING/TIMED_WAITING, or
+     * RUNNABLE when the stack shows the native/socket write frame (common while blocked in {@code socketWrite0}).
+     */
+    private static void awaitParkedInSslWrite(Thread writer, long timeoutMillis) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        String last = "";
+        while (System.nanoTime() < deadline) {
+            if (!writer.isAlive()) {
+                fail("writer exited before parking in an SSL/socket write");
+            }
+            var state = writer.getState();
+            var frames = writer.getStackTrace();
+            last = state + " " + java.util.Arrays.toString(frames);
+            if (frames.length > 0 && stackInSslOrSocketWrite(frames)) {
+                if (state == Thread.State.BLOCKED || state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING
+                        || state == Thread.State.RUNNABLE) {
+                    return;
+                }
+            }
+            Thread.sleep(5);
+        }
+        fail("writer never parked in SSL write within " + timeoutMillis + " ms; last=" + last);
+    }
+
+    private static boolean stackInSslOrSocketWrite(StackTraceElement[] frames) {
+        for (var f : frames) {
+            String c = f.getClassName();
+            String m = f.getMethodName();
+            if ("socketWrite0".equals(m) || "socketWrite".equals(m)) {
+                return true;
+            }
+            if (m.startsWith("write") && (c.contains("SocketOutputStream") || c.contains("SSLSocket")
+                    || c.contains("AppOutputStream") || c.contains("OutputRecord") || c.contains("NioSocketImpl")
+                    || c.contains("SocksSocketImpl") || c.contains("Socket$SocketOutputStream")
+                    || c.contains("SSLSocketImpl"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
