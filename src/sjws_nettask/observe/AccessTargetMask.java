@@ -20,14 +20,16 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import sjws_nettask.core.FilterDocument;
 import sjws_nettask.core.MiddlewareSpec;
+import sjws_nettask.core.QueryPairs;
 
 /**
  * Masks configured api-key query parameter values in a request-target before it is written to the
  * access log. Names are collected at config load or filter-document apply. With no names the hot
  * path returns the input string unchanged (same reference, no allocation or parsing).
  * <p>
- * Name matching follows {@link sjws_nettask.gateway.ApiKeyFilter#query}: case-sensitive, not
- * percent-decoded, value ends at {@code &} or {@code #}.
+ * Name matching follows the shared {@link QueryPairs} scanner used by
+ * {@link sjws_nettask.gateway.ApiKeyFilter#query}: case-sensitive, not percent-decoded, pairs
+ * continue after {@code #…&}, and a value ends at {@code &} or {@code #}.
  */
 public final class AccessTargetMask {
 
@@ -100,50 +102,33 @@ public final class AccessTargetMask {
     /**
      * Replaces the value of each configured query name with {@link #MASK}. When {@code names} is
      * null or empty, or the target has no query string, returns {@code target} unchanged.
+     * Uses {@link QueryPairs} so acceptance and masking cannot drift.
      */
     public static String mask(String target, String[] names) {
-        if (names == null || names.length == 0 || target == null) {
+        if (names == null || names.length == 0 || target == null || target.indexOf('?') < 0) {
             return target;
         }
-        int q = target.indexOf('?');
-        if (q < 0) {
-            return target;
-        }
-        StringBuilder sb = null;
-        int n = target.length();
-        int i = q + 1;
-        int copyFrom = 0;
-        while (i < n) {
-            int hash = target.indexOf('#', i);
-            int amp = target.indexOf('&', i);
-            int pairEnd = n;
-            boolean stop = false;
-            if (amp >= 0 && (hash < 0 || amp < hash)) {
-                pairEnd = amp;
-            } else if (hash >= 0) {
-                pairEnd = hash;
-                stop = true;
-            } else {
-                stop = true;
+        final StringBuilder[] box = {null};
+        final int[] copyFrom = {0};
+        QueryPairs.scan(target, (t, nameStart, nameEnd, valueStart, valueEnd) -> {
+            if (!nameMatches(names, t, nameStart, nameEnd - nameStart)) {
+                return false;
             }
-            int eq = target.indexOf('=', i);
-            if (eq >= i && eq < pairEnd && nameMatches(names, target, i, eq - i)) {
-                if (sb == null) {
-                    sb = new StringBuilder(target.length());
-                }
-                sb.append(target, copyFrom, eq + 1);
-                sb.append(MASK);
-                copyFrom = pairEnd;
+            var sb = box[0];
+            if (sb == null) {
+                sb = new StringBuilder(t.length());
+                box[0] = sb;
             }
-            if (stop) {
-                break;
-            }
-            i = amp + 1;
-        }
+            sb.append(t, copyFrom[0], valueStart);
+            sb.append(MASK);
+            copyFrom[0] = valueEnd;
+            return false;
+        });
+        var sb = box[0];
         if (sb == null) {
             return target;
         }
-        sb.append(target, copyFrom, n);
+        sb.append(target, copyFrom[0], target.length());
         return sb.toString();
     }
 

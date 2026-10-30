@@ -74,11 +74,68 @@ class AccessTargetMaskTest {
         assertEquals("/x?API_KEY=" + SECRET, AccessTargetMask.mask("/x?API_KEY=" + SECRET, names));
         assertEquals("/x?api_key=***", AccessTargetMask.mask("/x?api_key=", names));
         assertEquals("/no-query", AccessTargetMask.mask("/no-query", names));
-        // Fragment ends the query; a later &-pair is not scanned (URI rules).
-        assertEquals("/x?api_key=***#frag&api_key=" + SECRET,
+        // Shared scanner: pairs continue after #…& (same as ApiKeyFilter.query).
+        assertEquals("/x?api_key=***#frag&api_key=***",
                 AccessTargetMask.mask("/x?api_key=one#frag&api_key=" + SECRET, names));
         assertEquals("/x?z=1&api_key=***&z=2", AccessTargetMask.mask("/x?z=1&api_key=one&z=2", names));
         assertSame("/x?only", AccessTargetMask.mask("/x?only", names)); // no '=' value
+    }
+
+    /**
+     * Fail-closed: targets ApiKeyFilter accepts after {@code #…&} must be masked. These fail at
+     * bde2110 (mask stopped at {@code #}) and pass with the shared {@code QueryPairs} scanner.
+     * Filter acceptance for the same targets is covered in {@code ApiKeyFilterTest#queryParser}.
+     */
+    @Test
+    void maskFollowsFilterPastHashAmpersandPairs() {
+        var names = new String[] {"api_key"};
+        var a = "/x?other=1#frag&api_key=" + SECRET;
+        assertEquals("/x?other=1#frag&api_key=***", AccessTargetMask.mask(a, names));
+        assertFalse(AccessTargetMask.mask(a, names).contains(SECRET));
+
+        var b = "/x?keep=1#x&api_key=" + SECRET + "&y=2";
+        assertEquals("/x?keep=1#x&api_key=***&y=2", AccessTargetMask.mask(b, names));
+        assertFalse(AccessTargetMask.mask(b, names).contains(SECRET));
+    }
+
+    @Test
+    void maskMatchesFilterOnEncodedNameCaseEmptyAndSeparators() {
+        var names = new String[] {"api_key"};
+        // Percent-encoded name: filter does not decode; mask must not either.
+        var enc = "/x?api%5Fkey=" + SECRET;
+        assertSame(enc, AccessTargetMask.mask(enc, names));
+        // Case: regionMatches is case-sensitive.
+        var upper = "/x?API_KEY=" + SECRET;
+        assertSame(upper, AccessTargetMask.mask(upper, names));
+        // Empty first value, second holds the secret: mask covers every matching pair.
+        assertEquals("/x?api_key=***&api_key=***",
+                AccessTargetMask.mask("/x?api_key=&api_key=" + SECRET, names));
+        // '+' and '%26' stay inside the value; ';' is not a separator.
+        assertEquals("/x?api_key=***", AccessTargetMask.mask("/x?api_key=a+b%26c", names));
+        assertEquals("/x?api_key=***", AccessTargetMask.mask("/x?api_key=" + SECRET + ";x=1", names));
+        // Absolute-form target: first '?' starts the query.
+        assertEquals("http://h/x?api_key=***", AccessTargetMask.mask("http://h/x?api_key=" + SECRET, names));
+        // Path containing '?' is still first-'?' query start (same as filter).
+        assertEquals("/a?b=c&api_key=***", AccessTargetMask.mask("/a?b=c&api_key=" + SECRET, names));
+    }
+
+    @Test
+    void maskManyParamsStaysLinear() {
+        var names = new String[] {"api_key"};
+        var sb = new StringBuilder("/x?");
+        for (int i = 0; i < 5000; i++) {
+            if (i > 0) {
+                sb.append('&');
+            }
+            sb.append("p").append(i).append('=').append(i);
+        }
+        sb.append("&api_key=").append(SECRET);
+        long t0 = System.nanoTime();
+        var out = AccessTargetMask.mask(sb.toString(), names);
+        long ms = (System.nanoTime() - t0) / 1_000_000L;
+        assertTrue(out.endsWith("api_key=***"), out.substring(Math.max(0, out.length() - 40)));
+        assertFalse(out.contains(SECRET));
+        assertTrue(ms < 500, "mask of 5001 pairs took " + ms + "ms");
     }
 
     @Test
