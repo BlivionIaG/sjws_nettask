@@ -95,12 +95,19 @@ class ProxyPeerBudgetTest {
                 var stripe = budget.peerStripe(peer);
                 var stream = (Body.Stream) p.handle(request("GET", "/hold", peer)).body();
                 var src = stream.source();
-                assertNotNull(src.next());
-                for (int i = 0; i < 300 && !budget.exhausted(stripe); i++) {
-                    Thread.sleep(10);
+                // Do not take from the source first: next() releases bytes and races the fill.
+                // Wait on the budget condition until the peer stripe is at its share.
+                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+                while (!budget.exhausted(stripe) && System.nanoTime() < deadline) {
+                    Thread.onSpinWait();
+                    if (budget.peerInFlight(stripe) == 0) {
+                        Thread.sleep(1); // upstream has not charged yet
+                    }
                 }
-                assertTrue(budget.exhausted(stripe), "peer must hit its share");
+                assertTrue(budget.exhausted(stripe),
+                        "peer must hit its share; held=" + budget.peerInFlight(stripe) + " limit=" + PER_PEER);
                 assertEquals(503, p.handle(request("GET", "/again", peer)).status());
+                assertNotNull(src.next());
                 src.close();
                 awaitZero(budget);
                 assertEquals(0, budget.peerInFlight(stripe));
