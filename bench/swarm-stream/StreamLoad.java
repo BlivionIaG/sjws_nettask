@@ -26,6 +26,9 @@ public class StreamLoad {
     String base, tokensFile, out, accept = "binary";
     double warmup = 5, secs = 20, drainTimeout = 75;
     int streams = 1000, chunkBytes = 1024, window = 8;
+    int serverPid = 0; // optional: sample server CPU from /proc/<pid>/stat
+    /** Generator CPUs saturated if client %CPU of wall >= this (2 pinned CPUs → 200% = full). */
+    double genSatPct = 180.0;
   }
 
   public static void main(String[] a) throws Exception {
@@ -62,18 +65,23 @@ public class StreamLoad {
     bytesRx.reset(); latUs.clear(); creditWaits.clear(); measureErr.clear(); teardownErr.clear();
     requests.set(0); credit429.set(0);
 
-    // Measure + sample client CPU
-    AtomicReference<double[]> cpuSample = new AtomicReference<>(new double[]{0,0});
+    // Measure + sample client (/proc/self) and server (/proc/<serverPid>) CPU over the window
+    AtomicReference<double[]> cpuSample = new AtomicReference<>(new double[]{0,0,0,0}); // clientSec, clientPct, serverSec, serverPct
     Thread cpuMon = Thread.startVirtualThread(() -> {
       try {
-        long[] c0 = readProcStat();
+        long c0 = readProcJiffies("self");
+        long s0 = args.serverPid > 0 ? readProcJiffies(Integer.toString(args.serverPid)) : -1;
         long t0 = System.nanoTime();
         Thread.sleep(Math.max(1000, (long)(args.secs * 500)));
-        long[] c1 = readProcStat();
+        long c1 = readProcJiffies("self");
+        long s1 = args.serverPid > 0 ? readProcJiffies(Integer.toString(args.serverPid)) : -1;
         long dt = System.nanoTime() - t0;
-        // crude: total busy of this process from /proc/self/stat utime+stime
-        double sec = (c1[0] - c0[0]) * 1.0 / scClk();
-        cpuSample.set(new double[]{sec, sec / (dt / 1e9) * 100.0});
+        double wallS = dt / 1e9;
+        double cSec = (c1 - c0) * 1.0 / scClk();
+        double cPct = wallS > 0 ? cSec / wallS * 100.0 : 0;
+        double sSec = (s0 >= 0 && s1 >= 0) ? (s1 - s0) * 1.0 / scClk() : Double.NaN;
+        double sPct = (wallS > 0 && !Double.isNaN(sSec)) ? sSec / wallS * 100.0 : Double.NaN;
+        cpuSample.set(new double[]{cSec, cPct, sSec, sPct});
       } catch (Exception ignored) {}
     });
 
@@ -89,7 +97,13 @@ public class StreamLoad {
     Result r = new Result();
     r.mode = args.accept; r.streams = args.streams; r.agents = tokens.size(); r.window = args.window;
     r.elapsedS = args.secs; r.wallS = wall; r.load1Pre = load1Pre; r.load1Post = load1Post;
-    r.selfLoaded = load1Post >= 4.0;
+    double[] cpu = cpuSample.get();
+    r.clientCpuSec = cpu[0]; r.clientCpuPctOfWall = cpu[1];
+    r.serverCpuSec = cpu[2]; r.serverCpuPctOfWall = cpu[3];
+    // Architecture 2026-10-30: generator-CPU saturation ⇒ self_loaded (not a pass)
+    boolean genSat = !Double.isNaN(r.clientCpuPctOfWall) && r.clientCpuPctOfWall >= args.genSatPct;
+    r.selfLoaded = load1Post >= 4.0 || genSat;
+    r.generatorSaturated = genSat;
     List<Double> lat = new ArrayList<>(latUs);
     Collections.sort(lat);
     r.chunkSamples = lat.size();
@@ -106,7 +120,6 @@ public class StreamLoad {
     r.errorCount = measureErr.size(); r.teardownErrorCount = teardownErr.size();
     r.errors = measureErr.stream().limit(30).toList();
     r.teardownErrors = teardownErr.stream().limit(30).toList();
-    r.clientCpuSec = cpuSample.get()[0]; r.clientCpuPctOfWall = cpuSample.get()[1];
     r.requests = requests.get();
     r.hardZeros = Map.of(
         "sjws_swarm_stream_node_refusals_total", counters.getOrDefault("sjws_swarm_stream_node_refusals_total", Double.NaN),
@@ -417,12 +430,14 @@ public class StreamLoad {
   }
   static double load1() throws IOException {
     String s = Files.readString(Path.of("/proc/loadavg"));
-    return Double.parseDouble(s.split("\\s+")[0]);
+    return Double.parseDouble(s.split("\s+")[0]);
   }
-  static long[] readProcStat() throws IOException {
-    // /proc/self/stat fields 14,15 utime stime (clock ticks)
-    String[] f = Files.readString(Path.of("/proc/self/stat")).split("\\s+");
-    return new long[]{Long.parseLong(f[13]) + Long.parseLong(f[14])};
+  static long readProcJiffies(String pidOrSelf) throws IOException {
+    // /proc/<pid>/stat utime+stime after comm (USER_HZ ticks)
+    String raw = Files.readString(Path.of("/proc/" + pidOrSelf + "/stat"));
+    int rp = raw.lastIndexOf(')');
+    String[] rest = raw.substring(rp + 2).split("\s+");
+    return Long.parseLong(rest[11]) + Long.parseLong(rest[12]);
   }
   static double scClk() {
     return 100.0; // Linux USER_HZ typically 100
@@ -437,7 +452,7 @@ public class StreamLoad {
     for (String line : Files.readAllLines(Path.of(path))) {
       line = line.trim();
       if (line.isEmpty() || line.startsWith("#")) continue;
-      String[] p = line.split("\\s+");
+      String[] p = line.split("\s+");
       if (p.length >= 2) out.add(p[1]);
     }
     if (out.isEmpty()) throw new IllegalArgumentException("no tokens");
@@ -457,20 +472,26 @@ public class StreamLoad {
         case "--chunk-bytes" -> args.chunkBytes = Integer.parseInt(a[++i]);
         case "--window" -> args.window = Integer.parseInt(a[++i]);
         case "--drain-timeout" -> args.drainTimeout = Double.parseDouble(a[++i]);
+        case "--server-pid" -> args.serverPid = Integer.parseInt(a[++i]);
+        case "--gen-sat-pct" -> args.genSatPct = Double.parseDouble(a[++i]);
         default -> throw new IllegalArgumentException(a[i]);
       }
     }
     if (args.base == null || args.tokensFile == null || args.out == null) throw new IllegalArgumentException("need --base --tokens-file --out");
     if ("chunked".equals(args.accept)) args.accept = "binary";
+    if (args.serverPid <= 0) {
+      String env = System.getenv("SERVER_PID");
+      if (env != null && !env.isBlank()) args.serverPid = Integer.parseInt(env.trim());
+    }
     return args;
   }
 
   static final class Result {
     String mode; int streams, agents, window, chunkSamples, errorCount, teardownErrorCount, creditWaitN;
     long bytes, creditStalls, requests;
-    double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall;
+    double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall, serverCpuSec, serverCpuPctOfWall;
     Double p50, p90, p99, creditWaitP50, creditWaitP99;
-    boolean selfLoaded, stallFlag;
+    boolean selfLoaded, stallFlag, generatorSaturated;
     Map<String, Double> counters, hardZeros;
     List<String> errors, teardownErrors;
     String summary() {
@@ -503,6 +524,9 @@ public class StreamLoad {
       field(sb, "teardown_error_count", teardownErrorCount, true);
       field(sb, "client_cpu_sec", clientCpuSec, true);
       field(sb, "client_cpu_pct_of_wall", clientCpuPctOfWall, true);
+      field(sb, "server_cpu_sec", Double.isNaN(serverCpuSec) ? null : serverCpuSec, true);
+      field(sb, "server_cpu_pct_of_wall", Double.isNaN(serverCpuPctOfWall) ? null : serverCpuPctOfWall, true);
+      field(sb, "generator_saturated", generatorSaturated, true);
       field(sb, "requests", requests, true);
       sb.append("  \"credit_wait\":{")
         .append("\"n\":").append(creditWaitN)

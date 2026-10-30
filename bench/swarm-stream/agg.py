@@ -31,7 +31,9 @@ def main():
         n = r.get("chunk_samples") or 0
         p99 = r.get("p99_us")
         pre = r.get("load1_pre", 99)
-        valid = n >= 10000 and p99 is not None and pre < 4.0
+        # Architecture 2026-10-30: self_loaded (incl. generator-CPU sat) does not count as a pass
+        self_loaded = bool(r.get("self_loaded"))
+        valid = n >= 10000 and p99 is not None and pre < 4.0 and not self_loaded
         windows.append({
             "tag": p.parent.name,
             "valid": valid,

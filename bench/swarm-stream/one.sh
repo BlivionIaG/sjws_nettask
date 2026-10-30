@@ -29,6 +29,7 @@ taskset -c 2-7 nice -n 10 java -XX:+UseZGC $HEAP \
   -Dsjws.swarm.tokens.file="$WD/tokens" \
   -jar "$JAR" --metrics=localhost "$PORT" "$WD/site" >"$LOG" 2>&1 &
 SPID=$!
+export SERVER_PID=$SPID
 cleanup(){ kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true; }
 trap cleanup EXIT
 ok=0
@@ -43,7 +44,8 @@ if [ "$LOADGEN" = java ]; then
   taskset -c 0-1 nice -n 10 java "$HERE_DIR/StreamLoad.java" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
-    --out "$OUT" --drain-timeout "${DRAIN_TIMEOUT:-75}" --window "${WINDOW:-8}"
+    --out "$OUT" --drain-timeout "${DRAIN_TIMEOUT:-75}" --window "${WINDOW:-8}" \
+    --server-pid "$SPID"
 else
   export PYTHONPATH="$(cd "$(dirname "$0")/../.." && pwd)/sdk/python${PYTHONPATH:+:$PYTHONPATH}"
   taskset -c 0-1 nice -n 10 python3 "$HERE_DIR/drive.py" \

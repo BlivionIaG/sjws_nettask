@@ -47,7 +47,7 @@ r=json.load(open(sys.argv[1]))
 n=r.get("chunk_samples") or 0
 p99=r.get("p99_us")
 pre=r.get("load1_pre", 99)
-print("1" if n>=10000 and p99 is not None and pre<4.0 else "0")
+print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") else "0")
 PY2
 )
     [ "$ok" = 1 ] && valid=$((valid + 1))
@@ -79,7 +79,7 @@ r=json.load(open(sys.argv[1]))
 n=r.get("chunk_samples") or 0
 p99=r.get("p99_us")
 pre=r.get("load1_pre", 99)
-print("1" if n>=10000 and p99 is not None and pre<4.0 else "0")
+print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") else "0")
 PY2
 )
     if [ "$ok" = 1 ]; then

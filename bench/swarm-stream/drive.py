@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -229,9 +230,29 @@ def run_window(args) -> dict:
         credit_waits.clear(); writer_stats.clear()
         measure_errors.clear(); teardown_errors.clear()
 
+    def _jiffies(pid: str) -> int | None:
+        try:
+            raw = open(f"/proc/{pid}/stat").read()
+            rest = raw[raw.rfind(")") + 2 :].split()
+            return int(rest[11]) + int(rest[12])
+        except Exception:
+            return None
+    import os as _os
+    _hz = _os.sysconf("SC_CLK_TCK")
+    _server_pid = os.environ.get("SERVER_PID") or getattr(args, "server_pid", None)
+    _c0 = _jiffies("self")
+    _s0 = _jiffies(str(_server_pid)) if _server_pid else None
+    _cpu_t0 = time.monotonic()
     t0 = time.monotonic()
     run_wave(args.streams, args.secs, "g")
     wall = max(1e-6, time.monotonic() - t0)
+    _cpu_dt = max(1e-6, time.monotonic() - _cpu_t0)
+    _c1 = _jiffies("self")
+    _s1 = _jiffies(str(_server_pid)) if _server_pid else None
+    client_cpu_sec = ((_c1 - _c0) / _hz) if (_c0 is not None and _c1 is not None) else None
+    client_cpu_pct = (client_cpu_sec / _cpu_dt * 100.0) if client_cpu_sec is not None else None
+    server_cpu_sec = ((_s1 - _s0) / _hz) if (_s0 is not None and _s1 is not None) else None
+    server_cpu_pct = (server_cpu_sec / _cpu_dt * 100.0) if server_cpu_sec is not None else None
     elapsed = max(1e-6, float(args.secs))
     load1_post = float(open("/proc/loadavg").read().split()[0])
 
@@ -281,7 +302,12 @@ def run_window(args) -> dict:
         "wall_s": wall,
         "load1_pre": load1_pre,
         "load1_post": load1_post,
-        "self_loaded": load1_post >= 4.0,
+        "self_loaded": bool(load1_post >= 4.0 or (client_cpu_pct is not None and client_cpu_pct >= 180.0)),
+        "generator_saturated": bool(client_cpu_pct is not None and client_cpu_pct >= 180.0),
+        "client_cpu_sec": client_cpu_sec,
+        "client_cpu_pct_of_wall": client_cpu_pct,
+        "server_cpu_sec": server_cpu_sec,
+        "server_cpu_pct_of_wall": server_cpu_pct,
         "chunk_samples": n_chunks,
         "bytes": bytes_rx,
         "mib_s": mib_s,
