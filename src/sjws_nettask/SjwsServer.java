@@ -843,11 +843,11 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
             Handler terminal = next.handler();
             Handler armed = armedAround(terminal);
-            boolean bodies = !(terminal instanceof StaticFileHandler) || this.armed.get() != null
-                    || (this.control != null && this.control.isLive());
+            // control.isLive always sets this.armed via armSnapshot.
+            boolean bodies = !(terminal instanceof StaticFileHandler) || this.armed.get() != null;
             previousH2 = http2.armHandler(armed, bodies);
             // Keep SjwsServer.armed aligned with the pinned generation when filters/metrics are on.
-            if (this.armed.get() != null || (this.control != null && this.control.isLive())) {
+            if (this.armed.get() != null) {
                 this.armed.set(armed);
             }
         }
@@ -1103,8 +1103,6 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
             // Filters need bodies; publish as one generation (P2a).
             http2.armHandler(handler, true);
-        } else if (this.h2 != null) {
-            this.h2.armHandler(handler);
         }
     }
 
@@ -1178,8 +1176,6 @@ public final class SjwsServer implements AutoCloseable {
         }
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
             http2.armHandler(chain, true);
-        } else if (this.h2 != null) {
-            this.h2.armHandler(chain);
         }
     }
 
