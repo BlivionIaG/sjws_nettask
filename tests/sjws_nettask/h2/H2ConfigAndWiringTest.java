@@ -84,6 +84,141 @@ class H2ConfigAndWiringTest {
     }
 
     /** Filters (access rules, routes, middleware) apply to HTTP/2 exactly as to HTTP/1.1. */
+    /**
+     * #289 P1: {@link SjwsServer#startH2} arms HTTP/2 with a live-snapshot lambda that is never a
+     * {@link sjws_nettask.core.StaticFileHandler}. Bodies must stay off for static-only production wiring.
+     */
+    /**
+     * #289: YAML {@code routing.enabled} compiles a router into the live snapshot while {@code override}
+     * stays null. Bodies must be on so proxy routes receive DATA through the live-snapshot arm.
+     */
+    @Test
+    void yamlRoutingEnablesBodiesThroughLiveSnapshot() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        var yaml = this.root.resolve("sjws.yaml");
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: "%s"
+                routing:
+                  enabled: true
+                  upstreams:
+                    loop: { url: "http://127.0.0.1:9" }
+                  routes:
+                    - { prefix: /api, proxy: loop }
+                """.formatted(this.root.toAbsolutePath()));
+        var loaded = sjws_nettask.config.ConfigLoader.load(
+                new String[] {"--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded)) {
+            assertFalse(server.requestHandler() instanceof sjws_nettask.core.StaticFileHandler,
+                    "live snapshot should be a router");
+            assertTrue(((Http2Server) server.h2()).attachBodies(),
+                    "YAML routing under the live-snapshot arm must enable bodies");
+        }
+    }
+
+    /**
+     * #289: publish/reload must refresh attachBodies from the live handler (and keep it on when
+     * an observe/chain-control handler is armed). Covers the publish-path branches jacoco gates.
+     */
+    @Test
+    void publishRefreshAttachBodiesOnReload() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        var yaml = this.root.resolve("sjws.yaml");
+        var rootAbs = this.root.toAbsolutePath();
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: "%s"
+                routing:
+                  enabled: true
+                  upstreams:
+                    loop: { url: "http://127.0.0.1:9" }
+                  routes:
+                    - { prefix: /api, proxy: loop }
+                """.formatted(rootAbs));
+        var loaded = sjws_nettask.config.ConfigLoader.load(
+                new String[] {"--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded)) {
+            var h2 = (Http2Server) server.h2();
+            assertTrue(h2.attachBodies(), "routing at start");
+            Files.writeString(yaml, """
+                    server:
+                      port: 0
+                      root: "%s"
+                      idle_timeout: 33s
+                    routing:
+                      enabled: true
+                      upstreams:
+                        loop: { url: "http://127.0.0.1:9" }
+                      routes:
+                        - { prefix: /api, proxy: loop }
+                    """.formatted(rootAbs));
+            assertTrue(server.reload().applied(), "routing reload must apply");
+            assertTrue(h2.attachBodies(), "publish keeps bodies on while live handler is a router");
+        }
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: "%s"
+                """.formatted(rootAbs));
+        loaded = sjws_nettask.config.ConfigLoader.load(
+                new String[] {"--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded)) {
+            var h2 = (Http2Server) server.h2();
+            assertFalse(h2.attachBodies());
+            server.armMetrics();
+            assertTrue(h2.attachBodies(), "armMetrics installs an observe chain that needs bodies");
+            Files.writeString(yaml, """
+                    server:
+                      port: 0
+                      root: "%s"
+                      idle_timeout: 34s
+                    """.formatted(rootAbs));
+            assertTrue(server.reload().applied());
+            assertTrue(h2.attachBodies(),
+                    "publish must keep bodies on when armed is non-null even if live handler is static");
+        }
+    }
+
+    @Test
+    void productionStaticArmKeepsBodiesOff() throws Exception {
+        try (var server = SjwsServer.start(config())) {
+            var h2 = (Http2Server) server.h2();
+            assertNotNull(h2);
+            assertFalse(h2.attachBodies(),
+                    "production live-snapshot arm must not enable bodies on a static-only server");
+        }
+    }
+
+    /** A filter chain at startup needs bodies/fields (RequestSizeFilter, echo, etc.). */
+    @Test
+    void aFilterChainAtStartupEnablesBodies() throws Exception {
+        var filters = sjws_nettask.core.RequestFilters.create().add((request, next) -> next.proceed(request));
+        try (var server = SjwsServer.start(config(), filters)) {
+            assertTrue(((Http2Server) server.h2()).attachBodies());
+        }
+    }
+
+    /** Hot-swap style: arming a chain turns bodies on; re-arming the static live snapshot turns them off. */
+    @Test
+    void armHandlerHotSwapTogglesBodies() throws Exception {
+        try (var server = SjwsServer.start(config())) {
+            var h2 = (Http2Server) server.h2();
+            assertFalse(h2.attachBodies());
+            var chain = sjws_nettask.core.RequestFilters.create()
+                    .add((request, next) -> next.proceed(request))
+                    .build(request -> sjws_nettask.core.StaticFileHandler.error(404, false));
+            h2.armHandler(chain);
+            assertTrue(h2.attachBodies());
+            h2.armHandler(request -> server.handler().handle(request), false);
+            assertFalse(h2.attachBodies());
+        }
+    }
+
     @Test
     void requestFiltersApplyOverHttp2() throws Exception {
         var filters = sjws_nettask.core.RequestFilters.create().add((request, next) ->

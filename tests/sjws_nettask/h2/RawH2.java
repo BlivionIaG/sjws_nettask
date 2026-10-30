@@ -108,6 +108,15 @@ final class RawH2 implements AutoCloseable {
         frame(HEADERS, END_HEADERS | END_STREAM, stream, block("GET", path));
     }
 
+    /** HPACK block of regular fields only (trailers; no pseudo-headers). */
+    static byte[] blockTrailers(String... fields) {
+        var b = new ByteArrayOutputStream();
+        for (int i = 0; i < fields.length; i += 2) {
+            literal(b, fields[i], fields[i + 1]);
+        }
+        return b.toByteArray();
+    }
+
     void windowUpdate(int stream, int increment) throws IOException {
         frame(WINDOW_UPDATE, 0, stream, new byte[] {(byte) (increment >>> 24), (byte) (increment >>> 16),
             (byte) (increment >>> 8), (byte) increment});
