@@ -48,7 +48,7 @@ class ReloadHookTest {
             org.junit.jupiter.api.Assumptions.assumeTrue(ReloadHook.installSighup(),
                     "SIGHUP is already ignored, or sun.misc.Signal is hidden");
             var pid = ProcessHandle.current().pid();
-            var kill = new ProcessBuilder("kill", "-HUP", Long.toString(pid)).start();
+            var kill = new ProcessBuilder(TestCommands.resolve("kill"), "-HUP", Long.toString(pid)).start();
             assertEquals(0, kill.waitFor());
             var deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
             while (seen.get() == 0 && System.nanoTime() < deadline) {
