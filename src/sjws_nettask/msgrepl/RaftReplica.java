@@ -160,6 +160,8 @@ final class RaftReplica implements Replica {
     private final java.util.concurrent.locks.ReentrantLock applyLock = new java.util.concurrent.locks.ReentrantLock();
     /** Set while the group opens when the restored snapshot needs an install; run once the group is open. */
     private MsgSnapshot openInstall;
+    /** Coordinates constructor handoff with {@link #onSnapshotRestored} during {@code openGroup} (#288 Codex P1). */
+    private final Object installHandoff = new Object();
     private volatile CompletableFuture<Void> installing;
     /** Consensus index of the last snapshot recorded or restored. */
     private volatile long recordedIndex;
@@ -281,12 +283,18 @@ final class RaftReplica implements Replica {
                 RaftReplica.this.onSnapshotRestored(snapshot);
             }
         };
-        this.group = node.openGroup(groupId, options, listener);
+        // openGroup may deliver onSnapshotRestored before returning; defer install via openInstall until
+        // group is published under installHandoff so the callback and this handoff cannot disagree (#288 Codex P1).
+        var opened = node.openGroup(groupId, options, listener);
+        MsgSnapshot owed;
+        synchronized (this.installHandoff) {
+            this.group = opened;
+            owed = this.openInstall;
+            if (owed != null) this.openInstall = null;
+        }
         this.group.advertiseFeatures(FEATURE_PRODUCER_ENTRIES);
         node.onNoopApplied(groupId, (term, index) -> this.readyTerm = term);
-        var owed = this.openInstall;
         if (owed != null) {
-            this.openInstall = null;
             var done = new CompletableFuture<Void>();
             this.installing = done;
             Thread.ofVirtual().name("msgrepl-install-" + this.topic).start(() -> {
@@ -402,8 +410,8 @@ final class RaftReplica implements Replica {
 
     /**
      * Rewrites the stamp file to start at the snapshot point {@code (index, term, end)}: the header, the log start, and
-     * every stamp after {@code index}. Not fsynced, like every stamp: a lost or stale file is rebuilt from the restored
-     * snapshot and the ledger end on restart.
+     * every stamp after {@code index}. The replacement is forced before the rename so a crash cannot leave an empty
+     * stamp header over a durable ledger (#288 Codex P1); append-only stamps remain unforced as before.
      */
     private void resetStamps(long index, long term, long end, long keepAfter) throws IOException {
         var tmp = this.stampFile.resolveSibling(this.stampFile.getFileName() + ".tmp");
@@ -426,9 +434,15 @@ final class RaftReplica implements Replica {
             out.flip();
             try (var ch = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
                 while (out.hasRemaining()) ch.write(out);
+                ch.force(true);
             }
             fault("stamps-written");
             Files.move(tmp, this.stampFile, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            try (var d = FileChannel.open(this.stampFile.getParent(), StandardOpenOption.READ)) {
+                d.force(true);
+            } catch (IOException ignored) {
+                // some file systems refuse a directory fsync; the forced contents still cover the rename target
+            }
             var old = this.stamps;
             this.stamps = FileChannel.open(this.stampFile, StandardOpenOption.READ, StandardOpenOption.WRITE);
             old.close();
@@ -886,10 +900,12 @@ final class RaftReplica implements Replica {
             return;
         }
         if (this.snaps != null && this.hooks != null && (this.installPending || this.local.snapshot().nextOffset() < m.endOffset())) {
-            if (this.group == null) { // restored while the group opens (restart): installed off the opening thread
-                this.installPending = true;
-                this.openInstall = m;
-                return;
+            synchronized (this.installHandoff) {
+                if (this.group == null) { // restored while the group opens (restart): installed off the opening thread
+                    this.installPending = true;
+                    this.openInstall = m;
+                    return;
+                }
             }
             install(m);
             return;

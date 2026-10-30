@@ -19,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.AfterEach;
@@ -248,4 +249,31 @@ class SnapshotTransferTest {
         assertTrue(e.getMessage().contains("no snapshot"));
         assertThrows(SnapshotTransfer.Unavailable.class, () -> fetch(KEY, "nope", 0, 1 << 20));
     }
+
+    /**
+     * #288 Codex P2: if sending the manifest fails after acquire, the pin must still be released so prune
+     * can reclaim it.
+     */
+    @Test
+    void manifestWriteFailureReleasesPin() throws Exception {
+        setUp(40, 64L << 20, null);
+        var probe = store.acquire("t", 0);
+        assertEquals(1, probe.readers);
+        store.release(probe);
+        server.failManifestWrite = true;
+        var nonce = new byte[16];
+        nonce[0] = 99;
+        assertEquals(-1, send(hello(KEY, nonce, now.get(), "t", 0)), "server fails the manifest write");
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        int readers = -1;
+        while (System.nanoTime() < deadline) {
+            var held = store.acquire("t", 0);
+            readers = held.readers;
+            store.release(held);
+            if (readers == 1) break;
+            Thread.sleep(10);
+        }
+        assertEquals(1, readers, "pin.readers leaked after manifest write failure");
+    }
 }
+

@@ -179,7 +179,10 @@ final class SnapshotStore {
                     bytes = cutPosition(link, endOffset); // sealed (maybe compacted) holding the cut: scan the link itself
                 }
                 if (bytes < 0) throw new IOException("no frame boundary at " + endOffset + " in segment " + f.baseOffset());
-                if (markerNext >= 0 && next < f.nextOffset()) markerNext = -1; // a cut file is not the compacted whole
+                // Cut inside a compacted segment: keep a marker bounded to the snapshot end so recover()
+                // still advances across compaction gaps (empty prefix → nextOffset = marker). Clearing it
+                // made an empty cut reopen at base despite the manifest end (#288 Codex P1).
+                if (markerNext >= 0 && next < f.nextOffset()) markerNext = next;
                 segs.add(new MsgSnapshot.Seg(f.baseOffset(), next, bytes, markerNext, hash(link, bytes, chunkBytes)));
             }
             if (segs.isEmpty()) {

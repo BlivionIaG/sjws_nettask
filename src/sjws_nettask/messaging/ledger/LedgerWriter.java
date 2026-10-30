@@ -364,17 +364,34 @@ public final class LedgerWriter implements PartitionAppender, AutoCloseable {
     private long durableNow() { lock.lock(); try { return durable; } finally { lock.unlock(); } }
 
     /**
-     * Fsyncs the log and advances {@link LedgerSnapshot#durableOffset} to the written end (#270 / #288 MC-N1).
-     * Prefer this over {@link SegmentedLog#force} when a snapshot must observe the durable point.
+     * Test-only: runs after {@code log.force()} returns and before durable is published. Lets a test append
+     * between the fsync and the watermark publish to prove the durable offset never covers unsynced records
+     * (#288 Codex P1).
+     */
+    volatile Runnable afterLogForce;
+
+    /**
+     * Fsyncs the log and advances {@link LedgerSnapshot#durableOffset} to the watermark captured <em>before</em>
+     * that fsync (#270 / #288 MC-N1, Codex P1). Prefer this over {@link SegmentedLog#force} when a snapshot must
+     * observe the durable point: reading {@code written} after {@code log.force()} returns can include records the
+     * writer appended in between, which were never part of that fsync.
      */
     public void force() throws IOException {
         forceInline();
     }
 
     private void forceInline() throws IOException {
+        long watermark = written; // capture before fsync: only this prefix is covered
         log.force();
+        var hook = afterLogForce;
+        if (hook != null) hook.run();
         lock.lock();
-        try { fsyncs++; durable = written; } finally { lock.unlock(); }
+        try {
+            fsyncs++;
+            if (watermark > durable) durable = watermark;
+        } finally {
+            lock.unlock();
+        }
         publish();
     }
 

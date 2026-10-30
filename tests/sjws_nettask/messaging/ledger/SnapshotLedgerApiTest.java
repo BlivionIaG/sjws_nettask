@@ -171,4 +171,66 @@ class SnapshotLedgerApiTest {
             }
         }
     }
+
+    /** #288 Codex P1: force() must publish only the watermark captured before log.force(), not written after. */
+    @Test
+    void forcePublishesWatermarkCapturedBeforeFsync() throws Exception {
+        try (var log = SegmentedLog.open(dir.resolve("force-wm"), 1 << 20)) {
+            var w = new LedgerWriter(log, Durability.ASYNC, 0, 64, 4 << 20, 0);
+            try {
+                w.pauseSync(); // only our force() advances durable
+                w.append(List.of("a".getBytes(StandardCharsets.UTF_8))).get();
+                assertEquals(1, w.snapshot().nextOffset());
+                var appended = new java.util.concurrent.atomic.AtomicBoolean();
+                w.afterLogForce = () -> {
+                    try {
+                        w.append(List.of("b".getBytes(StandardCharsets.UTF_8))).get();
+                        appended.set(true);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                };
+                w.force();
+                assertTrue(appended.get());
+                assertEquals(2, w.snapshot().nextOffset(), "writer advanced during force");
+                assertEquals(1, w.snapshot().durableOffset(), "durable covers only the pre-fsync watermark");
+            } finally {
+                w.afterLogForce = null;
+                w.close();
+            }
+        }
+    }
+
+    /** #288 Codex P1: replaceWith invalidates an in-flight prepareCompaction so commit cannot close installed segments. */
+    @Test
+    void replaceWithInvalidatesPendingCompaction() throws Exception {
+        var staged = Files.createDirectories(dir.resolve("cmp-staged"));
+        List<String> want;
+        try (var src = SegmentedLog.open(dir.resolve("cmp-src"), 2048)) {
+            for (int i = 0; i < 40; i++) src.append(recs(i, 1), i);
+            src.force();
+            while (src.segmentFiles().size() < 2) src.append(recs(1000 + (int) src.nextOffset(), 1), 0);
+            src.force();
+            want = all(src);
+            for (var f : src.segmentFiles()) {
+                Files.copy(f.file(), staged.resolve(f.file().getFileName()));
+                if (Files.exists(f.marker())) Files.copy(f.marker(), staged.resolve(f.marker().getFileName()));
+            }
+        }
+        try (var log = SegmentedLog.open(dir.resolve("cmp-dst"), 2048)) {
+            for (int i = 0; i < 40; i++) log.append(recs(i, 1), i);
+            log.force();
+            while (log.segmentFiles().size() < 2) log.append(recs(2000 + (int) log.nextOffset(), 1), 0);
+            log.force();
+            long base = log.segmentFiles().getFirst().baseOffset();
+            log.prepareCompaction(base, o -> o % 2 == 0);
+            assertTrue(Files.isRegularFile(dir.resolve("cmp-dst").resolve(String.format("%020d.cmp", base))));
+            log.replaceWith(staged);
+            log.commitCompaction(base); // must no-op: epoch moved / .cmp gone
+            assertFalse(Files.isRegularFile(dir.resolve("cmp-dst").resolve(String.format("%020d.cmp", base))));
+            assertEquals(want, all(log));
+            // Installed segments stay open for reads (no ClosedChannelException).
+            assertEquals(want.size(), log.nextOffset());
+        }
+    }
 }

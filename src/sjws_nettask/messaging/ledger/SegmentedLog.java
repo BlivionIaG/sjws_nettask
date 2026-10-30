@@ -5,7 +5,9 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.List;
 import java.util.regex.Pattern;
 
@@ -29,6 +31,13 @@ public final class SegmentedLog implements AutoCloseable {
     private volatile Segment active;
     /** Held from open to close: one process per ledger directory. */
     private DirectoryLock dirLock;
+    /**
+     * Bumped by {@link #replaceWith} so an in-flight {@link #prepareCompaction}/{@link #commitCompaction} pair
+     * cannot close or overwrite segments that installation just swapped in (#288 Codex P1).
+     */
+    private final AtomicLong epoch = new AtomicLong();
+    /** baseOffset → epoch observed when that compaction was prepared. */
+    private final ConcurrentHashMap<Long, Long> preparedAt = new ConcurrentHashMap<>();
 
     private SegmentedLog(Path dir, long segmentBytes, long truncated) {
         this.dir = dir;
@@ -196,20 +205,32 @@ public final class SegmentedLog implements AutoCloseable {
      * batches whose base offset {@code keep} accepts, fsynced, plus its marker. Returns the new size in bytes.
      */
     public long prepareCompaction(long base, java.util.function.LongPredicate keep) throws IOException {
-        return sealedSegment(base).writeCompacted(keep);
+        long at = epoch.get();
+        long size = sealedSegment(base).writeCompacted(keep);
+        preparedAt.put(base, at);
+        return size;
     }
 
     /** Phase 2 (callers exclude readers of this segment): swaps in the compacted file and persists its index. */
     public void commitCompaction(long base) throws IOException {
+        var cmp = dir.resolve(Segment.name(base, ".cmp"));
+        Long at = preparedAt.get(base);
+        // Installation may have replaced the ledger (and deleted .cmp) between prepare and commit: do not close
+        // the newly installed segment or rename a stale preparation over it (#288 Codex P1).
+        if (at == null || at != epoch.get() || !Files.isRegularFile(cmp)) {
+            preparedAt.remove(base);
+            Files.deleteIfExists(cmp);
+            return;
+        }
         var old = sealedSegment(base);
         int i = segments.indexOf(old);
         old.close();
-        var cmp = dir.resolve(Segment.name(base, ".cmp"));
         java.nio.file.Files.move(cmp, old.logPath, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         java.nio.file.Files.deleteIfExists(old.indexPath);
         var seg = Segment.open(dir, base, true, new long[1]);
         seg.seal();
         segments.set(i, seg);
+        preparedAt.remove(base);
     }
 
     /**
@@ -245,6 +266,8 @@ public final class SegmentedLog implements AutoCloseable {
      * returns, and redoes the swap after a crash (#288 MC-N5).
      */
     public void replaceWith(Path staged) throws IOException {
+        epoch.incrementAndGet();
+        preparedAt.clear();
         for (var s : segments) s.close();
         try (var list = Files.list(dir)) {
             for (var p : (Iterable<Path>) list::iterator) {

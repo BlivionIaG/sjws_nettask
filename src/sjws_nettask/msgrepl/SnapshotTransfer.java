@@ -169,6 +169,8 @@ final class SnapshotTransfer {
         private final Thread acceptor;
         private volatile boolean closed;
         final AtomicLong refused = new AtomicLong();
+        /** Test-only: throw after acquire, before manifest write (#288 Codex P2). */
+        volatile boolean failManifestWrite;
         final AtomicLong bytesSent = new AtomicLong();
         final AtomicLong chunksSent = new AtomicLong();
 
@@ -277,16 +279,18 @@ final class SnapshotTransfer {
                 return; // no answer: an unauthenticated peer learns nothing, not even whether the topic exists
             }
             var pin = store.acquire(topic, minIndex);
-            var nonceS = new byte[NONCE];
-            RANDOM.nextBytes(nonceS);
-            byte status = (byte) (pin == null ? 1 : 0);
-            long pinIndex = pin == null ? -1 : pin.index;
-            var manifest = pin == null ? new byte[0] : pin.manifest;
-            var reply = ByteBuffer.allocate(1 + NONCE + 8 + 4).put(status).put(nonceS).putLong(pinIndex).putInt(manifest.length).array();
-            var rmac = tag(key, new byte[] {'M'}, nonceC, reply, manifest); // the key the client proved it holds
-            write(sc, ByteBuffer.wrap(reply), ByteBuffer.wrap(manifest), ByteBuffer.wrap(rmac));
-            if (pin == null) return;
             try {
+                var nonceS = new byte[NONCE];
+                RANDOM.nextBytes(nonceS);
+                byte status = (byte) (pin == null ? 1 : 0);
+                long pinIndex = pin == null ? -1 : pin.index;
+                var manifest = pin == null ? new byte[0] : pin.manifest;
+                var reply = ByteBuffer.allocate(1 + NONCE + 8 + 4).put(status).put(nonceS).putLong(pinIndex).putInt(manifest.length).array();
+                var rmac = tag(key, new byte[] {'M'}, nonceC, reply, manifest); // the key the client proved it holds
+                // Manifest write is inside the pin-release finally: a disconnect here must not leak readers (#288 Codex P2).
+                if (failManifestWrite) throw new IOException("test: fail manifest write");
+                write(sc, ByteBuffer.wrap(reply), ByteBuffer.wrap(manifest), ByteBuffer.wrap(rmac));
+                if (pin == null) return;
                 var snap = MsgSnapshot.decode(pin.manifest);
                 long lastSeq = 0;
                 while (true) {
@@ -322,7 +326,7 @@ final class SnapshotTransfer {
                     chunksSent.incrementAndGet();
                 }
             } finally {
-                store.release(pin);
+                if (pin != null) store.release(pin);
             }
         }
 
