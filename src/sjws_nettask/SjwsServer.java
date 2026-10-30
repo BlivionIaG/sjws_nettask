@@ -920,7 +920,7 @@ public final class SjwsServer implements AutoCloseable {
      * other terminal does. Used for the HTTP/2 live-snapshot arm so production static-only stays
      * zero-cost without disabling bodies for configured proxy routes (#289).
      */
-    private boolean liveNeedsBodies() {
+    boolean liveNeedsBodies() {
         return !(this.live.handler() instanceof StaticFileHandler) || this.armed.get() != null
                 || (this.control != null && this.control.isLive());
     }
@@ -931,7 +931,7 @@ public final class SjwsServer implements AutoCloseable {
      * re-read {@link #live} under the chain (#301 P1). Without a live chain control, keeps an
      * already-armed observe chain or returns the terminal.
      */
-    private Handler armedAround(Handler terminal) {
+    Handler armedAround(Handler terminal) {
         Objects.requireNonNull(terminal, "terminal");
         Handler frozen = request -> terminal.handle(request);
         var control = this.control;
@@ -948,7 +948,7 @@ public final class SjwsServer implements AutoCloseable {
      * After swapping away {@code previous}, close {@code replaced} when its pinned h2 Tasks drain,
      * with a bounded wait so close cannot hang forever (P2b).
      */
-    private void deferSnapshotClose(sjws_nettask.h2.Http2Server.Generation previous,
+    void deferSnapshotClose(sjws_nettask.h2.Http2Server.Generation previous,
             ConfigSnapshot replaced) {
         if (replaced == null) {
             return;
