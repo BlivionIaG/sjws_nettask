@@ -44,6 +44,8 @@ public final class ObserverSlot {
     private volatile Supplier<ClusterStatus> cluster;
     /** Copied onto the recording observer. Not read by {@link #get()}. */
     private volatile LabelSource labels;
+    /** Copied onto the recording observer. Not read by {@link #get()}. */
+    private volatile String[] credentialQueryParams = AccessTargetMask.NONE;
 
     public ObserverSlot(RequestObserver initial) {
         this.current = initial == null ? RequestObserver.NONE : initial;
@@ -78,6 +80,19 @@ public final class ObserverSlot {
         }
     }
 
+    /**
+     * Api-key query parameter names to mask in the access log. Null or empty clears masking.
+     * Does not install the observe filter.
+     */
+    public void attachCredentialQueryParams(String[] names) {
+        var next = names == null || names.length == 0 ? AccessTargetMask.NONE : names.clone();
+        this.credentialQueryParams = next;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.setCredentialQueryParams(next);
+        }
+    }
+
     /** Replaces the observer. Used before the listeners accept. */
     public void set(RequestObserver observer) {
         var next = observer == null ? RequestObserver.NONE : observer;
@@ -91,6 +106,7 @@ public final class ObserverSlot {
         }
         observer.attachCluster(this.cluster);
         observer.attachLabels(this.labels);
+        observer.setCredentialQueryParams(this.credentialQueryParams);
     }
 
     /**

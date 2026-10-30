@@ -62,6 +62,7 @@ import sjws_nettask.h3.Http3Server;
 import sjws_nettask.observe.ClusterStatus;
 import sjws_nettask.observe.LabelSource;
 import sjws_nettask.observe.ObserveRequestFilter;
+import sjws_nettask.observe.AccessTargetMask;
 import sjws_nettask.observe.ObserverSlot;
 import sjws_nettask.observe.RequestObserver;
 import sjws_nettask.observe.ServerMetrics;
@@ -150,6 +151,7 @@ public final class SjwsServer implements AutoCloseable {
             initial = RequestObserver.open(config);
         }
         this.slot = new ObserverSlot(initial);
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(snapshot.document().middleware()));
         this.observingAtStart = initial.recording();
         FilterChain built;
         Handler selected;
@@ -674,6 +676,7 @@ public final class SjwsServer implements AutoCloseable {
         }
         if (write) {
             persistLastGood(result.snapshot().document());
+            syncCredentialQueryParamsFromConfig(result.snapshot().document());
         }
         return result;
     }
@@ -742,6 +745,7 @@ public final class SjwsServer implements AutoCloseable {
                 }
                 persistLastGood(published.snapshot().document());
                 var appliedMw = published.snapshot().document().middleware();
+                syncCredentialQueryParamsFromConfig(published.snapshot().document());
                 sjws_nettask.config.MiddlewareSecrets.logStartupWarn(
                         System.getLogger(SjwsServer.class.getName()), appliedMw, null, null);
             }
@@ -1039,10 +1043,25 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     /**
+     * Refresh access-log credential query names from the config {@code middleware} list when no
+     * filter document is live. A live {@link ChainControl} document owns the names via
+     * {@link #armSnapshot}.
+     */
+    private void syncCredentialQueryParamsFromConfig(sjws_nettask.config.ConfigDocument document) {
+        var ctrl = this.control;
+        if (ctrl != null && ctrl.document() != null) {
+            return;
+        }
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
+    }
+
+    /**
      * Stores the compiled snapshot where every transport already reads its handler. One volatile
      * write per transport; the request path does not enter {@link ChainControl}.
      */
     private void armSnapshot(Handler handler) {
+        // onPublish runs only after {@link #chainControl} assigned {@link #control}.
+        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromDocument(this.control.document()));
         this.armed.set(handler);
         if (this.h3 != null) {
             this.h3.armHandler(handler);
@@ -1076,6 +1095,15 @@ public final class SjwsServer implements AutoCloseable {
      */
     public void attachGatewayMetrics(LabelSource labels) {
         this.slot.attachLabels(labels);
+    }
+
+    /**
+     * Sets the api-key query parameter names whose values are masked in the access log.
+     * Null or empty clears masking. Does not install the observe filter. Prefer letting
+     * {@link #chainControl} refresh these from each applied filter document.
+     */
+    public void attachCredentialQueryParams(String[] names) {
+        this.slot.attachCredentialQueryParams(names);
     }
 
     /**

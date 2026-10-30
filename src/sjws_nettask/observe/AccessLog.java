@@ -20,6 +20,13 @@ import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.EnumSet;
+import java.util.Set;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import sjws_nettask.ServerConfig.AccessLogFormat;
@@ -45,11 +52,81 @@ final class AccessLog implements Runnable, AutoCloseable {
     private volatile boolean stopped;
     private volatile boolean failed;
 
+    private static final Set<PosixFilePermission> FILE_0640 = EnumSet.of(PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ);
+    private static final Set<PosixFilePermission> DIR_0750 = EnumSet.of(PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE, PosixFilePermission.GROUP_READ,
+            PosixFilePermission.GROUP_EXECUTE);
+
     static AccessLog start(String target, AccessLogFormat format) throws IOException {
         if ("-".equals(target)) {
             return new AccessLog(unclosable(System.out), false, format, CAPACITY);
         }
-        return new AccessLog(new FileOutputStream(target, true), true, format, CAPACITY);
+        return new AccessLog(openFile(Path.of(target)), true, format, CAPACITY);
+    }
+
+    /**
+     * Opens {@code path} for append. A newly created file is mode {@code 0640}; a directory this
+     * process creates for it is {@code 0750}. An existing file keeps its mode; a world-readable
+     * existing file logs a WARN and is still appended.
+     */
+    static OutputStream openFile(Path path) throws IOException {
+        Path absolute = path.toAbsolutePath();
+        ensureParent(absolute);
+        if (Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
+            warnIfWorldReadable(absolute);
+        } else {
+            createNew(absolute);
+        }
+        return new FileOutputStream(absolute.toFile(), true);
+    }
+
+    private static void ensureParent(Path file) throws IOException {
+        Path parent = file.getParent();
+        if (parent == null || Files.isDirectory(parent, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        try {
+            if (posix(parent)) {
+                Files.createDirectories(parent, PosixFilePermissions.asFileAttribute(DIR_0750));
+            } else {
+                Files.createDirectories(parent);
+            }
+        } catch (UnsupportedOperationException e) {
+            Files.createDirectories(parent);
+        }
+    }
+
+    private static void createNew(Path path) throws IOException {
+        try {
+            if (posix(path)) {
+                Files.createFile(path, PosixFilePermissions.asFileAttribute(FILE_0640));
+                return;
+            }
+        } catch (UnsupportedOperationException e) {
+            // fall through
+        }
+        Files.createFile(path);
+    }
+
+    private static void warnIfWorldReadable(Path path) {
+        try {
+            if (!posix(path)) {
+                return;
+            }
+            var perms = Files.getPosixFilePermissions(path, LinkOption.NOFOLLOW_LINKS);
+            if (perms.contains(PosixFilePermission.OTHERS_READ) || perms.contains(PosixFilePermission.OTHERS_WRITE)
+                    || perms.contains(PosixFilePermission.OTHERS_EXECUTE)) {
+                System.err.println("WARN: access log " + path + " is world-accessible ("
+                        + PosixFilePermissions.toString(perms) + "); leaving mode unchanged");
+            }
+        } catch (IOException | UnsupportedOperationException e) {
+            // best-effort warning only
+        }
+    }
+
+    private static boolean posix(Path path) {
+        return path.getFileSystem().supportedFileAttributeViews().contains("posix");
     }
 
     /** @param capacity power of two; tests use a tiny queue to force drops */

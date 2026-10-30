@@ -77,6 +77,11 @@ public final class RequestObserver implements AutoCloseable {
     private volatile Supplier<ClusterStatus> cluster;
     /** Read only while rendering {@code /metrics}. Null or {@link LabelSource#NONE} omits gateway families. */
     private volatile LabelSource labels;
+    /**
+     * Api-key query parameter names to mask in the access-log target. {@link AccessTargetMask#NONE}
+     * when unset. Read on the logging path only.
+     */
+    private volatile String[] credentialQueryParams = AccessTargetMask.NONE;
 
     private RequestObserver(ServerMetrics metrics, AccessLog log, MetricsExposure exposure, boolean recording,
             boolean healthz) {
@@ -174,7 +179,8 @@ public final class RequestObserver implements AutoCloseable {
         }
         this.metrics.record(status, protocol, bytes, durationNanos);
         if (this.log != null) {
-            this.log.offer(remote, method, target, protocolName, status, bytes, durationNanos, referer, userAgent);
+            this.log.offer(remote, method, AccessTargetMask.mask(target, this.credentialQueryParams), protocolName,
+                    status, bytes, durationNanos, referer, userAgent);
         }
     }
 
@@ -219,6 +225,18 @@ public final class RequestObserver implements AutoCloseable {
         if (this != NONE) {
             this.labels = labels;
         }
+    }
+
+    /**
+     * Query parameter names whose values are replaced with {@code ***} in the access-log target.
+     * Null or empty clears masking ({@link AccessTargetMask#NONE}). Not used when logging is off.
+     * {@link #NONE} ignores this.
+     */
+    void setCredentialQueryParams(String[] names) {
+        if (this == NONE) {
+            return;
+        }
+        this.credentialQueryParams = names == null || names.length == 0 ? AccessTargetMask.NONE : names.clone();
     }
 
     /** Process counters, plus cluster and gateway families when those sources are attached. */
