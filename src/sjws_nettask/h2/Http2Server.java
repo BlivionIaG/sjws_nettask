@@ -238,6 +238,14 @@ public final class Http2Server implements Transport {
         return this.attachBodies.get();
     }
 
+    /**
+     * Refresh the bodies flag without replacing the armed handler (e.g. after a live-snapshot
+     * reload that turns routing on or off under the same live-snapshot lambda).
+     */
+    public void setAttachBodies(boolean attachBodies) {
+        this.attachBodies.set(attachBodies);
+    }
+
     @Override
     public Http2Server start() throws Exception {
         try {

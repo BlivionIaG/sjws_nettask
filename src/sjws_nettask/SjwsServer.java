@@ -528,8 +528,9 @@ public final class SjwsServer implements AutoCloseable {
             transport = factory.create(config(), handler(), published, this.override, this.slot);
             if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
                 // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies.
-                // The wrapper is never a StaticFileHandler; keep bodies off until a chain/terminal is armed (#289 P1).
-                http2.armHandler(request -> this.live.handler().handle(request), false);
+                // The wrapper is never a StaticFileHandler; derive bodies from the compiled live handler
+                // (static-only → false; YAML router / non-static → true) (#289 P1 / live-snapshot routes).
+                http2.armHandler(request -> this.live.handler().handle(request), liveNeedsBodies());
             }
             transport.start();
             this.h2 = transport;
@@ -848,6 +849,11 @@ public final class SjwsServer implements AutoCloseable {
                 http3.replaceTls(result.tls());
             }
         }
+        if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
+            // Routing may appear or disappear on reload under the same live-snapshot lambda.
+            boolean bodies = liveNeedsBodies() || this.armed.get() != null;
+            http2.setAttachBodies(bodies);
+        }
         if (closeOld && this.challengeHttp != null) {
             this.challengeHttp.close();
             this.challengeHttp = null;
@@ -895,6 +901,16 @@ public final class SjwsServer implements AutoCloseable {
             return this.ha.handler();
         }
         return this.override != null ? this.override : this.live.handler();
+    }
+
+    /**
+     * Whether the live snapshot's compiled handler may need request bodies / full field maps.
+     * A bare {@link StaticFileHandler} does not; a router (YAML {@code routing.enabled}) or any
+     * other terminal does. Used for the HTTP/2 live-snapshot arm so production static-only stays
+     * zero-cost without disabling bodies for configured proxy routes (#289).
+     */
+    private boolean liveNeedsBodies() {
+        return !(this.live.handler() instanceof StaticFileHandler);
     }
 
     /** @return null when this server was started without {@link HaSettings} */

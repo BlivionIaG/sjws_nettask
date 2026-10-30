@@ -88,7 +88,37 @@ class H2ConfigAndWiringTest {
      * #289 P1: {@link SjwsServer#startH2} arms HTTP/2 with a live-snapshot lambda that is never a
      * {@link sjws_nettask.core.StaticFileHandler}. Bodies must stay off for static-only production wiring.
      */
+    /**
+     * #289: YAML {@code routing.enabled} compiles a router into the live snapshot while {@code override}
+     * stays null. Bodies must be on so proxy routes receive DATA through the live-snapshot arm.
+     */
     @Test
+    void yamlRoutingEnablesBodiesThroughLiveSnapshot() throws Exception {
+        Files.writeString(this.root.resolve("a.txt"), "a");
+        var yaml = this.root.resolve("sjws.yaml");
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: "%s"
+                routing:
+                  enabled: true
+                  upstreams:
+                    loop: { url: "http://127.0.0.1:9" }
+                  routes:
+                    - { prefix: /api, proxy: loop }
+                """.formatted(this.root.toAbsolutePath()));
+        var loaded = sjws_nettask.config.ConfigLoader.load(
+                new String[] {"--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var server = SjwsServer.start(loaded)) {
+            assertFalse(server.requestHandler() instanceof sjws_nettask.core.StaticFileHandler,
+                    "live snapshot should be a router");
+            assertTrue(((Http2Server) server.h2()).attachBodies(),
+                    "YAML routing under the live-snapshot arm must enable bodies");
+        }
+    }
+
+        @Test
     void productionStaticArmKeepsBodiesOff() throws Exception {
         try (var server = SjwsServer.start(config())) {
             var h2 = (Http2Server) server.h2();
