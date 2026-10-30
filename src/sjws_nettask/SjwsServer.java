@@ -527,10 +527,11 @@ public final class SjwsServer implements AutoCloseable {
             FilterChain published = this.ha == null ? this.chain : null;
             transport = factory.create(config(), handler(), published, this.override, this.slot);
             if (transport instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
-                // like HTTP/1.1 and HTTP/3: follow the live snapshot so a reload (root, access rules) applies.
-                // The wrapper is never a StaticFileHandler; derive bodies from the compiled live handler
-                // (static-only → false; YAML router / non-static → true) (#289 P1 / live-snapshot routes).
-                http2.armHandler(request -> this.live.handler().handle(request), liveNeedsBodies());
+                // Pin the compiled snapshot handler (not a re-reading lambda) so each stream's Task
+                // can capture one generation with its attachBodies decision (#301). publish() re-arms
+                // on reload so root / access / routing changes still apply to new streams.
+                var pinned = this.live.handler();
+                http2.armHandler(request -> pinned.handle(request), liveNeedsBodies());
             }
             transport.start();
             this.h2 = transport;
@@ -836,16 +837,19 @@ public final class SjwsServer implements AutoCloseable {
         }
         var replaced = this.live.get();
         var next = result.snapshot();
-        // HTTP/2 attachBodies vs live swap (#289 Middleware Chain nit): enabling must happen
-        // before live.set so a new stream never sees a body-needing handler with bodies still
-        // off; disabling happens after the swap (brief extra attach is safe).
+        // HTTP/2: pin snapshot handler + attachBodies as one generation (#301). Enabling bodies
+        // (and the new handler) before live.set avoids under-attach; disabling after the swap is
+        // safe (brief extra attach). In-flight Tasks keep the handler they captured at start.
         sjws_nettask.h2.Http2Server http2ForBodies = null;
+        Handler pinned = null;
         boolean bodies = false;
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2 && this.override == null) {
             http2ForBodies = http2;
-            bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null;
+            pinned = next.handler();
+            bodies = !(pinned instanceof StaticFileHandler) || this.armed.get() != null;
             if (bodies) {
-                http2.setAttachBodies(true);
+                Handler enable = pinned;
+                http2.armHandler(request -> enable.handle(request), true);
             }
         }
         this.live.set(next);
@@ -863,7 +867,8 @@ public final class SjwsServer implements AutoCloseable {
             }
         }
         if (http2ForBodies != null) {
-            http2ForBodies.setAttachBodies(bodies);
+            Handler finalPinned = pinned;
+            http2ForBodies.armHandler(request -> finalPinned.handle(request), bodies);
         }
         if (closeOld && this.challengeHttp != null) {
             this.challengeHttp.close();
