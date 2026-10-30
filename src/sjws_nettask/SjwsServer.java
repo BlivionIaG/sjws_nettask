@@ -113,6 +113,7 @@ public final class SjwsServer implements AutoCloseable {
     /** Generations awaiting quiesce before their snapshot close; capped to bound memory. */
     private final java.util.ArrayDeque<sjws_nettask.h2.Http2Server.Generation> drainingGenerations =
             new java.util.ArrayDeque<>();
+    private final ReentrantLock drainLock = new ReentrantLock();
     private static final int MAX_DRAINING_GENERATIONS = 4;
     /** Set only by a data-role bootstrap. The field type is {@code Object} so standalone does not name {@code cp}. */
     private Object controlPlane;
@@ -997,7 +998,14 @@ public final class SjwsServer implements AutoCloseable {
                 replaced.close();
             }
         };
-        if (previous == null && drainingGenerations.isEmpty()) {
+        this.drainLock.lock();
+        boolean emptyDrain;
+        try {
+            emptyDrain = this.drainingGenerations.isEmpty();
+        } finally {
+            this.drainLock.unlock();
+        }
+        if (previous == null && emptyDrain) {
             close.run();
             return;
         }
@@ -1014,8 +1022,11 @@ public final class SjwsServer implements AutoCloseable {
         }
         // Also wait for any still-tracked gens from prior rearms under this snapshot (Codex P2).
         java.util.List<sjws_nettask.h2.Http2Server.Generation> extras;
-        synchronized (this.drainingGenerations) {
+        this.drainLock.lock();
+        try {
             extras = new java.util.ArrayList<>(this.drainingGenerations);
+        } finally {
+            this.drainLock.unlock();
         }
         for (var g : extras) {
             if (g == previous) {
@@ -1051,15 +1062,21 @@ public final class SjwsServer implements AutoCloseable {
             return;
         }
         sjws_nettask.h2.Http2Server.Generation evicted = null;
-        synchronized (this.drainingGenerations) {
+        this.drainLock.lock();
+        try {
             this.drainingGenerations.addLast(generation);
             while (this.drainingGenerations.size() > MAX_DRAINING_GENERATIONS) {
                 evicted = this.drainingGenerations.removeFirst();
             }
+        } finally {
+            this.drainLock.unlock();
         }
         generation.whenQuiesced(() -> {
-            synchronized (this.drainingGenerations) {
+            this.drainLock.lock();
+            try {
                 this.drainingGenerations.remove(generation);
+            } finally {
+                this.drainLock.unlock();
             }
         });
         if (evicted != null && evicted != generation) {
@@ -1071,8 +1088,11 @@ public final class SjwsServer implements AutoCloseable {
 
     /** Package-visible for tests. */
     public int drainingGenerationCount() {
-        synchronized (this.drainingGenerations) {
+        this.drainLock.lock();
+        try {
             return this.drainingGenerations.size();
+        } finally {
+            this.drainLock.unlock();
         }
     }
 
