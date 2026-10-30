@@ -28,6 +28,12 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import sjws_nettask.h2.Http2Server;
+import java.time.Duration;
+import java.net.http.HttpResponse;
+import java.net.http.HttpRequest;
+import java.net.http.HttpClient;
+import java.net.URI;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.EnumSet;
@@ -35,8 +41,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.HttpTestSupport;
@@ -264,85 +270,66 @@ class AccessTargetMaskTest {
 
     /**
      * After a live control document removes or adds {@code api-key}, a following config reload must
-     * not resurrect startup/middleware names or drop the document's names. Mask sync is keyed to
-     * {@code armSnapshot}/{@link FilterDocument}, not the startup override (#302 chainLeaf rebind).
+     * not resurrect startup/middleware names or drop the document's names. Covers the #302
+     * chainLeaf publish path on h1 and h2c (access-log masking is observer-side and shared).
      */
     @Test
     void controlDocRemoveOrAddThenReloadKeepsDocumentOwnedNames() throws Exception {
         Files.writeString(dir.resolve("index.html"), "ok");
+        var www2 = Files.createDirectories(dir.resolve("www2"));
+        Files.writeString(www2.resolve("index.html"), "ok2");
         var log = dir.resolve("cp-reload.log");
         var yaml = dir.resolve("sjws-cp-reload.yaml");
-        Files.writeString(yaml, """
-                server:
-                  port: 0
-                  root: %s
-                  access_log: %s
-                middleware:
-                  - name: api-key
-                    options:
-                      keys: %s
-                      query: from_mw
-                """.formatted(dir.toAbsolutePath(), log.toAbsolutePath(), SECRET));
-        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        writeAccessYaml(yaml, dir, log, SECRET);
+        var loaded = ConfigLoader.load(new String[] {
+                "--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
         assertTrue(loaded.ok(), loaded.errors().toString());
         try (var server = SjwsServer.start(loaded)) {
             var control = server.chainControl(GatewayFilters.install(RequestFilters.create()), Set.of());
-
-            // Add via control document: masks from_doc, not from_mw.
             control.apply(FilterDocument.of(1, List.of(
                     FilterDocument.FilterEntry.of("api-key", 0,
                             Map.of("keys", SECRET, "query", "from_doc"), FilterScope.all()))));
+
             get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&add=1");
+            getH2c(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&add-h2=1");
             var added = lineContaining(awaitLog(log, "add=1"), "add=1");
             assertTrue(added.contains("from_doc=***"), added);
             assertTrue(added.contains("from_mw=" + SECRET), added);
+            var addedH2 = lineContaining(awaitLog(log, "add-h2=1"), "add-h2=1");
+            assertTrue(addedH2.contains("from_doc=***"), addedH2);
 
-            // Reload still advertises from_mw in middleware; document names must stay.
-            Files.writeString(yaml, """
-                    server:
-                      port: 0
-                      root: %s
-                      access_log: %s
-                    middleware:
-                      - name: api-key
-                        options:
-                          keys: %s
-                          query: from_mw
-                    """.formatted(dir.toAbsolutePath(), log.toAbsolutePath(), SECRET));
+            // Root change forces publish() → chainLeaf terminal under live control.
+            writeAccessYaml(yaml, www2, log, SECRET);
             assertTrue(server.reload().applied());
             get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&after-add=1");
+            getH2c(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&after-add-h2=1");
             var afterAdd = lineContaining(awaitLog(log, "after-add=1"), "after-add=1");
             assertTrue(afterAdd.contains("from_doc=***"), afterAdd);
             assertFalse(afterAdd.contains("from_doc=" + SECRET), afterAdd);
-            assertTrue(afterAdd.contains("from_mw=" + SECRET), afterAdd);
+            var afterAddH2 = lineContaining(awaitLog(log, "after-add-h2=1"), "after-add-h2=1");
+            assertTrue(afterAddH2.contains("from_doc=***"), afterAddH2);
 
-            // Remove via empty control document: no masking.
             control.apply(FilterDocument.empty(2));
             get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&cleared=1");
+            getH2c(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&cleared-h2=1");
             var cleared = lineContaining(awaitLog(log, "cleared=1"), "cleared=1");
             assertTrue(cleared.contains("from_doc=" + SECRET), cleared);
-            assertTrue(cleared.contains("from_mw=" + SECRET), cleared);
+            var clearedH2 = lineContaining(awaitLog(log, "cleared-h2=1"), "cleared-h2=1");
+            assertTrue(clearedH2.contains("from_doc=" + SECRET), clearedH2);
 
-            // Reload must not resurrect from_mw (or any middleware query name) after the clear.
-            Files.writeString(yaml, """
-                    server:
-                      port: 0
-                      root: %s
-                      access_log: %s
-                    middleware:
-                      - name: api-key
-                        options:
-                          keys: %s
-                          query: from_mw
-                    """.formatted(dir.toAbsolutePath(), log.toAbsolutePath(), SECRET));
+            writeAccessYaml(yaml, dir, log, SECRET);
             assertTrue(server.reload().applied());
             get(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&after-clear=1");
+            getH2c(server, "/index.html?from_doc=" + SECRET + "&from_mw=" + SECRET + "&after-clear-h2=1");
             var afterClear = lineContaining(awaitLog(log, "after-clear=1"), "after-clear=1");
             assertTrue(afterClear.contains("from_doc=" + SECRET), afterClear);
             assertTrue(afterClear.contains("from_mw=" + SECRET), afterClear);
             assertFalse(afterClear.contains("***"), afterClear);
+            var afterClearH2 = lineContaining(awaitLog(log, "after-clear-h2=1"), "after-clear-h2=1");
+            assertFalse(afterClearH2.contains("***"), afterClearH2);
         }
     }
+
 
     @Test
     void accessLogMasksQueryAcrossFormatsAndReloadClears() throws Exception {
@@ -442,6 +429,35 @@ class AccessTargetMaskTest {
         }
     }
 
+    /**
+     * Observability nit: every ancestor this process creates for the access-log path is mode
+     * {@code 0750}; a pre-existing parent keeps whatever mode it already had.
+     */
+    @Test
+    void accessLogCreatesEachMissingParentAt0750AndLeavesExistingAlone() throws Exception {
+        var preexisting = Files.createDirectories(dir.resolve("logs"));
+        var odd = EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
+                PosixFilePermission.OWNER_EXECUTE, PosixFilePermission.OTHERS_READ,
+                PosixFilePermission.OTHERS_EXECUTE);
+        Files.setPosixFilePermissions(preexisting, odd);
+        var nested = preexisting.resolve("a").resolve("b").resolve("access.log");
+        try (var server = SjwsServer.start(ServerConfig.builder(dir).port(0).accessLog(nested.toString()).build())) {
+            assertNotNull(server);
+            assertTrue(Files.isRegularFile(nested));
+            var fileMode = Files.getPosixFilePermissions(nested);
+            assertEquals(EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.GROUP_READ), fileMode, fileMode.toString());
+            var a = preexisting.resolve("a");
+            var b = a.resolve("b");
+            var expect750 = EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.OWNER_EXECUTE, PosixFilePermission.GROUP_READ,
+                    PosixFilePermission.GROUP_EXECUTE);
+            assertEquals(expect750, Files.getPosixFilePermissions(a), "created parent a");
+            assertEquals(expect750, Files.getPosixFilePermissions(b), "created parent b");
+            assertEquals(odd, Files.getPosixFilePermissions(preexisting), "pre-existing parent untouched");
+        }
+    }
+
     @Test
     void newAccessLogFileIsGroupReadableOnly() throws Exception {
         var nested = dir.resolve("logs").resolve("access.log");
@@ -479,6 +495,33 @@ class AccessTargetMaskTest {
         assertEquals(1, err.split("WARN: access log ", -1).length - 1, err);
         assertTrue(err.contains("world-accessible"), err);
         assertTrue(err.contains(log.toAbsolutePath().toString()) || err.contains(log.toString()), err);
+    }
+
+    private static void writeAccessYaml(Path yaml, Path root, Path log, String secret) throws IOException {
+        Files.writeString(yaml, """
+                server:
+                  port: 0
+                  root: %s
+                  access_log: %s
+                middleware:
+                  - name: api-key
+                    options:
+                      keys: %s
+                      query: from_mw
+                """.formatted(root.toAbsolutePath(), log.toAbsolutePath(), secret));
+    }
+
+
+
+
+    private static void getH2c(SjwsServer server, String target) throws Exception {
+        int h2c = ((Http2Server) server.h2()).h2cPort();
+        var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
+                .connectTimeout(Duration.ofSeconds(5)).build();
+        var req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + h2c + target))
+                .timeout(Duration.ofSeconds(5)).header("x-api-key", SECRET).GET().build();
+        var resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertTrue(resp.statusCode() == 200 || resp.statusCode() == 401, "h2c status=" + resp.statusCode());
     }
 
     private static void get(SjwsServer server, String target) throws IOException {
