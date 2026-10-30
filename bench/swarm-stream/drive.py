@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Credit-on producer→consumer stream drive for S2c PR 8.
+
+Payload: 20-digit ASCII monotonic_ns + NUL pad to --chunk-bytes (SSE-safe).
+Chunk latency: emit→consumer receive (one host, one monotonic clock).
+
+Harness notes (2026-10-30 diagnosis):
+- Orderly shutdown: producers finish(LAST) first, then consumers close; avoids ~2
+  BrokenPipe/RemoteDisconnected errors per stream at tear-down.
+- /metrics scrape waits until open_sessions==0 (LAST grace is 60s) so charged_bytes
+  hard-zero is meaningful.
+- 1k streams × window senders on CPUs 0–1 saturates CPython; treat abs FAIL as
+  harness-bound until a Java/async loadgen matches §13.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+import urllib.request
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "sdk" / "python"))
+
+from sjws_swarm import Client  # noqa: E402
+from sjws_swarm.stream import Chunk, ChunkWriter  # noqa: E402
+
+
+def pct(sorted_vals, q):
+    if not sorted_vals:
+        return None
+    i = min(len(sorted_vals) - 1, int(q * len(sorted_vals)))
+    return sorted_vals[i]
+
+
+def fetch_metrics(url: str) -> dict[str, float]:
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        text = r.read().decode()
+    out = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                out[parts[0]] = float(parts[1])
+            except ValueError:
+                pass
+    return out
+
+
+def wait_metrics_drained(url: str, timeout_s: float = 75.0) -> dict[str, float]:
+    """Poll until open_sessions==0 or timeout (StreamHttp.GRACE_MS is 60s)."""
+    deadline = time.monotonic() + timeout_s
+    last = {}
+    while time.monotonic() < deadline:
+        try:
+            last = fetch_metrics(url)
+        except Exception as e:  # noqa: BLE001
+            last = {"_error": str(e)}
+            time.sleep(0.5)
+            continue
+        open_s = last.get("sjws_swarm_stream_open_sessions")
+        if open_s is None or open_s == 0:
+            return last
+        time.sleep(0.5)
+    return last
+
+
+
+def stamp_at_wire(w: ChunkWriter):
+    """Refresh emit ns in payload when the TOKEN frame is built (Architecture: just before :chunk write)."""
+    orig = w._frame
+
+    def framed(j):
+        data = j.data
+        if len(data) >= 20:
+            j.data = f"{time.monotonic_ns():020d}".encode("ascii") + data[20:]
+        return orig(j)
+
+    w._frame = framed  # type: ignore[method-assign]
+
+def instrument_credit_waits(w: ChunkWriter, waits: list[float]):
+    orig = w._credit_allows
+    state = {"blocked_since": None}
+
+    def wrapped(j, now):
+        ok = orig(j, now)
+        if ok:
+            if state["blocked_since"] is not None:
+                waits.append(now - state["blocked_since"])
+                state["blocked_since"] = None
+        else:
+            if state["blocked_since"] is None and not w._out:
+                state["blocked_since"] = now
+        return ok
+
+    w._credit_allows = wrapped  # type: ignore[method-assign]
+
+
+def load_tokens(path: str | None, single: str | None) -> list[str]:
+    if path:
+        toks = []
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                toks.append(parts[1])
+        if not toks:
+            raise SystemExit(f"no tokens in {path}")
+        return toks
+    if not single:
+        raise SystemExit("need --token or --tokens-file")
+    return [single]
+
+
+def run_window(args) -> dict:
+    load1_pre = float(open("/proc/loadavg").read().split()[0])
+    tokens = load_tokens(args.tokens_file, args.token)
+    clients = [Client(args.base, token=t) for t in tokens]
+    lat_us: list[float] = []
+    bytes_rx = 0
+    credit_waits: list[float] = []
+    writer_stats = Counter()
+    producers_stop = threading.Event()
+    consumers_stop = threading.Event()
+    measure_errors: list[str] = []
+    teardown_errors: list[str] = []
+    ttft_us: list[float] = []
+    inter_us: list[float] = []
+    lock = threading.Lock()
+    in_teardown = threading.Event()
+    if args.chunk_bytes < 21:
+        raise SystemExit("chunk-bytes must be >= 21")
+    pad = args.chunk_bytes - 20
+
+    def note_err(role_pool: str, e: BaseException):
+        msg = f"{role_pool}: {type(e).__name__}: {e}"
+        with lock:
+            (teardown_errors if in_teardown.is_set() else measure_errors).append(msg)
+
+    def producer(client: Client, pool: str):
+        try:
+            (lease,) = client.claim(pool, wait=30, visibility_ms=60_000)
+            with lease.stream(window=args.window, coalesce=False, heartbeat=0) as w:
+                instrument_credit_waits(w, credit_waits)
+                if args.stamp_at_wire:
+                    stamp_at_wire(w)
+                while not producers_stop.is_set():
+                    emit = time.monotonic_ns()
+                    w.send(f"{emit:020d}".encode("ascii") + (b"\x00" * pad))
+                w.finish(b"")
+                with lock:
+                    writer_stats.update(w.stats)
+        except BaseException as e:  # noqa: BLE001
+            note_err(f"producer {pool}", e)
+
+    def consumer(client: Client, pool: str, accept: str):
+        nonlocal bytes_rx
+        try:
+            with client.stream(pool, b"gate", deadline=180, sse=(accept == "sse")) as s:
+                first = True
+                prev_recv = None
+                start_ns = time.monotonic_ns()
+                for ev in s:
+                    if consumers_stop.is_set() and not first:
+                        break
+                    if not isinstance(ev, Chunk) or len(ev.data) < 20:
+                        continue
+                    recv = time.monotonic_ns()
+                    try:
+                        emit = int(ev.data[:20].decode("ascii"))
+                    except ValueError:
+                        continue
+                    d_us = (recv - emit) / 1e3
+                    with lock:
+                        lat_us.append(d_us)
+                        bytes_rx += len(ev.data)
+                        if first:
+                            ttft_us.append((recv - start_ns) / 1e3)
+                            first = False
+                        elif prev_recv is not None:
+                            inter_us.append((recv - prev_recv) / 1e3)
+                    prev_recv = recv
+        except BaseException as e:  # noqa: BLE001
+            note_err(f"consumer {pool}", e)
+
+    def run_wave(n_streams: int, duration: float, label: str):
+        nonlocal bytes_rx
+        threads = []
+        producers_stop.clear()
+        consumers_stop.clear()
+        in_teardown.clear()
+        g_count = max(1, min(int(getattr(args, "groups", n_streams) or n_streams), n_streams))
+        mapping = []
+        for i in range(n_streams):
+            gid = i % g_count
+            mapping.append(gid)
+            pool = f"{label}{gid}"  # Architecture 2026-10-30 15:13
+            c = clients[i % len(clients)]
+            t_c = threading.Thread(target=consumer, args=(c, pool, args.accept), daemon=True)
+            t_p = threading.Thread(target=producer, args=(c, pool), daemon=True)
+            threads.extend((t_c, t_p))
+            t_c.start()
+            if i % 32 == 0:
+                time.sleep(0.01)
+            t_p.start()
+        time.sleep(duration)
+        # Orderly: stop producers (they send LAST), wait, then stop consumers
+        in_teardown.set()
+        producers_stop.set()
+        time.sleep(2)
+        consumers_stop.set()
+        time.sleep(2)
+        for t in threads:
+            t.join(30)
+
+    # Warmup
+    with lock:
+        lat_us.clear(); bytes_rx = 0; ttft_us.clear(); inter_us.clear()
+        credit_waits.clear(); writer_stats.clear()
+        measure_errors.clear(); teardown_errors.clear()
+    run_wave(min(32, args.streams), args.warmup, "w")
+    with lock:
+        lat_us.clear(); bytes_rx = 0; ttft_us.clear(); inter_us.clear()
+        credit_waits.clear(); writer_stats.clear()
+        measure_errors.clear(); teardown_errors.clear()
+
+    def _jiffies(pid: str) -> int | None:
+        try:
+            raw = open(f"/proc/{pid}/stat").read()
+            rest = raw[raw.rfind(")") + 2 :].split()
+            return int(rest[11]) + int(rest[12])
+        except Exception:
+            return None
+    import os as _os
+    _hz = _os.sysconf("SC_CLK_TCK")
+    _server_pid = os.environ.get("SERVER_PID") or getattr(args, "server_pid", None)
+    _c0 = _jiffies("self")
+    _s0 = _jiffies(str(_server_pid)) if _server_pid else None
+    _cpu_t0 = time.monotonic()
+    t0 = time.monotonic()
+    run_wave(args.streams, args.secs, "g")
+    wall = max(1e-6, time.monotonic() - t0)
+    _cpu_dt = max(1e-6, time.monotonic() - _cpu_t0)
+    _c1 = _jiffies("self")
+    _s1 = _jiffies(str(_server_pid)) if _server_pid else None
+    client_cpu_sec = ((_c1 - _c0) / _hz) if (_c0 is not None and _c1 is not None) else None
+    client_cpu_pct = (client_cpu_sec / _cpu_dt * 100.0) if client_cpu_sec is not None else None
+    server_cpu_sec = ((_s1 - _s0) / _hz) if (_s0 is not None and _s1 is not None) else None
+    server_cpu_pct = (server_cpu_sec / _cpu_dt * 100.0) if server_cpu_sec is not None else None
+    elapsed = max(1e-6, float(args.secs))
+    load1_post = float(open("/proc/loadavg").read().split()[0])
+
+    # Metrics after grace / session exit
+    counters = wait_metrics_drained(args.metrics_url, timeout_s=float(args.drain_timeout))
+    try:
+        # also save raw scrape text path via one.sh; refresh once more
+        counters = fetch_metrics(args.metrics_url)
+    except Exception as e:  # noqa: BLE001
+        counters["_error"] = str(e)
+
+    lat_sorted = sorted(lat_us)
+    wait_sorted = sorted(credit_waits)
+    inter_sorted = sorted(inter_us)
+    ttft_sorted = sorted(ttft_us)
+    mib_s = (bytes_rx / (1024 * 1024)) / elapsed
+
+    def pack(vals):
+        s = sorted(vals)
+        return {
+            "n": len(s),
+            "p50_us": pct(s, 0.50),
+            "p90_us": pct(s, 0.90),
+            "p99_us": pct(s, 0.99),
+            "p999_us": pct(s, 0.999),
+        }
+
+    credit_429s = int(writer_stats.get("credit_429s", 0))
+    n_chunks = len(lat_us)
+    stall_pct = (100.0 * credit_429s / n_chunks) if n_chunks else 0.0
+
+    hard_zeros = {
+        "sjws_swarm_stream_node_refusals_total": counters.get("sjws_swarm_stream_node_refusals_total"),
+        "sjws_swarm_stream_session_admit_refusals_total": counters.get("sjws_swarm_stream_session_admit_refusals_total"),
+        "sjws_swarm_stream_budget_underflows_total": counters.get("sjws_swarm_stream_budget_underflows_total"),
+        "sjws_swarm_stream_reserve_underflows_total": counters.get("sjws_swarm_stream_reserve_underflows_total"),
+        "sjws_swarm_stream_charged_bytes": counters.get("sjws_swarm_stream_charged_bytes"),
+        "sjws_swarm_stream_open_sessions": counters.get("sjws_swarm_stream_open_sessions"),
+    }
+
+    out = {
+        "mode": args.accept,
+        "streams": args.streams,
+        "groups": int(args.groups),
+        "streams_per_group_approx": (float(args.streams) / float(args.groups)) if args.groups else 0.0,
+        "stream_to_group": [i % int(args.groups) for i in range(args.streams)],
+        "writer_count": -1,
+        "heap_flags": None,
+        "agents": len(clients),
+        "window": args.window,
+        "elapsed_s": elapsed,
+        "wall_s": wall,
+        "load1_pre": load1_pre,
+        "load1_post": load1_post,
+        "self_loaded": bool(load1_post >= 4.0 or (client_cpu_pct is not None and client_cpu_pct >= 180.0)),
+        "generator_saturated": bool(client_cpu_pct is not None and client_cpu_pct >= 180.0),
+        "client_cpu_sec": client_cpu_sec,
+        "client_cpu_pct_of_wall": client_cpu_pct,
+        "server_cpu_sec": server_cpu_sec,
+        "server_cpu_pct_of_wall": server_cpu_pct,
+        "chunk_samples": n_chunks,
+        "bytes": bytes_rx,
+        "mib_s": mib_s,
+        "chunk_latency": pack(lat_sorted),
+        "ttft": pack(ttft_sorted),
+        "inter_token": pack(inter_sorted),
+        "credit_wait": {
+            "n": len(wait_sorted),
+            "total_s": sum(wait_sorted) if wait_sorted else 0.0,
+            "p50_s": pct(wait_sorted, 0.50),
+            "p99_s": pct(wait_sorted, 0.99),
+        },
+        "writer_stats": dict(writer_stats),
+        "credit_stalls": credit_429s,
+        "credit_stall_pct_of_chunks": stall_pct,
+        "stall_flag": stall_pct > 1.0,
+        "counters": counters,
+        "hard_zeros": hard_zeros,
+        "errors": measure_errors[:30],
+        "error_count": len(measure_errors),
+        "teardown_errors": teardown_errors[:30],
+        "teardown_error_count": len(teardown_errors),
+        "p50_us": pct(lat_sorted, 0.50),
+        "p90_us": pct(lat_sorted, 0.90),
+        "p99_us": pct(lat_sorted, 0.99),
+        "rps": n_chunks / elapsed,
+    }
+    Path(args.out).write_text(json.dumps(out, indent=2) + "\n")
+    print(json.dumps({k: out[k] for k in (
+        "mib_s", "chunk_samples", "p50_us", "p90_us", "p99_us", "load1_pre", "load1_post",
+        "self_loaded", "stall_flag", "credit_stalls", "error_count", "teardown_error_count",
+        "agents", "window")}, indent=2))
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--base", required=True)
+    p.add_argument("--token", default=None)
+    p.add_argument("--tokens-file", default=None)
+    p.add_argument("--accept", choices=("sse", "binary", "chunked"), default="sse")
+    p.add_argument("--warmup", type=float, default=5)
+    p.add_argument("--secs", type=float, default=20)
+    p.add_argument("--streams", type=int, default=1000)
+    p.add_argument("--groups", type=int, default=0,
+                   help="Task groups; streams map round-robin (0=one group per stream). Architecture 2026-10-30 15:13")
+    p.add_argument("--chunk-bytes", type=int, default=1024)
+    p.add_argument("--window", type=int, default=8)
+    p.add_argument("--drain-timeout", type=float, default=75)
+    p.add_argument("--stamp-at-wire", action="store_true", default=True)
+    p.add_argument("--no-stamp-at-wire", action="store_false", dest="stamp_at_wire")
+    p.add_argument("--out", required=True)
+    p.add_argument("--metrics-url", required=True)
+    args = p.parse_args()
+    if args.accept == "chunked":
+        args.accept = "binary"
+    if not args.groups or args.groups <= 0:
+        args.groups = args.streams
+    if args.groups > args.streams:
+        args.groups = args.streams
+    run_window(args)
+
+
+if __name__ == "__main__":
+    main()

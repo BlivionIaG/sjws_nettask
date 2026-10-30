@@ -1331,6 +1331,14 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     /**
+     * Appends a Prometheus-text supplier to {@code /metrics} (S2c PR 8 stream counters). Null clears.
+     * Read only while a scrape is rendered; does not install the observe filter.
+     */
+    public void attachMetricsAppendix(java.util.function.Supplier<String> appendix) {
+        this.slot.attachAppendix(appendix);
+    }
+
+    /**
      * Sets the api-key query parameter names whose values are masked in the access log.
      * Null or empty clears masking. Does not install the observe filter. Prefer letting
      * {@link #chainControl} refresh these from each applied filter document.
@@ -1404,6 +1412,7 @@ public final class SjwsServer implements AutoCloseable {
     private void attachGauges(ServerMetrics metrics) {
         metrics.setConnectionGauges(this.manager::activeConnections,
                 () -> this.h3 == null ? 0 : this.h3.connections());
+        metrics.setRefusedPerIp(this.manager::refusedPerIp);
     }
 
     public AltSvc altSvc() {

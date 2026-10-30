@@ -16,6 +16,9 @@
  */
 package sjws_nettask;
 
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
 /**
  * An optional module started by the composition root before the server accepts and closed when the process
  * stops serving. Modules are loaded only through {@link OptionalModules}, by name, so a disabled module's
@@ -55,7 +58,15 @@ public interface OptionalModule extends AutoCloseable {
         }
     }
 
+    /**
+     * S2c PR 8: register a Prometheus-text appendix for {@code /metrics}. Called once after the server
+     * starts. Off modules leave the default no-op so nothing is loaded or allocated.
+     */
+    default void attachPrometheus(Consumer<Supplier<String>> sink) {
+    }
+
     /** Closing never throws; a module logs its own failures. */
     @Override
     void close();
 }
+

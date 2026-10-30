@@ -1,0 +1,4 @@
+3648186:
+ZHeap            used 1048M, capacity 2048M, max capacity 2048M
+ Cache           1000M (3)
+  size classes   2M (1), 128M (1), 512M (1)

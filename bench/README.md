@@ -95,3 +95,9 @@ java -cp target/classes bench/RaftPublishBench.java overload 4 10 200       # 20
 ```
 
 `overload` samples `deliveryLag`/`maxDeliveryLag` every 200 ms and counts `ApplyLagException`. It reads the metrics by reflection, so the same file runs on commits from before #182, where it prints `n/a`. Pin with `taskset` and run it under the bench lock like the others.
+
+## Swarm S2c stream gate (`bench/swarm-stream`)
+
+Credit-on producer→node→consumer over SSE and binary for the §13 token-streaming exit row (S2c PR 8).
+See [`bench/swarm-stream/README.md`](swarm-stream/README.md). Counters: `/metrics` appendix (`sjws_swarm_stream_*`).
+

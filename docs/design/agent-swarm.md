@@ -560,6 +560,15 @@ These are the reference points for the targets below. Neither this PR nor the ta
 - PR 8 also reports credit on vs off with the v2.2 Williams/paired-d method (#234), **information only**, stating its MDE; the block-8 sd look decides n. At the sd_d ≈ 6 pp seen in #234, MDE = (t.975 + t.80)·sd/√n is about 3.96 pp at n = 20, and a 2 pp gate would need n ≥ 76. If inceptor ever rules a hard gate here, it is 5 pp at n = 20 or 2 pp at n ≥ 76 (throughput and chunk p99), never a threshold below the MDE.
 - The S1c rr and off-mode re-runs are required only when the PR 6 diff leaves the stream files (§5.2 *Scope guard*).
 
+**PR 8 stream-gate harness (N4).** Scripts live under `bench/swarm-stream/` (see that README). Run under
+`flock /tmp/sjws-bench.lock`, `nice -n 10`, ZGC, `pool.shards=4`, load gen on CPUs 0–1 and server on 2–7,
+≥ 20 s measure after 5 s warmup, credit on. Counters come from the `/metrics` appendix only
+(`sjws_swarm_stream_*`; Observability-reviewed names). Assert
+`sjws_swarm_stream_node_refusals_total == 0` (and the other hard-zero counters). Report p50, p90, p99
+and throughput; include an A/A noise-floor block; credit on vs off ABBA is information only (3–8 valid
+blocks; flag if sign-flip p < 0.05 and geomean > 1.10). Absolute §13 token-streaming row remains the
+hard S2c exit bar (median of ≥ 5 and ≤ 8 valid windows; inceptor amendment 2026-10-29 23:59).
+
 **S1c gate (decided 2026-10-14, inceptor).** The S1c latency gate is: claim p99 < 100 µs on the task-dispatch row, heartbeat loss < 2 %, and request/reply p99 < 500 µs. Dispatch is measured with **workers = the machine's vCPU count**, and every result states that core count. The reference box has 8 vCPU, so the gate is `SwarmBench dispatch 8`. The 16-worker run (16 on 8 vCPU) is reported as a **stress line, not the gate**: with more runnable workers than cores, a lock holder can be descheduled mid-section, so its p99 measures scheduling as much as code. The batched variant (`SwarmBench batched <W>x<B>`: claim up to `B` and settle with one batched fenced ack, `TaskService.ackAll`) is reported separately and is not the gate, because its claim latency is per batch, not per task. The §13 claim-1/ack-1 workload stays as it is.
 
 **S1c result: NOT PASSED (re-measured 2026-10-14, 05:29–05:56 CEST).** An earlier PASSED call, based on the median of per-run p99s from the #176 quiet-window runs, was withdrawn by inceptor. **Gate statistic:** the mean ± stddev of the per-run p99 across ≥ 5 runs; no median.
