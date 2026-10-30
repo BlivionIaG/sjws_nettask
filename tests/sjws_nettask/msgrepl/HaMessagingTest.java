@@ -51,7 +51,8 @@ class HaMessagingTest {
     static HaMessagingSettings settings(String self, List<Member> members, boolean insecurePlaintext,
             boolean replicate) {
         return new HaMessagingSettings(HaMessagingSettings.Mode.ON, self, members, Duration.ofMillis(500),
-                Duration.ofMillis(50), null, Set.of("t"), insecurePlaintext, replicate, List.of());
+                Duration.ofMillis(50), null, Set.of("t"), insecurePlaintext, replicate, List.of(),
+                HaMessagingSettings.Snapshot.DEFAULT);
     }
 
     @Test

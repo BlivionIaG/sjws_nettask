@@ -214,6 +214,36 @@ class SnapshotSendTest {
         return new SimTransport.Frame(GROUP, RaftGroup.SNAP_CHUNK, body.array());
     }
 
+
+    /** #288 Security B2: SNAP_CHUNK must bind the body's leader wire to the transport peer, as TIMEOUT_NOW does. */
+    @Test
+    void snapChunkWhoseBodyNamesAnotherPeerThanItsSenderIsIgnored() throws Exception {
+        var net = new SimTransport();
+        var a = member(1);
+        var b = member(2);
+        var c = member(3);
+        var follower = ReplicatedNode.open(b.id(), List.of(a, b, c), new LinkedHashSet<>(List.of(a.id(), b.id(), c.id())),
+                QuorumPolicy.majority(), new FakeClock(0L), new MemoryLogStorage(), net);
+        var rec = new Recorder();
+        follower.openGroup(GROUP, opts(), rec);
+        var fakeA = net.attach(a.id(), (from, frame) -> { });
+        var fakeC = net.attach(c.id(), (from, frame) -> { });
+        var image = "state".getBytes(StandardCharsets.UTF_8);
+        int crc = new LogSnapshot(GROUP, 9, 2, image).crc32c();
+        // Establish term/leader via a legitimate chunk from a naming a (may install).
+        fakeA.send(b.id(), chunk(a, 5, 9, 2, image, crc, 0, image.length));
+        follower.drive();
+        long installed = follower.snapshotsInstalled(GROUP);
+        rec.restored.clear();
+        // Spoof: arrives from c, body claims leader is a.
+        fakeC.send(b.id(), chunk(a, 5, 11, 2, "other".getBytes(StandardCharsets.UTF_8),
+                new LogSnapshot(GROUP, 11, 2, "other".getBytes(StandardCharsets.UTF_8)).crc32c(), 0,
+                "other".length()));
+        follower.drive();
+        assertEquals(installed, follower.snapshotsInstalled(GROUP), "spoofed SNAP_CHUNK must not install");
+        assertTrue(rec.restored.isEmpty(), "no onSnapshotRestored from a non-leader sender");
+    }
+
     @Test
     void theCrcCoversIndexAndTermNotOnlyTheImage() throws Exception {
         var net = new SimTransport();

@@ -31,6 +31,7 @@ import sjws_nettask.cluster.GroupId;
 import sjws_nettask.cluster.GroupOptions;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LedgerWriter;
+import sjws_nettask.messaging.ledger.ReplicaHooks;
 import sjws_nettask.messaging.ledger.PartitionReplicator;
 import sjws_nettask.messaging.ledger.Replica;
 
@@ -43,12 +44,14 @@ import sjws_nettask.messaging.ledger.Replica;
  * <p>Lives outside the messaging packages: the HA bootstrap constructs it and hands it to
  * {@code MessagingModule.replication}; with HA off this class never loads.
  *
- * <p>Known limitation while HA PR-3/4/5 (snapshot taker, truncation bound, chunked install) are open: msg groups never
- * snapshot or truncate their consensus log ({@code snapshotEveryEntries = Long.MAX_VALUE}), so it grows with the
- * produced data and a node that falls behind catches up by log replay only. Producer dedup state (M2,
- * {@link ProducerTable}) relies on that replay; the snapshot taker that lifts this limitation (#270) must carry the
- * table's {@link ProducerTable#write} bytes together with the next offset at the snapshot's index, and restore both
- * before applying the next entry ({@link ProducerTable#read}, then {@code RaftReplica.restoreProducers}).
+ * <p>Snapshots (#270): with a {@link Snapshots.Runtime} each replica snapshots its own ledger (the consensus image is
+ * a small {@link MsgSnapshot} manifest; the data stays in the topic's segments), truncates the consensus log behind
+ * it, and installs a peer's segments when it falls behind the log. Without one (tests, or the pre-#270 constructors)
+ * the consensus log is never truncated. The group's own snapshot taker stays off ({@code snapshotEveryEntries =
+ * Long.MAX_VALUE}): the replica records snapshots itself, at points its ledger has made durable. Producer dedup state
+ * (M2, {@link ProducerTable}) is carried as snapshot section {@link MsgSnapshot#PRODUCERS}: a snapshot at index
+ * {@code i} holds {@link ProducerTable#write} as applied through {@code i}, and install calls
+ * {@link RaftReplica#restoreProducers} before applying {@code i + 1}.
  */
 public final class RaftReplicator implements PartitionReplicator {
 
@@ -72,6 +75,7 @@ public final class RaftReplicator implements PartitionReplicator {
     private final Path stateDir;
     private final GroupOptions options;
     private final java.util.function.LongSupplier nanoClock;
+    private final Snapshots.Runtime snapshots;
 
     /**
      * @param topics   replicated topics ({@code __offsets} is always added)
@@ -86,6 +90,13 @@ public final class RaftReplicator implements PartitionReplicator {
     /** {@code nanoClock} must be the node's clock: a leader whose lease ran out stops accepting appends. */
     public RaftReplicator(ClusterNode node, Set<String> topics, Map<String, String> urls, Path stateDir,
             Duration electionTimeout, Duration heartbeat, java.util.function.LongSupplier nanoClock) throws IOException {
+        this(node, topics, urls, stateDir, electionTimeout, heartbeat, nanoClock, null);
+    }
+
+    /** With {@code snapshots} (owned by the caller), replicas snapshot, truncate and install (see class doc). */
+    RaftReplicator(ClusterNode node, Set<String> topics, Map<String, String> urls, Path stateDir, Duration electionTimeout,
+            Duration heartbeat, java.util.function.LongSupplier nanoClock, Snapshots.Runtime snapshots) throws IOException {
+        this.snapshots = snapshots;
         this.nanoClock = Objects.requireNonNull(nanoClock);
         this.node = Objects.requireNonNull(node);
         this.topics = Set.copyOf(topics);
@@ -112,7 +123,7 @@ public final class RaftReplicator implements PartitionReplicator {
         return out.toByteArray();
     }
 
-    /** Group options for msg groups: RELAXED default, no snapshot or truncation (see class doc). */
+    /** Group options for msg groups: RELAXED default, the group\'s own snapshot taker off (see class doc). */
     public static GroupOptions options(Duration electionTimeout, Duration heartbeat) {
         return new GroupOptions(sjws_nettask.cluster.Durability.RELAXED, MAX_ENTRY_BYTES, electionTimeout, heartbeat,
                 Long.MAX_VALUE);
@@ -136,6 +147,12 @@ public final class RaftReplicator implements PartitionReplicator {
     public Replica open(String topic, LedgerWriter local, Durability defaultMode, Consumer<List<byte[]>> onApplied) throws IOException {
         return new RaftReplica(this.node, group(topic), this.options, local, defaultMode, onApplied, this.urls,
                 this.stateDir.resolve(topic + ".applied"), this.nanoClock);
+    }
+
+    @Override
+    public Replica open(String topic, LedgerWriter local, Durability defaultMode, ReplicaHooks hooks) throws IOException {
+        return new RaftReplica(this.node, group(topic), this.options, local, defaultMode, hooks, hooks.onApplied(), this.urls,
+                this.stateDir.resolve(topic + ".applied"), this.nanoClock, this.snapshots);
     }
 
     @Override

@@ -17,7 +17,9 @@
 package sjws_nettask.msgrepl;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -48,10 +50,15 @@ import sjws_nettask.cluster.TermChangedException;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LeaderUnavailableException;
 import sjws_nettask.messaging.ledger.LedgerWriter;
-import sjws_nettask.messaging.ledger.ProducerAppend;
 import sjws_nettask.messaging.ledger.Replica;
 import sjws_nettask.messaging.ledger.WriteOutcomeUnknownException;
 import sjws_nettask.messaging.ledger.WriteRefusedException;
+import sjws_nettask.messaging.ledger.ProducerAppend;
+import sjws_nettask.messaging.ledger.ReplicaHooks;
+import sjws_nettask.messaging.ledger.WriteRefusedException;
+import sjws_nettask.messaging.ledger.SegmentedLog;
+import sjws_nettask.cluster.GroupListener;
+import sjws_nettask.cluster.LogSnapshot;
 
 /**
  * One partition's consensus group wrapping its local ledger (msg-replication-sketch phase A).
@@ -64,8 +71,10 @@ import sjws_nettask.messaging.ledger.WriteRefusedException;
  *
  * <p>{@code <topic>.applied} records {@code [index][term][baseOffset][count]} per applied batch (the per-batch term
  * stamp). The consensus log is replayed from its start on restart; this file plus the ledger end decide which entries
- * are already in the ledger, so replay never duplicates records. A clean {@link #close} appends a marker
- * ({@code index = -1}, {@code baseOffset} = the ledger end) once every apply finished.
+ * are already in the ledger, so replay never duplicates records. Its first record is the header: the snapshot point
+ * {@code (index, term, endOffset)} the file starts after (index 0 and the ledger end when replication started). A
+ * record with count -1 is a replicated retention decision: {@code base} is the new log start. A clean {@link #close}
+ * appends a marker ({@code index = -1}, {@code baseOffset} = the ledger end) once every apply finished.
  *
  * <p>Offsets are assigned from the ledger end, so every node's ledger must hold exactly the replicated records. The
  * open refuses ({@link IllegalArgumentException}, exit 64 at startup, naming the topic and both numbers) a ledger
@@ -74,44 +83,39 @@ import sjws_nettask.messaging.ledger.WriteRefusedException;
  * than where replication started. A ledger past the stamps after a crash (stamps not on disk yet) is still recovered
  * by replay, as before.
  *
- * <p><b>Producer dedup (M2).</b> A batch sent with a producer id is entry {@code [P]...}: the same header as {@code [M]},
- * then {@code [producerOrigin:int][producerId:long][producerSeq:long]}, then the records (a batch without one stays a
- * byte-identical {@code [M]} entry). The {@link ProducerTable} decides each {@code P} entry when it is applied, on every
- * node: the next seq is appended, a remembered retry is acknowledged with the original offset, anything else is refused
- * with {@code ProducerSequenceException}; refused and duplicate entries take no offsets. Replay after a restart runs the
- * same decisions from the first entry, including entries already in the ledger, so the table is rebuilt exactly. A
- * duplicate is matched on the producer, the seq, the record count and a CRC32C of the encoded records, computed from
- * the committed entry on every node.
+ * <p><b>Snapshots (#270)</b>, with a {@link Snapshots.Runtime}. Off the produce path, the replicator's scheduler checks
+ * each replica: once {@code everyEntries} entries were applied since the last snapshot, the latest applied entry is the
+ * point. The ledger is fsynced through it (constraint 1), its segment files are pinned ({@link SnapshotStore}), and the
+ * {@link MsgSnapshot} manifest is recorded as the group's snapshot ({@code recordSnapshot}); the consensus log is then
+ * truncated up to {@code tailEntries} entries behind it (constraint 5), and the stamp file is cut to start at the point.
+ * A follower the leader can no longer serve from the log receives the manifest as a consensus snapshot and, on its
+ * delivery thread, fetches the segment data from a pin on any data node ({@link SnapshotTransfer}), swaps it in for
+ * its whole ledger, restores the application state, and continues from the installed point. An install marker
+ * ({@code <topic>.install}) makes a crash anywhere in that sequence redo it on restart. After a successful fetch the
+ * image must match the consensus manifest {@code m} (index/term/endOffset/logStart/sections/per-chunk digests);
+ * anything else is refused and the next peer is tried.
  *
- * <p><b>Mixed versions (#278 HA B1).</b> Builds before M2 skip any entry that is not {@code M}, so a {@code P} entry
- * would append on M2 nodes only and the ledgers would diverge with no error. Every msg group therefore advertises
- * {@link #FEATURE_PRODUCER_ENTRIES} in its append responses, and the leader proposes a {@code P} entry only while every
- * voter of the current configuration has advertised it to this leader (a voter it has not heard from since it started
- * counts as an older build); otherwise the produce is refused before anything is proposed. The check gates the first
- * producer entry: once one has committed (this node applied it, so its producer table exists), later ones are proposed
- * without it, which keeps dedup available right after a failover, when the new leader may not have heard from the old
- * one yet. From this build on, an
- * entry this node cannot apply exactly as its peers do (an unknown magic, a malformed entry, a replay that disagrees
- * with the stamp file) fails the replica closed instead of being skipped. Downgrading a node below M2, or adding a
- * voter that runs an older build, is unsupported once any {@code P} entry has committed: the older build would skip it.
+ * <p>Entry {@code [R][stampTerm][origin][seq][offset]}: "advance the log start to {@code offset}", proposed by the
+ * leader's retention pass and applied on every replica (constraint 3).
  */
 final class RaftReplica implements Replica {
 
     private static final byte MAGIC = 'M';
     /** A batch with a producer id (M2): {@link #MAGIC}'s layout plus {@link #PRODUCER} bytes before the records. */
     private static final byte MAGIC_PRODUCER = 'P';
+    private static final byte RETAIN = 'R';
     private static final int HEADER = 1 + 1 + 8 + 4 + 8 + 4;
     private static final int PRODUCER = 4 + 8 + 8;
-    private static final int STAMP = 28;
-    /** Stamp index of the clean-close marker. */
-    private static final long CLEAN = -1;
+    private static final int RETAIN_BYTES = 1 + 8 + 4 + 8 + 8;
     private static final Durability[] MODES = Durability.values();
     /**
      * Feature bit this build advertises on every msg group (#278 HA B1): it applies {@link #MAGIC_PRODUCER} entries and
-     * fails closed on any entry it cannot apply. The leader proposes a producer entry only when every voter has it,
-     * because an older build skips entries it does not know and its ledger would silently diverge.
+     * fails closed on any entry it cannot apply. The leader proposes a producer entry only when every voter has it.
      */
     static final int FEATURE_PRODUCER_ENTRIES = 1;
+    private static final int STAMP = 28;
+    /** Stamp index of the clean-close marker. */
+    private static final long CLEAN = -1;
 
     private final ClusterNode node;
     private final GroupId groupId;
@@ -121,7 +125,55 @@ final class RaftReplica implements Replica {
     private final Consumer<List<byte[]>> onApplied;
     private final Map<String, String> urls;
     private final int self;
-    private final FileChannel stamps;
+    /** Guarded by {@link #stampLock}: the delivery thread appends, the snapshotter rewrites. */
+    private FileChannel stamps;
+    private final java.util.concurrent.locks.ReentrantLock stampLock = new java.util.concurrent.locks.ReentrantLock();
+    private final Path stampFile;
+    private final String topic;
+    private final SegmentedLog log;
+    private final ReplicaHooks hooks;
+    /** Null: no snapshots (the replicator was built without a runtime). */
+    private final Snapshots.Runtime snaps;
+    private final Path installMarker;
+    private final Path staging;
+    private java.util.concurrent.ScheduledFuture<?> tick;
+    private final java.util.concurrent.atomic.AtomicBoolean snapshotting = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile boolean closed;
+    /** An install is owed (marker on disk, or one is running): the ledger is not trusted until it completes. */
+    private volatile boolean installPending;
+    /** The replicated log start (constraint 3). */
+    private volatile long logStart;
+    /** Latest applied batch whose records are written: the next snapshot point. */
+    private volatile Applied lastApplied;
+    /**
+     * Restart with a {@link ReplicaHooks.ReplicatedState}: its image was restored at this index, so entries after it
+     * that are already in the ledger are fed to {@code onApplied} again (not to the ledger). MAX_VALUE: none.
+     */
+    private long stateFrom = Long.MAX_VALUE;
+    /**
+     * Snapshot state sections, one per {@link ReplicaHooks.ReplicatedState} (the hooks' own, plus any registered with
+     * {@link #addState} before the group opens: #278's producer table as section 2). Non-empty: applies and the
+     * capture share {@link #applyLock}, so every image is the state right after the snapshot index.
+     */
+    private final List<ReplicaHooks.ReplicatedState> states = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private volatile boolean stateful;
+    private final java.util.concurrent.locks.ReentrantLock applyLock = new java.util.concurrent.locks.ReentrantLock();
+    /** Set while the group opens when the restored snapshot needs an install; run once the group is open. */
+    private MsgSnapshot openInstall;
+    /** Coordinates constructor handoff with {@link #onSnapshotRestored} during {@code openGroup} (#288 Codex P1). */
+    private final java.util.concurrent.locks.ReentrantLock installHandoff = new java.util.concurrent.locks.ReentrantLock();
+    private volatile CompletableFuture<Void> installing;
+    /** Consensus index of the last snapshot recorded or restored. */
+    private volatile long recordedIndex;
+    /** The last local append, so an install can wait for the writer to drain. */
+    private volatile CompletableFuture<?> lastLocal = CompletableFuture.completedFuture(null);
+    private final AtomicLong installs = new AtomicLong();
+    private final AtomicLong snapshotsTaken = new AtomicLong();
+    /** Tests only: called at named points of a snapshot or an install to simulate a crash there. Null in production. */
+    volatile java.util.function.Consumer<String> faultHook;
+
+    record Applied(long index, long term, long end) { }
+
     private final java.util.function.LongSupplier nanoClock;
     /** Single-member group: no peers renew the lease, and none can be elected instead. */
     private final boolean solo;
@@ -131,8 +183,9 @@ final class RaftReplica implements Replica {
     private volatile long readyTerm = -1;
     // Delivery-thread state (one delivery thread per group).
     private long resumeIndex;
-    /** Next offset for new applies: lined up from the stamp file in {@link #recover}, then advanced by each live batch. */
     private long expected;
+    private long skipTo;
+    private volatile long appliedIndex;
     /** {@link #expected} once the replay reaches {@link #resumeIndex} (from the stamp file), as a cross-check. */
     private long resumeExpected;
     /**
@@ -145,36 +198,70 @@ final class RaftReplica implements Replica {
      */
     private long replayAt = -1;
     /**
-     * Producer dedup state, created by the first producer entry applied (#278 B4: a topic that never sees one never
-     * loads the class); null is the empty table. Replaced only by {@link #restoreProducers}. Written by the delivery
-     * thread only; volatile because the producer gate in {@link #appendDeduplicated} reads whether it exists.
+     * Producer dedup state, created by the first producer entry applied (#278 B4); null is the empty table.
+     * Replaced only by {@link #restoreProducers}.
      */
     private volatile ProducerTable producers;
     /** Non-null once this replica failed closed (see {@link #fence}); volatile: read by producing threads. */
     private volatile String fenced;
-    /** The last local ledger append: a duplicate is acknowledged once the ledger has reached it. */
-    private CompletableFuture<Long> lastLocal = CompletableFuture.completedFuture(-1L);
-    private final long skipTo;
-    private volatile long appliedIndex;
-    /** Guards the delivery-thread state against {@link #close}; never contended while open. */
-    private final java.util.concurrent.locks.ReentrantLock applyLock = new java.util.concurrent.locks.ReentrantLock();
-    private boolean closed;
-    private final String topic;
 
     RaftReplica(ClusterNode node, GroupId groupId, GroupOptions options, LedgerWriter local, Durability defaultMode,
             Consumer<List<byte[]>> onApplied, Map<String, String> urls, Path stampFile, java.util.function.LongSupplier nanoClock) throws IOException {
+        this(node, groupId, options, local, defaultMode, null, onApplied, urls, stampFile, nanoClock, null);
+    }
+
+    RaftReplica(ClusterNode node, GroupId groupId, GroupOptions options, LedgerWriter local, Durability defaultMode,
+            ReplicaHooks hooks, Consumer<List<byte[]>> onApplied, Map<String, String> urls, Path stampFile,
+            java.util.function.LongSupplier nanoClock, Snapshots.Runtime snaps) throws IOException {
         this.nanoClock = nanoClock;
         this.solo = node.membership().others().isEmpty();
         this.node = node;
         this.groupId = groupId;
         this.local = local;
+        this.log = local.log();
         this.defaultMode = defaultMode;
-        this.onApplied = onApplied;
+        this.hooks = hooks;
+        if (hooks != null && hooks.state() != null) addState(hooks.state());
+        if (snaps != null) {
+            // Dedup on + snapshots: section 2 is mandatory; restoreProducers before entry i+1 (#278/#270 seam).
+            addState(new ReplicaHooks.ReplicatedState() {
+                @Override public int section() { return MsgSnapshot.PRODUCERS; }
+                @Override public byte[] snapshotState() {
+                    var out = new java.io.ByteArrayOutputStream();
+                    try (var d = new java.io.DataOutputStream(out)) {
+                        var t = producers;
+                        (t != null ? t : new ProducerTable()).write(d);
+                    } catch (java.io.IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                    return out.toByteArray();
+                }
+                @Override public void restoreState(byte[] image) {
+                    if (image == null || image.length == 0) {
+                        restoreProducers(null);
+                        return;
+                    }
+                    try {
+                        restoreProducers(ProducerTable.read(new java.io.DataInputStream(
+                                new java.io.ByteArrayInputStream(image))));
+                    } catch (java.io.IOException e) {
+                        throw new IllegalStateException(groupId.value() + ": PRODUCERS section refused: " + e.getMessage(), e);
+                    }
+                }
+            });
+        }
+        this.onApplied = hooks != null ? hooks.onApplied() : onApplied;
         this.urls = urls;
-        this.self = node.self().wire();
+        this.snaps = snaps;
         var name = groupId.value();
         this.topic = name.startsWith("msg/") ? name.substring(4) : name;
+        this.self = node.self().wire();
+        this.stampFile = stampFile;
+        this.installMarker = stampFile.resolveSibling(this.topic + ".install");
+        this.staging = stampFile.resolveSibling(this.topic + ".staging");
+        Files.deleteIfExists(stampFile.resolveSibling(stampFile.getFileName() + ".tmp"));
         this.stamps = FileChannel.open(stampFile, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        this.installPending = Files.exists(this.installMarker);
         long ledgerEnd = local.snapshot().nextOffset();
         this.skipTo = ledgerEnd;
         try {
@@ -183,16 +270,66 @@ final class RaftReplica implements Replica {
             this.stamps.close();
             throw e;
         }
-        this.group = node.openGroup(groupId, options, this::onCommitted);
+        this.recordedIndex = this.resumeIndex;
+        if (this.logStart > 0 && hooks != null) hooks.dropBelow().accept(this.logStart); // a crash may have kept them
+        var listener = new GroupListener() {
+            @Override
+            public void onCommitted(CommittedEntry entry) {
+                RaftReplica.this.onCommitted(entry);
+            }
+
+            @Override
+            public void onSnapshotRestored(LogSnapshot snapshot) {
+                RaftReplica.this.onSnapshotRestored(snapshot);
+            }
+        };
+        // openGroup may deliver onSnapshotRestored before returning; defer install via openInstall until
+        // group is published under installHandoff so the callback and this handoff cannot disagree (#288 Codex P1).
+        var opened = node.openGroup(groupId, options, listener);
+        MsgSnapshot owed;
+        CompletableFuture<Void> installDone = null;
+        this.installHandoff.lock();
+        try {
+            this.group = opened;
+            owed = this.openInstall;
+            if (owed != null) {
+                this.openInstall = null;
+                // Publish the future before releasing the handoff so onCommitted cannot see
+                // installPending without a joinable installing (#288 Codex P1).
+                installDone = this.installing;
+                if (installDone == null) {
+                    installDone = new CompletableFuture<>();
+                    this.installing = installDone;
+                }
+            }
+        } finally {
+            this.installHandoff.unlock();
+        }
         this.group.advertiseFeatures(FEATURE_PRODUCER_ENTRIES);
         node.onNoopApplied(groupId, (term, index) -> this.readyTerm = term);
+        if (owed != null) {
+            var done = installDone;
+            Thread.ofVirtual().name("msgrepl-install-" + this.topic).start(() -> {
+                try {
+                    install(owed);
+                } finally {
+                    done.complete(null);
+                }
+            });
+        }
+        if (snaps != null) {
+            long tail = snaps.settings.tailEntries();
+            node.snapshots(groupId).setTruncationBound((g, snapIndex) -> Math.max(0, snapIndex - tail));
+            long every = snaps.settings.check().toMillis();
+            this.tick = snaps.exec.scheduleWithFixedDelay(this::snapshotTick, every, every, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
     }
 
     /** Reads the stamp file: resume after the last batch wholly in the ledger; drops stamps past it. */
     private void recover(long ledgerEnd) throws IOException {
         long size = this.stamps.size() / STAMP * STAMP;
-        if (size == 0) { // header: the ledger end when replication started, which must be 0
-            if (ledgerEnd != 0) {
+        if (size == 0) { // header: the ledger end when replication started, which must be 0 (or an install will set it)
+            if (ledgerEnd != 0 && !this.installPending) {
                 throw refused("already holds " + ledgerEnd + " local record(s) (offsets 0.." + (ledgerEnd - 1)
                         + ") from before replication, but replication starts every node at offset 0; start a"
                         + " replicated topic from an empty log on every data node (see \"Migrating to HA"
@@ -213,7 +350,7 @@ final class RaftReplica implements Replica {
             if (last.getLong() == CLEAN) {
                 last.getLong();
                 long cleanEnd = last.getLong();
-                if (ledgerEnd > cleanEnd) {
+                if (ledgerEnd > cleanEnd && !this.installPending) {
                     throw refused("ledger end is " + ledgerEnd + " but replication stopped cleanly at " + cleanEnd
                             + ": " + (ledgerEnd - cleanEnd) + " record(s) were written while replication was off,"
                             + " and the other nodes do not have them; wipe this topic on every data node (or re-seed"
@@ -224,7 +361,7 @@ final class RaftReplica implements Replica {
         }
         var buf = ByteBuffer.allocate((int) Math.min(size, (long) STAMP << 15));
         long pos = 0, keep = STAMP;
-        boolean first = true;
+        boolean first = true, gap = false;
         while (pos < size) {
             buf.clear().limit((int) Math.min(buf.capacity(), size - pos));
             while (buf.hasRemaining()) if (this.stamps.read(buf, pos + buf.position()) < 0) break;
@@ -233,21 +370,30 @@ final class RaftReplica implements Replica {
                 long index = buf.getLong(), term = buf.getLong(), base = buf.getLong();
                 int count = buf.getInt();
                 if (first) {
-                    if (ledgerEnd < base) {
+                    if (ledgerEnd < base && !this.installPending) {
                         throw refused("ledger end is " + ledgerEnd + " but replication started at offset " + base
                                 + ": the ledger was wiped or truncated while its replication state was kept; wipe"
                                 + " both, or neither");
                     }
                     this.expected = base;
+                    this.resumeIndex = index; // the snapshot point the file starts after (0 before any snapshot)
                     this.resumeExpected = base;
-                    this.replayAt = base; // producer-table rebuild walks from here; expected advances with the stamps
+                    this.replayAt = base;
                     first = false;
                 } else if (index == CLEAN) {
                     break; // a marker before the end (should not happen): stop, keep what precedes it
-                } else if (base + count <= ledgerEnd) {
+                } else if (gap) {
+                    continue; // after the first batch not in the ledger: everything is re-applied
+                } else if (count < 0) { // replicated retention: base is the new log start
+                    this.logStart = Math.max(this.logStart, base);
                     this.resumeIndex = index;
+                    keep = pos + buf.position();
+                } else if (base + count > ledgerEnd) {
+                    gap = true;
+                } else {
+                    this.resumeIndex = index;
+                    this.expected = base + count;
                     this.resumeExpected = base + count;
-                    this.expected = base + count; // lined up: close() can write CLEAN without a raft replay
                     keep = pos + buf.position();
                 }
             }
@@ -265,8 +411,67 @@ final class RaftReplica implements Replica {
 
     private void writeStamp(long index, long term, long base, int count) throws IOException {
         var b = ByteBuffer.allocate(STAMP).putLong(index).putLong(term).putLong(base).putInt(count).flip();
-        long at = this.stamps.size();
-        while (b.hasRemaining()) at += this.stamps.write(b, at);
+        this.stampLock.lock();
+        try {
+            long at = this.stamps.size();
+            while (b.hasRemaining()) at += this.stamps.write(b, at);
+        } finally {
+            this.stampLock.unlock();
+        }
+    }
+
+    /**
+     * Rewrites the stamp file to start at the snapshot point {@code (index, term, end)}: the header, the log start, and
+     * every stamp after {@code index}. The replacement is forced before the rename so a crash cannot leave an empty
+     * stamp header over a durable ledger (#288 Codex P1); append-only stamps remain unforced as before.
+     */
+    private void resetStamps(long index, long term, long end, long keepAfter) throws IOException {
+        var tmp = this.stampFile.resolveSibling(this.stampFile.getFileName() + ".tmp");
+        this.stampLock.lock();
+        try {
+            long size = this.stamps.size() / STAMP * STAMP;
+            var all = ByteBuffer.allocate((int) Math.min(size, Integer.MAX_VALUE - 8));
+            while (all.hasRemaining()) if (this.stamps.read(all, all.position()) < 0) break;
+            all.flip();
+            var out = ByteBuffer.allocate(2 * STAMP + all.remaining());
+            out.putLong(index).putLong(term).putLong(end).putInt(0);
+            out.putLong(index).putLong(term).putLong(this.logStart).putInt(-1);
+            all.position(Math.min(all.limit(), STAMP)); // skip the old header
+            while (all.remaining() >= STAMP) {
+                int at = all.position();
+                long i = all.getLong(at);
+                if (i > keepAfter) out.put(all.array(), at, STAMP);
+                all.position(at + STAMP);
+            }
+            out.flip();
+            try (var ch = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                while (out.hasRemaining()) ch.write(out);
+                ch.force(true);
+            }
+            fault("stamps-written");
+            Files.move(tmp, this.stampFile, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            try (var d = FileChannel.open(this.stampFile.getParent(), StandardOpenOption.READ)) {
+                d.force(true);
+            } catch (IOException ignored) {
+                // some file systems refuse a directory fsync; the forced contents still cover the rename target
+            }
+            var old = this.stamps;
+            this.stamps = FileChannel.open(this.stampFile, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            old.close();
+        } finally {
+            this.stampLock.unlock();
+        }
+    }
+
+    private void fault(String at) throws IOException {
+        var h = this.faultHook;
+        if (h != null) {
+            try {
+                h.accept(at);
+            } catch (RuntimeException e) {
+                throw new IOException("injected fault at " + at, e);
+            }
+        }
     }
 
     static ByteBuffer encode(List<byte[]> records, Durability mode, long term, int origin, long seq) {
@@ -289,10 +494,46 @@ final class RaftReplica implements Replica {
         return b.flip();
     }
 
-    private void onCommitted(CommittedEntry e) {
+    /** Feeds an entry already in the ledger to {@code onApplied}, after a state image restored at {@link #stateFrom}. */
+    private void replayState(CommittedEntry e) {
+        var b = e.entry().duplicate();
+        if (b.remaining() < HEADER || b.get() != MAGIC) return;
+        b.get();
+        long stamp = b.getLong();
+        b.getInt();
+        b.getLong();
+        int count = b.getInt();
+        if (stamp != e.term() || count < 0) return;
+        var records = new ArrayList<byte[]>(count);
+        for (int i = 0; i < count && b.remaining() >= 4; i++) {
+            int len = b.getInt();
+            if (len < 0 || len > b.remaining()) return;
+            var r = new byte[len];
+            b.get(r);
+            records.add(r);
+        }
         this.applyLock.lock();
         try {
-            if (this.closed) return; // close() recorded the ledger end; the entry is replayed on restart
+            this.onApplied.accept(records);
+        } finally {
+            this.applyLock.unlock();
+        }
+    }
+
+    static ByteBuffer encodeRetain(long offset, long term, int origin, long seq) {
+        return ByteBuffer.allocate(RETAIN_BYTES).put(RETAIN).putLong(term).putInt(origin).putLong(seq).putLong(offset).flip();
+    }
+
+    private void onCommitted(CommittedEntry e) {
+        if (this.closed) return; // close() recorded the ledger end; the entry is replayed on restart
+        if (this.installPending) {
+            var f = this.installing;
+            if (f != null) f.join(); // the restart install: entries wait for the ledger they apply to
+            if (this.installPending) return; // a failed install: nothing applies until a restart redoes it
+        }
+        this.applyLock.lock();
+        try {
+            if (this.closed) return;
             apply(e);
         } finally {
             this.applyLock.unlock();
@@ -301,8 +542,12 @@ final class RaftReplica implements Replica {
 
     private void apply(CommittedEntry e) {
         var b = e.entry();
-        if (this.fenced != null) { // failed closed: applies nothing more; its own batches can no longer be acked here
+        if (this.fenced != null) {
             failMine(b);
+            return;
+        }
+        if (b.remaining() == RETAIN_BYTES && b.get(b.position()) == RETAIN) {
+            onRetain(e, b);
             return;
         }
         if (b.remaining() < HEADER) {
@@ -310,23 +555,23 @@ final class RaftReplica implements Replica {
             return;
         }
         byte magic = b.get();
-        if (magic != MAGIC && magic != MAGIC_PRODUCER) { // a newer entry format: never skip it silently (#278 HA B1)
+        if (magic != MAGIC && magic != MAGIC_PRODUCER) {
             fence(e, "unknown entry magic 0x" + Integer.toHexString(magic & 0xff), null);
             return;
         }
-        boolean replayed = e.index() <= this.resumeIndex; // already in the ledger: only rebuild the state (restart replay)
-        int modeOrdinal = b.get();
+        boolean replayed = e.index() <= this.resumeIndex;
+        int modeOrdinal = b.get() & 0xff;
         long stamp = b.getLong();
         int origin = b.getInt();
         long seq = b.getLong();
         int count = b.getInt();
         var mine = !replayed && origin == this.self ? this.pending.remove(seq) : null;
-        if (modeOrdinal < 0 || modeOrdinal >= MODES.length) {
+        if (modeOrdinal >= MODES.length) {
             fence(e, "unknown durability " + modeOrdinal, mine);
             return;
         }
         var mode = MODES[modeOrdinal];
-        if (stamp != e.term()) { // proposed in an older term, committed by a newer leader: fenced on every node
+        if (stamp != e.term()) {
             if (mine != null) mine.completeExceptionally(unavailable("stale term " + stamp + " < " + e.term()));
             return;
         }
@@ -352,18 +597,17 @@ final class RaftReplica implements Replica {
         }
         if (magic == MAGIC_PRODUCER) {
             var crc = new java.util.zip.CRC32C();
-            crc.update(b.duplicate()); // the encoded records region: identical bytes, identical digest on every node
+            crc.update(b.duplicate());
             digest = (int) crc.getValue();
-            if (this.producers == null) this.producers = new ProducerTable(); // lazy: null is the empty table
+            if (this.producers == null) this.producers = new ProducerTable();
             long c = this.producers.check(pOrigin, producerId, producerSeq, count, digest);
-            if (c != ProducerTable.NEW) { // decided identically on every node: takes no offsets
+            if (c != ProducerTable.NEW) {
                 if (mine != null) answerProducer(mine, c, pOrigin, producerId, producerSeq);
                 return;
             }
         }
         long base;
         if (replayed) {
-            // expected already mirrors the stamp file (recover); replayAt rebuilds the producer table only
             if (this.replayAt < 0) {
                 fence(e, "replay at index " + e.index() + " with no stamp-header base", null);
                 return;
@@ -371,10 +615,19 @@ final class RaftReplica implements Replica {
             base = this.replayAt;
             this.replayAt += count;
             if (producerId != 0) this.producers.apply(pOrigin, producerId, producerSeq, base, count, digest);
+            if (e.index() > this.stateFrom) {
+                // Re-feed APP_STATE after a restored image (offsets); producers already rebuilt above.
+                var records = new ArrayList<byte[]>(count);
+                var dup = b.duplicate();
+                for (int i = 0; i < count; i++) {
+                    var r = new byte[dup.getInt()];
+                    dup.get(r);
+                    records.add(r);
+                }
+                this.onApplied.accept(records);
+            }
             if (e.index() == this.resumeIndex) {
                 if (this.replayAt != this.resumeExpected) {
-                    // The replay did not reproduce the offsets this node wrote: the producer table built on the way holds
-                    // the same wrong bases, so dedup acks would disagree with the ledger and the peers (#278 HA B3).
                     fence(e, "replay reached offset " + this.replayAt + " at index " + e.index()
                             + ", the stamp file says " + this.resumeExpected, null);
                 }
@@ -393,18 +646,35 @@ final class RaftReplica implements Replica {
         }
         try {
             writeStamp(e.index(), e.term(), base, count);
-            if (base + count <= this.skipTo) { // in the ledger already: a crash lost the stamp, not the records
-                this.appliedIndex = e.index();
+            long index = e.index(), term = e.term();
+            if (base + count <= this.skipTo) {
+                this.appliedIndex = index;
+                if (this.stateful) {
+                    this.onApplied.accept(records);
+                    applied(index, term, base + count);
+                } else {
+                    applied(index, term, base + count);
+                }
                 if (mine != null) mine.complete(base);
                 return;
             }
             var f = this.local.append(records, mode);
             this.lastLocal = f;
-            long index = e.index();
             f.whenComplete((at, err) -> {
                 if (err == null) {
                     this.appliedIndex = index;
-                    this.onApplied.accept(records);
+                    if (this.stateful) {
+                        this.applyLock.lock();
+                        try {
+                            this.onApplied.accept(records);
+                            applied(index, term, at + count);
+                        } finally {
+                            this.applyLock.unlock();
+                        }
+                    } else {
+                        this.onApplied.accept(records);
+                        applied(index, term, at + count);
+                    }
                     if (mine != null) mine.complete(at);
                 } else if (mine != null) {
                     mine.completeExceptionally(err);
@@ -418,7 +688,6 @@ final class RaftReplica implements Replica {
         }
     }
 
-    /** The records region holds exactly {@code count} length-prefixed records, nothing short and nothing after. */
     private static boolean wellFormed(ByteBuffer b, int count) {
         if (count < 0) return false;
         int at = b.position(), end = b.limit();
@@ -432,13 +701,6 @@ final class RaftReplica implements Replica {
         return at == end;
     }
 
-    /**
-     * Fails closed (#278 HA B1, B3): an entry this build cannot apply exactly as its peers do (an unknown format, a
-     * malformed entry, a replay that disagrees with the stamp file). The group applies nothing more on this node,
-     * every batch of this node still waiting for its entry fails, and later appends are refused, rather than letting
-     * this ledger silently diverge from the others. An operator has to repair or replace the node (restart it with a
-     * build that understands the entry, or rebuild its state from a healthy peer).
-     */
     private void fence(CommittedEntry e, String why, CompletableFuture<Long> mine) {
         var reason = this.groupId.value() + ": failed closed at index " + e.index() + ": " + why;
         this.fenced = reason;
@@ -449,40 +711,495 @@ final class RaftReplica implements Replica {
         this.pending.clear();
     }
 
-    /** After a fence: this node's own batch committed but will not be applied here; its outcome is unknown. */
     private void failMine(ByteBuffer b) {
         if (b.remaining() < HEADER) return;
-        int origin = b.getInt(b.position() + 10);
-        long seq = b.getLong(b.position() + 14);
+        byte magic = b.get(b.position());
+        if (magic != MAGIC && magic != MAGIC_PRODUCER) return;
+        int origin = b.getInt(b.position() + 1 + 1 + 8);
+        long seq = b.getLong(b.position() + 1 + 1 + 8 + 4);
         var mine = origin == this.self ? this.pending.remove(seq) : null;
         if (mine != null) mine.completeExceptionally(outcomeUnknown(this.fenced, leaderName(), null));
     }
 
-    /** Non-null once this replica failed closed: why. */
-    String fenced() {
-        return this.fenced;
+    String fenced() { return this.fenced; }
+
+    /** Publishes the newest written batch (completions can arrive out of order across ack modes: keep the max). */
+    private void applied(long index, long term, long end) {
+        while (true) {
+            var cur = this.lastApplied;
+            if (cur != null && cur.index() >= index) return;
+            if (LAST_APPLIED.compareAndSet(this, cur, new Applied(index, term, end))) return;
+        }
+    }
+
+    private static final java.lang.invoke.VarHandle LAST_APPLIED;
+
+    static {
+        try {
+            LAST_APPLIED = java.lang.invoke.MethodHandles.lookup().findVarHandle(RaftReplica.class, "lastApplied", Applied.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    /** A replicated retention decision: every replica drops the same whole segments below it (constraint 3). */
+    private void onRetain(CommittedEntry e, ByteBuffer b) {
+        b.get();
+        long stamp = b.getLong();
+        int origin = b.getInt();
+        long seq = b.getLong();
+        long offset = b.getLong();
+        var mine = origin == this.self ? this.pending.remove(seq) : null;
+        if (stamp != e.term()) {
+            if (mine != null) mine.completeExceptionally(unavailable("stale term " + stamp + " < " + e.term()));
+            return;
+        }
+        try {
+            // #288 Codex P1: recovery replay must not append another retention stamp after newer batch
+            // stamps; recover() would then move resumeIndex backward and re-append those batches.
+            if (e.index() > this.resumeIndex) {
+                writeStamp(e.index(), e.term(), offset, -1);
+            }
+        } catch (IOException ex) {
+            System.err.println("WARN: " + this.groupId.value() + ": retention stamp: " + ex);
+        }
+        if (offset > this.logStart) {
+            this.logStart = offset;
+            if (this.hooks != null) this.hooks.dropBelow().accept(offset);
+        }
+        this.appliedIndex = e.index();
+        if (mine != null) mine.complete(offset);
+    }
+
+    @Override
+    public boolean replicatedRetention() {
+        return this.snaps != null && this.hooks != null;
+    }
+
+    @Override
+    public CompletableFuture<Void> advanceLogStart(long offset) {
+        if (this.snaps == null || this.hooks == null) return Replica.super.advanceLogStart(offset);
+        long term = this.group.leaderTerm();
+        if (!leaderReady(term)) return CompletableFuture.failedFuture(unavailable("not the ready leader"));
+        long seq = this.seqs.incrementAndGet();
+        var done = new CompletableFuture<Long>();
+        this.pending.put(seq, done);
+        this.node.append(this.groupId, List.of(encodeRetain(offset, term, this.self, seq)), null, term).whenComplete((ci, err) -> {
+            if (err != null) {
+                var p = this.pending.remove(seq);
+                if (p != null) p.completeExceptionally(map(err, true));
+            }
+        });
+        return done.thenApply(x -> null);
+    }
+
+    @Override
+    public long logStartOffset() {
+        return this.logStart;
+    }
+
+    long installs() {
+        return this.installs.get();
+    }
+
+    long snapshotsTaken() {
+        return this.snapshotsTaken.get();
+    }
+
+    Applied lastAppliedForTest() {
+        return this.lastApplied;
+    }
+
+    boolean installPending() {
+        return this.installPending;
+    }
+
+    long recordedIndex() {
+        return this.recordedIndex;
     }
 
     /**
-     * This node's own producer batch that the table did not append: a duplicate completes with the original base
-     * offset (encoded {@code -1 - base}, see {@link #appendDeduplicated}) once the local ledger has caught up to the
-     * last append, since it holds the original then; else a refusal.
-     *
-     * <p>{@link #lastLocal} is the latest append, which may be a later, unrelated batch. If that append fails, the
-     * duplicate's ack fails with it, and the client sees outcome unknown for a batch that is in the log. That is safe:
-     * its retry is a duplicate again and is acknowledged with the original offset once the ledger recovers (#278 HA N4).
+     * Scheduler thread, never the produce path: takes a snapshot when one is due (see the class doc). Any failure
+     * leaves the previous snapshot and the whole log in place; the next check tries again.
      */
-    private void answerProducer(CompletableFuture<Long> mine, long c, int pOrigin, long producerId, long producerSeq) {
-        if (c >= 0) {
-            this.lastLocal.whenComplete((at, err) -> {
-                if (err == null) mine.complete(-1 - c);
-                else mine.completeExceptionally(err);
-            });
+    void snapshotTick() {
+        if (this.closed || this.installPending || this.snaps == null || !this.snapshotting.compareAndSet(false, true)) return;
+        try {
+            var a = this.lastApplied;
+            if (a == null || a.index() - this.recordedIndex < this.snaps.settings.everyEntries()) return;
+            snapshotAt(a);
+        } catch (IOException | RuntimeException e) {
+            warn(this.groupId.value() + ": snapshot not taken: " + e);
+        } finally {
+            this.snapshotting.set(false);
+        }
+    }
+
+    /**
+     * Takes a snapshot now at the newest applied point (at or past {@code seen}; also tests). With a replicated state,
+     * the point and the state image are read together under the apply lock, so the image is the state right after
+     * the point's batch, never one with later batches in it (#278's constraint).
+     */
+    boolean snapshotAt(Applied seen) throws IOException {
+        Applied a;
+        List<MsgSnapshot.Section> sections = List.of();
+        if (this.stateful) {
+            this.applyLock.lock();
+            try {
+                a = this.lastApplied;
+                if (a == null || a.index() <= this.recordedIndex) return false;
+                var out = new ArrayList<MsgSnapshot.Section>(this.states.size());
+                for (var st : this.states) {
+                    int flags = st.section() == MsgSnapshot.PRODUCERS ? MsgSnapshot.REQUIRED : 0;
+                    out.add(new MsgSnapshot.Section(st.section(), flags, st.snapshotState()));
+                }
+                sections = out;
+            } finally {
+                this.applyLock.unlock();
+            }
+        } else {
+            a = this.lastApplied;
+            if (a == null) a = seen;
+        }
+        if (a.index() <= this.recordedIndex) return false; // nothing new since the last one (or the one restored)
+        // Constraint 1: the snapshot point must be durable in the segments, not only applied.
+        if (this.local.snapshot().durableOffset() < a.end()) {
+            this.local.force(); // advances durableOffset with the fsync (#288 MC-N1)
+            if (this.log.nextOffset() < a.end()) return false; // not written yet (cannot happen: a is published after the write)
+        }
+        var m = this.snaps.store.pin(this.topic, this.log, a.index(), a.term(), a.end(), this.logStart, sections,
+                this.snaps.settings.chunkBytes());
+        if (m == null) return false;
+        fault("snapshot-pinned");
+        var control = this.node.snapshots(this.groupId);
+        control.recordSnapshot(new LogSnapshot(this.groupId, a.index(), a.term(), m.encode()));
+        this.recordedIndex = a.index();
+        this.snapshotsTaken.incrementAndGet();
+        fault("snapshot-recorded");
+        try {
+            control.truncateToBound(snapshot -> null).get(30, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
+            warn(this.groupId.value() + ": truncation after the snapshot at " + a.index() + ": " + e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return true;
+        }
+        resetStamps(a.index(), a.term(), a.end(), a.index());
+        return true;
+    }
+
+    private volatile long lastWarnNanos = Long.MIN_VALUE / 2;
+
+    /** At most one warning per 10 s per replica: a peer down during an install must not flood the log. */
+    private void warn(String message) {
+        long now = this.nanoClock.getAsLong();
+        if (now - this.lastWarnNanos < 10_000_000_000L) return;
+        this.lastWarnNanos = now;
+        System.err.println("WARN: " + message);
+    }
+
+    /**
+     * Delivery thread, on open (the durable snapshot) or after the leader sent one: either this node's own ledger
+     * already holds the snapshot point, or the ledger is replaced by an install (constraint 3: nothing below the
+     * leader's log start is kept).
+     */
+    private void onSnapshotRestored(LogSnapshot s) {
+        MsgSnapshot m;
+        try {
+            m = MsgSnapshot.decode(s.data());
+            if (!m.topic().equals(this.topic) || m.index() != s.lastIncludedIndex() || m.term() != s.lastIncludedTerm()) {
+                throw new IllegalArgumentException("snapshot of " + m.topic() + " at " + m.index() + " delivered to "
+                        + this.groupId.value() + " at " + s.lastIncludedIndex());
+            }
+        } catch (IllegalArgumentException e) {
+            System.err.println("ERROR: " + this.groupId.value() + ": unusable snapshot, replica stops applying: " + e.getMessage());
+            this.installPending = true; // never append on top of a ledger we cannot place
             return;
         }
-        long next = this.producers.expectedSeq(pOrigin, producerId);
-        mine.completeExceptionally(ProducerTable.refusal(c, next, this.groupId.value() + ": producer " + producerId
-                + " seq " + producerSeq));
+        if (this.snaps != null && this.hooks != null && (this.installPending || this.local.snapshot().nextOffset() < m.endOffset())) {
+            boolean defer;
+            this.installHandoff.lock();
+            try {
+                defer = this.group == null;
+                if (defer) { // restored while the group opens (restart): installed off the opening thread
+                    this.installPending = true;
+                    this.openInstall = m;
+                    if (this.installing == null) this.installing = new CompletableFuture<>();
+                    // Marker under the handoff lock so the constructor cannot start install() and race
+                    // the same .install.tmp (#288 Codex P1).
+                    try {
+                        writeInstallMarker(m);
+                    } catch (IOException e) {
+                        System.err.println("ERROR: " + this.groupId.value() + ": could not write install marker: " + e.getMessage());
+                        this.installPending = true;
+                    }
+                }
+            } finally {
+                this.installHandoff.unlock();
+            }
+            if (defer) return;
+            install(m);
+            return;
+        }
+        if (this.local.snapshot().nextOffset() < m.endOffset()) {
+            System.err.println("ERROR: " + this.groupId.value() + ": snapshot at " + m.index() + " needs offsets up to "
+                    + m.endOffset() + " that this node cannot install (no snapshot runtime); replica stops applying");
+            this.installPending = true;
+            return;
+        }
+        if (this.resumeIndex < m.index()) {
+            this.resumeIndex = m.index();
+            this.expected = m.endOffset();
+        }
+        // #288 Codex P1: batches may land after capture and before resetStamps(); recover() then keeps
+        // the stamp-header replay cursor while Raft restores the newer durable snapshot. Rebase the
+        // cursor to the restored end; keep the stamp-derived resume watermark for the cross-check.
+        if (this.replayAt >= 0 && this.replayAt < m.endOffset()) {
+            this.replayAt = m.endOffset();
+        }
+        this.logStart = Math.max(this.logStart, m.logStart());
+        this.recordedIndex = Math.max(this.recordedIndex, m.index());
+        this.appliedIndex = Math.max(this.appliedIndex, m.index());
+        applied(m.index(), m.term(), m.endOffset());
+        if (this.stateful) {
+            restoreState(m);
+            this.stateFrom = m.index();
+        }
+    }
+
+    /**
+     * Persists the install marker if absent. Deferred startup installs must write it before {@code group} is
+     * published so a crash after {@link SegmentedLog#replaceWith} cannot leave an unmarked ledger (#288 Codex P1).
+     * Checks the durable file, not only {@link #installPending}.
+     */
+    /** Caller must hold {@link #installHandoff}, or be the sole installer after handoff. */
+    private void writeInstallMarker(MsgSnapshot m) throws IOException {
+        if (Files.exists(this.installMarker)) {
+            this.installPending = true;
+            return;
+        }
+        var tmp = this.installMarker.resolveSibling(this.installMarker.getFileName() + ".tmp");
+        Files.write(tmp, m.encode());
+        try (var ch = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
+            ch.force(true);
+        }
+        Files.move(tmp, this.installMarker, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        SnapshotStore.fsyncDir(this.installMarker.getParent());
+        this.installPending = true;
+    }
+
+    /**
+     * Fetches the newest pin at or above {@code m} from the data nodes (leader first), swaps it in for the whole local
+     * ledger, and moves the apply point there. Blocks this group's delivery thread: no later entry may apply before
+     * the ledger it lands on. Retries until it succeeds or the replica closes; the marker makes a restart redo it.
+     */
+    private void install(MsgSnapshot m) {
+        try {
+            this.installHandoff.lock();
+            try {
+                writeInstallMarker(m);
+            } finally {
+                this.installHandoff.unlock();
+            }
+            fault("install-marked");
+            boolean fetched = false;
+            long backoff = 20;
+            long maxBytes = this.snaps.settings.maxInstallBytes();
+            while (!fetched && !this.closed) {
+                for (var peer : peerOrder()) {
+                    try {
+                        // Fetch the pin, then refuse unless it is exactly the consensus image m (#288 Security B1).
+                        var got = SnapshotTransfer.fetch(peer, this.snaps.key, this.topic, m.index(), this.staging,
+                                GroupOptions.DEFAULT_MAX_SNAPSHOT_BYTES, this.snaps.clockMs,
+                                this.snaps.settings.bytesPerSecond(), this.snaps.settings.chunkBytes());
+                        if (!sameSnapshotImage(got, m)) {
+                            warn(this.groupId.value() + ": install from " + peer + ": pin at " + got.index()
+                                    + " does not match the consensus snapshot at " + m.index() + "; trying the next peer");
+                            clearStaging();
+                            continue;
+                        }
+                        if (maxBytes > 0) {
+                            long total = 0;
+                            for (var seg : m.segments()) total += seg.bytes();
+                            if (total > maxBytes) {
+                                throw new IOException("install of " + total + " bytes exceeds ha.snapshot.max_install_bytes "
+                                        + maxBytes);
+                            }
+                        }
+                        fetched = true;
+                        break;
+                    } catch (IOException e) {
+                        clearStaging();
+                        warn(this.groupId.value() + ": install from " + peer + ": " + e.getMessage());
+                    }
+                }
+                if (!fetched) {
+                    Thread.sleep(backoff);
+                    backoff = Math.min(2_000, backoff * 2);
+                }
+            }
+            if (!fetched) return;
+            fault("install-fetched");
+            try {
+                this.lastLocal.get(30, java.util.concurrent.TimeUnit.SECONDS); // the writer is drained: nothing in flight
+            } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException ignored) {
+                // a failed append left nothing in flight either
+            }
+            // Pause the ledger syncer before replaceWith closes segment channels; an overlapping force would
+            // otherwise become a permanent ClosedChannelException writer failure (#288 Codex P1).
+            this.local.pauseSync();
+            try {
+                // Local binding so lock/unlock are visibly the same Lock (CodeQL java/unreleased-lock).
+                var readers = this.hooks.readersOut();
+                readers.lock();
+                try {
+                    this.log.replaceWith(this.staging);
+                    this.local.reload();
+                } finally {
+                    readers.unlock();
+                }
+            } finally {
+                this.local.resumeSync();
+            }
+            fault("install-swapped");
+            // Always restore the consensus image m, never a peer-substituted pin (#288 Security B1).
+            this.logStart = m.logStart();
+            this.resumeIndex = m.index();
+            this.expected = m.endOffset();
+            this.skipTo = m.endOffset();
+            this.recordedIndex = m.index();
+            this.appliedIndex = Math.max(this.appliedIndex, m.index());
+            this.lastApplied = new Applied(m.index(), m.term(), m.endOffset());
+            resetStamps(m.index(), m.term(), m.endOffset(), Long.MAX_VALUE);
+            if (this.hooks != null && m.logStart() > 0) {
+                this.hooks.dropBelow().accept(m.logStart()); // constraint 3 / #288 MC-B1: same as the restart path
+            }
+            if (this.stateful) restoreState(m);
+            this.hooks.reloaded().run();
+            // Publish the verified install as a transferable pin before clearing staging, so this node can
+            // seed peers after failover while recordedIndex blocks a fresh capture (#288 Codex P1).
+            if (this.snaps != null) {
+                var published = this.snaps.store.pinInstalled(m, this.staging);
+                if (published == null) {
+                    warn(this.groupId.value() + ": installed snapshot at " + m.index()
+                            + " could not be published as a pin; peers may need another source");
+                }
+            }
+            Files.deleteIfExists(this.installMarker);
+            SnapshotStore.deleteTree(this.staging);
+            this.installPending = false;
+            this.installs.incrementAndGet();
+        } catch (IOException | RuntimeException e) {
+            System.err.println("ERROR: " + this.groupId.value() + ": snapshot install failed, replica stops applying until"
+                    + " restart: " + e);
+            this.installPending = true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * True when {@code got} is the same consensus image as {@code m}: same index/term/endOffset/logStart/chunkBytes,
+     * same typed sections (id, flags, bytes), and the same per-segment digests. A peer pin at a higher index, or with
+     * any divergent section or chunk, is refused (#288 Security B1).
+     */
+    static boolean sameSnapshotImage(MsgSnapshot got, MsgSnapshot m) {
+        if (got.index() != m.index() || got.term() != m.term() || got.endOffset() != m.endOffset()
+                || got.logStart() != m.logStart() || got.chunkBytes() != m.chunkBytes()) {
+            return false;
+        }
+        if (!got.topic().equals(m.topic())) return false;
+        if (got.sections().size() != m.sections().size()) return false;
+        for (int i = 0; i < m.sections().size(); i++) {
+            var a = got.sections().get(i);
+            var b = m.sections().get(i);
+            if (a.id() != b.id() || a.flags() != b.flags() || !java.util.Arrays.equals(a.data(), b.data())) return false;
+        }
+        if (got.segments().size() != m.segments().size()) return false;
+        for (int i = 0; i < m.segments().size(); i++) {
+            var a = got.segments().get(i);
+            var b = m.segments().get(i);
+            if (a.base() != b.base() || a.next() != b.next() || a.bytes() != b.bytes() || a.markerNext() != b.markerNext()) {
+                return false;
+            }
+            if (a.digests().length != b.digests().length) return false;
+            for (int d = 0; d < a.digests().length; d++) {
+                if (!java.util.Arrays.equals(a.digests()[d], b.digests()[d])) return false;
+            }
+        }
+        return true;
+    }
+
+    /** Drops staging contents after a refused or failed fetch so the next peer starts clean. */
+    private void clearStaging() {
+        try {
+            if (!Files.isDirectory(this.staging)) return;
+            try (var stream = Files.list(this.staging)) {
+                stream.forEach(f -> {
+                    try {
+                        Files.deleteIfExists(f);
+                    } catch (IOException ignored) {
+                    }
+                });
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
+    /**
+     * Restores each registered state's section of {@code m} (empty when the snapshot has none). Refuses a non-empty
+     * {@link MsgSnapshot#PRODUCERS} section when no handler is registered for it (#288 MC-N2 / #278 seam).
+     */
+    /** Tests only: exercise {@link #restoreState} fail-closed paths. */
+    void restoreStateForTest(MsgSnapshot m) { restoreState(m); }
+
+    private void restoreState(MsgSnapshot m) {
+        boolean haveProducersHandler = false;
+        for (var st : this.states) if (st.section() == MsgSnapshot.PRODUCERS) { haveProducersHandler = true; break; }
+        var producers = m.section(MsgSnapshot.PRODUCERS);
+        if (producers != null && producers.length > 0 && !haveProducersHandler) {
+            throw new IllegalStateException(this.groupId.value()
+                    + ": snapshot carries a PRODUCERS section but no handler is registered");
+        }
+        // Dedup + snapshots: section 2 is mandatory. Lining up expected without restoreProducers does not rebuild
+        // the table; after truncation a missing section would silently lose dedup (#278 Security via Messaging Core).
+        if (haveProducersHandler && producers == null) {
+            throw new IllegalStateException(this.groupId.value()
+                    + ": snapshot is missing the required PRODUCERS section (dedup cannot be rebuilt after truncation)");
+        }
+        this.applyLock.lock();
+        try {
+            for (var st : this.states) {
+                var d = m.section(st.section());
+                st.restoreState(d == null ? new byte[0] : d);
+            }
+        } finally {
+            this.applyLock.unlock();
+        }
+    }
+
+    /**
+     * Registers a state section (#278: the producer table, section {@link MsgSnapshot#PRODUCERS}). Call from the
+     * constructor before the group opens, so the restored snapshot reaches it before the first entry applies.
+     */
+    void addState(ReplicaHooks.ReplicatedState state) {
+        for (var st : this.states) {
+            if (st.section() == state.section()) throw new IllegalArgumentException("section " + state.section() + " taken");
+        }
+        this.states.add(state);
+        this.stateful = true;
+    }
+
+    /** Data nodes to fetch from: the current leader first, then the others; never this node. */
+    private List<InetSocketAddress> peerOrder() {
+        var out = new ArrayList<InetSocketAddress>();
+        var leader = leaderName();
+        var me = this.node.self().name();
+        if (leader != null && !leader.equals(me) && this.snaps.peers.containsKey(leader)) out.add(this.snaps.peers.get(leader));
+        for (var e : this.snaps.peers.entrySet()) {
+            if (!e.getKey().equals(me) && !e.getKey().equals(leader)) out.add(e.getValue());
+        }
+        return out;
     }
 
     @Override
@@ -502,14 +1219,9 @@ final class RaftReplica implements Replica {
             throw new IllegalArgumentException("producer seq must be 1 to " + ProducerTable.MAX_SEQ);
         }
         if (producerId != 0 && this.producers == null && !this.group.votersHaveFeatures(FEATURE_PRODUCER_ENTRIES)) {
-            // An older voter would skip the entry and diverge; nothing proposed (#278 HA B1). Once a producer entry
-            // has committed and been applied here, the group is past the point of no return (older builds and
-            // downgrades are unsupported from then on), so a leader that has not heard from a peer since it started,
-            // e.g. right after a failover, can still take producer retries.
             return CompletableFuture.failedFuture(ProducerTable.dedupUnavailable(this.groupId.value()
                     + ": not every voter has confirmed it applies producer entries; nothing appended"));
         }
-        // id 0: no dedup, at-least-once. A duplicate completes the proposal with -1 - base (answerProducer).
         return propose(records, mode, producerOrigin, producerId, producerSeq)
                 .thenApply(v -> v < 0 ? new ProducerAppend(-1 - v, true) : new ProducerAppend(v, false));
     }
@@ -522,6 +1234,7 @@ final class RaftReplica implements Replica {
             return CompletableFuture.failedFuture(new WriteRefusedException(down + "; not appended", false, null));
         }
         long term = this.group.leaderTerm();
+        if (this.installPending) return CompletableFuture.failedFuture(unavailable("installing a snapshot"));
         if (!leaderReady(term)) return CompletableFuture.failedFuture(unavailable("not the ready leader"));
         long seq = this.seqs.incrementAndGet();
         var acked = new CompletableFuture<Long>();
@@ -529,8 +1242,6 @@ final class RaftReplica implements Replica {
         var cd = m == Durability.GROUP || m == Durability.EACH ? sjws_nettask.cluster.Durability.STRICT : null;
         var entry = producerId == 0 ? encode(records, m, term, this.self, seq)
                 : encode(records, m, term, this.self, seq, producerOrigin, producerId, producerSeq);
-        // Conditional on the term just checked: a step-down and re-election between the check and the
-        // log write fails the append instead of proposing under the old term's readiness.
         this.node.append(this.groupId, List.of(entry), cd, term).whenComplete((ci, err) -> {
             if (err != null) {
                 var p = this.pending.remove(seq);
@@ -540,20 +1251,22 @@ final class RaftReplica implements Replica {
         return acked;
     }
 
-    /** The producer table, null while empty: owned by the delivery thread; for tests and the #270 snapshot seam. */
-    ProducerTable producers() {
-        return this.producers;
+    private void answerProducer(CompletableFuture<Long> mine, long c, int pOrigin, long producerId, long producerSeq) {
+        if (c >= 0) {
+            this.lastLocal.whenComplete((at, err) -> {
+                if (err == null) mine.complete(-1 - c);
+                else mine.completeExceptionally(err);
+            });
+            return;
+        }
+        long next = this.producers.expectedSeq(pOrigin, producerId);
+        mine.completeExceptionally(ProducerTable.refusal(c, next, this.groupId.value() + ": producer " + producerId
+                + " seq " + producerSeq));
     }
 
-    /**
-     * #270 install hook, delivery thread only: replaces the producer table with {@code table} as read from a snapshot
-     * ({@link ProducerTable#read}). A snapshot at index {@code i} must carry the producer table and the next offset
-     * ({@link #expected}) as applied through {@code i}, and restore both together before applying {@code i + 1}: once
-     * the consensus log is truncated, replay can no longer recompute either from the stamp header's base.
-     */
-    void restoreProducers(ProducerTable table) { // null: the snapshot predates any producer entry (keeps the gate)
-        this.producers = table;
-    }
+    ProducerTable producers() { return this.producers; }
+
+    void restoreProducers(ProducerTable table) { this.producers = table; }
 
     @Override
     public void awaitCapacity() throws InterruptedException {
@@ -657,13 +1370,14 @@ final class RaftReplica implements Replica {
 
     @Override
     public void close() {
+        if (this.tick != null) this.tick.cancel(false);
         this.node.openGroup(this.groupId, RaftReplicator.options(java.time.Duration.ofSeconds(1), java.time.Duration.ofMillis(100)), null);
         // Proposed and maybe in the log: the entry may still commit and be applied (on restart, or by the other
         // replicas), so a resend could duplicate it; not "not leader" (#254).
-        var closedOutcome = outcomeUnknown(this.groupId.value() + ": closed before the append was acknowledged", leaderName(), null);
-        this.pending.values().forEach(p -> p.completeExceptionally(closedOutcome));
+        var closed = outcomeUnknown(this.groupId.value() + ": closed before the append was acknowledged", leaderName(), null);
+        this.pending.values().forEach(p -> p.completeExceptionally(closed));
         this.pending.clear();
-        CompletableFuture<Long> inFlight;
+        CompletableFuture<?> inFlight;
         long end;
         this.applyLock.lock();
         try {
@@ -675,7 +1389,7 @@ final class RaftReplica implements Replica {
         }
         try {
             inFlight.get(5, java.util.concurrent.TimeUnit.SECONDS);
-            if (this.local.snapshot().nextOffset() == end) { // every stamped batch is in the ledger: a clean end
+            if (!this.installPending && this.local.snapshot().nextOffset() == end) {
                 writeStamp(CLEAN, CLEAN, end, 0);
                 this.stamps.force(false);
             }
@@ -684,10 +1398,13 @@ final class RaftReplica implements Replica {
         } catch (IOException | java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
             // no marker: the next open recovers as after a crash
         }
+        this.stampLock.lock();
         try {
             this.stamps.close();
         } catch (IOException e) {
             System.err.println("WARN: closing " + this.groupId.value() + " stamps: " + e);
+        } finally {
+            this.stampLock.unlock();
         }
     }
 }

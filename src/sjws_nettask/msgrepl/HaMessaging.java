@@ -68,12 +68,18 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
     private final TcpTransport transport;
     private final FileLogStorage storage;
     private final String describe;
+    /** Data nodes only (#270): the snapshot scheduler and pins, and the install listener. Null on the witness. */
+    private final Snapshots.Runtime snapshots;
+    private final SnapshotTransfer.Server snapshotServer;
 
-    private HaMessaging(ReplicatedNode node, TcpTransport transport, FileLogStorage storage, String describe) {
+    private HaMessaging(ReplicatedNode node, TcpTransport transport, FileLogStorage storage, String describe,
+            Snapshots.Runtime snapshots, SnapshotTransfer.Server snapshotServer) {
         this.node = node;
         this.transport = transport;
         this.storage = storage;
         this.describe = describe;
+        this.snapshots = snapshots;
+        this.snapshotServer = snapshotServer;
     }
 
     /**
@@ -121,25 +127,40 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
         Files.createDirectories(stateDir);
         var transport = TcpTransport.open(self, voters.members(), clusterKey, Clock.SYSTEM, PEER_QUEUE,
                 TcpTransport.SocketFactory.PLAIN, DOMAIN, false);
+        var snap = settings.snapshot();
         FileLogStorage storage = null;
         ReplicatedNode node = null;
+        Snapshots.Runtime runtime = null;
+        SnapshotTransfer.Server server = null;
         try {
-            storage = new FileLogStorage(stateDir.resolve("raft"));
+            // Rolling files: truncation behind a snapshot frees whole files (#270).
+            storage = new FileLogStorage(stateDir.resolve("raft"), snap.logSegmentBytes());
             node = ReplicatedNode.open(self, voters, Clock.SYSTEM, storage, transport);
             if (witness) {
                 RaftReplicator.openForWitness(node, settings.topics(), election, heartbeat);
             } else {
                 var urls = new LinkedHashMap<String, String>();
+                var peers = new LinkedHashMap<String, InetSocketAddress>();
                 for (var m : settings.members()) {
                     if (!m.witness()) {
                         urls.put(m.id(), m.httpUrl());
+                        peers.put(m.id(), new InetSocketAddress(m.host(), m.port() + snap.portOffset()));
                     }
                 }
+                var tKey = SnapshotTransfer.deriveKey(key);
+                var tPrevious = previous == null ? null : SnapshotTransfer.deriveKey(previous);
+                var settingsS = new Snapshots(snap.everyEntries(), snap.logTailEntries(), snap.chunkBytes(),
+                        snap.installRate(), Snapshots.DEFAULT_CHECK, snap.maxInstallBytes());
+                runtime = new Snapshots.Runtime(settingsS, stateDir, tKey, peers, System::currentTimeMillis);
+                var me = settings.self();
+                server = new SnapshotTransfer.Server(new InetSocketAddress(me.host(), me.port() + snap.portOffset()),
+                        tKey, tPrevious, runtime.store, snap.installRate(), System::currentTimeMillis);
                 ((MessagingModule) messaging).replication(new RaftReplicator(node, settings.topics(), urls,
-                        stateDir.resolve("apply"), election, heartbeat));
+                        stateDir.resolve("apply"), election, heartbeat, System::nanoTime, runtime));
             }
             node.begin(TICK);
         } catch (IOException | RuntimeException e) {
+            closeSnapshots(runtime, server);
             closeQuietly(node, transport, storage);
             throw e;
         }
@@ -153,7 +174,11 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
                     + " act as any member; keep the member network private (" + HaMessagingSettings.LINK_SECURITY_ISSUE
                     + ")");
         }
-        return new HaMessaging(node, transport, storage, line);
+        if (!witness) {
+            err.println("ha messaging: snapshots every " + snap.everyEntries() + " entries, " + snap.logTailEntries()
+                    + " kept behind; install listener on port +" + snap.portOffset() + " at " + snap.installRate() + " B/s");
+        }
+        return new HaMessaging(node, transport, storage, line, runtime, server);
     }
 
     /** {@code VoterSet.dataAndWitness} with a witness, else {@code VoterSet.majority} (which refuses a bare pair). */
@@ -195,7 +220,17 @@ public final class HaMessaging implements sjws_nettask.OptionalModule {
     /** Stops the node, then the transport and the log storage. The messaging module closes its replicas first. */
     @Override
     public void close() {
+        closeSnapshots(this.snapshots, this.snapshotServer);
         closeQuietly(this.node, this.transport, this.storage);
+    }
+
+    private static void closeSnapshots(Snapshots.Runtime runtime, SnapshotTransfer.Server server) {
+        if (server != null) {
+            server.close();
+        }
+        if (runtime != null) {
+            runtime.close();
+        }
     }
 
     private static void closeQuietly(ReplicatedNode node, TcpTransport transport, FileLogStorage storage) {

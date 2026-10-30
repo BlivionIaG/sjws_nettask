@@ -639,13 +639,20 @@ class CoalesceTest(Base):
         w.send(b"b" * 3000)  # would exceed 4 KiB: the first closes
         w.send(b"c" * 5000)  # at or above 4 KiB: its own chunk
         w.finish()
-        self.assertEqual([3000, 3000, 5000, 0], [len(c.data) for c in self.srv.chunks])
+        # FakeServer is threaded: HTTP arrival order can permute in-flight POSTs (#304).
+        # Coalesce boundaries are defined by chunk_seq, not socket arrival (see also
+        # test_large_final_data_splits_at_1mib).
+        by_seq = sorted(self.srv.chunks, key=lambda c: c.chunk_seq)
+        self.assertEqual([0, 1, 2, 3], [c.chunk_seq for c in by_seq])
+        self.assertEqual([3000, 3000, 5000, 0], [len(c.data) for c in by_seq])
+        self.assertEqual([b"a" * 3000, b"b" * 3000, b"c" * 5000, b""], [c.data for c in by_seq])
 
     def test_send_splits_at_1mib(self):
         w = self.writer(window=8, window_adv=64)
         w.send(b"s" * (CHUNK_MAX + 1))
         w.finish()
-        self.assertEqual([CHUNK_MAX, 1, 0], [len(c.data) for c in self.srv.chunks])
+        by_seq = sorted(self.srv.chunks, key=lambda c: c.chunk_seq)  # arrival order varies (#304)
+        self.assertEqual([CHUNK_MAX, 1, 0], [len(c.data) for c in by_seq])
 
 
 if __name__ == "__main__":

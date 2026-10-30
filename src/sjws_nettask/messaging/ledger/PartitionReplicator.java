@@ -36,6 +36,15 @@ public interface PartitionReplicator extends AutoCloseable {
      */
     Replica open(String topic, LedgerWriter local, Durability defaultMode, Consumer<List<byte[]>> onApplied) throws IOException;
 
+    /**
+     * As {@link #open(String, LedgerWriter, Durability, Consumer)} with the hooks a snapshotting replica needs (#270):
+     * replicated retention, reader exclusion for an install, and application state. The default ignores all but
+     * {@code onApplied}.
+     */
+    default Replica open(String topic, LedgerWriter local, Durability defaultMode, ReplicaHooks hooks) throws IOException {
+        return open(topic, local, defaultMode, hooks.onApplied());
+    }
+
     @Override
     void close();
 }

@@ -123,6 +123,14 @@ ha:
   heartbeat: 100ms              # default 100ms; 2 * heartbeat * 1.01 + 10ms must be below election_timeout
   state_dir: /var/lib/sjws/msgrepl   # default <--state-dir>/msgrepl
   messaging_insecure_plaintext: true   # required while any member address is off loopback (#277)
+  snapshot:                     # optional; the defaults are shown
+    every_entries: 10000        # applied entries between snapshots of each topic
+    log_tail_entries: 1000      # consensus entries kept behind a snapshot (brief lag catches up from these)
+    chunk_bytes: 1m             # install chunk (one SHA-256 each), 4k to 16m
+    install_rate: 64m           # install bytes per second a node sends, all transfers together
+    port_offset: 1              # install listener: each member's Raft port + this
+    log_segment_bytes: 16m      # rolling Raft log file size (truncation frees whole files)
+    max_install_bytes: 0        # optional total install payload cap; 0 = off
   members:                      # 2 data nodes + 1 witness, or 3 or more data nodes; same list everywhere
     - { id: a, address: "10.0.0.1:7100", http_url: "http://10.0.0.1:8080" }
     - { id: b, address: "10.0.0.2:7100", http_url: "http://10.0.0.2:8080" }
@@ -136,8 +144,15 @@ ha:
 | `ha.members[]` | none | `id` (1-64 of `A-Za-z0-9._-`), `address` (`host:port` of the Raft link), `http_url` (data nodes: base URL for 307s to the leader), `witness` (default false), `wire` (default: 1-based position; keep the list order the same everywhere or set it). |
 | `ha.topics` | `[]` | Replicated topics, with their consumer offsets. Each must start from an empty log on every data node: a listed topic (or `__offsets`) with local data from before replication refuses to start (exit 64); see [Migrating to HA messaging](../design/high-availability.md#migrating-to-ha-messaging). Unlisted topics stay local on each node, as with HA off (no redirect, no 503), and so do their consumer offsets. |
 | `ha.election_timeout`, `ha.heartbeat` | `1s`, `100ms` | Raft timings for every `msg/*` group. |
-| `ha.state_dir` | `<--state-dir>/msgrepl` | Raft log (`raft/`) and apply state (`apply/`). Relative to the config file. |
-| `ha.messaging_insecure_plaintext` | `false` | The member links are HMAC-authenticated but not encrypted, and the sender is not bound to its connection ([#277](https://github.com/BlivionIaG/sjws_nettask/issues/277)). A replicating node with any `members[].address` off loopback refuses to start (exit 64) unless this is `true`; with it, startup logs a WARN. Loopback-only member lists need nothing. |
+| `ha.state_dir` | `<--state-dir>/msgrepl` | Raft log (`raft/`), apply state (`apply/`) and snapshot pins (`snap/`). Relative to the config file. |
+| `ha.messaging_insecure_plaintext` | `false` | The member links are HMAC-authenticated but not encrypted, and the sender is not bound to its connection ([#277](https://github.com/BlivionIaG/sjws_nettask/issues/277)). A replicating node with any `members[].address` off loopback refuses to start (exit 64) unless this is `true`; with it, startup logs a WARN. Loopback-only member lists need no flag. |
+| `ha.snapshot.every_entries` | `10000` | Each data node snapshots a topic after this many applied entries, then truncates its consensus log. |
+| `ha.snapshot.log_tail_entries` | `1000` | Entries kept behind the snapshot. A follower less than this far behind catches up from the log; further behind it installs a peer's segments. |
+| `ha.snapshot.chunk_bytes` | `1m` | Install chunk size (one SHA-256 each), 4 KiB to 16 MiB. |
+| `ha.snapshot.install_rate` | `64m` | Bytes per second a node sends for installs, all transfers together. |
+| `ha.snapshot.port_offset` | `1` | Install listener binds to each member's Raft port plus this. |
+| `ha.snapshot.log_segment_bytes` | `16m` | Rolling Raft log file size for msg groups. |
+| `ha.snapshot.max_install_bytes` | `0` (off) | Optional upper bound on the sum of segment bytes in one install. `0` leaves it off; the manifest size and per-chunk SHA-256 checks still apply. |
 
 An invalid member list is refused in `on` and `auto` (by design, never a silent single-node fallback): a bare
 pair (`two voters require a witness`), more than
@@ -146,8 +161,10 @@ one witness, a witness with other than two data nodes, a `node_id` that is not l
 (`sjws.messaging.enabled=true`); the witness must have it off. Any `members` list counts as a multi-process
 deployment for `sjws.swarm.stream.enabled`. Raft frames are HMAC-authenticated (their own frame domain,
 HKDF info `sjws-msgrepl-frame-v1`), not encrypted: a member off loopback needs
-`ha.messaging_insecure_plaintext: true` until #277, and the member network must stay private. Changes need a
-restart; a reload that changes them says so and applies nothing.
+`ha.messaging_insecure_plaintext: true` until #277, and the member network must stay private. Install
+transfers use the same cluster key under HKDF info `sjws-msg-snapshot-v1` (#277). With replication, retention
+(`sjws.messaging.retention.*`) is decided by the leader and applied on every data node at the same offset.
+Changes need a restart; a reload that changes them says so and applies nothing.
 
 `WEB_SERVER_HA_CLUSTER_KEY` overrides `ha.cluster_key` and `ha.cluster_key_file`.
 `WEB_SERVER_HA_CLUSTER_KEY_PREVIOUS` overrides the previous key. An empty variable is an error
