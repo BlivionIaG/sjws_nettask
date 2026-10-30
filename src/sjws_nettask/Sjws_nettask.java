@@ -152,9 +152,11 @@ public class Sjws_nettask {
     }
 
     /**
-     * When HA messaging is on, publish its install counters on {@link SjwsServer#metrics()} (#315 N5). Detected by the
-     * {@code installPinExhausted}/{@code installOversizedAbandoned} getters so an {@code ha.messaging: off} process
-     * never loads {@code msgrepl}. Attaching does not install the observe filter.
+     * When HA messaging is on, publish its install counters on the server's {@link sjws_nettask.observe.ObserverSlot}
+     * (#315 N5 / B1). Detected by the {@code installPinExhausted}/{@code installOversizedAbandoned} getters so an
+     * {@code ha.messaging: off} process never loads {@code msgrepl}. Attaching stores the suppliers on the slot and
+     * never mutates {@link sjws_nettask.observe.RequestObserver#NONE}; a deferred {@link SjwsServer#armMetrics()}
+     * copies them onto the recording registry. Does not install the observe filter.
      */
     static void attachMsgreplInstallMetrics(OptionalModule modules, SjwsServer server) {
         var ha = findHaMessaging(modules);
@@ -164,7 +166,7 @@ public class Sjws_nettask {
         try {
             var pin = ha.getClass().getMethod("installPinExhausted");
             var oversized = ha.getClass().getMethod("installOversizedAbandoned");
-            server.metrics().setMsgreplInstallCounters(() -> invokeLong(pin, ha), () -> invokeLong(oversized, ha));
+            server.attachMsgreplInstallCounters(() -> invokeLong(pin, ha), () -> invokeLong(oversized, ha));
         } catch (ReflectiveOperationException ignored) {
             // HA messaging binary without the #315 getters: leave counters at 0
         }
