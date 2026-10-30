@@ -17,7 +17,6 @@
 package sjws_nettask.clusterharness;
 
 import java.io.IOException;
-import java.net.ServerSocket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -67,9 +66,23 @@ final class MsgReplCluster implements AutoCloseable {
     MsgReplCluster(Path dir) throws IOException {
         Runtime.getRuntime().addShutdownHook(this.reaper);
         this.dir = dir;
+        allocatePorts();
+    }
+
+    /**
+     * Picks fresh raft/http ports and rebuilds the link proxies. Child JVMs need concrete ports in their config
+     * before they start, so this is the TOCTOU-prone step; {@link #startAll} retries it when a bind fails.
+     */
+    private void allocatePorts() throws IOException {
+        for (var l : this.links.values()) {
+            l.close();
+        }
+        this.links.clear();
+        this.raft.clear();
+        this.http.clear();
         for (var n : NODES) {
-            this.raft.put(n, freePort());
-            this.http.put(n, freePort());
+            this.raft.put(n, EphemeralPorts.probe());
+            this.http.put(n, EphemeralPorts.probe());
         }
         for (var from : NODES) {
             for (var to : NODES) {
@@ -80,10 +93,9 @@ final class MsgReplCluster implements AutoCloseable {
         }
     }
 
+    /** @deprecated use {@link EphemeralPorts#probe()} — kept as a package alias for older call sites. */
     static int freePort() throws IOException {
-        try (var s = new ServerSocket(0)) {
-            return s.getLocalPort();
-        }
+        return EphemeralPorts.probe();
     }
 
     static boolean data(String node) {
@@ -114,12 +126,46 @@ final class MsgReplCluster implements AutoCloseable {
     }
 
     void startAll(String mode) throws Exception {
+        Exception last = null;
+        for (int attempt = 1; attempt <= EphemeralPorts.BIND_ATTEMPTS; attempt++) {
+            try {
+                startAllOnce(mode);
+                return;
+            } catch (Exception e) {
+                last = e;
+                if (!EphemeralPorts.addressInUse(e) || attempt == EphemeralPorts.BIND_ATTEMPTS) {
+                    throw e;
+                }
+                EphemeralPorts.logRetry("MsgReplCluster", attempt, e);
+                abortPartialStart();
+                allocatePorts();
+            }
+        }
+        throw last;
+    }
+
+    private void startAllOnce(String mode) throws Exception {
         for (var n : NODES) {
             launch(n, mode);
         }
         for (var n : NODES) {
             awaitStarted(n);
         }
+    }
+
+    /** Kills any children started by a failed {@link #startAllOnce} so a retry can reuse the work directory. */
+    private void abortPartialStart() {
+        for (var p : this.processes.values()) {
+            p.destroyForcibly();
+        }
+        for (var p : this.processes.values()) {
+            try {
+                p.waitFor(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        this.processes.clear();
     }
 
     void start(String node, String mode) throws Exception {
@@ -172,7 +218,11 @@ final class MsgReplCluster implements AutoCloseable {
             }
             Thread.sleep(50);
         }
-        throw new IllegalStateException(node + " did not start:\n" + text);
+        var msg = node + " did not start:\n" + text;
+        if (EphemeralPorts.looksLikeBindMessage(text)) {
+            throw new java.net.BindException(msg);
+        }
+        throw new IllegalStateException(msg);
     }
 
     /**
