@@ -1,5 +1,6 @@
 package sjws_nettask.msgrepl;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -69,4 +70,35 @@ class SnapshotStorePinTest {
             }
         }
     }
+    /** #288 Codex P1: pinInstalled publishes the consensus manifest from a verified staging tree. */
+    @Test
+    void pinInstalledPublishesConsensusManifestFromStaging() throws Exception {
+        try (var log = SegmentedLog.open(dir.resolve("ledger"), 4096)) {
+            for (int i = 0; i < 30; i++) {
+                log.append(List.of(("r" + i + "-" + "y".repeat(100)).getBytes(StandardCharsets.UTF_8)), i);
+            }
+            log.force();
+            var store = new SnapshotStore(dir.resolve("snap"));
+            var snap = store.pin("t", log, 5, 1, log.nextOffset(), 0, List.of(), MsgSnapshot.MIN_CHUNK);
+            assertNotNull(snap);
+            var staged = dir.resolve("staged");
+            Files.createDirectories(staged);
+            for (var seg : snap.segments()) {
+                Files.copy(dir.resolve("snap").resolve("t").resolve("5").resolve(SnapshotStore.name(seg.base())),
+                        staged.resolve(SnapshotStore.name(seg.base())));
+                if (seg.markerNext() >= 0) {
+                    Files.copy(dir.resolve("snap").resolve("t").resolve("5")
+                            .resolve(String.format("%020d.compacted", seg.base())),
+                            staged.resolve(String.format("%020d.compacted", seg.base())));
+                }
+            }
+            store.dropAboveForTest("t", -1); // clear pins
+            assertTrue(store.pinned("t").isEmpty());
+            var published = store.pinInstalled(snap, staged);
+            assertNotNull(published);
+            assertEquals(List.of(5L), store.pinned("t"));
+            assertArrayEquals(snap.encode(), Files.readAllBytes(dir.resolve("snap").resolve("t").resolve("5").resolve(SnapshotStore.MANIFEST)));
+        }
+    }
+
 }

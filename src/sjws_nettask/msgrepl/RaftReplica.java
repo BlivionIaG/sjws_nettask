@@ -1027,6 +1027,15 @@ final class RaftReplica implements Replica {
             }
             if (this.stateful) restoreState(m);
             this.hooks.reloaded().run();
+            // Publish the verified install as a transferable pin before clearing staging, so this node can
+            // seed peers after failover while recordedIndex blocks a fresh capture (#288 Codex P1).
+            if (this.snaps != null) {
+                var published = this.snaps.store.pinInstalled(m, this.staging);
+                if (published == null) {
+                    warn(this.groupId.value() + ": installed snapshot at " + m.index()
+                            + " could not be published as a pin; peers may need another source");
+                }
+            }
             Files.deleteIfExists(this.installMarker);
             SnapshotStore.deleteTree(this.staging);
             this.installPending = false;

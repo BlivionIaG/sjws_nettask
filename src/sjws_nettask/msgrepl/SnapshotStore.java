@@ -364,7 +364,68 @@ final class SnapshotStore {
         Files.deleteIfExists(p);
     }
 
-    /** Pins currently held for {@code topic} (tests). */
+    /**
+     * Publishes {@code m} as a pin whose segment files are hard-linked from {@code staged} (the verified install
+     * tree). Uses the consensus manifest bytes as-is so a recovered replica can seed peers after failover without
+     * rehashing (#288 Codex P1). Null when {@code staged} is missing a required file.
+     */
+    MsgSnapshot pinInstalled(MsgSnapshot m, Path staged) throws IOException {
+        var dir = root.resolve(m.topic());
+        Files.createDirectories(dir);
+        var tmp = dir.resolve(m.index() + ".tmp");
+        deleteTree(tmp);
+        Files.createDirectories(tmp);
+        boolean done = false;
+        try {
+            for (var seg : m.segments()) {
+                var src = staged.resolve(name(seg.base()));
+                var link = tmp.resolve(name(seg.base()));
+                try {
+                    Files.createLink(link, src);
+                } catch (NoSuchFileException gone) {
+                    return null;
+                } catch (UnsupportedOperationException | IOException e) {
+                    Files.copy(src, link);
+                }
+                if (seg.markerNext() >= 0) {
+                    var marker = staged.resolve(String.format("%020d.compacted", seg.base()));
+                    var dest = tmp.resolve(marker.getFileName());
+                    try {
+                        Files.createLink(dest, marker);
+                    } catch (NoSuchFileException none) {
+                        Files.write(dest, java.nio.ByteBuffer.allocate(8).putLong(seg.markerNext()).array());
+                    } catch (UnsupportedOperationException | IOException e) {
+                        if (Files.exists(marker)) Files.copy(marker, dest);
+                        else Files.write(dest, java.nio.ByteBuffer.allocate(8).putLong(seg.markerNext()).array());
+                    }
+                }
+            }
+            var manifest = m.encode();
+            try (var ch = FileChannel.open(tmp.resolve(MANIFEST), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                var b = java.nio.ByteBuffer.wrap(manifest);
+                while (b.hasRemaining()) ch.write(b);
+                ch.force(true);
+            }
+            fsyncDir(tmp);
+            var target = dir.resolve(Long.toString(m.index()));
+            deleteTree(target);
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
+            fsyncDir(dir);
+            done = true;
+            lock.lock();
+            try {
+                topicPins(m.topic()).put(m.index(), new Pin(m.topic(), m.index(), target, manifest));
+            } finally {
+                lock.unlock();
+            }
+            prune(m.topic());
+            return m;
+        } finally {
+            if (!done) deleteTree(tmp);
+        }
+    }
+
+        /** Pins currently held for {@code topic} (tests). */
     List<Long> pinned(String topic) {
         lock.lock();
         try {

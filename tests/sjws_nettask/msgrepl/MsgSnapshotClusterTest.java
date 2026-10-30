@@ -135,6 +135,8 @@ class MsgSnapshotClusterTest {
         c.awaitEnd(f, end);
         for (int k = 0; k < 2000 && c.data[f].replica.installs() == 0; k++) c.step();
         assertEquals(1, c.data[f].replica.installs(), "served by install-snapshot");
+        assertTrue(c.data[f].runtime.store.pinned("t").contains(m.index()),
+                "install publishes a transferable pin for failover seeding (#288 Codex P1)");
         assertTrue(c.data[l].server.bytesSent.get() > 0, "data came over the side channel");
         assertEquals(c.checksum(l, 0), c.checksum(f, 0), "same offsets, same records");
         // C4: the leader's files arrived as they are (compaction never re-done on the follower).
