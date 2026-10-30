@@ -57,9 +57,9 @@ import sjws_nettask.core.StaticFileHandler;
  * (flow-control window held). Size limits are the handler's. Trailers and unread content are released.
  * A stream closed by the peer (RST_STREAM) or by the connection interrupts its task.
  */
-final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
+class Http2StreamHandler extends ChannelInboundHandlerAdapter {
 
-    private final Http2Server.Shared shared;
+    final Http2Server.Shared shared;
     private boolean started;
     private Http2RequestBody body; // event loop only; null when we keep no content
 
@@ -68,23 +68,8 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
     }
 
     /** Pseudo-headers and the fields the core understands; :authority wins over a host field. */
-    /**
-     * Test-only: when non-null, {@link Task#run()} runs this before resolving the handler (#301).
-     * Production never sets it.
-     */
-    static volatile Runnable beforeDispatch;
 
-    /**
-     * Test-only: when non-null, runs after the generation is captured for {@code toRequest} and
-     * before {@code start} uses that same instance (#301 Middleware Chain). Production never sets it.
-     */
-    static volatile Runnable afterHeadersCapture;
 
-    /**
-     * Test-only: when non-null, runs after {@code generation()} and before {@link Http2Server.Generation#tryEnter}
-     * (B1 race). Production never sets it.
-     */
-    static volatile Runnable afterGenerationRead;
 
     static Request toRequest(Http2Headers h) {
         return toRequest(h, null, false, false);
@@ -178,26 +163,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
                     this.started = true;
                     var stream = (Http2StreamChannel) ctx.channel();
                     var headers = frame.headers();
-                    // Pin + captureFields from one Generation; retry if retired between read and tryEnter (B1).
-                    Http2Server.Generation generation;
-                    Request request;
-                    for (;;) {
-                        generation = this.shared.generation();
-                        var race = afterGenerationRead;
-                        if (race != null) {
-                            race.run();
-                        }
-                        if (!generation.tryEnter()) {
-                            continue;
-                        }
-                        request = toRequest(headers, peer(stream), secure(stream), generation.attachBodies());
-                        var hook = afterHeadersCapture;
-                        if (hook != null) {
-                            hook.run();
-                        }
-                        break;
-                    }
-                    start(stream, headers, request, frame.isEndStream(), generation);
+                    captureAndStart(stream, headers, frame.isEndStream());
                 } else if (frame.isEndStream() && this.body != null) {
                     // trailers end the request; field values are ignored
                     this.body.end();
@@ -217,7 +183,30 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    private static InetSocketAddress peer(Http2StreamChannel stream) {
+    /**
+     * Pin one {@link Http2Server.Generation} and start the Task. Overridden by
+     * {@link HookedHttp2StreamHandler} to insert test-only callbacks without touching this hot path.
+     */
+    void captureAndStart(Http2StreamChannel stream, Http2Headers headers, boolean endStream) {
+        Http2Server.Generation generation;
+        Request request;
+        for (;;) {
+            generation = this.shared.generation();
+            if (!generation.tryEnter()) {
+                continue;
+            }
+            request = toRequest(headers, peer(stream), secure(stream), generation.attachBodies());
+            break;
+        }
+        start(stream, headers, request, endStream, generation);
+    }
+
+    /** Submits the Task. Overridden by {@link HookedHttp2StreamHandler} for beforeDispatch. */
+    void executeTask(Runnable task) {
+        this.shared.executor().execute(task);
+    }
+
+    static InetSocketAddress peer(Http2StreamChannel stream) {
         var parent = stream.parent();
         if (parent == null) {
             return null;
@@ -226,12 +215,12 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         return remote instanceof InetSocketAddress inet ? inet : null;
     }
 
-    private static boolean secure(Http2StreamChannel stream) {
+    static boolean secure(Http2StreamChannel stream) {
         var parent = stream.parent();
         return parent != null && parent.pipeline().get(io.netty.handler.ssl.SslHandler.class) != null;
     }
 
-    private void start(Http2StreamChannel stream, Http2Headers headers, Request request, boolean endStream,
+    void start(Http2StreamChannel stream, Http2Headers headers, Request request, boolean endStream,
             Http2Server.Generation generation) {
         var budget = this.shared.budget(stream.parent());
         if (!budget.inflight().tryAcquire()) { // one connection can't take the whole server's share
@@ -265,7 +254,7 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
         // Pin the handler generation with the body-capture decision (#301).
         var task = new Task(stream, request, budget, this.body, generation);
         try {
-            this.shared.executor().execute(task);
+            executeTask(task);
         } catch (RejectedExecutionException e) { // shutting down
             task.finish();
             stream.writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.REFUSED_STREAM));
@@ -354,10 +343,6 @@ final class Http2StreamHandler extends ChannelInboundHandlerAdapter {
             try {
                 if (this.cancelled || !this.stream.isActive()) {
                     return;
-                }
-                var gate = beforeDispatch;
-                if (gate != null) {
-                    gate.run();
                 }
                 var refusal = refusal(this.request);
                 Response response;

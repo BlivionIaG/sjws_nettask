@@ -186,7 +186,17 @@ public final class Http2Server implements Transport {
          * drain (or immediately if already idle).
          */
         public void whenQuiesced(Runnable action) {
-            this.onQuiesce.set(Objects.requireNonNull(action, "action"));
+            Objects.requireNonNull(action, "action");
+            // Chain listeners so trackDrainingGeneration + deferSnapshotClose both run.
+            this.onQuiesce.updateAndGet(existing -> {
+                if (existing == null) {
+                    return action;
+                }
+                return () -> {
+                    existing.run();
+                    action.run();
+                };
+            });
             int s = this.state.updateAndGet(v -> v | RETIRED);
             if ((s & ~RETIRED) == 0) {
                 fireQuiesce();
@@ -196,6 +206,15 @@ public final class Http2Server implements Transport {
         /** Test / diagnostics: whether {@link #whenQuiesced} has retired this generation. */
         boolean retired() {
             return (this.state.get() & RETIRED) != 0;
+        }
+
+        /**
+         * Runs the quiesce action immediately (even with in-flight pins). Used when the draining
+         * generation cap is exceeded under rapid reload.
+         */
+        public void forceQuiesce() {
+            this.state.updateAndGet(v -> v | RETIRED);
+            fireQuiesce();
         }
 
         private void fireQuiesce() {
@@ -274,6 +293,12 @@ public final class Http2Server implements Transport {
             new io.netty.channel.group.DefaultChannelGroup(io.netty.util.concurrent.GlobalEventExecutor.INSTANCE);
     private PerIpLimit perIp;
     private Shared shared;
+    /** Production uses {@link Http2StreamHandler}; tests may install {@link HookedHttp2StreamHandler}. */
+    private volatile java.util.function.Function<Shared, io.netty.channel.ChannelHandler> streamHandlerFactory =
+            Http2StreamHandler::new;
+    private volatile java.util.function.Function<Shared, io.netty.channel.ChannelHandler> fallbackHandlerFactory =
+            Http1FallbackHandler::new;
+
     private EventLoopGroup boss;
     private EventLoopGroup workers;
     private ExecutorService executor;
@@ -329,6 +354,17 @@ public final class Http2Server implements Transport {
     Generation generation() {
         return this.published.get();
     }
+
+    /**
+     * Test-only: subsequent streams/fallback connections use hooked handlers so dispatch callbacks
+     * run without putting a hook check on the production {@link Http2StreamHandler} hot path.
+     */
+    void instrumentForTest(DispatchHooks hooks) {
+        var h = hooks == null ? DispatchHooks.NONE : hooks;
+        this.streamHandlerFactory = shared -> new HookedHttp2StreamHandler(shared, h);
+        this.fallbackHandlerFactory = shared -> new HookedHttp1FallbackHandler(shared, h);
+    }
+
 
     @Override
     public Http2Server start() throws Exception {
@@ -437,7 +473,7 @@ public final class Http2Server implements Transport {
         return new Http2MultiplexHandler(new ChannelInitializer<Http2StreamChannel>() {
             @Override
             protected void initChannel(Http2StreamChannel stream) {
-                stream.pipeline().addLast(new Http2StreamHandler(Http2Server.this.shared));
+                stream.pipeline().addLast(Http2Server.this.streamHandlerFactory.apply(Http2Server.this.shared));
             }
         });
     }
@@ -456,7 +492,7 @@ public final class Http2Server implements Transport {
         p.addLast(deadline.front(), new HttpServerCodec(8192, this.limits.maxHeaderListSize(), 8192),
                 new HttpServerExpectContinueHandler(),
                 new HttpObjectAggregator(64 * 1024), deadline.back(),
-                new Http1FallbackHandler(this.shared), Quiet.INSTANCE);
+                this.fallbackHandlerFactory.apply(this.shared), Quiet.INSTANCE);
     }
 
     /** h2c port: prior knowledge, Upgrade: h2c, or plain HTTP/1.1. */
@@ -482,7 +518,7 @@ public final class Http2Server implements Transport {
         p.addLast("expect-continue", new HttpServerExpectContinueHandler());
         p.addLast("h1-aggregator", new HttpObjectAggregator(64 * 1024));
         p.addLast(deadline.back());
-        p.addLast("h1-fallback", new Http1FallbackHandler(this.shared));
+        p.addLast("h1-fallback", this.fallbackHandlerFactory.apply(this.shared));
         p.addLast(Quiet.INSTANCE);
     }
 

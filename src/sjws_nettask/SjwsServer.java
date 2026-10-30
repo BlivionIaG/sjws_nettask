@@ -110,6 +110,10 @@ public final class SjwsServer implements AutoCloseable {
     private final AltSvc altSvc = new AltSvc();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final ReentrantLock reloadLock = new ReentrantLock();
+    /** Generations awaiting quiesce before their snapshot close; capped to bound memory. */
+    private final java.util.ArrayDeque<sjws_nettask.h2.Http2Server.Generation> drainingGenerations =
+            new java.util.ArrayDeque<>();
+    private static final int MAX_DRAINING_GENERATIONS = 4;
     /** Set only by a data-role bootstrap. The field type is {@code Object} so standalone does not name {@code cp}. */
     private Object controlPlane;
     /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
@@ -853,14 +857,26 @@ public final class SjwsServer implements AutoCloseable {
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
             // Override path must also publish an armed generation and drain the previous one (B3).
             Handler terminal = this.override != null ? this.override : next.handler();
-            Handler armed = armedAround(terminal);
-            // control.isLive always sets this.armed via armSnapshot.
             boolean bodies = !(next.handler() instanceof StaticFileHandler) || this.armed.get() != null
                     || this.override != null;
-            previousH2 = http2.armHandler(armed, bodies);
-            // Keep SjwsServer.armed aligned with the pinned generation when filters/metrics are on.
-            if (this.armed.get() != null) {
-                this.armed.set(armed);
+            var control = this.control;
+            if (control != null && control.isLive()) {
+                // Serialize compile + install with ChainControl.apply/pinOuter (Codex P1).
+                previousH2 = control.withPublishLock(() -> {
+                    Handler frozen = request -> terminal.handle(request);
+                    Handler armed = control.compileAroundUnlocked(frozen);
+                    var prev = http2.armHandler(armed, bodies);
+                    if (this.armed.get() != null) {
+                        this.armed.set(armed);
+                    }
+                    return prev;
+                });
+            } else {
+                Handler armed = armedAround(terminal);
+                previousH2 = http2.armHandler(armed, bodies);
+                if (this.armed.get() != null) {
+                    this.armed.set(armed);
+                }
             }
         }
         this.live.set(next);
@@ -950,6 +966,10 @@ public final class SjwsServer implements AutoCloseable {
         if (control != null && control.isLive()) {
             return control.compileAround(frozen);
         }
+        // Startup observe is already inside override; do not wrap it again (Codex P2).
+        if (this.observingAtStart && terminal == this.override) {
+            return frozen;
+        }
         // observingAtStart implies a recording slot, so recording covers that case.
         if (this.armed.get() != null || this.slot.get().recording()) {
             return sjws_nettask.observe.ObserveRequestFilter.chain(this.slot, frozen);
@@ -970,18 +990,41 @@ public final class SjwsServer implements AutoCloseable {
         if (replaced == null) {
             return;
         }
+        trackDrainingGeneration(previous);
         var once = new java.util.concurrent.atomic.AtomicBoolean();
         Runnable close = () -> {
             if (once.compareAndSet(false, true)) {
                 replaced.close();
             }
         };
-        if (previous == null) {
+        if (previous == null && drainingGenerations.isEmpty()) {
             close.run();
             return;
         }
-        previous.whenQuiesced(close);
-        // Bounded drain: force-close if Tasks never finish (client stall / bug).
+        // Close when the swap generation and any other tracked gens for this epoch drain.
+        var pending = new java.util.concurrent.atomic.AtomicInteger(1); // barrier until registration done
+        Runnable release = () -> {
+            if (pending.decrementAndGet() == 0) {
+                close.run();
+            }
+        };
+        if (previous != null) {
+            pending.incrementAndGet();
+            previous.whenQuiesced(release);
+        }
+        // Also wait for any still-tracked gens from prior rearms under this snapshot (Codex P2).
+        java.util.List<sjws_nettask.h2.Http2Server.Generation> extras;
+        synchronized (this.drainingGenerations) {
+            extras = new java.util.ArrayList<>(this.drainingGenerations);
+        }
+        for (var g : extras) {
+            if (g == previous) {
+                continue;
+            }
+            pending.incrementAndGet();
+            g.whenQuiesced(release);
+        }
+        release.run(); // drop registration barrier
         Thread.ofVirtual().name("sjws-snapshot-close").start(() -> {
             try {
                 Thread.sleep(java.time.Duration.ofSeconds(30));
@@ -996,6 +1039,41 @@ public final class SjwsServer implements AutoCloseable {
                     + "(in-flight h2 work on the previous generation was cut; errors must not leak secrets)");
             close.run();
         });
+    }
+
+    /**
+     * Remembers a replaced generation until it quiesces. Caps concurrent drains at
+     * {@link #MAX_DRAINING_GENERATIONS}: the oldest is force-retired so rapid reloads cannot retain
+     * unbounded pools (Security nit).
+     */
+    public void trackDrainingGeneration(sjws_nettask.h2.Http2Server.Generation generation) {
+        if (generation == null) {
+            return;
+        }
+        sjws_nettask.h2.Http2Server.Generation evicted = null;
+        synchronized (this.drainingGenerations) {
+            this.drainingGenerations.addLast(generation);
+            while (this.drainingGenerations.size() > MAX_DRAINING_GENERATIONS) {
+                evicted = this.drainingGenerations.removeFirst();
+            }
+        }
+        generation.whenQuiesced(() -> {
+            synchronized (this.drainingGenerations) {
+                this.drainingGenerations.remove(generation);
+            }
+        });
+        if (evicted != null && evicted != generation) {
+            System.err.println("WARN: forcing quiesce of oldest draining h2 generation "
+                    + "(cap " + MAX_DRAINING_GENERATIONS + " under rapid reload)");
+            evicted.forceQuiesce();
+        }
+    }
+
+    /** Package-visible for tests. */
+    public int drainingGenerationCount() {
+        synchronized (this.drainingGenerations) {
+            return this.drainingGenerations.size();
+        }
     }
 
     /** @return null when this server was started without {@link HaSettings} */
@@ -1122,8 +1200,9 @@ public final class SjwsServer implements AutoCloseable {
             this.h3.armHandler(handler);
         }
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
-            // Filters need bodies; publish as one generation (P2a).
-            http2.armHandler(handler, true);
+            // Filters need bodies; publish as one generation (P2a). Retain the previous generation
+            // so a later snapshot close waits for Tasks that pinned it (Codex P2 leases).
+            trackDrainingGeneration(http2.armHandler(handler, true));
         }
     }
 
@@ -1196,7 +1275,7 @@ public final class SjwsServer implements AutoCloseable {
             this.h3.armHandler(chain);
         }
         if (this.h2 instanceof sjws_nettask.h2.Http2Server http2) {
-            http2.armHandler(chain, true);
+            trackDrainingGeneration(http2.armHandler(chain, true));
         }
     }
 

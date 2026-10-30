@@ -54,6 +54,8 @@ public final class ChainControl implements Handler {
     private volatile FilterDocument document;
     private volatile Snapshot current;
     private volatile boolean live;
+    /** Last compiled filter spine (same document); rebound on {@link #compileAround}. */
+    private volatile FilterChain retained;
 
     private ChainControl(RequestFilters registry, Set<String> nodeLabels, Handler terminal,
             Supplier<RequestFilter> outerSource, Runnable onLive, Consumer<Handler> onPublish) {
@@ -211,6 +213,7 @@ public final class ChainControl implements Handler {
 
     private Snapshot compile(FilterDocument document) {
         var chain = this.registry.compile(document, this.nodeLabels, this.terminal, outerFilter());
+        this.retained = chain;
         return new Snapshot(document.version(), chain == null ? this.terminal : chain);
     }
 
@@ -223,16 +226,42 @@ public final class ChainControl implements Handler {
         Objects.requireNonNull(terminal, "terminal");
         this.publish.lock();
         try {
-            var doc = this.document;
-            if (doc == null) {
-                var outer = outerFilter();
-                if (outer == null) {
-                    return terminal;
-                }
-                return this.registry.compile(FilterDocument.empty(0), this.nodeLabels, terminal, outer);
+            return compileAroundUnlocked(terminal);
+        } finally {
+            this.publish.unlock();
+        }
+    }
+
+    /**
+     * Same as {@link #compileAround} but the caller already holds the publish lock (so compile +
+     * transport install can be one critical section).
+     */
+    public Handler compileAroundUnlocked(Handler terminal) {
+        Objects.requireNonNull(terminal, "terminal");
+        var kept = this.retained;
+        if (kept != null) {
+            return kept.withTerminal(terminal);
+        }
+        var doc = this.document;
+        if (doc == null) {
+            var outer = outerFilter();
+            if (outer == null) {
+                return terminal;
             }
-            var chain = this.registry.compile(doc, this.nodeLabels, terminal, outerFilter());
+            var chain = this.registry.compile(FilterDocument.empty(0), this.nodeLabels, terminal, outer);
+            this.retained = chain;
             return chain == null ? terminal : chain;
+        }
+        var chain = this.registry.compile(doc, this.nodeLabels, terminal, outerFilter());
+        this.retained = chain;
+        return chain == null ? terminal : chain;
+    }
+
+    /** Runs {@code action} under the publication lock (serialize with {@link #apply}/{@link #pinOuter}). */
+    public <T> T withPublishLock(java.util.function.Supplier<T> action) {
+        this.publish.lock();
+        try {
+            return action.get();
         } finally {
             this.publish.unlock();
         }

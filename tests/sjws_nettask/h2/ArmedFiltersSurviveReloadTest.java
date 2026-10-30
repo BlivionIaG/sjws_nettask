@@ -36,9 +36,6 @@ import sjws_nettask.ServerConfig;
 import sjws_nettask.core.Handler;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.security.cert.X509Certificate;
-import javax.net.ssl.X509TrustManager;
-import javax.net.ssl.TrustManager;
 import javax.net.ssl.SSLContext;
 import sjws_nettask.SjwsServer;
 import sjws_nettask.config.ConfigLoader;
@@ -62,10 +59,7 @@ class ArmedFiltersSurviveReloadTest {
 
     @AfterEach
     void stop() {
-        Http2StreamHandler.beforeDispatch = null;
-        Http2StreamHandler.afterHeadersCapture = null;
-        Http2StreamHandler.afterGenerationRead = null;
-        Http1FallbackHandler.beforeDispatch = null;
+        // hooks cleared by closing the server (instrumentation is per-Http2Server)
         if (this.server != null) {
             this.server.close();
             this.server = null;
@@ -155,14 +149,17 @@ class ArmedFiltersSurviveReloadTest {
         var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
                 .connectTimeout(Duration.ofSeconds(5)).build();
 
-        Http2StreamHandler.beforeDispatch = () -> {
-            entered.countDown();
-            try {
-                assertTrue(release.await(15, TimeUnit.SECONDS));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        ((Http2Server) this.server.h2()).instrumentForTest(new DispatchHooks() {
+            @Override
+            public void beforeDispatch() {
+                entered.countDown();
+                try {
+                    assertTrue(release.await(15, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
-        };
+        });
         try {
             var future = client.sendAsync(
                     HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + h2c + "/api/hold"))
@@ -182,7 +179,7 @@ class ArmedFiltersSurviveReloadTest {
             assertEquals("held-ok", response.body());
             assertEquals(1, upstreamEntered.get());
         } finally {
-            Http2StreamHandler.beforeDispatch = null;
+            ((Http2Server) this.server.h2()).instrumentForTest(DispatchHooks.NONE);
         }
     }
 
@@ -191,11 +188,15 @@ class ArmedFiltersSurviveReloadTest {
     void apiKeySurvivesReloadOverH2Tls() throws Exception {
         var www = Files.createDirectories(this.dir.resolve("www-tls"));
         Files.writeString(www.resolve("hello.txt"), "hello");
+        var cert = this.dir.resolve("bench-cert.pem");
+        var key = this.dir.resolve("bench-key.pem");
+        mintLocalhostPem(cert, key);
         var yaml = this.dir.resolve("sjws-tls.yaml");
         writeStatic(yaml, www);
 
         var loaded = ConfigLoader.load(new String[] {
-                "--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3"}, Map.of());
+                "--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0", "--no-h3",
+                "--cert=" + cert, "--key=" + key}, Map.of());
         assertTrue(loaded.ok(), loaded.errors().toString());
         this.server = SjwsServer.start(loaded);
 
@@ -207,7 +208,32 @@ class ArmedFiltersSurviveReloadTest {
                         FilterScope.all()))));
 
         int h2 = ((Http2Server) this.server.h2()).port();
-        var client = trustAllH2Client();
+        var client = pinnedTrustClient(cert);
+
+        // Empty / default truststore must reject the bench self-signed cert (proves trust is real).
+        var untrusted = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
+                .connectTimeout(Duration.ofSeconds(5)).build();
+        try {
+            getTls(untrusted, h2, "/hello.txt", "secret");
+            throw new AssertionError("default truststore must fail handshake against bench cert");
+        } catch (java.io.IOException | java.io.UncheckedIOException expected) {
+            // javax.net.ssl.SSLHandshakeException wrapped as IOException
+        }
+        var emptyKs = java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType());
+        emptyKs.load(null, null);
+        var emptyTmf = javax.net.ssl.TrustManagerFactory.getInstance(
+                javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+        emptyTmf.init(emptyKs);
+        var emptyCtx = SSLContext.getInstance("TLS");
+        emptyCtx.init(null, emptyTmf.getTrustManagers(), null);
+        var emptyClient = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
+                .sslContext(emptyCtx).connectTimeout(Duration.ofSeconds(5)).build();
+        try {
+            getTls(emptyClient, h2, "/hello.txt", "secret");
+            throw new AssertionError("empty truststore must fail handshake against bench cert");
+        } catch (java.io.IOException | java.io.UncheckedIOException expected) {
+            // real PKIX rejection — no trusted anchors
+        }
 
         assertEquals(401, getTls(client, h2, "/hello.txt", null).statusCode(), "api-key before reload (TLS)");
         assertEquals(200, getTls(client, h2, "/hello.txt", "secret").statusCode());
@@ -281,14 +307,17 @@ class ArmedFiltersSurviveReloadTest {
 
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        Http1FallbackHandler.beforeDispatch = () -> {
-            entered.countDown();
-            try {
-                assertTrue(release.await(15, TimeUnit.SECONDS));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        ((Http2Server) this.server.h2()).instrumentForTest(new DispatchHooks() {
+            @Override
+            public void beforeDispatch() {
+                entered.countDown();
+                try {
+                    assertTrue(release.await(15, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
-        };
+        });
 
         int h2c = ((Http2Server) this.server.h2()).h2cPort();
         var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
@@ -314,14 +343,34 @@ class ArmedFiltersSurviveReloadTest {
     }
 
 
-    private static HttpClient trustAllH2Client() throws Exception {
-        var tm = new X509TrustManager() {
-            public void checkClientTrusted(X509Certificate[] c, String a) {}
-            public void checkServerTrusted(X509Certificate[] c, String a) {}
-            public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-        };
+    private static void mintLocalhostPem(Path cert, Path key) throws Exception {
+        var pb = new ProcessBuilder("openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", key.toString(), "-out", cert.toString(),
+                "-days", "1", "-nodes", "-subj", "/CN=localhost",
+                "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1");
+        pb.redirectErrorStream(true);
+        var proc = pb.start();
+        var out = new String(proc.getInputStream().readAllBytes());
+        if (proc.waitFor() != 0) {
+            throw new IllegalStateException("openssl failed: " + out);
+        }
+    }
+
+    /** Trusts only the bench PEM (hostname/SAN verified by the default PKIX path). */
+    private static HttpClient pinnedTrustClient(Path pem) throws Exception {
+        var certs = java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificates(new java.io.ByteArrayInputStream(Files.readAllBytes(pem)));
+        var ks = java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType());
+        ks.load(null, null);
+        int i = 0;
+        for (var c : certs) {
+            ks.setCertificateEntry("bench-" + (i++), c);
+        }
+        var tmf = javax.net.ssl.TrustManagerFactory.getInstance(
+                javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(ks);
         var ctx = SSLContext.getInstance("TLS");
-        ctx.init(null, new TrustManager[] {tm}, null);
+        ctx.init(null, tmf.getTrustManagers(), null);
         return HttpClient.newBuilder().version(HttpClient.Version.HTTP_2).sslContext(ctx)
                 .connectTimeout(Duration.ofSeconds(5)).build();
     }

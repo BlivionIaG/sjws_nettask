@@ -51,15 +51,12 @@ import sjws_nettask.http1.Http1Writer;
  * deferred snapshot close waits for fallback work too (B2 / #301). This is not the main HTTP/1.1
  * server ({@code Http1Connection}), which is untouched by HTTP/2.
  */
-final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
-
-    /** Test-only: runs in {@link Task#run} before the handler (B2). Production never sets it. */
-    static volatile Runnable beforeDispatch;
+class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
 
     /** Pipelined requests decoded in the same read as one being served (they are answered in order). */
     static final int MAX_PIPELINED = 16;
 
-    private final Http2Server.Shared shared;
+    final Http2Server.Shared shared;
     private final java.util.ArrayDeque<Task> pending = new java.util.ArrayDeque<>(); // event loop only
     private boolean busy; // event loop only
 
@@ -126,12 +123,17 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
             return;
         }
         try {
-            this.shared.executor().execute(task);
+            executeTask(task);
         } catch (RejectedExecutionException e) {
             this.shared.inflight().release();
             generation.leave();
             task.channel.close();
         }
+    }
+
+    /** Submits the Task. Overridden by {@link HookedHttp1FallbackHandler} for beforeDispatch. */
+    void executeTask(Runnable task) {
+        this.shared.executor().execute(task);
     }
 
     /** 503 with Retry-After, then the connection closes (server busy). */
@@ -198,10 +200,6 @@ final class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpReq
             this.channel.closeFuture().addListener(interrupt);
             ResponseWriter.Outcome outcome = ResponseWriter.Outcome.FAILED;
             try {
-                var gate = beforeDispatch;
-                if (gate != null) {
-                    gate.run();
-                }
                 Response response;
                 try {
                     response = this.refusal != null ? this.refusal

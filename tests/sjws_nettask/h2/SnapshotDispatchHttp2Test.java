@@ -55,9 +55,6 @@ class SnapshotDispatchHttp2Test {
 
     @AfterEach
     void stop() {
-        Http2StreamHandler.beforeDispatch = null;
-        Http2StreamHandler.afterHeadersCapture = null;
-        Http2StreamHandler.afterGenerationRead = null;
         if (this.server != null) {
             this.server.close();
             this.server = null;
@@ -93,14 +90,17 @@ class SnapshotDispatchHttp2Test {
         this.server.armHandler(gen1, false);
         assertFalse(this.server.attachBodies());
 
-        Http2StreamHandler.beforeDispatch = () -> {
-            entered.countDown();
-            try {
-                assertTrue(release.await(10, TimeUnit.SECONDS));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        this.server.instrumentForTest(new DispatchHooks() {
+            @Override
+            public void beforeDispatch() {
+                entered.countDown();
+                try {
+                    assertTrue(release.await(10, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
-        };
+        });
 
         byte[] payload = "abcd".getBytes(StandardCharsets.UTF_8);
         try (var h2 = new RawH2(this.server.h2cPort(), 65535)) {
@@ -160,14 +160,17 @@ class SnapshotDispatchHttp2Test {
         this.server.armHandler(gen1, false);
         assertFalse(this.server.attachBodies());
 
-        Http2StreamHandler.afterHeadersCapture = () -> {
-            entered.countDown();
-            try {
-                assertTrue(release.await(10, TimeUnit.SECONDS));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        this.server.instrumentForTest(new DispatchHooks() {
+            @Override
+            public void afterHeadersCapture() {
+                entered.countDown();
+                try {
+                    assertTrue(release.await(10, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
-        };
+        });
 
         byte[] payload = "abcd".getBytes(StandardCharsets.UTF_8);
         try (var h2 = new RawH2(this.server.h2cPort(), 65535)) {

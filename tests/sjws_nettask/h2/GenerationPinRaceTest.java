@@ -49,9 +49,6 @@ class GenerationPinRaceTest {
 
     @AfterEach
     void stop() {
-        Http2StreamHandler.afterGenerationRead = null;
-        Http2StreamHandler.afterHeadersCapture = null;
-        Http2StreamHandler.beforeDispatch = null;
         if (this.server != null) {
             this.server.close();
             this.server = null;
@@ -107,13 +104,19 @@ class GenerationPinRaceTest {
         this.server.armHandler(gen1, false);
 
         AtomicReference<Http2Server.Generation> raced = new AtomicReference<>();
-        Http2StreamHandler.afterGenerationRead = () -> {
-            Http2StreamHandler.afterGenerationRead = null; // once — avoid retiring the retry generation
-            var previous = this.server.generation();
-            raced.set(previous);
-            this.server.armHandler(gen2, false);
-            previous.whenQuiesced(() -> closedGen1.set(true));
-        };
+        var once = new AtomicBoolean();
+        this.server.instrumentForTest(new DispatchHooks() {
+            @Override
+            public void afterGenerationRead() {
+                if (!once.compareAndSet(false, true)) {
+                    return;
+                }
+                var previous = GenerationPinRaceTest.this.server.generation();
+                raced.set(previous);
+                GenerationPinRaceTest.this.server.armHandler(gen2, false);
+                previous.whenQuiesced(() -> closedGen1.set(true));
+            }
+        });
 
         try (var h2 = new RawH2(this.server.h2cPort(), 65535)) {
             h2.get(1, "/a.txt");
