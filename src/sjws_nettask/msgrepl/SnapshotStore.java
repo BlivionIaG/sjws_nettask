@@ -54,6 +54,9 @@ final class SnapshotStore {
 
     private final Path root;
     private final ReentrantLock lock = new ReentrantLock();
+
+    /** Test-only: run after each segment hard-link, before cut sizing (#288 Codex 4420344746). */
+    static volatile Runnable afterSegmentLink;
     /** topic to index to pin; guarded by {@link #lock}. */
     private final Map<String, TreeMap<Long, Pin>> pins = new HashMap<>();
     /** inode key to chunk digests; only touched by the topic's snapshotter (one thread per replica at a time). */
@@ -168,15 +171,16 @@ final class SnapshotStore {
                 } catch (NoSuchFileException none) {
                     // not compacted
                 }
+                var afterLink = afterSegmentLink;
+                if (afterLink != null) afterLink.run();
                 long bytes;
                 long next = Math.min(f.nextOffset(), endOffset);
                 if (endOffset >= f.nextOffset() && !f.active()) {
                     bytes = Files.size(link); // a sealed file wholly inside the snapshot: whichever version was linked
-                } else if (f.active()) {
-                    bytes = log.positionOf(f.baseOffset(), endOffset); // the active file is never swapped: same inode
-                    if (bytes < 0) bytes = cutPosition(link, endOffset);
                 } else {
-                    bytes = cutPosition(link, endOffset); // sealed (maybe compacted) holding the cut: scan the link itself
+                    // Active or sealed cut: always scan the pinned inode. The live active segment may roll and
+                    // compact after createLink; positionOf would then read the replacement file (#288 Codex 4420344746).
+                    bytes = cutPosition(link, endOffset);
                 }
                 if (bytes < 0) throw new IOException("no frame boundary at " + endOffset + " in segment " + f.baseOffset());
                 // Cut inside a compacted segment: keep a marker bounded to the snapshot end so recover()

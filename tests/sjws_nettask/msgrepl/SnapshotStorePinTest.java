@@ -124,4 +124,64 @@ class SnapshotStorePinTest {
                     "incomplete coverage must not publish");
         }
     }
+
+    /**
+     * #288 Codex 4420344746: after hard-linking the active segment, a roll+compaction can replace the live
+     * inode; cut sizing must scan the pinned link, not {@code log.positionOf} on the replacement.
+     */
+    @Test
+    void activeCutUsesPinnedInodeNotLivePosition() throws Exception {
+        byte[] rec = "r0".getBytes(StandardCharsets.UTF_8);
+        long frameBytes;
+        try (var probe = SegmentedLog.open(dir.resolve("probe"), 1 << 20)) {
+            probe.append(List.of(rec), 0);
+            probe.force();
+            frameBytes = Files.size(probe.segmentFiles().getFirst().file());
+        }
+        // Exactly three frames fill the segment; the next append seals without writing into that inode.
+        long segBytes = frameBytes * 3;
+        try (var log = SegmentedLog.open(dir.resolve("active-cut"), segBytes)) {
+            for (int i = 0; i < 3; i++) {
+                log.append(List.of(("r" + i).getBytes(StandardCharsets.UTF_8)), i);
+            }
+            log.force();
+            assertEquals(1, log.segmentFiles().size());
+            assertTrue(log.segmentFiles().getFirst().active());
+            assertEquals(3, log.nextOffset());
+            long linkSizeBefore = Files.size(log.segmentFiles().getFirst().file());
+            var store = new SnapshotStore(dir.resolve("active-cut-snap"));
+            SnapshotStore.afterSegmentLink = () -> {
+                try {
+                    log.append(List.of("r3".getBytes(StandardCharsets.UTF_8)), 3); // rolls: sealed inode unchanged
+                    log.force();
+                    assertTrue(Files.size(log.segmentFiles().getFirst().file()) == linkSizeBefore
+                            || !log.segmentFiles().getFirst().active());
+                    log.prepareCompaction(0, o -> o == 2);
+                    log.commitCompaction(0);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            };
+            try {
+                var snap = store.pin("t", log, 1, 1, 3, 0, List.of(), MsgSnapshot.MIN_CHUNK);
+                assertNotNull(snap);
+                assertEquals(3, snap.endOffset());
+                var seg = snap.segments().getFirst();
+                assertEquals(0, seg.base());
+                assertEquals(3, seg.next());
+                var pinned = dir.resolve("active-cut-snap").resolve("t").resolve("1").resolve(SnapshotStore.name(0));
+                var cut = Files.readAllBytes(pinned);
+                var staged = dir.resolve("active-cut-staged");
+                Files.createDirectories(staged);
+                Files.write(staged.resolve(SnapshotStore.name(0)), java.util.Arrays.copyOf(cut, (int) seg.bytes()));
+                try (var installed = SegmentedLog.open(dir.resolve("active-cut-installed"), segBytes)) {
+                    installed.replaceWith(staged);
+                    assertEquals(3, installed.nextOffset(), "pinned three-frame image must survive reopen");
+                }
+            } finally {
+                SnapshotStore.afterSegmentLink = null;
+            }
+        }
+    }
+
 }
