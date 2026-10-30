@@ -54,6 +54,7 @@ class ArmedFiltersSurviveReloadTest {
 
     @AfterEach
     void stop() {
+        Http2StreamHandler.beforeDispatch = null;
         if (this.server != null) {
             this.server.close();
             this.server = null;
@@ -113,18 +114,14 @@ class ArmedFiltersSurviveReloadTest {
 
     @Test
     void pinnedProxyRequestSurvivesReloadUntilItFinishes() throws Exception {
-        var holding = new CountDownLatch(1);
+        // Gate BEFORE the pinned handler runs so UpstreamPool.acquire happens after reload.
+        // Without P2b, publish closes the old pools and acquire fails with 502.
+        var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         var upstreamEntered = new AtomicInteger();
         this.upstream = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
         this.upstream.createContext("/hold", exchange -> {
             upstreamEntered.incrementAndGet();
-            holding.countDown();
-            try {
-                assertTrue(release.await(15, TimeUnit.SECONDS));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
             byte[] body = "held-ok".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
@@ -147,21 +144,35 @@ class ArmedFiltersSurviveReloadTest {
         var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
                 .connectTimeout(Duration.ofSeconds(5)).build();
 
-        var future = client.sendAsync(
-                HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + h2c + "/api/hold"))
-                        .timeout(Duration.ofSeconds(20)).GET().build(),
-                HttpResponse.BodyHandlers.ofString());
-        assertTrue(holding.await(10, TimeUnit.SECONDS), "upstream must see the pinned request");
+        Http2StreamHandler.beforeDispatch = () -> {
+            entered.countDown();
+            try {
+                assertTrue(release.await(15, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        try {
+            var future = client.sendAsync(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + h2c + "/api/hold"))
+                            .timeout(Duration.ofSeconds(20)).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertTrue(entered.await(10, TimeUnit.SECONDS), "Task must reach the dispatch gate");
 
-        // Reload swaps the snapshot; without P2b the old pools close and the in-flight proxy gets 502.
-        writeProxy(yaml, www, base);
-        assertTrue(this.server.reload().applied());
+            var www2 = Files.createDirectories(this.dir.resolve("www2"));
+            Files.writeString(www2.resolve("index.html"), "static2");
+            writeProxy(yaml, www2, base);
+            assertTrue(this.server.reload().applied());
 
-        release.countDown();
-        var response = future.get(15, TimeUnit.SECONDS);
-        assertEquals(200, response.statusCode(), "pinned generation must still use its upstream pools");
-        assertEquals("held-ok", response.body());
-        assertEquals(1, upstreamEntered.get());
+            release.countDown();
+            var response = future.get(15, TimeUnit.SECONDS);
+            assertEquals(200, response.statusCode(),
+                    "pinned generation must still acquire on its upstream pools after reload");
+            assertEquals("held-ok", response.body());
+            assertEquals(1, upstreamEntered.get());
+        } finally {
+            Http2StreamHandler.beforeDispatch = null;
+        }
     }
 
     private static void writeStatic(Path yaml, Path www) throws Exception {
