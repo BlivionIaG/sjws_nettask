@@ -17,6 +17,7 @@
 package sjws_nettask.cp;
 
 import java.io.IOException;
+import sjws_nettask.observe.ServerMetrics;
 import java.io.PrintStream;
 import java.net.InetSocketAddress;
 import java.time.Duration;
@@ -49,6 +50,8 @@ public final class CpHost implements CpReloadable {
     private final List<String> events = new CopyOnWriteArrayList<>();
     final List<TlsReload> tlsReloads = new CopyOnWriteArrayList<>();
     private CpStore store;
+    /** Live when the store is open (#259); zero-cost when CP is off (host not started). */
+    private final ServerMetrics metrics = new ServerMetrics();
     private sjws_nettask.cluster.ClusterTransport transport;
     private AutoCloseable watch;
     private AutoCloseable admin;
@@ -100,6 +103,8 @@ public final class CpHost implements CpReloadable {
                     CpLaunch.nodeId(self), CpLaunch.voters(config), transport);
         }
         store.start();
+        // #259: sjws_cp_idempotency_evicted_total tracks the store's eviction counter while CP is on.
+        metrics.setCpIdempotencyEvictions(store::idempotencyEvictions);
         store.warnInlineSecretsAtStartup();
         events.add("store");
         if (keys.insecurePermissions()) {
@@ -169,6 +174,14 @@ public final class CpHost implements CpReloadable {
     /** The store, for tests and status. */
     public CpStore store() {
         return store;
+    }
+
+    /**
+     * Process metrics for this control host (#259). Includes {@code sjws_cp_idempotency_evicted_total} once the store
+     * is open. Creating the host is what turns the series on; a process without CP never constructs {@link CpHost}.
+     */
+    public ServerMetrics metrics() {
+        return metrics;
     }
 
     /** {@code /readyz} plus {@code leaderReady()}; a follower is never ready by design (NodeLifecycle). */

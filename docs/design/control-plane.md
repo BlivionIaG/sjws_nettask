@@ -172,7 +172,7 @@ The state machine, applied in index order on the group's delivery thread (`raft-
 
 As built, the log carries `Propose`, signed `Activate` and `Rollback`, `Rbac`, `Revoke`, rollout and advance entries, idempotency wrappers, and join issue and consume entries. The Idempotency-Key used-key map is bounded (#259, §12.8.1). Audit lines are written per voter to `<stateDir>/audit.jsonl` and are not replicated.
 
-Designed, not wired: `SnapshotControl.take` / `install` / `truncateAndCompact` compact the log to the latest activated snapshot plus the live registration table. Compaction runs off the request path, on the group's delivery thread, past an index that is both snapshotted and acked. The compactor keeps the latest value per key (current desired snapshot, denylist, registrations). History required for rollback is retained for a configured number of activated versions (default 8) inside the snapshot payload, then dropped. As built, `cp-config` keeps its whole log, and the history of 8 activated versions is held in `CpStore` memory.
+Designed, not wired: `SnapshotControl.take` / `install` / `truncateAndCompact` compact the log to the latest activated snapshot plus the live registration table (including the bounded Idempotency-Key table, #259). Compaction runs off the request path, on the group's delivery thread, past an index that is both snapshotted and acked. The compactor keeps the latest value per key (current desired snapshot, denylist, registrations). History required for rollback is retained for a configured number of activated versions (default 8) inside the snapshot payload, then dropped. **As built, `cp-config` never takes or installs an application Raft snapshot:** `CpGroup.options()` uses `GroupOptions.NO_AUTO_SNAPSHOT` (`src/sjws_nettask/cp/CpGroup.java`), `CpStore` sets no `SnapshotTaker` on `openGroup` (`CpStore.attach`), and nothing under `sjws_nettask.cp` calls `truncateAndCompact`. A lagging or restarted replica always rebuilds applied state by replaying the full log from index 1. The versioned `IdempotencyTable.write` / `read` encoding is the seam that future compaction will carry.
 
 Membership changes of the voters use `ReplicationGroup.changeMembership` (joint consensus). Learners are non-voting (§11).
 
@@ -738,9 +738,9 @@ Every admin mutation that carries an `Idempotency-Key` is wrapped in the log. On
 
 **Replicated bounds.** `WINDOW` and `MAX_KEYS` are constants of the state machine (like the messaging producer table), written into every versioned table snapshot. A snapshot with another window or cap is refused on install. They are not local startup properties: two replicas of the same build always agree.
 
-**Snapshot.** `CpStore.snapshotIdempotency` / `installIdempotencySnapshot` encode the surviving entries at the current applied index plus the bounds and the eviction counter. Install replaces the map; it does not merge. Full Raft `SnapshotTaker` compaction of all `CpStore` state remains designed, not wired (§4); the idempotency encoding is the seam that compaction will carry.
+**Snapshot.** As built, replicas never receive a CP Raft snapshot (§4): they replay the full `cp-config` log, so eviction stays deterministic without install. `CpStore.snapshotIdempotency` / `installIdempotencySnapshot` still encode the surviving entries plus bounds and the eviction counter (install replaces; no merge) so a future `SnapshotTaker` can carry them.
 
-**Metric.** `CpStore.idempotencyEvictions()` counts window and cap drops (Prometheus name `sjws_cp_idempotency_evicted_total` when attached to `ServerMetrics`).
+**Metric.** `CpStore.idempotencyEvictions()` counts window and cap drops. `CpHost` attaches it to a process `ServerMetrics` at store open (`sjws_cp_idempotency_evicted_total`). Content servers can attach the same supplier via `SjwsServer.attachCpIdempotencyEvictions` / `ObserverSlot`. The series stays at 0 when CP is off (no `CpHost`, no attach).
 
 ### 12.9 Audit
 

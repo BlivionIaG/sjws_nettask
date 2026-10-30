@@ -51,6 +51,8 @@ public final class ObserverSlot {
     private volatile LongSupplier msgreplInstallPinExhausted;
     /** Copied onto the recording observer's metrics. Not read by {@link #get()}. */
     private volatile LongSupplier msgreplInstallOversizedAbandoned;
+    /** Copied onto the recording observer's metrics (#259). Not read by {@link #get()}. */
+    private volatile LongSupplier cpIdempotencyEvictions;
 
     public ObserverSlot(RequestObserver initial) {
         this.current = initial == null ? RequestObserver.NONE : initial;
@@ -114,6 +116,18 @@ public final class ObserverSlot {
         }
     }
 
+    /**
+     * CP Idempotency-Key eviction counter (#259). Null resets to 0. Stored on the slot and copied onto a recording
+     * observer in {@link #arm}/{@link #set}; never mutates {@link RequestObserver#NONE}.
+     */
+    public void attachCpIdempotencyEvictions(LongSupplier evictions) {
+        this.cpIdempotencyEvictions = evictions;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.metrics().setCpIdempotencyEvictions(evictions);
+        }
+    }
+
     /** Replaces the observer. Used before the listeners accept. */
     public void set(RequestObserver observer) {
         var next = observer == null ? RequestObserver.NONE : observer;
@@ -130,6 +144,7 @@ public final class ObserverSlot {
         observer.setCredentialQueryParams(this.credentialQueryParams);
         observer.metrics().setMsgreplInstallCounters(this.msgreplInstallPinExhausted,
                 this.msgreplInstallOversizedAbandoned);
+        observer.metrics().setCpIdempotencyEvictions(this.cpIdempotencyEvictions);
     }
 
     /**

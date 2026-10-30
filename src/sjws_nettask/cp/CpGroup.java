@@ -32,8 +32,15 @@ public final class CpGroup {
     private CpGroup() {
     }
 
-    /** Election 100 ms, heartbeat 40 ms (lease 80 ms). {@link CpTiming#check} runs against these at startup. */
+    /**
+     * Election 100 ms, heartbeat 40 ms (lease 80 ms). {@link CpTiming#check} runs against these at startup.
+     * Automatic Raft snapshots are off ({@link GroupOptions#NO_AUTO_SNAPSHOT}): there is no {@code SnapshotTaker}
+     * for {@link CpStore} yet (control-plane.md §4, #259 follow-up), so a lagging or restarted replica always
+     * catches up by replaying the full {@code cp-config} log. Enabling {@code snapshotEveryEntries} without a
+     * taker would advance {@code snapIndex} with a payload image that {@code CpStore} does not restore.
+     */
     public static GroupOptions options() {
-        return new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40), 10_000);
+        return new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40),
+                GroupOptions.NO_AUTO_SNAPSHOT);
     }
 }
