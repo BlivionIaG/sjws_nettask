@@ -269,9 +269,16 @@ class MsgSnapshotClusterTest {
         assertTrue(Files.exists(c.data[f].root.resolve("msgrepl").resolve("apply").resolve("t.install")));
         c.data[f].close();
         c.data[f].open();
+        // Install redo runs on a virtual thread and backs off with real Thread.sleep. After a crash past
+        // replaceWith the ledger end is already at {@code end}, so awaitEnd would return before pending
+        // clears. Pump the sim and yield wall time (same pattern as divergentPinRetriesAreBoundedAndSurfaced).
+        for (int k = 0; k < 50_000 && c.data[f].replica.installPending(); k++) {
+            c.step();
+            Thread.sleep(0, 100_000);
+        }
+        assertFalse(c.data[f].replica.installPending(),
+                "install should finish after restart; end=" + c.data[f].end() + " want=" + end);
         c.awaitEnd(f, end);
-        for (int k = 0; k < 2000 && c.data[f].replica.installPending(); k++) c.step();
-        assertFalse(c.data[f].replica.installPending());
         assertEquals(c.checksum(l, 0), c.checksum(f, 0));
         assertTrue(c.data[f].dedup.duplicate("pid1", 60));
         end = produce("pid1", 70, 2);

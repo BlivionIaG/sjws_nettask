@@ -124,12 +124,20 @@ class MessagingSnapshotTest {
         return f.get(10, TimeUnit.SECONDS);
     }
 
+    /**
+     * Steps the FakeClock cluster until {@code ok} is true. Evaluates {@code ok} at most once per iteration and
+     * asserts that last result — do not re-call {@code ok} after the loop. Retention's predicate calls
+     * {@link LogTopics#enforceRetention()}, which can propose another cut; a second evaluation in the assert
+     * raced the async apply and flaked as "the same segments deleted on both" under load.
+     */
     void until(java.util.function.BooleanSupplier ok, String what) throws Exception {
-        for (int k = 0; k < 20_000 && !ok.getAsBoolean(); k++) {
+        boolean ready = false;
+        // 50k: loaded boxes need more FakeClock steps for pending dropBelow to land on both replicas.
+        for (int k = 0; k < 50_000 && !(ready = ok.getAsBoolean()); k++) {
             step();
             Thread.sleep(0, 100_000);
         }
-        assertTrue(ok.getAsBoolean(), what);
+        assertTrue(ready, what);
     }
 
     void cut(int i) {
@@ -244,6 +252,21 @@ class MessagingSnapshotTest {
         }
     }
 
+    /** Flushes {@code pendingDrops} without proposing a new cut (enforceRetention would). */
+    void flushPendingDrops(LogTopics t) throws Exception {
+        var maint = LogTopics.class.getDeclaredField("maintenance");
+        maint.setAccessible(true);
+        var lock = (java.util.concurrent.locks.ReentrantLock) maint.get(t);
+        var apply = LogTopics.class.getDeclaredMethod("applyPendingDrops");
+        apply.setAccessible(true);
+        lock.lock();
+        try {
+            apply.invoke(t);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     @Test
     void retentionPassIsOneReplicatedCut() throws Exception {
         start(new LogRetention(4096, 0));
@@ -253,21 +276,37 @@ class MessagingSnapshotTest {
         final int foll = 1 - lead;
         until(() -> safeEnd(foll, "t") >= 120, "follower at 120");
         assertEquals(0, topics.get(foll).enforceRetention(), "a follower proposes nothing");
-        topics.get(lead).enforceRetention();
         var lr = topics.get(lead).get("t", false).replica();
         var fr = topics.get(foll).get("t", false).replica();
-        until(() -> lr.logStartOffset() > 0 && fr.logStartOffset() == lr.logStartOffset(), "the cut applied on both");
-        until(() -> {
-            try {
-                topics.get(foll).enforceRetention(); // applies any cut left pending behind a maintenance pass
-                topics.get(lead).enforceRetention();
-                return topics.get(lead).get("t", false).log().startOffset() == topics.get(foll).get("t", false).log().startOffset()
-                        && topics.get(lead).get("t", false).log().startOffset() > 0;
-            } catch (Exception e) {
-                return false;
-            }
-        }, "the same segments deleted on both");
-        assertTrue(topics.get(lead).get("t", false).log().totalBytes() <= 4096 + 2048);
+        // Each enforceRetention on the leader may propose another cut while bytes stay over the
+        // limit. Under load, calling it every until-iteration leapfrogs the follower's dropBelow and
+        // flakes as "the same segments deleted on both". Settle one cut fully (logical + physical on
+        // both) before proposing the next.
+        boolean within = false;
+        for (int round = 0; round < 30 && !within; round++) {
+            topics.get(lead).enforceRetention(); // at most one new proposal per round
+            // Sync apply during enforceRetention can leave dropBelow pending; flush without proposing.
+            flushPendingDrops(topics.get(lead));
+            flushPendingDrops(topics.get(foll));
+            until(() -> {
+                try {
+                    flushPendingDrops(topics.get(lead));
+                    flushPendingDrops(topics.get(foll));
+                    long ls = lr.logStartOffset(), fs = fr.logStartOffset();
+                    if (ls <= 0 || ls != fs) return false;
+                    long lp = topics.get(lead).get("t", false).log().startOffset();
+                    long fp = topics.get(foll).get("t", false).log().startOffset();
+                    return lp == ls && fp == fs;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, "cut settled on both after retention round " + round);
+            within = topics.get(lead).get("t", false).log().totalBytes() <= 4096 + 2048;
+        }
+        assertTrue(within, "leader bytes within retention after settled cuts");
+        assertEquals(topics.get(lead).get("t", false).log().startOffset(),
+                topics.get(foll).get("t", false).log().startOffset(), "the same segments deleted on both");
+        assertTrue(topics.get(lead).get("t", false).log().startOffset() > 0);
     }
 
     /** #288 MC-B1: fetch uses max(physical start, replica.logStartOffset()), even when bytes remain on disk. */
