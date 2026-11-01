@@ -1,16 +1,23 @@
 name: Release
 
 # Push a tag `vX.Y.Z` (or `vX.Y.Z-rc.N`) to build, verify and publish a GitHub Release.
-# See docs/operations/releasing.md.
+# workflow_dispatch is dry-run only: build + package on ubuntu-latest, never create a release.
+# See docs/operations/releasing.md and #413.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Maven version for the dry-run package (no GitHub Release is created)'
+        type: string
+        default: '0.0.0-dryrun'
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -18,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      contents: write # create the release and upload assets
+      contents: write # create the release and upload assets (tag pushes only)
     steps:
       - uses: actions/checkout@v7
         with:
@@ -28,17 +35,40 @@ jobs:
           distribution: temurin
           java-version: '25'
           cache: maven
+      - name: Install Prometheus
+        run: |
+          ver=3.15.0
+          curl -fsSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz"
+          tar -C /tmp -xzf /tmp/prometheus.tar.gz
+          echo "PROMTOOL=/tmp/prometheus-${ver}.linux-amd64/promtool" >> "$GITHUB_ENV"
+          echo "PROMETHEUS=/tmp/prometheus-${ver}.linux-amd64/prometheus" >> "$GITHUB_ENV"
 
-      - name: Derive version from tag
+      - name: Derive version from tag or dry-run input
         id: v
         run: |
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+            if [ -z "$version" ]; then
+              echo "::error::workflow_dispatch requires inputs.version"
+              exit 1
+            fi
+            if [[ "$version" == v* ]]; then
+              echo "::error::pass the Maven version without a leading v (got $version)"
+              exit 1
+            fi
+            tag="v${version}"
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          else
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+          echo "Release mode: event=${{ github.event_name }} tag=$tag version=$version dry_run=$( [ "${{ github.event_name }}" = workflow_dispatch ] && echo true || echo false )"
 
-      # The pom keeps a -SNAPSHOT version on master; the tag decides the released version.
+      # The pom keeps a -SNAPSHOT version on master; the tag (or dry-run input) decides the version.
       - name: Set project version
         run: mvn -B -q versions:set -DnewVersion="${{ steps.v.outputs.version }}" -DgenerateBackupPoms=false
 
@@ -60,8 +90,33 @@ jobs:
           cp "target/$name.jar" dist/
           (cd dist && sha256sum "$name.tar.gz" "$name.zip" "$name.jar" > SHA256SUMS)
           echo "name=$name" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Distribution"
+            echo
+            if [ "${{ steps.v.outputs.dry_run }}" = true ]; then
+              echo "- mode: dry-run (no GitHub Release)"
+            else
+              echo "- mode: publish"
+            fi
+            echo "- version: \`${{ steps.v.outputs.version }}\`"
+            echo "- artifacts: \`$name.tar.gz\`, \`$name.zip\`, \`$name.jar\`, \`SHA256SUMS\`"
+            ls -lh "dist/$name.tar.gz" "dist/$name.zip" "dist/$name.jar" dist/SHA256SUMS
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload dry-run artifacts
+        if: steps.v.outputs.dry_run == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dryrun-${{ steps.v.outputs.version }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.jar
+            dist/SHA256SUMS
+          if-no-files-found: error
 
       - name: Publish GitHub Release
+        if: steps.v.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
