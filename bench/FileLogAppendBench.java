@@ -19,7 +19,8 @@ public class FileLogAppendBench {
         var group = new GroupId("bench/flog");
         var payload = new byte[bytes];
         ThreadLocalRandom.current().nextBytes(payload);
-        try (var log = new FileLogStorage(dir)) {
+        var log = new FileLogStorage(dir);
+        try {
             long warmUntil = System.nanoTime() + (long) (1.0 * 1_000_000_000L);
             long index = 1;
             while (System.nanoTime() < warmUntil) {
@@ -30,8 +31,7 @@ public class FileLogAppendBench {
                 index++;
             }
             log.force(group);
-            long start = System.nanoTime();
-            long end = start + (long) (secs * 1_000_000_000L);
+            long end = System.nanoTime() + (long) (secs * 1_000_000_000L);
             long counted = 0;
             long t0 = System.nanoTime();
             while (System.nanoTime() < end) {
@@ -47,6 +47,8 @@ public class FileLogAppendBench {
             double ops = counted / elapsed;
             System.out.printf("filelog-append bytes=%d forceEvery=%d ops/s=%.1f n=%d secs=%.3f%n",
                     bytes, forceEvery, ops, counted, elapsed);
+        } finally {
+            log.close();
         }
     }
 }
