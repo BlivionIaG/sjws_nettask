@@ -51,6 +51,8 @@ taskset -c "$SRV_CPUS" nice -n 10 java -XX:+UseZGC $HEAP \
   -jar "$JAR" --config="$WD/gate-server.yaml" --metrics=localhost "$PORT" "$WD/site" >"$LOG" 2>&1 &
 SPID=$!
 export SERVER_PID=$SPID
+# Own PIDs for foreign-CPU sampler (07:05 addendum): server + this one.sh shell.
+{ echo "$$"; echo "$SPID"; } > "$WD/bench.pids"
 cleanup(){ kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true; }
 trap cleanup EXIT
 ok=0
@@ -73,7 +75,10 @@ if [ "$LOADGEN" = java ]; then
     ${LEAN_HTTP_FLAG:-} \
     --out "$OUT" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
     --server-pid "$SPID" \
-    --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}"
+    --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}" &
+  GENPID=$!
+  echo "$GENPID" >> "$WD/bench.pids"
+  wait "$GENPID"
 else
   export PYTHONPATH="$(cd "$(dirname "$0")/../.." && pwd)/sdk/python${PYTHONPATH:+:$PYTHONPATH}"
   DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
@@ -81,7 +86,10 @@ else
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
     --groups "$GATE_GROUPS" \
-    --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}"
+    --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" &
+  GENPID=$!
+  echo "$GENPID" >> "$WD/bench.pids"
+  wait "$GENPID"
 fi
 
 # Architecture 2026-10-30 15:13: writer_count + heap_flags into result.json

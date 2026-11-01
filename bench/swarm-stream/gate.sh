@@ -26,21 +26,41 @@ if [ "${SKIP_FLOCK:-0}" != 1 ]; then
   flock 9
 fi
 echo "gate phase=$PHASE start $(date -Is) load=$(cat /proc/loadavg) streams=$STREAMS groups=$GATE_GROUPS" | tee -a "$OUT/gate.log"
+# 07:05 addendum: start gate load1 < 3 (also rechecked before every leg).
 LOAD_PRE=$(awk '{print $1}' /proc/loadavg)
-python3 -c "import sys; sys.exit(0 if float('$LOAD_PRE') < 4.0 else 1)" || {
-  echo "gate: pre-start load1=$LOAD_PRE >= 4 — refuse" | tee -a "$OUT/gate.log"
+python3 -c "import sys; sys.exit(0 if float('$LOAD_PRE') < 3.0 else 1)" || {
+  echo "gate: pre-start load1=$LOAD_PRE >= 3 — refuse" | tee -a "$OUT/gate.log"
   exit 3
 }
 
 run_one() {
   local jar=$1 arm=$2 accept=$3 credit_off=$4 tag=$5
-  local wd="$OUT/$tag"
+  local wd="$OUT/$tag" load_pre rc=0 mon
   mkdir -p "$wd"
-  echo "=== $tag accept=$accept credit_off=$credit_off load=$(cat /proc/loadavg) ===" | tee -a "$OUT/gate.log"
+  load_pre=$(awk '{print $1}' /proc/loadavg)
+  echo "=== $tag accept=$accept credit_off=$credit_off load1_pre=$load_pre ===" | tee -a "$OUT/gate.log"
+  # 07:05: recheck start gate (load1 < 3) before EVERY leg
+  if ! python3 -c "import sys; sys.exit(0 if float('$load_pre') < 3.0 else 1)"; then
+    echo "gate: skip $tag — load1_pre=$load_pre >= 3 (NOISY)" | tee -a "$OUT/gate.log"
+    printf '%s\n' "{\"noisy\":true,\"noisy_marker\":\"NOISY\",\"load1_pre\":$load_pre,\"load1_post\":$load_pre,\"noisy_reasons\":[\"load1_pre>=3\"],\"chunk_samples\":0,\"error_count\":1,\"group_open_refusals\":0,\"self_loaded\":false,\"hard_zeros\":{\"sjws_connections_refused_per_ip_total\":0,\"sjws_swarm_stream_open_sessions\":0}}" > "$wd/result.json"
+    return 1
+  fi
+  : > "$wd/bench.pids"
+  echo "$$" > "$wd/bench.pids"
+  python3 "$HERE/foreign_cpu.py" --out "$wd/foreign_cpu.json" --allow-pid "$$" \
+    --allow-pid-file "$wd/bench.pids" --interval 5 &
+  mon=$!
   CREDIT_OFF=$credit_off WARMUP=$WARMUP GATE_GROUPS=$GATE_GROUPS \
     "$HERE/one.sh" "$jar" "$wd" "$accept" "$wd/result.json" "$SECS" "$STREAMS" \
-    2>&1 | tee -a "$OUT/gate.log" || return $?
+    2>&1 | tee -a "$OUT/gate.log" || rc=$?
+  kill -TERM "$mon" 2>/dev/null || true
+  wait "$mon" 2>/dev/null || true
   sync "$wd/result.json" 2>/dev/null || true
+  if [ -f "$wd/result.json" ]; then
+    python3 "$HERE/merge_noisy.py" "$wd/result.json" "$wd/foreign_cpu.json" "$load_pre" \
+      | tee -a "$OUT/gate.log" || true
+  fi
+  return $rc
 }
 
 abs_valid_count() {
@@ -66,7 +86,20 @@ try: open_n=int(float(open_after)) if open_after is not None else -1
 except Exception: open_n=-1
 drain_to=bool(r.get("drain_timed_out"))
 err=int(r.get("error_count") or 0); go=int(r.get("group_open_refusals") or 0)
-print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 and err==0 and go==0 else "0")
+noisy=bool(r.get("noisy")) or (str(r.get("noisy_marker") or "").upper()=="NOISY")
+try: end_l1=float(r.get("load1_post") if r.get("load1_post") is not None else 0)
+except Exception: end_l1=0.0
+if end_l1>=6.0: noisy=True
+try: fcpu=float(r.get("foreign_cpu_avg_cores")) if r.get("foreign_cpu_avg_cores") is not None else 0.0
+except Exception: fcpu=0.0
+if fcpu>0.5: noisy=True
+if r.get("foreign_load_proc_seen"): noisy=True
+# Match agg.py: recompute self_loaded from 80*gen_cores (do not trust recorded flag alone)
+gen_cores=int(r.get("gen_cores") or 2); sat=80.0*gen_cores
+try: cpu=float(r.get("client_cpu_pct_of_wall")) if r.get("client_cpu_pct_of_wall") is not None else float("nan")
+except Exception: cpu=float("nan")
+self_loaded=bool(r.get("self_loaded")) or end_l1>=4.0 or (cpu==cpu and cpu>sat)
+print("1" if n>=10000 and p99 is not None and pre<3.0 and not self_loaded and not tx and refused==0 and not drain_to and open_n==0 and err==0 and go==0 and not noisy else "0")
 PY2
 )
     [ "$ok" = 1 ] && valid=$((valid + 1))
@@ -111,7 +144,20 @@ try: open_n=int(float(open_after)) if open_after is not None else -1
 except Exception: open_n=-1
 drain_to=bool(r.get("drain_timed_out"))
 err=int(r.get("error_count") or 0); go=int(r.get("group_open_refusals") or 0)
-print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 and err==0 and go==0 else "0")
+noisy=bool(r.get("noisy")) or (str(r.get("noisy_marker") or "").upper()=="NOISY")
+try: end_l1=float(r.get("load1_post") if r.get("load1_post") is not None else 0)
+except Exception: end_l1=0.0
+if end_l1>=6.0: noisy=True
+try: fcpu=float(r.get("foreign_cpu_avg_cores")) if r.get("foreign_cpu_avg_cores") is not None else 0.0
+except Exception: fcpu=0.0
+if fcpu>0.5: noisy=True
+if r.get("foreign_load_proc_seen"): noisy=True
+# Match agg.py: recompute self_loaded from 80*gen_cores (do not trust recorded flag alone)
+gen_cores=int(r.get("gen_cores") or 2); sat=80.0*gen_cores
+try: cpu=float(r.get("client_cpu_pct_of_wall")) if r.get("client_cpu_pct_of_wall") is not None else float("nan")
+except Exception: cpu=float("nan")
+self_loaded=bool(r.get("self_loaded")) or end_l1>=4.0 or (cpu==cpu and cpu>sat)
+print("1" if n>=10000 and p99 is not None and pre<3.0 and not self_loaded and not tx and refused==0 and not drain_to and open_n==0 and err==0 and go==0 and not noisy else "0")
 PY2
 )
     if [ "$ok" = 1 ]; then
@@ -154,3 +200,8 @@ if [ "$PHASE" = all ] || [ "$PHASE" = agg ]; then
     exit 1
   fi
 fi
+
+# 07:05 addendum: DONE marker for waiters (owner still appends to /workspace/bench-queue.md
+# with the PR comment URL when the queue item finishes).
+DONE_LINE="DONE swarm-stream-gate $(date -Is) out=$OUT phase=$PHASE"
+echo "$DONE_LINE" | tee -a "$OUT/gate.log" | tee "$OUT/DONE"

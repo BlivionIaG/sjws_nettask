@@ -78,10 +78,22 @@ def main():
         err_count = int(r.get("error_count") or 0)
         group_open = int(r.get("group_open_refusals") or 0)
         setup_fail = err_count > 0 or group_open > 0
-        # valid only when all hard conditions hold
-        valid = (n >= 10000 and p99 is not None and pre < 4.0 and not self_loaded
+        # 07:05 addendum: NOISY from foreign CPU / end load1 / explicit marker
+        noisy = bool(r.get("noisy")) or str(r.get("noisy_marker") or "").upper() == "NOISY"
+        try:
+            fcpu = float(r["foreign_cpu_avg_cores"]) if r.get("foreign_cpu_avg_cores") is not None else 0.0
+        except (TypeError, ValueError):
+            fcpu = 0.0
+        if fcpu > 0.5:
+            noisy = True
+        if r.get("foreign_load_proc_seen"):
+            noisy = True
+        if load1_post_f >= 6.0:
+            noisy = True
+        # valid only when all hard conditions hold (start gate recorded as load1_pre < 3)
+        valid = (n >= 10000 and p99 is not None and pre < 3.0 and not self_loaded
                  and not transport_retry_flag and not refused_flag
-                 and not drain_timed_out and not open_flag and not setup_fail)
+                 and not drain_timed_out and not open_flag and not setup_fail and not noisy)
         windows.append({
             "tag": p.parent.name,
             "valid": valid,
@@ -100,6 +112,8 @@ def main():
             "errors": err_count,
             "group_open_refusals": group_open,
             "setup_fail": setup_fail,
+            "noisy": noisy,
+            "foreign_cpu_avg_cores": fcpu,
             "producer_transport_retries": ptr,
             "consumer_connect_retries": ccr,
             "transport_retry_flag": transport_retry_flag,
@@ -122,12 +136,13 @@ def main():
               f"open_after={w['open_sessions_after_drain']} max_per_ip={w.get('max_connections_per_ip')} "
               f"load={w['load1_pre']}→{w['load1_post']}")
         if (w['transport_retry_flag'] or w['refused_per_ip'] or w['drain_timed_out']
-                or w['open_sessions_after_drain'] != 0 or w.get('setup_fail')):
+                or w['open_sessions_after_drain'] != 0 or w.get('setup_fail') or w.get('noisy')):
             print(f"  INVALID {w['tag']}: tx_retry={w['transport_retry_flag']} "
                   f"refused_per_ip={w['refused_per_ip']} drain_timed_out={w['drain_timed_out']} "
                   f"open_sessions_after_drain={w['open_sessions_after_drain']} "
                   f"setup_fail={w.get('setup_fail')} err={w.get('errors')} "
-                  f"group_open={w.get('group_open_refusals')}")
+                  f"group_open={w.get('group_open_refusals')} noisy={w.get('noisy')} "
+                  f"foreign_cpu={w.get('foreign_cpu_avg_cores')}")
 
     verdict = "FAIL"
     reason = []
@@ -156,6 +171,8 @@ def main():
                 reason.append(f"{w['tag']}: transport_retry_flag")
             if w.get("setup_fail"):
                 reason.append(f"{w['tag']}: setup_fail err={w.get('errors')} group_open={w.get('group_open_refusals')}")
+            if w.get("noisy"):
+                reason.append(f"{w['tag']}: NOISY foreign_cpu={w.get('foreign_cpu_avg_cores')}")
             if w.get("refused_per_ip"):
                 reason.append(f"{w['tag']}: refused_per_ip={w['refused_per_ip']}")
             if w.get("drain_timed_out"):

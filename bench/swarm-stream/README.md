@@ -59,3 +59,13 @@ agents in `one.sh` and round-robins them in `drive.py` to reach 1k concurrent st
 
 Metric names follow the sjws Observability review (`sjws_swarm_stream_*`, counters with `_total`,
 flag-off emits nothing). Validate a scrape with `promtool check metrics`.
+
+## Validity / NOISY (inceptor 2026-11-01 07:05)
+
+- Start gate: `load1 < 3` before **every** leg (`gate.sh` / `cross-check.sh`), recorded as `load1_pre`.
+- During a leg: `foreign_cpu.py` samples every 5 s. A leg is **NOISY** if foreign processes
+  (not the bench server/generator/harness tree) average **> 0.5 core**, or any sample shows a
+  foreign `java`/`mvn`/load-gen process, or end-of-leg `load1 >= 6`.
+- `agg.py` and `gate.sh` discard NOISY legs (never counted). A/A remains mandatory in `PHASE=aa|all`.
+- On completion `gate.sh` writes `$OUT/DONE` (`DONE swarm-stream-gate <time> …`). Queue owners still
+  append `DONE <item> <time> <PR comment URL>` to `/workspace/bench-queue.md`.
