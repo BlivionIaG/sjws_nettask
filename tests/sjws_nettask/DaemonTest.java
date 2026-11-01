@@ -313,6 +313,7 @@ class DaemonTest {
                 ours.subList(ours.indexOf("/java"), ours.size()));
         var hidden = Daemon.childCommand(List.of("1"), Optional.empty(), "/java", "cp");
         assertTrue(hidden.contains("cp") && hidden.contains("sjws_nettask.Sjws_nettask"), hidden.toString());
+        assertTrue(hidden.contains("--enable-native-access=ALL-UNNAMED"), hidden.toString());
         assertEquals(Path.of("/dev/null"), Daemon.discardInput(List.of("NUL", "/dev/null")));
         assertNull(Daemon.discardInput(List.of("no-such-null-device")));
 
