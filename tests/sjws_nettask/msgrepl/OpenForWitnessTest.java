@@ -104,4 +104,15 @@ class OpenForWitnessTest {
         RaftReplicator.openForWitness(nodes.get(2), Set.of("t", "u"), ELECTION, HEARTBEAT);
         RaftReplicator.openForWitness(nodes.get(2), Set.of("t", "u"), ELECTION, HEARTBEAT);
     }
+
+    /** N4: full NAME pattern, not only the {@code __} prefix. */
+    @Test
+    void invalidTopicNamePatternRefused() throws Exception {
+        openCluster();
+        for (var bad : List.of(".", "..", "bad/name", "has space", "x".repeat(129), "")) {
+            var err = assertThrows(IllegalArgumentException.class,
+                    () -> RaftReplicator.openForWitness(nodes.get(2), Set.of(bad), ELECTION, HEARTBEAT), bad);
+            assertTrue(err.getMessage().contains("invalid topic name"), err.getMessage());
+        }
+    }
 }
