@@ -32,7 +32,8 @@ import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
-import java.util.ArrayList;
+import java.util.Objects;
+import java.util.Set;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 import javax.security.auth.x500.X500Principal;
@@ -51,12 +52,14 @@ public final class AdminServer implements AutoCloseable {
     private final HttpServer server;
     private final CpAdmin admin;
     private final AdminTls tls;
+    private final Set<String> allowedOrigins;
     private volatile Thread watcher;
 
-    private AdminServer(HttpServer server, CpAdmin admin, AdminTls tls) {
+    private AdminServer(HttpServer server, CpAdmin admin, AdminTls tls, Set<String> allowedOrigins) {
         this.server = server;
         this.admin = admin;
         this.tls = tls;
+        this.allowedOrigins = Set.copyOf(Objects.requireNonNullElse(allowedOrigins, Set.of()));
     }
 
     /**
@@ -92,7 +95,7 @@ public final class AdminServer implements AutoCloseable {
                 params.setSSLParameters(ssl);
             }
         });
-        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls);
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls, Set.of());
         https.createContext("/", bound::handle);
         https.start();
         if (watchMillis > 0) {
@@ -126,6 +129,12 @@ public final class AdminServer implements AutoCloseable {
      */
     public static AdminServer startMtls(CpStore store, InetSocketAddress address, long nowMillis, long ttlMillis,
             CpServerTls serverTls) throws IOException {
+        return startMtls(store, address, nowMillis, ttlMillis, serverTls, Set.of());
+    }
+
+    /** mTLS admin listener with an explicit {@code Origin} allowlist for mutating methods. */
+    public static AdminServer startMtls(CpStore store, InetSocketAddress address, long nowMillis, long ttlMillis,
+            CpServerTls serverTls, Set<String> allowedOrigins) throws IOException {
         java.util.Objects.requireNonNull(serverTls, "serverTls");
         var https = HttpsServer.create(address, 0);
         https.setHttpsConfigurator(new HttpsConfigurator(serverTls.context()) {
@@ -134,7 +143,7 @@ public final class AdminServer implements AutoCloseable {
                 params.setSSLParameters(serverTls.parameters());
             }
         });
-        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), null);
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), null, allowedOrigins);
         https.createContext("/", bound::handle);
         https.start();
         return bound;
@@ -142,8 +151,17 @@ public final class AdminServer implements AutoCloseable {
 
     /** Plain HTTP, for tests that exercise routes without a certificate. Production code uses {@link #start}. */
     public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis) throws IOException {
+        return startPlainForTests(store, nowMillis, ttlMillis, Set.of());
+    }
+
+    /**
+     * Plain HTTP with an explicit {@code Origin} allowlist for mutating methods. Empty means any
+     * present {@code Origin} is refused (CLI clients that omit the header are unaffected).
+     */
+    public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis,
+            Set<String> allowedOrigins) throws IOException {
         var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis), null);
+        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis), null, allowedOrigins);
         http.createContext("/", bound::handle);
         http.start();
         return bound;
@@ -154,15 +172,58 @@ public final class AdminServer implements AutoCloseable {
     }
 
     private void handle(HttpExchange exchange) throws IOException {
-        var outcome = admin.handle(credential(exchange), exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
+        var method = exchange.getRequestMethod();
+        if (isMutation(method)) {
+            var refused = refuseMutation(exchange);
+            if (refused != null) {
+                exchange.getRequestBody().readAllBytes();
+                write(exchange, refused);
+                return;
+            }
+        }
+        var outcome = admin.handle(credential(exchange), method, exchange.getRequestURI().getPath(),
                 exchange.getRequestURI().getRawQuery(),
                 new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
                 exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+        write(exchange, outcome);
+    }
+
+    private static void write(HttpExchange exchange, CpStore.Outcome outcome) throws IOException {
         var bytes = outcome.body().getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
         exchange.sendResponseHeaders(outcome.status(), bytes.length);
         exchange.getResponseBody().write(bytes);
         exchange.close();
+    }
+
+    /** POST, PUT, PATCH and DELETE. GET and HEAD are unchanged. */
+    public static boolean isMutation(String method) {
+        return "POST".equals(method) || "PUT".equals(method) || "PATCH".equals(method) || "DELETE".equals(method);
+    }
+
+    /**
+     * A present {@code Origin} must be in {@link #allowedOrigins} (empty by default). Mutations must
+     * send {@code Content-Type: application/json} (optional parameters allowed).
+     */
+    CpStore.Outcome refuseMutation(HttpExchange exchange) {
+        var origin = exchange.getRequestHeaders().getFirst("Origin");
+        if (origin != null && !allowedOrigins.contains(origin)) {
+            return CpStore.Outcome.error(403, "origin");
+        }
+        if (!isJsonContentType(exchange.getRequestHeaders().getFirst("Content-Type"))) {
+            return CpStore.Outcome.error(415, "content-type");
+        }
+        return null;
+    }
+
+    /** {@code application/json} with optional parameters such as {@code charset=utf-8}. */
+    public static boolean isJsonContentType(String contentType) {
+        if (contentType == null || contentType.isBlank()) {
+            return false;
+        }
+        int semi = contentType.indexOf(';');
+        var type = (semi < 0 ? contentType : contentType.substring(0, semi)).trim();
+        return type.equalsIgnoreCase("application/json");
     }
 
     /** The verified peer certificate, or null when the connection did not present one. */

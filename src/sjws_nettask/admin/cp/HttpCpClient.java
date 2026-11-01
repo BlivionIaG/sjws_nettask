@@ -112,6 +112,9 @@ public final class HttpCpClient implements CpClient {
         if (idempotencyKey != null) {
             builder = builder.header("Idempotency-Key", idempotencyKey);
         }
+        if (sjws_nettask.cp.AdminServer.isMutation(method)) {
+            builder = builder.header("Content-Type", "application/json");
+        }
         builder = body == null ? builder.method(method, HttpRequest.BodyPublishers.noBody())
                 : builder.method(method, HttpRequest.BodyPublishers.ofString(body));
         HttpResponse<String> response;
