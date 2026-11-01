@@ -55,6 +55,9 @@ final class AccessLog implements Runnable, AutoCloseable {
     private volatile boolean failed;
     /** File key of the inode currently open; null until first open or when unsupported. */
     private Object openedKey;
+
+    /** Test-only: force N open attempts to treat the path key as raced. */
+    static volatile int testForceKeyRaceAttempts;
     private long nextReopenCheckNanos;
     /** Test/hook: force one reopen check, ignoring the 1s deadline once (#406). */
     private volatile boolean reopenRequested;
@@ -109,7 +112,13 @@ final class AccessLog implements Runnable, AutoCloseable {
             Object before = fileKey(path);
             OutputStream stream = openFile(path);
             Object after = fileKey(path);
-            if (before != null && after != null && !before.equals(after)) {
+            boolean raced = before != null && after != null && !before.equals(after);
+            int force = testForceKeyRaceAttempts;
+            if (force > 0) {
+                testForceKeyRaceAttempts = force - 1;
+                raced = true;
+            }
+            if (raced) {
                 try {
                     stream.close();
                 } catch (IOException e) {

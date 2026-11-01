@@ -48,4 +48,23 @@ final class AccessLogOpenKeyTest {
             assertTrue(Files.exists(path));
         }
     }
+
+    @Test
+    void forcesRetryWhenTestSeamSet() throws Exception {
+        Path path = dir.resolve("race.log");
+        AccessLog.testForceKeyRaceAttempts = 1;
+        try {
+            var opened = AccessLog.openFileWithKey(path);
+            try {
+                assertNotNull(opened.stream);
+                Object pathKey = Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class).fileKey();
+                Assumptions.assumeTrue(pathKey != null, "FS without file keys");
+                assertEquals(pathKey, opened.key);
+            } finally {
+                opened.stream.close();
+            }
+        } finally {
+            AccessLog.testForceKeyRaceAttempts = 0;
+        }
+    }
 }
