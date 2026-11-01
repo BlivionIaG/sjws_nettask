@@ -380,9 +380,18 @@ final class LogTopics implements AutoCloseable {
         return NAME.matcher(topic).matches() && !topic.equals(".") && !topic.equals("..");
     }
 
+    /** A client-facing topic name: {@link #validName} and not an internal {@code __}-prefixed name (#217). */
+    static boolean validUserTopic(String topic) {
+        return validName(topic) && !topic.startsWith("__");
+    }
+
     /** The topic's log, opening (and creating) it when {@code create}; null when absent and not created. */
     Log get(String topic, boolean create) throws IOException {
         if (this.closed) throw new IllegalStateException("closed");
+        // Open/create of a user topic must not invent an internal __ name (HTTP already refuses; this is the root).
+        if (create && topic.startsWith("__") && !LogOffsets.TOPIC.equals(topic) && !LogOffsets.LOCAL_TOPIC.equals(topic)) {
+            throw new IllegalArgumentException("topics starting with __ are internal: " + topic);
+        }
         var l = this.logs.get(topic);
         if (l != null || (!create && !java.nio.file.Files.isDirectory(this.dir.resolve(topic)))) return l;
         this.opening.lock(); // opens do file I/O, so not inside computeIfAbsent (design review M12)

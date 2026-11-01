@@ -28,12 +28,12 @@ fix, delete and re-push the tag. Real `v*` tags need Blivion's OK; never push on
 ## Dry run on ubuntu-latest ([#413](https://github.com/BlivionIaG/sjws_nettask/issues/413))
 
 `release.yml` also accepts `workflow_dispatch` with a `version` input (default
-`0.0.0-dryrun`). That path runs the same verify + package steps on `ubuntu-latest`,
+`0.0.0-SNAPSHOT`). That path runs the same verify + package steps on `ubuntu-latest`,
 uploads the artifacts, and **does not** create a GitHub Release or require a tag.
 Use it before the next real tag, after the workflow file with `workflow_dispatch` is
 on the branch you dispatch:
 
-    gh workflow run release.yml --ref master -f version=0.0.0-dryrun
+    gh workflow run release.yml --ref master -f version=0.0.0-SNAPSHOT
 
 Do not create a throwaway `v*` tag on `BlivionIaG/sjws_nettask` for this; a fork tag
 is the only tag-based alternative, and the dispatch path is preferred.
