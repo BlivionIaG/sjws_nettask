@@ -26,9 +26,10 @@ access ([control-plane design](../design/control-plane.md)); the filter factorie
 be bound on the node. Prefer `keys-file` / `hmac-keys-file` in any CP proposal (inline
 `keys` / `hmac-keys` → 400).
 
-**HTTP/2 note:** gateway filters read `request.headers().values(...)`. On HTTP/2 that map is
-empty today, so header-based auth and CORS see no headers on h2. HTTP/1.1 is complete; HTTP/3
-fills the map when a chain or non-static terminal exists at startup.
+**HTTP/2 note:** gateway filters read `request.headers().values(...)`. On HTTP/2 (h2/h2c and the
+HTTP/1.1 ALPN fallback) that map is filled when `attachBodies` is on — whenever a filter chain,
+metrics observe wrapper, or non-static terminal is armed. HTTP/1.1 always fills it; HTTP/3 fills
+it when a chain or non-static terminal exists at startup.
 
 ## Routes (`routing:`)
 
