@@ -73,6 +73,8 @@ final class PeerSockets implements TcpTransport.SocketFactory {
     private volatile PeerConfig config;
     private final AtomicLong identityRefused = new AtomicLong();
     private final AtomicLong policyDropped = new AtomicLong();
+    /** Times {@link #registerLive} failed closed after spending {@link #REGISTER_LIVE_MAX_ATTEMPTS} (#442 N1). */
+    private final AtomicLong registerBudgetExhausted = new AtomicLong();
     private final AtomicLong loggedNanos = new AtomicLong(System.nanoTime() - LOG_EVERY_NANOS);
     /** Bumped at the start of every {@link #dropPeersFailingPolicy} so registration cannot escape a concurrent reload. */
     private final AtomicLong tlsEpoch = new AtomicLong();
@@ -110,6 +112,11 @@ final class PeerSockets implements TcpTransport.SocketFactory {
     /** Established connections closed because they failed policy after a TLS reload. */
     long policyDropped() {
         return policyDropped.get();
+    }
+
+    /** Registrations that failed closed after the TLS-epoch retry budget was spent (#442 / #435). */
+    long registerBudgetExhausted() {
+        return registerBudgetExhausted.get();
     }
 
     /** Open (or not-yet-reclaimed) entries in the live-peer registry; for tests and ops. */
@@ -249,7 +256,18 @@ final class PeerSockets implements TcpTransport.SocketFactory {
         int attempts = 0;
         do {
             if (++attempts > REGISTER_LIVE_MAX_ATTEMPTS) {
-                throw new IOException("swarm peer registration exceeded TLS epoch retry budget (" + REGISTER_LIVE_MAX_ATTEMPTS + " attempts)");
+                long n = registerBudgetExhausted.incrementAndGet();
+                long now = System.nanoTime();
+                long last = loggedNanos.get();
+                if (now - last >= LOG_EVERY_NANOS && loggedNanos.compareAndSet(last, now)) {
+                    // Fixed text only: no peer / SAN / exception message (#442 N1).
+                    LOG.log(System.Logger.Level.WARNING,
+                            "swarm-peer: registerLive TLS-epoch retry budget exhausted ({0} attempts);"
+                                    + " registration failed closed ({1} so far)",
+                            REGISTER_LIVE_MAX_ATTEMPTS, n);
+                }
+                throw new IOException("swarm peer registration exceeded TLS epoch retry budget ("
+                        + REGISTER_LIVE_MAX_ATTEMPTS + " attempts)");
             }
             epoch = tlsEpoch.get();
             named = enforcePolicy(socket, peerIsClient, expected);
@@ -308,7 +326,9 @@ final class PeerSockets implements TcpTransport.SocketFactory {
                     throw new IOException("swarm peer no longer matches pinned identity of " + peer.expected().name());
                 }
             } catch (IOException | RuntimeException failed) {
-                // Stale snapshot: registerLive replaced Live under the new epoch — do not abort the newer entry.
+                // Stale snapshot: live value no longer matches this copy (concurrent registerLive replace).
+                // Skip abort; the replacement is either already validated under the current epoch, or will
+                // fail closed on the registerLive retry / caller cleanup (#442 N2).
                 if (live.get(socket) != peer) {
                     continue;
                 }

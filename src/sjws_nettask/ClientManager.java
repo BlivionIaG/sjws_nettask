@@ -19,6 +19,8 @@ package sjws_nettask;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.time.Duration;
@@ -194,6 +196,74 @@ public class ClientManager implements Runnable {
         return this.refusedPerIp.sum();
     }
 
+    /**
+     * Canned cleartext 503 for a per-IP refuse on this HTTP/1.1 accept path (#327).
+     * Generic and fixed: no limit, count or client address. Matches the H1 busy shape
+     * ({@code Retry-After: 1}, {@code Connection: close}, {@code Content-Length: 0}).
+     * ClientManager listens only for cleartext H1 ({@link Http1Connection}); TLS and
+     * h2c live on separate {@code Http2Server} ports, so this write is never sent into
+     * a handshake or preface sniff.
+     */
+    private static final byte[] PER_IP_REFUSE_503 = (
+            "HTTP/1.1 503 Service Unavailable\r\n"
+                    + "Retry-After: 1\r\n"
+                    + "Connection: close\r\n"
+                    + "Content-Length: 0\r\n"
+                    + "\r\n").getBytes(StandardCharsets.US_ASCII);
+
+    /** Read-only view of {@link #PER_IP_REFUSE_503}; duplicated per accept thread (Security N1). */
+    private static final ByteBuffer PER_IP_REFUSE_503_RO =
+            ByteBuffer.wrap(PER_IP_REFUSE_503).asReadOnlyBuffer();
+
+    /** Per-accept-thread duplicate of {@link #PER_IP_REFUSE_503_RO}; no shared mutable cursor. */
+    private static final ThreadLocal<ByteBuffer> PER_IP_REFUSE_OUT =
+            ThreadLocal.withInitial(PER_IP_REFUSE_503_RO::duplicate);
+
+    /**
+     * Per-accept-thread drain scratch for {@link #refuseWith503}. Never shared across
+     * accept or virtual threads (#327 / Security). Package-visible for the confinement test.
+     */
+    static final ThreadLocal<ByteBuffer> PER_IP_REFUSE_DRAIN =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocate(256));
+
+    /** Visible for tests: the ThreadLocal drain buffer for the calling thread. */
+    static ByteBuffer perIpRefuseDrainBufferForTest() {
+        return PER_IP_REFUSE_DRAIN.get();
+    }
+
+    /**
+     * Best-effort refuse for a cleartext H1 socket that failed {@code perIp.tryAcquire}.
+     * Writes the canned 503 once without blocking the accept loop (socket set non-blocking;
+     * incomplete write is abandoned — no retry, no timer, no per-refuse allocation of the
+     * response bytes), {@code shutdownOutput}, then at most one non-blocking drain read of
+     * already-buffered client bytes into the thread-confined buffer, then close. A concurrent
+     * RST can still drop the 503 before the client reads it.
+     */
+    private static void refuseWith503(SocketChannel socket) {
+        try {
+            socket.configureBlocking(false);
+            ByteBuffer out = PER_IP_REFUSE_OUT.get();
+            out.rewind(); // duplicate of read-only wrap; position only, never mutates the bytes
+            socket.write(out); // one shot; give up if the kernel cannot take it all now
+            try {
+                socket.shutdownOutput();
+            } catch (IOException ignored) {
+                // already half-closed or reset
+            }
+            ByteBuffer drain = PER_IP_REFUSE_DRAIN.get();
+            drain.clear();
+            try {
+                socket.read(drain); // at most one read of buffered bytes
+            } catch (IOException ignored) {
+                // reset while draining
+            }
+        } catch (IOException | RuntimeException ignored) {
+            // best-effort; close below
+        } finally {
+            closeQuietly(socket);
+        }
+    }
+
     private volatile ConnectionReaper reaper;
     /** How long {@link #run()}'s shutdown waits for a response already being written. */
     private volatile long shutdownTimeoutMs = Daemon.DEFAULT_SHUTDOWN_TIMEOUT.toMillis();
@@ -313,7 +383,7 @@ public class ClientManager implements Runnable {
                 if (!this.perIp.tryAcquire(address)) { // one address can't take every connection slot
                     this.refusedPerIp.increment();
                     this.permits.release();
-                    closeQuietly(socket);
+                    refuseWith503(socket); // #327: canned 503 on cleartext h1, then close
                     continue;
                 }
                 try {

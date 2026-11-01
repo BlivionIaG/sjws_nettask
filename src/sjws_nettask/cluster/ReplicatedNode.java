@@ -327,6 +327,24 @@ public final class ReplicatedNode implements ClusterNode {
         transport.detach(self);
     }
 
+
+    /**
+     * Explicit operator escape (#208): on this group's leader, append a {@code STRICT_RELEASE}
+     * marker covering stalled uncommitted {@code USER_STRICT} overrides so commit can proceed
+     * without the missing data copy. Existing log entries are not rewritten. Requires a non-blank
+     * {@code operatorId} (authenticated admin identity). See
+     * {@link RaftGroup#releaseStalledStrictOverrides(String)}.
+     */
+    @Override
+    public int releaseStalledStrictOverrides(GroupId groupId, String operatorId) throws NotLeaderException {
+        return group(groupId).releaseStalledStrictOverrides(operatorId);
+    }
+
+    /** How many stalled STRICT overrides an operator has released on {@code groupId} (#208). */
+    public long strictOverridesReleased(GroupId groupId) {
+        return group(groupId).strictOverridesReleased();
+    }
+
     /** STRICT override entries the group's leader holds uncommitted (0 on a follower). */
     public int strictPending(GroupId groupId) {
         return group(groupId).strictPendingCount();
@@ -368,6 +386,16 @@ public final class ReplicatedNode implements ClusterNode {
      */
     public boolean failedClosed(GroupId groupId) {
         return group(groupId).failedClosed();
+    }
+
+    /** Consecutive fsync failures on {@code groupId} since the last successful force (#242). */
+    public int consecutiveFsyncFailures(GroupId groupId) {
+        return group(groupId).consecutiveFsyncFailures();
+    }
+
+    /** Cumulative fsync failures on {@code groupId} since the group opened (#242). */
+    public long fsyncFailures(GroupId groupId) {
+        return group(groupId).fsyncFailures();
     }
 
     /** Apply lag of one group: deliveries queued or running. */

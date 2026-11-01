@@ -33,10 +33,19 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.ssl.SslHandler;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
 import sjws_nettask.core.DateClock;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestBody;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ServerInfo;
@@ -65,22 +74,110 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
     }
 
     static Request toRequest(FullHttpRequest r) {
-        return toRequest(r, null, false);
+        return toRequest(r, null, false, false);
     }
 
     static Request toRequest(FullHttpRequest r, InetSocketAddress peer, boolean secure) {
+        return toRequest(r, peer, secure, false);
+    }
+
+    /**
+     * @param captureFields copy every regular header into {@link RequestHeaders#fields()} (same gate
+     *        as h2 {@code generation.attachBodies})
+     */
+    static Request toRequest(FullHttpRequest r, InetSocketAddress peer, boolean secure, boolean captureFields) {
         var h = r.headers();
-        return new Request(r.method().name(), r.uri(), new RequestHeaders(h.get("if-none-match"),
-                h.get("if-modified-since"), h.get("if-range"), h.get("range"), h.get("accept-encoding"), h.get("host")),
-                peer, secure, r.protocolVersion().text());
+        var headers = captureFields
+                ? RequestHeaders.of(fieldMap(h), h.get("host"))
+                : new RequestHeaders(h.get("if-none-match"), h.get("if-modified-since"), h.get("if-range"),
+                        h.get("range"), h.get("accept-encoding"), h.get("host"));
+        return new Request(r.method().name(), r.uri(), headers, peer, secure, r.protocolVersion().text());
+    }
+
+    /** Lower-case name to values, first-seen order (HTTP/1 has no pseudo-headers). */
+    private static Map<String, List<String>> fieldMap(HttpHeaders headers) {
+        LinkedHashMap<String, List<String>> fields = null;
+        for (var entry : headers) {
+            if (fields == null) {
+                fields = new LinkedHashMap<>();
+            }
+            var name = entry.getKey().toLowerCase(Locale.ROOT);
+            var values = fields.get(name);
+            if (values == null) {
+                values = new ArrayList<>(1);
+                fields.put(name, values);
+            }
+            values.add(entry.getValue());
+        }
+        if (fields == null) {
+            return Map.of();
+        }
+        for (var entry : fields.entrySet()) {
+            entry.setValue(List.copyOf(entry.getValue()));
+        }
+        return Collections.unmodifiableMap(fields);
+    }
+
+    /**
+     * Copy already-aggregated content when {@code attachBodies} is on. Off path never calls this, so
+     * static requests allocate neither a field map nor a body buffer.
+     */
+    static RequestBody copyBody(FullHttpRequest r) {
+        var buf = r.content();
+        int n = buf.readableBytes();
+        if (n <= 0) {
+            return RequestBody.EMPTY;
+        }
+        byte[] bytes = new byte[n];
+        buf.getBytes(buf.readerIndex(), bytes);
+        return new RequestBody() {
+            private int pos;
+
+            @Override
+            public long length() {
+                return bytes.length;
+            }
+
+            @Override
+            public int read(byte[] into, int off, int len) {
+                if (this.pos >= bytes.length) {
+                    return -1;
+                }
+                int c = Math.min(len, bytes.length - this.pos);
+                System.arraycopy(bytes, this.pos, into, off, c);
+                this.pos += c;
+                return c;
+            }
+        };
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest msg) {
         var channel = ctx.channel();
         var remote = channel.remoteAddress();
-        var request = toRequest(msg, remote instanceof InetSocketAddress inet ? inet : null,
-                channel.pipeline().get(io.netty.handler.ssl.SslHandler.class) != null);
+        InetSocketAddress peer = remote instanceof InetSocketAddress inet ? inet : null;
+        boolean secure = channel.pipeline().get(SslHandler.class) != null;
+        channel.config().setAutoRead(false); // one request at a time; reading resumes when idle again
+        if (this.busy && this.pending.size() >= MAX_PIPELINED) {
+            releasePending(); // Security N1: drain queued pins before close (not only on inactive)
+            channel.close();
+            return;
+        }
+        // Pin first (like h2 captureAndStart) so attachBodies matches the handler (#301). When off,
+        // build the typed-only request with no retain and no map/body alloc (AGENTS.md zero-cost).
+        Http2Server.Generation generation;
+        for (;;) {
+            generation = this.shared.generation();
+            if (generation.tryEnter()) {
+                break;
+            }
+        }
+        boolean capture = generation.attachBodies();
+        var request = toRequest(msg, peer, secure, capture);
+        // Match h2: no body on GET/HEAD even if Content-Length is present.
+        if (capture && !request.headOnly() && !"GET".equals(request.method()) && msg.content().isReadable()) {
+            request = request.withBody(copyBody(msg));
+        }
         boolean keepAlive = HttpUtil.isKeepAlive(msg);
         Response refusal;
         if (msg.decoderResult().isFailure()) {
@@ -93,13 +190,9 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         } else {
             refusal = Http2StreamHandler.refusal(request);
         }
-        channel.config().setAutoRead(false); // one request at a time; reading resumes when idle again
-        var task = new Task(channel, request, refusal, keepAlive);
+        // msg is not retained: fields/body were copied under the pin while the inbound buffer lived.
+        var task = new Task(channel, request, refusal, keepAlive, generation);
         if (this.busy) {
-            if (this.pending.size() >= MAX_PIPELINED) {
-                channel.close();
-                return;
-            }
             this.pending.add(task);
             return;
         }
@@ -108,14 +201,8 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
 
     private void run(Task task) {
         this.busy = true;
-        Http2Server.Generation generation;
-        for (;;) {
-            generation = this.shared.generation();
-            if (generation.tryEnter()) {
-                break;
-            }
-        }
-        task.generation = generation;
+        // generation already entered in channelRead0 (and left in Task.finally or releasePending).
+        var generation = task.generation;
         if (!this.shared.inflight().tryAcquire()) { // the same server-wide cap as HTTP/2 streams
             generation.leave();
             this.shared.refused().increment();
@@ -156,6 +243,36 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         channel.read();
     }
 
+    /** Test-only: queued tasks behind the one being served. */
+    int pendingCount() {
+        return this.pending.size();
+    }
+
+    /** Drop queued pins if the connection dies before {@link #run(Task)} (Codex P1 / #446). */
+    private void releasePending() {
+        for (;;) {
+            var task = this.pending.poll();
+            if (task == null) {
+                return;
+            }
+            if (task.generation != null) {
+                task.generation.leave();
+                task.generation = null;
+            }
+        }
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        releasePending();
+        ctx.fireChannelInactive();
+    }
+
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) {
+        releasePending();
+    }
+
     /** h2c: once the connection switched to HTTP/2, the HTTP/1 handlers behind the codec must go. */
     @Override
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
@@ -183,14 +300,16 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         private final Request request;
         private final Response refusal;
         private final boolean keepAlive;
-        /** Set in {@link #run(Task)} after {@link Http2Server.Generation#tryEnter}. */
+        /** Entered in {@link #channelRead0}; left in {@link #run()} finally or {@link #releasePending()}. */
         Http2Server.Generation generation;
 
-        Task(Channel channel, Request request, Response refusal, boolean keepAlive) {
+        Task(Channel channel, Request request, Response refusal, boolean keepAlive,
+                Http2Server.Generation generation) {
             this.channel = channel;
             this.request = request;
             this.refusal = refusal;
             this.keepAlive = keepAlive;
+            this.generation = generation;
         }
 
         @Override

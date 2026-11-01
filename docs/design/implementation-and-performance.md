@@ -14,8 +14,8 @@ See [docs/design/architecture.md](architecture.md) for the layers, the `core.Han
   registered, and no other terminal, the static handler is called directly. `Request` carries the
   client address, whether the connection is TLS, a streamed body (HTTP/1.1 `Content-Length` requests
   only) and the raw header map (always filled on HTTP/1.1; on HTTP/3 only when a filter chain or a
-  non-static terminal is installed at startup; on HTTP/2 h2/h2c streams when `attachBodies` is on,
-  empty on the static-only path and on the HTTP/1.1 ALPN fallback).
+  non-static terminal is installed at startup; on HTTP/2 h2/h2c streams and the HTTP/1.1 ALPN
+  fallback when `attachBodies` is on, empty on the static-only path).
 * **HTTP/1.1** (`sjws_nettask` + `sjws_nettask.http1`): one virtual thread per connection on a blocking
   `SocketChannel`; an incremental, strict byte-level head parser (CL/TE smuggling, limits, obs-fold,
   Host, Expect); responses written whole (head and small bodies in one `write`, `Date` formatted once

@@ -52,9 +52,11 @@ flowchart TD
     q["Client connects<br/>kernel accept queue,<br/>--backlog default 1024"] --> cap{"Under --max-connections?"}
     cap -->|no| wait["Stays in the accept<br/>queue until a connection<br/>finishes"]
     cap -->|yes| ip{"Under<br/>--max-connections-per-ip<br/>for this address?"}
-    ip -->|no| drop["Closed at once, no<br/>response"]
+    ip -->|no| drop["503 Service Unavailable,<br/>Retry-After: 1, then close"]
     ip -->|yes| run["A virtual thread<br/>runs the connection<br/>under the IDLE, HEAD<br/>and WRITING deadlines"]
 ```
+
+Over the per-address cap on cleartext HTTP/1.1, the accept loop writes a fixed `503 Service Unavailable` with `Retry-After: 1`, `Connection: close` and `Content-Length: 0`, then closes. The response never names the limit, the current count or the client address. Delivery is best-effort: a concurrent reset can still drop the 503. HTTP/2 and h2c connection admission stay a silent close (separate listeners, before TLS / preface).
 
 **Per-address caps behind a reverse proxy or NAT.** The caps count connections per client address
 (IPv4: the full address; IPv6: its /64 prefix, since one host can use any address of its /64). Behind a

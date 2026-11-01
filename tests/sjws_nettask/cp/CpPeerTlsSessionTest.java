@@ -842,6 +842,8 @@ class CpPeerTlsSessionTest {
                         "message=" + err.getMessage() + " root=" + t.getMessage());
                 assertEquals(CpPeerSockets.REGISTER_LIVE_MAX_ATTEMPTS, bumps.get(),
                         "hook runs once per spent attempt before the budget trip");
+                assertEquals(1L, server.registerBudgetExhausted(),
+                        "budget exhaustion increments the registerBudgetExhausted counter");
             }
             return null;
         });

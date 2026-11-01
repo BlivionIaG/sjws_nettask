@@ -46,6 +46,8 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
     private final SwarmGate gate;
     private final boolean trace;
     private volatile boolean closed;
+    /** Retained so {@link #attachPrometheus} can scrape stream counters (S2c PR 8 N2). */
+    private volatile SwarmHttp http;
 
     public SwarmModule() {
         this(Swarm.open(Path.of(setting(DIR_PROPERTY, DIR_ENV, "swarm-data")),
@@ -203,7 +205,19 @@ public final class SwarmModule implements OptionalModule, HandlerContributor {
 
     @Override
     public void contribute(HandlerMounts mounts) {
-        mounts.mount("/swarm/v1", new SwarmHttp(this.swarm, new SecureRandom().nextLong(), this.gate, this.trace));
+        var http = new SwarmHttp(this.swarm, new SecureRandom().nextLong(), this.gate, this.trace);
+        this.http = http;
+        mounts.mount("/swarm/v1", http);
+    }
+
+    @Override
+    public void attachPrometheus(java.util.function.Consumer<java.util.function.Supplier<String>> sink) {
+        var http = this.http;
+        if (http == null || http.streams() == null) {
+            return; // stream flag off: StreamHttp (and StreamStats) stay unloaded
+        }
+        var streams = http.streams();
+        sink.accept(streams::statsText);
     }
 
     public boolean closed() {

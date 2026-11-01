@@ -42,7 +42,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * #241: on open, {@link FileLogStorage} truncates a torn last record (length/framing) with an fsync
- * of the file and directory; mid-log framing corruption fails closed. No per-record CRC (#207).
+ * of the file and directory; mid-log framing corruption fails closed. Per-record CRC32C is #207
+ * ({@link FileLogCrc32cTest}).
  */
 @Timeout(30)
 class FileLogTornTailTest {
@@ -213,7 +214,8 @@ class FileLogTornTailTest {
         while (t.getCause() != null) {
             t = t.getCause();
         }
-        assertTrue(t.getMessage().contains("index 99") || t.getMessage().contains("refusing"),
+        assertTrue(t.getMessage().contains("index 99") || t.getMessage().contains("CRC")
+                        || t.getMessage().contains("refusing"),
                 "message=" + t.getMessage());
         assertEquals(ends.get(3), Files.size(logFile(root)));
     }

@@ -75,7 +75,7 @@ static request allocates no header map. HTTP/2 (h2 and h2c streams) copies every
 the live generation has `attachBodies` on — the same gate that attaches request bodies, set whenever
 a filter chain, metrics observe wrapper, or non-static terminal is armed — and otherwise reads only
 the six typed fields so a static request allocates no header map. The HTTP/1.1 ALPN fallback on the
-HTTP/2 TLS listener still leaves `fields()` empty (typed fields only). When HTTP/2 or HTTP/3 does
+HTTP/2 TLS listener uses the same `attachBodies` gate (#446). When HTTP/2 or HTTP/3 does
 copy, that happens before the HEADERS frame is released, because the handler runs later on another
 thread; the copy does not follow later changes to the frame. `values(name)` does not allocate when
 the name is absent. `all()` flattens and allocates; the static file handler does not call it.

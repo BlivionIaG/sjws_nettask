@@ -22,6 +22,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
 import sjws_nettask.messaging.delivery.LeaseResult;
 import sjws_nettask.messaging.delivery.Partition;
@@ -232,7 +233,7 @@ public final class TokenStreams {
     private final Config config;
     private final ConcurrentHashMap<FenceKey, Fence> fences = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Key, Sink> sinks = new ConcurrentHashMap<>();
-    private final AtomicLong sinkDrops = new AtomicLong();
+    private final LongAdder sinkDrops = new LongAdder(); // metric counter; hot path
 
     /** S2c PR 5 cancel state: cancelled and deadline-bound stream tasks (swarm memory only, never in messaging). */
     private final CancelSet cancels;
@@ -385,7 +386,7 @@ public final class TokenStreams {
 
     /** Chunks dropped because a local sink was full (resume from the ledger is PR 4). */
     public long sinkDrops() {
-        return this.sinkDrops.get();
+        return this.sinkDrops.sum();
     }
 
     int fenceEntries() {
@@ -700,7 +701,7 @@ public final class TokenStreams {
             var credit = s.credit; // S2c PR 6: null unless the credit sub-flag is on
             long lower = s.offer(c, credit);
             if (lower < 0) {
-                this.sinkDrops.incrementAndGet();
+                this.sinkDrops.increment();
                 s.dropped = true;
             }
             if (credit == null) {
@@ -868,7 +869,7 @@ public final class TokenStreams {
                 }
                 long lower = offer(c, credit);
                 if (lower < 0) {
-                    this.owner.sinkDrops.incrementAndGet();
+                    this.owner.sinkDrops.increment();
                     this.dropped = true;
                 }
                 return lower & ~DROPPED;

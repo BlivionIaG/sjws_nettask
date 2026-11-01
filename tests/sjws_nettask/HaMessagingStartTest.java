@@ -409,18 +409,73 @@ class HaMessagingStartTest {
         }
     }
 
+    /**
+     * Same BindException / assertThrows trap as {@link #replicationOnAnExistingLocalTopicIsRefused}: a stolen Raft
+     * port on the first or second {@code install} used to surface as {@code BindException} (or
+     * {@code AssertionFailedError} from {@code assertThrows(IllegalStateException)}) with no retry. Wrap in
+     * {@link EphemeralPorts#withBindRetry}; catch {@link IllegalStateException} yourself so bind failures propagate.
+     */
     @Test
+    @Timeout(60)
     void aBootstrapFailureThatIsNotARefusalIsAnIllegalState() throws Exception {
-        int[] raft = {freePort(), freePort(), freePort()};
-        int[] http = {freePort(), freePort(), freePort()};
-        var a = load("twice-a", cluster("a", raft, http, "on"), http[0]);
-        var b = load("twice-b", cluster("b", raft, http, "on"), http[1]);
-        var mod = messaging("twice");
+        EphemeralPorts.withBindRetry("HaMessagingStartTest.bootstrapFailure", () -> {
+            aBootstrapFailureThatIsNotARefusalIsAnIllegalStateOnce(-1);
+            return null;
+        });
+    }
+
+    /**
+     * Occupies node {@code b}'s Raft port on the first attempt so the second install throws {@link java.net.BindException}
+     * inside what used to be {@code assertThrows(IllegalStateException)}; the retry must still reach IllegalStateException.
+     * Mutation: restoring {@code assertThrows(IllegalStateException)} around the second install makes this fail
+     * ({@code AssertionFailedError} escapes {@code withBindRetry}).
+     */
+    @Test
+    @Timeout(60)
+    void bootstrapFailureRetriesWhenBRaftPortIsOccupied() throws Exception {
+        try (var hog = EphemeralPorts.reserveSocket()) {
+            var attempts = new java.util.concurrent.atomic.AtomicInteger();
+            EphemeralPorts.withBindRetry("HaMessagingStartTest.bootstrapOccupied", () -> {
+                int n = attempts.incrementAndGet();
+                aBootstrapFailureThatIsNotARefusalIsAnIllegalStateOnce(n == 1 ? hog.getLocalPort() : -1);
+                return null;
+            });
+            assertTrue(attempts.get() >= 2, "occupied b raft port must force at least one retry, got " + attempts.get());
+        }
+    }
+
+    /**
+     * @param forceRaftB when {@code >= 0}, use that port as node {@code b}'s Raft address (occupied-port retry proof);
+     *                   otherwise probe a free port
+     */
+    private void aBootstrapFailureThatIsNotARefusalIsAnIllegalStateOnce(int forceRaftB) throws Exception {
+        // Fresh names each attempt so a prior bind failure does not leave raft/module state for the next try.
+        var tag = Long.toHexString(System.nanoTime());
+        final int[] raft;
+        final int[] http;
+        if (forceRaftB >= 0) {
+            int[] ports = EphemeralPorts.probeDistinct(5);
+            raft = new int[] {ports[0], forceRaftB, ports[1]};
+            http = new int[] {ports[2], ports[3], ports[4]};
+        } else {
+            int[] ports = EphemeralPorts.probeDistinct(6);
+            raft = new int[] {ports[0], ports[1], ports[2]};
+            http = new int[] {ports[3], ports[4], ports[5]};
+        }
+        var a = load("twice-a-" + tag, cluster("a", raft, http, "on"), http[0]);
+        var b = load("twice-b-" + tag, cluster("b", raft, http, "on"), http[1]);
+        var mod = messaging("twice-" + tag);
         var first = HaMessagingStart.install(a, mod, System.err);
         try {
+            // Do not use assertThrows(IllegalStateException): a BindException becomes AssertionFailedError (Error),
+            // which withBindRetry's catch (Exception) never sees. Catch IllegalStateException; let bind failures propagate.
             // the module already has replication installed: MessagingModule.replication refuses a second one
-            var e = assertThrows(IllegalStateException.class, () -> HaMessagingStart.install(b, mod, System.err));
-            assertTrue(e.getMessage().contains("HA messaging bootstrap failed"), e.getMessage());
+            try {
+                HaMessagingStart.install(b, mod, System.err);
+                fail("expected IllegalStateException");
+            } catch (IllegalStateException e) {
+                assertTrue(e.getMessage().contains("HA messaging bootstrap failed"), e.getMessage());
+            }
         } finally {
             first.close();
         }
