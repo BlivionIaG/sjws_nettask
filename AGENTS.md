@@ -59,6 +59,8 @@ Examples: root `sjws_nettask` line 0.96 / branch 0.96, `http1` 0.98 / 0.97, `cor
 - `codeql.yml` (CodeQL), job `analyze`: java-kotlin, on PRs to master, pushes and weekly.
 - `cluster-tests.yml` (Cluster tests), job `cluster`: nightly, manual, or the `cluster-tests` PR label.
 - `release.yml`: on `v*` tags ([releasing](docs/operations/releasing.md)).
+- No `continue-on-error` on jobs that must fail the workflow (`ci.yml` enforces this; see #356).
+- Cursor cloud agents often cannot `gh workflow run` (403 without `actions: write`); a human dispatches.
 
 Docs checks: `DocsConsistencyTest` (every `--flag`/`WEB_SERVER_*` in `--help` appears in the option
 tables listed in `DocsConsistencyTest.OPTION_DOCS`, defaults match). Keep relative links valid.

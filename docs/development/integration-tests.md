@@ -199,6 +199,28 @@ flowchart TB
 
 `.github/workflows/release.yml` is a tag workflow. It is not the test matrix.
 
+### CI correctness ([#356](https://github.com/BlivionIaG/sjws_nettask/issues/356))
+
+Two rules that came out of the Ubuntu 26.04 canary work (#265 / #269 / #356):
+
+1. **Do not use `continue-on-error: true` on a job whose failure must fail the
+   workflow.** A red job with `continue-on-error` still marks the workflow run
+   green, so reviewers reading the Actions list miss the failure. The
+   `verify-canary` job did that and masked seven `SwarmBenchCleanupTest`
+   failures. Prefer a hard-fail job, or a follow-up job that reads the canary
+   result and fails the run. `ci.yml` greps `.github/workflows/` for
+   `continue-on-error:` and fails if any remain.
+
+2. **Manual `workflow_dispatch` from Cursor cloud agents.** Those integrations
+   often hold only `contents: read`, so `gh workflow run …` returns
+   `HTTP 403 Resource not accessible by integration`. A human with
+   `actions: write` (or a PAT that has it) must dispatch when a PR needs a
+   manual run: the macOS matrix and mutation job on `ci.yml`,
+   `cluster-tests.yml` without the `cluster-tests` label, and any other
+   `workflow_dispatch`-only path. The Ubuntu 26.04 canary workflow itself was
+   deleted in #265 once `ubuntu-latest` became 26.04 and verify stayed green;
+   there is nothing left to dispatch for that canary.
+
 Local equivalents, with Java 25:
 
 ```
