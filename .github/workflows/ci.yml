@@ -47,6 +47,21 @@ jobs:
           tar -C /tmp -xzf /tmp/prometheus.tar.gz
           echo "PROMTOOL=/tmp/prometheus-${ver}.linux-amd64/promtool" >> "$GITHUB_ENV"
           echo "PROMETHEUS=/tmp/prometheus-${ver}.linux-amd64/prometheus" >> "$GITHUB_ENV"
+      - name: Install Pebble
+        if: runner.os == 'Linux'
+        run: |
+          ver=2.10.1
+          base="https://github.com/letsencrypt/pebble/releases/download/v${ver}"
+          curl -fsSL -o /tmp/pebble-linux-amd64.tar.gz "${base}/pebble-linux-amd64.tar.gz"
+          curl -fsSL -o /tmp/pebble-challtestsrv-linux-amd64.tar.gz "${base}/pebble-challtestsrv-linux-amd64.tar.gz"
+          echo "4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed  /tmp/pebble-linux-amd64.tar.gz" | sha256sum -c -
+          echo "e93a5aa25ecdf3af2f9fbb2de32b0173e64a2eae81002a4ccfe35fa6f4f60b92  /tmp/pebble-challtestsrv-linux-amd64.tar.gz" | sha256sum -c -
+          tar -C /tmp -xzf /tmp/pebble-linux-amd64.tar.gz
+          tar -C /tmp -xzf /tmp/pebble-challtestsrv-linux-amd64.tar.gz
+          chmod +x /tmp/pebble-linux-amd64/linux/amd64/pebble \
+                   /tmp/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv
+          echo "PEBBLE_BIN=/tmp/pebble-linux-amd64/linux/amd64/pebble" >> "$GITHUB_ENV"
+          echo "PEBBLE_CHALLTESTSRV_BIN=/tmp/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv" >> "$GITHUB_ENV"
       - name: Unit and integration tests, package, coverage gate
         run: mvn -B verify
       - name: HTTP/1 tests with the buffer pool on (debug pool, NoBufferLeaks)
