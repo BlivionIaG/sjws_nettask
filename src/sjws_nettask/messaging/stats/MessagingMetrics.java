@@ -96,7 +96,13 @@ public final class MessagingMetrics implements MessagingHooks {
             k = key(admitted, status);
         }
         final String label = admitted;
-        return map.computeIfAbsent(k, ignored -> new Hist(label, status));
+        Hist existing = map.get(k);
+        if (existing != null) {
+            return existing;
+        }
+        Hist created = new Hist(label, status);
+        Hist raced = map.putIfAbsent(k, created);
+        return raced != null ? raced : created;
     }
 
     private static String key(String topic, int status) {
