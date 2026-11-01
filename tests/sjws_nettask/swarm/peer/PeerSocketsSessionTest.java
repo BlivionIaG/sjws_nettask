@@ -349,6 +349,117 @@ class PeerSocketsSessionTest {
         });
     }
 
+
+    /**
+     * #334: a closed dialled peer and the matching accepted peer leave {@code live} when {@link PeerSockets#released}
+     * runs (as {@link sjws_nettask.cluster.TcpTransport} does on close / admit refusal / reader exit). No TLS reload
+     * is required. Mutating {@code released} to a no-op leaves liveSize at 1.
+     */
+    @Test
+    void closedPeersReclaimedFromLiveWithoutReload() throws Exception {
+        var ca = new PeerTestCa(dir.resolve("ca-reclaim"));
+        var ports = EphemeralPorts.probeDistinct(2);
+        var map = "a=1@127.0.0.1:" + ports[0] + ",b=2@127.0.0.1:" + ports[1];
+        var configA = PeerConfig.parse(map, "a");
+        var configB = PeerConfig.parse(map, "b");
+        var deny = Files.writeString(dir.resolve("deny-reclaim.txt"), "# none\n");
+        var cfgA = ca.node("a", PeerConfig.SAN_PREFIX + "a");
+        cfgA = new sjws_nettask.cp.CpListenerConfig(PeerSockets.LISTENER, cfgA.certPem(), cfgA.keyPem(), cfgA.caPem(),
+                deny, false);
+        var tlsA = CpTls.peerContext(cfgA);
+        var tlsB = CpTls.peerContext(ca.node("b", PeerConfig.SAN_PREFIX + "b"));
+        var socketsA = new PeerSockets(tlsA, configA);
+        var socketsB = new PeerSockets(tlsB, configB);
+
+        EphemeralPorts.withBindRetry("PeerSocketsSessionTest.reclaim", () -> {
+            try (var listener = socketsA.listen(configA.self().address())) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                var acceptor = CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        socketsA.handshake(ssl, 5_000);
+                        assertEquals(2, socketsA.peerWire(ssl));
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var connected = socketsB.dial(configA.self().address());
+                var live = accepted.get(10, TimeUnit.SECONDS);
+                assertEquals(1, socketsA.liveSize(), "accept registered");
+                assertEquals(1, socketsB.liveSize(), "dial registered");
+                assertFalse(live.isClosed());
+
+                connected.socket().close();
+                connected.abort().close();
+                live.close();
+                // Closing alone must not be enough historically; release is what TcpTransport calls.
+                assertEquals(1, socketsA.liveSize(), "closed accept still listed until released");
+                assertEquals(1, socketsB.liveSize(), "closed dial still listed until released");
+                socketsA.released(live);
+                socketsB.released(connected.socket());
+                assertEquals(0, socketsA.liveSize(), "acceptor reclaims without reload");
+                assertEquals(0, socketsB.liveSize(), "dialer reclaims without reload");
+                // Idempotent.
+                socketsA.released(live);
+                socketsB.released(connected.socket());
+                assertEquals(0, socketsA.liveSize());
+                assertEquals(0, socketsB.liveSize());
+                acceptor.join();
+            }
+            return null;
+        });
+    }
+
+    /**
+     * #334 end-to-end: when TcpTransport closes after a successful mTLS hop, both live registries are empty without
+     * a reload. Fails if the transport forgets {@link sjws_nettask.cluster.TcpTransport.SocketFactory#released} or if
+     * {@link PeerSockets#released} is a no-op.
+     */
+    @Test
+    void transportCloseReclaimsLiveWithoutReload() throws Exception {
+        var ca = new PeerTestCa(dir.resolve("ca-reclaim-t"));
+        var ports = EphemeralPorts.probeDistinct(2);
+        var map = "a=1@127.0.0.1:" + ports[0] + ",b=2@127.0.0.1:" + ports[1];
+        var configA = PeerConfig.parse(map, "a");
+        var configB = PeerConfig.parse(map, "b");
+        var deny = Files.writeString(dir.resolve("deny-reclaim-t.txt"), "# none\n");
+        var cfgA = ca.node("a", PeerConfig.SAN_PREFIX + "a");
+        cfgA = new sjws_nettask.cp.CpListenerConfig(PeerSockets.LISTENER, cfgA.certPem(), cfgA.keyPem(), cfgA.caPem(),
+                deny, false);
+        var tlsA = CpTls.peerContext(cfgA);
+        var tlsB = CpTls.peerContext(ca.node("b", PeerConfig.SAN_PREFIX + "b"));
+        var socketsA = new PeerSockets(tlsA, configA);
+        var socketsB = new PeerSockets(tlsB, configB);
+        var key = sjws_nettask.cluster.ClusterKey.of("swarm-peer-reclaim-key-012".getBytes(java.nio.charset.StandardCharsets.US_ASCII),
+                null);
+        var members = configA.members();
+        var group = new sjws_nettask.cluster.GroupId("swarm");
+        EphemeralPorts.withBindRetry("PeerSocketsSessionTest.reclaimTransport", () -> {
+            try (var a = sjws_nettask.cluster.TcpTransport.open(members.get(0).id(), members, key,
+                    sjws_nettask.cluster.Clock.SYSTEM, 64, socketsA);
+                    var b = sjws_nettask.cluster.TcpTransport.open(members.get(1).id(), members, key,
+                            sjws_nettask.cluster.Clock.SYSTEM, 64, socketsB)) {
+                a.attach(members.get(0).id(), (from, frame) -> {
+                });
+                var rpc = b.attach(members.get(1).id(), (from, frame) -> {
+                });
+                rpc.send(members.get(0).id(), new sjws_nettask.cluster.SimTransport.Frame(group, 1, new byte[] {1}));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (System.nanoTime() < deadline && (socketsA.liveSize() < 1 || socketsB.liveSize() < 1)) {
+                    a.deliver(50);
+                    b.deliver(50);
+                    Thread.sleep(10);
+                }
+                assertTrue(socketsA.liveSize() >= 1, "acceptor registered the peer");
+                assertTrue(socketsB.liveSize() >= 1, "dialer registered the peer");
+            }
+            assertEquals(0, socketsA.liveSize(), "transport close reclaims acceptor live");
+            assertEquals(0, socketsB.liveSize(), "transport close reclaims dialer live");
+            return null;
+        });
+    }
+
     /** Warm one accept+dial and return the dialer's session creation time (for resume checks). */
     private static long warmAccept(PeerSockets socketsA, PeerSockets socketsB, java.net.ServerSocket listener,
             PeerConfig configA) throws Exception {
@@ -381,6 +492,7 @@ class PeerSocketsSessionTest {
         assertNull(accepted.get(10, TimeUnit.SECONDS));
         c.socket().close();
         c.abort().close();
+        socketsB.released(c.socket());
         return created.get();
     }
 
