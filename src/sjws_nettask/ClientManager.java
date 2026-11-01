@@ -197,8 +197,27 @@ public class ClientManager implements Runnable {
     }
 
     /**
-     * Per-accept-thread drain scratch for {@link #refuseWith503}. Never shared across threads
-     * (#327 / Security). Package-visible for the confinement test.
+     * Canned cleartext 503 for a per-IP refuse on this HTTP/1.1 accept path (#327).
+     * Generic and fixed: no limit, count or client address. Matches the H1 busy shape
+     * ({@code Retry-After: 1}, {@code Connection: close}, {@code Content-Length: 0}).
+     * ClientManager listens only for cleartext H1 ({@link Http1Connection}); TLS and
+     * h2c live on separate {@code Http2Server} ports, so this write is never sent into
+     * a handshake or preface sniff.
+     */
+    private static final byte[] PER_IP_REFUSE_503 = (
+            "HTTP/1.1 503 Service Unavailable\r\n"
+                    + "Retry-After: 1\r\n"
+                    + "Connection: close\r\n"
+                    + "Content-Length: 0\r\n"
+                    + "\r\n").getBytes(StandardCharsets.US_ASCII);
+
+    /** Per-accept-thread write view of {@link #PER_IP_REFUSE_503}; no shared mutable cursor. */
+    private static final ThreadLocal<ByteBuffer> PER_IP_REFUSE_OUT =
+            ThreadLocal.withInitial(() -> ByteBuffer.wrap(PER_IP_REFUSE_503));
+
+    /**
+     * Per-accept-thread drain scratch for {@link #refuseWith503}. Never shared across
+     * accept or virtual threads (#327 / Security). Package-visible for the confinement test.
      */
     static final ThreadLocal<ByteBuffer> PER_IP_REFUSE_DRAIN =
             ThreadLocal.withInitial(() -> ByteBuffer.allocate(256));
@@ -209,11 +228,36 @@ public class ClientManager implements Runnable {
     }
 
     /**
-     * Placeholder until the #327 refuse path lands: still a silent close so the hardening
-     * test fails closed (expects 503).
+     * Best-effort refuse for a cleartext H1 socket that failed {@code perIp.tryAcquire}.
+     * Writes the canned 503 once without blocking the accept loop (socket set non-blocking;
+     * incomplete write is abandoned — no retry, no timer, no per-refuse allocation of the
+     * response bytes), {@code shutdownOutput}, then at most one non-blocking drain read of
+     * already-buffered client bytes into the thread-confined buffer, then close. A concurrent
+     * RST can still drop the 503 before the client reads it.
      */
     private static void refuseWith503(SocketChannel socket) {
-        closeQuietly(socket);
+        try {
+            socket.configureBlocking(false);
+            ByteBuffer out = PER_IP_REFUSE_OUT.get();
+            out.clear();
+            socket.write(out); // one shot; give up if the kernel cannot take it all now
+            try {
+                socket.shutdownOutput();
+            } catch (IOException ignored) {
+                // already half-closed or reset
+            }
+            ByteBuffer drain = PER_IP_REFUSE_DRAIN.get();
+            drain.clear();
+            try {
+                socket.read(drain); // at most one read of buffered bytes
+            } catch (IOException ignored) {
+                // reset while draining
+            }
+        } catch (IOException | RuntimeException ignored) {
+            // best-effort; close below
+        } finally {
+            closeQuietly(socket);
+        }
     }
 
     private volatile ConnectionReaper reaper;
@@ -335,7 +379,7 @@ public class ClientManager implements Runnable {
                 if (!this.perIp.tryAcquire(address)) { // one address can't take every connection slot
                     this.refusedPerIp.increment();
                     this.permits.release();
-                    refuseWith503(socket); // #327: canned 503 on cleartext h1 (stub until fix lands)
+                    refuseWith503(socket); // #327: canned 503 on cleartext h1, then close
                     continue;
                 }
                 try {
