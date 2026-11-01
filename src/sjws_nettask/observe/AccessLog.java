@@ -44,7 +44,8 @@ final class AccessLog implements Runnable, AutoCloseable {
     private static final int FLUSH_BYTES = 32 * 1024;
 
     private final LogQueue queue;
-    private final OutputStream out;
+    private final Path path; // null when logging to an injected stream / stdout
+    private volatile OutputStream out;
     private final boolean closeOut;
     private final AccessLogFormat format;
     private final LongAdder dropped = new LongAdder();
@@ -52,6 +53,18 @@ final class AccessLog implements Runnable, AutoCloseable {
     private final Clock clock = new Clock();
     private volatile boolean stopped;
     private volatile boolean failed;
+    /** File key of the inode currently open; null until first open or when unsupported. */
+    private Object openedKey;
+
+    /**
+     * Package-private reopen-path test seam for key-race retry coverage. Production leaves
+     * {@link OpenKeyRaceProbe#NONE} (always no-op).
+     */
+    static volatile OpenKeyRaceProbe openKeyRaceProbe = OpenKeyRaceProbe.NONE;
+    private long nextReopenCheckNanos;
+    /** Test/hook: force one reopen check, ignoring the 1s deadline once (#406). */
+    private volatile boolean reopenRequested;
+    private static final long REOPEN_CHECK_NANOS = 1_000_000_000L;
 
     private static final Set<PosixFilePermission> FILE_0640 = EnumSet.of(PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ);
@@ -61,22 +74,28 @@ final class AccessLog implements Runnable, AutoCloseable {
 
     static AccessLog start(String target, AccessLogFormat format) throws IOException {
         if ("-".equals(target)) {
-            return new AccessLog(unclosable(System.out), false, format, CAPACITY);
+            return new AccessLog(null, unclosable(System.out), false, format, CAPACITY);
         }
-        return new AccessLog(openFile(Path.of(target)), true, format, CAPACITY);
+        Path path = Path.of(target).toAbsolutePath();
+        Opened opened = openFileWithKey(path);
+        return new AccessLog(path, opened.stream, true, format, CAPACITY, opened.key);
     }
 
     /**
      * Opens {@code path} for append. A newly created file is mode {@code 0640}; each directory this
      * process creates for it is {@code 0750}. An existing file keeps its mode; a world-readable
-     * existing file logs a WARN and is still appended. A file rotated in by an external process
-     * keeps whatever mode that process gave it until this server reopens the path (AccessLog does
-     * not reopen on rename).
+     * existing file logs a WARN and is still appended. After an external rename/replace, the writer
+     * thread reopens the configured path (#406) so new lines hit the new inode (and a newly created
+     * file gets {@code 0640} again).
      */
     static OutputStream openFile(Path path) throws IOException {
         Path absolute = path.toAbsolutePath();
         ensureParent(absolute);
-        if (Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
+        if (Files.isSymbolicLink(absolute)) {
+            // Missing symlink targets must not be created by FileOutputStream (umask default);
+            // create the resolved target with 0640 / CREATE_NEW first (#428 Security P2).
+            ensureSymlinkTargetCreated(absolute);
+        } else if (Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
             warnIfWorldReadable(absolute);
         } else {
             try {
@@ -87,6 +106,82 @@ final class AccessLog implements Runnable, AutoCloseable {
             }
         }
         return new FileOutputStream(absolute.toFile(), true);
+    }
+
+    /**
+     * If {@code link}'s target is missing, create that target with {@code 0640} using
+     * {@link Files#createFile} (CREATE_NEW / O_EXCL). Does not create via a follow-then-open race
+     * on the symlink itself. Existing targets are left unchanged (WARN if world-readable).
+     */
+    static void ensureSymlinkTargetCreated(Path link) throws IOException {
+        Path target = Files.readSymbolicLink(link);
+        Path parent = link.toAbsolutePath().getParent();
+        Path resolved = (parent != null ? parent.resolve(target) : target).normalize();
+        if (Files.exists(resolved, LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isSymbolicLink(resolved)) {
+                warnIfWorldReadable(resolved);
+            }
+            return;
+        }
+        ensureParent(resolved);
+        try {
+            createNew(resolved);
+        } catch (FileAlreadyExistsException e) {
+            warnIfWorldReadable(resolved);
+        }
+    }
+
+    /**
+     * Opens {@code path} and records a file key that belongs to the opened stream. If the path's
+     * key changes across the open (rotator replaced the inode under us), close and retry so
+     * {@code openedKey} never describes a different inode than the stream we keep writing to.
+     */
+    static Opened openFileWithKey(Path path) throws IOException {
+        IOException lastClose = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            Object before = fileKey(path);
+            OutputStream stream = openFile(path);
+            Object after = fileKey(path);
+            boolean raced = before != null && after != null && !before.equals(after);
+            if (openKeyRaceProbe.consumeForceRace()) {
+                raced = true;
+            }
+            if (raced) {
+                try {
+                    stream.close();
+                } catch (IOException e) {
+                    lastClose = e;
+                }
+                continue;
+            }
+            return new Opened(stream, after);
+        }
+        if (lastClose != null) {
+            System.err.println("WARN: access log close after raced open: " + lastClose);
+        }
+        OutputStream stream = openFile(path);
+        return new Opened(stream, fileKey(path));
+    }
+
+    /** Stream plus the path file key observed to be stable across that open. */
+    static final class Opened {
+        final OutputStream stream;
+        final Object key;
+
+        Opened(OutputStream stream, Object key) {
+            this.stream = stream;
+            this.key = key;
+        }
+    }
+
+    /** Reopen-path only; {@link #NONE} is a no-op final for production. */
+    static class OpenKeyRaceProbe {
+        static final OpenKeyRaceProbe NONE = new OpenKeyRaceProbe();
+
+        /** @return true once per forced race the test wants to inject */
+        boolean consumeForceRace() {
+            return false;
+        }
     }
 
     /**
@@ -158,12 +253,37 @@ final class AccessLog implements Runnable, AutoCloseable {
 
     /** @param capacity power of two; tests use a tiny queue to force drops */
     AccessLog(OutputStream out, boolean closeOut, AccessLogFormat format, int capacity) {
+        this(null, out, closeOut, format, capacity);
+    }
+
+    private AccessLog(Path path, OutputStream out, boolean closeOut, AccessLogFormat format, int capacity) {
+        this(path, out, closeOut, format, capacity, path == null ? null : fileKey(path));
+    }
+
+    private AccessLog(Path path, OutputStream out, boolean closeOut, AccessLogFormat format, int capacity,
+            Object openedKey) {
         this.queue = new LogQueue(capacity);
+        this.path = path;
         this.out = out;
         this.closeOut = closeOut;
         this.format = format;
+        this.openedKey = openedKey;
+        this.nextReopenCheckNanos = System.nanoTime() + REOPEN_CHECK_NANOS;
         this.thread = Thread.ofPlatform().daemon().name("access-log").unstarted(this);
         this.thread.start();
+    }
+
+    /** Asks the writer to reopen the configured path (no-op for stdout / injected streams). */
+    /** True while a forced reopen check is pending (tests). Cleared when the check runs. */
+    boolean reopenForcedPending() {
+        return this.reopenRequested;
+    }
+
+    void requestReopen() {
+        if (this.path != null) {
+            this.reopenRequested = true;
+            LockSupport.unpark(this.thread);
+        }
     }
 
     boolean headers() {
@@ -193,7 +313,7 @@ final class AccessLog implements Runnable, AutoCloseable {
 
     @Override
     public void run() {
-        var buffered = new BufferedOutputStream(this.out, FLUSH_BYTES);
+        BufferedOutputStream buffered = new BufferedOutputStream(this.out, FLUSH_BYTES);
         long pending = 0;
         long flushedAt = System.nanoTime();
         try {
@@ -209,6 +329,12 @@ final class AccessLog implements Runnable, AutoCloseable {
                     if (this.stopped) {
                         break;
                     }
+                    BufferedOutputStream next = maybeReopen(buffered, pending > 0);
+                    if (next != buffered) {
+                        pending = 0;
+                        flushedAt = System.nanoTime();
+                        buffered = next;
+                    }
                     LockSupport.parkNanos(1_000_000L);
                     continue;
                 }
@@ -219,10 +345,24 @@ final class AccessLog implements Runnable, AutoCloseable {
                     pending = 0;
                     flushedAt = System.nanoTime();
                 }
+                // Reopen check also on the busy path so a full queue cannot defer rotation forever.
+                BufferedOutputStream next = maybeReopen(buffered, pending > 0);
+                if (next != buffered) {
+                    pending = 0;
+                    flushedAt = System.nanoTime();
+                    buffered = next;
+                }
             }
             byte[] rest;
             while ((rest = this.queue.poll()) != null) {
                 buffered.write(rest);
+                pending += rest.length;
+                BufferedOutputStream next = maybeReopen(buffered, pending > 0);
+                if (next != buffered) {
+                    pending = 0;
+                    flushedAt = System.nanoTime();
+                    buffered = next;
+                }
             }
             buffered.flush();
         } catch (IOException | RuntimeException e) {
@@ -236,6 +376,63 @@ final class AccessLog implements Runnable, AutoCloseable {
                     System.err.println("WARN: closing access log: " + e);
                 }
             }
+        }
+    }
+
+    /**
+     * Writer-only. Detects an external rename/replace of {@link #path} (inode / file key changed, or
+     * the path is gone) and reopens via {@link #openFile}. Request threads never call this.
+     */
+    private BufferedOutputStream maybeReopen(BufferedOutputStream buffered, boolean hadPending)
+            throws IOException {
+        if (this.path == null || this.failed) {
+            return buffered;
+        }
+        boolean forced = this.reopenRequested;
+        long now = System.nanoTime();
+        if (!forced && now < this.nextReopenCheckNanos) {
+            return buffered;
+        }
+        this.nextReopenCheckNanos = now + REOPEN_CHECK_NANOS;
+        this.reopenRequested = false;
+        // Follow links: FileOutputStream writes through a symlink; compare that target's key.
+        boolean exists = Files.exists(this.path);
+        Object current = exists ? fileKey(this.path) : null;
+        boolean missing = !exists;
+        // When the FS has no file keys, only forced reopen or a missing path triggers reopen.
+        boolean replaced = exists && this.openedKey != null && current != null && !this.openedKey.equals(current);
+        if (!forced && !missing && !replaced) {
+            return buffered;
+        }
+        if (hadPending) {
+            buffered.flush();
+        }
+        OutputStream previous = this.out;
+        try {
+            Opened opened = openFileWithKey(this.path);
+            try {
+                previous.close();
+            } catch (IOException e) {
+                System.err.println("WARN: closing rotated access log: " + e);
+            }
+            this.out = opened.stream;
+            this.openedKey = opened.key;
+            return new BufferedOutputStream(opened.stream, FLUSH_BYTES);
+        } catch (IOException e) {
+            // Keep writing the previous stream. nextReopenCheckNanos was already advanced above so
+            // the next attempt waits for the 1s deadline (do not set reopenRequested — that would
+            // bypass the deadline and WARN-storm under a persistent failure). Do not set failed.
+            System.err.println("WARN: access log reopen failed; keeping previous stream: " + e);
+            return buffered;
+        }
+    }
+
+    /** File key of the path after following symlinks (matches what {@link FileOutputStream} writes). */
+    private static Object fileKey(Path path) {
+        try {
+            return Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class).fileKey();
+        } catch (IOException | UnsupportedOperationException e) {
+            return null;
         }
     }
 

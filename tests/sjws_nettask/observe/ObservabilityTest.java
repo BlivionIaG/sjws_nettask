@@ -672,6 +672,112 @@ class ObservabilityTest {
         return new String(raw, charset);
     }
 
+    @Test
+    void reopensAfterExternalRotation(@TempDir Path dir) throws Exception {
+        Path path = dir.resolve("access.log");
+        try (var log = AccessLog.start(path.toString(), AccessLogFormat.COMMON)) {
+            log.offer("127.0.0.1", "GET", "/", "HTTP/1.1", 200, 3, 0, null, null);
+            awaitLog(() -> Files.exists(path) && Files.size(path) > 0);
+            Path rotated = dir.resolve("access.log.1");
+            Files.move(path, rotated);
+            log.requestReopen();
+            awaitLog(() -> Files.exists(path));
+            log.offer("127.0.0.1", "GET", "/after", "HTTP/1.1", 200, 5, 0, null, null);
+            awaitLog(() -> Files.exists(path) && Files.readString(path).contains("/after"));
+            assertTrue(Files.readString(rotated).contains("GET / "), rotated + " kept pre-rotate lines");
+            assertFalse(Files.readString(path).contains("GET / "), "new file should not have old lines");
+            assertTrue(Files.readString(path).contains("GET /after"), Files.readString(path));
+            if (path.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+                var perms = Files.getPosixFilePermissions(path);
+                assertFalse(perms.contains(java.nio.file.attribute.PosixFilePermission.OTHERS_READ), perms.toString());
+            }
+        }
+    }
+    @Test
+    void reopensAfterSymlinkTargetRotation(@TempDir Path dir) throws Exception {
+        Path target = dir.resolve("access.log");
+        Path link = dir.resolve("current.log");
+        Files.writeString(target, "");
+        Files.createSymbolicLink(link, target.getFileName());
+        try (var log = AccessLog.start(link.toString(), AccessLogFormat.COMMON)) {
+            log.offer("10.0.0.1", "GET", "/a", "HTTP/1.1", 200, 1, 0, "-", "-");
+            awaitLog(() -> Files.exists(target) && Files.size(target) > 0);
+            Path rotated = dir.resolve("access.log.1");
+            Files.move(target, rotated);
+            Files.writeString(target, "");
+            // Wait past the one-second reopen poll (no requestReopen) so the followed key change is seen.
+            Thread.sleep(1_200);
+            log.offer("10.0.0.1", "GET", "/b", "HTTP/1.1", 200, 1, 0, "-", "-");
+            awaitLog(() -> Files.size(target) > 0);
+            String neu = Files.readString(target);
+            String old = Files.readString(rotated);
+            assertTrue(neu.contains("GET /b"), neu);
+            assertFalse(neu.contains("GET /a"), neu);
+            assertTrue(old.contains("GET /a"), old);
+        }
+    }
+
+
+
+    @Test
+    void reopensWhileQueueStaysBusy(@TempDir Path dir) throws Exception {
+        Path path = dir.resolve("access.log");
+        try (var log = AccessLog.start(path.toString(), AccessLogFormat.COMMON)) {
+            var stop = new java.util.concurrent.atomic.AtomicBoolean();
+            var filler = Thread.ofVirtual().start(() -> {
+                while (!stop.get()) {
+                    log.offer("127.0.0.1", "GET", "/busy", "HTTP/1.1", 200, 1, 0, null, null);
+                }
+            });
+            try {
+                awaitLog(() -> Files.exists(path) && Files.size(path) > 0);
+                Path rotated = dir.resolve("access.log.1");
+                Files.move(path, rotated);
+                log.requestReopen();
+                awaitLog(() -> Files.exists(path) && Files.size(path) > 0);
+                // New inode received lines while the filler kept the queue nonempty.
+                assertTrue(Files.size(path) > 0, "reopen under load must create/write the new file");
+                String neu = Files.readString(path);
+                assertTrue(neu.contains("GET /busy"), neu);
+            } finally {
+                stop.set(true);
+                filler.join(2_000);
+            }
+        }
+    }
+
+    @Test
+    void failedReopenPreservesCheckDeadline(@TempDir Path dir) throws Exception {
+        Path path = dir.resolve("access.log");
+        try (var log = AccessLog.start(path.toString(), AccessLogFormat.COMMON)) {
+            log.offer("127.0.0.1", "GET", "/ok", "HTTP/1.1", 200, 1, 0, null, null);
+            awaitLog(() -> Files.exists(path) && Files.size(path) > 0);
+            // Next openFile fails: path becomes a directory (cannot open as FileOutputStream).
+            Files.delete(path);
+            Files.createDirectory(path);
+            log.requestReopen();
+            // Writer clears the force flag when the check runs; must not re-arm it on failure.
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+            while (System.nanoTime() < deadline && log.reopenForcedPending()) {
+                Thread.sleep(5);
+            }
+            assertFalse(log.reopenForcedPending(),
+                    "failed reopen must not leave reopenRequested set (would bypass the 1s deadline)");
+            // Previous stream is gone; further offers may drop — we only assert the deadline flag.
+        }
+    }
+
+    private static void awaitLog(java.util.concurrent.Callable<Boolean> ready) throws Exception {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            if (Boolean.TRUE.equals(ready.call())) {
+                return;
+            }
+            Thread.sleep(5);
+        }
+        fail("timed out waiting for access log condition");
+    }
+
     private static String line(AccessLogFormat format, int status, long bytes, long nanos, String referer, String ua) {
         return new String(AccessLine.format(format, T0, AccessLine.clfTime(T0), "127.0.0.1", "GET", "/a\"b", "HTTP/1.1",
                 status, bytes, nanos, referer, ua), StandardCharsets.UTF_8);
