@@ -18,7 +18,7 @@ Wired: `GET /cp/v1/health`, `GET /cp/v1/nodes` (labels, health, applied version,
 `GET /cp/v1/config`, `GET /cp/v1/config/{version}` (history), `POST /cp/v1/config:validate`
 (server dry run), `POST /cp/v1/config` (propose), `POST /cp/v1/rollout` (selector other than `*`),
 `POST /cp/v1/activate` (selector `*`), `GET /cp/v1/rollout`, `POST /cp/v1/rollback`, and
-`GET /cp/v1/audit`. Every mutation carries an `Idempotency-Key`. HTTP 503 (leader not ready) and
+`GET /cp/v1/audit`. Every mutation carries an `Idempotency-Key` and `Content-Type: application/json` (the console client sets both; it does not send `Origin`). HTTP 503 (leader not ready) and
 connection failures move to the next endpoint.
 
 Authentication is the client certificate only (#89): the CP requires one (`needClientAuth`), trusts

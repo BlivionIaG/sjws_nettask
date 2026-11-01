@@ -887,6 +887,16 @@ The control role binds a dedicated admin address and does not bind the content p
 
 Every route authenticates with the client certificate. There is no `Authorization` bearer. A missing or unmapped certificate is 401. A mapped certificate whose role lacks the permission is 403.
 
+Mutating methods (`POST`, `PUT`, `PATCH`, `DELETE`) require `Content-Type: application/json` (optional parameters such as `charset=utf-8` are allowed); any other media type is 415. When an `Origin` header is present it must match an entry in `cp.admin.allowedOrigins` (exact string match; the list is empty by default, so a present `Origin` is refused with 403). A missing `Origin` is allowed for CLI clients. `GET` and `HEAD` are unchanged. Configure origins under the admin block, for example:
+
+```yaml
+cp:
+  admin:
+    listen: 10.0.0.1:9444
+    allowedOrigins:
+      - https://console.example
+```
+
 Responses are JSON. Mutations return the committed `version` and `raftIndex`, or a validation error and no committed entry. A follower answers 503 `leader not ready` and does not append; clients try the next endpoint (the answer carries no leader address yet).
 
 `sjws_nettask.admin.ServerControl` stays the in-process control for `standalone` (start, stop, reload). The TUI gains a control-plane client that implements the calls above when the operator points it at an admin URL. The standalone screens are unchanged. The TUI never links the admin client into `Http1Connection`.
