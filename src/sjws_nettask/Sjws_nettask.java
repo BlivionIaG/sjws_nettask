@@ -95,7 +95,7 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
-                attachSwarmMetrics(server, modules);
+        attachSwarmMetrics(server, modules);
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true, modules);
     }
 

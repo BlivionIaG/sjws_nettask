@@ -18,6 +18,7 @@ package sjws_nettask.swarm;
 
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import sjws_nettask.swarm.wire.StreamChunk;
 
 /**
@@ -87,13 +88,14 @@ final class StreamBudget {
     private final AtomicLong peak = new AtomicLong();
     private final AtomicLong overshoot = new AtomicLong();
     private final AtomicInteger sessions = new AtomicInteger();
-    private final AtomicLong nodeRefusals = new AtomicLong();
-    private final AtomicLong sessionAdmitRefusals = new AtomicLong();
-    private final AtomicLong trimChunks = new AtomicLong();
-    private final AtomicLong trimBytes = new AtomicLong();
-    private final AtomicLong gapTickets = new AtomicLong();
-    private final AtomicLong lastTickets = new AtomicLong();
-    private final AtomicLong underflows = new AtomicLong();
+    // Metric counters: LongAdder on the hot path (zero alloc; see StreamBudgetCounterAllocTest).
+    private final LongAdder nodeRefusals = new LongAdder();
+    private final LongAdder sessionAdmitRefusals = new LongAdder();
+    private final LongAdder trimChunks = new LongAdder();
+    private final LongAdder trimBytes = new LongAdder();
+    private final LongAdder gapTickets = new LongAdder();
+    private final LongAdder lastTickets = new LongAdder();
+    private final LongAdder underflows = new LongAdder();
     /** Test hook (#267 §7): runs on the request thread just before its budget charge. */
     volatile Runnable beforeBudgetCharge;
 
@@ -182,33 +184,33 @@ final class StreamBudget {
 
     /** Non-LAST chunks answered 429 with {@code "scope":"node"}. */
     long nodeRefusals() {
-        return this.nodeRefusals.get();
+        return this.nodeRefusals.sum();
     }
 
     /** New sessions answered 503 because the admit watermark was reached. */
     long sessionAdmitRefusals() {
-        return this.sessionAdmitRefusals.get();
+        return this.sessionAdmitRefusals.sum();
     }
 
     long pressureTrimChunks() {
-        return this.trimChunks.get();
+        return this.trimChunks.sum();
     }
 
     long pressureTrimBytes() {
-        return this.trimBytes.get();
+        return this.trimBytes.sum();
     }
 
     long gapTicketsOutstanding() {
-        return this.gapTickets.get();
+        return this.gapTickets.sum();
     }
 
     long lastTicketsOutstanding() {
-        return this.lastTickets.get();
+        return this.lastTickets.sum();
     }
 
     /** Bug counter: a release that would have taken {@code charged} or a session's resident bytes below 0. */
     long budgetUnderflows() {
-        return this.underflows.get();
+        return this.underflows.sum();
     }
 
     // --- the word
@@ -231,7 +233,7 @@ final class StreamBudget {
     private void discharge(long n) {
         long c = this.charged.addAndGet(-n);
         if (c < 0) {
-            this.underflows.incrementAndGet();
+            this.underflows.increment();
             this.charged.addAndGet(-c);
         }
     }
@@ -270,7 +272,7 @@ final class StreamBudget {
     }
 
     void nodeRefused() {
-        this.nodeRefusals.incrementAndGet();
+        this.nodeRefusals.increment();
     }
 
     void release(long amount) {
@@ -303,7 +305,7 @@ final class StreamBudget {
         }
         long r = st.resident.addAndGet(delta);
         if (r < 0) {
-            this.underflows.incrementAndGet();
+            this.underflows.increment();
             st.resident.addAndGet(-r);
         }
         discharge(-delta);
@@ -313,7 +315,7 @@ final class StreamBudget {
     void bookGap(StreamCredit.State st) {
         if (!st.gapTicket) {
             st.gapTicket = true;
-            this.gapTickets.incrementAndGet();
+            this.gapTickets.increment();
             charge(GAP_TICKET);
         }
     }
@@ -322,7 +324,7 @@ final class StreamBudget {
     void releaseGap(StreamCredit.State st) {
         if (st.gapTicket) {
             st.gapTicket = false;
-            this.gapTickets.decrementAndGet();
+            this.gapTickets.add(-1);
             discharge(GAP_TICKET);
         }
     }
@@ -333,7 +335,7 @@ final class StreamBudget {
      */
     void convertLast(StreamCredit.State st) {
         if (st.lastTicket.compareAndSet(true, false)) {
-            this.lastTickets.decrementAndGet();
+            this.lastTickets.add(-1);
             discharge(LAST_TICKET);
         }
     }
@@ -345,7 +347,7 @@ final class StreamBudget {
      */
     void rebookLast(StreamCredit.State st) {
         if (st.lastTicket.compareAndSet(false, true)) {
-            this.lastTickets.incrementAndGet();
+            this.lastTickets.increment();
             charge(LAST_TICKET);
         }
     }
@@ -355,26 +357,26 @@ final class StreamBudget {
         long c = this.charged.addAndGet(LAST_TICKET);
         if (c > this.admit) {
             this.charged.addAndGet(-LAST_TICKET);
-            this.sessionAdmitRefusals.incrementAndGet();
+            this.sessionAdmitRefusals.increment();
             return false;
         }
         observe(c);
         this.sessions.incrementAndGet();
-        this.lastTickets.incrementAndGet();
+        this.lastTickets.increment();
         return true;
     }
 
     /** A submit failed before its session existed: gives back the ticket {@link #admitSession} booked. */
     void abandonSession() {
         this.sessions.decrementAndGet();
-        this.lastTickets.decrementAndGet();
+        this.lastTickets.add(-1);
         discharge(LAST_TICKET);
     }
 
     /** Pressure trim: {@code bytes} of read chunks left the retained window. */
     void trimmed(long bytes) {
-        this.trimChunks.incrementAndGet();
-        this.trimBytes.addAndGet(bytes);
+        this.trimChunks.increment();
+        this.trimBytes.add(bytes);
     }
 
     /**
