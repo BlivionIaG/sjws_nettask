@@ -122,6 +122,15 @@ child environment when the test wants the arguments to win (`HardeningIntegratio
 | HTTP/3 | Opt-in (`--h3`). Netty `netty-codec-http3` and the bundled quiche natives (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64). TLS 1.3 is the QUIC handshake (`QuicSslContextBuilder`), with a configured PEM chain or a generated self-signed certificate. | `h3/*` when the natives load; otherwise the tests assume false and skip. JaCoCo gates for `sjws_nettask.h3` and `sjws_nettask.tls` are 0 off those platforms. |
 | TLS on TCP | Only on the HTTP/2 listener's own port (`--h2-port`): `Http2Server` builds its Netty `SslContext` from `TlsMaterial` (the same PEM chain or generated self-signed certificate as HTTP/3; TLS 1.3 and 1.2). The main HTTP/1.1 port is cleartext, and `Alt-Svc` is still sent only there. `TlsMaterial.keyManagerFactory()` serves the control-plane mTLS code (`cp.CpTls`, `cp.AdminTls`, `admin.cp.HttpCpClient`). | `h2/*` (HTTPS through the JDK `HttpClient` with a trusting `SSLContext`), `tls/TlsMaterialTest`, `cp/CpServerTlsTest`, `cp/CpPeerTlsTest`, `cp/AdminTlsTest`. |
 
+## HTTP/3 qlog in CI ([#367](https://github.com/BlivionIaG/sjws_nettask/issues/367))
+
+`mvn verify` in `.github/workflows/ci.yml` sets `-Dsjws.h3.qlog.dir=target/h3-qlog`.
+When that property is set, `H3TestClient` and `Http3Server` write quiche qlog files
+(one per QUIC connection) so a stall can show whether the client sent
+`MAX_STREAM_DATA` and where server `STREAM_DATA` stopped. The directory is uploaded
+as the `h3-qlog-*` artifact when the verify job fails. Local runs leave the property
+unset (no qlog). Do not treat this as a production toggle.
+
 ## Timeouts and flakiness
 
 The harness does not sleep and does not retry. `start` has already bound the
