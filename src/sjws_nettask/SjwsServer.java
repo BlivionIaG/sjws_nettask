@@ -88,6 +88,11 @@ public final class SjwsServer implements AutoCloseable {
     private final ObserverSlot slot;
     /** True when the order-0 observe filter was compiled into {@link #chain} at startup. */
     private final boolean observingAtStart;
+    /**
+     * When metrics were {@link ServerConfig.MetricsExposure#OFF} at start, install messaging
+     * histogram hooks on the first {@link #armMetrics()} (#400 / Codex P1).
+     */
+    private volatile Runnable deferredMessagingHooks;
     /** Published when counters are armed and the filter was not installed at startup. */
     private final HandlerRef armed = new HandlerRef();
     /** Null when no filters were registered. */
@@ -1328,6 +1333,12 @@ public final class SjwsServer implements AutoCloseable {
         this.slot.attachMessagingMetrics(metrics);
     }
 
+    /** Run {@code install} on the next {@link #armMetrics()} when hooks were deferred (metrics off at start). */
+    public void deferMessagingHooks(Runnable install) {
+        this.deferredMessagingHooks = install;
+    }
+
+
     /**
      * Appends per-route and per-API-key series to {@code /metrics}. Null omits them.
      * The source is read only while a scrape is rendered. This does not install the observe filter.
@@ -1386,6 +1397,11 @@ public final class SjwsServer implements AutoCloseable {
      * A document-root file at {@code /healthz} keeps being served after the counters come on.
      */
     public ServerMetrics armMetrics() throws IOException {
+        var deferred = this.deferredMessagingHooks;
+        if (deferred != null) {
+            this.deferredMessagingHooks = null;
+            deferred.run();
+        }
         var metrics = this.slot.arm(config()).metrics();
         if (!this.observingAtStart) {
             publishArmed();

@@ -91,4 +91,22 @@ class MessagingMetricsAttachTest {
             assertFalse(text.contains("sjws_messaging_produce_duration_seconds"), text);
         }
     }
+
+    @Test
+    void metricsOffLeavesHooksNoneUntilArm() throws Exception {
+        var html = Files.createDirectories(dir.resolve("html-off"));
+        var msg = new FakeMessaging();
+        var metrics = Sjws_nettask.prepareMessagingMetrics(msg, false);
+        assertTrue(metrics != null);
+        assertNull(msg.hooks.get(), "hooks stay unset while metrics are off");
+        var cfg = ServerConfig.builder(html).metricsExposure(MetricsExposure.OFF).build();
+        try (var server = SjwsServer.start(cfg)) {
+            Sjws_nettask.attachMessagingMetricsExporter(metrics, server);
+            Sjws_nettask.deferMessagingHooksIfNeeded(msg, metrics, false, server);
+            assertNull(msg.hooks.get());
+            server.armMetrics();
+            assertTrue(msg.hooks.get() instanceof sjws_nettask.messaging.stats.MessagingMetrics);
+        }
+    }
+
 }
