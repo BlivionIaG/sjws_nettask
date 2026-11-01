@@ -157,8 +157,26 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         var remote = channel.remoteAddress();
         InetSocketAddress peer = remote instanceof InetSocketAddress inet ? inet : null;
         boolean secure = channel.pipeline().get(SslHandler.class) != null;
-        // Typed-only view for refusal checks; field map / body wait for the pinned generation.
-        var request = toRequest(msg, peer, secure, false);
+        channel.config().setAutoRead(false); // one request at a time; reading resumes when idle again
+        if (this.busy && this.pending.size() >= MAX_PIPELINED) {
+            channel.close();
+            return;
+        }
+        // Pin first (like h2 captureAndStart) so attachBodies matches the handler (#301). When off,
+        // build the typed-only request with no retain and no map/body alloc (AGENTS.md zero-cost).
+        Http2Server.Generation generation;
+        for (;;) {
+            generation = this.shared.generation();
+            if (generation.tryEnter()) {
+                break;
+            }
+        }
+        boolean capture = generation.attachBodies();
+        var request = toRequest(msg, peer, secure, capture);
+        // Match h2: no body on GET/HEAD even if Content-Length is present.
+        if (capture && !request.headOnly() && !"GET".equals(request.method()) && msg.content().isReadable()) {
+            request = request.withBody(copyBody(msg));
+        }
         boolean keepAlive = HttpUtil.isKeepAlive(msg);
         Response refusal;
         if (msg.decoderResult().isFailure()) {
@@ -171,15 +189,8 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         } else {
             refusal = Http2StreamHandler.refusal(request);
         }
-        channel.config().setAutoRead(false); // one request at a time; reading resumes when idle again
-        if (this.busy && this.pending.size() >= MAX_PIPELINED) {
-            channel.close();
-            return;
-        }
-        // Retain past SimpleChannelInboundHandler's release so run() can fill fields/body under the
-        // pinned attachBodies gate (#446 / #301). Off path only pays retain+release.
-        msg.retain();
-        var task = new Task(channel, msg, request, refusal, keepAlive, peer, secure);
+        // msg is not retained: fields/body were copied under the pin while the inbound buffer lived.
+        var task = new Task(channel, request, refusal, keepAlive, generation);
         if (this.busy) {
             this.pending.add(task);
             return;
@@ -189,26 +200,8 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
 
     private void run(Task task) {
         this.busy = true;
-        Http2Server.Generation generation;
-        for (;;) {
-            generation = this.shared.generation();
-            if (generation.tryEnter()) {
-                break;
-            }
-        }
-        task.generation = generation;
-        try {
-            if (generation.attachBodies()) {
-                var filled = toRequest(task.msg, task.peer, task.secure, true);
-                if (!filled.headOnly() && !"GET".equals(filled.method()) && task.msg.content().isReadable()) {
-                    filled = filled.withBody(copyBody(task.msg));
-                }
-                task.request = filled;
-            }
-        } finally {
-            task.msg.release();
-            task.msg = null;
-        }
+        // generation already entered in channelRead0 (and left in Task.finally or releasePending).
+        var generation = task.generation;
         if (!this.shared.inflight().tryAcquire()) { // the same server-wide cap as HTTP/2 streams
             generation.leave();
             this.shared.refused().increment();
@@ -249,16 +242,16 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         channel.read();
     }
 
-    /** Drop queued retains if the connection dies before {@link #run(Task)} (Codex P1 / #446). */
+    /** Drop queued pins if the connection dies before {@link #run(Task)} (Codex P1 / #446). */
     private void releasePending() {
         for (;;) {
             var task = this.pending.poll();
             if (task == null) {
                 return;
             }
-            if (task.msg != null) {
-                task.msg.release();
-                task.msg = null;
+            if (task.generation != null) {
+                task.generation.leave();
+                task.generation = null;
             }
         }
     }
@@ -298,25 +291,19 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
     private final class Task implements Runnable, ResponseWriter.Sink {
 
         private final Channel channel;
-        /** Retained until {@link #run(Task)} finishes the attachBodies fill; then released. */
-        FullHttpRequest msg;
-        private Request request;
+        private final Request request;
         private final Response refusal;
         private final boolean keepAlive;
-        private final InetSocketAddress peer;
-        private final boolean secure;
-        /** Set in {@link #run(Task)} after {@link Http2Server.Generation#tryEnter}. */
+        /** Entered in {@link #channelRead0}; left in {@link #run()} finally or {@link #releasePending()}. */
         Http2Server.Generation generation;
 
-        Task(Channel channel, FullHttpRequest msg, Request request, Response refusal, boolean keepAlive,
-                InetSocketAddress peer, boolean secure) {
+        Task(Channel channel, Request request, Response refusal, boolean keepAlive,
+                Http2Server.Generation generation) {
             this.channel = channel;
-            this.msg = msg;
             this.request = request;
             this.refusal = refusal;
             this.keepAlive = keepAlive;
-            this.peer = peer;
-            this.secure = secure;
+            this.generation = generation;
         }
 
         @Override
