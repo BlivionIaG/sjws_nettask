@@ -104,7 +104,7 @@ final class H3Fixture {
         var h1 = http1(handler, method, path, headers);
         var what = method + " " + path + " " + headers;
         assertFalse(h3.reset(), what + ": stream was reset " + h3.progress());
-        assertEquals(h1.statusCode(), h3.status(), what);
+        assertEquals(h1.statusCode(), h3.status(), () -> what + " (" + h3.progress() + ")");
         for (var e : h1.headers().entrySet()) {
             if (!TRANSPORT.contains(e.getKey())) {
                 assertEquals(e.getValue(), h3.header(e.getKey()), what + ": field " + e.getKey());
@@ -115,7 +115,7 @@ final class H3Fixture {
                 assertTrue(h1.headers().containsKey(name), what + ": extra HTTP/3 field " + name);
             }
         }
-        assertArrayEquals(h1.body(), h3.body(), what + ": body");
+        assertArrayEquals(h1.body(), h3.body(), () -> what + ": body (" + h3.progress() + ")");
         assertNotNull(h3.header("date"), what);
         assertEquals(sjws_nettask.core.ServerInfo.NAME, h3.header("server"), what);
         for (var forbidden : new String[] {"connection", "keep-alive", "transfer-encoding", "upgrade",

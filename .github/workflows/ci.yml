@@ -48,7 +48,7 @@ jobs:
           echo "PROMTOOL=/tmp/prometheus-${ver}.linux-amd64/promtool" >> "$GITHUB_ENV"
           echo "PROMETHEUS=/tmp/prometheus-${ver}.linux-amd64/prometheus" >> "$GITHUB_ENV"
       - name: Unit and integration tests, package, coverage gate
-        run: mvn -B verify
+        run: mvn -B verify -Dsjws.h3.qlog.dir=${{ github.workspace }}/target/h3-qlog
       - name: HTTP/1 tests with the buffer pool on (debug pool, NoBufferLeaks)
         run: mvn -B -Djacoco.skip=true -DargLine="-Dsjws.buf.pool=on -Dsjws.buf.debug=true" -Dtest='ClientManagerFaultTest,Http1*Test,sjws_nettask.http1.*Test' -Dsurefire.failIfNoSpecifiedTests=true test
       - name: Python SDK conformance and end-to-end (golden frames; Java server + Python unary client)
@@ -68,6 +68,13 @@ jobs:
         with:
           name: jacoco-${{ matrix.os }}
           path: target/site/jacoco/
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: h3-qlog-${{ matrix.os }}
+          path: target/h3-qlog/
           if-no-files-found: ignore
 
   # SafeOpen's macOS openat path (#344). Full verify stays Linux-only on PRs because of

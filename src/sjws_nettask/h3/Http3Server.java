@@ -33,6 +33,8 @@ import io.netty.handler.codec.http3.Http3Settings;
 import io.netty.handler.codec.quic.QuicTokenHandler;
 import io.netty.handler.codec.quic.Quic;
 import io.netty.handler.codec.quic.QuicChannel;
+import io.netty.handler.codec.quic.QLogConfiguration;
+import io.netty.handler.codec.quic.QuicChannelOption;
 import io.netty.handler.codec.quic.QuicSslContextBuilder;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import java.io.IOException;
@@ -45,6 +47,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -346,13 +350,15 @@ public final class Http3Server implements Transport {
                     new Semaphore(this.limits.maxInflight()),
                     new Semaphore(this.limits.maxOpenFiles()), this.outcomes, this.captureFields, this.armed);
             this.group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
-            var codec = Http3.newQuicServerCodecBuilder()
+            var serverCodec = Http3.newQuicServerCodecBuilder()
                     .sslContext(ssl)
                     .maxIdleTimeout(this.config.idleTimeout().toMillis(), TimeUnit.MILLISECONDS)
                     .initialMaxData(MAX_DATA)
                     .initialMaxStreamDataBidirectionalRemote(MAX_STREAM_DATA)
                     .initialMaxStreamsBidirectional(MAX_STREAMS)
-                    .tokenHandler(TOKENS) // no Retry: forged tokens can't bypass address validation
+                    .tokenHandler(TOKENS); // no Retry: forged tokens can't bypass address validation
+            maybeEnableQlog(serverCodec);
+            var codec = serverCodec
                     .handler(new ChannelInitializer<QuicChannel>() {
                         @Override
                         protected void initChannel(QuicChannel quic) {
@@ -377,6 +383,28 @@ public final class Http3Server implements Transport {
      * {@link Limits#handshakeTimeout()}); the connection limits apply once it is established
      * ({@link Gate}). Runs on the event loop, like every listener below.
      */
+
+    /**
+     * Test/CI only (#367): {@code -Dsjws.h3.qlog.dir=<dir>} enables quiche qlog on accepted
+     * connections (MAX_STREAM_DATA / STREAM_DATA diagnosis). Must be set on the codec builder
+     * before channels register. Off by default.
+     */
+    private static void maybeEnableQlog(io.netty.handler.codec.quic.QuicServerCodecBuilder builder) {
+        var raw = System.getProperty("sjws.h3.qlog.dir");
+        if (raw == null || raw.isBlank()) {
+            return;
+        }
+        try {
+            var root = Path.of(raw);
+            Files.createDirectories(root);
+            // Directory path: quiche writes one qlog file per connection under it.
+            builder.option(QuicChannelOption.QLOG, new QLogConfiguration(root.toAbsolutePath().toString(),
+                    "sjws-h3-server", "HTTP/3 server qlog for #367"));
+        } catch (Exception e) {
+            throw new IllegalStateException("sjws.h3.qlog.dir=" + raw + ": " + e.getMessage(), e);
+        }
+    }
+
     private void accept(QuicChannel quic) {
         if (this.halfOpen.incrementAndGet() > this.limits.maxHalfOpen()) {
             this.halfOpen.decrementAndGet();
