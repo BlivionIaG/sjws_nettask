@@ -249,6 +249,31 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         channel.read();
     }
 
+    /** Drop queued retains if the connection dies before {@link #run(Task)} (Codex P1 / #446). */
+    private void releasePending() {
+        for (;;) {
+            var task = this.pending.poll();
+            if (task == null) {
+                return;
+            }
+            if (task.msg != null) {
+                task.msg.release();
+                task.msg = null;
+            }
+        }
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        releasePending();
+        ctx.fireChannelInactive();
+    }
+
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) {
+        releasePending();
+    }
+
     /** h2c: once the connection switched to HTTP/2, the HTTP/1 handlers behind the codec must go. */
     @Override
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {

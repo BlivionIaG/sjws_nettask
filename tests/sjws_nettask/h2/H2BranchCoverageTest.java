@@ -241,6 +241,19 @@ class H2BranchCoverageTest {
         piped.writeInbound(request(HttpVersion.HTTP_1_1, "/overflow"));
         assertFalse(piped.isOpen());
 
+        // #446 Codex P1: queued retains must be released when the channel closes before run().
+        var leakHeld = new ArrayList<Runnable>();
+        var leakHandler = new Http1FallbackHandler(shared(holding(leakHeld), new Semaphore(4), new Semaphore(4)));
+        var leakCh = new EmbeddedChannel(leakHandler);
+        leakCh.writeInbound(request(HttpVersion.HTTP_1_1, "/run"));
+        var queuedMsg = request(HttpVersion.HTTP_1_1, "/queued");
+        assertEquals(1, queuedMsg.refCnt());
+        leakCh.writeInbound(queuedMsg);
+        assertEquals(1, leakHeld.size());
+        assertEquals(1, queuedMsg.refCnt(), "Task holds the retain after inbound release");
+        assertTrue(leakCh.close().awaitUninterruptibly().isSuccess());
+        assertEquals(0, queuedMsg.refCnt(), "channelInactive must release pending FullHttpRequest retains");
+
         var busy = new Http1FallbackHandler(shared(holding(), new Semaphore(0), new Semaphore(1)));
         var refused = new EmbeddedChannel(busy);
         refused.writeInbound(request(HttpVersion.HTTP_1_1, "/"));
