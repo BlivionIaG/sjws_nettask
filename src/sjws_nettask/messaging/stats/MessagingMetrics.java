@@ -42,6 +42,8 @@ public final class MessagingMetrics implements MessagingHooks {
 
     private final ConcurrentHashMap<String, Hist> produce = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Hist> fetch = new ConcurrentHashMap<>();
+    /** Distinct topic labels admitted (not topic/status pairs). Cap is on this set. */
+    private final java.util.Set<String> admittedTopics = ConcurrentHashMap.newKeySet();
     private final LongAdder foldedTopics = new LongAdder();
     private volatile Supplier<MessagingStats> stats = () -> MessagingStats.NONE;
 
@@ -89,12 +91,20 @@ public final class MessagingMetrics implements MessagingHooks {
 
     private Hist hist(ConcurrentHashMap<String, Hist> map, String topic, int status) {
         String admitted = topic == null || topic.isEmpty() ? "other" : topic;
-        String k = key(admitted, status);
-        if (map.size() >= TOPIC_CAP && !map.containsKey(k) && !"other".equals(admitted)) {
-            this.foldedTopics.increment();
-            admitted = "other";
-            k = key(admitted, status);
+        if (!"other".equals(admitted) && !this.admittedTopics.contains(admitted)) {
+            if (this.admittedTopics.size() >= TOPIC_CAP) {
+                this.foldedTopics.increment();
+                admitted = "other";
+            } else {
+                this.admittedTopics.add(admitted);
+                // Race: if we crossed the cap, fold this late arriver.
+                if (this.admittedTopics.size() > TOPIC_CAP && this.admittedTopics.remove(admitted)) {
+                    this.foldedTopics.increment();
+                    admitted = "other";
+                }
+            }
         }
+        String k = key(admitted, status);
         final String label = admitted;
         Hist existing = map.get(k);
         if (existing != null) {

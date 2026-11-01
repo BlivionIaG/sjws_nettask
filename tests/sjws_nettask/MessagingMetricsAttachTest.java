@@ -66,6 +66,22 @@ class MessagingMetricsAttachTest {
     }
 
     @Test
+    void prepareHooksBeforeServerStartThenAttach() throws Exception {
+        var html = Files.createDirectories(dir.resolve("html-order"));
+        var msg = new FakeMessaging();
+        var metrics = Sjws_nettask.prepareMessagingMetrics(msg);
+        assertTrue(metrics != null);
+        assertTrue(msg.hooks.get() instanceof sjws_nettask.messaging.stats.MessagingMetrics);
+        var cfg = ServerConfig.builder(html).metricsExposure(MetricsExposure.ON).build();
+        try (var server = SjwsServer.start(cfg)) {
+            Sjws_nettask.attachMessagingMetricsExporter(metrics, server);
+            msg.hooks.get().produced("orders", 200, 8, 1_000_000L);
+            var text = HttpTestSupport.get(server.tcpPort(), "/metrics", 2000).bodyText();
+            assertTrue(text.contains("topic=\"orders\""), text);
+        }
+    }
+
+    @Test
     void attachWithoutMessagingIsNoOp() throws Exception {
         var html = Files.createDirectories(dir.resolve("html-none"));
         var cfg = ServerConfig.builder(html).metricsExposure(MetricsExposure.ON).build();

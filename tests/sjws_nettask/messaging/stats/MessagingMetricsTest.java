@@ -86,17 +86,23 @@ final class MessagingMetricsTest {
     @Test
     void topicCardinalityCapFoldsIntoOther() {
         var m = new MessagingMetrics();
-        // Cap is on map size (keys = topic+status). Fill with distinct keys then fold.
+        // Cap is on distinct topics, not topic/status pairs.
         for (int i = 0; i < MessagingMetrics.TOPIC_CAP; i++) {
             m.produced("t" + i, 200, 1, 1000);
         }
-        m.produced("overflow-topic", 200, 1, 1000);
+        // New status on an admitted topic keeps its label.
+        m.produced("t0", 500, 1, 1000);
         var text = m.prometheus();
+        assertTrue(text.contains("topic=\"t0\",status=\"500\""), text);
+        assertFalse(text.contains("sjws_messaging_topics_folded_total"), text);
+        // A new topic beyond the cap folds.
+        m.produced("overflow-topic", 200, 1, 1000);
+        text = m.prometheus();
         assertTrue(text.contains("sjws_messaging_topics_folded_total"), text);
         assertTrue(text.contains("topic=\"other\""), text);
-        // Existing keys still record without folding again when re-hit
         m.produced("t0", 200, 1, 2000);
-        assertTrue(m.prometheus().contains("sjws_messaging_produce_duration_seconds_count{topic=\"t0\",status=\"200\"} 2"),
+        assertTrue(m.prometheus().contains(
+                "sjws_messaging_produce_duration_seconds_count{topic=\"t0\",status=\"200\"} 2"),
                 m.prometheus());
     }
 }

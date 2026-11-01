@@ -82,6 +82,7 @@ public class Sjws_nettask {
             }
         }
         var modules = OptionalModules.start(err);
+        var messagingMetrics = prepareMessagingMetrics(modules); // before contribute/mount (#400)
         SjwsServer server;
         try {
             server = SjwsServer.start(config, h3Factory, OptionalModules.contributors(modules));
@@ -95,6 +96,7 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
+        attachMessagingMetricsExporter(messagingMetrics, server);
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true, modules);
     }
 
@@ -133,6 +135,7 @@ public class Sjws_nettask {
             err.println("Failed to start HA messaging: " + e);
             return EXIT_CANNOT_LISTEN;
         }
+        var messagingMetrics = prepareMessagingMetrics(modules); // before contribute/mount (#400)
         SjwsServer server;
         try {
             server = SjwsServer.start(loaded, h3Factory, bindContent, OptionalModules.contributors(modules));
@@ -147,7 +150,7 @@ public class Sjws_nettask {
             return EXIT_CANNOT_LISTEN;
         }
         attachMsgreplInstallMetrics(modules, server); // #315 N5: suppliers only; does not arm counters
-        attachMessagingMetricsExporter(modules, server); // #400: histograms on /metrics when messaging is on
+        attachMessagingMetricsExporter(messagingMetrics, server); // #400: /metrics families
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
                 bindContent, modules);
     }
@@ -202,24 +205,40 @@ public class Sjws_nettask {
 
 
     /**
-     * When the HTTP messaging module is loaded, install {@link sjws_nettask.messaging.stats.MessagingMetrics}
-     * as its {@link sjws_nettask.messaging.http.MessagingHooks} and append those series on {@code /metrics}
-     * (#400). Detected by a {@code hooks(MessagingHooks)} method so a messaging-off process never loads the
-     * exporter. Does not arm the observe filter by itself.
+     * Install {@link sjws_nettask.messaging.stats.MessagingMetrics} on the messaging module <strong>before</strong>
+     * {@link SjwsServer#start} mounts handlers (#400 / Codex P1). {@code MessagingModule.contribute} copies the
+     * module's hooks into {@code MessagingHttp}; installing after start would leave the handler on NONE.
+     * Returns the exporter to attach on the server after start, or null when messaging is absent.
      */
-    static void attachMessagingMetricsExporter(OptionalModule modules, SjwsServer server) {
+    static sjws_nettask.messaging.stats.MessagingMetrics prepareMessagingMetrics(OptionalModule modules) {
         var messaging = findMessagingHttp(modules);
         if (messaging == null) {
-            return;
+            return null;
         }
         try {
             var metrics = new sjws_nettask.messaging.stats.MessagingMetrics();
             var hooks = messaging.getClass().getMethod("hooks", sjws_nettask.messaging.http.MessagingHooks.class);
             hooks.invoke(messaging, metrics);
-            server.attachMessagingMetrics(metrics);
+            return metrics;
         } catch (ReflectiveOperationException ignored) {
-            // messaging binary without hooks(MessagingHooks): leave /metrics without messaging families
+            // messaging binary without hooks(MessagingHooks)
+            return null;
         }
+    }
+
+    /** Appends prepared messaging series on {@code /metrics}. No-op when {@code metrics} is null. */
+    static void attachMessagingMetricsExporter(sjws_nettask.messaging.stats.MessagingMetrics metrics,
+            SjwsServer server) {
+        if (metrics != null) {
+            server.attachMessagingMetrics(metrics);
+        }
+    }
+
+    /**
+     * @deprecated Tests/compat: prepare hooks then attach. Prefer {@link #prepareMessagingMetrics} before start.
+     */
+    static void attachMessagingMetricsExporter(OptionalModule modules, SjwsServer server) {
+        attachMessagingMetricsExporter(prepareMessagingMetrics(modules), server);
     }
 
     /**
