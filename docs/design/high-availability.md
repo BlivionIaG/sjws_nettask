@@ -101,11 +101,17 @@ has heard from nobody yet, so it refuses STRICT overrides until its first heartb
 answered; retry. What remains: a data node that fails after a STRICT override was accepted
 holds that entry, and every entry behind it, until the node is back or a leader with two
 reachable data copies takes over (a new leader rescans the marker and needs the same copies, so
-stepping down does not help). Bringing the data node back is the only way out today; a bounded
-wait or an operator escape is tracked in #208. The leader makes such a stall visible:
-`ReplicatedNode.strictPending(group)` (uncommitted STRICT overrides) and
-`oldestStrictPendingAgeNanos(group)` (0 when none; followers report 0), and one WARNING per
-entry once it has waited 2 x lease, naming the group, the index and how many data copies it has.
+stepping down does not help). Bringing the data node back is the preferred recovery. When that is impossible, an
+**explicit operator escape** (#208) is available on the group's leader:
+`ClusterNode.releaseStalledStrictOverrides(group, operatorId)`. It runs only when the oldest
+pending STRICT override has waited at least 2 × lease (same threshold as the stall WARN),
+requires a non-blank authenticated `operatorId`, rewrites those uncommitted `USER_STRICT`
+markers to `USER` on the leader's log (then replicates), audits one WARNING
+(`audit strict.release: …`), and increments `ReplicatedNode.strictOverridesReleased(group)`.
+It never runs automatically and never changes a `GroupOptions` STRICT group. Authorize callers
+with control-plane `Permission.RELEASE_STALLED_STRICT` (OPERATOR and ADMIN). The leader
+also exposes `strictPending(group)` and `oldestStrictPendingAgeNanos(group)` (followers report 0),
+and one WARN per entry at 2 × lease.
 A STRICT group (`GroupOptions.durability()`) is unchanged and has no fail-fast.
 
 The leader counts an append response only when the voter id in its body matches the

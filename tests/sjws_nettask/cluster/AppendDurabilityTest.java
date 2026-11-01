@@ -369,4 +369,85 @@ class AppendDurabilityTest {
         return new Member(new NodeId(wire, "n" + wire), new SiteId("local"),
                 new InetSocketAddress("127.0.0.1", 23_200 + wire), 1L, MemberState.ALIVE, witness);
     }
+
+    /**
+     * #208: after a STRICT override stalls (≥ 2 × lease), an authenticated operator escape rewrites
+     * the marker and lets the entry commit without the second data copy.
+     */
+    @Test
+    void operatorEscapeReleasesStalledStrictOverride() throws Exception {
+        var records = new java.util.concurrent.CopyOnWriteArrayList<java.util.logging.LogRecord>();
+        var handler = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        var jul = java.util.logging.Logger.getLogger(RaftGroup.class.getName());
+        jul.addHandler(handler);
+        try {
+            var c = cluster(Durability.RELAXED);
+            var leader = c.nodes.get(0);
+            var strict = leader.append(GROUP, List.of(payload("s")), Durability.STRICT);
+            c.net.cut(leader.self(), c.nodes.get(1).self());
+            c.net.cut(c.nodes.get(1).self(), c.nodes.get(2).self());
+            c.drive();
+            assertFalse(strict.isDone());
+            assertEquals(1, leader.strictPending(GROUP));
+            assertThrows(IllegalArgumentException.class, () -> leader.releaseStalledStrictOverrides(GROUP, " "));
+            assertEquals(0, leader.releaseStalledStrictOverrides(GROUP, "ops-too-early"),
+                    "before 2×lease the escape is a no-op");
+            // Age past 2 × lease (lease = 2 × heartbeat = 80 ms).
+            for (int i = 0; i < 25; i++) {
+                c.clock.advance(Duration.ofMillis(40));
+                c.drive();
+            }
+            assertTrue(leader.oldestStrictPendingAgeNanos(GROUP) >= 2 * Duration.ofMillis(80).toNanos());
+            int n = leader.releaseStalledStrictOverrides(GROUP, "urn:sjws:admin:ops");
+            assertEquals(1, n);
+            assertEquals(1L, leader.strictOverridesReleased(GROUP));
+            var audits = records.stream().filter(r -> r.getMessage() != null && r.getMessage().contains("audit strict.release"))
+                    .toList();
+            assertEquals(1, audits.size(), audits.toString());
+            assertTrue(audits.get(0).getMessage().contains("operator=urn:sjws:admin:ops"));
+            for (int i = 0; i < 30 && !strict.isDone(); i++) {
+                c.drive();
+            }
+            assertTrue(strict.isDone(), "released STRICT commits without the second data copy");
+            assertEquals(0, leader.strictPending(GROUP));
+            // Marker on disk is USER now (not USER_STRICT).
+            byte[] raw = c.logs.get(0).read(GROUP, strict.get().index());
+            assertEquals(RaftGroup.USER, raw[0]);
+            c.close();
+        } finally {
+            jul.removeHandler(handler);
+        }
+    }
+
+    /** #208: a follower refuses the escape; a STRICT GroupOptions group refuses it. */
+    @Test
+    void operatorEscapeRefusesFollowerAndStrictGroup() throws Exception {
+        var relaxed = cluster(Durability.RELAXED);
+        assertThrows(NotLeaderException.class,
+                () -> relaxed.nodes.get(1).releaseStalledStrictOverrides(GROUP, "ops"));
+        relaxed.close();
+
+        var strictGroup = cluster(Durability.STRICT);
+        var leader = strictGroup.nodes.get(0);
+        // No per-append pending; group-level STRICT refuses the escape API.
+        var err = assertThrows(IllegalStateException.class,
+                () -> leader.releaseStalledStrictOverrides(GROUP, "ops"));
+        assertTrue(err.getMessage().contains("GroupOptions STRICT"), err.getMessage());
+        strictGroup.close();
+    }
+
+
 }

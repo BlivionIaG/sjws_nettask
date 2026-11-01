@@ -150,6 +150,8 @@ final class RaftGroup {
     private final java.util.TreeMap<Long, Long> strictPending = new java.util.TreeMap<>();
     /** Highest pending STRICT index already reported as stalled, so each entry warns once. */
     private long strictWarnedIndex;
+    /** Operator escapes that rewrote stalled USER_STRICT markers to USER (#208). */
+    private final java.util.concurrent.atomic.AtomicLong strictOverridesReleased = new java.util.concurrent.atomic.AtomicLong();
     private long recoveryUntil;
     /** Bytes of image per {@link #SNAP_CHUNK}; package-private so tests can force many chunks. */
     int snapshotChunkBytes = DEFAULT_SNAPSHOT_CHUNK_BYTES;
@@ -1522,7 +1524,8 @@ final class RaftGroup {
                 "group " + groupId.value() + ": STRICT entry " + oldest.getKey() + " pending for "
                         + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(now - oldest.getValue()) + " ms with "
                         + copies + " of " + dataCopiesRequired() + " data copies; " + strictPending.size()
-                        + " STRICT and every later entry wait until a data node is back");
+                        + " STRICT and every later entry wait until a data node is back or an operator"
+                        + " releases them (ClusterNode.releaseStalledStrictOverrides, #208)");
     }
 
     /** Leader view: uncommitted STRICT override entries. */
@@ -1545,6 +1548,119 @@ final class RaftGroup {
             lock.unlock();
         }
     }
+
+    /**
+     * Explicit operator escape (#208): rewrite every uncommitted {@link #USER_STRICT} override to
+     * {@link #USER} so commit can proceed without {@code dataCopiesRequired()} data disks. Only the
+     * leader may call this, and only when the oldest pending STRICT override has waited at least
+     * {@code 2 × lease} (the same stall threshold as the WARN). A STRICT {@link GroupOptions} group
+     * is refused — this escape is for per-append overrides in a RELAXED group only.
+     *
+     * <p>Fail-safe: {@code operatorId} must be non-blank (the authenticated operator identity from the
+     * admin channel). The rewrite is durable on this leader, then replicated; a new leader that
+     * rescans will not re-arm the released markers. Audited with one WARNING and counted in
+     * {@link #strictOverridesReleased()}.
+     *
+     * @return how many STRICT markers were rewritten (0 when nothing is stalled yet)
+     * @throws NotLeaderException if this node does not lead the group
+     * @throws IllegalArgumentException if {@code operatorId} is blank
+     * @throws IllegalStateException if the group itself is STRICT, or storage fails closed
+     */
+    int releaseStalledStrictOverrides(String operatorId) throws NotLeaderException {
+        if (operatorId == null || operatorId.isBlank()) {
+            throw new IllegalArgumentException("operatorId");
+        }
+        var after = new java.util.ArrayList<Runnable>();
+        int released;
+        lock.lock();
+        try {
+            if (storageFailed != null) {
+                throw storageFailed;
+            }
+            if (closed) {
+                throw new GroupClosedException(groupId);
+            }
+            if (role != Role.LEADER) {
+                throw new NotLeaderException(groupId, java.util.Optional.ofNullable(leader));
+            }
+            if (options.durability() == Durability.STRICT) {
+                throw new IllegalStateException("group " + groupId.value()
+                        + " uses GroupOptions STRICT; per-append escape does not apply");
+            }
+            if (strictPending.isEmpty()) {
+                return 0;
+            }
+            long now = clock.nanoTime();
+            var oldest = strictPending.firstEntry();
+            if (now - oldest.getValue() < 2 * options.leaseNanos()) {
+                return 0; // not stalled yet — refuse to weaken a fresh STRICT override
+            }
+            long from = oldest.getKey();
+            if (from <= commitIndex) {
+                strictPending.headMap(commitIndex, true).clear();
+                if (strictPending.isEmpty()) {
+                    return 0;
+                }
+                from = strictPending.firstKey();
+            }
+            long last = lastIndex();
+            record Ent(long index, byte[] data) {
+            }
+            var ents = new java.util.ArrayList<Ent>();
+            int count = 0;
+            for (long index = from; index <= last; index++) {
+                var data = read(index);
+                if (data == null) {
+                    break;
+                }
+                if (data.length > 0 && data[0] == USER_STRICT) {
+                    data = data.clone();
+                    data[0] = USER;
+                    count++;
+                }
+                ents.add(new Ent(index, data));
+            }
+            if (count == 0) {
+                strictPending.clear();
+                return 0;
+            }
+            truncateSuffix(from);
+            for (var ent : ents) {
+                appendStored(ent.index(), term, ent.data());
+            }
+            force(); // durability of the rewritten USER markers before we weaken commit
+            strictPending.clear();
+            strictWarnedIndex = 0;
+            for (var peer : peers) {
+                long match = matchIndex.getOrDefault(peer, 0L);
+                if (match >= from) {
+                    matchIndex.put(peer, from - 1);
+                }
+                nextIndex.put(peer, from);
+            }
+            strictOverridesReleased.addAndGet(count);
+            released = count;
+            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                    "audit strict.release: operator=" + operatorId + " group=" + groupId.value()
+                            + " fromIndex=" + from + " released=" + count
+                            + " term=" + term + " — stalled USER_STRICT overrides rewritten to USER;"
+                            + " commit no longer waits for dataCopiesRequired on those entries");
+            maybeCommit(after);
+            replicate();
+        } finally {
+            lock.unlock();
+        }
+        for (var task : after) {
+            task.run();
+        }
+        return released;
+    }
+
+    /** How many stalled STRICT overrides an operator has released on this group (#208). */
+    long strictOverridesReleased() {
+        return strictOverridesReleased.get();
+    }
+
 
     /** The leader plus data voters that answered an append within the last lease. */
     private int reachableDataCopies(long now) {

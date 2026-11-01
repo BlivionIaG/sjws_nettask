@@ -327,6 +327,23 @@ public final class ReplicatedNode implements ClusterNode {
         transport.detach(self);
     }
 
+
+    /**
+     * Explicit operator escape (#208): on this group's leader, rewrite stalled uncommitted
+     * {@code USER_STRICT} markers to {@code USER} so commit can proceed without the missing data
+     * copy. Requires a non-blank {@code operatorId} (authenticated admin identity). See
+     * {@link RaftGroup#releaseStalledStrictOverrides(String)}.
+     */
+    @Override
+    public int releaseStalledStrictOverrides(GroupId groupId, String operatorId) throws NotLeaderException {
+        return group(groupId).releaseStalledStrictOverrides(operatorId);
+    }
+
+    /** How many stalled STRICT overrides an operator has released on {@code groupId} (#208). */
+    public long strictOverridesReleased(GroupId groupId) {
+        return group(groupId).strictOverridesReleased();
+    }
+
     /** STRICT override entries the group's leader holds uncommitted (0 on a follower). */
     public int strictPending(GroupId groupId) {
         return group(groupId).strictPendingCount();
