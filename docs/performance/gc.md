@@ -1,3 +1,5 @@
+Operator profiles: [JVM flags](../operations/jvm-flags.md).
+
 # GC choice: G1 (default / tuned) vs generational ZGC — proposal
 
 **Status: proposal, 3 reps per config. No default is changed by this PR.** JDK 25.0.4.1, master `f60f08b`.

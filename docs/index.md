@@ -16,6 +16,7 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [Cluster mode (HA)](user/cluster-mode.md)
 
 ## Operations
+- [JVM flags (profiles)](operations/jvm-flags.md): G1 default; opt-in ZGC pinned / Serial; container MaxRAMPercentage
 - [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API, control heartbeat report
 - [Running in the background (daemon)](operations/daemon.md)
 - [Docker image](deployment/docker.md): multi-stage build, non-root runtime, health check
