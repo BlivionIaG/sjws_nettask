@@ -157,9 +157,15 @@ final class LogTopics implements AutoCloseable {
         for (var part : list.split(",")) {
             if (part.isBlank()) continue;
             int c = part.lastIndexOf(':');
+            var entry = part.trim();
             var topic = c < 0 ? "" : part.substring(0, c).trim();
-            if (!validName(topic)) throw new IllegalArgumentException("bad topic in durability override: " + part.trim());
-            out.put(topic, parseDurability(part.substring(c + 1)));
+            // User-topic pattern + no __* prefix; bad mode is the same shape of error so the config key wrapper can name the entry.
+            if (!validUserTopic(topic)) throw new IllegalArgumentException("invalid or reserved topic entry \"" + entry + "\"");
+            try {
+                out.put(topic, parseDurability(part.substring(c + 1)));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("invalid topic durability entry \"" + entry + "\": " + e.getMessage(), e);
+            }
         }
         return out;
     }
