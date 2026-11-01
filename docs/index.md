@@ -12,6 +12,7 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [Access rules](user/access-rules.md)
 - [Caching, validators and ranges](user/caching-and-ranges.md)
 - [Platform notes](user/platform-notes.md)
+- [Cluster mode (HA)](user/cluster-mode.md)
 
 ## Operations
 - [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API, control heartbeat report
