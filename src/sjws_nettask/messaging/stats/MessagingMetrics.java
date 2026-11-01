@@ -42,8 +42,11 @@ public final class MessagingMetrics implements MessagingHooks {
 
     private final ConcurrentHashMap<String, Hist> produce = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Hist> fetch = new ConcurrentHashMap<>();
-    /** Distinct topic labels admitted (not topic/status pairs). Cap is on this set. */
-    private final java.util.Set<String> admittedTopics = ConcurrentHashMap.newKeySet();
+    /**
+     * Distinct topic labels admitted (not topic/status pairs). Cap is on this map's size.
+     * Admission is synchronized so a topic is never visible to other threads until its slot is held.
+     */
+    private final ConcurrentHashMap<String, Boolean> admittedTopics = new ConcurrentHashMap<>();
     private final LongAdder foldedTopics = new LongAdder();
     private volatile Supplier<MessagingStats> stats = () -> MessagingStats.NONE;
 
@@ -90,29 +93,39 @@ public final class MessagingMetrics implements MessagingHooks {
     }
 
     private Hist hist(ConcurrentHashMap<String, Hist> map, String topic, int status) {
-        String admitted = topic == null || topic.isEmpty() ? "other" : topic;
-        if (!"other".equals(admitted) && !this.admittedTopics.contains(admitted)) {
-            if (this.admittedTopics.size() >= TOPIC_CAP) {
-                this.foldedTopics.increment();
-                admitted = "other";
-            } else {
-                this.admittedTopics.add(admitted);
-                // Race: if we crossed the cap, fold this late arriver.
-                if (this.admittedTopics.size() > TOPIC_CAP && this.admittedTopics.remove(admitted)) {
-                    this.foldedTopics.increment();
-                    admitted = "other";
-                }
-            }
-        }
+        String admitted = admitTopic(topic);
         String k = key(admitted, status);
-        final String label = admitted;
         Hist existing = map.get(k);
         if (existing != null) {
             return existing;
         }
-        Hist created = new Hist(label, status);
+        Hist created = new Hist(admitted, status);
         Hist raced = map.putIfAbsent(k, created);
         return raced != null ? raced : created;
+    }
+
+    /**
+     * Returns a topic label that is either already admitted, newly admitted under the cap, or
+     * {@code "other"}. A topic name is published into {@link #admittedTopics} only after its slot
+     * is secured, so concurrent callers never observe a topic that is later rolled back to
+     * {@code other}.
+     */
+    private String admitTopic(String topic) {
+        String candidate = topic == null || topic.isEmpty() ? "other" : topic;
+        if ("other".equals(candidate) || this.admittedTopics.containsKey(candidate)) {
+            return candidate;
+        }
+        synchronized (this.admittedTopics) {
+            if (this.admittedTopics.containsKey(candidate)) {
+                return candidate;
+            }
+            if (this.admittedTopics.size() >= TOPIC_CAP) {
+                this.foldedTopics.increment();
+                return "other";
+            }
+            this.admittedTopics.put(candidate, Boolean.TRUE);
+            return candidate;
+        }
     }
 
     private static String key(String topic, int status) {

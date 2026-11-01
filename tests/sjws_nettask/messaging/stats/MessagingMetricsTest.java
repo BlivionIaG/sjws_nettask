@@ -105,4 +105,42 @@ final class MessagingMetricsTest {
                 "sjws_messaging_produce_duration_seconds_count{topic=\"t0\",status=\"200\"} 2"),
                 m.prometheus());
     }
+
+    @Test
+    void concurrentAdmissionDoesNotExposeThenRollback() throws Exception {
+        var m = new MessagingMetrics();
+        for (int i = 0; i < MessagingMetrics.TOPIC_CAP - 1; i++) {
+            m.produced("seed" + i, 200, 1, 100);
+        }
+        int threads = 32;
+        var barrier = new java.util.concurrent.CyclicBarrier(threads);
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        var futures = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+        for (int i = 0; i < threads; i++) {
+            final int id = i;
+            futures.add(pool.submit(() -> {
+                barrier.await();
+                m.produced("race-" + id, 200, 1, 1000);
+                return null;
+            }));
+        }
+        for (var f : futures) {
+            f.get();
+        }
+        pool.shutdown();
+        var text = m.prometheus();
+        int named = 0;
+        for (int i = 0; i < threads; i++) {
+            if (text.contains("topic=\"race-" + i + "\"")) {
+                named++;
+            }
+        }
+        // One winner keeps its label; the rest fold to other — never a published-then-removed name.
+        assertTrue(named <= 1, "named=" + named);
+        assertTrue(named == 1 || text.contains("topic=\"other\""), text);
+        if (text.contains("sjws_messaging_topics_folded_total")) {
+            assertTrue(text.contains("topic=\"other\""), text);
+        }
+    }
+
 }
