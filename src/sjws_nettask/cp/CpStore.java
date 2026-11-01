@@ -218,6 +218,11 @@ public final class CpStore implements AutoCloseable {
         return idempotency.size();
     }
 
+    /** Oversize Idempotency-Keys skipped at apply (#341 N2). Local counter; not snapshotted. */
+    public long idempotencyOversizeSkipped() {
+        return idempotency.oversizeSkipped();
+    }
+
     /**
      * Snapshot image of the Idempotency-Key table at the current applied state (#259). Carries WINDOW, MAX_KEYS and
      * the surviving entries. Install with {@link #installIdempotencySnapshot}.
@@ -587,6 +592,11 @@ public final class CpStore implements AutoCloseable {
     /** Raft commit index for the {@code cp-config} group (#341 tests / compact). */
     long groupCommitIndex() {
         return group.commitIndex();
+    }
+
+    /** Test / ops seam (#341): the group's {@link SnapshotControl}. */
+    SnapshotControl snapshots() {
+        return node.snapshots(GROUP);
     }
 
 

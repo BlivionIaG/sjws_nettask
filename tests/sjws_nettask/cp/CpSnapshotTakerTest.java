@@ -20,8 +20,10 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -34,6 +36,7 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.FakeClock;
 import sjws_nettask.cluster.FileLogStorage;
+import sjws_nettask.cluster.LogSnapshot;
 import sjws_nettask.cluster.Member;
 import sjws_nettask.cluster.MemberState;
 import sjws_nettask.cluster.NodeId;
@@ -92,8 +95,88 @@ class CpSnapshotTakerTest {
             assertEquals(version, store.activated().version());
             assertArrayEquals(idemImage, store.snapshotIdempotency(), "idempotency table matches pre-restart");
             // Duplicate propose with same key still returns the first outcome (table restored).
+            // Determinism: verdicts come from log-index eviction / state at snap index s, not from when
+            // the wall-clock compact tick fired on this node (#341).
             assertEquals(200, store.propose(YAML, "idem-propose").status());
+            assertEquals(200, store.propose(YAML, "idem-propose").status(), "second retry still hit after restore");
         }
+    }
+
+    /**
+     * Crash between durable persist and prefix delete: {@code recordSnapshot} persists without truncating
+     * (same outcome as {@code RaftGroup.truncateLocked} after {@code persistSnapshotBeforePrefixDelete}
+     * succeeds and before {@code truncatePrefix}). Prefix stays; restart still restores CPS1 via
+     * {@code onSnapshotRestored}. Raft coverage for refuse-without-durable and CRC/torn snap files:
+     * {@code SnapshotPersistenceTest#withoutDurableSnapshotsNoPrefixIsDeleted},
+     * {@code SnapshotPersistenceTest#installValidatesBeforeChangingAnything},
+     * {@code SnapshotPersistenceTest#corruptOrLinkedSnapshotFileRefusesToStart},
+     * {@code FileLogRewriteCrashTest} (truncatePrefix rewrite crash points).
+     */
+    @Test
+    void persistWithoutPrefixDeleteThenRestartRestoresVerdicts() throws Exception {
+        var clock = new FakeClock(0);
+        var keys = keys();
+        Path state = dir.resolve("persist-no-trunc");
+        long version;
+        byte[] idemImage;
+        try (var store = CpStore.open(state, keys, clock)) {
+            clock.advance(Duration.ofMillis(150));
+            store.drive();
+            assertTrue(store.leadership().leaderReady());
+            assertEquals(200, store.propose(YAML, "k-persist").status());
+            store.drive();
+            assertEquals(200, store.activate(System.currentTimeMillis(), 60_000L, "a-persist").status());
+            store.drive();
+            version = store.activated().version();
+            // recordSnapshot (not take): persists an application image and advances snapIndex without
+            // truncating. take() would already advance snapIndex in memory, so a following
+            // recordSnapshot of the same index is refused as stale — that pairing is not the
+            // crash-between-persist-and-truncate path (#270 / RecordSnapshotTailTest).
+            long commit = store.groupCommitIndex();
+            long term = store.leadership().term();
+            byte[] cps1 = store.snapshotBytes();
+            store.snapshots().recordSnapshot(new LogSnapshot(CpStore.GROUP, commit, term, cps1));
+            store.drive();
+            var probe = new FileLogStorage(state.resolve("cp-config"));
+            try {
+                assertNotNull(probe.read(CpGroup.GROUP, 1), "prefix still on disk (truncate never ran)");
+            } finally {
+                probe.close();
+            }
+            idemImage = store.snapshotIdempotency();
+        }
+        try (var store = CpStore.open(state, keys, clock)) {
+            clock.advance(Duration.ofMillis(150));
+            store.drive();
+            assertEquals(version, store.activated().version());
+            assertArrayEquals(idemImage, store.snapshotIdempotency());
+            assertEquals(200, store.propose(YAML, "k-persist").status());
+        }
+    }
+
+    /** Truncated / torn CPS1 payload is refused on decode (Raft envelope CRC is covered by SnapshotPersistenceTest). */
+    @Test
+    void truncatedCpStateSnapshotPayloadIsRefused() throws Exception {
+        var clock = new FakeClock(0);
+        var keys = keys();
+        byte[] good;
+        try (var store = CpStore.open(dir.resolve("torn-cps1"), keys, clock)) {
+            clock.advance(Duration.ofMillis(150));
+            store.drive();
+            assertEquals(200, store.propose(YAML).status());
+            store.drive();
+            assertEquals(200, store.activate(System.currentTimeMillis(), 60_000L).status());
+            store.drive();
+            good = store.snapshotBytes();
+        }
+        assertTrue(good.length > 16);
+        var torn = java.util.Arrays.copyOf(good, good.length / 2);
+        var err = assertThrows(IOException.class, () -> CpStateSnapshot.read(torn));
+        assertNotNull(err.getMessage(), "torn CPS1 must carry a non-null refusal message (not bare EOFException)");
+        assertTrue(err.getMessage().contains("cp snapshot"), err.getMessage());
+        // Empty / too-short magic
+        assertThrows(IOException.class, () -> CpStateSnapshot.read(new byte[4]));
+        assertThrows(IOException.class, () -> CpStateSnapshot.read(null));
     }
 
     @Test

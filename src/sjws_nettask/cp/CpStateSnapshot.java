@@ -77,7 +77,7 @@ public final class CpStateSnapshot {
         return out.toByteArray();
     }
 
-    /** Decodes an image; refuses a bad magic/format or oversize section. */
+    /** Decodes an image; refuses a bad magic/format, truncated body, or oversize section. */
     static Image read(byte[] raw) throws IOException {
         if (raw == null || raw.length < 8) {
             throw new IOException("cp snapshot: truncated");
@@ -95,6 +95,9 @@ public final class CpStateSnapshot {
                 throw new IOException("cp snapshot: trailing bytes");
             }
             return image;
+        } catch (java.io.EOFException eof) {
+            // DataInputStream.readFully / readInt mid-image: message is often null.
+            throw new IOException("cp snapshot: truncated", eof);
         }
     }
 

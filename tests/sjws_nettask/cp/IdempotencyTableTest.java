@@ -203,6 +203,10 @@ class IdempotencyTableTest {
         assertNull(t.get("a"));
         assertEquals(0, t.size());
         assertEquals(1, t.evictions());
+        assertEquals(1, t.oversizeSkipped());
+        t.remember(over, "fp", 200, "nope", 6);
+        assertEquals(2, t.oversizeSkipped(), "further skips are counted");
+        assertNull(t.get(over), "still not deduplicated / stored");
     }
 
     @Test
