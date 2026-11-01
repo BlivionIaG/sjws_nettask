@@ -329,9 +329,10 @@ public final class ReplicatedNode implements ClusterNode {
 
 
     /**
-     * Explicit operator escape (#208): on this group's leader, rewrite stalled uncommitted
-     * {@code USER_STRICT} markers to {@code USER} so commit can proceed without the missing data
-     * copy. Requires a non-blank {@code operatorId} (authenticated admin identity). See
+     * Explicit operator escape (#208): on this group's leader, append a {@code STRICT_RELEASE}
+     * marker covering stalled uncommitted {@code USER_STRICT} overrides so commit can proceed
+     * without the missing data copy. Existing log entries are not rewritten. Requires a non-blank
+     * {@code operatorId} (authenticated admin identity). See
      * {@link RaftGroup#releaseStalledStrictOverrides(String)}.
      */
     @Override

@@ -12,8 +12,12 @@ copies hold it.
 
 ## Operator escape (fail-safe)
 
-If the data node cannot return in time, an **explicit** escape on the **current leader** rewrites
-stalled uncommitted `USER_STRICT` markers to `USER` so the group can commit with ordinary quorum:
+If the data node cannot return in time, an **explicit** escape on the **current leader** appends
+a new `STRICT_RELEASE` log marker that names the highest stalled uncommitted `USER_STRICT` index.
+Existing entries are never rewritten or truncated. Once the marker is in the leader's log, the
+STRICT barrier for covered indexes is dropped so the group can commit with ordinary quorum; every
+replica that applies the marker (and every `becomeLeader` rescan that sees it, committed or not)
+honours the same upto:
 
 ```text
 ClusterNode.releaseStalledStrictOverrides(groupId, operatorId)
@@ -26,11 +30,14 @@ ClusterNode.releaseStalledStrictOverrides(groupId, operatorId)
 | Stall age | Oldest pending STRICT override must be at least **2 × lease** old (same as the stall WARN). Younger entries return `0` and are unchanged. |
 | Group mode | `GroupOptions` STRICT groups are refused — this escape is only for per-append overrides in a RELAXED group. |
 | Leadership | Not the leader → `NotLeaderException`. |
-| Audit | One WARNING: `audit strict.release: operator=… group=… fromIndex=… released=…`. |
-| Metric | `ReplicatedNode.strictOverridesReleased(group)` increases by the number of markers rewritten. |
+| Audit | One WARNING: `audit strict.release: operator=… group=… uptoIndex=… released=…` (control characters stripped from `operatorId`). |
+| Metric | `ReplicatedNode.strictOverridesReleased(group)` increases by the number of overrides the marker covers. |
+| Idempotent | A second call with nothing pending returns `0`. |
 
 This **weakens durability** for the released entries (they no longer wait for two data disks). It
-does not run on a timer and does not change the group's configured durability.
+does not run on a timer and does not change the group's configured durability. The original
+`USER_STRICT` bytes stay on disk; the release is the new marker alone, so Raft log matching is
+preserved if a follower that stored the STRICT entry later becomes leader.
 
 ## Procedure
 

@@ -49,6 +49,12 @@ final class RaftGroup {
     static final byte NOOP = 3;
     /** User data appended with a STRICT override: every data copy fsyncs it before it counts. */
     static final byte USER_STRICT = 4;
+    /**
+     * Operator escape (#208): once committed (and on every becomeLeader scan), STRICT overrides at
+     * indexes {@code <=} the big-endian upto carried after this marker no longer need
+     * {@code dataCopiesRequired()} data disks. Existing {@link #USER_STRICT} bytes are left alone.
+     */
+    static final byte STRICT_RELEASE = 5;
 
     static final int VOTE = 1;
     static final int VOTE_RESP = 2;
@@ -150,8 +156,14 @@ final class RaftGroup {
     private final java.util.TreeMap<Long, Long> strictPending = new java.util.TreeMap<>();
     /** Highest pending STRICT index already reported as stalled, so each entry warns once. */
     private long strictWarnedIndex;
-    /** Operator escapes that rewrote stalled USER_STRICT markers to USER (#208). */
+    /** Operator escapes that appended a {@link #STRICT_RELEASE} for stalled overrides (#208). */
     private final java.util.concurrent.atomic.AtomicLong strictOverridesReleased = new java.util.concurrent.atomic.AtomicLong();
+    /**
+     * Highest index whose STRICT override a {@link #STRICT_RELEASE} has covered on this node
+     * (from apply or from an uncommitted marker a leader already honoured). Survive only in memory;
+     * after a restart the log (and snapshots that removed the prefix) are scanned again.
+     */
+    private long strictReleasedThrough;
     private long recoveryUntil;
     /** Bytes of image per {@link #SNAP_CHUNK}; package-private so tests can force many chunks. */
     int snapshotChunkBytes = DEFAULT_SNAPSHOT_CHUNK_BYTES;
@@ -698,14 +710,7 @@ final class RaftGroup {
             matchIndex.put(peer, 0L);
         }
         heardAt.clear();
-        strictPending.clear();
-        strictWarnedIndex = 0;
-        for (long index = commitIndex + 1; index <= lastIndex(); index++) {
-            var data = read(index);
-            if (data != null && data.length > 0 && data[0] == USER_STRICT) {
-                strictPending.put(index, now); // age counts from this leader's term
-            }
-        }
+        rescanStrictPending(now);
         appendRaw(new byte[] {NOOP});
         if (options.durability() != Durability.STRICT) {
             // RELAXED: schedule the no-op's fsync like any append. Otherwise a leader elected with only the witness
@@ -1402,6 +1407,11 @@ final class RaftGroup {
                         }
                     }, applied);
                 }
+                case STRICT_RELEASE -> {
+                    if (data.length >= 1 + Long.BYTES) {
+                        honourStrictRelease(strictReleaseUpto(data));
+                    }
+                }
                 default -> {
                     // Leave unknown markers applied so a bad record cannot stall the group.
                 }
@@ -1550,18 +1560,20 @@ final class RaftGroup {
     }
 
     /**
-     * Explicit operator escape (#208): rewrite every uncommitted {@link #USER_STRICT} override to
-     * {@link #USER} so commit can proceed without {@code dataCopiesRequired()} data disks. Only the
-     * leader may call this, and only when the oldest pending STRICT override has waited at least
-     * {@code 2 × lease} (the same stall threshold as the WARN). A STRICT {@link GroupOptions} group
-     * is refused — this escape is for per-append overrides in a RELAXED group only.
+     * Explicit operator escape (#208): append a {@link #STRICT_RELEASE} marker that names the highest
+     * stalled uncommitted {@link #USER_STRICT} index so commit can proceed without
+     * {@code dataCopiesRequired()} data disks. Existing log entries are never rewritten or truncated.
+     * Only the leader may call this, and only when the oldest pending STRICT override has waited at
+     * least {@code 2 × lease} (the same stall threshold as the WARN). A STRICT {@link GroupOptions}
+     * group is refused — this escape is for per-append overrides in a RELAXED group only.
      *
      * <p>Fail-safe: {@code operatorId} must be non-blank (the authenticated operator identity from the
-     * admin channel). The rewrite is durable on this leader, then replicated; a new leader that
-     * rescans will not re-arm the released markers. Audited with one WARNING and counted in
-     * {@link #strictOverridesReleased()}.
+     * admin channel). The marker is appended at the next index in the current term and replicated like
+     * any other entry; every replica that applies it, and every {@link #becomeLeader} rescan that sees
+     * it (committed or not), drops the STRICT barrier for indexes up to the marker's upto. Audited with
+     * one WARNING and counted in {@link #strictOverridesReleased()}.
      *
-     * @return how many STRICT markers were rewritten (0 when nothing is stalled yet)
+     * @return how many STRICT overrides the marker covers (0 when nothing is stalled yet)
      * @throws NotLeaderException if this node does not lead the group
      * @throws IllegalArgumentException if {@code operatorId} is blank
      * @throws IllegalStateException if the group itself is STRICT, or storage fails closed
@@ -1595,56 +1607,26 @@ final class RaftGroup {
             if (now - oldest.getValue() < 2 * options.leaseNanos()) {
                 return 0; // not stalled yet — refuse to weaken a fresh STRICT override
             }
-            long from = oldest.getKey();
-            if (from <= commitIndex) {
+            if (oldest.getKey() <= commitIndex) {
                 strictPending.headMap(commitIndex, true).clear();
                 if (strictPending.isEmpty()) {
                     return 0;
                 }
-                from = strictPending.firstKey();
             }
-            long last = lastIndex();
-            record Ent(long index, byte[] data) {
-            }
-            var ents = new java.util.ArrayList<Ent>();
-            int count = 0;
-            for (long index = from; index <= last; index++) {
-                var data = read(index);
-                if (data == null) {
-                    break;
-                }
-                if (data.length > 0 && data[0] == USER_STRICT) {
-                    data = data.clone();
-                    data[0] = USER;
-                    count++;
-                }
-                ents.add(new Ent(index, data));
-            }
-            if (count == 0) {
-                strictPending.clear();
-                return 0;
-            }
-            truncateSuffix(from);
-            for (var ent : ents) {
-                appendStored(ent.index(), term, ent.data());
-            }
-            force(); // durability of the rewritten USER markers before we weaken commit
-            strictPending.clear();
-            strictWarnedIndex = 0;
-            for (var peer : peers) {
-                long match = matchIndex.getOrDefault(peer, 0L);
-                if (match >= from) {
-                    matchIndex.put(peer, from - 1);
-                }
-                nextIndex.put(peer, from);
-            }
+            long upto = strictPending.lastKey();
+            int count = strictPending.size();
+            // Append a new marker only — never truncate or rewrite existing entries (#450 P1).
+            appendRaw(strictRelease(upto));
+            markDirty();
+            honourStrictRelease(upto); // leader must drop the barrier before maybeCommit
             strictOverridesReleased.addAndGet(count);
             released = count;
             System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
-                    "audit strict.release: operator=" + operatorId + " group=" + groupId.value()
-                            + " fromIndex=" + from + " released=" + count
-                            + " term=" + term + " — stalled USER_STRICT overrides rewritten to USER;"
-                            + " commit no longer waits for dataCopiesRequired on those entries");
+                    "audit strict.release: operator=" + sanitizeOperatorId(operatorId)
+                            + " group=" + groupId.value()
+                            + " uptoIndex=" + upto + " released=" + count
+                            + " term=" + term + " — STRICT_RELEASE marker appended;"
+                            + " commit no longer waits for dataCopiesRequired on covered entries");
             maybeCommit(after);
             replicate();
         } finally {
@@ -1656,10 +1638,82 @@ final class RaftGroup {
         return released;
     }
 
+    /**
+     * Rebuild {@link #strictPending} from the uncommitted suffix, honouring every
+     * {@link #STRICT_RELEASE} already in the log (and {@link #strictReleasedThrough} from apply).
+     * A follower that stored {@link #USER_STRICT} but later learns a release must not re-arm the
+     * barrier when elected.
+     */
+    private void rescanStrictPending(long now) {
+        strictPending.clear();
+        strictWarnedIndex = 0;
+        long releasedThrough = strictReleasedThrough;
+        long last = lastIndex();
+        for (long index = commitIndex + 1; index <= last; index++) {
+            var data = read(index);
+            if (data != null && data.length >= 1 + Long.BYTES && data[0] == STRICT_RELEASE) {
+                releasedThrough = Math.max(releasedThrough, strictReleaseUpto(data));
+            }
+        }
+        strictReleasedThrough = releasedThrough;
+        for (long index = commitIndex + 1; index <= last; index++) {
+            var data = read(index);
+            if (data != null && data.length > 0 && data[0] == USER_STRICT && index > releasedThrough) {
+                strictPending.put(index, now); // age counts from this leader's term
+            }
+        }
+    }
+
+    /** Drop the STRICT barrier for indexes {@code <= upto} on this node. */
+    private void honourStrictRelease(long upto) {
+        if (upto > strictReleasedThrough) {
+            strictReleasedThrough = upto;
+        }
+        strictPending.headMap(upto, true).clear();
+        if (strictWarnedIndex <= upto) {
+            strictWarnedIndex = upto;
+        }
+    }
+
+    /** Strip controls from {@code operatorId} before it is written into an audit line. */
+    static String sanitizeOperatorId(String operatorId) {
+        var out = new StringBuilder(operatorId.length());
+        for (int i = 0; i < operatorId.length(); i++) {
+            char c = operatorId.charAt(i);
+            if (c >= 0x20 && c != 0x7F) {
+                out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
+    static byte[] strictRelease(long uptoIndex) {
+        var body = java.nio.ByteBuffer.allocate(1 + Long.BYTES).order(java.nio.ByteOrder.BIG_ENDIAN);
+        body.put(STRICT_RELEASE);
+        body.putLong(uptoIndex);
+        return body.array();
+    }
+
+    static long strictReleaseUpto(byte[] data) {
+        return java.nio.ByteBuffer.wrap(data, 1, Long.BYTES).order(java.nio.ByteOrder.BIG_ENDIAN).getLong();
+    }
+
     /** How many stalled STRICT overrides an operator has released on this group (#208). */
     long strictOverridesReleased() {
         return strictOverridesReleased.get();
     }
+
+    /** Tests only: highest index a {@link #STRICT_RELEASE} has covered on this node. */
+    long strictReleasedThroughForTest() {
+        lock.lock();
+        try {
+            return strictReleasedThrough;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+
 
 
     /** The leader plus data voters that answered an append within the last lease. */
