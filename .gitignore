@@ -9,3 +9,13 @@ __pycache__/
 # Default data-node state and daemon log when a run leaves the paths unset.
 config/last-good.json
 sjws_nettask.log
+
+# Swarm stream-gate generated evidence / bench artifacts (never commit)
+bench/swarm-stream/evidence/
+bench/swarm-stream/**/result.json
+bench/swarm-stream/**/agg-summary.json
+bench/swarm-stream/**/cross-check.json
+bench/swarm-stream/**/verdict.txt
+bench/swarm-stream/**/gate.log
+bench/swarm-stream/**/jstack-*.txt
+bench/swarm-stream/**/*.jfr

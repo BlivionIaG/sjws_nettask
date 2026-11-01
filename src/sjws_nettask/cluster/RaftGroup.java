@@ -1571,7 +1571,9 @@ final class RaftGroup {
      *
      * <p>Fail-safe: {@code operatorId} must be non-blank (the authenticated operator identity from the
      * admin channel). The marker is appended at the next index in the current term through the same
-     * rollback/fence path as a user batch ({@link #rollBackBatch}). The leader clears
+     * rollback/fence path as a user batch ({@link #rollBackBatch}). On a fenced or rolled-back
+     * failure the deferred {@code after} completions from that path are drained before the error
+     * is rethrown, so a pending read-barrier or membership future cannot hang. The leader clears
      * {@link #strictPending} for covered indexes so {@link #maybeCommit} can advance, but only a
      * <em>committed</em> marker (via {@link #apply}) advances {@link #strictReleasedThrough}. An
      * uncommitted marker still in the log is honoured again on {@link #becomeLeader} by scanning the
@@ -1588,7 +1590,8 @@ final class RaftGroup {
             throw new IllegalArgumentException("operatorId");
         }
         var after = new java.util.ArrayList<Runnable>();
-        int released;
+        int released = 0;
+        Throwable releaseFailure = null;
         lock.lock();
         try {
             if (storageFailed != null) {
@@ -1626,33 +1629,39 @@ final class RaftGroup {
                 appendRaw(strictRelease(upto));
                 markDirty();
             } catch (RuntimeException failed) {
-                Throwable err = rollBackBatch(first, failed, after);
-                if (err instanceof RuntimeException runtime) {
-                    throw runtime;
+                // Queue fence / step-down completions into after; drain them after unlock so a
+                // pending read-barrier or membership future cannot hang (#450 Codex P2).
+                releaseFailure = rollBackBatch(first, failed, after);
+            }
+            if (releaseFailure == null) {
+                // This leader only: drop pending so maybeCommit can pass. Do not touch
+                // strictReleasedThrough until apply commits the marker (#450 P1 stale watermark).
+                strictPending.headMap(upto, true).clear();
+                if (strictWarnedIndex <= upto) {
+                    strictWarnedIndex = upto;
                 }
-                throw new UncheckedIOException(new java.io.IOException("STRICT_RELEASE append failed", err));
+                strictOverridesReleased.addAndGet(count);
+                released = count;
+                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                        "audit strict.release: operator=" + sanitizeOperatorId(operatorId)
+                                + " group=" + groupId.value()
+                                + " uptoIndex=" + upto + " released=" + count
+                                + " term=" + term + " — STRICT_RELEASE marker appended;"
+                                + " commit no longer waits for dataCopiesRequired on covered entries");
+                maybeCommit(after);
+                replicate();
             }
-            // This leader only: drop pending so maybeCommit can pass. Do not touch
-            // strictReleasedThrough until apply commits the marker (#450 P1 stale watermark).
-            strictPending.headMap(upto, true).clear();
-            if (strictWarnedIndex <= upto) {
-                strictWarnedIndex = upto;
-            }
-            strictOverridesReleased.addAndGet(count);
-            released = count;
-            System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
-                    "audit strict.release: operator=" + sanitizeOperatorId(operatorId)
-                            + " group=" + groupId.value()
-                            + " uptoIndex=" + upto + " released=" + count
-                            + " term=" + term + " — STRICT_RELEASE marker appended;"
-                            + " commit no longer waits for dataCopiesRequired on covered entries");
-            maybeCommit(after);
-            replicate();
         } finally {
             lock.unlock();
         }
         for (var task : after) {
             task.run();
+        }
+        if (releaseFailure != null) {
+            if (releaseFailure instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new UncheckedIOException(new java.io.IOException("STRICT_RELEASE append failed", releaseFailure));
         }
         return released;
     }

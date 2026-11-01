@@ -118,7 +118,7 @@
           <excludedGroups>jar,${excludedGroups}</excludedGroups>
           <workingDirectory>${project.basedir}</workingDirectory>
           <!-- @{argLine} keeps the JaCoCo agent; native access for Netty's QUIC natives (JEP 472). -->
-          <argLine>@{argLine} --enable-native-access=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED</argLine>
+          <argLine>@{argLine} --enable-native-access=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED</argLine>
           <systemPropertyVariables>
             <sjws.h3.qlog.dir>${sjws.h3.qlog.dir}</sjws.h3.qlog.dir>
           </systemPropertyVariables>
@@ -134,7 +134,7 @@
               <groups>jar</groups>
               <!-- Non-empty values: an empty element would inherit the plugin-level config. -->
               <excludedGroups>bug-only-placeholder,${excludedGroups}</excludedGroups>
-              <argLine>-Dsjws.jarTests=true --enable-native-access=ALL-UNNAMED</argLine>
+              <argLine>-Dsjws.jarTests=true --enable-native-access=ALL-UNNAMED --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED</argLine>
               <failIfNoSpecifiedTests>false</failIfNoSpecifiedTests>
             </configuration>
           </execution>
@@ -424,8 +424,8 @@
             <manifestEntries>
               <!-- JDK 22+: lets Netty load the QUIC natives without a warning (blocked in future JDKs). -->
               <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
-              <!-- SafeOpenAt wraps openat fds; ReusePort already needs sun.nio.ch in tests. -->
-              <Add-Opens>java.base/java.io java.base/sun.nio.ch</Add-Opens>
+              <!-- SafeOpenAt wraps openat fds; ReusePort needs sun.nio.ch; admin TLS drop needs jdk.httpserver. -->
+              <Add-Opens>java.base/java.io java.base/sun.nio.ch jdk.httpserver/sun.net.httpserver</Add-Opens>
             </manifestEntries>
           </archive>
         </configuration>

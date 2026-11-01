@@ -16,6 +16,7 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [Cluster mode (HA)](user/cluster-mode.md)
 
 ## Operations
+- [JVM flags (profiles)](operations/jvm-flags.md): G1 default; opt-in ZGC pinned / Serial; container MaxRAMPercentage
 - [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API, control heartbeat report
 - [Running in the background (daemon)](operations/daemon.md)
 - [Docker image](deployment/docker.md): multi-stage build, non-root runtime, health check
@@ -35,6 +36,7 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [Messaging metrics (proposal)](design/messaging-metrics.md)
 - [Messaging config and broker apply (draft)](messaging/config.md)
 - [Durable partition log](design/partition-log.md) · [plan](design/durable-log-plan.md)
+- [Shared ledger writer pool for NONE/ASYNC (design, #336)](design/shared-ledger-pool.md)
 - [High availability, as implemented](design/high-availability.md)
 - [High availability (draft)](ha/design.md) · [two-node decision](design/two-node-ha-decision.md) · [upstream discovery](ha/discovery.md)
 - [Raft delivery executor](design/raft-delivery-executor.md)

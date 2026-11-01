@@ -566,6 +566,8 @@ class PeerSocketsSessionTest {
                                 || String.valueOf(err.getMessage()).contains("retry budget"),
                         "message=" + err.getMessage() + " root=" + t.getMessage());
                 assertEquals(PeerSockets.REGISTER_LIVE_MAX_ATTEMPTS, bumps.get());
+                assertEquals(1L, socketsA.registerBudgetExhausted(),
+                        "budget exhaustion increments the registerBudgetExhausted counter");
             }
             return null;
         });

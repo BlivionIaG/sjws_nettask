@@ -38,6 +38,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
@@ -635,6 +636,135 @@ class AppendDurabilityTest {
             node.close();
         }
         file.close();
+    }
+
+    /**
+     * #450 Codex P2: a fenced STRICT_RELEASE append must drain deferred {@code after} completions
+     * before rethrowing. Without that drain a pending read-barrier future hangs forever.
+     */
+    @Test
+    void fencedReleaseFailureCompletesPendingReadBarrier() throws Exception {
+        var clock = new FakeClock(0L);
+        var net = new SimTransport();
+        var members = List.of(member(1, false), member(2, false), member(3, true));
+        var voters = VoterSet.dataAndWitness(members.get(0), members.get(1), members.get(2));
+        var opts = new GroupOptions(Durability.RELAXED, 1024, Duration.ofMillis(100), Duration.ofMillis(40), 1_000_000);
+        var faulty = new BatchAtomicityTest.Faulty(new MemoryLogStorage(), null);
+        var nodes = new ArrayList<ReplicatedNode>();
+        for (int i = 0; i < members.size(); i++) {
+            LogStorage storage = i == 0 ? faulty : new MemoryLogStorage();
+            var node = ReplicatedNode.open(members.get(i).id(), voters, clock, storage, net);
+            node.openGroup(GROUP, opts, null);
+            nodes.add(node);
+        }
+        clock.advance(Duration.ofMillis(100));
+        ReplicatedNode.driveAll(nodes);
+        assertTrue(nodes.get(0).openGroup(GROUP, opts, null).isLeader());
+        var strict = nodes.get(0).append(GROUP, List.of(payload("s")), Durability.STRICT);
+        net.cut(nodes.get(0).self(), nodes.get(1).self());
+        net.cut(nodes.get(1).self(), nodes.get(2).self());
+        ReplicatedNode.driveAll(nodes);
+        assertFalse(strict.isDone());
+        for (int i = 0; i < 25; i++) {
+            clock.advance(Duration.ofMillis(40));
+            ReplicatedNode.driveAll(nodes);
+        }
+        // Past the lease so the barrier must wait (and be queued in reads).
+        clock.advance(Duration.ofSeconds(10));
+        var read = nodes.get(0).openGroup(GROUP, opts, null).readBarrier();
+        assertFalse(read.isDone(), "read barrier past the lease waits for a quorum round");
+        faulty.failTruncate = true;
+        faulty.armAppend(0);
+        assertThrows(RuntimeException.class,
+                () -> nodes.get(0).releaseStalledStrictOverrides(GROUP, "ops-drain"));
+        assertTrue(nodes.get(0).failedClosed(GROUP), "failed truncate fences the group");
+        // Without draining after, this hangs. With the fix it completes exceptionally promptly.
+        var cause = assertThrows(ExecutionException.class,
+                () -> read.get(2, TimeUnit.SECONDS)).getCause();
+        assertTrue(cause instanceof java.io.UncheckedIOException
+                || cause.getMessage() != null && cause.getMessage().contains("failed closed"),
+                () -> "expected fenced error, got " + cause);
+        for (var node : nodes) {
+            node.close();
+        }
+    }
+
+    /**
+     * #208 / Security N3: after a committed RELEASE, restart replay and snapshot install keep the
+     * barrier dropped (committed-only watermark + surviving log / snapshotted prefix).
+     */
+    @Test
+    void releaseSurvivesRestartReplayAndSnapshotInstall() throws Exception {
+        var c = cluster(Durability.RELAXED);
+        var leader = c.nodes.get(0);
+        var strict = leader.append(GROUP, List.of(payload("s")), Durability.STRICT);
+        c.net.cut(leader.self(), c.nodes.get(1).self());
+        c.net.cut(c.nodes.get(1).self(), c.nodes.get(2).self());
+        c.drive();
+        for (int i = 0; i < 25; i++) {
+            c.clock.advance(Duration.ofMillis(40));
+            c.drive();
+        }
+        assertEquals(1, leader.releaseStalledStrictOverrides(GROUP, "ops-restart"));
+        for (int i = 0; i < 40 && !strict.isDone(); i++) {
+            c.drive();
+        }
+        assertTrue(strict.isDone());
+        long strictIndex = strict.get().index();
+        long releaseIndex = findRelease(c.logs.get(0), strictIndex);
+        // Drive until the RELEASE itself is committed (take requires <= commitIndex).
+        var group = leader.openGroup(GROUP, new GroupOptions(Durability.RELAXED, 1024,
+                Duration.ofMillis(100), Duration.ofMillis(40), 1_000_000), null);
+        for (int i = 0; i < 40 && group.commitIndex() < releaseIndex; i++) {
+            c.drive();
+        }
+        assertTrue(group.commitIndex() >= releaseIndex, "RELEASE must commit before snapshot");
+        long snapAt = group.commitIndex();
+        // Snapshot through the RELEASE on the leader, then install on a fresh node storage.
+        var snap = leader.snapshots(GROUP).take(snapAt);
+        assertEquals(snapAt, snap.lastIncludedIndex());
+        assertTrue(snapAt >= releaseIndex);
+        var installed = new MemoryLogStorage();
+        // Seed a divergent uncommitted STRICT that a naive rescan would re-arm, then install snapshot.
+        installed.saveHardState(GROUP, 1, 0);
+        installed.append(GROUP, 1, 1, new byte[] {RaftGroup.USER_STRICT, 'x'});
+        var clock = new FakeClock(0L);
+        var net = new SimTransport();
+        var members = List.of(member(1, false), member(2, false), member(3, true));
+        var voters = VoterSet.dataAndWitness(members.get(0), members.get(1), members.get(2));
+        var opts = new GroupOptions(Durability.RELAXED, 1024, Duration.ofMillis(100), Duration.ofMillis(40), 1_000_000);
+        var n1 = ReplicatedNode.open(members.get(0).id(), voters, clock, installed, net);
+        n1.openGroup(GROUP, opts, null);
+        n1.snapshots(GROUP).install(snap);
+        // Restart-style election with the same storage that holds the RELEASE in the original cluster log.
+        var replayLog = c.logs.get(0);
+        c.close();
+        var net2 = new SimTransport();
+        var clock2 = new FakeClock(1_000_000_000L); // past any recovery window
+        var nodes = new ArrayList<ReplicatedNode>();
+        for (int i = 0; i < members.size(); i++) {
+            LogStorage storage = i == 0 ? replayLog : new MemoryLogStorage();
+            var node = ReplicatedNode.open(members.get(i).id(), voters, clock2, storage, net2);
+            node.openGroup(GROUP, opts, null);
+            nodes.add(node);
+        }
+        for (int i = 0; i < 40; i++) {
+            clock2.advance(Duration.ofMillis(40));
+            ReplicatedNode.driveAll(nodes);
+        }
+        int leaderIdx = -1;
+        for (int i = 0; i < nodes.size(); i++) {
+            if (nodes.get(i).openGroup(GROUP, opts, null).isLeader()) {
+                leaderIdx = i;
+                break;
+            }
+        }
+        assertTrue(leaderIdx >= 0, "a leader elected after restart");
+        assertEquals(0, nodes.get(leaderIdx).strictPending(GROUP), "RELEASE honoured on restart rescan");
+        n1.close();
+        for (var node : nodes) {
+            node.close();
+        }
     }
 
     /**
