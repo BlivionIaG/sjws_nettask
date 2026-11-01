@@ -55,7 +55,10 @@ import sjws_nettask.cluster.TcpTransport;
  * established peer connections and closes any that no longer pass. Refusals are counted in {@link #identityRefused}
  * and logged at most once a minute (subject and serial only). A TLS reload whose new certificate does not carry this
  * voter's own pinned SAN is refused (the current material stays), counted in {@link #reloadRefused} and logged.
- * {@code endpointIdentification} stays unset: the pinned SAN, not the host name, is the identity.
+ * {@code endpointIdentification} stays unset: the pinned SAN, not the host name, is the identity. Closed sockets are
+ * removed from {@link #live} when the transport calls {@link #released} (normal close, admit refusal after
+ * {@link #peerWire}, or {@link TcpTransport#close}), so a long-running node without reloads does not retain every
+ * historical peer socket (#334).
  */
 final class CpPeerSockets implements TcpTransport.SocketFactory {
 
@@ -174,6 +177,22 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         return policyDropped.get();
     }
 
+    /** Open (or not-yet-reclaimed) entries in the live-peer registry; for tests and ops. */
+    int liveSize() {
+        return live.size();
+    }
+
+    /**
+     * The transport is done with this socket: drop it from {@link #live} so a closed peer is not retained until a
+     * reload (#334). Idempotent.
+     */
+    @Override
+    public void released(Socket socket) {
+        if (socket instanceof SSLSocket ssl) {
+            live.remove(ssl);
+        }
+    }
+
     @Override
     public ServerSocket listen(InetSocketAddress bind) throws IOException {
         var server = (SSLServerSocket) tls.context().getServerSocketFactory().createServerSocket();
@@ -223,6 +242,7 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         } catch (IOException | RuntimeException e) {
             abortClose(plain);
             closeQuietly(socket);
+            live.remove(socket);
             throw e;
         }
         return new TcpTransport.SocketFactory.Connected(socket, plain);
@@ -281,6 +301,7 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
             return registerLive(ssl, null, ssl, true).wire();
         } catch (IOException e) {
             closeQuietly(ssl);
+            live.remove(ssl);
             throw new IllegalStateException("cp-peer certificate names no other pinned voter", e);
         }
     }

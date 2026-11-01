@@ -206,6 +206,14 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         }
 
         /**
+         * The transport is done with {@code socket} (it is closed or about to be). TLS factories remove it from any
+         * live-peer registry so a closed connection is not retained until a reload or pin change. Plain sockets have
+         * nothing to do. Idempotent: may be called more than once for the same socket.
+         */
+        default void released(Socket socket) {
+        }
+
+        /**
          * Connects like {@link #connect} and also returns the socket's abort handle: a socket whose {@code close()}
          * never waits behind a blocked write, used to abort a stalled connection ({@link Domain#writeStallMillis}) and
          * on {@link TcpTransport#close}. A plain socket is its own handle. An {@code SSLSocket}'s {@code close()} sends
@@ -587,6 +595,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         }
         for (var socket : inboundSockets) {
             closeQuietly(socket);
+            sockets.released(socket);
         }
         inbound.clear();
     }
@@ -632,6 +641,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             handshakeFailures.incrementAndGet();
             closeQuietly(socket);
             inboundSockets.remove(socket);
+            sockets.released(socket);
             return;
         } finally {
             handshaking.decrementAndGet();
@@ -643,12 +653,14 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             handshakeFailures.incrementAndGet();
             closeQuietly(socket);
             inboundSockets.remove(socket);
+            sockets.released(socket);
             return;
         }
         if (pinned >= 0 && heldOff(pinned)) {
             originHeldOff.incrementAndGet();
             closeQuietly(socket);
             inboundSockets.remove(socket);
+            sockets.released(socket);
             return;
         }
         if (inboundCount.incrementAndGet() > maxInbound) {
@@ -656,6 +668,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             inboundRefused.incrementAndGet();
             closeQuietly(socket);
             inboundSockets.remove(socket);
+            sockets.released(socket);
             return;
         }
         try {
@@ -664,6 +677,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             closeQuietly(socket);
             inboundSockets.remove(socket);
             inboundCount.decrementAndGet();
+            sockets.released(socket);
             return;
         }
         read(socket, pinned);
@@ -770,6 +784,7 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
         } finally {
             inboundSockets.remove(socket);
             inboundCount.decrementAndGet();
+            sockets.released(socket);
         }
     }
 
@@ -1036,8 +1051,10 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             conn = null;
             if (c != null) {
                 c.abort();
-            } else {
+                sockets.released(c.socket);
+            } else if (socket != null) {
                 closeQuietly(socket);
+                sockets.released(socket);
             }
             socket = null;
             out = null;
@@ -1196,9 +1213,13 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                         try {
                             out.flush();
                         } catch (IOException failed) {
-                            closeQuietly(socket);
+                            var dead = socket;
+                            closeQuietly(dead);
                             socket = null;
                             out = null;
+                            if (dead != null) {
+                                sockets.released(dead);
+                            }
                         }
                     }
                     continue;
@@ -1215,9 +1236,13 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
                     }
                 } catch (IOException failed) {
                     sendDrops.incrementAndGet();
-                    closeQuietly(socket);
+                    var dead = socket;
+                    closeQuietly(dead);
                     socket = null;
                     out = null;
+                    if (dead != null) {
+                        sockets.released(dead);
+                    }
                     try {
                         Thread.sleep(RECONNECT_MILLIS);
                     } catch (InterruptedException interrupted) {
@@ -1241,10 +1266,12 @@ public final class TcpTransport implements ClusterTransport, AutoCloseable {
             var c = conn;
             if (c != null) {
                 c.abort(); // the abort handle first: a plain close never waits behind a blocked (TLS) write
+                sockets.released(c.socket);
             }
             var current = socket;
             if (current != null) {
                 closeQuietly(current);
+                sockets.released(current);
             }
         }
     }

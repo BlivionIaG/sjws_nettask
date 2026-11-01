@@ -30,6 +30,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
@@ -546,6 +547,49 @@ class TcpTransportTest {
             }
             Thread.sleep(10);
         }
+    }
+
+
+    /**
+     * #334: when a transport finishes with a peer socket it calls {@link SocketFactory#released}, so TLS factories
+     * can drop closed entries from their live registry without waiting for a reload.
+     */
+    @Test
+    void closedSocketsAreReleasedToTheFactory() throws Exception {
+        var released = new AtomicInteger();
+        var factory = new TcpTransport.SocketFactory() {
+            @Override
+            public ServerSocket listen(InetSocketAddress bind) throws IOException {
+                return TcpTransport.SocketFactory.PLAIN.listen(bind);
+            }
+
+            @Override
+            public Socket connect(InetSocketAddress to) throws IOException {
+                return TcpTransport.SocketFactory.PLAIN.connect(to);
+            }
+
+            @Override
+            public void released(Socket socket) {
+                released.incrementAndGet();
+            }
+        };
+        var members = members(false, false);
+        try (var a = TcpTransport.open(members.get(0).id(), members, KEY, Clock.SYSTEM, 64, factory);
+                var b = TcpTransport.open(members.get(1).id(), members, KEY, Clock.SYSTEM, 64, factory)) {
+            a.attach(members.get(0).id(), (from, frame) -> {
+            });
+            var rpc = b.attach(members.get(1).id(), (from, frame) -> {
+            });
+            rpc.send(members.get(0).id(), new SimTransport.Frame(GROUP, 1, new byte[] {1}));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (System.nanoTime() < deadline && a.inboundConnections() < 1) {
+                a.deliver(50);
+                b.deliver(50);
+                Thread.sleep(10);
+            }
+            assertTrue(a.inboundConnections() >= 1, "frame admitted");
+        }
+        assertTrue(released.get() >= 1, "transport close must call SocketFactory.released");
     }
 
     private static List<Member> members(boolean... witness) throws IOException {

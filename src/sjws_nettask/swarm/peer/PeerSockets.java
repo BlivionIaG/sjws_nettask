@@ -49,7 +49,9 @@ import sjws_nettask.cp.CpServerTls;
  * safe publication); a swarm pin change needs a reconfig that builds a new {@code PeerSockets}. After every handshake
  * the peer is re-checked against the current trust, revocation and pin policy before any application byte is read or
  * written. A successful {@link CpServerTls#reloadTls()} re-checks established peer connections and closes any that no
- * longer pass. Only URI and DNS SANs count (no CN fallback).
+ * longer pass. Only URI and DNS SANs count (no CN fallback). Closed sockets are removed from the live registry when
+ * the transport calls {@link #released} (normal close, admit refusal after {@link #peerWire}, or transport close), so
+ * a long-running node without reloads does not retain every historical peer socket (#334).
  */
 final class PeerSockets implements TcpTransport.SocketFactory {
 
@@ -91,6 +93,22 @@ final class PeerSockets implements TcpTransport.SocketFactory {
     /** Established connections closed because they failed policy after a TLS reload. */
     long policyDropped() {
         return policyDropped.get();
+    }
+
+    /** Open (or not-yet-reclaimed) entries in the live-peer registry; for tests and ops. */
+    int liveSize() {
+        return live.size();
+    }
+
+    /**
+     * The transport is done with this socket: drop it from the live registry so a closed peer is not retained until a
+     * reload (#334). Idempotent.
+     */
+    @Override
+    public void released(Socket socket) {
+        if (socket instanceof SSLSocket ssl) {
+            live.remove(ssl);
+        }
     }
 
     @Override
@@ -145,6 +163,7 @@ final class PeerSockets implements TcpTransport.SocketFactory {
         } catch (IOException | RuntimeException e) {
             abortClose(plain);
             closeQuietly(socket);
+            live.remove(socket);
             throw e;
         }
         return new TcpTransport.SocketFactory.Connected(socket, plain);
@@ -196,6 +215,7 @@ final class PeerSockets implements TcpTransport.SocketFactory {
             return registerLive(ssl, null, ssl, true).wire();
         } catch (IOException e) {
             closeQuietly(ssl);
+            live.remove(ssl);
             throw new IllegalStateException("swarm peer certificate carries no pinned peer identity", e);
         }
     }
