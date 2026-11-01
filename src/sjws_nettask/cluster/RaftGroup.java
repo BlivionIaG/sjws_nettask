@@ -146,6 +146,12 @@ final class RaftGroup {
     private boolean ackedFromMemory;
     /** Highest index this node has forced to its own disk (data nodes only). */
     private long durableIndex;
+    /** Consecutive {@link #force()} failures; reset on a successful force (#242). */
+    private int consecutiveFsyncFailures;
+    /** Cumulative fsync failures for metrics (#242). */
+    private long fsyncFailures;
+    /** Set when the latest {@link #force()} threw; cleared by the append/tick handlers (#242). */
+    private boolean fsyncFailedInForce;
     /**
      * A data voter that restarts with state on disk may have lost entries it acked from memory
      * (RELAXED). Until it catches up to a leader's commit index, or {@link #recoveryUntil} passes,
@@ -334,10 +340,15 @@ final class RaftGroup {
                 return; // failed closed or node closed: no fsync, heartbeat or campaign (until restart)
             }
             if (relaxedDirty && now - dirtySince >= options.relaxedSyncDelay().toNanos()) {
-                force();
-                relaxedDirty = false;
-                if (role == Role.LEADER) {
-                    maybeCommit(after);
+                try {
+                    force();
+                    relaxedDirty = false;
+                    if (role == Role.LEADER) {
+                        maybeCommit(after);
+                    }
+                } catch (UncheckedIOException failed) {
+                    // Keep relaxedDirty so the next tick retries. Count and maybe step down (#242).
+                    onFsyncFailed(failed, after);
                 }
             }
             if (recovering && now >= recoveryUntil) {
@@ -484,6 +495,12 @@ final class RaftGroup {
                 // throughout), so it is still safe to take back.
                 future.completeExceptionally(rollBackBatch(first, failed, after));
                 rolledBack = true;
+                // A clean rollback after a force() failure: count consecutive fsync failures and maybe step down
+                // so a healthy peer can take over (#242). Fail-closed already stepped down in rollBackBatch.
+                if (storageFailed == null && fsyncFailedInForce) {
+                    fsyncFailedInForce = false;
+                    maybeStepDownAfterFsyncFailures(after);
+                }
             }
             if (!rolledBack) {
                 try {
@@ -540,8 +557,36 @@ final class RaftGroup {
         }
     }
 
+    /** Health/metrics: consecutive fsync failures since the last successful force (#242). */
+    int consecutiveFsyncFailures() {
+        lock.lock();
+        try {
+            return consecutiveFsyncFailures;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Health/metrics: total fsync failures observed by this group since open (#242). */
+    long fsyncFailures() {
+        lock.lock();
+        try {
+            return fsyncFailures;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** Per-batch storage failures: a full trace once per 30 s per exception type, one line otherwise (#254). */
     private static final ThrottledLog WRITE_FAILURES = new ThrottledLog(System.getLogger(RaftGroup.class.getName()),
+            java.time.Duration.ofSeconds(30));
+
+    /**
+     * Fsync failures on force/tick: keep counting every failure, but full stack traces at most once per 30 s per
+     * exception type (same shape as {@link #WRITE_FAILURES}). A separate instance so write-failure traces do not
+     * suppress fsync traces and vice versa (#242).
+     */
+    static final ThrottledLog FSYNC_FAILURES = new ThrottledLog(System.getLogger(RaftGroup.class.getName()),
             java.time.Duration.ofSeconds(30));
 
     /**
@@ -1971,11 +2016,64 @@ final class RaftGroup {
         try {
             storage.force(groupId);
         } catch (IOException failed) {
+            // Count under the lock before the caller rolls back or the tick catches (#242).
+            fsyncFailedInForce = true;
+            recordFsyncFailure(failed);
             throw new UncheckedIOException(failed);
         }
+        fsyncFailedInForce = false;
+        consecutiveFsyncFailures = 0;
         if (!witness) {
             durableIndex = lastIndex();
         }
+    }
+
+    /**
+     * Under the lock: bump the consecutive and cumulative fsync-failure counters and log. Counting is never
+     * rate-limited; only the stack trace is (via {@link #FSYNC_FAILURES}). The step-down WARNING in
+     * {@link #maybeStepDownAfterFsyncFailures} stays unthrottled and has no throwable (#242).
+     */
+    private void recordFsyncFailure(Throwable failed) {
+        consecutiveFsyncFailures++;
+        fsyncFailures++;
+        FSYNC_FAILURES.log(System.Logger.Level.WARNING,
+                "group " + groupId.value() + ": fsync failed (" + consecutiveFsyncFailures + " consecutive, step-down at "
+                        + options.fsyncFailureStepDown() + ")",
+                failed);
+    }
+
+    /**
+     * Under the lock, after a counted fsync failure: if this node still leads and the consecutive count reached the
+     * configured threshold, step down in the same term (no hard-state write). Always applies a campaign backoff of at
+     * least {@code 2 * (lease + electionTimeout)} (or {@code failbackHysteresis} when larger), even when ordinary
+     * failback hysteresis is zero, so a healthy peer can take over before this node campaigns again (#242).
+     */
+    private void maybeStepDownAfterFsyncFailures(List<Runnable> after) {
+        if (role != Role.LEADER || consecutiveFsyncFailures < options.fsyncFailureStepDown()) {
+            return;
+        }
+        System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                "group " + groupId.value() + ": stepping down after " + consecutiveFsyncFailures
+                        + " consecutive fsync failures (threshold " + options.fsyncFailureStepDown() + ")");
+        stepDown(term, after);
+        // Outlast a follower's worst-case remaining electionDeadline (lease + election) so a healthy peer
+        // can startPreVote and win before this node campaigns again; plain lease+election races the peer.
+        long peerWindow = options.leaseNanos() + options.electionTimeout().toNanos();
+        long wait = Math.max(options.failbackHysteresis().toNanos(), 2 * peerWindow);
+        long until = clock.nanoTime() + wait;
+        if (campaignNotBefore < until) {
+            campaignNotBefore = until;
+        }
+        if (electionDeadline < until) {
+            electionDeadline = until;
+        }
+    }
+
+    /** Tick path: record (already done in {@link #force()}) was not — force threw after recordFsyncFailure. */
+    private void onFsyncFailed(UncheckedIOException failed, List<Runnable> after) {
+        // force() already called recordFsyncFailure before throwing.
+        fsyncFailedInForce = false;
+        maybeStepDownAfterFsyncFailures(after);
     }
 
     /** RELAXED: fsync later (tick) or now when the entry bound is reached. */
@@ -2013,6 +2111,7 @@ final class RaftGroup {
             force();
             return true;
         } catch (UncheckedIOException failed) {
+            fsyncFailedInForce = false; // counted; witness does not step down
             return false;
         }
     }
@@ -2024,6 +2123,7 @@ final class RaftGroup {
             force();
             return true;
         } catch (IOException | UncheckedIOException failed) {
+            fsyncFailedInForce = false; // counted; witness does not step down
             return false;
         }
     }
