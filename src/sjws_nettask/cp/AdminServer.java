@@ -66,6 +66,8 @@ public final class AdminServer implements AutoCloseable {
     private final ConcurrentHashMap<SSLSession, Live> live = new ConcurrentHashMap<>();
     private final AtomicLong policyDropped = new AtomicLong();
     private final AtomicLong abortUnavailable = new AtomicLong();
+    /** Test/ops: how many times the null-abort WARNING was emitted. */
+    private final AtomicLong abortUnavailableWarns = new AtomicLong();
     /** Bumped at the start of every {@link #dropConnectionsFailingPolicy} so registration cannot escape a concurrent reload. */
     private final AtomicLong tlsEpoch = new AtomicLong();
     private volatile Thread watcher;
@@ -253,6 +255,10 @@ public final class AdminServer implements AutoCloseable {
         return abortUnavailable.get();
     }
 
+    long abortUnavailableWarns() {
+        return abortUnavailableWarns.get();
+    }
+
     /** Test/ops: drop closed or invalid sessions without a policy reload. */
     void pruneDeadSessionsForTest() {
         pruneDeadSessions();
@@ -330,6 +336,7 @@ public final class AdminServer implements AutoCloseable {
         }
         if (abort == null && session != null) {
             long n = abortUnavailable.incrementAndGet();
+            abortUnavailableWarns.incrementAndGet();
             LOG.log(System.Logger.Level.WARNING,
                     "admin-tls: connection abort unavailable (need --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED); keep-alive drop degraded ({0} so far)",
                     n);
@@ -369,14 +376,15 @@ public final class AdminServer implements AutoCloseable {
 
     /**
      * A present {@code Origin} must be in {@link #allowedOrigins} (empty by default). The header is
-     * trimmed; blank-after-trim is treated as present and refused. Mutations must send
-     * {@code Content-Type: application/json} (optional parameters allowed). Match is exact on the
-     * trimmed value (scheme, host, port, case).
+     * trimmed; blank-after-trim is treated as present and refused. Match is exact on the trimmed
+     * value (scheme, host, port, case). Mutations must send {@code Content-Type: application/json}
+     * (optional parameters allowed).
      */
     CpStore.Outcome refuseMutation(HttpExchange exchange) {
         var raw = exchange.getRequestHeaders().getFirst("Origin");
         if (raw != null) {
             var origin = raw.trim();
+            // Blank-after-trim is present-and-refused (exact match on trimmed allowlist entries).
             if (origin.isEmpty() || !allowedOrigins.contains(origin)) {
                 return CpStore.Outcome.error(403, "origin");
             }

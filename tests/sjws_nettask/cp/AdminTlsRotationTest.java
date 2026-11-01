@@ -413,10 +413,12 @@ class AdminTlsRotationTest {
             socket.setSoTimeout(5_000);
             socket.startHandshake();
             long before = http.abortUnavailable();
+            long warnsBefore = http.abortUnavailableWarns();
             var body = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
             assertTrue(body.startsWith("HTTP/1.1 200"), body);
             assertTrue(body.toLowerCase(java.util.Locale.ROOT).contains("connection: close"), body);
             assertTrue(http.abortUnavailable() > before, "null abort must bump abortUnavailable");
+            assertTrue(http.abortUnavailableWarns() > warnsBefore, "null abort must emit WARNING");
             assertEquals(0, http.liveSize(), "null abort must not retain a keep-alive Live");
         } finally {
             AdminServer.connectionAbortForTest = null;

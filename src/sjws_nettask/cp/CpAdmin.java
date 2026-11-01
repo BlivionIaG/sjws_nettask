@@ -29,9 +29,15 @@ public final class CpAdmin {
 
     /**
      * Test-only permission overlay. When non-null, consulted after the built-in table so a test can
-     * authorize a route that has no handler. Always null in production.
+     * authorize a route that has no handler. Always null in production; mutate only via
+     * {@link #setTestPermission}.
      */
-    static volatile BiFunction<String, String, sjws_nettask.controlplane.Permission> testPermission;
+    private static volatile BiFunction<String, String, sjws_nettask.controlplane.Permission> testPermission;
+
+    /** Test-only: install or clear the permission overlay. */
+    static void setTestPermission(BiFunction<String, String, sjws_nettask.controlplane.Permission> hook) {
+        testPermission = hook;
+    }
 
     public CpAdmin(CpStore store, long nowMillis, long ttlMillis) {
         this.store = store;
@@ -53,7 +59,8 @@ public final class CpAdmin {
         var route = path.endsWith("/") && path.length() > 1 ? path.substring(0, path.length() - 1) : path;
         var permission = permission(method, route);
         if (permission == null) {
-            return CpStore.Outcome.error(knownRoute(route) ? 405 : 404, knownRoute(route) ? "method" : "not found");
+            boolean known = knownRoute(route);
+            return CpStore.Outcome.error(known ? 405 : 404, known ? "method" : "not found");
         }
         var decision = store.authorize(credential, permission, route);
         if (!decision.allowed()) {

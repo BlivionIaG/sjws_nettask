@@ -320,6 +320,11 @@ class DaemonTest {
         var opens = "jdk.httpserver/sun.net.httpserver";
         var pom = Files.readString(Path.of("pom.xml"));
         assertTrue(pom.contains("<Add-Opens>") && pom.contains(opens), "jar Add-Opens in pom.xml");
+        assertTrue(pom.contains("<argLine>") && pom.contains("--add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"),
+                "surefire argLine must open jdk.httpserver");
+        var dockerfile = Files.readString(Path.of("Dockerfile"));
+        assertTrue(dockerfile.contains("jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"),
+                "Dockerfile ENTRYPOINT must open jdk.httpserver");
         for (var unit : List.of("contrib/sjws_nettask.service", "contrib/sjws_nettask-control@.service",
                 "contrib/sjws_nettask-data@.service")) {
             var text = Files.readString(Path.of(unit));
