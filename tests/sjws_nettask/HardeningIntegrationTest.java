@@ -83,7 +83,11 @@ class HardeningIntegrationTest {
         }
     }
 
-    /** Verification V1 for HTTP/1.1: one address gets at most maxConnectionsPerIp connections. */
+    /**
+     * Verification V1 for HTTP/1.1 (#327): one address gets at most maxConnectionsPerIp connections.
+     * Over the cap the accept loop sends a canned cleartext 503 + Retry-After: 1, then closes.
+     * The response is generic (no limit, count or client address). Under the cap is unchanged.
+     */
     @Test
     void connectionsPerAddressAreCapped() throws Exception {
         Files.writeString(root.resolve("hello.txt"), "hello");
@@ -91,7 +95,22 @@ class HardeningIntegrationTest {
         try (var a = connect(); var b = connect()) {
             waitUntil(() -> manager.activeConnections() == 2);
             try (var c = connect()) {
-                assertEquals(-1, readOrReset(c), "the third connection is closed at once");
+                // May send a request immediately; the refuse path drains at most one read best-effort.
+                c.getOutputStream().write("GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                c.getOutputStream().flush();
+                Response r = HttpTestSupport.readResponse(c.getInputStream());
+                assertEquals(503, r.statusCode(), r.rawHead());
+                assertEquals("1", r.headers().get("retry-after"), r.rawHead());
+                assertEquals("close", r.headers().get("connection"), r.rawHead());
+                assertEquals("0", r.headers().get("content-length"), r.rawHead());
+                String raw = r.rawHead().toLowerCase(java.util.Locale.ROOT);
+                assertFalse(raw.contains("max-connections") || raw.contains("per-ip") || raw.contains("per_ip"),
+                        "must not name the limit: " + r.rawHead());
+                assertFalse(raw.contains("256") || raw.contains("refused") || raw.contains("limit"),
+                        "must not name a count or limit token: " + r.rawHead());
+                assertFalse(raw.contains("127.0.0.1") || raw.contains("address"),
+                        "must not name the client: " + r.rawHead());
+                assertEquals(-1, c.getInputStream().read(), "EOF after the 503");
             }
             waitUntil(() -> manager.refusedPerIp() == 1);
             a.close();
@@ -102,6 +121,24 @@ class HardeningIntegrationTest {
             }
         }
         assertEquals(ServerConfig.DEFAULT_MAX_CONNECTIONS_PER_IP, ServerConfig.defaults(root.toString()).maxConnectionsPerIp());
+    }
+
+    /** #327: the per-IP refuse drain buffer is ThreadLocal, never shared across accept/virtual threads. */
+    @Test
+    void perIpRefuseDrainBufferIsThreadConfined() throws Exception {
+        var fromA = new java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer>();
+        var fromB = new java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer>();
+        var t1 = new Thread(() -> fromA.set(ClientManager.perIpRefuseDrainBufferForTest()), "drain-a");
+        var t2 = new Thread(() -> fromB.set(ClientManager.perIpRefuseDrainBufferForTest()), "drain-b");
+        t1.start();
+        t2.start();
+        t1.join(2000);
+        t2.join(2000);
+        assertNotNull(fromA.get());
+        assertNotNull(fromB.get());
+        assertNotSame(fromA.get(), fromB.get(), "each thread must see its own drain buffer");
+        assertSame(ClientManager.perIpRefuseDrainBufferForTest(), ClientManager.perIpRefuseDrainBufferForTest(),
+                "same thread reuses the same buffer");
     }
 
     private static int readOrReset(Socket s) {

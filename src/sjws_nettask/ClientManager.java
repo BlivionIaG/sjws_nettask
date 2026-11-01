@@ -19,6 +19,8 @@ package sjws_nettask;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.time.Duration;
@@ -194,6 +196,26 @@ public class ClientManager implements Runnable {
         return this.refusedPerIp.sum();
     }
 
+    /**
+     * Per-accept-thread drain scratch for {@link #refuseWith503}. Never shared across threads
+     * (#327 / Security). Package-visible for the confinement test.
+     */
+    static final ThreadLocal<ByteBuffer> PER_IP_REFUSE_DRAIN =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocate(256));
+
+    /** Visible for tests: the ThreadLocal drain buffer for the calling thread. */
+    static ByteBuffer perIpRefuseDrainBufferForTest() {
+        return PER_IP_REFUSE_DRAIN.get();
+    }
+
+    /**
+     * Placeholder until the #327 refuse path lands: still a silent close so the hardening
+     * test fails closed (expects 503).
+     */
+    private static void refuseWith503(SocketChannel socket) {
+        closeQuietly(socket);
+    }
+
     private volatile ConnectionReaper reaper;
     /** How long {@link #run()}'s shutdown waits for a response already being written. */
     private volatile long shutdownTimeoutMs = Daemon.DEFAULT_SHUTDOWN_TIMEOUT.toMillis();
@@ -313,7 +335,7 @@ public class ClientManager implements Runnable {
                 if (!this.perIp.tryAcquire(address)) { // one address can't take every connection slot
                     this.refusedPerIp.increment();
                     this.permits.release();
-                    closeQuietly(socket);
+                    refuseWith503(socket); // #327: canned 503 on cleartext h1 (stub until fix lands)
                     continue;
                 }
                 try {
