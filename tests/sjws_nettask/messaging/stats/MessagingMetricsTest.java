@@ -143,4 +143,33 @@ final class MessagingMetricsTest {
         }
     }
 
+
+    @Test
+    void sameTopicLastSlotStaysAttributed() throws Exception {
+        var m = new MessagingMetrics();
+        for (int i = 0; i < MessagingMetrics.TOPIC_CAP - 1; i++) {
+            m.produced("seed" + i, 200, 1, 100);
+        }
+        int threads = 32;
+        var barrier = new java.util.concurrent.CyclicBarrier(threads);
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        var futures = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                barrier.await();
+                m.produced("last-slot", 200, 1, 1000);
+                return null;
+            }));
+        }
+        for (var f : futures) {
+            f.get();
+        }
+        pool.shutdown();
+        var text = m.prometheus();
+        assertTrue(text.contains("topic=\"last-slot\""), text);
+        // All samples for the same name must share the admitted label — no split to other.
+        assertFalse(text.contains("topic=\"other\""), text);
+        assertFalse(text.contains("sjws_messaging_topics_folded_total"), text);
+    }
+
 }

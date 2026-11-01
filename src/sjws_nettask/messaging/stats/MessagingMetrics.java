@@ -110,37 +110,47 @@ public final class MessagingMetrics implements MessagingHooks {
 
     /**
      * Returns a topic label that is either already admitted, newly admitted under the cap, or
-     * {@code "other"}. Slot reservation ({@link #admittedCount} CAS) happens before the name is
-     * published into {@link #admittedTopics}, so concurrent callers never observe a topic that is
-     * later rolled back to {@code other}.
+     * {@code "other"}. Per-topic admission is serialized with {@link ConcurrentHashMap#compute} so a
+     * CAS-reserved slot is never visible as "full" to a peer racing the same name before publication
+     * (which would split that topic across {@code other} and the real label). The global cap still
+     * uses {@link #admittedCount} CAS across different names. Names are published only after a slot
+     * is taken, so callers never observe a topic that is later rolled back to {@code other}.
      */
     private String admitTopic(String topic) {
         String candidate = topic == null || topic.isEmpty() ? "other" : topic;
         if ("other".equals(candidate)) {
             return candidate;
         }
-        while (true) {
-            if (this.admittedTopics.containsKey(candidate)) {
-                return candidate;
-            }
-            int n = this.admittedCount.get();
-            if (n >= TOPIC_CAP) {
-                if (this.admittedTopics.containsKey(candidate)) {
-                    return candidate;
-                }
-                this.foldedTopics.increment();
-                return "other";
-            }
-            if (!this.admittedCount.compareAndSet(n, n + 1)) {
-                continue;
-            }
-            if (this.admittedTopics.putIfAbsent(candidate, Boolean.TRUE) == null) {
-                return candidate;
-            }
-            // Peer admitted the same name first; release the unused slot.
-            this.admittedCount.decrementAndGet();
+        if (this.admittedTopics.containsKey(candidate)) {
             return candidate;
         }
+        class Decision {
+            String label = "other";
+            boolean folded;
+        }
+        var decision = new Decision();
+        this.admittedTopics.compute(candidate, (key, existing) -> {
+            if (existing != null) {
+                decision.label = candidate;
+                return existing;
+            }
+            while (true) {
+                int n = this.admittedCount.get();
+                if (n >= TOPIC_CAP) {
+                    decision.label = "other";
+                    decision.folded = true;
+                    return null;
+                }
+                if (this.admittedCount.compareAndSet(n, n + 1)) {
+                    decision.label = candidate;
+                    return Boolean.TRUE;
+                }
+            }
+        });
+        if (decision.folded) {
+            this.foldedTopics.increment();
+        }
+        return decision.label;
     }
 
     private static String key(String topic, int status) {
