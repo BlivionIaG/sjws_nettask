@@ -10,6 +10,7 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [YAML config file](user/config-file.md)
 - [HTTP/1.x](user/http1.md) · [HTTP/2](user/http2.md) · [HTTP/3](user/http3.md)
 - [Access rules](user/access-rules.md)
+- [API gateway](user/api-gateway.md): routes, auth and rate limits
 - [Caching, validators and ranges](user/caching-and-ranges.md)
 - [Platform notes](user/platform-notes.md)
 
