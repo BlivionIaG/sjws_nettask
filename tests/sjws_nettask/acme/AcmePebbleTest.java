@@ -19,6 +19,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLContext;
@@ -32,8 +33,9 @@ import sjws_nettask.tls.TlsMaterial;
 
 /**
  * Issues a real HTTP-01 certificate against Pebble when {@code PEBBLE_BIN} and
- * {@code PEBBLE_CHALLTESTSRV_BIN} point at the binaries. Otherwise the test skips. It does not
- * download a release from GitHub.
+ * {@code PEBBLE_CHALLTESTSRV_BIN} point at the binaries. Otherwise the test skips locally.
+ * On Linux CI both env vars are required (same rule as {@code PROMTOOL}/{@code PROMETHEUS}).
+ * This class never downloads a release from GitHub.
  */
 class AcmePebbleTest {
 
@@ -202,11 +204,17 @@ class AcmePebbleTest {
 
     private static Path binary(String env) {
         var override = System.getenv(env);
-        assumeTrue(override != null && !override.isBlank(),
-                env + " is unset; this test does not download Pebble");
-        var path = Path.of(override);
-        assertTrue(Files.isExecutable(path), path + " is not executable");
-        return path;
+        if (override != null && !override.isBlank()) {
+            var path = Path.of(override);
+            assertTrue(Files.isExecutable(path), path + " is not executable");
+            return path;
+        }
+        if ("true".equals(System.getenv("CI"))
+                && System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux")) {
+            fail(env + " is required on Linux CI");
+        }
+        assumeTrue(false, env + " is unset; this test does not download Pebble");
+        return null;
     }
 
     private static String pem(String type, byte[] der) {

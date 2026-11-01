@@ -272,7 +272,7 @@ class HaMessagingSettingsTest {
         }
         assertTrue(error(h + "  members: [{ id: a, address: \"x:1\" }, { id: a, address: \"x:2\" }]\n").contains("duplicate id a"));
         assertTrue(error(h + "  members: [{ id: a, address: \"x:1\", wire: 2 }, { id: b, address: \"x:2\" }]\n").contains("duplicate wire 2"));
-        for (var bad : new String[] {"\"a/b\"", "__offsets", "\".\"", "\"..\"", "\"\"", "3"}) {
+        for (var bad : new String[] {"\"a/b\"", "__offsets", "__offsets_local", "__evil", "\".\"", "\"..\"", "\"\"", "3"}) {
             assertTrue(error(h + "  topics: [" + bad + "]\n").contains("ha.topics"), bad);
         }
         assertTrue(error(h + "  heartbeat: 0ms\n").contains("ha.heartbeat"));

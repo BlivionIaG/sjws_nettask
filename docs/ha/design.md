@@ -641,3 +641,12 @@ the PR body.
 4. **Failover tooling.** `VipHook` driven by the lease (claim on grant, release before
    expiry), preferred-node campaign delay, failback left off, `RollingRestart` gated on
    `/readyz`, and `SO_REUSEPORT` hand-over when the JVM opens the nio packages.
+
+## HA messaging witness (msgrepl)
+
+Messaging replication (phase A: one Raft group `msg/<topic>` per `ha.topics` entry plus `msg/__offsets`) is
+wired by `HaMessaging`. The witness must **not** run messaging; it calls
+`RaftReplicator.openForWitness` with the **same** `ha.topics` and election/heartbeat timings as the data nodes,
+so every `msg/*` group has the tie-breaker (#217). `openForWitness` refuses a non-witness node and refuses
+topic names starting with `__` (internal; `__offsets` is opened by the helper itself). Full bootstrap,
+migration and known limits: [high-availability.md](../design/high-availability.md#ha-messaging-bootstrap).

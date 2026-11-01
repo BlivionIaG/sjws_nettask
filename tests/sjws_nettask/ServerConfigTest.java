@@ -48,6 +48,20 @@ class ServerConfigTest {
     }
 
     @Test
+    void portZeroIsEphemeralFromCliAndEnv() {
+        var cli = parse(Map.of(), "0");
+        assertEquals(0, cli.config().port());
+        assertTrue(cli.warnings().isEmpty(), cli.warnings()::toString);
+        var env = parse(Map.of("WEB_SERVER_PORT", "0"), "9000");
+        assertEquals(0, env.config().port()); // env wins, and 0 is kept
+        assertTrue(env.warnings().isEmpty(), env.warnings()::toString);
+        assertTrue(ServerConfig.usage().contains("0 = ephemeral"), ServerConfig.usage());
+        var stillInvalid = parse(Map.of("WEB_SERVER_PORT", "-1"));
+        assertEquals(8080, stillInvalid.config().port());
+        assertFalse(stillInvalid.warnings().isEmpty());
+    }
+
+    @Test
     void invalidValuesFallBackWithWarnings() {
         var p = parse(Map.of("WEB_SERVER_MAX_CONNECTIONS", "lots"), "80.5", "--idle-timeout=-1", "--bogus", "dir", "extra");
         assertEquals(8080, p.config().port());

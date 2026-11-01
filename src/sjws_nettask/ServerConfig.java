@@ -331,7 +331,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         return """
                 Usage: java -jar sjws_nettask.jar [port] [document root] [options]
 
-                  port                      TCP port (default 8080)                       WEB_SERVER_PORT
+                  port                      TCP port (default 8080; 0 = ephemeral)         WEB_SERVER_PORT
                   document root             folder to serve (default ./HTML)             WEB_SERVER_DIR
                   --max-connections=N       concurrent HTTP/1 connections (2048)          WEB_SERVER_MAX_CONNECTIONS
                   --max-connections-per-ip=N  HTTP/1 connections per client IP (256)      WEB_SERVER_MAX_CONNECTIONS_PER_IP
@@ -585,7 +585,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
                 }
             } else if (positional == 0) {
                 positional++;
-                port = (int) number(arg, port, 1, 65535, "port", warnings);
+                port = (int) number(arg, port, 0, 65535, "port", warnings);
             } else if (positional == 1) {
                 positional++;
                 dir = arg;
@@ -597,7 +597,7 @@ public record ServerConfig(int port, Path root, int maxConnections, Duration idl
         // environment overrides
         String v;
         if ((v = env.get("WEB_SERVER_PORT")) != null) {
-            port = number(v, port, 1, 65535, "WEB_SERVER_PORT", warnings);
+            port = number(v, port, 0, 65535, "WEB_SERVER_PORT", warnings);
         }
         if ((v = env.get("WEB_SERVER_DIR")) != null) {
             dir = v;

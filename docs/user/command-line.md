@@ -6,7 +6,7 @@ Run:
 
 | Option | Environment | Default | |
 |---|---|---|---|
-| `[port]` | `WEB_SERVER_PORT` | 8080 | TCP port |
+| `[port]` | `WEB_SERVER_PORT` | 8080 | TCP port; `0` binds an ephemeral port (startup prints `HTTP/1.1 on tcp/<bound>`) |
 | `[html folder]` | `WEB_SERVER_DIR` | `./HTML` | document root (must exist) |
 | `--max-connections=N` | `WEB_SERVER_MAX_CONNECTIONS` | 2048 | concurrent connections; extra ones wait in the backlog |
 | `--backlog=N` | `WEB_SERVER_BACKLOG` | 1024 | TCP accept backlog (connections queued by the kernel before they are accepted); the OS caps it (Linux: `net.core.somaxconn`, 4096 by default since 5.4) |
