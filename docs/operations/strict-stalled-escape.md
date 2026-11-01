@@ -39,6 +39,12 @@ does not run on a timer and does not change the group's configured durability. T
 `USER_STRICT` bytes stay on disk; the release is the new marker alone, so Raft log matching is
 preserved if a follower that stored the STRICT entry later becomes leader.
 
+The durable barrier drop is the **committed** `STRICT_RELEASE` only. An uncommitted marker still in
+the log is honoured again when a node becomes leader (by scanning the surviving suffix). If that
+suffix was replaced before the marker committed, the barrier re-arms for any new `USER_STRICT` at
+reused indexes until a release commits — fail-safe, not a silent weaken. The release append uses
+the same rollback/fence path as a user batch.
+
 ## Procedure
 
 1. Confirm the stall: `strictPending(group) > 0`, `oldestStrictPendingAgeNanos` ≥ 2 × lease, and the

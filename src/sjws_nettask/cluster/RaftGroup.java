@@ -159,9 +159,11 @@ final class RaftGroup {
     /** Operator escapes that appended a {@link #STRICT_RELEASE} for stalled overrides (#208). */
     private final java.util.concurrent.atomic.AtomicLong strictOverridesReleased = new java.util.concurrent.atomic.AtomicLong();
     /**
-     * Highest index whose STRICT override a {@link #STRICT_RELEASE} has covered on this node
-     * (from apply or from an uncommitted marker a leader already honoured). Survive only in memory;
-     * after a restart the log (and snapshots that removed the prefix) are scanned again.
+     * Highest index whose STRICT override a <em>committed</em> {@link #STRICT_RELEASE} has covered
+     * on this node (advanced only from {@link #apply}). Uncommitted markers never write this field:
+     * a truncated/replaced suffix must not leave a stale watermark that skips new {@link #USER_STRICT}
+     * entries at reused indexes. Uncommitted coverage is recomputed from the surviving log on
+     * {@link #rescanStrictPending}.
      */
     private long strictReleasedThrough;
     private long recoveryUntil;
@@ -1568,10 +1570,13 @@ final class RaftGroup {
      * group is refused — this escape is for per-append overrides in a RELAXED group only.
      *
      * <p>Fail-safe: {@code operatorId} must be non-blank (the authenticated operator identity from the
-     * admin channel). The marker is appended at the next index in the current term and replicated like
-     * any other entry; every replica that applies it, and every {@link #becomeLeader} rescan that sees
-     * it (committed or not), drops the STRICT barrier for indexes up to the marker's upto. Audited with
-     * one WARNING and counted in {@link #strictOverridesReleased()}.
+     * admin channel). The marker is appended at the next index in the current term through the same
+     * rollback/fence path as a user batch ({@link #rollBackBatch}). The leader clears
+     * {@link #strictPending} for covered indexes so {@link #maybeCommit} can advance, but only a
+     * <em>committed</em> marker (via {@link #apply}) advances {@link #strictReleasedThrough}. An
+     * uncommitted marker still in the log is honoured again on {@link #becomeLeader} by scanning the
+     * surviving suffix; if that suffix was replaced, the barrier re-arms until a release commits
+     * (fail-safe). Audited with one WARNING and counted in {@link #strictOverridesReleased()}.
      *
      * @return how many STRICT overrides the marker covers (0 when nothing is stalled yet)
      * @throws NotLeaderException if this node does not lead the group
@@ -1615,10 +1620,24 @@ final class RaftGroup {
             }
             long upto = strictPending.lastKey();
             int count = strictPending.size();
-            // Append a new marker only — never truncate or rewrite existing entries (#450 P1).
-            appendRaw(strictRelease(upto));
-            markDirty();
-            honourStrictRelease(upto); // leader must drop the barrier before maybeCommit
+            long first = Math.max(lastIndex(), snapIndex) + 1;
+            // Append a new marker only — never rewrite existing entries. Fence like a user batch.
+            try {
+                appendRaw(strictRelease(upto));
+                markDirty();
+            } catch (RuntimeException failed) {
+                Throwable err = rollBackBatch(first, failed, after);
+                if (err instanceof RuntimeException runtime) {
+                    throw runtime;
+                }
+                throw new UncheckedIOException(new java.io.IOException("STRICT_RELEASE append failed", err));
+            }
+            // This leader only: drop pending so maybeCommit can pass. Do not touch
+            // strictReleasedThrough until apply commits the marker (#450 P1 stale watermark).
+            strictPending.headMap(upto, true).clear();
+            if (strictWarnedIndex <= upto) {
+                strictWarnedIndex = upto;
+            }
             strictOverridesReleased.addAndGet(count);
             released = count;
             System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
@@ -1639,15 +1658,15 @@ final class RaftGroup {
     }
 
     /**
-     * Rebuild {@link #strictPending} from the uncommitted suffix, honouring every
-     * {@link #STRICT_RELEASE} already in the log (and {@link #strictReleasedThrough} from apply).
-     * A follower that stored {@link #USER_STRICT} but later learns a release must not re-arm the
-     * barrier when elected.
+     * Rebuild {@link #strictPending} from the uncommitted suffix. Coverage is the committed watermark
+     * {@link #strictReleasedThrough} plus any {@link #STRICT_RELEASE} still present in the surviving
+     * uncommitted log (recomputed every time — never cached into the watermark). A replaced suffix
+     * therefore cannot skip a new {@link #USER_STRICT} at a reused index.
      */
     private void rescanStrictPending(long now) {
         strictPending.clear();
         strictWarnedIndex = 0;
-        long releasedThrough = strictReleasedThrough;
+        long releasedThrough = strictReleasedThrough; // committed coverage only
         long last = lastIndex();
         for (long index = commitIndex + 1; index <= last; index++) {
             var data = read(index);
@@ -1655,7 +1674,6 @@ final class RaftGroup {
                 releasedThrough = Math.max(releasedThrough, strictReleaseUpto(data));
             }
         }
-        strictReleasedThrough = releasedThrough;
         for (long index = commitIndex + 1; index <= last; index++) {
             var data = read(index);
             if (data != null && data.length > 0 && data[0] == USER_STRICT && index > releasedThrough) {
@@ -1664,7 +1682,10 @@ final class RaftGroup {
         }
     }
 
-    /** Drop the STRICT barrier for indexes {@code <= upto} on this node. */
+    /**
+     * Commit-time honour: advance the durable watermark and drop pending. Called only from
+     * {@link #apply} for a committed {@link #STRICT_RELEASE}.
+     */
     private void honourStrictRelease(long upto) {
         if (upto > strictReleasedThrough) {
             strictReleasedThrough = upto;
@@ -1703,7 +1724,7 @@ final class RaftGroup {
         return strictOverridesReleased.get();
     }
 
-    /** Tests only: highest index a {@link #STRICT_RELEASE} has covered on this node. */
+    /** Tests only: highest index a <em>committed</em> {@link #STRICT_RELEASE} has covered. */
     long strictReleasedThroughForTest() {
         lock.lock();
         try {

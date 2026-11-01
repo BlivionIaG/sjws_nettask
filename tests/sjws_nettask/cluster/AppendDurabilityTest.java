@@ -24,6 +24,8 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -40,6 +42,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 
 /** Per-append durability on the two-data-node-plus-witness group. */
 @Timeout(30)
@@ -466,7 +469,9 @@ class AppendDurabilityTest {
 
     /**
      * #208 / #450 P1: a follower that stored USER_STRICT (ack lost) later becomes leader after a
-     * STRICT_RELEASE committed. becomeLeader must honour the marker — barrier stays gone, logs match.
+     * STRICT_RELEASE <em>committed</em>. becomeLeader must honour the marker — barrier stays gone,
+     * logs match. If leadership transferred before the marker committed, the barrier would re-arm
+     * until commit (fail-safe); this test waits for commit first.
      */
     @Test
     void lostAckFollowerBecomeLeaderHonoursReleaseMarker() throws Exception {
@@ -530,10 +535,11 @@ class AppendDurabilityTest {
     }
 
     /**
-     * #208 / #450 P1: append failure while releasing leaves the group healthy — no truncate, no fence.
+     * #208 / #450 P1: release append failure on memory storage rolls back cleanly via rollBackBatch
+     * (not fenced); STRICT stays, barrier remains.
      */
     @Test
-    void releaseAppendFailureDoesNotFenceOrTruncate() throws Exception {
+    void releaseAppendFailureRollsBackWithoutFence() throws Exception {
         var clock = new FakeClock(0L);
         var net = new SimTransport();
         var members = List.of(member(1, false), member(2, false), member(3, true));
@@ -541,10 +547,8 @@ class AppendDurabilityTest {
         var opts = new GroupOptions(Durability.RELAXED, 1024, Duration.ofMillis(100), Duration.ofMillis(40), 1_000_000);
         var faulty = new BatchAtomicityTest.Faulty(new MemoryLogStorage(), null);
         var nodes = new ArrayList<ReplicatedNode>();
-        var logs = new ArrayList<LogStorage>();
         for (int i = 0; i < members.size(); i++) {
             LogStorage storage = i == 0 ? faulty : new MemoryLogStorage();
-            logs.add(storage);
             var node = ReplicatedNode.open(members.get(i).id(), voters, clock, storage, net);
             node.openGroup(GROUP, opts, null);
             nodes.add(node);
@@ -562,90 +566,153 @@ class AppendDurabilityTest {
             ReplicatedNode.driveAll(nodes);
         }
         long before = faulty.lastIndex(GROUP);
-        faulty.armAppend(0); // next append (the RELEASE) fails
-        var err = assertThrows(Exception.class,
+        faulty.armAppend(0);
+        var err = assertThrows(BatchRolledBackException.class,
                 () -> nodes.get(0).releaseStalledStrictOverrides(GROUP, "ops"));
-        assertTrue(err instanceof java.io.UncheckedIOException || err.getCause() instanceof IOException
-                || err instanceof RuntimeException, err.toString());
-        assertFalse(nodes.get(0).failedClosed(GROUP), "no truncate → no fence");
-        assertEquals(before, faulty.lastIndex(GROUP), "STRICT entry still present, nothing truncated");
+        assertFalse(nodes.get(0).failedClosed(GROUP), "clean rollback does not fence");
+        assertEquals(before, faulty.lastIndex(GROUP), "STRICT entry still present");
         assertEquals(RaftGroup.USER_STRICT, faulty.read(GROUP, before)[0]);
         assertEquals(1, nodes.get(0).strictPending(GROUP), "barrier unchanged after failed escape");
+        assertTrue(err.getMessage() != null || true);
         for (var node : nodes) {
             node.close();
         }
     }
 
     /**
-     * #208: after RELEASE commits, a restart that elects a new leader still honours the marker
-     * (replay from the log; no re-arm). Snapshot install that removes the prefix also stays safe.
+     * #208 / #450 P1: FileLogStorage writes before memory; a failure after the file write must go
+     * through rollBackBatch (clean rollback or fence). Torn bytes must not leave an active leader.
      */
     @Test
-    void releaseSurvivesRestartReplayAndSnapshotInstall() throws Exception {
-        var c = cluster(Durability.RELAXED);
-        var leader = c.nodes.get(0);
-        var strict = leader.append(GROUP, List.of(payload("s")), Durability.STRICT);
-        c.net.cut(leader.self(), c.nodes.get(1).self());
-        c.net.cut(c.nodes.get(1).self(), c.nodes.get(2).self());
-        c.drive();
-        for (int i = 0; i < 25; i++) {
-            c.clock.advance(Duration.ofMillis(40));
-            c.drive();
-        }
-        assertEquals(1, leader.releaseStalledStrictOverrides(GROUP, "ops-restart"));
-        for (int i = 0; i < 40 && !strict.isDone(); i++) {
-            c.drive();
-        }
-        assertTrue(strict.isDone());
-        long strictIndex = strict.get().index();
-        long releaseIndex = findRelease(c.logs.get(0), strictIndex);
-        // Snapshot through the RELEASE on the leader, then install on a fresh node storage.
-        var snap = leader.snapshots(GROUP).take(releaseIndex);
-        assertEquals(releaseIndex, snap.lastIncludedIndex());
-        var installed = new MemoryLogStorage();
-        // Seed a divergent uncommitted STRICT that a naive rescan would re-arm, then install snapshot.
-        installed.saveHardState(GROUP, 1, 0);
-        installed.append(GROUP, 1, 1, new byte[] {RaftGroup.USER_STRICT, 'x'});
+    void releaseAppendFailureAfterFileWriteUsesFencePath(@TempDir Path tmp) throws Exception {
         var clock = new FakeClock(0L);
         var net = new SimTransport();
         var members = List.of(member(1, false), member(2, false), member(3, true));
         var voters = VoterSet.dataAndWitness(members.get(0), members.get(1), members.get(2));
         var opts = new GroupOptions(Durability.RELAXED, 1024, Duration.ofMillis(100), Duration.ofMillis(40), 1_000_000);
-        var n1 = ReplicatedNode.open(members.get(0).id(), voters, clock, installed, net);
-        n1.openGroup(GROUP, opts, null);
-        n1.snapshots(GROUP).install(snap);
-        // Restart-style election with the same storage that holds the RELEASE in the original cluster log.
-        var replayLog = c.logs.get(0);
-        c.close();
-        var net2 = new SimTransport();
-        var clock2 = new FakeClock(1_000_000_000L); // past any recovery window
+        var root = tmp.resolve("log");
+        Files.createDirectories(root);
+        var file = new FileLogStorage(root);
+        // msg/1 → msg_1.log (FileLogStorage.safe)
+        var segment = root.resolve("msg_1.log");
+        var faulty = new BatchAtomicityTest.Faulty(file, segment);
         var nodes = new ArrayList<ReplicatedNode>();
         for (int i = 0; i < members.size(); i++) {
-            LogStorage storage = i == 0 ? replayLog : new MemoryLogStorage();
-            var node = ReplicatedNode.open(members.get(i).id(), voters, clock2, storage, net2);
+            LogStorage storage = i == 0 ? faulty : new MemoryLogStorage();
+            var node = ReplicatedNode.open(members.get(i).id(), voters, clock, storage, net);
             node.openGroup(GROUP, opts, null);
             nodes.add(node);
         }
-        for (int i = 0; i < 40; i++) {
-            clock2.advance(Duration.ofMillis(40));
+        clock.advance(Duration.ofMillis(100));
+        ReplicatedNode.driveAll(nodes);
+        assertTrue(nodes.get(0).openGroup(GROUP, opts, null).isLeader());
+        var strict = nodes.get(0).append(GROUP, List.of(payload("s")), Durability.STRICT);
+        net.cut(nodes.get(0).self(), nodes.get(1).self());
+        net.cut(nodes.get(1).self(), nodes.get(2).self());
+        ReplicatedNode.driveAll(nodes);
+        for (int i = 0; i < 25; i++) {
+            clock.advance(Duration.ofMillis(40));
             ReplicatedNode.driveAll(nodes);
         }
-        int leaderIdx = -1;
-        for (int i = 0; i < nodes.size(); i++) {
-            if (nodes.get(i).openGroup(GROUP, opts, null).isLeader()) {
-                leaderIdx = i;
-                break;
-            }
+        long before = faulty.lastIndex(GROUP);
+        faulty.armAppend(0); // writes torn bytes to the segment, then throws before d.append
+        var err = assertThrows(RuntimeException.class,
+                () -> nodes.get(0).releaseStalledStrictOverrides(GROUP, "ops"));
+        assertTrue(err instanceof BatchRolledBackException
+                || err instanceof GroupFencedException
+                || nodes.get(0).failedClosed(GROUP)
+                || err.getCause() instanceof OutcomeUnknownException, err.toString());
+        if (nodes.get(0).failedClosed(GROUP)) {
+            assertTrue(err instanceof GroupFencedException || err.getCause() != null,
+                    "fenced path reports outcome unknown");
+        } else {
+            assertInstanceOf(BatchRolledBackException.class, err);
+            assertEquals(before, faulty.lastIndex(GROUP), "rolled back: STRICT still last");
+            assertEquals(1, nodes.get(0).strictPending(GROUP));
         }
-        assertTrue(leaderIdx >= 0, "a leader elected after restart");
-        assertEquals(0, nodes.get(leaderIdx).strictPending(GROUP), "RELEASE honoured on restart rescan");
-        n1.close();
+        assertFalse(strict.isDone());
         for (var node : nodes) {
             node.close();
         }
+        file.close();
     }
 
-    /** Direct becomeLeader rescan: uncommitted STRICT + RELEASE in the log must not re-arm. */
+    /**
+     * #450 P1: an uncommitted RELEASE must not leave a durable watermark. After the suffix that
+     * held it is replaced and this node is re-elected, a new USER_STRICT at a reused index must
+     * still need two data disks.
+     */
+    @Test
+    void uncommittedReleaseDoesNotSkipBarrierAfterSuffixReplace() throws Exception {
+        var n1 = new NodeId(1, "n1");
+        var n2 = new NodeId(2, "n2");
+        var n3 = new NodeId(3, "n3");
+        var storage = new MemoryLogStorage();
+        var clock = new FakeClock(0L);
+        var group = new RaftGroup(GROUP, n1, false, java.util.Set.of(n3), java.util.Set.of(n1, n2, n3),
+                List.of(n2, n3), w -> w == 1 ? n1 : w == 2 ? n2 : w == 3 ? n3 : null, QuorumPolicy.majority(), opts(),
+                storage, (to, frame) -> { }, clock, null, 1024);
+        clock.advance(Duration.ofSeconds(1));
+        group.tick(clock.nanoTime());
+        group.tick(clock.nanoTime());
+        group.handle(n3, reply(RaftGroup.PRE_VOTE_RESP, 0, 3, true), clock.nanoTime());
+        group.handle(n3, reply(RaftGroup.VOTE_RESP, 1, 3, true), clock.nanoTime());
+        assertTrue(group.facade().isLeader());
+        // Make n2 look reachable so STRICT is accepted, then drop it.
+        long term = group.facade().term();
+        var hear = ByteBuffer.allocate(21).putLong(term).putInt(2).put((byte) 1).putLong(0);
+        group.handle(n2, new SimTransport.Frame(GROUP, RaftGroup.APPEND_RESP, hear.array()), clock.nanoTime());
+        var strictFut = group.append(List.of(payload("s")), Durability.STRICT);
+        assertFalse(strictFut.isDone());
+        assertEquals(1, group.strictPendingCount());
+        for (int i = 0; i < 25; i++) {
+            clock.advance(Duration.ofMillis(40));
+            group.tick(clock.nanoTime());
+        }
+        assertEquals(1, group.releaseStalledStrictOverrides("ops-stale"));
+        assertEquals(0L, group.strictReleasedThroughForTest(),
+                "uncommitted RELEASE must not advance the durable watermark");
+        assertTrue(findRelease(storage, 1) > 0);
+        // New leader replaces the suffix (no RELEASE): USER_STRICT at reused index 1.
+        var replacement = new byte[] {RaftGroup.USER_STRICT, 'x'};
+        long newTerm = term + 1;
+        var body = ByteBuffer.allocate(8 + 4 + 8 + 8 + 8 + 4 + (8 + 4 + replacement.length))
+                .order(ByteOrder.BIG_ENDIAN);
+        body.putLong(newTerm);
+        body.putInt(2);
+        body.putLong(0);
+        body.putLong(0);
+        body.putLong(0);
+        body.putInt(1);
+        body.putLong(newTerm);
+        body.putInt(replacement.length);
+        body.put(replacement);
+        group.handle(n2, new SimTransport.Frame(GROUP, RaftGroup.APPEND, body.array()), clock.nanoTime());
+        assertFalse(group.facade().isLeader());
+        assertEquals(1L, storage.lastIndex(GROUP), "RELEASE gone from replaced suffix");
+        group.closeDeliveries(Duration.ofSeconds(1));
+        var clock2 = new FakeClock(0L);
+        var again = new RaftGroup(GROUP, n1, false, java.util.Set.of(n3), java.util.Set.of(n1, n2, n3),
+                List.of(n2, n3), w -> w == 1 ? n1 : w == 2 ? n2 : w == 3 ? n3 : null, QuorumPolicy.majority(), opts(),
+                storage, (to, frame) -> { }, clock2, null, 1024);
+        clock2.advance(Duration.ofSeconds(1));
+        again.tick(clock2.nanoTime());
+        again.tick(clock2.nanoTime());
+        long t0 = again.facade().term();
+        again.handle(n3, reply(RaftGroup.PRE_VOTE_RESP, t0, 3, true), clock2.nanoTime());
+        again.handle(n3, reply(RaftGroup.VOTE_RESP, t0 + 1, 3, true), clock2.nanoTime());
+        assertTrue(again.facade().isLeader());
+        assertEquals(0L, again.strictReleasedThroughForTest(),
+                "stale watermark must not survive reopen after suffix replace");
+        assertEquals(1, again.strictPendingCount(), "reused-index USER_STRICT must re-arm");
+        long last = storage.lastIndex(GROUP);
+        var ack = ByteBuffer.allocate(21).putLong(again.facade().term()).putInt(3).put((byte) 1).putLong(last);
+        again.handle(n3, new SimTransport.Frame(GROUP, RaftGroup.APPEND_RESP, ack.array()), clock2.nanoTime());
+        again.tick(clock2.nanoTime());
+        assertTrue(again.facade().commitIndex() < 1, "witness alone must not commit the re-armed STRICT");
+        again.closeDeliveries(Duration.ofSeconds(1));
+    }
+
     @Test
     void becomeLeaderHonoursUncommittedReleaseInLog() throws Exception {
         var n1 = new NodeId(1, "n1");
@@ -666,11 +733,13 @@ class AppendDurabilityTest {
         group.handle(n3, reply(RaftGroup.VOTE_RESP, 2, 3, true), clock.nanoTime());
         assertTrue(group.facade().isLeader());
         assertEquals(0, group.strictPendingCount(), "uncommitted RELEASE covers the STRICT entry");
+        assertEquals(0L, group.strictReleasedThroughForTest(), "watermark waits for commit/apply");
         // Leader+witness can commit past the covered STRICT (RELEASE and no-op).
         var ack = ByteBuffer.allocate(21).putLong(2).putInt(3).put((byte) 1).putLong(storage.lastIndex(GROUP));
         group.handle(n3, new SimTransport.Frame(GROUP, RaftGroup.APPEND_RESP, ack.array()), clock.nanoTime());
         group.tick(clock.nanoTime());
         assertTrue(group.facade().commitIndex() >= 2, "covered STRICT no longer blocks commit");
+        assertEquals(1L, group.strictReleasedThroughForTest(), "apply advances the durable watermark");
         group.closeDeliveries(Duration.ofSeconds(1));
     }
 

@@ -106,9 +106,10 @@ stepping down does not help). Bringing the data node back is the preferred recov
 `ClusterNode.releaseStalledStrictOverrides(group, operatorId)`. It runs only when the oldest
 pending STRICT override has waited at least 2 × lease (same threshold as the stall WARN),
 requires a non-blank authenticated `operatorId`, and appends a new `STRICT_RELEASE` (5) marker
-that names the highest stalled index (existing `USER_STRICT` bytes are left alone). Every
-replica that applies the marker, and every `becomeLeader` rescan that sees it, drops the STRICT
-barrier for covered indexes. Audits one WARNING (`audit strict.release: …`; control characters
+that names the highest stalled index (existing `USER_STRICT` bytes are left alone). A committed
+marker (apply) advances the durable watermark; `becomeLeader` also honours any marker still in
+the surviving uncommitted suffix. A replaced suffix re-arms the barrier until a release commits
+(fail-safe). The release append uses the same rollback/fence path as a user batch. Audits one WARNING (`audit strict.release: …`; control characters
 stripped from `operatorId`) and increments `ReplicatedNode.strictOverridesReleased(group)`.
 It never runs automatically and never changes a `GroupOptions` STRICT group. Authorize callers
 with control-plane `Permission.RELEASE_STALLED_STRICT` (OPERATOR and ADMIN). The leader
