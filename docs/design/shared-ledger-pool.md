@@ -1,5 +1,17 @@
 # SharedLedgerPool for NONE/ASYNC ledger writers
 
+> **Status note (2026-11-01):** The 2026-10-30 ~18:20 inceptor correction — recorded on
+> [PR #339](https://github.com/BlivionIaG/sjws_nettask/pull/339) (“thread and heap win at high
+> group counts only… **not** the [#299](https://github.com/BlivionIaG/sjws_nettask/pull/299)
+> blocker; syncer path first”) — superseded this doc’s earlier “pool as PR-8 / #299 blocker”
+> framing. Implementation [PR #339](https://github.com/BlivionIaG/sjws_nettask/pull/339) is
+> **parked** (branch kept;
+> [comment](https://github.com/BlivionIaG/sjws_nettask/pull/339#issuecomment-6553962246)).
+> G=64 JFR ([#337 comment](https://github.com/BlivionIaG/sjws_nettask/pull/337#issuecomment-6527508238))
+> **refuted H1** (writers idle; p99 bound by force/fsync), so the ledger pool is not the
+> swarm-stream p99 lever for the #299 gate.
+
+
 Status: **design only** (2026-10-30 Europe/Paris). Tracks [#336](https://github.com/BlivionIaG/sjws_nettask/issues/336).
 Blocks S2c PR 8 / [#299](https://github.com/BlivionIaG/sjws_nettask/pull/299) after [#335](https://github.com/BlivionIaG/sjws_nettask/pull/335).
 Depends on: #333 (eager heap), #335 (lazy queue + fail-closed budget), #331 / #329 (shared **syncers** already).
