@@ -122,6 +122,39 @@ public final class FileLogStorage implements LogStorage {
     static final int RECORD_HEADER_BYTES = 20;
     static final int RECORD_CRC_BYTES = 4;
 
+    /**
+     * True when {@code magic} is a near-miss on {@link #LOG_MAGIC} (bit flips) or a four-byte
+     * printable ASCII format tag other than {@code FLG2}. Such headers are never treated as legacy.
+     */
+    static boolean looksLikeDamagedOrUnknownLogMagic(int magic) {
+        if (magic == LOG_MAGIC) {
+            return false;
+        }
+        int dist = Integer.bitCount(magic ^ LOG_MAGIC);
+        if (dist > 0 && dist <= 8) {
+            return true;
+        }
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            int b = (magic >>> shift) & 0xff;
+            if (b < 0x20 || b > 0x7e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * True when the first eight bytes are a recognized pre-{@code FLG2} record header: not a
+     * damaged/unknown format tag, and the putative Raft index is in a sane positive range.
+     */
+    static boolean isRecognizedLegacyFileHeader(int magic, int versionWord) {
+        if (looksLikeDamagedOrUnknownLogMagic(magic)) {
+            return false;
+        }
+        long putativeIndex = ((long) magic << 32) | (versionWord & 0xffffffffL);
+        return putativeIndex >= 1L && putativeIndex <= 1_000_000_000_000L;
+    }
+
     /** CRC32C of {@code index|term|len|data} (the bytes preceding the trailing CRC word). */
     static int recordCrc(long index, long term, byte[] data) {
         var buf = ByteBuffer.allocate(RECORD_HEADER_BYTES + data.length);
@@ -197,7 +230,8 @@ public final class FileLogStorage implements LogStorage {
     /**
      * Scans {@code in} as a Raft log of {@code fileSize} bytes. Package-visible so tests can inject
      * a short-read {@link java.nio.channels.ReadableByteChannel} wrapper. Detects {@code FLG2}
-     * (CRC32C records) vs legacy pre-#207 framing from the first eight bytes.
+     * (CRC32C records) vs recognized legacy pre-#207 framing from the first eight bytes. A damaged
+     * or unrecognized header fails closed (no truncate, no upgrade rewrite).
      */
     static Scan scanRecords(java.nio.channels.ReadableByteChannel in, long fileSize, Path path)
             throws IOException {
@@ -228,6 +262,11 @@ public final class FileLogStorage implements LogStorage {
             legacy = false;
             pos = LOG_FILE_HEADER_BYTES;
             lastGood = LOG_FILE_HEADER_BYTES;
+        } else if (!isRecognizedLegacyFileHeader(magic, version)) {
+            // Damaged FLG2 (e.g. flipped magic bits) or any unrecognized header: fail closed.
+            // Never fall through to the destructive legacy truncate/upgrade path.
+            throw new IOException("unrecognized or damaged log file header in "
+                    + path.getFileName() + "; refusing to start");
         } else {
             v2 = false;
             legacy = true;
@@ -423,9 +462,11 @@ public final class FileLogStorage implements LogStorage {
             }
             if (upgradeLegacy) {
                 // One-time rewrite to FLG2 + per-record CRC32C (#207), like the vote-file upgrade.
+                // rewrite() installs a fresh map in logs; return that live map, not the detached
+                // pre-rewrite instance, so the first append/read after upgrade stays coherent.
                 rewrite(group, loaded);
             }
-            return loaded;
+            return logs.get(group);
         } finally {
             lock.unlock();
         }

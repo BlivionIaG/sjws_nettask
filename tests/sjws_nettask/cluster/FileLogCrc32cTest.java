@@ -36,7 +36,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * #207: per-record CRC32C on {@link FileLogStorage} — mid-log fail-closed, last-record truncate,
- * legacy pre-{@code FLG2} read + upgrade.
+ * legacy pre-{@code FLG2} read + upgrade, live map after upgrade, damaged-header fail-closed.
  */
 @Timeout(30)
 class FileLogCrc32cTest {
@@ -342,5 +342,103 @@ class FileLogCrc32cTest {
         assertEquals(FileLogStorage.LOG_MAGIC, hdr.getInt());
         assertEquals(FileLogStorage.LOG_VERSION, hdr.getInt());
     }
+
+
+    @Test
+    void legacyUpgradeKeepsLiveMapForAppendViaLog() throws Exception {
+        var root = dir.resolve("legacy-live-map");
+        Files.createDirectories(root);
+        Path log = logFile(root);
+        // One legacy record at index 1. append() must be the first log() call so the upgrade
+        // rewrite runs inside that call; returning the detached pre-rewrite map would hide the
+        // append from later lastIndex/read/termAt (which use logs.get).
+        try (var ch = FileChannel.open(log, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            byte[] data = b("L1");
+            var buf = ByteBuffer.allocate(20 + data.length);
+            buf.putLong(1L).putLong(1L).putInt(data.length).put(data);
+            buf.flip();
+            while (buf.hasRemaining()) {
+                ch.write(buf);
+            }
+        }
+        var re = new FileLogStorage(root);
+        re.append(GROUP, 2, 1, b("L2"));
+        re.force(GROUP);
+        assertEquals(2L, re.lastIndex(GROUP), "live map after legacy upgrade must see the append");
+        assertArrayEquals(b("L1"), re.read(GROUP, 1));
+        assertArrayEquals(b("L2"), re.read(GROUP, 2), "read through log() must see post-upgrade append");
+        assertEquals(1L, re.termAt(GROUP, 2));
+        re.close();
+        var again = new FileLogStorage(root);
+        assertEquals(2L, again.lastIndex(GROUP));
+        assertArrayEquals(b("L2"), again.read(GROUP, 2));
+        again.close();
+        var hdr = ByteBuffer.wrap(Files.readAllBytes(log), 0, 8);
+        assertEquals(FileLogStorage.LOG_MAGIC, hdr.getInt());
+        assertEquals(FileLogStorage.LOG_VERSION, hdr.getInt());
+    }
+
+    @Test
+    void damagedFlg2MagicFailsClosedWithoutRewrite() throws Exception {
+        var root = dir.resolve("damaged-magic");
+        Files.createDirectories(root);
+        writeComplete(root, 1);
+        Path log = logFile(root);
+        byte[] before = Files.readAllBytes(log);
+        assertEquals(FileLogStorage.LOG_MAGIC, ByteBuffer.wrap(before, 0, 4).getInt());
+        // Flip one bit of the FLG2 magic; version word and records stay intact.
+        before[0] ^= 0x01;
+        Files.write(log, before);
+        assertTrue(FileLogStorage.looksLikeDamagedOrUnknownLogMagic(
+                ByteBuffer.wrap(before, 0, 4).getInt()));
+        assertFalse(FileLogStorage.isRecognizedLegacyFileHeader(
+                ByteBuffer.wrap(before, 0, 4).getInt(),
+                ByteBuffer.wrap(before, 4, 4).getInt()));
+        var err = assertThrows(Exception.class, () -> {
+            var re = new FileLogStorage(root);
+            try {
+                re.lastIndex(GROUP);
+            } finally {
+                try {
+                    re.close();
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        String msg = rootCause(err).getMessage();
+        assertTrue(msg.contains("unrecognized") || msg.contains("damaged") || msg.contains("refusing"),
+                "message=" + msg);
+        byte[] after = Files.readAllBytes(log);
+        assertArrayEquals(before, after, "damaged FLG2 must not be truncated or upgraded");
+    }
+
+    @Test
+    void unknownAsciiMagicFailsClosedWithoutRewrite() throws Exception {
+        var root = dir.resolve("unknown-magic");
+        Files.createDirectories(root);
+        Path log = logFile(root);
+        byte[] raw = new byte[32];
+        ByteBuffer.wrap(raw).putInt(0x41424344).putInt(1); // "ABCD" + version 1
+        Files.write(log, raw);
+        byte[] before = Files.readAllBytes(log);
+        var err = assertThrows(Exception.class, () -> {
+            var re = new FileLogStorage(root);
+            try {
+                re.lastIndex(GROUP);
+            } finally {
+                try {
+                    re.close();
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        assertTrue(rootCause(err).getMessage().contains("refusing")
+                || rootCause(err).getMessage().contains("unrecognized")
+                || rootCause(err).getMessage().contains("damaged"),
+                "message=" + rootCause(err).getMessage());
+        assertArrayEquals(before, Files.readAllBytes(log));
+    }
+
 
 }
