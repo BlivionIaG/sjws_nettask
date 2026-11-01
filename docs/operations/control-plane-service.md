@@ -14,7 +14,7 @@ not read this file and does not load `sjws_nettask.service`.
 | `contrib/sjws_nettask-control@.service` | `systemctl enable --now sjws_nettask-control@1` |
 | `contrib/sjws_nettask-data@.service` | `systemctl enable --now sjws_nettask-data@edge1` |
 
-Both role units are `Type=forking`. `--daemon` writes the pid file and the parent exits.
+Both role units are `Type=forking`. `--daemon` writes the pid file and the parent exits. Their `ExecStart` lines pass `--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED` (also in the jar `Add-Opens` manifest) so admin TLS can close keep-alive connections after a reload.
 `User=sjws` must exist (`useradd --system --home /var/lib/sjws_nettask --shell /usr/sbin/nologin sjws`).
 `UMask=0077`, `-XX:-HeapDumpOnOutOfMemoryError`, and `LimitCORE=0` keep a join token out of
 files the process creates and out of crash dumps. Those JVM flags are not on the standalone unit.
