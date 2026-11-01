@@ -31,6 +31,14 @@ public interface ClusterNode extends AutoCloseable {
 
     NodeId self();
 
+    /**
+     * True when this node is the voter-without-log in a data-and-witness set. Default false (data node or a
+     * membership-only stub). {@link ReplicatedNode} overrides from the seed list.
+     */
+    default boolean witness() {
+        return false;
+    }
+
     MembershipView membership();
 
     void onMembershipChange(Consumer<MembershipView> listener);

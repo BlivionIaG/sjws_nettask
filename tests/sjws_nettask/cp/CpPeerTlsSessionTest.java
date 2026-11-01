@@ -672,4 +672,108 @@ class CpPeerTlsSessionTest {
             return null;
         });
     }
+
+    /**
+     * #334: closed CP peer sockets leave {@code live} when {@link CpPeerSockets#released} runs (as the transport does
+     * on close). No TLS reload required. Mutating {@code released} to a no-op leaves liveSize at 1.
+     */
+    @Test
+    void closedPeersReclaimedFromLiveWithoutReload() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-reclaim"));
+        var deny = denylist("reclaim-deny");
+        var acceptorTls = CpTls.peerContext(peer(ca, "a", deny));
+        var dialerTls = CpTls.peerContext(ca.peer("b"));
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.reclaim", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(acceptorTls, port, "a");
+            var dialer = new CpPeerSockets(dialerTls, List.of(
+                    new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", port), false, CpTestCa.san("a")),
+                    new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", 1), false, CpTestCa.san("b"))), "b");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                var acceptor = CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        server.handshake(ssl, 5_000);
+                        assertEquals(2, server.peerWire(ssl));
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var connected = dialer.dial(new InetSocketAddress("127.0.0.1", port));
+                var live = accepted.get(10, TimeUnit.SECONDS);
+                assertEquals(1, server.liveSize(), "accept registered");
+                assertEquals(1, dialer.liveSize(), "dial registered");
+
+                connected.socket().close();
+                connected.abort().close();
+                live.close();
+                assertEquals(1, server.liveSize(), "closed accept still listed until released");
+                assertEquals(1, dialer.liveSize(), "closed dial still listed until released");
+                server.released(live);
+                dialer.released(connected.socket());
+                assertEquals(0, server.liveSize(), "acceptor reclaims without reload");
+                assertEquals(0, dialer.liveSize(), "dialer reclaims without reload");
+                server.released(live);
+                dialer.released(connected.socket());
+                assertEquals(0, server.liveSize());
+                assertEquals(0, dialer.liveSize());
+                acceptor.join();
+            }
+            return null;
+        });
+    }
+
+    /**
+     * #334 end-to-end through {@link sjws_nettask.cluster.TcpTransport}: closing the transports empties both live
+     * registries without a reload.
+     */
+    @Test
+    void transportCloseReclaimsLiveWithoutReload() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-reclaim-t"));
+        var deny = denylist("reclaim-t-deny");
+        var key = sjws_nettask.cluster.ClusterKey.of("cp-raft-key-for-tests-0123".getBytes(java.nio.charset.StandardCharsets.US_ASCII), null);
+        var ports = EphemeralPorts.probeDistinct(2);
+        var members = new java.util.ArrayList<sjws_nettask.cluster.Member>();
+        for (int wire = 1; wire <= 2; wire++) {
+            members.add(new sjws_nettask.cluster.Member(new sjws_nettask.cluster.NodeId(wire, "cp-" + wire),
+                    new sjws_nettask.cluster.SiteId("cp"),
+                    new InetSocketAddress("127.0.0.1", ports[wire - 1]), 1L, sjws_nettask.cluster.MemberState.ALIVE,
+                    false));
+        }
+        var peers = List.of(
+                new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", ports[0]), false, CpTestCa.san("a")),
+                new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", ports[1]), false, CpTestCa.san("b")));
+        var acceptorSockets = new CpPeerSockets(CpTls.peerContext(peer(ca, "a", deny)), peers, "a");
+        var dialerSockets = new CpPeerSockets(CpTls.peerContext(ca.peer("b")), peers, "b");
+        var group = new sjws_nettask.cluster.GroupId("cp-config");
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.reclaimTransport", () -> {
+            try (var a = sjws_nettask.cluster.TcpTransport.open(members.get(0).id(), members, key,
+                    sjws_nettask.cluster.Clock.SYSTEM, 64, acceptorSockets);
+                    var b = sjws_nettask.cluster.TcpTransport.open(members.get(1).id(), members, key,
+                            sjws_nettask.cluster.Clock.SYSTEM, 64, dialerSockets)) {
+                a.attach(members.get(0).id(), (from, frame) -> {
+                });
+                var rpc = b.attach(members.get(1).id(), (from, frame) -> {
+                });
+                rpc.send(members.get(0).id(), new sjws_nettask.cluster.SimTransport.Frame(group, 7, new byte[] {7}));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (System.nanoTime() < deadline
+                        && (acceptorSockets.liveSize() < 1 || dialerSockets.liveSize() < 1)) {
+                    a.deliver(50);
+                    b.deliver(50);
+                    Thread.sleep(10);
+                }
+                assertTrue(acceptorSockets.liveSize() >= 1, "acceptor registered");
+                assertTrue(dialerSockets.liveSize() >= 1, "dialer registered");
+            }
+            assertEquals(0, acceptorSockets.liveSize(), "transport close reclaims acceptor live");
+            assertEquals(0, dialerSockets.liveSize(), "transport close reclaims dialer live");
+            return null;
+        });
+    }
+
+
 }

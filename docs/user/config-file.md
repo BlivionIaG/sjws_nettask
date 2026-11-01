@@ -305,13 +305,19 @@ the certificate on HTTP/3 only (`Http3Server.replaceTls`). See
 [Handler composition](../design/architecture.md#handler-composition).
 
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
-the JDK does not expose `sun.misc.Signal`, and when this process already ignores
-`SIGHUP`. An ignored `SIGHUP` stays ignored: the VM does not install a Java
-handler over it. `main` calls it only for the daemon child. A foreground process
-must still die on `SIGHUP`. The child is also detached with `setsid` when that
-binary exists, so a terminal hangup is not delivered. On a data node that has
-accepted a pushed config, the hook reloads bootstrap local settings and leaves
-the pushed document in place. Control and standalone re-read the local file.
+the JDK does not expose `sun.misc.Signal`, or when this process already ignores
+`SIGHUP` and the disposition cannot be restored. It calls `Signal.handle` first.
+Only when that returns `SIG_IGN` (HotSpot will not replace an inherited ignore)
+does it restore `SIG_DFL` via `signal(SIGHUP, SIG_DFL)` when the FFM linker is
+available, then call `handle` again. An unconditional restore would drop HotSpot's
+own hangup handler on the normal path. That way a child that inherited ignore from
+a CI runner or a parent with no controlling terminal still reloads on hangup, and
+a normal start keeps shutdown hooks until the Java handler is installed. `main`
+calls it only for the daemon child. A foreground process must still die on
+`SIGHUP`. The child is also detached with `setsid` when that binary exists, so a
+terminal hangup is not delivered. On a data node that has accepted a pushed config,
+the hook reloads bootstrap local settings and leaves the pushed document in place.
+Control and standalone re-read the local file.
 
 ## ACME
 
@@ -353,7 +359,7 @@ unknown token is 404 and is not served as a file.
 Storage (created on first issue): `account.key`, `domain.key` (PKCS#8 `PRIVATE KEY`,
 mode 0600 where the filesystem allows it), `cert.pem`, `account.url`, `directory`.
 If the directory URL changes, the account URL is ignored and the account key is kept.
-An integration test issues a certificate against Pebble on linux/amd64.
+An integration test issues a certificate against Pebble on linux/amd64 when `PEBBLE_BIN` and `PEBBLE_CHALLTESTSRV_BIN` are set (Linux CI installs pinned binaries).
 
 Issuance and renewal run on a daemon thread, never on a request. A certificate
 already on disk is published immediately when it is still valid. Renewal is

@@ -3,6 +3,15 @@
 Status: Draft · Scope: HA only (2-node, 3-node; N-node/multi-site roadmap)
 Base: master `b8055fe` (Java 25)
 
+> **Normative for shipped behaviour:** [high-availability.md](../design/high-availability.md)
+> (as implemented: per-group Raft, HMAC heartbeats, HA messaging / `msgrepl`, failover matrix).
+> This file keeps design rationale, the serving-tier sketch, and **planned** §13 items
+> (N-node gossip / multi-site / GSLB). Where the two disagree, trust the as-implemented doc
+> and the code on master.
+>
+> Operator entry points: [cluster-mode.md](../user/cluster-mode.md),
+> [control-plane-service.md](../operations/control-plane-service.md).
+
 ## 1. Context
 
 sjws_nettask (**SJWS**, Swarm Java Web Services) is a Java 25 message-oriented middleware and web server; the HA design below starts from the HTTP serve path. `Sjws_nettask.serve(ServerConfig)` checks the
@@ -28,10 +37,13 @@ workstream. The process shutdown hook calls `SjwsServer.drain()`, which is `clos
 is detached, and otherwise `Lifecycle.drain()` followed by `close()`.
 
 What the code has today. Solid boxes run in a shipped process (`java -jar`). Dotted boxes are built, but a shipped
-process never reaches them. `HaSettings` is attached only by tests, embedders and the HA bench, and
-`GenerationSync` and `VipFence` have no caller in `src` at all. The one shipped user of Raft is the control role
-(`cp.CpStore`), which is not an HA node: with `cp.peers` its voters talk over `TcpTransport`. The YAML `ha:`
-section is validated and starts nothing yet. The dashed box lists what is still only designed:
+process never reaches them. `HaSettings` (UDP membership / VIP / drain wiring for the HTTP serve path) is attached
+only by tests, embedders and the HA bench; `GenerationSync` and `VipFence` have no caller in `src` at all.
+Shipped Raft users on master: (1) control role `cp.CpStore` (`cp-config`, `SJWS_CP_RAFT_KEY` over `TcpTransport`
+when `cp.peers` is set); (2) **HA messaging** via YAML `ha.messaging` / `ha.members` (`HaMessagingStart` →
+`msgrepl`, HMAC under `ha.cluster_key`). Those two keys **must differ** — see
+[control-plane-hosting](../design/control-plane-hosting.md). Heartbeats for `ha.enabled` use the same cluster key
+family (`WEB_SERVER_HA_CLUSTER_KEY`). The dashed box lists what is still only designed for the *HTTP HA* attach path:
 
 ```mermaid
 flowchart LR
@@ -146,6 +158,10 @@ closes the TCP `ServerSocketChannel`, which is the rule the HTTP/3 transport alr
 
 ## 4. Modes
 
+Preferred messaging topology on master is **2 data nodes + 1 witness** (or 3+ data nodes). A bare
+pair of voters is refused for `ha.messaging` — see [high-availability.md](../design/high-availability.md)
+and [config-file.md](../user/config-file.md#ha).
+
 Static HTTP is active on every node that has a snapshot, in both modes below. Raft
 leadership does not gate file serving. A node in a minority partition keeps serving the
 last generation (fail static). Messaging endpoints, when Messaging Core adds them, follow
@@ -209,6 +225,12 @@ flowchart TB
 
 ## 5. Health checks
 
+Shipped peer liveness (when `ha.enabled: true` and a cluster key is set) is **UDP HMAC heartbeats**
+(`info` `sjws-ha-heartbeat-v1` under HKDF of `ha.cluster_key` / `WEB_SERVER_HA_CLUSTER_KEY`), not a
+generic unauthenticated health protocol. Details and rotation:
+[high-availability.md](../design/high-availability.md) and [config-file.md](../user/config-file.md#ha).
+The membership / `HealthBoard` wiring below is still mostly the design sketch for the HTTP HA attach path.
+
 - `/healthz` (liveness: process up and the accept loop still inside `ClientManager.run`),
   `/readyz` (a snapshot is published, not draining, quorum OK if policy demands it).
   `HealthBoard` precomputes the `Response` objects (plain text, 200 or 503) and `HaHandler`
@@ -263,6 +285,11 @@ flowchart TB
   An extra hysteresis delay applies before a demoted node may campaign again.
 
 ## 7. Graceful shutdown / drain
+
+Load balancers and rolling restart (`ha.RollingRestart`) treat **`GET /readyz`** as the readiness
+gate: drain flips the node to not-ready (503) before `drainDelay`, so peers/LB stop sending traffic.
+See also [control-plane-service.md](../operations/control-plane-service.md) (`TimeoutStopSec` /
+`--drain-budget`).
 
 - `Lifecycle.drain()`: mark not-ready → wait LB deregistration (`drainDelay`, default 5 s) →
   set `Connection: close` on later keep-alive responses → expire *idle* keep-alives through
@@ -395,7 +422,13 @@ for a content request. Probes only read the precomputed board.
 `mvn verify` stays the CI command (workflow file not edited). New packages get JaCoCo
 `PACKAGE` rules because `DocsConsistencyTest` requires one per directory under `src/`.
 
-## 13a. Cluster API for Messaging Core
+## 13a. Cluster layer API (Raft groups) — messaging consumer
+
+> **Not the Broker API.** README Status still lists a separate `Broker` API / admin endpoint and
+> `ReplicatedLedger` as **planned**. Shipped messaging HTTP remains produce/fetch at
+> `/messaging/v1`. This section is the **cluster** module API (`openGroup` / per-group Raft) that
+> HA messaging (`ha.messaging` / `msgrepl`) and the control plane consume. Do not read it as a
+> user-facing broker wire protocol.
 
 The cluster layer is a standalone module (`sjws_nettask.cluster`, no HTTP dependency).
 HTTP failover (§4–§9) is one consumer; Messaging Core log replication is another.
@@ -494,7 +527,7 @@ Messaging Core calls `openGroup` once per partition and `append(groupId, batch)`
 broker's single writer for that partition. The HTTP request path never calls `append`.
 Callers pass `Durability.STRICT` only when they opt into quorum commit plus fsync.
 
-## Default ack mode
+### Default ack mode
 
 Blivion has decided. The questions were
 [PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) (HA open question 4, T3 `replicated`)
@@ -529,7 +562,7 @@ milliseconds. Low-latency mechanics: one Raft thread per node, one delivery thre
 `ByteBuffer` payloads copied once into the log, apply/commit callback single-threaded per
 group.
 
-## Decisions for PR #16
+### Decisions for PR #16
 
 Answers to the High Availability questions in
 [PR #16](https://github.com/BlivionIaG/sjws_nettask/pull/16) (`docs/design/architecture.md` §A).
@@ -603,6 +636,8 @@ PR #16's T4 asks for a choice; this section is that choice.
 
 ## 13. N-node and multi-site roadmap
 
+**Planned** (not shipped). Do not confuse with today’s `ha.members` list or static `cp.peers`.
+
 1. **N nodes (single site):** gossip dissemination (SWIM) replaces all-to-all heartbeats
    (O(N) per node → O(1)); quorum stays majority; sync via peer-to-peer pull (fan-out tree).
    `Membership` is the seam: today it applies a static seed list, later a gossip pluggable.
@@ -641,3 +676,12 @@ the PR body.
 4. **Failover tooling.** `VipHook` driven by the lease (claim on grant, release before
    expiry), preferred-node campaign delay, failback left off, `RollingRestart` gated on
    `/readyz`, and `SO_REUSEPORT` hand-over when the JVM opens the nio packages.
+
+## HA messaging witness (msgrepl)
+
+Messaging replication (phase A: one Raft group `msg/<topic>` per `ha.topics` entry plus `msg/__offsets`) is
+wired by `HaMessaging`. The witness must **not** run messaging; it calls
+`RaftReplicator.openForWitness` with the **same** `ha.topics` and election/heartbeat timings as the data nodes,
+so every `msg/*` group has the tie-breaker (#217). `openForWitness` refuses a non-witness node and refuses
+topic names starting with `__` (internal; `__offsets` is opened by the helper itself). Full bootstrap,
+migration and known limits: [high-availability.md](../design/high-availability.md#ha-messaging-bootstrap).

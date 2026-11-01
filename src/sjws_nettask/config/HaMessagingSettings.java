@@ -431,7 +431,8 @@ public record HaMessagingSettings(Mode mode, String nodeId, List<Member> members
         var out = new LinkedHashSet<String>();
         for (var t : YamlValues.sequence(raw, "ha.topics")) {
             var name = string(t, "ha.topics[]");
-            if (!TOPIC.matcher(name).matches() || name.equals(".") || name.equals("..") || name.equals("__offsets")) {
+            // Names starting with __ are internal (__offsets, __offsets_local); a user topic would collide (#217).
+            if (!TOPIC.matcher(name).matches() || name.equals(".") || name.equals("..") || name.startsWith("__")) {
                 throw new ConfigException("ha.topics: invalid topic name " + name);
             }
             out.add(name);
