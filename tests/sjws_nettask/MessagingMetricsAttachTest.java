@@ -36,6 +36,17 @@ class MessagingMetricsAttachTest {
         }
     }
 
+    /** hooks() present but invoke fails — prepare/install must catch ReflectiveOperationException. */
+    static final class BrokenMessaging implements OptionalModule {
+        public void hooks(MessagingHooks h) {
+            throw new RuntimeException("broken hooks");
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
     @TempDir
     Path dir;
 
@@ -107,6 +118,58 @@ class MessagingMetricsAttachTest {
             server.armMetrics();
             assertTrue(msg.hooks.get() instanceof sjws_nettask.messaging.stats.MessagingMetrics);
         }
+    }
+
+
+    @Test
+    void deferNoOpWhenHooksAlreadyInstalled() throws Exception {
+        var html = Files.createDirectories(dir.resolve("html-on"));
+        var msg = new FakeMessaging();
+        var metrics = Sjws_nettask.prepareMessagingMetrics(msg, true);
+        assertTrue(msg.hooks.get() instanceof sjws_nettask.messaging.stats.MessagingMetrics);
+        var cfg = ServerConfig.builder(html).metricsExposure(MetricsExposure.ON).build();
+        try (var server = SjwsServer.start(cfg)) {
+            Sjws_nettask.attachMessagingMetricsExporter(metrics, server);
+            Sjws_nettask.deferMessagingHooksIfNeeded(msg, metrics, true, server);
+            // arm must not NPE / reinstall when nothing was deferred
+            server.armMetrics();
+            assertSame(metrics, msg.hooks.get());
+        }
+    }
+
+    @Test
+    void prepareWithoutMessagingReturnsNull() {
+        assertNull(Sjws_nettask.prepareMessagingMetrics(new Plain(), false));
+        assertNull(Sjws_nettask.prepareMessagingMetrics(OptionalModules.NONE, true));
+    }
+
+    @Test
+    void installHooksNoOpOnPlainModule() {
+        var metrics = new sjws_nettask.messaging.stats.MessagingMetrics();
+        Sjws_nettask.installMessagingHooks(new Plain(), metrics);
+        Sjws_nettask.installMessagingHooks(null, metrics);
+        Sjws_nettask.installMessagingHooks(new Plain(), null);
+        Sjws_nettask.deferMessagingHooksIfNeeded(new Plain(), null, false, null);
+    }
+
+    @Test
+    void attachNullExporterIsNoOp() throws Exception {
+        var html = Files.createDirectories(dir.resolve("html-null"));
+        var cfg = ServerConfig.builder(html).metricsExposure(MetricsExposure.ON).build();
+        try (var server = SjwsServer.start(cfg)) {
+            Sjws_nettask.attachMessagingMetricsExporter((sjws_nettask.messaging.stats.MessagingMetrics) null, server);
+            server.armMetrics();
+        }
+    }
+
+
+    @Test
+    void prepareReturnsNullWhenHooksInvokeFails() {
+        assertNull(Sjws_nettask.prepareMessagingMetrics(new BrokenMessaging(), true));
+        // installHooks=false skips invoke — still returns a metrics instance
+        assertTrue(Sjws_nettask.prepareMessagingMetrics(new BrokenMessaging(), false) != null);
+        var metrics = new sjws_nettask.messaging.stats.MessagingMetrics();
+        Sjws_nettask.installMessagingHooks(new BrokenMessaging(), metrics);
     }
 
 }

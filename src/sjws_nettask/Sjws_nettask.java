@@ -287,6 +287,9 @@ public class Sjws_nettask {
      * {@code hooks(MessagingHooks)}. Does not load messaging when absent.
      */
     static OptionalModule findMessagingHttp(OptionalModule module) {
+        if (module == null) {
+            return null;
+        }
         if (module instanceof OptionalModules.Both both) {
             var first = findMessagingHttp(both.first());
             return first != null ? first : findMessagingHttp(both.second());
