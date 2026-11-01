@@ -129,12 +129,32 @@ public final class RaftReplicator implements PartitionReplicator {
                 Long.MAX_VALUE);
     }
 
-    /** A witness (or any node without messaging) must still open the groups to vote: no listener, nothing applied. */
+    /**
+     * Opens every {@code msg/<topic>} group plus {@code msg/__offsets} on the witness so it can vote: no listener,
+     * nothing applied (#217). Callers must pass the same topic set and election/heartbeat timings the data nodes use
+     * ({@code ha.topics} / {@code HaMessaging}); a missing topic on the witness leaves that group with two data voters
+     * and no tie-breaker. Refuses a non-witness node (a data node would join with a null listener and apply nothing)
+     * and refuses topic names that start with {@code __} (those collide with internal groups such as {@code __offsets}).
+     */
     public static void openForWitness(ClusterNode node, Set<String> topics, Duration electionTimeout, Duration heartbeat) {
+        Objects.requireNonNull(node, "node");
+        Objects.requireNonNull(topics, "topics");
+        if (!node.witness()) {
+            throw new IllegalArgumentException(
+                    "openForWitness requires a witness node (self is not the voter-without-log)");
+        }
+        for (var t : topics) {
+            if (t == null || t.isBlank() || t.startsWith("__")) {
+                throw new IllegalArgumentException("openForWitness: invalid topic name " + t
+                        + " (names starting with __ are internal)");
+            }
+        }
         var opts = options(electionTimeout, heartbeat);
         // The witness stores no entries, but it is a voter: it advertises the build's msg-group features like the data
         // nodes, so the leader's every-voter check (RaftReplica.FEATURE_PRODUCER_ENTRIES) covers the whole group.
-        for (var t : topics) node.openGroup(group(t), opts, null).advertiseFeatures(FEATURES);
+        for (var t : topics) {
+            node.openGroup(group(t), opts, null).advertiseFeatures(FEATURES);
+        }
         node.openGroup(group("__offsets"), opts, null).advertiseFeatures(FEATURES);
     }
 

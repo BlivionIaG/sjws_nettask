@@ -574,7 +574,9 @@ the others. The Raft state under `state_dir` stays. Turning replication back on:
 
 Known limits (gates before any default change): no multi-process test yet (G3); member links not encrypted and the sender not
 bound to its connection (#277: until it ships, `ha.messaging_insecure_plaintext` stays mandatory for members
-off loopback); members whose member lists or `ha.topics` differ are not detected (#217 item 2).
+off loopback); members whose member lists or `ha.topics` differ across processes are not detected at runtime
+(#217 item 1: production derives both from the same config; cross-node mismatch still needs an operator check).
+`openForWitness` refuses a non-witness node and refuses `__`-prefixed topic names (#217 items 2 and 4).
 `ha.messaging`, `ha.topics` and `ha.members` are read at startup only: a SIGHUP reload that changes them reports
 "until restart" and applies nothing.
 
