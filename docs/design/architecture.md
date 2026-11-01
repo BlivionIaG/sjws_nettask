@@ -55,8 +55,9 @@ flowchart TB
   compare every HTTP/2 and HTTP/3 response with the HTTP/1.1 bytes for the same request. `Request`
   carries the client address, whether the connection is TLS, a streamed body (HTTP/1.1 `Content-Length`
   requests only) and the raw header map. HTTP/1.1 always fills the map, HTTP/3 only when a filter
-  chain or a non-static terminal is installed at startup, and HTTP/2 leaves it empty (the six typed
-  fields only).
+  chain or a non-static terminal is installed at startup, and HTTP/2 (h2/h2c streams) when the live
+  generation has `attachBodies` on (otherwise the six typed fields only; the HTTP/1.1 ALPN fallback
+  on the HTTP/2 TLS listener also leaves the map empty).
 * Errors raised before a request reaches the handler (parse errors, 408 deadlines, 431 on HTTP/3) use
   `StaticFileHandler.error(...)`, so their pages match the handler's. Status lines and
   error-page titles use `StaticFileHandler.reasonPhrase` (all RFC 9110 codes plus 429, empty for
