@@ -159,6 +159,7 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         boolean secure = channel.pipeline().get(SslHandler.class) != null;
         channel.config().setAutoRead(false); // one request at a time; reading resumes when idle again
         if (this.busy && this.pending.size() >= MAX_PIPELINED) {
+            releasePending(); // Security N1: drain queued pins before close (not only on inactive)
             channel.close();
             return;
         }
@@ -240,6 +241,11 @@ class Http1FallbackHandler extends SimpleChannelInboundHandler<FullHttpRequest> 
         this.busy = false;
         channel.config().setAutoRead(true);
         channel.read();
+    }
+
+    /** Test-only: queued tasks behind the one being served. */
+    int pendingCount() {
+        return this.pending.size();
     }
 
     /** Drop queued pins if the connection dies before {@link #run(Task)} (Codex P1 / #446). */

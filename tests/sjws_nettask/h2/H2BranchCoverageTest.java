@@ -232,14 +232,28 @@ class H2BranchCoverageTest {
         assertEquals(1, held.size(), "later requests wait behind the one already being served");
 
         var queued = new ArrayList<Runnable>();
-        var piped = new EmbeddedChannel(new Http1FallbackHandler(shared(holding(queued), new Semaphore(4), new Semaphore(4))));
+        // Skip inactive/removed drains so only the overflow-path releasePending can empty the queue.
+        var overflowHandler = new Http1FallbackHandler(shared(holding(queued), new Semaphore(4), new Semaphore(4))) {
+            @Override
+            public void channelInactive(io.netty.channel.ChannelHandlerContext ctx) throws Exception {
+                ctx.fireChannelInactive();
+            }
+
+            @Override
+            public void handlerRemoved(io.netty.channel.ChannelHandlerContext ctx) {
+            }
+        };
+        var piped = new EmbeddedChannel(overflowHandler);
         piped.writeInbound(request(HttpVersion.HTTP_1_1, "/run"));
         for (int i = 0; i < Http1FallbackHandler.MAX_PIPELINED; i++) {
             piped.writeInbound(request(HttpVersion.HTTP_1_1, "/p" + i));
         }
         assertTrue(piped.isOpen());
+        assertEquals(Http1FallbackHandler.MAX_PIPELINED, overflowHandler.pendingCount());
         piped.writeInbound(request(HttpVersion.HTTP_1_1, "/overflow"));
         assertFalse(piped.isOpen());
+        assertEquals(0, overflowHandler.pendingCount(),
+                "MAX_PIPELINED overflow must releasePending() before close");
 
         // #446: off path does not retain the aggregated request; teardown still drops queued pins.
         var leakHeld = new ArrayList<Runnable>();
