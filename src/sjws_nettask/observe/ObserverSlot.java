@@ -22,6 +22,7 @@ import java.lang.invoke.VarHandle;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import sjws_nettask.ServerConfig;
+import sjws_nettask.messaging.stats.MessagingMetrics;
 
 /**
  * The observer both transports read on each request. It starts as {@link RequestObserver#NONE}
@@ -53,6 +54,8 @@ public final class ObserverSlot {
     private volatile LongSupplier msgreplInstallOversizedAbandoned;
     /** Copied onto the recording observer's metrics (#259). Not read by {@link #get()}. */
     private volatile LongSupplier cpIdempotencyEvictions;
+    /** Copied onto the recording observer (#400). Not read by {@link #get()}. */
+    private volatile MessagingMetrics messagingMetrics;
 
     public ObserverSlot(RequestObserver initial) {
         this.current = initial == null ? RequestObserver.NONE : initial;
@@ -128,6 +131,18 @@ public final class ObserverSlot {
         }
     }
 
+    /**
+     * Messaging histogram exporter on {@code /metrics} (#400). Null omits the families. Stored on the
+     * slot and copied in {@link #arm}/{@link #set}; never mutates {@link RequestObserver#NONE}.
+     */
+    public void attachMessagingMetrics(MessagingMetrics metrics) {
+        this.messagingMetrics = metrics;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.attachMessagingMetrics(metrics);
+        }
+    }
+
     /** Replaces the observer. Used before the listeners accept. */
     public void set(RequestObserver observer) {
         var next = observer == null ? RequestObserver.NONE : observer;
@@ -145,6 +160,7 @@ public final class ObserverSlot {
         observer.metrics().setMsgreplInstallCounters(this.msgreplInstallPinExhausted,
                 this.msgreplInstallOversizedAbandoned);
         observer.metrics().setCpIdempotencyEvictions(this.cpIdempotencyEvictions);
+        observer.attachMessagingMetrics(this.messagingMetrics);
     }
 
     /**

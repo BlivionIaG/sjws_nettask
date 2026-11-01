@@ -1,6 +1,6 @@
 # Messaging metrics
 
-Status: proposal, revised 2026-10-13 with input from sjws Messaging Core. The produce and fetch histogram names are decided (`*_duration_seconds`). The hook points exist (`messaging.http.MessagingHooks`), but no exporter implements them, so the series are not on `/metrics`. The gauge names in the [proposed](#proposed-names) section are still `PROPOSED` and not stable, so Messaging Core can change them before anything is scraped. The [shipped](#shipped-partition-lag) lag gauges are already in the tree; this doc does not rename them.
+Status: produce/fetch histograms shipped via `messaging.stats.MessagingMetrics` on `/metrics` when messaging is on (#400). Histogram names are decided (`*_duration_seconds`). The gauge names in the [proposed](#proposed-names) offset/replication section are still `PROPOSED` and not scraped. The [shipped](#shipped-partition-lag) lag gauges render when a `MessagingStats` supplier is attached to the exporter; they are not renamed here. Overlap note: PR #299 uses `sjws_swarm_stream_*` — no name collision with `sjws_messaging_*`.
 
 No code in this change. Nothing here adds a `ServerConfig` flag, a request-path branch, or a series on `/metrics`.
 

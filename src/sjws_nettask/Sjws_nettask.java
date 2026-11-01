@@ -147,6 +147,7 @@ public class Sjws_nettask {
             return EXIT_CANNOT_LISTEN;
         }
         attachMsgreplInstallMetrics(modules, server); // #315 N5: suppliers only; does not arm counters
+        attachMessagingMetricsExporter(modules, server); // #400: histograms on /metrics when messaging is on
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
                 bindContent, modules);
     }
@@ -193,6 +194,45 @@ public class Sjws_nettask {
         try {
             module.getClass().getMethod("installPinExhausted");
             module.getClass().getMethod("installOversizedAbandoned");
+            return module;
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
+    }
+
+
+    /**
+     * When the HTTP messaging module is loaded, install {@link sjws_nettask.messaging.stats.MessagingMetrics}
+     * as its {@link sjws_nettask.messaging.http.MessagingHooks} and append those series on {@code /metrics}
+     * (#400). Detected by a {@code hooks(MessagingHooks)} method so a messaging-off process never loads the
+     * exporter. Does not arm the observe filter by itself.
+     */
+    static void attachMessagingMetricsExporter(OptionalModule modules, SjwsServer server) {
+        var messaging = findMessagingHttp(modules);
+        if (messaging == null) {
+            return;
+        }
+        try {
+            var metrics = new sjws_nettask.messaging.stats.MessagingMetrics();
+            var hooks = messaging.getClass().getMethod("hooks", sjws_nettask.messaging.http.MessagingHooks.class);
+            hooks.invoke(messaging, metrics);
+            server.attachMessagingMetrics(metrics);
+        } catch (ReflectiveOperationException ignored) {
+            // messaging binary without hooks(MessagingHooks): leave /metrics without messaging families
+        }
+    }
+
+    /**
+     * The HTTP messaging module among {@code modules}, or null. Matches a module that exposes
+     * {@code hooks(MessagingHooks)}. Does not load messaging when absent.
+     */
+    static OptionalModule findMessagingHttp(OptionalModule module) {
+        if (module instanceof OptionalModules.Both both) {
+            var first = findMessagingHttp(both.first());
+            return first != null ? first : findMessagingHttp(both.second());
+        }
+        try {
+            module.getClass().getMethod("hooks", sjws_nettask.messaging.http.MessagingHooks.class);
             return module;
         } catch (NoSuchMethodException e) {
             return null;

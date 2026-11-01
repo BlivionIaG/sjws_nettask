@@ -60,6 +60,7 @@ import sjws_nettask.core.RequestFilter;
 import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.h3.Http3Server;
+import sjws_nettask.messaging.stats.MessagingMetrics;
 import sjws_nettask.observe.ClusterStatus;
 import sjws_nettask.observe.LabelSource;
 import sjws_nettask.observe.ObserveRequestFilter;
@@ -1320,6 +1321,11 @@ public final class SjwsServer implements AutoCloseable {
      */
     public void attachClusterMetrics(Supplier<ClusterStatus> cluster) {
         this.slot.attachCluster(cluster);
+    }
+
+    /** Messaging produce/fetch metrics on {@code /metrics} (#400). Null omits them. */
+    public void attachMessagingMetrics(sjws_nettask.messaging.stats.MessagingMetrics metrics) {
+        this.slot.attachMessagingMetrics(metrics);
     }
 
     /**
