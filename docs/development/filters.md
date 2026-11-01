@@ -71,13 +71,15 @@ parser's reference and does not clear the map, so a filter may retain the reques
 every regular header only when a filter chain or a non-static terminal is installed (decided once
 at startup, so a chain that `ChainControl` applies later to a server started without filters does
 not switch it on). With neither, it reads the six typed fields and leaves `fields()` empty, so a
-static request allocates no header map. HTTP/2, and the HTTP/1.1 fallback on its listener, read only
-the six typed fields and always leave `fields()` empty, so a filter or the proxy that needs another
-header sees none there. When it does copy, that happens before the HEADERS frame is
-released, because the handler runs later on another thread; the copy does not follow later changes
-to the frame. `values(name)` does not allocate when the name is absent. `all()` flattens and
-allocates; the static file handler does not call it. `:authority` wins over `host` for
-`headers().host()`, and a copied `host` field stays in the map.
+static request allocates no header map. HTTP/2 (h2 and h2c streams) copies every regular header when
+the live generation has `attachBodies` on — the same gate that attaches request bodies, set whenever
+a filter chain, metrics observe wrapper, or non-static terminal is armed — and otherwise reads only
+the six typed fields so a static request allocates no header map. The HTTP/1.1 ALPN fallback on the
+HTTP/2 TLS listener still leaves `fields()` empty (typed fields only). When HTTP/2 or HTTP/3 does
+copy, that happens before the HEADERS frame is released, because the handler runs later on another
+thread; the copy does not follow later changes to the frame. `values(name)` does not allocate when
+the name is absent. `all()` flattens and allocates; the static file handler does not call it.
+`:authority` wins over `host` for `headers().host()`, and a copied `host` field stays in the map.
 
 A filter must be safe for concurrent requests. Call `proceed` synchronously, on the request
 thread. The chain rejects a second call on that thread (`IllegalStateException`, and the rest of
