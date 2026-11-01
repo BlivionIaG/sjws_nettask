@@ -7,6 +7,9 @@ appends stdout and stderr to the log file (default `sjws_nettask.log` in the wor
 JVM flags placed before `-jar` or the main class, such as `-Xmx`, are kept. Paths in `--pid-file`
 and `--log-file` are relative to the working directory; a service should use absolute paths.
 
+
+JVM flags for a bare `java -jar` launch come from the jar manifest (`Enable-Native-Access`, `Add-Opens`). That includes `jdk.httpserver/sun.net.httpserver`, which the admin TLS keep-alive drop needs so it can close the underlying connection after a credential reload. Custom launchers that do **not** use `java -jar` (for example `java -cp … sjws_nettask.Sjws_nettask`) must pass `--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED` themselves. The contrib systemd units and `--daemon` splice also set that flag so a missing manifest entry cannot leave the child without it. Operators can confirm a packaged jar with `java -jar sjws_nettask.jar --self-check-admin-tls-abort` (exits 0 and prints `admin-tls-abort: ok` when the open is effective).
+
 ```
 java -jar target/sjws_nettask-0.2-SNAPSHOT.jar --daemon --pid-file=/run/sjws_nettask.pid \
     --log-file=/var/log/sjws_nettask.log 8080 /var/www/html

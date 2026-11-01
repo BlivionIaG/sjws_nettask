@@ -85,6 +85,16 @@ public final class SimTransport implements ClusterTransport {
         }
     }
 
+    /** Tests only: discard every queued frame (for example a lost append ack). */
+    public void clearQueue() {
+        lock.lock();
+        try {
+            queue.clear();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** Deliver up to {@code max} queued frames. Returns how many handlers ran. */
     @Override
     public int deliver(int max) {

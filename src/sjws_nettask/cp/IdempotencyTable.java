@@ -63,6 +63,13 @@ public final class IdempotencyTable {
     public static final int MAX_KEYS = 100_000;
     /** Admission bound on the Idempotency-Key (UTF-8 byte length). */
     public static final int MAX_KEY_BYTES = 128;
+    /**
+     * Max UTF-8 bytes for a fingerprint on snapshot decode (#341 N3). Fingerprints store method/path/body
+     * (#258); 512 KiB covers large YAML proposals while refusing a hostile 1 MiB-per-string image.
+     */
+    public static final int MAX_FINGERPRINT_BYTES = 512 * 1024;
+    /** Max UTF-8 bytes for a recorded outcome body on snapshot decode (#341 N3). */
+    public static final int MAX_BODY_BYTES = 512 * 1024;
     /** Encoding version; bump when the on-disk layout changes. */
     static final int FORMAT = 1;
 
@@ -75,6 +82,8 @@ public final class IdempotencyTable {
     /** Insertion order = first-apply order; the eldest is the lowest appliedIndex. */
     private final LinkedHashMap<String, Entry> entries = new LinkedHashMap<>();
     private long evictions;
+    /** Times {@link #remember} saw a key over {@link #MAX_KEY_BYTES} (#341 N2). Local; not in the snapshot. */
+    private long oversizeSkipped;
 
     public IdempotencyTable() {
         this(WINDOW, MAX_KEYS);
@@ -108,6 +117,11 @@ public final class IdempotencyTable {
         return evictions;
     }
 
+    /** Oversize keys skipped by {@link #remember} (#341 N2). Not snapshotted. */
+    long oversizeSkipped() {
+        return oversizeSkipped;
+    }
+
     /** The remembered entry for {@code key}, or null when unknown (never seen or evicted). */
     public Entry get(String key) {
         return entries.get(key);
@@ -119,7 +133,8 @@ public final class IdempotencyTable {
 
     /**
      * Records {@code key} as first applied at {@code appliedIndex}. No-op when the key is already present (a second
-     * IDEM wrapper for the same key: first applied wins). Then evicts by window and by cap.
+     * IDEM wrapper for the same key: first applied wins). Keys over {@link #MAX_KEY_BYTES} UTF-8 are skipped
+     * (counted, first logged) and are <b>not</b> deduplicated (#341 N2). Then evicts by window and by cap.
      */
     public void remember(String key, String fingerprint, int status, String body, long appliedIndex) {
         if (key == null) {
@@ -127,6 +142,19 @@ public final class IdempotencyTable {
         }
         if (appliedIndex < 1) {
             throw new IllegalArgumentException("appliedIndex " + appliedIndex);
+        }
+        // #341 N2: agree with admission and snapshot read — oversize keys are not stored, but eviction still runs.
+        // Deterministic: every replica that applies the same log entry takes the same branch. The key is not
+        // deduplicated (a later retry with a legal key is a new first apply). Counted; first skip is logged.
+        if (key.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_BYTES) {
+            oversizeSkipped++;
+            if (oversizeSkipped == 1L) {
+                System.getLogger(IdempotencyTable.class.getName()).log(System.Logger.Level.WARNING,
+                        "cp idempotency: skipped Idempotency-Key over " + MAX_KEY_BYTES
+                                + " UTF-8 bytes at apply (not stored, not deduplicated); further skips are counted only");
+            }
+            evictThrough(appliedIndex);
+            return;
         }
         if (entries.containsKey(key)) {
             evictThrough(appliedIndex);
@@ -213,10 +241,10 @@ public final class IdempotencyTable {
         }
         long prevIndex = 0;
         for (int k = 0; k < size; k++) {
-            var key = readString(in);
-            var fp = readString(in);
+            var key = readString(in, MAX_KEY_BYTES);
+            var fp = readString(in, MAX_FINGERPRINT_BYTES);
             int status = in.readInt();
-            var body = readString(in);
+            var body = readString(in, MAX_BODY_BYTES);
             long applied = in.readLong();
             if (key.isEmpty() || key.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_BYTES) {
                 throw new IOException("idempotency table: bad key");
@@ -238,10 +266,10 @@ public final class IdempotencyTable {
         out.write(raw);
     }
 
-    private static String readString(DataInput in) throws IOException {
+    private static String readString(DataInput in, int maxBytes) throws IOException {
         int len = in.readInt();
-        if (len < 0 || len > 1_048_576) {
-            throw new IOException("idempotency table: string length " + len);
+        if (len < 0 || len > maxBytes) {
+            throw new IOException("idempotency table: string length " + len + " (max " + maxBytes + ")");
         }
         var raw = new byte[len];
         in.readFully(raw);

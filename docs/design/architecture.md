@@ -57,7 +57,7 @@ flowchart TB
   requests only) and the raw header map. HTTP/1.1 always fills the map, HTTP/3 only when a filter
   chain or a non-static terminal is installed at startup, and HTTP/2 (h2/h2c streams) when the live
   generation has `attachBodies` on (otherwise the six typed fields only; the HTTP/1.1 ALPN fallback
-  on the HTTP/2 TLS listener also leaves the map empty).
+  on the HTTP/2 TLS listener uses the same gate).
 * Errors raised before a request reaches the handler (parse errors, 408 deadlines, 431 on HTTP/3) use
   `StaticFileHandler.error(...)`, so their pages match the handler's. Status lines and
   error-page titles use `StaticFileHandler.reasonPhrase` (all RFC 9110 codes plus 429, empty for

@@ -158,11 +158,13 @@ class ControlPlaneSecurityTest {
         var admin = cert("urn:sjws:admin:root");
         var viewer = cert("cn=viewer, o=sjws");
         assertTrue(r.authorize(viewer, Permission.READ, "status", 0).allowed(), "DN match is canonical");
-        for (var p : List.of(Permission.EDIT_ROUTES, Permission.ROLLOUT, Permission.ROLLBACK, Permission.NODE_DRAIN, Permission.MANAGE_OPERATORS)) {
+        for (var p : List.of(Permission.EDIT_ROUTES, Permission.ROLLOUT, Permission.ROLLBACK, Permission.NODE_DRAIN,
+                Permission.RELEASE_STALLED_STRICT, Permission.MANAGE_OPERATORS)) {
             assertFalse(r.authorize(viewer, p, "x", 0).allowed(), p.name());
         }
         var ops = cert("cn=Ops Bot,o=Sjws");
         assertTrue(r.authorize(ops, Permission.ROLLOUT, "v5", 5).allowed());
+        assertTrue(r.authorize(ops, Permission.RELEASE_STALLED_STRICT, "group:msg/1", 0).allowed());
         assertFalse(r.authorize(ops, Permission.MANAGE_OPERATORS, "x", 0).allowed());
         assertTrue(r.authorize(admin, Permission.MANAGE_OPERATORS, "x", 0).allowed());
         // unauthenticated paths: unknown, disabled, malformed, case-changed SAN, null

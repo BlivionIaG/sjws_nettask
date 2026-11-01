@@ -92,9 +92,11 @@ The box (8 cores, 15 GB RAM) is shared by every bot.
 
 - Run every benchmark (wrk, wrk2, JMH, `LogBench`, the swarm benches) as `flock /tmp/sjws-bench.lock <cmd>`.
 - Run local builds as `nice -n 10 mvn ...`, one build per bot at a time; prefer CI where possible.
-- Benchmark only when the 1-minute load average is under 4. Record the load at the start and end of
-  the run in the PR body; if it goes above 4 during the run, mark the numbers noisy and rerun in a
-  quiet window.
+- Swarm-stream / shared-box NOISY rule (inceptor 2026-11-01 07:05): start every leg with load1 < 3.
+  A leg is **NOISY** (discard, never count) if foreign CPU averages > 0.5 core, a foreign
+  java/mvn/load process is seen, or **any** sample has load1 ≥ 6. Record load1_pre/post and
+  foreign_cpu judgment in the PR body; rerun NOISY legs in a quiet window. Other benches still
+  use `flock /tmp/sjws-bench.lock` and prefer a quiet box before starting.
 
 ## Security
 

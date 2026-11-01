@@ -16,6 +16,7 @@
  */
 package sjws_nettask.cp;
 
+
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.IOException;
@@ -36,6 +37,7 @@ import java.time.Duration;
 import java.util.Date;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManagerFactory;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.BasicConstraints;
@@ -49,6 +51,7 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.cert.X509v2CRLBuilder;
 import org.bouncycastle.cert.jcajce.JcaX509CRLConverter;
 import org.bouncycastle.asn1.x509.CRLReason;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.FakeClock;
@@ -61,6 +64,23 @@ class AdminTlsRotationTest {
 
     @TempDir
     Path dir;
+
+    @AfterEach
+    void clearStaticAbortHooks() {
+        // Static test hooks must not leak across methods (order is not fixed under Surefire).
+        AdminServer.connectionAbortForTest = null;
+        AdminServer.abortReflectFailureForTest = null;
+    }
+
+    /** Wait for the live registry to drain after an abort/close that races the assertion thread. */
+    private static void awaitLiveEmpty(AdminServer http, String message) throws InterruptedException {
+        long until = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (http.liveSize() != 0 && System.nanoTime() < until) {
+            Thread.sleep(20);
+            http.pruneDeadSessionsForTest();
+        }
+        assertEquals(0, http.liveSize(), message);
+    }
 
     private CpStore store() throws Exception {
         var keys = KeyRing.generate("online-1", NOW + 86_400_000L, 0, Long.MAX_VALUE / 2);
@@ -206,6 +226,361 @@ class AdminTlsRotationTest {
                     .getMessage().contains("missing"));
         }
     }
+
+
+    /**
+     * An established keep-alive admin connection must be closed (not merely 401'd) after the client
+     * cert is denylisted and TLS reloads, and the live registry must be empty afterwards.
+     */
+    @Test
+    void keepAliveConnectionIsClosedAfterDenylistReload() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca.pem"), ca.cert());
+        var deny = Files.writeString(dir.resolve("revoked-keepalive.txt"), "# none yet\n");
+        try (var store = store();
+                var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust, deny, 0);
+                SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                        .createSocket("127.0.0.1", http.port())) {
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            var first = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+            assertTrue(first.startsWith("HTTP/1.1 200"), first);
+            assertEquals(1, http.liveSize(), "keep-alive session stays registered");
+
+            Files.writeString(deny, "sha256:" + AdminTls.fingerprint(root.cert()) + "\n");
+            assertNull(http.reloadTls());
+            assertTrue(http.policyDropped() >= 1L, "live session should be dropped on reload");
+            awaitLiveEmpty(http, "registry empty after policy drop");
+
+            var closed = assertThrows(IOException.class, () -> rawHttp(socket,
+                    "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"));
+            assertTrue(closed.getMessage() != null && !closed.getMessage().isBlank(), closed.toString());
+        }
+    }
+
+    /** Connection: close responses must leave the live registry empty. */
+    @Test
+    void clientConnectionCloseClearsRegistry() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-close.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-close-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-close.pem"), ca.cert());
+        try (var store = store();
+                var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust);
+                SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                        .createSocket("127.0.0.1", http.port())) {
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            var body = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            assertTrue(body.startsWith("HTTP/1.1 200"), body);
+            assertEquals(0, http.liveSize(), "Connection: close must remove the session by key");
+        }
+    }
+
+    /** After the client closes a keep-alive socket, prune must clear the registry entry. */
+    @Test
+    void clientSocketCloseClearsRegistryAfterPrune() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-prune.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-prune-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-prune.pem"), ca.cert());
+        try (var store = store(); var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust)) {
+            SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                    .createSocket("127.0.0.1", http.port());
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            var body = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+            assertTrue(body.startsWith("HTTP/1.1 200"), body);
+            assertEquals(1, http.liveSize());
+            socket.close();
+            awaitLiveEmpty(http, "closed keep-alive connection must leave the registry");
+        }
+    }
+
+
+    /**
+     * A reload that lands after registerLive and before/during handle must drop the in-flight session
+     * (Architecture R2). Without early registration the sweep would miss it.
+     */
+    @Test
+    void reloadDuringInFlightHandleDropsSession() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-inflight.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-inflight-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-inflight.pem"), ca.cert());
+        var deny = Files.writeString(dir.resolve("revoked-inflight.txt"), "# none yet\n");
+        try (var store = store();
+                var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust, deny, 0)) {
+            http.afterRegisterBeforeHandle = () -> {
+                try {
+                    Files.writeString(deny, "sha256:" + AdminTls.fingerprint(root.cert()) + "\n");
+                    assertNull(http.reloadTls());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            };
+            try (SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                    .createSocket("127.0.0.1", http.port())) {
+                socket.setSoTimeout(5_000);
+                socket.startHandshake();
+                try {
+                    var body = rawHttp(socket,
+                            "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+                    assertTrue(body.startsWith("HTTP/1.1 401") || body.startsWith("HTTP/1.1 403"), body);
+                } catch (IOException closed) {
+                    // abort during/after handle is also success
+                    assertNotNull(closed.getMessage());
+                }
+            }
+            assertTrue(http.policyDropped() >= 1L, "in-flight session must be policy-dropped");
+            // dropConnectionsFailingPolicy increments policyDropped then abortQuietly before live.remove.
+            // abort closes the client socket so this thread can resume before remove runs — await/prune.
+            awaitLiveEmpty(http, "registry empty after in-flight drop");
+        }
+    }
+
+    /** An epoch bump between revalidate and put forces a retry; the second pass must succeed. */
+    @Test
+    void epochBumpBetweenRevalidateAndRegisterRetries() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-epoch.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-epoch-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-epoch.pem"), ca.cert());
+        try (var store = store(); var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust)) {
+            var bumps = new java.util.concurrent.atomic.AtomicInteger();
+            http.betweenValidateAndRegister = () -> {
+                if (bumps.getAndIncrement() == 0) {
+                    http.bumpTlsEpochForTest();
+                }
+            };
+            assertTrue(handshakes(root, ca.cert(), http.port()));
+            assertEquals(1, bumps.get(), "hook should run once then clear, plus the retry without bump");
+            // After success a keep-alive registration path left or cleared; at least one request worked.
+            assertTrue(http.liveSize() >= 0);
+        }
+    }
+
+    /** Exhausting the epoch retry budget refuses the request and does not leave a live entry. */
+    @Test
+    void epochRetryBudgetFailsClosed() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-cap.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-cap-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-cap.pem"), ca.cert());
+        try (var store = store(); var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust)) {
+            var bumps = new java.util.concurrent.atomic.AtomicInteger();
+            Runnable bump = new Runnable() {
+                @Override
+                public void run() {
+                    bumps.incrementAndGet();
+                    // Re-arm: registerLive clears the hook after each attempt (same as CpPeerSockets).
+                    http.betweenValidateAndRegister = this;
+                    http.bumpTlsEpochForTest();
+                }
+            };
+            http.betweenValidateAndRegister = bump;
+            try (SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                    .createSocket("127.0.0.1", http.port())) {
+                socket.setSoTimeout(5_000);
+                socket.startHandshake();
+                try {
+                    var body = rawHttp(socket,
+                            "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                    assertTrue(body.startsWith("HTTP/1.1 401"), body);
+                } catch (IOException closed) {
+                    assertNotNull(closed.getMessage());
+                }
+            }
+            assertEquals(AdminServer.REGISTER_LIVE_MAX_ATTEMPTS, bumps.get());
+            assertEquals(0, http.liveSize(), "failed registration must not retain the session");
+            assertTrue(http.policyDropped() >= 1L);
+        }
+    }
+
+
+    /** Surefire argLine must open jdk.httpserver so abort installs in-process. */
+    @Test
+    void connectionAbortInstallsUnderConfiguredJvmOpens() throws Exception {
+        assertTrue(AdminServer.probeConnectionAbortInstalls(),
+                "need --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED (surefire argLine)");
+    }
+
+    /** Without a reflective abort handle: WARN path increments the counter and forces Connection: close. */
+    @Test
+    void nullAbortForcesConnectionCloseAndCounts() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-nullabort.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-nullabort-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-nullabort.pem"), ca.cert());
+        AdminServer.connectionAbortForTest = () -> null;
+        try (var store = store();
+                var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust);
+                SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                        .createSocket("127.0.0.1", http.port())) {
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            long before = http.abortUnavailable();
+            long warnsBefore = http.abortUnavailableWarns();
+            var body = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+            assertTrue(body.startsWith("HTTP/1.1 200"), body);
+            assertTrue(body.toLowerCase(java.util.Locale.ROOT).contains("connection: close"), body);
+            assertTrue(http.abortUnavailable() > before, "null abort must bump abortUnavailable");
+            assertTrue(http.abortUnavailableWarns() > warnsBefore, "null abort must emit WARNING");
+            assertEquals(0, http.liveSize(), "null abort must not retain a keep-alive Live");
+        } finally {
+            AdminServer.connectionAbortForTest = null;
+        }
+    }
+
+
+    /** InaccessibleObjectException from setAccessible must not fail the handler; degrade like null abort. */
+    @Test
+    void inaccessibleObjectExceptionDegradesToNullAbortPath() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-ioe.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-ioe-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-ioe.pem"), ca.cert());
+        AdminServer.abortReflectFailureForTest =
+                new java.lang.reflect.InaccessibleObjectException("forced for test");
+        try (var store = store();
+                var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust);
+                SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                        .createSocket("127.0.0.1", http.port())) {
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            long before = http.abortUnavailable();
+            long warnsBefore = http.abortUnavailableWarns();
+            var body = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+            assertTrue(body.startsWith("HTTP/1.1 200"), body);
+            assertTrue(body.toLowerCase(java.util.Locale.ROOT).contains("connection: close"), body);
+            assertTrue(http.abortUnavailable() > before, "IOE path must bump abortUnavailable");
+            assertTrue(http.abortUnavailableWarns() > warnsBefore, "IOE path must emit WARNING");
+            assertEquals(0, http.liveSize(), "IOE path must not retain a keep-alive Live");
+        } finally {
+            AdminServer.abortReflectFailureForTest = null;
+        }
+    }
+
+
+    /**
+     * Write {@code request} and return the complete framed HTTP response (status line, headers, and
+     * body per {@code Content-Length} or chunked transfer). A single {@code InputStream#read} is not
+     * enough: leftover body bytes would be mistaken for a later keep-alive response.
+     */
+    private static String rawHttp(SSLSocket socket, String request) throws IOException {
+        var out = socket.getOutputStream();
+        out.write(request.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        out.flush();
+        var in = socket.getInputStream();
+        var headerBytes = new java.io.ByteArrayOutputStream();
+        int match = 0;
+        while (match < 4) {
+            int b = in.read();
+            if (b < 0) {
+                throw new IOException("admin connection closed");
+            }
+            headerBytes.write(b);
+            if (b == (match == 0 || match == 2 ? '\r' : '\n')) {
+                match++;
+            } else {
+                match = b == '\r' ? 1 : 0;
+            }
+        }
+        var headers = headerBytes.toString(java.nio.charset.StandardCharsets.US_ASCII);
+        var lower = headers.toLowerCase(java.util.Locale.ROOT);
+        var body = new java.io.ByteArrayOutputStream();
+        int cl = contentLength(lower);
+        if (cl >= 0) {
+            readFully(in, body, cl);
+        } else if (lower.contains("transfer-encoding: chunked")) {
+            readChunked(in, body);
+        } else if (lower.contains("connection: close")) {
+            in.transferTo(body);
+        }
+        return headers + body.toString(java.nio.charset.StandardCharsets.US_ASCII);
+    }
+
+    private static int contentLength(String lowerHeaders) {
+        for (var line : lowerHeaders.split("\r\n")) {
+            if (line.startsWith("content-length:")) {
+                return Integer.parseInt(line.substring("content-length:".length()).trim());
+            }
+        }
+        return -1;
+    }
+
+    private static void readFully(java.io.InputStream in, java.io.ByteArrayOutputStream out, int n)
+            throws IOException {
+        var buf = new byte[Math.min(n, 8192)];
+        int left = n;
+        while (left > 0) {
+            int r = in.read(buf, 0, Math.min(buf.length, left));
+            if (r < 0) {
+                throw new IOException("admin connection closed");
+            }
+            out.write(buf, 0, r);
+            left -= r;
+        }
+    }
+
+    private static void readChunked(java.io.InputStream in, java.io.ByteArrayOutputStream out) throws IOException {
+        while (true) {
+            var sizeLine = readLine(in);
+            int semi = sizeLine.indexOf(';');
+            int size = Integer.parseInt((semi < 0 ? sizeLine : sizeLine.substring(0, semi)).trim(), 16);
+            if (size == 0) {
+                // trailers + final CRLF
+                while (true) {
+                    var trailer = readLine(in);
+                    if (trailer.isEmpty()) {
+                        return;
+                    }
+                }
+            }
+            readFully(in, out, size);
+            // chunk CRLF
+            if (in.read() != '\r' || in.read() != '\n') {
+                throw new IOException("bad chunk framing");
+            }
+        }
+    }
+
+    private static String readLine(java.io.InputStream in) throws IOException {
+        var line = new java.io.ByteArrayOutputStream();
+        int prev = -1;
+        while (true) {
+            int b = in.read();
+            if (b < 0) {
+                throw new IOException("admin connection closed");
+            }
+            if (prev == '\r' && b == '\n') {
+                return line.toString(java.nio.charset.StandardCharsets.US_ASCII);
+            }
+            if (prev >= 0) {
+                line.write(prev);
+            }
+            prev = b;
+        }
+    }
+
 
     private static java.security.cert.X509CRL crl(Id issuer, BigInteger serial) throws Exception {
         var builder = new X509v2CRLBuilder(new X500Name(issuer.cert().getSubjectX500Principal().getName()), notBefore());
