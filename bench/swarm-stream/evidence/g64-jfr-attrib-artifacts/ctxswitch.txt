@@ -1,0 +1,90 @@
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:16.587 (2026-10-30)
+  switchRate = 87406.73 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:17.587 (2026-10-30)
+  switchRate = 6320.3203 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:18.588 (2026-10-30)
+  switchRate = 2907.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:19.589 (2026-10-30)
+  switchRate = 5908.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:20.594 (2026-10-30)
+  switchRate = 56298.508 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:21.596 (2026-10-30)
+  switchRate = 91702.59 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:22.597 (2026-10-30)
+  switchRate = 89797.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:23.598 (2026-10-30)
+  switchRate = 100238.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:24.602 (2026-10-30)
+  switchRate = 99102.586 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:25.603 (2026-10-30)
+  switchRate = 109801.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:26.603 (2026-10-30)
+  switchRate = 101312.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:27.603 (2026-10-30)
+  switchRate = 105036.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:28.603 (2026-10-30)
+  switchRate = 107051.055 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:29.604 (2026-10-30)
+  switchRate = 102935.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:30.605 (2026-10-30)
+  switchRate = 107563.44 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:31.606 (2026-10-30)
+  switchRate = 111712.0 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:32.607 (2026-10-30)
+  switchRate = 108765.234 Hz
+}
+
+jdk.ThreadContextSwitchRate {
+  startTime = 17:06:33.611 (2026-10-30)
+  switchRate = 105345.96 Hz
+}
+

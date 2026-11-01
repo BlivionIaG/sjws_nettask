@@ -1,0 +1,48 @@
+# HELP sjws_swarm_stream_credit_enabled 1 when stream credit is on
+# TYPE sjws_swarm_stream_credit_enabled gauge
+sjws_swarm_stream_credit_enabled 1
+# HELP sjws_swarm_stream_budget_bytes configured node stream-memory budget in bytes
+# TYPE sjws_swarm_stream_budget_bytes gauge
+sjws_swarm_stream_budget_bytes 536870912
+# HELP sjws_swarm_stream_charged_bytes bytes currently charged to the node stream budget
+# TYPE sjws_swarm_stream_charged_bytes gauge
+sjws_swarm_stream_charged_bytes 0
+# HELP sjws_swarm_stream_peak_charged_bytes since start
+# TYPE sjws_swarm_stream_peak_charged_bytes gauge
+sjws_swarm_stream_peak_charged_bytes 0
+# HELP sjws_swarm_stream_open_sessions sessions holding a LAST ticket
+# TYPE sjws_swarm_stream_open_sessions gauge
+sjws_swarm_stream_open_sessions 0
+# HELP sjws_swarm_stream_gap_tickets_outstanding gap tickets currently outstanding
+# TYPE sjws_swarm_stream_gap_tickets_outstanding gauge
+sjws_swarm_stream_gap_tickets_outstanding 0
+# HELP sjws_swarm_stream_last_tickets_outstanding LAST tickets currently outstanding
+# TYPE sjws_swarm_stream_last_tickets_outstanding gauge
+sjws_swarm_stream_last_tickets_outstanding 0
+# HELP sjws_swarm_stream_node_refusals_total non-LAST chunks answered 429 with scope=node
+# TYPE sjws_swarm_stream_node_refusals_total counter
+sjws_swarm_stream_node_refusals_total 0
+# HELP sjws_swarm_stream_session_admit_refusals_total new sessions answered 503 at the admit watermark
+# TYPE sjws_swarm_stream_session_admit_refusals_total counter
+sjws_swarm_stream_session_admit_refusals_total 0
+# HELP sjws_swarm_stream_budget_underflows_total releases that would have taken charged below 0 (bug counter)
+# TYPE sjws_swarm_stream_budget_underflows_total counter
+sjws_swarm_stream_budget_underflows_total 0
+# HELP sjws_swarm_stream_pressure_trim_chunks_total chunks trimmed under node pressure
+# TYPE sjws_swarm_stream_pressure_trim_chunks_total counter
+sjws_swarm_stream_pressure_trim_chunks_total 0
+# HELP sjws_swarm_stream_pressure_trim_bytes_total bytes trimmed under node pressure
+# TYPE sjws_swarm_stream_pressure_trim_bytes_total counter
+sjws_swarm_stream_pressure_trim_bytes_total 0
+# HELP sjws_swarm_stream_credit_refusals_total session-scope 429s (credit window stalls)
+# TYPE sjws_swarm_stream_credit_refusals_total counter
+sjws_swarm_stream_credit_refusals_total 0
+# HELP sjws_swarm_stream_credit_unknown_total non-LAST chunks answered 204 because the session is not on this node
+# TYPE sjws_swarm_stream_credit_unknown_total counter
+sjws_swarm_stream_credit_unknown_total 0
+# HELP sjws_swarm_stream_reserve_underflows_total releases that would have taken a reservation below 0 (bug counter)
+# TYPE sjws_swarm_stream_reserve_underflows_total counter
+sjws_swarm_stream_reserve_underflows_total 0
+# HELP sjws_swarm_stream_sink_drops_total chunks dropped at the sink (overflow / full)
+# TYPE sjws_swarm_stream_sink_drops_total counter
+sjws_swarm_stream_sink_drops_total 0
