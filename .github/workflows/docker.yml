@@ -10,6 +10,8 @@ on:
       - 'src/**'
       - 'pom.xml'
       - 'HTML/**'
+      - 'tools/check-jlink-modules.sh'
+      - 'docker/**'
       - '.github/workflows/docker.yml'
   pull_request:
     paths: *paths
@@ -23,6 +25,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  jlink-modules:
+    name: jlink module list vs jdeps
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Package (skip tests; image job covers the smoke)
+        run: mvn -B -DskipTests package
+      - name: Check Dockerfile --add-modules against jdeps
+        run: |
+          jar="$(ls target/sjws_nettask-*.jar | head -1)"
+          tools/check-jlink-modules.sh Dockerfile "$jar" target/lib
+
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 25

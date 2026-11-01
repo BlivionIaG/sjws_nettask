@@ -672,4 +672,287 @@ class CpPeerTlsSessionTest {
             return null;
         });
     }
+
+    /**
+     * #334: closed CP peer sockets leave {@code live} when {@link CpPeerSockets#released} runs (as the transport does
+     * on close). No TLS reload required. Mutating {@code released} to a no-op leaves liveSize at 1.
+     */
+    @Test
+    void closedPeersReclaimedFromLiveWithoutReload() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-reclaim"));
+        var deny = denylist("reclaim-deny");
+        var acceptorTls = CpTls.peerContext(peer(ca, "a", deny));
+        var dialerTls = CpTls.peerContext(ca.peer("b"));
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.reclaim", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(acceptorTls, port, "a");
+            var dialer = new CpPeerSockets(dialerTls, List.of(
+                    new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", port), false, CpTestCa.san("a")),
+                    new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", 1), false, CpTestCa.san("b"))), "b");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                var acceptor = CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        server.handshake(ssl, 5_000);
+                        assertEquals(2, server.peerWire(ssl));
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var connected = dialer.dial(new InetSocketAddress("127.0.0.1", port));
+                var live = accepted.get(10, TimeUnit.SECONDS);
+                assertEquals(1, server.liveSize(), "accept registered");
+                assertEquals(1, dialer.liveSize(), "dial registered");
+
+                connected.socket().close();
+                connected.abort().close();
+                live.close();
+                assertEquals(1, server.liveSize(), "closed accept still listed until released");
+                assertEquals(1, dialer.liveSize(), "closed dial still listed until released");
+                server.released(live);
+                dialer.released(connected.socket());
+                assertEquals(0, server.liveSize(), "acceptor reclaims without reload");
+                assertEquals(0, dialer.liveSize(), "dialer reclaims without reload");
+                server.released(live);
+                dialer.released(connected.socket());
+                assertEquals(0, server.liveSize());
+                assertEquals(0, dialer.liveSize());
+                acceptor.join();
+            }
+            return null;
+        });
+    }
+
+    /**
+     * #334 end-to-end through {@link sjws_nettask.cluster.TcpTransport}: closing the transports empties both live
+     * registries without a reload.
+     */
+    @Test
+    void transportCloseReclaimsLiveWithoutReload() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-reclaim-t"));
+        var deny = denylist("reclaim-t-deny");
+        var key = sjws_nettask.cluster.ClusterKey.of("cp-raft-key-for-tests-0123".getBytes(java.nio.charset.StandardCharsets.US_ASCII), null);
+        var ports = EphemeralPorts.probeDistinct(2);
+        var members = new java.util.ArrayList<sjws_nettask.cluster.Member>();
+        for (int wire = 1; wire <= 2; wire++) {
+            members.add(new sjws_nettask.cluster.Member(new sjws_nettask.cluster.NodeId(wire, "cp-" + wire),
+                    new sjws_nettask.cluster.SiteId("cp"),
+                    new InetSocketAddress("127.0.0.1", ports[wire - 1]), 1L, sjws_nettask.cluster.MemberState.ALIVE,
+                    false));
+        }
+        var peers = List.of(
+                new CpConfig.Peer(1, "a", new InetSocketAddress("127.0.0.1", ports[0]), false, CpTestCa.san("a")),
+                new CpConfig.Peer(2, "b", new InetSocketAddress("127.0.0.1", ports[1]), false, CpTestCa.san("b")));
+        var acceptorSockets = new CpPeerSockets(CpTls.peerContext(peer(ca, "a", deny)), peers, "a");
+        var dialerSockets = new CpPeerSockets(CpTls.peerContext(ca.peer("b")), peers, "b");
+        var group = new sjws_nettask.cluster.GroupId("cp-config");
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.reclaimTransport", () -> {
+            try (var a = sjws_nettask.cluster.TcpTransport.open(members.get(0).id(), members, key,
+                    sjws_nettask.cluster.Clock.SYSTEM, 64, acceptorSockets);
+                    var b = sjws_nettask.cluster.TcpTransport.open(members.get(1).id(), members, key,
+                            sjws_nettask.cluster.Clock.SYSTEM, 64, dialerSockets)) {
+                a.attach(members.get(0).id(), (from, frame) -> {
+                });
+                var rpc = b.attach(members.get(1).id(), (from, frame) -> {
+                });
+                rpc.send(members.get(0).id(), new sjws_nettask.cluster.SimTransport.Frame(group, 7, new byte[] {7}));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (System.nanoTime() < deadline
+                        && (acceptorSockets.liveSize() < 1 || dialerSockets.liveSize() < 1)) {
+                    a.deliver(50);
+                    b.deliver(50);
+                    Thread.sleep(10);
+                }
+                assertTrue(acceptorSockets.liveSize() >= 1, "acceptor registered");
+                assertTrue(dialerSockets.liveSize() >= 1, "dialer registered");
+            }
+            assertEquals(0, acceptorSockets.liveSize(), "transport close reclaims acceptor live");
+            assertEquals(0, dialerSockets.liveSize(), "transport close reclaims dialer live");
+            return null;
+        });
+    }
+
+
+    /**
+     * #435 / #321 N1: {@code registerLive} fails closed once the TLS-epoch retry budget is spent, instead of
+     * spinning forever under a reload storm.
+     */
+    @Test
+    void registerLiveFailsClosedAfterEpochRetryBudget() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-budget"));
+        var deny = denylist("budget-deny");
+        var acceptorTls = CpTls.peerContext(peer(ca, "a", deny));
+        var dialerTls = CpTls.peerContext(ca.peer("b"));
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.budget", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(acceptorTls, port, "a");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var outcome = new CompletableFuture<Exception>();
+                var bumps = new java.util.concurrent.atomic.AtomicInteger();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        server.handshake(ssl, 5_000);
+                        Runnable bump = new Runnable() {
+                            @Override
+                            public void run() {
+                                bumps.incrementAndGet();
+                                // Re-arm: registerLive clears the hook after each attempt.
+                                server.betweenValidateAndRegister = this;
+                                server.bumpTlsEpochForTest();
+                            }
+                        };
+                        server.betweenValidateAndRegister = bump;
+                        try {
+                            server.peerWire(ssl);
+                            outcome.complete(null);
+                        } catch (Exception e) {
+                            outcome.complete(e);
+                        } finally {
+                            try {
+                                ssl.close();
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    } catch (Exception e) {
+                        outcome.completeExceptionally(e);
+                    }
+                });
+                try {
+                    var client = (SSLSocket) dialerTls.context().getSocketFactory().createSocket();
+                    client.setSSLParameters(dialerTls.parameters());
+                    client.connect(new InetSocketAddress("127.0.0.1", port), CpPeerSockets.CONNECT_TIMEOUT_MILLIS);
+                    client.startHandshake();
+                    Thread.sleep(200);
+                    client.close();
+                } catch (Exception ignored) {
+                }
+                var err = outcome.get(20, TimeUnit.SECONDS);
+                assertNotNull(err, "peerWire must fail closed when the epoch keeps moving");
+                Throwable t = err;
+                while (t.getCause() != null) {
+                    t = t.getCause();
+                }
+                assertTrue(String.valueOf(t.getMessage()).contains("retry budget")
+                                || String.valueOf(err.getMessage()).contains("retry budget"),
+                        "message=" + err.getMessage() + " root=" + t.getMessage());
+                assertEquals(CpPeerSockets.REGISTER_LIVE_MAX_ATTEMPTS, bumps.get(),
+                        "hook runs once per spent attempt before the budget trip");
+            }
+            return null;
+        });
+    }
+
+    /**
+     * #435 / #321 N2: if {@code dropPeersFailingPolicy} aborts a copied Live while a concurrent registerLive
+     * replace put a newer Live for the same socket, removal is by key so the closed socket cannot stay in
+     * {@code live}. Deterministic via {@code betweenDropFailAndAbort}.
+     */
+    @Test
+    void dropRemovesClosedSocketWhenLiveReplacedConcurrently() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-race"));
+        var deny = denylist("race-deny");
+        var acceptorTls = CpTls.peerContext(peer(ca, "a", deny));
+        var clientCfg = ca.peer("b");
+        var clientSerial = ca.lastSerial();
+        var dialerTls = CpTls.peerContext(clientCfg);
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.dropRace", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(acceptorTls, port, "a");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        server.handshake(ssl, 5_000);
+                        assertEquals(2, server.peerWire(ssl));
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var client = (SSLSocket) dialerTls.context().getSocketFactory().createSocket();
+                client.setSSLParameters(dialerTls.parameters());
+                client.connect(new InetSocketAddress("127.0.0.1", port), CpPeerSockets.CONNECT_TIMEOUT_MILLIS);
+                client.startHandshake();
+                var live = accepted.get(10, TimeUnit.SECONDS);
+                assertEquals(1, server.liveSize());
+                var replaced = new java.util.concurrent.atomic.AtomicBoolean();
+                server.betweenDropFailAndAbort = () -> {
+                    try {
+                        // Simulate registerLive putting a fresh Live for the same SSLSocket.
+                        server.replaceLiveAbortForTest(live, new java.net.Socket());
+                        replaced.set(true);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                };
+                Files.writeString(deny, "serial:" + clientSerial.toString(16) + "\n");
+                acceptorTls.reloadTls();
+                assertTrue(replaced.get(), "drop path must hit the replace hook");
+                assertTrue(live.isClosed(), "stale abort still closes the SSLSocket");
+                assertEquals(0, server.liveSize(), "closed socket must leave live even after Live replace");
+                client.close();
+            }
+            return null;
+        });
+    }
+
+    /**
+     * #435: already-closed sockets are swept from {@code live} by key, so a concurrent Live replace cannot
+     * retain them.
+     */
+    @Test
+    void dropSweepsClosedSocketByKeyDespiteLiveReplace() throws Exception {
+        var ca = new CpTestCa(dir.resolve("ca-closed-key"));
+        var deny = denylist("closed-key-deny");
+        var acceptorTls = CpTls.peerContext(peer(ca, "a", deny));
+        var dialerTls = CpTls.peerContext(ca.peer("b"));
+
+        EphemeralPorts.withBindRetry("CpPeerTlsSessionTest.closedKey", () -> {
+            int port = EphemeralPorts.probe();
+            var server = sockets(acceptorTls, port, "a");
+            try (var listener = server.listen(new InetSocketAddress("127.0.0.1", port))) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        server.handshake(ssl, 5_000);
+                        assertEquals(2, server.peerWire(ssl));
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var client = (SSLSocket) dialerTls.context().getSocketFactory().createSocket();
+                client.setSSLParameters(dialerTls.parameters());
+                client.connect(new InetSocketAddress("127.0.0.1", port), CpPeerSockets.CONNECT_TIMEOUT_MILLIS);
+                client.startHandshake();
+                var live = accepted.get(10, TimeUnit.SECONDS);
+                live.close();
+                client.close();
+                assertEquals(1, server.liveSize());
+                var replaced = new java.util.concurrent.atomic.AtomicBoolean();
+                server.betweenClosedSweepAndRemove = () -> {
+                    try {
+                        server.replaceLiveAbortForTest(live, new java.net.Socket());
+                        replaced.set(true);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                };
+                server.dropPeersFailingPolicy();
+                assertTrue(replaced.get(), "closed sweep must hit the replace hook");
+                assertEquals(0, server.liveSize(), "closed-socket sweep removes by key despite Live replace");
+            }
+            return null;
+        });
+    }
+
+
 }

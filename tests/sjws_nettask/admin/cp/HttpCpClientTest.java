@@ -309,9 +309,12 @@ class HttpCpClientTest {
             ctx = HttpCpClient.tls(who.cert(), who.key(), null, caPem);
         }
         var b = java.net.http.HttpRequest.newBuilder(java.net.URI.create("https://" + cp.endpoint() + path))
-                .timeout(Duration.ofSeconds(3))
-                .method(method, body == null ? java.net.http.HttpRequest.BodyPublishers.noBody()
-                        : java.net.http.HttpRequest.BodyPublishers.ofString(body));
+                .timeout(Duration.ofSeconds(3));
+        if ("POST".equals(method) || "PUT".equals(method) || "PATCH".equals(method) || "DELETE".equals(method)) {
+            b.header("Content-Type", "application/json");
+        }
+        b.method(method, body == null ? java.net.http.HttpRequest.BodyPublishers.noBody()
+                : java.net.http.HttpRequest.BodyPublishers.ofString(body));
         if (authorization != null) {
             b.header("Authorization", authorization);
         }

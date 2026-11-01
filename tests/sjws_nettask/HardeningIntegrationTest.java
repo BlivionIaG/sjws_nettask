@@ -386,6 +386,28 @@ class HardeningIntegrationTest {
     }
 
     @Test
+    @org.junit.jupiter.api.Timeout(30)
+    void portZeroBindsEphemeralAndPrintsBoundPort() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        Process p = null;
+        try {
+            p = launch("0", root.toString());
+            waitForLine(p, "Server started: HTTP/1.1 on tcp/");
+            var line = this.lastLog.toString().lines()
+                    .filter(l -> l.startsWith("Server started: HTTP/1.1 on tcp/"))
+                    .findFirst().orElseThrow();
+            int bound = Integer.parseInt(line.substring("Server started: HTTP/1.1 on tcp/".length()).split("[^0-9]", 2)[0]);
+            assertTrue(bound > 0 && bound <= 65535, line);
+            assertEquals("hello", HttpTestSupport.get(bound, "/hello.txt", TIMEOUT_MS).bodyText());
+        } finally {
+            if (p != null) {
+                p.destroy();
+                p.waitFor(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
     void configErrorsExitWithUsageCode() throws Exception {
         Process p = launch("18097", root.toString(), "--h3", "--cert=/only/cert.pem");
         assertTrue(p.waitFor(10, TimeUnit.SECONDS));

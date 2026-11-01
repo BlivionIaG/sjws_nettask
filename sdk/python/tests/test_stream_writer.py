@@ -85,8 +85,15 @@ class SpanTest(Base):
         t = threading.Thread(target=lambda: [w.send(b"x%d" % i) for i in range(4 * window)])
         t.start()
         self.assertTrue(held.wait(5))
-        time.sleep(0.3)  # let everything the writer may issue arrive
-        seen = [c.chunk_seq for c in self.srv.chunks]
+        # Poll instead of a fixed sleep: under CI load 0.3s was not always enough for the
+        # full window to arrive (flake: max(seen)+1 == 8 with window 8).
+        deadline = time.monotonic() + 5.0
+        seen = []
+        while time.monotonic() < deadline:
+            seen = [c.chunk_seq for c in self.srv.chunks]
+            if seen and max(seen) >= window:
+                break
+            time.sleep(0.05)
         self.assertEqual(1 + window, max(seen) + 1, seen)  # seqs 1..window (span window − 1), no more
         released.set()
         t.join(10)

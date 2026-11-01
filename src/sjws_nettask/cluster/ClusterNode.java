@@ -31,6 +31,14 @@ public interface ClusterNode extends AutoCloseable {
 
     NodeId self();
 
+    /**
+     * True when this node is the voter-without-log in a data-and-witness set. Default false (data node or a
+     * membership-only stub). {@link ReplicatedNode} overrides from the seed list.
+     */
+    default boolean witness() {
+        return false;
+    }
+
     MembershipView membership();
 
     void onMembershipChange(Consumer<MembershipView> listener);
@@ -94,6 +102,17 @@ public interface ClusterNode extends AutoCloseable {
         var future = new CompletableFuture<CommittedIndex>();
         future.completeExceptionally(new UnsupportedOperationException("conditional append"));
         return future;
+    }
+
+
+    /**
+     * Explicit operator escape for stalled per-append STRICT overrides (#208). See
+     * {@link ReplicatedNode#releaseStalledStrictOverrides(GroupId, String)}. The default refuses.
+     *
+     * @param operatorId authenticated operator identity (non-blank)
+     */
+    default int releaseStalledStrictOverrides(GroupId groupId, String operatorId) throws NotLeaderException {
+        throw new UnsupportedOperationException("releaseStalledStrictOverrides");
     }
 
     /** Leadership of this group only. Invoked off the request path. */

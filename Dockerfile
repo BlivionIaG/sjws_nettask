@@ -20,7 +20,10 @@ RUN javac --release 25 -d /out/healthcheck HealthCheck.java \
 # Minimal Java runtime. Modules from `jdeps --print-module-deps` over the jar and lib/
 # (java.desktop/java.sql/java.management/jdk.jfr are pulled in by dependencies), plus the
 # ones jdeps can't see: jdk.crypto.ec/jdk.crypto.cryptoki (TLS/ACME keys), jdk.naming.dns
-# (Netty/JNDI DNS), jdk.zipfs, jdk.management. java.net.http also serves HealthCheck.
+# (Netty/JNDI DNS), jdk.zipfs, jdk.management, and java.logging/java.xml (JUL/XML via
+# reflective factories). java.net.http also serves HealthCheck.
+# CI: tools/check-jlink-modules.sh (docker.yml job jlink-modules) fails on drift (#411).
+# If you change --add-modules or the manual extras, update that script's MANUAL_EXTRA too.
 RUN jlink \
       --add-modules java.base,java.desktop,java.logging,java.management,java.naming,java.net.http,java.sql,java.xml,jdk.httpserver,jdk.jfr,jdk.unsupported,jdk.naming.dns,jdk.crypto.ec,jdk.crypto.cryptoki,jdk.management,jdk.zipfs \
       --strip-debug --no-man-pages --no-header-files --compress=zip-6 \

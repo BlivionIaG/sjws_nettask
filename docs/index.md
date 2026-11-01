@@ -10,16 +10,20 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [YAML config file](user/config-file.md)
 - [HTTP/1.x](user/http1.md) · [HTTP/2](user/http2.md) · [HTTP/3](user/http3.md)
 - [Access rules](user/access-rules.md)
+- [API gateway](user/api-gateway.md): routes, auth and rate limits
 - [Caching, validators and ranges](user/caching-and-ranges.md)
 - [Platform notes](user/platform-notes.md)
+- [Cluster mode (HA)](user/cluster-mode.md)
 
 ## Operations
 - [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API, control heartbeat report
 - [Running in the background (daemon)](operations/daemon.md)
 - [Docker image](deployment/docker.md): multi-stage build, non-root runtime, health check
 - [Control-plane and data-node service](operations/control-plane-service.md): systemd units, join bootstrap, status, drain
+- [Control-plane operations runbook](operations/control-plane.md): bootstrap voters, join data nodes, backup, upgrades, DR
 - [Admin console (TUI)](operations/admin-console.md)
 - [Control-plane console](operations/cp-console.md)
+- [Stalled STRICT override escape](operations/strict-stalled-escape.md): operator release when a data copy is lost after a STRICT append (#208)
 - [Releasing](operations/releasing.md)
 
 ## Design

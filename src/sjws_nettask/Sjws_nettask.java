@@ -249,7 +249,7 @@ public class Sjws_nettask {
                 out.println("content port not bound");
             }
             out.println("Server started: " + server.describe());
-            sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
+            sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.PINNED)
                     .ifPresent(w -> err.println("WARN: " + w));
             sjws_nettask.core.SafeOpen.unlistableWarning(config.allowUnlistableDirs())
                     .ifPresent(w -> err.println("WARN: " + w));

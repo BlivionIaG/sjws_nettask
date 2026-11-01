@@ -82,15 +82,17 @@ A full server path, checked with a real client.
   0, 1, 2, and 64; `ServerIntegrationTest` launches it with `WEB_SERVER_DIR`
   pointed at a `@TempDir`; `h3/JarLaunchTest` (tags `jar` and `h3`) runs
   `java -jar` after `package` and fetches HTTP/3. Those process tests pass a
-  concrete TCP port. The command-line and `WEB_SERVER_PORT` parsers only accept
-  ports from 1 to 65535, so they cannot request port 0. Several of them take a
-  port from a short-lived `ServerSocket(0)` and then bind it again, which can
-  race. The harness does not do that: `SjwsServer.bind` accepts 0 and the test
+  concrete TCP port. The command-line and `WEB_SERVER_PORT` accept `0` as
+  ephemeral (#397); the child prints `Server started: HTTP/1.1 on tcp/<bound>`.
+  Older process tests that probed with `ServerSocket(0)` and rebound can drop
+  that race. The harness still prefers in-JVM `SjwsServer.bind` with port 0 and
   reads the bound port after `start` returns.
 
 ## Ephemeral port
 
-`ServerConfig` documents TCP port 0 as ephemeral. `SjwsServer.bind` opens a
+`ServerConfig` documents TCP port 0 as ephemeral. The CLI positional port and
+`WEB_SERVER_PORT` accept `0` the same way (YAML `server.port: 0` already did).
+`SjwsServer.bind` opens a
 `ServerSocketChannel`, sets `SO_REUSEADDR`, and binds `new InetSocketAddress(port)`
 (the wildcard address) with the configured backlog. `tcpPort()` reads the address
 after the bind. `start` returns only after that bind has succeeded and the accept
@@ -119,6 +121,15 @@ child environment when the test wants the arguments to win (`HardeningIntegratio
 | HTTP/2 | Opt-in (`--h2`). Netty `Http2Server` on its own TCP port: TLS with ALPN `h2` (falling back to `http/1.1`) on `--h2-port`, and optional cleartext h2c on `--h2c-port` (prior knowledge or `Upgrade: h2c`). The main HTTP/1.1 listener still answers a request line `HTTP/2.0` with 505. | `h2/*` (`Http2ServerTest`, `Http2EdgeTest`, `Http2BudgetTest`, `Http2JuryTest`, `H2ConfigAndWiringTest`) start the real `Http2Server` on ephemeral ports with a self-signed certificate, the JDK `HttpClient` and the raw frame client `RawH2`; untagged. The 505 cases stay in `Http1ParserTest`, `Http1GoldenTest`, `HardeningIntegrationTest`. |
 | HTTP/3 | Opt-in (`--h3`). Netty `netty-codec-http3` and the bundled quiche natives (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64). TLS 1.3 is the QUIC handshake (`QuicSslContextBuilder`), with a configured PEM chain or a generated self-signed certificate. | `h3/*` when the natives load; otherwise the tests assume false and skip. JaCoCo gates for `sjws_nettask.h3` and `sjws_nettask.tls` are 0 off those platforms. |
 | TLS on TCP | Only on the HTTP/2 listener's own port (`--h2-port`): `Http2Server` builds its Netty `SslContext` from `TlsMaterial` (the same PEM chain or generated self-signed certificate as HTTP/3; TLS 1.3 and 1.2). The main HTTP/1.1 port is cleartext, and `Alt-Svc` is still sent only there. `TlsMaterial.keyManagerFactory()` serves the control-plane mTLS code (`cp.CpTls`, `cp.AdminTls`, `admin.cp.HttpCpClient`). | `h2/*` (HTTPS through the JDK `HttpClient` with a trusting `SSLContext`), `tls/TlsMaterialTest`, `cp/CpServerTlsTest`, `cp/CpPeerTlsTest`, `cp/AdminTlsTest`. |
+
+## HTTP/3 qlog in CI ([#367](https://github.com/BlivionIaG/sjws_nettask/issues/367))
+
+`mvn verify` in `.github/workflows/ci.yml` sets `-Dsjws.h3.qlog.dir=target/h3-qlog`.
+When that property is set, `H3TestClient` and `Http3Server` write quiche qlog files
+(one per QUIC connection) so a stall can show whether the client sent
+`MAX_STREAM_DATA` and where server `STREAM_DATA` stopped. The directory is uploaded
+as the `h3-qlog-*` artifact when the verify job fails. Local runs leave the property
+unset (no qlog). Do not treat this as a production toggle.
 
 ## Timeouts and flakiness
 
@@ -198,6 +209,28 @@ flowchart TB
 ```
 
 `.github/workflows/release.yml` is a tag workflow. It is not the test matrix.
+
+### CI correctness ([#356](https://github.com/BlivionIaG/sjws_nettask/issues/356))
+
+Two rules that came out of the Ubuntu 26.04 canary work (#265 / #269 / #356):
+
+1. **Do not use `continue-on-error: true` on a job whose failure must fail the
+   workflow.** A red job with `continue-on-error` still marks the workflow run
+   green, so reviewers reading the Actions list miss the failure. The
+   `verify-canary` job did that and masked seven `SwarmBenchCleanupTest`
+   failures. Prefer a hard-fail job, or a follow-up job that reads the canary
+   result and fails the run. `ci.yml` greps `.github/workflows/` for
+   `continue-on-error:` and fails if any remain.
+
+2. **Manual `workflow_dispatch` from Cursor cloud agents.** Those integrations
+   often hold only `contents: read`, so `gh workflow run …` returns
+   `HTTP 403 Resource not accessible by integration`. A human with
+   `actions: write` (or a PAT that has it) must dispatch when a PR needs a
+   manual run: the macOS matrix and mutation job on `ci.yml`,
+   `cluster-tests.yml` without the `cluster-tests` label, and any other
+   `workflow_dispatch`-only path. The Ubuntu 26.04 canary workflow itself was
+   deleted in #265 once `ubuntu-latest` became 26.04 and verify stayed green;
+   there is nothing left to dispatch for that canary.
 
 Local equivalents, with Java 25:
 
@@ -284,10 +317,9 @@ Not implemented. Nothing above depends on these.
 - HTTPS on the main TCP port. The main listener stays cleartext; HTTPS exists only on
   the HTTP/2 listener's own port (`--h2-port`). A TLS accept path on the main port
   would be a new server path.
-- Accepting port 0 on the command line and in `WEB_SERVER_PORT`, so a subprocess
-  can bind an ephemeral TCP port and print it (the startup line already includes
-  `HTTP/1.1 on tcp/<port>`). Today those parsers replace 0 with the default and
-  warn. A subprocess can already do this with `--config` and `server.port: 0`.
+- ~~Accepting port 0 on the command line and in `WEB_SERVER_PORT`~~ (done in #397):
+  parsers keep `0` as ephemeral; startup prints `HTTP/1.1 on tcp/<bound>`. YAML
+  `server.port: 0` already worked.
 - HTTP/3 inside `FileServingEndToEndTest`. The same temporary root and ephemeral
   port are already covered by `h3/Http3ServerTest` and `h3/JarLaunchTest`.
 - Dropping fixed `Thread.sleep` calls that only poll for a condition, in favour
