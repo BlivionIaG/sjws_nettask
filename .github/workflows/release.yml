@@ -45,9 +45,13 @@ jobs:
 
       - name: Derive version from tag or dry-run input
         id: v
+        env:
+          # inputs.* must not be interpolated into run: scripts (script-injection).
+          VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            version="${{ inputs.version }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$VERSION"
             if [ -z "$version" ]; then
               echo "::error::workflow_dispatch requires inputs.version"
               exit 1
@@ -66,19 +70,25 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
-          echo "Release mode: event=${{ github.event_name }} tag=$tag version=$version dry_run=$( [ "${{ github.event_name }}" = workflow_dispatch ] && echo true || echo false )"
+          dry_run=$( [ "$EVENT_NAME" = workflow_dispatch ] && echo true || echo false )
+          echo "Release mode: event=$EVENT_NAME tag=$tag version=$version dry_run=$dry_run"
 
       # The pom keeps a -SNAPSHOT version on master; the tag (or dry-run input) decides the version.
       - name: Set project version
-        run: mvn -B -q versions:set -DnewVersion="${{ steps.v.outputs.version }}" -DgenerateBackupPoms=false
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: mvn -B -q versions:set -DnewVersion="$VERSION" -DgenerateBackupPoms=false
 
       - name: Build and verify (tests, jar tests, coverage gate)
         run: mvn -B verify
 
       - name: Package distribution
         id: dist
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          DRY_RUN: ${{ steps.v.outputs.dry_run }}
         run: |
-          name="sjws_nettask-${{ steps.v.outputs.version }}"
+          name="sjws_nettask-$VERSION"
           mkdir -p "dist/$name"
           cp "target/$name.jar" "dist/$name/"
           cp -r target/lib "dist/$name/lib"
@@ -93,12 +103,12 @@ jobs:
           {
             echo "### Distribution"
             echo
-            if [ "${{ steps.v.outputs.dry_run }}" = true ]; then
+            if [ "$DRY_RUN" = true ]; then
               echo "- mode: dry-run (no GitHub Release)"
             else
               echo "- mode: publish"
             fi
-            echo "- version: \`${{ steps.v.outputs.version }}\`"
+            echo "- version: \`$VERSION\`"
             echo "- artifacts: \`$name.tar.gz\`, \`$name.zip\`, \`$name.jar\`, \`SHA256SUMS\`"
             ls -lh "dist/$name.tar.gz" "dist/$name.zip" "dist/$name.jar" dist/SHA256SUMS
           } >> "$GITHUB_STEP_SUMMARY"
@@ -119,9 +129,12 @@ jobs:
         if: steps.v.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          DIST_NAME: ${{ steps.dist.outputs.name }}
+          TAG: ${{ steps.v.outputs.tag }}
+          PRERELEASE: ${{ steps.v.outputs.prerelease }}
         run: |
-          name="${{ steps.dist.outputs.name }}"
-          flags=(--title "sjws_nettask ${{ steps.v.outputs.tag }}" --generate-notes --verify-tag)
-          if [[ "${{ steps.v.outputs.prerelease }}" == true ]]; then flags+=(--prerelease); fi
-          gh release create "${{ steps.v.outputs.tag }}" "${flags[@]}" \
+          name="$DIST_NAME"
+          flags=(--title "sjws_nettask $TAG" --generate-notes --verify-tag)
+          if [[ "$PRERELEASE" == true ]]; then flags+=(--prerelease); fi
+          gh release create "$TAG" "${flags[@]}" \
             "dist/$name.tar.gz" "dist/$name.zip" "dist/$name.jar" dist/SHA256SUMS
