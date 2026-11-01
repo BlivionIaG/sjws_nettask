@@ -69,7 +69,7 @@ public final class AdminServer implements AutoCloseable {
      */
     public static AdminServer start(CpStore store, long nowMillis, long ttlMillis, Path certPem, Path keyPem,
             String keyPassword, Path trustBundle) throws IOException {
-        return start(store, nowMillis, ttlMillis, certPem, keyPem, keyPassword, trustBundle, null, 0);
+        return start(store, nowMillis, ttlMillis, certPem, keyPem, keyPassword, trustBundle, null, 0, Set.of());
     }
 
     /**
@@ -83,6 +83,14 @@ public final class AdminServer implements AutoCloseable {
      */
     public static AdminServer start(CpStore store, long nowMillis, long ttlMillis, Path certPem, Path keyPem,
             String keyPassword, Path trustBundle, Path revocations, long watchMillis) throws IOException {
+        return start(store, nowMillis, ttlMillis, certPem, keyPem, keyPassword, trustBundle, revocations, watchMillis,
+                Set.of());
+    }
+
+    /** File-based mTLS admin listener with an explicit {@code Origin} allowlist for mutating methods. */
+    public static AdminServer start(CpStore store, long nowMillis, long ttlMillis, Path certPem, Path keyPem,
+            String keyPassword, Path trustBundle, Path revocations, long watchMillis, Set<String> allowedOrigins)
+            throws IOException {
         var tls = AdminTls.open(certPem, keyPem, keyPassword, trustBundle, revocations, store::recordSecurityEvent);
         var https = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         https.setHttpsConfigurator(new HttpsConfigurator(tls.context()) {
@@ -95,7 +103,7 @@ public final class AdminServer implements AutoCloseable {
                 params.setSSLParameters(ssl);
             }
         });
-        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls, Set.of());
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls, allowedOrigins);
         https.createContext("/", bound::handle);
         https.start();
         if (watchMillis > 0) {
@@ -202,13 +210,19 @@ public final class AdminServer implements AutoCloseable {
     }
 
     /**
-     * A present {@code Origin} must be in {@link #allowedOrigins} (empty by default). Mutations must
-     * send {@code Content-Type: application/json} (optional parameters allowed).
+     * A present {@code Origin} must be in {@link #allowedOrigins} (empty by default). The header is
+     * trimmed; blank-after-trim is treated as present and refused. Match is exact on the trimmed
+     * value (scheme, host, port, case). Mutations must send {@code Content-Type: application/json}
+     * (optional parameters allowed).
      */
     CpStore.Outcome refuseMutation(HttpExchange exchange) {
-        var origin = exchange.getRequestHeaders().getFirst("Origin");
-        if (origin != null && !allowedOrigins.contains(origin)) {
-            return CpStore.Outcome.error(403, "origin");
+        var raw = exchange.getRequestHeaders().getFirst("Origin");
+        if (raw != null) {
+            var origin = raw.trim();
+            // Blank-after-trim is present-and-refused (exact match on trimmed allowlist entries).
+            if (origin.isEmpty() || !allowedOrigins.contains(origin)) {
+                return CpStore.Outcome.error(403, "origin");
+            }
         }
         if (!isJsonContentType(exchange.getRequestHeaders().getFirst("Content-Type"))) {
             return CpStore.Outcome.error(415, "content-type");

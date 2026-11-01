@@ -114,6 +114,27 @@ class AdminMutationValidationTest {
     }
 
     @Test
+    void whitespaceOnlyOriginIs403() throws Exception {
+        var keys = KeyRing.generate("online-1", NOW + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var clock = new FakeClock(0);
+        try (var store = CpStore.open(dir.resolve("cp-ws"), keys, clock);
+                var http = AdminServer.startPlainForTests(store, NOW, TTL, Set.of())) {
+            clock.advance(Duration.ofMillis(100));
+            store.drive();
+            var client = HttpClient.newHttpClient();
+            var base = "http://127.0.0.1:" + http.port() + "/cp/v1/rbac";
+            var body = "{"san":"urn:sjws:admin:x","role":"viewer"}";
+            var blank = client.send(HttpRequest.newBuilder(URI.create(base)).timeout(Duration.ofSeconds(3))
+                    .header("Origin", "   ")
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(403, blank.statusCode(), blank.body());
+        }
+    }
+
+
+    @Test
     void jsonContentTypeHelper() {
         assertTrue(AdminServer.isJsonContentType("application/json"));
         assertTrue(AdminServer.isJsonContentType("Application/JSON; charset=utf-8"));
