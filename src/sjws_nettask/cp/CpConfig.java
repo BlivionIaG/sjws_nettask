@@ -40,7 +40,8 @@ import sjws_nettask.config.Durations;
  * through a property or the environment is refused rather than ignored, so a wrong deployment fails loudly.
  */
 public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchListen, InetSocketAddress adminListen,
-        CpKeyConfig keys, double maxClockDriftRatio, Duration leaseSafetyMargin, List<String> warnings) {
+        List<String> adminAllowedOrigins, CpKeyConfig keys, double maxClockDriftRatio, Duration leaseSafetyMargin,
+        List<String> warnings) {
 
     /** Keys of the YAML {@code cp:} block. {@code tls} belongs to Security's listener config and is not read here. */
     static final List<String> YAML_KEYS = List.of("nodeId", "peers", "watch", "admin", "stateDir", "keyDir", "rootPub",
@@ -81,6 +82,7 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         Objects.requireNonNull(nodeId, "nodeId");
         Objects.requireNonNull(keys, "keys");
         peers = List.copyOf(peers);
+        adminAllowedOrigins = List.copyOf(adminAllowedOrigins == null ? List.of() : adminAllowedOrigins);
         warnings = List.copyOf(warnings);
     }
 
@@ -133,8 +135,10 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
         Path rootPub = path(required(pick(properties, env, y, "rootPub", "ROOT_PUB"), "cp.rootPub"), base);
         var watch = address(required(pickNamed(properties, env, nested(y, "watch"), "listen", "sjws.cp.watch.listen",
                 "SJWS_CP_WATCH_LISTEN"), "cp.watch.listen"), "cp.watch.listen");
-        var admin = address(required(pickNamed(properties, env, nested(y, "admin"), "listen", "sjws.cp.admin.listen",
+        var adminMap = nested(y, "admin", Set.of("listen", "allowedOrigins"));
+        var admin = address(required(pickNamed(properties, env, adminMap, "listen", "sjws.cp.admin.listen",
                 "SJWS_CP_ADMIN_LISTEN"), "cp.admin.listen"), "cp.admin.listen");
+        var adminOrigins = allowedOrigins(adminMap.get("allowedOrigins"));
         String pin = text(y.get("rootPubSha256"), "cp.rootPubSha256");
         boolean insecure = false;
         if (y.containsKey("insecureSkipPermissionChecks")) {
@@ -182,7 +186,7 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
                     + " certificate.");
         }
         var keys = new CpKeyConfig(keyDir, rootPub, stateDir, pin, insecure, minSerial);
-        return new CpConfig(nodeId, peers, watch, admin, keys, ratio, margin, warnings);
+        return new CpConfig(nodeId, peers, watch, admin, adminOrigins, keys, ratio, margin, warnings);
     }
 
     /**
@@ -298,6 +302,11 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
 
     @SuppressWarnings("unchecked")
     private static Map<String, Object> nested(Map<String, Object> y, String key) {
+        return nested(y, key, Set.of("listen"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> nested(Map<String, Object> y, String key, Set<String> allowed) {
         var raw = y.get(key);
         if (raw == null) {
             return Map.of();
@@ -306,11 +315,30 @@ public record CpConfig(String nodeId, List<Peer> peers, InetSocketAddress watchL
             throw new IllegalArgumentException("cp." + key + " must be a mapping");
         }
         for (var k : map.keySet()) {
-            if (!"listen".equals(k)) {
+            if (!allowed.contains(k)) {
                 throw new IllegalArgumentException("Unknown key cp." + key + "." + k);
             }
         }
         return (Map<String, Object>) map;
+    }
+
+    /** Exact-match Origin values for mutating admin requests. Empty refuses any present Origin. */
+    static List<String> allowedOrigins(Object raw) {
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list)) {
+            throw new IllegalArgumentException("cp.admin.allowedOrigins must be a list of strings");
+        }
+        var out = new ArrayList<String>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            var item = list.get(i);
+            if (!(item instanceof String s) || s.isBlank()) {
+                throw new IllegalArgumentException("cp.admin.allowedOrigins[" + i + "] must be a non-empty string");
+            }
+            out.add(s.trim());
+        }
+        return out;
     }
 
     private static String pick(Function<String, String> properties, Map<String, String> env, Map<String, Object> y,
