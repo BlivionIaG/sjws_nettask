@@ -566,6 +566,14 @@ final class RaftGroup {
             java.time.Duration.ofSeconds(30));
 
     /**
+     * Fsync failures on force/tick: keep counting every failure, but full stack traces at most once per 30 s per
+     * exception type (same shape as {@link #WRITE_FAILURES}). A separate instance so write-failure traces do not
+     * suppress fsync traces and vice versa (#242).
+     */
+    static final ThrottledLog FSYNC_FAILURES = new ThrottledLog(System.getLogger(RaftGroup.class.getName()),
+            java.time.Duration.ofSeconds(30));
+
+    /**
      * Under the lock, when failing closed: the error for writes that were already in the log and still pending.
      * They are not refused like a {@link NotLeaderException} would suggest: they may already be on a follower (or
      * on this node's disk) and commit under a later leader, so their outcome is unknown. Same type and the same
@@ -1816,11 +1824,15 @@ final class RaftGroup {
         }
     }
 
-    /** Under the lock: bump the consecutive and cumulative fsync-failure counters and log. */
+    /**
+     * Under the lock: bump the consecutive and cumulative fsync-failure counters and log. Counting is never
+     * rate-limited; only the stack trace is (via {@link #FSYNC_FAILURES}). The step-down WARNING in
+     * {@link #maybeStepDownAfterFsyncFailures} stays unthrottled and has no throwable (#242).
+     */
     private void recordFsyncFailure(Throwable failed) {
         consecutiveFsyncFailures++;
         fsyncFailures++;
-        System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+        FSYNC_FAILURES.log(System.Logger.Level.WARNING,
                 "group " + groupId.value() + ": fsync failed (" + consecutiveFsyncFailures + " consecutive, step-down at "
                         + options.fsyncFailureStepDown() + ")",
                 failed);
@@ -1829,8 +1841,8 @@ final class RaftGroup {
     /**
      * Under the lock, after a counted fsync failure: if this node still leads and the consecutive count reached the
      * configured threshold, step down in the same term (no hard-state write). Always applies a campaign backoff of at
-     * least one lease plus election timeout (or {@code failbackHysteresis} when larger), even when ordinary failback
-     * hysteresis is zero, so a healthy peer can take over before this node campaigns again (#242).
+     * least {@code 2 * (lease + electionTimeout)} (or {@code failbackHysteresis} when larger), even when ordinary
+     * failback hysteresis is zero, so a healthy peer can take over before this node campaigns again (#242).
      */
     private void maybeStepDownAfterFsyncFailures(List<Runnable> after) {
         if (role != Role.LEADER || consecutiveFsyncFailures < options.fsyncFailureStepDown()) {

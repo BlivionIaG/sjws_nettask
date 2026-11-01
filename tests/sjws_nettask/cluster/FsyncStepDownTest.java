@@ -33,6 +33,10 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -335,6 +339,62 @@ class FsyncStepDownTest {
             step();
         }
         assertTrue(group(other).isLeader(), "peer took over after tick-path step-down");
+    }
+
+    /**
+     * #242: every fsync failure is counted; only stack traces are rate-limited. The step-down WARNING is a
+     * separate unthrottled line (no throwable), so demotion stays visible even when traces are suppressed.
+     */
+    @Test
+    void fsyncFailureStacksAreThrottledButCountsAndStepDownAreNot() throws Exception {
+        var records = new ArrayList<LogRecord>();
+        var jul = Logger.getLogger(RaftGroup.class.getName());
+        var handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        var previous = jul.getLevel();
+        jul.addHandler(handler);
+        jul.setLevel(Level.ALL);
+        try {
+            start(2);
+            int l = leader();
+            settle(nodes.get(l).append(GROUP, batch("before", 1)));
+            storages.get(l).failForceRemaining = 4;
+            final int leaderIdx = l;
+            for (int i = 0; i < 2; i++) {
+                final int n = i;
+                assertThrows(ExecutionException.class,
+                        () -> nodes.get(leaderIdx).append(GROUP, batch("bad" + n, 1)).get());
+            }
+            assertEquals(2, nodes.get(leaderIdx).fsyncFailures(GROUP), "every failure is counted");
+            assertFalse(group(leaderIdx).isLeader(), "step-down at threshold 2");
+
+            boolean stepDownLine = records.stream().anyMatch(r -> r.getMessage() != null
+                    && r.getMessage().contains("stepping down after")
+                    && r.getThrown() == null);
+            assertTrue(stepDownLine, "step-down WARNING is not rate-limited");
+
+            long fsyncLines = records.stream()
+                    .filter(r -> r.getMessage() != null && r.getMessage().contains("fsync failed"))
+                    .count();
+            assertTrue(fsyncLines >= 2, "each failure still logs a line; fsyncLines=" + fsyncLines);
+            // Full-vs-one-line timing is covered by ThrottledLogTest; this suite may share the static
+            // FSYNC_FAILURES window with other tests, so either shape is acceptable here.
+        } finally {
+            jul.removeHandler(handler);
+            jul.setLevel(previous);
+        }
     }
 
     @Test
