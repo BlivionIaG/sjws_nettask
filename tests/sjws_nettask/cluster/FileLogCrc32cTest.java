@@ -30,13 +30,18 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
  * #207: per-record CRC32C on {@link FileLogStorage} — mid-log fail-closed, last-record truncate,
- * legacy pre-{@code FLG2} read + upgrade, live map after upgrade, damaged-header fail-closed.
+ * legacy pre-{@code FLG2} read + upgrade, live map after upgrade, damaged-header fail-closed,
+ * upgrade failure rollback, no pre-upgrade map publication.
  */
 @Timeout(30)
 class FileLogCrc32cTest {
@@ -66,6 +71,22 @@ class FileLogCrc32cTest {
         log.force(GROUP);
         log.close();
         return ends;
+    }
+
+
+    /** Writes a single legacy (pre-FLG2) record at index 1 with payload {@code body}. */
+    private static void writeLegacyOne(Path root, String body) throws Exception {
+        Path log = logFile(root);
+        try (var ch = FileChannel.open(log, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            byte[] data = b(body);
+            var buf = ByteBuffer.allocate(20 + data.length);
+            buf.putLong(1L).putLong(1L).putInt(data.length).put(data);
+            buf.flip();
+            while (buf.hasRemaining()) {
+                ch.write(buf);
+            }
+        }
     }
 
     private static Throwable rootCause(Throwable err) {
@@ -438,6 +459,144 @@ class FileLogCrc32cTest {
                 || rootCause(err).getMessage().contains("damaged"),
                 "message=" + rootCause(err).getMessage());
         assertArrayEquals(before, Files.readAllBytes(log));
+    }
+
+
+
+    @Test
+    void legacyUpgradeFailureBeforeRenameDoesNotMixFormatsOnRetry() throws Exception {
+        var root = dir.resolve("legacy-upgrade-fail");
+        Files.createDirectories(root);
+        writeLegacyOne(root, "L1");
+        Path logPath = logFile(root);
+        byte[] before = Files.readAllBytes(logPath);
+        assertTrue(ByteBuffer.wrap(before, 0, 4).getInt() != FileLogStorage.LOG_MAGIC);
+
+        var re = new FileLogStorage(root);
+        String stage = logPath.getFileName() + ":rewrite-temp";
+        re.crashHook = at -> {
+            if (at.equals(stage)) {
+                throw new IllegalStateException("injected upgrade failure before rename");
+            }
+        };
+        var err = assertThrows(Exception.class, () -> re.append(GROUP, 2, 1, b("L2")));
+        assertTrue(rootCause(err).getMessage().contains("injected upgrade failure")
+                || rootCause(err).getMessage().contains("legacy log upgrade failed")
+                || err.getMessage().contains("legacy log upgrade failed"),
+                "message=" + rootCause(err).getMessage());
+        // Still unpublished / not mixed: on-disk bytes unchanged (pure legacy).
+        assertArrayEquals(before, Files.readAllBytes(logPath), "pre-rename failure must not alter legacy bytes");
+        assertFalse(re.hasPublishedLog(GROUP), "failed upgrade must not leave a usable cached log");
+        assertFalse(re.hasPublishedChannel(GROUP), "failed upgrade must not leave a usable legacy channel");
+        assertFalse(Files.exists(root.resolve(logPath.getFileName() + ".rewrite")));
+
+        // Retry after clearing the hook: clean upgrade, then append — never a mixed file.
+        re.crashHook = null;
+        re.append(GROUP, 2, 1, b("L2"));
+        re.force(GROUP);
+        assertEquals(2L, re.lastIndex(GROUP));
+        assertArrayEquals(b("L1"), re.read(GROUP, 1));
+        assertArrayEquals(b("L2"), re.read(GROUP, 2));
+        re.close();
+
+        byte[] after = Files.readAllBytes(logPath);
+        var hdr = ByteBuffer.wrap(after, 0, 8);
+        assertEquals(FileLogStorage.LOG_MAGIC, hdr.getInt());
+        assertEquals(FileLogStorage.LOG_VERSION, hdr.getInt());
+        // Reopen proves the segment is coherent FLG2 (no legacy/V2 mix).
+        var again = new FileLogStorage(root);
+        assertEquals(2L, again.lastIndex(GROUP));
+        assertArrayEquals(b("L2"), again.read(GROUP, 2));
+        again.close();
+    }
+
+    @Test
+    void legacyUpgradeDoesNotPublishMapUntilRewriteCompletes() throws Exception {
+        var root = dir.resolve("legacy-no-early-publish");
+        Files.createDirectories(root);
+        writeLegacyOne(root, "L1");
+        Path logPath = logFile(root);
+        String stage = logPath.getFileName() + ":rewrite-temp";
+
+        var re = new FileLogStorage(root);
+        var publishedDuringUpgrade = new AtomicBoolean(true); // fail closed if hook never runs
+        var hookRan = new AtomicBoolean(false);
+        re.crashHook = at -> {
+            if (at.equals(stage)) {
+                hookRan.set(true);
+                // Preferred fix: the pre-upgrade map is not in logs while rewrite runs.
+                publishedDuringUpgrade.set(re.hasPublishedLog(GROUP));
+            }
+        };
+        re.append(GROUP, 2, 1, b("L2"));
+        re.force(GROUP);
+        re.crashHook = null;
+        assertTrue(hookRan.get(), "rewrite-temp hook must run during legacy upgrade");
+        assertFalse(publishedDuringUpgrade.get(),
+                "pre-upgrade map must stay unpublished until rewrite completes");
+        assertTrue(re.hasPublishedLog(GROUP));
+        assertEquals(2L, re.lastIndex(GROUP));
+        assertArrayEquals(b("L2"), re.read(GROUP, 2));
+        re.close();
+    }
+
+    @Test
+    void concurrentCallerDuringLegacyUpgradeSeesLiveMap() throws Exception {
+        var root = dir.resolve("legacy-concurrent-upgrade");
+        Files.createDirectories(root);
+        writeLegacyOne(root, "L1");
+        Path logPath = logFile(root);
+        String stage = logPath.getFileName() + ":rewrite-temp";
+
+        var re = new FileLogStorage(root);
+        var inUpgrade = new CountDownLatch(1);
+        var peerStarted = new CountDownLatch(1);
+        var peerDone = new CountDownLatch(1);
+        var peerIndex = new AtomicReference<Long>();
+        var peerRead = new AtomicReference<byte[]>();
+        var peerErr = new AtomicReference<Throwable>();
+
+        re.crashHook = at -> {
+            if (!at.equals(stage)) {
+                return;
+            }
+            inUpgrade.countDown();
+            Thread peer = new Thread(() -> {
+                peerStarted.countDown();
+                try {
+                    // Blocks on the upgrade lock, then must observe the live post-upgrade map
+                    // (and the append that the upgrading thread performs after rewrite).
+                    peerIndex.set(re.lastIndex(GROUP));
+                    peerRead.set(re.read(GROUP, 2));
+                } catch (Throwable t) {
+                    peerErr.set(t);
+                } finally {
+                    peerDone.countDown();
+                }
+            }, "legacy-upgrade-peer");
+            peer.setDaemon(true);
+            peer.start();
+            try {
+                assertTrue(peerStarted.await(5, TimeUnit.SECONDS));
+                // Peer is blocked on lock; stay in upgrade briefly so the race window existed.
+                Thread.sleep(50);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(ie);
+            }
+        };
+
+        re.append(GROUP, 2, 1, b("L2"));
+        re.force(GROUP);
+        re.crashHook = null;
+        assertEquals(0L, inUpgrade.getCount(), "upgrade hook must have run");
+        assertTrue(peerDone.await(10, TimeUnit.SECONDS), "peer must finish after upgrade");
+        assertTrue(peerErr.get() == null, "peer error=" + peerErr.get());
+        assertEquals(2L, peerIndex.get(), "concurrent caller must see live map after upgrade+append");
+        assertArrayEquals(b("L2"), peerRead.get());
+        assertEquals(2L, re.lastIndex(GROUP));
+        assertArrayEquals(b("L2"), re.read(GROUP, 2));
+        re.close();
     }
 
 

@@ -455,16 +455,37 @@ public final class FileLogStorage implements LogStorage {
             }
             var channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
                     StandardOpenOption.WRITE);
-            channels.put(group, channel);
-            logs.put(group, loaded);
             if (pendingTorn != null && pendingTorn.torn()) {
                 truncateTornTail(path, channel, pendingTorn.lastGoodPos, pendingTorn.fileSize);
             }
             if (upgradeLegacy) {
-                // One-time rewrite to FLG2 + per-record CRC32C (#207), like the vote-file upgrade.
-                // rewrite() installs a fresh map in logs; return that live map, not the detached
-                // pre-rewrite instance, so the first append/read after upgrade stays coherent.
-                rewrite(group, loaded);
+                // One-time rewrite to FLG2 + per-record CRC32C (#207). Publish the channel so
+                // rewrite() can close it after rename, but do NOT publish {@code loaded} yet:
+                // concurrent fast-path callers must not observe the pre-upgrade map. rewrite()
+                // installs the live map only after the rename succeeds.
+                channels.put(group, channel);
+                try {
+                    rewrite(group, loaded);
+                } catch (IOException | RuntimeException failed) {
+                    if (failedClosed == null) {
+                        // Pre-rename failure: roll back so a retry cannot append V2 records into
+                        // the still-headerless legacy file (mixed format).
+                        unpublishGroup(group);
+                        try {
+                            Files.deleteIfExists(rewritePath(group));
+                        } catch (IOException ignored) {
+                            // best-effort temp cleanup
+                        }
+                    }
+                    if (failed instanceof IOException io) {
+                        throw io;
+                    }
+                    throw new IOException("legacy log upgrade failed for " + group.value()
+                            + "; refusing further use until reopen", failed);
+                }
+            } else {
+                channels.put(group, channel);
+                logs.put(group, loaded);
             }
             return logs.get(group);
         } finally {
@@ -656,6 +677,33 @@ public final class FileLogStorage implements LogStorage {
         if (failed != null) {
             throw new IOException(failed.getMessage(), failed);
         }
+    }
+
+    /**
+     * Removes any published in-memory log map and channel for {@code group}. Used when a legacy
+     * upgrade fails before rename so the instance does not keep a usable legacy channel that would
+     * accept V2 appends into a headerless file.
+     */
+    private void unpublishGroup(GroupId group) {
+        logs.remove(group);
+        var ch = channels.remove(group);
+        if (ch != null) {
+            try {
+                ch.close();
+            } catch (IOException ignored) {
+                // closing a failed upgrade channel is best-effort
+            }
+        }
+    }
+
+    /** Tests only: whether {@code group} has a published in-memory log map. */
+    boolean hasPublishedLog(GroupId group) {
+        return logs.containsKey(group);
+    }
+
+    /** Tests only: whether {@code group} has a published open channel. */
+    boolean hasPublishedChannel(GroupId group) {
+        return channels.containsKey(group);
     }
 
     /**
