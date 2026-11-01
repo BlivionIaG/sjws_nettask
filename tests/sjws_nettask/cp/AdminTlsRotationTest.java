@@ -51,6 +51,7 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.cert.X509v2CRLBuilder;
 import org.bouncycastle.cert.jcajce.JcaX509CRLConverter;
 import org.bouncycastle.asn1.x509.CRLReason;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.cluster.FakeClock;
@@ -63,6 +64,23 @@ class AdminTlsRotationTest {
 
     @TempDir
     Path dir;
+
+    @AfterEach
+    void clearStaticAbortHooks() {
+        // Static test hooks must not leak across methods (order is not fixed under Surefire).
+        AdminServer.connectionAbortForTest = null;
+        AdminServer.abortReflectFailureForTest = null;
+    }
+
+    /** Wait for the live registry to drain after an abort/close that races the assertion thread. */
+    private static void awaitLiveEmpty(AdminServer http, String message) throws InterruptedException {
+        long until = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (http.liveSize() != 0 && System.nanoTime() < until) {
+            Thread.sleep(20);
+            http.pruneDeadSessionsForTest();
+        }
+        assertEquals(0, http.liveSize(), message);
+    }
 
     private CpStore store() throws Exception {
         var keys = KeyRing.generate("online-1", NOW + 86_400_000L, 0, Long.MAX_VALUE / 2);
@@ -236,7 +254,7 @@ class AdminTlsRotationTest {
             Files.writeString(deny, "sha256:" + AdminTls.fingerprint(root.cert()) + "\n");
             assertNull(http.reloadTls());
             assertTrue(http.policyDropped() >= 1L, "live session should be dropped on reload");
-            assertEquals(0, http.liveSize(), "registry empty after policy drop");
+            awaitLiveEmpty(http, "registry empty after policy drop");
 
             var closed = assertThrows(IOException.class, () -> rawHttp(socket,
                     "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"));
@@ -283,12 +301,7 @@ class AdminTlsRotationTest {
             assertTrue(body.startsWith("HTTP/1.1 200"), body);
             assertEquals(1, http.liveSize());
             socket.close();
-            long until = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-            while (http.liveSize() != 0 && System.nanoTime() < until) {
-                Thread.sleep(20);
-                http.pruneDeadSessionsForTest();
-            }
-            assertEquals(0, http.liveSize(), "closed keep-alive connection must leave the registry");
+            awaitLiveEmpty(http, "closed keep-alive connection must leave the registry");
         }
     }
 
@@ -330,7 +343,9 @@ class AdminTlsRotationTest {
                 }
             }
             assertTrue(http.policyDropped() >= 1L, "in-flight session must be policy-dropped");
-            assertEquals(0, http.liveSize(), "registry empty after in-flight drop");
+            // dropConnectionsFailingPolicy increments policyDropped then abortQuietly before live.remove.
+            // abort closes the client socket so this thread can resume before remove runs — await/prune.
+            awaitLiveEmpty(http, "registry empty after in-flight drop");
         }
     }
 
