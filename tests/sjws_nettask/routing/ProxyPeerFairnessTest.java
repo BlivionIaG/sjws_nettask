@@ -55,7 +55,8 @@ import sjws_nettask.core.Response;
  * A request is accepted instead of refused, so this fails at runtime there.
  *
  * <p>Waits on {@link ByteBudget#setChangeObserver} rather than sleeping on budget state
- * (#298 follow-up).
+ * (#298 follow-up). Charge await is hard ({@code assertTrue}) so a missed observer cannot
+ * mask a race (#398).
  */
 class ProxyPeerFairnessTest {
 
@@ -109,7 +110,11 @@ class ProxyPeerFairnessTest {
                         if (budget.inFlight() >= 32 * 1024L) {
                             charged.countDown();
                         }
-                        charged.await(2, TimeUnit.SECONDS);
+                        // #398: hard latch like ProxyPeerBudgetTest — a missed charge must fail.
+                        assertTrue(charged.await(10, TimeUnit.SECONDS),
+                                "peer A charge never observed; in_flight=" + budget.inFlight()
+                                        + " peerInFlight="
+                                        + budget.peerInFlight(budget.peerStripe(peerA)));
                     } finally {
                         budget.setChangeObserver(null);
                     }
