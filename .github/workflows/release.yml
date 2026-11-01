@@ -11,7 +11,7 @@ on:
       version:
         description: 'Maven version for the dry-run package (no GitHub Release is created)'
         type: string
-        default: '0.0.0-dryrun'
+        default: '0.0.0-SNAPSHOT'
 
 permissions:
   contents: read
