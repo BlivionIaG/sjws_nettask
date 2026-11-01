@@ -46,6 +46,8 @@ public final class ObserverSlot {
     private volatile Supplier<ClusterStatus> cluster;
     /** Copied onto the recording observer. Not read by {@link #get()}. */
     private volatile LabelSource labels;
+    /** Extra Prometheus families (swarm stream stats). Not read by {@link #get()}. */
+    private volatile java.util.function.Supplier<String> appendix;
     /** Copied onto the recording observer. Not read by {@link #get()}. */
     private volatile String[] credentialQueryParams = AccessTargetMask.NONE;
     /** Copied onto the recording observer's metrics. Not read by {@link #get()}. */
@@ -87,6 +89,18 @@ public final class ObserverSlot {
         var obs = this.current;
         if (obs != RequestObserver.NONE) {
             obs.attachLabels(labels);
+        }
+    }
+
+    /**
+     * Extra Prometheus text appended on scrape (S2c PR 8 stream counters). Null clears. Not read on the
+     * request path; {@link RequestObserver#NONE} ignores it.
+     */
+    public void attachAppendix(java.util.function.Supplier<String> appendix) {
+        this.appendix = appendix;
+        var obs = this.current;
+        if (obs != RequestObserver.NONE) {
+            obs.attachAppendix(appendix);
         }
     }
 
@@ -156,6 +170,7 @@ public final class ObserverSlot {
         }
         observer.attachCluster(this.cluster);
         observer.attachLabels(this.labels);
+        observer.attachAppendix(this.appendix);
         observer.setCredentialQueryParams(this.credentialQueryParams);
         observer.metrics().setMsgreplInstallCounters(this.msgreplInstallPinExhausted,
                 this.msgreplInstallOversizedAbandoned);

@@ -96,6 +96,7 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
+        attachSwarmMetrics(server, modules);
         attachMessagingMetricsExporter(messagingMetrics, server);
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, null, -1L, true, modules);
     }
@@ -149,6 +150,7 @@ public class Sjws_nettask {
             err.println("Failed to start the server on port " + config.port() + ": " + e);
             return EXIT_CANNOT_LISTEN;
         }
+        attachSwarmMetrics(server, modules);
         attachMsgreplInstallMetrics(modules, server); // #315 N5: suppliers only; does not arm counters
         attachMessagingMetricsExporter(messagingMetrics, server); // #400: /metrics families
         return awaitServing(server, config, out, err, started, shutdownTimeout, pidFile, hooks, drainBudgetMs,
@@ -549,6 +551,22 @@ public class Sjws_nettask {
                 out.print(usage());
                 return EXIT_OK;
             }
+            if (arg.equals("--self-check-admin-tls-abort")) {
+                // Reflective name: SourceGuard keeps CONTROL-role types inside sjws_nettask.cp.
+                try {
+                    var probe = Class.forName("sjws_nettask.cp." + "AdminServer")
+                            .getMethod("probeConnectionAbortInstalls");
+                    if (Boolean.TRUE.equals(probe.invoke(null))) {
+                        out.println("admin-tls-abort: ok");
+                        return EXIT_OK;
+                    }
+                    err.println("admin-tls-abort: reflective abort unavailable (need jar Add-Opens or --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED)");
+                    return EXIT_USAGE;
+                } catch (ReflectiveOperationException e) {
+                    err.println("admin-tls-abort: " + e.getMessage());
+                    return EXIT_USAGE;
+                }
+            }
         }
         var opt = Daemon.parse(args, env);
         boolean child = "1".equals(env.get(Daemon.CHILD_ENV));
@@ -824,4 +842,9 @@ public class Sjws_nettask {
         }, redirectGlobals);
         exit.accept(code);
     }
+    /** S2c PR 8 N2: register stream counters on {@code /metrics} when the swarm module exposes them. */
+    private static void attachSwarmMetrics(SjwsServer server, OptionalModule modules) {
+        modules.attachPrometheus(server::attachMetricsAppendix);
+    }
+
 }
