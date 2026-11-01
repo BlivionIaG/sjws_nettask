@@ -42,7 +42,7 @@ class CpAdminDispatchTest {
 
     @AfterEach
     void clearHook() {
-        CpAdmin.testPermission = null;
+        CpAdmin.setTestPermission(null);
     }
 
     @Test
@@ -56,9 +56,9 @@ class CpAdminDispatchTest {
             var admin = new CpAdmin(store, NOW, TTL);
             var cert = new Rbac.ClientCert("urn:sjws:admin:root");
             // Test-only: authorize a path that has no handler (production hook is null).
-            CpAdmin.testPermission = (method, route) -> "POST".equals(method) && "/cp/v1/test-unmatched".equals(route)
+            CpAdmin.setTestPermission((method, route) -> "POST".equals(method) && "/cp/v1/test-unmatched".equals(route)
                     ? Permission.MANAGE_OPERATORS
-                    : null;
+                    : null);
             var body = "{\"san\":\"urn:sjws:admin:should-not-grant\",\"role\":\"viewer\"}";
             var outcome = admin.handle(cert, "POST", "/cp/v1/test-unmatched", null, body);
             assertEquals(404, outcome.status(), outcome.body());
