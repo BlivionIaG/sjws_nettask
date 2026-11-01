@@ -276,6 +276,31 @@ public final class TokenStreams {
         return "stream." + node + "#" + shard;
     }
 
+    /**
+     * True for lazy swarm stream partitions {@code stream.<node>#i} (#224 / §5.2). Used to scope Deliver/Ack
+     * {@link Durability#NONE} to those partitions only (#416).
+     */
+    static boolean isStreamPartitionTopic(String topic) {
+        if (topic == null || !topic.startsWith("stream.")) {
+            return false;
+        }
+        int hash = topic.indexOf('#', "stream.".length());
+        // node non-empty and shard suffix present (hash digit(s) after '#')
+        return hash > "stream.".length() && hash + 1 < topic.length();
+    }
+
+    /**
+     * Deliver/Ack durability for the stream-partition reader (#416). Returns {@link Durability#NONE} only when
+     * {@code topic} is a {@code stream.<node>#i} partition; otherwise refuses so regular consumer groups cannot
+     * silently take the NONE path through this helper.
+     */
+    static Durability deliverAckDurabilityForStreamPartition(String topic) {
+        if (!isStreamPartitionTopic(topic)) {
+            throw new IllegalArgumentException("Deliver/Ack NONE only for stream partitions, got: " + topic);
+        }
+        return Durability.NONE;
+    }
+
     /** This node's shard topic for a stream id (where streams submitted here are read). */
     public String topicFor(long streamHi, long streamLo) {
         return topicFor(this.node, streamHi, streamLo);
@@ -655,9 +680,11 @@ public final class TokenStreams {
     int readOnce(int shard, long waitNanos) {
         var p = this.topics.partitionWithoutDlq(shardTopic(shard));
         // Stream-partition reader Deliver/Ack are NONE: read watermark not crash-durable (§5.2 / #236 revisit).
+        // Scope guard (#416): NONE only through the stream-partition helper, never a bare literal on an arbitrary topic.
+        var deliverAck = deliverAckDurabilityForStreamPartition(p.topic());
         var got = waitNanos > 0
-                ? p.poll(READER_GROUP, this.node, 256, 30_000, waitNanos, Durability.NONE)
-                : p.poll(READER_GROUP, this.node, 256, 30_000, Durability.NONE);
+                ? p.poll(READER_GROUP, this.node, 256, 30_000, waitNanos, deliverAck)
+                : p.poll(READER_GROUP, this.node, 256, 30_000, deliverAck);
         int n = got.size();
         if (n == 0) {
             return 0;
@@ -696,7 +723,7 @@ public final class TokenStreams {
                 }
             }
         }
-        p.ack(READER_GROUP, offs, atts, Durability.NONE);
+        p.ack(READER_GROUP, offs, atts, deliverAck);
         return n;
     }
 

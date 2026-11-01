@@ -537,6 +537,7 @@ class TokenStreamsTest {
         }
         assertTrue(sawLast, "LAST Enqueue must survive restart (ASYNC produce)");
         this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        assertEquals(0, this.streams.openSinks(), "in-memory session/sink is gone after crash/restart");
         // Re-offer saved ledger copies into a fresh sink: no duplicates on a second pass.
         try (var sink = this.streams.open(cid)) {
             for (var c : first) {
@@ -550,6 +551,30 @@ class TokenStreamsTest {
             }
             assertEquals(0, sink.drain().size(), "no duplicate chunks after second ledger pass");
         }
+    }
+
+    /**
+     * #416 ruling (a): Deliver/Ack NONE is scoped to {@code stream.<node>#i} partitions only. The helper refuses
+     * every other topic so regular consumer groups cannot take the NONE path through {@code readOnce}.
+     */
+    @Test
+    void deliverAckNoneScopedToStreamPartitionsOnly() {
+        assertTrue(TokenStreams.isStreamPartitionTopic("stream.n1#0"));
+        assertTrue(TokenStreams.isStreamPartitionTopic(TokenStreams.shardTopic("n1", 3)));
+        assertFalse(TokenStreams.isStreamPartitionTopic("orders"));
+        assertFalse(TokenStreams.isStreamPartitionTopic("tasks.p"));
+        assertFalse(TokenStreams.isStreamPartitionTopic("reply.n1"));
+        assertFalse(TokenStreams.isStreamPartitionTopic("stream.")); // no node / shard
+        assertFalse(TokenStreams.isStreamPartitionTopic("stream.n1")); // no #shard
+        assertFalse(TokenStreams.isStreamPartitionTopic("stream.n1#")); // empty shard
+        assertFalse(TokenStreams.isStreamPartitionTopic(null));
+        assertEquals(Durability.NONE, TokenStreams.deliverAckDurabilityForStreamPartition("stream.n1#0"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TokenStreams.deliverAckDurabilityForStreamPartition("orders"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TokenStreams.deliverAckDurabilityForStreamPartition("tasks.gen"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TokenStreams.deliverAckDurabilityForStreamPartition("stream.n1"));
     }
 
     /**
