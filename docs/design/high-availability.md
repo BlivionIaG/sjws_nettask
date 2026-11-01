@@ -10,7 +10,8 @@ This is the HA behavior on master after the witness vote cursor
 [#144](https://github.com/BlivionIaG/sjws_nettask/pull/144),
 [#145](https://github.com/BlivionIaG/sjws_nettask/pull/145)).
 The choice of option A is recorded in [two-node HA decision](two-node-ha-decision.md).
-[HA design](../ha/design.md) is the earlier draft (serving sketch, N-node roadmap).
+[HA design](../ha/design.md) is the earlier draft (serving sketch, N-node roadmap, **planned** §13).
+This file is **normative for shipped** HA behaviour on master; prefer it when the draft disagrees.
 Where this file and that draft disagree, this file is the implementation.
 
 `sjws_nettask.cluster` does not import `sjws_nettask.ha`, HTTP, or Netty.
