@@ -16,6 +16,7 @@
  */
 package sjws_nettask.cp;
 
+
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.IOException;
@@ -396,6 +397,13 @@ class AdminTlsRotationTest {
     }
 
 
+    /** Surefire argLine must open jdk.httpserver so abort installs in-process. */
+    @Test
+    void connectionAbortInstallsUnderConfiguredJvmOpens() throws Exception {
+        assertTrue(AdminServer.probeConnectionAbortInstalls(),
+                "need --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED (surefire argLine)");
+    }
+
     /** Without a reflective abort handle: WARN path increments the counter and forces Connection: close. */
     @Test
     void nullAbortForcesConnectionCloseAndCounts() throws Exception {
@@ -425,17 +433,137 @@ class AdminTlsRotationTest {
         }
     }
 
+
+    /** InaccessibleObjectException from setAccessible must not fail the handler; degrade like null abort. */
+    @Test
+    void inaccessibleObjectExceptionDegradesToNullAbortPath() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-ioe.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-ioe-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-ioe.pem"), ca.cert());
+        AdminServer.abortReflectFailureForTest =
+                new java.lang.reflect.InaccessibleObjectException("forced for test");
+        try (var store = store();
+                var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust);
+                SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                        .createSocket("127.0.0.1", http.port())) {
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            long before = http.abortUnavailable();
+            long warnsBefore = http.abortUnavailableWarns();
+            var body = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+            assertTrue(body.startsWith("HTTP/1.1 200"), body);
+            assertTrue(body.toLowerCase(java.util.Locale.ROOT).contains("connection: close"), body);
+            assertTrue(http.abortUnavailable() > before, "IOE path must bump abortUnavailable");
+            assertTrue(http.abortUnavailableWarns() > warnsBefore, "IOE path must emit WARNING");
+            assertEquals(0, http.liveSize(), "IOE path must not retain a keep-alive Live");
+        } finally {
+            AdminServer.abortReflectFailureForTest = null;
+        }
+    }
+
+
+    /**
+     * Write {@code request} and return the complete framed HTTP response (status line, headers, and
+     * body per {@code Content-Length} or chunked transfer). A single {@code InputStream#read} is not
+     * enough: leftover body bytes would be mistaken for a later keep-alive response.
+     */
     private static String rawHttp(SSLSocket socket, String request) throws IOException {
         var out = socket.getOutputStream();
         out.write(request.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
         out.flush();
         var in = socket.getInputStream();
-        var buf = new byte[16_384];
-        int n = in.read(buf);
-        if (n < 0) {
-            throw new IOException("admin connection closed");
+        var headerBytes = new java.io.ByteArrayOutputStream();
+        int match = 0;
+        while (match < 4) {
+            int b = in.read();
+            if (b < 0) {
+                throw new IOException("admin connection closed");
+            }
+            headerBytes.write(b);
+            if (b == (match == 0 || match == 2 ? '\r' : '\n')) {
+                match++;
+            } else {
+                match = b == '\r' ? 1 : 0;
+            }
         }
-        return new String(buf, 0, n, java.nio.charset.StandardCharsets.US_ASCII);
+        var headers = headerBytes.toString(java.nio.charset.StandardCharsets.US_ASCII);
+        var lower = headers.toLowerCase(java.util.Locale.ROOT);
+        var body = new java.io.ByteArrayOutputStream();
+        int cl = contentLength(lower);
+        if (cl >= 0) {
+            readFully(in, body, cl);
+        } else if (lower.contains("transfer-encoding: chunked")) {
+            readChunked(in, body);
+        } else if (lower.contains("connection: close")) {
+            in.transferTo(body);
+        }
+        return headers + body.toString(java.nio.charset.StandardCharsets.US_ASCII);
+    }
+
+    private static int contentLength(String lowerHeaders) {
+        for (var line : lowerHeaders.split("\r\n")) {
+            if (line.startsWith("content-length:")) {
+                return Integer.parseInt(line.substring("content-length:".length()).trim());
+            }
+        }
+        return -1;
+    }
+
+    private static void readFully(java.io.InputStream in, java.io.ByteArrayOutputStream out, int n)
+            throws IOException {
+        var buf = new byte[Math.min(n, 8192)];
+        int left = n;
+        while (left > 0) {
+            int r = in.read(buf, 0, Math.min(buf.length, left));
+            if (r < 0) {
+                throw new IOException("admin connection closed");
+            }
+            out.write(buf, 0, r);
+            left -= r;
+        }
+    }
+
+    private static void readChunked(java.io.InputStream in, java.io.ByteArrayOutputStream out) throws IOException {
+        while (true) {
+            var sizeLine = readLine(in);
+            int semi = sizeLine.indexOf(';');
+            int size = Integer.parseInt((semi < 0 ? sizeLine : sizeLine.substring(0, semi)).trim(), 16);
+            if (size == 0) {
+                // trailers + final CRLF
+                while (true) {
+                    var trailer = readLine(in);
+                    if (trailer.isEmpty()) {
+                        return;
+                    }
+                }
+            }
+            readFully(in, out, size);
+            // chunk CRLF
+            if (in.read() != '\r' || in.read() != '\n') {
+                throw new IOException("bad chunk framing");
+            }
+        }
+    }
+
+    private static String readLine(java.io.InputStream in) throws IOException {
+        var line = new java.io.ByteArrayOutputStream();
+        int prev = -1;
+        while (true) {
+            int b = in.read();
+            if (b < 0) {
+                throw new IOException("admin connection closed");
+            }
+            if (prev == '\r' && b == '\n') {
+                return line.toString(java.nio.charset.StandardCharsets.US_ASCII);
+            }
+            if (prev >= 0) {
+                line.write(prev);
+            }
+            prev = b;
+        }
     }
 
 

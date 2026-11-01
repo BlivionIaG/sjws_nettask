@@ -79,6 +79,8 @@ public final class AdminServer implements AutoCloseable {
     };
     /** Test-only: when non-null, {@link #connectionAbort} returns this supplier's value. */
     static volatile java.util.function.Supplier<ConnAbort> connectionAbortForTest;
+    /** When non-null, {@link #connectionAbort} throws this instead of reflecting (tests). */
+    public static volatile RuntimeException abortReflectFailureForTest;
 
 
     /**
@@ -529,6 +531,10 @@ public final class AdminServer implements AutoCloseable {
             return override.get();
         }
         try {
+            var forced = abortReflectFailureForTest;
+            if (forced != null) {
+                throw forced;
+            }
             var implField = exchange.getClass().getDeclaredField("impl");
             implField.setAccessible(true);
             var exchangeImpl = implField.get(exchange);
@@ -542,8 +548,53 @@ public final class AdminServer implements AutoCloseable {
             var getChannel = connection.getClass().getDeclaredMethod("getChannel");
             getChannel.setAccessible(true);
             return new ConnAbort(connection, close, closedField, getChannel);
-        } catch (ReflectiveOperationException e) {
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            // InaccessibleObjectException (Java 9+) is a RuntimeException, not ReflectiveOperationException.
             return null;
+        }
+    }
+
+    /**
+     * True when this JVM can install a reflective abort handle (manifest {@code Add-Opens} or
+     * {@code --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED}). Used by
+     * {@code --self-check-admin-tls-abort} under {@code java -jar}.
+     */
+    public static boolean probeConnectionAbortInstalls() throws IOException, InterruptedException {
+        var http = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        var done = new java.util.concurrent.CountDownLatch(1);
+        var installed = new java.util.concurrent.atomic.AtomicBoolean();
+        var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        http.createContext("/", exchange -> {
+            try {
+                var abort = connectionAbort(exchange);
+                installed.set(abort != null);
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+            } catch (Throwable t) {
+                failure.set(t);
+            } finally {
+                done.countDown();
+            }
+        });
+        http.start();
+        try {
+            try (var socket = new java.net.Socket("127.0.0.1", http.getAddress().getPort())) {
+                socket.setSoTimeout(5_000);
+                var req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                socket.getOutputStream().write(req.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                socket.getOutputStream().flush();
+                socket.getInputStream().readAllBytes();
+            }
+            if (!done.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                throw new IOException("admin-tls abort probe timed out");
+            }
+            var err = failure.get();
+            if (err != null) {
+                throw new IOException("admin-tls abort probe failed: " + err, err);
+            }
+            return installed.get();
+        } finally {
+            http.stop(0);
         }
     }
 
