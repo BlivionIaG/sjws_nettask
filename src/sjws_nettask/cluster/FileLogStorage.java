@@ -48,8 +48,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * as authoritative from its first index on.
  *
  * <p>On open, a torn (half-written) last record is detected by length/framing, truncated, and the file and directory
- * are fsynced (#241). Mid-log framing corruption fails closed. Per-record CRC32C for bit flips inside a well-framed
- * record is #207 and is not required to drop a crash torn tail.
+ * are fsynced (#241). Mid-log framing corruption fails closed. Each record carries a CRC32C over
+ * {@code index|term|len|data} (#207): a mismatch on the last record is treated as a corrupt/torn tail and truncated;
+ * a mismatch earlier in the file fails closed. On-disk format is versioned ({@code FLG2} file header); legacy
+ * pre-CRC segments are readable and upgraded to the CRC format on open (active file rewrite).
  */
 public final class FileLogStorage implements LogStorage {
 
@@ -101,17 +103,65 @@ public final class FileLogStorage implements LogStorage {
     }
 
     /**
-     * One file scan: complete {@code [index][term][len][data]} records and the end offset of the last
-     * one. A torn tail ({@code lastGoodPos < fileSize}) is truncated by the caller with an fsync of
-     * the file and directory (#241). Header and body reads loop until full or EOF: a short mid-file
-     * read is never treated as torn. A complete header with a negative length fails closed. Index
-     * gaps are mode-specific: non-rolling refuses them; rolling keeps the contiguous suffix ending
-     * at the newest entry when that suffix starts at {@code snapIndex + 1} (or at/below snapIndex).
-     * Bit flips inside a well-framed record need per-record CRC32C (#207).
+     * One file scan: complete records and the end offset of the last one. A torn or CRC-corrupt tail
+     * ({@code lastGoodPos < fileSize}) is truncated by the caller with an fsync of the file and directory
+     * (#241, #207). Header and body reads loop until full or EOF: a short mid-file read is never treated
+     * as torn. A complete header with a negative length, or a CRC mismatch with bytes after the record,
+     * fails closed. {@code legacy} is true when the file had no {@code FLG2} header (pre-#207).
      */
-    record Scan(java.util.TreeMap<Long, Rec> records, long lastGoodPos, long fileSize) {
+    record Scan(java.util.TreeMap<Long, Rec> records, long lastGoodPos, long fileSize, boolean legacy) {
         boolean torn() {
             return lastGoodPos < fileSize;
+        }
+    }
+
+    /** {@code "FLG2"}: versioned Raft log segment with per-record CRC32C (#207). */
+    static final int LOG_MAGIC = 0x464C4732;
+    static final int LOG_VERSION = 1;
+    static final int LOG_FILE_HEADER_BYTES = 8;
+    static final int RECORD_HEADER_BYTES = 20;
+    static final int RECORD_CRC_BYTES = 4;
+
+    /** CRC32C of {@code index|term|len|data} (the bytes preceding the trailing CRC word). */
+    static int recordCrc(long index, long term, byte[] data) {
+        var buf = ByteBuffer.allocate(RECORD_HEADER_BYTES + data.length);
+        buf.putLong(index);
+        buf.putLong(term);
+        buf.putInt(data.length);
+        buf.put(data);
+        var crc = new java.util.zip.CRC32C();
+        crc.update(buf.array(), 0, buf.capacity());
+        return (int) crc.getValue();
+    }
+
+    static void writeLogFileHeader(FileChannel ch) throws IOException {
+        var h = ByteBuffer.allocate(LOG_FILE_HEADER_BYTES);
+        h.putInt(LOG_MAGIC);
+        h.putInt(LOG_VERSION);
+        h.flip();
+        while (h.hasRemaining()) {
+            ch.write(h);
+        }
+    }
+
+    static void writeRecordV2(FileChannel ch, long index, long term, byte[] data) throws IOException {
+        int crc = recordCrc(index, term, data);
+        var buf = ByteBuffer.allocate(RECORD_HEADER_BYTES + data.length + RECORD_CRC_BYTES);
+        buf.putLong(index);
+        buf.putLong(term);
+        buf.putInt(data.length);
+        buf.put(data);
+        buf.putInt(crc);
+        buf.flip();
+        while (buf.hasRemaining()) {
+            ch.write(buf);
+        }
+    }
+
+    /** Ensures a brand-new empty segment starts with the {@code FLG2} header before the first record. */
+    private static void ensureLogFileHeader(FileChannel channel) throws IOException {
+        if (channel.size() == 0) {
+            writeLogFileHeader(channel);
         }
     }
 
@@ -136,7 +186,7 @@ public final class FileLogStorage implements LogStorage {
     static Scan scanRecords(Path path) throws IOException {
         var out = new java.util.TreeMap<Long, Rec>();
         if (!Files.exists(path) || Files.size(path) == 0) {
-            return new Scan(out, 0L, 0L);
+            return new Scan(out, 0L, 0L, false);
         }
         long fileSize = Files.size(path);
         try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
@@ -146,22 +196,72 @@ public final class FileLogStorage implements LogStorage {
 
     /**
      * Scans {@code in} as a Raft log of {@code fileSize} bytes. Package-visible so tests can inject
-     * a short-read {@link java.nio.channels.ReadableByteChannel} wrapper.
+     * a short-read {@link java.nio.channels.ReadableByteChannel} wrapper. Detects {@code FLG2}
+     * (CRC32C records) vs legacy pre-#207 framing from the first eight bytes.
      */
     static Scan scanRecords(java.nio.channels.ReadableByteChannel in, long fileSize, Path path)
             throws IOException {
         var out = new java.util.TreeMap<Long, Rec>();
-        long lastGood = 0L;
-        long pos = 0L;
-        var header = ByteBuffer.allocate(20);
+        if (fileSize == 0) {
+            return new Scan(out, 0L, 0L, false);
+        }
+        var peek = ByteBuffer.allocate(LOG_FILE_HEADER_BYTES);
+        int peekGot = readFullyOrEof(in, peek);
+        if (peekGot < LOG_FILE_HEADER_BYTES) {
+            // Fewer than 8 bytes: cannot be a FLG2 header; legacy torn stub.
+            return new Scan(out, 0L, fileSize, true);
+        }
+        peek.flip();
+        int magic = peek.getInt(0);
+        int version = peek.getInt(4);
+        boolean v2;
+        boolean legacy;
+        long pos;
+        long lastGood;
+        ByteBuffer pendingHeader = null;
+        if (magic == LOG_MAGIC) {
+            if (version != LOG_VERSION) {
+                throw new IOException("unsupported log format version " + version + " in "
+                        + path.getFileName() + "; refusing to start");
+            }
+            v2 = true;
+            legacy = false;
+            pos = LOG_FILE_HEADER_BYTES;
+            lastGood = LOG_FILE_HEADER_BYTES;
+        } else {
+            v2 = false;
+            legacy = true;
+            pos = 0L;
+            lastGood = 0L;
+            pendingHeader = ByteBuffer.allocate(RECORD_HEADER_BYTES);
+            peek.position(0);
+            pendingHeader.put(peek);
+        }
+        var header = ByteBuffer.allocate(RECORD_HEADER_BYTES);
+        var crcBuf = ByteBuffer.allocate(RECORD_CRC_BYTES);
         while (pos < fileSize) {
             long recordStart = pos;
             header.clear();
-            int got = readFullyOrEof(in, header);
-            if (got < 20) {
-                break; // real EOF before a complete header: torn tail
+            if (pendingHeader != null) {
+                pendingHeader.flip();
+                header.put(pendingHeader);
+                pendingHeader = null;
+                int need = RECORD_HEADER_BYTES - header.position();
+                if (need > 0) {
+                    var rest = header.slice();
+                    int got = readFullyOrEof(in, rest);
+                    if (got < need) {
+                        break; // torn before complete header
+                    }
+                    header.position(RECORD_HEADER_BYTES);
+                }
+            } else {
+                int got = readFullyOrEof(in, header);
+                if (got < RECORD_HEADER_BYTES) {
+                    break; // real EOF before a complete header: torn tail
+                }
             }
-            pos += 20;
+            pos += RECORD_HEADER_BYTES;
             header.flip();
             long index = header.getLong();
             long term = header.getLong();
@@ -173,8 +273,9 @@ public final class FileLogStorage implements LogStorage {
                         + "; refusing to start");
             }
             long remaining = fileSize - pos;
-            if (len > remaining) {
-                break; // body would run past EOF: torn tail
+            long needBody = len + (v2 ? RECORD_CRC_BYTES : 0);
+            if (needBody > remaining) {
+                break; // body/CRC would run past EOF: torn tail
             }
             var data = new byte[len];
             var body = ByteBuffer.wrap(data);
@@ -183,19 +284,68 @@ public final class FileLogStorage implements LogStorage {
                 break; // real EOF mid-body: torn tail
             }
             pos += len;
+            if (v2) {
+                crcBuf.clear();
+                int crcGot = readFullyOrEof(in, crcBuf);
+                if (crcGot < RECORD_CRC_BYTES) {
+                    break; // torn before CRC word
+                }
+                pos += RECORD_CRC_BYTES;
+                crcBuf.flip();
+                int stored = crcBuf.getInt();
+                int expect = recordCrc(index, term, data);
+                if (stored != expect) {
+                    if (pos >= fileSize) {
+                        // Last framed record fails CRC: corrupt/torn tail — drop it.
+                        break;
+                    }
+                    throw new IOException("corrupt log record CRC32C in " + path.getFileName()
+                            + " at offset " + recordStart + "; refusing to start");
+                }
+            }
             out.put(index, new Rec(term, data));
             lastGood = pos;
         }
-        return new Scan(out, lastGood, fileSize);
+        return new Scan(out, lastGood, fileSize, legacy);
     }
 
     /** Scans {@code path} and, when the tail is torn, truncates it and fsyncs the file and directory. */
     private java.util.TreeMap<Long, Rec> readRecords(Path path) throws IOException {
+        return readRecords(path, false);
+    }
+
+    /**
+     * @param upgradeLegacy when true and the file is pre-{@code FLG2}, rewrite it with a header and
+     *                      per-record CRC32C (active {@code .log} on rolling open; sealed {@code .seg}
+     *                      stay readable as legacy until prefix-truncated).
+     */
+    private java.util.TreeMap<Long, Rec> readRecords(Path path, boolean upgradeLegacy) throws IOException {
         var scan = scanRecords(path);
         if (scan.torn()) {
             truncateTornTail(path, null, scan.lastGoodPos, scan.fileSize);
         }
+        if (upgradeLegacy && scan.legacy() && Files.exists(path) && Files.size(path) > 0) {
+            writeV2Segment(path, scan.records);
+        }
         return scan.records;
+    }
+
+    /** Crash-safe rewrite of {@code target} as an {@code FLG2} segment (header + CRC records). */
+    private void writeV2Segment(Path target, NavigableMap<Long, Rec> keep) throws IOException {
+        var tmp = target.resolveSibling(target.getFileName().toString() + ".upgrade");
+        Files.deleteIfExists(tmp);
+        try (var out = FileChannel.open(tmp, java.util.Set.of(StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.WRITE, java.nio.file.LinkOption.NOFOLLOW_LINKS), OWNER_ONLY)) {
+            writeLogFileHeader(out);
+            for (var entry : keep.entrySet()) {
+                writeRecordV2(out, entry.getKey(), entry.getValue().term, entry.getValue().data);
+            }
+            out.force(true);
+        }
+        Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        try (var dir = FileChannel.open(root, StandardOpenOption.READ)) {
+            dir.force(true);
+        }
     }
 
     /**
@@ -255,12 +405,14 @@ public final class FileLogStorage implements LogStorage {
             var path = path(group);
             Files.deleteIfExists(rewritePath(group));
             Scan pendingTorn = null;
+            boolean upgradeLegacy = false;
             if (rolling()) {
                 loadRolling(group, loaded);
             } else if (Files.exists(path) && Files.size(path) > 0) {
                 pendingTorn = scanRecords(path);
                 loaded.putAll(pendingTorn.records);
                 refuseNonContiguous(path, loaded);
+                upgradeLegacy = pendingTorn.legacy();
             }
             var channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
                     StandardOpenOption.WRITE);
@@ -268,6 +420,10 @@ public final class FileLogStorage implements LogStorage {
             logs.put(group, loaded);
             if (pendingTorn != null && pendingTorn.torn()) {
                 truncateTornTail(path, channel, pendingTorn.lastGoodPos, pendingTorn.fileSize);
+            }
+            if (upgradeLegacy) {
+                // One-time rewrite to FLG2 + per-record CRC32C (#207), like the vote-file upgrade.
+                rewrite(group, loaded);
             }
             return loaded;
         } finally {
@@ -291,16 +447,9 @@ public final class FileLogStorage implements LogStorage {
         lock.lock();
         try {
             var channel = channels.get(group);
+            ensureLogFileHeader(channel);
             channel.position(channel.size());
-            var header = ByteBuffer.allocate(20 + copy.length);
-            header.putLong(index);
-            header.putLong(term);
-            header.putInt(copy.length);
-            header.put(copy);
-            header.flip();
-            while (header.hasRemaining()) {
-                channel.write(header);
-            }
+            writeRecordV2(channel, index, term, copy);
             log.put(index, new Rec(term, copy));
             maybeRoll(group, channel, log, index);
         } finally {
@@ -417,17 +566,10 @@ public final class FileLogStorage implements LogStorage {
             try (var out = FileChannel.open(tmp, java.util.Set.of(StandardOpenOption.CREATE_NEW,
                     StandardOpenOption.WRITE, java.nio.file.LinkOption.NOFOLLOW_LINKS),
                     OWNER_ONLY)) {
+                writeLogFileHeader(out);
                 for (var entry : keep.entrySet()) {
                     var rec = entry.getValue();
-                    var header = ByteBuffer.allocate(20 + rec.data.length);
-                    header.putLong(entry.getKey());
-                    header.putLong(rec.term);
-                    header.putInt(rec.data.length);
-                    header.put(rec.data);
-                    header.flip();
-                    while (header.hasRemaining()) {
-                        out.write(header);
-                    }
+                    writeRecordV2(out, entry.getKey(), rec.term, rec.data);
                     fresh.put(entry.getKey(), rec);
                 }
                 crashPoint(target.getFileName() + ":rewrite-written");
@@ -504,7 +646,7 @@ public final class FileLogStorage implements LogStorage {
                 loaded.putAll(recs);
             }
         }
-        var active = readRecords(path(group));
+        var active = readRecords(path(group), true);
         if (!active.isEmpty()) {
             loaded.tailMap(active.firstKey(), true).clear();
             loaded.putAll(active);

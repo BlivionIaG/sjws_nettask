@@ -111,11 +111,12 @@ The leader counts an append response only when the voter id in its body matches 
 authenticated sender of the frame, so one member cannot refresh another's liveness or
 `matchIndex` (a member holding the group key can still lie about itself, #175).
 
-The marker byte is protected on the wire (inside the HMAC-covered frame body) but not on disk:
-`FileLogStorage` records (`index, term, len, data`) carry no checksum, so a bit flip on disk can
-turn `USER_STRICT` (4) into `USER` (0), or garble the payload, without detection. Per-record
-CRCs are tracked in #207. Every member holds the group key, so a compromised member
-can forge the marker either way (the #175 limitation).
+The marker byte is protected on the wire (inside the HMAC-covered frame body). On disk,
+`FileLogStorage` records are versioned (`FLG2` file header) and each carries a CRC32C over
+`index|term|len|data` (#207): a mid-log CRC mismatch fails closed; a corrupt last record is
+truncated like a torn tail. Legacy pre-CRC segments are readable and upgraded on open. Every
+member holds the group key, so a compromised member can forge the marker either way (the #175
+limitation).
 
 ### durableIndex and the RELAXED fsync-lag bound
 
