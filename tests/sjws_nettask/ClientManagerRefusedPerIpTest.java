@@ -14,7 +14,9 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * A2 (inceptor 2026-10-30 / Architecture 2026-10-30): hitting {@code max_connections_per_ip}
  * increments {@link ClientManager#refusedPerIp()} on the refuse branch
- * ({@code ClientManager.java:313}) and publishes {@code sjws_connections_refused_per_ip_total}.
+ * ({@code ClientManager.java} refuseWith503) and publishes {@code sjws_connections_refused_per_ip_total}.
+ * #327/#448: cleartext h1 refuse sends the canned 503 (Retry-After: 1, Connection: close,
+ * Content-Length: 0) then EOF — not a silent close.
  */
 @org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class ClientManagerRefusedPerIpTest {
@@ -46,8 +48,14 @@ class ClientManagerRefusedPerIpTest {
                 try (var second = new Socket()) {
                     second.connect(new InetSocketAddress("127.0.0.1", port), 2000);
                     second.setSoTimeout(1500);
-                    assertEquals(-1, second.getInputStream().read(),
-                            "refused accept must close without an HTTP response");
+                    // No client request: same as HardeningIntegrationTest.connectionsPerAddressAreCapped
+                    // (avoids racing refuseWith503's one-shot drain + close).
+                    HttpTestSupport.Response r = HttpTestSupport.readResponse(second.getInputStream());
+                    assertEquals(503, r.statusCode(), r.rawHead());
+                    assertEquals("1", r.headers().get("retry-after"), r.rawHead());
+                    assertEquals("close", r.headers().get("connection"), r.rawHead());
+                    assertEquals("0", r.headers().get("content-length"), r.rawHead());
+                    assertEquals(-1, second.getInputStream().read(), "EOF after the canned 503");
                 }
                 long after = before;
                 deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
