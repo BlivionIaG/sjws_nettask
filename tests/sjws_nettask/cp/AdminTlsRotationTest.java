@@ -395,6 +395,34 @@ class AdminTlsRotationTest {
         }
     }
 
+
+    /** Without a reflective abort handle: WARN path increments the counter and forces Connection: close. */
+    @Test
+    void nullAbortForcesConnectionCloseAndCounts() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server-nullabort.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-nullabort-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca-nullabort.pem"), ca.cert());
+        AdminServer.connectionAbortForTest = () -> null;
+        try (var store = store();
+                var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust);
+                SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                        .createSocket("127.0.0.1", http.port())) {
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            long before = http.abortUnavailable();
+            var body = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+            assertTrue(body.startsWith("HTTP/1.1 200"), body);
+            assertTrue(body.toLowerCase(java.util.Locale.ROOT).contains("connection: close"), body);
+            assertTrue(http.abortUnavailable() > before, "null abort must bump abortUnavailable");
+            assertEquals(0, http.liveSize(), "null abort must not retain a keep-alive Live");
+        } finally {
+            AdminServer.connectionAbortForTest = null;
+        }
+    }
+
     private static String rawHttp(SSLSocket socket, String request) throws IOException {
         var out = socket.getOutputStream();
         out.write(request.getBytes(java.nio.charset.StandardCharsets.US_ASCII));

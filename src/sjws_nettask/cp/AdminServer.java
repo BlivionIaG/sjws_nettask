@@ -75,6 +75,9 @@ public final class AdminServer implements AutoCloseable {
     /** Test hook: runs after register and before {@code admin.handle}. */
     volatile Runnable afterRegisterBeforeHandle = () -> {
     };
+    /** Test-only: when non-null, {@link #connectionAbort} returns this supplier's value. */
+    static volatile java.util.function.Supplier<ConnAbort> connectionAbortForTest;
+
 
     /**
      * Mutable so a reload can mark {@link #dropped} and a late {@link #abort} fill still sees the drop.
@@ -513,6 +516,10 @@ public final class AdminServer implements AutoCloseable {
      * {@code --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED}.
      */
     static ConnAbort connectionAbort(HttpExchange exchange) {
+        var override = connectionAbortForTest;
+        if (override != null) {
+            return override.get();
+        }
         try {
             var implField = exchange.getClass().getDeclaredField("impl");
             implField.setAccessible(true);
