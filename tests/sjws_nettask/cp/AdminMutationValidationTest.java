@@ -123,7 +123,7 @@ class AdminMutationValidationTest {
             store.drive();
             var client = HttpClient.newHttpClient();
             var base = "http://127.0.0.1:" + http.port() + "/cp/v1/rbac";
-            var body = "{"san":"urn:sjws:admin:x","role":"viewer"}";
+            var body = "{\"san\":\"urn:sjws:admin:x\",\"role\":\"viewer\"}";
             var blank = client.send(HttpRequest.newBuilder(URI.create(base)).timeout(Duration.ofSeconds(3))
                     .header("Origin", "   ")
                     .header("Content-Type", "application/json")
