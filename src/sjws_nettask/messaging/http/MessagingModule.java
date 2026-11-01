@@ -71,6 +71,8 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
 
     private final LogTopics topics;
     private volatile MessagingHooks hooks = MessagingHooks.NONE;
+    /** Mounted handler; updated when {@link #hooks(MessagingHooks)} runs after contribute. */
+    private volatile MessagingHttp http;
     private volatile boolean producerDedup = flag(setting(PRODUCER_DEDUP_PROPERTY, PRODUCER_DEDUP_ENV, ""));
     /** Null unless a retention limit or a compacted topic is set: no thread when both are off. */
     private java.util.concurrent.ScheduledExecutorService retentionTimer;
@@ -232,9 +234,17 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         this.producerDedup = on;
     }
 
-    /** Installs the metrics hooks (see {@link MessagingHooks}); call before the server mounts the module. */
+    /**
+     * Installs the metrics hooks (see {@link MessagingHooks}). Safe before or after
+     * {@link #contribute}: when the HTTP handler is already mounted, it is updated too so a
+     * deferred arm (metrics off at start, armed later) actually records.
+     */
     public void hooks(MessagingHooks h) {
         this.hooks = java.util.Objects.requireNonNull(h);
+        var http = this.http;
+        if (http != null) {
+            http.hooks(h);
+        }
     }
 
     @Override
@@ -242,6 +252,7 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         var h = new MessagingHttp(this.topics);
         h.hooks(this.hooks);
         h.producerDedup(this.producerDedup);
+        this.http = h;
         mounts.mount("/messaging/v1", h);
     }
 

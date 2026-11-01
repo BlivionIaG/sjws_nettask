@@ -111,15 +111,23 @@ final class MessagingHttp implements Handler {
         try {
             return switch (request.method()) {
                 case "POST" -> {
+                    var hooks = this.hooks;
+                    if (hooks == MessagingHooks.NONE) {
+                        yield produce(topic, request, target);
+                    }
                     long t0 = System.nanoTime();
                     var r = produce(topic, request, target);
-                    this.hooks.produced(topic, r.status(), Math.max(0, request.body().length()), System.nanoTime() - t0);
+                    hooks.produced(topic, r.status(), Math.max(0, request.body().length()), System.nanoTime() - t0);
                     yield r;
                 }
                 case "GET" -> {
+                    var hooks = this.hooks;
+                    if (hooks == MessagingHooks.NONE) {
+                        yield fetch(topic, query(q < 0 ? "" : target.substring(q + 1)), request, target);
+                    }
                     long t0 = System.nanoTime();
                     var r = fetch(topic, query(q < 0 ? "" : target.substring(q + 1)), request, target);
-                    this.hooks.fetched(topic, r.status(), Math.max(0, r.contentLength()), System.nanoTime() - t0);
+                    hooks.fetched(topic, r.status(), Math.max(0, r.contentLength()), System.nanoTime() - t0);
                     yield r;
                 }
                 default -> {
