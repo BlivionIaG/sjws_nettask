@@ -57,9 +57,9 @@ import java.util.Set;
  * no {@code O_NONBLOCK}): someone with write access in the root who swaps a FIFO in exactly then
  * blocks that writer thread in {@code open} until the FIFO is opened for writing.
  * <p>
- * <b>macOS</b> (no {@link SecureDirectoryStream}): each path component is opened with {@code openat}
- * and {@code O_NOFOLLOW} through the foreign linker, so a parent swapped for a symlink fails with
- * {@code ELOOP} the same way secure mode does. The helper class loads only on macOS.
+ * <b>macOS</b>: each path component is opened with {@code openat} and {@code O_NOFOLLOW} through
+ * the foreign linker ({@link SafeOpenAt}), so a parent swapped for a symlink fails with
+ * {@code ELOOP} the same way Linux secure mode does. The helper class loads only on macOS.
  * <p>
  * <b>Fallback</b> (Windows; and, when allowed, directories without read permission): the path is opened with
  * {@code NOFOLLOW_LINKS} (last component only), then immediately re-resolved with
@@ -74,7 +74,7 @@ public final class SafeOpen {
     /** True where secure mode is available on the default file system. */
     public static final boolean SECURE = probe();
 
-    /** macOS has no SecureDirectoryStream; {@link SafeOpenAt} covers that case with {@code openat}. */
+    /** When true, production opens go through {@link SafeOpenAt} ({@code openat}/{@code O_NOFOLLOW}). */
     static final boolean MAC_OS = System.getProperty("os.name", "").toLowerCase().contains("mac");
 
     /**
@@ -155,12 +155,14 @@ public final class SafeOpen {
      * @throws IOException if the file can't be opened (deleted, unreadable)
      */
     public static FileChannel open(Body.FileBody file) throws IOException {
-        return open(file, SECURE);
+        // macOS: always use openat (SafeOpenAt). Newer JDKs may probe true for
+        // SecureDirectoryStream there; production still pins via openat (#344).
+        return open(file, SECURE && !MAC_OS, MAC_OS);
     }
 
     /** @param secure false forces the fallback (tests; platforms without secure mode) */
     static FileChannel open(Body.FileBody file, boolean secure) throws IOException {
-        return open(file, secure, !secure && MAC_OS);
+        return open(file, secure, false);
     }
 
     /**
