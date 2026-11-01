@@ -7,9 +7,9 @@ Operator profiles: [JVM flags](../operations/jvm-flags.md).
 ## Summary
 
 - **Keep G1 as the default.** On HTTP (wrk2 1 KiB / 64 KiB) every GC is within noise at p99 (≈2.0–2.3 ms on this loopback box) and G1 has the best messaging produce throughput with a modest RSS.
-- **Recommend generational ZGC with a pinned heap (`-XX:+UseZGC -Xms<N> -Xmx<N> -XX:SoftMaxHeapSize=<0.75N>`) as the documented latency profile** for swarm request/reply and messaging-fetch nodes: max pause 0.02–0.06 ms vs 7–10 ms on G1, fetch p99.9 266 µs vs 1004 µs, produce at 96% of G1 throughput. Pinning matters: unpinned ZGC grows RSS to 1.19 GiB and loses 14% produce throughput.
+- **Recommend generational ZGC with a pinned heap (`-XX:+UseZGC -Xms<N> -Xmx<N> -XX:SoftMaxHeapSize=<0.75N>`) as the documented latency profile** for swarm request/reply and messaging-fetch nodes: max pause 0.02–0.06 ms vs 7–10 ms on G1, fetch p99.9 266 µs vs 1004 µs, produce at 96% of G1 throughput. Pinning matters: unpinned ZGC grows RSS to 1.13 GiB (1,188,744 KiB) and loses 14% produce throughput.
 - **Tuned G1 (fixed young `-Xmn400m`, pinned 1 GiB heap) is not worth it**: young collections drop 14 → 4 per reqreply run but each pause is still 7–8 ms, RSS doubles, fetch p99.9 is unchanged.
-- **Serial (`-Xmx256m`) for small CP/footprint nodes**: lowest RSS under load (166 MiB vs 260 MiB G1), same startup and idle RSS; tail latency is worse (6–10 ms pauses).
+- **Serial (`-Xmx256m`) for small CP/footprint nodes**: lowest RSS under load (162 MiB vs 254 MiB G1; 166,220 vs 260,312 KiB), same startup and idle RSS; tail latency is worse (6–10 ms pauses).
 - **The 500 µs swarm reqreply gate is not decidable on this shared box.** p99 ranged 465–4178 µs within a single config; no config's median is under 500 µs, and ZGC (no pause > 0.06 ms) still had 2 ms runs. GC removes the 7–10 ms pause component (max/p99.9) but the p99 at shards=1 is dominated by CPU contention and the partition lock (as in the S1c findings). A CPU-isolated run is needed for the gate.
 
 ## Configs (`bench/gc/run.sh`)
