@@ -211,9 +211,13 @@ public class ClientManager implements Runnable {
                     + "Content-Length: 0\r\n"
                     + "\r\n").getBytes(StandardCharsets.US_ASCII);
 
-    /** Per-accept-thread write view of {@link #PER_IP_REFUSE_503}; no shared mutable cursor. */
+    /** Read-only view of {@link #PER_IP_REFUSE_503}; duplicated per accept thread (Security N1). */
+    private static final ByteBuffer PER_IP_REFUSE_503_RO =
+            ByteBuffer.wrap(PER_IP_REFUSE_503).asReadOnlyBuffer();
+
+    /** Per-accept-thread duplicate of {@link #PER_IP_REFUSE_503_RO}; no shared mutable cursor. */
     private static final ThreadLocal<ByteBuffer> PER_IP_REFUSE_OUT =
-            ThreadLocal.withInitial(() -> ByteBuffer.wrap(PER_IP_REFUSE_503));
+            ThreadLocal.withInitial(PER_IP_REFUSE_503_RO::duplicate);
 
     /**
      * Per-accept-thread drain scratch for {@link #refuseWith503}. Never shared across
@@ -239,7 +243,7 @@ public class ClientManager implements Runnable {
         try {
             socket.configureBlocking(false);
             ByteBuffer out = PER_IP_REFUSE_OUT.get();
-            out.clear();
+            out.rewind(); // duplicate of read-only wrap; position only, never mutates the bytes
             socket.write(out); // one shot; give up if the kernel cannot take it all now
             try {
                 socket.shutdownOutput();

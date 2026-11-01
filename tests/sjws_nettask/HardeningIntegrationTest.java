@@ -140,19 +140,19 @@ class HardeningIntegrationTest {
                     Response r = HttpTestSupport.readResponse(c.getInputStream());
                     // Empty rawHead (peer closed/reset with no bytes) is a permitted best-effort
                     // outcome; statusCode() would NPE on a null statusLine (Codex P2).
-                    if (r.rawHead() == null || r.rawHead().isEmpty()) {
-                        return;
-                    }
-                    if (r.statusCode() == 503) {
-                        assertEquals("1", r.headers().get("retry-after"), r.rawHead());
-                        // EOF or reset after the 503 are both fine on this path.
-                        try {
-                            c.getInputStream().read();
-                        } catch (IOException ignored) {
-                            // reset by peer after the 503
+                    // Do not return early: refusedPerIp must be asserted on every path (Security N2).
+                    if (r.rawHead() != null && !r.rawHead().isEmpty()) {
+                        if (r.statusCode() == 503) {
+                            assertEquals("1", r.headers().get("retry-after"), r.rawHead());
+                            // EOF or reset after the 503 are both fine on this path.
+                            try {
+                                c.getInputStream().read();
+                            } catch (IOException ignored) {
+                                // reset by peer after the 503
+                            }
+                        } else {
+                            fail("only 503 or an empty/reset read, got: " + r.rawHead());
                         }
-                    } else {
-                        fail("only 503 or an empty/reset read, got: " + r.rawHead());
                     }
                 } catch (IOException e) {
                     assertTrue(e.getMessage() == null
