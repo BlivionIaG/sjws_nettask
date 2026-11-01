@@ -31,6 +31,7 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.net.ssl.SSLSession;
@@ -48,26 +49,62 @@ import sjws_nettask.controlplane.Rbac;
  */
 public final class AdminServer implements AutoCloseable {
 
+    /** Bound retries when a reload bumps {@link #tlsEpoch} between revalidate and put (#321 / #442). */
+    static final int REGISTER_LIVE_MAX_ATTEMPTS = 32;
+    private static final System.Logger LOG = System.getLogger(AdminServer.class.getName());
+
     private final HttpServer server;
     private final CpAdmin admin;
     private final AdminTls tls;
     private final CpServerTls serverTls;
+    private final Set<String> allowedOrigins;
     /**
-     * Live HTTPS sessions: peer chain plus a best-effort abort handle for the underlying
+     * Live HTTPS sessions: peer chain plus an abort handle for the underlying sun httpserver
      * connection (so a reload can close keep-alive sockets, not only invalidate the session).
+     * Requires {@code --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED}.
      */
     private final ConcurrentHashMap<SSLSession, Live> live = new ConcurrentHashMap<>();
     private final AtomicLong policyDropped = new AtomicLong();
+    private final AtomicLong abortUnavailable = new AtomicLong();
+    /** Bumped at the start of every {@link #dropConnectionsFailingPolicy} so registration cannot escape a concurrent reload. */
+    private final AtomicLong tlsEpoch = new AtomicLong();
     private volatile Thread watcher;
+    /** Test hook: runs after revalidate and before {@code live.put} inside {@link #registerLive}. */
+    volatile Runnable betweenValidateAndRegister = () -> {
+    };
+    /** Test hook: runs after register and before {@code admin.handle}. */
+    volatile Runnable afterRegisterBeforeHandle = () -> {
+    };
 
-    private record Live(X509Certificate[] chain, AutoCloseable abort) {
+    /**
+     * Mutable so a reload can mark {@link #dropped} and a late {@link #abort} fill still sees the drop.
+     */
+    static final class Live {
+        final X509Certificate[] chain;
+        volatile ConnAbort abort;
+        volatile boolean dropped;
+
+        Live(X509Certificate[] chain, ConnAbort abort) {
+            this.chain = chain;
+            this.abort = abort;
+        }
+
+        X509Certificate[] chain() {
+            return chain;
+        }
+
+        ConnAbort abort() {
+            return abort;
+        }
     }
 
-    private AdminServer(HttpServer server, CpAdmin admin, AdminTls tls, CpServerTls serverTls) {
+    private AdminServer(HttpServer server, CpAdmin admin, AdminTls tls, CpServerTls serverTls,
+            Set<String> allowedOrigins) {
         this.server = server;
         this.admin = admin;
         this.tls = tls;
         this.serverTls = serverTls;
+        this.allowedOrigins = Set.copyOf(Objects.requireNonNullElse(allowedOrigins, Set.of()));
         if (tls != null) {
             tls.afterReload(this::dropConnectionsFailingPolicy);
         }
@@ -83,7 +120,7 @@ public final class AdminServer implements AutoCloseable {
      */
     public static AdminServer start(CpStore store, long nowMillis, long ttlMillis, Path certPem, Path keyPem,
             String keyPassword, Path trustBundle) throws IOException {
-        return start(store, nowMillis, ttlMillis, certPem, keyPem, keyPassword, trustBundle, null, 0);
+        return start(store, nowMillis, ttlMillis, certPem, keyPem, keyPassword, trustBundle, null, 0, Set.of());
     }
 
     /**
@@ -98,6 +135,14 @@ public final class AdminServer implements AutoCloseable {
      */
     public static AdminServer start(CpStore store, long nowMillis, long ttlMillis, Path certPem, Path keyPem,
             String keyPassword, Path trustBundle, Path revocations, long watchMillis) throws IOException {
+        return start(store, nowMillis, ttlMillis, certPem, keyPem, keyPassword, trustBundle, revocations, watchMillis,
+                Set.of());
+    }
+
+    /** File-based mTLS admin listener with an explicit {@code Origin} allowlist for mutating methods. */
+    public static AdminServer start(CpStore store, long nowMillis, long ttlMillis, Path certPem, Path keyPem,
+            String keyPassword, Path trustBundle, Path revocations, long watchMillis, Set<String> allowedOrigins)
+            throws IOException {
         var tls = AdminTls.open(certPem, keyPem, keyPassword, trustBundle, revocations, store::recordSecurityEvent);
         var https = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         https.setHttpsConfigurator(new HttpsConfigurator(tls.context()) {
@@ -110,7 +155,7 @@ public final class AdminServer implements AutoCloseable {
                 params.setSSLParameters(ssl);
             }
         });
-        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls, null);
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls, null, allowedOrigins);
         https.createContext("/", bound::handle);
         https.start();
         if (watchMillis > 0) {
@@ -148,6 +193,12 @@ public final class AdminServer implements AutoCloseable {
      */
     public static AdminServer startMtls(CpStore store, InetSocketAddress address, long nowMillis, long ttlMillis,
             CpServerTls serverTls) throws IOException {
+        return startMtls(store, address, nowMillis, ttlMillis, serverTls, Set.of());
+    }
+
+    /** mTLS admin listener with an explicit {@code Origin} allowlist for mutating methods. */
+    public static AdminServer startMtls(CpStore store, InetSocketAddress address, long nowMillis, long ttlMillis,
+            CpServerTls serverTls, Set<String> allowedOrigins) throws IOException {
         Objects.requireNonNull(serverTls, "serverTls");
         var https = HttpsServer.create(address, 0);
         https.setHttpsConfigurator(new HttpsConfigurator(serverTls.context()) {
@@ -156,7 +207,7 @@ public final class AdminServer implements AutoCloseable {
                 params.setSSLParameters(serverTls.parameters());
             }
         });
-        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), null, serverTls);
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), null, serverTls, allowedOrigins);
         https.createContext("/", bound::handle);
         https.start();
         return bound;
@@ -164,8 +215,17 @@ public final class AdminServer implements AutoCloseable {
 
     /** Plain HTTP, for tests that exercise routes without a certificate. Production code uses {@link #start}. */
     public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis) throws IOException {
+        return startPlainForTests(store, nowMillis, ttlMillis, Set.of());
+    }
+
+    /**
+     * Plain HTTP with an explicit {@code Origin} allowlist for mutating methods. Empty means any
+     * present {@code Origin} is refused (CLI clients that omit the header are unaffected).
+     */
+    public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis,
+            Set<String> allowedOrigins) throws IOException {
         var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis), null, null);
+        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis), null, null, allowedOrigins);
         http.createContext("/", bound::handle);
         http.start();
         return bound;
@@ -180,43 +240,101 @@ public final class AdminServer implements AutoCloseable {
         return policyDropped.get();
     }
 
+    /** How many HTTPS sessions are retained for reload drop; for tests. */
+    int liveSize() {
+        return live.size();
+    }
+
+    /** How many times reflective abort capture failed; for tests / ops. */
+    long abortUnavailable() {
+        return abortUnavailable.get();
+    }
+
+    /** Test/ops: drop closed or invalid sessions without a policy reload. */
+    void pruneDeadSessionsForTest() {
+        pruneDeadSessions();
+    }
+
+    /** Test-only: bump the TLS epoch without a material reload. */
+    void bumpTlsEpochForTest() {
+        tlsEpoch.incrementAndGet();
+    }
+
     private void handle(HttpExchange exchange) throws IOException {
-        HttpsExchange https = exchange instanceof HttpsExchange h ? h : null;
-        X509Certificate[] chain = null;
-        SSLSession session = null;
-        if (https != null) {
-            pruneDeadSessions();
-            session = https.getSSLSession();
-            chain = session == null ? null : peerChain(session);
-            if (chain != null) {
-                try {
-                    revalidate(chain);
-                } catch (CertificateException | IOException e) {
-                    policyDropped.incrementAndGet();
-                    live.remove(session);
-                    try {
-                        session.invalidate();
-                    } catch (RuntimeException ignored) {
-                        // best effort
-                    }
-                    exchange.getRequestBody().readAllBytes();
-                    write(exchange, CpStore.Outcome.error(401, "tls"), true);
-                    return;
-                }
+        var method = exchange.getRequestMethod();
+        if (isMutation(method)) {
+            var refused = refuseMutation(exchange);
+            if (refused != null) {
+                exchange.getRequestBody().readAllBytes();
+                write(exchange, refused, true);
+                return;
             }
         }
-        var outcome = admin.handle(credential(exchange), exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
+        if (!(exchange instanceof HttpsExchange https)) {
+            var outcome = admin.handle(credential(exchange), method, exchange.getRequestURI().getPath(),
+                    exchange.getRequestURI().getRawQuery(),
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
+                    exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+            write(exchange, outcome, wantsClose(exchange));
+            return;
+        }
+        pruneDeadSessions();
+        var session = https.getSSLSession();
+        var chain = session == null ? null : peerChain(session);
+        // Reflective read is safe mid-request; close() is not. Prefer capturing before dispatch so a
+        // concurrent reload can abort an in-flight exchange.
+        var abort = connectionAbort(https);
+        Live registered = null;
+        if (chain != null) {
+            try {
+                registered = registerLive(session, chain, abort);
+            } catch (CertificateException | IOException e) {
+                policyDropped.incrementAndGet();
+                live.remove(session);
+                invalidateQuietly(session);
+                abortQuietly(abort);
+                exchange.getRequestBody().readAllBytes();
+                write(exchange, CpStore.Outcome.error(401, "tls"), true);
+                return;
+            }
+        }
+        var mid = afterRegisterBeforeHandle;
+        afterRegisterBeforeHandle = () -> {
+        };
+        mid.run();
+        if (registered != null && registered.dropped) {
+            exchange.getRequestBody().readAllBytes();
+            abortQuietly(registered.abort());
+            live.remove(session);
+            write(exchange, CpStore.Outcome.error(401, "tls"), true);
+            return;
+        }
+        var outcome = admin.handle(credential(exchange), method, exchange.getRequestURI().getPath(),
                 exchange.getRequestURI().getRawQuery(),
                 new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
                 exchange.getRequestHeaders().getFirst("Idempotency-Key"));
-        if (https != null && session != null && chain != null) {
-            live.put(session, new Live(chain, null));
+        if (registered != null && registered.dropped) {
+            if (registered.abort() == null && abort != null) {
+                registered.abort = abort;
+            }
+            abortQuietly(registered.abort());
+            live.remove(session);
+            write(exchange, outcome, true);
+            return;
         }
-        write(exchange, outcome);
-        // Fill the abort handle only after the response is written; probing the connection
-        // mid-request via reflection breaks the sun httpserver exchange.
-        if (https != null && session != null && chain != null && session.isValid()) {
-            live.put(session, new Live(chain, connectionAbort(https)));
+        if (registered != null && registered.abort() == null && abort != null) {
+            registered.abort = abort;
+        }
+        if (abort == null && session != null) {
+            long n = abortUnavailable.incrementAndGet();
+            LOG.log(System.Logger.Level.WARNING,
+                    "admin-tls: connection abort unavailable (need --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED); keep-alive drop degraded ({0} so far)",
+                    n);
+        }
+        boolean closeConnection = wantsClose(exchange) || abort == null || (registered != null && registered.dropped);
+        write(exchange, outcome, closeConnection);
+        if (session != null && closeConnection) {
+            live.remove(session);
         }
     }
 
@@ -236,46 +354,122 @@ public final class AdminServer implements AutoCloseable {
         exchange.close();
     }
 
+    private static boolean wantsClose(HttpExchange exchange) {
+        var value = exchange.getRequestHeaders().getFirst("Connection");
+        return value != null && value.equalsIgnoreCase("close");
+    }
+
+    /** POST, PUT, PATCH and DELETE. GET and HEAD are unchanged. */
+    public static boolean isMutation(String method) {
+        return "POST".equals(method) || "PUT".equals(method) || "PATCH".equals(method) || "DELETE".equals(method);
+    }
+
+    /**
+     * A present {@code Origin} must be in {@link #allowedOrigins} (empty by default). The header is
+     * trimmed; blank-after-trim is treated as present and refused. Mutations must send
+     * {@code Content-Type: application/json} (optional parameters allowed). Match is exact on the
+     * trimmed value (scheme, host, port, case).
+     */
+    CpStore.Outcome refuseMutation(HttpExchange exchange) {
+        var raw = exchange.getRequestHeaders().getFirst("Origin");
+        if (raw != null) {
+            var origin = raw.trim();
+            if (origin.isEmpty() || !allowedOrigins.contains(origin)) {
+                return CpStore.Outcome.error(403, "origin");
+            }
+        }
+        if (!isJsonContentType(exchange.getRequestHeaders().getFirst("Content-Type"))) {
+            return CpStore.Outcome.error(415, "content-type");
+        }
+        return null;
+    }
+
+    /** {@code application/json} with optional parameters such as {@code charset=utf-8}. */
+    public static boolean isJsonContentType(String contentType) {
+        if (contentType == null || contentType.isBlank()) {
+            return false;
+        }
+        int semi = contentType.indexOf(';');
+        var type = (semi < 0 ? contentType : contentType.substring(0, semi)).trim();
+        return type.equalsIgnoreCase("application/json");
+    }
+
+    /**
+     * Revalidate under the current TLS epoch, then put into {@link #live} <em>before</em> the handler runs.
+     * If a reload bumps the epoch between the check and the put, retry so the connection cannot escape both
+     * the new-policy check and the reload sweep (#321 / #442). Exhausting the budget fails closed.
+     */
+    private Live registerLive(SSLSession session, X509Certificate[] chain, ConnAbort abort)
+            throws CertificateException, IOException {
+        long epoch;
+        int attempts = 0;
+        Live peer;
+        do {
+            if (++attempts > REGISTER_LIVE_MAX_ATTEMPTS) {
+                throw new IOException("admin session registration exceeded TLS epoch retry budget ("
+                        + REGISTER_LIVE_MAX_ATTEMPTS + " attempts)");
+            }
+            epoch = tlsEpoch.get();
+            revalidate(chain);
+            var mid = betweenValidateAndRegister;
+            betweenValidateAndRegister = () -> {
+            };
+            mid.run();
+            peer = new Live(chain, abort);
+            live.put(session, peer);
+        } while (tlsEpoch.get() != epoch);
+        return peer;
+    }
+
     /**
      * After reload: re-check every remembered peer chain against the new material. {@link AdminTls#reload()}
      * may already have invalidated SSL sessions before this runs, so we key off the stored chain, not
      * {@link SSLSession#isValid()}.
      */
     void dropConnectionsFailingPolicy() {
+        tlsEpoch.incrementAndGet();
         for (var entry : List.copyOf(live.entrySet())) {
             var session = entry.getKey();
             var peer = entry.getValue();
+            if (isDead(session, peer)) {
+                live.remove(session);
+                continue;
+            }
             try {
                 revalidate(peer.chain());
-                if (!session.isValid()) {
-                    // Cert still OK; drop the stale map entry only (connection may stay for a new handshake).
-                    live.remove(session, peer);
-                }
             } catch (CertificateException | IOException | RuntimeException failed) {
-                policyDropped.incrementAndGet();
-                live.remove(session, peer);
-                abortQuietly(peer);
-                try {
-                    if (session.isValid()) {
-                        session.invalidate();
-                    }
-                } catch (RuntimeException ignored) {
-                    // best effort
+                // Stale snapshot: registerLive replaced Live under the new epoch — do not abort the newer entry.
+                if (live.get(session) != peer) {
+                    continue;
                 }
+                peer.dropped = true;
+                policyDropped.incrementAndGet();
+                abortQuietly(peer.abort());
+                invalidateQuietly(session);
+                // By key after abort: remove-by-value can miss a concurrent replace and leave a closed connection.
+                live.remove(session);
             }
         }
         pruneDeadSessions();
     }
 
-    /** Drop entries whose TLS session is already invalid so the map cannot grow without bound. */
+    /** Drop entries whose TLS session or underlying connection is already gone so the map cannot grow without bound. */
     private void pruneDeadSessions() {
         for (var entry : List.copyOf(live.entrySet())) {
-            if (!entry.getKey().isValid()) {
-                if (live.remove(entry.getKey(), entry.getValue())) {
-                    abortQuietly(entry.getValue());
-                }
+            if (isDead(entry.getKey(), entry.getValue())) {
+                live.remove(entry.getKey());
             }
         }
+    }
+
+    private static boolean isDead(SSLSession session, Live peer) {
+        if (peer.dropped) {
+            return true;
+        }
+        if (session == null || !session.isValid()) {
+            return true;
+        }
+        return peer.abort() != null && peer.abort().isClosed();
     }
 
     private void revalidate(X509Certificate[] chain) throws CertificateException, IOException {
@@ -290,23 +484,35 @@ public final class AdminServer implements AutoCloseable {
         // Plain listener: nothing to revalidate.
     }
 
-    private static void abortQuietly(Live live) {
-        if (live == null || live.abort() == null) {
+    private static void abortQuietly(ConnAbort abort) {
+        if (abort == null) {
             return;
         }
         try {
-            live.abort().close();
+            abort.close();
         } catch (Exception ignored) {
             // best effort
         }
     }
 
+    private static void invalidateQuietly(SSLSession session) {
+        if (session == null) {
+            return;
+        }
+        try {
+            session.invalidate();
+        } catch (RuntimeException ignored) {
+            // best effort
+        }
+    }
+
     /**
-     * Best-effort handle that closes the sun.net.httpserver connection behind an exchange.
-     * Public HTTPS APIs do not expose the socket; without this, invalidate alone leaves keep-alive
-     * TCP up until the next request.
+     * Handle that closes the sun.net.httpserver connection behind an exchange and reports whether it
+     * is already closed. Public HTTPS APIs do not expose the socket; without this, invalidate alone
+     * leaves keep-alive TCP up until the next request. Needs
+     * {@code --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED}.
      */
-    static AutoCloseable connectionAbort(HttpExchange exchange) {
+    static ConnAbort connectionAbort(HttpExchange exchange) {
         try {
             var implField = exchange.getClass().getDeclaredField("impl");
             implField.setAccessible(true);
@@ -316,18 +522,52 @@ public final class AdminServer implements AutoCloseable {
             var connection = getConnection.invoke(exchangeImpl);
             var close = connection.getClass().getDeclaredMethod("close");
             close.setAccessible(true);
-            return () -> {
-                try {
-                    close.invoke(connection);
-                } catch (ReflectiveOperationException e) {
-                    throw new IOException(e);
-                }
-            };
+            var closedField = connection.getClass().getDeclaredField("closed");
+            closedField.setAccessible(true);
+            var getChannel = connection.getClass().getDeclaredMethod("getChannel");
+            getChannel.setAccessible(true);
+            return new ConnAbort(connection, close, closedField, getChannel);
         } catch (ReflectiveOperationException e) {
             return null;
         }
     }
 
+    /** Reflective abort handle for one sun.net.httpserver.HttpConnection. */
+    static final class ConnAbort implements AutoCloseable {
+        private final Object connection;
+        private final java.lang.reflect.Method close;
+        private final java.lang.reflect.Field closedField;
+        private final java.lang.reflect.Method getChannel;
+
+        ConnAbort(Object connection, java.lang.reflect.Method close, java.lang.reflect.Field closedField,
+                java.lang.reflect.Method getChannel) {
+            this.connection = connection;
+            this.close = close;
+            this.closedField = closedField;
+            this.getChannel = getChannel;
+        }
+
+        boolean isClosed() {
+            try {
+                if (closedField.getBoolean(connection)) {
+                    return true;
+                }
+                var channel = getChannel.invoke(connection);
+                return channel instanceof java.nio.channels.Channel ch && !ch.isOpen();
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                return false;
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                close.invoke(connection);
+            } catch (ReflectiveOperationException e) {
+                throw new IOException(e);
+            }
+        }
+    }
 
     private static X509Certificate[] peerChain(SSLSession session) {
         try {
@@ -382,6 +622,11 @@ public final class AdminServer implements AutoCloseable {
         var w = watcher;
         if (w != null) {
             w.interrupt();
+        }
+        for (var entry : List.copyOf(live.entrySet())) {
+            if (live.remove(entry.getKey(), entry.getValue())) {
+                abortQuietly(entry.getValue().abort());
+            }
         }
         server.stop(0);
     }

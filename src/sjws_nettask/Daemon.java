@@ -361,6 +361,8 @@ final class Daemon {
         // Match the container entrypoint and Surefire: ReloadHook may need FFM to clear an
         // inherited SIG_IGN before installing SIGHUP as reload (GitHub Actions).
         cmd.add("--enable-native-access=ALL-UNNAMED");
+        // Admin keep-alive drop closes sun.net.httpserver.HttpConnection via reflection (#388 / #451).
+        cmd.add("--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED");
         cmd.add("-cp");
         cmd.add(classPath);
         cmd.add("sjws_nettask.Sjws_nettask");
