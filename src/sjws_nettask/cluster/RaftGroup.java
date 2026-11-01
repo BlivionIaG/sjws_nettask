@@ -49,6 +49,12 @@ final class RaftGroup {
     static final byte NOOP = 3;
     /** User data appended with a STRICT override: every data copy fsyncs it before it counts. */
     static final byte USER_STRICT = 4;
+    /**
+     * Operator escape (#208): once committed (and on every becomeLeader scan), STRICT overrides at
+     * indexes {@code <=} the big-endian upto carried after this marker no longer need
+     * {@code dataCopiesRequired()} data disks. Existing {@link #USER_STRICT} bytes are left alone.
+     */
+    static final byte STRICT_RELEASE = 5;
 
     static final int VOTE = 1;
     static final int VOTE_RESP = 2;
@@ -150,6 +156,16 @@ final class RaftGroup {
     private final java.util.TreeMap<Long, Long> strictPending = new java.util.TreeMap<>();
     /** Highest pending STRICT index already reported as stalled, so each entry warns once. */
     private long strictWarnedIndex;
+    /** Operator escapes that appended a {@link #STRICT_RELEASE} for stalled overrides (#208). */
+    private final java.util.concurrent.atomic.AtomicLong strictOverridesReleased = new java.util.concurrent.atomic.AtomicLong();
+    /**
+     * Highest index whose STRICT override a <em>committed</em> {@link #STRICT_RELEASE} has covered
+     * on this node (advanced only from {@link #apply}). Uncommitted markers never write this field:
+     * a truncated/replaced suffix must not leave a stale watermark that skips new {@link #USER_STRICT}
+     * entries at reused indexes. Uncommitted coverage is recomputed from the surviving log on
+     * {@link #rescanStrictPending}.
+     */
+    private long strictReleasedThrough;
     private long recoveryUntil;
     /** Bytes of image per {@link #SNAP_CHUNK}; package-private so tests can force many chunks. */
     int snapshotChunkBytes = DEFAULT_SNAPSHOT_CHUNK_BYTES;
@@ -696,14 +712,7 @@ final class RaftGroup {
             matchIndex.put(peer, 0L);
         }
         heardAt.clear();
-        strictPending.clear();
-        strictWarnedIndex = 0;
-        for (long index = commitIndex + 1; index <= lastIndex(); index++) {
-            var data = read(index);
-            if (data != null && data.length > 0 && data[0] == USER_STRICT) {
-                strictPending.put(index, now); // age counts from this leader's term
-            }
-        }
+        rescanStrictPending(now);
         appendRaw(new byte[] {NOOP});
         if (options.durability() != Durability.STRICT) {
             // RELAXED: schedule the no-op's fsync like any append. Otherwise a leader elected with only the witness
@@ -1404,6 +1413,11 @@ final class RaftGroup {
                         }
                     }, applied);
                 }
+                case STRICT_RELEASE -> {
+                    if (data.length >= 1 + Long.BYTES) {
+                        honourStrictRelease(strictReleaseUpto(data));
+                    }
+                }
                 default -> {
                     // Leave unknown markers applied so a bad record cannot stall the group.
                 }
@@ -1526,7 +1540,8 @@ final class RaftGroup {
                 "group " + groupId.value() + ": STRICT entry " + oldest.getKey() + " pending for "
                         + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(now - oldest.getValue()) + " ms with "
                         + copies + " of " + dataCopiesRequired() + " data copies; " + strictPending.size()
-                        + " STRICT and every later entry wait until a data node is back");
+                        + " STRICT and every later entry wait until a data node is back or an operator"
+                        + " releases them (ClusterNode.releaseStalledStrictOverrides, #208)");
     }
 
     /** Leader view: uncommitted STRICT override entries. */
@@ -1549,6 +1564,191 @@ final class RaftGroup {
             lock.unlock();
         }
     }
+
+    /**
+     * Explicit operator escape (#208): append a {@link #STRICT_RELEASE} marker that names the highest
+     * stalled uncommitted {@link #USER_STRICT} index so commit can proceed without
+     * {@code dataCopiesRequired()} data disks. Existing log entries are never rewritten or truncated.
+     * Only the leader may call this, and only when the oldest pending STRICT override has waited at
+     * least {@code 2 × lease} (the same stall threshold as the WARN). A STRICT {@link GroupOptions}
+     * group is refused — this escape is for per-append overrides in a RELAXED group only.
+     *
+     * <p>Fail-safe: {@code operatorId} must be non-blank (the authenticated operator identity from the
+     * admin channel). The marker is appended at the next index in the current term through the same
+     * rollback/fence path as a user batch ({@link #rollBackBatch}). On a fenced or rolled-back
+     * failure the deferred {@code after} completions from that path are drained before the error
+     * is rethrown, so a pending read-barrier or membership future cannot hang. The leader clears
+     * {@link #strictPending} for covered indexes so {@link #maybeCommit} can advance, but only a
+     * <em>committed</em> marker (via {@link #apply}) advances {@link #strictReleasedThrough}. An
+     * uncommitted marker still in the log is honoured again on {@link #becomeLeader} by scanning the
+     * surviving suffix; if that suffix was replaced, the barrier re-arms until a release commits
+     * (fail-safe). Audited with one WARNING and counted in {@link #strictOverridesReleased()}.
+     *
+     * @return how many STRICT overrides the marker covers (0 when nothing is stalled yet)
+     * @throws NotLeaderException if this node does not lead the group
+     * @throws IllegalArgumentException if {@code operatorId} is blank
+     * @throws IllegalStateException if the group itself is STRICT, or storage fails closed
+     */
+    int releaseStalledStrictOverrides(String operatorId) throws NotLeaderException {
+        if (operatorId == null || operatorId.isBlank()) {
+            throw new IllegalArgumentException("operatorId");
+        }
+        var after = new java.util.ArrayList<Runnable>();
+        int released = 0;
+        Throwable releaseFailure = null;
+        lock.lock();
+        try {
+            if (storageFailed != null) {
+                throw storageFailed;
+            }
+            if (closed) {
+                throw new GroupClosedException(groupId);
+            }
+            if (role != Role.LEADER) {
+                throw new NotLeaderException(groupId, java.util.Optional.ofNullable(leader));
+            }
+            if (options.durability() == Durability.STRICT) {
+                throw new IllegalStateException("group " + groupId.value()
+                        + " uses GroupOptions STRICT; per-append escape does not apply");
+            }
+            if (strictPending.isEmpty()) {
+                return 0;
+            }
+            long now = clock.nanoTime();
+            var oldest = strictPending.firstEntry();
+            if (now - oldest.getValue() < 2 * options.leaseNanos()) {
+                return 0; // not stalled yet — refuse to weaken a fresh STRICT override
+            }
+            if (oldest.getKey() <= commitIndex) {
+                strictPending.headMap(commitIndex, true).clear();
+                if (strictPending.isEmpty()) {
+                    return 0;
+                }
+            }
+            long upto = strictPending.lastKey();
+            int count = strictPending.size();
+            long first = Math.max(lastIndex(), snapIndex) + 1;
+            // Append a new marker only — never rewrite existing entries. Fence like a user batch.
+            try {
+                appendRaw(strictRelease(upto));
+                markDirty();
+            } catch (RuntimeException failed) {
+                // Queue fence / step-down completions into after; drain them after unlock so a
+                // pending read-barrier or membership future cannot hang (#450 Codex P2).
+                releaseFailure = rollBackBatch(first, failed, after);
+            }
+            if (releaseFailure == null) {
+                // This leader only: drop pending so maybeCommit can pass. Do not touch
+                // strictReleasedThrough until apply commits the marker (#450 P1 stale watermark).
+                strictPending.headMap(upto, true).clear();
+                if (strictWarnedIndex <= upto) {
+                    strictWarnedIndex = upto;
+                }
+                strictOverridesReleased.addAndGet(count);
+                released = count;
+                System.getLogger(RaftGroup.class.getName()).log(System.Logger.Level.WARNING,
+                        "audit strict.release: operator=" + sanitizeOperatorId(operatorId)
+                                + " group=" + groupId.value()
+                                + " uptoIndex=" + upto + " released=" + count
+                                + " term=" + term + " — STRICT_RELEASE marker appended;"
+                                + " commit no longer waits for dataCopiesRequired on covered entries");
+                maybeCommit(after);
+                replicate();
+            }
+        } finally {
+            lock.unlock();
+        }
+        for (var task : after) {
+            task.run();
+        }
+        if (releaseFailure != null) {
+            if (releaseFailure instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new UncheckedIOException(new java.io.IOException("STRICT_RELEASE append failed", releaseFailure));
+        }
+        return released;
+    }
+
+    /**
+     * Rebuild {@link #strictPending} from the uncommitted suffix. Coverage is the committed watermark
+     * {@link #strictReleasedThrough} plus any {@link #STRICT_RELEASE} still present in the surviving
+     * uncommitted log (recomputed every time — never cached into the watermark). A replaced suffix
+     * therefore cannot skip a new {@link #USER_STRICT} at a reused index.
+     */
+    private void rescanStrictPending(long now) {
+        strictPending.clear();
+        strictWarnedIndex = 0;
+        long releasedThrough = strictReleasedThrough; // committed coverage only
+        long last = lastIndex();
+        for (long index = commitIndex + 1; index <= last; index++) {
+            var data = read(index);
+            if (data != null && data.length >= 1 + Long.BYTES && data[0] == STRICT_RELEASE) {
+                releasedThrough = Math.max(releasedThrough, strictReleaseUpto(data));
+            }
+        }
+        for (long index = commitIndex + 1; index <= last; index++) {
+            var data = read(index);
+            if (data != null && data.length > 0 && data[0] == USER_STRICT && index > releasedThrough) {
+                strictPending.put(index, now); // age counts from this leader's term
+            }
+        }
+    }
+
+    /**
+     * Commit-time honour: advance the durable watermark and drop pending. Called only from
+     * {@link #apply} for a committed {@link #STRICT_RELEASE}.
+     */
+    private void honourStrictRelease(long upto) {
+        if (upto > strictReleasedThrough) {
+            strictReleasedThrough = upto;
+        }
+        strictPending.headMap(upto, true).clear();
+        if (strictWarnedIndex <= upto) {
+            strictWarnedIndex = upto;
+        }
+    }
+
+    /** Strip controls from {@code operatorId} before it is written into an audit line. */
+    static String sanitizeOperatorId(String operatorId) {
+        var out = new StringBuilder(operatorId.length());
+        for (int i = 0; i < operatorId.length(); i++) {
+            char c = operatorId.charAt(i);
+            if (c >= 0x20 && c != 0x7F) {
+                out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
+    static byte[] strictRelease(long uptoIndex) {
+        var body = java.nio.ByteBuffer.allocate(1 + Long.BYTES).order(java.nio.ByteOrder.BIG_ENDIAN);
+        body.put(STRICT_RELEASE);
+        body.putLong(uptoIndex);
+        return body.array();
+    }
+
+    static long strictReleaseUpto(byte[] data) {
+        return java.nio.ByteBuffer.wrap(data, 1, Long.BYTES).order(java.nio.ByteOrder.BIG_ENDIAN).getLong();
+    }
+
+    /** How many stalled STRICT overrides an operator has released on this group (#208). */
+    long strictOverridesReleased() {
+        return strictOverridesReleased.get();
+    }
+
+    /** Tests only: highest index a <em>committed</em> {@link #STRICT_RELEASE} has covered. */
+    long strictReleasedThroughForTest() {
+        lock.lock();
+        try {
+            return strictReleasedThrough;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+
+
 
     /** The leader plus data voters that answered an append within the last lease. */
     private int reachableDataCopies(long now) {

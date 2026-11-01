@@ -18,6 +18,7 @@ package sjws_nettask.cp;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BiFunction;
 
 /** Role checks in front of {@link CpStore}. The HTTP adapter calls {@link #handle}. */
 public final class CpAdmin {
@@ -25,6 +26,18 @@ public final class CpAdmin {
     private final CpStore store;
     private final long nowMillis;
     private final long ttlMillis;
+
+    /**
+     * Test-only permission overlay. When non-null, consulted after the built-in table so a test can
+     * authorize a route that has no handler. Always null in production; mutate only via
+     * {@link #setTestPermission}.
+     */
+    private static volatile BiFunction<String, String, sjws_nettask.controlplane.Permission> testPermission;
+
+    /** Test-only: install or clear the permission overlay. */
+    static void setTestPermission(BiFunction<String, String, sjws_nettask.controlplane.Permission> hook) {
+        testPermission = hook;
+    }
 
     public CpAdmin(CpStore store, long nowMillis, long ttlMillis) {
         this.store = store;
@@ -46,7 +59,8 @@ public final class CpAdmin {
         var route = path.endsWith("/") && path.length() > 1 ? path.substring(0, path.length() - 1) : path;
         var permission = permission(method, route);
         if (permission == null) {
-            return CpStore.Outcome.error(404, "not found");
+            boolean known = knownRoute(route);
+            return CpStore.Outcome.error(known ? 405 : 404, known ? "method" : "not found");
         }
         var decision = store.authorize(credential, permission, route);
         if (!decision.allowed()) {
@@ -105,12 +119,16 @@ public final class CpAdmin {
         if ("POST".equals(method) && "/cp/v1/activate".equals(route)) {
             return store.activate(nowMillis, ttlMillis, idempotencyKey);
         }
-        var san = jsonString(body, "san");
-        var name = jsonString(body, "role");
-        if (san == null || name == null) {
-            return CpStore.Outcome.error(400, "rbac");
+        if ("POST".equals(method) && "/cp/v1/rbac".equals(route)) {
+            var san = jsonString(body, "san");
+            var name = jsonString(body, "role");
+            if (san == null || name == null) {
+                return CpStore.Outcome.error(400, "rbac");
+            }
+            return store.grant(san, parseRole(name));
         }
-        return store.grant(san, parseRole(name));
+        // Authorized but no handler: fail closed. Grant is only reached from /cp/v1/rbac above.
+        return CpStore.Outcome.error(404, "not found");
     }
 
     private static sjws_nettask.controlplane.Permission permission(String method, String route) {
@@ -136,7 +154,29 @@ public final class CpAdmin {
         if ("POST".equals(method) && "/cp/v1/rbac".equals(route)) {
             return sjws_nettask.controlplane.Permission.MANAGE_OPERATORS;
         }
+        var hook = testPermission;
+        if (hook != null) {
+            var extra = hook.apply(method, route);
+            if (extra != null) {
+                return extra;
+            }
+        }
         return null;
+    }
+
+    /** True when {@code route} is a known admin path for at least one method. */
+    static boolean knownRoute(String route) {
+        if ("/cp/v1/health".equals(route) || "/cp/v1/config".equals(route) || "/cp/v1/config/diff".equals(route)
+                || "/cp/v1/nodes".equals(route) || "/cp/v1/rollout".equals(route) || "/cp/v1/audit".equals(route)
+                || "/cp/v1/config:validate".equals(route) || "/cp/v1/rollback".equals(route)
+                || "/cp/v1/rollout/advance".equals(route) || "/cp/v1/activate".equals(route)
+                || "/cp/v1/rbac".equals(route)) {
+            return true;
+        }
+        if (route.startsWith("/cp/v1/nodes/") && route.endsWith("/revoke")) {
+            return true;
+        }
+        return versionPath(route);
     }
 
     private static boolean versionPath(String route) {

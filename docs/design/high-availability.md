@@ -101,11 +101,20 @@ has heard from nobody yet, so it refuses STRICT overrides until its first heartb
 answered; retry. What remains: a data node that fails after a STRICT override was accepted
 holds that entry, and every entry behind it, until the node is back or a leader with two
 reachable data copies takes over (a new leader rescans the marker and needs the same copies, so
-stepping down does not help). Bringing the data node back is the only way out today; a bounded
-wait or an operator escape is tracked in #208. The leader makes such a stall visible:
-`ReplicatedNode.strictPending(group)` (uncommitted STRICT overrides) and
-`oldestStrictPendingAgeNanos(group)` (0 when none; followers report 0), and one WARNING per
-entry once it has waited 2 x lease, naming the group, the index and how many data copies it has.
+stepping down does not help). Bringing the data node back is the preferred recovery. When that is impossible, an
+**explicit operator escape** (#208) is available on the group's leader:
+`ClusterNode.releaseStalledStrictOverrides(group, operatorId)`. It runs only when the oldest
+pending STRICT override has waited at least 2 × lease (same threshold as the stall WARN),
+requires a non-blank authenticated `operatorId`, and appends a new `STRICT_RELEASE` (5) marker
+that names the highest stalled index (existing `USER_STRICT` bytes are left alone). A committed
+marker (apply) advances the durable watermark; `becomeLeader` also honours any marker still in
+the surviving uncommitted suffix. A replaced suffix re-arms the barrier until a release commits
+(fail-safe). The release append uses the same rollback/fence path as a user batch. Audits one WARNING (`audit strict.release: …`; control characters
+stripped from `operatorId`) and increments `ReplicatedNode.strictOverridesReleased(group)`.
+It never runs automatically and never changes a `GroupOptions` STRICT group. Authorize callers
+with control-plane `Permission.RELEASE_STALLED_STRICT` (OPERATOR and ADMIN). The leader
+also exposes `strictPending(group)` and `oldestStrictPendingAgeNanos(group)` (followers report 0),
+and one WARN per entry at 2 × lease.
 A STRICT group (`GroupOptions.durability()`) is unchanged and has no fail-fast.
 
 The leader counts an append response only when the voter id in its body matches the

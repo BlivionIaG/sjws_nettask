@@ -53,6 +53,27 @@ class MainTest {
     }
 
     @Test
+    void selfCheckAdminTlsAbortOkUnderConfiguredOpens() {
+        assertEquals(Sjws_nettask.EXIT_OK, run(Map.of(), "--self-check-admin-tls-abort"));
+        assertTrue(out().contains("admin-tls-abort: ok"), out());
+        assertEquals("", err());
+    }
+
+    @Test
+    void selfCheckAdminTlsAbortReportsUnavailableWhenReflectBlocked() {
+        sjws_nettask.cp.AdminServer.abortReflectFailureForTest =
+                new java.lang.reflect.InaccessibleObjectException("forced for test");
+        try {
+            assertEquals(Sjws_nettask.EXIT_USAGE, run(Map.of(), "--self-check-admin-tls-abort"));
+            assertTrue(err().contains("admin-tls-abort: reflective abort unavailable"), err());
+            assertEquals("", out());
+        } finally {
+            sjws_nettask.cp.AdminServer.abortReflectFailureForTest = null;
+        }
+    }
+
+
+    @Test
     void usageErrorsExit64() {
         assertEquals(Sjws_nettask.EXIT_USAGE, run(Map.of(), "--cert=/c.pem", root.toString()));
         assertTrue(err().contains("ERROR: --cert and --key must be given together"), err());
