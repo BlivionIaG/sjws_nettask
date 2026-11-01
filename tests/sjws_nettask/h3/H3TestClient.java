@@ -117,9 +117,15 @@ final class H3TestClient implements AutoCloseable {
                 .bind(new InetSocketAddress("127.0.0.1", 0)).sync().channel();
     }
 
+    private static io.netty.handler.codec.quic.QuicChannelBootstrap withQlog(
+            io.netty.handler.codec.quic.QuicChannelBootstrap boot) {
+        H3Qlog.next("client").ifPresent(q -> boot.option(H3Qlog.OPTION, q));
+        return boot;
+    }
+
     /** Like {@link #connect(InetSocketAddress)}, passing every connection-level user event to {@code events}. */
     QuicChannel connect(InetSocketAddress server, java.util.function.Consumer<Object> events) throws Exception {
-        var quic = QuicChannel.newBootstrap(this.datagram).handler(new io.netty.channel.ChannelInitializer<QuicChannel>() {
+        var quic = withQlog(QuicChannel.newBootstrap(this.datagram)).handler(new io.netty.channel.ChannelInitializer<QuicChannel>() {
             @Override
             protected void initChannel(QuicChannel ch) {
                 ch.pipeline().addLast(new Http3ClientConnectionHandler(), new io.netty.channel.ChannelInboundHandlerAdapter() {
@@ -142,7 +148,7 @@ final class H3TestClient implements AutoCloseable {
     QuicChannel connect(InetSocketAddress server, long maxFieldSection) throws Exception {
         var settings = new io.netty.handler.codec.http3.DefaultHttp3SettingsFrame();
         settings.put(io.netty.handler.codec.http3.Http3SettingsFrame.HTTP3_SETTINGS_MAX_FIELD_SECTION_SIZE, maxFieldSection);
-        var quic = QuicChannel.newBootstrap(this.datagram)
+        var quic = withQlog(QuicChannel.newBootstrap(this.datagram))
                 .handler(new Http3ClientConnectionHandler(null, null, null, settings, true))
                 .remoteAddress(server).localAddress(this.datagram.localAddress()).connect().get(10, TimeUnit.SECONDS);
         this.connections.add(quic);
@@ -150,7 +156,7 @@ final class H3TestClient implements AutoCloseable {
     }
 
     QuicChannel connect(InetSocketAddress server) throws Exception {
-        var quic = QuicChannel.newBootstrap(this.datagram).handler(new Http3ClientConnectionHandler())
+        var quic = withQlog(QuicChannel.newBootstrap(this.datagram)).handler(new Http3ClientConnectionHandler())
                 .remoteAddress(server).localAddress(this.datagram.localAddress()).connect().get(10, TimeUnit.SECONDS);
         this.connections.add(quic);
         return quic;
