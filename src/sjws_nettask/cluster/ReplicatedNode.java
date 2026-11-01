@@ -388,6 +388,16 @@ public final class ReplicatedNode implements ClusterNode {
         return group(groupId).failedClosed();
     }
 
+    /** Consecutive fsync failures on {@code groupId} since the last successful force (#242). */
+    public int consecutiveFsyncFailures(GroupId groupId) {
+        return group(groupId).consecutiveFsyncFailures();
+    }
+
+    /** Cumulative fsync failures on {@code groupId} since the group opened (#242). */
+    public long fsyncFailures(GroupId groupId) {
+        return group(groupId).fsyncFailures();
+    }
+
     /** Apply lag of one group: deliveries queued or running. */
     public long deliveryLag(GroupId groupId) {
         return group(groupId).deliveryLag();

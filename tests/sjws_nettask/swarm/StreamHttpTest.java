@@ -28,6 +28,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -648,5 +649,33 @@ class StreamHttpTest {
         assertTrue(SwarmHttpTest.text(r).contains("reply router stream limit"), SwarmHttpTest.text(r));
         assertEquals(1, this.http.streams().sessionCount());
         assertEquals(1, this.swarm.replies().streams());
+    }
+
+    /** S2c PR 8 N2: credit-off {@code /metrics} appendix emits nothing (Observability review). */
+    @Test
+    void streamStatsCreditOffEmitsNothing() {
+        streamsOn();
+        var body = this.http.streams().statsText();
+        assertEquals("", body, "flag-off must emit no stream series");
+    }
+
+    @Test
+    void streamStatsCreditOnPrometheusNames() {
+        streamsOn(TokenStreams.Config.from(Map.of("sjws.swarm.stream.credit.enabled", "true")::get));
+        var body = this.http.streams().statsText();
+        assertTrue(body.contains("# TYPE sjws_swarm_stream_credit_enabled gauge"), body);
+        assertTrue(body.contains("sjws_swarm_stream_credit_enabled 1"), body);
+        assertTrue(body.contains("# TYPE sjws_swarm_stream_node_refusals_total counter"), body);
+        assertTrue(body.contains("sjws_swarm_stream_node_refusals_total 0"), body);
+        assertTrue(body.contains("# TYPE sjws_swarm_stream_budget_underflows_total counter"), body);
+        assertTrue(body.contains("sjws_swarm_stream_budget_underflows_total 0"), body);
+        assertTrue(body.contains("# TYPE sjws_swarm_stream_credit_refusals_total counter"), body);
+        assertTrue(body.contains("sjws_swarm_stream_credit_refusals_total 0"), body);
+        assertTrue(body.contains("# HELP sjws_swarm_stream_credit_refusals_total session-scope 429s"), body);
+        assertTrue(body.contains("sjws_swarm_stream_gap_tickets_outstanding"), body);
+        assertTrue(body.contains("sjws_swarm_stream_last_tickets_outstanding"), body);
+        assertTrue(body.contains("sjws_swarm_stream_pressure_trim_bytes_total"), body);
+        assertTrue(body.contains("sjws_swarm_stream_sink_drops_total"), body);
+        assertTrue(body.contains("# HELP sjws_swarm_stream_peak_charged_bytes since start"), body);
     }
 }

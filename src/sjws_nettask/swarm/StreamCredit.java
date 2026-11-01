@@ -18,6 +18,7 @@ package sjws_nettask.swarm;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import sjws_nettask.swarm.wire.Credit;
 
 /**
@@ -67,9 +68,10 @@ final class StreamCredit {
     /** S2c PR 6b (#267): the node stream-memory budget; always present with credit on (no sub-flag). */
     final StreamBudget budget;
     private final ConcurrentHashMap<Key, StreamHttp.Session> sessions = new ConcurrentHashMap<>();
-    private final AtomicLong refusals = new AtomicLong();
-    private final AtomicLong unknown = new AtomicLong();
-    private final AtomicLong underflows = new AtomicLong();
+    // Metric counters: LongAdder on the hot path (zero alloc; see StreamBudgetCounterAllocTest).
+    private final LongAdder refusals = new LongAdder();
+    private final LongAdder unknown = new LongAdder();
+    private final LongAdder underflows = new LongAdder();
     /** Test hook (#248 r5 C3): runs between a check's read of {@code reserved} and its CAS. */
     volatile Runnable beforeReserve;
     /** Test hook (#248 r5 C3): runs after an offer's listener drain returned, before held is lowered. */
@@ -104,25 +106,25 @@ final class StreamCredit {
 
     /** Non-LAST chunks answered 429 (including refusals on validation after the CAS). */
     long refusals() {
-        return this.refusals.get();
+        return this.refusals.sum();
     }
 
     /** Non-LAST chunks answered 204 because the session is not on this node (credit unknown, not refused). */
     long unknown() {
-        return this.unknown.get();
+        return this.unknown.sum();
     }
 
     /** Bug counter: a release that would have taken a {@code reserved} field below 0 (clamped); expected 0. */
     long reserveUnderflows() {
-        return this.underflows.get();
+        return this.underflows.sum();
     }
 
     void refused() {
-        this.refusals.incrementAndGet();
+        this.refusals.increment();
     }
 
     void unknownSession() {
-        this.unknown.incrementAndGet();
+        this.unknown.increment();
     }
 
     /**
@@ -250,7 +252,7 @@ final class StreamCredit {
             boolean under = c < 1 || b < size;
             if (st.reserved.compareAndSet(r, pack(Math.max(0, c - 1), Math.max(0, b - size)))) {
                 if (under) {
-                    this.underflows.incrementAndGet();
+                    this.underflows.increment();
                 }
                 return;
             }

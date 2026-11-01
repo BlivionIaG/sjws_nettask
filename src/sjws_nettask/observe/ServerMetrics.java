@@ -69,6 +69,8 @@ public final class ServerMetrics {
     private final AtomicLong latencyMax = new AtomicLong();
     private volatile IntSupplier http1 = () -> 0;
     private volatile IntSupplier http3 = () -> 0;
+    /** HTTP/1.1 accepts closed at the per-IP cap; 0 until {@link #setRefusedPerIp} attaches. */
+    private volatile LongSupplier refusedPerIp = () -> 0;
     private volatile LongSupplier dropped = () -> 0;
     /** #315: msgrepl install pin-round exhaustions; 0 until {@link #setMsgreplInstallCounters} attaches. */
     private volatile LongSupplier msgreplInstallPinExhausted = () -> 0;
@@ -96,6 +98,14 @@ public final class ServerMetrics {
     public void setConnectionGauges(IntSupplier http1Connections, IntSupplier http3Connections) {
         this.http1 = http1Connections == null ? () -> 0 : http1Connections;
         this.http3 = http3Connections == null ? () -> 0 : http3Connections;
+    }
+
+    /**
+     * HTTP/1.1 accepts closed because {@code max_connections_per_ip} was hit. Read only at scrape time.
+     * Null resets to 0. Core connections family (not swarm-gated). Does not install the observe filter.
+     */
+    public void setRefusedPerIp(LongSupplier refused) {
+        this.refusedPerIp = refused == null ? () -> 0 : refused;
     }
 
     void setDropped(LongSupplier droppedLines) {
@@ -184,8 +194,13 @@ public final class ServerMetrics {
 
     /** Prometheus text exposition 0.0.4 of one {@link #snapshot()}, plus attached msgrepl install counters (#315). */
     public String prometheus() {
-        return prometheus(snapshot(), this.msgreplInstallPinExhausted.getAsLong(),
+        var text = prometheus(snapshot(), this.msgreplInstallPinExhausted.getAsLong(),
                 this.msgreplInstallOversizedAbandoned.getAsLong(), this.cpIdempotencyEvictions.getAsLong());
+        // Core connections family (Observability: sjws_connections_*), not swarm-gated: always HELP+TYPE.
+        return text
+                + "# HELP sjws_connections_refused_per_ip_total HTTP/1.1 accepts closed because max_connections_per_ip was exceeded.\n"
+                + "# TYPE sjws_connections_refused_per_ip_total counter\n"
+                + "sjws_connections_refused_per_ip_total " + this.refusedPerIp.getAsLong() + "\n";
     }
 
     static String prometheus(Snapshot snap) {

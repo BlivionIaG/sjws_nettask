@@ -30,13 +30,30 @@ import java.util.Objects;
  * {@code relaxedSyncDelay} old (checked every tick, so {@link Duration#ZERO}, the default, means the
  * next tick), or immediately inside the append or ack once {@code relaxedSyncEntries} entries are
  * unsynced. {@link ReplicationGroup#durableIndex()} reports how far a node has got.
+ *
+ * <p>{@code fsyncFailureStepDown}: a leader that sees this many consecutive fsync failures steps down so a
+ * healthy peer can take over (#242). A successful fsync resets the count.
  */
 public record GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
         long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis, Duration relaxedSyncDelay,
-        long relaxedSyncEntries, int maxSnapshotBytes) {
+        long relaxedSyncEntries, int maxSnapshotBytes, int fsyncFailureStepDown) {
 
     /** Default {@link #maxSnapshotBytes}: 64 MiB. */
     public static final int DEFAULT_MAX_SNAPSHOT_BYTES = 64 << 20;
+
+    /**
+     * Default {@link #fsyncFailureStepDown}: after this many consecutive fsync failures a leader steps down (#242).
+     * A successful fsync resets the count.
+     */
+    public static final int DEFAULT_FSYNC_FAILURE_STEP_DOWN = 3;
+
+    /** Before the fsync step-down threshold was configurable: {@link #DEFAULT_FSYNC_FAILURE_STEP_DOWN}. */
+    public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
+            long snapshotEveryEntries, boolean preferred, Duration failbackHysteresis, Duration relaxedSyncDelay,
+            long relaxedSyncEntries, int maxSnapshotBytes) {
+        this(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred, failbackHysteresis,
+                relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes, DEFAULT_FSYNC_FAILURE_STEP_DOWN);
+    }
 
     /** Before the snapshot size limit was configurable: {@link #DEFAULT_MAX_SNAPSHOT_BYTES}. */
     public GroupOptions(Durability durability, int maxBatchBytes, Duration electionTimeout, Duration heartbeat,
@@ -90,6 +107,9 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
         if (maxSnapshotBytes < 1) {
             throw new IllegalArgumentException("maxSnapshotBytes");
         }
+        if (fsyncFailureStepDown < 1) {
+            throw new IllegalArgumentException("fsyncFailureStepDown");
+        }
     }
 
     public long leaseNanos() {
@@ -98,12 +118,12 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
 
     public GroupOptions withPreferred(Duration failbackHysteresis) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, true,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes, fsyncFailureStepDown);
     }
 
     public GroupOptions withFailback(Duration failbackHysteresis) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes, fsyncFailureStepDown);
     }
 
     /**
@@ -114,7 +134,7 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
      */
     public GroupOptions withRelaxedSyncBound(Duration delay, long entries) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
-                failbackHysteresis, delay, entries, maxSnapshotBytes);
+                failbackHysteresis, delay, entries, maxSnapshotBytes, fsyncFailureStepDown);
     }
 
     /** {@code snapshotEveryEntries} value that never triggers an automatic snapshot. */
@@ -123,7 +143,7 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
     /** Automatic snapshots off: the log grows until the application calls {@link SnapshotControl#take}. */
     public GroupOptions withoutAutoSnapshot() {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, NO_AUTO_SNAPSHOT, preferred,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes, fsyncFailureStepDown);
     }
 
     /**
@@ -133,7 +153,16 @@ public record GroupOptions(Durability durability, int maxBatchBytes, Duration el
      */
     public GroupOptions withMaxSnapshotBytes(int bytes) {
         return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
-                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, bytes);
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, bytes, fsyncFailureStepDown);
+    }
+
+    /**
+     * After this many consecutive fsync failures a leader steps down in the same term (#242). A successful fsync
+     * resets the count. Default {@link #DEFAULT_FSYNC_FAILURE_STEP_DOWN}.
+     */
+    public GroupOptions withFsyncFailureStepDown(int failures) {
+        return new GroupOptions(durability, maxBatchBytes, electionTimeout, heartbeat, snapshotEveryEntries, preferred,
+                failbackHysteresis, relaxedSyncDelay, relaxedSyncEntries, maxSnapshotBytes, failures);
     }
 
     public boolean autoSnapshot() {

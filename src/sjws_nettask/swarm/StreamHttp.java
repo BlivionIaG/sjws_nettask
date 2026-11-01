@@ -190,6 +190,17 @@ final class StreamHttp {
     }
 
     /**
+     * S2c PR 8 (N2): Prometheus appendix for {@code /metrics}. Credit-off returns empty so flag-off
+     * emits nothing and does not load {@link StreamBudget}/{@link StreamCredit}.
+     */
+    String statsText() {
+        if (this.credit == null) {
+            return StreamStats.prometheusCreditOff();
+        }
+        return StreamStats.prometheus(this.credit, this.streams.sinkDrops());
+    }
+
+    /**
      * One daemon thread for every live StreamHttp of the process (stream flag on only): created by the first one,
      * shut down when the last one's swarm closes (#181: it used to outlive every close).
      */
