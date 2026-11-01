@@ -64,20 +64,7 @@ class CpConfigTest {
         assertEquals(0L, c.keys().minBundleSerial());
         assertNull(c.keys().rootPubSha256());
         assertTrue(c.peers().isEmpty());
-        assertTrue(c.adminAllowedOrigins().isEmpty());
         assertTrue(c.warnings().get(0).contains("single-voter"));
-    }
-
-    @Test
-    void adminAllowedOrigins() {
-        var y = base();
-        y.put("admin", Map.of("listen", "127.0.0.1:1", "allowedOrigins",
-                List.of("https://console.example", "https://ops.example")));
-        var c = parse(y);
-        assertEquals(List.of("https://console.example", "https://ops.example"), c.adminAllowedOrigins());
-        var bad = base();
-        bad.put("admin", Map.of("listen", "127.0.0.1:1", "allowedOrigins", "https://x"));
-        assertThrows(IllegalArgumentException.class, () -> parse(bad));
     }
 
     @Test

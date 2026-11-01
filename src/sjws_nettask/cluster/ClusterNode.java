@@ -104,17 +104,6 @@ public interface ClusterNode extends AutoCloseable {
         return future;
     }
 
-
-    /**
-     * Explicit operator escape for stalled per-append STRICT overrides (#208). See
-     * {@link ReplicatedNode#releaseStalledStrictOverrides(GroupId, String)}. The default refuses.
-     *
-     * @param operatorId authenticated operator identity (non-blank)
-     */
-    default int releaseStalledStrictOverrides(GroupId groupId, String operatorId) throws NotLeaderException {
-        throw new UnsupportedOperationException("releaseStalledStrictOverrides");
-    }
-
     /** Leadership of this group only. Invoked off the request path. */
     void onLeaderChange(GroupId groupId, BiConsumer<Long, Optional<NodeId>> listener);
 

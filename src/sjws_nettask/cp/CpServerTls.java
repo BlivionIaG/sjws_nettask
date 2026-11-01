@@ -119,15 +119,6 @@ public final class CpServerTls {
         }
     }
 
-    /** Same checks as {@link #revalidatePeer(SSLSocket, boolean)} when only the peer chain is available (HTTPS exchanges). */
-    public void revalidatePeer(X509Certificate[] chain, boolean peerIsClient) throws IOException {
-        try {
-            tls.revalidatePeer(chain, peerIsClient);
-        } catch (CertificateException e) {
-            throw new IOException(config.name() + " peer refused after handshake: " + e.getMessage(), e);
-        }
-    }
-
     /**
      * Builds the new material from disk (key owner/mode check first), then swaps it in one step.
      * On any failure, including a refusal by the {@link #checkLeafOnReload} check, the current material stays in use.

@@ -34,6 +34,3 @@ root must be readable by uid 10001.
 CI: `.github/workflows/docker.yml` builds the image with Buildx (GitHub Actions cache), starts it,
 waits for `healthy`, checks `/healthz`, a static file and that the process is not root, then removes
 it. Nothing is pushed to a registry.
-
-
-See [JVM flag profiles](../operations/jvm-flags.md) for G1 / ZGC / Serial recommendations measured outside the image.

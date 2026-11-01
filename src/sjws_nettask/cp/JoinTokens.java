@@ -16,9 +16,6 @@
  */
 package sjws_nettask.cp;
 
-import java.io.DataInput;
-import java.io.DataOutput;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -170,109 +167,6 @@ public final class JoinTokens {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
         }
-    }
-
-
-    /** Replace contents from another table (#341 install). */
-    void replaceWith(JoinTokens other) {
-        writeLock.lock();
-        try {
-            tokens.clear();
-            byNode.clear();
-            other.writeLock.lock();
-            try {
-                tokens.putAll(other.tokens);
-                byNode.putAll(other.byNode);
-            } finally {
-                other.writeLock.unlock();
-            }
-        } finally {
-            writeLock.unlock();
-        }
-    }
-
-    /** Snapshot encode (#341): issued tokens then by-node joins. Replace-on-read. */
-    void writeSnapshot(DataOutput out) throws IOException {
-        writeLock.lock();
-        try {
-            out.writeInt(tokens.size());
-            for (var e : tokens.values()) {
-                writeStr(out, e.tokenId);
-                writeStr(out, e.secretHash);
-                out.writeLong(e.expiresAtMillis);
-                writeStr(out, e.consumedBy == null ? "" : e.consumedBy);
-                out.writeLong(e.consumedAtMillis);
-            }
-            out.writeInt(byNode.size());
-            for (var j : byNode.values()) {
-                writeStr(out, j.nodeId());
-                writeStr(out, j.tokenId());
-                writeStr(out, j.secretHash());
-                out.writeLong(j.expiresAtMillis());
-            }
-        } finally {
-            writeLock.unlock();
-        }
-    }
-
-    /** Snapshot decode (#341): clears then loads. Caps match {@link #MAX_TOKENS}. */
-    void readSnapshot(DataInput in) throws IOException {
-        writeLock.lock();
-        try {
-            tokens.clear();
-            byNode.clear();
-            int n = in.readInt();
-            if (n < 0 || n > MAX_TOKENS) {
-                throw new IOException("join tokens: " + n + " issued");
-            }
-            for (int i = 0; i < n; i++) {
-                var id = readStr(in, 64);
-                var hash = readStr(in, 64);
-                long exp = in.readLong();
-                var consumedBy = readStr(in, 64);
-                long consumedAt = in.readLong();
-                if (!isHash(hash)) {
-                    throw new IOException("join tokens: bad hash");
-                }
-                tokens.put(id, new Issued(id, hash, exp, consumedBy.isEmpty() ? null : consumedBy, consumedAt));
-            }
-            int m = in.readInt();
-            if (m < 0 || m > MAX_TOKENS) {
-                throw new IOException("join tokens: " + m + " joins");
-            }
-            for (int i = 0; i < m; i++) {
-                var nodeId = readStr(in, 64);
-                var tokenId = readStr(in, 64);
-                var hash = readStr(in, 64);
-                long exp = in.readLong();
-                if (!isHash(hash)) {
-                    throw new IOException("join tokens: bad join hash");
-                }
-                byNode.put(nodeId, new Join(nodeId, tokenId, hash, exp));
-            }
-        } finally {
-            writeLock.unlock();
-        }
-    }
-
-    private static void writeStr(DataOutput out, String s) throws IOException {
-        var raw = s.getBytes(StandardCharsets.UTF_8);
-        out.writeInt(raw.length);
-        out.write(raw);
-    }
-
-    private static String readStr(DataInput in, int maxChars) throws IOException {
-        int len = in.readInt();
-        if (len < 0 || len > maxChars * 4) { // UTF-8 upper bound
-            throw new IOException("join tokens: string length " + len);
-        }
-        var raw = new byte[len];
-        in.readFully(raw);
-        var s = new String(raw, StandardCharsets.UTF_8);
-        if (s.length() > maxChars) {
-            throw new IOException("join tokens: string too long");
-        }
-        return s;
     }
 
     private record Issued(String tokenId, String secretHash, long expiresAtMillis, String consumedBy,

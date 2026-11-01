@@ -213,9 +213,6 @@ class AdminTlsTest {
         if (bearer != null) {
             request.header("Authorization", "Bearer " + bearer);
         }
-        if ("POST".equals(method) || "PUT".equals(method) || "PATCH".equals(method) || "DELETE".equals(method)) {
-            request.header("Content-Type", "application/json");
-        }
         request.method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body));
         return client.send(request.build(), HttpResponse.BodyHandlers.ofString());
     }

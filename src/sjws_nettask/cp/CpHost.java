@@ -123,12 +123,11 @@ public final class CpHost implements CpReloadable {
         var adminTls = serverTls("cp-admin");
         var adminAt = resolve(config.adminListen());
         long now = deps.clock().currentTimeMillis();
-        var origins = java.util.Set.copyOf(config.adminAllowedOrigins());
         if (adminTls == null) {
             loopback(adminAt, "cp.admin.listen");
-            admin = AdminServer.startPlainForTests(store, now, 60_000L, origins);
+            admin = AdminServer.startPlainForTests(store, now, 60_000L);
         } else {
-            admin = AdminServer.startMtls(store, adminAt, now, 60_000L, adminTls, origins);
+            admin = AdminServer.startMtls(store, adminAt, now, 60_000L, adminTls);
             tlsReloads.add(adminTls::reloadTls);
         }
         events.add("admin");

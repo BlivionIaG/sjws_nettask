@@ -5,7 +5,6 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ResourceBundle;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -111,44 +110,6 @@ class ReloadHookTest {
             assertEquals(1, seen.get());
         } finally {
             hook.close();
-        }
-    }
-
-
-    @Test
-    @Order(6)
-    void restoreFailureWarnUsesSystemLogger() {
-        var previous = ReloadHook.LOG;
-        var seen = new java.util.ArrayList<String>();
-        ReloadHook.LOG = new System.Logger() {
-            @Override
-            public String getName() {
-                return "test.reloadhook";
-            }
-
-            @Override
-            public boolean isLoggable(Level level) {
-                return true;
-            }
-
-            @Override
-            public void log(Level level, ResourceBundle bundle, String msg, Throwable thrown) {
-                seen.add(level + "|" + msg);
-            }
-
-            @Override
-            public void log(Level level, ResourceBundle bundle, String format, Object... params) {
-                seen.add(level + "|" + format);
-            }
-        };
-        try {
-            ReloadHook.warnRestoreFailed(new IllegalStateException("boom"));
-            assertEquals(1, seen.size(), seen.toString());
-            assertTrue(seen.get(0).startsWith("WARNING|"), seen.get(0));
-            assertTrue(seen.get(0).contains("WARN: could not restore SIGHUP default disposition: "), seen.get(0));
-            assertTrue(seen.get(0).contains("boom"), seen.get(0));
-        } finally {
-            ReloadHook.LOG = previous;
         }
     }
 

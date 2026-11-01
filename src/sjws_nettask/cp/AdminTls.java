@@ -115,8 +115,6 @@ public final class AdminTls {
     private final AtomicLong generation = new AtomicLong();
     private volatile Material current;
     private volatile Material previous;
-    private volatile Runnable afterReload = () -> {
-    };
 
     private AdminTls(String label, Path certPem, Path keyPem, String keyPassword, Path trustBundle, Path revocations,
             Audit audit, boolean actsAsClient) throws IOException {
@@ -197,11 +195,6 @@ public final class AdminTls {
         return generation.get();
     }
 
-    /** Runs after a successful {@link #reload()} (admin connections use this to drop peers that fail policy). */
-    public void afterReload(Runnable hook) {
-        this.afterReload = java.util.Objects.requireNonNull(hook, "hook");
-    }
-
     /**
      * Re-reads every file and swaps the material if all of it is valid. Cached sessions listed by
      * the session context are invalidated. Peer links also re-check the presented chain after every
@@ -234,7 +227,6 @@ public final class AdminTls {
                 invalidateSessions(context.getClientSessionContext());
             }
             audit.record("system", label + ".reload", String.valueOf(trustBundle), "ok");
-            afterReload.run();
             return null;
         } catch (IOException | RuntimeException e) {
             var why = String.valueOf(e.getMessage());

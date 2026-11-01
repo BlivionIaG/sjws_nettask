@@ -14,7 +14,7 @@ not read this file and does not load `sjws_nettask.service`.
 | `contrib/sjws_nettask-control@.service` | `systemctl enable --now sjws_nettask-control@1` |
 | `contrib/sjws_nettask-data@.service` | `systemctl enable --now sjws_nettask-data@edge1` |
 
-Both role units are `Type=forking`. `--daemon` writes the pid file and the parent exits. Their `ExecStart` lines pass `--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED` (also in the jar `Add-Opens` manifest) so admin TLS can close keep-alive connections after a reload.
+Both role units are `Type=forking`. `--daemon` writes the pid file and the parent exits.
 `User=sjws` must exist (`useradd --system --home /var/lib/sjws_nettask --shell /usr/sbin/nologin sjws`).
 `UMask=0077`, `-XX:-HeapDumpOnOutOfMemoryError`, and `LimitCORE=0` keep a join token out of
 files the process creates and out of crash dumps. Those JVM flags are not on the standalone unit.
@@ -137,8 +137,6 @@ This process does not implement that check. It holds the file until `tokenConsum
 disconnected connection does not drain the process.
 
 Admin mutations with an `Idempotency-Key` are deduplicated for 100 000 applied `cp-config` log indexes (cap 100 000 keys). After eviction a retry is applied again; there is no `KeyExpired`. Details: [control-plane design §12.8.1](../design/control-plane.md).
-
-The `cp-config` group takes application Raft snapshots every 10 000 entries (`CpStore` SnapshotTaker, #341). `compactThrough` truncates the log after a durable snapshot (`persistSnapshotBeforePrefixDelete`). A restarted or lagging replica installs the image via the real Raft snapshot path and then applies the suffix; duplicate Idempotency-Key verdicts match a full replay.
 
 
 A control process with `cp` settings hosts the control plane (`sjws_nettask.cp.CpHost`: a

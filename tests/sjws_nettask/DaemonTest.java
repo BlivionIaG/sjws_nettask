@@ -276,13 +276,11 @@ class DaemonTest {
         var out = new ArrayList<String>();
         assertTrue(Daemon.splice(out, "/java", new String[] {"-Xmx1g", "-jar", "/opt/app.jar", "--daemon", "1"},
                 List.of("8080", "--pid-file=p")));
-        assertEquals(List.of("/java", "-Xmx1g", Daemon.ADMIN_HTTPSERVER_ADD_OPENS, "-jar", "/opt/app.jar",
-                "8080", "--pid-file=p"), out);
+        assertEquals(List.of("/java", "-Xmx1g", "-jar", "/opt/app.jar", "8080", "--pid-file=p"), out);
         out.clear();
         assertTrue(Daemon.splice(out, "/java",
                 new String[] {"-cp", "a.jar", "sjws_nettask.Sjws_nettask", "--daemon"}, List.of("--log-file=l")));
-        assertEquals(List.of("/java", "-cp", "a.jar", Daemon.ADMIN_HTTPSERVER_ADD_OPENS, "sjws_nettask.Sjws_nettask",
-                "--log-file=l"), out);
+        assertEquals(List.of("/java", "-cp", "a.jar", "sjws_nettask.Sjws_nettask", "--log-file=l"), out);
         assertFalse(Daemon.splice(new ArrayList<>(), "/java", new String[] {"-jar"}, List.of("x")));
         assertFalse(Daemon.splice(new ArrayList<>(), "/java", new String[] {"-version"}, List.of()));
         assertTrue(Daemon.isOurLaunch(new String[] {"-jar", "/opt/sjws_nettask.jar"}));
@@ -291,81 +289,6 @@ class DaemonTest {
         assertFalse(Daemon.isOurLaunch(new String[] {"-jar", "sjws_nettask-surefire.jar"}));
         assertFalse(Daemon.isOurLaunch(new String[] {"-jar"}));
         assertFalse(Daemon.isOurLaunch(new String[] {"-version"}));
-    }
-
-
-    @Test
-    void spliceInjectsHttpserverAddOpensWhenMissingAndDoesNotDuplicate() {
-        var out = new ArrayList<String>();
-        assertTrue(Daemon.splice(out, "/java",
-                new String[] {"-jar", "/opt/sjws_nettask.jar", "--daemon"}, List.of("8080")));
-        assertEquals(1, out.stream().filter(Daemon.ADMIN_HTTPSERVER_ADD_OPENS::equals).count(), out.toString());
-        out.clear();
-        assertTrue(Daemon.splice(out, "/java",
-                new String[] {Daemon.ADMIN_HTTPSERVER_ADD_OPENS, "-jar", "/opt/sjws_nettask.jar", "--daemon"},
-                List.of("8080")));
-        assertEquals(1, out.stream().filter(Daemon.ADMIN_HTTPSERVER_ADD_OPENS::equals).count(), out.toString());
-        out.clear();
-        assertTrue(Daemon.splice(out, "/java",
-                new String[] {"--add-opens", "jdk.httpserver/sun.net.httpserver=ALL-UNNAMED", "-jar",
-                        "/opt/sjws_nettask.jar", "--daemon"},
-                List.of("8080")));
-        assertEquals(0, out.stream().filter(Daemon.ADMIN_HTTPSERVER_ADD_OPENS::equals).count(), out.toString());
-        assertTrue(out.contains("--add-opens") && out.contains("jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"),
-                out.toString());
-    }
-
-    @Test
-    void packagedJarManifestAndSystemdUnitsCarryHttpserverAddOpens() throws Exception {
-        var opens = "jdk.httpserver/sun.net.httpserver";
-        var pom = Files.readString(Path.of("pom.xml"));
-        assertTrue(pom.contains("<Add-Opens>") && pom.contains(opens), "jar Add-Opens in pom.xml");
-        assertTrue(pom.contains("<argLine>") && pom.contains("--add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"),
-                "surefire argLine must open jdk.httpserver");
-        var dockerfile = Files.readString(Path.of("Dockerfile"));
-        assertTrue(dockerfile.contains("jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"),
-                "Dockerfile ENTRYPOINT must open jdk.httpserver");
-        for (var unit : List.of("contrib/sjws_nettask.service", "contrib/sjws_nettask-control@.service",
-                "contrib/sjws_nettask-data@.service")) {
-            var text = Files.readString(Path.of(unit));
-            var exec = text.lines().filter(l -> l.startsWith("ExecStart=")).findFirst().orElseThrow();
-            assertTrue(exec.contains(Daemon.ADMIN_HTTPSERVER_ADD_OPENS)
-                            || exec.contains("--add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"),
-                    unit + ": " + exec);
-        }
-        // Prefer the built jar when present (after package); otherwise the pom entry is the source of truth.
-        var jars = Files.list(Path.of("target"))
-                .filter(p -> {
-                    var n = p.getFileName().toString();
-                    return n.startsWith("sjws_nettask-") && n.endsWith(".jar") && !n.contains("sources")
-                            && !n.contains("javadoc");
-                })
-                .toList();
-        if (!jars.isEmpty()) {
-            try (var z = new java.util.zip.ZipFile(jars.get(0).toFile())) {
-                var entry = z.getEntry("META-INF/MANIFEST.MF");
-                assertNotNull(entry, jars.get(0).toString());
-                var mf = new String(z.getInputStream(entry).readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                assertTrue(mf.replaceAll("\r?\n ", "").contains(opens), mf);
-            }
-        }
-    }
-
-
-    @Test
-    void ensureJvmFlagCoversEdgePaths() {
-        var bare = new ArrayList<>(List.of("/java", "-Xmx1g"));
-        Daemon.ensureJvmFlag(bare, bare.size() - 1, Daemon.ADMIN_HTTPSERVER_ADD_OPENS);
-        assertEquals(List.of("/java", "-Xmx1g", Daemon.ADMIN_HTTPSERVER_ADD_OPENS), bare);
-
-        var trailing = new ArrayList<>(List.of("/java", "--add-opens"));
-        Daemon.ensureJvmFlag(trailing, trailing.size() - 1, Daemon.ADMIN_HTTPSERVER_ADD_OPENS);
-        assertTrue(trailing.contains(Daemon.ADMIN_HTTPSERVER_ADD_OPENS), trailing.toString());
-
-        var other = new ArrayList<>(List.of("/java", "--add-opens", "java.base/java.io=ALL-UNNAMED", "-jar", "a.jar"));
-        Daemon.ensureJvmFlag(other, 3, Daemon.ADMIN_HTTPSERVER_ADD_OPENS);
-        assertEquals(Daemon.ADMIN_HTTPSERVER_ADD_OPENS, other.get(3));
-        assertEquals("-jar", other.get(4));
     }
 
     @Test
@@ -386,12 +309,11 @@ class DaemonTest {
         var ours = Daemon.childCommand(List.of("8080"),
                 Optional.of(new String[] {"-Xmx1g", "-jar", "/opt/sjws_nettask.jar", "--daemon"}),
                 "/java", "unused-cp");
-        assertEquals(List.of("/java", "-Xmx1g", Daemon.ADMIN_HTTPSERVER_ADD_OPENS, "-jar", "/opt/sjws_nettask.jar",
-                "8080"), ours.subList(ours.indexOf("/java"), ours.size()));
+        assertEquals(List.of("/java", "-Xmx1g", "-jar", "/opt/sjws_nettask.jar", "8080"),
+                ours.subList(ours.indexOf("/java"), ours.size()));
         var hidden = Daemon.childCommand(List.of("1"), Optional.empty(), "/java", "cp");
         assertTrue(hidden.contains("cp") && hidden.contains("sjws_nettask.Sjws_nettask"), hidden.toString());
         assertTrue(hidden.contains("--enable-native-access=ALL-UNNAMED"), hidden.toString());
-        assertTrue(hidden.contains("--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"), hidden.toString());
         assertEquals(Path.of("/dev/null"), Daemon.discardInput(List.of("NUL", "/dev/null")));
         assertNull(Daemon.discardInput(List.of("no-such-null-device")));
 

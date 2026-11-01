@@ -37,7 +37,7 @@ RuntimeDirectory=sjws_nettask
 StateDirectory=sjws_nettask
 LogsDirectory=sjws_nettask
 WorkingDirectory=/var/www/html
-ExecStart=/usr/bin/java -XX:-HeapDumpOnOutOfMemoryError --add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED -jar /usr/share/sjws_nettask/sjws_nettask.jar --daemon --role=data --config=/etc/sjws_nettask/data-%i/sjws_nettask-data.yaml --bootstrap=/etc/sjws_nettask/data-%i/bootstrap --pid-file=/run/sjws_nettask/data-%i.pid --log-file=/var/log/sjws_nettask/data-%i.log --shutdown-timeout=10 8080 /var/www/html
+ExecStart=/usr/bin/java -XX:-HeapDumpOnOutOfMemoryError -jar /usr/share/sjws_nettask/sjws_nettask.jar --daemon --role=data --config=/etc/sjws_nettask/data-%i/sjws_nettask-data.yaml --bootstrap=/etc/sjws_nettask/data-%i/bootstrap --pid-file=/run/sjws_nettask/data-%i.pid --log-file=/var/log/sjws_nettask/data-%i.log --shutdown-timeout=10 8080 /var/www/html
 ExecStop=/usr/bin/java -jar /usr/share/sjws_nettask/sjws_nettask.jar --stop --pid-file=/run/sjws_nettask/data-%i.pid --shutdown-timeout=10
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

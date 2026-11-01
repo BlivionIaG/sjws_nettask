@@ -49,9 +49,6 @@ public final class ReloadHook {
     /** How many times {@link #restoreDefaultHangup()} was entered. Package-visible for tests. */
     static final AtomicInteger RESTORE_ATTEMPTS = new AtomicInteger();
 
-    /** Daemon/server WARN path uses the JDK system logger (same facility as CP / HA). Tests may replace. */
-    static System.Logger LOG = System.getLogger(ReloadHook.class.getName());
-
     private ReloadHook() {
     }
 
@@ -124,14 +121,9 @@ public final class ReloadHook {
             mh.invoke(SIGHUP, MemorySegment.NULL);
             return true;
         } catch (Throwable t) {
-            warnRestoreFailed(t);
+            System.err.println("WARN: could not restore SIGHUP default disposition: " + t);
             return false;
         }
-    }
-
-    /** Package-visible so tests can assert the WARN goes through {@link #LOG}. */
-    static void warnRestoreFailed(Throwable t) {
-        LOG.log(System.Logger.Level.WARNING, "WARN: could not restore SIGHUP default disposition: " + t);
     }
 
     /**

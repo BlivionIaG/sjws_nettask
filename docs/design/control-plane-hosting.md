@@ -245,7 +245,6 @@ Follow `OptionalModules`: JVM property `sjws.cp.*`, env `SJWS_CP_*`, YAML `cp:` 
 | — | — | `cp.peers[]` (`id`, `address`, `witness: bool`, optional `wire`, `san`) | voter set; `wire` defaults to the 1-based list position, so list peers in the same order on every voter. `san` is the typed subject alternative name that voter's `cp-peer` certificate carries: `uri:<URI SAN>` or `dns:<DNS name>`, for example `uri:urn:sjws:node:cp-1` (exact, case-sensitive match against SANs of that type only; no `*`); required on every entry whenever `cp.tls` is present (even if it only configures watch or admin), unique across entries, and ignored with a warning without `cp.tls`. Addresses must be unique too |
 | `sjws.cp.watch.listen` | `SJWS_CP_WATCH_LISTEN` | `cp.watch.listen` | WatchServer |
 | `sjws.cp.admin.listen` | `SJWS_CP_ADMIN_LISTEN` | `cp.admin.listen` | AdminServer |
-| — | — | `cp.admin.allowedOrigins` | Exact `Origin` values allowed on admin mutations; empty (default) refuses any present `Origin` |
 | — | — | `cp.tls.{cert,key,ca,adminCa,revocations}` | owned by Security; watch and admin listeners |
 | — | — | `cp.tls.{peerCert,peerKey,peerCa}` | voter links; all three required with `cp.peers`, no fallback; `peerCa` must not be `ca` |
 | — | `SJWS_CP_RAFT_KEY` (`SJWS_CP_RAFT_KEY_PREVIOUS` during rotation) | — | CP-only Raft frame HMAC key, same on every voter; required with `cp.peers`; must differ from `WEB_SERVER_HA_CLUSTER_KEY` and the config-file `ha.cluster_key` |

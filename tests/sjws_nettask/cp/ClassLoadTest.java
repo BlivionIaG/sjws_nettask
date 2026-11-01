@@ -91,7 +91,7 @@ class ClassLoadTest {
         }
         assertTrue(text.contains("witness up"), text);
         assertTrue(text.contains("sjws_nettask.cp.CpWitness "), "sanity: the witness itself is loaded");
-        for (var name : java.util.List.of("KeyRing", "CpStore", "WatchServer", "AdminServer", "CpAdmin", "CpHost ")) {
+        for (var name : java.util.List.of("KeyRing", "CpStore", "WatchServer", "AdminServer", "CpHost ")) {
             assertFalse(text.contains("sjws_nettask.cp." + name), name + " loaded by a witness host");
         }
     }
@@ -140,8 +140,7 @@ class ClassLoadTest {
         assertTrue(text.contains("control-plane role=data/gateway"), text);
         for (var name : java.util.List.of("sjws_nettask.cp.CpLaunch ", "sjws_nettask.cp.CpHost ",
                 "sjws_nettask.cp.CpHostDeps ", "sjws_nettask.cp.CpWitness", "sjws_nettask.cp.CpStore ",
-                "sjws_nettask.cp.WatchServer ", "sjws_nettask.cp.AdminServer ", "sjws_nettask.cp.CpAdmin ",
-                "sjws_nettask.cp.KeyRing ",
+                "sjws_nettask.cp.WatchServer ", "sjws_nettask.cp.AdminServer ", "sjws_nettask.cp.KeyRing ",
                 "sjws_nettask.cp.KeyRingLoader ", "sjws_nettask.cp.CpServerTls ", "sjws_nettask.cp.CpPeerSockets ",
                 "sjws_nettask.cp.CpConfig ", "sjws_nettask.cp.CpConfig$Peer ", "sjws_nettask.cluster.TcpTransport ",
                 "sjws_nettask.cluster.TcpTransport$OriginMismatch ", "sjws_nettask.cluster.RaftGroup ",
