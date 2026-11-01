@@ -16,6 +16,11 @@ ACCEPT=${ACCEPT:-binary}
 PHASE=${PHASE:-all}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
+# Bench lock convention (AGENTS.md / shared box):
+# - Entry points acquire /tmp/sjws-bench.lock exactly once.
+# - If the caller already holds it (outer `flock /tmp/sjws-bench.lock …`), set SKIP_FLOCK=1
+#   so this script does not re-acquire and deadlock on the same fd/file.
+# - Bare `./gate.sh` (no outer flock) takes the lock itself.
 if [ "${SKIP_FLOCK:-0}" != 1 ]; then
   exec 9>>/tmp/sjws-bench.lock
   flock 9

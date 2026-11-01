@@ -5,6 +5,11 @@ set -euo pipefail
 JAR=$1; OUT=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
+# Same lock convention as gate.sh: acquire once, or SKIP_FLOCK=1 when the caller already holds it.
+if [ "${SKIP_FLOCK:-0}" != 1 ]; then
+  exec 9>>/tmp/sjws-bench.lock
+  flock 9
+fi
 export DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
 export WARMUP=${WARMUP:-5}
 SECS=${SECS:-20}

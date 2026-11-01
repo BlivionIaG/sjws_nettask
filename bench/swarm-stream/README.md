@@ -16,10 +16,18 @@ Producer → node → consumer with **credit on**, over SSE and binary drains. A
 export JAVA_HOME=~/jdk25/jdk-25.0.4.1+1
 export PATH="$JAVA_HOME/bin:$PATH"
 mvn -B -q -DskipTests package
+# Outer flock holds the shared-box lock; SKIP_FLOCK=1 prevents gate.sh from re-acquiring it.
 flock /tmp/sjws-bench.lock nice -n 10 \
-  env SECS=20 WARMUP=5 NVALID=6 \
+  env SKIP_FLOCK=1 SECS=20 WARMUP=5 NVALID=6 \
   bench/swarm-stream/gate.sh /path/to/base.jar /path/to/head.jar /tmp/s2c-pr8-out
 ```
+
+### Bench lock (`/tmp/sjws-bench.lock`)
+
+`gate.sh` and `cross-check.sh` take an exclusive flock on `/tmp/sjws-bench.lock` unless
+`SKIP_FLOCK=1`. When you wrap them in an outer `flock /tmp/sjws-bench.lock …` (the shared-box
+rule), **always** set `SKIP_FLOCK=1` — otherwise the child waits forever on the lock the parent
+already holds. `one.sh` never takes the lock; only those entry points do.
 
 CPU pin: wrk / load gen on 0–1, server on 2–7. ZGC, `-Dsjws.swarm.pool.shards=4`, stream+credit on.
 Counters: `/metrics` appendix only (Observability-reviewed `sjws_swarm_stream_*` names).
