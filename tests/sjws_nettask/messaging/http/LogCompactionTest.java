@@ -239,7 +239,10 @@ class LogCompactionTest {
         assertEquals("", keyOf(kv("", "zz")));
         assertEquals(Set.of("a", "b.c"), LogCompaction.parseTopics(" a, b.c ,,"));
         assertThrows(IllegalArgumentException.class, () -> LogCompaction.parseTopics("ok,bad/name"));
+        assertThrows(IllegalArgumentException.class, () -> LogCompaction.parseTopics("__evil"));
+        assertThrows(IllegalArgumentException.class, () -> LogCompaction.parseTopics("ok,__offsets"));
         assertEquals(Set.of(), MessagingModule.compactionTopics("bad/name"));
+        assertEquals(Set.of(), MessagingModule.compactionTopics("__evil"));
     }
 
     // --- crash at each step of the copy, fsync, marker, swap protocol ---

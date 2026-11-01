@@ -137,7 +137,7 @@ public final class LogCompaction {
         for (var part : list.split(",")) {
             var t = part.trim();
             if (t.isEmpty()) continue;
-            if (!LogTopics.validName(t)) throw new IllegalArgumentException("bad topic in compaction list: " + t);
+            if (!LogTopics.validUserTopic(t)) throw new IllegalArgumentException("bad topic in compaction list: " + t);
             out.add(t);
         }
         return Set.copyOf(out);

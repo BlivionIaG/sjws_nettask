@@ -158,7 +158,7 @@ final class LogTopics implements AutoCloseable {
             if (part.isBlank()) continue;
             int c = part.lastIndexOf(':');
             var topic = c < 0 ? "" : part.substring(0, c).trim();
-            if (!validName(topic)) throw new IllegalArgumentException("bad topic in durability override: " + part.trim());
+            if (!validUserTopic(topic)) throw new IllegalArgumentException("bad topic in durability override: " + part.trim());
             out.put(topic, parseDurability(part.substring(c + 1)));
         }
         return out;

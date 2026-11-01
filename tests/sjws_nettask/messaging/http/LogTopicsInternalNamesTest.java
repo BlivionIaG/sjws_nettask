@@ -16,20 +16,26 @@
  */
 package sjws_nettask.messaging.http;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
+import sjws_nettask.core.Request;
 import sjws_nettask.messaging.ledger.Durability;
+import sjws_nettask.messaging.ledger.LedgerWriter;
+import sjws_nettask.messaging.ledger.SegmentedLog;
 
-/** #217: open/create rejects user topic names starting with {@code __}. */
+/** Reserved {@code __*} topic checks (#217 / #433 follow-up). */
 @Timeout(30)
 class LogTopicsInternalNamesTest {
 
@@ -51,6 +57,39 @@ class LogTopicsInternalNamesTest {
             assertTrue(err.getMessage().contains("internal"), err.getMessage());
             assertNotNull(topics.get(LogOffsets.TOPIC, true));
             assertNotNull(topics.get(LogOffsets.LOCAL_TOPIC, true));
+        }
+    }
+
+    /** N1: GET refuses a reserved name even when an on-disk directory already exists. */
+    @Test
+    void httpGetRefusesReservedTopicWhenDirectoryExists() throws Exception {
+        var logs = dir.resolve("logs");
+        // Pre-create a directory that LogTopics.get(..., false) would otherwise open for read.
+        try (var log = SegmentedLog.open(logs.resolve("__evil"));
+                var w = new LedgerWriter(log, Durability.ASYNC)) {
+            w.append(List.of("x".getBytes(StandardCharsets.UTF_8))).get();
+        }
+        try (var topics = new LogTopics(logs, Durability.ASYNC)) {
+            var h = new MessagingHttp(topics);
+            var get = h.handle(new Request("GET", "/messaging/v1/topics/__evil/records"));
+            var getBody = new String(MessagingHttpTest.bytes(get), StandardCharsets.UTF_8);
+            assertEquals(400, get.status(), getBody);
+            assertTrue(getBody.contains("internal"), getBody);
+            assertEquals(400, MessagingHttpTest.post(h, "__evil", MessagingHttpTest.recs("y"), null).status());
+            assertEquals(400, MessagingHttpTest.post(h, "__offsets", MessagingHttpTest.recs("y"), null).status());
+            // Internal offsets topics still open for the module itself.
+            assertNotNull(topics.get(LogOffsets.TOPIC, true));
+        }
+    }
+
+    /** N2: HTTP doors go through {@link LogTopics#validUserTopic}. */
+    @Test
+    void httpOffsetsAlsoUseValidUserTopic() throws Exception {
+        try (var topics = new LogTopics(dir.resolve("logs"), Durability.ASYNC)) {
+            var h = new MessagingHttp(topics);
+            assertEquals(400, h.handle(new Request("GET", "/messaging/v1/topics/__evil/offsets/g")).status());
+            assertEquals(400, h.handle(new Request("PUT", "/messaging/v1/topics/__offsets/offsets/g")
+                    .withBody(MessagingHttpTest.body("{\"offset\":0}".getBytes(StandardCharsets.UTF_8)))).status());
         }
     }
 }

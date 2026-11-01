@@ -45,6 +45,9 @@ class TopicDurabilityTest {
         assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("orders"));
         assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("../x:group"));
         assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("orders:maybe"));
+        assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("__evil:group"));
+        assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("__offsets:async"));
+        assertEquals(Map.of(), MessagingModule.topicDurability("__evil:group"));
     }
 
     @Test
