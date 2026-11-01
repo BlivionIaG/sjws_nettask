@@ -1,10 +1,16 @@
 package sjws_nettask;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicReference;
@@ -170,6 +176,40 @@ class MessagingMetricsAttachTest {
         assertTrue(Sjws_nettask.prepareMessagingMetrics(new BrokenMessaging(), false) != null);
         var metrics = new sjws_nettask.messaging.stats.MessagingMetrics();
         Sjws_nettask.installMessagingHooks(new BrokenMessaging(), metrics);
+    }
+
+
+    @Test
+    void serveWithMetricsOnInstallsHooksBeforeMount() throws Exception {
+        var html = Files.createDirectories(dir.resolve("html-serve-on"));
+        Files.writeString(html.resolve("index.html"), "ok");
+        var out = new ByteArrayOutputStream();
+        var err = new ByteArrayOutputStream();
+        var running = new CompletableFuture<SjwsServer>();
+        var exit = CompletableFuture.supplyAsync(() -> Sjws_nettask.serve(
+                ServerConfig.builder(html).port(0).metricsExposure(MetricsExposure.ON).build(),
+                (c, h) -> { throw new AssertionError("no h3"); }, new PrintStream(out), new PrintStream(err), running::complete));
+        var server = running.get(15, TimeUnit.SECONDS);
+        try {
+            var scrape = HttpTestSupport.get(server.tcpPort(), "/metrics", 2000);
+            assertEquals(200, scrape.statusCode());
+        } finally {
+            server.close();
+        }
+        assertEquals(Sjws_nettask.EXIT_OK, exit.get(15, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void runWithMetricsFlagCoversServeLoadedOnPath() throws Exception {
+        var html = Files.createDirectories(dir.resolve("html-run-on"));
+        Files.writeString(html.resolve("index.html"), "ok");
+        var out = new ByteArrayOutputStream();
+        var err = new ByteArrayOutputStream();
+        int code = Sjws_nettask.run(
+                new String[] {"--metrics", "0", html.toString()},
+                Map.of(), new PrintStream(out), new PrintStream(err),
+                (c, h) -> { throw new AssertionError("no h3"); }, SjwsServer::close);
+        assertEquals(Sjws_nettask.EXIT_OK, code, err.toString());
     }
 
 }
