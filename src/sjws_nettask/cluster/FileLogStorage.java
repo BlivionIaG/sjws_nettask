@@ -108,6 +108,8 @@ public final class FileLogStorage implements LogStorage {
      * (#241, #207). Header and body reads loop until full or EOF: a short mid-file read is never treated
      * as torn. A complete header with a negative length, or a CRC mismatch with bytes after the record,
      * fails closed. {@code legacy} is true when the file had no {@code FLG2} header (pre-#207).
+     * A truncatable torn tail ({@code lastGoodPos < fileSize}) is only meaningful for the active
+     * unsealed segment; sealed {@code .seg} scans must refuse instead.
      */
     record Scan(java.util.TreeMap<Long, Rec> records, long lastGoodPos, long fileSize, boolean legacy) {
         boolean torn() {
@@ -217,13 +219,22 @@ public final class FileLogStorage implements LogStorage {
     }
 
     static Scan scanRecords(Path path) throws IOException {
+        return scanRecords(path, true);
+    }
+
+    /**
+     * @param allowTornTail when false (sealed {@code .seg}), incomplete tails and last-record CRC
+     *                      mismatches fail closed with no byte modification; when true (active
+     *                      {@code .log}), they are reported as a truncatable torn tail.
+     */
+    static Scan scanRecords(Path path, boolean allowTornTail) throws IOException {
         var out = new java.util.TreeMap<Long, Rec>();
         if (!Files.exists(path) || Files.size(path) == 0) {
             return new Scan(out, 0L, 0L, false);
         }
         long fileSize = Files.size(path);
         try (var in = FileChannel.open(path, StandardOpenOption.READ)) {
-            return scanRecords(in, fileSize, path);
+            return scanRecords(in, fileSize, path, allowTornTail);
         }
     }
 
@@ -235,6 +246,11 @@ public final class FileLogStorage implements LogStorage {
      */
     static Scan scanRecords(java.nio.channels.ReadableByteChannel in, long fileSize, Path path)
             throws IOException {
+        return scanRecords(in, fileSize, path, true);
+    }
+
+    static Scan scanRecords(java.nio.channels.ReadableByteChannel in, long fileSize, Path path,
+            boolean allowTornTail) throws IOException {
         var out = new java.util.TreeMap<Long, Rec>();
         if (fileSize == 0) {
             return new Scan(out, 0L, 0L, false);
@@ -242,7 +258,11 @@ public final class FileLogStorage implements LogStorage {
         var peek = ByteBuffer.allocate(LOG_FILE_HEADER_BYTES);
         int peekGot = readFullyOrEof(in, peek);
         if (peekGot < LOG_FILE_HEADER_BYTES) {
-            // Fewer than 8 bytes: cannot be a FLG2 header; legacy torn stub.
+            // Fewer than 8 bytes: cannot be a FLG2 header.
+            if (!allowTornTail) {
+                throw new IOException("corrupt sealed log segment " + path.getFileName()
+                        + ": truncated header; refusing to start");
+            }
             return new Scan(out, 0L, fileSize, true);
         }
         peek.flip();
@@ -290,14 +310,16 @@ public final class FileLogStorage implements LogStorage {
                     var rest = header.slice();
                     int got = readFullyOrEof(in, rest);
                     if (got < need) {
-                        break; // torn before complete header
+                        refuseTornUnlessAllowed(allowTornTail, path, recordStart, "incomplete header");
+                        break; // torn before complete header (active only)
                     }
                     header.position(RECORD_HEADER_BYTES);
                 }
             } else {
                 int got = readFullyOrEof(in, header);
                 if (got < RECORD_HEADER_BYTES) {
-                    break; // real EOF before a complete header: torn tail
+                    refuseTornUnlessAllowed(allowTornTail, path, recordStart, "incomplete header");
+                    break; // real EOF before a complete header: torn tail (active only)
                 }
             }
             pos += RECORD_HEADER_BYTES;
@@ -312,22 +334,28 @@ public final class FileLogStorage implements LogStorage {
                         + "; refusing to start");
             }
             long remaining = fileSize - pos;
-            long needBody = len + (v2 ? RECORD_CRC_BYTES : 0);
-            if (needBody > remaining) {
-                break; // body/CRC would run past EOF: torn tail
+            // Widen before adding CRC size: int overflow of len+CRC would go negative and skip the
+            // remaining-size check, then new byte[len] could OOM.
+            long needBody = (long) len + (v2 ? RECORD_CRC_BYTES : 0L);
+            if (needBody < 0L || needBody > remaining) {
+                refuseTornUnlessAllowed(allowTornTail, path, recordStart,
+                        "length " + len + " exceeds remaining " + remaining);
+                break; // body/CRC would run past EOF: torn tail (active only)
             }
             var data = new byte[len];
             var body = ByteBuffer.wrap(data);
             int bodyGot = readFullyOrEof(in, body);
             if (bodyGot < len) {
-                break; // real EOF mid-body: torn tail
+                refuseTornUnlessAllowed(allowTornTail, path, recordStart, "incomplete body");
+                break; // real EOF mid-body: torn tail (active only)
             }
             pos += len;
             if (v2) {
                 crcBuf.clear();
                 int crcGot = readFullyOrEof(in, crcBuf);
                 if (crcGot < RECORD_CRC_BYTES) {
-                    break; // torn before CRC word
+                    refuseTornUnlessAllowed(allowTornTail, path, recordStart, "incomplete CRC word");
+                    break; // torn before CRC word (active only)
                 }
                 pos += RECORD_CRC_BYTES;
                 crcBuf.flip();
@@ -335,7 +363,8 @@ public final class FileLogStorage implements LogStorage {
                 int expect = recordCrc(index, term, data);
                 if (stored != expect) {
                     if (pos >= fileSize) {
-                        // Last framed record fails CRC: corrupt/torn tail — drop it.
+                        // Last framed record fails CRC: active torn tail, or sealed fail-closed.
+                        refuseTornUnlessAllowed(allowTornTail, path, recordStart, "CRC32C mismatch");
                         break;
                     }
                     throw new IOException("corrupt log record CRC32C in " + path.getFileName()
@@ -348,25 +377,53 @@ public final class FileLogStorage implements LogStorage {
         return new Scan(out, lastGood, fileSize, legacy);
     }
 
-    /** Scans {@code path} and, when the tail is torn, truncates it and fsyncs the file and directory. */
+    /** Sealed {@code .seg}: fail-closed on torn/CRC tails (never truncate). */
     private java.util.TreeMap<Long, Rec> readRecords(Path path) throws IOException {
-        return readRecords(path, false);
+        return readRecords(path, false, false);
     }
 
     /**
+     * Active {@code .log}: may upgrade legacy and may truncate a torn tail.
+     *
      * @param upgradeLegacy when true and the file is pre-{@code FLG2}, rewrite it with a header and
      *                      per-record CRC32C (active {@code .log} on rolling open; sealed {@code .seg}
      *                      stay readable as legacy until prefix-truncated).
      */
     private java.util.TreeMap<Long, Rec> readRecords(Path path, boolean upgradeLegacy) throws IOException {
-        var scan = scanRecords(path);
+        return readRecords(path, upgradeLegacy, true);
+    }
+
+    /**
+     * @param allowTornTail when false, a torn or last-record CRC failure refuses to start and does
+     *                      not modify bytes (sealed segments). When true, truncates the torn tail.
+     */
+    private java.util.TreeMap<Long, Rec> readRecords(Path path, boolean upgradeLegacy, boolean allowTornTail)
+            throws IOException {
+        var scan = scanRecords(path, allowTornTail);
         if (scan.torn()) {
+            if (!allowTornTail) {
+                throw new IOException("corrupt sealed log segment " + path.getFileName()
+                        + "; refusing to start");
+            }
             truncateTornTail(path, null, scan.lastGoodPos, scan.fileSize);
         }
         if (upgradeLegacy && scan.legacy() && Files.exists(path) && Files.size(path) > 0) {
             writeV2Segment(path, scan.records);
         }
         return scan.records;
+    }
+
+    /**
+     * Sealed segments must never treat an incomplete or CRC-bad last record as a truncatable torn
+     * tail: refuse instead. Active segments return normally so the caller can {@code break}.
+     */
+    private static void refuseTornUnlessAllowed(boolean allowTornTail, Path path, long recordStart,
+            String detail) throws IOException {
+        if (allowTornTail) {
+            return;
+        }
+        throw new IOException("corrupt sealed log segment " + path.getFileName()
+                + " at offset " + recordStart + ": " + detail + "; refusing to start");
     }
 
     /** Crash-safe rewrite of {@code target} as an {@code FLG2} segment (header + CRC records). */

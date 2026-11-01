@@ -34,6 +34,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.security.MessageDigest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -41,7 +42,8 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * #207: per-record CRC32C on {@link FileLogStorage} — mid-log fail-closed, last-record truncate,
  * legacy pre-{@code FLG2} read + upgrade, live map after upgrade, damaged-header fail-closed,
- * upgrade failure rollback, no pre-upgrade map publication.
+ * upgrade failure rollback, no pre-upgrade map publication,
+ * sealed-segment fail-closed, bounded record lengths.
  */
 @Timeout(30)
 class FileLogCrc32cTest {
@@ -73,6 +75,11 @@ class FileLogCrc32cTest {
         return ends;
     }
 
+
+
+    private static byte[] sha256(Path file) throws Exception {
+        return MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(file));
+    }
 
     /** Writes a single legacy (pre-FLG2) record at index 1 with payload {@code body}. */
     private static void writeLegacyOne(Path root, String body) throws Exception {
@@ -597,6 +604,198 @@ class FileLogCrc32cTest {
         assertEquals(2L, re.lastIndex(GROUP));
         assertArrayEquals(b("L2"), re.read(GROUP, 2));
         re.close();
+    }
+
+
+
+    @Test
+    void sealedSegmentLastRecordCrcFailsClosedWithoutTruncate() throws Exception {
+        var root = dir.resolve("sealed-last-crc");
+        Files.createDirectories(root);
+        // rollBytes just under one FLG2 record (8+20+1+4=33) so each append seals.
+        var s = new FileLogStorage(root, 32);
+        for (int i = 1; i <= 3; i++) {
+            s.append(GROUP, i, 1, b("x"));
+        }
+        s.force(GROUP);
+        assertTrue(s.sealedFiles(GROUP) >= 2, "need sealed segments, sealed=" + s.sealedFiles(GROUP));
+        s.close();
+        var segs = Files.list(root).filter(p -> p.getFileName().toString().endsWith(".seg")).sorted().toList();
+        assertTrue(segs.size() >= 2, "segs=" + segs);
+        Path mid = segs.get(segs.size() >= 3 ? 1 : 0);
+        byte[] before = Files.readAllBytes(mid);
+        byte[] beforeHash = sha256(mid);
+        assertTrue(before.length >= FileLogStorage.LOG_FILE_HEADER_BYTES + FileLogStorage.RECORD_HEADER_BYTES + 1
+                + FileLogStorage.RECORD_CRC_BYTES);
+        // Flip one payload byte of the (only) record — complete framing, bad CRC at segment EOF.
+        long payloadAt = FileLogStorage.LOG_FILE_HEADER_BYTES + FileLogStorage.RECORD_HEADER_BYTES;
+        try (var ch = FileChannel.open(mid, StandardOpenOption.WRITE)) {
+            var one = ByteBuffer.allocate(1);
+            one.put((byte) 'Z');
+            one.flip();
+            ch.write(one, payloadAt);
+        }
+        byte[] corrupted = Files.readAllBytes(mid);
+        assertTrue(corrupted.length == before.length);
+        var err = assertThrows(Exception.class, () -> {
+            var re = new FileLogStorage(root, 32);
+            try {
+                re.lastIndex(GROUP);
+            } finally {
+                try {
+                    re.close();
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        String msg = rootCause(err).getMessage();
+        assertTrue(msg.contains("sealed") || msg.contains("CRC") || msg.contains("refusing"),
+                "message=" + msg);
+        assertArrayEquals(corrupted, Files.readAllBytes(mid), "sealed segment bytes must be unchanged");
+        assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(corrupted), sha256(mid));
+        assertTrue(corrupted.length == before.length, "must not truncate sealed segment");
+    }
+
+    @Test
+    void absurdRecordLengthFailsWithoutHugeAllocation() throws Exception {
+        var root = dir.resolve("absurd-len-active");
+        Files.createDirectories(root);
+        Path log = logFile(root);
+        // FLG2 header + one record header declaring Integer.MAX_VALUE length (no body).
+        try (var ch = FileChannel.open(log, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            FileLogStorage.writeLogFileHeader(ch);
+            var hdr = ByteBuffer.allocate(FileLogStorage.RECORD_HEADER_BYTES);
+            hdr.putLong(1L).putLong(1L).putInt(Integer.MAX_VALUE);
+            hdr.flip();
+            while (hdr.hasRemaining()) {
+                ch.write(hdr);
+            }
+        }
+        long size = Files.size(log);
+        // Active file: absurd length is a torn tail (truncate to header), not an OOM.
+        try {
+            var re = new FileLogStorage(root);
+            assertEquals(0L, re.lastIndex(GROUP));
+            assertEquals(FileLogStorage.LOG_FILE_HEADER_BYTES, Files.size(log),
+                    "active absurd length truncates to FLG2 header only");
+            re.close();
+        } catch (OutOfMemoryError oom) {
+            throw new AssertionError("absurd length must not allocate Integer.MAX_VALUE bytes", oom);
+        }
+        assertTrue(size > FileLogStorage.LOG_FILE_HEADER_BYTES);
+    }
+
+    @Test
+    void scanSealedAllowTornFalseRefusesLastRecordCrc() throws Exception {
+        var root = dir.resolve("scan-sealed-crc");
+        Files.createDirectories(root);
+        Path seg = root.resolve("msg_crc.00000000000000000001.seg");
+        // Minimal sealed-shaped FLG2 file with one record.
+        try (var ch = FileChannel.open(seg, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+            FileLogStorage.writeLogFileHeader(ch);
+            FileLogStorage.writeRecordV2(ch, 1L, 1L, b("x"));
+        }
+        byte[] before = Files.readAllBytes(seg);
+        long payloadAt = FileLogStorage.LOG_FILE_HEADER_BYTES + FileLogStorage.RECORD_HEADER_BYTES;
+        try (var ch = FileChannel.open(seg, StandardOpenOption.WRITE)) {
+            var one = ByteBuffer.allocate(1);
+            one.put((byte) 'Z');
+            one.flip();
+            ch.write(one, payloadAt);
+        }
+        byte[] corrupted = Files.readAllBytes(seg);
+        var err = assertThrows(Exception.class,
+                () -> FileLogStorage.scanRecords(seg, false));
+        assertTrue(rootCause(err).getMessage().contains("sealed")
+                || rootCause(err).getMessage().contains("CRC")
+                || rootCause(err).getMessage().contains("refusing"),
+                "message=" + rootCause(err).getMessage());
+        assertArrayEquals(corrupted, Files.readAllBytes(seg));
+        assertEquals(before.length, Files.size(seg));
+    }
+
+    @Test
+    void absurdRecordLengthOnSealedFailsClosedWithoutTruncate() throws Exception {
+        var root = dir.resolve("absurd-len-sealed");
+        Files.createDirectories(root);
+        var s = new FileLogStorage(root, 32);
+        s.append(GROUP, 1, 1, b("x"));
+        s.force(GROUP);
+        s.append(GROUP, 2, 1, b("y"));
+        s.force(GROUP);
+        s.close();
+        var segs = Files.list(root).filter(p -> p.getFileName().toString().endsWith(".seg")).sorted().toList();
+        assertFalse(segs.isEmpty());
+        Path seg = segs.get(0);
+        byte[] before = Files.readAllBytes(seg);
+        // Overwrite the sealed segment with FLG2 + absurd length header (same size pad or shorter file).
+        try (var ch = FileChannel.open(seg, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            FileLogStorage.writeLogFileHeader(ch);
+            var hdr = ByteBuffer.allocate(FileLogStorage.RECORD_HEADER_BYTES);
+            hdr.putLong(1L).putLong(1L).putInt(Integer.MAX_VALUE);
+            hdr.flip();
+            while (hdr.hasRemaining()) {
+                ch.write(hdr);
+            }
+        }
+        byte[] planted = Files.readAllBytes(seg);
+        var err = assertThrows(Exception.class, () -> {
+            var re = new FileLogStorage(root, 32);
+            try {
+                re.lastIndex(GROUP);
+            } finally {
+                try {
+                    re.close();
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        assertTrue(rootCause(err).getMessage().contains("refusing")
+                || rootCause(err).getMessage().contains("sealed")
+                || rootCause(err).getMessage().contains("length"),
+                "message=" + rootCause(err).getMessage());
+        assertArrayEquals(planted, Files.readAllBytes(seg), "sealed absurd length must not truncate");
+    }
+
+    @Test
+    void negativeLengthOnSealedFailsClosedWithoutTruncate() throws Exception {
+        var root = dir.resolve("neg-len-sealed");
+        Files.createDirectories(root);
+        var s = new FileLogStorage(root, 32);
+        s.append(GROUP, 1, 1, b("x"));
+        s.force(GROUP);
+        s.append(GROUP, 2, 1, b("y"));
+        s.force(GROUP);
+        s.close();
+        var segs = Files.list(root).filter(p -> p.getFileName().toString().endsWith(".seg")).sorted().toList();
+        Path seg = segs.get(0);
+        byte[] before = Files.readAllBytes(seg);
+        // Negative length at the record header (offset 8+16).
+        long lenAt = FileLogStorage.LOG_FILE_HEADER_BYTES + 16;
+        try (var ch = FileChannel.open(seg, StandardOpenOption.WRITE)) {
+            var neg = ByteBuffer.allocate(4);
+            neg.putInt(-1);
+            neg.flip();
+            ch.write(neg, lenAt);
+        }
+        byte[] corrupted = Files.readAllBytes(seg);
+        var err = assertThrows(Exception.class, () -> {
+            var re = new FileLogStorage(root, 32);
+            try {
+                re.lastIndex(GROUP);
+            } finally {
+                try {
+                    re.close();
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        assertTrue(rootCause(err).getMessage().contains("negative length")
+                || rootCause(err).getMessage().contains("refusing"),
+                "message=" + rootCause(err).getMessage());
+        assertArrayEquals(corrupted, Files.readAllBytes(seg));
+        assertEquals(before.length, Files.size(seg));
     }
 
 
