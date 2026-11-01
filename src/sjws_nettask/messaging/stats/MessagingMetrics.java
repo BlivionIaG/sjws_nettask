@@ -18,6 +18,7 @@ package sjws_nettask.messaging.stats;
 
 import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Supplier;
 import sjws_nettask.messaging.http.MessagingHooks;
@@ -43,10 +44,13 @@ public final class MessagingMetrics implements MessagingHooks {
     private final ConcurrentHashMap<String, Hist> produce = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Hist> fetch = new ConcurrentHashMap<>();
     /**
-     * Distinct topic labels admitted (not topic/status pairs). Cap is on this map's size.
-     * Admission is synchronized so a topic is never visible to other threads until its slot is held.
+     * Distinct topic labels admitted (not topic/status pairs). Cap is {@link #admittedCount}.
+     * A topic is published into the map only after a CAS reserves its slot, so peers never observe
+     * a name that is later rolled back to {@code other}. Uses AtomicInteger CAS (SourceGuard:
+     * no monitor locks on the request path).
      */
     private final ConcurrentHashMap<String, Boolean> admittedTopics = new ConcurrentHashMap<>();
+    private final AtomicInteger admittedCount = new AtomicInteger();
     private final LongAdder foldedTopics = new LongAdder();
     private volatile Supplier<MessagingStats> stats = () -> MessagingStats.NONE;
 
@@ -106,24 +110,35 @@ public final class MessagingMetrics implements MessagingHooks {
 
     /**
      * Returns a topic label that is either already admitted, newly admitted under the cap, or
-     * {@code "other"}. A topic name is published into {@link #admittedTopics} only after its slot
-     * is secured, so concurrent callers never observe a topic that is later rolled back to
-     * {@code other}.
+     * {@code "other"}. Slot reservation ({@link #admittedCount} CAS) happens before the name is
+     * published into {@link #admittedTopics}, so concurrent callers never observe a topic that is
+     * later rolled back to {@code other}.
      */
     private String admitTopic(String topic) {
         String candidate = topic == null || topic.isEmpty() ? "other" : topic;
-        if ("other".equals(candidate) || this.admittedTopics.containsKey(candidate)) {
+        if ("other".equals(candidate)) {
             return candidate;
         }
-        synchronized (this.admittedTopics) {
+        while (true) {
             if (this.admittedTopics.containsKey(candidate)) {
                 return candidate;
             }
-            if (this.admittedTopics.size() >= TOPIC_CAP) {
+            int n = this.admittedCount.get();
+            if (n >= TOPIC_CAP) {
+                if (this.admittedTopics.containsKey(candidate)) {
+                    return candidate;
+                }
                 this.foldedTopics.increment();
                 return "other";
             }
-            this.admittedTopics.put(candidate, Boolean.TRUE);
+            if (!this.admittedCount.compareAndSet(n, n + 1)) {
+                continue;
+            }
+            if (this.admittedTopics.putIfAbsent(candidate, Boolean.TRUE) == null) {
+                return candidate;
+            }
+            // Peer admitted the same name first; release the unused slot.
+            this.admittedCount.decrementAndGet();
             return candidate;
         }
     }
