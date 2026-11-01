@@ -1,6 +1,7 @@
 package sjws_nettask.observe;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -129,5 +130,52 @@ final class AccessLogOpenKeyTest {
         assertTrue(Files.exists(target));
         var perms = Files.getPosixFilePermissions(target);
         assertEquals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-r-----"), perms, perms.toString());
+    }
+
+    @Test
+    void openFileThroughExistingSymlinkTargetLeavesPerms() throws Exception {
+        Assumptions.assumeTrue(
+                dir.getFileSystem().supportedFileAttributeViews().contains("posix"),
+                "POSIX required");
+        Path target = dir.resolve("preexist.log");
+        Path link = dir.resolve("preexist.link");
+        Files.writeString(target, "");
+        Files.setPosixFilePermissions(target, java.nio.file.attribute.PosixFilePermissions.fromString("rw-r-----"));
+        Files.createSymbolicLink(link, target.getFileName());
+        AccessLog.ensureSymlinkTargetCreated(link); // existing target branch
+        assertFalse(AccessLog.OpenKeyRaceProbe.NONE.consumeForceRace());
+        try (var out = AccessLog.openFile(link)) {
+            out.write("y\n".getBytes());
+            out.flush();
+        }
+        var perms = Files.getPosixFilePermissions(target);
+        assertEquals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-r-----"), perms, perms.toString());
+    }
+
+    @Test
+    void forcesThreeRacesThenOpens() throws Exception {
+        Path path = dir.resolve("triple-race.log");
+        AccessLog.openKeyRaceProbe = new AccessLog.OpenKeyRaceProbe() {
+            private int left = 3;
+
+            @Override
+            boolean consumeForceRace() {
+                if (left > 0) {
+                    left--;
+                    return true;
+                }
+                return false;
+            }
+        };
+        try {
+            var opened = AccessLog.openFileWithKey(path);
+            try {
+                assertNotNull(opened.stream);
+            } finally {
+                opened.stream.close();
+            }
+        } finally {
+            AccessLog.openKeyRaceProbe = AccessLog.OpenKeyRaceProbe.NONE;
+        }
     }
 }
