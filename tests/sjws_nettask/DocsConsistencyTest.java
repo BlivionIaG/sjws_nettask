@@ -91,7 +91,9 @@ class DocsConsistencyTest {
         var filters = Files.readString(Path.of("docs/development/filters.md"));
         var stale = List.of(
                 "HTTP/2 leaves it empty",
-                "always leave `fields()` empty");
+                "always leave `fields()` empty",
+                "ALPN fallback on the HTTP/2 TLS listener still leaves",
+                "ALPN fallback still omits");
         try (var walk = Files.walk(Path.of("docs"))) {
             walk.filter(p -> p.toString().endsWith(".md")).forEach(doc -> {
                 String body;
@@ -110,5 +112,9 @@ class DocsConsistencyTest {
                 "gateway.md must describe attachBodies-gated field capture on HTTP/2 (#383)");
         assertTrue(filters.contains("attachBodies"),
                 "filters.md must describe attachBodies-gated field capture on HTTP/2 (#383)");
+        assertTrue(gateway.contains("ALPN fallback") && gateway.contains("attachBodies"),
+                "gateway.md must say the ALPN fallback uses the attachBodies gate (#446)");
+        assertTrue(filters.contains("ALPN fallback") && filters.contains("#446"),
+                "filters.md must say the ALPN fallback uses the attachBodies gate (#446)");
     }
 }

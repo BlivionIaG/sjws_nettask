@@ -290,16 +290,23 @@ class ResponseWriterTest {
         assertEquals("a.example", on.headers().host());
     }
 
-    /** #383 audit: HTTP/1.1 ALPN fallback on the h2 TLS listener still omits the raw map. */
+    /** #446: captureFields (attachBodies) fills the raw map; false keeps the typed-only path. */
     @Test
-    void http1FallbackLeavesFieldsEmpty() {
+    void http1FallbackCaptureFieldsMatchesAttachBodiesGate() {
         var req = new io.netty.handler.codec.http.DefaultFullHttpRequest(
                 io.netty.handler.codec.http.HttpVersion.HTTP_1_1,
                 io.netty.handler.codec.http.HttpMethod.GET, "/x");
-        req.headers().set("x-api-key", "secret");
+        req.headers().set("X-Api-Key", "secret");
         req.headers().set("host", "h.example");
-        var mapped = Http1FallbackHandler.toRequest(req);
-        assertTrue(mapped.headers().fields().isEmpty());
-        assertEquals("h.example", mapped.headers().host());
+        req.headers().add("x-multi", "one");
+        req.headers().add("x-multi", "two");
+        var off = Http1FallbackHandler.toRequest(req, null, false, false);
+        assertTrue(off.headers().fields().isEmpty(), "static path: no field map");
+        assertEquals("h.example", off.headers().host());
+        var on = Http1FallbackHandler.toRequest(req, null, true, true);
+        assertEquals(List.of("secret"), on.headers().fields().get("x-api-key"));
+        assertEquals(List.of("one", "two"), on.headers().fields().get("x-multi"));
+        assertEquals("h.example", on.headers().host());
+        assertTrue(on.secure());
     }
 }

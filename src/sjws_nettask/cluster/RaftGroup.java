@@ -842,6 +842,10 @@ final class RaftGroup {
         for (int i = 0; i < count; i++) {
             long entryTerm = body.getLong();
             int len = body.getInt();
+            if (len < 0 || len > body.remaining()) {
+                throw new IllegalArgumentException("append entry length " + len + " exceeds frame remaining "
+                        + body.remaining());
+            }
             var data = new byte[len];
             body.get(data);
             entries.add(new Rec(entryTerm, data));

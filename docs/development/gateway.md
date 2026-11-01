@@ -7,8 +7,8 @@ HTTP/3 fills it only when a chain or a non-static terminal exists at startup. HT
 streams) fills it when the live generation has `attachBodies` on — true whenever a filter chain,
 metrics observe wrapper, or non-static terminal is armed — and leaves it empty on the static-only
 path. Gateway filters therefore see headers such as `x-api-key` and `authorization` over h2/h2c
-once a chain is live. The HTTP/1.1 ALPN fallback on the HTTP/2 TLS listener still leaves the map
-empty (typed fields only).
+once a chain is live. The HTTP/1.1 ALPN fallback on the HTTP/2 TLS listener uses the same
+`attachBodies` gate (#446).
 `GatewayFilters.install(registry)` binds all six. `SjwsServer.chainControl` still does not
 change the request path until the first successful `apply`.
 
