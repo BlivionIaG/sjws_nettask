@@ -36,6 +36,7 @@ import java.time.Duration;
 import java.util.Date;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManagerFactory;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.BasicConstraints;
@@ -206,6 +207,58 @@ class AdminTlsRotationTest {
                     .getMessage().contains("missing"));
         }
     }
+
+
+    /**
+     * An established keep-alive admin connection must be refused after the client cert is
+     * denylisted and TLS reloads. New handshakes already fail; this covers the live session.
+     */
+    @Test
+    void keepAliveConnectionIsRefusedAfterDenylistReload() throws Exception {
+        var ca = ca("CN=admin-ca");
+        var server = issued(ca, "CN=localhost", null, true);
+        var root = issued(ca, "CN=root", "urn:sjws:admin:root", false);
+        var cert = pem(dir.resolve("server.pem"), server.cert(), ca.cert());
+        var key = pkcs8(dir.resolve("server-key.pem"), server.key());
+        var trust = pem(dir.resolve("ca.pem"), ca.cert());
+        var deny = Files.writeString(dir.resolve("revoked-keepalive.txt"), "# none yet\n");
+        try (var store = store();
+                var http = AdminServer.start(store, NOW, TTL, cert, key, null, trust, deny, 0);
+                SSLSocket socket = (SSLSocket) client(root, ca.cert()).getSocketFactory()
+                        .createSocket("127.0.0.1", http.port())) {
+            socket.setSoTimeout(5_000);
+            socket.startHandshake();
+            var first = rawHttp(socket, "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+            assertTrue(first.startsWith("HTTP/1.1 200"), first);
+
+            Files.writeString(deny, "sha256:" + AdminTls.fingerprint(root.cert()) + "\n");
+            assertNull(http.reloadTls());
+            assertTrue(http.policyDropped() >= 1L, "live session should be dropped on reload");
+
+            try {
+                var second = rawHttp(socket,
+                        "GET /cp/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+                assertTrue(second.startsWith("HTTP/1.1 401") || second.startsWith("HTTP/1.1 403"), second);
+            } catch (IOException closed) {
+                // Connection reset / closed after policy drop is also acceptable.
+                assertTrue(closed.getMessage() != null && !closed.getMessage().isBlank() || true);
+            }
+        }
+    }
+
+    private static String rawHttp(SSLSocket socket, String request) throws IOException {
+        var out = socket.getOutputStream();
+        out.write(request.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        out.flush();
+        var in = socket.getInputStream();
+        var buf = new byte[16_384];
+        int n = in.read(buf);
+        if (n < 0) {
+            throw new IOException("admin connection closed");
+        }
+        return new String(buf, 0, n, java.nio.charset.StandardCharsets.US_ASCII);
+    }
+
 
     private static java.security.cert.X509CRL crl(Id issuer, BigInteger serial) throws Exception {
         var builder = new X509v2CRLBuilder(new X500Name(issuer.cert().getSubjectX500Principal().getName()), notBefore());

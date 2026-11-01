@@ -19,44 +19,55 @@ package sjws_nettask.cp;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsExchange;
 import com.sun.net.httpserver.HttpsParameters;
 import com.sun.net.httpserver.HttpsServer;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.GeneralSecurityException;
-import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
-import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
-import java.util.ArrayList;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManagerFactory;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import javax.net.ssl.SSLSession;
 import javax.security.auth.x500.X500Principal;
 import sjws_nettask.controlplane.Rbac;
-import sjws_nettask.tls.TlsMaterial;
 
 /**
  * Loopback admin listener. Outside tests it starts only with mTLS: a server certificate, its key,
  * and a trust bundle limited to the admin CA. Client authentication is required. Identity is the
  * verified client certificate, mapped by {@link Rbac}. {@code Authorization} is ignored. A
  * connection without a certificate is unauthorized. Certificates, key, CA bundle and an optional
- * revocation list reload without a restart ({@link AdminTls}). Plain HTTP is {@link #startPlainForTests}.
+ * revocation list reload without a restart ({@link AdminTls}). After a successful reload, live
+ * admin connections whose client certificate no longer passes policy are dropped (same idea as
+ * {@link CpPeerSockets#dropPeersFailingPolicy}). Plain HTTP is {@link #startPlainForTests}.
  */
 public final class AdminServer implements AutoCloseable {
 
     private final HttpServer server;
     private final CpAdmin admin;
     private final AdminTls tls;
+    private final CpServerTls serverTls;
+    /** Live HTTPS sessions and the peer chain presented when they were registered. */
+    private final ConcurrentHashMap<SSLSession, X509Certificate[]> live = new ConcurrentHashMap<>();
+    private final AtomicLong policyDropped = new AtomicLong();
     private volatile Thread watcher;
 
-    private AdminServer(HttpServer server, CpAdmin admin, AdminTls tls) {
+    private AdminServer(HttpServer server, CpAdmin admin, AdminTls tls, CpServerTls serverTls) {
         this.server = server;
         this.admin = admin;
         this.tls = tls;
+        this.serverTls = serverTls;
+        if (tls != null) {
+            tls.afterReload(this::dropConnectionsFailingPolicy);
+        }
+        if (serverTls != null) {
+            serverTls.afterReload(this::dropConnectionsFailingPolicy);
+        }
     }
 
     /**
@@ -72,7 +83,8 @@ public final class AdminServer implements AutoCloseable {
     /**
      * mTLS admin listener with optional revocation and rotation. See {@link AdminTls} for the
      * revocation file format. Revoked client certificates are refused at the handshake and each
-     * refusal is written to the CP audit log.
+     * refusal is written to the CP audit log. A successful reload also drops established connections
+     * whose client certificate fails the new policy.
      *
      * @param revocations CRL or denylist file, or null for none
      * @param watchMillis when positive, check the files this often and reload when they change;
@@ -92,7 +104,7 @@ public final class AdminServer implements AutoCloseable {
                 params.setSSLParameters(ssl);
             }
         });
-        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls);
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), tls, null);
         https.createContext("/", bound::handle);
         https.start();
         if (watchMillis > 0) {
@@ -112,12 +124,16 @@ public final class AdminServer implements AutoCloseable {
 
     /**
      * Re-reads the certificate, key, CA bundle and revocation list (for an operator trigger such
-     * as SIGHUP). New handshakes use the new material; on failure the old material stays.
+     * as SIGHUP). New handshakes use the new material; on failure the old material stays. On
+     * success, established admin connections that fail the new policy are dropped.
      *
      * @return null on success, otherwise the reason
      */
     public String reloadTls() {
-        return tls == null ? "plain listener has no TLS material" : tls.reload();
+        if (tls == null) {
+            return "plain listener has no TLS material";
+        }
+        return tls.reload();
     }
 
     /**
@@ -126,7 +142,7 @@ public final class AdminServer implements AutoCloseable {
      */
     public static AdminServer startMtls(CpStore store, InetSocketAddress address, long nowMillis, long ttlMillis,
             CpServerTls serverTls) throws IOException {
-        java.util.Objects.requireNonNull(serverTls, "serverTls");
+        Objects.requireNonNull(serverTls, "serverTls");
         var https = HttpsServer.create(address, 0);
         https.setHttpsConfigurator(new HttpsConfigurator(serverTls.context()) {
             @Override
@@ -134,7 +150,7 @@ public final class AdminServer implements AutoCloseable {
                 params.setSSLParameters(serverTls.parameters());
             }
         });
-        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), null);
+        var bound = new AdminServer(https, new CpAdmin(store, nowMillis, ttlMillis), null, serverTls);
         https.createContext("/", bound::handle);
         https.start();
         return bound;
@@ -143,7 +159,7 @@ public final class AdminServer implements AutoCloseable {
     /** Plain HTTP, for tests that exercise routes without a certificate. Production code uses {@link #start}. */
     public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis) throws IOException {
         var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis), null);
+        var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis), null, null);
         http.createContext("/", bound::handle);
         http.start();
         return bound;
@@ -153,21 +169,129 @@ public final class AdminServer implements AutoCloseable {
         return server.getAddress().getPort();
     }
 
+    /** How many live admin sessions were dropped because they failed policy after a reload. */
+    long policyDropped() {
+        return policyDropped.get();
+    }
+
     private void handle(HttpExchange exchange) throws IOException {
+        if (exchange instanceof HttpsExchange https) {
+            var refused = registerAndRevalidate(https);
+            if (refused != null) {
+                exchange.getRequestBody().readAllBytes();
+                write(exchange, refused, true);
+                return;
+            }
+        }
         var outcome = admin.handle(credential(exchange), exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
                 exchange.getRequestURI().getRawQuery(),
                 new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
                 exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+        write(exchange, outcome);
+    }
+
+    private static void write(HttpExchange exchange, CpStore.Outcome outcome) throws IOException {
+        write(exchange, outcome, false);
+    }
+
+    private static void write(HttpExchange exchange, CpStore.Outcome outcome, boolean closeConnection)
+            throws IOException {
         var bytes = outcome.body().getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
+        if (closeConnection) {
+            exchange.getResponseHeaders().set("Connection", "close");
+        }
         exchange.sendResponseHeaders(outcome.status(), bytes.length);
         exchange.getResponseBody().write(bytes);
         exchange.close();
     }
 
+    /**
+     * Track the session's peer chain and re-apply trust/revocation against the current material.
+     * A failure invalidates the session so a keep-alive reuse cannot continue.
+     */
+    private CpStore.Outcome registerAndRevalidate(HttpsExchange https) {
+        var session = https.getSSLSession();
+        if (session == null) {
+            return null;
+        }
+        var chain = peerChain(session);
+        if (chain == null) {
+            return null;
+        }
+        live.put(session, chain);
+        try {
+            revalidate(chain);
+            return null;
+        } catch (CertificateException | IOException e) {
+            policyDropped.incrementAndGet();
+            live.remove(session, chain);
+            try {
+                session.invalidate();
+            } catch (RuntimeException ignored) {
+                // best effort
+            }
+            return CpStore.Outcome.error(401, "tls");
+        }
+    }
+
+    /** After reload: invalidate every live session whose peer chain fails current policy. */
+    void dropConnectionsFailingPolicy() {
+        for (var entry : List.copyOf(live.entrySet())) {
+            var session = entry.getKey();
+            var chain = entry.getValue();
+            if (!session.isValid()) {
+                live.remove(session, chain);
+                continue;
+            }
+            try {
+                revalidate(chain);
+            } catch (CertificateException | IOException | RuntimeException failed) {
+                policyDropped.incrementAndGet();
+                try {
+                    session.invalidate();
+                } catch (RuntimeException ignored) {
+                    // best effort
+                }
+                live.remove(session, chain);
+            }
+        }
+    }
+
+    private void revalidate(X509Certificate[] chain) throws CertificateException, IOException {
+        if (tls != null) {
+            tls.revalidatePeer(chain, true);
+            return;
+        }
+        if (serverTls != null) {
+            serverTls.revalidatePeer(chain, true);
+            return;
+        }
+        // Plain listener: nothing to revalidate.
+    }
+
+    private static X509Certificate[] peerChain(SSLSession session) {
+        try {
+            Certificate[] presented = session.getPeerCertificates();
+            if (presented == null || presented.length == 0) {
+                return null;
+            }
+            var chain = new X509Certificate[presented.length];
+            for (int i = 0; i < presented.length; i++) {
+                if (!(presented[i] instanceof X509Certificate x509)) {
+                    return null;
+                }
+                chain[i] = x509;
+            }
+            return chain;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /** The verified peer certificate, or null when the connection did not present one. */
     static Rbac.Credential credential(HttpExchange exchange) {
-        if (!(exchange instanceof com.sun.net.httpserver.HttpsExchange https)) {
+        if (!(exchange instanceof HttpsExchange https)) {
             return null;
         }
         var session = https.getSSLSession();
