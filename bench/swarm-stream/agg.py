@@ -7,6 +7,8 @@ import math
 import sys
 from pathlib import Path
 
+from window_valid import evaluate as evaluate_window
+
 
 def binom_sf(k, n, p=0.5):
     from math import comb
@@ -28,107 +30,45 @@ def main():
         r = load(p)
         if not r:
             continue
-        n = r.get("chunk_samples") or 0
-        p99 = r.get("p99_us")
-        pre = r.get("load1_pre", 99)
-        # Architecture 2026-10-30 + inceptor 2026-10-30 18:46:
-        # self_loaded if load1_post>=4 OR gen CPU > 80% of its cores. Always derive the limit
-        # from 80 × gen_cores — never trust a recorded gen_sat_limit_pct override (Codex P2 #459).
-        gen_cores = int(r.get("gen_cores") or 2)
-        sat_lim = 80.0 * gen_cores
-        cpu = r.get("client_cpu_pct_of_wall")
-        try:
-            cpu_f = float(cpu) if cpu is not None else float("nan")
-        except (TypeError, ValueError):
-            cpu_f = float("nan")
-        load1_post = r.get("load1_post")
-        try:
-            load1_post_f = float(load1_post) if load1_post is not None else 0.0
-        except (TypeError, ValueError):
-            load1_post_f = 0.0
-        gen_sat = (cpu_f == cpu_f) and cpu_f > sat_lim  # nan-safe
-        self_loaded = bool(r.get("self_loaded")) or gen_sat or load1_post_f >= 4.0
-        # Any retry or refused connection ⇒ INVALID (inceptor+Architecture; stricter wins).
-        ptr = int(r.get("producer_transport_retries") or 0)
-        ccr = int(r.get("consumer_connect_retries") or 0)
-        refused = int(r.get("refused_per_ip") or 0)
-        hz = r.get("hard_zeros") or {}
-        if refused == 0:
-            try:
-                refused = int(float(hz.get("sjws_connections_refused_per_ip_total") or 0))
-            except (TypeError, ValueError):
-                refused = 0
-        open_after = r.get("open_sessions_after_drain")
-        if open_after is None:
-            try:
-                open_after = hz.get("sjws_swarm_stream_open_sessions")
-            except Exception:
-                open_after = None
-        try:
-            open_after_n = int(float(open_after)) if open_after is not None else -1
-        except (TypeError, ValueError):
-            open_after_n = -1
-        drain_timed_out = bool(r.get("drain_timed_out"))
-        transport_retry_flag = bool(r.get("transport_retry_flag")) or ptr > 0 or ccr > 0
-        refused_flag = refused > 0
-        open_flag = open_after_n != 0  # must be exactly 0 after drain
-        # Setup / measure failures invalidate the window (Codex P2 #459): claim/stream 503s
-        # are group_open_refusals + error_count, not transport retries — surviving streams
-        # must not certify a short concurrent workload.
-        err_count = int(r.get("error_count") or 0)
-        group_open = int(r.get("group_open_refusals") or 0)
-        setup_fail = err_count > 0 or group_open > 0
-        # 07:05 addendum: NOISY from foreign CPU / end load1 / explicit marker
-        noisy = bool(r.get("noisy")) or str(r.get("noisy_marker") or "").upper() == "NOISY"
-        try:
-            fcpu = float(r["foreign_cpu_avg_cores"]) if r.get("foreign_cpu_avg_cores") is not None else 0.0
-        except (TypeError, ValueError):
-            fcpu = 0.0
-        if fcpu > 0.5:
-            noisy = True
-        if r.get("foreign_load_proc_seen"):
-            noisy = True
-        if load1_post_f >= 6.0:
-            noisy = True
-        # valid only when all hard conditions hold (start gate recorded as load1_pre < 3)
-        valid = (n >= 10000 and p99 is not None and pre < 3.0 and not self_loaded
-                 and not transport_retry_flag and not refused_flag
-                 and not drain_timed_out and not open_flag and not setup_fail and not noisy)
+        # Shared absolute-window validity (window_valid.py) — same rule as gate.sh
+        ev = evaluate_window(r)
         windows.append({
             "tag": p.parent.name,
-            "valid": valid,
+            "valid": ev["valid"],
             "mib_s": r.get("mib_s"),
             "p50_us": r.get("p50_us"),
             "p90_us": r.get("p90_us"),
-            "p99_us": p99,
-            "samples": n,
-            "self_loaded": self_loaded,
-            "gen_cores": gen_cores,
-            "gen_sat_limit_pct": sat_lim,
-            "client_cpu_pct_of_wall": cpu_f,
+            "p99_us": ev["p99_us"],
+            "samples": ev["samples"],
+            "self_loaded": ev["self_loaded"],
+            "gen_cores": ev["gen_cores"],
+            "gen_sat_limit_pct": ev["gen_sat_limit_pct"],
+            "client_cpu_pct_of_wall": ev["client_cpu_pct_of_wall"],
             "stall_flag": r.get("stall_flag"),
             "credit_stalls": r.get("credit_stalls"),
             "hard_zeros": r.get("hard_zeros"),
-            "errors": err_count,
-            "group_open_refusals": group_open,
-            "setup_fail": setup_fail,
-            "noisy": noisy,
-            "foreign_cpu_avg_cores": fcpu,
-            "producer_transport_retries": ptr,
-            "consumer_connect_retries": ccr,
-            "transport_retry_flag": transport_retry_flag,
-            "refused_per_ip": refused,
-            "drain_timed_out": drain_timed_out,
-            "open_sessions_after_drain": open_after_n,
+            "errors": ev["errors"],
+            "group_open_refusals": ev["group_open_refusals"],
+            "setup_fail": ev["setup_fail"],
+            "noisy": ev["noisy"],
+            "foreign_cpu_avg_cores": ev["foreign_cpu_avg_cores"],
+            "producer_transport_retries": ev["producer_transport_retries"],
+            "consumer_connect_retries": ev["consumer_connect_retries"],
+            "transport_retry_flag": ev["transport_retry_flag"],
+            "refused_per_ip": ev["refused_per_ip"],
+            "drain_timed_out": ev["drain_timed_out"],
+            "open_sessions_after_drain": ev["open_sessions_after_drain"],
             "max_connections_per_ip": r.get("max_connections_per_ip"),
-            "load1_pre": pre,
-            "load1_post": r.get("load1_post"),
+            "load1_pre": ev["load1_pre"],
+            "load1_post": ev["load1_post"],
         })
 
     valid = [w for w in windows if w["valid"]]
     print(f"absolute windows: {len(windows)} total, {len(valid)} valid (need 5–8)")
     for w in windows:
-        print(f"  {w['tag']}: valid={w['valid']} mib_s={w['mib_s']:.3f} p50={w['p50_us']} p99={w['p99_us']} "
+        mib_s = w['mib_s']
+        mib_txt = f"{mib_s:.3f}" if isinstance(mib_s, (int, float)) else "n/a"
+        print(f"  {w['tag']}: valid={w['valid']} mib_s={mib_txt} p50={w['p50_us']} p99={w['p99_us']} "
               f"n={w['samples']} self_loaded={w['self_loaded']} stalls={w['credit_stalls']} "
               f"stall_flag={w['stall_flag']} err={w['errors']} group_open={w.get('group_open_refusals')} "
               f"prod_tx_retry={w['producer_transport_retries']} cons_conn_retry={w['consumer_connect_retries']} "
@@ -151,12 +91,19 @@ def main():
     else:
         # use first 8 valid if more
         use = valid[:8]
-        mibs = sorted(w["mib_s"] for w in use)
-        p99s = sorted(w["p99_us"] for w in use)
-        med_mib = mibs[len(mibs) // 2]
-        med_p99 = p99s[len(p99s) // 2]
-        worst_mib = min(mibs)
-        worst_p99 = max(p99s)
+        mibs = sorted(float(w["mib_s"]) for w in use if w["mib_s"] is not None)
+        p99s = sorted(float(w["p99_us"]) for w in use if w["p99_us"] is not None)
+        if len(mibs) < len(use) or len(p99s) < len(use):
+            reason.append("valid window missing mib_s/p99_us")
+        if not mibs or not p99s:
+            reason.append("no numeric mib_s/p99 among valid windows")
+            med_mib = worst_mib = 0.0
+            med_p99 = worst_p99 = float("inf")
+        else:
+            med_mib = mibs[len(mibs) // 2]
+            med_p99 = p99s[len(p99s) // 2]
+            worst_mib = min(mibs)
+            worst_p99 = max(p99s)
         print(f"median mib_s={med_mib:.3f} (need ≥100)  median p99_us={med_p99:.1f} (need <1000)")
         print(f"worst mib_s={worst_mib:.3f} (floor 80)  worst p99_us={worst_p99:.1f} (ceil 1500)")
         ok_med = med_mib >= 100.0 and med_p99 < 1000.0

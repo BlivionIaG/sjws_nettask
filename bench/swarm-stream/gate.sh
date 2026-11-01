@@ -64,44 +64,11 @@ run_one() {
 }
 
 abs_valid_count() {
+  # Shared rule with agg.py via window_valid.py (Codex P2 #459)
   local valid=0 f ok
   for f in "$OUT"/abs-*/result.json; do
     [ -f "$f" ] || continue
-    ok=$(python3 - "$f" <<'PY2'
-import json,sys
-r=json.load(open(sys.argv[1]))
-n=r.get("chunk_samples") or 0
-p99=r.get("p99_us")
-pre=r.get("load1_pre", 99)
-ptr=int(r.get("producer_transport_retries") or 0); ccr=int(r.get("consumer_connect_retries") or 0)
-tx=bool(r.get("transport_retry_flag")) or ptr>0 or ccr>0
-refused=int(r.get("refused_per_ip") or 0)
-hz=r.get("hard_zeros") or {}
-if refused==0:
-  try: refused=int(float(hz.get("sjws_connections_refused_per_ip_total") or 0))
-  except Exception: refused=0
-open_after=r.get("open_sessions_after_drain")
-if open_after is None: open_after=hz.get("sjws_swarm_stream_open_sessions")
-try: open_n=int(float(open_after)) if open_after is not None else -1
-except Exception: open_n=-1
-drain_to=bool(r.get("drain_timed_out"))
-err=int(r.get("error_count") or 0); go=int(r.get("group_open_refusals") or 0)
-noisy=bool(r.get("noisy")) or (str(r.get("noisy_marker") or "").upper()=="NOISY")
-try: end_l1=float(r.get("load1_post") if r.get("load1_post") is not None else 0)
-except Exception: end_l1=0.0
-if end_l1>=6.0: noisy=True
-try: fcpu=float(r.get("foreign_cpu_avg_cores")) if r.get("foreign_cpu_avg_cores") is not None else 0.0
-except Exception: fcpu=0.0
-if fcpu>0.5: noisy=True
-if r.get("foreign_load_proc_seen"): noisy=True
-# Match agg.py: recompute self_loaded from 80*gen_cores (do not trust recorded flag alone)
-gen_cores=int(r.get("gen_cores") or 2); sat=80.0*gen_cores
-try: cpu=float(r.get("client_cpu_pct_of_wall")) if r.get("client_cpu_pct_of_wall") is not None else float("nan")
-except Exception: cpu=float("nan")
-self_loaded=bool(r.get("self_loaded")) or end_l1>=4.0 or (cpu==cpu and cpu>sat)
-print("1" if n>=10000 and p99 is not None and pre<3.0 and not self_loaded and not tx and refused==0 and not drain_to and open_n==0 and err==0 and go==0 and not noisy else "0")
-PY2
-)
+    ok=$(python3 "$HERE/window_valid.py" "$f")
     [ "$ok" = 1 ] && valid=$((valid + 1))
   done
   echo "$valid"
@@ -125,41 +92,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = abs ]; then
       continue
     fi
     created=$((created + 1))
-    ok=$(python3 - "$OUT/$tag/result.json" <<'PY2'
-import json,sys
-r=json.load(open(sys.argv[1]))
-n=r.get("chunk_samples") or 0
-p99=r.get("p99_us")
-pre=r.get("load1_pre", 99)
-ptr=int(r.get("producer_transport_retries") or 0); ccr=int(r.get("consumer_connect_retries") or 0)
-tx=bool(r.get("transport_retry_flag")) or ptr>0 or ccr>0
-refused=int(r.get("refused_per_ip") or 0)
-hz=r.get("hard_zeros") or {}
-if refused==0:
-  try: refused=int(float(hz.get("sjws_connections_refused_per_ip_total") or 0))
-  except Exception: refused=0
-open_after=r.get("open_sessions_after_drain")
-if open_after is None: open_after=hz.get("sjws_swarm_stream_open_sessions")
-try: open_n=int(float(open_after)) if open_after is not None else -1
-except Exception: open_n=-1
-drain_to=bool(r.get("drain_timed_out"))
-err=int(r.get("error_count") or 0); go=int(r.get("group_open_refusals") or 0)
-noisy=bool(r.get("noisy")) or (str(r.get("noisy_marker") or "").upper()=="NOISY")
-try: end_l1=float(r.get("load1_post") if r.get("load1_post") is not None else 0)
-except Exception: end_l1=0.0
-if end_l1>=6.0: noisy=True
-try: fcpu=float(r.get("foreign_cpu_avg_cores")) if r.get("foreign_cpu_avg_cores") is not None else 0.0
-except Exception: fcpu=0.0
-if fcpu>0.5: noisy=True
-if r.get("foreign_load_proc_seen"): noisy=True
-# Match agg.py: recompute self_loaded from 80*gen_cores (do not trust recorded flag alone)
-gen_cores=int(r.get("gen_cores") or 2); sat=80.0*gen_cores
-try: cpu=float(r.get("client_cpu_pct_of_wall")) if r.get("client_cpu_pct_of_wall") is not None else float("nan")
-except Exception: cpu=float("nan")
-self_loaded=bool(r.get("self_loaded")) or end_l1>=4.0 or (cpu==cpu and cpu>sat)
-print("1" if n>=10000 and p99 is not None and pre<3.0 and not self_loaded and not tx and refused==0 and not drain_to and open_n==0 and err==0 and go==0 and not noisy else "0")
-PY2
-)
+    ok=$(python3 "$HERE/window_valid.py" "$OUT/$tag/result.json")
     if [ "$ok" = 1 ]; then
       valid=$((valid + 1))
       echo "window $tag: VALID ($valid/$NVALID)" | tee -a "$OUT/gate.log"

@@ -86,7 +86,9 @@ else
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
     --groups "$GATE_GROUPS" \
-    --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" &
+    --gen-cores "$GEN_CORES" \
+    --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
+    ${SPID:+--server-pid "$SPID"} &
   GENPID=$!
   echo "$GENPID" >> "$WD/bench.pids"
   wait "$GENPID"

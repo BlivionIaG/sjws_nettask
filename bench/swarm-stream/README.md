@@ -65,7 +65,8 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
 - Start gate: `load1 < 3` before **every** leg (`gate.sh` / `cross-check.sh`), recorded as `load1_pre`.
 - During a leg: `foreign_cpu.py` samples every 5 s. A leg is **NOISY** if foreign processes
   (not the bench server/generator/harness tree) average **> 0.5 core**, or any sample shows a
-  foreign `java`/`mvn`/load-gen process, or end-of-leg `load1 >= 6`.
+  foreign `java`/`mvn`/load-gen process, or **any** sample (including end-of-leg) has `load1 >= 6`.
+- Absolute-window validity is one shared rule: `window_valid.py` (used by `agg.py` and `gate.sh`).
 - `agg.py` and `gate.sh` discard NOISY legs (never counted). A/A remains mandatory in `PHASE=aa|all`.
 - On completion `gate.sh` writes `$OUT/DONE` (`DONE swarm-stream-gate <time> …`). Queue owners still
   append `DONE <item> <time> <PR comment URL>` to `/workspace/bench-queue.md`.

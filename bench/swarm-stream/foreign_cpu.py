@@ -5,7 +5,7 @@ A block is NOISY if:
   - processes OTHER than the bench's own server/generator/harness use > 0.5 core
     averaged over the block, OR
   - any sample shows a foreign java / mvn / load process, OR
-  - end-of-block load1 >= 6 (absolute guard).
+  - ANY sample (or end-of-block) load1 >= 6 (absolute guard; 07:05 addendum).
 
 Own processes = allowlisted PIDs plus their descendants (one.sh tree).
 """
@@ -133,6 +133,7 @@ def judge(samples: list[dict], load1_end: float | None = None,
             "foreign_cpu_avg_cores": 0.0,
             "foreign_load_proc_seen": False,
             "load1_end": load1_end,
+            "load1_peak": float(load1_end or 0.0),
             "reasons": [],
             "samples_n": 0,
         }
@@ -167,13 +168,23 @@ def judge(samples: list[dict], load1_end: float | None = None,
         end_f = float(end) if end is not None else 0.0
     except (TypeError, ValueError):
         end_f = 0.0
-    if end_f >= load1_end_limit:
-        reasons.append(f"load1_end={end_f}>={load1_end_limit}")
+    # Absolute guard on EVERY sample (Codex P1 / 07:05): mid-block spike still NOISY
+    peak = end_f
+    for s in samples:
+        try:
+            v = float(s.get("load1")) if s.get("load1") is not None else 0.0
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > peak:
+            peak = v
+    if peak >= load1_end_limit:
+        reasons.append(f"load1_sample_peak={peak}>={load1_end_limit}")
     return {
         "noisy": bool(reasons),
         "foreign_cpu_avg_cores": avg,
         "foreign_load_proc_seen": foreign_seen,
         "load1_end": end_f,
+        "load1_peak": peak,
         "reasons": reasons,
         "samples_n": len(samples),
     }
@@ -191,6 +202,8 @@ def merge_into_result(result_path: Path, judgment: dict, load1_pre: float | None
         r["load1_pre"] = float(load1_pre)
     if judgment.get("load1_end") is not None:
         r["load1_post"] = float(judgment["load1_end"])
+    if judgment.get("load1_peak") is not None:
+        r["load1_peak"] = float(judgment["load1_peak"])
     # Marker string for aggregators that scan text
     if r["noisy"]:
         r["noisy_marker"] = "NOISY"

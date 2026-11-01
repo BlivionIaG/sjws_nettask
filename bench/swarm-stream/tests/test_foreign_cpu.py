@@ -50,7 +50,24 @@ def main():
         samp(0, {}),
         samp(5, {}, load1=6.2),
     ], load1_end=6.2)
-    assert j["noisy"] and any("load1_end" in r for r in j["reasons"]), j
+    assert j["noisy"] and any("load1_sample_peak" in r for r in j["reasons"]), j
+    assert j["load1_peak"] >= 6.2, j
+
+    # Mid-block spike then quiet end (Codex P1 / inceptor HOLD): still NOISY
+    j = fc.judge([
+        samp(0, {}, load1=2.0),
+        samp(5, {}, load1=6.5),
+        samp(10, {}, load1=2.0),
+    ], load1_end=2.0)
+    assert j["noisy"] and j["load1_peak"] >= 6.5, j
+    assert any("load1_sample_peak" in r for r in j["reasons"]), j
+
+    # Below 6 throughout → not load-noisy (foreign quiet)
+    j = fc.judge([
+        samp(0, {7: 1000}, load1=5.9),
+        samp(5, {7: 1000 + 40}, load1=5.5),
+    ], load1_end=5.5)
+    assert not j["noisy"], j
 
     print("OK test_foreign_cpu")
 
