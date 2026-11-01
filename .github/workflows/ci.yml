@@ -64,6 +64,22 @@ jobs:
           path: target/site/jacoco/
           if-no-files-found: ignore
 
+  # SafeOpen's macOS openat path (#344). Full verify stays Linux-only on PRs because of
+  # unrelated known platform gaps (docs/development/testing.md); this job only runs SafeOpen*.
+  safeopen-macos:
+    if: github.event_name != 'schedule'
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: SafeOpen tests (macOS openat path)
+        run: mvn -B -Djacoco.skip=true -Dtest=SafeOpenTest,SafeOpenAtTest,SafeOpenClassLoadTest -Dsurefire.failIfNoSpecifiedTests=true test
+
   mutation:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

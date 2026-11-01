@@ -420,6 +420,8 @@
             <manifestEntries>
               <!-- JDK 22+: lets Netty load the QUIC natives without a warning (blocked in future JDKs). -->
               <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+              <!-- SafeOpenAt wraps openat fds; ReusePort already needs sun.nio.ch in tests. -->
+              <Add-Opens>java.base/java.io java.base/sun.nio.ch</Add-Opens>
             </manifestEntries>
           </archive>
         </configuration>
