@@ -8,12 +8,13 @@
 > **parked** (branch kept;
 > [comment](https://github.com/BlivionIaG/sjws_nettask/pull/339#issuecomment-6553962246)).
 > G=64 JFR ([#337 comment](https://github.com/BlivionIaG/sjws_nettask/pull/337#issuecomment-6527508238))
-> **refuted H1** (writers idle; p99 bound by force/fsync), so the ledger pool is not the
-> swarm-stream p99 lever for the #299 gate.
+> **refuted H1** (writers idle). At 64 groups, stream p99 is **CPU-bound in `serveRequest`
+> and the swarm stream/credit path**; chunk delivery never waits on force. The ledger pool
+> is still not the swarm-stream p99 lever for the #299 gate.
 
 
 Status: **design only** (2026-10-30 Europe/Paris). Tracks [#336](https://github.com/BlivionIaG/sjws_nettask/issues/336).
-Blocks S2c PR 8 / [#299](https://github.com/BlivionIaG/sjws_nettask/pull/299) after [#335](https://github.com/BlivionIaG/sjws_nettask/pull/335).
+Formerly framed as blocking #299; superseded, see status note.
 Depends on: #333 (eager heap), #335 (lazy queue + fail-closed budget), #331 / #329 (shared **syncers** already).
 No Java changes in this PR.
 
@@ -40,7 +41,7 @@ No Java changes in this PR.
 3. Keep the **fail-closed** `LedgerWriterBudget` (#335): refusals → `LedgerBudgetExhaustedException` → HTTP **503** with scrubbed detail and `Retry-After`; never OOM.
 4. Isolate failures: one partition's IO error or budget refusal must **not** fence other partitions that share a writer shard (Security #335 B1; D7).
 5. Leave **GROUP / EACH** on dedicated per-partition writer threads (D6; there is no `Durability.SYNC` enum value).
-6. Unblock the #299 §13 gate at G=64 (1k streams): today p99 ≈ 169 ms with 774 writers and 0 `ZAllocationStall`.
+6. Cap writer threads at high group counts (e.g. G=64 / 1k streams historically showed p99 ≈ 169 ms with 774 writers and 0 `ZAllocationStall`). Not a #299 stream-p99 fix — see status note.
 7. Zero cost when messaging is off: lazy pool, 0 writer-pool threads until first NONE/ASYNC open (D4).
 
 ### Non-goals
@@ -224,7 +225,7 @@ Prediction: 1k groups stay open under default 0.25×heap for NONE/ASYNC swarm tr
 
 ### 9.3 p99
 
-#299 abs-01: 29.6 MiB/s, p99 169 ms, 774 writers, 0 ZAllocationStall. If scheduling / thread fan-out dominates, pooled N=8 should move p99 toward the **1.5 ms** guard. If disk or lock hold times dominate, p99 stays high and the JFR table (§14) tells us which.
+#299 abs-01: 29.6 MiB/s, p99 169 ms, 774 writers, 0 ZAllocationStall. Early design asked whether scheduling / writer fan-out dominated; G=64 JFR **refuted H1** and attributed stream p99 to CPU in `serveRequest` / swarm stream+credit (chunk delivery never waits on force) — see status note and §14. Pool remains a thread/heap win at high G, not the stream-p99 lever.
 
 ## 10. Test plan (with mutation proofs)
 
@@ -297,7 +298,7 @@ If the bench lock is free and load1 < 3: W synthetic partitions on 1 vs N pooled
 
 ### 13.1 Status quo + #335 only
 
-Lazy queues stop OOM but leave **O(writers)** threads. #299 G=64: 774 threads, p99 169 ms, 0 ZAllocationStall. Rejected as the PR 8 fix; kept as prerequisite.
+Lazy queues stop OOM but leave **O(writers)** threads. #299 G=64: 774 threads, p99 169 ms, 0 ZAllocationStall. Not the #299 stream-p99 fix (see status note); kept as a thread/heap prerequisite at high G.
 
 ### 13.2 Kafka-style: shared request threads, per-partition lock
 
@@ -329,11 +330,11 @@ Rejected by D5; rename to `sharedSyncers` with a one-release deprecated alias.
 
 ## 14. Hypothesis table for Agent Swarm's JFR (64-group window)
 
-After #335 merges, Agent Swarm will attribute p99 on a 64-group / 1k-stream window. Design predictions:
+G=64 JFR has run (see status note / [#337 comment](https://github.com/BlivionIaG/sjws_nettask/pull/337#issuecomment-6527508238)): **H1 REFUTED**. Stream p99 at 64 groups is CPU-bound in `serveRequest` and the swarm stream/credit path; chunk delivery never waits on force. Design predictions below are retained for the record:
 
 | ID | Hypothesis | JFR / signals that **confirm** | Signals that **refute** | Design implication if confirmed |
 |--|--|--|--|--|
-| H1 | Runnable writer count / context switches dominate p99 | high `JavaThreadPark`, `ContextSwitch`, many `ledger-writer-*` runnable; CPU in scheduler | CPU in `force` / `write` / `appendFrames`; few runnables | **Pool v1 is the right fix** for the guard |
+| H1 | Runnable writer count / context switches dominate p99 | high `JavaThreadPark`, `ContextSwitch`, many `ledger-writer-*` runnable; CPU in scheduler | writers idle; CPU in `serveRequest` / swarm stream+credit; chunk path never waits on force | **REFUTED** — pool is **not** the stream-p99 lever (thread/heap only) |
 | H2 | Per-write unpark / syncer flooring dominates | stacks in `unparkSyncer`, `LockSupport.park` on syncer; fsync interval binding | writers runnable without syncer parks | tune flooring / batch unpark; pool optional for p99 |
 | H3 | `Partition` lock hold / encode path dominates | samples in `Partition.append*` / `RecordBatch.encode` under lock | little time under Partition lock | messaging lock refactor; pool alone won't hit 1.5 ms |
 | H4 | Disk / `FileChannel.write` / page cache dominates | `NativeMethod` in write/force; high `java.io` time; device util | CPU-bound Java stacks | pool still needed for thread/heap at 1k groups; p99 needs batching or device |
@@ -358,7 +359,7 @@ YAML under `ledger:` mirrors the properties (same pattern as #335). Docs note (D
 1. Land #335 (budget + lazy + non-fencing refuse).
 2. Land this design (docs) after inceptor approval of the Decisions above.
 3. Implementation PR referencing #336: pool writers for NONE/ASYNC; tests T1–T13; ABBA; 16/64/256/1k heap+thread+stall sweep with max/mean occupancy; Security + Agent Swarm review (D7).
-4. Re-run #299 G=64 counted window; only then claim the PR 8 blocker cleared.
+4. Re-run #299 G=64 counted window for evidence; the pool is not claimed as clearing a #299 / PR-8 stream-p99 blocker (see status note).
 
 ## 17. References
 
