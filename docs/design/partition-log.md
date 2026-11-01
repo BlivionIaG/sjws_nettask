@@ -85,7 +85,10 @@ sequenceDiagram
 
 Module settings, each a JVM property or the matching `SJWS_MESSAGING_*` variable: `sjws.messaging.enabled`, `.dir`,
 `.segment.bytes`, `.retention.bytes`, `.retention.ms`, `.retention.check.ms`, `.durability` (the default for every topic)
-and `.durability.topics` (`topic:mode,...`).
+and `.durability.topics` (`topic:mode,...`). Topic names in `.durability.topics` and in
+`sjws.messaging.compaction.topics` must be user topics: the same pattern as HTTP produce/fetch, and names starting with
+`__` are rejected. A bad or reserved entry fails startup (exit 64 via `OptionalModule.Refused`) naming the property and
+the offending entry; the rest of the list is not applied.
 
 #### Write failures: problem types (#254, #256)
 
