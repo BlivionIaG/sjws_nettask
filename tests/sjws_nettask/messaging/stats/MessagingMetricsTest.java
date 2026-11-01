@@ -3,6 +3,8 @@ package sjws_nettask.messaging.stats;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
 
 final class MessagingMetricsTest {
@@ -28,5 +30,73 @@ final class MessagingMetricsTest {
         var text = new MessagingMetrics().prometheus();
         assertTrue(text.contains("sjws_messaging_produce_duration_seconds"), text);
         assertFalse(text.contains("sjws_messaging_lag_offsets"), text);
+    }
+
+    @Test
+    void nullAndEmptyTopicFoldToOther() {
+        var m = new MessagingMetrics();
+        m.produced(null, 400, 0, 100);
+        m.fetched("", 404, 0, 200);
+        var text = m.prometheus();
+        assertTrue(text.contains("topic=\"other\",status=\"400\""), text);
+        assertTrue(text.contains("topic=\"other\",status=\"404\""), text);
+    }
+
+    @Test
+    void negativeNanosClampToZeroAndAppendToWorks() {
+        var m = new MessagingMetrics();
+        m.produced("t", 200, 1, -5);
+        var sb = new StringBuilder();
+        m.appendTo(sb);
+        assertTrue(sb.toString().contains("sjws_messaging_produce_duration_seconds_sum{topic=\"t\",status=\"200\"} 0.000000"),
+                sb.toString());
+    }
+
+    @Test
+    void escapeTopicLabelSpecialChars() {
+        var m = new MessagingMetrics();
+        m.produced("a\"b\\c\nd", 200, 1, 1_000);
+        var text = m.prometheus();
+        assertTrue(text.contains("topic=\"a\\\"b\\\\c\\nd\""), text);
+    }
+
+    @Test
+    void statsNullAndNoneOmitLagFamily() {
+        var m = new MessagingMetrics();
+        m.stats(null);
+        assertFalse(m.prometheus().contains("sjws_messaging_lag_offsets"));
+        m.stats(() -> MessagingStats.NONE);
+        assertFalse(m.prometheus().contains("sjws_messaging_lag_offsets"));
+        m.stats(() -> null);
+        assertFalse(m.prometheus().contains("sjws_messaging_lag_offsets"));
+    }
+
+    @Test
+    void statsSnapshotAppendsLagGauges() {
+        var m = new MessagingMetrics();
+        var snap = new MessagingStats.StatsSnapshot(1L, List.of(
+                new MessagingStats.PartitionStats("orders", 0, false, 10, 10, 1,
+                        List.of(new MessagingStats.GroupStats("g1", 5, 5, 1, 1, 0, 0, 0, 0, 0, 0)))));
+        m.stats(() -> () -> snap);
+        var text = m.prometheus();
+        assertTrue(text.contains("sjws_messaging_lag_offsets"), text);
+        assertTrue(text.contains("topic=\"orders\""), text);
+    }
+
+    @Test
+    void topicCardinalityCapFoldsIntoOther() {
+        var m = new MessagingMetrics();
+        // Cap is on map size (keys = topic+status). Fill with distinct keys then fold.
+        for (int i = 0; i < MessagingMetrics.TOPIC_CAP; i++) {
+            m.produced("t" + i, 200, 1, 1000);
+        }
+        m.produced("overflow-topic", 200, 1, 1000);
+        var text = m.prometheus();
+        assertTrue(text.contains("sjws_messaging_topics_folded_total"), text);
+        assertTrue(text.contains("topic=\"other\""), text);
+        // Existing keys still record without folding again when re-hit
+        m.produced("t0", 200, 1, 2000);
+        assertTrue(m.prometheus().contains("sjws_messaging_produce_duration_seconds_count{topic=\"t0\",status=\"200\"} 2"),
+                m.prometheus());
     }
 }
