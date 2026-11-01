@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 import sjws_nettask.cluster.ClusterNode;
 import sjws_nettask.cluster.GroupId;
@@ -54,6 +55,10 @@ import sjws_nettask.messaging.ledger.Replica;
  * {@link RaftReplica#restoreProducers} before applying {@code i + 1}.
  */
 public final class RaftReplicator implements PartitionReplicator {
+
+    /** Same rule as {@code LogTopics.NAME} / {@code HaMessagingSettings} topic names. */
+    private static final Pattern TOPIC_NAME = Pattern.compile("[A-Za-z0-9._-]{1,128}");
+
 
     /**
      * Feature bits this build advertises on every msg group it opens (#278): it applies producer entries and fails
@@ -134,7 +139,7 @@ public final class RaftReplicator implements PartitionReplicator {
      * nothing applied (#217). Callers must pass the same topic set and election/heartbeat timings the data nodes use
      * ({@code ha.topics} / {@code HaMessaging}); a missing topic on the witness leaves that group with two data voters
      * and no tie-breaker. Refuses a non-witness node (a data node would join with a null listener and apply nothing)
-     * and refuses topic names that start with {@code __} (those collide with internal groups such as {@code __offsets}).
+     * and refuses topic names that fail the messaging NAME pattern or start with {@code __} (those collide with internal groups such as {@code __offsets}).
      */
     public static void openForWitness(ClusterNode node, Set<String> topics, Duration electionTimeout, Duration heartbeat) {
         Objects.requireNonNull(node, "node");
@@ -144,9 +149,10 @@ public final class RaftReplicator implements PartitionReplicator {
                     "openForWitness requires a witness node (self is not the voter-without-log)");
         }
         for (var t : topics) {
-            if (t == null || t.isBlank() || t.startsWith("__")) {
+            // Full NAME pattern (defense in depth; production also goes through HaMessagingSettings).
+            if (t == null || !TOPIC_NAME.matcher(t).matches() || t.equals(".") || t.equals("..") || t.startsWith("__")) {
                 throw new IllegalArgumentException("openForWitness: invalid topic name " + t
-                        + " (names starting with __ are internal)");
+                        + " (must match [A-Za-z0-9._-]{1,128} and must not start with __)");
             }
         }
         var opts = options(electionTimeout, heartbeat);
