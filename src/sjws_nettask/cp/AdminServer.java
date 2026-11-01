@@ -52,10 +52,16 @@ public final class AdminServer implements AutoCloseable {
     private final CpAdmin admin;
     private final AdminTls tls;
     private final CpServerTls serverTls;
-    /** Live HTTPS sessions and the peer chain presented when they were registered. */
-    private final ConcurrentHashMap<SSLSession, X509Certificate[]> live = new ConcurrentHashMap<>();
+    /**
+     * Live HTTPS sessions: peer chain plus a best-effort abort handle for the underlying
+     * connection (so a reload can close keep-alive sockets, not only invalidate the session).
+     */
+    private final ConcurrentHashMap<SSLSession, Live> live = new ConcurrentHashMap<>();
     private final AtomicLong policyDropped = new AtomicLong();
     private volatile Thread watcher;
+
+    private record Live(X509Certificate[] chain, AutoCloseable abort) {
+    }
 
     private AdminServer(HttpServer server, CpAdmin admin, AdminTls tls, CpServerTls serverTls) {
         this.server = server;
@@ -175,19 +181,43 @@ public final class AdminServer implements AutoCloseable {
     }
 
     private void handle(HttpExchange exchange) throws IOException {
-        if (exchange instanceof HttpsExchange https) {
-            var refused = registerAndRevalidate(https);
-            if (refused != null) {
-                exchange.getRequestBody().readAllBytes();
-                write(exchange, refused, true);
-                return;
+        HttpsExchange https = exchange instanceof HttpsExchange h ? h : null;
+        X509Certificate[] chain = null;
+        SSLSession session = null;
+        if (https != null) {
+            pruneDeadSessions();
+            session = https.getSSLSession();
+            chain = session == null ? null : peerChain(session);
+            if (chain != null) {
+                try {
+                    revalidate(chain);
+                } catch (CertificateException | IOException e) {
+                    policyDropped.incrementAndGet();
+                    live.remove(session);
+                    try {
+                        session.invalidate();
+                    } catch (RuntimeException ignored) {
+                        // best effort
+                    }
+                    exchange.getRequestBody().readAllBytes();
+                    write(exchange, CpStore.Outcome.error(401, "tls"), true);
+                    return;
+                }
             }
         }
         var outcome = admin.handle(credential(exchange), exchange.getRequestMethod(), exchange.getRequestURI().getPath(),
                 exchange.getRequestURI().getRawQuery(),
                 new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
                 exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+        if (https != null && session != null && chain != null) {
+            live.put(session, new Live(chain, null));
+        }
         write(exchange, outcome);
+        // Fill the abort handle only after the response is written; probing the connection
+        // mid-request via reflection breaks the sun httpserver exchange.
+        if (https != null && session != null && chain != null && session.isValid()) {
+            live.put(session, new Live(chain, connectionAbort(https)));
+        }
     }
 
     private static void write(HttpExchange exchange, CpStore.Outcome outcome) throws IOException {
@@ -207,53 +237,43 @@ public final class AdminServer implements AutoCloseable {
     }
 
     /**
-     * Track the session's peer chain and re-apply trust/revocation against the current material.
-     * A failure invalidates the session so a keep-alive reuse cannot continue.
+     * After reload: re-check every remembered peer chain against the new material. {@link AdminTls#reload()}
+     * may already have invalidated SSL sessions before this runs, so we key off the stored chain, not
+     * {@link SSLSession#isValid()}.
      */
-    private CpStore.Outcome registerAndRevalidate(HttpsExchange https) {
-        var session = https.getSSLSession();
-        if (session == null) {
-            return null;
-        }
-        var chain = peerChain(session);
-        if (chain == null) {
-            return null;
-        }
-        live.put(session, chain);
-        try {
-            revalidate(chain);
-            return null;
-        } catch (CertificateException | IOException e) {
-            policyDropped.incrementAndGet();
-            live.remove(session, chain);
-            try {
-                session.invalidate();
-            } catch (RuntimeException ignored) {
-                // best effort
-            }
-            return CpStore.Outcome.error(401, "tls");
-        }
-    }
-
-    /** After reload: invalidate every live session whose peer chain fails current policy. */
     void dropConnectionsFailingPolicy() {
         for (var entry : List.copyOf(live.entrySet())) {
             var session = entry.getKey();
-            var chain = entry.getValue();
-            if (!session.isValid()) {
-                live.remove(session, chain);
-                continue;
-            }
+            var peer = entry.getValue();
             try {
-                revalidate(chain);
+                revalidate(peer.chain());
+                if (!session.isValid()) {
+                    // Cert still OK; drop the stale map entry only (connection may stay for a new handshake).
+                    live.remove(session, peer);
+                }
             } catch (CertificateException | IOException | RuntimeException failed) {
                 policyDropped.incrementAndGet();
+                live.remove(session, peer);
+                abortQuietly(peer);
                 try {
-                    session.invalidate();
+                    if (session.isValid()) {
+                        session.invalidate();
+                    }
                 } catch (RuntimeException ignored) {
                     // best effort
                 }
-                live.remove(session, chain);
+            }
+        }
+        pruneDeadSessions();
+    }
+
+    /** Drop entries whose TLS session is already invalid so the map cannot grow without bound. */
+    private void pruneDeadSessions() {
+        for (var entry : List.copyOf(live.entrySet())) {
+            if (!entry.getKey().isValid()) {
+                if (live.remove(entry.getKey(), entry.getValue())) {
+                    abortQuietly(entry.getValue());
+                }
             }
         }
     }
@@ -269,6 +289,45 @@ public final class AdminServer implements AutoCloseable {
         }
         // Plain listener: nothing to revalidate.
     }
+
+    private static void abortQuietly(Live live) {
+        if (live == null || live.abort() == null) {
+            return;
+        }
+        try {
+            live.abort().close();
+        } catch (Exception ignored) {
+            // best effort
+        }
+    }
+
+    /**
+     * Best-effort handle that closes the sun.net.httpserver connection behind an exchange.
+     * Public HTTPS APIs do not expose the socket; without this, invalidate alone leaves keep-alive
+     * TCP up until the next request.
+     */
+    static AutoCloseable connectionAbort(HttpExchange exchange) {
+        try {
+            var implField = exchange.getClass().getDeclaredField("impl");
+            implField.setAccessible(true);
+            var exchangeImpl = implField.get(exchange);
+            var getConnection = exchangeImpl.getClass().getDeclaredMethod("getConnection");
+            getConnection.setAccessible(true);
+            var connection = getConnection.invoke(exchangeImpl);
+            var close = connection.getClass().getDeclaredMethod("close");
+            close.setAccessible(true);
+            return () -> {
+                try {
+                    close.invoke(connection);
+                } catch (ReflectiveOperationException e) {
+                    throw new IOException(e);
+                }
+            };
+        } catch (ReflectiveOperationException e) {
+            return null;
+        }
+    }
+
 
     private static X509Certificate[] peerChain(SSLSession session) {
         try {
