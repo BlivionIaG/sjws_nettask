@@ -248,6 +248,13 @@ final class AccessLog implements Runnable, AutoCloseable {
                     pending = 0;
                     flushedAt = System.nanoTime();
                 }
+                // Reopen check also on the busy path so a full queue cannot defer rotation forever.
+                BufferedOutputStream next = maybeReopen(buffered, pending > 0);
+                if (next != buffered) {
+                    pending = 0;
+                    flushedAt = System.nanoTime();
+                    buffered = next;
+                }
             }
             byte[] rest;
             while ((rest = this.queue.poll()) != null) {
@@ -284,7 +291,8 @@ final class AccessLog implements Runnable, AutoCloseable {
         }
         this.nextReopenCheckNanos = now + REOPEN_CHECK_NANOS;
         this.reopenRequested = false;
-        boolean exists = Files.exists(this.path, LinkOption.NOFOLLOW_LINKS);
+        // Follow links: FileOutputStream writes through a symlink; compare that target's key.
+        boolean exists = Files.exists(this.path);
         Object current = exists ? fileKey(this.path) : null;
         boolean missing = !exists;
         // When the FS has no file keys, only forced reopen or a missing path triggers reopen.
@@ -295,21 +303,29 @@ final class AccessLog implements Runnable, AutoCloseable {
         if (hadPending) {
             buffered.flush();
         }
-        // Drop the buffer without writing through a second close of an already-replaced stream.
+        OutputStream previous = this.out;
         try {
-            this.out.close();
+            OutputStream neu = openFile(this.path);
+            try {
+                previous.close();
+            } catch (IOException e) {
+                System.err.println("WARN: closing rotated access log: " + e);
+            }
+            this.out = neu;
+            this.openedKey = fileKey(this.path);
+            return new BufferedOutputStream(neu, FLUSH_BYTES);
         } catch (IOException e) {
-            System.err.println("WARN: closing rotated access log: " + e);
+            // Keep writing the previous stream; retry on the next check (do not set failed).
+            System.err.println("WARN: access log reopen failed; keeping previous stream: " + e);
+            this.reopenRequested = forced || missing || replaced;
+            return buffered;
         }
-        this.out = openFile(this.path);
-        this.openedKey = fileKey(this.path);
-        return new BufferedOutputStream(this.out, FLUSH_BYTES);
     }
 
+    /** File key of the path after following symlinks (matches what {@link FileOutputStream} writes). */
     private static Object fileKey(Path path) {
         try {
-            return Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class,
-                    LinkOption.NOFOLLOW_LINKS).fileKey();
+            return Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class).fileKey();
         } catch (IOException | UnsupportedOperationException e) {
             return null;
         }

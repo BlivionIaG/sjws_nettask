@@ -693,6 +693,30 @@ class ObservabilityTest {
             }
         }
     }
+    @Test
+    void reopensAfterSymlinkTargetRotation(@TempDir Path dir) throws Exception {
+        Path target = dir.resolve("access.log");
+        Path link = dir.resolve("current.log");
+        Files.writeString(target, "");
+        Files.createSymbolicLink(link, target.getFileName());
+        try (var log = AccessLog.start(link.toString(), AccessLogFormat.COMMON)) {
+            log.offer("10.0.0.1", "GET", "/a", "HTTP/1.1", 200, 1, 0, "-", "-");
+            awaitLog(() -> Files.exists(target) && Files.size(target) > 0);
+            Path rotated = dir.resolve("access.log.1");
+            Files.move(target, rotated);
+            Files.writeString(target, "");
+            // Wait past the one-second reopen poll (no requestReopen) so the followed key change is seen.
+            Thread.sleep(1_200);
+            log.offer("10.0.0.1", "GET", "/b", "HTTP/1.1", 200, 1, 0, "-", "-");
+            awaitLog(() -> Files.size(target) > 0);
+            String neu = Files.readString(target);
+            String old = Files.readString(rotated);
+            assertTrue(neu.contains("GET /b"), neu);
+            assertFalse(neu.contains("GET /a"), neu);
+            assertTrue(old.contains("GET /a"), old);
+        }
+    }
+
 
     private static void awaitLog(java.util.concurrent.Callable<Boolean> ready) throws Exception {
         long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
