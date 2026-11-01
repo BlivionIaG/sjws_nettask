@@ -56,8 +56,11 @@ final class AccessLog implements Runnable, AutoCloseable {
     /** File key of the inode currently open; null until first open or when unsupported. */
     private Object openedKey;
 
-    /** Test-only: force N open attempts to treat the path key as raced. */
-    static volatile int testForceKeyRaceAttempts;
+    /**
+     * Package-private reopen-path test seam for key-race retry coverage. Production leaves
+     * {@link OpenKeyRaceProbe#NONE} (always no-op).
+     */
+    static volatile OpenKeyRaceProbe openKeyRaceProbe = OpenKeyRaceProbe.NONE;
     private long nextReopenCheckNanos;
     /** Test/hook: force one reopen check, ignoring the 1s deadline once (#406). */
     private volatile boolean reopenRequested;
@@ -88,7 +91,11 @@ final class AccessLog implements Runnable, AutoCloseable {
     static OutputStream openFile(Path path) throws IOException {
         Path absolute = path.toAbsolutePath();
         ensureParent(absolute);
-        if (Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
+        if (Files.isSymbolicLink(absolute)) {
+            // Missing symlink targets must not be created by FileOutputStream (umask default);
+            // create the resolved target with 0640 / CREATE_NEW first (#428 Security P2).
+            ensureSymlinkTargetCreated(absolute);
+        } else if (Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
             warnIfWorldReadable(absolute);
         } else {
             try {
@@ -99,6 +106,29 @@ final class AccessLog implements Runnable, AutoCloseable {
             }
         }
         return new FileOutputStream(absolute.toFile(), true);
+    }
+
+    /**
+     * If {@code link}'s target is missing, create that target with {@code 0640} using
+     * {@link Files#createFile} (CREATE_NEW / O_EXCL). Does not create via a follow-then-open race
+     * on the symlink itself. Existing targets are left unchanged (WARN if world-readable).
+     */
+    static void ensureSymlinkTargetCreated(Path link) throws IOException {
+        Path target = Files.readSymbolicLink(link);
+        Path parent = link.toAbsolutePath().getParent();
+        Path resolved = (parent != null ? parent.resolve(target) : target).normalize();
+        if (Files.exists(resolved, LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isSymbolicLink(resolved)) {
+                warnIfWorldReadable(resolved);
+            }
+            return;
+        }
+        ensureParent(resolved);
+        try {
+            createNew(resolved);
+        } catch (FileAlreadyExistsException e) {
+            warnIfWorldReadable(resolved);
+        }
     }
 
     /**
@@ -113,9 +143,7 @@ final class AccessLog implements Runnable, AutoCloseable {
             OutputStream stream = openFile(path);
             Object after = fileKey(path);
             boolean raced = before != null && after != null && !before.equals(after);
-            int force = testForceKeyRaceAttempts;
-            if (force > 0) {
-                testForceKeyRaceAttempts = force - 1;
+            if (openKeyRaceProbe.consumeForceRace()) {
                 raced = true;
             }
             if (raced) {
@@ -143,6 +171,16 @@ final class AccessLog implements Runnable, AutoCloseable {
         Opened(OutputStream stream, Object key) {
             this.stream = stream;
             this.key = key;
+        }
+    }
+
+    /** Reopen-path only; {@link #NONE} is a no-op final for production. */
+    static class OpenKeyRaceProbe {
+        static final OpenKeyRaceProbe NONE = new OpenKeyRaceProbe();
+
+        /** @return true once per forced race the test wants to inject */
+        boolean consumeForceRace() {
+            return false;
         }
     }
 
