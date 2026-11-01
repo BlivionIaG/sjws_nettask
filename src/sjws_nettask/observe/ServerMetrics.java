@@ -76,6 +76,8 @@ public final class ServerMetrics {
     private volatile LongSupplier msgreplInstallPinExhausted = () -> 0;
     /** #315 N2: msgrepl oversized-install abandonments; 0 until attached. */
     private volatile LongSupplier msgreplInstallOversizedAbandoned = () -> 0;
+    /** #259: CpStore Idempotency-Key evictions; 0 until {@link #setCpIdempotencyEvictions} attaches. */
+    private volatile LongSupplier cpIdempotencyEvictions = () -> 0;
 
     public ServerMetrics() {
         for (int i = 0; i < this.byStatus.length; i++) {
@@ -117,6 +119,13 @@ public final class ServerMetrics {
     public void setMsgreplInstallCounters(LongSupplier pinExhausted, LongSupplier oversizedAbandoned) {
         this.msgreplInstallPinExhausted = pinExhausted == null ? () -> 0 : pinExhausted;
         this.msgreplInstallOversizedAbandoned = oversizedAbandoned == null ? () -> 0 : oversizedAbandoned;
+    }
+
+    /**
+     * Attach the CP Idempotency-Key eviction counter (#259). Read only at scrape time. Null resets to 0.
+     */
+    public void setCpIdempotencyEvictions(LongSupplier evictions) {
+        this.cpIdempotencyEvictions = evictions == null ? () -> 0 : evictions;
     }
 
     /** Hot path: a handful of striped increments, no allocation. */
@@ -186,7 +195,7 @@ public final class ServerMetrics {
     /** Prometheus text exposition 0.0.4 of one {@link #snapshot()}, plus attached msgrepl install counters (#315). */
     public String prometheus() {
         var text = prometheus(snapshot(), this.msgreplInstallPinExhausted.getAsLong(),
-                this.msgreplInstallOversizedAbandoned.getAsLong());
+                this.msgreplInstallOversizedAbandoned.getAsLong(), this.cpIdempotencyEvictions.getAsLong());
         // Core connections family (Observability: sjws_connections_*), not swarm-gated: always HELP+TYPE.
         return text
                 + "# HELP sjws_connections_refused_per_ip_total HTTP/1.1 accepts closed because max_connections_per_ip was exceeded.\n"
@@ -195,10 +204,15 @@ public final class ServerMetrics {
     }
 
     static String prometheus(Snapshot snap) {
-        return prometheus(snap, 0L, 0L);
+        return prometheus(snap, 0L, 0L, 0L);
     }
 
     static String prometheus(Snapshot snap, long installPinExhausted, long installOversizedAbandoned) {
+        return prometheus(snap, installPinExhausted, installOversizedAbandoned, 0L);
+    }
+
+    static String prometheus(Snapshot snap, long installPinExhausted, long installOversizedAbandoned,
+            long cpIdempotencyEvicted) {
         var sb = new StringBuilder(1024);
         sb.append("# HELP sjws_http_requests_total Responses by status and protocol.\n");
         sb.append("# TYPE sjws_http_requests_total counter\n");
@@ -247,6 +261,9 @@ public final class ServerMetrics {
         sb.append("# HELP sjws_msgrepl_install_oversized_abandoned_total Consensus snapshot installs abandoned because the image exceeded ha.snapshot.max_install_bytes.\n");
         sb.append("# TYPE sjws_msgrepl_install_oversized_abandoned_total counter\n");
         sb.append("sjws_msgrepl_install_oversized_abandoned_total ").append(installOversizedAbandoned).append('\n');
+        sb.append("# HELP sjws_cp_idempotency_evicted_total Idempotency-Key entries dropped by the CP replay window or hard cap (#259).\n");
+        sb.append("# TYPE sjws_cp_idempotency_evicted_total counter\n");
+        sb.append("sjws_cp_idempotency_evicted_total ").append(cpIdempotencyEvicted).append('\n');
         return sb.toString();
     }
 }

@@ -7,11 +7,11 @@
 * Where the file system has no file keys (Windows), the "file was swapped between resolve and send"
   check falls back to the size check during transfer.
 * Files are opened relative to the document root one directory at a time without following symlinks
-  (`SecureDirectoryStream`, i.e. `openat`, on Linux and macOS), so a directory swapped for a symlink
-  between resolve and send is never followed. Where that API is missing (Windows; startup then prints a
-  `WARN:` line), the server opens the path without following a final symlink and re-checks its real
-  path (containment) and file key afterwards; that narrows but does not close the race, so don't serve
-  a tree that untrusted users can write to on such a platform.
+  (`SecureDirectoryStream` on Linux; `openat` with `O_NOFOLLOW` on macOS), so a directory swapped for a
+  symlink between resolve and send is never followed. Where neither path is available (Windows; startup
+  then prints a `WARN:` line), the server opens the path without following a final symlink and re-checks
+  its real path (containment) and file key afterwards; that narrows but does not close the race, so don't
+  serve a tree that untrusted users can write to on such a platform.
 * **Unlistable directories.** Opening relative to a directory needs read permission on it. Files below
   a directory the server can search but not read (mode `--x`, e.g. `711`), or below such a root, are
   therefore answered **403** by default. `--allow-unlistable-dirs` serves them through the path-based

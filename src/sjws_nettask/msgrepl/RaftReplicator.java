@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 import sjws_nettask.cluster.ClusterNode;
 import sjws_nettask.cluster.GroupId;
@@ -54,6 +55,10 @@ import sjws_nettask.messaging.ledger.Replica;
  * {@link RaftReplica#restoreProducers} before applying {@code i + 1}.
  */
 public final class RaftReplicator implements PartitionReplicator {
+
+    /** Same rule as {@code LogTopics.NAME} / {@code HaMessagingSettings} topic names. */
+    private static final Pattern TOPIC_NAME = Pattern.compile("[A-Za-z0-9._-]{1,128}");
+
 
     /**
      * Feature bits this build advertises on every msg group it opens (#278): it applies producer entries and fails
@@ -129,12 +134,33 @@ public final class RaftReplicator implements PartitionReplicator {
                 Long.MAX_VALUE);
     }
 
-    /** A witness (or any node without messaging) must still open the groups to vote: no listener, nothing applied. */
+    /**
+     * Opens every {@code msg/<topic>} group plus {@code msg/__offsets} on the witness so it can vote: no listener,
+     * nothing applied (#217). Callers must pass the same topic set and election/heartbeat timings the data nodes use
+     * ({@code ha.topics} / {@code HaMessaging}); a missing topic on the witness leaves that group with two data voters
+     * and no tie-breaker. Refuses a non-witness node (a data node would join with a null listener and apply nothing)
+     * and refuses topic names that fail the messaging NAME pattern or start with {@code __} (those collide with internal groups such as {@code __offsets}).
+     */
     public static void openForWitness(ClusterNode node, Set<String> topics, Duration electionTimeout, Duration heartbeat) {
+        Objects.requireNonNull(node, "node");
+        Objects.requireNonNull(topics, "topics");
+        if (!node.witness()) {
+            throw new IllegalArgumentException(
+                    "openForWitness requires a witness node (self is not the voter-without-log)");
+        }
+        for (var t : topics) {
+            // Full NAME pattern (defense in depth; production also goes through HaMessagingSettings).
+            if (t == null || !TOPIC_NAME.matcher(t).matches() || t.equals(".") || t.equals("..") || t.startsWith("__")) {
+                throw new IllegalArgumentException("openForWitness: invalid topic name " + t
+                        + " (must match [A-Za-z0-9._-]{1,128} and must not start with __)");
+            }
+        }
         var opts = options(electionTimeout, heartbeat);
         // The witness stores no entries, but it is a voter: it advertises the build's msg-group features like the data
         // nodes, so the leader's every-voter check (RaftReplica.FEATURE_PRODUCER_ENTRIES) covers the whole group.
-        for (var t : topics) node.openGroup(group(t), opts, null).advertiseFeatures(FEATURES);
+        for (var t : topics) {
+            node.openGroup(group(t), opts, null).advertiseFeatures(FEATURES);
+        }
         node.openGroup(group("__offsets"), opts, null).advertiseFeatures(FEATURES);
     }
 

@@ -6,7 +6,7 @@ The repository's `Dockerfile` builds a two-stage image:
   (BuildKit cache mount on `~/.m2`), then `src/` is compiled and packaged with `-DskipTests`
   (tests run in CI, not in the image build).
 * **runtime**: `gcr.io/distroless/cc-debian12` (glibc and libstdc++ for the QUIC natives, no shell)
-  with a `jlink` runtime in `/opt/java` (modules from `jdeps`, see the Dockerfile; debug info,
+  with a `jlink` runtime in `/opt/java` (modules from `jdeps` plus a fixed manual set; `tools/check-jlink-modules.sh` / docker.yml job `jlink-modules` fails on drift, see #411; debug info,
   man pages and headers stripped, zip-compressed), and `/opt/sjws/sjws_nettask.jar` and `/opt/sjws/lib/`
   (Netty and the Linux QUIC natives, on the manifest Class-Path; the macOS/Windows native jars are dropped). Runs as the non-root
   uid/gid 10001 (numeric, no passwd entry). The sample document root `HTML/` is at `/srv/www`.
@@ -34,3 +34,6 @@ root must be readable by uid 10001.
 CI: `.github/workflows/docker.yml` builds the image with Buildx (GitHub Actions cache), starts it,
 waits for `healthy`, checks `/healthz`, a static file and that the process is not root, then removes
 it. Nothing is pushed to a registry.
+
+
+See [JVM flag profiles](../operations/jvm-flags.md) for G1 / ZGC / Serial recommendations measured outside the image.

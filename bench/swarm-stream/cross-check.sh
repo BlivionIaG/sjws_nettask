@@ -5,15 +5,26 @@ set -euo pipefail
 JAR=$1; OUT=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
+# Same lock convention as gate.sh: acquire once, or SKIP_FLOCK=1 when the caller already holds it.
+if [ "${SKIP_FLOCK:-0}" != 1 ]; then
+  exec 9>>/tmp/sjws-bench.lock
+  flock 9
+fi
 export DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
 export WARMUP=${WARMUP:-5}
 SECS=${SECS:-20}
 
 run() {
   local tag=$1 loadgen=$2 streams=$3
-  local wd="$OUT/$tag"
+  local wd="$OUT/$tag" load_pre
   rm -rf "$wd"; mkdir -p "$wd"
-  echo "=== cross $tag loadgen=$loadgen streams=$streams load=$(cat /proc/loadavg) ==="
+  load_pre=$(awk '{print $1}' /proc/loadavg)
+  echo "=== cross $tag loadgen=$loadgen streams=$streams load1_pre=$load_pre ==="
+  # 07:05: recheck start gate before every leg
+  if ! python3 -c "import sys; sys.exit(0 if float('$load_pre') < 3.0 else 1)"; then
+    echo "cross-check: skip $tag — load1_pre=$load_pre >= 3"
+    return 1
+  fi
   LOADGEN=$loadgen bash "$HERE/one.sh" "$JAR" "$wd" binary "$wd/result.json" "$SECS" "$streams"
   sync "$wd/result.json" 2>/dev/null || true
 }

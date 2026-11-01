@@ -1357,6 +1357,14 @@ public final class SjwsServer implements AutoCloseable {
     }
 
     /**
+     * Attach the CP Idempotency-Key eviction counter (#259). Stored on the {@link ObserverSlot} and copied when
+     * observation arms; {@link RequestObserver#NONE} is never mutated. Null resets to 0.
+     */
+    public void attachCpIdempotencyEvictions(LongSupplier evictions) {
+        this.slot.attachCpIdempotencyEvictions(evictions);
+    }
+
+    /**
      * Turns request counters on if they were off, then returns them. The admin TUI calls this
      * (through {@link #metricsSnapshot()}) when it draws a status view.
      * <p>

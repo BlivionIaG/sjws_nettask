@@ -339,6 +339,12 @@ final class Daemon {
      * before {@code -jar} / the main class (for example {@code -Xmx}) are kept. When this process
      * was not itself {@code sjws_nettask} (the test runner), falls back to {@code java -cp}.
      */
+    /**
+     * JVM flag the admin keep-alive drop needs so reflective {@code HttpConnection} abort works.
+     * Also listed in the jar {@code Add-Opens} manifest entry for bare {@code java -jar}.
+     */
+    static final String ADMIN_HTTPSERVER_ADD_OPENS = "--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED";
+
     static List<String> childCommand(List<String> appArgs) {
         var java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         return childCommand(appArgs, ProcessHandle.current().info().arguments(), java,
@@ -358,6 +364,11 @@ final class Daemon {
         }
         cmd.clear();
         cmd.add(javaBin);
+        // Match the container entrypoint and Surefire: ReloadHook may need FFM to clear an
+        // inherited SIG_IGN before installing SIGHUP as reload (GitHub Actions).
+        cmd.add("--enable-native-access=ALL-UNNAMED");
+        // Admin keep-alive drop closes sun.net.httpserver.HttpConnection via reflection (#388 / #451).
+        cmd.add(ADMIN_HTTPSERVER_ADD_OPENS);
         cmd.add("-cp");
         cmd.add(classPath);
         cmd.add("sjws_nettask.Sjws_nettask");
@@ -403,8 +414,36 @@ final class Daemon {
         for (int i = 0; i <= main; i++) {
             out.add(argv[i]);
         }
+        // systemd / bare parent may omit the open; the jar manifest covers java -jar, but a -cp
+        // splice and an older jar still need the flag on the child command line.
+        ensureJvmFlag(out, out.size() - 1, ADMIN_HTTPSERVER_ADD_OPENS);
         out.addAll(appArgs);
         return true;
+    }
+
+    /**
+     * Inserts {@code flag} before {@code -jar}/main when absent. Accepts {@code --add-opens=…}
+     * and the two-token {@code --add-opens …} form.
+     */
+    static void ensureJvmFlag(List<String> cmd, int jvmArgsEndInclusive, String flag) {
+        int end = Math.min(jvmArgsEndInclusive, cmd.size() - 1);
+        String value = flag.startsWith("--add-opens=") ? flag.substring("--add-opens=".length()) : flag;
+        for (int i = 1; i <= end; i++) {
+            var arg = cmd.get(i);
+            if (arg.equals(flag)) {
+                return;
+            }
+            if ("--add-opens".equals(arg) && i < end && value.equals(cmd.get(i + 1))) {
+                return;
+            }
+        }
+        for (int i = 1; i < cmd.size(); i++) {
+            if ("-jar".equals(cmd.get(i)) || "sjws_nettask.Sjws_nettask".equals(cmd.get(i))) {
+                cmd.add(i, flag);
+                return;
+            }
+        }
+        cmd.add(flag);
     }
 
     /** Prepends {@code setsid} when that binary is executable, so the child becomes a new session. */

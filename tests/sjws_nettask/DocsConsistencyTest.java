@@ -3,6 +3,7 @@ package sjws_nettask;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -78,5 +79,36 @@ class DocsConsistencyTest {
             gated.add(m.group(1));
         }
         assertEquals(packages, gated, "every package under src/ needs its own JaCoCo PACKAGE rule (and no stale ones)");
+    }
+
+    /**
+     * #383: after #296 / #302, HTTP/2 (h2/h2c streams) fills {@code fields()} when the live
+     * generation has {@code attachBodies} on. Docs must not claim HTTP/2 always leaves the map empty.
+     */
+    @Test
+    void h2FieldCaptureDocsMatchAttachBodies() throws IOException {
+        var gateway = Files.readString(Path.of("docs/development/gateway.md"));
+        var filters = Files.readString(Path.of("docs/development/filters.md"));
+        var stale = List.of(
+                "HTTP/2 leaves it empty",
+                "always leave `fields()` empty");
+        try (var walk = Files.walk(Path.of("docs"))) {
+            walk.filter(p -> p.toString().endsWith(".md")).forEach(doc -> {
+                String body;
+                try {
+                    body = Files.readString(doc);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+                for (var phrase : stale) {
+                    assertFalse(body.contains(phrase),
+                            () -> doc + " must not say HTTP/2 never has a field map (#383): found " + phrase);
+                }
+            });
+        }
+        assertTrue(gateway.contains("attachBodies"),
+                "gateway.md must describe attachBodies-gated field capture on HTTP/2 (#383)");
+        assertTrue(filters.contains("attachBodies"),
+                "filters.md must describe attachBodies-gated field capture on HTTP/2 (#383)");
     }
 }

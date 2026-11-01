@@ -3,6 +3,9 @@
 set -euo pipefail
 JAR=$1; WD=$2; ACCEPT=$3; OUT=$4; SECS=${5:-20}; STREAMS=${6:-1000}
 GATE_GROUPS=${GATE_GROUPS:-$STREAMS}  # Architecture 2026-10-30 15:13; gate default 64
+GEN_CPUS=${GEN_CPUS:-0-1}             # inceptor 2026-10-30 18:46 (A)=0-1; (B)=0-2
+GEN_CORES=${GEN_CORES:-2}             # width of GEN_CPUS; sat limit = 80% × GEN_CORES
+SRV_CPUS=${SRV_CPUS:-2-7}             # (B) fallback 3-7
 HEAP_FLAGS=${HEAP:--Xms2g -Xmx2g}
 HEAP=$HEAP_FLAGS
 export HEAP
@@ -39,7 +42,7 @@ if [ "${CREDIT_OFF:-0}" = 1 ]; then
 fi
 HEAP=${HEAP:--Xms2g -Xmx2g}
 # shellcheck disable=SC2086
-taskset -c 2-7 nice -n 10 java -XX:+UseZGC $HEAP \
+taskset -c "$SRV_CPUS" nice -n 10 java -XX:+UseZGC $HEAP \
   -Dsjws.swarm.enabled=true -Dsjws.swarm.stream.enabled=true \
   "${CREDIT_FLAGS[@]}" \
   -Dsjws.swarm.pool.shards=4 -Dsjws.swarm.stream.shards=4 \
@@ -48,6 +51,8 @@ taskset -c 2-7 nice -n 10 java -XX:+UseZGC $HEAP \
   -jar "$JAR" --config="$WD/gate-server.yaml" --metrics=localhost "$PORT" "$WD/site" >"$LOG" 2>&1 &
 SPID=$!
 export SERVER_PID=$SPID
+# Own PIDs for foreign-CPU sampler (07:05 addendum): server + this one.sh shell.
+{ echo "$$"; echo "$SPID"; } > "$WD/bench.pids"
 cleanup(){ kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true; }
 trap cleanup EXIT
 ok=0
@@ -59,23 +64,34 @@ done
 LOADGEN=${LOADGEN:-python}
 HERE_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$LOADGEN" = java ]; then
+  if [ "${LEAN_HTTP:-1}" = 0 ]; then LEAN_HTTP_FLAG=--no-lean-http; else LEAN_HTTP_FLAG=--lean-http; fi
   # B1: drain timeout ≥ GRACE_MS + 15s (StreamHttp.GRACE_MS=60000 → ≥75s). Do not use 40.
   DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
-  taskset -c 0-1 nice -n 10 java "$HERE_DIR/StreamLoad.java" \
+  taskset -c "$GEN_CPUS" nice -n 10 java "$HERE_DIR/StreamLoad.java" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
     --groups "$GATE_GROUPS" \
+    --gen-cores "$GEN_CORES" \
+    ${LEAN_HTTP_FLAG:-} \
     --out "$OUT" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
     --server-pid "$SPID" \
-    --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}"
+    --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}" &
+  GENPID=$!
+  echo "$GENPID" >> "$WD/bench.pids"
+  wait "$GENPID"
 else
   export PYTHONPATH="$(cd "$(dirname "$0")/../.." && pwd)/sdk/python${PYTHONPATH:+:$PYTHONPATH}"
   DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
-  taskset -c 0-1 nice -n 10 python3 "$HERE_DIR/drive.py" \
+  taskset -c "$GEN_CPUS" nice -n 10 python3 "$HERE_DIR/drive.py" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
     --groups "$GATE_GROUPS" \
-    --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}"
+    --gen-cores "$GEN_CORES" \
+    --out "$OUT" --metrics-url "http://127.0.0.1:$PORT/metrics" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
+    ${SPID:+--server-pid "$SPID"} &
+  GENPID=$!
+  echo "$GENPID" >> "$WD/bench.pids"
+  wait "$GENPID"
 fi
 
 # Architecture 2026-10-30 15:13: writer_count + heap_flags into result.json

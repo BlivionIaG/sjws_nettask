@@ -100,4 +100,3 @@ java -cp target/classes bench/RaftPublishBench.java overload 4 10 200       # 20
 
 Credit-on producer→node→consumer over SSE and binary for the §13 token-streaming exit row (S2c PR 8).
 See [`bench/swarm-stream/README.md`](swarm-stream/README.md). Counters: `/metrics` appendix (`sjws_swarm_stream_*`).
-

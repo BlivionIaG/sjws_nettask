@@ -16,53 +16,59 @@ ACCEPT=${ACCEPT:-binary}
 PHASE=${PHASE:-all}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
+# Bench lock convention (AGENTS.md / shared box):
+# - Entry points acquire /tmp/sjws-bench.lock exactly once.
+# - If the caller already holds it (outer `flock /tmp/sjws-bench.lock …`), set SKIP_FLOCK=1
+#   so this script does not re-acquire and deadlock on the same fd/file.
+# - Bare `./gate.sh` (no outer flock) takes the lock itself.
 if [ "${SKIP_FLOCK:-0}" != 1 ]; then
   exec 9>>/tmp/sjws-bench.lock
   flock 9
 fi
 echo "gate phase=$PHASE start $(date -Is) load=$(cat /proc/loadavg) streams=$STREAMS groups=$GATE_GROUPS" | tee -a "$OUT/gate.log"
+# 07:05 addendum: start gate load1 < 3 (also rechecked before every leg).
 LOAD_PRE=$(awk '{print $1}' /proc/loadavg)
-python3 -c "import sys; sys.exit(0 if float('$LOAD_PRE') < 4.0 else 1)" || {
-  echo "gate: pre-start load1=$LOAD_PRE >= 4 — refuse" | tee -a "$OUT/gate.log"
+python3 -c "import sys; sys.exit(0 if float('$LOAD_PRE') < 3.0 else 1)" || {
+  echo "gate: pre-start load1=$LOAD_PRE >= 3 — refuse" | tee -a "$OUT/gate.log"
   exit 3
 }
 
 run_one() {
   local jar=$1 arm=$2 accept=$3 credit_off=$4 tag=$5
-  local wd="$OUT/$tag"
+  local wd="$OUT/$tag" load_pre rc=0 mon
   mkdir -p "$wd"
-  echo "=== $tag accept=$accept credit_off=$credit_off load=$(cat /proc/loadavg) ===" | tee -a "$OUT/gate.log"
+  load_pre=$(awk '{print $1}' /proc/loadavg)
+  echo "=== $tag accept=$accept credit_off=$credit_off load1_pre=$load_pre ===" | tee -a "$OUT/gate.log"
+  # 07:05: recheck start gate (load1 < 3) before EVERY leg
+  if ! python3 -c "import sys; sys.exit(0 if float('$load_pre') < 3.0 else 1)"; then
+    echo "gate: skip $tag — load1_pre=$load_pre >= 3 (NOISY)" | tee -a "$OUT/gate.log"
+    printf '%s\n' "{\"noisy\":true,\"noisy_marker\":\"NOISY\",\"load1_pre\":$load_pre,\"load1_post\":$load_pre,\"noisy_reasons\":[\"load1_pre>=3\"],\"chunk_samples\":0,\"error_count\":1,\"group_open_refusals\":0,\"self_loaded\":false,\"hard_zeros\":{\"sjws_connections_refused_per_ip_total\":0,\"sjws_swarm_stream_open_sessions\":0}}" > "$wd/result.json"
+    return 1
+  fi
+  : > "$wd/bench.pids"
+  echo "$$" > "$wd/bench.pids"
+  python3 "$HERE/foreign_cpu.py" --out "$wd/foreign_cpu.json" --allow-pid "$$" \
+    --allow-pid-file "$wd/bench.pids" --interval 5 &
+  mon=$!
   CREDIT_OFF=$credit_off WARMUP=$WARMUP GATE_GROUPS=$GATE_GROUPS \
     "$HERE/one.sh" "$jar" "$wd" "$accept" "$wd/result.json" "$SECS" "$STREAMS" \
-    2>&1 | tee -a "$OUT/gate.log" || return $?
+    2>&1 | tee -a "$OUT/gate.log" || rc=$?
+  kill -TERM "$mon" 2>/dev/null || true
+  wait "$mon" 2>/dev/null || true
   sync "$wd/result.json" 2>/dev/null || true
+  if [ -f "$wd/result.json" ]; then
+    python3 "$HERE/merge_noisy.py" "$wd/result.json" "$wd/foreign_cpu.json" "$load_pre" \
+      | tee -a "$OUT/gate.log" || true
+  fi
+  return $rc
 }
 
 abs_valid_count() {
+  # Shared rule with agg.py via window_valid.py (Codex P2 #459)
   local valid=0 f ok
   for f in "$OUT"/abs-*/result.json; do
     [ -f "$f" ] || continue
-    ok=$(python3 - "$f" <<'PY2'
-import json,sys
-r=json.load(open(sys.argv[1]))
-n=r.get("chunk_samples") or 0
-p99=r.get("p99_us")
-pre=r.get("load1_pre", 99)
-ptr=int(r.get("producer_transport_retries") or 0); ccr=int(r.get("consumer_connect_retries") or 0)
-tx=bool(r.get("transport_retry_flag")) or ptr>0 or ccr>0
-refused=int(r.get("refused_per_ip") or 0)
-hz=r.get("hard_zeros") or {}
-if refused==0:
-  try: refused=int(float(hz.get("sjws_connections_refused_per_ip_total") or 0))
-  except Exception: refused=0
-open_after=r.get("open_sessions_after_drain")
-if open_after is None: open_after=hz.get("sjws_swarm_stream_open_sessions")
-try: open_n=int(float(open_after)) if open_after is not None else -1
-except Exception: open_n=-1
-drain_to=bool(r.get("drain_timed_out"))
-print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 else "0")
-PY2
-)
+    ok=$(python3 "$HERE/window_valid.py" "$f")
     [ "$ok" = 1 ] && valid=$((valid + 1))
   done
   echo "$valid"
@@ -86,27 +92,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = abs ]; then
       continue
     fi
     created=$((created + 1))
-    ok=$(python3 - "$OUT/$tag/result.json" <<'PY2'
-import json,sys
-r=json.load(open(sys.argv[1]))
-n=r.get("chunk_samples") or 0
-p99=r.get("p99_us")
-pre=r.get("load1_pre", 99)
-ptr=int(r.get("producer_transport_retries") or 0); ccr=int(r.get("consumer_connect_retries") or 0)
-tx=bool(r.get("transport_retry_flag")) or ptr>0 or ccr>0
-refused=int(r.get("refused_per_ip") or 0)
-hz=r.get("hard_zeros") or {}
-if refused==0:
-  try: refused=int(float(hz.get("sjws_connections_refused_per_ip_total") or 0))
-  except Exception: refused=0
-open_after=r.get("open_sessions_after_drain")
-if open_after is None: open_after=hz.get("sjws_swarm_stream_open_sessions")
-try: open_n=int(float(open_after)) if open_after is not None else -1
-except Exception: open_n=-1
-drain_to=bool(r.get("drain_timed_out"))
-print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 else "0")
-PY2
-)
+    ok=$(python3 "$HERE/window_valid.py" "$OUT/$tag/result.json")
     if [ "$ok" = 1 ]; then
       valid=$((valid + 1))
       echo "window $tag: VALID ($valid/$NVALID)" | tee -a "$OUT/gate.log"
@@ -147,3 +133,8 @@ if [ "$PHASE" = all ] || [ "$PHASE" = agg ]; then
     exit 1
   fi
 fi
+
+# 07:05 addendum: DONE marker for waiters (owner still appends to /workspace/bench-queue.md
+# with the PR comment URL when the queue item finishes).
+DONE_LINE="DONE swarm-stream-gate $(date -Is) out=$OUT phase=$PHASE"
+echo "$DONE_LINE" | tee -a "$OUT/gate.log" | tee "$OUT/DONE"

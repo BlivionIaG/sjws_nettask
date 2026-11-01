@@ -38,6 +38,30 @@ def pct(sorted_vals, q):
     return sorted_vals[i]
 
 
+
+def hard_zeros_from_counters(counters: dict) -> tuple[dict, int]:
+    """Build StreamLoad-compatible hard_zeros + refused_per_ip (Codex P2 #459).
+
+    Always includes sjws_connections_refused_per_ip_total (0 when the scrape lacks it)
+    so agg.py cannot fail a window for a missing key under LOADGEN=python.
+    """
+    raw = counters.get("sjws_connections_refused_per_ip_total")
+    try:
+        refused = int(float(raw)) if raw is not None else 0
+    except (TypeError, ValueError):
+        refused = 0
+    hz = {
+        "sjws_swarm_stream_node_refusals_total": counters.get("sjws_swarm_stream_node_refusals_total"),
+        "sjws_swarm_stream_session_admit_refusals_total": counters.get("sjws_swarm_stream_session_admit_refusals_total"),
+        "sjws_swarm_stream_budget_underflows_total": counters.get("sjws_swarm_stream_budget_underflows_total"),
+        "sjws_swarm_stream_reserve_underflows_total": counters.get("sjws_swarm_stream_reserve_underflows_total"),
+        "sjws_swarm_stream_charged_bytes": counters.get("sjws_swarm_stream_charged_bytes"),
+        "sjws_swarm_stream_open_sessions": counters.get("sjws_swarm_stream_open_sessions"),
+        "sjws_connections_refused_per_ip_total": float(refused),
+    }
+    return hz, refused
+
+
 def fetch_metrics(url: str) -> dict[str, float]:
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=10) as r:
@@ -55,22 +79,25 @@ def fetch_metrics(url: str) -> dict[str, float]:
     return out
 
 
-def wait_metrics_drained(url: str, timeout_s: float = 75.0) -> dict[str, float]:
-    """Poll until open_sessions==0 or timeout (StreamHttp.GRACE_MS is 60s)."""
+def wait_metrics_drained(url: str, timeout_s: float = 75.0) -> tuple[dict[str, float], bool]:
+    """Poll until open_sessions==0 or timeout (StreamHttp.GRACE_MS is 60s).
+
+    Returns (counters, drain_timed_out).
+    """
     deadline = time.monotonic() + timeout_s
-    last = {}
+    last: dict[str, float] = {}
     while time.monotonic() < deadline:
         try:
             last = fetch_metrics(url)
         except Exception as e:  # noqa: BLE001
-            last = {"_error": str(e)}
+            last = {"_error": str(e)}  # type: ignore[dict-item]
             time.sleep(0.5)
             continue
         open_s = last.get("sjws_swarm_stream_open_sessions")
         if open_s is None or open_s == 0:
-            return last
+            return last, False
         time.sleep(0.5)
-    return last
+    return last, True
 
 
 
@@ -86,7 +113,9 @@ def stamp_at_wire(w: ChunkWriter):
 
     w._frame = framed  # type: ignore[method-assign]
 
-def instrument_credit_waits(w: ChunkWriter, waits: list[float]):
+def instrument_credit_waits(w: ChunkWriter, waits: list[float],
+                            active: threading.Event | None = None):
+    """Record credit-block waits only while ``active`` is set (measure window)."""
     orig = w._credit_allows
     state = {"blocked_since": None}
 
@@ -94,7 +123,8 @@ def instrument_credit_waits(w: ChunkWriter, waits: list[float]):
         ok = orig(j, now)
         if ok:
             if state["blocked_since"] is not None:
-                waits.append(now - state["blocked_since"])
+                if active is None or active.is_set():
+                    waits.append(now - state["blocked_since"])
                 state["blocked_since"] = None
         else:
             if state["blocked_since"] is None and not w._out:
@@ -138,6 +168,8 @@ def run_window(args) -> dict:
     inter_us: list[float] = []
     lock = threading.Lock()
     in_teardown = threading.Event()
+    measure_active = threading.Event()  # Java measureActive parity
+    consumer_connect_retries = 0
     if args.chunk_bytes < 21:
         raise SystemExit("chunk-bytes must be >= 21")
     pad = args.chunk_bytes - 20
@@ -151,7 +183,7 @@ def run_window(args) -> dict:
         try:
             (lease,) = client.claim(pool, wait=30, visibility_ms=60_000)
             with lease.stream(window=args.window, coalesce=False, heartbeat=0) as w:
-                instrument_credit_waits(w, credit_waits)
+                instrument_credit_waits(w, credit_waits, active=measure_active)
                 if args.stamp_at_wire:
                     stamp_at_wire(w)
                 while not producers_stop.is_set():
@@ -164,32 +196,38 @@ def run_window(args) -> dict:
             note_err(f"producer {pool}", e)
 
     def consumer(client: Client, pool: str, accept: str):
-        nonlocal bytes_rx
+        nonlocal bytes_rx, consumer_connect_retries
         try:
             with client.stream(pool, b"gate", deadline=180, sse=(accept == "sse")) as s:
                 first = True
                 prev_recv = None
                 start_ns = time.monotonic_ns()
-                for ev in s:
-                    if consumers_stop.is_set() and not first:
-                        break
-                    if not isinstance(ev, Chunk) or len(ev.data) < 20:
-                        continue
-                    recv = time.monotonic_ns()
-                    try:
-                        emit = int(ev.data[:20].decode("ascii"))
-                    except ValueError:
-                        continue
-                    d_us = (recv - emit) / 1e3
+                try:
+                    for ev in s:
+                        if consumers_stop.is_set() and not first:
+                            break
+                        if not isinstance(ev, Chunk) or len(ev.data) < 20:
+                            continue
+                        recv = time.monotonic_ns()
+                        try:
+                            emit = int(ev.data[:20].decode("ascii"))
+                        except ValueError:
+                            continue
+                        d_us = (recv - emit) / 1e3
+                        with lock:
+                            # Only the delimited measure window (Codex P2 / Java measureActive)
+                            if measure_active.is_set():
+                                lat_us.append(d_us)
+                                bytes_rx += len(ev.data)
+                                if first:
+                                    ttft_us.append((recv - start_ns) / 1e3)
+                                    first = False
+                                elif prev_recv is not None:
+                                    inter_us.append((recv - prev_recv) / 1e3)
+                                prev_recv = recv
+                finally:
                     with lock:
-                        lat_us.append(d_us)
-                        bytes_rx += len(ev.data)
-                        if first:
-                            ttft_us.append((recv - start_ns) / 1e3)
-                            first = False
-                        elif prev_recv is not None:
-                            inter_us.append((recv - prev_recv) / 1e3)
-                    prev_recv = recv
+                        consumer_connect_retries += int(getattr(s, "reconnects", 0) or 0)
         except BaseException as e:  # noqa: BLE001
             note_err(f"consumer {pool}", e)
 
@@ -213,7 +251,12 @@ def run_window(args) -> dict:
             if i % 32 == 0:
                 time.sleep(0.01)
             t_p.start()
-        time.sleep(duration)
+        # Measurement window only — exclude admit ramp + drain (Java measureActive)
+        measure_active.set()
+        try:
+            time.sleep(duration)
+        finally:
+            measure_active.clear()
         # Orderly: stop producers (they send LAST), wait, then stop consumers
         in_teardown.set()
         producers_stop.set()
@@ -228,11 +271,13 @@ def run_window(args) -> dict:
         lat_us.clear(); bytes_rx = 0; ttft_us.clear(); inter_us.clear()
         credit_waits.clear(); writer_stats.clear()
         measure_errors.clear(); teardown_errors.clear()
+        consumer_connect_retries = 0
     run_wave(min(32, args.streams), args.warmup, "w")
     with lock:
         lat_us.clear(); bytes_rx = 0; ttft_us.clear(); inter_us.clear()
         credit_waits.clear(); writer_stats.clear()
         measure_errors.clear(); teardown_errors.clear()
+        consumer_connect_retries = 0
 
     def _jiffies(pid: str) -> int | None:
         try:
@@ -261,7 +306,7 @@ def run_window(args) -> dict:
     load1_post = float(open("/proc/loadavg").read().split()[0])
 
     # Metrics after grace / session exit
-    counters = wait_metrics_drained(args.metrics_url, timeout_s=float(args.drain_timeout))
+    counters, drain_timed_out = wait_metrics_drained(args.metrics_url, timeout_s=float(args.drain_timeout))
     try:
         # also save raw scrape text path via one.sh; refresh once more
         counters = fetch_metrics(args.metrics_url)
@@ -287,15 +332,21 @@ def run_window(args) -> dict:
     credit_429s = int(writer_stats.get("credit_429s", 0))
     n_chunks = len(lat_us)
     stall_pct = (100.0 * credit_429s / n_chunks) if n_chunks else 0.0
+    gen_cores = max(1, int(getattr(args, "gen_cores", None) or 2))
+    gen_sat_limit_pct = 80.0 * gen_cores
+    producer_transport_retries = int(writer_stats.get("transport_errors", 0) or 0)
+    transport_retry_flag = producer_transport_retries > 0 or consumer_connect_retries > 0
+    self_loaded = bool(
+        (load1_post is not None and load1_post >= 4.0)
+        or (client_cpu_pct is not None and client_cpu_pct > gen_sat_limit_pct)
+    )
 
-    hard_zeros = {
-        "sjws_swarm_stream_node_refusals_total": counters.get("sjws_swarm_stream_node_refusals_total"),
-        "sjws_swarm_stream_session_admit_refusals_total": counters.get("sjws_swarm_stream_session_admit_refusals_total"),
-        "sjws_swarm_stream_budget_underflows_total": counters.get("sjws_swarm_stream_budget_underflows_total"),
-        "sjws_swarm_stream_reserve_underflows_total": counters.get("sjws_swarm_stream_reserve_underflows_total"),
-        "sjws_swarm_stream_charged_bytes": counters.get("sjws_swarm_stream_charged_bytes"),
-        "sjws_swarm_stream_open_sessions": counters.get("sjws_swarm_stream_open_sessions"),
-    }
+    hard_zeros, refused_per_ip = hard_zeros_from_counters(counters)
+    open_after = counters.get("sjws_swarm_stream_open_sessions")
+    try:
+        open_sessions_after_drain = int(float(open_after)) if open_after is not None else -1
+    except (TypeError, ValueError):
+        open_sessions_after_drain = -1
 
     out = {
         "mode": args.accept,
@@ -311,8 +362,10 @@ def run_window(args) -> dict:
         "wall_s": wall,
         "load1_pre": load1_pre,
         "load1_post": load1_post,
-        "self_loaded": bool(load1_post >= 4.0 or (client_cpu_pct is not None and client_cpu_pct >= 180.0)),
-        "generator_saturated": bool(client_cpu_pct is not None and client_cpu_pct >= 180.0),
+        "self_loaded": self_loaded,
+        "generator_saturated": bool(client_cpu_pct is not None and client_cpu_pct > gen_sat_limit_pct),
+        "gen_cores": gen_cores,
+        "gen_sat_limit_pct": gen_sat_limit_pct,
         "client_cpu_sec": client_cpu_sec,
         "client_cpu_pct_of_wall": client_cpu_pct,
         "server_cpu_sec": server_cpu_sec,
@@ -330,11 +383,17 @@ def run_window(args) -> dict:
             "p99_s": pct(wait_sorted, 0.99),
         },
         "writer_stats": dict(writer_stats),
+        "producer_transport_retries": producer_transport_retries,
+        "consumer_connect_retries": consumer_connect_retries,
+        "transport_retry_flag": transport_retry_flag,
         "credit_stalls": credit_429s,
         "credit_stall_pct_of_chunks": stall_pct,
         "stall_flag": stall_pct > 1.0,
         "counters": counters,
         "hard_zeros": hard_zeros,
+        "refused_per_ip": refused_per_ip,
+        "open_sessions_after_drain": open_sessions_after_drain,
+        "drain_timed_out": drain_timed_out,
         "errors": measure_errors[:30],
         "error_count": len(measure_errors),
         "teardown_errors": teardown_errors[:30],
@@ -347,7 +406,8 @@ def run_window(args) -> dict:
     Path(args.out).write_text(json.dumps(out, indent=2) + "\n")
     print(json.dumps({k: out[k] for k in (
         "mib_s", "chunk_samples", "p50_us", "p90_us", "p99_us", "load1_pre", "load1_post",
-        "self_loaded", "stall_flag", "credit_stalls", "error_count", "teardown_error_count",
+        "self_loaded", "gen_cores", "stall_flag", "credit_stalls", "error_count", "teardown_error_count",
+        "producer_transport_retries", "consumer_connect_retries", "transport_retry_flag",
         "agents", "window")}, indent=2))
     return out
 
@@ -370,7 +430,17 @@ def main():
     p.add_argument("--no-stamp-at-wire", action="store_false", dest="stamp_at_wire")
     p.add_argument("--out", required=True)
     p.add_argument("--metrics-url", required=True)
+    p.add_argument("--server-pid", default=None,
+                   help="Server PID for /proc CPU attribution (or SERVER_PID env)")
+    p.add_argument("--gen-cores", type=int, default=None,
+                   help="Generator cores (GEN_CORES); sat = 80%% × gen_cores (default env GEN_CORES or 2)")
     args = p.parse_args()
+    if args.gen_cores is None:
+        try:
+            args.gen_cores = int(os.environ.get("GEN_CORES") or "2")
+        except ValueError:
+            args.gen_cores = 2
+    args.gen_cores = max(1, int(args.gen_cores))
     if args.accept == "chunked":
         args.accept = "binary"
     if not args.groups or args.groups <= 0:

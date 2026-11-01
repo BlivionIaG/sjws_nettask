@@ -23,7 +23,7 @@ import java.util.Set;
 public enum Role {
     VIEWER(EnumSet.of(Permission.READ)),
     OPERATOR(EnumSet.of(Permission.READ, Permission.EDIT_ROUTES, Permission.ROLLOUT, Permission.ROLLBACK,
-            Permission.NODE_DRAIN)),
+            Permission.NODE_DRAIN, Permission.RELEASE_STALLED_STRICT)),
     ADMIN(EnumSet.allOf(Permission.class));
 
     private final Set<Permission> permissions;

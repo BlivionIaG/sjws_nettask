@@ -32,8 +32,21 @@ public final class CpGroup {
     private CpGroup() {
     }
 
-    /** Election 100 ms, heartbeat 40 ms (lease 80 ms). {@link CpTiming#check} runs against these at startup. */
+    /**
+     * Automatic snapshot every this many committed entries once a {@code SnapshotTaker} is set (#341).
+     * Matches the pre-#340 threshold; #340 turned auto-snapshots off because no taker existed yet.
+     */
+    public static final long SNAPSHOT_EVERY_ENTRIES = 10_000L;
+
+    /**
+     * Election 100 ms, heartbeat 40 ms (lease 80 ms). {@link CpTiming#check} runs against these at startup.
+     * Automatic Raft snapshots fire every {@link #SNAPSHOT_EVERY_ENTRIES} with {@link CpStore}'s
+     * {@code SnapshotTaker} (#341). Auto-snapshots advance {@code snapIndex} with the application image but
+     * do not truncate the log; {@link CpStore#compactThrough} calls {@code truncateAndCompact} so a durable
+     * image is persisted before the prefix is deleted ({@code persistSnapshotBeforePrefixDelete}).
+     */
     public static GroupOptions options() {
-        return new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40), 10_000);
+        return new GroupOptions(Durability.RELAXED, 1024 * 1024, Duration.ofMillis(100), Duration.ofMillis(40),
+                SNAPSHOT_EVERY_ENTRIES);
     }
 }

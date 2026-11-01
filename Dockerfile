@@ -20,7 +20,10 @@ RUN javac --release 25 -d /out/healthcheck HealthCheck.java \
 # Minimal Java runtime. Modules from `jdeps --print-module-deps` over the jar and lib/
 # (java.desktop/java.sql/java.management/jdk.jfr are pulled in by dependencies), plus the
 # ones jdeps can't see: jdk.crypto.ec/jdk.crypto.cryptoki (TLS/ACME keys), jdk.naming.dns
-# (Netty/JNDI DNS), jdk.zipfs, jdk.management. java.net.http also serves HealthCheck.
+# (Netty/JNDI DNS), jdk.zipfs, jdk.management, and java.logging/java.xml (JUL/XML via
+# reflective factories). java.net.http also serves HealthCheck.
+# CI: tools/check-jlink-modules.sh (docker.yml job jlink-modules) fails on drift (#411).
+# If you change --add-modules or the manual extras, update that script's MANUAL_EXTRA too.
 RUN jlink \
       --add-modules java.base,java.desktop,java.logging,java.management,java.naming,java.net.http,java.sql,java.xml,jdk.httpserver,jdk.jfr,jdk.unsupported,jdk.naming.dns,jdk.crypto.ec,jdk.crypto.cryptoki,jdk.management,jdk.zipfs \
       --strip-debug --no-man-pages --no-header-files --compress=zip-6 \
@@ -40,5 +43,5 @@ USER 10001:10001
 EXPOSE 8080/tcp 8443/tcp 8443/udp
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
   CMD ["java", "-Xshare:auto", "-XX:TieredStopAtLevel=1", "-Xmx16m", "-cp", "/opt/sjws/healthcheck", "HealthCheck", "http://127.0.0.1:8080/healthz"]
-ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75", "-jar", "/opt/sjws/sjws_nettask.jar"]
+ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "--add-opens", "jdk.httpserver/sun.net.httpserver=ALL-UNNAMED", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75", "-jar", "/opt/sjws/sjws_nettask.jar"]
 CMD ["8080", "/srv/www", "--healthz"]

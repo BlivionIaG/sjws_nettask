@@ -57,17 +57,31 @@ import java.util.Set;
  * no {@code O_NONBLOCK}): someone with write access in the root who swaps a FIFO in exactly then
  * blocks that writer thread in {@code open} until the FIFO is opened for writing.
  * <p>
+ * <b>macOS</b>: each path component is opened with {@code openat} and {@code O_NOFOLLOW} through
+ * the foreign linker ({@link SafeOpenAt}), so a parent swapped for a symlink fails with
+ * {@code ELOOP} the same way Linux secure mode does. The helper class loads only on macOS.
+ * <p>
  * <b>Fallback</b> (Windows; and, when allowed, directories without read permission): the path is opened with
  * {@code NOFOLLOW_LINKS} (last component only), then immediately re-resolved with
  * {@code toRealPath()}: it must still be the same real path inside the root, and the file key (where
  * the platform has one) must match. This narrows the race window to the time between the open and
- * the re-check but cannot close it; serve untrusted-writable roots from a platform with secure mode.
- * (The JDK can't {@code fstat} an open channel, so the file key is read by path right after the open.)
+ * the re-check but cannot close it; serve untrusted-writable roots from a platform with secure mode
+ * or the macOS {@code openat} path. (The JDK can't {@code fstat} an open channel, so the file key is
+ * read by path right after the open.)
  */
 public final class SafeOpen {
 
     /** True where secure mode is available on the default file system. */
     public static final boolean SECURE = probe();
+
+    /** When true, production opens go through {@link SafeOpenAt} ({@code openat}/{@code O_NOFOLLOW}). */
+    static final boolean MAC_OS = System.getProperty("os.name", "").toLowerCase().contains("mac");
+
+    /**
+     * True when opens are descriptor-relative (Linux {@link SecureDirectoryStream}, or macOS
+     * {@code openat}). Windows stays on the path fallback.
+     */
+    public static final boolean PINNED = SECURE || MAC_OS;
 
     /** The file is not (or no longer) the one that was resolved: nothing may be sent. */
     public static final class FileChangedException extends IOException {
@@ -141,11 +155,20 @@ public final class SafeOpen {
      * @throws IOException if the file can't be opened (deleted, unreadable)
      */
     public static FileChannel open(Body.FileBody file) throws IOException {
-        return open(file, SECURE);
+        // macOS: always use openat (SafeOpenAt). Newer JDKs may probe true for
+        // SecureDirectoryStream there; production still pins via openat (#344).
+        return open(file, SECURE && !MAC_OS, MAC_OS);
     }
 
     /** @param secure false forces the fallback (tests; platforms without secure mode) */
     static FileChannel open(Body.FileBody file, boolean secure) throws IOException {
+        return open(file, secure, false);
+    }
+
+    /**
+     * @param openAt when true, use {@link SafeOpenAt} (macOS production path; tests on any Unix)
+     */
+    static FileChannel open(Body.FileBody file, boolean secure, boolean openAt) throws IOException {
         var root = file.root();
         var path = file.realPath();
         var relative = root.relativize(path);
@@ -168,7 +191,19 @@ public final class SafeOpen {
             }
             top.close();
         }
+        if (openAt) {
+            try {
+                return openAt(file);
+            } catch (AccessDeniedException e) {
+                return searchOnly(file, e);
+            }
+        }
         return openFallback(file, true);
+    }
+
+    /** Loads {@link SafeOpenAt} only when called (macOS / tests). */
+    private static FileChannel openAt(Body.FileBody file) throws IOException {
+        return SafeOpenAt.open(file);
     }
 
     private static FileChannel openSecure(SecureDirectoryStream<Path> top, Path relative, Body.FileBody file)

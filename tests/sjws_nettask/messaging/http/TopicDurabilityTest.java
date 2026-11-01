@@ -18,6 +18,7 @@ package sjws_nettask.messaging.http;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
 import java.util.Map;
@@ -25,6 +26,7 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import sjws_nettask.OptionalModule;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.LedgerWriter;
 
@@ -45,15 +47,37 @@ class TopicDurabilityTest {
         assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("orders"));
         assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("../x:group"));
         assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("orders:maybe"));
+        assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("__evil:group"));
+        assertThrows(IllegalArgumentException.class, () -> LogTopics.parseTopicDurability("__offsets:async"));
     }
 
     @Test
-    void moduleFallsBackOnBadSettings() {
+    void moduleFallsBackOnBadDefaultDurabilityOnly() {
         assertEquals(LedgerWriter.DEFAULT_DURABILITY, MessagingModule.durability(""));
         assertEquals(LedgerWriter.DEFAULT_DURABILITY, MessagingModule.durability("bogus"));
         assertEquals(Durability.GROUP, MessagingModule.durability("group"));
-        assertEquals(Map.of(), MessagingModule.topicDurability("a:bogus"));
         assertEquals(Map.of("a", Durability.EACH), MessagingModule.topicDurability("a:each"));
+        assertEquals(Map.of("orders", Durability.EACH, "logs.v1", Durability.GROUP),
+                MessagingModule.topicDurability("orders:each, logs.v1:group"));
+    }
+
+    /** Codex P1 / Security N1: one bad entry fails startup; it must not empty the whole override map. */
+    @Test
+    void badOrReservedTopicDurabilityListFailsStartupNamingKeyAndEntry() {
+        var reserved = assertThrows(OptionalModule.Refused.class,
+                () -> MessagingModule.topicDurability("orders:each,__offsets:group"));
+        assertTrue(reserved.getMessage().contains(MessagingModule.TOPIC_DURABILITY_PROPERTY), reserved.getMessage());
+        assertTrue(reserved.getMessage().contains("__offsets:group"), reserved.getMessage());
+
+        var invalid = assertThrows(OptionalModule.Refused.class,
+                () -> MessagingModule.topicDurability("orders:each,a:bogus"));
+        assertTrue(invalid.getMessage().contains(MessagingModule.TOPIC_DURABILITY_PROPERTY), invalid.getMessage());
+        assertTrue(invalid.getMessage().contains("a:bogus"), invalid.getMessage());
+
+        var pattern = assertThrows(OptionalModule.Refused.class,
+                () -> MessagingModule.topicDurability("ok:each,bad/name:group"));
+        assertTrue(pattern.getMessage().contains(MessagingModule.TOPIC_DURABILITY_PROPERTY), pattern.getMessage());
+        assertTrue(pattern.getMessage().contains("bad/name:group"), pattern.getMessage());
     }
 
     @Test

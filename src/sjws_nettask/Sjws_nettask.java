@@ -251,7 +251,7 @@ public class Sjws_nettask {
                 out.println("content port not bound");
             }
             out.println("Server started: " + server.describe());
-            sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.SECURE)
+            sjws_nettask.core.SafeOpen.startupWarning(sjws_nettask.core.SafeOpen.PINNED)
                     .ifPresent(w -> err.println("WARN: " + w));
             sjws_nettask.core.SafeOpen.unlistableWarning(config.allowUnlistableDirs())
                     .ifPresent(w -> err.println("WARN: " + w));
@@ -491,6 +491,22 @@ public class Sjws_nettask {
             if (arg.equals("-h") || arg.equals("--help")) {
                 out.print(usage());
                 return EXIT_OK;
+            }
+            if (arg.equals("--self-check-admin-tls-abort")) {
+                // Reflective name: SourceGuard keeps CONTROL-role types inside sjws_nettask.cp.
+                try {
+                    var probe = Class.forName("sjws_nettask.cp." + "AdminServer")
+                            .getMethod("probeConnectionAbortInstalls");
+                    if (Boolean.TRUE.equals(probe.invoke(null))) {
+                        out.println("admin-tls-abort: ok");
+                        return EXIT_OK;
+                    }
+                    err.println("admin-tls-abort: reflective abort unavailable (need jar Add-Opens or --add-opens jdk.httpserver/sun.net.httpserver=ALL-UNNAMED)");
+                    return EXIT_USAGE;
+                } catch (ReflectiveOperationException e) {
+                    err.println("admin-tls-abort: " + e.getMessage());
+                    return EXIT_USAGE;
+                }
             }
         }
         var opt = Daemon.parse(args, env);

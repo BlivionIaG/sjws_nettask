@@ -17,7 +17,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `ServerConfigTest`, `BackoffTest` | config parsing/precedence, accept-loop back-off |
 | `config/ConfigLoaderTest`, `config/RouteTableTest`, `ReloadServerTest`, `ReloadCoverageTest` | YAML file, routing table validation, immutable snapshot reload, challenge-port rebind, HTTP/3 cert swap on reload |
 | `ReloadHookTest` | reload hook registry |
-| `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance (linux/amd64), hot cert swap |
+| `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance when `PEBBLE_BIN` / `PEBBLE_CHALLTESTSRV_BIN` are set (required on Linux CI; pinned install in `.github/workflows/ci.yml`), hot cert swap |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `admin/cp/CpConsoleTest` | control-plane console: label selectors, diff, validation, stage/rollout/rollback on the fake CP, failover client, rendering, zero-cost guard |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
@@ -138,7 +138,7 @@ Lines JaCoCo reports as missed that no behaviour test can reach (or only by faki
 
 The suite is green on Linux. On macOS (CI run 38212694685, manual job only) three tests failed and need a fix in the code, not the test:
 
-- `core/SafeOpenTest.parentSymlinkRaceNeverLeaksOverHttp1`: a file was served while a parent directory was swapped for a symlink (the race guard relies on Linux `SecureDirectoryStream`/`O_NOFOLLOW` behaviour).
+- ~~`core/SafeOpenTest.parentSymlinkRaceNeverLeaksOverHttp1`~~ (fixed, #344): macOS opens each path component with `openat`/`O_NOFOLLOW` (`SafeOpenAt`); covered by `SafeOpenAtTest` and the `safeopen-macos` CI job.
 - ~~`core/FileCacheTest.searchOnlyDirectoryStays403`~~ (fixed): without `SecureDirectoryStream` every open took the path fallback, which skipped the search-only directory rule; the fallback now checks every directory from the root down (`SafeOpenTest.fallbackRefusesFilesBelowSearchOnlyDirectories`).
 - `HardeningIntegrationTest.trickledRequestIsCutOffAtDeadline`: the client sees a reset instead of the 408 (macOS sends RST when a socket with unread data is closed).
 

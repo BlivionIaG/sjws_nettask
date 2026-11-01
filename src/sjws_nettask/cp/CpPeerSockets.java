@@ -52,10 +52,13 @@ import sjws_nettask.cluster.TcpTransport;
  * </ul>
  * After every handshake (including a resumed one) the peer is re-checked against the current trust, revocation and
  * pin policy before any application byte is read or written. A successful {@link CpServerTls#reloadTls()} re-checks
- * established peer connections and closes any that no longer pass. Refusals are counted in {@link #identityRefused}
+ * established peer connections and closes any that no longer pass. Refusals are counted in {@link #identityRefused}; TLS-epoch retry-budget exhaustion in {@link #registerBudgetExhausted}
  * and logged at most once a minute (subject and serial only). A TLS reload whose new certificate does not carry this
  * voter's own pinned SAN is refused (the current material stays), counted in {@link #reloadRefused} and logged.
- * {@code endpointIdentification} stays unset: the pinned SAN, not the host name, is the identity.
+ * {@code endpointIdentification} stays unset: the pinned SAN, not the host name, is the identity. Closed sockets are
+ * removed from {@link #live} when the transport calls {@link #released} (normal close, admit refusal after
+ * {@link #peerWire}, or {@link TcpTransport#close}), so a long-running node without reloads does not retain every
+ * historical peer socket (#334). {@link #registerLive} retries are bounded (#435); {@link #dropPeersFailingPolicy} removes closed sockets by key so a concurrent Live replace cannot retain them (#435).
  */
 final class CpPeerSockets implements TcpTransport.SocketFactory {
 
@@ -64,6 +67,11 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
     static final int CONNECT_TIMEOUT_MILLIS = 1_000;
     static final int HANDSHAKE_TIMEOUT_MILLIS = TcpTransport.HANDSHAKE_TIMEOUT_MILLIS;
     static final long LOG_EVERY_NANOS = 60_000_000_000L;
+    /**
+     * Upper bound on {@link #registerLive} TLS-epoch retries (#435 / #321 N1). A reload storm that keeps
+     * bumping the epoch cannot spin forever; registration fails closed once the budget is spent.
+     */
+    static final int REGISTER_LIVE_MAX_ATTEMPTS = 32;
     private static final System.Logger LOG = System.getLogger(CpPeerSockets.class.getName());
 
     /** Pinned peer plus the abort handle that unblocks a stalled TLS write without waiting on SSLSocket.close. */
@@ -76,6 +84,8 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
     private final AtomicLong identityRefused = new AtomicLong();
     private final AtomicLong reloadRefused = new AtomicLong();
     private final AtomicLong policyDropped = new AtomicLong();
+    /** Times {@link #registerLive} failed closed after spending {@link #REGISTER_LIVE_MAX_ATTEMPTS} (#442 N1). */
+    private final AtomicLong registerBudgetExhausted = new AtomicLong();
     private final AtomicLong loggedNanos = new AtomicLong(System.nanoTime() - LOG_EVERY_NANOS);
     /** Bumped at the start of every {@link #dropPeersFailingPolicy} so registration cannot escape a concurrent reload. */
     private final AtomicLong tlsEpoch = new AtomicLong();
@@ -86,6 +96,18 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
      * {@code reloadTls} in the handshake/register window.
      */
     volatile Runnable betweenValidateAndRegister = () -> {
+    };
+    /**
+     * Test hook: runs after a policy-fail decision for a copied {@link Live} and after confirming that entry is
+     * still mapped, immediately before abort/close (#435). Tests use it to replace the Live value and prove the
+     * drop path still removes the closed socket.
+     */
+    volatile Runnable betweenDropFailAndAbort = () -> {
+    };
+    /**
+     * Test hook: runs when a copied entry's socket is already closed, before the by-key remove (#435).
+     */
+    volatile Runnable betweenClosedSweepAndRemove = () -> {
     };
 
     /**
@@ -174,6 +196,27 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         return policyDropped.get();
     }
 
+    /** Registrations that failed closed after the TLS-epoch retry budget was spent (#442 / #435). */
+    long registerBudgetExhausted() {
+        return registerBudgetExhausted.get();
+    }
+
+    /** Open (or not-yet-reclaimed) entries in the live-peer registry; for tests and ops. */
+    int liveSize() {
+        return live.size();
+    }
+
+    /**
+     * The transport is done with this socket: drop it from {@link #live} so a closed peer is not retained until a
+     * reload (#334). Idempotent.
+     */
+    @Override
+    public void released(Socket socket) {
+        if (socket instanceof SSLSocket ssl) {
+            live.remove(ssl);
+        }
+    }
+
     @Override
     public ServerSocket listen(InetSocketAddress bind) throws IOException {
         var server = (SSLServerSocket) tls.context().getServerSocketFactory().createServerSocket();
@@ -223,6 +266,7 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
         } catch (IOException | RuntimeException e) {
             abortClose(plain);
             closeQuietly(socket);
+            live.remove(socket);
             throw e;
         }
         return new TcpTransport.SocketFactory.Connected(socket, plain);
@@ -281,6 +325,7 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
             return registerLive(ssl, null, ssl, true).wire();
         } catch (IOException e) {
             closeQuietly(ssl);
+            live.remove(ssl);
             throw new IllegalStateException("cp-peer certificate names no other pinned voter", e);
         }
     }
@@ -294,7 +339,22 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
             throws IOException {
         CpConfig.Peer named;
         long epoch;
+        int attempts = 0;
         do {
+            if (++attempts > REGISTER_LIVE_MAX_ATTEMPTS) {
+                long n = registerBudgetExhausted.incrementAndGet();
+                long now = System.nanoTime();
+                long last = loggedNanos.get();
+                if (now - last >= LOG_EVERY_NANOS && loggedNanos.compareAndSet(last, now)) {
+                    // Fixed text only: no peer / SAN / exception message (#442 N1).
+                    LOG.log(System.Logger.Level.WARNING,
+                            "cp-peer: registerLive TLS-epoch retry budget exhausted ({0} attempts);"
+                                    + " registration failed closed ({1} so far)",
+                            REGISTER_LIVE_MAX_ATTEMPTS, n);
+                }
+                throw new IOException("cp-peer registration exceeded TLS epoch retry budget ("
+                        + REGISTER_LIVE_MAX_ATTEMPTS + " attempts)");
+            }
             epoch = tlsEpoch.get();
             named = enforcePolicy(socket, peerIsClient, expected);
             var mid = betweenValidateAndRegister;
@@ -341,7 +401,13 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
             var socket = entry.getKey();
             var peer = entry.getValue();
             if (socket.isClosed()) {
-                live.remove(socket, peer);
+                var closedMid = betweenClosedSweepAndRemove;
+                betweenClosedSweepAndRemove = () -> {
+                };
+                // Test hook may replace Live here (concurrent registerLive) before remove.
+                closedMid.run();
+                // By key: a concurrent registerLive replace must not leave a closed socket in live (#435 / #321 N2).
+                live.remove(socket);
                 continue;
             }
             // Accepted sockets are server-mode; dialled sockets are client-mode.
@@ -354,6 +420,17 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
                     throw new IOException("cp-peer no longer matches pinned san of " + peer.expected().id());
                 }
             } catch (IOException | RuntimeException failed) {
+                // Stale snapshot: live value no longer matches this copy (concurrent registerLive replace).
+                // Skip abort; the replacement is either already validated under the current epoch, or will
+                // fail closed on the registerLive retry / caller cleanup (#442 N2).
+                if (live.get(socket) != peer) {
+                    continue;
+                }
+                var mid = betweenDropFailAndAbort;
+                betweenDropFailAndAbort = () -> {
+                };
+                // Test hook may replace Live here (simulating concurrent registerLive) before abort.
+                mid.run();
                 policyDropped.incrementAndGet();
                 warnPolicy(socket, String.valueOf(failed.getMessage()));
                 // Abort handle first: SSLSocket.close waits on the TLS write lock a blocked writer holds.
@@ -361,9 +438,30 @@ final class CpPeerSockets implements TcpTransport.SocketFactory {
                 if (peer.abort() != socket) {
                     closeQuietly(socket);
                 }
-                live.remove(socket, peer);
+                // By key after abort: remove-by-value can miss a concurrent replace and leave a closed socket (#435).
+                live.remove(socket);
             }
         }
+    }
+
+
+    /**
+     * Test-only (#435): replace the Live abort handle for {@code socket} while keeping the same expected pin.
+     * Simulates a concurrent {@code registerLive} put of a new Live for the same SSLSocket. Returns the previous
+     * abort handle.
+     */
+    Socket replaceLiveAbortForTest(SSLSocket socket, Socket newAbort) {
+        var cur = live.get(socket);
+        if (cur == null) {
+            throw new IllegalStateException("no live entry for " + socket);
+        }
+        live.put(socket, new Live(cur.expected(), newAbort));
+        return cur.abort();
+    }
+
+    /** Test-only (#435): bump the TLS epoch without sweeping, so registerLive retries. */
+    void bumpTlsEpochForTest() {
+        tlsEpoch.incrementAndGet();
     }
 
     private void warnPolicy(SSLSocket socket, String why) {

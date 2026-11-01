@@ -170,9 +170,9 @@ The state machine, applied in index order on the group's delivery thread (`raft-
 | `Audit` | One control-plane audit record (§12.10). Replicated so one voter cannot drop it. |
 | `CertReference` | ACME result: chain reference and envelope-encrypted key material (§5.7, §12.6). |
 
-As built, the log carries `Propose`, signed `Activate` and `Rollback`, `Rbac`, `Revoke`, rollout and advance entries, idempotency wrappers, and join issue and consume entries. Audit lines are written per voter to `<stateDir>/audit.jsonl` and are not replicated.
+As built, the log carries `Propose`, signed `Activate` and `Rollback`, `Rbac`, `Revoke`, rollout and advance entries, idempotency wrappers, and join issue and consume entries. The Idempotency-Key used-key map is bounded (#259, §12.8.1). Audit lines are written per voter to `<stateDir>/audit.jsonl` and are not replicated.
 
-Designed, not wired: `SnapshotControl.take` / `install` / `truncateAndCompact` compact the log to the latest activated snapshot plus the live registration table. Compaction runs off the request path, on the group's delivery thread, past an index that is both snapshotted and acked. The compactor keeps the latest value per key (current desired snapshot, denylist, registrations). History required for rollback is retained for a configured number of activated versions (default 8) inside the snapshot payload, then dropped. As built, `cp-config` keeps its whole log, and the history of 8 activated versions is held in `CpStore` memory.
+**As built (#341):** `CpStore.attach` installs a `SnapshotTaker` that encodes the full applied state (`CpStateSnapshot`: activated history, staged proposal, RBAC policy, revokes, rollout, join tokens, and the bounded Idempotency-Key table). `onSnapshotRestored` replaces state (no merge). `CpGroup.options()` uses `SNAPSHOT_EVERY_ENTRIES = 10_000` so automatic snapshots advance `snapIndex` with that image (InstallSnapshot path for a lagging follower). Automatic snapshots do not truncate the log; `CpStore.compactThrough` calls `SnapshotControl.take` then `truncateAndCompact` (identity compactor). Raft persists the image via `persistSnapshotBeforePrefixDelete` before `truncatePrefix` (temp + fsync + atomic rename in `FileLogStorage`). A crash during the write keeps the previous durable snapshot; a crash after rename restores the new image on open. History keeps the last 8 activated versions inside the payload.
 
 Membership changes of the voters use `ReplicationGroup.changeMembership` (joint consensus). Learners are non-voting (§11).
 
@@ -722,6 +722,26 @@ Only `admin` appends an `Rbac` entry (`Rbac.putOperator` / `removeOperator`, whi
 
 The signature is verified before a payload is parsed or decompressed. Compile is bounded in time and output size. An unauthenticated join is rejected on the token check before any signing work.
 
+### 12.8.1 Idempotency-Key replay window (#259)
+
+Every admin mutation that carries an `Idempotency-Key` is wrapped in the log. On apply, `CpStore` records the key, the request fingerprint, and the outcome in a bounded table (`IdempotencyTable`). The table is a deterministic function of the applied log:
+
+| Bound | Default | Meaning |
+|---|---|---|
+| `WINDOW` | 100 000 log indexes | An entry applied at index `i` is dropped once the applied index reaches `i + WINDOW` (`appliedIndex <= i - WINDOW` under the documented `<=`). |
+| `MAX_KEYS` | 100 000 | Hard count cap; eldest by applied index first. |
+| Key length | 128 UTF-8 bytes | Refused at admission with 400; `remember` skips put (still evicts); snapshot read refuses. |
+
+**Retry after eviction.** A retry whose key has been dropped is unknown again and is **applied again**. The table cannot tell an evicted key from a new one, so there is no `KeyExpired` and no tombstone. Clients that need dedup must retry inside the window (or keep the key live with periodic writes).
+
+**Why a global cap.** IDEM log entries do not carry a principal or group, so a per-principal cap is not available without a wire change. The global cap is large; the index window is the primary bound.
+
+**Replicated bounds.** `WINDOW` and `MAX_KEYS` are constants of the state machine (like the messaging producer table), written into every versioned table snapshot. A snapshot with another window or cap is refused on install. They are not local startup properties: two replicas of the same build always agree.
+
+**Snapshot.** The Raft `SnapshotTaker` (#341, §4) carries the Idempotency-Key table inside `CpStateSnapshot`. `remember` refuses keys over 128 UTF-8 bytes (same bound as admission and snapshot read). Fingerprint and outcome body decode caps are 512 KiB each (#341 N3). Install replaces the table; a mismatched WINDOW/MAX_KEYS is refused.
+
+**Metric.** `CpStore.idempotencyEvictions()` counts window and cap drops. `CpHost` attaches it to a process `ServerMetrics` at store open (`sjws_cp_idempotency_evicted_total`). Content servers can attach the same supplier via `SjwsServer.attachCpIdempotencyEvictions` / `ObserverSlot`. The series stays at 0 when CP is off (no `CpHost`, no attach).
+
 ### 12.9 Audit
 
 An append-only audit stream, separate from the access log, records actor SAN, role, action, target, `version`, `raftIndex`, result, source address, and timestamp. It covers every admin mutation, join success and failure, revoke, key and CA rotation, signature and anti-replay rejection, and admin authentication failure. In the design the control-plane events are `Audit` log entries, so one voter cannot drop them. As built, each voter writes its own hash-chained `<stateDir>/audit.jsonl` and the lines are not replicated (§4). The stream never contains token or secret bytes (§12.6).
@@ -866,6 +886,16 @@ The control role binds a dedicated admin address and does not bind the content p
 | `POST` | `/cp/v1/rbac` | `admin` | `MANAGE_OPERATORS` | `{ "san": <certificate SAN>, "role": <role> }` grants a role |
 
 Every route authenticates with the client certificate. There is no `Authorization` bearer. A missing or unmapped certificate is 401. A mapped certificate whose role lacks the permission is 403.
+
+Mutating methods (`POST`, `PUT`, `PATCH`, `DELETE`) require `Content-Type: application/json` (optional parameters such as `charset=utf-8` are allowed); any other media type is 415. When an `Origin` header is present it must match an entry in `cp.admin.allowedOrigins` (exact string match; the list is empty by default, so a present `Origin` is refused with 403). A missing `Origin` is allowed for CLI clients. `GET` and `HEAD` are unchanged. Configure origins under the admin block, for example:
+
+```yaml
+cp:
+  admin:
+    listen: 10.0.0.1:9444
+    allowedOrigins:
+      - https://console.example
+```
 
 Responses are JSON. Mutations return the committed `version` and `raftIndex`, or a validation error and no committed entry. A follower answers 503 `leader not ready` and does not append; clients try the next endpoint (the answer carries no leader address yet).
 
