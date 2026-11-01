@@ -29,7 +29,7 @@ implementing work. This design does **not** re-specify them:
 
 1. **[#444](https://github.com/BlivionIaG/sjws_nettask/pull/444) admin route dispatch fails closed**
    (§3.3) — unmatched routes return 404/405 and cannot fall through to a grant. Covers
-   threat-model T2-adjacent dispatch and wrong-method **405**.
+   threat-model dispatch fail-closed and wrong-method **405** (HTTP authz cases are T2b, not wrong-CA).
 2. **[#447](https://github.com/BlivionIaG/sjws_nettask/pull/447) admin request validation** (§3.4) —
    if `Origin` is present it must be on an allowlist that is empty by default; the body must be
    `application/json` or the request gets **415**. TUI and curl docs stay compatible. Covers
@@ -80,7 +80,7 @@ Every claim in this section was checked against the source.
 | Plain start | `AdminServer.startPlainForTests` | Loopback `HttpServer`; documented as tests only (`AdminServer.java:143–149`). Hosted path still calls it when admin TLS is null (`CpHost.java:126–128`). |
 | Principal | `AdminServer.credential` | Verified peer cert → URI SAN starting with `urn:` preferred, else RFC 2253 canonical subject DN (`AdminServer.java:168–194`). `Authorization` is ignored (class javadoc `AdminServer.java:42–47`). |
 | Routes | `CpAdmin.handle` / `permission` | Unknown method+path → `permission == null` → **404** (`CpAdmin.java:47–49`, `116–139`). No **405** / fall-through guard as of `2462f42` — [#444](https://github.com/BlivionIaG/sjws_nettask/pull/444) (prerequisite 1). |
-| Authorize | `CpStore.authorize` → `Rbac.authorize` | Unknown / disabled cert → 401; mapped but lacking permission → 403 (`CpAdmin.java:51–54`; `Rbac.java:118–136`). |
+| Authorize | `CpStore.authorize` → `Rbac.authorize` | Reached only after a successful mTLS handshake. Unknown / disabled (but CA-trusted) cert → 401; mapped but lacking permission → 403 (`CpAdmin.java:51–54`; `Rbac.java:118–136`). A wrong-CA client never gets here — the handshake fails. |
 | Propose rbac/trust | `CpStore.propose` / `forbidden` | Bodies carrying `rbac` or `trust` rejected (`CpCoverageTest` and `CpStore`; control-plane.md §12.7). |
 | Idempotency | `CpStore.replayed` | Blank / null `Idempotency-Key` skips the table and applies (`CpStore.java:1345–1348`). Console always sends a key (`HttpCpClient` javadoc). Fingerprint is method+path+body only — **no principal** (`CpStore.java:1365–1367`; `IdempotencyTable.java:44`). Target: extend fingerprint with operator id (§3.4, Resolved Q1). |
 | Origin / Content-Type | `AdminServer.handle` | Not checked as of `2462f42`. Response `Content-Type` is set to `application/json` (`AdminServer.java:156–165`). Mutation `Origin` allowlist + require `application/json` (else 415) — [#447](https://github.com/BlivionIaG/sjws_nettask/pull/447) (prerequisite 2). |
@@ -131,7 +131,7 @@ implementation and for this design.
 
 | Requirement | Design |
 |---|---|
-| Every route authorized; deny by default | Keep `CpAdmin.permission` → `store.authorize`. Unmapped / disabled → 401; lacking permission → 403. **T2 (gate).** |
+| Every route authorized; deny by default | Keep `CpAdmin.permission` → `store.authorize`. A client cert from an **untrusted CA** fails the **TLS handshake** (no HTTP status). A trusted but unmapped / disabled cert → **401**; mapped but lacking permission → **403**. **T2a** / **T2b** / viewer-mutate **403**. |
 | Roles `viewer` < `operator` < `admin` | Keep control-plane.md §12.7 / `Role.allows`. `MANAGE_OPERATORS` admin-only. **T5 (gate)** last enabled admin. |
 | Propose must not carry `rbac` / `trust` | Keep. **T4 (gate).** |
 | Unmatched routes fail closed | **Prerequisite:** [#444](https://github.com/BlivionIaG/sjws_nettask/pull/444) — unmatched routes return 404/405 and cannot fall through to a grant. As of `2462f42`, wrong method is 404 (`CpAdmin.java:47–49`); grant tail at `CpAdmin.java:108–113`. |
@@ -235,35 +235,39 @@ flowchart TD
 
 ### 6.1 Tests (from Security threat model §6, plus Architecture additions)
 
-Each row maps to a design section. **(gate)** means the property must fail on current master at runtime and pass on the implementing PR.
+Each row maps to a design section. Kind:
 
-| # | Test | Design section | Notes |
-|---|---|---|---|
-| T1 | Missing cert/key/CA → admin listener does not bind **(gate)** | §3.2 | Regression on `AdminServer.start` |
-| T2 | Wrong CA / unmapped cert → 401; viewer on mutate → 403 **(gate)** | §3.3 | |
-| T3 | `Authorization: Bearer …` ignored; mTLS principal wins **(gate)** | §3.2 | |
-| T4 | Propose with embedded rbac/trust → rejected **(gate)** | §3.3 | |
-| T5 | Last enabled admin cannot be removed **(gate)** | §3.3 | |
-| T6 | Non-loopback admin without TLS refused at start **(gate)** | §3.2 | |
-| T7 | SecureKeyFile refuses bad mode/symlink/parent for admin key **(gate)** | §3.6 | |
-| T8 | reloadTls failure keeps old material; success drops admin clients failing new policy **(gate for drop)** | §3.6 | Drop half: [#451](https://github.com/BlivionIaG/sjws_nettask/pull/451); ordering per #321/#442 |
-| T9 | Revoked operator cert fails new handshake; live connection closed after reload/revoke **(gate)** | §3.6 | [#451](https://github.com/BlivionIaG/sjws_nettask/pull/451) |
-| T10 | Mutation without Idempotency-Key refused (including `config:validate`) | §3.4 | Architecture; fingerprint includes operator id |
-| T11 | Cross-origin mutation with `Origin` not on allowlist refused **(gate)** | §3.4 | [#447](https://github.com/BlivionIaG/sjws_nettask/pull/447) (+ 415 on bad Content-Type) |
-| T12 | Content overload does not starve drain/admin (unit/fake) **(gate for #388 AC)** | §3.5 | |
-| T13 | Admin flood hits admin caps only; content accept still progresses | §3.5 | |
-| T14 | Class-load: `standalone` loads no cp admin stack **(gate)** | §3.8 | Extend `ClassLoadTest` |
-| T15 | Audit failure → action denied; audit line redaction scan | §3.7 | |
-| T16 | Rate limit: burst of failed handshakes / mutations from one IP is throttled; tables are per-listener | §3.5 | Architecture |
-| T16b | A 503 rate-limit (or admin-queue-full) response does **not** stall on request content | §3.5 | Architecture; next to T13/T16 |
-| T17 | After `removeOperator` / disable commits and is visible on this voter, that principal's live admin connections are dropped (fail closed) **(gate)** | §3.6 | Architecture MUST |
+- **preserve** — already true on master (existing tests keep passing; do **not** require a red→green flip).
+- **red→green** — new or incomplete protection; the implementing PR's test **MUST** fail on master at runtime and pass on the PR.
+
+| # | Test | Design section | Kind | Notes |
+|---|---|---|---|---|
+| T1 | Missing cert/key/CA → admin listener does not bind | §3.2 | preserve | e.g. `AdminTlsTest.missingMaterialRefusesToStart` |
+| T2a | Client cert from an untrusted CA → **TLS handshake failure** (no HTTP 401) | §3.3 | preserve | mTLS `needClientAuth` + admin-CA trust; never reaches `CpAdmin` |
+| T2b | Trusted but unmapped / disabled cert → **401**; mapped viewer on mutate → **403** | §3.3 | preserve | e.g. `ConsoleApiTest` / role mapping tests |
+| T3 | `Authorization: Bearer …` ignored; mTLS principal wins | §3.2 | preserve | e.g. `AdminTlsTest.mtlsMapsRolesAndIgnoresBearerTokens` |
+| T4 | Propose with embedded rbac/trust → rejected | §3.3 | preserve | |
+| T5 | Last enabled admin cannot be removed | §3.3 | preserve | |
+| T6 | Non-loopback admin without TLS refused at start | §3.2 | preserve | `CpHost.loopback` |
+| T7 | SecureKeyFile refuses bad mode/symlink/parent for admin key | §3.6 | preserve | |
+| T8 | reloadTls failure keeps old material; success drops admin clients failing new policy | §3.6 | red→green (drop half) | Keep-old may already hold; drop half: [#451](https://github.com/BlivionIaG/sjws_nettask/pull/451); ordering per #321/#442 |
+| T9 | Revoked operator cert fails new handshake; live connection closed after reload/revoke | §3.6 | red→green | [#451](https://github.com/BlivionIaG/sjws_nettask/pull/451) |
+| T10 | Mutation without Idempotency-Key refused (including `config:validate`) | §3.4 | red→green | Architecture; fingerprint includes operator id |
+| T11 | Cross-origin mutation with `Origin` not on allowlist refused | §3.4 | red→green | [#447](https://github.com/BlivionIaG/sjws_nettask/pull/447) (+ 415 on bad Content-Type) |
+| T12 | Content overload does not starve drain/admin (unit/fake) | §3.5 | red→green | #388 AC |
+| T13 | Admin flood hits admin caps only; content accept still progresses | §3.5 | red→green | |
+| T14 | Class-load: `standalone` loads no cp admin stack | §3.8 | preserve | `ClassLoadTest` |
+| T15 | Audit failure → action denied; audit line redaction scan | §3.7 | preserve (deny) / extend (redaction) | Deny-on-audit-fail already in `Rbac.authorize` |
+| T16 | Rate limit: burst of failed handshakes / mutations from one IP is throttled; tables are per-listener | §3.5 | red→green | Architecture |
+| T16b | A 503 rate-limit (or admin-queue-full) response does **not** stall on request content | §3.5 | red→green | Architecture; next to T13/T16 |
+| T17 | After `removeOperator` / disable commits and is visible on this voter, that principal's live admin connections are dropped (fail closed) | §3.6 | red→green | Architecture MUST |
 
 ### 6.2 Merge gates (threat model §7)
 
 1. This design cites the threat model and Decision 13; Security **APPROVED** review on the design before code that widens the admin surface ([review on 017df3b](https://github.com/BlivionIaG/sjws_nettask/pull/445#pullrequestreview-5726063685)).
 2. One PR per issue; CI green; no push to master / no force-push.
-3. Regression tests marked **(gate)** fail on master at runtime and pass on the implementing PR.
-4. Feature off → class-load proof (T14); no new listener in `standalone`.
+3. **Preserve** tests in §6.1 stay green on master and on the PR (do not invent a red→green flip for them). **red→green** tests in §6.1 fail on master at runtime and pass on the implementing PR.
+4. Feature off → class-load proof (T14, preserve); no new listener in `standalone`.
 5. Hot-path / request-path untouched; if any shared code changes, wrk before/after under bench rule #263 (≥9 valid blocks + A/A; FAIL only if p < 0.05 and geomean > 1.10).
 6. Public PR text stays neutral (no exploit narrative); hold line: "Do not merge until inceptor approves".
 7. Owner reviews when Arch/MC/HTTP code is touched; Security reviews auth/TLS/RBAC/audit pieces.
