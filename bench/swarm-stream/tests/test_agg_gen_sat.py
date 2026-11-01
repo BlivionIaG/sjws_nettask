@@ -35,6 +35,7 @@ def write_abs(root: Path, tag: str, cpu: float, gen_cores: int = 2, load1_post: 
         "producer_transport_retries": 0,
         "consumer_connect_retries": 0,
         "error_count": 0,
+        "group_open_refusals": 0,
         "credit_stalls": 0,
         "stall_flag": False,
     }

@@ -65,7 +65,8 @@ if open_after is None: open_after=hz.get("sjws_swarm_stream_open_sessions")
 try: open_n=int(float(open_after)) if open_after is not None else -1
 except Exception: open_n=-1
 drain_to=bool(r.get("drain_timed_out"))
-print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 else "0")
+err=int(r.get("error_count") or 0); go=int(r.get("group_open_refusals") or 0)
+print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 and err==0 and go==0 else "0")
 PY2
 )
     [ "$ok" = 1 ] && valid=$((valid + 1))
@@ -109,7 +110,8 @@ if open_after is None: open_after=hz.get("sjws_swarm_stream_open_sessions")
 try: open_n=int(float(open_after)) if open_after is not None else -1
 except Exception: open_n=-1
 drain_to=bool(r.get("drain_timed_out"))
-print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 else "0")
+err=int(r.get("error_count") or 0); go=int(r.get("group_open_refusals") or 0)
+print("1" if n>=10000 and p99 is not None and pre<4.0 and not r.get("self_loaded") and not tx and refused==0 and not drain_to and open_n==0 and err==0 and go==0 else "0")
 PY2
 )
     if [ "$ok" = 1 ]; then

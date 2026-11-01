@@ -38,6 +38,30 @@ def pct(sorted_vals, q):
     return sorted_vals[i]
 
 
+
+def hard_zeros_from_counters(counters: dict) -> tuple[dict, int]:
+    """Build StreamLoad-compatible hard_zeros + refused_per_ip (Codex P2 #459).
+
+    Always includes sjws_connections_refused_per_ip_total (0 when the scrape lacks it)
+    so agg.py cannot fail a window for a missing key under LOADGEN=python.
+    """
+    raw = counters.get("sjws_connections_refused_per_ip_total")
+    try:
+        refused = int(float(raw)) if raw is not None else 0
+    except (TypeError, ValueError):
+        refused = 0
+    hz = {
+        "sjws_swarm_stream_node_refusals_total": counters.get("sjws_swarm_stream_node_refusals_total"),
+        "sjws_swarm_stream_session_admit_refusals_total": counters.get("sjws_swarm_stream_session_admit_refusals_total"),
+        "sjws_swarm_stream_budget_underflows_total": counters.get("sjws_swarm_stream_budget_underflows_total"),
+        "sjws_swarm_stream_reserve_underflows_total": counters.get("sjws_swarm_stream_reserve_underflows_total"),
+        "sjws_swarm_stream_charged_bytes": counters.get("sjws_swarm_stream_charged_bytes"),
+        "sjws_swarm_stream_open_sessions": counters.get("sjws_swarm_stream_open_sessions"),
+        "sjws_connections_refused_per_ip_total": float(refused),
+    }
+    return hz, refused
+
+
 def fetch_metrics(url: str) -> dict[str, float]:
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=10) as r:
@@ -55,22 +79,25 @@ def fetch_metrics(url: str) -> dict[str, float]:
     return out
 
 
-def wait_metrics_drained(url: str, timeout_s: float = 75.0) -> dict[str, float]:
-    """Poll until open_sessions==0 or timeout (StreamHttp.GRACE_MS is 60s)."""
+def wait_metrics_drained(url: str, timeout_s: float = 75.0) -> tuple[dict[str, float], bool]:
+    """Poll until open_sessions==0 or timeout (StreamHttp.GRACE_MS is 60s).
+
+    Returns (counters, drain_timed_out).
+    """
     deadline = time.monotonic() + timeout_s
-    last = {}
+    last: dict[str, float] = {}
     while time.monotonic() < deadline:
         try:
             last = fetch_metrics(url)
         except Exception as e:  # noqa: BLE001
-            last = {"_error": str(e)}
+            last = {"_error": str(e)}  # type: ignore[dict-item]
             time.sleep(0.5)
             continue
         open_s = last.get("sjws_swarm_stream_open_sessions")
         if open_s is None or open_s == 0:
-            return last
+            return last, False
         time.sleep(0.5)
-    return last
+    return last, True
 
 
 
@@ -261,7 +288,7 @@ def run_window(args) -> dict:
     load1_post = float(open("/proc/loadavg").read().split()[0])
 
     # Metrics after grace / session exit
-    counters = wait_metrics_drained(args.metrics_url, timeout_s=float(args.drain_timeout))
+    counters, drain_timed_out = wait_metrics_drained(args.metrics_url, timeout_s=float(args.drain_timeout))
     try:
         # also save raw scrape text path via one.sh; refresh once more
         counters = fetch_metrics(args.metrics_url)
@@ -288,14 +315,12 @@ def run_window(args) -> dict:
     n_chunks = len(lat_us)
     stall_pct = (100.0 * credit_429s / n_chunks) if n_chunks else 0.0
 
-    hard_zeros = {
-        "sjws_swarm_stream_node_refusals_total": counters.get("sjws_swarm_stream_node_refusals_total"),
-        "sjws_swarm_stream_session_admit_refusals_total": counters.get("sjws_swarm_stream_session_admit_refusals_total"),
-        "sjws_swarm_stream_budget_underflows_total": counters.get("sjws_swarm_stream_budget_underflows_total"),
-        "sjws_swarm_stream_reserve_underflows_total": counters.get("sjws_swarm_stream_reserve_underflows_total"),
-        "sjws_swarm_stream_charged_bytes": counters.get("sjws_swarm_stream_charged_bytes"),
-        "sjws_swarm_stream_open_sessions": counters.get("sjws_swarm_stream_open_sessions"),
-    }
+    hard_zeros, refused_per_ip = hard_zeros_from_counters(counters)
+    open_after = counters.get("sjws_swarm_stream_open_sessions")
+    try:
+        open_sessions_after_drain = int(float(open_after)) if open_after is not None else -1
+    except (TypeError, ValueError):
+        open_sessions_after_drain = -1
 
     out = {
         "mode": args.accept,
@@ -335,6 +360,9 @@ def run_window(args) -> dict:
         "stall_flag": stall_pct > 1.0,
         "counters": counters,
         "hard_zeros": hard_zeros,
+        "refused_per_ip": refused_per_ip,
+        "open_sessions_after_drain": open_sessions_after_drain,
+        "drain_timed_out": drain_timed_out,
         "errors": measure_errors[:30],
         "error_count": len(measure_errors),
         "teardown_errors": teardown_errors[:30],

@@ -72,10 +72,16 @@ def main():
         transport_retry_flag = bool(r.get("transport_retry_flag")) or ptr > 0 or ccr > 0
         refused_flag = refused > 0
         open_flag = open_after_n != 0  # must be exactly 0 after drain
+        # Setup / measure failures invalidate the window (Codex P2 #459): claim/stream 503s
+        # are group_open_refusals + error_count, not transport retries — surviving streams
+        # must not certify a short concurrent workload.
+        err_count = int(r.get("error_count") or 0)
+        group_open = int(r.get("group_open_refusals") or 0)
+        setup_fail = err_count > 0 or group_open > 0
         # valid only when all hard conditions hold
         valid = (n >= 10000 and p99 is not None and pre < 4.0 and not self_loaded
                  and not transport_retry_flag and not refused_flag
-                 and not drain_timed_out and not open_flag)
+                 and not drain_timed_out and not open_flag and not setup_fail)
         windows.append({
             "tag": p.parent.name,
             "valid": valid,
@@ -91,7 +97,9 @@ def main():
             "stall_flag": r.get("stall_flag"),
             "credit_stalls": r.get("credit_stalls"),
             "hard_zeros": r.get("hard_zeros"),
-            "errors": r.get("error_count"),
+            "errors": err_count,
+            "group_open_refusals": group_open,
+            "setup_fail": setup_fail,
             "producer_transport_retries": ptr,
             "consumer_connect_retries": ccr,
             "transport_retry_flag": transport_retry_flag,
@@ -108,15 +116,18 @@ def main():
     for w in windows:
         print(f"  {w['tag']}: valid={w['valid']} mib_s={w['mib_s']:.3f} p50={w['p50_us']} p99={w['p99_us']} "
               f"n={w['samples']} self_loaded={w['self_loaded']} stalls={w['credit_stalls']} "
-              f"stall_flag={w['stall_flag']} err={w['errors']} "
+              f"stall_flag={w['stall_flag']} err={w['errors']} group_open={w.get('group_open_refusals')} "
               f"prod_tx_retry={w['producer_transport_retries']} cons_conn_retry={w['consumer_connect_retries']} "
               f"refused_per_ip={w['refused_per_ip']} drain_to={w['drain_timed_out']} "
               f"open_after={w['open_sessions_after_drain']} max_per_ip={w.get('max_connections_per_ip')} "
               f"load={w['load1_pre']}→{w['load1_post']}")
-        if w['transport_retry_flag'] or w['refused_per_ip'] or w['drain_timed_out'] or w['open_sessions_after_drain'] != 0:
+        if (w['transport_retry_flag'] or w['refused_per_ip'] or w['drain_timed_out']
+                or w['open_sessions_after_drain'] != 0 or w.get('setup_fail')):
             print(f"  INVALID {w['tag']}: tx_retry={w['transport_retry_flag']} "
                   f"refused_per_ip={w['refused_per_ip']} drain_timed_out={w['drain_timed_out']} "
-                  f"open_sessions_after_drain={w['open_sessions_after_drain']}")
+                  f"open_sessions_after_drain={w['open_sessions_after_drain']} "
+                  f"setup_fail={w.get('setup_fail')} err={w.get('errors')} "
+                  f"group_open={w.get('group_open_refusals')}")
 
     verdict = "FAIL"
     reason = []
@@ -143,6 +154,8 @@ def main():
         for w in use:
             if w.get("transport_retry_flag"):
                 reason.append(f"{w['tag']}: transport_retry_flag")
+            if w.get("setup_fail"):
+                reason.append(f"{w['tag']}: setup_fail err={w.get('errors')} group_open={w.get('group_open_refusals')}")
             if w.get("refused_per_ip"):
                 reason.append(f"{w['tag']}: refused_per_ip={w['refused_per_ip']}")
             if w.get("drain_timed_out"):
