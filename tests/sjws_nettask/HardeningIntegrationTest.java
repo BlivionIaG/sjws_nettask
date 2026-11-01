@@ -141,14 +141,6 @@ class HardeningIntegrationTest {
                 "same thread reuses the same buffer");
     }
 
-    private static int readOrReset(Socket s) {
-        try {
-            return s.getInputStream().read();
-        } catch (IOException e) {
-            return -1; // reset by peer
-        }
-    }
-
     private static void waitUntil(java.util.function.BooleanSupplier condition) throws InterruptedException {
         long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
         while (!condition.getAsBoolean()) {
