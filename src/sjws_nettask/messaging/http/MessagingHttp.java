@@ -103,11 +103,14 @@ final class MessagingHttp implements Handler {
         if (path.startsWith(PREFIX) && path.indexOf("/offsets/", PREFIX.length()) > 0) return offsets(request, path);
         if (!path.startsWith(PREFIX) || !path.endsWith("/records")) return problem(404, "not found", path);
         var topic = URLDecoder.decode(path.substring(PREFIX.length(), path.length() - "/records".length()), StandardCharsets.UTF_8);
-        if (!LogTopics.validName(topic)) return problem(400, "bad request", "topic name must match " + LogTopics.NAME);
+        // Single front-door policy for GET and POST (#433 follow-up): pattern + reserved __* names.
+        if (!LogTopics.validUserTopic(topic)) {
+            return problem(400, "bad request",
+                    LogTopics.validName(topic) ? "topics starting with __ are internal" : "topic name must match " + LogTopics.NAME);
+        }
         try {
             return switch (request.method()) {
                 case "POST" -> {
-                    if (topic.startsWith("__")) yield problem(400, "bad request", "topics starting with __ are internal");
                     long t0 = System.nanoTime();
                     var r = produce(topic, request, target);
                     this.hooks.produced(topic, r.status(), Math.max(0, request.body().length()), System.nanoTime() - t0);
@@ -148,7 +151,7 @@ final class MessagingHttp implements Handler {
         int at = path.indexOf("/offsets/", PREFIX.length());
         var topic = URLDecoder.decode(path.substring(PREFIX.length(), at), StandardCharsets.UTF_8);
         var group = URLDecoder.decode(path.substring(at + "/offsets/".length()), StandardCharsets.UTF_8);
-        if (!LogTopics.validName(topic) || topic.startsWith("__")) return problem(400, "bad request", "bad topic name");
+        if (!LogTopics.validUserTopic(topic)) return problem(400, "bad request", "bad topic name");
         if (!LogTopics.validName(group)) return problem(400, "bad request", "group name must match " + LogTopics.NAME);
         try {
             var log = this.topics.get(topic, false);
