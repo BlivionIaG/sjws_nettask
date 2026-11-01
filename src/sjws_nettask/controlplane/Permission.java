@@ -28,6 +28,11 @@ public enum Permission {
     ROLLBACK,
     /** drain or undrain a data-plane node */
     NODE_DRAIN,
+    /**
+     * Explicitly release stalled per-append STRICT overrides so the group can commit without the
+     * missing data copy (#208). Weakens durability for those entries; must be audited.
+     */
+    RELEASE_STALLED_STRICT,
     /** add, change or revoke operators and their credentials */
     MANAGE_OPERATORS
 }

@@ -23,6 +23,7 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [Control-plane operations runbook](operations/control-plane.md): bootstrap voters, join data nodes, backup, upgrades, DR
 - [Admin console (TUI)](operations/admin-console.md)
 - [Control-plane console](operations/cp-console.md)
+- [Stalled STRICT override escape](operations/strict-stalled-escape.md): operator release when a data copy is lost after a STRICT append (#208)
 - [Releasing](operations/releasing.md)
 
 ## Design
