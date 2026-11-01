@@ -82,15 +82,17 @@ A full server path, checked with a real client.
   0, 1, 2, and 64; `ServerIntegrationTest` launches it with `WEB_SERVER_DIR`
   pointed at a `@TempDir`; `h3/JarLaunchTest` (tags `jar` and `h3`) runs
   `java -jar` after `package` and fetches HTTP/3. Those process tests pass a
-  concrete TCP port. The command-line and `WEB_SERVER_PORT` parsers only accept
-  ports from 1 to 65535, so they cannot request port 0. Several of them take a
-  port from a short-lived `ServerSocket(0)` and then bind it again, which can
-  race. The harness does not do that: `SjwsServer.bind` accepts 0 and the test
+  concrete TCP port. The command-line and `WEB_SERVER_PORT` accept `0` as
+  ephemeral (#397); the child prints `Server started: HTTP/1.1 on tcp/<bound>`.
+  Older process tests that probed with `ServerSocket(0)` and rebound can drop
+  that race. The harness still prefers in-JVM `SjwsServer.bind` with port 0 and
   reads the bound port after `start` returns.
 
 ## Ephemeral port
 
-`ServerConfig` documents TCP port 0 as ephemeral. `SjwsServer.bind` opens a
+`ServerConfig` documents TCP port 0 as ephemeral. The CLI positional port and
+`WEB_SERVER_PORT` accept `0` the same way (YAML `server.port: 0` already did).
+`SjwsServer.bind` opens a
 `ServerSocketChannel`, sets `SO_REUSEADDR`, and binds `new InetSocketAddress(port)`
 (the wildcard address) with the configured backlog. `tcpPort()` reads the address
 after the bind. `start` returns only after that bind has succeeded and the accept
@@ -315,10 +317,9 @@ Not implemented. Nothing above depends on these.
 - HTTPS on the main TCP port. The main listener stays cleartext; HTTPS exists only on
   the HTTP/2 listener's own port (`--h2-port`). A TLS accept path on the main port
   would be a new server path.
-- Accepting port 0 on the command line and in `WEB_SERVER_PORT`, so a subprocess
-  can bind an ephemeral TCP port and print it (the startup line already includes
-  `HTTP/1.1 on tcp/<port>`). Today those parsers replace 0 with the default and
-  warn. A subprocess can already do this with `--config` and `server.port: 0`.
+- ~~Accepting port 0 on the command line and in `WEB_SERVER_PORT`~~ (done in #397):
+  parsers keep `0` as ephemeral; startup prints `HTTP/1.1 on tcp/<bound>`. YAML
+  `server.port: 0` already worked.
 - HTTP/3 inside `FileServingEndToEndTest`. The same temporary root and ephemeral
   port are already covered by `h3/Http3ServerTest` and `h3/JarLaunchTest`.
 - Dropping fixed `Thread.sleep` calls that only poll for a condition, in favour
