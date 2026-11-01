@@ -1828,7 +1828,9 @@ final class RaftGroup {
 
     /**
      * Under the lock, after a counted fsync failure: if this node still leads and the consecutive count reached the
-     * configured threshold, step down in the same term (no hard-state write; campaign backoff via failback hysteresis).
+     * configured threshold, step down in the same term (no hard-state write). Always applies a campaign backoff of at
+     * least one lease plus election timeout (or {@code failbackHysteresis} when larger), even when ordinary failback
+     * hysteresis is zero, so a healthy peer can take over before this node campaigns again (#242).
      */
     private void maybeStepDownAfterFsyncFailures(List<Runnable> after) {
         if (role != Role.LEADER || consecutiveFsyncFailures < options.fsyncFailureStepDown()) {
@@ -1838,6 +1840,17 @@ final class RaftGroup {
                 "group " + groupId.value() + ": stepping down after " + consecutiveFsyncFailures
                         + " consecutive fsync failures (threshold " + options.fsyncFailureStepDown() + ")");
         stepDown(term, after);
+        // Outlast a follower's worst-case remaining electionDeadline (lease + election) so a healthy peer
+        // can startPreVote and win before this node campaigns again; plain lease+election races the peer.
+        long peerWindow = options.leaseNanos() + options.electionTimeout().toNanos();
+        long wait = Math.max(options.failbackHysteresis().toNanos(), 2 * peerWindow);
+        long until = clock.nanoTime() + wait;
+        if (campaignNotBefore < until) {
+            campaignNotBefore = until;
+        }
+        if (electionDeadline < until) {
+            electionDeadline = until;
+        }
     }
 
     /** Tick path: record (already done in {@link #force()}) was not — force threw after recordFsyncFailure. */

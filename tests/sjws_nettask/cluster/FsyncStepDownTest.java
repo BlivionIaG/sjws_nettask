@@ -202,9 +202,9 @@ class FsyncStepDownTest {
     }
 
     private void startRelaxed(int stepDownAfter) throws IOException {
+        // Default failback hysteresis is zero; fsync step-down must still delay campaigns (#242).
         var opts = new GroupOptions(Durability.RELAXED, 1 << 20, Duration.ofMillis(100), Duration.ofMillis(40),
-                Long.MAX_VALUE).withFsyncFailureStepDown(stepDownAfter).withRelaxedSyncBound(Duration.ZERO, Long.MAX_VALUE)
-                .withFailback(Duration.ofSeconds(30)); // demoted leader must not win again before the peer
+                Long.MAX_VALUE).withFsyncFailureStepDown(stepDownAfter).withRelaxedSyncBound(Duration.ZERO, Long.MAX_VALUE);
         var members = List.of(member(1, false), member(2, false), member(3, true));
         var voters = VoterSet.dataAndWitness(members.get(0), members.get(1), members.get(2));
         for (var m : members) {
