@@ -56,7 +56,7 @@ final class AccessLog implements Runnable, AutoCloseable {
     /** File key of the inode currently open; null until first open or when unsupported. */
     private Object openedKey;
     private long nextReopenCheckNanos;
-    /** Test/hook: writer reopens on the next idle poll (#406). */
+    /** Test/hook: force one reopen check, ignoring the 1s deadline once (#406). */
     private volatile boolean reopenRequested;
     private static final long REOPEN_CHECK_NANOS = 1_000_000_000L;
 
@@ -182,6 +182,11 @@ final class AccessLog implements Runnable, AutoCloseable {
     }
 
     /** Asks the writer to reopen the configured path (no-op for stdout / injected streams). */
+    /** True while a forced reopen check is pending (tests). Cleared when the check runs. */
+    boolean reopenForcedPending() {
+        return this.reopenRequested;
+    }
+
     void requestReopen() {
         if (this.path != null) {
             this.reopenRequested = true;
@@ -259,6 +264,13 @@ final class AccessLog implements Runnable, AutoCloseable {
             byte[] rest;
             while ((rest = this.queue.poll()) != null) {
                 buffered.write(rest);
+                pending += rest.length;
+                BufferedOutputStream next = maybeReopen(buffered, pending > 0);
+                if (next != buffered) {
+                    pending = 0;
+                    flushedAt = System.nanoTime();
+                    buffered = next;
+                }
             }
             buffered.flush();
         } catch (IOException | RuntimeException e) {
@@ -315,9 +327,10 @@ final class AccessLog implements Runnable, AutoCloseable {
             this.openedKey = fileKey(this.path);
             return new BufferedOutputStream(neu, FLUSH_BYTES);
         } catch (IOException e) {
-            // Keep writing the previous stream; retry on the next check (do not set failed).
+            // Keep writing the previous stream. nextReopenCheckNanos was already advanced above so
+            // the next attempt waits for the 1s deadline (do not set reopenRequested — that would
+            // bypass the deadline and WARN-storm under a persistent failure). Do not set failed.
             System.err.println("WARN: access log reopen failed; keeping previous stream: " + e);
-            this.reopenRequested = forced || missing || replaced;
             return buffered;
         }
     }

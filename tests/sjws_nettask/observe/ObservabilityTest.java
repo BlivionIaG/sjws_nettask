@@ -718,6 +718,55 @@ class ObservabilityTest {
     }
 
 
+
+    @Test
+    void reopensWhileQueueStaysBusy(@TempDir Path dir) throws Exception {
+        Path path = dir.resolve("access.log");
+        try (var log = AccessLog.start(path.toString(), AccessLogFormat.COMMON)) {
+            var stop = new java.util.concurrent.atomic.AtomicBoolean();
+            var filler = Thread.ofVirtual().start(() -> {
+                while (!stop.get()) {
+                    log.offer("127.0.0.1", "GET", "/busy", "HTTP/1.1", 200, 1, 0, null, null);
+                }
+            });
+            try {
+                awaitLog(() -> Files.exists(path) && Files.size(path) > 0);
+                Path rotated = dir.resolve("access.log.1");
+                Files.move(path, rotated);
+                log.requestReopen();
+                awaitLog(() -> Files.exists(path) && Files.size(path) > 0);
+                // New inode received lines while the filler kept the queue nonempty.
+                assertTrue(Files.size(path) > 0, "reopen under load must create/write the new file");
+                String neu = Files.readString(path);
+                assertTrue(neu.contains("GET /busy"), neu);
+            } finally {
+                stop.set(true);
+                filler.join(2_000);
+            }
+        }
+    }
+
+    @Test
+    void failedReopenPreservesCheckDeadline(@TempDir Path dir) throws Exception {
+        Path path = dir.resolve("access.log");
+        try (var log = AccessLog.start(path.toString(), AccessLogFormat.COMMON)) {
+            log.offer("127.0.0.1", "GET", "/ok", "HTTP/1.1", 200, 1, 0, null, null);
+            awaitLog(() -> Files.exists(path) && Files.size(path) > 0);
+            // Next openFile fails: path becomes a directory (cannot open as FileOutputStream).
+            Files.delete(path);
+            Files.createDirectory(path);
+            log.requestReopen();
+            // Writer clears the force flag when the check runs; must not re-arm it on failure.
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+            while (System.nanoTime() < deadline && log.reopenForcedPending()) {
+                Thread.sleep(5);
+            }
+            assertFalse(log.reopenForcedPending(),
+                    "failed reopen must not leave reopenRequested set (would bypass the 1s deadline)");
+            // Previous stream is gone; further offers may drop — we only assert the deadline flag.
+        }
+    }
+
     private static void awaitLog(java.util.concurrent.Callable<Boolean> ready) throws Exception {
         long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
         while (System.nanoTime() < deadline) {
