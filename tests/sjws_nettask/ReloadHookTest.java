@@ -11,7 +11,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 
-/** Signal tests are ordered: delivery first, then a case that ignores {@code SIGHUP} for good. */
+/** Signal tests are ordered: delivery first, then restore-over-ignore, then dispatch. */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ReloadHookTest {
 
@@ -63,9 +63,26 @@ class ReloadHookTest {
     @Test
     @Order(4)
     @EnabledOnOs(OS.LINUX)
-    void installSighupLeavesAnIgnoredHangupIgnored() {
+    void installSighupRestoresAnIgnoredHangup() throws Exception {
+        // CI runners and a parent with no controlling terminal often leave SIGHUP ignored.
+        // The daemon child must still install reload (systemd ExecReload sends hangup).
         assertTrue(Daemon.ignoreSignal("HUP"));
-        assertFalse(ReloadHook.installSighup());
+        var seen = new AtomicInteger();
+        var hook = ReloadHook.register(seen::incrementAndGet);
+        try {
+            assertTrue(ReloadHook.installSighup(),
+                    "installSighup must clear an inherited SIG_IGN then attach ReloadHook");
+            var pid = ProcessHandle.current().pid();
+            var kill = new ProcessBuilder(TestCommands.resolve("kill"), "-HUP", Long.toString(pid)).start();
+            assertEquals(0, kill.waitFor());
+            var deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+            while (seen.get() == 0 && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+            }
+            assertTrue(seen.get() >= 1, "SIGHUP must run the hook after restoring SIG_DFL");
+        } finally {
+            hook.close();
+        }
     }
 
     @Test

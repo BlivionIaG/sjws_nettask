@@ -305,9 +305,13 @@ the certificate on HTTP/3 only (`Http3Server.replaceTls`). See
 [Handler composition](../design/architecture.md#handler-composition).
 
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
-the JDK does not expose `sun.misc.Signal`, and when this process already ignores
-`SIGHUP`. An ignored `SIGHUP` stays ignored: the VM does not install a Java
-handler over it. `main` calls it only for the daemon child. A foreground process
+the JDK does not expose `sun.misc.Signal`, or when this process already ignores
+`SIGHUP` and the disposition cannot be restored. HotSpot alone will not replace
+`SIG_IGN`; the daemon child first restores the default disposition via
+`signal(SIGHUP, SIG_DFL)` when the FFM linker is available (same native access as
+the container entrypoint), then installs the Java handler. That way a child that
+inherited ignore from a CI runner or a parent with no controlling terminal still
+reloads on hangup. `main` calls it only for the daemon child. A foreground process
 must still die on `SIGHUP`. The child is also detached with `setsid` when that
 binary exists, so a terminal hangup is not delivered. On a data node that has
 accepted a pushed config, the hook reloads bootstrap local settings and leaves
