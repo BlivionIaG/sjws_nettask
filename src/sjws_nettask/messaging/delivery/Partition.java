@@ -375,11 +375,19 @@ public final class Partition implements AutoCloseable {
      * A due message that already had {@code maxAttempts} deliveries is dead-lettered instead.
      */
     public List<Delivery> poll(String group, String consumer, int max, long visibilityMs) {
+        return poll(group, consumer, max, visibilityMs, (Durability) null);
+    }
+
+    /**
+     * As {@link #poll(String, String, int, long)} with a per-Deliver durability override ({@code null} = writer default).
+     * Stream-partition readers pass {@link Durability#NONE} so Deliver records do not schedule background fsyncs.
+     */
+    public List<Delivery> poll(String group, String consumer, int max, long visibilityMs, Durability deliverDurability) {
         if (max < 1 || visibilityMs < 1) throw new IllegalArgumentException("max/visibility");
         List<Leased> got;
         lockForAppend();
         try {
-            got = pollLocked(group, consumer, max, visibilityMs);
+            got = pollLocked(group, consumer, max, visibilityMs, deliverDurability);
         } finally {
             lock.unlock();
         }
@@ -394,16 +402,26 @@ public final class Partition implements AutoCloseable {
      * caller is waiting.
      */
     public List<Delivery> poll(String group, String consumer, int max, long visibilityMs, long waitNanos) {
-        return toDeliveries(pollWaiting(group, consumer, max, visibilityMs, waitNanos));
+        return poll(group, consumer, max, visibilityMs, waitNanos, null);
     }
 
-    private List<Leased> pollWaiting(String group, String consumer, int max, long visibilityMs, long waitNanos) {
+    /**
+     * As {@link #poll(String, String, int, long, long)} with a per-Deliver durability override
+     * ({@code null} = writer default).
+     */
+    public List<Delivery> poll(String group, String consumer, int max, long visibilityMs, long waitNanos,
+            Durability deliverDurability) {
+        return toDeliveries(pollWaiting(group, consumer, max, visibilityMs, waitNanos, deliverDurability));
+    }
+
+    private List<Leased> pollWaiting(String group, String consumer, int max, long visibilityMs, long waitNanos,
+            Durability deliverDurability) {
         if (max < 1 || visibilityMs < 1 || waitNanos < 0) throw new IllegalArgumentException("max/visibility/wait");
         long deadline = System.nanoTime() + waitNanos;
         lockForAppend();
         try {
             while (true) {
-                var out = pollLocked(group, consumer, max, visibilityMs);
+                var out = pollLocked(group, consumer, max, visibilityMs, deliverDurability);
                 if (!out.isEmpty() || closed) return out;
                 long left = deadline - System.nanoTime();
                 if (left <= 0) return out;
@@ -485,7 +503,8 @@ public final class Partition implements AutoCloseable {
      * Lock held. Counts/snapshot publication runs once at the end of the poll instead of once per lease
      * ({@link #deferPublish}), which is what bounds the lock hold time of a multi-message claim.
      */
-    private List<Leased> pollLocked(String group, String consumer, int max, long visibilityMs) {
+    private List<Leased> pollLocked(String group, String consumer, int max, long visibilityMs,
+            Durability deliverDurability) {
         var g = state.group(group);
         // Empty poll (a spinning or woken consumer finding nothing): no allocation at all.
         if ((g.due.isEmpty() || g.due.first().atMs() > clockMs.getAsLong())
@@ -508,12 +527,12 @@ public final class Partition implements AutoCloseable {
                     deadLetter(g.name, o, attempts, lease != null ? "lease-expired:max-attempts" : "nacked:max-attempts");
                     continue;
                 }
-                out.add(deliver(group, o, consumer, now + visibilityMs, attempts + 1));
+                out.add(deliver(group, o, consumer, now + visibilityMs, attempts + 1, deliverDurability));
             }
             while (out.size() < max) {
                 Long o = state.messages.ceilingKey(g.cursor);
                 if (o == null) break;
-                out.add(deliver(group, o, consumer, now + visibilityMs, 1));
+                out.add(deliver(group, o, consumer, now + visibilityMs, 1, deliverDurability));
             }
         } finally {
             deferPublish = false;
@@ -522,8 +541,8 @@ public final class Partition implements AutoCloseable {
         return out;
     }
 
-    private Leased deliver(String group, long o, String consumer, long deadline, int attempt) {
-        append(new LedgerEntry.Deliver(group, o, consumer, deadline, attempt), null);
+    private Leased deliver(String group, long o, String consumer, long deadline, int attempt, Durability durability) {
+        append(new LedgerEntry.Deliver(group, o, consumer, deadline, attempt), durability);
         return new Leased(o, attempt, deadline, state.messages.get(o), payloadOf(o));
     }
 
@@ -1137,6 +1156,11 @@ public final class Partition implements AutoCloseable {
      * Exact counts as of the last applied entry. Computed on first read after a change (an append only marks them
      * stale, so the hot path allocates nothing for them); a stale read takes the lock briefly.
      */
+    /** The partition writer's ledger snapshot (next/durable/fsyncs); for tests and metrics. */
+    public sjws_nettask.messaging.ledger.LedgerSnapshot writerSnapshot() {
+        return writer.snapshot();
+    }
+
     public DeliveryCounts counts() {
         var c = counts.get();
         if (c != null) return c;

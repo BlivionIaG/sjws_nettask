@@ -29,6 +29,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.messaging.delivery.LeaseResult;
+import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.delivery.RetryPolicy;
 import sjws_nettask.swarm.wire.Frame;
 import sjws_nettask.swarm.wire.StreamChunk;
@@ -49,7 +50,9 @@ class TokenStreamsTest {
 
     @AfterEach
     void close() {
-        this.swarm.close();
+        if (this.swarm != null) {
+            this.swarm.close();
+        }
     }
 
     byte[] submit(byte[] id) {
@@ -475,4 +478,230 @@ class TokenStreamsTest {
         assertFalse(this.streams.reading(), "the reader exits with the topics, even with a sink open");
         sink.close();
     }
+
+    /**
+     * Crash/restart: LAST (ASYNC) survives on the shard log; re-offering ledger copies into a fresh sink does not
+     * duplicate. Covers Architecture's Deliver/Ack NONE condition (read watermark not required for result safety).
+     */
+    @Test
+    void crashRestartKeepsLastWithoutDuplicateSinkChunks() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var cid = id(40);
+        java.util.List<StreamChunk> first;
+        try (var sink = this.streams.open(cid)) {
+            submit(cid);
+            var t = claim(30_000);
+            assertEquals(LeaseResult.OK, this.swarm.tasks().streamChunk(t, 9, 1,
+                    new StreamChunk(42, 40, 0, StreamChunk.FIRST, new byte[] {1})));
+            assertEquals(LeaseResult.OK, this.swarm.tasks().streamChunk(t, 9, 2,
+                    new StreamChunk(42, 40, 1, 0, new byte[] {2})));
+            this.swarm.tasks().streamLast(t, 9, 3, new StreamChunk(42, 40, 2, Frame.LAST, new byte[] {9}), "ok",
+                    new byte[] {9}).get(5, TimeUnit.SECONDS);
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (!sink.complete() && System.nanoTime() < until) {
+                Thread.sleep(5);
+            }
+            assertTrue(sink.complete());
+            first = sink.drain();
+            assertEquals(3, first.size());
+            assertEquals(Frame.LAST, first.get(2).flags() & Frame.LAST);
+        }
+        var shardTopic = this.streams.shardTopic(0);
+        // LAST was ASYNC: force the shard before "crash" so the result is on disk (page-cache crash would keep it too).
+        var shard = this.swarm.topics().partitionWithoutDlq(shardTopic);
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (shard.writerSnapshot().durableOffset() < shard.writerSnapshot().nextOffset()
+                && System.nanoTime() < until) {
+            Thread.sleep(5);
+        }
+        assertTrue(shard.writerSnapshot().durableOffset() >= 1, "shard has durable bytes before restart");
+        this.swarm.close();
+        this.swarm = Swarm.open(this.dir, "n1", 7, RetryPolicy.DEFAULT, this.now::get, 600_000);
+        // Scan the shard log before Topics takes the directory lock again.
+        boolean sawLast = false;
+        try (var log = sjws_nettask.messaging.ledger.SegmentedLog.open(this.dir.resolve(shardTopic))) {
+            assertTrue(log.nextOffset() >= 1, "shard log survived restart");
+            for (var batch : log.readAll()) {
+                for (var rec : batch.records()) {
+                    try {
+                        var e = sjws_nettask.messaging.delivery.LedgerEntry.decode(rec);
+                        if (e instanceof sjws_nettask.messaging.delivery.LedgerEntry.Enqueue enq) {
+                            var c = StreamChunk.decode(enq.payload());
+                            if ((c.flags() & Frame.LAST) != 0 && c.streamLo() == 40) {
+                                sawLast = true;
+                            }
+                        }
+                    } catch (RuntimeException ignored) {
+                        // non-chunk / non-entry
+                    }
+                }
+            }
+        }
+        assertTrue(sawLast, "LAST Enqueue must survive restart (ASYNC produce)");
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        assertEquals(0, this.streams.openSinks(), "in-memory session/sink is gone after crash/restart");
+        // Re-offer saved ledger copies into a fresh sink: no duplicates on a second pass.
+        try (var sink = this.streams.open(cid)) {
+            for (var c : first) {
+                assertTrue(sink.offerFromLedger(c));
+            }
+            var got = sink.drain();
+            assertEquals(3, got.size(), "one of each seq after ledger re-offer");
+            assertEquals(java.util.List.of(0L, 1L, 2L), got.stream().map(StreamChunk::chunkSeq).toList());
+            for (var c : first) {
+                assertFalse(sink.offerFromLedger(c), "already held → skip");
+            }
+            assertEquals(0, sink.drain().size(), "no duplicate chunks after second ledger pass");
+        }
+    }
+
+    /**
+     * #416 ruling (c) / option B: crash after durable LAST+reply but before the fenced task ack. On restart the
+     * task is redelivered (attempt increases). The worker retries {@code streamLast} with the <b>same</b>
+     * {@code (producerId, seq)} (§4.4 contract); exactly one RESULT remains on the reply topic. Correlation-level
+     * idempotency for a new-seq retry is #463.
+     */
+    @Test
+    void crashBeforeAckSameSeqRetryKeepsOneResultPerTask() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        long corrLo = 77;
+        byte[] cid = id(corrLo);
+        var replyTopic = this.swarm.replies().topic();
+        var env = new TaskEnvelope(cid, cid, replyTopic, this.now.get() + 600_000, "", "", "", "text/plain",
+                new byte[] {1});
+        this.swarm.tasks().submit("p", 1, 1, env);
+        var first = this.swarm.tasks().claim("p", "w", 1, 500).get(0);
+        long producerId = 9;
+        long seq = 100;
+        var last = new StreamChunk(42, corrLo, 0, Frame.LAST, new byte[] {7});
+        var adm = this.streams.admitAndWrite(first, producerId, seq, last);
+        assertEquals(LeaseResult.OK, adm.result());
+        var reply = first.envelope().reply("text/plain", new byte[] {42});
+        var replyProd = this.swarm.topics().partition(replyTopic)
+                .produce(producerId, seq + 1, reply.encode(), Durability.ASYNC);
+        adm.produced().durable().get(5, TimeUnit.SECONDS);
+        replyProd.durable().get(5, TimeUnit.SECONDS);
+        this.now.addAndGet(5_000); // expire lease so reopen redelivers
+        this.swarm.close(); // crash before fenced ack / settle
+
+        this.swarm = Swarm.open(this.dir, "n1", 7, RetryPolicy.DEFAULT, this.now::get, 600_000);
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var again = this.swarm.tasks().claim("p", "w", 1, 60_000);
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+        while (again.isEmpty() && System.nanoTime() < until) {
+            Thread.sleep(50);
+            again = this.swarm.tasks().claim("p", "w", 1, 60_000);
+        }
+        assertFalse(again.isEmpty(), "task redelivered after crash before fenced ack");
+        assertTrue(again.get(0).attempt() > first.attempt(),
+                "redelivery raises attempt; was " + first.attempt() + " now " + again.get(0).attempt());
+        // Same-(producerId, seq) retry — worker contract.
+        var lastRetry = new StreamChunk(42, corrLo, 0, Frame.LAST, new byte[] {7});
+        assertEquals(LeaseResult.OK, this.swarm.tasks()
+                .streamLast(again.get(0), producerId, seq, lastRetry, "text/plain", new byte[] {42})
+                .get(5, TimeUnit.SECONDS));
+        this.swarm.close();
+
+        int replyCount = 0;
+        try (var log = sjws_nettask.messaging.ledger.SegmentedLog.open(this.dir.resolve(replyTopic))) {
+            for (var batch : log.readAll()) {
+                for (var rec : batch.records()) {
+                    try {
+                        var e = sjws_nettask.messaging.delivery.LedgerEntry.decode(rec);
+                        if (e instanceof sjws_nettask.messaging.delivery.LedgerEntry.Enqueue enq) {
+                            var r = TaskEnvelope.decode(enq.payload());
+                            if (r.correlationLo() == corrLo) {
+                                replyCount++;
+                            }
+                        }
+                    } catch (RuntimeException ignored) {
+                    }
+                }
+            }
+        }
+        assertEquals(1, replyCount, "exactly one RESULT per task after same-seq retry");
+    }
+
+    /**
+     * #416 ruling (a): Deliver/Ack NONE is scoped to {@code stream.<node>#i} partitions only. The helper refuses
+     * every other topic so regular consumer groups cannot take the NONE path through {@code readOnce}.
+     */
+    @Test
+    void deliverAckNoneScopedToStreamPartitionsOnly() {
+        assertTrue(TokenStreams.isStreamPartitionTopic("stream.n1#0"));
+        assertTrue(TokenStreams.isStreamPartitionTopic(TokenStreams.shardTopic("n1", 3)));
+        assertFalse(TokenStreams.isStreamPartitionTopic("orders"));
+        assertFalse(TokenStreams.isStreamPartitionTopic("tasks.p"));
+        assertFalse(TokenStreams.isStreamPartitionTopic("reply.n1"));
+        assertFalse(TokenStreams.isStreamPartitionTopic("stream.")); // no node / shard
+        assertFalse(TokenStreams.isStreamPartitionTopic("stream.n1")); // no #shard
+        assertFalse(TokenStreams.isStreamPartitionTopic("stream.n1#")); // empty shard
+        assertFalse(TokenStreams.isStreamPartitionTopic(null));
+        assertEquals(Durability.NONE, TokenStreams.deliverAckDurabilityForStreamPartition("stream.n1#0"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TokenStreams.deliverAckDurabilityForStreamPartition("orders"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TokenStreams.deliverAckDurabilityForStreamPartition("tasks.gen"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TokenStreams.deliverAckDurabilityForStreamPartition("stream.n1"));
+    }
+
+    /**
+     * Mutation pin: if readOnce passes null (writer default ASYNC) for Deliver/Ack, the shard syncer forces and
+     * fsyncs climb after the reader catches up. With NONE they stay flat (#342 append-mode dirtiness).
+     */
+    @Test
+    void streamReaderDeliverAckDoNotForce() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var cid = id(42);
+        try (var sink = this.streams.open(cid)) {
+            submit(cid);
+            var t = claim(30_000);
+            // Non-LAST NONE produce + reader Deliver/Ack NONE: after produce settles, reader must not force.
+            assertEquals(LeaseResult.OK, this.swarm.tasks().streamChunk(t, 9, 1,
+                    new StreamChunk(42, 42, 0, StreamChunk.FIRST, new byte[] {1})));
+            var shard = this.swarm.topics().partitionWithoutDlq(this.streams.shardTopic(0));
+            awaitShardRead(shard);
+            // Let any ASYNC (subscribe etc.) settle, then sample fsyncs.
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (shard.writerSnapshot().durableOffset() < shard.writerSnapshot().nextOffset()
+                    && System.nanoTime() < until) {
+                // May never catch up while only NONE dirtiness remains — that is the point.
+                Thread.sleep(10);
+            }
+            long f0 = shard.writerSnapshot().fsyncs();
+            long next0 = shard.writerSnapshot().nextOffset();
+            assertEquals(LeaseResult.OK, this.swarm.tasks().streamChunk(t, 9, 2,
+                    new StreamChunk(42, 42, 1, 0, new byte[] {2})));
+            awaitShardRead(shard);
+            Thread.sleep(250);
+            assertEquals(f0, shard.writerSnapshot().fsyncs(),
+                    "reader Deliver/Ack NONE must not schedule force; f0=" + f0 + " now="
+                            + shard.writerSnapshot().fsyncs());
+            assertTrue(shard.writerSnapshot().nextOffset() > next0, "chunk + Deliver/Ack appended");
+            assertFalse(sink.drain().isEmpty(), "sink got at least the FIRST chunk");
+            this.swarm.tasks().streamLast(t, 9, 3, new StreamChunk(42, 42, 1, Frame.LAST, new byte[0]), "x", new byte[0])
+                    .get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shardReaderCountsSkippedLedgerCopies() throws Exception {
+        this.streams = this.swarm.enableStreams(TokenStreams.Config.DEFAULT);
+        var cid = id(41);
+        try (var sink = this.streams.open(cid)) {
+            submit(cid);
+            var t = claim(30_000);
+            // Local deliver fills the sink; the shard reader's ledger copy is then SKIPPED.
+            assertEquals(LeaseResult.OK, this.swarm.tasks().streamChunk(t, 9, 1,
+                    new StreamChunk(42, 41, 0, StreamChunk.FIRST, new byte[] {1})));
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (this.streams.ledgerSkipped() < 1 && System.nanoTime() < until) {
+                Thread.sleep(5);
+            }
+            assertTrue(this.streams.ledgerSkipped() >= 1, "local push then ledger copy → skip");
+            assertEquals(1, sink.drain().size());
+        }
+    }
+
 }

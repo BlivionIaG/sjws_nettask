@@ -742,6 +742,8 @@ public final class TaskService {
      * Writes the reply to the task's {@code replyTo} topic with {@link Durability#ASYNC}, then acks the task once
      * the reply is durable (§4.4): a crash before that redelivers the task, and the caller dedups by taskId.
      * The future holds the ack's result. {@code (producerId, seq)} dedups a reply retried after a crash.
+     * <p><b>Worker contract:</b> after redelivery the retry <b>must</b> reuse the same {@code (producerId, seq)};
+     * a new seq can store a second RESULT (see #463).
      */
     /**
      * Replies to every task in {@code tasks} ({@code bodies[i]} for {@code tasks.get(i)}, all from one pool), each
@@ -809,6 +811,9 @@ public final class TaskService {
      * {@code (producerId, seq)} and the reply with {@code (producerId, seq + 1)}, and acks the task (fenced) only
      * once both are durable. A stale attempt gets {@code STALE_ATTEMPT} and writes nothing. The reply uses
      * {@code seq + 1} on the reply topic: the caller's next produce must skip it (use {@code seq + 2}).
+     * <p><b>Worker contract:</b> if a crash redelivers the task after {@code LAST}+reply were durable but before
+     * the fenced ack, the retry <b>must</b> reuse the same {@code (producerId, seq)} (and {@code seq + 1} for the
+     * reply). A new seq can store a second RESULT; correlation-level idempotency is #463.
      */
     public CompletableFuture<LeaseResult> streamLast(Task t, long producerId, long seq,
             sjws_nettask.swarm.wire.StreamChunk last, String contentType, byte[] body) {
