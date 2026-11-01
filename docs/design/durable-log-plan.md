@@ -27,7 +27,9 @@ second mechanism. Each step is one PR. The benches are `MessagingLogBench` (prod
 - **Bench:** retention/compaction run off the hot path. The bench checks that produce and fetch are unchanged during a
   compaction pass.
 - **As built:** topics are listed in `sjws.messaging.compaction.topics` / `SJWS_MESSAGING_COMPACTION_TOPICS`
-  (comma-separated); passes run on the retention timer (`sjws.messaging.retention.check.ms`), which exists only when
+  (comma-separated; each name must be a user topic — names starting with `__` are rejected, and a bad entry fails
+  startup naming the property and the entry); passes run on the retention timer (`sjws.messaging.retention.check.ms`),
+  which exists only when
   retention or compaction is configured. The key map is built from sealed segments only (they are fsynced at seal), and
   the unit dropped is a whole batch: a batch stays if any of its records is a key's last value or has no key, because
   a frame's offsets are contiguous and its CRC covers every record. Fetch on a compacted topic uses
