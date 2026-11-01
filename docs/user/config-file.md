@@ -306,16 +306,18 @@ the certificate on HTTP/3 only (`Http3Server.replaceTls`). See
 
 `installSighup()` points `SIGHUP` at `ReloadHook.run()` and returns false when
 the JDK does not expose `sun.misc.Signal`, or when this process already ignores
-`SIGHUP` and the disposition cannot be restored. HotSpot alone will not replace
-`SIG_IGN`; the daemon child first restores the default disposition via
-`signal(SIGHUP, SIG_DFL)` when the FFM linker is available (same native access as
-the container entrypoint), then installs the Java handler. That way a child that
-inherited ignore from a CI runner or a parent with no controlling terminal still
-reloads on hangup. `main` calls it only for the daemon child. A foreground process
-must still die on `SIGHUP`. The child is also detached with `setsid` when that
-binary exists, so a terminal hangup is not delivered. On a data node that has
-accepted a pushed config, the hook reloads bootstrap local settings and leaves
-the pushed document in place. Control and standalone re-read the local file.
+`SIGHUP` and the disposition cannot be restored. It calls `Signal.handle` first.
+Only when that returns `SIG_IGN` (HotSpot will not replace an inherited ignore)
+does it restore `SIG_DFL` via `signal(SIGHUP, SIG_DFL)` when the FFM linker is
+available, then call `handle` again. An unconditional restore would drop HotSpot's
+own hangup handler on the normal path. That way a child that inherited ignore from
+a CI runner or a parent with no controlling terminal still reloads on hangup, and
+a normal start keeps shutdown hooks until the Java handler is installed. `main`
+calls it only for the daemon child. A foreground process must still die on
+`SIGHUP`. The child is also detached with `setsid` when that binary exists, so a
+terminal hangup is not delivered. On a data node that has accepted a pushed config,
+the hook reloads bootstrap local settings and leaves the pushed document in place.
+Control and standalone re-read the local file.
 
 ## ACME
 

@@ -22,8 +22,8 @@ import org.junit.jupiter.api.io.TempDir;
  * <p>
  * The daemon child must not leave {@code SIGHUP} ignored. HotSpot will not replace {@code SIG_IGN},
  * and CI runners often inherit ignore; {@link ReloadHook#installSighup()} restores {@code SIG_DFL}
- * first. This test forces that inheritance on the parent so the child path is exercised the same
- * way as under GitHub Actions.
+ * only after {@code Signal.handle} returns {@code SIG_IGN}. This test forces that inheritance on
+ * the parent so the child path is exercised the same way as under GitHub Actions.
  */
 @Timeout(60)
 @EnabledOnOs(OS.LINUX)
@@ -83,14 +83,17 @@ class DaemonSighupReloadTest {
             Files.writeString(yaml, "server: [\n");
             kill = new ProcessBuilder(TestCommands.resolve("kill"), "-HUP", Long.toString(child)).start();
             assertEquals(0, kill.waitFor());
-            // Give the child a moment to attempt the bad reload, then confirm the live snapshot stayed.
-            Thread.sleep(300);
+            // SnakeYAML rejection for "server: [": logged as ERROR by onReload.
+            String rejectMarker = "while parsing a flow node";
+            waitFor(() -> logContains(log, rejectMarker), 5_000, "failed-reload ERROR in the daemon log");
             assertEquals("two", HttpTestSupport.get(port, "/marker.txt", 2_000).bodyText(),
                     "invalid YAML on reload must keep the previous snapshot");
+            var logged = Files.readString(log);
+            assertTrue(logged.contains("ERROR:"), logged);
+            assertTrue(logged.contains(rejectMarker), logged);
+            assertTrue(logged.contains(yaml.getFileName().toString()) || logged.contains(yaml.toString()),
+                    "ERROR should name the config file:\n" + logged);
             assertTrue(ProcessHandle.of(child).orElseThrow().isAlive());
-            assertTrue(Files.readString(log).contains("reload") || Files.readString(log).toLowerCase().contains("fail")
-                    || Files.readString(log).contains("ERROR"),
-                    "log should mention the failed reload:\n" + Files.readString(log));
 
             outBytes.reset();
             errBytes.reset();
@@ -112,6 +115,14 @@ class DaemonSighupReloadTest {
         try {
             var response = HttpTestSupport.get(port, path, 1_000);
             return response.statusCode() == 200 && expected.equals(response.bodyText());
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private static boolean logContains(Path log, String text) {
+        try {
+            return Files.exists(log) && Files.readString(log).contains(text);
         } catch (IOException e) {
             return false;
         }

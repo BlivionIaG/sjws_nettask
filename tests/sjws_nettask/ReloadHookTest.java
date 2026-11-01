@@ -2,6 +2,8 @@ package sjws_nettask;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.MethodOrderer;
@@ -11,7 +13,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 
-/** Signal tests are ordered: delivery first, then restore-over-ignore, then dispatch. */
+/** Signal tests are ordered: delivery first (no restore), then restore-over-ignore, then dispatch. */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ReloadHookTest {
 
@@ -45,8 +47,14 @@ class ReloadHookTest {
         var seen = new AtomicInteger();
         var hook = ReloadHook.register(seen::incrementAndGet);
         try {
+            boolean ignoredBefore = sighupIgnored();
+            int restoresBefore = ReloadHook.RESTORE_ATTEMPTS.get();
             org.junit.jupiter.api.Assumptions.assumeTrue(ReloadHook.installSighup(),
-                    "SIGHUP is already ignored, or sun.misc.Signal is hidden");
+                    "SIGHUP is already ignored and restore failed, or sun.misc.Signal is hidden");
+            if (!ignoredBefore) {
+                assertEquals(restoresBefore, ReloadHook.RESTORE_ATTEMPTS.get(),
+                        "FFM restore runs only when HotSpot returned SIG_IGN");
+            }
             var pid = ProcessHandle.current().pid();
             var kill = new ProcessBuilder(TestCommands.resolve("kill"), "-HUP", Long.toString(pid)).start();
             assertEquals(0, kill.waitFor());
@@ -70,8 +78,11 @@ class ReloadHookTest {
         var seen = new AtomicInteger();
         var hook = ReloadHook.register(seen::incrementAndGet);
         try {
+            int restoresBefore = ReloadHook.RESTORE_ATTEMPTS.get();
             assertTrue(ReloadHook.installSighup(),
                     "installSighup must clear an inherited SIG_IGN then attach ReloadHook");
+            assertTrue(ReloadHook.RESTORE_ATTEMPTS.get() > restoresBefore,
+                    "inherited SIG_IGN must trigger restoreDefaultHangup");
             var pid = ProcessHandle.current().pid();
             var kill = new ProcessBuilder(TestCommands.resolve("kill"), "-HUP", Long.toString(pid)).start();
             assertEquals(0, kill.waitFor());
@@ -100,5 +111,20 @@ class ReloadHookTest {
         } finally {
             hook.close();
         }
+    }
+
+    /** SIGHUP is signal 1, the least significant bit of SigIgn. */
+    private static boolean sighupIgnored() throws Exception {
+        var status = Path.of("/proc/self/status");
+        if (!Files.isRegularFile(status)) {
+            return false;
+        }
+        for (var line : Files.readAllLines(status)) {
+            if (line.startsWith("SigIgn:")) {
+                var hex = line.substring("SigIgn:".length()).trim();
+                return new java.math.BigInteger(hex, 16).testBit(0);
+            }
+        }
+        return false;
     }
 }
