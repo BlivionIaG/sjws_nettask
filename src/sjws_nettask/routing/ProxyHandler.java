@@ -37,7 +37,6 @@ import java.util.Set;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -175,6 +174,9 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     /**
      * 503 when this peer already holds its in-flight share (#78). Mid-stream backpressure still
      * pauses reads; a new request fails fast instead of waiting on that peer's queue.
+     * Peers are keyed on the connection remote socket address ({@code request.peer()}), never on
+     * {@code X-Forwarded-For} or {@code Forwarded}, including when the peer is listed in
+     * {@code trusted_proxies}.
      */
     private Response peerBudgetRefused(Request request, boolean head) {
         var budget = this.pool.budget();

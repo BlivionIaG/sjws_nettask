@@ -156,8 +156,9 @@ class DurableOrderingTest {
     }
 
     /**
-     * Stress: under NONE-on-ASYNC churn, durable must keep advancing (pinged / unpark not lost).
-     * A lost wakeup would leave durable stuck below written.
+     * Stress: under ASYNC churn, durable must keep advancing (pinged / unpark not lost).
+     * A lost wakeup would leave durable stuck below written. (NONE-only no longer schedules forces —
+     * see SyncerDirtinessTest.noneOnlyAppendsIssueNoBackgroundFsyncs.)
      */
     @Test
     void pingedUnparkEventuallyAdvancesDurableUnderChurn() throws Exception {
@@ -175,7 +176,7 @@ class DurableOrderingTest {
             byte[] payload = b("x");
             for (int round = 0; round < 200; round++) {
                 for (var w : ws) {
-                    w.append(List.of(payload), Durability.NONE).get();
+                    w.append(List.of(payload), Durability.ASYNC).get();
                 }
             }
             long deadline = System.nanoTime() + 15_000_000_000L;

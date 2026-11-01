@@ -342,12 +342,15 @@ class LedgerTest {
     @Test
     void perAppendAsyncOverrideOnGroupWriterSkipsFsync() throws Exception {
         try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.GROUP)) {
+            w.pauseSync(); // ack-path check: ASYNC override must not forceInline; background sync is separate
             for (int i = 0; i < 20; i++) w.append(List.of(b("q")), Durability.ASYNC).get();
             assertEquals(0, w.snapshot().fsyncs(), "no fsync on the ack path");
             assertEquals(20, w.snapshot().nextOffset());
-            w.append(List.of(b("sync")), Durability.GROUP).get();
+            assertEquals(20, w.asyncForceThroughForTests(), "ASYNC overrides still schedule background sync");
+            w.append(List.of(b("sync")), Durability.GROUP).get(); // forceInline on GROUP
             assertEquals(1, w.snapshot().fsyncs());
             assertEquals(21, w.snapshot().durableOffset());
+            w.resumeSync();
         }
     }
 
@@ -371,10 +374,13 @@ class LedgerTest {
     @Test
     void eachWriterWithAsyncOverride() throws Exception {
         try (var log = SegmentedLog.open(dir); var w = new LedgerWriter(log, Durability.EACH)) {
+            w.pauseSync();
             w.append(List.of(b("a")), Durability.ASYNC).get();
-            assertEquals(0, w.snapshot().fsyncs());
-            w.append(List.of(b("b"))).get();
+            assertEquals(0, w.snapshot().fsyncs(), "ASYNC override skips EACH's inline fsync");
+            assertEquals(1, w.asyncForceThroughForTests());
+            w.append(List.of(b("b"))).get(); // default EACH → forceInline
             assertEquals(1, w.snapshot().fsyncs());
+            w.resumeSync();
         }
     }
 

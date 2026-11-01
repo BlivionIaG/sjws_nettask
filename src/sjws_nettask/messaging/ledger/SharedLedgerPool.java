@@ -10,7 +10,9 @@ import java.util.concurrent.locks.LockSupport;
  * Each partition still has a dedicated writer thread ({@code ArrayBlockingQueue.take} wake), so the
  * produce / request-reply p50 path stays as on master. Syncers are pooled and sized to the CPUs so a
  * swarm with many partitions does not run one fsync loop per log (claim-wakeup #184: ~15 writer+syncer
- * threads on few CPUs). Writers unpark the shard syncer after ASYNC writes, same as a dedicated syncer.
+ * threads on few CPUs). Writers unpark the shard syncer after ASYNC writes (not NONE), same as a dedicated syncer.
+ * The fsync floor is enforced per member but slept at <em>shard</em> level so one member's interval
+ * cannot hold off a sibling's due force (HOL).
  * <p>
  * Default size is the CPU count ({@value #PROPERTY} unset or {@code auto}). Set the property to
  * {@code 0} / {@code false} for a dedicated syncer per writer (fully legacy). Shard threads start
@@ -167,10 +169,23 @@ public final class SharedLedgerPool {
             while (true) {
                 pinged = false;
                 boolean busy = false;
+                long floorWait = -1;
                 for (var w : members) {
-                    if (w.sharedSyncSlice()) busy = true;
+                    int r = w.sharedSyncSlice();
+                    if (r == LedgerWriter.SYNC_BUSY) busy = true;
+                    else if (r == LedgerWriter.SYNC_FLOORED) {
+                        long wait = w.sharedSyncFloorWaitNanos();
+                        if (floorWait < 0 || wait < floorWait) floorWait = wait;
+                    }
                 }
                 if (busy) continue;
+                // Shard-level floor: sleep once for the soonest eligible member instead of parking inside
+                // one member's slice (which blocked siblings). Mutation: omit this park and fall through to
+                // IDLE_PARK_NANOS, or park inside sharedSyncSlice again, breaks the HOL bound test.
+                if (floorWait >= 0) {
+                    if (floorWait > 0) LockSupport.parkNanos(this, floorWait);
+                    continue;
+                }
                 if (retire()) return;
                 // Brief spin so an unpark that races the idle check is not delayed by a long park.
                 // Watch {@link #pinged} instead of scanning every member on each iteration (#329 durableNow hotspot).

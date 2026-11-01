@@ -31,6 +31,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -52,6 +53,9 @@ import sjws_nettask.core.Response;
  * <p>Scenario: peer A holds a large in-flight proxied body. A further request from A must be
  * refused with 503 (per-peer admission), while peer B must still complete. On master the further
  * A request is accepted instead of refused, so this fails at runtime there.
+ *
+ * <p>Waits on {@link ByteBudget#setChangeObserver} rather than sleeping on budget state
+ * (#298 follow-up).
  */
 class ProxyPeerFairnessTest {
 
@@ -94,8 +98,20 @@ class ProxyPeerFairnessTest {
                     }
                     held.add(src);
                     opened++;
-                    for (int w = 0; w < 80 && budget.inFlight() < 32 * 1024L; w++) {
-                        Thread.sleep(10);
+                    // Wait until this open has charged some bytes (deterministic; no sleep poll).
+                    var charged = new CountDownLatch(1);
+                    budget.setChangeObserver((stripe, peer, global) -> {
+                        if (global >= 32 * 1024L) {
+                            charged.countDown();
+                        }
+                    });
+                    try {
+                        if (budget.inFlight() >= 32 * 1024L) {
+                            charged.countDown();
+                        }
+                        charged.await(2, TimeUnit.SECONDS);
+                    } finally {
+                        budget.setChangeObserver(null);
                     }
                     // Probe: a further A request. On the branch this becomes 503 once the peer
                     // share is full; on master it stays 200.
