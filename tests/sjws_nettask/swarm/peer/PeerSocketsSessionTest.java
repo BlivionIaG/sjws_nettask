@@ -500,4 +500,185 @@ class PeerSocketsSessionTest {
         created.set(s.getCreationTime());
     }
 
+
+    /**
+     * #435 / #321 N1: {@code registerLive} fails closed once the TLS-epoch retry budget is spent.
+     */
+    @Test
+    void registerLiveFailsClosedAfterEpochRetryBudget() throws Exception {
+        var ca = new PeerTestCa(dir.resolve("ca-budget"));
+        var ports = EphemeralPorts.probeDistinct(2);
+        var map = "a=1@127.0.0.1:" + ports[0] + ",b=2@127.0.0.1:" + ports[1];
+        var configA = PeerConfig.parse(map, "a");
+        var configB = PeerConfig.parse(map, "b");
+        var deny = Files.writeString(dir.resolve("deny-budget.txt"), "# none\n");
+        var cfgA = ca.node("a", PeerConfig.SAN_PREFIX + "a");
+        cfgA = new sjws_nettask.cp.CpListenerConfig(PeerSockets.LISTENER, cfgA.certPem(), cfgA.keyPem(), cfgA.caPem(),
+                deny, false);
+        var tlsA = CpTls.peerContext(cfgA);
+        var tlsB = CpTls.peerContext(ca.node("b", PeerConfig.SAN_PREFIX + "b"));
+        var socketsA = new PeerSockets(tlsA, configA);
+        var socketsB = new PeerSockets(tlsB, configB);
+
+        EphemeralPorts.withBindRetry("PeerSocketsSessionTest.budget", () -> {
+            try (var listener = socketsA.listen(configA.self().address())) {
+                var outcome = new CompletableFuture<Exception>();
+                var bumps = new java.util.concurrent.atomic.AtomicInteger();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        socketsA.handshake(ssl, 5_000);
+                        Runnable bump = new Runnable() {
+                            @Override
+                            public void run() {
+                                bumps.incrementAndGet();
+                                socketsA.betweenValidateAndRegister = this;
+                                socketsA.bumpTlsEpochForTest();
+                            }
+                        };
+                        socketsA.betweenValidateAndRegister = bump;
+                        try {
+                            socketsA.peerWire(ssl);
+                            outcome.complete(null);
+                        } catch (Exception e) {
+                            outcome.complete(e);
+                        } finally {
+                            try {
+                                ssl.close();
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    } catch (Exception e) {
+                        outcome.completeExceptionally(e);
+                    }
+                });
+                try {
+                    socketsB.dial(configA.self().address()).socket().close();
+                } catch (Exception ignored) {
+                }
+                var err = outcome.get(20, TimeUnit.SECONDS);
+                assertNotNull(err, "peerWire must fail closed when the epoch keeps moving");
+                Throwable t = err;
+                while (t.getCause() != null) {
+                    t = t.getCause();
+                }
+                assertTrue(String.valueOf(t.getMessage()).contains("retry budget")
+                                || String.valueOf(err.getMessage()).contains("retry budget"),
+                        "message=" + err.getMessage() + " root=" + t.getMessage());
+                assertEquals(PeerSockets.REGISTER_LIVE_MAX_ATTEMPTS, bumps.get());
+            }
+            return null;
+        });
+    }
+
+    /**
+     * #435 / #321 N2: drop-path abort + concurrent Live replace still clears the closed socket (remove by key).
+     */
+    @Test
+    void dropRemovesClosedSocketWhenLiveReplacedConcurrently() throws Exception {
+        var ca = new PeerTestCa(dir.resolve("ca-race"));
+        var ports = EphemeralPorts.probeDistinct(2);
+        var map = "a=1@127.0.0.1:" + ports[0] + ",b=2@127.0.0.1:" + ports[1];
+        var configA = PeerConfig.parse(map, "a");
+        var configB = PeerConfig.parse(map, "b");
+        var deny = Files.writeString(dir.resolve("deny-race.txt"), "# none\n");
+        var cfgA = ca.node("a", PeerConfig.SAN_PREFIX + "a");
+        cfgA = new sjws_nettask.cp.CpListenerConfig(PeerSockets.LISTENER, cfgA.certPem(), cfgA.keyPem(), cfgA.caPem(),
+                deny, false);
+        var tlsA = CpTls.peerContext(cfgA);
+        var leafB = ca.node("b", PeerConfig.SAN_PREFIX + "b");
+        var serialB = ca.lastSerial();
+        var tlsB = CpTls.peerContext(leafB);
+        var socketsA = new PeerSockets(tlsA, configA);
+        var socketsB = new PeerSockets(tlsB, configB);
+
+        EphemeralPorts.withBindRetry("PeerSocketsSessionTest.dropRace", () -> {
+            try (var listener = socketsA.listen(configA.self().address())) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        socketsA.handshake(ssl, 5_000);
+                        assertEquals(2, socketsA.peerWire(ssl));
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var dialed = socketsB.dial(configA.self().address());
+                var live = accepted.get(10, TimeUnit.SECONDS);
+                assertEquals(1, socketsA.liveSize());
+                var replaced = new java.util.concurrent.atomic.AtomicBoolean();
+                socketsA.betweenDropFailAndAbort = () -> {
+                    try {
+                        socketsA.replaceLiveAbortForTest(live, new java.net.Socket());
+                        replaced.set(true);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                };
+                Files.writeString(deny, "serial:" + serialB.toString(16) + "\n");
+                tlsA.reloadTls();
+                assertTrue(replaced.get(), "drop path must hit the replace hook");
+                assertTrue(live.isClosed(), "stale abort still closes the SSLSocket");
+                assertEquals(0, socketsA.liveSize(), "closed socket must leave live even after Live replace");
+                dialed.socket().close();
+            }
+            return null;
+        });
+    }
+
+    /** #435: closed-socket sweep removes by key despite a concurrent Live replace. */
+    @Test
+    void dropSweepsClosedSocketByKeyDespiteLiveReplace() throws Exception {
+        var ca = new PeerTestCa(dir.resolve("ca-closed-key"));
+        var ports = EphemeralPorts.probeDistinct(2);
+        var map = "a=1@127.0.0.1:" + ports[0] + ",b=2@127.0.0.1:" + ports[1];
+        var configA = PeerConfig.parse(map, "a");
+        var configB = PeerConfig.parse(map, "b");
+        var deny = Files.writeString(dir.resolve("deny-closed-key.txt"), "# none\n");
+        var cfgA = ca.node("a", PeerConfig.SAN_PREFIX + "a");
+        cfgA = new sjws_nettask.cp.CpListenerConfig(PeerSockets.LISTENER, cfgA.certPem(), cfgA.keyPem(), cfgA.caPem(),
+                deny, false);
+        var tlsA = CpTls.peerContext(cfgA);
+        var tlsB = CpTls.peerContext(ca.node("b", PeerConfig.SAN_PREFIX + "b"));
+        var socketsA = new PeerSockets(tlsA, configA);
+        var socketsB = new PeerSockets(tlsB, configB);
+
+        EphemeralPorts.withBindRetry("PeerSocketsSessionTest.closedKey", () -> {
+            try (var listener = socketsA.listen(configA.self().address())) {
+                var accepted = new CompletableFuture<SSLSocket>();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        var ssl = (SSLSocket) listener.accept();
+                        socketsA.handshake(ssl, 5_000);
+                        assertEquals(2, socketsA.peerWire(ssl));
+                        accepted.complete(ssl);
+                    } catch (Exception e) {
+                        accepted.completeExceptionally(e);
+                    }
+                });
+                var dialed = socketsB.dial(configA.self().address());
+                var live = accepted.get(10, TimeUnit.SECONDS);
+                live.close();
+                dialed.socket().close();
+                assertEquals(1, socketsA.liveSize());
+                var replaced = new java.util.concurrent.atomic.AtomicBoolean();
+                socketsA.betweenClosedSweepAndRemove = () -> {
+                    try {
+                        socketsA.replaceLiveAbortForTest(live, new java.net.Socket());
+                        replaced.set(true);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                };
+                socketsA.dropPeersFailingPolicy();
+                assertTrue(replaced.get(), "closed sweep must hit the replace hook");
+                assertEquals(0, socketsA.liveSize(), "closed-socket sweep removes by key despite Live replace");
+            }
+            return null;
+        });
+    }
+
+
 }
