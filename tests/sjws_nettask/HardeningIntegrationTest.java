@@ -87,6 +87,8 @@ class HardeningIntegrationTest {
      * Verification V1 for HTTP/1.1 (#327): one address gets at most maxConnectionsPerIp connections.
      * Over the cap the accept loop sends a canned cleartext 503 + Retry-After: 1, then closes.
      * The response is generic (no limit, count or client address). Under the cap is unchanged.
+     * The refused socket is read without writing a request so the assertion does not race the
+     * non-blocking drain/close (Codex P2). Concurrent request delivery is covered separately.
      */
     @Test
     void connectionsPerAddressAreCapped() throws Exception {
@@ -95,9 +97,7 @@ class HardeningIntegrationTest {
         try (var a = connect(); var b = connect()) {
             waitUntil(() -> manager.activeConnections() == 2);
             try (var c = connect()) {
-                // May send a request immediately; the refuse path drains at most one read best-effort.
-                c.getOutputStream().write("GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
-                c.getOutputStream().flush();
+                // No client request: avoids racing refuseWith503's one-shot drain + close.
                 Response r = HttpTestSupport.readResponse(c.getInputStream());
                 assertEquals(503, r.statusCode(), r.rawHead());
                 assertEquals("1", r.headers().get("retry-after"), r.rawHead());
@@ -121,6 +121,44 @@ class HardeningIntegrationTest {
             }
         }
         assertEquals(ServerConfig.DEFAULT_MAX_CONNECTIONS_PER_IP, ServerConfig.defaults(root.toString()).maxConnectionsPerIp());
+    }
+
+    /**
+     * #327 best-effort path: a request that races the refuse drain may see the canned 503 or a
+     * TCP reset. Either outcome is accepted; the counter still increments.
+     */
+    @Test
+    void perIpRefuseWithRacedRequestIsBestEffort() throws Exception {
+        Files.writeString(root.resolve("hello.txt"), "hello");
+        start(ServerConfig.builder(root).maxConnectionsPerIp(1).build());
+        try (var held = connect()) {
+            waitUntil(() -> manager.activeConnections() == 1);
+            try (var c = connect()) {
+                c.getOutputStream().write("GET /hello.txt HTTP/1.1\r\nHost: h\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                c.getOutputStream().flush();
+                try {
+                    Response r = HttpTestSupport.readResponse(c.getInputStream());
+                    if (r.statusCode() == 503) {
+                        assertEquals("1", r.headers().get("retry-after"), r.rawHead());
+                        // EOF or reset after the 503 are both fine on this path.
+                        try {
+                            c.getInputStream().read();
+                        } catch (IOException ignored) {
+                            // reset by peer after the 503
+                        }
+                    } else {
+                        assertTrue(r.rawHead().isEmpty() || r.statusCode() < 0,
+                                "only 503 or a reset/empty read, got: " + r.rawHead());
+                    }
+                } catch (IOException e) {
+                    assertTrue(e.getMessage() == null
+                                    || e.getMessage().toLowerCase(java.util.Locale.ROOT).contains("reset")
+                                    || e.getMessage().toLowerCase(java.util.Locale.ROOT).contains("closed"),
+                            "unexpected I/O on raced refuse: " + e);
+                }
+            }
+            waitUntil(() -> manager.refusedPerIp() >= 1);
+        }
     }
 
     /** #327: the per-IP refuse drain buffer is ThreadLocal, never shared across accept/virtual threads. */
