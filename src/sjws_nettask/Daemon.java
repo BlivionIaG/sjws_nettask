@@ -358,6 +358,9 @@ final class Daemon {
         }
         cmd.clear();
         cmd.add(javaBin);
+        // Match the container entrypoint and Surefire: ReloadHook may need FFM to clear an
+        // inherited SIG_IGN before installing SIGHUP as reload (GitHub Actions).
+        cmd.add("--enable-native-access=ALL-UNNAMED");
         cmd.add("-cp");
         cmd.add(classPath);
         cmd.add("sjws_nettask.Sjws_nettask");
