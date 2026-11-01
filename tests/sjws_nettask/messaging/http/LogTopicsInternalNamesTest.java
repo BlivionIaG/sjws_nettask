@@ -82,6 +82,33 @@ class LogTopicsInternalNamesTest {
         }
     }
 
+    /** Security N3: missing and existing reserved topics share the same HTTP status and body (no existence oracle). */
+    @Test
+    void httpGetReservedTopicSameStatusAndBodyWhetherDirectoryExists() throws Exception {
+        var logs = dir.resolve("logs");
+        try (var topics = new LogTopics(logs, Durability.ASYNC)) {
+            var h = new MessagingHttp(topics);
+            var missing = h.handle(new Request("GET", "/messaging/v1/topics/__evil/records"));
+            var missingBody = new String(MessagingHttpTest.bytes(missing), StandardCharsets.UTF_8);
+            assertEquals(400, missing.status(), missingBody);
+            assertTrue(missingBody.contains("internal"), missingBody);
+        }
+        try (var log = SegmentedLog.open(logs.resolve("__evil"));
+                var w = new LedgerWriter(log, Durability.ASYNC)) {
+            w.append(List.of("x".getBytes(StandardCharsets.UTF_8))).get();
+        }
+        try (var topics = new LogTopics(logs, Durability.ASYNC)) {
+            var h = new MessagingHttp(topics);
+            var existing = h.handle(new Request("GET", "/messaging/v1/topics/__evil/records"));
+            var existingBody = new String(MessagingHttpTest.bytes(existing), StandardCharsets.UTF_8);
+            var missing = h.handle(new Request("GET", "/messaging/v1/topics/__never_created/records"));
+            var missingBody = new String(MessagingHttpTest.bytes(missing), StandardCharsets.UTF_8);
+            assertEquals(400, existing.status(), existingBody);
+            assertEquals(existing.status(), missing.status());
+            assertEquals(existingBody, missingBody);
+        }
+    }
+
     /** N2: HTTP doors go through {@link LogTopics#validUserTopic}. */
     @Test
     void httpOffsetsAlsoUseValidUserTopic() throws Exception {
