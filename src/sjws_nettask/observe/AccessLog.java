@@ -71,7 +71,8 @@ final class AccessLog implements Runnable, AutoCloseable {
             return new AccessLog(null, unclosable(System.out), false, format, CAPACITY);
         }
         Path path = Path.of(target).toAbsolutePath();
-        return new AccessLog(path, openFile(path), true, format, CAPACITY);
+        Opened opened = openFileWithKey(path);
+        return new AccessLog(path, opened.stream, true, format, CAPACITY, opened.key);
     }
 
     /**
@@ -95,6 +96,45 @@ final class AccessLog implements Runnable, AutoCloseable {
             }
         }
         return new FileOutputStream(absolute.toFile(), true);
+    }
+
+    /**
+     * Opens {@code path} and records a file key that belongs to the opened stream. If the path's
+     * key changes across the open (rotator replaced the inode under us), close and retry so
+     * {@code openedKey} never describes a different inode than the stream we keep writing to.
+     */
+    static Opened openFileWithKey(Path path) throws IOException {
+        IOException lastClose = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            Object before = fileKey(path);
+            OutputStream stream = openFile(path);
+            Object after = fileKey(path);
+            if (before != null && after != null && !before.equals(after)) {
+                try {
+                    stream.close();
+                } catch (IOException e) {
+                    lastClose = e;
+                }
+                continue;
+            }
+            return new Opened(stream, after);
+        }
+        if (lastClose != null) {
+            System.err.println("WARN: access log close after raced open: " + lastClose);
+        }
+        OutputStream stream = openFile(path);
+        return new Opened(stream, fileKey(path));
+    }
+
+    /** Stream plus the path file key observed to be stable across that open. */
+    static final class Opened {
+        final OutputStream stream;
+        final Object key;
+
+        Opened(OutputStream stream, Object key) {
+            this.stream = stream;
+            this.key = key;
+        }
     }
 
     /**
@@ -170,12 +210,17 @@ final class AccessLog implements Runnable, AutoCloseable {
     }
 
     private AccessLog(Path path, OutputStream out, boolean closeOut, AccessLogFormat format, int capacity) {
+        this(path, out, closeOut, format, capacity, path == null ? null : fileKey(path));
+    }
+
+    private AccessLog(Path path, OutputStream out, boolean closeOut, AccessLogFormat format, int capacity,
+            Object openedKey) {
         this.queue = new LogQueue(capacity);
         this.path = path;
         this.out = out;
         this.closeOut = closeOut;
         this.format = format;
-        this.openedKey = path == null ? null : fileKey(path);
+        this.openedKey = openedKey;
         this.nextReopenCheckNanos = System.nanoTime() + REOPEN_CHECK_NANOS;
         this.thread = Thread.ofPlatform().daemon().name("access-log").unstarted(this);
         this.thread.start();
@@ -317,15 +362,15 @@ final class AccessLog implements Runnable, AutoCloseable {
         }
         OutputStream previous = this.out;
         try {
-            OutputStream neu = openFile(this.path);
+            Opened opened = openFileWithKey(this.path);
             try {
                 previous.close();
             } catch (IOException e) {
                 System.err.println("WARN: closing rotated access log: " + e);
             }
-            this.out = neu;
-            this.openedKey = fileKey(this.path);
-            return new BufferedOutputStream(neu, FLUSH_BYTES);
+            this.out = opened.stream;
+            this.openedKey = opened.key;
+            return new BufferedOutputStream(opened.stream, FLUSH_BYTES);
         } catch (IOException e) {
             // Keep writing the previous stream. nextReopenCheckNanos was already advanced above so
             // the next attempt waits for the 1s deadline (do not set reopenRequested — that would
