@@ -44,7 +44,8 @@ final class AccessLog implements Runnable, AutoCloseable {
     private static final int FLUSH_BYTES = 32 * 1024;
 
     private final LogQueue queue;
-    private final OutputStream out;
+    private final Path path; // null when logging to an injected stream / stdout
+    private volatile OutputStream out;
     private final boolean closeOut;
     private final AccessLogFormat format;
     private final LongAdder dropped = new LongAdder();
@@ -52,6 +53,12 @@ final class AccessLog implements Runnable, AutoCloseable {
     private final Clock clock = new Clock();
     private volatile boolean stopped;
     private volatile boolean failed;
+    /** File key of the inode currently open; null until first open or when unsupported. */
+    private Object openedKey;
+    private long nextReopenCheckNanos;
+    /** Test/hook: writer reopens on the next idle poll (#406). */
+    private volatile boolean reopenRequested;
+    private static final long REOPEN_CHECK_NANOS = 1_000_000_000L;
 
     private static final Set<PosixFilePermission> FILE_0640 = EnumSet.of(PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ);
@@ -61,17 +68,18 @@ final class AccessLog implements Runnable, AutoCloseable {
 
     static AccessLog start(String target, AccessLogFormat format) throws IOException {
         if ("-".equals(target)) {
-            return new AccessLog(unclosable(System.out), false, format, CAPACITY);
+            return new AccessLog(null, unclosable(System.out), false, format, CAPACITY);
         }
-        return new AccessLog(openFile(Path.of(target)), true, format, CAPACITY);
+        Path path = Path.of(target).toAbsolutePath();
+        return new AccessLog(path, openFile(path), true, format, CAPACITY);
     }
 
     /**
      * Opens {@code path} for append. A newly created file is mode {@code 0640}; each directory this
      * process creates for it is {@code 0750}. An existing file keeps its mode; a world-readable
-     * existing file logs a WARN and is still appended. A file rotated in by an external process
-     * keeps whatever mode that process gave it until this server reopens the path (AccessLog does
-     * not reopen on rename).
+     * existing file logs a WARN and is still appended. After an external rename/replace, the writer
+     * thread reopens the configured path (#406) so new lines hit the new inode (and a newly created
+     * file gets {@code 0640} again).
      */
     static OutputStream openFile(Path path) throws IOException {
         Path absolute = path.toAbsolutePath();
@@ -158,12 +166,27 @@ final class AccessLog implements Runnable, AutoCloseable {
 
     /** @param capacity power of two; tests use a tiny queue to force drops */
     AccessLog(OutputStream out, boolean closeOut, AccessLogFormat format, int capacity) {
+        this(null, out, closeOut, format, capacity);
+    }
+
+    private AccessLog(Path path, OutputStream out, boolean closeOut, AccessLogFormat format, int capacity) {
         this.queue = new LogQueue(capacity);
+        this.path = path;
         this.out = out;
         this.closeOut = closeOut;
         this.format = format;
+        this.openedKey = path == null ? null : fileKey(path);
+        this.nextReopenCheckNanos = System.nanoTime() + REOPEN_CHECK_NANOS;
         this.thread = Thread.ofPlatform().daemon().name("access-log").unstarted(this);
         this.thread.start();
+    }
+
+    /** Asks the writer to reopen the configured path (no-op for stdout / injected streams). */
+    void requestReopen() {
+        if (this.path != null) {
+            this.reopenRequested = true;
+            LockSupport.unpark(this.thread);
+        }
     }
 
     boolean headers() {
@@ -193,7 +216,7 @@ final class AccessLog implements Runnable, AutoCloseable {
 
     @Override
     public void run() {
-        var buffered = new BufferedOutputStream(this.out, FLUSH_BYTES);
+        BufferedOutputStream buffered = new BufferedOutputStream(this.out, FLUSH_BYTES);
         long pending = 0;
         long flushedAt = System.nanoTime();
         try {
@@ -208,6 +231,12 @@ final class AccessLog implements Runnable, AutoCloseable {
                     }
                     if (this.stopped) {
                         break;
+                    }
+                    BufferedOutputStream next = maybeReopen(buffered, pending > 0);
+                    if (next != buffered) {
+                        pending = 0;
+                        flushedAt = System.nanoTime();
+                        buffered = next;
                     }
                     LockSupport.parkNanos(1_000_000L);
                     continue;
@@ -236,6 +265,53 @@ final class AccessLog implements Runnable, AutoCloseable {
                     System.err.println("WARN: closing access log: " + e);
                 }
             }
+        }
+    }
+
+    /**
+     * Writer-only. Detects an external rename/replace of {@link #path} (inode / file key changed, or
+     * the path is gone) and reopens via {@link #openFile}. Request threads never call this.
+     */
+    private BufferedOutputStream maybeReopen(BufferedOutputStream buffered, boolean hadPending)
+            throws IOException {
+        if (this.path == null || this.failed) {
+            return buffered;
+        }
+        boolean forced = this.reopenRequested;
+        long now = System.nanoTime();
+        if (!forced && now < this.nextReopenCheckNanos) {
+            return buffered;
+        }
+        this.nextReopenCheckNanos = now + REOPEN_CHECK_NANOS;
+        this.reopenRequested = false;
+        boolean exists = Files.exists(this.path, LinkOption.NOFOLLOW_LINKS);
+        Object current = exists ? fileKey(this.path) : null;
+        boolean missing = !exists;
+        // When the FS has no file keys, only forced reopen or a missing path triggers reopen.
+        boolean replaced = exists && this.openedKey != null && current != null && !this.openedKey.equals(current);
+        if (!forced && !missing && !replaced) {
+            return buffered;
+        }
+        if (hadPending) {
+            buffered.flush();
+        }
+        // Drop the buffer without writing through a second close of an already-replaced stream.
+        try {
+            this.out.close();
+        } catch (IOException e) {
+            System.err.println("WARN: closing rotated access log: " + e);
+        }
+        this.out = openFile(this.path);
+        this.openedKey = fileKey(this.path);
+        return new BufferedOutputStream(this.out, FLUSH_BYTES);
+    }
+
+    private static Object fileKey(Path path) {
+        try {
+            return Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS).fileKey();
+        } catch (IOException | UnsupportedOperationException e) {
+            return null;
         }
     }
 

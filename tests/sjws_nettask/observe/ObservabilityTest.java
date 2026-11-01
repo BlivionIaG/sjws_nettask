@@ -672,6 +672,39 @@ class ObservabilityTest {
         return new String(raw, charset);
     }
 
+    @Test
+    void reopensAfterExternalRotation(@TempDir Path dir) throws Exception {
+        Path path = dir.resolve("access.log");
+        try (var log = AccessLog.start(path.toString(), AccessLogFormat.COMMON)) {
+            log.offer("127.0.0.1", "GET", "/", "HTTP/1.1", 200, 3, 0, null, null);
+            awaitLog(() -> Files.exists(path) && Files.size(path) > 0);
+            Path rotated = dir.resolve("access.log.1");
+            Files.move(path, rotated);
+            log.requestReopen();
+            awaitLog(() -> Files.exists(path));
+            log.offer("127.0.0.1", "GET", "/after", "HTTP/1.1", 200, 5, 0, null, null);
+            awaitLog(() -> Files.exists(path) && Files.readString(path).contains("/after"));
+            assertTrue(Files.readString(rotated).contains("GET / "), rotated + " kept pre-rotate lines");
+            assertFalse(Files.readString(path).contains("GET / "), "new file should not have old lines");
+            assertTrue(Files.readString(path).contains("GET /after"), Files.readString(path));
+            if (path.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+                var perms = Files.getPosixFilePermissions(path);
+                assertFalse(perms.contains(java.nio.file.attribute.PosixFilePermission.OTHERS_READ), perms.toString());
+            }
+        }
+    }
+
+    private static void awaitLog(java.util.concurrent.Callable<Boolean> ready) throws Exception {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            if (Boolean.TRUE.equals(ready.call())) {
+                return;
+            }
+            Thread.sleep(5);
+        }
+        fail("timed out waiting for access log condition");
+    }
+
     private static String line(AccessLogFormat format, int status, long bytes, long nanos, String referer, String ua) {
         return new String(AccessLine.format(format, T0, AccessLine.clfTime(T0), "127.0.0.1", "GET", "/a\"b", "HTTP/1.1",
                 status, bytes, nanos, referer, ua), StandardCharsets.UTF_8);
