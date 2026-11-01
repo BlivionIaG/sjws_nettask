@@ -28,6 +28,22 @@ Off-mode class-load proof (credit / StreamStats stay unloaded when credit is off
 `ClassLoadTest` and, when new classes are added on the credit-off path, attach a
 `-Xlog:class+load` excerpt from a flag-off rr run to the PR body.
 
+
+## Generator CPU / self_loaded (inceptor 2026-10-30 18:46)
+
+A window is **valid only if** the generator's CPU stays at or below **80% of its cores**
+(`self_loaded` when `client_cpu_pct_of_wall > 80 × gen_cores`, or `load1_post ≥ 4`).
+`agg.py` recomputes this from `result.json` (does not trust a stale `self_loaded` flag alone).
+
+| Mode | Gen CPUs | Server CPUs | `GEN_CORES` | Sat limit |
+|------|----------|-------------|-------------|-----------|
+| (A) default | `0-1` | `2-7` | 2 | 160% of wall |
+| (B) fallback (pre-approved if (A) cannot unsat 1k) | `0-2` (multi-process OK) | `3-7` | 3 | 240% of wall |
+
+(B) is a **disclosed rule change** for #299 / this gate when used. Thresholds (§13) unchanged.
+`StreamLoad` lean keep-alive HTTP/1.1 POST (`--lean-http`, default on) is harness-only.
+
+
 ## Agents
 
 `StreamHttp.MAX_SESSIONS_PER_AGENT` is 64, so the harness mints `NAGENTS` (default 20) bearer

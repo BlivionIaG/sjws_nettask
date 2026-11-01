@@ -31,8 +31,23 @@ def main():
         n = r.get("chunk_samples") or 0
         p99 = r.get("p99_us")
         pre = r.get("load1_pre", 99)
-        # Architecture 2026-10-30: self_loaded (incl. generator-CPU sat) does not count as a pass
-        self_loaded = bool(r.get("self_loaded"))
+        # Architecture 2026-10-30 + inceptor 2026-10-30 18:46:
+        # self_loaded if load1_post>=4 OR gen CPU > 80% of its cores (recomputed here so old
+        # result.json with genSatPct=180 still get the disclosed rule).
+        gen_cores = int(r.get("gen_cores") or 2)
+        sat_lim = float(r.get("gen_sat_limit_pct") or (80.0 * gen_cores))
+        cpu = r.get("client_cpu_pct_of_wall")
+        try:
+            cpu_f = float(cpu) if cpu is not None else float("nan")
+        except (TypeError, ValueError):
+            cpu_f = float("nan")
+        load1_post = r.get("load1_post")
+        try:
+            load1_post_f = float(load1_post) if load1_post is not None else 0.0
+        except (TypeError, ValueError):
+            load1_post_f = 0.0
+        gen_sat = (cpu_f == cpu_f) and cpu_f > sat_lim  # nan-safe
+        self_loaded = bool(r.get("self_loaded")) or gen_sat or load1_post_f >= 4.0
         # Any retry or refused connection ⇒ INVALID (inceptor+Architecture; stricter wins).
         ptr = int(r.get("producer_transport_retries") or 0)
         ccr = int(r.get("consumer_connect_retries") or 0)
@@ -69,7 +84,10 @@ def main():
             "p90_us": r.get("p90_us"),
             "p99_us": p99,
             "samples": n,
-            "self_loaded": r.get("self_loaded"),
+            "self_loaded": self_loaded,
+            "gen_cores": gen_cores,
+            "gen_sat_limit_pct": sat_lim,
+            "client_cpu_pct_of_wall": cpu_f,
             "stall_flag": r.get("stall_flag"),
             "credit_stalls": r.get("credit_stalls"),
             "hard_zeros": r.get("hard_zeros"),
