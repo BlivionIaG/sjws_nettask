@@ -32,10 +32,10 @@ def main():
         p99 = r.get("p99_us")
         pre = r.get("load1_pre", 99)
         # Architecture 2026-10-30 + inceptor 2026-10-30 18:46:
-        # self_loaded if load1_post>=4 OR gen CPU > 80% of its cores (recomputed here so old
-        # result.json with genSatPct=180 still get the disclosed rule).
+        # self_loaded if load1_post>=4 OR gen CPU > 80% of its cores. Always derive the limit
+        # from 80 × gen_cores — never trust a recorded gen_sat_limit_pct override (Codex P2 #459).
         gen_cores = int(r.get("gen_cores") or 2)
-        sat_lim = float(r.get("gen_sat_limit_pct") or (80.0 * gen_cores))
+        sat_lim = 80.0 * gen_cores
         cpu = r.get("client_cpu_pct_of_wall")
         try:
             cpu_f = float(cpu) if cpu is not None else float("nan")

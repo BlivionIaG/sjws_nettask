@@ -30,23 +30,53 @@ public class StreamLoad {
   static final long DRAIN_SLACK_MS = 15_000L;
 
   /**
-   * Fixed log2-µs histogram (HdrHistogram-style). No per-sample allocation.
-   * Buckets: floor(log2(us)) clipped to [0, 63]; count + sum for p50/p99 from cumulative.
+   * Fixed log2-µs histogram with linear sub-buckets (HdrHistogram-style).
+   * SUB_BITS=6 → 64 steps per octave so §13 thresholds (p99<1000 / ceil 1500 µs) are not
+   * crossed by a coarse power-of-two midpoint (Codex P2 on #459).
    */
   static final class LatBag {
-    static final int BUCKETS = 64;
+    static final int SUB_BITS = 6;
+    static final int SUB = 1 << SUB_BITS; // 64
+    static final int BUCKETS = 64 * SUB;  // 4096
     static final ThreadLocal<long[]> TL = ThreadLocal.withInitial(() -> new long[BUCKETS]);
     static final ConcurrentLinkedQueue<long[]> ALL = new ConcurrentLinkedQueue<>();
     static final ThreadLocal<Boolean> REG = ThreadLocal.withInitial(() -> Boolean.FALSE);
     static final LongAdder TOTAL = new LongAdder();
+
+    static int index(long us) {
+      if (us < 1) us = 1;
+      int exp = 63 - Long.numberOfLeadingZeros(us);
+      if (exp < SUB_BITS) {
+        int b = (int) us;
+        return b < BUCKETS ? b : BUCKETS - 1;
+      }
+      long base = 1L << exp;
+      int sub = (int) (((us - base) << SUB_BITS) >> exp);
+      if (sub >= SUB) sub = SUB - 1;
+      if (sub < 0) sub = 0;
+      int b = exp * SUB + sub;
+      return b < BUCKETS ? b : BUCKETS - 1;
+    }
+
+    /**
+     * Upper edge of bucket {@code b} in µs. Percentiles use the high edge so §13 gates
+     * (p99<1000 / ceil 1500) cannot false-pass on a mid-bucket under-estimate.
+     */
+    static double upper(int b) {
+      int exp = b / SUB;
+      int sub = b % SUB;
+      if (exp < SUB_BITS) return Math.max(1.0, b + 1);
+      long base = 1L << exp;
+      long width = base >> SUB_BITS;
+      if (width < 1) width = 1;
+      return base + (sub + 1.0) * width;
+    }
+
     static void add(double us) {
       long[] a = TL.get();
       if (!REG.get()) { ALL.add(a); REG.set(Boolean.TRUE); }
       long u = us < 1 ? 1 : (long) us;
-      int b = 63 - Long.numberOfLeadingZeros(u);
-      if (b < 0) b = 0;
-      if (b >= BUCKETS) b = BUCKETS - 1;
-      a[b]++;
+      a[index(u)]++;
       TOTAL.increment();
     }
     /** Unused after pctFromBuckets; kept for API compat. */
@@ -63,9 +93,9 @@ public class StreamLoad {
       long seen = 0;
       for (int b = 0; b < BUCKETS; b++) {
         seen += sum[b];
-        if (seen >= need) return b == 0 ? 1.0 : (1L << b) * 1.5;
+        if (seen >= need) return upper(b);
       }
-      return (1L << (BUCKETS - 1)) * 1.5;
+      return upper(BUCKETS - 1);
     }
     static long count() {
       long n = 0;
@@ -123,6 +153,7 @@ public class StreamLoad {
     AtomicBoolean producersStop = new AtomicBoolean();
     AtomicBoolean consumersStop = new AtomicBoolean();
     AtomicBoolean inTeardown = new AtomicBoolean();
+    AtomicBoolean measureActive = new AtomicBoolean();
     AtomicLong requests = new AtomicLong();
     AtomicLong credit429 = new AtomicLong();
     AtomicLong producerTransportRetries = new AtomicLong();
@@ -131,7 +162,7 @@ public class StreamLoad {
 
     // Warmup (same group count; fewer streams)
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w",
-        producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
+        producersStop, consumersStop, inTeardown, measureActive, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
     bytesRx.reset(); LatBag.clearAll(); creditWaits.clear(); measureErr.clear(); teardownErr.clear();
     requests.set(0); credit429.set(0);
@@ -167,7 +198,7 @@ public class StreamLoad {
 
     long t0 = System.nanoTime();
     int[] streamToGroup = wave(http, args, tokens, args.streams, args.secs, "g",
-        producersStop, consumersStop, inTeardown, bytesRx, creditWaits,
+        producersStop, consumersStop, inTeardown, measureActive, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
     double wall = (System.nanoTime() - t0) / 1e9;
     cpuMon.join(2000);
@@ -235,12 +266,14 @@ public class StreamLoad {
 
   static int[] wave(HttpClient http, Args args, List<String> tokens, int n, double duration, String label,
       AtomicBoolean producersStop, AtomicBoolean consumersStop, AtomicBoolean inTeardown,
+      AtomicBoolean measureActive,
       LongAdder bytesRx, ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429,
       AtomicLong producerTransportRetries, AtomicLong consumerConnectRetries,
       AtomicLong groupOpenRefusals) throws Exception {
     producersStop.set(false); consumersStop.set(false); inTeardown.set(false);
+    measureActive.set(false);
     int gCount = Math.max(1, Math.min(args.groups > 0 ? args.groups : n, n));
     int[] mapping = new int[n];
     List<Thread> threads = new ArrayList<>(n * 2);
@@ -251,7 +284,7 @@ public class StreamLoad {
       String tok = tokens.get(i % tokens.size());
       int idx = i;
       threads.add(Thread.startVirtualThread(() -> {
-        try { consumer(http, args, tok, pool, consumersStop, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
+        try { consumer(http, args, tok, pool, consumersStop, inTeardown, measureActive, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
@@ -260,7 +293,13 @@ public class StreamLoad {
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
       }));
     }
-    Thread.sleep((long)(duration * 1000));
+    // Account bytes/latency only during the nominal measure interval (not admit ramp / teardown).
+    measureActive.set(true);
+    try {
+      Thread.sleep((long)(duration * 1000));
+    } finally {
+      measureActive.set(false);
+    }
     inTeardown.set(true);
     producersStop.set(true);
     Thread.sleep(2000);
@@ -324,6 +363,8 @@ public class StreamLoad {
             if (lean != null) {
               LeanResp lr = lean.post(path, token, frame);
               sc = lr.status; body = lr.body; raHdr = lr.retryAfter;
+              if (lr.recoveredAttempts > 0 && !inTeardown.get())
+                producerTransportRetries.addAndGet(lr.recoveredAttempts);
             } else {
               HttpResponse<byte[]> r = post(http, url, token, frame);
               sc = r.statusCode(); body = r.body();
@@ -377,6 +418,8 @@ public class StreamLoad {
           if (lean != null) {
             LeanResp lr = lean.post(path, token, last);
             sc = lr.status; raHdr = lr.retryAfter;
+            if (lr.recoveredAttempts > 0 && !inTeardown.get())
+              producerTransportRetries.addAndGet(lr.recoveredAttempts);
           } else {
             HttpResponse<byte[]> r = post(http, url, token, last);
             sc = r.statusCode();
@@ -468,7 +511,7 @@ public class StreamLoad {
   }
 
   static void consumer(HttpClient http, Args args, String token, String pool,
-      AtomicBoolean stop, AtomicBoolean inTeardown, LongAdder bytesRx,
+      AtomicBoolean stop, AtomicBoolean inTeardown, AtomicBoolean measureActive, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals) throws Exception {
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
@@ -508,8 +551,8 @@ public class StreamLoad {
         HttpResponse<InputStream> get = http.send(gb.build(), HttpResponse.BodyHandlers.ofInputStream());
         if (get.statusCode() != 200) throw new IOException("replies " + get.statusCode());
         try (InputStream in = get.body()) {
-          if ("sse".equals(args.accept)) readSse(in, stop, bytesRx);
-          else readBinary(in, stop, bytesRx);
+          if ("sse".equals(args.accept)) readSse(in, stop, measureActive, bytesRx);
+          else readBinary(in, stop, measureActive, bytesRx);
         }
         return;
       } catch (Exception e) {
@@ -527,7 +570,15 @@ public class StreamLoad {
     if (last != null) throw last;
   }
 
-  static void readBinary(InputStream in, AtomicBoolean stop, LongAdder bytesRx) throws IOException {
+
+  /** Strip the optional single space after SSE "data:" (StreamHttp emits "data: "). */
+  static String sseDataField(String line) {
+    String v = line.substring(5);
+    if (!v.isEmpty() && v.charAt(0) == ' ') v = v.substring(1);
+    return v;
+  }
+
+  static void readBinary(InputStream in, AtomicBoolean stop, AtomicBoolean measureActive, LongAdder bytesRx) throws IOException {
     byte[] hdr = new byte[FRAME_HDR];
     while (!stop.get()) {
       if (!readFully(in, hdr)) break;
@@ -545,20 +596,22 @@ public class StreamLoad {
       if (payload.length >= CHUNK_HDR + 20) {
         try {
           long emit = Long.parseLong(new String(payload, CHUNK_HDR, 20, StandardCharsets.US_ASCII));
-          LatBag.add((recv - emit) / 1e3);
-          bytesRx.add(payload.length - CHUNK_HDR);
+          if (measureActive.get()) {
+            LatBag.add((recv - emit) / 1e3);
+            bytesRx.add(payload.length - CHUNK_HDR);
+          }
         } catch (NumberFormatException ignored) {}
       }
       if ((payload[CHUNK_HDR - 1] & LAST) != 0 || (flags & LAST) != 0) break;
     }
   }
 
-  static void readSse(InputStream in, AtomicBoolean stop, LongAdder bytesRx) throws IOException {
+  static void readSse(InputStream in, AtomicBoolean stop, AtomicBoolean measureActive, LongAdder bytesRx) throws IOException {
     BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
     String line; StringBuilder data = new StringBuilder(); String event = "";
     while (!stop.get() && (line = br.readLine()) != null) {
       if (line.startsWith("event:")) event = line.substring(6).trim();
-      else if (line.startsWith("data:")) data.append(line.substring(5)).append('\n');
+      else if (line.startsWith("data:")) data.append(sseDataField(line)).append('\n');
       else if (line.isEmpty()) {
         if ("end".equals(event)) break;
         if ("chunk".equals(event) || data.length() > 0) {
@@ -567,8 +620,10 @@ public class StreamLoad {
             try {
               long emit = Long.parseLong(d.substring(0, 20).trim());
               long recv = System.nanoTime();
-              LatBag.add((recv - emit) / 1e3);
-              bytesRx.add(d.length());
+              if (measureActive.get()) {
+                LatBag.add((recv - emit) / 1e3);
+                bytesRx.add(d.length());
+              }
             } catch (NumberFormatException ignored) {}
           }
         }
@@ -765,6 +820,7 @@ public class StreamLoad {
 
     /** POST path with body; returns status + body. Auth bearer + CT fixed. */
     LeanResp post(String path, String token, byte[] body) throws IOException {
+      int recovered = 0;
       for (int attempt = 0; attempt < 2; attempt++) {
         try {
           if (sock == null || sock.isClosed() || !sock.isConnected()) reconnect();
@@ -778,10 +834,12 @@ public class StreamLoad {
           out.write(h);
           out.write(body);
           out.flush();
-          return readResponse();
+          LeanResp r = readResponse();
+          return recovered == 0 ? r : new LeanResp(r.status, r.body, r.retryAfter, recovered);
         } catch (IOException e) {
           closeQuiet();
           if (attempt == 1) throw e;
+          recovered++; // failed attempt recovered by reconnect (Codex P2 #459)
         }
       }
       throw new IOException("lean post failed");
@@ -861,7 +919,12 @@ public class StreamLoad {
     final int status;
     final byte[] body;
     final String retryAfter;
-    LeanResp(int s, byte[] b, String ra) { status = s; body = b; retryAfter = ra; }
+    /** IOExceptions recovered inside LeanHttp.post by reconnecting (counted as transport retries). */
+    final int recoveredAttempts;
+    LeanResp(int s, byte[] b, String ra) { this(s, b, ra, 0); }
+    LeanResp(int s, byte[] b, String ra, int recovered) {
+      status = s; body = b; retryAfter = ra; recoveredAttempts = recovered;
+    }
   }
 
 
