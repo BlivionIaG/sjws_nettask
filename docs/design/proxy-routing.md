@@ -260,7 +260,7 @@ Before phase 2, `Request(method, target, RequestHeaders)` carried only the stati
 |---|---|
 | Request body | `Request.body(): RequestBody` with `RequestBody.EMPTY` default. It is a pull-style `InputStream`-like source with known/unknown length. Only HTTP/1.1 attaches one today, for a `Content-Length` request (`Http1Connection.BodyReader`). The static handler ignores it, and the transport closes the connection if the handler leaves any of it unread. |
 | Client address | `Request.peer(): InetSocketAddress` (nullable in tests), plus `secure(): boolean` for proto and `protocol()`. |
-| Arbitrary headers | `RequestHeaders.fields()` (a lower-cased map) and `all(): List<Map.Entry<String,String>>`. The existing typed fields stay as they are. HTTP/1.1 always fills the map, HTTP/3 only when a filter chain or a non-static terminal is installed at startup, and HTTP/2 leaves it empty. |
+| Arbitrary headers | `RequestHeaders.fields()` (a lower-cased map) and `all(): List<Map.Entry<String,String>>`. The existing typed fields stay as they are. HTTP/1.1 always fills the map, HTTP/3 only when a filter chain or a non-static terminal is installed at startup, and HTTP/2 (h2/h2c streams) when `attachBodies` is on (empty on the static-only path and on the HTTP/1.1 ALPN fallback). |
 | Streaming response body | A new `Body.Stream(long lengthOrMinus1, Source)` variant. Writers use chunked encoding (HTTP/1.1, or close-delimited for 1.0) or DATA frames (HTTP/2 and HTTP/3) when the length is unknown. An abort on source error is never a short response. |
 
 All four are additive, with existing constructors kept, so the static path and existing tests are unchanged. They landed
