@@ -99,13 +99,15 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         return false;
     }
 
-    /** Topics with key compaction; a bad list is logged and ignored as a whole. */
+    /**
+     * Topics with key compaction. A bad or reserved entry fails startup ({@link OptionalModule.Refused})
+     * naming {@link #COMPACTION_TOPICS_PROPERTY} and the offending entry; the list is never emptied quietly.
+     */
     static java.util.Set<String> compactionTopics(String v) {
         try {
             return LogCompaction.parseTopics(v);
         } catch (IllegalArgumentException e) {
-            System.err.println("WARN: " + e.getMessage());
-            return java.util.Set.of();
+            throw new OptionalModule.Refused(COMPACTION_TOPICS_PROPERTY + ": " + e.getMessage());
         }
     }
 
@@ -120,13 +122,16 @@ public final class MessagingModule implements OptionalModule, HandlerContributor
         }
     }
 
-    /** Per-topic overrides; a bad list is logged and ignored as a whole. */
+    /**
+     * Per-topic durability overrides. A bad or reserved entry fails startup ({@link OptionalModule.Refused})
+     * naming {@link #TOPIC_DURABILITY_PROPERTY} and the offending entry; other overrides in the same list are
+     * not dropped (the whole list is refused).
+     */
     static java.util.Map<String, Durability> topicDurability(String v) {
         try {
             return LogTopics.parseTopicDurability(v);
         } catch (IllegalArgumentException e) {
-            System.err.println("WARN: " + e.getMessage());
-            return java.util.Map.of();
+            throw new OptionalModule.Refused(TOPIC_DURABILITY_PROPERTY + ": " + e.getMessage());
         }
     }
 

@@ -35,6 +35,7 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import sjws_nettask.OptionalModule;
 import sjws_nettask.core.Request;
 import sjws_nettask.messaging.ledger.Durability;
 import sjws_nettask.messaging.ledger.RecordBatch;
@@ -238,8 +239,20 @@ class LogCompactionTest {
         assertEquals("ab", keyOf(kv("ab", "zz")));
         assertEquals("", keyOf(kv("", "zz")));
         assertEquals(Set.of("a", "b.c"), LogCompaction.parseTopics(" a, b.c ,,"));
+        assertEquals(Set.of("orders", "events"), MessagingModule.compactionTopics("orders, events"));
         assertThrows(IllegalArgumentException.class, () -> LogCompaction.parseTopics("ok,bad/name"));
-        assertEquals(Set.of(), MessagingModule.compactionTopics("bad/name"));
+        assertThrows(IllegalArgumentException.class, () -> LogCompaction.parseTopics("__evil"));
+        assertThrows(IllegalArgumentException.class, () -> LogCompaction.parseTopics("ok,__offsets"));
+
+        var reserved = assertThrows(OptionalModule.Refused.class,
+                () -> MessagingModule.compactionTopics("orders,__offsets"));
+        assertTrue(reserved.getMessage().contains(MessagingModule.COMPACTION_TOPICS_PROPERTY), reserved.getMessage());
+        assertTrue(reserved.getMessage().contains("__offsets"), reserved.getMessage());
+
+        var invalid = assertThrows(OptionalModule.Refused.class,
+                () -> MessagingModule.compactionTopics("orders,bad/name"));
+        assertTrue(invalid.getMessage().contains(MessagingModule.COMPACTION_TOPICS_PROPERTY), invalid.getMessage());
+        assertTrue(invalid.getMessage().contains("bad/name"), invalid.getMessage());
     }
 
     // --- crash at each step of the copy, fsync, marker, swap protocol ---
