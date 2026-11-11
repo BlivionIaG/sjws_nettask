@@ -547,13 +547,25 @@ final class AccessLog implements Runnable, AutoCloseable {
         // Unpark first: FileChannel write/flush is interruptible, and aborting a shutdown
         // flush would drop the last queued lines. Interrupt only if the join times out.
         LockSupport.unpark(this.thread);
-        try {
-            this.thread.join(2_000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        // Already-interrupted (or mid-join interrupted) closers must still wait out the flush.
+        boolean interrupted = Thread.interrupted();
+        long deadline = System.nanoTime() + 2_000_000_000L;
+        while (this.thread.isAlive()) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                break;
+            }
+            try {
+                this.thread.join(remaining / 1_000_000L, (int) (remaining % 1_000_000L));
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
         }
         if (this.thread.isAlive()) {
             this.thread.interrupt();
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 

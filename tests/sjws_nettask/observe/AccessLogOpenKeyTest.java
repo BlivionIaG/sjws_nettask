@@ -331,6 +331,23 @@ final class AccessLogOpenKeyTest {
     }
 
     @Test
+    void closeWithInterruptedCallerFlushesAcceptedLines() throws Exception {
+        Path path = dir.resolve("close-intr-flush.log");
+        var log = AccessLog.start(path.toString(), AccessLogFormat.COMMON);
+        int n = 4096;
+        for (int i = 0; i < n; i++) {
+            log.offer("127.0.0.1", "GET", "/l" + i, "HTTP/1.1", 200, 1, 0, null, null);
+        }
+        long accepted = n - log.dropped();
+        assertTrue(accepted > 0, "queue must have accepted some lines");
+        Thread.currentThread().interrupt();
+        log.close();
+        assertTrue(Thread.interrupted(), "close must preserve the caller interrupt status");
+        long written = Files.exists(path) ? Files.readString(path).lines().count() : 0;
+        assertEquals(accepted, written, "accepted lines must be flushed even if close() is interrupted");
+    }
+
+    @Test
     void symlinkLoopFailsAndReopenKeepsPreviousStream() throws Exception {
         assumePosix(dir);
         Path a = dir.resolve("loop-a.log");
@@ -367,7 +384,7 @@ final class AccessLogOpenKeyTest {
         Assumptions.assumeTrue(Files.isDirectory(Path.of("/proc/self/fd")), "procfs required");
         Set<String> beforePipes = pipeTargets();
         Path dest = dir.resolve("from-pipe.log");
-        Process cat = new ProcessBuilder("cat").redirectOutput(dest.toFile()).start();
+        Process cat = new ProcessBuilder("/bin/cat").redirectOutput(dest.toFile()).start();
         try {
             Path fdLink = newPipeFd(beforePipes);
             Assumptions.assumeTrue(fdLink != null, "could not find the cat pipe write fd");
