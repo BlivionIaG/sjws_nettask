@@ -71,9 +71,15 @@ LABELS=(before after after before)
 echo "### h1 wrk -t4 -c64 -d10s --latency (ABBA)"
 for i in 0 1 2 3; do
   gate || exit 2
-  srv "${ORDER[$i]}" || continue
-  wrk -t2 -c16 -d2s http://127.0.0.1:$H1/1k.bin >/dev/null
-  echo "${LABELS[$i]} slot$i wrk: $(wrk -t4 -c64 -d10s --latency http://127.0.0.1:$H1/1k.bin | grep -E 'Requests/sec| 50%| 99%' | tr -s ' ' | tr '\n' ' ')"
+  srv "${ORDER[$i]}" || { echo "SERVER START FAIL slot$i ${LABELS[$i]}" >&2; exit 1; }
+  wrk -t2 -c16 -d2s http://127.0.0.1:$H1/1k.bin >/dev/null || { echo "${LABELS[$i]} slot$i wrk warmup FAIL" >&2; exit 1; }
+  wrk_out=$(wrk -t4 -c64 -d10s --latency http://127.0.0.1:$H1/1k.bin) || { echo "${LABELS[$i]} slot$i wrk FAIL" >&2; exit 1; }
+  metrics=$(printf '%s\n' "$wrk_out" | grep -E 'Requests/sec| 50%| 99%' | tr -s ' ' | tr '\n' ' ')
+  if [[ -z "$metrics" ]]; then
+    echo "${LABELS[$i]} slot$i wrk FAIL (no metrics)" >&2
+    exit 1
+  fi
+  echo "${LABELS[$i]} slot$i wrk: $metrics"
   end_load=$(cut -d' ' -f1 /proc/loadavg)
   python3 -c "import sys; sys.exit(0 if float('$end_load') < 4 else 1)" || echo "  [end_load1=$end_load NOISY]"
   stop
@@ -81,7 +87,7 @@ done
 echo "### h2/h2c GET static via SjwsServer main (ABBA)"
 for i in 0 1 2 3; do
   gate || exit 2
-  srv "${ORDER[$i]}" || continue
+  srv "${ORDER[$i]}" || { echo "SERVER START FAIL slot$i ${LABELS[$i]}" >&2; exit 1; }
   # Gate each measurement independently (Codex P1): h2c then TLS, each with ending load.
   # Architecture N1: a FAIL from measure_h2 fails the script (no || true).
   measure_h2 "${LABELS[$i]}" "$i" "h2c-GET" "http://127.0.0.1:$H2C/1k.bin" || exit 1
