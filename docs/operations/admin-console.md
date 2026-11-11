@@ -7,13 +7,24 @@ admin see its status and configuration, tail logs, and start, stop or reload it:
 
 It takes the server's option flags and `WEB_SERVER_*` variables (not a `--config` file, and not the daemon, role and bootstrap options), plus its own: `--log-file=PATH` (a file
 shown in the logs view, e.g. redirected output), `--no-color`, `--no-autostart`. Commands (letter +
-Enter): `s` start, `x` stop, `r` reload (re-reads arguments and environment; an invalid config
+Enter): `s` start, `x` stop, `n` drain, `r` reload (re-reads arguments and environment; an invalid config
 leaves the server running, a config that fails to bind restores the previous one), `v`/`c`/`l`
 status/config/logs views, Enter refresh, `h` help, `q` quit (stops the server). The console talks to
 the server only through `sjws_nettask.admin.ServerControl`, so another implementation (e.g. one
 controlling a daemon) can be plugged in. `clusterStatus()` is null until a control plane attaches
 a `ClusterBoard`; the status view then shows cluster requests per second, p99, errors, drifted
 nodes, and per-route totals.
+
+## Drain
+
+`n` explains what a drain does. Typing `drain confirm` starts one (#381): the server stops
+accepting, in-flight work finishes up to the HA drain timeout, and then the server closes. With HA
+detached, a drain is a graceful close. The drain runs in the background, so the console stays
+responsive. The status view shows the operation id (`drain-N`) as `DRAINING`, `DRAINED`, or
+`FAILED` with the reason. A second `drain confirm` while one runs returns the same operation.
+`s` and `r` are refused until it ends, and `x` still stops the server at once. A drain cannot be
+cancelled, because HA's drain lifecycle has no cancel. Failover is not available from this
+console: it stays behind HA's fencing path.
 
 `r` restarts the server with the re-evaluated configuration and rolls back if that cannot start. The
 new server fails to start when, for example, its port cannot be bound:
