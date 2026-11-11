@@ -467,6 +467,13 @@ A request without the key (no address, or no header) shares one extra bucket. Th
 `rate-limit` filter type uses this same table. Its `capacity` is the burst and
 `refill-per-second` is the steady rate; `max-keys` only sizes the table.
 
+A later v2 can split a named global limit across ready gateways (`share = rate / ready count`,
+same split for burst). The control plane publishes the per-node share when membership changes;
+this server only applies a share it is given. That API is not in this tree, and there is no
+config flag that enables it. Until it lands, every `rate_limit` stays local. When a share *is*
+applied, a later missing snapshot keeps the last share; a node that has never received a share
+fails closed (429) rather than falling back to the full local rate. See design §13.
+
 Weighted and canary routes list `backends` instead of `proxy` (a plain `proxy:` route is unchanged):
 
 ```yaml
