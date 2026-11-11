@@ -39,6 +39,14 @@ class ActiveHealthTest {
         assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/", "POST", S, S, S));
         assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/", "GET", Duration.ZERO, S, S));
         assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/", "GET", S, Duration.ZERO, S));
+        assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/", "GET", S, S, Duration.ZERO));
+        assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/", "GET", Duration.ofSeconds(-1), S, S));
+        assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/", "GET", S, S, null));
+        assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("", "GET", S, S, S));
+        assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/#x", "GET", S, S, S));
+        assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/a\\b", "GET", S, S, S));
+        assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/\u007f", "GET", S, S, S));
+        assertThrows(IllegalArgumentException.class, () -> new ActiveHealth("/\t", "GET", S, S, S));
         assertThrows(NullPointerException.class, () -> new ActiveHealth(null, "GET", S, S, S));
     }
 

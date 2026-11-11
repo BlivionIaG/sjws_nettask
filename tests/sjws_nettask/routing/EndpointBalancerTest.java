@@ -530,4 +530,41 @@ class EndpointBalancerTest {
         assertEquals(40, counts.getOrDefault("a", 0) + counts.getOrDefault("b", 0), counts.toString());
     }
 
+    @Test
+    void publicCtorsAndClosedTicksAndDeadProbes() throws Exception {
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(200), Duration.ofSeconds(1), 1024, "http",
+                null));
+        var src = new StaticUpstreamSource(set(1, null, ep(0, 1)));
+        var plain = new EndpointBalancer(src, pools, null, null);
+        this.balancers.add(plain);
+        assertFalse(plain.hasActiveProbes());
+        assertNull(plain.poolOf("missing:1"));
+
+        var live = new EndpointBalancer(new StaticUpstreamSource(set(1, null, ep(0, 1))), pools, null, null,
+                testHealth());
+        this.balancers.add(live);
+        assertTrue(live.hasActiveProbes());
+        live.close();
+        live.probeTick(); // closed: no-op
+
+        var o = new EndpointBalancer.Outlier(1, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        var deadEp = dead();
+        var deadB = balancer(new StaticUpstreamSource(set(1, null, deadEp)), null, o, Duration.ZERO, testHealth());
+        this.now.addAndGet(20_000_000_000L);
+        deadB.probeTick(); // first tick only staggers the first in-rotation probe
+        this.now.addAndGet(20_000_000_000L);
+        deadB.probeTick();
+        assertTrue(deadB.probesSent() >= 1);
+        assertEquals(1, deadB.ejectedCount());
+        assertTrue(deadB.poolOf(deadEp.authority()).health.ejected());
+
+        var healthy = balancer(new StaticUpstreamSource(set(1, null, ep(0, 1))), null, o, Duration.ZERO, testHealth());
+        assertThrows(IllegalArgumentException.class,
+                () -> healthy.poolOf(ep(0, 1).authority()).proxy.probe("GET", "health", Duration.ofSeconds(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> healthy.poolOf(ep(0, 1).authority()).proxy.probe("GET", null, Duration.ofSeconds(1)));
+        assertEquals(200, healthy.poolOf(ep(0, 1).authority()).proxy.probe("HEAD", "/", Duration.ofSeconds(1)));
+    }
+
 }
