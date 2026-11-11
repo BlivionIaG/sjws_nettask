@@ -120,6 +120,8 @@ class ContractTest {
         assertEquals("text/css; charset=utf-8", Mime.contentType(Mime.of("x.css")));
         assertEquals("image/png", Mime.contentType(Mime.of("x.png")));
         assertEquals(Mime.DEFAULT, Mime.of("noext"));
+        assertEquals("application/json", Mime.of("app.js.map"));
+        assertEquals("application/json; charset=utf-8", Mime.contentType(Mime.of("style.css.map")));
     }
 
     @Test
