@@ -74,7 +74,9 @@ jobs:
         run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
       - name: Install wrk
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wrk
+        run: |
+          tools/perf-gate/apt-retry.sh update -q
+          tools/perf-gate/apt-retry.sh install -y -q wrk
       - name: wrk standalone vs gateway-off
         if: runner.os == 'Linux'
         run: GATEWAY_BENCH_WARMUP=1s GATEWAY_BENCH_DURATION=3s GATEWAY_BENCH_WRK2=0 tools/gateway-bench.sh

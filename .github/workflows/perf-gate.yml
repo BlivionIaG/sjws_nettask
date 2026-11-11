@@ -48,7 +48,9 @@ jobs:
             head/pom.xml
             base/pom.xml
       - name: Install wrk
-        run: sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q wrk
+        run: |
+          head/tools/perf-gate/apt-retry.sh update -q
+          head/tools/perf-gate/apt-retry.sh install -y -q wrk
       - name: Install wrk2
         run: |
           head/tools/perf-gate/install-wrk2.sh "$HOME/.local/bin/wrk2"

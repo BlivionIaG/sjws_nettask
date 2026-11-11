@@ -36,7 +36,9 @@ jobs:
       - name: Cluster harness scenarios
         run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
       - name: Install wrk
-        run: sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q wrk
+        run: |
+          tools/perf-gate/apt-retry.sh update -q
+          tools/perf-gate/apt-retry.sh install -y -q wrk
       - name: Install wrk2
         run: |
           tools/perf-gate/install-wrk2.sh "$HOME/.local/bin/wrk2"
