@@ -505,4 +505,34 @@ class LastGoodLifecycleCoverageTest {
         assertFalse(guard.pastMaxStaleness());
     }
 
+    @Test
+    void aSnapshotWithoutMaxStalenessDropsThePushedCeiling() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-ceiling"));
+        long now = System.currentTimeMillis();
+        long sixteenMinutesAgo = now - Duration.ofMinutes(16).toMillis();
+        var none = dir.resolve("ceiling-none.yaml");
+        Files.writeString(none, "schema: 1\nnode:\n  mode: data\n  state_dir: " + dir.resolve("c1").toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var guard = DataPlaneGuard.forDocument(ConfigLoader.load(new String[] {"--config=" + none}, Map.of()).document());
+        guard.applied(DataPlaneGuardTest.snapshot(2, sixteenMinutesAgo, now + 3_600_000L), true);
+        guard.pushedMaxStaleness(Duration.ofMinutes(15));
+        assertTrue(guard.pastMaxStaleness());
+        guard.pushedMaxStaleness(null);
+        assertFalse(guard.pastMaxStaleness(), "no local ceiling: only signed expiry applies");
+
+        var local = dir.resolve("ceiling-local.yaml");
+        Files.writeString(local, "schema: 1\nnode:\n  mode: data\n  max_staleness: 1h\n  state_dir: "
+                + dir.resolve("c2").toAbsolutePath() + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var withLocal = DataPlaneGuard.forDocument(ConfigLoader.load(new String[] {"--config=" + local}, Map.of()).document());
+        withLocal.applied(DataPlaneGuardTest.snapshot(2, sixteenMinutesAgo, now + 3_600_000L), true);
+        withLocal.pushedMaxStaleness(Duration.ofMinutes(15));
+        assertTrue(withLocal.pastMaxStaleness());
+        withLocal.pushedMaxStaleness(null);
+        assertFalse(withLocal.pastMaxStaleness(), "falls back to the local 1h ceiling");
+        withLocal.applied(DataPlaneGuardTest.snapshot(3, now - Duration.ofHours(2).toMillis(), now + 3_600_000L), true);
+        assertTrue(withLocal.pastMaxStaleness());
+        DataPlaneGuard.inactive().pushedMaxStaleness(Duration.ofMinutes(1));
+        assertFalse(DataPlaneGuard.inactive().pastMaxStaleness());
+    }
+
 }

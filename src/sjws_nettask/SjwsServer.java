@@ -799,10 +799,7 @@ public final class SjwsServer implements AutoCloseable {
             }
             syncCredentialQueryParamsFromConfig(published.snapshot().document());
             dataPlane().applied(snapshot, false);
-            var pushed = published.snapshot().document().node().maxStaleness();
-            if (pushed != null) {
-                dataPlane().maxStaleness(pushed);
-            }
+            dataPlane().pushedMaxStaleness(published.snapshot().document().node().maxStaleness());
             this.remoteApplied.set(true);
             this.restoredLastGood = snapshot;
             if (this.controlPlane instanceof sjws_nettask.cp.DataApply apply) {
@@ -875,10 +872,7 @@ public final class SjwsServer implements AutoCloseable {
                 }
                 persistLastGood(published.snapshot().document());
                 dataPlane().applied(snapshot, true);
-                var pushed = published.snapshot().document().node().maxStaleness();
-                if (pushed != null) {
-                    dataPlane().maxStaleness(pushed);
-                }
+                dataPlane().pushedMaxStaleness(published.snapshot().document().node().maxStaleness());
                 try {
                     bindContentPort();
                 } catch (IOException e) {

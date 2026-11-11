@@ -40,6 +40,8 @@ public final class DataPlaneGuard {
     private volatile LongSupplier clock;
     private volatile boolean injectedClock;
     private volatile long maxStalenessMs;
+    /** The ceiling from the local YAML; a pushed snapshot without one falls back to this. */
+    private final long localMaxStalenessMs;
     private volatile boolean controlPlaneUp;
     private volatile boolean hasLastGood;
     private volatile long expiresAtMillis;
@@ -50,6 +52,7 @@ public final class DataPlaneGuard {
     private DataPlaneGuard(boolean active, long maxStalenessMs, LongSupplier clock) {
         this.active = active;
         this.maxStalenessMs = maxStalenessMs;
+        this.localMaxStalenessMs = maxStalenessMs;
         this.clock = clock == null || clock == WALL_CLOCK ? WALL_CLOCK : clock;
         this.injectedClock = this.clock != WALL_CLOCK;
     }
@@ -106,7 +109,19 @@ public final class DataPlaneGuard {
         refreshStaleDeadline();
     }
 
-    /** Keep a process-local ceiling when a pushed snapshot does not name one. */
+    /**
+     * Ceiling from an applied snapshot. A snapshot that names none falls back to the local YAML
+     * ceiling, so a value pushed earlier does not outlive the snapshot that carried it.
+     */
+    public void pushedMaxStaleness(Duration pushed) {
+        if (!this.active) {
+            return;
+        }
+        this.maxStalenessMs = pushed == null ? this.localMaxStalenessMs : pushed.toMillis();
+        refreshStaleDeadline();
+    }
+
+    /** Sets the ceiling directly; {@code null} turns it off. */
     public void maxStaleness(Duration duration) {
         if (!this.active) {
             return;
