@@ -535,4 +535,30 @@ class LastGoodLifecycleCoverageTest {
         assertFalse(DataPlaneGuard.inactive().pastMaxStaleness());
     }
 
+    @Test
+    void remoteApplyUsesTheNodeStateDir() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-node-state"));
+        Files.writeString(html.resolve("index.html"), "ok");
+        var state = dir.resolve("node-state");
+        var elsewhere = dir.resolve("elsewhere-state");
+        var yaml = dir.resolve("node-state.yaml");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        long now = System.currentTimeMillis();
+        var keys = KeyRing.generate("online-1", now + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var apply = DataApply.open(keys, dir.resolve("node-state.pin"), state, System::currentTimeMillis);
+        var body = "schema: 1\nversion: 2\nnode:\n  mode: data\n  state_dir: " + elsewhere.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n";
+        var snap = DataReadinessTest.signYaml(keys, body, 2L, 1L, now, now + 3_600_000L);
+        try (var server = SjwsServer.start(loaded, null, false)) {
+            server.attachControlPlane(apply);
+            var result = server.applyRemote(snap);
+            assertTrue(result.applied(), result.errors().toString());
+            assertEquals(state.toAbsolutePath().normalize(),
+                    result.snapshot().document().stateDir().toAbsolutePath().normalize());
+            assertFalse(Files.exists(elsewhere));
+        }
+    }
+
 }

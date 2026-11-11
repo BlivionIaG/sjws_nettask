@@ -790,9 +790,7 @@ public final class SjwsServer implements AutoCloseable {
                 dataPlane().clearLastGood();
                 return false;
             }
-            var localStateDir = this.live.get().document().stateDir();
-            var published = applyEnvelope(snapshot, loaded.document(),
-                    localStateDir != null ? localStateDir : loaded.document().stateDir());
+            var published = applyEnvelope(snapshot, loaded.document());
             if (!published.applied()) {
                 dataPlane().clearLastGood();
                 return false;
@@ -859,7 +857,7 @@ public final class SjwsServer implements AutoCloseable {
                 var errors = loaded.errors().isEmpty() ? java.util.List.of("configuration rejected") : loaded.errors();
                 return ReloadResult.rejected(this.live.get(), errors);
             }
-            var published = applyEnvelope(snapshot, loaded.document(), loaded.document().stateDir());
+            var published = applyEnvelope(snapshot, loaded.document());
             // Last-good (signed envelope, floor, trust, and the config sibling) is written only in DATA mode.
             if (published.applied() && this.live.get().document().node().mode() != NodeSettings.Mode.DATA) {
                 apply.record(snapshot);
@@ -891,11 +889,12 @@ public final class SjwsServer implements AutoCloseable {
 
     /**
      * Applies a parsed envelope document under {@link #reloadLock}: adopts the envelope's schema,
-     * version and epoch, sets {@code stateDir}, then publishes. The caller has already verified
-     * the envelope.
+     * version and epoch, keeps this node's state dir, then publishes. The caller has already
+     * verified the envelope.
      */
-    private ReloadResult applyEnvelope(sjws_nettask.cp.SignedSnapshot snapshot, ConfigDocument document,
-            Path stateDir) {
+    private ReloadResult applyEnvelope(sjws_nettask.cp.SignedSnapshot snapshot, ConfigDocument document) {
+        var localStateDir = this.live.get().document().stateDir();
+        var stateDir = localStateDir != null ? localStateDir : document.stateDir();
         if (document.bundleVersion() != snapshot.version() || document.schemaVersion() != snapshot.schema()) {
             document = ConfigDocument.of(document.server(), document.acme(), document.routing(),
                     document.middleware(), document.access(), document.node(), snapshot.schema(),
