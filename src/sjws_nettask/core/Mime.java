@@ -19,7 +19,14 @@ package sjws_nettask.core;
 import java.util.Locale;
 import java.util.Map;
 
-/** File extension to media type, plus the charset rule for textual types. */
+/**
+ * File extension to media type, plus the charset rule for textual types.
+ * <p>
+ * {@code .map} (JavaScript/CSS source maps) is served as {@code application/json}. There is no
+ * IANA-registered type dedicated to source maps; {@code application/json} is the type browsers
+ * and tooling already expect, so this keeps the mapping from PR #9 rather than inventing
+ * {@code application/source-map} or falling back to {@code application/octet-stream}.
+ */
 public final class Mime {
 
     public static final String DEFAULT = "application/octet-stream";
@@ -35,7 +42,7 @@ public final class Mime {
             Map.entry("md", "text/markdown"),
             Map.entry("csv", "text/csv"),
             Map.entry("xml", "application/xml"),
-            Map.entry("map", "application/json"),
+            Map.entry("map", "application/json"), // source maps; see class javadoc
             Map.entry("webmanifest", "application/manifest+json"),
             Map.entry("avif", "image/avif"),
             Map.entry("bmp", "image/bmp"),
