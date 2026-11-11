@@ -48,8 +48,9 @@ Each `user:password` is hashed with SHA-256 when the filter is built; the raw pa
 kept. A presented credential is hashed once and compared with every stored hash. `realm`
 defaults to `sjws` and is quoted in `WWW-Authenticate: Basic realm="..."`. A miss, a missing
 header, a non-Basic scheme, or a malformed token is 401 with that challenge. The request path
-does no I/O. A control plane should prefer `users-file` (mode `0600`) or a sealed document over
-leaving passwords in a world-readable projection.
+does no I/O. A control-plane proposal must use `users-file`; inline `users` is refused with 400.
+Local config may still use inline `users` (a WARN points at the file form). Viewer reads mask
+any retained inline `users` values.
 
 ## jwt
 
@@ -79,10 +80,10 @@ The header must not carry `crit`, `jku`, `jwk`, `x5u` or `x5c`. `typ`, when pres
 must name one. The signature is checked before the claims. A bad token is 401 with
 `WWW-Authenticate: Bearer`, not a 500. There is no remote key fetch.
 
-HMAC secrets and API keys must not sit in the control-plane canonical document. Use
-`keys-file` / `hmac-keys-file` so each node reads a local `0600` file; a proposal that still
-carries inline `keys` or `hmac-keys` is refused, and viewer reads mask those fields. Public JWT
-keys can travel with the projection. Publishing a new snapshot is the rotation: in-flight
+HMAC secrets, API keys and Basic-auth credentials must not sit in the control-plane canonical
+document. Use `keys-file` / `hmac-keys-file` / `users-file` so each node reads a local `0600`
+file; a proposal that still carries inline `keys`, `hmac-keys` or `users` is refused, and viewer
+reads mask those fields. Public JWT keys can travel with the projection. Publishing a new snapshot is the rotation: in-flight
 requests keep the previous filter. For clusters that still have inline secrets in older log
 entries or snapshots, see the operator note under middleware in
 [config-file.md](../user/config-file.md) (file refs, key rotation, snapshot and compaction).

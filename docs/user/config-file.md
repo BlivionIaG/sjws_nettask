@@ -617,14 +617,16 @@ middleware:
       keys-file: /etc/sjws/api-keys   # preferred; mode 0600/0400, owned by this process
 ```
 
-Gateway credential options (`api-key` `keys`, `jwt` `hmac-keys`) may be inline in a local
-file. Prefer `keys-file` / `hmac-keys-file`. A control-plane proposal that still carries the
-inline form is refused with 400; see [gateway filters](../development/gateway.md).
+Gateway credential options (`api-key` `keys`, `jwt` `hmac-keys`, `basic-auth` `users`) may be
+inline in a local file. Prefer `keys-file` / `hmac-keys-file` / `users-file`. A control-plane
+proposal that still carries the inline form is refused with 400; see [gateway
+filters](../development/gateway.md).
 
-Older Raft log entries and signed snapshots can still carry inline `keys` / `hmac-keys` from
-before file refs. Operators should move those credentials to `keys-file` / `hmac-keys-file` on
-each node, rotate the affected keys, propose and activate a config that uses only the file
-refs, then let a snapshot and log compaction run so the old entries are dropped. A control-plane
+Older Raft log entries and signed snapshots can still carry inline `keys` / `hmac-keys` /
+`users` from before file refs. Operators should move those credentials to `keys-file` /
+`hmac-keys-file` / `users-file` on each node, rotate the affected credentials, propose and
+activate a config that uses only the file refs, then let a snapshot and log compaction run so
+the old entries are dropped. A control-plane
 process logs a single WARN at startup while applied, activated, or last-good config still holds
 the inline form (filter/route and field names only; values are never logged).
 

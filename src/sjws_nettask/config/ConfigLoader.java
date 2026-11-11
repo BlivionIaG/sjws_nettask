@@ -1107,8 +1107,8 @@ public final class ConfigLoader {
                 throw new ConfigException(path + ": " + e.getMessage());
             }
             if (MiddlewareSecrets.hasInline(options)) {
-                warnings.add(path + ": inline keys/hmac-keys sit in the file in clear; prefer keys-file / "
-                        + "hmac-keys-file (required for control-plane proposals)");
+                warnings.add(path + ": inline secret options sit in the file in clear; prefer keys-file / "
+                        + "hmac-keys-file / users-file (required for control-plane proposals)");
             }
         }
         if (!specs.isEmpty()) {
