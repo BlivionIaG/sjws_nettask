@@ -45,6 +45,12 @@ public final class ServiceStatus {
 
     public static void write(Path pidFile, long pid, long startedMillis, String role, String dataRole,
             String connection, long version, long drainBudgetMs) throws IOException {
+        write(pidFile, pid, startedMillis, role, dataRole, connection, version, drainBudgetMs, "", "");
+    }
+
+    public static void write(Path pidFile, long pid, long startedMillis, String role, String dataRole,
+            String connection, long version, long drainBudgetMs, String adminListen, String adminState)
+            throws IOException {
         var body = new StringBuilder();
         body.append("pid=").append(pid).append('\n');
         body.append("start=").append(startedMillis).append('\n');
@@ -57,7 +63,55 @@ public final class ServiceStatus {
         if (drainBudgetMs >= 0) {
             body.append("drain-ms=").append(Math.min(drainBudgetMs, MAX_BUDGET_MS)).append('\n');
         }
+        var listen = canonicalListen(adminListen);
+        var state = canonicalAdminState(adminState);
+        if (!listen.isEmpty()) {
+            body.append("admin=").append(listen).append('\n');
+        }
+        if (!state.isEmpty()) {
+            body.append("admin-state=").append(state).append('\n');
+        }
         AtomicFiles.write(beside(pidFile), body.toString().getBytes(StandardCharsets.UTF_8), PosixMode.STATUS);
+    }
+
+    /** {@code host:port} or {@code [v6]:port}, else empty (not echoed). */
+    static String canonicalListen(String value) {
+        if (value == null || value.isBlank() || value.length() > 262) {
+            return "";
+        }
+        if (value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0 || value.indexOf('=') >= 0
+                || value.indexOf(' ') >= 0) {
+            return "";
+        }
+        int colon = value.lastIndexOf(':');
+        if (colon <= 0 || colon == value.length() - 1) {
+            return "";
+        }
+        var host = value.substring(0, colon);
+        var port = value.substring(colon + 1);
+        if (!port.matches("[0-9]{1,5}")) {
+            return "";
+        }
+        int n = Integer.parseInt(port);
+        if (n < 1 || n > 65535) {
+            return "";
+        }
+        boolean v6 = host.startsWith("[") && host.endsWith("]") && host.length() > 2;
+        boolean v4orName = host.matches("[A-Za-z0-9._-]+");
+        if (!v6 && !v4orName) {
+            return "";
+        }
+        return value;
+    }
+
+    static String canonicalAdminState(String value) {
+        if (value == null) {
+            return "";
+        }
+        return switch (value) {
+            case "listening", "not-bound", "failed" -> value;
+            default -> "";
+        };
     }
 
     /** HA attached, role still standalone: record the drain budget without changing {@code --status} text. */
@@ -83,6 +137,12 @@ public final class ServiceStatus {
         }
         sb.append(" connection=").append(view.connection);
         sb.append(" config-version=").append(view.version);
+        if (!view.adminListen.isEmpty()) {
+            sb.append(" admin=").append(view.adminListen);
+        }
+        if (!view.adminState.isEmpty()) {
+            sb.append(" admin-state=").append(view.adminState);
+        }
         return sb.toString();
     }
 
@@ -130,7 +190,8 @@ public final class ServiceStatus {
     }
 
     /** Parsed sidecar. Unknown keys are ignored. Unsafe values are dropped, not echoed. */
-    record View(long pid, long started, String role, String dataRole, String connection, long version, long drainMs) {
+    record View(long pid, long started, String role, String dataRole, String connection, long version, long drainMs,
+            String adminListen, String adminState) {
 
         boolean matches(long pid, long startedMillis) {
             return this.pid == pid && this.started == startedMillis;
@@ -147,6 +208,8 @@ public final class ServiceStatus {
             String connection = ConnectionState.DISCONNECTED.wire();
             long version = 0;
             long drain = NO_BUDGET;
+            String adminListen = "";
+            String adminState = "";
             boolean sawPid = false;
             boolean sawStart = false;
             for (var line : text.split("\n", -1)) {
@@ -188,6 +251,8 @@ public final class ServiceStatus {
                         long v = longOrSentinel(value);
                         drain = v < 0 ? NO_BUDGET : v;
                     }
+                    case "admin" -> adminListen = canonicalListen(value);
+                    case "admin-state" -> adminState = canonicalAdminState(value);
                     default -> {
                         // forward compatible; never printed
                     }
@@ -196,7 +261,7 @@ public final class ServiceStatus {
             if (!sawPid || !sawStart || role == null) {
                 return null;
             }
-            return new View(pid, started, role, dataRole, connection, version, drain);
+            return new View(pid, started, role, dataRole, connection, version, drain, adminListen, adminState);
         }
 
         private static long longOrSentinel(String value) {

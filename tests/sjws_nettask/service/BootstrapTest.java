@@ -607,4 +607,80 @@ class BootstrapTest {
                     root.resolve("state"));
         }
     }
+
+    @Test
+    void statusSidecarRecordsASanitisedAdminListener() throws Exception {
+        long me = ProcessHandle.current().pid();
+        long started = ProcessHandle.current().info().startInstant().orElseThrow().toEpochMilli();
+        var pid = tmp.resolve("admin.pid");
+        Files.writeString(pid, me + "\n" + started + "\n");
+        ServiceStatus.write(pid, me, started, "control", "", "pending", 0, 30_000, "127.0.0.1:9443", "listening");
+        var suffix = ServiceStatus.runningSuffix(pid, me, started);
+        assertTrue(suffix.contains("admin=127.0.0.1:9443"), suffix);
+        assertTrue(suffix.contains("admin-state=listening"), suffix);
+        assertTrue(Files.readString(ServiceStatus.beside(pid)).contains("admin=127.0.0.1:9443"));
+
+        ServiceStatus.write(pid, me, started, "control", "", "pending", 0, 30_000, "127.0.0.1:9443\nrole=pwned",
+                "wobbly");
+        suffix = ServiceStatus.runningSuffix(pid, me, started);
+        assertFalse(suffix.contains("admin="), suffix);
+        assertFalse(suffix.contains("pwned"), suffix);
+        assertFalse(suffix.contains("admin-state="), suffix);
+
+        ServiceStatus.write(pid, me, started, "control", "", "pending", 0, 30_000, "[::1]:9", "not-bound");
+        suffix = ServiceStatus.runningSuffix(pid, me, started);
+        assertTrue(suffix.contains("admin=[::1]:9"), suffix);
+        assertTrue(suffix.contains("admin-state=not-bound"), suffix);
+
+        assertEquals("", ServiceStatus.canonicalListen(""));
+        assertEquals("", ServiceStatus.canonicalListen(null));
+        assertEquals("", ServiceStatus.canonicalListen("   "));
+        assertEquals("", ServiceStatus.canonicalListen("x" + "a".repeat(262) + ":1"));
+        assertEquals("", ServiceStatus.canonicalListen("127.0.0.1:80\n"));
+        assertEquals("", ServiceStatus.canonicalListen("127.0.0.1:80\r"));
+        assertEquals("", ServiceStatus.canonicalListen("host=evil:80"));
+        assertEquals("", ServiceStatus.canonicalListen("127.0.0.1 :80"));
+        assertEquals("", ServiceStatus.canonicalListen(":80"));
+        assertEquals("", ServiceStatus.canonicalListen("127.0.0.1:"));
+        assertEquals("", ServiceStatus.canonicalListen("127.0.0.1:abc"));
+        assertEquals("", ServiceStatus.canonicalListen("fe80::1:80"));
+        assertEquals("", ServiceStatus.canonicalListen("no-port"));
+        assertEquals("", ServiceStatus.canonicalListen("127.0.0.1:0"));
+        assertEquals("", ServiceStatus.canonicalListen("127.0.0.1:99999"));
+        assertEquals("10.0.0.1:80", ServiceStatus.canonicalListen("10.0.0.1:80"));
+        assertEquals("[::1]:9443", ServiceStatus.canonicalListen("[::1]:9443"));
+        assertEquals("", ServiceStatus.canonicalAdminState("up"));
+        assertEquals("", ServiceStatus.canonicalAdminState(null));
+        assertEquals("failed", ServiceStatus.canonicalAdminState("failed"));
+        assertEquals("listening", ServiceStatus.canonicalAdminState("listening"));
+        assertEquals("not-bound", ServiceStatus.canonicalAdminState("not-bound"));
+
+        var fix = controlTree("");
+        var enrollment = NodeEnrollment.open(Bootstrap.load(fix.boot, "control"), pid, 30_000);
+        try {
+            assertFalse(ServiceStatus.runningSuffix(pid, me, started).contains("admin="));
+            enrollment.adminListener("127.0.0.1:9443", "listening");
+            var withAdmin = ServiceStatus.runningSuffix(pid, me, started);
+            assertTrue(withAdmin.contains("role=control"), withAdmin);
+            assertTrue(withAdmin.contains("admin=127.0.0.1:9443"), withAdmin);
+            assertTrue(withAdmin.contains("admin-state=listening"), withAdmin);
+            enrollment.attach(new ControlPlaneBinding() {
+                @Override
+                public String connectionState() {
+                    return "leader";
+                }
+
+                @Override
+                public long configVersion() {
+                    return 2;
+                }
+            });
+            var kept = ServiceStatus.runningSuffix(pid, me, started);
+            assertTrue(kept.contains("connection=leader"), kept);
+            assertTrue(kept.contains("admin=127.0.0.1:9443"), kept);
+        } finally {
+            enrollment.close();
+        }
+    }
+
 }

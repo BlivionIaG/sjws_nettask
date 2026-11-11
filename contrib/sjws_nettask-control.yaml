@@ -2,9 +2,11 @@
 # Packaged path: contrib/sjws_nettask-control.yaml
 # Installed path used by contrib/sjws_nettask-control@.service:
 #   install -D -m 0640 contrib/sjws_nettask-control.yaml /etc/sjws_nettask/control-1/sjws_nettask-control.yaml
-# listen address, peers, pin, and the join token stay in the bootstrap file.
-# The content port stays unbound unless bind_content is true or --bind-content is set.
-# The admin listener is not part of this file.
+# listen address, peers, pin, and the join token stay in the bootstrap file and
+# the cp: block (cp.admin.listen, cp.watch.listen, cp.peers). Add that block before
+# the first start. The content port stays unbound unless bind_content is true or
+# --bind-content is set. The pid file is still written. --status reports
+# admin=<host:port> admin-state=listening once the admin listener is bound.
 schema: 1
 version: 0
 node:

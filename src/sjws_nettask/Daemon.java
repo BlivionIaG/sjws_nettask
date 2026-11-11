@@ -159,7 +159,9 @@ final class Daemon {
                 drain-ms (the status file, else --drain-budget, else 30s) plus 5 seconds, then
                 SIGKILL. That budget is not added on top of --shutdown-timeout. A standalone
                 --status line stays "running pid=N". Control and data add role, connection, and
-                config-version. Connection state does not drain the process. --role=control or data
+                config-version. A control process also reports admin=<host:port> and admin-state
+                when the admin listener is bound. Connection state does not drain the process.
+                --role=control or data
                 requires --bootstrap and --pid-file. The join token is a mode 0600 file named by
                 the bootstrap file. node.mode in the config file is the same role. Precedence is
                 --role, then WEB_SERVER_ROLE, then node.mode. A difference is logged at startup.

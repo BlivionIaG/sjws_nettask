@@ -242,6 +242,12 @@ public final class AdminServer implements AutoCloseable {
         return server.getAddress().getPort();
     }
 
+    /** Bound listen address, including the kernel-assigned port when the bind used port 0. */
+    public java.net.InetSocketAddress address() {
+        var bound = server.getAddress();
+        return bound instanceof java.net.InetSocketAddress inet ? inet : new java.net.InetSocketAddress(port());
+    }
+
     /** How many live admin sessions were dropped because they failed policy after a reload. */
     long policyDropped() {
         return policyDropped.get();
