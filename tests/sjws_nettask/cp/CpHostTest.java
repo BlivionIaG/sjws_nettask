@@ -245,4 +245,23 @@ class CpHostTest {
         }
     }
 
+    @Test
+    void adminBindFailureWritesFailedAndKeepsTheHostUp() throws Exception {
+        var deps = new CpTestDeps();
+        try (var occupied = new java.net.ServerSocket()) {
+            occupied.setReuseAddress(false);
+            occupied.bind(new java.net.InetSocketAddress("127.0.0.1", 0));
+            int port = occupied.getLocalPort();
+            var y = yaml("cp-1", 0, 0);
+            y.put("admin", Map.of("listen", "127.0.0.1:" + port));
+            var errBuf = new ByteArrayOutputStream();
+            try (var host = (CpHost) CpLaunch.start(config(y), deps, new PrintStream(errBuf))) {
+                assertEquals("failed", host.adminState());
+                assertEquals("127.0.0.1:" + port, host.adminListen());
+                assertTrue(errBuf.toString().contains("admin listener failed to bind"), errBuf.toString());
+                assertNull(host.reload());
+            }
+        }
+    }
+
 }

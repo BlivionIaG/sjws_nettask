@@ -153,8 +153,11 @@ running pid=123 role=data data-role=gateway connection=pending config-version=0
 running pid=123 role=control connection=pending config-version=0 admin=127.0.0.1:9443 admin-state=listening
 ```
 
-The sidecar is `<pid-file>.status`. It is trusted only when `pid` and `start` match the pid
-file, so a recycled pid does not keep the previous node's version. Connection values outside
+The sidecar is `<pid-file>.status`. It is created mode `0600` (owner-only) by writing a
+temporary file with those permissions and renaming it into place. A pre-existing sidecar
+with looser permissions is tightened on the next write. It is trusted only when `pid` and
+`start` match the pid file, so a recycled pid does not keep the previous node's version.
+Connection values outside
 `pending`, `connecting`, `connected`, `disconnected`, `leader`, and `follower` are stored as
 `disconnected` and are not echoed. Standalone `--status` stays `running pid=<n>`.
 
