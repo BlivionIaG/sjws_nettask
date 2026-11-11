@@ -9,23 +9,33 @@
 #
 # Usage: tools/ci/install-wrk.sh
 # Optional: WRK_CACHE=/path/to/dir  (stores or restores wrk + its libs)
+# Source this file to load runnable()/already() without installing.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
 # wrk 4.1 has no --version; missing flags print usage and exit 1 once
 # the binary has loaded. A missing shared library typically exits 127
-# (see 43066143761) and is also visible in ldd as "not found".
+# (see 43066143761) and is also visible in ldd as "not found", but some
+# loaders may exit 1 with a "loading shared libraries" message — that
+# must not be treated as a usage failure.
 runnable() {
-  local bin rc=0
+  local bin rc=0 out
   bin="$(command -v wrk 2>/dev/null)" || return 1
   [ -x "$bin" ] || return 1
   if command -v ldd >/dev/null 2>&1 && ldd "$bin" 2>/dev/null | grep -q 'not found'; then
     ldd "$bin" >&2 || true
     return 1
   fi
-  wrk >/dev/null 2>&1 || rc=$?
+  out="$(wrk 2>&1)" || rc=$?
+  case "$out" in
+    *"error while loading shared libraries"*|*"cannot open shared object"*)
+      printf '%s\n' "$out" >&2
+      return 1
+      ;;
+  esac
   if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+    printf '%s\n' "$out" >&2
     return 1
   fi
   return 0
@@ -36,7 +46,6 @@ already() {
     return 1
   fi
   echo "wrk already on PATH: $(command -v wrk)"
-  wrk --version 2>&1 || true
   return 0
 }
 
@@ -79,6 +88,11 @@ install_prefix() {
     sudo ldconfig
   fi
 }
+
+# When sourced (by install-wrk-test.sh), expose the helpers only.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
 
 if already; then
   exit 0

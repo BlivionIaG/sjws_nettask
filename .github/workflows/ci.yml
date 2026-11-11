@@ -34,6 +34,9 @@ jobs:
             echo '::error::continue-on-error masks a red job as a green workflow (#356). Remove it.'
             exit 1
           fi
+      - name: Test wrk installer probes
+        if: runner.os == 'Linux'
+        run: tools/ci/install-wrk-test.sh
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
