@@ -35,7 +35,10 @@ import sjws_nettask.core.Body;
 import sjws_nettask.core.Problem;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.Response;
+import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.core.MiddlewareSpec;
+import sjws_nettask.gateway.HeaderRewriteFilter;
 import sjws_nettask.routing.ProblemErrorHandler;
 import sjws_nettask.routing.Router;
 
@@ -253,6 +256,32 @@ class RouteErrorsTest {
         var star = new ProblemErrorHandler(r -> StaticFileHandler.error(400, false), "/", null, null)
                 .handle(new Request("OPTIONS", "*"));
         assertFalse(body(star).contains("instance"));
+    }
+
+    @Test
+    void problemJsonSurvivesAHeaderRewritingFilter() {
+        var rewrite = HeaderRewriteFilter.create(MiddlewareSpec.of("header-rewrite", 0, null,
+                Map.of("response-set", "content-security-policy: default-src 'self'",
+                        "response-remove", "x-content-type-options")));
+        var h = new ProblemErrorHandler(
+                request -> rewrite.filter(request, r -> StaticFileHandler.error(404, r.headOnly())),
+                "/", null, "https://e.example/");
+        var out = h.handle(new Request("GET", "/missing"));
+        assertEquals(404, out.status());
+        assertEquals(Problem.CONTENT_TYPE, out.headers().get("content-type"));
+        assertTrue(body(out).contains("\"status\":404") && body(out).contains("\"instance\":\"/missing\""),
+                body(out));
+    }
+
+    @Test
+    void aNonGeneratedPageWithTheCspMarkerIsNotConverted() {
+        var headers = ResponseHeaders.of()
+                .add("content-type", "text/html")
+                .add("content-security-policy", StaticFileHandler.HTML_CSP);
+        var upstream = new Response(404, headers, Body.Bytes.of("upstream".getBytes(StandardCharsets.UTF_8)));
+        assertFalse(StaticFileHandler.isGenerated(upstream));
+        assertSame(upstream,
+                new ProblemErrorHandler(r -> upstream, "/", null, null).handle(new Request("GET", "/x")));
     }
 
     @Test
