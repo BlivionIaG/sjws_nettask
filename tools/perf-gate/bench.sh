@@ -200,6 +200,11 @@ wrk2_once() { # url duration rate
   if try_wrk2 -t"$THREADS" -c"$CONNECTIONS" -d"$duration" -R"$rate" -L "$url"; then
     return 0
   fi
+  # -L has been observed to panic on some wrk2/LuaJIT builds; the default
+  # summary still has Requests/sec and a 99% latency line.
+  if try_wrk2 -t"$THREADS" -c"$CONNECTIONS" -d"$duration" -R"$rate" "$url"; then
+    return 0
+  fi
   echo "wrk2 produced no usable output (rate $rate):" >&2
   printf '%s\n' "$raw" >&2
   return 1
