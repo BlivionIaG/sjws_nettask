@@ -6,7 +6,7 @@
 #      CONNECTIONS (64), BODY_BYTES (1024),
 #      WRK2 (auto|1|0; default auto: run wrk2 when it is on PATH),
 #      REQUIRE_WRK2 (1: fail if wrk2 is missing),
-#      WRK2_RUNS (3), WRK2_DURATION (same as DURATION),
+#      WRK2_RUNS (3), WRK2_DURATION (20s; independent of DURATION so wrk2 runs past its 10s calibration),
 #      WRK2_FRACTION (0.7 of that side's median wrk req/s; WRK2_RATE overrides),
 #      WRK2_RATE (optional absolute rate for both sides; do not invent a default).
 # Each server runs in standalone mode (default; no cluster/gateway flags) with access logging off.
@@ -18,7 +18,7 @@ RUNS="${RUNS:-5}" DURATION="${DURATION:-10s}" WARMUP="${WARMUP:-5s}"
 THREADS="${THREADS:-2}" CONNECTIONS="${CONNECTIONS:-64}" BODY_BYTES="${BODY_BYTES:-1024}"
 WRK2_MODE="${WRK2:-auto}"
 WRK2_RUNS="${WRK2_RUNS:-3}"
-WRK2_DURATION="${WRK2_DURATION:-$DURATION}"
+WRK2_DURATION="${WRK2_DURATION:-20s}"
 WRK2_FRACTION="${WRK2_FRACTION:-0.7}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 JAVA="${JAVA_HOME:+$JAVA_HOME/bin/}java"
@@ -193,19 +193,16 @@ wrk2_once() { # url duration rate
 
   # Prefer the shared report.lua JSON line; wrk2's Lua API is not identical to wrk
   # on every build, so a missing PERF_JSON line falls back to parsing -L text, and
-  # a Lua failure is retried without a script.
+  # a Lua failure is retried without a script. Both measured paths keep -L (HdrHistogram).
+  # A run without -L must not be treated as a p99 measurement: it would let the gate
+  # pass on uncorrected summary text.
   if try_wrk2 -t"$THREADS" -c"$CONNECTIONS" -d"$duration" -R"$rate" -L -s "$HERE/report.lua" "$url"; then
     return 0
   fi
   if try_wrk2 -t"$THREADS" -c"$CONNECTIONS" -d"$duration" -R"$rate" -L "$url"; then
     return 0
   fi
-  # -L has been observed to panic on some wrk2/LuaJIT builds; the default
-  # summary still has Requests/sec and a 99% latency line.
-  if try_wrk2 -t"$THREADS" -c"$CONNECTIONS" -d"$duration" -R"$rate" "$url"; then
-    return 0
-  fi
-  echo "wrk2 produced no usable output (rate $rate):" >&2
+  echo "wrk2 -L produced no usable output (rate $rate); not falling back without -L because that cannot measure corrected p99:" >&2
   printf '%s\n' "$raw" >&2
   return 1
 }

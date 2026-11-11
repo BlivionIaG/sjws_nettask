@@ -81,6 +81,7 @@ jobs:
           WARMUP: 5s
           WRK2: '1'
           REQUIRE_WRK2: '1'
+          WRK2_DURATION: 20s
           THRESHOLD: ${{ vars.PERF_THRESHOLD || '10' }}
           P99_THRESHOLD: ${{ vars.PERF_P99_THRESHOLD || '' }}
           RSS_THRESHOLD: ${{ vars.PERF_RSS_THRESHOLD || '' }}

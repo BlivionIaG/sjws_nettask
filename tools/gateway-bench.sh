@@ -136,6 +136,22 @@ run_mode() {
       echo "wrk2 produced no summary ($mode)" >&2
       exit 1
     fi
+    w2err=$(python3 -c '
+import re, sys
+text = sys.stdin.read()
+n = 0
+m = re.search(r"Non-2xx or 3xx responses:\s*(\d+)", text, re.I)
+if m:
+    n += int(m.group(1))
+m = re.search(r"Socket errors:\s*([^\n]+)", text, re.I)
+if m:
+    n += sum(int(x) for x in re.findall(r"(\d+)", m.group(1)))
+print(n)
+' < "$LOG.wrk2")
+    if [ "$w2err" != "0" ]; then
+      echo "request errors in wrk2 $mode: $w2err" >&2
+      exit 1
+    fi
     rss=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' \t')
     if [ -n "$rss" ] && [ "$rss" != "0" ]; then
       echo "rss_kb=$rss ($mode after wrk2)"
