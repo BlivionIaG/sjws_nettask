@@ -61,7 +61,19 @@ public final class DataPlaneGuard {
         long ms = max == null ? 0L : max.toMillis();
         var guard = new DataPlaneGuard(true, ms, System::currentTimeMillis);
         if (document.stateDir() != null) {
-            guard.loadLastGood(document.stateDir());
+            guard.loadLastGood(document.stateDir(), null);
+        }
+        return guard;
+    }
+
+    /**
+     * Like {@link #forDocument(ConfigDocument)}, then verifies a persisted last-good against
+     * {@code pin} (the root public key, kept outside the state directory).
+     */
+    public static DataPlaneGuard forDocument(ConfigDocument document, Path pin) {
+        var guard = forDocument(document);
+        if (guard.active && document != null && document.stateDir() != null) {
+            guard.loadLastGood(document.stateDir(), pin);
         }
         return guard;
     }
@@ -92,10 +104,18 @@ public final class DataPlaneGuard {
     }
 
     public void loadLastGood(Path stateDir) {
+        loadLastGood(stateDir, null);
+    }
+
+    /**
+     * Accepts a persisted last-good only after signature, hash, expiry, and rollback checks
+     * against the pinned trust material. A missing pin is fail-closed.
+     */
+    public void loadLastGood(Path stateDir, Path pin) {
         if (!this.active) {
             return;
         }
-        var snapshot = DataApply.tryReadLastGood(stateDir).orElse(null);
+        var snapshot = DataApply.tryReadVerifiedLastGood(stateDir, pin).orElse(null);
         if (snapshot != null) {
             remember(snapshot);
         }

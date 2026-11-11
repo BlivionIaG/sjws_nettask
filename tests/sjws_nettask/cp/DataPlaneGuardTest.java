@@ -51,9 +51,7 @@ class DataPlaneGuardTest {
 
         guard.clock(clock::get);
         var snap = snapshot(2, 1_000, 2_000);
-        Files.createDirectories(LastGoodFiles.configDir(state));
-        Files.writeString(LastGoodFiles.configDir(state).resolve("last-good.json"), LastGoodFiles.snapshotJson(snap));
-        guard.loadLastGood(state);
+        guard.applied(snap, true);
         assertTrue(guard.hasLastGood());
         assertTrue(guard.ready());
         clock.set(1_501);

@@ -189,6 +189,11 @@ public final class ServiceLaunch {
             return this.bootstrap.stateDir();
         }
 
+        @Override
+        public Path pinFile() {
+            return this.bootstrap.pinFile();
+        }
+
         private void reloadLocal() {
             try {
                 var fresh = Bootstrap.load(this.bootstrap.source(), this.bootstrap.role().wire());

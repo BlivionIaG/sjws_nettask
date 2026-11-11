@@ -142,7 +142,8 @@ public class Sjws_nettask {
         var messagingMetrics = prepareMessagingMetrics(modules, installMessagingHooks); // before contribute/mount (#400)
         SjwsServer server;
         try {
-            server = SjwsServer.start(loaded, h3Factory, bindContent, OptionalModules.contributors(modules));
+            server = SjwsServer.start(loaded, h3Factory, bindContent, OptionalModules.contributors(modules),
+                    hooks != null ? hooks.pinFile() : null);
         } catch (BindException e) {
             modules.close();
             err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
@@ -779,10 +780,13 @@ public class Sjws_nettask {
 
     /** Signed {@code last-good.json} in the document state dir or the bootstrap {@code state-dir}. */
     static boolean hasVerifiedLastGood(sjws_nettask.config.ConfigLoader.Loaded loaded, ServiceHooks hooks) {
-        if (loaded != null && sjws_nettask.cp.DataApply.tryReadLastGood(loaded.document().stateDir()).isPresent()) {
+        var pin = hooks != null ? hooks.pinFile() : null;
+        if (loaded != null && sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(loaded.document().stateDir(), pin)
+                .isPresent()) {
             return true;
         }
-        return hooks != null && sjws_nettask.cp.DataApply.tryReadLastGood(hooks.stateDir()).isPresent();
+        return hooks != null
+                && sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(hooks.stateDir(), pin).isPresent();
     }
 
     /**

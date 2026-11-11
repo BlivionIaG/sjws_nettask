@@ -54,4 +54,12 @@ public interface ServiceHooks {
     default Path stateDir() {
         return null;
     }
+
+    /**
+     * Bootstrap pin file (root public key, outside {@code state-dir}) used to verify a persisted
+     * last-good, or null when this hook does not name one. The request path does not call this.
+     */
+    default Path pinFile() {
+        return null;
+    }
 }

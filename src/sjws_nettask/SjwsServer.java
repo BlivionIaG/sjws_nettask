@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -137,6 +138,8 @@ public final class SjwsServer implements AutoCloseable {
     private ServerSocketChannel tcp;
     private ClientManager manager;
     private Thread acceptThread;
+    /** The real accept loop after a late bind; {@link #acceptThread} is the lifecycle waiter. */
+    private volatile Thread contentAcceptThread;
     /** Released by {@link #close()} so a control process with no content port can leave {@link #awaitTermination()}. */
     private final CountDownLatch contentless = new CountDownLatch(1);
     private Transport.Factory contentH3Factory;
@@ -314,7 +317,7 @@ public final class SjwsServer implements AutoCloseable {
             Function<StaticFileHandler, Handler> terminal, List<HandlerContributor> contributors)
             throws IOException {
         return start(ConfigLoader.standalone(config), H3Transports.defaultFactory(), H2_FACTORY, filters, terminal,
-                null, null, true, contributors);
+                null, null, true, contributors, null);
     }
 
     /**
@@ -411,13 +414,18 @@ public final class SjwsServer implements AutoCloseable {
 
     static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent,
             List<HandlerContributor> contributors) throws IOException {
-        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, contributors);
+        return start(loaded, h3Factory, bindContent, contributors, null);
+    }
+
+    static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent,
+            List<HandlerContributor> contributors, Path pin) throws IOException {
+        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, contributors, pin);
     }
 
     static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, List<HandlerContributor> contributors)
             throws IOException {
         return start(ConfigLoader.standalone(config), h3Factory, H2_FACTORY, null, null, null, null, true,
-                contributors);
+                contributors, null);
     }
 
     /**
@@ -425,7 +433,7 @@ public final class SjwsServer implements AutoCloseable {
      *        for standalone and tests. A null verifier uses {@link SnapshotVerifier#forMode}.
      */
     public static SjwsServer start(ConfigLoader.Loaded loaded, SnapshotVerifier verifier) throws IOException {
-        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier, true, null);
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier, true, null, null);
     }
 
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory) throws IOException {
@@ -435,12 +443,21 @@ public final class SjwsServer implements AutoCloseable {
     /** {@code bindContent} false leaves the content port unbound. The process still stays up until {@link #close()}. */
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent)
             throws IOException {
-        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, null);
+        return start(loaded, h3Factory, bindContent, (Path) null);
+    }
+
+    /**
+     * {@code pin} is the data-node root public key, used only to verify a persisted last-good
+     * at start. Null is fail-closed for that check.
+     */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent,
+            Path pin) throws IOException {
+        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, null, pin);
     }
 
     /** Config-file startup with HA attached (data-role {@code /readyz} still follows last-good). */
     public static SjwsServer start(ConfigLoader.Loaded loaded, HaSettings ha) throws IOException {
-        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, ha, null, true, null);
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, ha, null, true, null, null);
     }
 
     /** Package-visible so same-package tests can wire a custom {@code h2Factory} with a file-backed reload. */
@@ -453,13 +470,13 @@ public final class SjwsServer implements AutoCloseable {
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
             HaSettings ha) throws IOException {
-        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null, true, null);
+        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null, true, null, null);
     }
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
-            HaSettings ha, SnapshotVerifier verifier, boolean bindContent, List<HandlerContributor> contributors)
-            throws IOException {
+            HaSettings ha, SnapshotVerifier verifier, boolean bindContent, List<HandlerContributor> contributors,
+            Path pin) throws IOException {
         var board = new ChallengeBoard();
         var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
         if (ha != null && ha.handler() instanceof StaticFileHandler injected) {
@@ -473,6 +490,9 @@ public final class SjwsServer implements AutoCloseable {
                 contributors);
         server.contentH3Factory = h3Factory;
         server.contentH2Factory = h2Factory;
+        if (pin != null && snapshot.document().stateDir() != null) {
+            server.dataPlane().loadLastGood(snapshot.document().stateDir(), pin);
+        }
         if (bindContent) {
             try {
                 if (!server.bindContentPort()) {
@@ -1512,17 +1532,11 @@ public final class SjwsServer implements AutoCloseable {
                     }
                 }
                 openChallenge(snapshot);
+                // Start the accept loop, then release the lifecycle waiter so it can join this
+                // thread. Replacing acceptThread would return awaitTermination() on the idle join.
+                this.contentAcceptThread = new Thread(this.manager, "accept-loop");
+                this.contentAcceptThread.start();
                 this.contentless.countDown();
-                Thread idle = this.acceptThread;
-                this.acceptThread = new Thread(this.manager, "accept-loop");
-                this.acceptThread.start();
-                if (idle != null && idle != this.acceptThread) {
-                    try {
-                        idle.join(1_000);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
                 return true;
             } catch (IOException | RuntimeException e) {
                 rollbackContentBind();
@@ -1543,6 +1557,13 @@ public final class SjwsServer implements AutoCloseable {
         this.acceptThread = new Thread(() -> {
             try {
                 this.contentless.await();
+                if (this.closed.get()) {
+                    return;
+                }
+                Thread accept = this.contentAcceptThread;
+                if (accept != null) {
+                    accept.join();
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

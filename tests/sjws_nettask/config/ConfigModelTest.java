@@ -570,6 +570,12 @@ class ConfigModelTest {
         var extra = "{\"extra\":1,\"note\":\"z\",\"neg\":-2," + raw.substring(1);
         Files.writeString(dir.resolve("extra.json"), extra);
         assertEquals(data.canonicalText(), LastGoodStore.dataPlaneYaml(dir.resolve("extra.json")));
+        var signedShape = "schema: 1\nnode:\n  mode: data\n";
+        var signedHash = ConfigCodec.sha256(signedShape);
+        Files.writeString(dir.resolve("canonical-yaml.json"),
+                "{\"schema\":1,\"version\":4,\"canonicalHash\":\"" + signedHash
+                        + "\",\"canonicalYaml\":\"" + signedShape.replace("\n", "\\n") + "\"}\n");
+        assertEquals(signedShape, LastGoodStore.dataPlaneYaml(dir.resolve("canonical-yaml.json")));
 
         var shifted = base.server().toBuilder().tlsKeyPassword("pw").build();
         var hashed = ConfigDocument.of(shifted, base.acme(), base.routing(), base.middleware(), base.access(),

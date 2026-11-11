@@ -26,6 +26,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -88,14 +90,12 @@ class DataReadinessTest {
         var html = Files.createDirectory(dir.resolve("html"));
         Files.writeString(html.resolve("index.html"), "cached");
         var state = dir.resolve("state");
-        Files.createDirectories(LastGoodFiles.configDir(state));
-        var snap = DataPlaneGuardTest.snapshot(5, System.currentTimeMillis(), System.currentTimeMillis() + 60_000);
-        Files.writeString(LastGoodFiles.configDir(state).resolve("last-good.json"), LastGoodFiles.snapshotJson(snap));
         var yaml = dir.resolve("sjws.yaml");
         Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
                 + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
         var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
-        try (var server = SjwsServer.start(loaded, null, true)) {
+        var pin = persistVerifiedLastGood(dir, state, loaded.document(), 5);
+        try (var server = SjwsServer.start(loaded, null, true, pin)) {
             assertTrue(server.contentBound());
             assertTrue(server.dataPlane().hasLastGood());
             assertTrue(server.dataPlane().ready());
@@ -106,6 +106,55 @@ class DataReadinessTest {
     }
 
     @Test
+    void forgedLastGoodOnDiskDoesNotSatisfyReadiness() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-forged"));
+        Files.writeString(html.resolve("index.html"), "cached");
+        var state = dir.resolve("state-forged");
+        Files.createDirectories(LastGoodFiles.configDir(state));
+        var snap = DataPlaneGuardTest.snapshot(5, System.currentTimeMillis(), System.currentTimeMillis() + 60_000);
+        Files.writeString(LastGoodFiles.configDir(state).resolve("last-good.json"), LastGoodFiles.snapshotJson(snap));
+        var yaml = dir.resolve("forged.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(DataApply.tryReadLastGood(state).isPresent());
+        assertTrue(DataApply.tryReadVerifiedLastGood(state, dir.resolve("missing.pin")).isEmpty());
+        try (var server = SjwsServer.start(loaded, null, true)) {
+            assertTrue(server.contentBound());
+            assertFalse(server.dataPlane().hasLastGood());
+            assertFalse(server.dataPlane().ready());
+            assertEquals(503, HttpTestSupport.get(server.tcpPort(), "/readyz", 2_000).statusCode());
+        }
+    }
+
+    @Test
+    void awaitTerminationSurvivesLateBind() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-term"));
+        Files.writeString(html.resolve("index.html"), "x");
+        var yaml = dir.resolve("term.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + dir.resolve("term-state").toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var finished = new CountDownLatch(1);
+        try (var server = SjwsServer.start(loaded, null, false)) {
+            Thread waiter = new Thread(() -> {
+                try {
+                    server.awaitTermination();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    finished.countDown();
+                }
+            }, "term-wait");
+            waiter.start();
+            assertTrue(server.bindContentPort());
+            assertFalse(finished.await(300, TimeUnit.MILLISECONDS),
+                    "late bind must not release awaitTermination");
+            server.close();
+            assertTrue(finished.await(5, TimeUnit.SECONDS));
+        }
+    }
+
     void persistLastGoodDoesNotOverwriteASignedSnapshot() throws Exception {
         var html = Files.createDirectory(dir.resolve("html"));
         Files.writeString(html.resolve("index.html"), "x");
@@ -345,4 +394,17 @@ class DataReadinessTest {
         sign.update(SnapshotCrypto.snapshotInput(unsigned));
         return unsigned.withSignature(sign.sign());
     }
+
+    static Path persistVerifiedLastGood(Path pinDir, Path stateDir, ConfigDocument document, long version)
+            throws Exception {
+        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var pin = pinDir.resolve("root-" + version + ".pin");
+        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        long now = System.currentTimeMillis();
+        var snap = keys.sign(document, version, 1L, 1L, now, now + 3_600_000L, 0L);
+        LastGoodFiles.write(stateDir, snap.version(), snap.epoch(), snap.keyId(), keys.bundle().keys(),
+                keys.bundle().versionFloor(), keys.bundle().encoded(), snap);
+        return pin;
+    }
+
 }
