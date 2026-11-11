@@ -616,7 +616,7 @@ public class Sjws_nettask {
         if (opt.action() == Daemon.Action.STOP || opt.action() == Daemon.Action.STATUS) {
             return control(opt, out, err);
         }
-        var loaded = sjws_nettask.config.ConfigLoader.load(opt.remaining(), env);
+        var loaded = sjws_nettask.config.ConfigLoader.load(opt.remaining(), env, recoveryPin(opt.bootstrap()));
         opt.warnings().forEach(w -> err.println("WARN: " + w));
         loaded.warnings().forEach(w -> err.println("WARN: " + w));
         if (!opt.ok() || !loaded.ok()) {
@@ -780,6 +780,22 @@ public class Sjws_nettask {
             err.println("WARN: " + source + "=true binds the content port with no verified last-good");
         }
         return chosen;
+    }
+
+    /**
+     * The pin a normal boot resolves from the bootstrap ({@code --bootstrap} or
+     * {@code WEB_SERVER_BOOTSTRAP}), for missing-config recovery. Null when there is none or it
+     * does not read; the full bootstrap load later reports that error.
+     */
+    static java.nio.file.Path recoveryPin(java.nio.file.Path bootstrap) {
+        if (bootstrap == null) {
+            return null;
+        }
+        try {
+            return sjws_nettask.service.Bootstrap.pinFile(bootstrap);
+        } catch (java.io.IOException e) {
+            return null;
+        }
     }
 
     /** Signed {@code last-good.json} in the document state dir or the bootstrap {@code state-dir}. */

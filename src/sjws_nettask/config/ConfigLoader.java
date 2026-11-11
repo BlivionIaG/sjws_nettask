@@ -61,7 +61,20 @@ public final class ConfigLoader {
                 ServerConfig::readPasswordFile, null);
     }
 
+    /**
+     * Like {@link #load(String[], Map)}. {@code recoveryPin} is the bootstrap pin the caller already
+     * resolved; missing-config recovery needs it to boot from a signed last-good.
+     */
+    public static Loaded load(String[] args, Map<String, String> env, Path recoveryPin) {
+        return load(args, env, ServerConfig::readPasswordFile, recoveryPin);
+    }
+
     public static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
+        return load(args, env, passwords, null);
+    }
+
+    private static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+            Path recoveryPin) {
         var arguments = args.clone();
         var environment = Map.copyOf(env);
         for (var arg : arguments) {
@@ -70,14 +83,14 @@ public final class ConfigLoader {
             }
         }
         try {
-            return loadFile(arguments, environment, passwords);
+            return loadFile(arguments, environment, passwords, recoveryPin);
         } catch (ConfigException e) {
             return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords, null);
         }
     }
 
-    private static Loaded loadFile(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords)
-            throws ConfigException {
+    private static Loaded loadFile(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+            Path recoveryPin) throws ConfigException {
         var warnings = new ArrayList<String>();
         String fromArgs = null;
         for (var arg : args) {
@@ -124,11 +137,11 @@ public final class ConfigLoader {
             if (!Files.isRegularFile(requested)) {
                 var state = stateDir(args, env, null, requested.toAbsolutePath().getParent());
                 var json = LastGoodStore.file(state);
-                var recovered = recoverLastGoodYaml(json, state, args);
+                var recovered = recoverLastGoodYaml(json, state, recoveryPin);
                 var source = json;
                 if (recovered == null) {
                     var legacy = LastGoodStore.beside(requested);
-                    recovered = LastGoodStore.dataPlaneYaml(legacy);
+                    recovered = unsignedLastGoodYaml(legacy);
                     source = legacy;
                 }
                 if (recovered == null) {
@@ -293,56 +306,19 @@ public final class ConfigLoader {
 
     /**
      * Missing-config recovery. A signed last-good is used only when it verifies under the
-     * bootstrap pin; an unsigned boot envelope is still read when no pin is available.
+     * resolved bootstrap pin (none: not a boot source); an unsigned boot envelope is still read.
      */
-    private static String recoverLastGoodYaml(Path json, Path state, String[] args) {
-        var pin = pinFromBootstrapArgs(args);
-        if (pin != null && LastGoodStore.signature(json) != null) {
-            var verified = sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(state, pin);
-            return verified.map(value -> value.snapshot().canonicalYaml()).orElse(null);
+    private static String recoverLastGoodYaml(Path json, Path state, Path pin) {
+        if (LastGoodStore.signature(json) != null) {
+            return sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(state, pin)
+                    .map(value -> value.snapshot().canonicalYaml()).orElse(null);
         }
         return LastGoodStore.dataPlaneYaml(json);
     }
 
-    private static Path pinFromBootstrapArgs(String[] args) {
-        if (args == null) {
-            return null;
-        }
-        String listed = null;
-        for (int i = 0; i < args.length; i++) {
-            var arg = args[i];
-            if (arg != null && arg.startsWith("--bootstrap=")) {
-                listed = arg.substring("--bootstrap=".length());
-                break;
-            }
-            if ("--bootstrap".equals(arg) && i + 1 < args.length) {
-                listed = args[i + 1];
-                break;
-            }
-        }
-        if (listed == null || listed.isBlank()) {
-            return null;
-        }
-        try {
-            var bootstrap = Path.of(listed);
-            if (!java.nio.file.Files.isRegularFile(bootstrap)) {
-                return null;
-            }
-            Path pin = null;
-            for (var line : java.nio.file.Files.readAllLines(bootstrap)) {
-                var trimmed = line.strip();
-                if (trimmed.startsWith("pin=")) {
-                    pin = Path.of(trimmed.substring("pin=".length()).trim());
-                    break;
-                }
-            }
-            if (pin == null) {
-                return null;
-            }
-            return pin.isAbsolute() ? pin : bootstrap.toAbsolutePath().getParent().resolve(pin).normalize();
-        } catch (RuntimeException | java.io.IOException e) {
-            return null;
-        }
+    /** A signed file beside the config is only a boot source through the pinned path above. */
+    private static String unsignedLastGoodYaml(Path legacy) {
+        return LastGoodStore.signature(legacy) != null ? null : LastGoodStore.dataPlaneYaml(legacy);
     }
 
     /**

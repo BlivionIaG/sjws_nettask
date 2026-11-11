@@ -215,18 +215,18 @@ class LastGoodLifecycleCoverageTest {
         var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
         var fixture = DataReadinessTest.persistVerifiedLastGoodWithKeys(dir, state, loaded.document(), 6);
         Files.delete(yaml);
-        var boot = dir.resolve("bootstrap");
-        Files.writeString(boot, "role=data\npin=" + fixture.pin().toAbsolutePath() + "\n");
-        var recovered = ConfigLoader.load(new String[] {"--config=" + yaml, "--bootstrap=" + boot,
-                "--state-dir=" + state}, Map.of());
+        var args = new String[] {"--config=" + yaml, "--state-dir=" + state};
+        var recovered = ConfigLoader.load(args, Map.of(), fixture.pin());
         assertTrue(recovered.ok(), recovered.errors().toString());
         assertTrue(recovered.warnings().stream().anyMatch(w -> w.contains("last good")), recovered.warnings().toString());
         assertEquals(NodeSettings.Mode.DATA, recovered.document().node().mode());
         assertEquals(html.toAbsolutePath().normalize(), recovered.document().server().root().toAbsolutePath().normalize());
+        assertFalse(ConfigLoader.load(args, Map.of(), (Path) null).ok(),
+                "a signed last-good is a boot source only with the resolved bootstrap pin");
+        assertFalse(ConfigLoader.load(args, Map.of()).ok());
         LastGoodFiles.writePin(fixture.pin(), fixture.keys().rootPublic(), fixture.keys().versionFloor(), 0L,
                 fixture.keys().bundle().bundleSerial() + 1);
-        var rejected = ConfigLoader.load(new String[] {"--config=" + yaml, "--bootstrap", boot.toString(),
-                "--state-dir=" + state}, Map.of());
+        var rejected = ConfigLoader.load(args, Map.of(), fixture.pin());
         assertFalse(rejected.ok(), "a signed envelope that does not meet the pin must not be a boot source");
     }
 
