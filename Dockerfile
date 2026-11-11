@@ -30,7 +30,7 @@ RUN jlink \
       --output /jre
 
 # distroless/cc: glibc + libgcc/libstdc++ for the QUIC natives, no shell or package manager.
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 ENV JAVA_HOME=/opt/java PATH=/opt/java/bin:/usr/bin:/bin
 COPY --from=build /jre /opt/java
 WORKDIR /opt/sjws
@@ -45,3 +45,21 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
   CMD ["java", "-Xshare:auto", "-XX:TieredStopAtLevel=1", "-Xmx16m", "-cp", "/opt/sjws/healthcheck", "HealthCheck", "http://127.0.0.1:8080/healthz"]
 ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "--add-opens", "jdk.httpserver/sun.net.httpserver=ALL-UNNAMED", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75", "-jar", "/opt/sjws/sjws_nettask.jar"]
 CMD ["8080", "/srv/www", "--healthz"]
+
+# Optional debug variant: the same jlink runtime, jar, and non-root uid, plus the busybox
+# shell from distroless :debug-nonroot. Build with --target debug. Not the default image.
+FROM gcr.io/distroless/cc-debian12:debug-nonroot AS debug
+ENV JAVA_HOME=/opt/java PATH=/opt/java/bin:/usr/bin:/bin
+COPY --from=runtime /opt/java /opt/java
+COPY --from=runtime /opt/sjws /opt/sjws
+COPY --from=runtime /srv/www /srv/www
+WORKDIR /opt/sjws
+USER 10001:10001
+EXPOSE 8080/tcp 8443/tcp 8443/udp
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["java", "-Xshare:auto", "-XX:TieredStopAtLevel=1", "-Xmx16m", "-cp", "/opt/sjws/healthcheck", "HealthCheck", "http://127.0.0.1:8080/healthz"]
+ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "--add-opens", "jdk.httpserver/sun.net.httpserver=ALL-UNNAMED", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75", "-jar", "/opt/sjws/sjws_nettask.jar"]
+CMD ["8080", "/srv/www", "--healthz"]
+
+# Default `docker build` target stays the shell-less runtime image.
+FROM runtime
