@@ -123,9 +123,11 @@ class DataApplyLastGoodVerifyTest {
                 + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
         var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, java.util.Map.of());
         var pin = DataReadinessTest.persistVerifiedLastGood(dir, state, loaded.document(), 2);
-        var guard = DataPlaneGuard.forDocument(loaded.document(), pin);
-        assertTrue(guard.hasLastGood());
-        assertTrue(guard.ready());
+        try (var server = sjws_nettask.SjwsServer.start(loaded, null, true, pin)) {
+            assertTrue(server.dataPlane().hasLastGood());
+            assertTrue(server.dataPlane().ready());
+            assertTrue(server.contentBound());
+        }
         var unsigned = DataPlaneGuard.forDocument(loaded.document());
         unsigned.loadLastGood(state);
         assertFalse(unsigned.hasLastGood());

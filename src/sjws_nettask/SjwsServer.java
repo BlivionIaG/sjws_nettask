@@ -128,6 +128,7 @@ public final class SjwsServer implements AutoCloseable {
     volatile java.time.Duration snapshotDrainTimeout = java.time.Duration.ofSeconds(30);
     /** Set only by a data-role bootstrap. The field type is {@code Object} so standalone does not name {@code cp}. */
     private Object controlPlane;
+    private Path pinFile;
     /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
     private final CountDownLatch shutdownDone = new CountDownLatch(1);
     private volatile Duration shutdownTimeout = Daemon.DEFAULT_SHUTDOWN_TIMEOUT;
@@ -497,10 +498,16 @@ public final class SjwsServer implements AutoCloseable {
                 contributors);
         server.contentH3Factory = h3Factory;
         server.contentH2Factory = h2Factory;
+        server.pinFile = pin;
+        boolean lastGoodPresent = false;
+        boolean lastGoodInstalled = false;
         if (pin != null && snapshot.document().stateDir() != null) {
-            server.dataPlane().loadLastGood(snapshot.document().stateDir(), pin);
+            var verified = sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(snapshot.document().stateDir(), pin)
+                    .orElse(null);
+            lastGoodPresent = verified != null;
+            lastGoodInstalled = verified != null && server.installVerifiedLastGood(verified);
         }
-        if (bindContent) {
+        if (bindContent && !(lastGoodPresent && !lastGoodInstalled)) {
             try {
                 if (!server.bindContentPort()) {
                     server.close();
@@ -621,6 +628,12 @@ public final class SjwsServer implements AutoCloseable {
     private void openChallenge(ConfigSnapshot snapshot) throws IOException {
         var acme = snapshot.document().acme();
         if (acme.enabled() && !acme.onMainListener(snapshot.document().server().port())) {
+            if (this.challengeHttp != null && this.challengeHttp.port() == acme.httpPort()) {
+                return;
+            }
+            if (this.challengeHttp != null) {
+                this.challengeHttp = closeQuietly(this.challengeHttp);
+            }
             this.challengeHttp = ChallengeHttpServer.open(acme.httpPort(), this.board);
         }
     }
@@ -740,6 +753,90 @@ public final class SjwsServer implements AutoCloseable {
      */
     public void attachControlPlane(Object apply) {
         this.controlPlane = Objects.requireNonNull(apply, "apply");
+    }
+
+    /**
+     * Restores a persisted last-good into the running snapshot, then records it as the
+     * readiness source. Uses the already-verified in-memory envelope, not a second disk read.
+     * Returns false when the file does not verify or the document cannot be published.
+     */
+    public boolean installPersistedLastGood(Path stateDir, Path pin) {
+        var verified = sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(stateDir, pin).orElse(null);
+        if (verified == null) {
+            dataPlane().clearLastGood();
+            return false;
+        }
+        return installVerifiedLastGood(verified);
+    }
+
+    private boolean installVerifiedLastGood(sjws_nettask.cp.DataApply.VerifiedLastGood verified) {
+        var snapshot = verified.snapshot();
+        this.reloadLock.lock();
+        try {
+            ConfigLoader.Loaded loaded;
+            try {
+                loaded = parseSnapshotYaml(snapshot.canonicalYaml());
+            } catch (IOException e) {
+                dataPlane().clearLastGood();
+                return false;
+            }
+            if (!loaded.ok() || loaded.document() == null) {
+                dataPlane().clearLastGood();
+                return false;
+            }
+            var document = loaded.document();
+            if (document.bundleVersion() != snapshot.version() || document.schemaVersion() != snapshot.schema()) {
+                document = ConfigDocument.of(document.server(), document.acme(), document.routing(),
+                        document.middleware(), document.access(), document.node(), snapshot.schema(),
+                        snapshot.version(), this.live.get().document().configFile(), document.messaging())
+                        .withStateDir(this.live.get().document().stateDir() != null
+                                ? this.live.get().document().stateDir()
+                                : document.stateDir());
+            } else if (this.live.get().document().stateDir() != null && document.stateDir() == null) {
+                document = document.withStateDir(this.live.get().document().stateDir());
+            }
+            var result = this.reloader.apply(this.live.get(), document, this.h3 != null, this.board, true);
+            if (result.applied() && snapshot.epoch() != result.snapshot().epoch()) {
+                var snap = result.snapshot().withEpoch(snapshot.epoch());
+                result = new ReloadResult(true, snap.generation(), result.warnings(), java.util.List.of(),
+                        result.needsRestart(), snap, result.tls());
+            }
+            var published = result.applied() && result.snapshot() == this.live.get() ? result : publish(result);
+            if (!published.applied()) {
+                dataPlane().clearLastGood();
+                return false;
+            }
+            dataPlane().applied(snapshot, false);
+            var pushed = published.snapshot().document().node().maxStaleness();
+            if (pushed != null) {
+                dataPlane().maxStaleness(pushed);
+            }
+            if (this.controlPlane instanceof sjws_nettask.cp.DataApply apply) {
+                apply.record(snapshot);
+            }
+            if (this.pinFile != null) {
+                try {
+                    sjws_nettask.cp.LastGoodFiles.ratchetPin(this.pinFile, snapshot.version(), verified.bundleSerial());
+                } catch (IOException e) {
+                    System.err.println("WARN: pin floor was not updated: " + e.getMessage());
+                }
+            }
+            return true;
+        } finally {
+            this.reloadLock.unlock();
+        }
+    }
+
+    private ConfigLoader.Loaded parseSnapshotYaml(String yaml) throws IOException {
+        var dir = java.nio.file.Files.createTempDirectory("sjws-last-good-");
+        var file = dir.resolve("snap.yaml");
+        try {
+            java.nio.file.Files.writeString(file, yaml);
+            return ConfigLoader.load(new String[] {"--config=" + file}, java.util.Map.of());
+        } finally {
+            java.nio.file.Files.deleteIfExists(file);
+            java.nio.file.Files.deleteIfExists(dir);
+        }
     }
 
     /**
@@ -1338,10 +1435,24 @@ public final class SjwsServer implements AutoCloseable {
      * just applied), not from startup middleware / override. HTTP/2 publish goes through
      * {@link #armH2} (generation + custom factory).
      */
+    private Handler withDataReadiness(Handler handler) {
+        if (handler == null || this.ha != null) {
+            return handler;
+        }
+        if (!(this.dataPlane instanceof sjws_nettask.cp.DataPlaneGuard guard) || !guard.active()) {
+            return handler;
+        }
+        if (handler instanceof DataReadyHandler) {
+            return handler;
+        }
+        return new DataReadyHandler(() -> handler, guard::ready);
+    }
+
     private void armSnapshot(Handler handler) {
         // onPublish runs only after {@link #chainControl} assigned {@link #control}, and after
         // apply/pinOuter has written {@link ChainControl#document()}.
         this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromDocument(this.control.document()));
+        handler = withDataReadiness(handler);
         this.armed.set(handler);
         if (this.h3 != null) {
             this.h3.armHandler(handler);
@@ -1539,6 +1650,10 @@ public final class SjwsServer implements AutoCloseable {
                     }
                 }
                 openChallenge(snapshot);
+                if (this.closed.get()) {
+                    rollbackContentBind();
+                    return false;
+                }
                 // Start the accept loop, then release the lifecycle waiter so it can join this
                 // thread. Replacing acceptThread would return awaitTermination() on the idle join.
                 this.contentAcceptThread = new Thread(this.manager, "accept-loop");
@@ -1711,7 +1826,17 @@ public final class SjwsServer implements AutoCloseable {
     @Override
     public void close() {
         long waitMs = this.shutdownTimeout.toMillis() + 3_000;
-        if (!this.closed.compareAndSet(false, true)) {
+        boolean first;
+        this.contentBindLock.lock();
+        try {
+            first = this.closed.compareAndSet(false, true);
+            if (first) {
+                this.contentless.countDown();
+            }
+        } finally {
+            this.contentBindLock.unlock();
+        }
+        if (!first) {
             try {
                 this.shutdownDone.await(waitMs, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
@@ -1719,7 +1844,6 @@ public final class SjwsServer implements AutoCloseable {
             }
             return;
         }
-        this.contentless.countDown();
         try {
             if (this.reloadHook != null) {
                 try {

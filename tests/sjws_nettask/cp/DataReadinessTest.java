@@ -26,14 +26,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.HttpTestSupport;
 import sjws_nettask.SjwsServer;
+import sjws_nettask.core.ChainControl;
+import sjws_nettask.core.FilterDocument;
 import sjws_nettask.core.RequestFilters;
 import sjws_nettask.ha.HaSettings;
 import sjws_nettask.config.ConfigDocument;
@@ -379,6 +383,215 @@ class DataReadinessTest {
         }
     }
 
+
+    @Test
+    void verifiedLastGoodIsAppliedBeforeReadyAndBind() throws Exception {
+        var local = Files.createDirectory(dir.resolve("html-local"));
+        Files.writeString(local.resolve("index.html"), "local");
+        var cached = Files.createDirectory(dir.resolve("html-cached"));
+        Files.writeString(cached.resolve("index.html"), "cached");
+        var state = dir.resolve("state-apply");
+        var yaml = dir.resolve("apply.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + local.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var cachedYaml = loaded.document().server().toBuilder().root(cached).build();
+        var cachedDoc = ConfigDocument.of(cachedYaml, loaded.document().acme(), loaded.document().routing(),
+                loaded.document().middleware(), loaded.document().access(), loaded.document().node(),
+                loaded.document().schemaVersion(), 5, loaded.document().configFile()).withStateDir(state);
+        var pin = persistVerifiedLastGood(dir, state, cachedDoc, 5);
+        try (var server = SjwsServer.start(loaded, null, true, pin)) {
+            assertTrue(server.contentBound());
+            assertTrue(server.dataPlane().hasLastGood());
+            assertTrue(server.dataPlane().ready());
+            assertEquals(200, HttpTestSupport.get(server.tcpPort(), "/readyz", 2_000).statusCode());
+            assertEquals("cached", HttpTestSupport.get(server.tcpPort(), "/index.html", 2_000).bodyText());
+        }
+    }
+
+    @Test
+    void closeAndLateBindDoNotLeaveAListener() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-race"));
+        Files.writeString(html.resolve("index.html"), "x");
+        var yaml = dir.resolve("race.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + dir.resolve("race-state").toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        for (int i = 0; i < 40; i++) {
+            var server = SjwsServer.start(loaded, null, false);
+            var start = new CountDownLatch(2);
+            var fail = new AtomicReference<Throwable>();
+            Thread binder = new Thread(() -> {
+                start.countDown();
+                try {
+                    start.await(2, TimeUnit.SECONDS);
+                    server.bindContentPort();
+                } catch (Throwable e) {
+                    fail.compareAndSet(null, e);
+                }
+            }, "race-bind-" + i);
+            Thread closer = new Thread(() -> {
+                start.countDown();
+                try {
+                    start.await(2, TimeUnit.SECONDS);
+                    server.close();
+                } catch (Throwable e) {
+                    fail.compareAndSet(null, e);
+                }
+            }, "race-close-" + i);
+            binder.start();
+            closer.start();
+            binder.join(5_000);
+            closer.join(5_000);
+            if (fail.get() != null) {
+                server.close();
+                throw new AssertionError("iteration " + i, fail.get());
+            }
+            assertFalse(server.bindContentPort(), "iteration " + i + " bind after close must be a no-op");
+            assertFalse(server.contentBound(), "iteration " + i + " must not leave a listener");
+            server.close();
+        }
+    }
+
+    @Test
+    void restartRejectsAnOlderSignedSnapshot() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-floor"));
+        Files.writeString(html.resolve("index.html"), "v5");
+        var state = dir.resolve("floor-state");
+        var yaml = dir.resolve("floor.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var fixture = persistVerifiedLastGoodWithKeys(dir, state, loaded.document(), 5);
+        try (var server = SjwsServer.start(loaded, null, true, fixture.pin())) {
+            assertTrue(server.dataPlane().hasLastGood());
+            assertTrue(server.dataPlane().ready());
+        }
+        assertEquals(5, LastGoodFiles.readPin(fixture.pin()).appliedVersion());
+        long now = System.currentTimeMillis();
+        var older = fixture.keys().sign(loaded.document(), 3L, 1L, 1L, now - 1_000, now + 3_600_000L, 0L);
+        LastGoodFiles.write(state, older.version(), older.epoch(), older.keyId(), fixture.keys().bundle().keys(),
+                fixture.keys().bundle().versionFloor(), fixture.keys().bundle().encoded(), older);
+        assertTrue(DataApply.tryReadLastGood(state).isPresent());
+        assertTrue(DataApply.tryReadVerifiedLastGood(state, fixture.pin()).isEmpty());
+        try (var server = SjwsServer.start(loaded, null, true, fixture.pin())) {
+            assertFalse(server.dataPlane().hasLastGood());
+            assertFalse(server.dataPlane().ready());
+            assertEquals(503, HttpTestSupport.get(server.tcpPort(), "/readyz", 2_000).statusCode());
+            var apply = DataApply.open(fixture.keys(), fixture.pin(), state, System::currentTimeMillis);
+            server.attachControlPlane(apply);
+            var offered = server.applyRemote(older);
+            assertFalse(offered.applied(), offered.errors().toString());
+        }
+    }
+
+    @Test
+    void applyRemoteKeepsMaxStalenessWhenModeIsClamped() throws Exception {
+        var html = Files.createDirectory(dir.resolve("clamp-html"));
+        Files.writeString(html.resolve("index.html"), "ok");
+        var state = dir.resolve("clamp-state");
+        var yaml = dir.resolve("clamp.yaml");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\n  state_dir: "
+                + state.toAbsolutePath() + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        long now = 1_700_000_000_000L;
+        var clock = new AtomicLong(now + 1);
+        var keys = KeyRing.generate("online-1", now + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var apply = DataApply.open(keys, dir.resolve("clamp-pin"), state, clock::get);
+        var incomingNode = new NodeSettings(NodeSettings.Mode.STANDALONE, Map.of(), Duration.ofMinutes(15));
+        var document = ConfigDocument.of(loaded.document().server(), loaded.document().acme(),
+                loaded.document().routing(), loaded.document().middleware(), loaded.document().access(),
+                incomingNode, 1, 2, loaded.document().configFile()).withStateDir(state);
+        var snapshot = keys.sign(document, 2L, 1L, 1L, now, now + 3_600_000L, 0L);
+        try (var server = SjwsServer.start(loaded, null, false)) {
+            server.attachControlPlane(apply);
+            server.dataPlane().clock(clock::get);
+            var result = server.applyRemote(snapshot);
+            assertTrue(result.applied(), result.errors().toString());
+            assertEquals(NodeSettings.Mode.DATA, result.snapshot().document().node().mode());
+            assertEquals(Duration.ofMinutes(15), result.snapshot().document().node().maxStaleness());
+            assertTrue(server.dataPlane().ready());
+            clock.set(now + Duration.ofMinutes(16).toMillis());
+            assertTrue(server.dataPlane().pastMaxStaleness());
+            assertFalse(server.dataPlane().ready());
+        }
+    }
+
+    @Test
+    void liveChainControlKeepsReadyzOnADataNode() throws Exception {
+        var html = Files.createDirectory(dir.resolve("chain-html"));
+        Files.writeString(html.resolve("index.html"), "ok");
+        var state = dir.resolve("chain-state");
+        var yaml = dir.resolve("chain.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var pin = persistVerifiedLastGood(dir, state, loaded.document(), 4);
+        var filters = RequestFilters.create().factory("mark", spec -> (request, next) -> next.proceed(request));
+        try (var server = SjwsServer.start(loaded, null, true, pin)) {
+            assertEquals(200, HttpTestSupport.get(server.tcpPort(), "/readyz", 2_000).statusCode());
+            var control = server.chainControl(filters, Set.of());
+            control.apply(FilterDocument.empty(1));
+            assertEquals(200, HttpTestSupport.get(server.tcpPort(), "/readyz", 2_000).statusCode());
+            assertEquals("ok", HttpTestSupport.get(server.tcpPort(), "/index.html", 2_000).bodyText());
+        }
+    }
+
+    @Test
+    void bindContentPortReusesAnOpenChallengeListener() throws Exception {
+        var html = Files.createDirectory(dir.resolve("acme-html"));
+        Files.writeString(html.resolve("index.html"), "ok");
+        var storage = Files.createDirectory(dir.resolve("acme-store"));
+        int httpPort;
+        try (var probe = new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+            httpPort = probe.getLocalPort();
+        }
+        var state = dir.resolve("acme-state");
+        var yaml = dir.resolve("acme.yaml");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\n  state_dir: "
+                + state.toAbsolutePath() + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath()
+                + "\nacme:\n  enabled: true\n  directory: \"http://127.0.0.1:1/directory\"\n"
+                + "  email: ops@example.com\n  domains: [example.com]\n  storage: " + storage.toAbsolutePath()
+                + "\n  http_port: " + httpPort + "\n  accept_terms: true\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        long now = 1_700_000_000_000L;
+        var keys = KeyRing.generate("online-1", now + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var apply = DataApply.open(keys, dir.resolve("acme-pin"), state, () -> now + 1);
+        var document = ConfigDocument.of(loaded.document().server(), loaded.document().acme(),
+                loaded.document().routing(), loaded.document().middleware(), loaded.document().access(),
+                loaded.document().node(), 1, 2, loaded.document().configFile()).withStateDir(state);
+        var snapshot = keys.sign(document, 2L, 0L, 1L, now, now + 3_600_000L, 0L);
+        try (var server = SjwsServer.start(loaded, null, false)) {
+            server.attachControlPlane(apply);
+            var result = server.applyRemote(snapshot);
+            assertTrue(result.applied(), result.errors().toString());
+            assertTrue(server.contentBound());
+            assertTrue(server.dataPlane().hasLastGood());
+            assertEquals("ok", HttpTestSupport.get(server.tcpPort(), "/index.html", 2_000).bodyText());
+        }
+    }
+
+    static Path persistVerifiedLastGood(Path pinDir, Path stateDir, ConfigDocument document, long version)
+            throws Exception {
+        return persistVerifiedLastGoodWithKeys(pinDir, stateDir, document, version).pin();
+    }
+
+    record LastGoodFixture(Path pin, KeyRing keys, SignedSnapshot snapshot) {
+    }
+
+    static LastGoodFixture persistVerifiedLastGoodWithKeys(Path pinDir, Path stateDir, ConfigDocument document,
+            long version) throws Exception {
+        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var pin = pinDir.resolve("root-" + version + ".pin");
+        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        long now = System.currentTimeMillis();
+        var snap = keys.sign(document, version, 1L, 1L, now, now + 3_600_000L, 0L);
+        LastGoodFiles.write(stateDir, snap.version(), snap.epoch(), snap.keyId(), keys.bundle().keys(),
+                keys.bundle().versionFloor(), keys.bundle().encoded(), snap);
+        return new LastGoodFixture(pin, keys, snap);
+    }
+
     static SignedSnapshot signYaml(KeyRing keys, String yaml, long version, long epoch, long issued, long expires)
             throws Exception {
         var hash = KeyRing.hash(yaml);
@@ -395,16 +608,5 @@ class DataReadinessTest {
         return unsigned.withSignature(sign.sign());
     }
 
-    static Path persistVerifiedLastGood(Path pinDir, Path stateDir, ConfigDocument document, long version)
-            throws Exception {
-        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
-        var pin = pinDir.resolve("root-" + version + ".pin");
-        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
-        long now = System.currentTimeMillis();
-        var snap = keys.sign(document, version, 1L, 1L, now, now + 3_600_000L, 0L);
-        LastGoodFiles.write(stateDir, snap.version(), snap.epoch(), snap.keyId(), keys.bundle().keys(),
-                keys.bundle().versionFloor(), keys.bundle().encoded(), snap);
-        return pin;
-    }
 
 }

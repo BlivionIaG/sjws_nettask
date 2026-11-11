@@ -44,6 +44,7 @@ public final class DataApply {
     private final byte[] trustBundle;
     private final long trustFloor;
     private final Path stateDir;
+    private final Path pin;
     private final LongSupplier nowMillis;
     private final Map<Long, String> retained = new LinkedHashMap<>();
     private final ArrayDeque<Long> order = new ArrayDeque<>();
@@ -51,21 +52,25 @@ public final class DataApply {
     private long appliedEpoch;
 
     private DataApply(byte[] rootPublic, long pinFloor, List<TrustKey> keys, byte[] trustBundle, long trustFloor,
-            Path stateDir, LongSupplier nowMillis) {
+            Path stateDir, Path pin, LongSupplier nowMillis, long appliedVersion) {
         this.rootPublic = rootPublic;
         this.pinFloor = pinFloor;
         this.keys = List.copyOf(keys);
         this.trustBundle = trustBundle.clone();
         this.trustFloor = trustFloor;
         this.stateDir = stateDir;
+        this.pin = pin;
         this.nowMillis = nowMillis;
+        this.appliedVersion = appliedVersion;
     }
 
     public static DataApply open(KeyRing keys, Path pin, Path stateDir, LongSupplier nowMillis) throws IOException {
-        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        if (!LastGoodFiles.isRegularFile(pin)) {
+            LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        }
         var read = LastGoodFiles.readPin(pin);
         return new DataApply(read.rootPublic(), read.versionFloor(), keys.bundle().keys(), keys.bundle().encoded(),
-                keys.bundle().versionFloor(), stateDir, nowMillis);
+                keys.bundle().versionFloor(), stateDir, pin, nowMillis, read.appliedVersion());
     }
 
     /**
@@ -85,11 +90,14 @@ public final class DataApply {
         if (parsed.versionFloor() < read.versionFloor()) {
             throw new IOException("trust bundle floor is below the pinned floor");
         }
+        if (parsed.bundleSerial() < read.bundleSerial()) {
+            throw new IOException("trust bundle serial is below the pinned floor");
+        }
         if (nowMillis.getAsLong() > parsed.notAfterMillis()) {
             throw new IOException("trust bundle has expired");
         }
         return new DataApply(read.rootPublic(), read.versionFloor(), parsed.keys(), parsed.encoded(),
-                parsed.versionFloor(), stateDir, nowMillis);
+                parsed.versionFloor(), stateDir, pin, nowMillis, read.appliedVersion());
     }
 
     public record Decision(String error, boolean noop, String yaml) {
@@ -209,6 +217,15 @@ public final class DataApply {
         record(snapshot);
         LastGoodFiles.write(stateDir, appliedVersion, appliedEpoch, snapshot.keyId(), keys, trustFloor, trustBundle,
                 snapshot);
+        if (this.pin != null) {
+            long serial = 0L;
+            try {
+                serial = TrustBundle.parse(this.trustBundle, this.rootPublic).bundleSerial();
+            } catch (CpKeyException e) {
+                serial = 0L;
+            }
+            LastGoodFiles.ratchetPin(this.pin, snapshot.version(), serial);
+        }
     }
 
     /** In-memory part of {@link #remember}: the anti-rollback floor holds even where nothing is written. */
@@ -251,7 +268,7 @@ public final class DataApply {
 
     /** Reads a snapshot back out of {@code last-good.json}. The caller still runs {@link #decide}. */
     public static SignedSnapshot readLastGood(Path stateDir) throws IOException {
-        return parseSnapshot(Files.readString(LastGoodFiles.configDir(stateDir).resolve("last-good.json")));
+        return parseSnapshot(LastGoodFiles.readStringNoFollow(LastGoodFiles.configDir(stateDir).resolve("last-good.json")));
     }
 
     /**
@@ -266,10 +283,10 @@ public final class DataApply {
         }
         try {
             var path = LastGoodFiles.configDir(stateDir).resolve("last-good.json");
-            if (!Files.isRegularFile(path)) {
+            if (!LastGoodFiles.isRegularFile(path)) {
                 return Optional.empty();
             }
-            var snapshot = parseSnapshot(Files.readString(path));
+            var snapshot = parseSnapshot(LastGoodFiles.readStringNoFollow(path));
             if (snapshot.version() <= 0) {
                 return Optional.empty();
             }
@@ -285,7 +302,14 @@ public final class DataApply {
      * canonical hash is wrong, the envelope is expired, or the version does not match the floor.
      * Startup/readiness only; the request path does not call this.
      */
-    public static Optional<SignedSnapshot> tryReadVerifiedLastGood(Path stateDir, Path pin) {
+    /**
+     * A last-good snapshot that already passed the pin, trust, signature, and floor checks,
+     * plus the bundle serial stored on the pin.
+     */
+    public record VerifiedLastGood(SignedSnapshot snapshot, long bundleSerial) {
+    }
+
+    public static Optional<VerifiedLastGood> tryReadVerifiedLastGood(Path stateDir, Path pin) {
         if (stateDir == null || pin == null) {
             return Optional.empty();
         }
@@ -298,10 +322,10 @@ public final class DataApply {
             var dir = LastGoodFiles.configDir(stateDir);
             var trustPath = dir.resolve("trust.json");
             var floorPath = dir.resolve("floor.json");
-            if (!Files.isRegularFile(trustPath) || !Files.isRegularFile(floorPath)) {
+            if (!LastGoodFiles.isRegularFile(trustPath) || !LastGoodFiles.isRegularFile(floorPath)) {
                 return Optional.empty();
             }
-            var trustJson = Files.readString(trustPath);
+            var trustJson = LastGoodFiles.readStringNoFollow(trustPath);
             var bundleBytes = Base64.getDecoder().decode(LastGoodFiles.readString(trustJson, "bundle"));
             TrustBundle bundle;
             try {
@@ -310,6 +334,9 @@ public final class DataApply {
                 return Optional.empty();
             }
             if (bundle.versionFloor() < pinned.versionFloor()) {
+                return Optional.empty();
+            }
+            if (bundle.bundleSerial() < pinned.bundleSerial()) {
                 return Optional.empty();
             }
             long now = System.currentTimeMillis();
@@ -355,12 +382,15 @@ public final class DataApply {
             if (now < snapshot.issuedAtMillis() || now > snapshot.expiresAtMillis()) {
                 return Optional.empty();
             }
-            long maxVersion = LastGoodFiles.readLong(Files.readString(floorPath), "maxVersion");
+            long maxVersion = LastGoodFiles.readLong(LastGoodFiles.readStringNoFollow(floorPath), "maxVersion");
             long floor = Math.max(pinned.versionFloor(), bundle.versionFloor());
             if (snapshot.version() < floor || snapshot.version() != maxVersion) {
                 return Optional.empty();
             }
-            return Optional.of(snapshot);
+            if (snapshot.version() < pinned.appliedVersion()) {
+                return Optional.empty();
+            }
+            return Optional.of(new VerifiedLastGood(snapshot, bundle.bundleSerial()));
         } catch (RuntimeException | IOException e) {
             return Optional.empty();
         }

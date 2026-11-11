@@ -67,8 +67,8 @@ No flag, no variable, and no config file leaves the role to the bootstrap file.
 (including a file that omits `node`) rejects `--bootstrap`.
 
 A control process does not bind the content port unless `--bind-content` /
-`WEB_SERVER_BIND_CONTENT` or `server.bind_content: true` says so. Data and standalone
-bind it unless that flag or key turns it off. The sample control file sets
+`WEB_SERVER_BIND_CONTENT` or `server.bind_content: true` says so. Standalone binds it unless that flag or key turns it off. A data process binds it
+once a verified last-good has been applied, or earlier when that flag or key forces a bind. The sample control file sets
 `bind_content: false`. The document root in the file must still exist: the process
 builds the content snapshot even when it does not listen. The admin and watch listeners
 come from the `cp:` block (`cp.admin.listen`, `cp.watch.listen`, mTLS from `cp.tls`; see
@@ -84,7 +84,7 @@ flowchart TD
     s2 --> s3["3. Else node.mode, when a<br/>config file was named. A<br/>file without it is<br/>standalone"]
     s3 --> s4["4. Else the role in the<br/>bootstrap file, or<br/>standalone without one"]
     s4 --> s5["5. control or data<br/>without --bootstrap, or<br/>standalone with it: exit<br/>64"]
-    s5 --> s6["6. Content port:<br/>WEB_SERVER_BIND_CONTENT,<br/>then --bind-content, then<br/>server.bind_content, then<br/>the role: off for<br/>control, on for the<br/>others"]
+    s5 --> s6["6. Content port:<br/>WEB_SERVER_BIND_CONTENT,<br/>then --bind-content, then<br/>server.bind_content, then<br/>the role: off for control,<br/>on for standalone, data<br/>after a verified last-good<br/>is applied unless forced"]
 ```
 
 ## Bootstrap
@@ -182,19 +182,24 @@ implemented outside this daemon slice, in `sjws_nettask.cp`.
    `attach`. Do not treat "service started" as "config applied".
 
 4. **Data node, control plane down.** Boot from a verified signed last-good when
-   that snapshot is present; otherwise not-ready (content port not bound, so
-   `/readyz` is unreachable until the first apply, then `503` if still not ready)
-   and retry with backoff. Past max-staleness, readiness is false and the process
-   keeps serving. There is no automatic drain. Readiness is `NodeLifecycle.dataPlane`
-   against the signed `expiresAtMillis` and an optional `node.max_staleness`
-   ceiling on `issuedAtMillis` (no default ceiling). The data-role content port
-   binds only after that signed last-good exists, unless `--bind-content` or
-   `server.bind_content` forces a bind. For role data this daemon starts the watch
-   client (`cp.DataWatch`, a long poll), which moves `connection` between
-   `pending`, `connected` and `disconnected`, and late-binds the content port after
-   the first applied snapshot. A missing config file on a data
-   node already boots from `<stateDir>/config/last-good.json` when the envelope hash
-   matches and `node.mode` is `data`. An unsigned `LastGoodStore` boot file is not
+   that snapshot is present, and install those already-checked bytes as the running
+   configuration before `/readyz` may return 200 or the content port binds.
+   Otherwise not-ready (content port not bound, so `/readyz` is unreachable until
+   the first apply, then `503` if still not ready) and retry with backoff. Past
+   max-staleness, readiness is false and the process keeps serving. There is no
+   automatic drain. Readiness is `NodeLifecycle.dataPlane` against the signed
+   `expiresAtMillis` and an optional `node.max_staleness` ceiling on
+   `issuedAtMillis` (no default ceiling; the operator interval uses a monotonic
+   clock). The data-role content port binds only after that signed last-good has
+   been applied, unless `--bind-content` or `server.bind_content` forces a bind.
+   An explicit `--bind-content=false` still late-binds once a verified last-good
+   is applied. For role data this daemon starts the watch client (`cp.DataWatch`,
+   a long poll), which moves `connection` between `pending`, `connected` and
+   `disconnected`, and late-binds the content port after the first applied
+   snapshot. A missing config file on a data node boots from the same verified
+   last-good when the bootstrap pin is present, or from an unsigned
+   `<stateDir>/config/last-good.json` envelope when that file is the unsigned boot
+   form and `node.mode` is `data`. An unsigned `LastGoodStore` boot file is not
    a verified last-good for readiness. A leftover sibling `<file>.last-good` is read
    once when that JSON file is absent (`LastGoodStore`). `Requires=` stays off the data unit.
 

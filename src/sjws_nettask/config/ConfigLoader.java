@@ -124,7 +124,7 @@ public final class ConfigLoader {
             if (!Files.isRegularFile(requested)) {
                 var state = stateDir(args, env, null, requested.toAbsolutePath().getParent());
                 var json = LastGoodStore.file(state);
-                var recovered = LastGoodStore.dataPlaneYaml(json);
+                var recovered = recoverLastGoodYaml(json, state, args);
                 var source = json;
                 if (recovered == null) {
                     var legacy = LastGoodStore.beside(requested);
@@ -289,6 +289,60 @@ public final class ConfigLoader {
             path = base.resolve(path);
         }
         return path;
+    }
+
+    /**
+     * Missing-config recovery. A signed last-good is used only when it verifies under the
+     * bootstrap pin; an unsigned boot envelope is still read when no pin is available.
+     */
+    private static String recoverLastGoodYaml(Path json, Path state, String[] args) {
+        var pin = pinFromBootstrapArgs(args);
+        if (pin != null && LastGoodStore.signature(json) != null) {
+            var verified = sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(state, pin);
+            return verified.map(value -> value.snapshot().canonicalYaml()).orElse(null);
+        }
+        return LastGoodStore.dataPlaneYaml(json);
+    }
+
+    private static Path pinFromBootstrapArgs(String[] args) {
+        if (args == null) {
+            return null;
+        }
+        String listed = null;
+        for (int i = 0; i < args.length; i++) {
+            var arg = args[i];
+            if (arg != null && arg.startsWith("--bootstrap=")) {
+                listed = arg.substring("--bootstrap=".length());
+                break;
+            }
+            if ("--bootstrap".equals(arg) && i + 1 < args.length) {
+                listed = args[i + 1];
+                break;
+            }
+        }
+        if (listed == null || listed.isBlank()) {
+            return null;
+        }
+        try {
+            var bootstrap = Path.of(listed);
+            if (!java.nio.file.Files.isRegularFile(bootstrap)) {
+                return null;
+            }
+            Path pin = null;
+            for (var line : java.nio.file.Files.readAllLines(bootstrap)) {
+                var trimmed = line.strip();
+                if (trimmed.startsWith("pin=")) {
+                    pin = Path.of(trimmed.substring("pin=".length()).trim());
+                    break;
+                }
+            }
+            if (pin == null) {
+                return null;
+            }
+            return pin.isAbsolute() ? pin : bootstrap.toAbsolutePath().getParent().resolve(pin).normalize();
+        } catch (RuntimeException | java.io.IOException e) {
+            return null;
+        }
     }
 
     /**

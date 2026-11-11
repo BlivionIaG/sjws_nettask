@@ -124,7 +124,7 @@ public final class ConfigReloader {
         var clamped = clamp(current.document().server(), incoming.server(), http3Running, restart);
         var node = incoming.node();
         if (current.document().node().mode() != node.mode()) {
-            node = new NodeSettings(current.document().node().mode(), node.labels());
+            node = new NodeSettings(current.document().node().mode(), node.labels(), node.maxStaleness());
             restart.add("node.mode changed to " + incoming.node().mode().wire() + "; still "
                     + current.document().node().mode().wire() + " until restart");
         }

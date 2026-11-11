@@ -603,7 +603,7 @@ class ServiceDaemonTest {
         var matched = Daemon.parse(new String[] {"--bind-content=true"}, Map.of());
         errBytes.reset();
         assertTrue(Sjws_nettask.resolveBind(matched, dataLoaded, err));
-        assertEquals("", err());
+        assertTrue(err().contains("--bind-content=true binds the content port with no verified last-good"), err());
 
         ServiceHooks nameless = new ServiceHooks() {
             @Override
@@ -921,7 +921,8 @@ class ServiceDaemonTest {
         assertEquals("", err());
         errBytes.reset();
         assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {"--bind-content=true"}, Map.of()), loaded, err));
-        assertEquals("", err(), "forcing bind on data matches the historical role default, so no override warn");
+        assertTrue(err().contains("--bind-content=true binds the content port with no verified last-good"), err());
+        assertFalse(err().contains("overrides the data"), err());
 
         var empty = tmp.resolve("empty-state");
         var hookDir = tmp.resolve("hook-state");

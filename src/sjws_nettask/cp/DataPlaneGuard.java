@@ -32,16 +32,20 @@ public final class DataPlaneGuard {
 
     private final boolean active;
     private volatile LongSupplier clock;
+    private volatile boolean injectedClock;
     private volatile long maxStalenessMs;
     private volatile boolean controlPlaneUp;
     private volatile boolean hasLastGood;
     private volatile long expiresAtMillis;
     private volatile long issuedAtMillis;
+    /** Operator-interval deadline on {@link System#nanoTime()} when the wall clock is not injected. */
+    private volatile long staleDeadlineNanos;
 
     private DataPlaneGuard(boolean active, long maxStalenessMs, LongSupplier clock) {
         this.active = active;
         this.maxStalenessMs = maxStalenessMs;
         this.clock = clock == null ? System::currentTimeMillis : clock;
+        this.injectedClock = false;
     }
 
     public static DataPlaneGuard inactive() {
@@ -86,7 +90,14 @@ public final class DataPlaneGuard {
         if (!this.active) {
             return;
         }
-        this.clock = clock == null ? System::currentTimeMillis : clock;
+        if (clock == null) {
+            this.clock = System::currentTimeMillis;
+            this.injectedClock = false;
+        } else {
+            this.clock = clock;
+            this.injectedClock = true;
+        }
+        refreshStaleDeadline();
     }
 
     /** Keep a process-local ceiling when a pushed snapshot does not name one. */
@@ -95,6 +106,7 @@ public final class DataPlaneGuard {
             return;
         }
         this.maxStalenessMs = duration == null ? 0L : duration.toMillis();
+        refreshStaleDeadline();
     }
 
     public void controlPlane(boolean up) {
@@ -115,10 +127,21 @@ public final class DataPlaneGuard {
         if (!this.active) {
             return;
         }
-        var snapshot = DataApply.tryReadVerifiedLastGood(stateDir, pin).orElse(null);
-        if (snapshot != null) {
-            remember(snapshot);
+        var verified = DataApply.tryReadVerifiedLastGood(stateDir, pin).orElse(null);
+        if (verified == null) {
+            clearLastGood();
         }
+    }
+
+    /** Drops a previously accepted last-good when a later load does not verify. */
+    public void clearLastGood() {
+        if (!this.active) {
+            return;
+        }
+        this.hasLastGood = false;
+        this.expiresAtMillis = 0L;
+        this.issuedAtMillis = 0L;
+        this.staleDeadlineNanos = 0L;
     }
 
     public void applied(SignedSnapshot snapshot, boolean controlPlaneUp) {
@@ -133,6 +156,16 @@ public final class DataPlaneGuard {
         this.hasLastGood = snapshot.version() > 0;
         this.expiresAtMillis = snapshot.expiresAtMillis();
         this.issuedAtMillis = snapshot.issuedAtMillis();
+        refreshStaleDeadline();
+    }
+
+    private void refreshStaleDeadline() {
+        if (this.maxStalenessMs <= 0 || this.issuedAtMillis <= 0) {
+            this.staleDeadlineNanos = 0L;
+            return;
+        }
+        long remaining = this.issuedAtMillis + this.maxStalenessMs - this.clock.getAsLong();
+        this.staleDeadlineNanos = remaining <= 0L ? System.nanoTime() : System.nanoTime() + remaining * 1_000_000L;
     }
 
     public boolean hasLastGood() {
@@ -140,8 +173,17 @@ public final class DataPlaneGuard {
     }
 
     public boolean pastMaxStaleness() {
-        return NodeLifecycle.pastMaxStaleness(this.clock.getAsLong(), this.expiresAtMillis, this.issuedAtMillis,
-                this.maxStalenessMs);
+        long now = this.clock.getAsLong();
+        if (this.expiresAtMillis > 0 && now > this.expiresAtMillis) {
+            return true;
+        }
+        if (this.maxStalenessMs <= 0 || this.issuedAtMillis <= 0) {
+            return false;
+        }
+        if (this.injectedClock) {
+            return NodeLifecycle.pastMaxStaleness(now, this.expiresAtMillis, this.issuedAtMillis, this.maxStalenessMs);
+        }
+        return this.staleDeadlineNanos > 0L && System.nanoTime() >= this.staleDeadlineNanos;
     }
 
     public NodeLifecycle.DataReadiness readiness() {

@@ -775,6 +775,10 @@ public class Sjws_nettask {
             err.println("WARN: " + source + "=" + chosen + " overrides the " + mode.wire()
                     + " content-port default");
         }
+        if (chosen.booleanValue() && mode == sjws_nettask.config.NodeSettings.Mode.DATA
+                && !hasVerifiedLastGood(loaded, hooks)) {
+            err.println("WARN: " + source + "=true binds the content port with no verified last-good");
+        }
         return chosen;
     }
 
