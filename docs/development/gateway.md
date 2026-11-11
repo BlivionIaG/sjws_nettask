@@ -126,3 +126,27 @@ rules cannot change `content-length`, `transfer-encoding`, `connection`, `keep-a
 `server` or `alt-svc`. Request rules build one new header map and pass `request.withHeaders`.
 Response-only rules do not. Response fields are removed and then set, so a set wins over a
 remove of the same name.
+
+
+## compress
+
+gzip response compression negotiated from `Accept-Encoding`. Off, with no cost, until a document
+names this filter. This land is gzip only; `encodings` that include `br` are rejected at apply time
+so brotli is not advertised before it is implemented.
+
+The request path looks at `Accept-Encoding` after the inner handler returns. gzip (or `x-gzip`, or
+`*` with q > 0) is required; a missing header is left uncompressed. The filter skips 1xx/204/304,
+206 and `Content-Range`, an already encoded body (other than `identity`), a missing or
+non-compressible `Content-Type`, and bodies shorter than `min_size` (default 256). Default
+compressible types are `text/*` except `text/event-stream`, common XML/JSON/JavaScript types,
+`image/svg+xml`, and `+json` / `+xml` suffixes. `types` replaces that default with an allow list;
+`except` always excludes. `max_buffer` (default 1 MiB, cap 16 MiB) is the largest in-memory body
+the filter will compress: a `Body.Stream` is read only when its length is known and under that cap,
+then replaced with a new `Body.Bytes` so `FilterChain` can close the original source. A
+`Body.FileBody` larger than the cap is compressed as a new unknown-length stream (chunked on
+HTTP/1.1 keep-alive). If gzip does not shrink a buffered body, the original response is kept.
+
+A compressed response gets `Content-Encoding: gzip` and `Vary: Accept-Encoding` (merged into an
+existing Vary, left alone when Vary is `*`). Stale `Content-Length`, `Content-MD5` and
+`Accept-Ranges` are removed; the transport writes `Content-Length` from the new body. A present
+ETag is suffixed with `-gzip` inside the quotes.
