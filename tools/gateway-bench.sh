@@ -12,6 +12,14 @@
 #   GATEWAY_BENCH_CONNECTIONS wrk -c (default 128)
 #   GATEWAY_BENCH_MAX_DELTA  fail when abs(gateway-off/standalone - 1) exceeds this
 #                            (unset: print the ratio, do not fail on it)
+#   GATEWAY_BENCH_WRK2       auto (default; run wrk2 when it is on PATH), 1 (required),
+#                            or 0 (skip). Fixed-rate p99 is printed; it does not fail
+#                            the script on magnitude (no absolute floor has been measured).
+#   GATEWAY_BENCH_WRK2_FRACTION  fraction of that mode's wrk req/s used as wrk2 -R (default 0.7)
+#   GATEWAY_BENCH_WRK2_RATE  optional absolute wrk2 -R for both modes
+#
+# After the wrk (and optional wrk2) pass the script prints the server RSS in kB.
+# A missing RSS reading fails the script; the value itself is not gated.
 #
 # The official comparison is warmup 5s, duration 30s, -t4 -c128, 1 KiB file, loopback.
 # Each mode binds an ephemeral port (GatewayBench --port=0) and prints it.
@@ -23,7 +31,7 @@ THREADS="${GATEWAY_BENCH_THREADS:-4}"
 CONNS="${GATEWAY_BENCH_CONNECTIONS:-128}"
 ROOT="$(mktemp -d)"
 LOG="$(mktemp)"
-trap 'rm -rf "$ROOT"; rm -f "$LOG" "$LOG.wrk"; [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null || true' EXIT
+trap 'rm -rf "$ROOT"; rm -f "$LOG" "$LOG.wrk" "$LOG.wrk2"; [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null || true' EXIT
 mkdir -p "$ROOT/html"
 dd if=/dev/zero of="$ROOT/html/index.html" bs=1024 count=1 status=none
 if [ ! -d target/classes ] || [ ! -d target/lib ]; then
@@ -87,6 +95,54 @@ run_mode() {
     exit 1
   fi
   printf '%s\n' "$req" > "$ROOT/${mode}.req"
+
+  rss=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' \t')
+  if [ -z "$rss" ] || [ "$rss" = "0" ]; then
+    echo "could not read RSS ($mode pid $PID)" >&2
+    exit 1
+  fi
+  echo "rss_kb=$rss ($mode)"
+  printf '%s\n' "$rss" > "$ROOT/${mode}.rss"
+
+  run_wrk2=0
+  case "${GATEWAY_BENCH_WRK2:-auto}" in
+    1|yes|true) run_wrk2=1 ;;
+    0|no|false) run_wrk2=0 ;;
+    auto)
+      if command -v wrk2 >/dev/null 2>&1; then
+        run_wrk2=1
+      fi
+      ;;
+    *)
+      echo "GATEWAY_BENCH_WRK2 must be auto, 1, or 0" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$run_wrk2" = 1 ]; then
+    if ! command -v wrk2 >/dev/null 2>&1; then
+      echo "wrk2 is required (GATEWAY_BENCH_WRK2=${GATEWAY_BENCH_WRK2}) but is not on PATH" >&2
+      exit 1
+    fi
+    fraction=${GATEWAY_BENCH_WRK2_FRACTION:-0.7}
+    if [ -n "${GATEWAY_BENCH_WRK2_RATE:-}" ]; then
+      rate=$GATEWAY_BENCH_WRK2_RATE
+    else
+      rate=$(awk -v r="$req" -v f="$fraction" 'BEGIN { v=int(r * f); if (v < 1) v=1; print v }')
+    fi
+    echo "wrk2 -R$rate ($mode, fraction $fraction of wrk req/s unless GATEWAY_BENCH_WRK2_RATE is set)"
+    wrk2 -t"$THREADS" -c"$CONNS" -d"$DURATION" -R"$rate" -L \
+      "http://127.0.0.1:$port/index.html" | tee "$LOG.wrk2"
+    if ! grep -q 'Requests/sec:' "$LOG.wrk2"; then
+      echo "wrk2 produced no summary ($mode)" >&2
+      exit 1
+    fi
+    rss=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' \t')
+    if [ -n "$rss" ] && [ "$rss" != "0" ]; then
+      echo "rss_kb=$rss ($mode after wrk2)"
+      printf '%s\n' "$rss" > "$ROOT/${mode}.rss"
+    fi
+  fi
+
   kill "$PID" 2>/dev/null || true
   wait "$PID" 2>/dev/null || true
   PID=
@@ -99,6 +155,10 @@ standalone_req=$(cat "$ROOT/standalone.req")
 gateway_off_req=$(cat "$ROOT/gateway-off.req")
 echo "standalone req/s=${standalone_req}"
 echo "gateway-off req/s=${gateway_off_req}"
+if [ -f "$ROOT/standalone.rss" ] && [ -f "$ROOT/gateway-off.rss" ]; then
+  echo "standalone rss_kb=$(cat "$ROOT/standalone.rss")"
+  echo "gateway-off rss_kb=$(cat "$ROOT/gateway-off.rss")"
+fi
 ratio=$(awk -v a="$standalone_req" -v b="$gateway_off_req" 'BEGIN { printf "%.4f", b / a }')
 echo "ratio gateway-off/standalone=${ratio}"
 if [ -n "${GATEWAY_BENCH_MAX_DELTA:-}" ]; then

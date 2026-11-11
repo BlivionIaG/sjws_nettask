@@ -77,7 +77,7 @@ jobs:
         run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wrk
       - name: wrk standalone vs gateway-off
         if: runner.os == 'Linux'
-        run: GATEWAY_BENCH_WARMUP=1s GATEWAY_BENCH_DURATION=3s tools/gateway-bench.sh
+        run: GATEWAY_BENCH_WARMUP=1s GATEWAY_BENCH_DURATION=3s GATEWAY_BENCH_WRK2=0 tools/gateway-bench.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:

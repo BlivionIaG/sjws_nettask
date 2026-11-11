@@ -1,9 +1,11 @@
 name: Perf gate
 
-# A/B wrk benchmark of the PR head against its base branch on the same runner.
+# A/B wrk + wrk2 benchmark of the PR head against its base branch on the same runner.
 # Opt out per PR with the `skip-perf` label. Tune with repository variables
-# PERF_THRESHOLD (throughput %, default 10) and PERF_P99_THRESHOLD (default 2x).
-# See docs/development/perf-gate.md.
+# PERF_THRESHOLD (throughput %, default 10), PERF_P99_THRESHOLD (default 2x that,
+# also used for wrk2 p99), and PERF_RSS_THRESHOLD (unset = record RSS only).
+# workflow_dispatch runs the same job as an A/A on the selected ref (baseline
+# collector; not a release). See docs/development/perf-gate.md.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
@@ -13,6 +15,7 @@ on:
       - 'tools/perf-gate/**'
       - 'contrib/sjws_nettask-standalone.yaml'
       - '.github/workflows/perf-gate.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,7 +26,7 @@ concurrency:
 
 jobs:
   perf:
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-perf') }}
+    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'skip-perf') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -32,7 +35,9 @@ jobs:
           path: head
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          # PRs compare against the base SHA. A manual dispatch is A/A on github.sha
+          # so the job can record wrk2 p99 and RSS without inventing floors.
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           path: base
       - uses: actions/setup-java@v6
         with:
@@ -43,7 +48,13 @@ jobs:
             head/pom.xml
             base/pom.xml
       - name: Install wrk
-        run: sudo apt-get update -q && sudo apt-get install -y -q wrk
+        run: sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q wrk
+      - name: Install wrk2
+        run: |
+          head/tools/perf-gate/install-wrk2.sh "$HOME/.local/bin/wrk2"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: compare.py unit tests
+        run: python3 head/tools/perf-gate/test_compare.py
       - name: Build base and head jars
         run: |
           for side in base head; do
@@ -56,14 +67,18 @@ jobs:
           RUNS: '5'
           DURATION: 10s
           WARMUP: 5s
+          WRK2: '1'
+          REQUIRE_WRK2: '1'
           THRESHOLD: ${{ vars.PERF_THRESHOLD || '10' }}
           P99_THRESHOLD: ${{ vars.PERF_P99_THRESHOLD || '' }}
+          RSS_THRESHOLD: ${{ vars.PERF_RSS_THRESHOLD || '' }}
         # Scripts and the sample config come from the PR head; the base build only runs as a server.
         # Pass 1: default CLI (standalone). Pass 2: explicit --role=standalone with the packaged
         # standalone config and the swarm forced off (control plane detached on both sides).
         run: |
-          args=(--threshold "$THRESHOLD")
+          args=(--threshold "$THRESHOLD" --require-wrk2)
           [[ -n "$P99_THRESHOLD" ]] && args+=(--p99-threshold "$P99_THRESHOLD")
+          [[ -n "$RSS_THRESHOLD" ]] && args+=(--rss-threshold "$RSS_THRESHOLD")
           rc=0
           run_pass() { # dir title
             head/tools/perf-gate/bench.sh "$BASE_JAR" "$HEAD_JAR" "perf-out/$1"
