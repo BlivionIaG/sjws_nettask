@@ -971,6 +971,10 @@ class ServiceDaemonTest {
         errBytes.reset();
         assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), hookLoaded, err, hooks));
         assertEquals("", err());
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {"--bind-content=true"}, Map.of()), hookLoaded,
+                err, hooks));
+        assertFalse(err().contains("no verified last-good"), err());
         assertFalse(Sjws_nettask.hasVerifiedLastGood(null, null));
         assertTrue(Sjws_nettask.hasVerifiedLastGood(null, hooks));
     }
