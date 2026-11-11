@@ -17,6 +17,7 @@
 package sjws_nettask;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
@@ -75,5 +76,6 @@ class DataReadyHandlerWrapTest {
             var already = new DataReadyHandler(() -> request -> new sjws_nettask.core.Response(200, sjws_nettask.core.ResponseHeaders.of(), sjws_nettask.core.Body.Bytes.of(new byte[0]), false), () -> true);
             assertSame(already, wrap.invoke(server, already));
         }
+        assertFalse(Sjws_nettask.hasVerifiedLastGood(dataLoaded, null));
     }
 }

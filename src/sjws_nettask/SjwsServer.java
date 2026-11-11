@@ -503,11 +503,12 @@ public final class SjwsServer implements AutoCloseable {
         server.pinFile = pin;
         boolean lastGoodPresent = false;
         boolean lastGoodInstalled = false;
-        if (pin != null && snapshot.document().stateDir() != null) {
+        // Standalone has no pin; the guard keeps the control-plane classes unloaded there.
+        if (pin != null) {
             var verified = sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(snapshot.document().stateDir(), pin)
                     .orElse(null);
             lastGoodPresent = verified != null;
-            lastGoodInstalled = verified != null && server.installVerifiedLastGood(verified);
+            lastGoodInstalled = lastGoodPresent && server.installVerifiedLastGood(verified);
         }
         if (bindContent && !(lastGoodPresent && !lastGoodInstalled)) {
             try {
@@ -789,24 +790,9 @@ public final class SjwsServer implements AutoCloseable {
                 dataPlane().clearLastGood();
                 return false;
             }
-            var document = loaded.document();
-            if (document.bundleVersion() != snapshot.version() || document.schemaVersion() != snapshot.schema()) {
-                document = ConfigDocument.of(document.server(), document.acme(), document.routing(),
-                        document.middleware(), document.access(), document.node(), snapshot.schema(),
-                        snapshot.version(), this.live.get().document().configFile(), document.messaging())
-                        .withStateDir(this.live.get().document().stateDir() != null
-                                ? this.live.get().document().stateDir()
-                                : document.stateDir());
-            } else if (this.live.get().document().stateDir() != null && document.stateDir() == null) {
-                document = document.withStateDir(this.live.get().document().stateDir());
-            }
-            var result = this.reloader.apply(this.live.get(), document, this.h3 != null, this.board, true);
-            if (result.applied() && snapshot.epoch() != result.snapshot().epoch()) {
-                var snap = result.snapshot().withEpoch(snapshot.epoch());
-                result = new ReloadResult(true, snap.generation(), result.warnings(), java.util.List.of(),
-                        result.needsRestart(), snap, result.tls());
-            }
-            var published = result.applied() && result.snapshot() == this.live.get() ? result : publish(result);
+            var localStateDir = this.live.get().document().stateDir();
+            var published = applyEnvelope(snapshot, loaded.document(),
+                    localStateDir != null ? localStateDir : loaded.document().stateDir());
             if (!published.applied()) {
                 dataPlane().clearLastGood();
                 return false;
@@ -875,20 +861,7 @@ public final class SjwsServer implements AutoCloseable {
                 var errors = loaded.errors().isEmpty() ? java.util.List.of("configuration rejected") : loaded.errors();
                 return ReloadResult.rejected(this.live.get(), errors);
             }
-            var document = loaded.document();
-            if (document.bundleVersion() != snapshot.version() || document.schemaVersion() != snapshot.schema()) {
-                document = ConfigDocument.of(document.server(), document.acme(), document.routing(),
-                        document.middleware(), document.access(), document.node(), snapshot.schema(),
-                        snapshot.version(), this.live.get().document().configFile(), document.messaging())
-                        .withStateDir(document.stateDir());
-            }
-            var result = this.reloader.apply(this.live.get(), document, this.h3 != null, this.board, true);
-            if (result.applied() && snapshot.epoch() != result.snapshot().epoch()) {
-                var snap = result.snapshot().withEpoch(snapshot.epoch());
-                result = new ReloadResult(true, snap.generation(), result.warnings(), java.util.List.of(),
-                        result.needsRestart(), snap, result.tls());
-            }
-            var published = result.applied() && result.snapshot() == this.live.get() ? result : publish(result);
+            var published = applyEnvelope(snapshot, loaded.document(), loaded.document().stateDir());
             // Last-good (signed envelope, floor, trust, and the config sibling) is written only in DATA mode.
             if (published.applied() && this.live.get().document().node().mode() != NodeSettings.Mode.DATA) {
                 apply.record(snapshot);
@@ -919,6 +892,30 @@ public final class SjwsServer implements AutoCloseable {
         } finally {
             this.reloadLock.unlock();
         }
+    }
+
+    /**
+     * Applies a parsed envelope document under {@link #reloadLock}: adopts the envelope's schema,
+     * version and epoch, sets {@code stateDir}, then publishes. The caller has already verified
+     * the envelope.
+     */
+    private ReloadResult applyEnvelope(sjws_nettask.cp.SignedSnapshot snapshot, ConfigDocument document,
+            Path stateDir) {
+        if (document.bundleVersion() != snapshot.version() || document.schemaVersion() != snapshot.schema()) {
+            document = ConfigDocument.of(document.server(), document.acme(), document.routing(),
+                    document.middleware(), document.access(), document.node(), snapshot.schema(),
+                    snapshot.version(), this.live.get().document().configFile(), document.messaging());
+        }
+        if (!Objects.equals(document.stateDir(), stateDir)) {
+            document = document.withStateDir(stateDir);
+        }
+        var result = this.reloader.apply(this.live.get(), document, this.h3 != null, this.board, true);
+        if (result.applied() && snapshot.epoch() != result.snapshot().epoch()) {
+            var snap = result.snapshot().withEpoch(snapshot.epoch());
+            result = new ReloadResult(true, snap.generation(), result.warnings(), java.util.List.of(),
+                    result.needsRestart(), snap, result.tls());
+        }
+        return result.applied() && result.snapshot() == this.live.get() ? result : publish(result);
     }
 
     private static boolean controlPlaneSectionsChanged(ConfigDocument current, ConfigDocument next) {
@@ -1446,7 +1443,8 @@ public final class SjwsServer implements AutoCloseable {
         if (handler == null || this.ha != null) {
             return handler;
         }
-        if (!(this.dataPlane instanceof sjws_nettask.cp.DataPlaneGuard guard) || !guard.active()) {
+        var guard = dataPlane();
+        if (!guard.active()) {
             return handler;
         }
         if (handler instanceof DataReadyHandler) {

@@ -346,6 +346,140 @@ class LastGoodLifecycleCoverageTest {
     }
 
     @Test
+    void lastGoodInstallKeepsMatchingFieldsAndFillsTheLocalStateDir() throws Exception {
+        var local = Files.createDirectory(dir.resolve("html-match-local"));
+        Files.writeString(local.resolve("index.html"), "local");
+        var cached = Files.createDirectory(dir.resolve("html-match-cached"));
+        Files.writeString(cached.resolve("index.html"), "cached");
+        var state = dir.resolve("match-state");
+        var yaml = dir.resolve("match.yaml");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + local.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var pin = dir.resolve("match.pin");
+        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        long now = System.currentTimeMillis();
+        var body = "schema: 1\nversion: 5\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
+                + cached.toAbsolutePath() + "\n";
+        var snap = DataReadinessTest.signYaml(keys, body, 5L, 0L, now, now + 3_600_000L);
+        LastGoodFiles.write(state, snap.version(), snap.epoch(), snap.keyId(), keys.bundle().keys(),
+                keys.bundle().versionFloor(), keys.bundle().encoded(), snap);
+        try (var server = SjwsServer.start(loaded, null, false)) {
+            server.attachControlPlane(new Object());
+            assertTrue(server.installPersistedLastGood(state, pin));
+            assertTrue(server.dataPlane().hasLastGood());
+            assertEquals(cached.toAbsolutePath().normalize(), server.config().root().toAbsolutePath().normalize());
+            assertTrue(server.installPersistedLastGood(state, pin), "reinstalling the same envelope stays applied");
+            assertTrue(server.dataPlane().ready());
+        }
+    }
+
+    @Test
+    void lastGoodInstallFromAnotherStateDirKeepsTheNodeDefault() throws Exception {
+        var local = Files.createDirectory(dir.resolve("html-nostate-local"));
+        Files.writeString(local.resolve("index.html"), "local");
+        var cached = Files.createDirectory(dir.resolve("html-nostate-cached"));
+        Files.writeString(cached.resolve("index.html"), "cached");
+        var state = Files.createDirectory(dir.resolve("nostate-state"));
+        var yaml = dir.resolve("nostate.yaml");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
+                + local.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var pin = dir.resolve("nostate.pin");
+        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        long now = System.currentTimeMillis();
+        var mismatched = "schema: 1\nversion: 2\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
+                + cached.toAbsolutePath() + "\n";
+        var first = DataReadinessTest.signYaml(keys, mismatched, 6L, 3L, now, now + 3_600_000L);
+        LastGoodFiles.write(state, first.version(), first.epoch(), first.keyId(), keys.bundle().keys(),
+                keys.bundle().versionFloor(), keys.bundle().encoded(), first);
+        try (var server = SjwsServer.start(loaded, null, false, pin)) {
+            assertFalse(server.contentBound());
+            assertFalse(server.dataPlane().hasLastGood());
+            assertTrue(server.installPersistedLastGood(state, pin));
+            assertEquals(cached.toAbsolutePath().normalize(), server.config().root().toAbsolutePath().normalize());
+            var matching = "schema: 1\nversion: 7\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
+                    + cached.toAbsolutePath() + "\n";
+            var second = DataReadinessTest.signYaml(keys, matching, 7L, 3L, now, now + 3_600_000L);
+            LastGoodFiles.write(state, second.version(), second.epoch(), second.keyId(), keys.bundle().keys(),
+                    keys.bundle().versionFloor(), keys.bundle().encoded(), second);
+            assertTrue(server.installPersistedLastGood(state, pin));
+            assertEquals(cached.toAbsolutePath().normalize(), server.config().root().toAbsolutePath().normalize());
+            assertEquals(7L, LastGoodFiles.readPin(pin).appliedVersion());
+            assertTrue(server.dataPlane().hasLastGood());
+        }
+    }
+
+    @Test
+    void lastGoodInstallWithoutANodeSectionKeepsTheLocalStateDir() throws Exception {
+        var cached = Files.createDirectory(dir.resolve("html-nonode-cached"));
+        Files.writeString(cached.resolve("index.html"), "cached");
+        var state = dir.resolve("nonode-state");
+        var yaml = dir.resolve("nonode.yaml");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + cached.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var pin = dir.resolve("nonode.pin");
+        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        long now = System.currentTimeMillis();
+        var body = "schema: 1\nversion: 3\nserver:\n  port: 0\n  root: " + cached.toAbsolutePath() + "\n";
+        var snap = DataReadinessTest.signYaml(keys, body, 3L, 2L, now, now + 3_600_000L);
+        LastGoodFiles.write(state, snap.version(), snap.epoch(), snap.keyId(), keys.bundle().keys(),
+                keys.bundle().versionFloor(), keys.bundle().encoded(), snap);
+        try (var server = SjwsServer.start(loaded, null, false)) {
+            assertTrue(server.installPersistedLastGood(state, pin));
+            assertTrue(server.dataPlane().hasLastGood());
+            assertTrue(server.dataPlane().ready());
+        }
+    }
+
+    @Test
+    void lastGoodTheReloaderRejectsIsNotInstalled() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-reject"));
+        Files.writeString(html.resolve("index.html"), "local");
+        var state = dir.resolve("reject-state");
+        var yaml = dir.resolve("reject.yaml");
+        Files.writeString(yaml, "schema: 1\nversion: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var pin = dir.resolve("reject.pin");
+        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        long now = System.currentTimeMillis();
+        var body = "schema: 1\nversion: 2\nnode:\n  mode: data\nserver:\n  port: 0\n  root: "
+                + dir.resolve("missing-root").toAbsolutePath() + "\n";
+        var snap = DataReadinessTest.signYaml(keys, body, 2L, 1L, now, now + 3_600_000L);
+        LastGoodFiles.write(state, snap.version(), snap.epoch(), snap.keyId(), keys.bundle().keys(),
+                keys.bundle().versionFloor(), keys.bundle().encoded(), snap);
+        try (var server = SjwsServer.start(loaded, null, false)) {
+            assertFalse(server.installPersistedLastGood(state, pin));
+            assertFalse(server.dataPlane().hasLastGood());
+            assertFalse(server.dataPlane().ready());
+            assertEquals(html.toAbsolutePath().normalize(), server.config().root().toAbsolutePath().normalize());
+        }
+    }
+
+    @Test
+    void standaloneStartWithAPinBindsWithoutALastGood() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-stand-pin"));
+        Files.writeString(html.resolve("index.html"), "ok");
+        var yaml = dir.resolve("stand-pin.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: standalone\nserver:\n  port: 0\n  root: "
+                + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        try (var server = SjwsServer.start(loaded, null, true, dir.resolve("unused.pin"))) {
+            assertTrue(server.contentBound());
+            assertFalse(server.dataPlane().active());
+            assertEquals("ok", HttpTestSupport.get(server.tcpPort(), "/index.html", 2_000).bodyText());
+        }
+    }
+
+    @Test
     void aVeryLongMaxStalenessIsNotStale() throws Exception {
         var html = Files.createDirectory(dir.resolve("html-long"));
         var state = dir.resolve("long-state");
