@@ -191,6 +191,7 @@ public final class DataWatch implements AutoCloseable {
                     offer(WatchWire.decode(body));
                 } else if (status == 204) {
                     report("connected");
+                    retryContentBind();
                 } else {
                     throw new IOException("watch answered " + status);
                 }
@@ -376,6 +377,13 @@ public final class DataWatch implements AutoCloseable {
             this.server.dataPlane().clock(this.nowMillis);
         }
         this.server.installPersistedLastGood(this.stateDir, this.pin);
+        if (this.server.dataPlane().hasLastGood()) {
+            bindContentAfterLastGood();
+        }
+    }
+
+    /** A bind that failed earlier is tried again on each watch tick while a last-good is installed. */
+    private void retryContentBind() {
         if (this.server.dataPlane().hasLastGood()) {
             bindContentAfterLastGood();
         }
