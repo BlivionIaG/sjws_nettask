@@ -1006,6 +1006,8 @@ public final class SjwsServer implements AutoCloseable {
         }
         var replaced = this.live.get();
         var next = result.snapshot();
+        // Mask the incoming config's credential query names before any transport serves it.
+        syncCredentialQueryParamsFromConfig(next.document());
         // HTTP/2: one atomic generation = fully armed chain (filters/metrics) + attachBodies (#301
         // P1/P2a). In-flight Tasks keep the generation they captured; defer closing replaced pools
         // until those Tasks leave (P2b).
