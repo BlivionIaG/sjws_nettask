@@ -38,6 +38,21 @@ public interface ServerControl extends AutoCloseable {
         return null;
     }
 
+    /**
+     * Starts a graceful drain without blocking (#381): stop accepting, let in-flight work finish
+     * up to the HA drain timeout, then close. Idempotent: while a drain runs, the same operation
+     * is returned. Cancelling a drain is not supported: HA's drain lifecycle has no cancel.
+     * @throws ControlException when the server is not running or drain is not supported
+     */
+    default DrainOperation drain() throws ControlException {
+        throw new ControlException("drain is not available for this server");
+    }
+
+    /** The last drain started from this control, or null. Never throws. */
+    default DrainOperation drainStatus() {
+        return null;
+    }
+
     /** Starts the server if stopped. @throws ControlException if it cannot start */
     void start() throws ControlException;
 

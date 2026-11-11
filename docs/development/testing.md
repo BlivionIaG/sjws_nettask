@@ -19,6 +19,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `ReloadHookTest` | reload hook registry |
 | `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance when `PEBBLE_BIN` / `PEBBLE_CHALLTESTSRV_BIN` are set (required on Linux CI; pinned install in `.github/workflows/ci.yml`), hot cert swap |
 | `admin/ClusterViewTest` | admin Cluster view: UP/DEGRADED/DOWN from named checks, node detail, missing, failing and slow (timed-out) cluster status sources |
+| `admin/DrainControlTest` | admin drain: background drain with a fake HA drainer, idempotent operation id, start/reload refused while draining, stop during a drain, failed and interrupted drains shown |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `admin/cp/CpConsoleTest` | control-plane console: label selectors, diff, validation, stage/rollout/rollback on the fake CP, failover client, rendering, zero-cost guard |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
