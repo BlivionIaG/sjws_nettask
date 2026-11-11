@@ -127,6 +127,7 @@ public final class ConfigLoader {
         byte[] haPrevious = null;
         byte[] bootSignature = null;
         String recoveredHash = null;
+        boolean pinnedRecovery = false;
         Path yamlState = null;
         Map<String, Object> yamlCp = null;
         String text;
@@ -138,6 +139,7 @@ public final class ConfigLoader {
                 var state = stateDir(args, env, null, requested.toAbsolutePath().getParent());
                 var json = LastGoodStore.file(state);
                 var recovered = recoverLastGoodYaml(json, state, recoveryPin);
+                pinnedRecovery = recovered != null && LastGoodStore.signature(json) != null;
                 var source = json;
                 if (recovered == null) {
                     var legacy = LastGoodStore.beside(requested);
@@ -170,6 +172,11 @@ public final class ConfigLoader {
             schemaVersion = schemaOf(root);
             bundleVersion = versionOf(root);
             node = nodeSection(root);
+            if (pinnedRecovery && node.mode() != NodeSettings.Mode.DATA) {
+                // A pinned last-good belongs to this data node. Keep the data role, as live apply
+                // does when it clamps node.mode, so a recovered snapshot does not select another role.
+                node = new NodeSettings(NodeSettings.Mode.DATA, node.labels(), node.maxStaleness());
+            }
             var base = configFile.toAbsolutePath().getParent();
             var bindHolder = new Boolean[1];
             yamlState = stateDirKey(root, base);

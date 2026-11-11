@@ -128,6 +128,24 @@ public final class AccessTargetMask {
     }
 
     /**
+     * Distinct names from {@code outgoing} then {@code incoming}, in first-seen order.
+     * Null or empty sides are skipped. A config publish uses this so a request that still
+     * enters the outgoing generation is masked for both documents' names.
+     */
+    public static String[] union(String[] outgoing, String[] incoming) {
+        if (outgoing == null || outgoing.length == 0) {
+            return incoming == null || incoming.length == 0 ? NONE : incoming;
+        }
+        if (incoming == null || incoming.length == 0) {
+            return outgoing;
+        }
+        var names = new LinkedHashSet<String>(outgoing.length + incoming.length);
+        java.util.Collections.addAll(names, outgoing);
+        java.util.Collections.addAll(names, incoming);
+        return names.size() == outgoing.length ? outgoing : names.toArray(String[]::new);
+    }
+
+    /**
      * Replaces the value of each configured query name with {@link #MASK}. When {@code names} is
      * null or empty, or the target has no query string, returns {@code target} unchanged.
      * Uses {@link QueryPairs} so acceptance and masking cannot drift.

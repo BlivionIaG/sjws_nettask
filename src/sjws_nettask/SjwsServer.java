@@ -742,6 +742,9 @@ public final class SjwsServer implements AutoCloseable {
                             && this.live.get().document().node().mode() == NodeSettings.Mode.DATA) {
                         this.remoteApplied.set(true);
                     }
+                    if (incoming == null && result.applied()) {
+                        dataPlane().localMaxStaleness(result.snapshot().document().node().maxStaleness());
+                    }
                 }
             } catch (ConfigException e) {
                 var message = e.getMessage() == null ? "configuration rejected" : e.getMessage();
@@ -975,6 +978,10 @@ public final class SjwsServer implements AutoCloseable {
             }
         }
         var current = this.live.get();
+        var localDocument = this.reloader.readLocal(current.document().configFile());
+        if (localDocument != null) {
+            dataPlane().localMaxStaleness(localDocument.node().maxStaleness());
+        }
         return new ReloadResult(false, current.generation(), warnings, java.util.List.of(), java.util.List.of(),
                 current, null);
     }
@@ -1006,6 +1013,9 @@ public final class SjwsServer implements AutoCloseable {
         }
         var replaced = this.live.get();
         var next = result.snapshot();
+        // Union of outgoing and incoming names, before any transport is armed with the new
+        // config, so a request that still enters the outgoing generation stays masked.
+        syncCredentialQueryParamsUnion(replaced.document(), next.document());
         // HTTP/2: one atomic generation = fully armed chain (filters/metrics) + attachBodies (#301
         // P1/P2a). In-flight Tasks keep the generation they captured; defer closing replaced pools
         // until those Tasks leave (P2b).
@@ -1085,6 +1095,9 @@ public final class SjwsServer implements AutoCloseable {
         } else if (this.acme != null) {
             this.acme.update(result.snapshot().document().acme());
         }
+        // The previous generation has been swapped out and can no longer start requests.
+        // Outgoing-only names can drop; incoming names stay.
+        syncCredentialQueryParamsFromConfig(next.document());
         return result;
     }
 
@@ -1433,6 +1446,17 @@ public final class SjwsServer implements AutoCloseable {
         this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
     }
 
+    private void syncCredentialQueryParamsUnion(sjws_nettask.config.ConfigDocument outgoing,
+            sjws_nettask.config.ConfigDocument incoming) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return;
+        }
+        this.slot.attachCredentialQueryParams(AccessTargetMask.union(
+                AccessTargetMask.namesFromMiddleware(outgoing.middleware()),
+                AccessTargetMask.namesFromMiddleware(incoming.middleware())));
+    }
+
     /**
      * Publishes {@code handler} on the HTTP/2 transport. {@link sjws_nettask.h2.Http2Server} gets
      * the generation-aware overload ({@code bodies} + drain tracking). Any other non-null
@@ -1589,16 +1613,23 @@ public final class SjwsServer implements AutoCloseable {
             control.pinOuter(new ObserveRequestFilter(this.slot));
             return;
         }
-        if (this.armed.get() != null) {
-            return;
+        // Under the reload lock, so a concurrent publish cannot be overtaken by an older HTTP/2 generation.
+        this.reloadLock.lock();
+        try {
+            if (this.armed.get() != null) {
+                return;
+            }
+            Handler leaf = this.override != null ? this.override : request -> this.live.handler().handle(request);
+            var chain = ObserveRequestFilter.chain(this.slot, leaf);
+            this.armed.set(chain);
+            if (this.h3 != null) {
+                this.h3.armHandler(chain);
+            }
+            // HTTP/2 pins this generation's leaf, as startH2 and publish do.
+            armH2(this.h2 == null ? chain : ObserveRequestFilter.chain(this.slot, generationLeaf(this.live.get())), true);
+        } finally {
+            this.reloadLock.unlock();
         }
-        Handler leaf = this.override != null ? this.override : request -> this.live.handler().handle(request);
-        var chain = ObserveRequestFilter.chain(this.slot, leaf);
-        this.armed.set(chain);
-        if (this.h3 != null) {
-            this.h3.armHandler(chain);
-        }
-        armH2(chain, true);
     }
 
     /**

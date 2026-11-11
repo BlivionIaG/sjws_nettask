@@ -62,6 +62,18 @@ public final class ConfigReloader {
     }
 
     /**
+     * Re-reads the local config file with the startup arguments, without compiling or publishing it.
+     * Null when {@code configFile} is not a readable file or the file does not load.
+     */
+    public ConfigDocument readLocal(Path configFile) {
+        if (configFile == null || !java.nio.file.Files.isRegularFile(configFile)) {
+            return null;
+        }
+        var loaded = ConfigLoader.load(this.args, this.env, this.passwords);
+        return loaded.ok() ? loaded.document() : null;
+    }
+
+    /**
      * {@code ha.messaging}, {@code ha.topics} and {@code ha.members} (and the other msg settings) are read once at
      * startup: a reload that changes them applies nothing there, and says so instead of staying silent.
      */
