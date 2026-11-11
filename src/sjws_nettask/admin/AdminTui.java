@@ -78,6 +78,11 @@ public final class AdminTui {
         var cmd = line.trim().toLowerCase(Locale.ROOT);
         this.message = "";
         try {
+            if (cmd.equals("drain confirm")) {
+                var op = this.control.drain();
+                this.message = op.id() + ": " + op.state().name().toLowerCase(Locale.ROOT);
+                return true;
+            }
             if (cmd.startsWith("d ")) {
                 deadLetters(line.trim().substring(2).trim());
                 return true;
@@ -91,13 +96,15 @@ public final class AdminTui {
                 case "s" -> act("start", this.control::start);
                 case "x" -> act("stop", this.control::stop);
                 case "r" -> act("reload", this.control::reload);
+                case "n" -> this.message = "drain stops accepting and closes the server once in-flight work ends;"
+                        + " type 'drain confirm' to start";
                 case "q" -> {
                     return false;
                 }
                 default -> this.message = "unknown command '" + line.trim() + "' (h for help)";
             }
             if (cmd.equals("h") || cmd.equals("?")) {
-                this.message = "commands: s start, x stop, r reload, v/c/l/m status/config/logs/queues,"
+                this.message = "commands: s start, x stop, r reload, n drain, v/c/l/m status/config/logs/queues,"
                         + " d <topic> <group> [from] dead letters, Enter refresh, q quit";
             }
         } catch (ServerControl.ControlException e) {
@@ -145,7 +152,7 @@ public final class AdminTui {
         if (!this.message.isEmpty()) {
             sb.append(this.message).append('\n');
         }
-        sb.append("[s]tart [x] stop [r]eload [h]elp [q]uit > ");
+        sb.append("[s]tart [x] stop [r]eload [n] drain [h]elp [q]uit > ");
         return sb.toString();
     }
 
@@ -157,6 +164,16 @@ public final class AdminTui {
         var root = status.config().get("root");
         if (root != null) {
             sb.append("  Document root     : ").append(root).append('\n');
+        }
+        var drain = this.control.drainStatus();
+        if (drain != null) {
+            sb.append("  Drain             : ").append(drain.id()).append(' ').append(drainText(drain.state()));
+            if (drain.state() == DrainOperation.State.RUNNING) {
+                sb.append(" since ").append(drain.startedAt());
+            } else if (drain.error() != null) {
+                sb.append(" (").append(drain.error()).append(')');
+            }
+            sb.append('\n');
         }
         var cluster = this.control.clusterStatus();
         if (cluster != null) {
@@ -294,6 +311,14 @@ public final class AdminTui {
                 sb.append("  ").append(color(YELLOW, "cannot read: " + e.getMessage())).append('\n');
             }
         }
+    }
+
+    private String drainText(DrainOperation.State state) {
+        return switch (state) {
+            case RUNNING -> color(YELLOW, "DRAINING");
+            case DONE -> color(GREEN, "DRAINED");
+            case FAILED -> color(RED, "FAILED");
+        };
     }
 
     private String tab(View v, String label) {

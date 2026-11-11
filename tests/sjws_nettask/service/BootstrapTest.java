@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -241,8 +242,7 @@ class BootstrapTest {
             assertTrue(suffix.contains("connection=pending"), suffix);
             assertTrue(suffix.contains("config-version=0"), suffix);
             assertFalse(Files.readString(ServiceStatus.beside(pid)).contains(SECRET));
-            assertEquals(PosixFilePermissions.fromString("rw-r--r--"),
-                    Files.getPosixFilePermissions(ServiceStatus.beside(pid)));
+            assertEquals(OWNER_RW, Files.getPosixFilePermissions(ServiceStatus.beside(pid)));
 
             enrollment.attach(new ControlPlaneBinding() {
                 @Override
@@ -690,4 +690,48 @@ class BootstrapTest {
         }
     }
 
+    @Test
+    void statusSidecarIsOwnerOnlyAndTightensALooserPreExistingFile() throws Exception {
+        long me = ProcessHandle.current().pid();
+        long started = ProcessHandle.current().info().startInstant().orElseThrow().toEpochMilli();
+        var pid = tmp.resolve("nits.pid");
+        Files.writeString(pid, me + "\n" + started + "\n");
+        Path status = ServiceStatus.beside(pid);
+        Files.writeString(status, "stale-world-readable\n");
+        Files.setPosixFilePermissions(status, WORLD);
+
+        ServiceStatus.write(pid, me, started, "control", "", "pending", 0, 30_000, "127.0.0.1:18444", "failed");
+        var perms = Files.getPosixFilePermissions(status);
+        assertEquals(OWNER_RW, perms, perms.toString());
+        assertFalse(perms.contains(PosixFilePermission.GROUP_READ));
+        assertFalse(perms.contains(PosixFilePermission.OTHERS_READ));
+        var body = Files.readString(status);
+        assertTrue(body.contains("admin-state=failed"), body);
+        var suffix = ServiceStatus.runningSuffix(pid, me, started);
+        assertTrue(suffix.contains("admin=127.0.0.1:18444"), suffix);
+        assertTrue(suffix.contains("admin-state=failed"), suffix);
+
+        var fix = controlTree("");
+        var enrollment = NodeEnrollment.open(Bootstrap.load(fix.boot, "control"), pid, 30_000);
+        try {
+            enrollment.adminListener("127.0.0.1:18444", "failed");
+            var viaEnrollment = ServiceStatus.runningSuffix(pid, me, started);
+            assertTrue(viaEnrollment.contains("admin-state=failed"), viaEnrollment);
+            assertEquals(OWNER_RW, Files.getPosixFilePermissions(status));
+        } finally {
+            enrollment.close();
+        }
+    }
+
+    @Test
+    void sharedModeConstantsCannotBeWidened() {
+        for (var mode : List.of(PosixMode.OWNER_RW, PosixMode.OWNER_READ, PosixMode.OWNER_RWX, PosixMode.STATUS)) {
+            assertThrows(UnsupportedOperationException.class, () -> mode.add(PosixFilePermission.OTHERS_READ));
+            assertThrows(UnsupportedOperationException.class, () -> mode.remove(PosixFilePermission.OWNER_READ));
+            assertThrows(UnsupportedOperationException.class, mode::clear);
+        }
+        assertEquals(OWNER_RW, PosixMode.STATUS);
+        assertEquals(OWNER_R, PosixMode.OWNER_READ);
+        assertEquals(PosixFilePermissions.fromString("rwx------"), PosixMode.OWNER_RWX);
+    }
 }

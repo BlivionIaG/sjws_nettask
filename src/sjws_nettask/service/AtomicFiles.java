@@ -42,6 +42,7 @@ final class AtomicFiles {
         Files.createDirectories(parent);
         Path tmp = createTemp(parent, mode);
         try {
+            applyMode(tmp, mode);
             Files.write(tmp, body);
             try (var channel = FileChannel.open(tmp, WRITE)) {
                 channel.force(true);
@@ -52,13 +53,18 @@ final class AtomicFiles {
                 Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
             }
             tmp = null;
-            if (PosixMode.supported(path)) {
-                Files.setPosixFilePermissions(path, mode);
-            }
+            // Re-apply after rename so a replaced file that kept looser mode is tightened.
+            applyMode(path, mode);
         } finally {
             if (tmp != null) {
                 Files.deleteIfExists(tmp);
             }
+        }
+    }
+
+    private static void applyMode(Path path, Set<PosixFilePermission> mode) throws IOException {
+        if (PosixMode.supported(path)) {
+            Files.setPosixFilePermissions(path, mode);
         }
     }
 
