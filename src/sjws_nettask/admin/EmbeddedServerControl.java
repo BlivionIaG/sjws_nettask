@@ -139,7 +139,13 @@ public final class EmbeddedServerControl implements ServerControl {
         if (source == null) {
             throw new ControlException("messaging is not enabled");
         }
-        var inspector = source.get().get(topic);
+        sjws_nettask.messaging.delivery.LedgerInspector inspector;
+        try {
+            inspector = source.get().get(topic);
+        } catch (RuntimeException e) {
+            this.log.add("dead-letter read failed: " + e.getMessage());
+            throw new ControlException("dead-letter read failed: " + e.getMessage(), e);
+        }
         if (inspector == null) {
             throw new ControlException("unknown topic " + topic);
         }
@@ -147,6 +153,9 @@ public final class EmbeddedServerControl implements ServerControl {
             return QueueView.deadLetters(inspector, group, fromOffset, limit);
         } catch (IllegalArgumentException e) {
             throw new ControlException(e.getMessage(), e);
+        } catch (RuntimeException e) {
+            this.log.add("dead-letter read failed: " + e.getMessage());
+            throw new ControlException("dead-letter read failed: " + e.getMessage(), e);
         }
     }
 

@@ -100,6 +100,39 @@ class QueueViewTest {
     }
 
     @Test
+    void deadLetterFailuresBecomeControlErrorsAndKeepTheConsoleRunning() throws Exception {
+        var log = new LogBuffer(20);
+        try (var control = new EmbeddedServerControl(() -> null, log)) {
+            control.attachQueues(() -> {
+                throw new IllegalStateException("topic closed");
+            });
+            var e = assertThrows(ServerControl.ControlException.class,
+                    () -> control.deadLetters("orders", "billing", 0, 5));
+            assertEquals("dead-letter read failed: topic closed", e.getMessage());
+            assertTrue(log.tail(1).get(0).contains("dead-letter read failed: topic closed"));
+
+            // an inspector that fails while paging (its partition is gone)
+            control.attachQueues(() -> Map.of("orders", new LedgerInspector(null)));
+            assertThrows(ServerControl.ControlException.class, () -> control.deadLetters("orders", "billing", 0, 5));
+
+            var tui = new AdminTui(control, new LogBuffer(5), null, false);
+            assertTrue(tui.handle("d orders billing"), "console loop must keep running");
+            assertTrue(tui.render().contains("error: dead-letter read failed"), tui.render());
+            assertTrue(tui.handle("d \u202eevil\u2028 billing"));
+            var screen = tui.render();
+            assertTrue(screen.contains("error: unknown topic ?evil?"), screen);
+            assertFalse(screen.contains("\u202e") || screen.contains("\u2028"), screen);
+        }
+    }
+
+    @Test
+    void printableFoldsBidiControlsAndLineSeparators() {
+        assertEquals("a?b?c?d?e?f", AdminTui.printable("a\u202eb\u2066c\u200fd\u2028e\u2029f"));
+        assertEquals("x?y?z", AdminTui.printable("x\u061cy\u2069z"));
+        assertEquals("caf\u00e9 \u2030", AdminTui.printable("caf\u00e9 \u2030"));
+    }
+
+    @Test
     void tuiShowsQueuesPagesDeadLettersAndNeverPrintsPayloadsOrEscapes() throws Exception {
         try (var p = orders(); var control = new EmbeddedServerControl(() -> null, new LogBuffer(20))) {
             this.now.addAndGet(5_000);

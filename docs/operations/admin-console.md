@@ -23,8 +23,12 @@ in-flight and dead-lettered counts and the age of the oldest pending message. `d
 consumer and reason. When a page is full the console prints the command for the next page. The view
 reads Messaging Core's `LedgerInspector` snapshots, the same rate-limited view the messaging API
 uses, and does not take partition locks for the admin call. Payloads are never read or shown, and
-control characters in topic, group, consumer and reason text are shown as `?`. The view is empty
-until messaging topics are attached with `EmbeddedServerControl.attachQueues`.
+control characters, bidi formatting characters and the U+2028/U+2029 separators in topic, group,
+consumer, reason and error text are shown as `?`. A failure while reading dead letters is shown as
+an error and leaves the console and the server running. The view is empty until messaging topics
+are attached with `EmbeddedServerControl.attachQueues`. The server's start path holds no
+`LedgerInspector` sources today (delivery partitions live inside the optional swarm layer), so
+nothing attaches them automatically yet.
 
 The view is read-only. DLQ requeue and purge wait for a Messaging Core API, and in-flight entries
 stay read-only from the console.

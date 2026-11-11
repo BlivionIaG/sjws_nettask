@@ -101,7 +101,7 @@ public final class AdminTui {
                         + " d <topic> <group> [from] dead letters, Enter refresh, q quit";
             }
         } catch (ServerControl.ControlException e) {
-            this.message = color(RED, "error: " + e.getMessage());
+            this.message = color(RED, "error: " + printable(String.valueOf(e.getMessage())));
         }
         return true;
     }
@@ -216,7 +216,8 @@ public final class AdminTui {
         this.dlqTitle = printable(parts[0]) + " / " + printable(parts[1]) + " from " + from;
         this.view = View.QUEUES;
         this.message = this.dlqPage.size() == QUEUE_PAGE
-                ? "next page: d " + parts[0] + " " + parts[1] + " " + (this.dlqPage.get(QUEUE_PAGE - 1).offset() + 1)
+                ? "next page: d " + printable(parts[0]) + " " + printable(parts[1]) + " "
+                        + (this.dlqPage.get(QUEUE_PAGE - 1).offset() + 1)
                 : "dead letters: " + this.dlqPage.size();
     }
 
@@ -250,11 +251,20 @@ public final class AdminTui {
     }
 
     /** Names and reasons come from clients: control characters become '?', and long values are cut. */
+    /**
+     * C0 and C1 controls, bidi formatting (U+061C, U+200E/F, U+202A-E, U+2066-9) and the line and
+     * paragraph separators U+2028/9: anything that could recolour, split or reorder the screen.
+     */
+    static boolean unsafe(char c) {
+        return c < 0x20 || (c >= 0x7f && c <= 0x9f) || c == '\u061c' || c == '\u200e' || c == '\u200f'
+                || (c >= '\u2028' && c <= '\u202e') || (c >= '\u2066' && c <= '\u2069');
+    }
+
     static String printable(String s) {
         var sb = new StringBuilder(Math.min(s.length(), 120));
         for (int i = 0; i < s.length() && sb.length() < 120; i++) {
             char c = s.charAt(i);
-            sb.append(c < 0x20 || (c >= 0x7f && c <= 0x9f) ? '?' : c);
+            sb.append(unsafe(c) ? '?' : c);
         }
         if (s.length() > 120) {
             sb.append("...");
