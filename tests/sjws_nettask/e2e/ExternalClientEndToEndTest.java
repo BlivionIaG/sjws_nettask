@@ -108,7 +108,7 @@ class ExternalClientEndToEndTest {
         assumeTrue(onPath("curl"), "curl is missing");
         assumeTrue(curlFeature("HTTP2"), "curl was not built with HTTP/2");
         int h2c = h2cPort();
-        assumeTrue(h2c > 0, "h2c listener did not bind" + h2Hint());
+        assertTrue(h2c > 0, "h2c listener is enabled but did not bind" + h2Hint());
         var ok = run(List.of("curl", "-sS", "--http2-prior-knowledge", "-w", " %{http_code} %{http_version}",
                 "http://127.0.0.1:" + h2c + "/hello.txt"));
         assertEquals(0, ok.exit, ok.detail());
@@ -120,7 +120,7 @@ class ExternalClientEndToEndTest {
     void h2loadSmokeWhenInstalled() throws Exception {
         assumeTrue(onPath("h2load"), "h2load (nghttp2-client) is not on PATH");
         int h2c = h2cPort();
-        assumeTrue(h2c > 0, "h2c listener did not bind" + h2Hint());
+        assertTrue(h2c > 0, "h2c listener is enabled but did not bind" + h2Hint());
         var result = run(List.of("h2load", "--no-tls-proto=h2c", "-n", "10", "-c", "2",
                 "http://127.0.0.1:" + h2c + "/hello.txt"), CLIENT_TIMEOUT);
         assertEquals(0, result.exit, result.detail());
