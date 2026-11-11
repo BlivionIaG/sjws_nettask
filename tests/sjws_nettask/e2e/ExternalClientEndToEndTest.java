@@ -148,12 +148,21 @@ class ExternalClientEndToEndTest {
         List<String> cmd = new ArrayList<>();
         cmd.add(client);
         String name = Path.of(client).getFileName().toString();
+        String host = "127.0.0.1";
+        int port = server.udpPort();
+        String uri = "https://" + host + ":" + port + "/hello.txt";
         if (name.contains("quiche")) {
             cmd.add("--no-verify");
+            cmd.add(uri);
         } else {
-            cmd.add("--insecure");
+            // ngtcp2 examples/client.cc: [OPTIONS] <HOST> <PORT> [<URI>...]
+            // --insecure is a wolfSSL wsslclient flag, not the generic client.
+            cmd.add("--exit-on-first-stream-close");
+            cmd.add("--quiet");
+            cmd.add(host);
+            cmd.add(Integer.toString(port));
+            cmd.add(uri);
         }
-        cmd.add("https://127.0.0.1:" + server.udpPort() + "/hello.txt");
         var result = run(cmd);
         assertEquals(0, result.exit, result.detail());
         var text = result.stdout + result.stderr;
