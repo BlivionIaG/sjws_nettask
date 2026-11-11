@@ -77,7 +77,7 @@ jobs:
         id: wrk-cache
         run: |
           . /etc/os-release
-          echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+          echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}-v2" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         if: runner.os == 'Linux'
         with:
