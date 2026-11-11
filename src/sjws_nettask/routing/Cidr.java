@@ -74,7 +74,30 @@ public record Cidr(byte[] network, int bits) {
         if (peer == null || peer.getAddress() == null) {
             return false;
         }
-        return containsAddress(peer.getAddress().getAddress());
+        return containsAddress(addressBytes(peer.getAddress()));
+    }
+
+    /**
+     * Bytes to match against a {@link Cidr}. An IPv4-mapped IPv6 address is returned as four
+     * IPv4 bytes; any other address is returned as {@link InetAddress#getAddress()}.
+     */
+    public static byte[] addressBytes(InetAddress address) {
+        if (address == null) {
+            return null;
+        }
+        var raw = address.getAddress();
+        if (raw.length != 16) {
+            return raw;
+        }
+        for (int i = 0; i < 10; i++) {
+            if (raw[i] != 0) {
+                return raw;
+            }
+        }
+        if (raw[10] != (byte) 0xff || raw[11] != (byte) 0xff) {
+            return raw;
+        }
+        return new byte[] {raw[12], raw[13], raw[14], raw[15]};
     }
 
     /**

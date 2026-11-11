@@ -28,7 +28,8 @@ import sjws_nettask.routing.Cidr;
 /**
  * Client-address allow/deny list. Lists are compiled to {@link Cidr} when the filter is built.
  * The request path uses {@link Request#peer()} and does not allocate for a known address.
- * A missing peer is refused. When both lists are set, a deny match wins.
+ * The peer address is normalized before matching, so an IPv4-mapped IPv6 peer is compared
+ * as IPv4. A missing peer is refused. When both lists are set, a deny match wins.
  * <p>
  * Params: {@code allow} and/or {@code deny}, each a list of addresses or CIDRs (one per line,
  * or comma-separated when there is no newline). At least one list is required.
@@ -73,7 +74,7 @@ public final class IpAclFilter implements RequestFilter {
         if (peer == null || peer.getAddress() == null) {
             return false;
         }
-        var addr = peer.getAddress().getAddress();
+        var addr = Cidr.addressBytes(peer.getAddress());
         if (matches(this.deny, addr)) {
             return false;
         }
