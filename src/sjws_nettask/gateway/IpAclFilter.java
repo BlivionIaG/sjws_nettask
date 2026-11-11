@@ -66,15 +66,16 @@ public final class IpAclFilter implements RequestFilter {
         if (peer == null || peer.getAddress() == null) {
             return false;
         }
-        if (matches(this.deny, peer)) {
+        var addr = peer.getAddress().getAddress();
+        if (matches(this.deny, addr)) {
             return false;
         }
-        return this.allow.length == 0 || matches(this.allow, peer);
+        return this.allow.length == 0 || matches(this.allow, addr);
     }
 
-    private static boolean matches(Cidr[] list, InetSocketAddress peer) {
+    private static boolean matches(Cidr[] list, byte[] addr) {
         for (var cidr : list) {
-            if (cidr.contains(peer)) {
+            if (cidr.containsAddress(addr)) {
                 return true;
             }
         }

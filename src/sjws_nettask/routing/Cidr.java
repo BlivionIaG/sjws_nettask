@@ -74,13 +74,20 @@ public record Cidr(byte[] network, int bits) {
         if (peer == null || peer.getAddress() == null) {
             return false;
         }
-        var a = peer.getAddress().getAddress();
-        if (a.length != this.network.length) {
+        return containsAddress(peer.getAddress().getAddress());
+    }
+
+    /**
+     * Same check as {@link #contains(InetSocketAddress)} against already-extracted address
+     * bytes, so a caller scanning many CIDRs can extract the peer once.
+     */
+    public boolean containsAddress(byte[] address) {
+        if (address == null || address.length != this.network.length) {
             return false;
         }
         int full = this.bits / 8;
         for (int i = 0; i < full; i++) {
-            if (a[i] != this.network[i]) {
+            if (address[i] != this.network[i]) {
                 return false;
             }
         }
@@ -89,6 +96,6 @@ public record Cidr(byte[] network, int bits) {
             return true;
         }
         int mask = 0xff << (8 - rest);
-        return (a[full] & mask) == (this.network[full] & mask);
+        return (address[full] & mask) == (this.network[full] & mask);
     }
 }

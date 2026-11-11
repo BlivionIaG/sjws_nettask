@@ -130,13 +130,17 @@ class RoutingCompilerTest {
     }
 
     @Test
-    void cidr() {
+    void cidr() throws Exception {
         var v4 = Cidr.parse("10.1.0.0/16");
         assertTrue(v4.contains(new InetSocketAddress("10.1.200.3", 1)));
         assertFalse(v4.contains(new InetSocketAddress("10.2.0.1", 1)));
         assertFalse(v4.contains(new InetSocketAddress("::1", 1)));
         assertFalse(v4.contains(null));
         assertFalse(v4.contains(InetSocketAddress.createUnresolved("x", 1)));
+        var bytes = java.net.InetAddress.getByName("10.1.200.3").getAddress();
+        assertTrue(v4.containsAddress(bytes));
+        assertFalse(v4.containsAddress(java.net.InetAddress.getByName("10.2.0.1").getAddress()));
+        assertFalse(v4.containsAddress(null));
         var odd = Cidr.parse(" 192.168.0.0/23 ");
         assertTrue(odd.contains(new InetSocketAddress("192.168.1.9", 1)));
         assertFalse(odd.contains(new InetSocketAddress("192.168.2.9", 1)));
