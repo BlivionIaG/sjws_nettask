@@ -35,6 +35,22 @@ refused with 400. Local config may still use inline `keys` (a WARN points at the
 `header` defaults to `x-api-key`. `query`, when set, is read only if the header is absent (the
 value is not percent-decoded). A miss is 401 with `WWW-Authenticate: ApiKey`.
 
+## basic-auth
+
+RFC 7617 `Authorization: Basic`. `users` is one `user:password` per line (or comma-separated
+when the value has no newline). `users-file` is the same format in a regular file; on POSIX
+the file must not be group- or world-readable (mode `0600` is the usual form). Exactly one of
+`users` or `users-file` is required; the file is read when the filter is built. A password may
+contain colons. Empty usernames and empty passwords are rejected. At most 1024 users, and a
+file is at most 64 KiB.
+
+Each `user:password` is hashed with SHA-256 when the filter is built; the raw password is not
+kept. A presented credential is hashed once and compared with every stored hash. `realm`
+defaults to `sjws` and is quoted in `WWW-Authenticate: Basic realm="..."`. A miss, a missing
+header, a non-Basic scheme, or a malformed token is 401 with that challenge. The request path
+does no I/O. A control plane should prefer `users-file` (mode `0600`) or a sealed document over
+leaving passwords in a world-readable projection.
+
 ## jwt
 
 Bearer JWT. `alg` is a comma-separated allow-list: `HS256`, `HS384`, `HS512`, `RS256`,
