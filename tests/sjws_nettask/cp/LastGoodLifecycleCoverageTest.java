@@ -345,4 +345,24 @@ class LastGoodLifecycleCoverageTest {
         assertTrue(guard.pastMaxStaleness());
     }
 
+    @Test
+    void aVeryLongMaxStalenessIsNotStale() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-long"));
+        var state = dir.resolve("long-state");
+        var yaml = dir.resolve("long.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var guard = DataPlaneGuard.forDocument(loaded.document());
+        guard.maxStaleness(Duration.ofMillis(Long.MAX_VALUE));
+        long now = System.currentTimeMillis();
+        guard.applied(DataPlaneGuardTest.snapshot(2, now, Long.MAX_VALUE), true);
+        assertFalse(guard.pastMaxStaleness());
+        guard.applied(DataPlaneGuardTest.snapshot(3, Long.MAX_VALUE - 1, Long.MAX_VALUE), true);
+        assertFalse(guard.pastMaxStaleness());
+        guard.maxStaleness(Duration.ofMillis(Long.MAX_VALUE / 2));
+        guard.applied(DataPlaneGuardTest.snapshot(4, now, Long.MAX_VALUE), true);
+        assertFalse(guard.pastMaxStaleness());
+    }
+
 }

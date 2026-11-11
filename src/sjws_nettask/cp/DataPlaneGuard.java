@@ -170,8 +170,18 @@ public final class DataPlaneGuard {
             this.staleDeadlineNanos = 0L;
             return;
         }
-        long remaining = this.issuedAtMillis + this.maxStalenessMs - this.clock.getAsLong();
-        this.staleDeadlineNanos = remaining <= 0L ? System.nanoTime() : System.nanoTime() + remaining * 1_000_000L;
+        long deadlineMs = this.maxStalenessMs > Long.MAX_VALUE - this.issuedAtMillis
+                ? Long.MAX_VALUE
+                : this.issuedAtMillis + this.maxStalenessMs;
+        long now = this.clock.getAsLong();
+        long remainingMs = now < 0L ? Long.MAX_VALUE : deadlineMs - now;
+        long start = System.nanoTime();
+        if (remainingMs <= 0L) {
+            this.staleDeadlineNanos = start;
+            return;
+        }
+        long remainingNanos = remainingMs > Long.MAX_VALUE / 1_000_000L ? Long.MAX_VALUE : remainingMs * 1_000_000L;
+        this.staleDeadlineNanos = start > Long.MAX_VALUE - remainingNanos ? Long.MAX_VALUE : start + remainingNanos;
     }
 
     public boolean hasLastGood() {
