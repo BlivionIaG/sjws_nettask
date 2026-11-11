@@ -11,6 +11,8 @@ package sjws_nettask.h2;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -87,6 +89,18 @@ class ConnWindowHolTest {
                         return new Response(200, ResponseHeaders.of(), new Body.Bytes(ByteBuffer.wrap(new byte[0])));
                     }
                     if ("/ping".equals(request.target())) {
+                        var all = new ByteArrayOutputStream();
+                        var buf = new byte[8];
+                        try {
+                            int n;
+                            while ((n = request.body().read(buf, 0, buf.length)) >= 0) {
+                                all.write(buf, 0, n);
+                            }
+                        } catch (IOException e) {
+                            return StaticFileHandler.error(400, false);
+                        }
+                        assertEquals("ping", all.toString(StandardCharsets.UTF_8),
+                                "/ping must consume its request body so a stalled sibling DATA cannot skip this path");
                         var h = ResponseHeaders.of();
                         h.set("x-pong", "1");
                         return new Response(200, h, new Body.Bytes(ByteBuffer.wrap("pong".getBytes(StandardCharsets.UTF_8))));
