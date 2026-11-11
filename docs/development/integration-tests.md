@@ -267,6 +267,19 @@ starts `CpStoreControlPlane`. `PendingControlPlane` is the null object for a sce
 no control nodes: `available()` is false and every other call throws
 `ControlPlanePendingException`.
 
+`WatchRelayTest` covers the relay in isolation: pause vs resume, clock delay
+on the control-to-data direction only (data-to-control is not delayed), a
+clamped negative delay, drop of a dead upstream, a client closed when no
+upstream is live, and fallback to the next live voter port. `CpStoreControlPlaneGuardsTest`
+covers start-count and already-started rejection, `appliedVersion` / `contentHash` /
+`delay` / `rollback` on missing ids or versions, and a successful hash after a
+push. Residual risk still covered only indirectly (or in the named scenario
+tests): `join` cleanup when the first watch answer never arrives, `propose` /
+`activate` failure in `push`, `awaitConverged` and `dispatched` timeouts,
+`interTickGap` mid-round advances (`ClusterTickGapStressTest`), and composed
+partition / delay / kill / heal through data nodes (`ClusterScenariosTest`,
+`CpVoterRestartTest`). Those scenario assertions are unchanged.
+
 `NodeFixtures.pending(dir, "data")` writes the bootstrap files under that temp directory
 (`state` is `dir/state`, not the working directory). A process started from that file
 reports `connection=pending`. That replaces the copy
