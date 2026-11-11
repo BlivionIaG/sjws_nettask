@@ -38,6 +38,8 @@ import java.time.Duration;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -79,6 +81,8 @@ class ProxyRoutingMiddlewareEndToEndTest {
 
     private HttpServer upstream;
     private final AtomicInteger hits = new AtomicInteger();
+    private final CountDownLatch gatedFirstChunk = new CountDownLatch(1);
+    private final CountDownLatch gatedRelease = new CountDownLatch(1);
     private SjwsServer server;
     private HttpClient client;
     private int port;
@@ -98,6 +102,28 @@ class ProxyRoutingMiddlewareEndToEndTest {
                     yield "upstream-hello".getBytes(StandardCharsets.UTF_8);
                 }
                 case "/big" -> BIG;
+                case "/gated" -> {
+                    var first = "BEGIN".repeat(1024).getBytes(StandardCharsets.US_ASCII);
+                    exchange.sendResponseHeaders(200, first.length + BIG.length);
+                    exchange.getResponseBody().write(first);
+                    exchange.getResponseBody().flush();
+                    this.gatedFirstChunk.countDown();
+                    try {
+                        if (!this.gatedRelease.await(10, TimeUnit.SECONDS)) {
+                            throw new IOException("gated upstream timed out");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("gated upstream interrupted", e);
+                    }
+                    try {
+                        exchange.getResponseBody().write(BIG);
+                    } catch (IOException cancelled) {
+                        // the client closed while this remainder was still held
+                    }
+                    exchange.close();
+                    yield null;
+                }
                 case "/echo" -> exchange.getRequestBody().readAllBytes();
                 default -> {
                     exchange.sendResponseHeaders(404, 0);
@@ -227,16 +253,36 @@ class ProxyRoutingMiddlewareEndToEndTest {
         assertEquals("yes", big.headers().firstValue("x-edge").orElseThrow());
 
         try (var socket = new Socket("127.0.0.1", this.port)) {
-            socket.setSoTimeout(3000);
+            socket.setSoTimeout(8000);
             socket.getOutputStream().write("""
-                    GET /api/big HTTP/1.1\r
+                    GET /api/gated HTTP/1.1\r
                     Host: 127.0.0.1\r
                     \r
                     """.getBytes(StandardCharsets.US_ASCII));
             socket.getOutputStream().flush();
-            var buf = new byte[256];
-            int n = socket.getInputStream().read(buf);
-            assertTrue(n > 0, "received the start of the streamed body");
+            var incoming = socket.getInputStream();
+            var buf = new byte[4096];
+            int got = 0;
+            int headerEnd = -1;
+            var assembled = new byte[16 * 1024];
+            while (got < assembled.length) {
+                int n = incoming.read(buf);
+                assertTrue(n > 0, "upstream closed before headers and a body chunk arrived");
+                System.arraycopy(buf, 0, assembled, got, n);
+                got += n;
+                headerEnd = indexOfHeaderEnd(assembled, got);
+                if (headerEnd >= 0 && got > headerEnd) {
+                    break;
+                }
+            }
+            assertTrue(headerEnd >= 0, "received HTTP headers");
+            int bodyBytes = got - headerEnd;
+            assertTrue(bodyBytes > 0, "received the start of the gated body");
+            assertTrue(this.gatedFirstChunk.await(5, TimeUnit.SECONDS),
+                    "upstream must have sent the first chunk and be holding the remainder");
+            assertEquals(1, this.gatedRelease.getCount(), "remainder must still be gated when the client closes");
+        } finally {
+            this.gatedRelease.countDown();
         }
 
         var hello = get("/api/hello");
@@ -261,4 +307,14 @@ class ProxyRoutingMiddlewareEndToEndTest {
     private static String sha(byte[] body) throws Exception {
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(body));
     }
+
+    private static int indexOfHeaderEnd(byte[] data, int len) {
+        for (int i = 0; i + 3 < len; i++) {
+            if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') {
+                return i + 4;
+            }
+        }
+        return -1;
+    }
+
 }
