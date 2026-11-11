@@ -475,6 +475,13 @@ public final class SjwsServer implements AutoCloseable {
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
+            HaSettings ha, SnapshotVerifier verifier, boolean bindContent, List<HandlerContributor> contributors)
+            throws IOException {
+        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, verifier, bindContent, contributors, null);
+    }
+
+    private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
+            Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
             HaSettings ha, SnapshotVerifier verifier, boolean bindContent, List<HandlerContributor> contributors,
             Path pin) throws IOException {
         var board = new ChallengeBoard();
