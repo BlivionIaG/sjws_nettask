@@ -118,6 +118,8 @@ class WatchRelayTest {
                 try {
                     return session.client.isClosed() || session.upstream.isClosed()
                             || session.client.getInputStream().read() == -1;
+                } catch (SocketTimeoutException e) {
+                    return false;
                 } catch (IOException e) {
                     return true;
                 }
@@ -135,6 +137,8 @@ class WatchRelayTest {
             await(() -> {
                 try {
                     return client.getInputStream().read() == -1 || client.isClosed();
+                } catch (SocketTimeoutException e) {
+                    return false;
                 } catch (IOException e) {
                     return true;
                 }
