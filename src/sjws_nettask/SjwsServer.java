@@ -153,6 +153,8 @@ public final class SjwsServer implements AutoCloseable {
     private final ReentrantLock contentBindLock = new ReentrantLock();
     /** Set after a data node accepts a control-plane document. SIGHUP then keeps that document. */
     private final AtomicBoolean remoteApplied = new AtomicBoolean();
+    /** Restored at boot so a later {@link #attachControlPlane} can seed the applicator. */
+    private volatile sjws_nettask.cp.SignedSnapshot restoredLastGood;
     /** Re-reads bootstrap local settings. Null until the service hook attaches one. */
     private volatile Runnable localReload;
     private AutoCloseable reloadHook;
@@ -753,6 +755,9 @@ public final class SjwsServer implements AutoCloseable {
      */
     public void attachControlPlane(Object apply) {
         this.controlPlane = Objects.requireNonNull(apply, "apply");
+        if (apply instanceof sjws_nettask.cp.DataApply data && this.restoredLastGood != null) {
+            data.record(this.restoredLastGood);
+        }
     }
 
     /**
@@ -811,6 +816,8 @@ public final class SjwsServer implements AutoCloseable {
             if (pushed != null) {
                 dataPlane().maxStaleness(pushed);
             }
+            this.remoteApplied.set(true);
+            this.restoredLastGood = snapshot;
             if (this.controlPlane instanceof sjws_nettask.cp.DataApply apply) {
                 apply.record(snapshot);
             }

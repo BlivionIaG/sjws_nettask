@@ -26,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -276,6 +277,72 @@ class LastGoodLifecycleCoverageTest {
         }
         assertNotEquals(first, second);
         assertNotNull(movedAcme);
+    }
+
+
+    @Test
+    void reloadAfterLastGoodKeepsTheInstalledSnapshot() throws Exception {
+        var local = Files.createDirectory(dir.resolve("html-sighup-local"));
+        Files.writeString(local.resolve("index.html"), "local");
+        var cached = Files.createDirectory(dir.resolve("html-sighup-cached"));
+        Files.writeString(cached.resolve("index.html"), "cached");
+        var state = dir.resolve("sighup-state");
+        var yaml = dir.resolve("sighup.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + local.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var cachedDoc = ConfigDocument.of(loaded.document().server().toBuilder().root(cached).build(),
+                loaded.document().acme(), loaded.document().routing(), loaded.document().middleware(),
+                loaded.document().access(), loaded.document().node(), loaded.document().schemaVersion(), 5,
+                loaded.document().configFile()).withStateDir(state);
+        var pin = DataReadinessTest.persistVerifiedLastGood(dir, state, cachedDoc, 5);
+        try (var server = SjwsServer.start(loaded, null, true, pin)) {
+            assertEquals("cached", HttpTestSupport.get(server.tcpPort(), "/index.html", 2_000).bodyText());
+            var ran = new AtomicBoolean();
+            server.setLocalReload(() -> ran.set(true));
+            var result = server.reload();
+            assertFalse(result.applied(), result.errors().toString() + result.warnings());
+            assertTrue(ran.get(), result.warnings().toString());
+            assertEquals("cached", HttpTestSupport.get(server.tcpPort(), "/index.html", 2_000).bodyText());
+            assertEquals(200, HttpTestSupport.get(server.tcpPort(), "/readyz", 2_000).statusCode());
+        }
+    }
+
+    @Test
+    void attachControlPlaneRecordsTheRestoredEnvelope() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-seed"));
+        Files.writeString(html.resolve("index.html"), "ok");
+        var state = dir.resolve("seed-state");
+        var yaml = dir.resolve("seed.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var fixture = DataReadinessTest.persistVerifiedLastGoodWithKeys(dir, state, loaded.document(), 4);
+        try (var server = SjwsServer.start(loaded, null, true, fixture.pin())) {
+            assertTrue(server.dataPlane().hasLastGood());
+            var apply = DataApply.open(fixture.keys(), fixture.pin(), state, System::currentTimeMillis);
+            server.attachControlPlane(apply);
+            assertEquals(4L, apply.appliedVersion());
+            var result = server.applyRemote(fixture.snapshot());
+            assertTrue(result.applied(), result.errors().toString());
+            assertTrue(result.errors().isEmpty(), result.errors().toString());
+        }
+    }
+
+    @Test
+    void attachingTheWallClockKeepsTheMonotonicDeadline() throws Exception {
+        var html = Files.createDirectory(dir.resolve("html-wall"));
+        var state = dir.resolve("wall-state");
+        var yaml = dir.resolve("wall.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\n  max_staleness: 15m\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        var guard = DataPlaneGuard.forDocument(loaded.document());
+        long now = System.currentTimeMillis();
+        guard.applied(DataPlaneGuardTest.snapshot(2, now - Duration.ofMinutes(16).toMillis(), now + 3_600_000L), true);
+        assertTrue(guard.pastMaxStaleness());
+        guard.clock(DataPlaneGuard.WALL_CLOCK);
+        assertTrue(guard.pastMaxStaleness());
     }
 
 }

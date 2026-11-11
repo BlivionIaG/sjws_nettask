@@ -175,7 +175,7 @@ public final class ServiceLaunch {
                 return sjws_nettask.cp.DataWatch.open(contact, this.bootstrap.nodeId(),
                         join == null ? null : join.tokenId(), join == null ? null : join.copySecret(),
                         this.bootstrap.pinFile(), this.bootstrap.stateDir(), server, this.enrollment,
-                        System::currentTimeMillis, tls);
+                        sjws_nettask.cp.DataPlaneGuard.WALL_CLOCK, tls);
             } catch (IOException e) {
                 System.err.println("WARN: control-plane watch not started: " + e.getMessage());
                 return null;

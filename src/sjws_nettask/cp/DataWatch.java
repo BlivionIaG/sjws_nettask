@@ -372,7 +372,9 @@ public final class DataWatch implements AutoCloseable {
 
     /** Rewrites the status file only on a change. {@code down} maps to disconnected or pending. */
     private void attachReadiness() {
-        this.server.dataPlane().clock(this.nowMillis);
+        if (this.nowMillis != DataPlaneGuard.WALL_CLOCK) {
+            this.server.dataPlane().clock(this.nowMillis);
+        }
         this.server.installPersistedLastGood(this.stateDir, this.pin);
         if (this.server.dataPlane().hasLastGood()) {
             bindContentAfterLastGood();

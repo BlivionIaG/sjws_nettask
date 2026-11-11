@@ -28,7 +28,13 @@ import sjws_nettask.config.NodeSettings;
  */
 public final class DataPlaneGuard {
 
-    public static final DataPlaneGuard INACTIVE = new DataPlaneGuard(false, 0L, System::currentTimeMillis);
+    /**
+     * Production wall clock. Passing this to {@link #clock(LongSupplier)} keeps the monotonic
+     * operator-interval deadline. Any other supplier is a test clock.
+     */
+    public static final LongSupplier WALL_CLOCK = System::currentTimeMillis;
+
+    public static final DataPlaneGuard INACTIVE = new DataPlaneGuard(false, 0L, WALL_CLOCK);
 
     private final boolean active;
     private volatile LongSupplier clock;
@@ -44,8 +50,8 @@ public final class DataPlaneGuard {
     private DataPlaneGuard(boolean active, long maxStalenessMs, LongSupplier clock) {
         this.active = active;
         this.maxStalenessMs = maxStalenessMs;
-        this.clock = clock == null ? System::currentTimeMillis : clock;
-        this.injectedClock = false;
+        this.clock = clock == null || clock == WALL_CLOCK ? WALL_CLOCK : clock;
+        this.injectedClock = this.clock != WALL_CLOCK;
     }
 
     public static DataPlaneGuard inactive() {
@@ -63,7 +69,7 @@ public final class DataPlaneGuard {
         }
         var max = document.node().maxStaleness();
         long ms = max == null ? 0L : max.toMillis();
-        var guard = new DataPlaneGuard(true, ms, System::currentTimeMillis);
+        var guard = new DataPlaneGuard(true, ms, WALL_CLOCK);
         if (document.stateDir() != null) {
             guard.loadLastGood(document.stateDir(), null);
         }
@@ -90,13 +96,13 @@ public final class DataPlaneGuard {
         if (!this.active) {
             return;
         }
-        if (clock == null) {
-            this.clock = System::currentTimeMillis;
+        if (clock == null || clock == WALL_CLOCK) {
+            this.clock = WALL_CLOCK;
             this.injectedClock = false;
-        } else {
-            this.clock = clock;
-            this.injectedClock = true;
+            return;
         }
+        this.clock = clock;
+        this.injectedClock = true;
         refreshStaleDeadline();
     }
 
