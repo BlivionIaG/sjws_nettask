@@ -158,6 +158,45 @@ class Http1RequestBodyTest {
         assertTrue(text.contains("Connection: close"), text);
     }
 
+    @Test
+    void aMalformedChunkedBodyFailsAndALaterReadIsRejected() throws Exception {
+        var text = exchange(readTwiceAfterFailure(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nxyz\r\n", true);
+        assertTrue(text.startsWith("HTTP/1.1 502 "), text);
+        assertTrue(text.contains("chunk size"), text);
+        assertTrue(text.contains("no longer readable"), text);
+    }
+
+    @Test
+    void aSecondReadAfterATruncatedChunkedBodyIsRejected() throws Exception {
+        var text = exchange(readTwiceAfterFailure(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n32\r\nabc", true);
+        assertTrue(text.startsWith("HTTP/1.1 502 "), text);
+        assertTrue(text.contains("mid-chunked body"), text);
+        assertTrue(text.contains("no longer readable"), text);
+    }
+
+    /** Hits {@code throwFailed} after the reader has already recorded a failure. */
+    private static Handler readTwiceAfterFailure() {
+        return request -> {
+            var buf = new byte[8];
+            try {
+                while (request.body().read(buf, 0, buf.length) >= 0) {
+                    // drain until the decoder fails or the stream ends
+                }
+                return new Response(500, ResponseHeaders.of(), Body.Bytes.of("first-read-ok".getBytes()));
+            } catch (IOException first) {
+                try {
+                    request.body().read(buf, 0, buf.length);
+                    return new Response(500, ResponseHeaders.of(), Body.Bytes.of("second-read-ok".getBytes()));
+                } catch (IOException second) {
+                    var msg = first.getMessage() + ";" + second.getMessage();
+                    return new Response(502, ResponseHeaders.of(), Body.Bytes.of(msg.getBytes()));
+                }
+            }
+        };
+    }
+
     private static long exchangeLength(String raw) throws Exception {
         var seen = new AtomicReference<Long>();
         Handler taking = request -> {
