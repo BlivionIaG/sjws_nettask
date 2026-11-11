@@ -264,12 +264,20 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
 
     @Override
     public Response handle(Request request) {
+        return dispatch(request, this.retry);
+    }
+
+    /** One try, no balancer retry: used by a per-route {@link RouteResilience} wrapper. */
+    Response oneShot(Request request) {
+        return dispatch(request, null);
+    }
+
+    private Response dispatch(Request request, Resilience.Retry retry) {
         var v = this.view;
         boolean head = request.headOnly();
         if (v == null) {
             return StaticFileHandler.error(503, head); // never populated
         }
-        var retry = this.retry;
         boolean mayRetry = retry != null && request.body().length() == 0 && ProxyHandler.idempotent(request.method());
         if (retry != null) {
             this.budget.deposit();

@@ -26,6 +26,7 @@ import sjws_nettask.routing.RedirectHandler;
 import sjws_nettask.routing.Router;
 import sjws_nettask.routing.WeightedHandler;
 import sjws_nettask.routing.EndpointBalancer;
+import sjws_nettask.routing.RouteResilience;
 import sjws_nettask.routing.discovery.Endpoint;
 import sjws_nettask.routing.discovery.UpstreamRegistry;
 import sjws_nettask.routing.discovery.UpstreamSet;
@@ -64,6 +65,10 @@ final class RoutingCompiler {
                 case RouteSpec.Action.Redirect r -> new RedirectHandler(r.status(), r.location(), r.keepPath());
                 case RouteSpec.Action.Static s -> files.withListings(s.listing());
             };
+            var policy = routePolicy(spec);
+            if (policy != null) { // private retry/circuit; the inner pool stays shared
+                handler = new RouteResilience(handler, policy);
+            }
             if (spec.rateLimit() != null) { // inside the problem wrapper, so a 429 renders like the route's other errors
                 handler = limited(spec.rateLimit(), handler);
             }
@@ -122,6 +127,31 @@ final class RoutingCompiler {
         return new ProxyHandler(new ProxyHandler.Settings(u.url(), u.connectTimeout(), u.responseTimeout(),
                 u.idleReadTimeout(), u.maxBody(), proto, cidrs, u.preserveHost(), 256),
                 sjws_nettask.routing.ByteBudget.shared(), u.resilience());
+    }
+
+    /**
+     * A route that sets {@code retry} and/or {@code circuit} gets a private policy. Unspecified
+     * fields on a {@code proxy:} route inherit the upstream's settings (the breaker itself is
+     * still private). A {@code backends:} route does not inherit (there is no single upstream).
+     */
+    static sjws_nettask.routing.Resilience routePolicy(RouteSpec spec) {
+        if (spec.retry() == null && spec.circuit() == null) {
+            return null;
+        }
+        var retry = spec.retry();
+        var circuit = spec.circuit();
+        if (spec.action() instanceof RouteSpec.Action.Proxy proxy) {
+            var base = proxy.upstream().resilience();
+            if (base != null) {
+                if (retry == null) {
+                    retry = base.retry();
+                }
+                if (circuit == null) {
+                    circuit = base.circuit();
+                }
+            }
+        }
+        return new sjws_nettask.routing.Resilience(retry, circuit);
     }
 
 }

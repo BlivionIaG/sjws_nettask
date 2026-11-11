@@ -473,8 +473,8 @@ O(1) per request, no allocation, exact to the configured ratio. A `pin` (`header
 optional exact `value`; without one, presence is enough) sends a matching request to that backend
 whatever the weights; pins are checked in order. `sticky` hashes that header or cookie value so a
 client keeps its backend while the weights are unchanged; requests without it are picked at random.
-Each upstream keeps one pool and its own `retry` and `circuit`, however many routes or backends name it.
-Up to 64 backends per route.
+Each upstream keeps one pool and its own `retry` and `circuit`, however many routes or backends name it,
+unless a route overrides those keys (see below). Up to 64 backends per route.
 
 Retries and circuit breaking are per upstream and off unless configured (no cost when absent):
 
@@ -527,6 +527,29 @@ always on with the defaults above, per endpoint, per attempt: an endpoint is eje
 goes somewhere rather than failing fast. The endpoint list can be replaced at run time by the
 control plane (see `docs/ha/discovery.md`); a reload keeps a list the control plane has set.
 A plain `url` upstream is unchanged and pays nothing for this.
+
+A route may set `retry` and/or `circuit` (the same shape as the `url` upstream keys) to override
+those defaults for that route only:
+
+```yaml
+routes:
+  - prefix: /api
+    proxy: api
+    retry: { attempts: 1 }          # this route only; the pool is still shared
+  - prefix: /hooks
+    proxy: api                      # uses the upstream's shared retry and circuit
+```
+
+The connection pool (and, for `endpoints:`, the balancer and per-endpoint ejection) stays shared.
+A route that sets either key gets a private retry budget and, if a circuit applies, a private
+breaker: it does not share state with the upstream policy or with other routes, so two routes
+naming the same upstream cannot trip each other's circuit. Unspecified fields on a `proxy:` route
+inherit the upstream's `retry` / `circuit` settings (the breaker is still private). On a
+`backends:` route there is no single upstream to inherit from, so only the keys written on the
+route apply. `retry` and `circuit` are only valid with `proxy` or `backends`. Routes that set
+neither follow the upstream policy exactly (zero cost, same path as today). On a multi-endpoint
+upstream, a route-level `circuit` is this consecutive-failure breaker in front of the balancer;
+it does not replace per-endpoint ejection, which stays on the upstream and is shared.
 
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 

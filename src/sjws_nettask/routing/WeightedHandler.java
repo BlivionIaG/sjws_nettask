@@ -16,6 +16,7 @@
  */
 package sjws_nettask.routing;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -102,6 +103,21 @@ public final class WeightedHandler implements Handler {
     @Override
     public Response handle(Request request) {
         return this.handlers[select(request.headers())].handle(request);
+    }
+
+    /**
+     * One try on the selected backend, skipping that backend's own retry / circuit so a
+     * {@link RouteResilience} wrapper can apply a per-route policy without nesting.
+     */
+    Response oneShot(Request request) throws IOException, InterruptedException {
+        var handler = this.handlers[select(request.headers())];
+        if (handler instanceof ProxyHandler proxy) {
+            return proxy.attempt(request);
+        }
+        if (handler instanceof EndpointBalancer balancer) {
+            return balancer.oneShot(request);
+        }
+        return handler.handle(request);
     }
 
     /** Index of the backend for these headers. Package-private for the distribution tests. */

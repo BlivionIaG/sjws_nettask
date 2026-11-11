@@ -597,6 +597,61 @@ class ConfigLoaderTest {
     }
 
     @Test
+    void routeRetryAndCircuitParseAndRoundTrip() throws Exception {
+        var yaml = """
+                routing:
+                  upstreams:
+                    api: { url: "http://127.0.0.1:9", retry: { attempts: 3 }, circuit: { failures: 4, eject_for: 2s } }
+                  routes:
+                    - prefix: /a
+                      proxy: api
+                      retry: { attempts: 1, on: [503], budget: 50% }
+                    - prefix: /b
+                      proxy: api
+                    - prefix: /c
+                      backends: [ { upstream: api, weight: 1 } ]
+                      circuit: { failures: 2, eject_for: 1s }
+                """;
+        Files.createDirectories(dir.resolve("www"));
+        var file = dir.resolve("route-resilience.yaml");
+        Files.writeString(file, "server:\n  port: 0\n  root: \"" + dir.resolve("www") + "\"\n" + yaml);
+        var loaded = ConfigLoader.load(new String[] {"--config=" + file, "--no-h3"}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var routes = loaded.document().routing().routes().routes();
+        assertEquals(1, routes.get(0).retry().attempts());
+        assertEquals(50, routes.get(0).retry().budgetPercent());
+        assertNull(routes.get(0).circuit());
+        assertNull(routes.get(1).retry());
+        assertNull(routes.get(1).circuit());
+        assertNull(routes.get(2).retry());
+        assertEquals(2, routes.get(2).circuit().failures());
+        assertEquals(Duration.ofSeconds(1), routes.get(2).circuit().openFor());
+        var text = ConfigCodec.text(loaded.document());
+        assertTrue(text.contains("retry: { attempts: 1"), text);
+        var copy = dir.resolve("route-resilience-copy.yaml");
+        Files.writeString(copy, text);
+        var again = ConfigLoader.load(new String[] {"--config=" + copy, "--no-h3"}, Map.of());
+        assertTrue(again.ok(), again.errors() + "\n" + text);
+        assertEquals(loaded.document().canonicalHash(), again.document().canonicalHash());
+        assertTrue(error("""
+                routing:
+                  upstreams:
+                    api: { url: "http://127.0.0.1:9" }
+                  routes:
+                    - prefix: /x
+                      static: true
+                      retry: {}
+                """).contains("only valid with proxy or backends"));
+        assertTrue(error("""
+                routing:
+                  routes:
+                    - prefix: /x
+                      redirect: { status: 302, location: /y }
+                      circuit: {}
+                """).contains("only valid with proxy or backends"));
+    }
+
+    @Test
     void haClusterKeyComesFromTheFileOrEnvAndIsNeverLogged() throws Exception {
         var fileKey = "file-cluster-key-0123456789";
         var previous = "file-previous-key-0123456";
