@@ -170,18 +170,35 @@ public final class DataPlaneGuard {
             this.staleDeadlineNanos = 0L;
             return;
         }
-        long deadlineMs = this.maxStalenessMs > Long.MAX_VALUE - this.issuedAtMillis
-                ? Long.MAX_VALUE
-                : this.issuedAtMillis + this.maxStalenessMs;
-        long now = this.clock.getAsLong();
-        long remainingMs = now < 0L ? Long.MAX_VALUE : deadlineMs - now;
+        long deadlineMs = saturatedAdd(this.issuedAtMillis, this.maxStalenessMs);
+        long remainingMs = saturatedAdd(deadlineMs, saturatedNegate(this.clock.getAsLong()));
         long start = System.nanoTime();
         if (remainingMs <= 0L) {
             this.staleDeadlineNanos = start;
             return;
         }
-        long remainingNanos = remainingMs > Long.MAX_VALUE / 1_000_000L ? Long.MAX_VALUE : remainingMs * 1_000_000L;
-        this.staleDeadlineNanos = start > Long.MAX_VALUE - remainingNanos ? Long.MAX_VALUE : start + remainingNanos;
+        this.staleDeadlineNanos = saturatedAdd(start, saturatedMillisToNanos(remainingMs));
+    }
+
+    /** Each call has a non-negative term, so an overflow can only be upward. */
+    private static long saturatedAdd(long a, long b) {
+        try {
+            return Math.addExact(a, b);
+        } catch (ArithmeticException e) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    private static long saturatedNegate(long a) {
+        return a == Long.MIN_VALUE ? Long.MAX_VALUE : Math.negateExact(a);
+    }
+
+    private static long saturatedMillisToNanos(long millis) {
+        try {
+            return Math.multiplyExact(millis, 1_000_000L);
+        } catch (ArithmeticException e) {
+            return Long.MAX_VALUE;
+        }
     }
 
     public boolean hasLastGood() {

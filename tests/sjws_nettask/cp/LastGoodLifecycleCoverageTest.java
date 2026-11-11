@@ -497,6 +497,12 @@ class LastGoodLifecycleCoverageTest {
         guard.maxStaleness(Duration.ofMillis(Long.MAX_VALUE / 2));
         guard.applied(DataPlaneGuardTest.snapshot(4, now, Long.MAX_VALUE), true);
         assertFalse(guard.pastMaxStaleness());
+        guard.clock(() -> Long.MIN_VALUE);
+        guard.applied(DataPlaneGuardTest.snapshot(5, now, Long.MAX_VALUE), true);
+        guard.clock(() -> -1L);
+        guard.applied(DataPlaneGuardTest.snapshot(6, now, Long.MAX_VALUE), true);
+        guard.clock(DataPlaneGuard.WALL_CLOCK);
+        assertFalse(guard.pastMaxStaleness());
     }
 
 }
