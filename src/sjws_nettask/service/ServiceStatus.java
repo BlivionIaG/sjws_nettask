@@ -17,6 +17,8 @@
 package sjws_nettask.service;
 
 import java.io.IOException;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -79,9 +81,11 @@ public final class ServiceStatus {
         if (value == null || value.isBlank() || value.length() > 262) {
             return "";
         }
-        if (value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0 || value.indexOf('=') >= 0
-                || value.indexOf(' ') >= 0) {
-            return "";
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c <= ' ' || c == 127 || c == '=') {
+                return "";
+            }
         }
         int colon = value.lastIndexOf(':');
         if (colon <= 0 || colon == value.length() - 1) {
@@ -96,12 +100,26 @@ public final class ServiceStatus {
         if (n < 1 || n > 65535) {
             return "";
         }
-        boolean v6 = host.startsWith("[") && host.endsWith("]") && host.length() > 2;
-        boolean v4orName = host.matches("[A-Za-z0-9._-]+");
-        if (!v6 && !v4orName) {
+        if (host.startsWith("[") && host.endsWith("]") && host.length() > 2) {
+            if (!ipv6Literal(host.substring(1, host.length() - 1))) {
+                return "";
+            }
+        } else if (!host.matches("[A-Za-z0-9._-]+")) {
             return "";
         }
         return value;
+    }
+
+    /** A real IPv6 literal, including an optional scope id; parsed without DNS. */
+    private static boolean ipv6Literal(String inner) {
+        if (inner.indexOf('[') >= 0 || inner.indexOf(']') >= 0) {
+            return false;
+        }
+        try {
+            return InetAddress.ofLiteral(inner) instanceof Inet6Address;
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
     }
 
     static String canonicalAdminState(String value) {

@@ -649,6 +649,13 @@ class BootstrapTest {
         assertEquals("", ServiceStatus.canonicalListen("127.0.0.1:99999"));
         assertEquals("10.0.0.1:80", ServiceStatus.canonicalListen("10.0.0.1:80"));
         assertEquals("[::1]:9443", ServiceStatus.canonicalListen("[::1]:9443"));
+        assertEquals("[2001:db8::1]:9443", ServiceStatus.canonicalListen("[2001:db8::1]:9443"));
+        assertEquals("[fe80::1%1]:9443", ServiceStatus.canonicalListen("[fe80::1%1]:9443"));
+        assertEquals("", ServiceStatus.canonicalListen("[::1\u001b[2J]:9443"));
+        assertEquals("", ServiceStatus.canonicalListen("[::1\t]:9443"));
+        assertEquals("", ServiceStatus.canonicalListen("[127.0.0.1]:9443"));
+        assertEquals("", ServiceStatus.canonicalListen("[not-an-ip]:9443"));
+        assertEquals("", ServiceStatus.canonicalListen("[[::1]]:9443"));
         assertEquals("", ServiceStatus.canonicalAdminState("up"));
         assertEquals("", ServiceStatus.canonicalAdminState(null));
         assertEquals("failed", ServiceStatus.canonicalAdminState("failed"));
