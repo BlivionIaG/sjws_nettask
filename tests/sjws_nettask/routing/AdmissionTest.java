@@ -29,6 +29,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestHeaders;
+import sjws_nettask.core.StaticFileHandler;
 
 class AdmissionTest {
 
@@ -66,6 +68,14 @@ class AdmissionTest {
         assertEquals(1, a.pending());
         assertNotNull(a.tryPending());
         assertEquals(2, a.pending());
+        var connectionsOnly = Admission.of(0, 2);
+        assertFalse(connectionsOnly.limitsPending());
+        assertTrue(connectionsOnly.limitsConnections());
+        assertThrows(IllegalStateException.class, () -> a.tryConnection()); // pending-only: connections unset
+        assertThrows(IllegalStateException.class, connectionsOnly::tryPending);
+        var hold = connectionsOnly.tryConnection();
+        assertNotNull(hold);
+        hold.release();
     }
 
     @Test
@@ -244,6 +254,153 @@ class AdmissionTest {
         assertEquals(200, again.status());
         assertEquals("ok", ProxyHandlerTest.text(again));
         assertEquals(2, hits.get());
+    }
+
+    @Test
+    void withPendingReleasesANonStreamResponseAndAttemptRejectsLocally() throws Exception {
+        start(ex -> {
+            ex.sendResponseHeaders(200, 0);
+            ex.close();
+        });
+        var admission = Admission.of(1, 0);
+        var hold = admission.tryPending();
+        var released = ProxyHandler.withPending(StaticFileHandler.error(502, false), hold);
+        assertEquals(502, released.status());
+        assertEquals(0, admission.pending());
+        assertEquals(Resilience.On.STATUS_502, ProxyHandler.kind(502));
+        assertEquals(Resilience.On.STATUS_504, ProxyHandler.kind(504));
+        this.proxy = proxy(Admission.of(1, 0));
+        var te = new Request("POST", "/", RequestHeaders.of(java.util.Map.of("transfer-encoding", java.util.List.of("chunked"))),
+                null, false);
+        assertEquals(501, this.proxy.attempt(te).status());
+        var declared = new Request("POST", "/", RequestHeaders.of(java.util.Map.of("content-length", java.util.List.of("3"))),
+                null, false);
+        assertEquals(501, this.proxy.attempt(declared).status());
+        var huge = new sjws_nettask.core.RequestBody() {
+            @Override
+            public long length() {
+                return 10_000;
+            }
+
+            @Override
+            public int read(byte[] into, int off, int len) {
+                return -1;
+            }
+        };
+        assertEquals(413, this.proxy.attempt(new Request("POST", "/").withBody(huge)).status());
+        assertEquals(400, this.proxy.attempt(new Request("OPTIONS", "*")).status());
+        assertEquals(0, this.proxy.admission().pending());
+    }
+
+    @Test
+    void attemptConnectionLimitIsALocal503() throws Exception {
+        var entered = new CountDownLatch(1);
+        this.release = new CountDownLatch(1);
+        start(ex -> {
+            entered.countDown();
+            if (!this.release.await(8, TimeUnit.SECONDS)) {
+                throw new RuntimeException("release timed out");
+            }
+            var body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        this.proxy = proxy(Admission.of(0, 1));
+        var held = new java.util.concurrent.CompletableFuture<sjws_nettask.core.Response>();
+        Thread.ofPlatform().start(() -> {
+            try {
+                held.complete(this.proxy.attempt(new Request("GET", "/")));
+            } catch (Exception e) {
+                held.completeExceptionally(e);
+            }
+        });
+        assertTrue(entered.await(8, TimeUnit.SECONDS));
+        var refused = this.proxy.attempt(new Request("GET", "/"));
+        assertEquals(503, refused.status());
+        assertTrue(ProxyHandler.isLocalRefusal(refused));
+        this.release.countDown();
+        assertEquals(200, held.get(8, TimeUnit.SECONDS).status());
+    }
+
+    @Test
+    void connectFailureAndTimeoutReleaseTheConnectionSlot() throws Exception {
+        int closed;
+        try (var s = new java.net.ServerSocket(0)) {
+            closed = s.getLocalPort();
+        }
+        var failed = Admission.of(0, 1);
+        var refused = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://127.0.0.1:" + closed),
+                Duration.ofMillis(200), Duration.ofMillis(200), 1024, "http", null), ByteBudget.shared(), null, failed);
+        try {
+            assertEquals(502, refused.handle(new Request("GET", "/")).status());
+            assertEquals(0, failed.connections());
+            assertEquals(502, refused.handle(new Request("GET", "/")).status());
+            assertEquals(0, failed.connections());
+        } finally {
+            refused.close();
+        }
+        var timed = Admission.of(0, 1);
+        var blackhole = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://192.0.2.1:9"),
+                Duration.ofMillis(200), Duration.ofMillis(200), 1024, "http", null), ByteBudget.shared(), null, timed);
+        try {
+            assertEquals(504, blackhole.handle(new Request("GET", "/")).status());
+            assertEquals(0, timed.connections());
+        } finally {
+            blackhole.close();
+        }
+    }
+
+    @Test
+    void resilientPathReleasesPendingWhenTheCircuitIsOpenAndOnAConnectionLimit() throws Exception {
+        start(ex -> {
+            var body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        var open = new Resilience(null, new Resilience.Circuit(1, Duration.ofSeconds(30)));
+        var pending = Admission.of(1, 0);
+        int closedPort;
+        try (var s = new java.net.ServerSocket(0)) {
+            closedPort = s.getLocalPort();
+        }
+        var trip = new ProxyHandler(new ProxyHandler.Settings(URI.create("http://127.0.0.1:" + closedPort),
+                Duration.ofMillis(200), Duration.ofMillis(200), 1024, "http", null), ByteBudget.shared(), open, pending);
+        try {
+            assertEquals(502, trip.handle(new Request("GET", "/")).status());
+            var refused = trip.handle(new Request("GET", "/"));
+            assertEquals(503, refused.status());
+            assertEquals(0, pending.pending());
+        } finally {
+            trip.close();
+        }
+        var entered = new CountDownLatch(1);
+        this.release = new CountDownLatch(1);
+        this.upstream.stop(0);
+        start(ex -> {
+            entered.countDown();
+            if (!this.release.await(8, TimeUnit.SECONDS)) {
+                throw new RuntimeException("release timed out");
+            }
+            var body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        var resilience = new Resilience(null, new Resilience.Circuit(5, Duration.ofSeconds(30)));
+        this.proxy = new ProxyHandler(new ProxyHandler.Settings(this.base(), Duration.ofSeconds(2), Duration.ofSeconds(2),
+                1024, "http", null), ByteBudget.shared(), resilience, Admission.of(0, 1));
+        var held = new java.util.concurrent.CompletableFuture<sjws_nettask.core.Response>();
+        Thread.ofPlatform().start(() -> held.complete(this.proxy.handle(new Request("GET", "/"))));
+        assertTrue(entered.await(8, TimeUnit.SECONDS));
+        var limited = this.proxy.handle(new Request("GET", "/"));
+        assertEquals(503, limited.status());
+        assertTrue(ProxyHandler.isLocalRefusal(limited));
+        assertEquals("CLOSED", this.proxy.circuitState());
+        this.release.countDown();
+        assertEquals(200, held.get(8, TimeUnit.SECONDS).status());
+        Body.discard(held.get().body());
     }
 
     @FunctionalInterface
