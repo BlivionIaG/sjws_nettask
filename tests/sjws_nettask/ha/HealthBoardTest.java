@@ -14,8 +14,15 @@ class HealthBoardTest {
         assertSame(board.ready(false), board.ready(false));
         assertEquals(200, board.health(false).status());
         assertEquals(503, board.ready(false).status(), "no snapshot yet");
+        assertEquals("unavailable\n", new String(bytes(board.ready(false))));
+        assertEquals("text/plain; charset=utf-8", board.ready(false).headers().get("content-type"));
+        assertEquals("no-store", board.ready(false).headers().get("cache-control"));
+        assertEquals("1", board.ready(false).headers().get("retry-after"));
+        assertEquals("1", board.ready(true).headers().get("retry-after"));
         assertTrue(board.health(true).headOnly());
         assertFalse(board.health(false).headOnly());
+        assertEquals("no-store", board.health(false).headers().get("cache-control"));
+        assertNull(board.health(false).headers().get("retry-after"));
 
         board.setSnapshotLoaded(true);
         assertTrue(board.readyNow());
@@ -63,7 +70,12 @@ class HealthBoardTest {
 
         var unloaded = new HealthBoard(false);
         var empty = new SnapshotHolder<sjws_nettask.core.Handler>();
-        assertEquals(503, new HaHandler(empty, unloaded).handle(new Request("GET", "/file")).status());
+        var pre = new HaHandler(empty, unloaded).handle(new Request("GET", "/file"));
+        assertEquals(503, pre.status());
+        assertEquals("unavailable\n", new String(bytes(pre)));
+        assertEquals("no-store", pre.headers().get("cache-control"));
+        assertEquals("1", pre.headers().get("retry-after"));
+        assertEquals("text/plain; charset=utf-8", pre.headers().get("content-type"));
     }
 
     private static byte[] bytes(sjws_nettask.core.Response response) {
