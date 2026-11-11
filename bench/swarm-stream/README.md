@@ -89,12 +89,32 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
   `chunk_latency_send` / `chunk_latency_sched` are always reported side by side, with
   `offered_mib_s`, `sched_late_pct` (sends > 1 ms behind their slot) and `sched_lag_max_us`.
   Validity rules are unchanged.
-- **Gate-rule change (disclosed on PR 8 / #299, Architecture sign-off pending):** `gate.sh` runs
-  abs and A/A windows paced at `GATE_RATE_MIB_S` (default 110) and `agg.py` passes only paced windows
-  (offered ≥ 100, scheduled-time p99) on achieved ≥ 100 MiB/s and p99 < 1 ms (guards unchanged).
-  Each abs window is followed by a closed-loop info leg `cl-NN` (info only; `CLOSED_LOOP_INFO=0`
-  skips it) and one `floor` leg at `FLOOR_RATE_MIB_S` (default 10) reports the generator's own
-  latency floor next to every window, never subtracted.
+- **Gate-rule change (disclosed on PR 8 / #299 and #502; Q2 confirmed; Architecture sign-off pending):**
+  the bar moves from p99 at closed-loop saturation to p99 at a fixed 110 MiB/s offered operating point.
+  - `gate.sh` runs abs and A/A windows paced at **exactly** `GATE_RATE_MIB_S=110`. `agg.py` rejects abs/A-A
+    windows at any other offered rate or not on the scheduled basis.
+  - It passes on median achieved ≥ 100 MiB/s and scheduled-basis p99 < 1 ms. Guards are unchanged.
+- **Window accounting:**
+  - Chunks are counted by slot (scheduled) time inside the window, and consumers keep receiving through the
+    drain cutoff.
+  - In-window slots unsent or unreceived at cutoff are recorded at their age.
+  - `result.json` reports these fields: `offered_actual_mib_s`, `sched_expected`, `sched_sent`,
+    `sched_received`, `sched_unreceived_at_cutoff`, `sched_phantom_streams`, `sched_inflight_at_end`,
+    `cutoff_hit`, `sched_stamp_fallback`, `sched_lag_p50_us` and `sched_lag_p99_us`.
+  - `agg.py` fails any slot shortfall, `cutoff_hit` or stamp fallback on a counted window.
+- **Leg order:**
+  1. `lowload-floor-N`, the low-load end-to-end floor at `FLOOR_RATE_MIB_S=10`. Its p99 must be ≤ 300 µs.
+     An invalid floor leg is rerun, up to `FLOOR_TRIES`. It understates generator delay at 110.
+  2. The `abs-NN` windows.
+  3. The closed-loop info legs `cl-NN`, info only (`CLOSED_LOOP_INFO=0` skips them).
+  4. A/A.
+
+  Every leg first waits for load1 < 3 (`QUIET_WAIT_MAX_S` per leg, `QUIET_WAIT_TOTAL_S` total, exit 6).
+- **Preconditions:**
+  - `PHASE=all|abs` refuses to start without `CALIBRATION_REF`, the posted smoke plus calibration result.
+  - Every DONE line records `harness=<commit>` and `calibration=<ref>`.
+  - Until the post-#465 merge flips `Q4_LANDED` in `agg.py`, the verdict is
+    `NOT_COUNTABLE (pre-Q4 harness, would be X)`. `--assume-q4` is for tests.
 - `result.json` also carries the sparse latency histogram (`chunk_latency.hist`, LatBag buckets,
   `hist_sub_bits`) so windows from several generator processes ((B) split) can be merged exactly.
 

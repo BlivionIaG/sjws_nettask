@@ -39,13 +39,12 @@ public class StreamLoad {
     static final int SUB_BITS = 6;
     static final int SUB = 1 << SUB_BITS; // 64
     static final int BUCKETS = 64 * SUB;  // 4096
-    // #415: instance histograms so the consumer records, per chunk, both the send-stamp latency
-    // (LAT) and the scheduled-send-time latency (LAT_CO). inceptor Q1 (2026-11-11): paced gate
-    // windows report p99 from the scheduled send time, so a stalled producer cannot hide backlog.
-    final ThreadLocal<long[]> TL = ThreadLocal.withInitial(() -> new long[BUCKETS]);
-    final ConcurrentLinkedQueue<long[]> ALL = new ConcurrentLinkedQueue<>();
-    final ThreadLocal<Boolean> REG = ThreadLocal.withInitial(() -> Boolean.FALSE);
-    final LongAdder TOTAL = new LongAdder();
+    // #415: instance histograms (LAT send stamp, LAT_CO scheduled send time, LAG schedule lag).
+    // Striped shared counters instead of one 32 KiB array per virtual thread: 3 histograms x 2k VTs
+    // were ~190 MiB of generator heap (Architecture review of 5f4805d6). 16 stripes = 512 KiB each.
+    static final int STRIPES = 16;
+    final AtomicLongArray[] st = new AtomicLongArray[STRIPES];
+    LatBag() { for (int i = 0; i < STRIPES; i++) st[i] = new AtomicLongArray(BUCKETS); }
 
     static int index(long us) {
       if (us < 1) us = 1;
@@ -77,18 +76,18 @@ public class StreamLoad {
     }
 
     void add(double us) {
-      long[] a = TL.get();
-      if (!REG.get()) { ALL.add(a); REG.set(Boolean.TRUE); }
       long u = us < 1 ? 1 : (long) us;
-      a[index(u)]++;
-      TOTAL.increment();
+      st[(int) (Thread.currentThread().threadId() & (STRIPES - 1))].incrementAndGet(index(u));
+    }
+    long[] sum() {
+      long[] sum = new long[BUCKETS];
+      for (AtomicLongArray a : st) for (int i = 0; i < BUCKETS; i++) sum[i] += a.get(i);
+      return sum;
     }
     double pctFromBuckets(double p) {
-      long[] sum = new long[BUCKETS];
+      long[] sum = sum();
       long n = 0;
-      for (long[] a : ALL) {
-        for (int i = 0; i < BUCKETS; i++) { sum[i] += a[i]; n += a[i]; }
-      }
+      for (long c : sum) n += c;
       if (n == 0) return Double.NaN;
       long need = (long) Math.ceil(p * n);
       if (need < 1) need = 1;
@@ -101,13 +100,12 @@ public class StreamLoad {
     }
     long count() {
       long n = 0;
-      for (long[] a : ALL) for (long c : a) n += c;
+      for (long c : sum()) n += c;
       return n;
     }
     /** Sparse [[bucket, count], ...] JSON so several generator processes can be merged ((B) split). */
     String sparseJson() {
-      long[] sum = new long[BUCKETS];
-      for (long[] a : ALL) for (int i = 0; i < BUCKETS; i++) sum[i] += a[i];
+      long[] sum = sum();
       StringBuilder sb = new StringBuilder("[");
       boolean first = true;
       for (int i = 0; i < BUCKETS; i++) {
@@ -119,9 +117,7 @@ public class StreamLoad {
       return sb.append(']').toString();
     }
     void clearAll() {
-      for (long[] a : ALL) Arrays.fill(a, 0);
-      ALL.clear();
-      TOTAL.reset();
+      for (AtomicLongArray a : st) for (int i = 0; i < BUCKETS; i++) a.set(i, 0);
     }
   }
   /** Send-stamp chunk latency (actual send → consumer). Reported beside the gate p99 when paced. */
@@ -131,10 +127,124 @@ public class StreamLoad {
    * (inceptor Q1). Equal to LAT in closed loop, where the slot is the send time.
    */
   static final LatBag LAT_CO = new LatBag();
-  /** #415 pacing: sends during measure, sends that started > 1 ms after their slot, worst lag. */
+  /** #415 schedule lag (slot -> send start, µs) for in-window paced slots (Architecture item 5). */
+  static final LatBag LAG = new LatBag();
+  /** #415 pacing: in-window slot sends, sends started > 1 ms after their slot, worst lag. */
   static final LongAdder SCHED_SENDS = new LongAdder(), SCHED_LATE = new LongAdder();
   static final LongAccumulator SCHED_LAG_MAX_NS = new LongAccumulator(Long::max, 0L);
   static final long LATE_NS = 1_000_000L;
+  /**
+   * #415 window accounting (Architecture item 1): a chunk belongs to the window by its SLOT time
+   * (scheduled send; send time in closed loop), not by when it was received. Producers send every
+   * slot in [start, end), consumers keep reading until LAST or the drain cutoff, and in-window slots
+   * still unsent or unreceived at cutoff are recorded in LAT_CO at their age (cutoff - slot).
+   */
+  static final LongAdder SCHED_EXPECTED = new LongAdder(), SCHED_SENT = new LongAdder(),
+      SCHED_RECEIVED = new LongAdder(), SCHED_UNRECEIVED = new LongAdder(),
+      SCHED_PHANTOM_STREAMS = new LongAdder(), SCHED_STAMP_FALLBACK = new LongAdder(),
+      SCHED_INFLIGHT_AT_END = new LongAdder();
+  static final AtomicBoolean CUTOFF_HIT = new AtomicBoolean();
+
+  record StreamKey(long hi, long lo) {}
+
+  /** Per-stream schedule and counts (producer registers it after its claim, before any chunk). */
+  static final class Track {
+    final long phaseNs, intervalNs;
+    final AtomicLong sent = new AtomicLong(), recv = new AtomicLong();
+    Track(long phaseNs, long intervalNs) { this.phaseNs = phaseNs; this.intervalNs = intervalNs; }
+  }
+
+  /** One wave (warmup or measure). The measure window is [startNs, endNs); unset = Long.MAX_VALUE. */
+  static final class Win {
+    final boolean account;
+    final int n;
+    final long intervalNs;
+    volatile long startNs = Long.MAX_VALUE, endNs = Long.MAX_VALUE;
+    final AtomicBoolean hardStop = new AtomicBoolean();
+    final ConcurrentHashMap<StreamKey, Track> tracks = new ConcurrentHashMap<>();
+    final ConcurrentLinkedQueue<LeanHttp> consumerSockets = new ConcurrentLinkedQueue<>();
+    Win(boolean account, int n, long intervalNs) { this.account = account; this.n = n; this.intervalNs = intervalNs; }
+    boolean inWindow(long slotNs) { return slotNs >= startNs && slotNs < endNs; }
+  }
+
+  /**
+   * Per-stream slot interval for a wave of {@code n} streams at {@code rateMibS} aggregate
+   * (Architecture item 3: the wave's own stream count, so warmup also runs at the gate rate).
+   */
+  static long intervalNs(Args args, int n) {
+    if (args.rateMibS <= 0) return 0L;
+    return Math.max(1L, (long) (n * (double) args.chunkBytes * 1e9 / (args.rateMibS * 1048576.0)));
+  }
+
+  /** Slots k >= 0 with phase + k*interval in [start, end). Mirrored in tests/test_window_accounting.py. */
+  static long slotsInWindow(long phase, long interval, long start, long end) {
+    long kLo = Math.max(0L, Math.ceilDiv(start - phase, interval));
+    long kHi = Math.max(0L, Math.ceilDiv(end - phase, interval));
+    return Math.max(0L, kHi - kLo);
+  }
+
+  /**
+   * After the wave: every in-window slot not received is recorded in LAT_CO at age cutoff - slot.
+   * Missing slots are taken as the stream's LAST ones (youngest, so the smallest ages: conservative
+   * for the reported p99 only in the generator's favour by at most the window length; every one is
+   * still >= cutoff - end). A stream whose producer never registered (never claimed) contributes
+   * floor(window / interval) phantom slots spread over the window.
+   */
+  static void accountWave(Win w, long cutoffNs) {
+    if (!w.account || w.intervalNs <= 0 || w.startNs == Long.MAX_VALUE) return;
+    long start = w.startNs, end = w.endNs, iv = w.intervalNs;
+    for (Track t : w.tracks.values()) {
+      long exp = slotsInWindow(t.phaseNs, iv, start, end);
+      SCHED_EXPECTED.add(exp);
+      long missing = exp - t.recv.get();
+      if (missing <= 0) continue;
+      SCHED_UNRECEIVED.add(missing);
+      long kHi = Math.max(0L, Math.ceilDiv(end - t.phaseNs, iv));
+      for (long j = 1; j <= missing; j++) {
+        long slot = t.phaseNs + (kHi - j) * iv;
+        LAT_CO.add((cutoffNs - slot) / 1e3);
+      }
+    }
+    long phantom = Math.max(0, w.n - w.tracks.size());
+    if (phantom > 0) {
+      SCHED_PHANTOM_STREAMS.add(phantom);
+      long per = (end - start) / iv;
+      SCHED_EXPECTED.add(phantom * per);
+      SCHED_UNRECEIVED.add(phantom * per);
+      for (long p = 0; p < phantom; p++)
+        for (long k = 0; k < per; k++) LAT_CO.add((cutoffNs - (start + k * iv)) / 1e3);
+    }
+  }
+
+  /**
+   * One received TOKEN chunk; {@code off} is the chunk payload start ([2][hi8][lo8][attempt4][seq4]
+   * [flags1][data]). Counts by slot time inside the window; the scheduled stamp falls back to the
+   * send stamp only when unparsable (counted, flagged on paced windows).
+   */
+  static void onChunk(Win w, Track[] cache, byte[] b, int off, int len, long recvNs, LongAdder bytesRx) {
+    if (!w.account || len < CHUNK_HDR + 20) return;
+    long emit = asciiLong(b, off + CHUNK_HDR);
+    if (emit <= 0) return;
+    long slot = len >= CHUNK_HDR + 40 ? asciiLong(b, off + CHUNK_HDR + 20) : -1;
+    if (slot <= 0) { SCHED_STAMP_FALLBACK.increment(); slot = emit; }
+    if (!w.inWindow(slot)) return;
+    LAT.add((recvNs - emit) / 1e3);
+    LAT_CO.add((recvNs - slot) / 1e3);
+    bytesRx.add(len - CHUNK_HDR);
+    SCHED_RECEIVED.increment();
+    Track t = cache[0];
+    if (t == null) {
+      t = w.tracks.get(new StreamKey(getLong(b, off + 1), getLong(b, off + 9)));
+      cache[0] = t;
+    }
+    if (t != null) t.recv.incrementAndGet();
+  }
+
+  static long getLong(byte[] b, int off) {
+    long v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | (b[off + i] & 0xffL);
+    return v;
+  }
 
   static final class Args {
     String base, tokensFile, out, accept = "binary";
@@ -187,10 +297,7 @@ public class StreamLoad {
     LAT.clearAll(); LAT_CO.clearAll();
     ConcurrentLinkedQueue<String> measureErr = new ConcurrentLinkedQueue<>();
     ConcurrentLinkedQueue<String> teardownErr = new ConcurrentLinkedQueue<>();
-    AtomicBoolean producersStop = new AtomicBoolean();
-    AtomicBoolean consumersStop = new AtomicBoolean();
     AtomicBoolean inTeardown = new AtomicBoolean();
-    AtomicBoolean measureActive = new AtomicBoolean();
     AtomicLong requests = new AtomicLong();
     AtomicLong credit429 = new AtomicLong();
     AtomicLong producerTransportRetries = new AtomicLong();
@@ -198,11 +305,14 @@ public class StreamLoad {
     AtomicLong groupOpenRefusals = new AtomicLong(); // claim/stream HTTP 503 (ledger budget) — not transport
 
     // Warmup (same group count; fewer streams)
-    wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w",
-        producersStop, consumersStop, inTeardown, measureActive, bytesRx, creditWaits,
+    wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w", false,
+        inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
-    bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); creditWaits.clear();
+    bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll(); creditWaits.clear();
     SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
+    for (LongAdder c : List.of(SCHED_EXPECTED, SCHED_SENT, SCHED_RECEIVED, SCHED_UNRECEIVED,
+        SCHED_PHANTOM_STREAMS, SCHED_STAMP_FALLBACK, SCHED_INFLIGHT_AT_END)) c.reset();
+    CUTOFF_HIT.set(false);
     requests.set(0); credit429.set(0);
     producerTransportRetries.set(0); consumerConnectRetries.set(0);
 
@@ -235,8 +345,8 @@ public class StreamLoad {
     });
 
     long t0 = System.nanoTime();
-    int[] streamToGroup = wave(http, args, tokens, args.streams, args.secs, "g",
-        producersStop, consumersStop, inTeardown, measureActive, bytesRx, creditWaits,
+    int[] streamToGroup = wave(http, args, tokens, args.streams, args.secs, "g", true,
+        inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
     double wall = (System.nanoTime() - t0) / 1e9;
     cpuMon.join(2000);
@@ -264,7 +374,7 @@ public class StreamLoad {
     r.generatorSaturated = genSat;
     r.genCores = args.genCores;
     r.genSatLimitPct = satLim;
-    r.chunkSamples = (int) Math.min(Integer.MAX_VALUE, LAT.count());
+    r.chunkSamples = (int) Math.min(Integer.MAX_VALUE, SCHED_RECEIVED.sum());
     r.bytes = bytesRx.sum();
     r.mibS = (r.bytes / (1024.0 * 1024.0)) / Math.max(1e-6, args.secs);
     // inceptor Q1 (2026-11-11): paced windows gate on latency from each chunk's SCHEDULED send time;
@@ -276,11 +386,18 @@ public class StreamLoad {
     r.p50Send = LAT.pctFromBuckets(0.50); r.p90Send = LAT.pctFromBuckets(0.90); r.p99Send = LAT.pctFromBuckets(0.99);
     r.p50Sched = LAT_CO.pctFromBuckets(0.50); r.p90Sched = LAT_CO.pctFromBuckets(0.90); r.p99Sched = LAT_CO.pctFromBuckets(0.99);
     r.latHistSend = LAT.sparseJson(); r.latHistSched = LAT_CO.sparseJson();
-    LAT.clearAll(); LAT_CO.clearAll();
+    if (paced && LAG.count() > 0) { r.lagP50 = LAG.pctFromBuckets(0.50); r.lagP99 = LAG.pctFromBuckets(0.99); }
+    LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll();
+    r.schedExpected = SCHED_EXPECTED.sum(); r.schedSent = SCHED_SENT.sum();
+    r.schedReceived = SCHED_RECEIVED.sum(); r.schedUnreceived = SCHED_UNRECEIVED.sum();
+    r.schedPhantomStreams = SCHED_PHANTOM_STREAMS.sum(); r.schedStampFallback = SCHED_STAMP_FALLBACK.sum();
+    r.schedInflightAtEnd = SCHED_INFLIGHT_AT_END.sum(); r.cutoffHit = CUTOFF_HIT.get();
     r.rateMibS = args.rateMibS;
     r.leanConsumer = args.leanConsumerActive();
     long ss = SCHED_SENDS.sum();
     r.schedSends = ss;
+    // Architecture item 2: actual offered = in-window slot sends x chunk bytes / secs.
+    r.offeredActualMibS = paced ? ss * (double) args.chunkBytes / 1048576.0 / Math.max(1e-6, args.secs) : 0;
     r.schedLatePct = ss == 0 ? 0 : 100.0 * SCHED_LATE.sum() / ss;
     r.schedLagMaxUs = SCHED_LAG_MAX_NS.get() / 1e3;
     List<Double> cw = new ArrayList<>(creditWaits); Collections.sort(cw);
@@ -317,52 +434,68 @@ public class StreamLoad {
   }
 
   static int[] wave(HttpClient http, Args args, List<String> tokens, int n, double duration, String label,
-      AtomicBoolean producersStop, AtomicBoolean consumersStop, AtomicBoolean inTeardown,
-      AtomicBoolean measureActive,
+      boolean account, AtomicBoolean inTeardown,
       LongAdder bytesRx, ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429,
       AtomicLong producerTransportRetries, AtomicLong consumerConnectRetries,
       AtomicLong groupOpenRefusals) throws Exception {
-    producersStop.set(false); consumersStop.set(false); inTeardown.set(false);
-    measureActive.set(false);
+    inTeardown.set(false);
+    Win w = new Win(account, n, intervalNs(args, n));
     int gCount = Math.max(1, Math.min(args.groups > 0 ? args.groups : n, n));
     int[] mapping = new int[n];
-    List<Thread> threads = new ArrayList<>(n * 2);
+    List<Thread> consumers = new ArrayList<>(n), producers = new ArrayList<>(n);
     for (int i = 0; i < n; i++) {
       int gid = i % gCount;
       mapping[i] = gid;
       String pool = label + gid; // Architecture 2026-10-30 15:13: G groups, streams round-robin
       String tok = tokens.get(i % tokens.size());
-      int idx = i;
-      threads.add(Thread.startVirtualThread(() -> {
-        try { consumer(http, args, tok, pool, consumersStop, inTeardown, measureActive, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
+      consumers.add(Thread.startVirtualThread(() -> {
+        try { consumer(http, args, tok, pool, w, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
-      threads.add(Thread.startVirtualThread(() -> {
-        try { producer(http, args, tok, pool, producersStop, inTeardown, measureActive, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
+      producers.add(Thread.startVirtualThread(() -> {
+        try { producer(http, args, tok, pool, w, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
       }));
     }
-    // Account bytes/latency only during the nominal measure interval (not admit ramp / teardown).
-    measureActive.set(true);
-    try {
-      Thread.sleep((long)(duration * 1000));
-    } finally {
-      measureActive.set(false);
+    // The window opens after the admit ramp. Chunks count by slot time in [start, end).
+    long start = System.nanoTime();
+    w.endNs = start + (long) (duration * 1e9);
+    w.startNs = start;
+    Thread.sleep((long) (duration * 1000));
+    // Producers finish their in-window slots (a late stream catches up) and send LAST; consumers
+    // read until LAST. Nothing is cut at the window end: the hard cutoff is end + drain timeout.
+    long cutoff = w.endNs + (long) (Math.max(args.drainTimeout, (GRACE_MS + DRAIN_SLACK_MS) / 1000.0) * 1e9);
+    if (account) SCHED_INFLIGHT_AT_END.add(Math.max(0L, SCHED_SENT.sum() - SCHED_RECEIVED.sum()));
+    boolean allDone = joinUntil(producers, cutoff) & joinUntil(consumers, cutoff);
+    long cutoffNs = System.nanoTime();
+    if (!allDone) {
+      if (account) CUTOFF_HIT.set(true);
+      inTeardown.set(true);
+      w.hardStop.set(true);
+      for (LeanHttp h : w.consumerSockets) h.close(); // unblock readers stuck in read()
+      joinUntil(producers, System.nanoTime() + 5_000_000_000L);
+      joinUntil(consumers, System.nanoTime() + 5_000_000_000L);
     }
     inTeardown.set(true);
-    producersStop.set(true);
-    Thread.sleep(2000);
-    consumersStop.set(true);
-    Thread.sleep(2000);
-    for (Thread t : threads) t.join(30_000);
+    if (!"sse".equals(args.accept)) accountWave(w, cutoffNs); // SSE frames carry no stream id
     return mapping;
   }
 
+  /** Join threads until {@code deadlineNs}; true if all finished. */
+  static boolean joinUntil(List<Thread> ts, long deadlineNs) throws InterruptedException {
+    for (Thread t : ts) {
+      long left = deadlineNs - System.nanoTime();
+      if (left <= 0) return !ts.stream().anyMatch(Thread::isAlive);
+      t.join(Duration.ofNanos(left));
+    }
+    return !ts.stream().anyMatch(Thread::isAlive);
+  }
+
   static void producer(HttpClient http, Args args, String token, String pool,
-      AtomicBoolean stop, AtomicBoolean inTeardown, AtomicBoolean measureActive,
+      Win w, AtomicBoolean inTeardown,
       ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429, AtomicLong producerTransportRetries,
@@ -394,13 +527,16 @@ public class StreamLoad {
     java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
     LeanHttp lean = null;
     byte[] dataHdr = null; // #415: request head for data frames, built once per stream (fixed length)
-    // #415 pacing: per-stream slot = streams × chunkBytes / rate; random phase so 1k streams do not
-    // fire in lockstep. Slots are never skipped: a late stream catches up (one sync POST at a time).
-    final long intervalNs = args.rateMibS > 0
-        ? Math.max(1L, (long) (args.streams * (double) args.chunkBytes * 1e9 / (args.rateMibS * 1048576.0)))
-        : 0L;
+    // #415 pacing: per-stream slot = n × chunkBytes / rate for this wave's n streams (warmup runs
+    // at the gate rate too); random phase so 1k streams do not fire in lockstep. Slots are never
+    // skipped: a late stream catches up (one sync POST at a time). The producer stops at the first
+    // slot at or after the window end, so every in-window slot is sent (or counted unsent).
+    final long intervalNs = w.intervalNs;
     long nextNs = intervalNs > 0 ? System.nanoTime() + rnd.nextLong(intervalNs) : 0L;
     final boolean coStamp = args.chunkBytes >= 40; // second 20-digit stamp fits in the payload
+    final AtomicBoolean stop = w.hardStop;
+    Track track = new Track(nextNs, intervalNs);
+    w.tracks.put(new StreamKey(lease.streamHi, lease.streamLo), track);
     try {
       if (args.leanHttp) lean = new LeanHttp(URI.create(args.base), 60_000);
       while (!stop.get()) {
@@ -412,6 +548,7 @@ public class StreamLoad {
         }
         long slotNs;
         if (intervalNs > 0) {
+          if (nextNs >= w.endNs) break; // all in-window slots done
           long now = System.nanoTime();
           while (now < nextNs && !stop.get()) {
             LockSupport.parkNanos(nextNs - now);
@@ -420,17 +557,19 @@ public class StreamLoad {
           if (stop.get()) break;
           slotNs = nextNs;
           nextNs += intervalNs;
-          if (measureActive.get()) {
+          if (w.account && w.inWindow(slotNs)) {
             long lag = now - slotNs;
             SCHED_SENDS.increment();
             if (lag > LATE_NS) SCHED_LATE.increment();
             SCHED_LAG_MAX_NS.accumulate(lag);
+            LAG.add(lag / 1e3);
           }
         } else {
-          slotNs = -1;
+          slotNs = System.nanoTime();
+          if (slotNs >= w.endNs) break; // closed loop: send until the window end
         }
         long emitNs = System.nanoTime();
-        if (slotNs < 0) slotNs = emitNs; // closed loop: schedule stamp == send stamp
+        if (intervalNs <= 0) slotNs = emitNs; // closed loop: schedule stamp == send stamp
         int flags = (seq == 0 ? FIRST : 0);
         byte[] frame = tokenFrameInto(lease.streamHi, lease.streamLo, lease.attempt, seq, flags, payload, frameScratch);
         frameScratch = frame;
@@ -466,9 +605,11 @@ public class StreamLoad {
             if (sc == 204) {
               mode = 2; creditChunks = 0; creditBytes = 0; zeroTries = 0;
               seq++;
+              if (w.account && w.inWindow(slotNs)) { track.sent.incrementAndGet(); SCHED_SENT.increment(); }
               break;
             }
             if (sc != 200) throw new IOException("chunk " + sc);
+            if (w.account && w.inWindow(slotNs)) { track.sent.incrementAndGet(); SCHED_SENT.increment(); }
             int[] snap = parseCreditChunksBytes(body);
             if (snap != null) {
               mode = 1;
@@ -594,52 +735,17 @@ public class StreamLoad {
   }
 
   static void consumer(HttpClient http, Args args, String token, String pool,
-      AtomicBoolean stop, AtomicBoolean inTeardown, AtomicBoolean measureActive, LongAdder bytesRx,
+      Win w, AtomicBoolean inTeardown, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals) throws Exception {
+    if (args.leanConsumerActive()) {
+      consumerLean(args, token, pool, w, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals);
+      return;
+    }
+    AtomicBoolean stop = w.hardStop;
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     Exception last = null;
     for (int attempt = 0; attempt < 3 && !stop.get(); attempt++) {
-      if (args.leanConsumerActive()) {
-        // #415: :stream POST and the replies GET on one raw keep-alive socket; frames are decoded
-        // from a reused buffer (no HttpClient selector hop, no per-frame byte[] or String).
-        LeanHttp lh = null;
-        try {
-          lh = new LeanHttp(URI.create(args.base), 200_000);
-          String spath = "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000";
-          LeanResp sr = lh.postOnce(lh.head("POST", spath, token, CT, CT, task.length), task);
-          if (sr.status == 503) {
-            groupOpenRefusals.incrementAndGet();
-            note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool, new IOException("stream 503"));
-            return;
-          }
-          if (sr.status != 201 && sr.status != 200) throw new IOException("stream " + sr.status);
-          String loc = sr.location;
-          if (loc == null) {
-            Frame f = decodeFrame(ByteBuffer.wrap(sr.body));
-            loc = "/swarm/v1/replies/" + hex(f.payload);
-          }
-          if (loc.startsWith("http")) {
-            URI u = URI.create(loc);
-            loc = u.getRawPath() + (u.getRawQuery() == null ? "" : "?" + u.getRawQuery());
-          }
-          int gsc = lh.startGet(lh.head("GET", loc, token, null, CT, -1));
-          if (gsc != 200) throw new IOException("replies " + gsc);
-          readBinaryLean(lh.bodyStream(), stop, measureActive, bytesRx);
-          return;
-        } catch (Exception e) {
-          last = e;
-          if (!inTeardown.get()) consumerConnectRetries.incrementAndGet();
-          if (attempt < 2 && !stop.get()) {
-            try { Thread.sleep(20L << attempt); } catch (InterruptedException ie) {
-              Thread.currentThread().interrupt(); throw ie;
-            }
-          }
-          continue;
-        } finally {
-          if (lh != null) lh.close();
-        }
-      }
       try {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(args.base + "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000"))
             .timeout(Duration.ofSeconds(200))
@@ -674,8 +780,8 @@ public class StreamLoad {
         HttpResponse<InputStream> get = http.send(gb.build(), HttpResponse.BodyHandlers.ofInputStream());
         if (get.statusCode() != 200) throw new IOException("replies " + get.statusCode());
         try (InputStream in = get.body()) {
-          if ("sse".equals(args.accept)) readSse(in, stop, measureActive, bytesRx);
-          else readBinary(in, stop, measureActive, bytesRx);
+          if ("sse".equals(args.accept)) readSse(in, w, bytesRx);
+          else readBinary(in, w, bytesRx);
         }
         return;
       } catch (Exception e) {
@@ -693,6 +799,67 @@ public class StreamLoad {
     if (last != null) throw last;
   }
 
+  /**
+   * #415 lean consumer: :stream POST and the replies GET on one raw keep-alive socket; frames are
+   * decoded from a reused buffer (no HttpClient selector hop, no per-frame byte[] or String).
+   * Only the connect/POST step is retried, and only while no session exists: once :stream answered
+   * 201 a failure is an error, never a second :stream (Architecture review: no second session).
+   */
+  static void consumerLean(Args args, String token, String pool,
+      Win w, AtomicBoolean inTeardown, LongAdder bytesRx,
+      ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
+      AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals) throws Exception {
+    byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
+    String spath = "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000";
+    LeanHttp lh = null;
+    LeanResp sr = null;
+    Exception last = null;
+    try {
+      for (int attempt = 0; attempt < 3 && !w.hardStop.get(); attempt++) {
+        boolean written = false;
+        try {
+          if (lh != null) lh.close();
+          lh = new LeanHttp(URI.create(args.base), 200_000);
+          byte[] head = lh.head("POST", spath, token, CT, CT, task.length);
+          written = true; // from here a resend could open a second session
+          sr = lh.postOnce(head, task);
+          break;
+        } catch (IOException e) {
+          last = e;
+          if (!inTeardown.get()) consumerConnectRetries.incrementAndGet();
+          if (written) throw e; // the request may have reached the server: never resend :stream
+          if (attempt < 2) Thread.sleep(20L << attempt);
+        }
+      }
+      if (sr == null) throw last != null ? last : new IOException("stream not opened");
+      if (sr.status == 503) {
+        groupOpenRefusals.incrementAndGet();
+        note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool, new IOException("stream 503"));
+        return;
+      }
+      if (sr.status != 201 && sr.status != 200) throw new IOException("stream " + sr.status);
+      String loc = sr.location;
+      if (loc == null) {
+        Frame f = decodeFrame(ByteBuffer.wrap(sr.body));
+        loc = "/swarm/v1/replies/" + hex(f.payload);
+      }
+      if (loc.startsWith("http")) {
+        URI u = URI.create(loc);
+        loc = u.getRawPath() + (u.getRawQuery() == null ? "" : "?" + u.getRawQuery());
+      }
+      w.consumerSockets.add(lh);
+      int gsc = lh.startGet(lh.head("GET", loc, token, null, CT, -1));
+      if (gsc != 200) throw new IOException("replies " + gsc);
+      try {
+        readBinaryLean(lh.bodyStream(), w, bytesRx);
+      } catch (IOException e) {
+        if (!w.hardStop.get()) throw e; // closed by the drain cutoff: unreceived slots are aged
+      }
+    } finally {
+      if (lh != null) lh.close();
+    }
+  }
+
 
   /** Strip the optional single space after SSE "data:" (StreamHttp emits "data: "). */
   static String sseDataField(String line) {
@@ -701,44 +868,35 @@ public class StreamLoad {
     return v;
   }
 
-  static void readBinary(InputStream in, AtomicBoolean stop, AtomicBoolean measureActive, LongAdder bytesRx) throws IOException {
+  static void readBinary(InputStream in, Win w, LongAdder bytesRx) throws IOException {
     byte[] hdr = new byte[FRAME_HDR];
-    while (!stop.get()) {
+    Track[] cache = new Track[1];
+    while (!w.hardStop.get()) {
       if (!readFully(in, hdr)) break;
-      int ver = hdr[0] & 0xff, type = hdr[1] & 0xff, flags = hdr[2] & 0xff;
+      int type = hdr[1] & 0xff, flags = hdr[2] & 0xff;
       int len = ((hdr[3] & 0xff) << 16) | ((hdr[4] & 0xff) << 8) | (hdr[5] & 0xff);
       byte[] payload = new byte[len];
       if (!readFully(in, payload)) break;
       if (type != TYPE_TOKEN) continue;
-      if (payload.length < CHUNK_HDR + 20) {
+      if (len < CHUNK_HDR + 20) {
         if ((flags & LAST) != 0) break;
         continue;
       }
-      long recv = System.nanoTime();
-      // chunk v2: [2][hi8][lo8][attempt4][seq4][flags1][bytes]
-      if (payload.length >= CHUNK_HDR + 20) {
-        try {
-          long emit = Long.parseLong(new String(payload, CHUNK_HDR, 20, StandardCharsets.US_ASCII));
-          if (measureActive.get()) {
-            LAT.add((recv - emit) / 1e3);
-            long slot = payload.length >= CHUNK_HDR + 40 ? asciiLong(payload, CHUNK_HDR + 20) : -1;
-            LAT_CO.add((recv - (slot > 0 ? slot : emit)) / 1e3);
-            bytesRx.add(payload.length - CHUNK_HDR);
-          }
-        } catch (NumberFormatException ignored) {}
-      }
+      onChunk(w, cache, payload, 0, len, System.nanoTime(), bytesRx);
       if ((payload[CHUNK_HDR - 1] & LAST) != 0 || (flags & LAST) != 0) break;
     }
   }
 
   /**
    * #415 binary drain over {@link LeanHttp#bodyStream()}: one reused payload buffer, stamps parsed
-   * from bytes. Same accounting as {@link #readBinary} (bytes = chunk data, latency in µs).
+   * from bytes. Same accounting as {@link #readBinary} (via {@link #onChunk}). Reads until LAST/EOF;
+   * the drain cutoff closes the socket to stop it.
    */
-  static void readBinaryLean(InputStream in, AtomicBoolean stop, AtomicBoolean measureActive, LongAdder bytesRx) throws IOException {
+  static void readBinaryLean(InputStream in, Win w, LongAdder bytesRx) throws IOException {
     byte[] hdr = new byte[FRAME_HDR];
     byte[] buf = new byte[4096];
-    while (!stop.get()) {
+    Track[] cache = new Track[1];
+    while (true) {
       if (!readFully(in, hdr, hdr.length)) break;
       int type = hdr[1] & 0xff, flags = hdr[2] & 0xff;
       int len = ((hdr[3] & 0xff) << 16) | ((hdr[4] & 0xff) << 8) | (hdr[5] & 0xff);
@@ -749,14 +907,7 @@ public class StreamLoad {
         if ((flags & LAST) != 0) break;
         continue;
       }
-      long recv = System.nanoTime();
-      long emit = asciiLong(buf, CHUNK_HDR);
-      if (emit > 0 && measureActive.get()) {
-        LAT.add((recv - emit) / 1e3);
-        long slot = len >= CHUNK_HDR + 40 ? asciiLong(buf, CHUNK_HDR + 20) : -1;
-        LAT_CO.add((recv - (slot > 0 ? slot : emit)) / 1e3);
-        bytesRx.add(len - CHUNK_HDR);
-      }
+      onChunk(w, cache, buf, 0, len, System.nanoTime(), bytesRx);
       if ((buf[CHUNK_HDR - 1] & LAST) != 0 || (flags & LAST) != 0) break;
     }
   }
@@ -772,28 +923,31 @@ public class StreamLoad {
     return v;
   }
 
-  static void readSse(InputStream in, AtomicBoolean stop, AtomicBoolean measureActive, LongAdder bytesRx) throws IOException {
+  /** SSE drain (diagnostic only): slot-time window counting, no per-stream accounting (no stream id). */
+  static void readSse(InputStream in, Win w, LongAdder bytesRx) throws IOException {
     BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
     String line; StringBuilder data = new StringBuilder(); String event = "";
-    while (!stop.get() && (line = br.readLine()) != null) {
+    while (!w.hardStop.get() && (line = br.readLine()) != null) {
       if (line.startsWith("event:")) event = line.substring(6).trim();
       else if (line.startsWith("data:")) data.append(sseDataField(line)).append('\n');
       else if (line.isEmpty()) {
         if ("end".equals(event)) break;
         if ("chunk".equals(event) || data.length() > 0) {
           String d = data.toString();
-          if (d.length() >= 20) {
+          if (d.length() >= 20 && w.account) {
             try {
               long emit = Long.parseLong(d.substring(0, 20).trim());
               long recv = System.nanoTime();
-              if (measureActive.get()) {
+              long slot = -1;
+              if (d.length() >= 40) {
+                try { slot = Long.parseLong(d.substring(20, 40).trim()); } catch (NumberFormatException ignored) {}
+              }
+              if (slot <= 0) { SCHED_STAMP_FALLBACK.increment(); slot = emit; }
+              if (w.inWindow(slot)) {
                 LAT.add((recv - emit) / 1e3);
-                long slot = -1;
-                if (d.length() >= 40) {
-                  try { slot = Long.parseLong(d.substring(20, 40).trim()); } catch (NumberFormatException ignored) {}
-                }
-                LAT_CO.add((recv - (slot > 0 ? slot : emit)) / 1e3);
+                LAT_CO.add((recv - slot) / 1e3);
                 bytesRx.add(d.length());
+                SCHED_RECEIVED.increment();
               }
             } catch (NumberFormatException ignored) {}
           }
@@ -1336,8 +1490,11 @@ public class StreamLoad {
     String latencyBasis = "send";
     Double p50Send, p90Send, p99Send, p50Sched, p90Sched, p99Sched;
     String latHistSend = "[]", latHistSched = "[]";
-    double rateMibS, schedLatePct, schedLagMaxUs;
-    long schedSends;
+    double rateMibS, schedLatePct, schedLagMaxUs, offeredActualMibS;
+    Double lagP50, lagP99;
+    long schedSends, schedExpected, schedSent, schedReceived, schedUnreceived, schedPhantomStreams,
+        schedStampFallback, schedInflightAtEnd;
+    boolean cutoffHit;
     boolean leanConsumer;
     Map<String, Double> counters, hardZeros;
     List<String> errors, teardownErrors;
@@ -1377,7 +1534,18 @@ public class StreamLoad {
       field(sb, "gen_cores", genCores, true);
       field(sb, "gen_sat_limit_pct", genSatLimitPct, true);
       field(sb, "offered_mib_s", rateMibS, true);
+      field(sb, "offered_actual_mib_s", offeredActualMibS, true);
       field(sb, "sched_sends", schedSends, true);
+      field(sb, "sched_expected", schedExpected, true);
+      field(sb, "sched_sent", schedSent, true);
+      field(sb, "sched_received", schedReceived, true);
+      field(sb, "sched_unreceived_at_cutoff", schedUnreceived, true);
+      field(sb, "sched_phantom_streams", schedPhantomStreams, true);
+      field(sb, "sched_inflight_at_end", schedInflightAtEnd, true);
+      field(sb, "sched_stamp_fallback", schedStampFallback, true);
+      field(sb, "cutoff_hit", cutoffHit, true);
+      field(sb, "sched_lag_p50_us", lagP50, true);
+      field(sb, "sched_lag_p99_us", lagP99, true);
       field(sb, "sched_late_pct", schedLatePct, true);
       field(sb, "sched_lag_max_us", schedLagMaxUs, true);
       field(sb, "lean_consumer", leanConsumer, true);

@@ -4,6 +4,9 @@ from __future__ import annotations
 import json, subprocess, sys, tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gatefix import ACCOUNTING, write_floor  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 AGG = HERE.parent / "agg.py"
 
@@ -18,6 +21,7 @@ def write_abs(root: Path, tag: str, **over):
         "mib_s": 120.0,
         "offered_mib_s": 110.0,  # inceptor Q1: paced gate window
         "latency_basis": "scheduled",
+        **ACCOUNTING,
         "load1_pre": 0.5,
         "load1_post": 1.0,
         "self_loaded": False,
@@ -45,7 +49,8 @@ def write_abs(root: Path, tag: str, **over):
     (d / "result.json").write_text(json.dumps(body))
 
 def run_agg(root: Path) -> str:
-    return subprocess.check_output([sys.executable, str(AGG), str(root)], text=True)
+    write_floor(root)
+    return subprocess.check_output([sys.executable, str(AGG), str(root), "--assume-q4"], text=True)
 
 def line(out: str, tag: str) -> str:
     for ln in out.splitlines():

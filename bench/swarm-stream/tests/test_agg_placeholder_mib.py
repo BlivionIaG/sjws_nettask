@@ -8,6 +8,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gatefix import ACCOUNTING, write_floor  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 AGG = HERE.parent / "agg.py"
 
@@ -33,7 +36,7 @@ def main():
                 "sjws_swarm_stream_open_sessions": 0,
             },
         }))
-        proc = subprocess.run([sys.executable, str(AGG), str(out)],
+        proc = subprocess.run([sys.executable, str(AGG), str(out), "--assume-q4"],
                               capture_output=True, text=True, cwd=str(HERE.parent))
         assert proc.returncode == 0, proc.stderr + proc.stdout
         assert "TypeError" not in (proc.stderr + proc.stdout)

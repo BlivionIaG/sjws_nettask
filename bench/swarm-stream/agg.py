@@ -9,6 +9,18 @@ from pathlib import Path
 
 from window_valid import evaluate as evaluate_window
 
+# inceptor Q1 (2026-11-11): the disclosed gate operating point. abs and A/A windows must be offered
+# exactly this rate (no other rate counts, Architecture item 2).
+GATE_RATE_MIB_S = 110.0
+# Architecture item 5, fixed before any run: the low-load end-to-end floor (10 MiB/s offered, same
+# config) must show scheduled-basis p99 <= 300 µs (30 % of the 1 ms budget), or the harness cannot
+# resolve the gate and the verdict is not PASS. It understates generator delay at 110 MiB/s.
+FLOOR_P99_MAX_US = 300.0
+# Architecture item 7 / inceptor Q4: no gate window counts until the Q4 validity change lands
+# (after #465 merges: master merged into #502, stricter self_loaded + --rate-mib-s folded in).
+# Flip to True in that commit. Tests pass --assume-q4 to exercise the PASS path.
+Q4_LANDED = False
+
 
 def binom_sf(k, n, p=0.5):
     from math import comb
@@ -31,8 +43,24 @@ def closed_loop_info(out: Path, abs_tag: str) -> dict:
             "client_cpu_pct_of_wall": r.get("client_cpu_pct_of_wall")}
 
 
+def lowload_floor(out: Path):
+    """First valid lowload-floor-N leg (gate.sh reruns invalid ones), else the last one, else None."""
+    legs = [load(p) for p in sorted(out.glob("lowload-floor-*/result.json"))]
+    legs = [r for r in legs if r]
+    for r in legs:
+        if evaluate_window(r)["valid"]:
+            return r, True
+    return (legs[-1], False) if legs else (None, False)
+
+
+def is_gate_rate(off) -> bool:
+    return isinstance(off, (int, float)) and abs(float(off) - GATE_RATE_MIB_S) < 1e-6
+
+
 def main():
-    out = Path(sys.argv[1])
+    argv = sys.argv[1:]
+    assume_q4 = "--assume-q4" in argv
+    out = Path([a for a in argv if not a.startswith("--")][0])
     abs_runs = sorted(out.glob("abs-*/result.json"))
     windows = []
     for p in abs_runs:
@@ -76,15 +104,26 @@ def main():
             "p99_send_us": r.get("p99_send_us"),
             "p99_sched_us": r.get("p99_sched_us"),
             "sched_late_pct": r.get("sched_late_pct"),
+            "offered_actual_mib_s": r.get("offered_actual_mib_s"),
+            "sched_lag_p50_us": r.get("sched_lag_p50_us"),
+            "sched_lag_p99_us": r.get("sched_lag_p99_us"),
+            "sched_expected": r.get("sched_expected"),
+            "sched_sent": r.get("sched_sent"),
+            "sched_received": r.get("sched_received"),
+            "sched_unreceived_at_cutoff": r.get("sched_unreceived_at_cutoff"),
+            "sched_phantom_streams": r.get("sched_phantom_streams"),
+            "sched_stamp_fallback": r.get("sched_stamp_fallback"),
+            "cutoff_hit": r.get("cutoff_hit"),
             "closed_loop": closed_loop_info(out, p.parent.name),
         })
 
     valid = [w for w in windows if w["valid"]]
-    floor = load(out / "floor" / "result.json")
-    floor_txt = (f"floor@{floor.get('offered_mib_s')}MiB/s p99={floor.get('p99_us')}µs "
-                 f"(send {floor.get('p99_send_us')}, valid={evaluate_window(floor)['valid']})") if floor else "floor=n/a"
+    floor, floor_valid = lowload_floor(out)
+    floor_txt = (f"lowload-floor@{floor.get('offered_mib_s')}MiB/s p99={floor.get('p99_us')}µs "
+                 f"(send {floor.get('p99_send_us')}, valid={floor_valid})") if floor else "lowload-floor=n/a"
     print(f"absolute windows: {len(windows)} total, {len(valid)} valid (need 5–8)")
-    print(f"generator latency {floor_txt} (Q5: reported, never subtracted)")
+    print(f"low-load end-to-end {floor_txt} (Q5: reported, never subtracted; accept p99 <= "
+          f"{FLOOR_P99_MAX_US:.0f} µs; understates generator delay at {GATE_RATE_MIB_S:.0f} MiB/s)")
     for w in windows:
         mib_s = w['mib_s']
         mib_txt = f"{mib_s:.3f}" if isinstance(mib_s, (int, float)) else "n/a"
@@ -96,8 +135,12 @@ def main():
               f"open_after={w['open_sessions_after_drain']} max_per_ip={w.get('max_connections_per_ip')} "
               f"load={w['load1_pre']}→{w['load1_post']}")
         cl = w.get("closed_loop") or {}
-        print(f"    offered={w.get('offered_mib_s')} achieved={mib_txt} basis={w.get('latency_basis')} "
-              f"p99_sched={w.get('p99_sched_us')} p99_send={w.get('p99_send_us')} late%={w.get('sched_late_pct')} | "
+        print(f"    offered={w.get('offered_mib_s')} offered_actual={w.get('offered_actual_mib_s')} "
+              f"achieved={mib_txt} basis={w.get('latency_basis')} "
+              f"p99_sched={w.get('p99_sched_us')} p99_send={w.get('p99_send_us')} late%={w.get('sched_late_pct')} "
+              f"lag_p50={w.get('sched_lag_p50_us')} lag_p99={w.get('sched_lag_p99_us')} "
+              f"slots exp/sent/recv={w.get('sched_expected')}/{w.get('sched_sent')}/{w.get('sched_received')} "
+              f"unrecv={w.get('sched_unreceived_at_cutoff')} cutoff_hit={w.get('cutoff_hit')} | "
               f"closed-loop(info) mib_s={cl.get('mib_s')} p99={cl.get('p99_us')} cpu={cl.get('client_cpu_pct_of_wall')} | "
               f"{floor_txt}")
         if (w['transport_retry_flag'] or w['refused_per_ip'] or w['drain_timed_out']
@@ -137,11 +180,30 @@ def main():
             reason.append("median missed §13 (≥100 MiB/s and p99<1ms)")
         if not ok_floor:
             reason.append("a window below 80 MiB/s or p99>1.5ms")
-        # inceptor Q1: gate windows must be paced (offered >= 100) with p99 from the scheduled send time.
+        # inceptor Q1 + Architecture items 1/2: paced at exactly the disclosed rate, scheduled-basis
+        # p99, every in-window slot received (nothing lost or hung at the drain cutoff).
         for w in use:
             off = w.get("offered_mib_s")
-            if w.get("latency_basis") != "scheduled" or not isinstance(off, (int, float)) or off < 100.0:
-                reason.append(f"{w['tag']}: not a paced gate window (offered={off}, basis={w.get('latency_basis')})")
+            if w.get("latency_basis") != "scheduled" or not is_gate_rate(off):
+                reason.append(f"{w['tag']}: not a paced gate window at {GATE_RATE_MIB_S:.0f} MiB/s "
+                              f"(offered={off}, basis={w.get('latency_basis')})")
+            exp, rec = w.get("sched_expected"), w.get("sched_received")
+            if not isinstance(exp, int) or not isinstance(rec, int) or exp <= 0:
+                reason.append(f"{w['tag']}: no slot accounting (sched_expected={exp})")
+            elif rec < exp:
+                reason.append(f"{w['tag']}: slot shortfall {exp - rec} of {exp} "
+                              f"(unreceived at cutoff {w.get('sched_unreceived_at_cutoff')}, "
+                              f"phantom streams {w.get('sched_phantom_streams')})")
+            if w.get("cutoff_hit"):
+                reason.append(f"{w['tag']}: drain cutoff hit (hung streams)")
+            if (w.get("sched_stamp_fallback") or 0) > 0:
+                reason.append(f"{w['tag']}: {w.get('sched_stamp_fallback')} scheduled stamps unparsable")
+        # Architecture item 5: the low-load floor acceptance, fixed in advance.
+        if not floor or not floor_valid:
+            reason.append("no valid low-load end-to-end floor leg")
+        elif not isinstance(floor.get("p99_us"), (int, float)) or floor["p99_us"] > FLOOR_P99_MAX_US:
+            reason.append(f"low-load floor p99={floor.get('p99_us')} µs > {FLOOR_P99_MAX_US:.0f} µs: "
+                          "harness cannot resolve the 1 ms gate")
         # hard zeros across valid windows (retries/refused/open already exclude from valid)
         for w in use:
             if w.get("transport_retry_flag"):
@@ -211,6 +273,12 @@ def main():
     # A/A
     aa = [load(p) for p in sorted(out.glob("aa-*/result.json"))]
     aa = [r for r in aa if r and r.get("mib_s") is not None]
+    for i, r in enumerate(aa):
+        if not is_gate_rate(r.get("offered_mib_s")) or r.get("latency_basis") != "scheduled":
+            reason.append(f"A/A leg {i}: not paced at {GATE_RATE_MIB_S:.0f} MiB/s "
+                          f"(offered={r.get('offered_mib_s')}, basis={r.get('latency_basis')})")
+            if verdict == "PASS":
+                verdict = "FAIL"
     if len(aa) >= 2:
         print(f"A/A noise floor: {aa[0]['mib_s']:.3f} vs {aa[1]['mib_s']:.3f} MiB/s; "
               f"p99 {aa[0].get('p99_us')} vs {aa[1].get('p99_us')} µs")
@@ -246,6 +314,10 @@ def main():
             print(f"  {row['tag']}: groups={row['groups']} mib_s={row['mib_s']} p99_us={row['p99_us']} "
                   f"writers={row['writer_count']} zstall={row['zallocation_stalls']} oom={row['oom']}")
 
+    if not (Q4_LANDED or assume_q4):
+        # Sequencing (Architecture item 7): report what it would be, but nothing counts yet.
+        reason.insert(0, f"pre-Q4 harness, would be {verdict}")
+        verdict = "NOT_COUNTABLE"
     print(f"VERDICT: {verdict}" + (f" ({'; '.join(reason)})" if reason else ""))
     (out / "agg-summary.json").write_text(json.dumps({
         "verdict": verdict, "reason": reason, "windows": windows, "valid_n": len(valid),
